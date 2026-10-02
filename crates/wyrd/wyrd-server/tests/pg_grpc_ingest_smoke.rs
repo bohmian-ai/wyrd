@@ -1380,3 +1380,253 @@ async fn system_drift_reader_reads_only_the_observation_table() {
 
     harness.shutdown().await;
 }
+
+/// Every staged `bifrost.record.write` decision is a refusal of the expected
+/// writer and the WAL holds no verification result row.
+///
+/// # Panics
+///
+/// Panics when the staged decisions differ from `expected` or the
+/// acknowledged WAL replays any `results`, `result_features`, or
+/// `result_items` record.
+async fn assert_only_denials_and_no_durable_result(
+    harness: &SystemWriterHarness,
+    expected: Vec<(bool, String, String, String)>,
+) {
+    assert_eq!(harness.write_decisions().await, expected);
+    let replayed = replay_wal_directory(
+        harness
+            .server
+            .scribe_wal_root_for_test()
+            .expect("Scribe-composed server owns a WAL root"),
+    )
+    .expect("acknowledged WAL replays");
+    let durable_results = replayed
+        .values()
+        .filter(|stream| {
+            ["results", "result_features", "result_items"]
+                .contains(&stream.seal_key.table.name.as_str())
+        })
+        .map(|stream| stream.data_records.len())
+        .sum::<usize>();
+    assert_eq!(durable_results, 0, "no refused result write became durable");
+}
+
+/// Mints a five-minute token for `principal` carrying only
+/// `bifrost:record:write`.
+///
+/// # Panics
+///
+/// Panics when the fixture key cannot sign the token.
+fn mint_record_writer_jwt(state: &AppState, principal: TokenPrincipalRef) -> String {
+    state
+        .auth
+        .issuing_key
+        .as_ref()
+        .expect("test state has issuing key")
+        .issue_access_token(
+            wyrd_auth_issue::AccessGrant {
+                principal,
+                roles: vec![],
+                permissions: [wyrd_runtime::Permission::bifrost_record_write()]
+                    .into_iter()
+                    .collect(),
+                credential_id: None,
+                act: None,
+                audience: wyrd_spec::auth::TokenAudience::Wyrd,
+            },
+            ChronoDuration::minutes(5),
+        )
+        .expect("record-writer jwt mints")
+}
+
+/// The SYSTEM writer matrix over the full built-in catalog, through public
+/// gRPC and Gate.
+///
+/// Every principal other than SYSTEM — a wildcard administrator and a
+/// record-writing card-free service — is refused each of the three
+/// verification result tables, and the SYSTEM writer is refused every other
+/// built-in table and a user table. Each refusal answers `PermissionDenied`
+/// and stages exactly one denied decision carrying the true principal kind,
+/// and nothing reaches the WAL. The retained audit log is the one exception
+/// to the staged decision: Gate refuses the audit namespace to every public
+/// writer before evaluating any permission, so that refusal is not a
+/// principal decision and stages nothing.
+///
+/// # Panics
+///
+/// Panics when any cell is admitted or answered with another code, when the
+/// staged decisions differ from one denial per cell in order, or when a
+/// result row becomes durable.
+#[tokio::test]
+async fn system_writer_matrix_spans_every_builtin_table() {
+    let harness = SystemWriterHarness::start("system-writer-matrix").await;
+    let state = harness.server.state();
+    let results = [
+        "vala.verification.results",
+        "vala.drift.result_features",
+        "vala.eval.result_items",
+    ];
+    let service_jwt = mint_record_writer_jwt(
+        state,
+        TokenPrincipalRef {
+            id: PrincipalId::new(Uuid::now_v7()),
+            kind: PrincipalKindTag::Service,
+            tenant_id: harness.tenant,
+            card_ref: None,
+            card_ref_scope: Default::default(),
+        },
+    );
+    let non_system = [
+        ("user", mint_user_jwt(state, harness.tenant, &["admin"])),
+        ("service", service_jwt),
+    ];
+    let mut cells: Vec<(bool, &str, String, String)> = Vec::new();
+    for table in results {
+        for (kind, jwt) in &non_system {
+            cells.push((false, kind, jwt.clone(), table.to_owned()));
+        }
+    }
+    let others = vala_bifrost_redux::tables::builtin_fqns()
+        .into_iter()
+        .filter(|fqn| !results.contains(&fqn.as_str()))
+        .chain(["vala.datasets.customer_rows".to_owned()]);
+    for table in others {
+        cells.push((true, "system", harness.system_jwt.clone(), table));
+    }
+    assert!(
+        cells.iter().filter(|cell| cell.0).count() >= 9,
+        "the SYSTEM column covers the whole non-result built-in catalog plus a user table"
+    );
+
+    let mut expected = Vec::new();
+    for (system, kind, jwt, table) in &cells {
+        let ipc = if *system {
+            valid_arrow_ipc()
+        } else {
+            verification_result_ipc(Some(Some(&harness.identity())))
+        };
+        let refused = insert_as(harness.bind, jwt, table, ipc)
+            .await
+            .expect_err("the cell is refused");
+        assert_eq!(
+            refused.code(),
+            Code::PermissionDenied,
+            "{kind} on {table}: {refused:?}"
+        );
+        if table != "vala.system.audit_log" {
+            expected.push((
+                *system,
+                (*kind).to_owned(),
+                table.clone(),
+                "denied".to_owned(),
+            ));
+        }
+    }
+    assert_only_denials_and_no_durable_result(&harness, expected).await;
+
+    harness.shutdown().await;
+}
+
+/// A result write whose token names a forged tenant is refused before any
+/// decision or durable write.
+///
+/// Gate derives the tenant only from the signed token claim; there is no wire
+/// tenant to forge. Rewriting the SYSTEM token's `principal.tenant_id` to
+/// another tenant or to the system owner, or stripping its signature, breaks
+/// verification, so each attempt answers `Unauthenticated`, stages no write
+/// decision in the real tenant, and nothing reaches the WAL.
+///
+/// # Panics
+///
+/// Panics when the token cannot be decoded or re-encoded, when a forged write
+/// is admitted or answered with another code, or when any decision or result
+/// row is recorded.
+#[tokio::test]
+async fn forged_tenant_result_writes_are_refused() {
+    use base64::Engine as _;
+    let harness = SystemWriterHarness::start("system-forged-tenant").await;
+    let foreign = DataTenantId::new_v7();
+    seed_tenant(&harness.server, foreign, "system-forged-foreign").await;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let parts: Vec<&str> = harness.system_jwt.split('.').collect();
+    let [header, payload, signature] = parts.as_slice() else {
+        panic!("the SYSTEM token is a compact JWS");
+    };
+    let forge = |tenant: DataTenantId| {
+        let mut claims: serde_json::Value = serde_json::from_slice(
+            &engine
+                .decode(payload)
+                .expect("the token payload is base64url"),
+        )
+        .expect("the token payload is JSON");
+        claims["principal"]["tenant_id"] = serde_json::json!(tenant.to_string());
+        let forged = engine.encode(serde_json::to_vec(&claims).expect("claims encode"));
+        format!("{header}.{forged}.{signature}")
+    };
+    let attempts = [
+        ("foreign tenant", forge(foreign)),
+        ("system owner", forge(DataTenantId::SYSTEM_OWNER)),
+        ("unsigned", format!("{header}.{payload}.")),
+    ];
+    for (label, jwt) in attempts {
+        let refused = insert_as(
+            harness.bind,
+            &jwt,
+            "vala.verification.results",
+            verification_result_ipc(Some(Some(&harness.identity()))),
+        )
+        .await
+        .expect_err("a forged tenant is refused");
+        assert_eq!(
+            refused.code(),
+            Code::Unauthenticated,
+            "{label}: {refused:?}"
+        );
+    }
+    assert_only_denials_and_no_durable_result(&harness, vec![]).await;
+
+    harness.shutdown().await;
+}
+
+/// A validly signed global SYSTEM_OWNER SYSTEM token cannot write a
+/// customer-tenant verification result through Gate.
+///
+/// The token carries the customer's exact Verifier scope and
+/// `bifrost:record:write`, but binds the reserved system-owner tenant. Gate
+/// takes the tenant only from that claim, so the write can never address the
+/// customer tenant, and a SYSTEM claim set outside a customer tenant does not
+/// verify: the write answers `Unauthenticated`, the customer tenant stages no
+/// decision, and the WAL holds no result row.
+///
+/// # Panics
+///
+/// Panics when the token cannot be minted, when the write is admitted or
+/// answered with another code, or when any customer decision or durable
+/// result row is recorded.
+#[tokio::test]
+async fn system_owner_token_cannot_write_a_customer_result() {
+    let harness = SystemWriterHarness::start("system-owner-result").await;
+    let jwt = mint_record_writer_jwt(
+        harness.server.state(),
+        TokenPrincipalRef {
+            id: PrincipalId::new(harness.writer),
+            kind: PrincipalKindTag::System,
+            tenant_id: DataTenantId::SYSTEM_OWNER,
+            card_ref: None,
+            card_ref_scope: wyrd_spec::reference::CardRefScope::own(&harness.verifier),
+        },
+    );
+    let refused = insert_as(
+        harness.bind,
+        &jwt,
+        "vala.verification.results",
+        verification_result_ipc(Some(Some(&harness.identity()))),
+    )
+    .await
+    .expect_err("a system-owner token is refused a customer result");
+    assert_eq!(refused.code(), Code::Unauthenticated, "{refused:?}");
+    assert_only_denials_and_no_durable_result(&harness, vec![]).await;
+
+    harness.shutdown().await;
+}

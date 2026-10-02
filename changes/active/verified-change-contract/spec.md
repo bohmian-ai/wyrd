@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 50
+revision: 51
 status: approved
 ---
 
@@ -1335,8 +1335,9 @@ table on `(data_tenant_id, result_id)`.
   `spec` or makes a binding a Card.
 - **REQ-135**: The only new Verification HTTP operations in this change MUST
   be `GET /v1/verification/bindings/{binding_id}`,
-  `POST /v1/verification/runs`, and
-  `GET /v1/verification/runs/{run_id}`. Binding GET MUST return exact owner,
+  `POST /v1/verification/runs`,
+  `GET /v1/verification/runs/{run_id}`, and the synchronous
+  `POST /v1/verification/execute` defined by REQ-167. Binding GET MUST return exact owner,
   subject, and Verifier Card identities, the current principal-activity gate,
   readiness and reason, nullable `next_run_at` (null for Eval), nullable
   `last_activated_at`, and nullable `last_run_id`. Run GET MUST return run ID,
@@ -1632,6 +1633,89 @@ table on `(data_tenant_id, result_id)`.
   policy attribution in exchange audit. Existing token exchange and Wyrd API
   authorization otherwise remain intact. No replacement policy gate is part
   of this change.
+
+### Direct execution, telemetry, and verification capacity (revision 51)
+
+- **REQ-167**: `POST /v1/verification/execute` MUST synchronously execute
+  one exact registered Verifier for one exact subject over supplied input and
+  return the judgment in the response. The request is `{ verifier_uid,
+  subject_card_uid, input }`. `input` is tagged by `kind`:
+  `eval_record { context: object, media?: [MediaRef] }` for assertion-only
+  and LLM-judge Evals, with judges receiving the supplied context; or
+  `drift_samples { columns: { <feature>: [number | string | null] } }`, where
+  PSI and SPC score against the Verifier's `ready` fitted baseline and Custom
+  scores the mean of `profile.metric_name`. Success is `200 { execution_id,
+  verifier, subject, kind, verdict, summary, counts, detail }`. `verdict` is
+  `passed | failed | inconclusive`, and `detail` is `{ drift: DriftReport }`
+  or `{ eval: EvalReport }`. `execution_id` is a UUIDv7 that appears only in
+  the response, audit, and trace. It is never persisted or queryable. A
+  `failed` verdict is a successful response. The operation MUST NOT create a
+  durable run, publish a result, dispatch an Operator, read or write Bifrost,
+  or apply the Eval sampling policy. Registry, baseline, and judge
+  Agent/Prompt resolution and canonical audit still use PostgreSQL.
+- **REQ-168**: Direct execution MUST require `evals:run` with exact Verifier
+  and subject scope, exactly as the direct-target run start does. It MUST
+  transactionally audit one allowed or denied decision per request and
+  refuse the request when the audit append fails. Unknown or cross-tenant
+  targets return `404 verification_target_not_found`. Bounds:
+  - a request body of at most 1 MiB;
+  - `drift_samples` of at most 64 columns × 100,000 values;
+  - `eval_record.context` of at most 256 KiB;
+  - one 60-second execution deadline;
+  - no concurrency cap or admission layer.
+
+  Stable errors:
+
+  | Status | Code | Condition |
+  |---|---|---|
+  | 400 | `verification_input_invalid` | Malformed input |
+  | 413 | `verification_input_too_large` | A bound is exceeded |
+  | 403 | existing RBAC code | Permission denied |
+  | 409 | `verification_baseline_not_ready` | No `ready` fitted baseline |
+  | 409 | `verification_baseline_legacy` | Baseline fitted under an earlier format |
+  | 422 | `verification_input_incompatible` | Missing feature or type mismatch |
+  | 422 | `verification_input_unsupported` | An Eval with trace or agent assertions, refused before any task runs |
+  | 502 | `verification_dependency_failed` | Judge provider failure after the task's own `max_retries` |
+  | 504 | `verification_execution_timed_out` | The deadline elapsed |
+
+  The operation is not idempotent, takes no `Idempotency-Key`, and is never
+  retried automatically by an SDK. A client disconnect cancels in-flight work.
+  Provider calls already issued may have incurred cost.
+- **REQ-169**: `wyrd-client` and the Rust, Python, and TypeScript SDKs MUST
+  expose `verification.execute(...)` over REQ-167 without duplicating
+  transport or scoring. MCP MUST expose the write tool `verification_execute`,
+  gated on `evals:run`, and the served OpenAPI MUST describe the operation.
+- **REQ-170**: Verifier execution telemetry MUST follow the TASK-008 closeout
+  telemetry contract. Required elements:
+  - one execution owner shared by queued and direct paths;
+  - closed labels: `kind` (`drift_psi`, `drift_spc`, `drift_custom`,
+    `eval_assertion`, `eval_llm_judge`, `eval_other`, `unknown`), `mode`
+    (`queued`, `direct`), `origin`, `phase` (`load`, `input_read`, `prepare`,
+    `engine`, `publication`, `settlement`), and the bounded `outcome` sets;
+  - `wyrd_verification_engine_overhead_seconds`, computed as engine elapsed
+    time minus the union of measured wait intervals;
+  - the shared bucket set
+    `0.0005, 0.001, 0.0025, 0.005, 0.0075, 0.009, 0.01, 0.025, 0.05, 0.1,
+    0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300`;
+  - INFO-level correlated spans and queued task-start delay;
+  - the operator catalog and its PromQL.
+
+  No Grafana deliverable is part of this change.
+- **REQ-171**: `mise run bench:verification:capacity` MUST replace the
+  verification journey benchmark. It measures queued, direct, and concurrent
+  queued/direct execution of PSI, SPC, Custom, assertion Eval, and LLM-judge
+  Eval, both solo and mixed, on one and two release replicas.
+  - Defaults: 30-second steps; offered totals of 10, 25, 50, 100, and 200
+    executions per second split evenly across kinds; one noisy, one quiet,
+    and 70 background tenants.
+  - It reports, per path, step, and kind: reconciled work, achieved rate,
+    raw client p50/p95/p99, bucket-estimated server phases, paired engine
+    overhead, task-start delay, backlog, the resource envelope, and a verdict.
+  - `--profile` captures symbolized per-step, per-replica `perf` profiles of
+    a diagnostic build and fails explicitly on missing evidence.
+  - Manual activations used for capacity are labelled and never counted as
+    scheduler throughput. Scheduled Drift and observation-triggered Eval
+    correctness stays proven by the existing journeys.
 
 ## Invariants
 
@@ -2099,6 +2183,32 @@ published image pinned by an immutable registry digest before release.
   delegated exchange MUST still work without `PolicyHook`, policy-only audit,
   or unevaluated `invoke` attribution.
 
+- **AC-039**: Real Rust, Python, and TypeScript client journeys MUST prove
+  direct execution for PSI, SPC, Custom, assertion Eval, and LLM-judge Eval.
+  They MUST prove exact version attribution, passed and failed judgments,
+  missing or legacy baselines, permission and cross-tenant refusal,
+  malformed, oversized, incompatible, and unsupported input, and timeout. They
+  MUST also prove that no durable run, result, dispatch, or Bifrost evidence
+  operation occurs. An isolated test MUST prove that an audit-append failure
+  refuses the request.
+- **AC-040**: The reference workloads are:
+
+  | Case | Workload |
+  |---|---|
+  | Assertion Eval | 4 assertion tasks over a 2 KiB context |
+  | Custom | 1 metric, 1,000 samples |
+  | PSI | 8 numeric features × 1,000 samples, 10 quantile bins, baseline fitted from 10,000 rows |
+  | SPC | 4 features × 1,000 samples, subgroup size 5, baseline from 10,000 rows |
+  | LLM judge | 1 judge plus 1 assertion against a local TLS mock with a 200 ms delay |
+
+  Sustainable load is the highest offered step whose achieved rate is at
+  least 95% of offered and whose outstanding work drains within one step. At
+  sustainable load, solo and mixed, on one release replica, the four
+  non-judge cases MUST show direct-mode paired per-request engine overhead
+  below 10 ms at p95, from at least 1,000 samples per case per step. Judge
+  cases report overhead and provider waits separately, with no threshold.
+  Mixed slowdown is reported without a contractual bound.
+
 ## Open material decisions
 
 None. Revision 39 records the user's narrow deletion: remove the always-allow
@@ -2134,6 +2244,19 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 - [PagerDuty Global Integrations and Service Routes](https://support.pagerduty.com/main/docs/event-orchestration)
 
 ## Revision history
+
+- **Revision 51 direct execution, telemetry, and capacity (2026-10-02):** The
+  user approved the TASK-008 closeout amendments.
+  - REQ-135 gains a fourth operation.
+  - REQ-167 to REQ-169 define synchronous supplied-input execution, its
+    authorization, bounds, errors, and SDK/MCP projections.
+  - REQ-170 carries the caller-aligned telemetry contract.
+  - REQ-171 defines the capacity benchmark.
+  - AC-039 and AC-040 fix direct-execution proof, the reference workloads,
+    and the strict latency proof.
+
+  This revision supersedes the recovery task's fixed traffic profile and its
+  prohibition on synchronous execution.
 
 - **Revision 50 remove Verifier execution caps (2026-10-02):** Explicit caller
   instruction removes the 16-process/4-tenant permits from Verifier runs and

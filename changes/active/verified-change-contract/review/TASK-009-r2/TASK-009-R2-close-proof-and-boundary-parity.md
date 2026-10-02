@@ -86,3 +86,16 @@ git diff --check
 ```
 
 Route directly to `$wyrd-implement`. A later task review must assess the cumulative original base through the remediated candidate, not merely this fix diff.
+
+## Implementation evidence
+
+Commits: `c50aa1b07`, plus formatter-only follow-up.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| 1. FIND-TASK-009-1: an actual registration attempt raises during Run entry and Drift still reaches the offline error; normal exit and app exceptions keep their behavior | `tests/unit/state/test_observe_surface.py::test_registration_and_attach_failures_never_block_observations` selects a global provider whose `add_span_processor` records the attempt and raises, runs `_drift_reaches_the_ordinary_boundary` in scope, asserts one attempt, then asserts a `ValueError` from the block propagates (second attempt). No production change | `uv run python -m pytest -q tests/unit/state/test_observe_surface.py::test_registration_and_attach_failures_never_block_observations` (pass) | PASS |
+| 2. FIND-TASK-009-5: conventional-keyword and omitted exit calls return False; runtime names/defaults match generated stubs | `src/observe/mod.rs` `__exit__` signature `(exc_type=None, exc_value=None, traceback=None)`; `python/wyrd/stubs/observe.pyi` defaults `= None`, regenerated `observe/__init__.pyi` via `mise run codegen:regen` | `uv run python -m pytest -q tests/unit/state/test_observe_surface.py::test_run_exit_accepts_conventional_keywords_and_omitted_arguments` (red before rebuild: params were `_exc_type…`; green after); `codegen:check`, `py:typecheck` pass | PASS |
+| 3. FIND-TASK-009-6: both new Rust tests document panic conditions | `crates/shared/wyrd-client/src/observe/tests.rs` `# Panics` on `run_for_card_selects_the_initial_view_and_shares_its_invocation` and `run_for_card_refuses_an_unknown_alias_without_network_io`; bodies unchanged | static inspection, `mise run fmt`, `mise run lints` | PASS |
+| 4. Existing behavior, generation, typing and boundary gates stay green | no other changes | full `test_observe_surface.py` (34 passed); persisted journey `test_scoped_run_emits_drift_eval_and_generic_rows` (1 passed); `test:shared` (704 passed); `py:test:unit` (513 passed); `py:test:integration` (72 passed); `py:typecheck`, `codegen:check`, `check:pyo3-scope`, `fmt`, `py:format`, `lints`, `py:lints`, `git diff --check` all exit 0 | PASS |
+
+Non-goals stayed excluded: no production OTel change, no alias/compat layer, no `#[allow]` (the unused exception triple is bound explicitly), and no unrelated files changed.

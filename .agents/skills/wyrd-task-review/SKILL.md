@@ -145,7 +145,14 @@ Inspect specifically for:
 - **REGRESSION** — existing behavior was unintentionally changed.
 
 Do not report optional improvements, speculative hardening, preferences,
-unrelated pre-existing debt, or refactors not required by the task. Tests prove
+unrelated pre-existing debt, or refactors not required by the task.
+
+A finding blocks only when it has a behavioral, security, tenancy,
+durability, or public-contract consequence, or when it deletes unearned code.
+Placement, naming, structure, and wording findings with no such consequence
+are non-blocking even when a style rule can be cited; record them under
+non-blocking notes and never let them alone produce `FIX_REQUIRED`. Missing
+rustdoc on a changed item stays blocking per `AGENTS.md`. Tests prove
 behavior; they do not prove that the requested behavior was built. Rely on
 repository source and the diff, not agent summaries.
 
@@ -392,8 +399,7 @@ For `FIX_REQUIRED`, also write one self-contained remediation task named
    review.
 
 Batch bounded documentation corrections with the same remediation task. Keep
-the rustdoc gate intact, but do not create a style-only round while a shared
-security, tenancy, or concurrency cause remains open. If approved spec text
+the rustdoc gate intact, but never create a style-only round. If approved spec text
 conflicts with the required correction, return `SPEC_REVISION_REQUIRED` and
 name the conflict instead of prescribing an unapproved behavior change.
 

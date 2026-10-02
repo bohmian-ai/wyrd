@@ -351,9 +351,7 @@ mod pg_tests {
     }
 
     /// GET `/auth/authorize?{query}` with hostile `Host` and forwarded
-    /// headers through the handler alone, without the auth router's per-peer
-    /// rate limiter, which needs a real socket's peer address; returns the
-    /// status and `Location`.
+    /// headers through the handler alone; returns the status and `Location`.
     ///
     /// # Panics
     /// Panics when the request cannot be built or answered.

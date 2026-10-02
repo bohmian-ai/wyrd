@@ -7,12 +7,9 @@ use axum::Json;
 use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use std::sync::Arc;
 
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
-use tower_governor::GovernorLayer;
-use tower_governor::governor::GovernorConfigBuilder;
 use uuid::Uuid;
 use wyrd_auth::callback::{AuthorizationCodeExchange, LoginCompletion};
 use wyrd_auth_verify::AccessTokenClaims;
@@ -34,7 +31,7 @@ use crate::auth::exchange_api_key::{
 };
 use crate::auth::issue_api_key::{IssueApiKey, WyrdApiKey};
 use crate::auth::jwt_bearer::exchange_jwt_bearer;
-use crate::auth::oauth::{GRANT_TYPES, OAuthError, OAuthForm, no_store};
+use crate::auth::oauth::{ClientForm, GRANT_TYPES, OAuthError, OAuthForm, no_store};
 use crate::auth::refresh::{RefreshError, RefreshTokens, tenant_from_refresh_jwt};
 use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::http::error::WyrdErrorResponse;
@@ -51,23 +48,11 @@ use utoipa_axum::routes;
 /// (`GET`/`POST /auth/device`), the common OIDC provider callback
 /// (`GET /auth/callback`), the token endpoint (`POST /auth/token`), token
 /// revocation (`POST /auth/revoke`), authorization server metadata, and API
-/// key issuance (`POST /auth/issue-key`) — behind one shared per-peer-IP
-/// governor, so credential guessing, device-code polling, and login-state
-/// churn draw on a single admission budget rather than one per route.
-///
-/// # Panics
-/// Panics when the static governor configuration is invalid (a zero period
-/// or burst). The values are compile-time constants, so this is an invariant
-/// rather than a runtime condition.
+/// key issuance (`POST /auth/issue-key`). Device user-code attempts are
+/// limited per client address at the gateway (RFC 8628 §5.1), which sees the
+/// real client and one budget across replicas; the token endpoint enforces
+/// the device polling interval with `slow_down`.
 pub fn auth_router() -> OpenApiRouter<AppState> {
-    let auth_governor = Arc::new(
-        GovernorConfigBuilder::default()
-            .per_millisecond(100)
-            .burst_size(20)
-            .finish()
-            .expect("static auth governor config is valid"),
-    );
-
     OpenApiRouter::new()
         .routes(routes!(crate::auth::authorize::authorize))
         .routes(routes!(crate::auth::authorize::metadata))
@@ -80,7 +65,6 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
         .routes(routes!(callback))
         .routes(routes!(token))
         .routes(routes!(issue_key))
-        .layer(GovernorLayer::new(auth_governor))
 }
 
 /// `POST /auth/token` — the OAuth token endpoint.
@@ -108,7 +92,8 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
 #[utoipa::path(
     post,
     path = "/auth/token",
-    request_body(content = TokenRequest, content_type = "application/x-www-form-urlencoded"),
+    request_body(content = ClientForm<TokenRequest>,
+        content_type = "application/x-www-form-urlencoded"),
     responses(
         (status = 200, description = "Access token issued", body = TokenResponse),
         (status = 400, description = "RFC 6749 §5.2 or RFC 8628 §3.5 refusal: \
@@ -119,9 +104,9 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
         (status = 500, description = "`server_error`", body = OAuthErrorResponse),
         (status = 503, description = "`temporarily_unavailable`", body = OAuthErrorResponse)
     ),
-    // No session exists yet at this operation, so it clears the document-wide
-    // requirement instead of inheriting it.
-    security(()),
+    // No session exists yet at this operation: a public client names itself
+    // with `client_id` and needs nothing, a confidential client uses Basic.
+    security((), ("oauthClientBasic" = [])),
     tag = "Auth"
 )]
 #[tracing::instrument(level = "debug", skip_all)]

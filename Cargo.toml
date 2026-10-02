@@ -153,8 +153,6 @@ password-hash = { version = "0.5", features = ["getrandom"] }
 secrecy = "0.10"
 subtle = "2.6"
 zeroize = "1"
-governor = "0.10"
-tower_governor = { version = "0.8", features = ["axum"] }
 rand = "0.9"
 url = { version = "2", features = ["serde"] }
 urlencoding = "2"

@@ -23,7 +23,7 @@ use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::request_id::RequestId;
 
 use crate::auth::auth_not_configured;
-use crate::auth::oauth::{OAuthError, OAuthForm, no_store};
+use crate::auth::oauth::{ClientForm, OAuthError, OAuthForm, no_store};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -54,7 +54,7 @@ pub(crate) fn cli_logins(state: &AppState) -> Result<CliLogins, WyrdError> {
 #[utoipa::path(
     post,
     path = "/auth/device_authorization",
-    request_body(content = DeviceAuthorizationRequest,
+    request_body(content = ClientForm<DeviceAuthorizationRequest>,
         content_type = "application/x-www-form-urlencoded"),
     responses(
         (status = 200, description = "Device code issued; show `user_code`, open \
@@ -67,9 +67,9 @@ pub(crate) fn cli_logins(state: &AppState) -> Result<CliLogins, WyrdError> {
         (status = 500, description = "`server_error`", body = OAuthErrorResponse),
         (status = 503, description = "`temporarily_unavailable`", body = OAuthErrorResponse)
     ),
-    // No session exists yet at this operation, so it clears the document-wide
-    // requirement instead of inheriting it.
-    security(()),
+    // No session exists yet at this operation: a public client names itself
+    // with `client_id` and needs nothing, a confidential client uses Basic.
+    security((), ("oauthClientBasic" = [])),
     tag = "Auth"
 )]
 #[tracing::instrument(level = "debug", skip_all)]
@@ -279,7 +279,7 @@ pub(crate) fn page(status: StatusCode, body: &str) -> Response {
 #[utoipa::path(
     post,
     path = "/auth/revoke",
-    request_body(content = TokenRevocationRequest,
+    request_body(content = ClientForm<TokenRevocationRequest>,
         content_type = "application/x-www-form-urlencoded"),
     responses(
         (status = 200, description = "The token's login, if it named one, no longer renews"),
@@ -288,7 +288,7 @@ pub(crate) fn page(status: StatusCode, body: &str) -> Response {
         (status = 500, description = "`server_error`", body = OAuthErrorResponse),
         (status = 503, description = "`temporarily_unavailable`", body = OAuthErrorResponse)
     ),
-    security(()),
+    security((), ("oauthClientBasic" = [])),
     tag = "Auth"
 )]
 #[tracing::instrument(level = "debug", skip_all)]

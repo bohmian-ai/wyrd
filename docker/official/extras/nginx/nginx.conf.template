@@ -37,6 +37,18 @@ http {
         '' '';
     }
 
+    # RFC 8628 section 5.1: limit attempts to verify the short device user
+    # code, per client address this gateway observes. Only POST /auth/device
+    # has a key; an empty key is never limited, so no other route shares the
+    # zone. The zone is gateway shared memory, so backend replicas see one
+    # budget.
+    map "$request_method $uri" $device_verification_client {
+        "POST /auth/device" $binary_remote_addr;
+        default "";
+    }
+    limit_req_zone $device_verification_client zone=device_verification:10m rate=10r/m;
+    limit_req_status 429;
+
     server {
         listen 8080;
         server_name _;
@@ -59,6 +71,7 @@ http {
             proxy_buffering off;
             proxy_read_timeout 1h;
             proxy_send_timeout 1h;
+            limit_req zone=device_verification burst=5 nodelay;
         }
 
         location / {

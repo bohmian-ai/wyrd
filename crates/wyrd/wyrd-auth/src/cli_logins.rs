@@ -552,20 +552,26 @@ mod pg_tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wyrd_auth_issue::IssuingKey;
+    use wyrd_auth_oidc::MappedClaims;
     use wyrd_auth_oidc::ScreenedHttp;
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
     use wyrd_crypt::{SealingKeyring, SecretKey};
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
-    use wyrd_spec::auth::{OAuthClientId, PrincipalId, PrincipalKindTag, SecretBearer};
+    use wyrd_spec::auth::{
+        DeviceAuthorization, LoginInitiation, OAuthClientId, PrincipalId, PrincipalKindTag,
+        SecretBearer, Sha256Hex,
+    };
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::TenantSlug;
     use wyrd_sql::queries::auth::{
-        approve_device_authorization, deny_device_authorization, insert_human_refresh_token,
-        pending_device_authorization, refresh_by_hash,
+        LoginState, approve_device_authorization, consume_login_state, deny_device_authorization,
+        insert_human_refresh_token, insert_login_state, pending_device_authorization,
+        refresh_by_hash,
     };
     use wyrd_sql::row_types::auth::HumanSessionBinding;
 
     use super::{CliLogins, TOKEN_REVOCATION_OPERATION};
+    use crate::callback::{AuthorizationCodeExchange, LoginCompletion};
     use crate::connections::HumanConnections;
     use crate::exchange_api_key::token_hash;
     use crate::issuance::{TenantTokenIssuer, TokenExchangeSettings};
@@ -880,6 +886,228 @@ mod pg_tests {
             "access_denied"
         );
         assert_eq!(refresh_rows().await, 1, "the session was issued once");
+    }
+
+    /// How another actor ends a device grant while its approval is in flight.
+    #[derive(Debug, Clone, Copy)]
+    enum Termination {
+        /// The person denies the user code.
+        Deny,
+        /// The code expires and the CLI's next poll deletes it.
+        ExpireAndPoll,
+    }
+
+    /// Approve a fresh device code with [`CliLogins::approve`] parked after
+    /// its live-row lookup and before its bound login-state insert, end the
+    /// grant by `termination` meanwhile, then complete the provider sign-in
+    /// for the login the approval began.
+    ///
+    /// A gate transaction holds an uncommitted login state bound to the same
+    /// device id, so the approval's insert waits on the device binding's
+    /// unique index; the wait is observed through `pg_blocking_pids`, not
+    /// timing, and rolling the gate back releases the approval. Returns the
+    /// device authorization and the provider completion's result.
+    ///
+    /// # Panics
+    /// Panics when a step outside the race fails or the approval never parks.
+    async fn approval_racing(
+        fixture: &PgFixture,
+        logins: &CliLogins,
+        termination: Termination,
+    ) -> (DeviceAuthorization, Result<LoginCompletion, WyrdError>) {
+        let slug = TenantSlug::new(fixture.tenant_slug()).expect("slug");
+        let device = logins.authorize(&slug).await.expect("authorizes");
+        let active = logins
+            .connections
+            .active_connection(fixture.data_tenant_id())
+            .await
+            .expect("connection reads")
+            .expect("connection is active");
+        let mut gate = fixture.tenant_conn().await.expect("gate conn opens");
+        let device_id = pending_device_authorization(&mut gate, &device.user_code)
+            .await
+            .expect("lookup runs")
+            .expect("code is pending");
+        let gate_login = LoginState {
+            connection: active.binding,
+            issuer: "https://gate.example.com".to_owned(),
+            client_id: "gate".to_owned(),
+            redirect_uri: "https://gate.example.com/callback".to_owned(),
+            code_verifier: SecretString::from("gate"),
+            nonce: "gate".to_owned(),
+            initiation: LoginInitiation::Device(device_id),
+        };
+        let gated = insert_login_state(
+            &mut gate,
+            &Sha256Hex::digest(b"gate"),
+            &gate_login,
+            std::time::Duration::from_mins(5),
+        )
+        .await
+        .expect("gate state inserts");
+        assert!(gated, "the gate holds the device binding");
+        let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut **gate.transaction())
+            .await
+            .expect("gate pid reads");
+
+        let (approval, ()) = tokio::join!(logins.approve(&slug, &device.user_code), async {
+            wait_for_blocked_by(fixture, gate_pid).await;
+            match termination {
+                Termination::Deny => logins.deny(&slug, &device.user_code).await.expect("denies"),
+                Termination::ExpireAndPoll => {
+                    sqlx::query(
+                        "UPDATE wyrd.auth_device_authorizations
+                            SET created_at = statement_timestamp() - interval '11 minutes',
+                                expires_at = statement_timestamp() - interval '1 minute'
+                          WHERE device_id = $1",
+                    )
+                    .bind(device_id)
+                    .execute(&fixture.superuser_pool().await.expect("superuser pool"))
+                    .await
+                    .expect("expires the code");
+                    assert_eq!(
+                        device_error(logins.redeem(&device.device_code, "req-expire").await),
+                        "expired_token"
+                    );
+                }
+            }
+            gate.rollback().await.expect("the gate releases");
+        });
+        let url = approval.expect("the parked approval begins its login");
+        let state = Url::parse(url.as_str())
+            .expect("provider URL parses")
+            .query_pairs()
+            .find(|(name, _)| name == "state")
+            .map(|(_, value)| value.into_owned())
+            .expect("provider URL carries state");
+        let state_hash = Sha256Hex::digest(state.as_bytes());
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let login = consume_login_state(&mut conn, &state_hash)
+            .await
+            .expect("state consumes")
+            .expect("the approval's login is pending");
+        conn.commit().await.expect("consumption commits");
+        let completion = AuthorizationCodeExchange {
+            issuer: logins.issuer.clone(),
+            connections: logins.connections.clone(),
+        }
+        .finish_id_token_exchange(
+            &state_hash,
+            &active.trusted,
+            &login,
+            &MappedClaims {
+                subject: "device-racer".to_owned(),
+                email: None,
+                groups: Vec::new(),
+            },
+            "req-race",
+        )
+        .await;
+        (device, completion)
+    }
+
+    /// Wait until some backend is blocked by the backend `pid`.
+    ///
+    /// # Panics
+    /// Panics when lock state cannot be read or no waiter appears within 30s.
+    async fn wait_for_blocked_by(fixture: &PgFixture, pid: i32) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                                     WHERE $1 = ANY(pg_blocking_pids(pid)))",
+                )
+                .bind(pid)
+                .fetch_one(fixture.app_pool())
+                .await
+                .expect("lock state reads");
+                if blocked {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the approval parks behind the gate");
+    }
+
+    /// Assert the raced sign-in left no User, session, refresh row,
+    /// authorization code, device approval, or login audit behind.
+    ///
+    /// # Panics
+    /// Panics when anything persisted.
+    async fn assert_no_device_authority(fixture: &PgFixture) {
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let counts: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM wyrd.auth_users),
+                    (SELECT count(*) FROM wyrd.auth_refresh_tokens),
+                    (SELECT count(*) FROM wyrd.auth_login_state WHERE code_hash IS NOT NULL),
+                    (SELECT count(*) FROM wyrd.auth_device_authorizations
+                      WHERE principal_id IS NOT NULL),
+                    (SELECT count(*) FROM vala.audit_staging WHERE operation = 'auth.login')",
+        )
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("authority counts run");
+        assert_eq!(counts, (0, 0, 0, 0, 0), "the raced sign-in left authority");
+    }
+
+    /// A denial that lands while an approval is between its live-row lookup
+    /// and its login-state insert wins: the approval's sign-in is refused,
+    /// records no approval or credential, and the CLI's poll ends the login
+    /// with `access_denied`, then finds nothing.
+    ///
+    /// # Panics
+    /// Panics when the sign-in records anything or a poll issues a token.
+    #[tokio::test]
+    async fn a_denial_during_approval_wins() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let provider = MockServer::start().await;
+        let logins = owner(&fixture, &provider).await;
+        let (device, completion) = approval_racing(&fixture, &logins, Termination::Deny).await;
+
+        assert!(
+            matches!(completion, Err(WyrdError::InvalidState { .. })),
+            "{completion:?}"
+        );
+        assert_no_device_authority(&fixture).await;
+        assert_eq!(
+            device_error(logins.redeem(&device.device_code, "req-denied").await),
+            "access_denied"
+        );
+        assert_eq!(
+            device_error(logins.redeem(&device.device_code, "req-again").await),
+            "invalid_grant"
+        );
+        assert_no_device_authority(&fixture).await;
+    }
+
+    /// An expiry whose poll deletes the device authorization while an
+    /// approval is between its live-row lookup and its login-state insert
+    /// wins: the approval's sign-in is refused, records no approval or
+    /// credential, and every later poll is an invalid grant.
+    ///
+    /// # Panics
+    /// Panics when the sign-in records anything or a poll issues a token.
+    #[tokio::test]
+    async fn an_expiry_deleted_during_approval_wins() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let provider = MockServer::start().await;
+        let logins = owner(&fixture, &provider).await;
+        let (device, completion) =
+            approval_racing(&fixture, &logins, Termination::ExpireAndPoll).await;
+
+        assert!(
+            matches!(completion, Err(WyrdError::InvalidState { .. })),
+            "{completion:?}"
+        );
+        assert_no_device_authority(&fixture).await;
+        assert_eq!(
+            device_error(logins.redeem(&device.device_code, "req-after").await),
+            "invalid_grant"
+        );
+        assert_no_device_authority(&fixture).await;
     }
 
     /// Seed one User with two CLI logins: a stale refresh token and its live

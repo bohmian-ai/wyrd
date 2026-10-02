@@ -28,6 +28,14 @@ const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
 /// Name the contract gives the one Wyrd authentication scheme.
 const WYRD_ACCESS_TOKEN_SCHEME: &str = "wyrdAccessToken";
 
+/// The served contract's name for confidential OAuth client HTTP Basic.
+const OAUTH_CLIENT_BASIC_SCHEME: &str = "oauthClientBasic";
+
+/// The OAuth client endpoints: each identifies its client by the public
+/// form's `client_id` or by confidential HTTP Basic.
+const OAUTH_CLIENT_OPERATIONS: [&str; 3] =
+    ["/auth/token", "/auth/device_authorization", "/auth/revoke"];
+
 /// The HTTP methods an `OpenAPI` path item may key an operation by.
 const METHODS: [&str; 7] = ["get", "put", "post", "delete", "options", "head", "patch"];
 
@@ -288,7 +296,10 @@ async fn identity_connection_operations_publish_their_contract() {
 /// browser's `303` back to the client (with its `Location`) and the CLI's
 /// `text/html` page, never a token body. The token endpoint takes an RFC 6749
 /// form body that offers the authorization-code grant, and RFC 8414 metadata
-/// is served.
+/// is served. The token, device authorization, and revocation forms publish
+/// the public client's optional `client_id`, and each operation accepts
+/// either that public form or confidential RFC 7617 Basic client
+/// authentication.
 #[tokio::test]
 async fn tenant_login_operations_publish_their_contract() {
     let server = WyrdTestServer::start_in_process()
@@ -335,6 +346,35 @@ async fn tenant_login_operations_publish_their_contract() {
             .contains("authorization_code"),
         "the token endpoint offers the authorization-code grant"
     );
+
+    let basic = &document["components"]["securitySchemes"][OAUTH_CLIENT_BASIC_SCHEME];
+    assert_eq!(basic["type"], "http", "{basic}");
+    assert_eq!(basic["scheme"], "basic", "{basic}");
+    for path in OAUTH_CLIENT_OPERATIONS {
+        let operation = &document["paths"][path]["post"];
+        assert_eq!(
+            operation["security"],
+            serde_json::json!([{}, { OAUTH_CLIENT_BASIC_SCHEME: [] }]),
+            "{path} accepts the public form or confidential Basic"
+        );
+        let form = resolve_schema(
+            &document,
+            &operation["requestBody"]["content"]["application/x-www-form-urlencoded"]["schema"],
+        );
+        let client_id = form["allOf"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|part| resolve_schema(&document, part))
+            .find(|part| part["properties"]["client_id"].is_object())
+            .unwrap_or_else(|| panic!("{path} form publishes client_id: {form}"));
+        assert!(
+            !client_id["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&"client_id".into())),
+            "{path} client_id is optional: {client_id}"
+        );
+    }
 
     server.shutdown().await.expect("server shuts down");
 }
@@ -517,8 +557,10 @@ async fn every_problem_response_declares_its_media_type_and_stable_code() {
 /// declared once on the document and inherited. An operation a caller reaches
 /// before it can have a session clears the requirement beside its own handler
 /// with `security(())`, which is the only override the contract permits: a
-/// per-operation requirement naming some *other* scheme would be a second
-/// authentication story, and there is only one header.
+/// per-operation requirement naming some *other* caller scheme would be a
+/// second authentication story, and there is only one header. The one
+/// exception is OAuth client authentication: the OAuth client endpoints offer
+/// confidential HTTP Basic beside the empty requirement.
 #[tokio::test]
 async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
     let server = WyrdTestServer::start_in_process()
@@ -543,8 +585,12 @@ async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
             };
             // utoipa renders `security(())` as one empty requirement object,
             // which is OpenAPI's way of saying the operation needs nothing.
+            let oauth_client = OAUTH_CLIENT_OPERATIONS.contains(&path.as_str())
+                && overridden == &serde_json::json!([{}, { OAUTH_CLIENT_BASIC_SCHEME: [] }]);
             assert!(
-                overridden == &serde_json::json!([]) || overridden == &serde_json::json!([{}]),
+                oauth_client
+                    || overridden == &serde_json::json!([])
+                    || overridden == &serde_json::json!([{}]),
                 "{method} {path} overrides the document requirement with a second scheme"
             );
             cleared.insert(path.clone());

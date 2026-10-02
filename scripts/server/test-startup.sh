@@ -9,7 +9,8 @@
 #                                exits nonzero, serve stays unready, and the
 #                                retry succeeds without losing tenant data.
 #   startup_image_journey        migrate, serve, idempotent setup, nginx routes
-#                                (API, BFF, health, MCP stream, no authz check),
+#                                (API, BFF, health, MCP stream, no authz check,
+#                                per-client device user-code limit),
 #                                public Rust SDK over HTTP and derived gRPC,
 #                                restart into APP_ENV=production, persistence.
 #
@@ -22,7 +23,7 @@ readonly run_id="wyrd-startup-$$"
 readonly tag="$run_id:test"
 # Replaced by the immutable image ID the build produces; every container runs by ID.
 image="$tag"
-readonly net="$run_id" pg="$run_id-pg" app="$run_id-app" volume="$run_id-data"
+readonly net="$run_id" pg="$run_id-pg" app="$run_id-app" volume="$run_id-data" keys="$run_id-keys"
 readonly owner_pw=owner_pw_startup app_pw=app_pw_startup platform_pw=platform_pw_startup
 readonly owner_url="postgres://wyrd_owner:${owner_pw}@${pg}:5432/wyrd"
 # Under the repository, not /tmp: VM-backed Docker (Colima, Docker Desktop)
@@ -38,7 +39,7 @@ cleanup() {
     echo "--- app logs (full log: target/$run_id-app.log)"; tail -n 80 "$root/target/$run_id-app.log"
   fi
   docker rm -f "$app" "$pg" >/dev/null 2>&1 || true
-  docker volume rm -f "$volume" >/dev/null 2>&1 || true
+  docker volume rm -f "$volume" "$keys" >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
   docker image rm -f "$tag" >/dev/null 2>&1 || true
   rm -rf "$work" "$root/binary"
@@ -54,9 +55,12 @@ serving_env=(
   -e "WYRD_PLATFORM_DATABASE_URL=postgres://wyrd_platform_admin:${platform_pw}@${pg}:5432/wyrd"
   -e WYRD_STORAGE_URL=file:///var/lib/wyrd/storage
   -e WYRD_SIGNING_KEY_FILE=/run/wyrd/signing.pem
+  -e WYRD_SERVER_TENANT_SLUG=acme
+  -e WYRD_OPERATOR_KEK_SOURCE=file
+  -e WYRD_OPERATOR_KEK_DIR=/run/wyrd/kek
   ${WYRD_LOG:+-e "WYRD_LOG=$WYRD_LOG"}
 )
-serving_mounts=(-v "$volume:/var/lib/wyrd" -v "$work/signing.pem:/run/wyrd/signing.pem:ro")
+serving_mounts=(-v "$volume:/var/lib/wyrd" -v "$keys:/run/wyrd:ro")
 
 # One-off migration: the only process that ever receives the owner URL.
 migrate() { docker run --rm --network "$net" -e "WYRD_DATABASE_URL=$owner_url" "$image" wyrd-server migrate; }
@@ -109,8 +113,16 @@ image="$(docker build -q -f "$root/docker/official/Dockerfile" \
   --label "org.opencontainers.image.revision=$source_commit" -t "$tag" "$root")"
 [[ $image == sha256:* ]] || fail "the official build reported no immutable image ID: $image"
 echo "image: $image source: $source_commit" | tee "$root/target/startup-image-provenance.txt"
-openssl genpkey -algorithm ed25519 -out "$work/signing.pem" 2>/dev/null
-chmod 0644 "$work/signing.pem"
+# The server reads only owner-only key files, so the signing key and the
+# single-tenant deployment's file operator KEK are written into a volume as
+# the image's serving user, the way mounted secrets are delivered.
+docker volume create "$keys" >/dev/null
+put_key() {
+  docker run --rm -i -u root -v "$keys:/run/wyrd" "$image" sh -c \
+    "mkdir -p /run/wyrd/kek && cat >/run/wyrd/$1 && chown -R wyrd:wyrd /run/wyrd && chmod 0600 /run/wyrd/$1"
+}
+openssl genpkey -algorithm ed25519 2>/dev/null | put_key signing.pem
+openssl rand -base64 32 | tr -d '\n' | put_key kek/v1
 
 echo "== fresh external Postgres with only the two serving roles"
 docker network create "$net" >/dev/null
@@ -175,6 +187,20 @@ mcp="$(curl -sS -N --max-time 30 -D - -H "x-wyrd-access-token: Bearer $token" \
   "$http/mcp")"
 grep -qi '^content-type: text/event-stream' <<<"$mcp" || fail "MCP did not stream: $mcp"
 grep -q '"supportedVersions":\["2026-07-28"\]' <<<"$mcp" || fail "MCP discovery returned no supported version: $mcp"
+# RFC 8628 user-code attempts: the gateway limits one client address's
+# `POST /auth/device` burst; another address and other auth routes still pass.
+device_attempt() { curl -s -o /dev/null -w '%{http_code}' -d user_code=WRONGCODE "$http/auth/device"; }
+for attempt in 1 2 3 4 5 6; do
+  [[ "$(device_attempt)" != 429 ]] || fail "device attempt $attempt was limited inside the burst"
+done
+[[ "$(device_attempt)" == 429 ]] || fail "the gateway did not limit excess device user-code attempts"
+[[ "$(curl -s -o /dev/null -w '%{http_code}' -d grant_type=refresh_token "$http/auth/token")" != 429 ]] \
+  || fail "the device limit throttled the token endpoint"
+[[ "$(curl -s -o /dev/null -w '%{http_code}' "$http/auth/device")" != 429 ]] \
+  || fail "the device limit throttled the verification page"
+other_client="$(docker exec "$app" node -e \
+  'fetch("http://127.0.0.1:8080/auth/device",{method:"POST",body:new URLSearchParams({user_code:"WRONGCODE"})}).then(r=>console.log(r.status))')"
+[[ $other_client != 429 ]] || fail "one client's device attempts limited another client address"
 sdk_phase startup_image_write
 passed+=(startup_image_journey:write)
 

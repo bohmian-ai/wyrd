@@ -32,6 +32,23 @@ pub const GRANT_TYPES: [&str; 5] = [
     "urn:ietf:params:oauth:grant-type:jwt-bearer",
 ];
 
+/// The complete form an OAuth client endpoint documents: the endpoint's own
+/// parameters plus the public client's `client_id` (RFC 6749 §2.3.1, §3.2.1).
+///
+/// It exists for the served contract only. Requests are read by
+/// [`OAuthForm`] and the client is identified by [`OAuthClients`]; a
+/// confidential client sends HTTP Basic (RFC 7617) instead of `client_id`,
+/// which the operation declares as its alternative security requirement.
+#[derive(utoipa::ToSchema)]
+pub struct ClientForm<T> {
+    /// The endpoint's own parameters.
+    #[serde(flatten)]
+    pub params: T,
+    /// The public client's identifier. A confidential client omits it and
+    /// authenticates with HTTP Basic instead.
+    pub client_id: Option<OAuthClientId>,
+}
+
 /// The RFC 6749 §5.2 refusal of one OAuth endpoint request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OAuthError(

@@ -1226,38 +1226,6 @@ fn pkce_pair() -> (String, String) {
     (verifier, challenge)
 }
 
-/// Send one auth-route request the way a well-behaved client does: a `429`
-/// from the shared per-peer auth governor is retried after the advertised
-/// `retry-after` (at least the governor's 100 ms replenish period).
-///
-/// Every journey request arrives from the same test peer, so a journey that
-/// makes more auth calls than the governor's burst would otherwise be refused
-/// by admission, not by the behavior under test. The governor refuses before
-/// any handler runs, so a retried request has consumed no login state.
-///
-/// # Panics
-/// Panics when the router fails or the request is still refused after 50
-/// attempts.
-async fn auth_call(
-    srv: &WyrdTestServer,
-    request: impl Fn() -> Request<Body>,
-) -> axum::http::Response<Body> {
-    for _ in 0..50 {
-        let response = srv.oneshot(request()).await.expect("auth call completes");
-        if response.status() != StatusCode::TOO_MANY_REQUESTS {
-            return response;
-        }
-        let after = response
-            .headers()
-            .get(header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
-        tokio::time::sleep(StdDuration::from_secs(after).max(StdDuration::from_millis(100))).await;
-    }
-    panic!("the auth governor never admitted the request");
-}
-
 /// `GET /auth/authorize` as the `wyrd-ui` client for `tenant_slug` with the
 /// S256 `challenge`, under hostile `Host` and forwarded headers that must play
 /// no part; returns the status and `Location`.
@@ -1279,17 +1247,19 @@ async fn authorize(
         .append_pair("state", UI_STATE)
         .append_pair("tenant", tenant_slug)
         .finish();
-    let response = auth_call(srv, || {
-        Request::builder()
-            .method(Method::GET)
-            .uri(format!("/auth/authorize?{query}"))
-            .header(header::HOST, "attacker.example.net")
-            .header("x-forwarded-host", "attacker.example.net")
-            .header("x-forwarded-proto", "https")
-            .body(Body::empty())
-            .expect("authorize request builds")
-    })
-    .await;
+    let response = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/auth/authorize?{query}"))
+                .header(header::HOST, "attacker.example.net")
+                .header("x-forwarded-host", "attacker.example.net")
+                .header("x-forwarded-proto", "https")
+                .body(Body::empty())
+                .expect("authorize request builds"),
+        )
+        .await
+        .expect("auth call completes");
     let location = response
         .headers()
         .get(header::LOCATION)
@@ -1491,15 +1461,17 @@ async fn callback_reply_with(
         query.append_pair("iss", iss);
     }
     let query = query.finish();
-    let response = auth_call(srv, || {
-        Request::builder()
-            .method(Method::GET)
-            .uri(format!("/auth/callback?{query}"))
-            .header(header::HOST, host)
-            .body(Body::empty())
-            .expect("callback request builds")
-    })
-    .await;
+    let response = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/auth/callback?{query}"))
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .expect("callback request builds"),
+        )
+        .await
+        .expect("auth call completes");
     let status = response.status();
     let location = response
         .headers()
@@ -1629,16 +1601,18 @@ async fn token_request(
     body: String,
 ) -> (StatusCode, header::HeaderMap, Value) {
     let basic = base64::engine::general_purpose::STANDARD.encode(format!("wyrd-ui:{secret}"));
-    let response = auth_call(srv, || {
-        Request::builder()
-            .method(Method::POST)
-            .uri("/auth/token")
-            .header(header::AUTHORIZATION, format!("Basic {basic}"))
-            .header(header::CONTENT_TYPE, content_type)
-            .body(Body::from(body.clone()))
-            .expect("token request builds")
-    })
-    .await;
+    let response = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/auth/token")
+                .header(header::AUTHORIZATION, format!("Basic {basic}"))
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body.clone()))
+                .expect("token request builds"),
+        )
+        .await
+        .expect("auth call completes");
     let status = response.status();
     let headers = response.headers().clone();
     let bytes = to_bytes(response.into_body(), 65_536)
@@ -1743,8 +1717,7 @@ fn cli_client() -> CliClient {
 }
 
 /// Serve one `oauth2` crate request through `srv`'s router, exactly as the
-/// crate's network client would deliver it; the shared auth governor's `429`
-/// is retried as [`auth_call`] does.
+/// crate's network client would deliver it.
 ///
 /// # Errors
 /// Never fails: a router failure panics instead.
@@ -1755,18 +1728,20 @@ async fn oauth_http(
     srv: &WyrdTestServer,
     request: oauth2::HttpRequest,
 ) -> Result<oauth2::HttpResponse, std::convert::Infallible> {
-    let response = auth_call(srv, || {
-        let mut rebuilt = Request::builder()
-            .method(request.method().clone())
-            .uri(request.uri().clone());
-        for (name, value) in request.headers() {
-            rebuilt = rebuilt.header(name, value);
-        }
-        rebuilt
-            .body(Body::from(request.body().clone()))
-            .expect("request rebuilds")
-    })
-    .await;
+    let response = srv
+        .oneshot({
+            let mut rebuilt = Request::builder()
+                .method(request.method().clone())
+                .uri(request.uri().clone());
+            for (name, value) in request.headers() {
+                rebuilt = rebuilt.header(name, value);
+            }
+            rebuilt
+                .body(Body::from(request.body().clone()))
+                .expect("request rebuilds")
+        })
+        .await
+        .expect("auth call completes");
     let (parts, body) = response.into_parts();
     let body = to_bytes(body, 65_536).await.expect("body reads");
     Ok(oauth2::HttpResponse::from_parts(parts, body.to_vec()))
@@ -1847,16 +1822,17 @@ async fn decide_device(
         .append_pair("user_code", user_code)
         .append_pair("decision", decision)
         .finish();
-    auth_call(srv, || {
+    srv.oneshot(
         Request::builder()
             .method(Method::POST)
             .uri("/auth/device")
             .header(header::ORIGIN, PUBLIC_ORIGIN)
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(Body::from(form.clone()))
-            .expect("device decision request builds")
-    })
+            .expect("device decision request builds"),
+    )
     .await
+    .expect("auth call completes")
 }
 
 /// Poll `POST /auth/token` once with `device_code` as the public `wyrd-cli`
@@ -1871,15 +1847,17 @@ async fn device_poll(srv: &WyrdTestServer, device_code: &str) -> (StatusCode, Va
         .append_pair("device_code", device_code)
         .append_pair("client_id", "wyrd-cli")
         .finish();
-    let response = auth_call(srv, || {
-        Request::builder()
-            .method(Method::POST)
-            .uri("/auth/token")
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from(form.clone()))
-            .expect("device poll builds")
-    })
-    .await;
+    let response = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/auth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(form.clone()))
+                .expect("device poll builds"),
+        )
+        .await
+        .expect("auth call completes");
     let status = response.status();
     let body = to_bytes(response.into_body(), 65_536)
         .await
@@ -2036,13 +2014,15 @@ async fn device_grant_refusal_journey() {
     let cli = cli_client();
 
     // Step 1: RFC 8414 metadata.
-    let response = auth_call(&srv, || {
-        Request::builder()
-            .uri("/.well-known/oauth-authorization-server")
-            .body(Body::empty())
-            .expect("metadata request builds")
-    })
-    .await;
+    let response = srv
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/oauth-authorization-server")
+                .body(Body::empty())
+                .expect("metadata request builds"),
+        )
+        .await
+        .expect("auth call completes");
     assert_eq!(response.status(), StatusCode::OK);
     let metadata: Value = serde_json::from_slice(
         &to_bytes(response.into_body(), 65_536)
@@ -2125,15 +2105,17 @@ async fn device_grant_refusal_journey() {
 
     // Step 5: revoking an unknown token succeeds and revokes nothing.
     let form = "token=not-a-token&client_id=wyrd-cli";
-    let revoked = auth_call(&srv, || {
-        Request::builder()
-            .method(Method::POST)
-            .uri("/auth/revoke")
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from(form))
-            .expect("revoke request builds")
-    })
-    .await;
+    let revoked = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/auth/revoke")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(form))
+                .expect("revoke request builds"),
+        )
+        .await
+        .expect("auth call completes");
     assert_eq!(revoked.status(), StatusCode::OK);
 }
 

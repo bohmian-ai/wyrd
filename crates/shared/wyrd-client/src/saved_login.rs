@@ -440,12 +440,6 @@ impl SavedLogins {
                 "the server renewed the saved login without a refresh token",
             )
         })?;
-        if access_token_tenant(&rotated.access_token) != Some(tenant_id) {
-            return Err(saved_login(
-                "tenant_mismatch",
-                "the server renewed the saved login for another tenant; run `wyrd auth login`",
-            ));
-        }
         let login = &mut logins[index];
         login.generation = login.generation.saturating_add(1);
         login.state = SavedLoginState::Ready {
@@ -570,8 +564,7 @@ impl AccessTokenSource for SavedLoginSource {
     /// removed or logged-out record, `refresh_pending` for a record an earlier
     /// renewal left uncertain or a renewal whose outcome is unknown,
     /// `refresh_refused` when the server refuses the refresh token,
-    /// `tenant_mismatch` when it renews into another tenant, `lock_timeout`,
-    /// `unsafe_store`, or `corrupt`. A failed renewal leaves the record
+    /// `lock_timeout`, `unsafe_store`, or `corrupt`. A failed renewal leaves the record
     /// `RefreshPending`, so it never retries the token.
     fn mint(&self) -> Result<MintedAccessToken, WyrdClientError> {
         self.store
@@ -584,33 +577,6 @@ impl AccessTokenSource for SavedLoginSource {
     fn revalidates_cache(&self) -> bool {
         true
     }
-}
-
-/// The `principal.tenant_id` claim of a Wyrd access token, read without
-/// verifying it.
-///
-/// Only a consistency check on a token the server just issued over TLS: the
-/// server still verifies every token it receives. `None` when the token is
-/// not a decodable JWT with that claim.
-fn access_token_tenant(token: &SecretBearer) -> Option<DataTenantId> {
-    /// The one claim this check reads.
-    #[derive(Deserialize)]
-    struct Claims {
-        /// Subject the token acts as.
-        principal: Principal,
-    }
-    /// The token subject, reduced to its tenant.
-    #[derive(Deserialize)]
-    struct Principal {
-        /// Tenant the token acts in.
-        tenant_id: DataTenantId,
-    }
-    let payload = token.expose().split('.').nth(1)?;
-    let bytes =
-        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload).ok()?;
-    serde_json::from_slice::<Claims>(&bytes)
-        .ok()
-        .map(|claims| claims.principal.tenant_id)
 }
 
 /// The client-local saved-login error.
@@ -632,38 +598,8 @@ mod tests {
     use wyrd_spec::ids::TenantSlug;
 
     use super::{
-        SAVED_LOGIN_FORMAT_VERSION, SavedLogin, SavedLoginState, SavedLogins, access_token_tenant,
-        canonical_origin,
+        SAVED_LOGIN_FORMAT_VERSION, SavedLogin, SavedLoginState, SavedLogins, canonical_origin,
     };
-
-    /// The renewal tenant check reads the access token's `principal.tenant_id`
-    /// claim, and a token without it never passes as some tenant.
-    #[test]
-    fn access_token_tenant_reads_the_principal_claim() {
-        let tenant = DataTenantId::new_v7();
-        let token = |claims: serde_json::Value| {
-            let payload = base64::Engine::encode(
-                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-                claims.to_string(),
-            );
-            SecretBearer::new(format!("e30.{payload}.sig"))
-        };
-        assert_eq!(
-            access_token_tenant(&token(serde_json::json!({
-                "sub": "user",
-                "principal": { "id": "user", "tenant_id": tenant },
-            }))),
-            Some(tenant)
-        );
-        assert_eq!(
-            access_token_tenant(&token(serde_json::json!({ "tenant_id": tenant }))),
-            None
-        );
-        assert_eq!(
-            access_token_tenant(&SecretBearer::new("opaque".to_owned())),
-            None
-        );
-    }
 
     /// A ready record for `origin` and the tenant `key`.
     fn login(origin: &str, key: &str) -> SavedLogin {

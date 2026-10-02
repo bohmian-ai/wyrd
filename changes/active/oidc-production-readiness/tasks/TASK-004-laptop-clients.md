@@ -219,7 +219,7 @@ targets), 4d6a72c3d (Rust SDK journey), ed50a2e61 (concurrent renewal), 00529eef
 | Same-server multi-tenant selection: ambiguous and unmatched refused, selection by route key or tenant id | `SavedLogins::select`; `tenant` option on every Rust/Python/TypeScript constructor | Rust, Python, and TypeScript `saved user auth` journeys | PASS |
 | Allowed read, denied write as the CLI-established reader; renewal through Wyrd only, exactly one generation | `SavedLoginSource`, `SavedLogins::renew` | three SDK journeys (generation == before + 1) | PASS |
 | Revoked login fails closed (`refresh_refused`), never retried (`refresh_pending`) | `SavedLogins::renew` persists RefreshPending before exchanging | three SDK journeys | PASS |
-| Concurrent processes: one rotation, winner generation, no family revocation, crash-uncertain and unsafe stores fail closed, logout racing renewal never restores a record (AC-004) | per-record lock; reread under lock; `access_token_tenant` reads `principal.tenant_id` | `concurrent_saved_renewal` (identity target `client`) | PASS |
+| Concurrent processes: one rotation, winner generation, no family revocation, crash-uncertain and unsafe stores fail closed, logout racing renewal never restores a record (AC-004) | reread under lock in `credentials.toml` | `concurrent_saved_renewal` (identity target `client`) | PASS |
 | Generated artifacts current | error catalog, `.pyi`, `index.d.ts`, `error-codes.ts` | `codegen:check`, `ts:napi:check` | PASS |
 
 Lanes (each run alone, all exit 0): `test:identity:journey` unfiltered and each
@@ -339,3 +339,13 @@ r1 diagnoses:
 - **Not rerun after the late fixes.** After the workspace-hack and test-only
   fixes, `lints` was rerun clean, which compiles every target. The other
   lanes were not rerun.
+
+Human decision 4 (commit 83e4c597b): saved-login renewal trusts the server, as
+gh, gcloud, az, and aws sso do. It sends the refresh token, stores what the
+server returns, and uses it. The client-side tenant re-check is removed:
+`access_token_tenant`, its test, and the renewal `tenant_mismatch` branch. The
+earlier "Renewal refused as `tenant_mismatch`" diagnosis is superseded. Nothing
+replaced it. `tenant_mismatch` remains only as the `select` reason for an
+unmatched selector, and the three journeys still assert it there. `fmt`, `lints`,
+and `test:shared` (724 passed) exited 0. The identity lane was not rerun because
+no journey referenced the removed check.

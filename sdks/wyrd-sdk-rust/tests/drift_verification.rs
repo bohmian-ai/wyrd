@@ -39,9 +39,9 @@ use wyrd_sdk::bifrost::client_from_options;
 use wyrd_sdk::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode, RegistrationReceipt};
 use wyrd_sdk::state::WyrdState;
 use wyrd_sdk::verification::{
-    BindingId, OperatorDispatchState, OperatorDispatchStatus, StartVerificationRunRequest,
-    Verification, VerificationExecutionStatus, VerificationResultId, VerificationRunId,
-    VerificationRunStatus,
+    BindingId, ExecuteVerificationRequest, OperatorDispatchState, OperatorDispatchStatus,
+    StartVerificationRunRequest, Verification, VerificationExecutionStatus, VerificationResultId,
+    VerificationRunId, VerificationRunStatus,
 };
 use wyrd_sdk::{Bifrost, QueueConfig, WyrdClient};
 use wyrd_testing::Bootstrap;
@@ -2357,5 +2357,490 @@ impl<'a> IntegratedJourney<'a> {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+}
+
+/// Judge answer the judge mock delays past the server's execution deadline.
+///
+/// Each attempt outlives the judge provider's 30-second transport timeout, so
+/// the retrying judge spends its retries until the server deadline elapses.
+const SLOW_ANSWER: &str = "slow";
+
+/// Judge answer the judge mock refuses with a provider failure.
+const BROKEN_ANSWER: &str = "broken";
+
+/// Write the direct-execution Eval Verifiers next to the Drift fixtures.
+///
+/// `direct-assert` is assertion-only on `$.answer`, `direct-judge` grades
+/// `$.answer` with the integrated journey's JSON-schema judge Prompt and no
+/// retries, `direct-judge-retrying` grades it with two retries, and
+/// `direct-traced` carries a trace assertion no supplied record
+/// can satisfy.
+///
+/// # Panics
+/// Panics when a fixture file cannot be written.
+fn write_direct_evals(root: &Path) {
+    write_integrated_graph(root, "http://127.0.0.1:9/unused");
+    let eval = |name: &str, task: &str| {
+        format!(
+            "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: {name}\n  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: eval\n    spec:\n      pass_gate: {{kind: all_pass}}\n      tasks:\n{task}"
+        )
+    };
+    let files = [
+        (
+            "direct-assert",
+            "        answer: {kind: assertion, id: answer, context_path: $.answer, operator: equals, expected: \"yes\"}\n",
+        ),
+        (
+            "direct-judge",
+            "        judge:\n          kind: llm_judge\n          id: judge\n          judge_ref: {prompt: ./integrated-judge.json, tool_names: [], run_config: {max_iterations: 1}}\n          context_path: $.answer\n          operator: equals\n          expected: {passed: true}\n          max_retries: 0\n",
+        ),
+        (
+            "direct-judge-retrying",
+            "        judge:\n          kind: llm_judge\n          id: judge\n          judge_ref: {prompt: ./integrated-judge.json, tool_names: [], run_config: {max_iterations: 1}}\n          context_path: $.answer\n          operator: equals\n          expected: {passed: true}\n          max_retries: 2\n",
+        ),
+        (
+            "direct-traced",
+            "        t: {kind: trace_assertion, id: t, span_selector: \"$.spans[0].name\", operator: equals, expected: x}\n",
+        ),
+    ];
+    for (name, task) in files {
+        std::fs::write(root.join(format!("{name}.yaml")), eval(name, task))
+            .expect("eval verifier card writes");
+    }
+}
+
+/// Start the `OpenAI`-compatible judge mock of the direct journey.
+///
+/// The judge passes every answer except [`SLOW_ANSWER`], answered after the
+/// server's execution deadline, and [`BROKEN_ANSWER`], refused with a 500.
+///
+/// # Panics
+/// Panics when a mock cannot be mounted.
+async fn start_direct_judge() -> wiremock::MockServer {
+    let upstream = wiremock::MockServer::start().await;
+    let graded = wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "id": "chatcmpl_direct", "object": "chat.completion",
+        "created": 1_700_000_000, "model": "gpt-test",
+        "choices": [{ "index": 0, "finish_reason": "stop",
+            "message": { "role": "assistant", "content": "{\"passed\":true}" } }],
+        "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
+    }));
+    wiremock::Mock::given(wiremock::matchers::path(JUDGE_PATH))
+        .and(wiremock::matchers::body_string_contains(SLOW_ANSWER))
+        .respond_with(
+            graded
+                .clone()
+                .set_delay(wyrd_sdk::verification::EXECUTION_DEADLINE + Duration::from_secs(5)),
+        )
+        .with_priority(1)
+        .mount(&upstream)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::path(JUDGE_PATH))
+        .and(wiremock::matchers::body_string_contains(BROKEN_ANSWER))
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(&upstream)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::path(JUDGE_PATH))
+        .respond_with(graded)
+        .mount(&upstream)
+        .await;
+    upstream
+}
+
+/// Build a direct execution request of `verifier` over `subject` judging `input`.
+///
+/// # Panics
+/// Panics when the JSON fixture does not match the wire contract.
+fn execute_request(
+    verifier: &RegistrationReceipt,
+    subject: &RegistrationReceipt,
+    input: &Value,
+) -> ExecuteVerificationRequest {
+    ExecuteVerificationRequest::decode(serde_json::json!({
+        "verifier_uid": verifier.root.uid,
+        "subject_card_uid": subject.root.uid,
+        "input": input,
+    }))
+    .expect("execute request matches the wire contract")
+}
+
+/// A `drift_samples` input of `columns`.
+fn samples(columns: Value) -> Value {
+    Value::Object(serde_json::Map::from_iter([
+        ("kind".to_owned(), Value::from("drift_samples")),
+        ("columns".to_owned(), columns),
+    ]))
+}
+
+/// An `eval_record` input whose context answers `answer`.
+fn record(answer: &str) -> Value {
+    serde_json::json!({ "kind": "eval_record", "context": { "answer": answer } })
+}
+
+/// Prove direct execution judges supplied input through the public SDK for
+/// PSI, SPC, Custom, assertion Eval, and LLM-judge Eval with exact version
+/// attribution, refuses every unusable request with its stable code, and
+/// leaves no durable run behind.
+///
+/// Passed, failed, and inconclusive judgments each return normally. A
+/// missing baseline, a legacy fitted profile, a caller without `evals:run`,
+/// a second tenant, malformed, oversized, incompatible, and unsupported
+/// input, a failing judge provider, and a judge slower than the server
+/// deadline are each refused, the last with the server's 504 rather than a
+/// client timeout.
+///
+/// # Panics
+/// Panics when any judgment, refusal, or the empty run ledger differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn direct_execution_judges_supplied_input_through_the_sdk() {
+    let root = tempfile::tempdir().expect("fixture root creates");
+    write_baseline(root.path());
+    write_verifiers(root.path());
+    write_direct_evals(root.path());
+    let upstream = start_direct_judge().await;
+    let server = Box::pin(
+        WyrdTestServer::builder()
+            .with_verification_runtime_for_test()
+            .with_gateway_provider_root_for_test(
+                url::Url::parse(&upstream.uri()).expect("the mock URI parses"),
+            )
+            .start_bound(),
+    )
+    .await
+    .expect("test server starts");
+    let admin = connect(
+        &server,
+        &api_key(
+            server
+                .bootstrap_service("rust_direct_admin", &["admin"])
+                .await
+                .expect("admin bootstraps"),
+        ),
+    );
+    let cards = Cards::with_client(WyrdClient::clone(&admin));
+    register(&cards, &root.path().join("baseline.yaml")).await;
+    let path = |name: &str| root.path().join(format!("{name}.yaml"));
+    let psi = register(&cards, &path("drift-psi")).await;
+    let spc = register(&cards, &path("drift-spc")).await;
+    let unfit = register(&cards, &path("drift-spc-unfit")).await;
+    let custom = register(&cards, &path("drift-custom")).await;
+    let assert_eval = register(&cards, &path("direct-assert")).await;
+    let judge = register(&cards, &path("direct-judge")).await;
+    let retrying = register(&cards, &path("direct-judge-retrying")).await;
+    let traced = register(&cards, &path("direct-traced")).await;
+    register(&cards, &path("trigger")).await;
+    let subject = register(&cards, &path("service")).await;
+    wait_baseline(&cards, &psi, "ready").await;
+    wait_baseline(&cards, &spc, "ready").await;
+    wait_baseline(&cards, &unfit, "failed").await;
+    let journey = DirectJourney {
+        server: &server,
+        verification: Verification::with_client(connect(
+            &server,
+            &api_key(
+                server
+                    .credential_registered_service(&subject.root, &["admin"])
+                    .await
+                    .expect("the subject Service is credentialed"),
+            ),
+        )),
+        subject: &subject,
+        psi: &psi,
+        spc: &spc,
+        unfit: &unfit,
+        custom: &custom,
+        assert_eval: &assert_eval,
+        judge: &judge,
+        retrying: &retrying,
+        traced: &traced,
+    };
+    journey.assert_judgments().await;
+    assert_eq!(
+        requests_to(&upstream, JUDGE_PATH).await,
+        1,
+        "one judge call"
+    );
+    journey.assert_input_refusals().await;
+    journey.assert_callers_refused().await;
+    journey.assert_legacy_timeout_and_no_runs().await;
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// The registered Cards and executing handle of the direct execution journey.
+struct DirectJourney<'a> {
+    /// Bound test server, for second callers and the run ledger.
+    server: &'a WyrdTestServer,
+    /// The subject Service's own handle, scoped over the subject.
+    verification: Verification,
+    /// The Service every execution judges.
+    subject: &'a RegistrationReceipt,
+    /// PSI Verifier with a ready baseline over `latency` and `tier`.
+    psi: &'a RegistrationReceipt,
+    /// SPC Verifier with a ready baseline over `latency`.
+    spc: &'a RegistrationReceipt,
+    /// SPC Verifier whose baseline failed to fit.
+    unfit: &'a RegistrationReceipt,
+    /// Custom Verifier over the `score` metric.
+    custom: &'a RegistrationReceipt,
+    /// Assertion-only Eval Verifier.
+    assert_eval: &'a RegistrationReceipt,
+    /// LLM-judge Eval Verifier with no retries.
+    judge: &'a RegistrationReceipt,
+    /// LLM-judge Eval Verifier with two retries.
+    retrying: &'a RegistrationReceipt,
+    /// Eval Verifier with a trace assertion.
+    traced: &'a RegistrationReceipt,
+}
+
+impl DirectJourney<'_> {
+    /// A request executing `verifier` over the journey's subject on `input`.
+    fn request(&self, verifier: &RegistrationReceipt, input: &Value) -> ExecuteVerificationRequest {
+        execute_request(verifier, self.subject, input)
+    }
+
+    /// Execute `request` and assert it is refused with `code`.
+    ///
+    /// # Panics
+    /// Panics when the execution succeeds or carries another code.
+    async fn refuse(&self, request: &ExecuteVerificationRequest, code: &str) {
+        let error = self.verification.execute(request).await.expect_err(code);
+        assert_eq!(error.code(), code, "{error:?}");
+    }
+
+    /// Every method judges supplied input with its verdict and exact version
+    /// attribution.
+    ///
+    /// # Panics
+    /// Panics when an execution fails or its kind, verdict, or references differ.
+    async fn assert_judgments(&self) {
+        let baseline_latency: Vec<f64> = (0..BASELINE_ROWS).map(f64::from).collect();
+        let stationary = [47.5, 48.5, 49.5, 50.5, 51.5].repeat(4);
+        let tiers: Vec<&str> = (0..BASELINE_ROWS)
+            .map(|row| if row % 2 == 0 { "gold" } else { "silver" })
+            .collect();
+        let judged = [
+            (
+                self.psi,
+                samples(serde_json::json!({ "latency": baseline_latency, "tier": tiers })),
+                "drift_psi",
+                "passed",
+            ),
+            (
+                self.psi,
+                samples(
+                    serde_json::json!({ "latency": vec![99.0; 100], "tier": vec!["bronze"; 100] }),
+                ),
+                "drift_psi",
+                "failed",
+            ),
+            (
+                self.spc,
+                samples(serde_json::json!({ "latency": stationary })),
+                "drift_spc",
+                "passed",
+            ),
+            (
+                self.spc,
+                samples(serde_json::json!({ "latency": vec![1000.0; 20] })),
+                "drift_spc",
+                "failed",
+            ),
+            (
+                self.custom,
+                samples(serde_json::json!({ "score": [1.2] })),
+                "drift_custom",
+                "passed",
+            ),
+            (
+                self.custom,
+                samples(serde_json::json!({ "score": [3.0] })),
+                "drift_custom",
+                "failed",
+            ),
+            (
+                self.custom,
+                samples(serde_json::json!({ "score": [null] })),
+                "drift_custom",
+                "inconclusive",
+            ),
+            (self.assert_eval, record("yes"), "eval_assertion", "passed"),
+            (self.assert_eval, record("no"), "eval_assertion", "failed"),
+            (self.judge, record("yes"), "eval_llm_judge", "passed"),
+        ];
+        for (verifier, input, kind, verdict) in judged {
+            let response = self
+                .verification
+                .execute(&self.request(verifier, &input))
+                .await
+                .unwrap_or_else(|error| panic!("{} executes: {error:?}", verifier.root.name));
+            let response = serde_json::to_value(&response).expect("response serializes");
+            assert_eq!(response["kind"], kind, "{response}");
+            assert_eq!(response["verdict"], verdict, "{response}");
+            assert_eq!(
+                response["verifier"]["uid"],
+                serde_json::json!(verifier.root.uid)
+            );
+            assert_eq!(response["verifier"]["version"], "1.0.0");
+            assert_eq!(
+                response["subject"]["uid"],
+                serde_json::json!(self.subject.root.uid)
+            );
+            assert_eq!(response["subject"]["version"], "1.0.0");
+        }
+    }
+
+    /// Malformed, oversized, unready, incompatible, unsupported, unknown,
+    /// and judge-failure input is refused with its stable code.
+    ///
+    /// # Panics
+    /// Panics when a refusal succeeds or carries another code.
+    async fn assert_input_refusals(&self) {
+        let malformed = ExecuteVerificationRequest::decode(serde_json::json!({
+            "verifier_uid": self.custom.root.uid, "subject_card_uid": self.subject.root.uid,
+            "input": samples(serde_json::json!({ "score": [1.0] })), "extra": true,
+        }))
+        .expect_err("an unknown field is refused at the wire owner");
+        assert_eq!(malformed.code(), "WYRD_VERIFICATION_400_INPUT_INVALID");
+        let wide: serde_json::Map<String, Value> = (0..65)
+            .map(|column| (format!("c{column}"), serde_json::json!([1.0])))
+            .collect();
+        let cases = [
+            (
+                self.request(
+                    self.custom,
+                    &samples(serde_json::json!({ "score": [1.0, "a"] })),
+                ),
+                "WYRD_VERIFICATION_400_INPUT_INVALID",
+            ),
+            (
+                self.request(self.custom, &samples(Value::Object(wide))),
+                "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
+            ),
+            (
+                self.request(
+                    self.custom,
+                    &samples(serde_json::json!({ "score": vec![1.0; 100_001] })),
+                ),
+                "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
+            ),
+            (
+                self.request(
+                    self.unfit,
+                    &samples(serde_json::json!({ "tier": ["gold"] })),
+                ),
+                "WYRD_VERIFICATION_409_BASELINE_NOT_READY",
+            ),
+            (
+                self.request(self.custom, &record("yes")),
+                "WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE",
+            ),
+            (
+                self.request(self.psi, &samples(serde_json::json!({ "latency": [1.0] }))),
+                "WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE",
+            ),
+            (
+                self.request(self.traced, &record("yes")),
+                "WYRD_VERIFICATION_422_INPUT_UNSUPPORTED",
+            ),
+            (
+                self.request(self.subject, &record("yes")),
+                "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
+            ),
+            (
+                self.request(self.judge, &record(BROKEN_ANSWER)),
+                "WYRD_VERIFICATION_502_DEPENDENCY_FAILED",
+            ),
+        ];
+        for (request, code) in cases {
+            self.refuse(&request, code).await;
+        }
+    }
+
+    /// A caller without `evals:run` and another tenant's caller are refused.
+    ///
+    /// # Panics
+    /// Panics when either caller is not refused with its stable code.
+    async fn assert_callers_refused(&self) {
+        let reader = Verification::with_client(connect(
+            self.server,
+            &api_key(
+                self.server
+                    .bootstrap_service("rust_direct_reader", &["reader"])
+                    .await
+                    .expect("reader bootstraps"),
+            ),
+        ));
+        let custom_request =
+            self.request(self.custom, &samples(serde_json::json!({ "score": [1.0] })));
+        let denied = reader
+            .execute(&custom_request)
+            .await
+            .expect_err("a caller without evals:run is refused");
+        assert_eq!(
+            denied.code(),
+            "WYRD_PERMISSION_403_DENIED_RBAC",
+            "{denied:?}"
+        );
+        let other = self
+            .server
+            .seed_tenant("direct-other")
+            .await
+            .expect("second tenant seeds");
+        let foreign = Verification::with_client(connect(
+            self.server,
+            &api_key(
+                self.server
+                    .bootstrap_service_in_tenant(other, "rust_direct_other", &["admin"])
+                    .await
+                    .expect("second tenant admin bootstraps"),
+            ),
+        ))
+        .execute(&custom_request)
+        .await
+        .expect_err("another tenant cannot execute this tenant's Verifier");
+        assert_eq!(
+            foreign.code(),
+            "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
+            "{foreign:?}"
+        );
+    }
+
+    /// A legacy fitted profile and a judge slower than the server deadline
+    /// are refused, and no execution left a durable run.
+    ///
+    /// # Panics
+    /// Panics when a refusal differs or a run exists.
+    async fn assert_legacy_timeout_and_no_runs(&self) {
+        let fixture = VerificationFixture::provision(
+            self.server.state().postgres.wyrd(),
+            self.server.pg_fixture().data_tenant_id(),
+        )
+        .await
+        .expect("fixture tenant opens");
+        fixture
+            .retire_fitted_format(self.psi.root.uid.as_ref().expect("verifier has a UID"))
+            .await
+            .expect("fitted profile retires");
+        self.refuse(
+            &self.request(
+                self.psi,
+                &samples(serde_json::json!({ "latency": [1.0], "tier": ["gold"] })),
+            ),
+            "WYRD_VERIFICATION_409_BASELINE_LEGACY",
+        )
+        .await;
+
+        self.refuse(
+            &self.request(self.retrying, &record(SLOW_ANSWER)),
+            "WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT",
+        )
+        .await;
+        assert!(
+            fixture.runs().await.expect("runs read").is_empty(),
+            "direct execution leaves no durable run"
+        );
     }
 }

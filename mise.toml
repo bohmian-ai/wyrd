@@ -1247,9 +1247,17 @@ hide = true
 description = "Assert the production wyrd-sdk-python wheel does not expose wyrd.testing"
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
+# py:setup installs the testing-enabled development build, so the check builds
+# the default wheel itself and imports it from an isolated environment; the
+# plain `import wyrd` proves that environment loads the wheel at all.
 run = """
 set -eu
-if uv run python -c 'import wyrd.testing' 2>/dev/null; then
+out="$(mktemp -d)"
+trap 'rm -rf "$out"' EXIT
+uv run maturin build --out "$out"
+wheel="$(ls "$out"/*.whl)"
+uv run --isolated --no-project --with "$wheel" python -c 'import wyrd'
+if uv run --isolated --no-project --with "$wheel" python -c 'import wyrd.testing' 2>/dev/null; then
   echo 'FAIL: wyrd.testing leaked into the default wyrd-sdk-python wheel'
   exit 1
 fi

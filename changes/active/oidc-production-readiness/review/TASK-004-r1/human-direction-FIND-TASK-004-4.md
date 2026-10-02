@@ -27,3 +27,7 @@ REQ-012's "user-protected credential store" is satisfied as below.
 - Delete `~/.config/wyrd/tokens`. The access token exchanged from an API key
   is cached in `credentials.toml` next to that key, through the same locked
   writer as saved logins.
+- Saved-login renewal does what gh, gcloud, az, and aws sso do: send the
+  refresh token, store what the server returns, use it. The client does not
+  decode the renewed access token to compare its tenant; the server already
+  binds a refresh token to its login. Delete that check and its test.

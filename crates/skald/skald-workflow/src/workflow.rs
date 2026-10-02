@@ -16,10 +16,13 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroUsize;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use futures_util::FutureExt;
+use skald_agent::AgentError;
 use skald_runtime::ProviderRegistry;
 use tokio::task::{Id, JoinError, JoinSet};
 use tokio::time::Instant;
@@ -414,7 +417,13 @@ impl StepTask {
     ///
     /// Each attempt fixes its own and the Agent's deadlines, opens its
     /// `workflow.step` span, then races, in order, cancellation, the total
-    /// deadline, the step attempt timeout, and the attempt itself. Retryable
+    /// deadline, the step attempt timeout, the Agent timeout, and the attempt
+    /// itself. The fixed Agent deadline bounds all Agent work, including
+    /// normalization, output admission, and terminal journal settlement; on
+    /// expiry the attempt is dropped and classified as the Agent's typed
+    /// timeout. A panic inside the attempt is caught while its span is still
+    /// open and becomes a non-retryable `WYRD_WORKFLOW_500_INTERNAL` failure,
+    /// so the span and the run record the same outcome. Retryable
     /// failures emit a `workflow.step.backoff` event and wait the
     /// deterministic backoff, which also races cancellation and the total
     /// deadline. No attempt begins after either fires.
@@ -457,9 +466,28 @@ impl StepTask {
                         true,
                     )
                 }
-                outcome = self
-                    .attempt(attempt, attempt_deadline, agent_deadline)
-                    .instrument(span.span.clone()) => outcome,
+                () = sleep_until(agent_deadline), if agent_deadline.is_some() => {
+                    let duration = step.agent.run_config.timeout.unwrap_or_default();
+                    AttemptOutcome::from_agent(
+                        &step.id,
+                        Err(AgentError::Timeout { duration }),
+                        step.validator.as_ref(),
+                        self.max_step_result_bytes,
+                    )
+                }
+                outcome = AssertUnwindSafe(
+                    self.attempt(attempt, attempt_deadline, agent_deadline)
+                        .instrument(span.span.clone()),
+                )
+                .catch_unwind() => outcome.unwrap_or_else(|_panic| {
+                    AttemptOutcome::failed(
+                        &WyrdError::WorkflowInternal {
+                            message: format!("step '{}' attempt panicked", step.id),
+                            details: serde_json::json!({ "step": step.id }),
+                        },
+                        false,
+                    )
+                }),
             };
             let (error, retryable) = match outcome {
                 AttemptOutcome::Succeeded(payload) => {
@@ -1573,6 +1601,237 @@ mod tests {
         assert_eq!(
             attempts(&children),
             [("1".to_owned(), "cancelled".to_owned(), None)]
+        );
+    }
+
+    /// Journal that accepts every event but never settles a terminal
+    /// `AgentFinish` or `AgentError` append, counting those appends.
+    #[derive(Default)]
+    struct HeldTerminalJournal {
+        /// Terminal appends begun.
+        begun: AtomicUsize,
+        /// Terminal appends begun whose future is still alive.
+        held: AtomicUsize,
+    }
+
+    /// Decrements [`HeldTerminalJournal::held`] when a held terminal append's
+    /// future is dropped.
+    struct HeldAppend<'a>(&'a AtomicUsize);
+
+    impl Drop for HeldAppend<'_> {
+        /// Release the held count.
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl skald_agent::Journal for HeldTerminalJournal {
+        /// Accept non-terminal events at once; hold a terminal event pending
+        /// forever, so only an outer deadline or abort can end the append.
+        async fn append(
+            &self,
+            event: skald_agent::JournalEvent,
+        ) -> Result<(), skald_agent::JournalError> {
+            if matches!(
+                event,
+                skald_agent::JournalEvent::AgentFinish { .. }
+                    | skald_agent::JournalEvent::AgentError { .. }
+            ) {
+                self.begun.fetch_add(1, Ordering::SeqCst);
+                self.held.fetch_add(1, Ordering::SeqCst);
+                let _held = HeldAppend(&self.held);
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+    }
+
+    /// Workflow of one step `settle` whose Agent has a one-second timeout and
+    /// a journal that never settles its terminal append; the step allows one
+    /// retry and an optional step timeout.
+    fn held_settlement(journal: &Arc<HeldTerminalJournal>, step_timeout: Option<u64>) -> Workflow {
+        let held = agent("settle", "settle call", None)
+            .with_journal(Arc::clone(journal) as Arc<dyn skald_agent::Journal>)
+            .with_run_config(skald_agent::RunConfig {
+                timeout: Some(Duration::from_secs(1)),
+                ..skald_agent::RunConfig::default()
+            });
+        with_policy(
+            Workflow::builder("held_settlement")
+                .add(held)
+                .and_then(|b| b.with_outputs(bindings(&[("out", "steps.settle.output.text")])))
+                .and_then(|b| b.build())
+                .expect("held settlement workflow builds"),
+            "settle",
+            1,
+            None,
+            step_timeout,
+        )
+    }
+
+    /// REQ-016/REQ-043: the fixed Agent deadline bounds terminal journal
+    /// settlement. Each attempt fails with the retryable Agent timeout, the
+    /// retry is exhausted, both attempt spans close failed with that code,
+    /// and no held append survives. At an equal instant the step timeout and
+    /// the total deadline each take precedence over the Agent deadline.
+    #[tokio::test(start_paused = true)]
+    async fn agent_deadline_bounds_settlement() {
+        capture();
+        let journal = Arc::new(HeldTerminalJournal::default());
+        let provider = ScriptedProvider::new();
+        provider.on(
+            "settle call",
+            vec![Reply::Text("done".into()), Reply::Text("done".into())],
+        );
+        let started = tokio::time::Instant::now();
+        let run = run_limited(
+            &held_settlement(&journal, None),
+            &provider,
+            WorkflowExecutionLimits::default(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert_eq!(run.status, WorkflowRunStatus::Failed);
+        let step = &run.steps["settle"];
+        assert_eq!(
+            (step.status, step.attempts),
+            (WorkflowStepStatus::Failed, 2)
+        );
+        assert_eq!(
+            step.error.as_ref().map(|e| e.code.as_str()),
+            Some("WYRD_AGENT_504_TIMEOUT")
+        );
+        assert_eq!(journal.begun.load(Ordering::SeqCst), 2);
+        assert_eq!(journal.held.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.in_flight(), 0);
+        let (_, children) = run_spans(&run);
+        let timed_out = Some("WYRD_AGENT_504_TIMEOUT".to_owned());
+        assert_eq!(
+            attempts(&children),
+            [
+                ("1".to_owned(), "failed".to_owned(), timed_out.clone()),
+                ("2".to_owned(), "failed".to_owned(), timed_out),
+            ]
+        );
+
+        // An equal step timeout wins over the Agent deadline.
+        let journal = Arc::new(HeldTerminalJournal::default());
+        let provider = ScriptedProvider::new();
+        provider.on("settle call", vec![Reply::Hang, Reply::Hang]);
+        let run = run_limited(
+            &held_settlement(&journal, Some(1)),
+            &provider,
+            WorkflowExecutionLimits::default(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(
+            run.steps["settle"].error.as_ref().map(|e| e.code.as_str()),
+            Some("WYRD_WORKFLOW_504_STEP_TIMEOUT")
+        );
+        assert_eq!(provider.in_flight(), 0);
+
+        // An equal total deadline wins over both.
+        let provider = ScriptedProvider::new();
+        provider.on("settle call", vec![Reply::Hang]);
+        let limits = WorkflowExecutionLimits {
+            deadline: Some(Duration::from_secs(1)),
+            ..WorkflowExecutionLimits::default()
+        };
+        let run = run_limited(
+            &held_settlement(&journal, Some(1)),
+            &provider,
+            limits,
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(run.status, WorkflowRunStatus::TimedOut);
+        assert_eq!(run.steps["settle"].status, WorkflowStepStatus::Cancelled);
+        assert_eq!(provider.in_flight(), 0);
+    }
+
+    /// Local tool that panics when invoked.
+    struct PanickingTool;
+
+    #[async_trait::async_trait]
+    impl skald_tool::AgentTool for PanickingTool {
+        /// Name the model calls.
+        fn name(&self) -> &str {
+            "explode"
+        }
+
+        /// Fixed description.
+        fn description(&self) -> &str {
+            "panics on invocation"
+        }
+
+        /// Accepts any object.
+        fn input_schema(&self) -> serde_json::Value {
+            json!({ "type": "object" })
+        }
+
+        /// No declared output.
+        fn output_schema(&self) -> serde_json::Value {
+            json!({})
+        }
+
+        /// Panic inside the attempt.
+        ///
+        /// # Panics
+        ///
+        /// Always panics.
+        async fn invoke(
+            &self,
+            _args: serde_json::Value,
+        ) -> Result<serde_json::Value, skald_tool::ToolError> {
+            panic!("caller-supplied tool panicked")
+        }
+    }
+
+    /// REQ-053: a panicking local tool fails the step and run with the
+    /// non-retryable `WYRD_WORKFLOW_500_INTERNAL`, and its attempt span
+    /// records the same failed outcome and code rather than `cancelled`.
+    #[tokio::test(start_paused = true)]
+    async fn attempt_panic_matches_span() {
+        capture();
+        let boom = agent("boom", "boom call", None).add_tool(Arc::new(PanickingTool));
+        let workflow = with_policy(
+            Workflow::builder("panicking")
+                .add(boom)
+                .and_then(|b| b.with_outputs(bindings(&[("out", "steps.boom.output.text")])))
+                .and_then(|b| b.build())
+                .expect("panicking workflow builds"),
+            "boom",
+            2,
+            None,
+            None,
+        );
+        let provider = ScriptedProvider::new();
+        provider.on(
+            "boom call",
+            vec![Reply::ToolCall("explode".into(), json!({}))],
+        );
+        let run = run_local(&workflow, &provider, json!({})).await;
+        assert_eq!(run.status, WorkflowRunStatus::Failed);
+        let step = &run.steps["boom"];
+        assert_eq!(
+            (step.status, step.attempts),
+            (WorkflowStepStatus::Failed, 1)
+        );
+        assert_eq!(
+            step.error.as_ref().map(|e| e.code.as_str()),
+            Some("WYRD_WORKFLOW_500_INTERNAL")
+        );
+        let (_, children) = run_spans(&run);
+        assert_eq!(
+            attempts(&children),
+            [(
+                "1".to_owned(),
+                "failed".to_owned(),
+                Some("WYRD_WORKFLOW_500_INTERNAL".to_owned())
+            )]
         );
     }
 

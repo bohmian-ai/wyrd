@@ -25,9 +25,10 @@ impl SchemaResolver for NoRemoteResolver {
         url: &Url,
         _original_reference: &str,
     ) -> Result<Arc<Value>, SchemaResolverError> {
-        Err(anyhow::anyhow!(
-            "remote schema resolution is disabled: {url}"
-        ))
+        Err(SchemaResolverError::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("remote schema resolution is disabled: {url}"),
+        )))
     }
 }
 

@@ -8776,9 +8776,9 @@ dependencies = [
 name = "skald-workflow"
 version = "0.0.1"
 dependencies = [
- "anyhow",
  "async-trait",
  "chrono",
+ "futures-util",
  "http 1.4.2",
  "jsonschema",
  "pyo3",

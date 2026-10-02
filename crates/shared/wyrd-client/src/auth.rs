@@ -137,7 +137,7 @@ impl TokenExchange {
     /// Bind an exchange to one deployment.
     ///
     /// Every route this type calls carries a secret — an API key, a workload
-    /// assertion, a handoff verifier, or a refresh token — so the target goes
+    /// assertion, a device code, or a refresh token — so the target goes
     /// through the same [`HttpConfig::validate`] rule as the authenticated
     /// transport before anything is built: remote cleartext `http://` is
     /// refused, HTTPS and loopback HTTP are accepted. This one check covers

@@ -166,7 +166,7 @@ pub(crate) async fn cli_device_login_journey() {
     let config = tempfile::tempdir().expect("config home");
     let tenant: TenantSlug = FIXTURE_TENANT_SLUG.parse().expect("slug");
 
-    // A remote cleartext server never receives a handoff verifier or a
+    // A remote cleartext server never receives a device-code request or a
     // refresh token: login and refresh refuse it before any request.
     for arguments in [
         &[

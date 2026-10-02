@@ -1238,14 +1238,19 @@ mod tests {
     /// Scenario 4: step routes resolve with step-over-workflow precedence;
     /// each gateway call carries its own immutable fallback, deadline-derived
     /// timeout, and run/step/attempt correlation; native steps never reach the
-    /// gateway; tool declarations survive the route; remote problems keep only
-    /// safe metadata; a missing gateway refuses the run before dispatch.
+    /// gateway; tool declarations survive the route; an OpenAI Responses
+    /// Agent keeps its native shape through its tool loop; remote problems keep
+    /// only safe metadata; a missing gateway refuses the run before dispatch.
     #[tokio::test(start_paused = true)]
     async fn isolated_route_calls() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
-        use skald_spec::ProviderRequest;
+        use skald_prompt::{OpenAiResponsesOptions, openai_responses};
+        use skald_spec::wire::openai_responses::{
+            OpenAiResponseContentPart, OpenAiResponseItem, OpenAiResponsesResponse,
+        };
+        use skald_spec::{ProviderRequest, ProviderResponse};
         use wyrd_spec::card::workflow::{LlmRoute, WorkflowRetryPolicy};
         use wyrd_spec::gateway::{GatewayFallbackOverride, ModelRef};
 
@@ -1256,12 +1261,39 @@ mod tests {
             name: "lookup".to_owned(),
             calls: AtomicUsize::new(0),
         });
+        let responses_prompt = openai_responses(
+            "gpt-test",
+            OpenAiResponsesOptions {
+                messages: vec!["responses call".to_owned()],
+                ..OpenAiResponsesOptions::default()
+            },
+        )
+        .expect("Responses prompt builds");
+        let responses_answer = |output| {
+            ProviderResponse::OpenAiResponses(OpenAiResponsesResponse {
+                id: "resp".to_owned(),
+                object: "response".to_owned(),
+                model: "gpt-test".to_owned(),
+                status: "completed".to_owned(),
+                created_at: 0,
+                output,
+                usage: None,
+                previous_response_id: None,
+            })
+        };
         let mut workflow = Workflow::builder("routes")
             .add(agent("routed", "routed call", None))
             .and_then(|b| b.add(agent("plain", "plain call", None)))
             .and_then(|b| b.add(agent("local", "local call", None)))
             .and_then(|b| b.add(agent("remote", "remote call", None)))
             .and_then(|b| b.add(agent("tooling", "tooling call", None).with_tool(tool.clone())))
+            .and_then(|b| {
+                b.add(
+                    skald_agent::Agent::new(responses_prompt)
+                        .name("responses")
+                        .with_tool(tool.clone()),
+                )
+            })
             .and_then(|b| b.with_outputs(bindings(&[("out", "steps.routed.output.text")])))
             .and_then(|b| b.build())
             .expect("route workflow builds");
@@ -1313,6 +1345,23 @@ mod tests {
                 ]
                 .into(),
             );
+            replies.insert(
+                "responses".into(),
+                [
+                    Ok(responses_answer(vec![OpenAiResponseItem::FunctionCall {
+                        call_id: "c1".to_owned(),
+                        name: "lookup".to_owned(),
+                        arguments: "{}".to_owned(),
+                    }])),
+                    Ok(responses_answer(vec![OpenAiResponseItem::Message {
+                        role: "assistant".to_owned(),
+                        content: vec![OpenAiResponseContentPart::OutputText {
+                            text: "responses used".to_owned(),
+                        }],
+                    }])),
+                ]
+                .into(),
+            );
         }
         let native = ScriptedProvider::new();
         native.on("local call", vec![Reply::Text("native answer".into())]);
@@ -1331,7 +1380,11 @@ mod tests {
         assert_eq!(run.steps["local"].text.as_deref(), Some("native answer"));
         assert_eq!(run.steps["routed"].text.as_deref(), Some("via gateway"));
         assert_eq!(run.steps["tooling"].text.as_deref(), Some("tool used"));
-        assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            run.steps["responses"].text.as_deref(),
+            Some("responses used")
+        );
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
 
         {
             let calls = crate::test_support::lock(&gateway.calls);
@@ -1365,6 +1418,20 @@ mod tests {
                 &call.request,
                 ProviderRequest::OpenAiChatCompletion(request)
                     if request.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+            )));
+            let responses = by_step("responses");
+            assert_eq!(responses.len(), 2);
+            assert!(responses.iter().all(|call| matches!(
+                &call.request,
+                ProviderRequest::OpenAiResponses(request)
+                    if request.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+            )));
+            let ProviderRequest::OpenAiResponses(second) = &responses[1].request else {
+                unreachable!("asserted above");
+            };
+            assert!(second.input.items().iter().any(|item| matches!(
+                item,
+                OpenAiResponseItem::FunctionCallOutput { call_id, .. } if call_id == "c1"
             )));
             assert!(by_step("local").is_empty());
             assert_eq!(by_step("remote").len(), 1, "gateway refusals are terminal");

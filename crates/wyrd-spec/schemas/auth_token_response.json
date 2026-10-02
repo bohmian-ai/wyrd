@@ -1,11 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TokenResponse",
-  "description": "Response from `POST /auth/token`.",
+  "description": "RFC 6749 §5.1 successful token response.",
   "type": "object",
   "required": [
     "access_token",
-    "expires_at",
+    "expires_in",
     "token_type"
   ],
   "properties": {
@@ -17,13 +17,25 @@
         }
       ]
     },
-    "expires_at": {
-      "description": "Access-token expiry timestamp.",
-      "type": "string",
-      "format": "date-time"
+    "expires_in": {
+      "description": "Seconds until the access token expires.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "issued_token_type": {
+      "description": "RFC 8693 §2.2.1 type of the issued token; present on token-exchange responses.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ExchangeTokenType"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "refresh_token": {
-      "description": "Refresh token. Present only for human sessions: a human OIDC login completed through the common callback and human refresh rotation (`refresh_token`). Absent for every machine grant — API-key exchange (`wyrd_api_key`), the workload `jwt-bearer` grant, and `token-exchange` delegation — whose clients re-present their durable credential to obtain a fresh access token instead of holding a long-lived refresh secret.",
+      "description": "Refresh token. Issued only for a human session: at authorization-code and device-code redemption, and when `wyrd-cli` rotates its refresh token. `wyrd-ui` keeps presenting its original refresh token, and no machine grant issues one: those clients re-present their durable credential instead.",
       "anyOf": [
         {
           "$ref": "#/definitions/SecretBearer"
@@ -42,8 +54,26 @@
       ]
     }
   },
-  "additionalProperties": false,
   "definitions": {
+    "ExchangeTokenType": {
+      "description": "RFC 8693 §3 token type of a subject, actor, or issued token.",
+      "oneOf": [
+        {
+          "description": "OAuth access token.",
+          "type": "string",
+          "enum": [
+            "urn:ietf:params:oauth:token-type:access_token"
+          ]
+        },
+        {
+          "description": "A Wyrd API key (`wyrd_sk_…`) or platform credential.",
+          "type": "string",
+          "enum": [
+            "urn:wyrd:oauth:token-type:api_key"
+          ]
+        }
+      ]
+    },
     "SecretBearer": {
       "description": "Opaque secret. Redacted in logs and audit payloads.",
       "writeOnly": true,

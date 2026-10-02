@@ -115,6 +115,31 @@ export declare class NativeWyrdTestServer {
    */
   scopedApiKey(role: string, permissions: Array<string>): string
   /**
+   * Provision a second active tenant so a journey can prove cross-tenant
+   * isolation, returning its tenant ID.
+   *
+   * The tenant is seeded through the same operator path the Rust harness
+   * uses, so the journey observes the production tenancy boundary.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or seeding fails.
+   */
+  seedTenant(slug: string): string
+  /**
+   * Bootstrap a service principal holding `roles` in tenant `tenant_id` and
+   * return its API key.
+   *
+   * Pairs with [`Self::seed_tenant`]: the key is the foreign caller a
+   * cross-tenant journey uses to prove the fixture tenant is unreachable.
+   *
+   * # Errors
+   *
+   * Returns a napi error when `tenant_id` is not a tenant ID, the harness
+   * is closed, or bootstrapping fails.
+   */
+  bootstrapServiceInTenant(tenantId: string, roles: Array<string>, name: string): string
+  /**
    * Issue an API key for the principal a registered Service Card projects.
    *
    * `card_ref` is the canonical `space/Kind/name@version` identity a
@@ -180,6 +205,17 @@ export declare class NativeWyrdTestServer {
    */
   restoreTableDescribe(): void
   /**
+   * Rewrite table `fqn`'s registered schema fingerprint, as a server-side
+   * schema change leaves it, so a writer holding the earlier describe is
+   * refused with `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed, the table is not
+   * registered, or the update fails.
+   */
+  changeTableFingerprint(fqn: string): void
+  /**
    * Truncate the next query after its schema frame.
    *
    * # Errors
@@ -212,7 +248,9 @@ export declare class NativeWyrdTestServer {
  *
  * `auditPublication: false` keeps staged audit rows for assertions.
  * `verificationRuntime: true` runs Drift baseline fitting and Verifier runs.
- * `providerBaseUrl` roots built-in gateway adapters at a local mock upstream.
+ * `providerBaseUrl` roots built-in gateway adapters at a local mock upstream;
+ * its `/v1` segment also serves the verification runtime's `OpenAI` Eval
+ * judge, which calls `<providerBaseUrl>/v1/chat/completions`.
  *
  * # Errors
  *

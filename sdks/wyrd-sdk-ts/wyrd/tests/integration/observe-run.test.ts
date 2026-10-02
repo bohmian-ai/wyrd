@@ -3,8 +3,10 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { Metadata } from "@grpc/grpc-js";
 import { context, trace } from "@opentelemetry/api";
-import { BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-grpc";
+import { BasicTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { type NativeWyrdTestServer, startTestServer } from "@wyrd/testing";
 import { describe, expect, it } from "vitest";
 
@@ -182,7 +184,8 @@ describe("scoped observation journey", () => {
       const stamp = Date.now().toString(36);
       const dataset = `vala.datasets.observe_ts_${stamp}_a`;
       const datasetB = `vala.datasets.observe_ts_${stamp}_b`;
-      for (const fqn of [dataset, datasetB]) {
+      const datasetC = `vala.datasets.observe_ts_${stamp}_c`;
+      for (const fqn of [dataset, datasetB, datasetC]) {
         const registrar = await Bifrost.connect({
           table: TableConfig.fromJsonSchema(fqn, DATASET_SCHEMA),
           serverUrl: server.baseUrl,
@@ -234,13 +237,23 @@ describe("scoped observation journey", () => {
       expect(agentUid).not.toBe(modelUid);
 
       model.observe.drift({ latency_ms: 12.5, tier: "gold" });
-      // A real tracer's active span crosses N-API as the Eval row's identity.
-      const span = new BasicTracerProvider().getTracer("wyrd.tests.observe").startSpan("observe");
+      // A real tracer's active span crosses N-API as the Eval row's identity,
+      // and its stock OTLP exporter lands the same span in `vala.traces.spans`.
+      const metadata = new Metadata();
+      metadata.set("x-wyrd-access-token", `Bearer ${server.token}`);
+      const tracerProvider = new BasicTracerProvider({
+        spanProcessors: [
+          new BatchSpanProcessor(new OTLPTraceExporter({ url: server.grpcUrl, metadata })),
+        ],
+      });
+      const span = tracerProvider.getTracer("wyrd.tests.observe").startSpan("observe");
       const active = span.spanContext();
       context.with(trace.setSpan(context.active(), span), () =>
         agent.observe.eval({ answer: "yes" }, { sessionId: SESSION, media: MEDIA }),
       );
       span.end();
+      await tracerProvider.forceFlush();
+      await tracerProvider.shutdown();
       await agent.observe.record(dataset, { value: 41 });
       await agent.observe.record(dataset, { value: 43 });
       // The repeated write reused its cached describe.
@@ -250,6 +263,16 @@ describe("scoped observation journey", () => {
       expect(() =>
         agent.observe.eval({ answer: "orphan" }, { spanId: active.spanId }),
       ).toThrow(expect.objectContaining({ code: "WYRD_SPEC_400_VALIDATION" }));
+      // Malformed trace identity fails visibly rather than dropping correlation.
+      for (const identity of [
+        { traceId: `zz${active.traceId.slice(2)}`, spanId: active.spanId },
+        { traceId: active.traceId.slice(2), spanId: active.spanId },
+        { traceId: active.traceId, spanId: `${active.spanId}00` },
+      ]) {
+        expect(() => agent.observe.eval({ answer: "bad-trace" }, identity), JSON.stringify(identity)).toThrow(
+          expect.objectContaining({ code: "WYRD_SPEC_400_VALIDATION" }),
+        );
+      }
       expect(() =>
         agent.observe.eval(
           { answer: "bad-media" },
@@ -346,6 +369,19 @@ describe("scoped observation journey", () => {
         },
       ]);
 
+      // The typed trace/span identities join the exported span by type.
+      const joined = (
+        await reader.sql(
+          `SELECT s.name, e.run_id FROM vala.eval.observations e
+             JOIN vala.traces.spans s ON e.trace_id = s.trace_id AND e.span_id = s.span_id
+             WHERE e.run_id = '${run.runId}'`,
+        )
+      )
+        .toArrow()
+        .toArray()
+        .map((row) => row.toJSON());
+      expect(joined).toEqual([{ name: "observe", run_id: run.runId }]);
+
       // Two tables, two scopes, one invocation: each row keeps the subject of
       // the view that wrote it, so a second table never inherits the first's.
       for (const [table, values, subject] of [
@@ -363,6 +399,20 @@ describe("scoped observation journey", () => {
           .map((row) => row.toJSON());
         expect(rows).toEqual(values.map((value) => ({ value, run_id: run.runId, card_uid: subject })));
       }
+
+      // A writer that described a table before its server-side schema changed
+      // keeps its cached schema, and the server's fingerprint fence refuses the
+      // stale batch visibly at the drain rather than landing it.
+      const stale = WyrdState.fromPath(bundle);
+      await stale.startBifrost({ serverUrl: server.baseUrl, credential, grpcUrl: server.grpcUrl });
+      const staleRun = stale.run("agent");
+      await staleRun.observe.record(datasetC, { value: 1 });
+      expect(server.tableDescribeCount(datasetC)).toBe(1);
+      server.changeTableFingerprint(datasetC);
+      await staleRun.observe.record(datasetC, { value: 2 });
+      expect(server.tableDescribeCount(datasetC), "the stale writer never re-describes").toBe(1);
+      const fenced = await rejection(stale.shutdown());
+      expect(fenced.code).toBe("WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH");
     } finally {
       context.disable();
       server.shutdown();

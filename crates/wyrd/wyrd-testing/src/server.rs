@@ -2072,6 +2072,41 @@ impl WyrdTestServer {
         Ok(())
     }
 
+    /// Rewrite the registered schema fingerprint of the fixture tenant's table
+    /// `fqn`, as a server-side schema change leaves its control row.
+    ///
+    /// A writer that described the table earlier keeps sealing batches under
+    /// the schema it cached, so Scribe's registration lookup now refuses each
+    /// of them at the fingerprint fence with
+    /// `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`. The rewrite is permanent
+    /// for the server's lifetime.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Unsupported`] when the tenant has no
+    /// registered table `fqn`, and an SQL error when the update fails.
+    pub async fn change_table_fingerprint_for_test(
+        &self,
+        fqn: &str,
+    ) -> Result<(), WyrdTestServerError> {
+        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        let changed = sqlx::query(
+            "UPDATE vala.bifrost_tables SET fingerprint = sha256(fingerprint), updated_at = now() \
+             WHERE data_tenant_id = $1 AND fqn = $2",
+        )
+        .bind(self.data_tenant_id().as_uuid())
+        .bind(fqn)
+        .execute(&pool)
+        .await
+        .map_err(sql)?
+        .rows_affected();
+        if changed != 1 {
+            return Err(WyrdTestServerError::Unsupported(format!(
+                "no registered table {fqn:?} to change"
+            )));
+        }
+        Ok(())
+    }
+
     /// Count the exact tenant-bound read-decision audit row for one request ID.
     ///
     /// # Errors

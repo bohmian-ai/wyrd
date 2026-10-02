@@ -3195,27 +3195,13 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// A workflow lookup referenced an unknown task id.
-    #[error("[WYRD_WORKFLOW_404_TASK] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_404_TASK",
-        status = 404,
-        title = "Workflow task not found",
-        remediation = "Correct the task id; it must match a task defined in the workflow."
-    )]
-    WorkflowTaskNotFound {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// A step prompt referenced a variable absent from both workflow input and upstream output.
+    /// A declared step binding or Workflow output selected a value the run did not produce.
     #[error("[WYRD_WORKFLOW_422_MISSING_PARAMETER] {message}")]
     #[wyrd_error(
         code = "WYRD_WORKFLOW_422_MISSING_PARAMETER",
         status = 422,
-        title = "Workflow step parameter unresolved",
-        remediation = "Supply the variable in the workflow input or produce it from an upstream step."
+        title = "Workflow binding selected a missing value",
+        remediation = "Make the bound step produce the selected field, or bind a field it always produces."
     )]
     WorkflowMissingParameter {
         /// Human-readable error message.
@@ -3237,20 +3223,6 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// A workflow task's agent run completed without a consumable final provider response.
-    #[error("[WYRD_WORKFLOW_500_AGENT_RESPONSE_MISSING] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_500_AGENT_RESPONSE_MISSING",
-        status = 500,
-        title = "Workflow agent run produced no final response",
-        remediation = "Inspect the task's agent run; the workflow needs a final provider response to continue."
-    )]
-    WorkflowAgentResponseMissing {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
     /// The workflow user surface raised a boundary failure with no more specific code.
     #[error("[WYRD_WORKFLOW_500_INTERNAL] {message}")]
     #[wyrd_error(
@@ -3260,62 +3232,6 @@ pub enum WyrdError {
         remediation = "Inspect the workflow run logs; the failure detail names the internal boundary that failed."
     )]
     WorkflowInternal {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// The workflow scheduler could not acquire a task lock.
-    #[error("[WYRD_WORKFLOW_500_LOCK] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_500_LOCK",
-        status = 500,
-        title = "Workflow task lock acquisition failed",
-        remediation = "Retry the workflow run; a poisoned or contended task lock prevented scheduling."
-    )]
-    WorkflowLock {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// A workflow task exhausted its configured retry budget.
-    #[error("[WYRD_WORKFLOW_500_MAX_RETRIES] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_500_MAX_RETRIES",
-        status = 500,
-        title = "Workflow task exceeded max retries",
-        remediation = "Raise the task's retry budget or fix the underlying task failure it kept hitting."
-    )]
-    WorkflowMaxRetries {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// No workflow task is ready to run yet the workflow is not complete.
-    #[error("[WYRD_WORKFLOW_500_STALLED] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_500_STALLED",
-        status = 500,
-        title = "Workflow stalled with pending tasks",
-        remediation = "Inspect the pending task ids in details; their dependencies can never become ready."
-    )]
-    WorkflowStalled {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// No message conversion exists between the upstream and downstream task providers.
-    #[error("[WYRD_WORKFLOW_501_UNSUPPORTED_HANDOFF] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_501_UNSUPPORTED_HANDOFF",
-        status = 501,
-        title = "Unsupported workflow provider handoff",
-        remediation = "Keep adjacent workflow tasks on providers with a supported message conversion."
-    )]
-    WorkflowUnsupportedHandoff {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -4029,15 +3945,9 @@ impl WyrdError {
             | Self::RuntimeProviderNotRegistered { message, details }
             | Self::RuntimeResponseDecode { message, details }
             | Self::WorkflowAgentNotFound { message, details }
-            | Self::WorkflowTaskNotFound { message, details }
             | Self::WorkflowMissingParameter { message, details }
             | Self::WorkflowOutputSchema { message, details }
-            | Self::WorkflowAgentResponseMissing { message, details }
             | Self::WorkflowInternal { message, details }
-            | Self::WorkflowLock { message, details }
-            | Self::WorkflowMaxRetries { message, details }
-            | Self::WorkflowStalled { message, details }
-            | Self::WorkflowUnsupportedHandoff { message, details }
             | Self::WorkflowRunNotFound { message, details }
             | Self::WorkflowIdempotencyConflict { message, details }
             | Self::WorkflowRunRequest { message, details }
@@ -4415,18 +4325,12 @@ mod tests {
         ("WYRD_RUNTIME_404_PROVIDER", 404),
         ("WYRD_RUNTIME_422_RESPONSE_DECODE", 422),
         ("WYRD_WORKFLOW_404_AGENT", 404),
-        ("WYRD_WORKFLOW_404_TASK", 404),
         ("WYRD_WORKFLOW_422_CYCLE", 422),
         ("WYRD_WORKFLOW_422_DUPLICATE_STEP_ID", 422),
         ("WYRD_WORKFLOW_422_MISSING_DEPENDENCY", 422),
         ("WYRD_WORKFLOW_422_MISSING_PARAMETER", 422),
         ("WYRD_WORKFLOW_422_OUTPUT_SCHEMA", 422),
-        ("WYRD_WORKFLOW_500_AGENT_RESPONSE_MISSING", 500),
         ("WYRD_WORKFLOW_500_INTERNAL", 500),
-        ("WYRD_WORKFLOW_500_LOCK", 500),
-        ("WYRD_WORKFLOW_500_MAX_RETRIES", 500),
-        ("WYRD_WORKFLOW_500_STALLED", 500),
-        ("WYRD_WORKFLOW_501_UNSUPPORTED_HANDOFF", 501),
         ("WYRD_CLIENT_400_CONFIG_INVALID", 400),
         ("WYRD_CLIENT_401_NO_CREDENTIALS", 401),
         ("WYRD_CLIENT_413_PAYLOAD_TOO_LARGE", 413),

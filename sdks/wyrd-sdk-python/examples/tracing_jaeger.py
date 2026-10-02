@@ -44,9 +44,14 @@ def main() -> None:
         ),
     )
 
-    workflow = Workflow.sequential("jaeger-greeting", agent, observers=[OtelObserver()])
+    workflow = (
+        Workflow.sequential("jaeger-greeting", agent, observers=[OtelObserver()])
+        .with_inputs({"name": ""})
+        .with_step_inputs("greeter", {"name": "input.name"})
+        .with_outputs({"greeting": "steps.greeter.output.text"})
+    )
     result = workflow.run({"name": "world"})
-    print(result.final_output)
+    print(result.outputs["greeting"])
     print("View trace at http://localhost:16686")
 
 

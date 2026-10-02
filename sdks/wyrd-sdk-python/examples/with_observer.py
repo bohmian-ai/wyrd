@@ -44,12 +44,16 @@ def main() -> None:
         name="writer",
         prompt=Prompt(provider="mock", model="mock-model", messages=["Brief: ${summary}"]),
     )
-    wf = Workflow.sequential("research", planner, writer, observers=[OtelObserver(), counter])
-    run = wf.run({"topic": "the Rust borrow checker"})
+    wf = (
+        Workflow.sequential("research", planner, writer, observers=[OtelObserver(), counter])
+        .with_step_inputs("writer", {"summary": "steps.planner.output.structured.summary"})
+        .with_outputs({"brief": "steps.writer.output.text"})
+    )
+    run = wf.run()
     print(f"model calls: {counter.calls}")
     print(f"tokens in:   {counter.total_tokens_in}")
     print(f"tokens out:  {counter.total_tokens_out}")
-    print(f"final:       {run.final_output}")
+    print(f"outputs:     {run.outputs}")
 
 
 if __name__ == "__main__":

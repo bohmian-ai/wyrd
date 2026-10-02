@@ -47,14 +47,20 @@ def _workflow(observer: Observer | None = None) -> Workflow:
     planner = _agent("planner", "plan ${input}")
     writer = _agent("writer", "write ${input}")
     observers = [] if observer is None else [observer]
-    return Workflow.sequential("research", planner, writer, observers=observers)
+    return (
+        Workflow.sequential("research", planner, writer, observers=observers)
+        .with_inputs({"input": ""})
+        .with_step_inputs("planner", {"input": "input.input"})
+        .with_step_inputs("writer", {"input": "input.input"})
+        .with_outputs({"report": "steps.writer.output.text"})
+    )
 
 
 def test_workflow_accepts_observers_list() -> None:
     observer = RecordingObserver()
     wf = _workflow(observer)
 
-    assert wf.run("topic").final_output == "write topic"
+    assert wf.run("topic").outputs == {"report": "write topic"}
     assert "workflow_start:research:2" in observer.events
 
 
@@ -101,7 +107,10 @@ def test_workflow_observer_typed_provider_request_and_response() -> None:
 def test_workflow_loaded_from_yaml_has_empty_observers(tmp_path: Path) -> None:
     observer = RecordingObserver()
     path = tmp_path / "workflow.yaml"
-    wf = Workflow(name="empty", observers=[observer])
+    agent = Agent(prompt=Prompt.openai_chat("gpt-4o-mini", messages=["plan"]), name="planner")
+    wf = Workflow.sequential("research", agent, observers=[observer]).with_outputs(
+        {"plan": "steps.planner.output.text"}
+    )
     wf.set_version("0.1.0")
     wf.save(path)
 
@@ -115,4 +124,4 @@ def test_workflow_loaded_from_yaml_has_empty_observers(tmp_path: Path) -> None:
 def test_otel_observer_in_workflow() -> None:
     wf = _workflow(OtelObserver())
 
-    assert wf.run("topic").final_output == "write topic"
+    assert wf.run("topic").outputs == {"report": "write topic"}

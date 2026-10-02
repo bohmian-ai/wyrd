@@ -4,6 +4,10 @@ metadata:
   name: research
   version: 0.1.0
 spec:
+  inputs:
+    topic:
+      type: str
+      value: ''
   steps:
   - id: planner
     action:
@@ -13,6 +17,8 @@ spec:
         name: planner
         space: default
         version: 0.1.0
+    inputs:
+      topic: input.topic
   - id: writer
     action:
       type: agent
@@ -23,6 +29,10 @@ spec:
         version: 0.1.0
     depends_on:
     - planner
+    inputs:
+      summary: steps.planner.output.structured.summary
+  outputs:
+    brief: steps.writer.output.text
 relationships:
   outbound: []
 status: null

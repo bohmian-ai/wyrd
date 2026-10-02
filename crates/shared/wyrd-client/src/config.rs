@@ -744,16 +744,20 @@ mod tests {
             "WYRD_TENANT",
             "WYRD_API_KEY",
         ];
-        let tiers: [(&str, Option<&str>, &[(&str, &str)]); 5] = [
-            ("explicit bearer", Some("explicit-access-token"), &[]),
-            ("explicit API key", Some(API_KEY_FIXTURE), &[]),
+        let tiers = [
+            ("explicit bearer", Some("explicit-access-token"), None),
+            ("explicit API key", Some(API_KEY_FIXTURE), None),
             (
                 "WYRD_ACCESS_TOKEN",
                 None,
-                &[("WYRD_ACCESS_TOKEN", "env-access-token")],
+                Some(("WYRD_ACCESS_TOKEN", "env-access-token")),
             ),
-            ("WYRD_API_KEY", None, &[("WYRD_API_KEY", API_KEY_FIXTURE)]),
-            ("credentials.toml floor", None, &[]),
+            (
+                "WYRD_API_KEY",
+                None,
+                Some(("WYRD_API_KEY", API_KEY_FIXTURE)),
+            ),
+            ("credentials.toml floor", None, None),
         ];
         let mut outcomes = Vec::new();
         for (tier, credential, env) in tiers {
@@ -763,7 +767,7 @@ mod tests {
                 for name in names {
                     std::env::remove_var(name);
                 }
-                for (name, value) in env {
+                if let Some((name, value)) = env {
                     std::env::set_var(name, value);
                 }
             }

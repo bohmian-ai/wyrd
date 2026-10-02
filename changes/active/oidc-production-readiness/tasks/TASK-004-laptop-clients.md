@@ -250,14 +250,11 @@ Diagnoses:
   identity lane runs them.
 
 Ceilings:
-- The tenant selector is not enforced on the env-variable credential tiers.
-- Lock timeout and Ctrl-C cancel have no journey coverage; they are covered by
-  unit tests and code paths only.
+- Ctrl-C cancel has no journey coverage; it is covered by unit tests and code
+  paths only. (The env-tier selector and lock-timeout ceilings were closed in r1.)
 - The SDK journeys establish the login through the `HumanSso` handoff helper,
   which uses the same server handoff and `SavedLogin::from_cli_login` as the
   CLI, rather than through the `wyrd` binary. The CLI journey covers the binary.
-- The "uncertain timeout" case shares the RefreshPending state with the crash
-  case; only the crash state is driven.
 - The focused `concurrent_saved_renewal` command needs `--run-ignored=all`; the
   identity target supplies it.
 - Non-goals stayed excluded. No unrelated files changed, apart from the broken

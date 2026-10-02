@@ -678,8 +678,19 @@ class Workflow:
             Workflow: Fully hydrated and validated workflow.
 
         Raises:
-            WyrdError: When the file fails to load or validate, credentials
-                are missing, or a referenced Card cannot be read.
+            WyrdError: When the file fails to load or validate;
+                `WYRD_CLIENT_401_NO_CREDENTIALS` when the file references a
+                registered Card and no credential is configured;
+                `WYRD_REGISTRY_404_CARD_NOT_FOUND` when a referenced Card does
+                not exist or was deleted.
+
+        Example:
+            ```python
+            from wyrd.agent import Workflow
+
+            workflow = Workflow.from_path("workflows/code-review/workflow.yaml")
+            print(workflow.steps)
+            ```
         """
         ...
 

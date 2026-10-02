@@ -1219,7 +1219,23 @@ export class WorkflowCards {
     this.#native = native;
   }
 
-  /** Load one registered Workflow and the exact Card versions it pins. */
+  /**
+   * Load one registered Workflow and the exact Card versions it pins.
+   *
+   * @example
+   * ```ts
+   * const workflow = await cards.workflow.load({
+   *   space: "reviews",
+   *   name: "code-review",
+   *   version: "1.0.0",
+   * });
+   * const same = await cards.workflow.load({ uid: workflowUid });
+   * ```
+   *
+   * @throws {WyrdError} `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no such
+   * Workflow exists, `WYRD_PERMISSION_403_DENIED_RBAC` when the credential
+   * cannot read Cards, or `WYRD_SPEC_400_VALIDATION` for a mixed selector.
+   */
   async load(selector: WorkflowSelector): Promise<Workflow> {
     const loaded = await this.#native.loadWorkflow(JSON.stringify(selector));
     return new Workflow(nativeHandle(loaded.workflow, loaded.error));
@@ -1237,17 +1253,23 @@ export type WorkflowRunStatus =
 
 /** Snapshot of one Workflow run. */
 export interface WorkflowRun {
+  /** Run identity. */
   readonly run_id: string;
   /** Pinned Workflow Card, `null` for an unregistered local run. */
   readonly workflow: CardRef | null;
+  /** Run lifecycle status. */
   readonly status: WorkflowRunStatus;
   /** Declared outputs, populated only for a succeeded run. */
   readonly outputs: Record<string, unknown>;
   /** Step results keyed by step ID. */
   readonly steps: Record<string, unknown>;
+  /** RFC 3339 creation time. */
   readonly created_at: string;
+  /** RFC 3339 start time, `null` before the run starts. */
   readonly started_at: string | null;
+  /** RFC 3339 terminal time, `null` while the run is active. */
   readonly ended_at: string | null;
+  /** Stable catalog code and message for a `failed` or `timed_out` run. */
   readonly error: { readonly code: string; readonly message: string } | null;
 }
 
@@ -1269,6 +1291,16 @@ export class Workflow {
    *
    * Local files need no server. Registry refs are read with the ambient
    * client configuration (`WYRD_SERVER_URL`, `WYRD_API_KEY`).
+   *
+   * @example
+   * ```ts
+   * const workflow = await Workflow.fromPath("workflows/code-review/workflow.yaml");
+   * console.log(workflow.stepIds);
+   * ```
+   *
+   * @throws {WyrdError} `WYRD_CLIENT_401_NO_CREDENTIALS` when the file
+   * references a registered Card and no credential is configured, or
+   * `WYRD_REGISTRY_404_CARD_NOT_FOUND` when a referenced Card is missing.
    */
   static async fromPath(path: string): Promise<Workflow> {
     const loaded = await loadWorkflowFromPath(path);

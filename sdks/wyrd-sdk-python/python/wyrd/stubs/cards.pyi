@@ -634,35 +634,63 @@ class ModelCardRegistry:
         ...
 
 class WorkflowCards:
-    """Typed loading of registered Workflows.
+    """Load registered Workflows from the Wyrd registry.
 
-    Obtain this view from `Cards.workflow`.
+    Obtain this view from `Cards.workflow`. A loaded Workflow runs the exact
+    Agent and Prompt versions it was registered with; registering a newer
+    Agent version later does not change it.
+
+    Example:
+        ```python
+        from wyrd.cards import Cards
+
+        cards = Cards()
+        workflow = cards.workflow.load(
+            space="reviews", name="code-review", version="1.0.0"
+        )
+        same = cards.workflow.load(uid=workflow_uid)
+        ```
     """
 
     @overload
-    def load(self, *, space: str, name: str, version: str) -> Workflow: ...
-    @overload
-    def load(self, *, uid: str) -> Workflow: ...
-    def load(
-        self,
-        *,
-        uid: str | None = None,
-        space: str | None = None,
-        name: str | None = None,
-        version: str | None = None,
-    ) -> Workflow:
-        """Load one registered Workflow by exact identity or by UID.
+    def load(self, *, space: str, name: str, version: str) -> Workflow:
+        """Load one registered Workflow by its exact identity.
 
-        Pass either `uid` alone or all of `space`, `name`, and `version`.
-        Every Agent and Prompt is read along the Workflow's locked
-        relationships, so later versions never float in.
+        Args:
+            space (str): Space the Workflow is registered in.
+            name (str): Workflow name.
+            version (str): Exact registered version, such as `"1.0.0"`.
+                Version ranges and omitted versions are refused.
 
         Returns:
-            Workflow: A runnable `wyrd.agent.Workflow`.
+            Workflow: A validated, runnable `wyrd.agent.Workflow` whose Agents
+                and Prompts are the exact versions it was registered with.
 
         Raises:
-            WyrdError: For a mixed or incomplete selector, or when a Card is
-                unreadable, inactive, not a Workflow, or fails validation.
+            WyrdError: `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no such
+                Workflow exists or it was deleted;
+                `WYRD_PERMISSION_403_DENIED_RBAC` when the credential cannot
+                read Cards; a validation error when the stored graph is
+                invalid.
+        """
+        ...
+
+    @overload
+    def load(self, *, uid: str) -> Workflow:
+        """Load one registered Workflow by its UID.
+
+        Args:
+            uid (str): The Workflow Card's UID, as returned by registration.
+
+        Returns:
+            Workflow: A validated, runnable `wyrd.agent.Workflow` whose Agents
+                and Prompts are the exact versions it was registered with.
+
+        Raises:
+            WyrdError: `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no Workflow has
+                this UID; `WYRD_PERMISSION_403_DENIED_RBAC` when the
+                credential cannot read Cards; `WYRD_SPEC_400_VALIDATION` when
+                `uid` is combined with `space`, `name`, or `version`.
         """
         ...
 

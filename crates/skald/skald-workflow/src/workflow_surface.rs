@@ -1061,13 +1061,7 @@ mod tests {
         });
         let tooled = Workflow::builder("tooled")
             .add(agent("lookup_step", "lookup call", None).with_tool(declared_tool.clone()))
-            .and_then(|b| b.add(agent("plain_step", "plain call", None)))
-            .and_then(|b| {
-                b.with_outputs(bindings(&[
-                    ("found", "steps.lookup_step.output.text"),
-                    ("plain", "steps.plain_step.output.text"),
-                ]))
-            })
+            .and_then(|b| b.with_outputs(bindings(&[("found", "steps.lookup_step.output.text")])))
             .and_then(|b| b.build())
             .expect("tooled workflow builds");
         let provider = ScriptedProvider::new();
@@ -1078,6 +1072,29 @@ mod tests {
                 Reply::Text("found it".into()),
             ],
         );
+        let run = run_local(&tooled, &provider, serde_json::Map::new())
+            .await
+            .expect("tooled workflow starts");
+        assert_eq!(
+            run.outputs.get("found"),
+            Some(&json!("found it")),
+            "{run:?}"
+        );
+        assert_eq!(declared_tool.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            provider
+                .requests()
+                .iter()
+                .any(|text| text.contains("answered")),
+            "the tool result is returned to the model"
+        );
+
+        let undeclared = Workflow::builder("undeclared")
+            .add(agent("plain_step", "plain call", None))
+            .and_then(|b| b.with_outputs(bindings(&[("plain", "steps.plain_step.output.text")])))
+            .and_then(|b| b.build())
+            .expect("plain workflow builds");
+        let provider = ScriptedProvider::new();
         provider.on(
             "plain call",
             vec![
@@ -1085,14 +1102,9 @@ mod tests {
                 Reply::Text("no tool".into()),
             ],
         );
-        let run = run_local(&tooled, &provider, serde_json::Map::new())
+        let run = run_local(&undeclared, &provider, serde_json::Map::new())
             .await
-            .expect("tooled workflow starts");
-        assert_eq!(
-            run.steps["lookup_step"].text.as_deref(),
-            Some("found it"),
-            "{run:?}"
-        );
+            .expect("plain workflow starts");
         let refused = run.steps["plain_step"]
             .error
             .as_ref()
@@ -1102,7 +1114,7 @@ mod tests {
         assert_eq!(
             declared_tool.calls.load(Ordering::SeqCst),
             1,
-            "only the step that declares the tool executes it"
+            "an Agent that does not declare the tool never executes it"
         );
     }
 }

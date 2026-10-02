@@ -23,6 +23,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use wyrd_spec::auth::{SecretBearer, TokenRequest, TokenResponse};
 use wyrd_spec::ids::TenantSlug;
+use wyrd_spec::operator_connection::HttpsOrigin;
 
 use crate::auth::{AuthError, TokenExchange};
 use crate::credentials_file::CredentialsFile;
@@ -105,20 +106,27 @@ impl SavedLogin {
 }
 
 /// Canonical form of a server URL, the key saved logins are stored and
-/// selected under: parsed and normalized, without query, fragment, or a
-/// trailing slash.
+/// selected under: its origin, `scheme://host[:port]`, with the scheme and
+/// host lowercased and the default port elided by the URL parser, so every
+/// spelling and path of one deployment selects the same login.
+///
+/// This is [`HttpsOrigin::of_url`], so URL userinfo is refused before a
+/// login can be saved, selected, or printed, and only HTTPS or loopback HTTP
+/// is accepted, as for every secret-bearing request.
 ///
 /// # Errors
 /// Returns [`WyrdClientError::Config`] when `server_url` is not an absolute
-/// URL.
+/// URL, carries userinfo, or is not HTTPS or loopback HTTP.
 pub fn canonical_origin(server_url: &str) -> Result<String, WyrdClientError> {
-    let mut url = reqwest::Url::parse(server_url).map_err(|error| WyrdClientError::Config {
+    let invalid = |reason: String| WyrdClientError::Config {
         field: "http_config.base_url".to_owned(),
-        reason: format!("not an absolute URL: {error}"),
-    })?;
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url.as_str().trim_end_matches('/').to_owned())
+        reason,
+    };
+    let url = reqwest::Url::parse(server_url)
+        .map_err(|error| invalid(format!("not an absolute URL: {error}")))?;
+    HttpsOrigin::of_url(&url)
+        .map(|origin| origin.as_str().to_owned())
+        .map_err(|error| invalid(error.to_string()))
 }
 
 /// The `credentials.toml` array of tables holding saved logins.
@@ -459,24 +467,46 @@ mod tests {
         }
     }
 
-    /// The canonical origin drops query, fragment, and trailing slash.
+    /// Every spelling, default port, path, query, and fragment of one
+    /// deployment canonicalizes to its origin, and URL userinfo is refused
+    /// with no part of it in the error.
     #[test]
-    fn canonical_origin_normalizes() {
+    fn canonical_origin_is_the_url_origin() {
+        for spelling in [
+            "https://wyrd.example.com",
+            "HTTPS://Wyrd.Example.com:443/?x=1#f",
+            "https://wyrd.example.com/api/v1/",
+            "https://wyrd.example.com:443/",
+        ] {
+            assert_eq!(
+                canonical_origin(spelling).expect("parses"),
+                "https://wyrd.example.com",
+                "{spelling}"
+            );
+        }
         assert_eq!(
-            canonical_origin("HTTPS://Wyrd.Example.com:443/?x=1#f").expect("parses"),
-            "https://wyrd.example.com"
+            canonical_origin("http://LOCALHOST:8080/x").expect("parses"),
+            "http://localhost:8080"
         );
-        assert!(canonical_origin("not a url").is_err());
+        for refused in [
+            "not a url",
+            "https://alice:hunter2@wyrd.example.com",
+            "https://alice@wyrd.example.com",
+        ] {
+            let error = canonical_origin(refused).expect_err("refused");
+            assert!(!error.to_string().contains("hunter2"), "{error}");
+        }
     }
 
-    /// Selection by origin and tenant: a tenant route key picks its tenant
-    /// while a selector naming no record fails, no selector picks the newest
+    /// Selection by origin and tenant: a tenant route key picks its tenant,
+    /// under any spelling of the origin, while a selector naming no record
+    /// fails, no selector picks the newest
     /// login for the origin, and another origin selects nothing. A repeated
     /// login replaces its record and becomes the newest, and the status
     /// projection carries no token.
     #[test]
     fn selection_picks_the_named_or_newest_login() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::credentials_file::private_tempdir();
         let store = SavedLogins::at(dir.path().to_path_buf());
         let origin = "https://wyrd.example.com";
         let acme = login(origin, "acme");
@@ -495,6 +525,12 @@ mod tests {
             .select(origin, Some("acme"))
             .expect("selects")
             .expect("one");
+        assert_eq!(named.tenant_key, acme.tenant_key);
+        let respelled = canonical_origin("HTTPS://WYRD.example.com:443/api?x#f").expect("parses");
+        let named = store
+            .select(&respelled, Some("acme"))
+            .expect("selects")
+            .expect("another spelling selects the same login");
         assert_eq!(named.tenant_key, acme.tenant_key);
         let mismatch = store.select(origin, Some("initech")).expect_err("mismatch");
         assert_eq!(mismatch.code(), "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE");
@@ -515,7 +551,7 @@ mod tests {
     /// directory is left behind.
     #[test]
     fn logins_live_in_credentials_toml_beside_user_content() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::credentials_file::private_tempdir();
         let file = dir.path().join("credentials.toml");
         let user = "# my machine key\n[default]\napi_key = \"wyrd_sk_user\" # keep\n";
         std::fs::write(&file, user).expect("writes");
@@ -560,12 +596,13 @@ mod tests {
     }
 
     /// A file that does not decode, a file other users can read, a
-    /// symlinked file, and a world-writable directory are refused,
-    /// never skipped.
+    /// symlinked file, and a group- or world-writable directory are refused,
+    /// never skipped, while a directory only its owner writes keeps the full
+    /// save, select, and remove lifecycle.
     #[cfg(unix)]
     #[test]
     fn unsafe_and_corrupt_stores_fail_closed() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::credentials_file::private_tempdir();
         let store = SavedLogins::at(dir.path().to_path_buf());
         let record = login("https://wyrd.example.com", "acme");
         store.save(record.clone()).expect("saves");
@@ -598,15 +635,28 @@ mod tests {
         assert!(error.to_string().contains("unsafe_store"), "{error}");
         std::fs::remove_file(&file).expect("unlinks");
 
-        chmod(dir.path(), 0o777);
-        let error = store.select(&record.origin, None).expect_err("open dir");
-        assert!(error.to_string().contains("unsafe_store"), "{error}");
-        chmod(dir.path(), 0o775);
-        assert!(
-            store
+        for writable in [0o777, 0o775, 0o757] {
+            chmod(dir.path(), writable);
+            let error = store
                 .select(&record.origin, None)
-                .expect("readable dir")
-                .is_none()
-        );
+                .expect_err("a directory others can write");
+            assert!(error.to_string().contains("unsafe_store"), "{error}");
+            let error = store.save(record.clone()).expect_err("no write either");
+            assert!(error.to_string().contains("unsafe_store"), "{error}");
+        }
+        for private in [0o755, 0o700] {
+            chmod(dir.path(), private);
+            store.save(record.clone()).expect("saves");
+            assert_eq!(
+                store.select(&record.origin, None).expect("selects"),
+                Some(record.clone())
+            );
+            assert_eq!(
+                store
+                    .remove(&record.origin, &record.tenant_key)
+                    .expect("removes"),
+                Some(record.clone())
+            );
+        }
     }
 }

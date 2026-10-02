@@ -634,7 +634,7 @@ mod tests {
     #[test]
     fn saved_login_ranks_between_env_and_credentials_file() {
         let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let home = tempfile::tempdir().expect("tempdir");
+        let home = crate::credentials_file::private_tempdir();
         std::fs::write(
             home.path().join("credentials.toml"),
             format!("[default]\napi_key = \"{API_KEY_FIXTURE}\"\n"),
@@ -721,7 +721,7 @@ mod tests {
     #[test]
     fn tenant_selector_is_refused_beside_a_self_naming_credential() {
         let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let home = tempfile::tempdir().expect("tempdir");
+        let home = crate::credentials_file::private_tempdir();
         let floor = home.path().join("credentials.toml");
         std::fs::write(
             &floor,

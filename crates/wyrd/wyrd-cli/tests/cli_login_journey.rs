@@ -163,7 +163,7 @@ pub(crate) async fn cli_device_login_journey() {
     let sso = HumanSso::new(&server);
     sso.activate_keycloak(admin.api_key().expect("admin key").expose_secret())
         .await;
-    let config = tempfile::tempdir().expect("config home");
+    let config = wyrd_testing::human_login::private_config_home();
     let tenant: TenantSlug = FIXTURE_TENANT_SLUG.parse().expect("slug");
 
     // A remote cleartext server never receives a device-code request or a
@@ -193,6 +193,27 @@ pub(crate) async fn cli_device_login_journey() {
             "{}",
             transcript(&output)
         );
+    }
+    // A server URL carrying userinfo is refused before any request, and the
+    // password is never echoed.
+    let with_userinfo = server.replacen("://", "://alice:hunter2@", 1);
+    for arguments in [
+        &[
+            "auth",
+            "login",
+            "--server",
+            &with_userinfo,
+            "--tenant",
+            FIXTURE_TENANT_SLUG,
+            "--no-browser",
+        ][..],
+        &["auth", "logout", "--server", &with_userinfo][..],
+    ] {
+        let output = run(config.path(), arguments).await;
+        let text = transcript(&output);
+        assert!(!output.status.success(), "{text}");
+        assert!(text.contains("userinfo"), "{text}");
+        assert!(!text.contains("hunter2"), "{text}");
     }
     assert!(
         saved_logins(config.path())
@@ -443,7 +464,12 @@ pub(crate) async fn cli_device_login_journey() {
         )
         .expect("saves");
     srv.shutdown().await.expect("server stops");
-    let offline_logout = run(config.path(), &["auth", "logout", "--server", &server]).await;
+    // Another spelling of the same origin selects the same saved login.
+    let respelled = format!(
+        "{}/some/path/?x=1#f",
+        server.replacen("http://", "HTTP://", 1)
+    );
+    let offline_logout = run(config.path(), &["auth", "logout", "--server", &respelled]).await;
     let offline_text = transcript(&offline_logout);
     assert!(offline_logout.status.success(), "{offline_text}");
     assert!(offline_text.contains("warning"), "{offline_text}");

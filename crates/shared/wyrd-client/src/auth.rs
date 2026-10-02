@@ -1232,7 +1232,7 @@ mod tests {
     ///
     /// Panics when the temporary directory or file cannot be created.
     fn credentials_dir() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = crate::credentials_file::private_tempdir();
         let path = dir.path().join("credentials.toml");
         std::fs::write(
             &path,
@@ -1406,7 +1406,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn saved_login_token_is_reused_until_expiry() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::credentials_file::private_tempdir();
         let origin = "http://127.0.0.1:9";
         let login = SavedLogin {
             origin: origin.to_owned(),

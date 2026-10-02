@@ -182,22 +182,22 @@ impl CredentialsFile {
     /// Check the configuration directory, creating it private to the user
     /// when `create` is set, and report whether it exists.
     ///
-    /// The directory may be readable by others and writable by the user's
-    /// group (a plain `~/.config/wyrd` under a `002` umask is): the file's
-    /// own ownership, mode, and symlink checks are what keep the secrets
-    /// private, so the directory need only be the user's and not
-    /// world-writable.
+    /// The directory may be readable and searchable by others, but, as
+    /// `ssh` requires of `~/.ssh`, it must be the user's and writable by no
+    /// one else (`0o022` clear): another writer could replace
+    /// `credentials.toml` between its checks and its read. The file's own
+    /// ownership, mode, and symlink checks keep the secrets unreadable.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::SavedLogin`] with reason `unsafe_store` for
-    /// a symlinked, foreign-owned, or world-writable directory.
+    /// a symlinked, foreign-owned, or group- or world-writable directory.
     fn check_dir(&self, create: bool) -> Result<bool, WyrdClientError> {
         match std::fs::symlink_metadata(&self.dir) {
             Ok(metadata) => {
                 if !metadata.is_dir() {
                     return Err(unsafe_store(&self.dir, "is not a directory"));
                 }
-                check_owned(&self.dir, &metadata, 0o002)?;
+                check_owned(&self.dir, &metadata, 0o022)?;
                 Ok(true)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -329,4 +329,19 @@ fn check_owned(
         }
     }
     Ok(())
+}
+
+/// A fresh temporary Wyrd configuration directory only its owner can write,
+/// as the credential file requires; `tempfile`'s own default follows the
+/// umask and may leave it group-writable.
+///
+/// # Panics
+/// Panics when the directory cannot be created.
+#[cfg(test)]
+pub(crate) fn private_tempdir() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    builder
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700));
+    builder.tempdir().expect("private tempdir")
 }

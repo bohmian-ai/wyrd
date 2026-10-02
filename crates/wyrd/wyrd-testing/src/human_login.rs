@@ -342,6 +342,21 @@ impl HumanSso {
     }
 }
 
+/// A fresh temporary Wyrd configuration directory for `WYRD_CONFIG_HOME`,
+/// writable only by its owner as the credential file requires; `tempfile`'s
+/// own default follows the umask and may leave it group-writable.
+///
+/// # Panics
+/// Panics when the directory cannot be created.
+#[must_use]
+pub fn private_config_home() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    builder
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700));
+    builder.tempdir().expect("private config home")
+}
+
 /// The saved logins in `credentials.toml` under the Wyrd configuration
 /// directory `config_home`, the one `WYRD_CONFIG_HOME` names.
 #[must_use]

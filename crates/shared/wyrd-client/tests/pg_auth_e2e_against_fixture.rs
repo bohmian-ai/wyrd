@@ -221,7 +221,7 @@ async fn concurrent_saved_renewal() {
     let sso = HumanSso::new(&server);
     sso.activate_keycloak(admin.api_key().expect("admin key").expose_secret())
         .await;
-    let config = tempfile::tempdir().expect("config home");
+    let config = wyrd_testing::human_login::private_config_home();
     sso.save_login(config.path(), FIXTURE_TENANT_SLUG, "bob", "wyrd-test")
         .await;
     let store = saved_logins(config.path());

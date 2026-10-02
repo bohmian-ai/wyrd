@@ -453,7 +453,7 @@ fn prompt_card() -> PathBuf {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the Keycloak identity lane; run via `mise run test:identity:journey`"]
 async fn saved_user_auth_journey() {
-    let config = tempfile::tempdir().expect("config home creates");
+    let config = wyrd_testing::human_login::private_config_home();
     let server = Box::pin(
         WyrdTestServerBuilder::default()
             .with_public_origin(HUMAN_PUBLIC_ORIGIN.parse().expect("origin parses"))

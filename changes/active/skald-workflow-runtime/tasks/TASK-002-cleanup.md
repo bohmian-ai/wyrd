@@ -279,3 +279,81 @@ mechanics through planning; do not rebuild duplicate orchestration to obey them.
 - AGENTS.md; architecture/agent-rules.md; architecture/wyrd-design.md
 - architecture/wyrd-doctrine.mdx; architecture/wyrd-security-posture.md
 - architecture/references/languages/{spec-driven-development,implementation-execution,testing-workflows,pyo3-boundaries,typescript-guide,errors}.md
+
+## Implementation Evidence
+
+Commits: b5d88a590, d46018cde, 1f893a91c, a4c4c73c5, 0d3dbbc5a, c61168a1b, b9b27c2b4 (+ this evidence commit).
+Shared journey fixtures: `tests/fixtures/workflow-loading/` (README describes each case).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| S1 local file loading is automatic and registry-free when possible | `crates/shared/wyrd-client/src/workflow.rs::Workflow::from_path` (builds `Cards` only when external refs exist) | `wyrd-client --lib workflow::tests::from_path_uses_existing_loader`; each SDK journey step 1 loads `examples/workflows/code-review` with no server/credentials | PASS |
+| S2 composite registration keeps validation and provenance fences; no Workflow principal | `wyrd-server` cards `resolve`/`service` (WorkflowGraph lookup loop removed) | `pg_workflow_registration::{registers_only_valid_explicit_workflow_graphs, refuses_stale_preflight_after_dependency_replacement, fetches_and_executes_locked_workflow_graph}` | PASS |
+| S3 Rust SDK: refs, apply/reload, pinned after v2, refusals | `sdks/wyrd-sdk-rust/src/lib.rs` re-exports; `tests/workflow_loading.rs` | `wyrd-sdk-rust --test workflow_loading --run-ignored all workflow_loading_journey` | PASS |
+| S4 Python `Workflow.from_path`, `cards.workflow.load` | `sdks/wyrd-sdk-python/src/{workflow.rs,state/mod.rs}`, stubs `agent.pyi`/`cards.pyi` | `test_cards_crud.py::test_workflow_loading_journey`; `py:typecheck`; `codegen:check` | PASS |
+| S5 TypeScript `Workflow.fromPath`, `cards.workflow.load`, `run` | `sdks/wyrd-sdk-ts/native/src/workflow.rs`, `native/src/cards.rs::load_workflow`, `wyrd/src/index.ts::{Workflow,WorkflowCards,WorkflowSelector,WorkflowRun}` | `tests/integration/workflow-loading.test.ts` "workflow loading journey"; `ts:typecheck`; `ts:napi:check` | PASS |
+| S6 obsolete machinery removed, no collateral regression | `workflow_loader.rs`, keyed normalization, `InlineableSlotField` deleted; `CardRefIdentity` retained (`cards/hydrate/workflow.rs`, `wyrd-spec/src/graph`) | `git grep` WorkflowLoader/workflow_loader/InlineableSlotField/keyed refs: none outside `changes/`; `test:shared`, `test:cards:integration` Service hydration and loader tests | PASS |
+
+Observed codes, consistent across SDKs:
+
+| Case | Code |
+|---|---|
+| Registry ref, no credentials | `WYRD_CLIENT_401_NO_CREDENTIALS` |
+| Principal cannot read Cards | `WYRD_PERMISSION_403_DENIED_RBAC` |
+| Deleted Card / Agent UID used as Workflow UID | `WYRD_REGISTRY_404_CARD_NOT_FOUND` |
+| Exact Agent ref used as Workflow selector | `WYRD_REGISTRY_400_INVALID_CARD_SPEC` |
+| Versionless selector | `WYRD_REGISTRY_400_VERSION_REQUIRED` |
+| Ref UID naming another Card | `WYRD_REGISTRY_400_CARD_REF_UID_NOT_RESOLVABLE_HERE` |
+| Mixed TS/Python selector | `WYRD_SPEC_400_VALIDATION` |
+| `run()` on the `wyrd_gateway` route | `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` (pre-dispatch) |
+
+### Material limits and deviations
+
+- Ambient-credential `from_path` with registry refs is proved in Python and
+  TypeScript only. The Rust journey would need `unsafe { set_var }` under
+  edition 2024 with `unsafe_code = deny`; the maintainer asked for plain tests.
+- The code-review bundle uses the `wyrd_gateway` route. Python and TypeScript
+  `run()` refuse with `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` until the gateway
+  binding lands (TASK-003). The Rust journey executes the pinned graph through a
+  fake gateway via `as_skald().run_with_options`.
+- "Inactive" is exercised as deletion (a referenced Card cannot be deleted, so
+  the `retired` fixture references a standalone Prompt that is deleted).
+- Skald's engine-level `Workflow::load(path, tools, prompts)` remains as the
+  lower-tier seam used by `examples/rust/workflow_from_yaml.rs`.
+
+### Reuse-map revalidation
+
+| Capability | Existing owner reused | Gap closed | New machinery |
+|---|---|---|---|
+| Authored bundle | `wyrd-loader::load`/`resolve_tree` | bodies fed to Cards graph owner | none |
+| Registered graph | `CardGraphHydrator`/`GraphTraversal` | in-memory Workflow consumption | none |
+| Runtime lowering | Skald `Workflow::from_card_bodies`/`validate_card_bodies` | client IO boundary | thin `wyrd_client::Workflow` facade |
+| Registration | `EffectiveSpecs::{load,validate_workflows}` | WorkflowGraph lookup loop removed | none |
+| Python | `PyWorkflow`, `PyCards` getters | `from_path`, `PyWorkflowCards` view | typed boundary view only |
+| TypeScript | `NativeCards`, `NativeLifecycleResult`, `nativeHandle` | `NativeWorkflow`, `loadWorkflow` | napi wrapper + selector parse only |
+| Rust SDK | `wyrd_sdk` re-exports, `WyrdTestServer` | journey | none |
+
+### Verification commands
+
+All PASS:
+
+- Focused: `wyrd-client --lib workflow::tests::from_path_uses_existing_loader` (1/1);
+  `wyrd-server --test pg_workflow_registration` three named tests (3/3);
+  `wyrd-sdk-rust --test workflow_loading --run-ignored all workflow_loading_journey` (1/1);
+  Python `-k test_workflow_loading_journey` (1 passed, 13 deselected);
+  TS `vitest run tests/integration/workflow-loading.test.ts -t "^Workflow loading workflow loading journey$"` (1/1).
+  The task's `-t "^workflow loading journey$"` selects nothing because Vitest
+  matches the full name including the `describe` block; corrected above.
+- Lanes: `test:shared`, `test:skald`, `test:cards:integration`, `test:wyrd-sdk`,
+  `py:test:unit`, `py:test:cards:integration`, `py:typecheck`, `ts:test:unit`,
+  `ts:test:integration` (11 files / 26 tests, includes the new journey),
+  `ts:typecheck`, `ts:napi:check`, `codegen:check`, `check:client-tier`,
+  `check:sdk-client-tier`, `check:pyo3-scope`, `check:registry-tx-coupling`,
+  `fmt`, `lints`, `py:format`, `py:lints`, `git diff --check`.
+- The Rust SDK journey is `#[ignore]` and is not selected by `test:wyrd-sdk`;
+  it is run by the exact focused command above.
+
+Non-goals stayed excluded: no gateway execution binding, no Workflow
+principal, WyrdState unchanged and Service-rooted, no new reference dialect.
+
+**Status: IMPLEMENTED.**

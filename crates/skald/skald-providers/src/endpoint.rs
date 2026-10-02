@@ -13,11 +13,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::error::ProviderResult;
+use crate::transport::{HttpTransport, TransportConfig};
 use reqwest::ClientBuilder;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect::Policy;
-use crate::error::ProviderResult;
-use crate::transport::{HttpTransport, TransportConfig};
 use url::{Host, Url};
 
 /// Bound on one DNS resolution.

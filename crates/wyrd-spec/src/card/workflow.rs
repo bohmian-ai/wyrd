@@ -157,7 +157,10 @@ impl WorkflowSpec {
     /// # Errors
     /// Returns [`WorkflowValidationError::Cycle`] when some steps can never
     /// become ready.
-    fn require_acyclic(&self, index: &BTreeMap<&str, usize>) -> Result<(), WorkflowValidationError> {
+    fn require_acyclic(
+        &self,
+        index: &BTreeMap<&str, usize>,
+    ) -> Result<(), WorkflowValidationError> {
         let mut remaining: Vec<usize> = self.steps.iter().map(|s| s.depends_on.len()).collect();
         let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); self.steps.len()];
         for (position, step) in self.steps.iter().enumerate() {
@@ -263,7 +266,10 @@ impl WorkflowSpec {
     /// # Errors
     /// Returns a validation error for an empty map, an invalid output name, or
     /// a binding to an undeclared input or step.
-    fn validate_outputs(&self, index: &BTreeMap<&str, usize>) -> Result<(), WorkflowValidationError> {
+    fn validate_outputs(
+        &self,
+        index: &BTreeMap<&str, usize>,
+    ) -> Result<(), WorkflowValidationError> {
         if self.outputs.is_empty() {
             return Err(WorkflowValidationError::invalid(
                 "outputs",
@@ -571,9 +577,9 @@ impl LlmRoute {
 /// Return true for a non-empty RFC 9110 `token` field name.
 fn is_http_token(name: &str) -> bool {
     !name.is_empty()
-        && name.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
-        })
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
 }
 
 /// Return true when a lowercase header name may not appear in a Card route.
@@ -1128,10 +1134,12 @@ impl From<WorkflowValidationError> for WyrdError {
     fn from(error: WorkflowValidationError) -> Self {
         let message = error.to_string();
         match error {
-            WorkflowValidationError::DuplicateStep { field } => WyrdError::WorkflowDuplicateStepId {
-                message,
-                details: json!({ "field": field }),
-            },
+            WorkflowValidationError::DuplicateStep { field } => {
+                WyrdError::WorkflowDuplicateStepId {
+                    message,
+                    details: json!({ "field": field }),
+                }
+            }
             WorkflowValidationError::MissingDependency { field } => {
                 WyrdError::WorkflowMissingDependency {
                     message,
@@ -1253,10 +1261,10 @@ mod tests {
         WorkflowRunError, WorkflowRunStatus, WorkflowSpec, WorkflowStep, WorkflowStepStatus,
         jcs_len,
     };
-    use crate::gateway::GatewayFallbackOverride;
-    use crate::ids::CredentialBindingName;
     use crate::envelope::CardKind;
     use crate::error::WyrdError;
+    use crate::gateway::GatewayFallbackOverride;
+    use crate::ids::CredentialBindingName;
     use crate::ids::SpaceName;
     use crate::metadata::{Annotations, Labels};
     use crate::reference::{CardRef, InlineableRef, Ref};
@@ -1552,10 +1560,7 @@ mod tests {
             binding("steps.summarize.output.structured.summary"),
         );
         WorkflowSpec {
-            inputs: BTreeMap::from([(
-                "topic".to_owned(),
-                ParameterValue::Str("rust".to_owned()),
-            )]),
+            inputs: BTreeMap::from([("topic".to_owned(), ParameterValue::Str("rust".to_owned()))]),
             steps: vec![summarize, review],
             outputs: BTreeMap::from([
                 ("review".to_owned(), binding("steps.review.output.text")),
@@ -1615,7 +1620,10 @@ mod tests {
             "steps..output.text",
             "outputs.a",
         ] {
-            assert!(WorkflowBinding::new(bad).is_err(), "{bad:?} must be rejected");
+            assert!(
+                WorkflowBinding::new(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
             assert!(
                 serde_json::from_value::<WorkflowBinding>(json!(bad)).is_err(),
                 "{bad:?} must not deserialize"
@@ -1657,7 +1665,10 @@ mod tests {
         );
         for (protocol, wire) in [
             (ExternalGatewayProtocol::OpenAiResponses, "openai_responses"),
-            (ExternalGatewayProtocol::AnthropicMessages, "anthropic_messages"),
+            (
+                ExternalGatewayProtocol::AnthropicMessages,
+                "anthropic_messages",
+            ),
             (
                 ExternalGatewayProtocol::GeminiGenerateContent,
                 "gemini_generate_content",
@@ -1667,7 +1678,10 @@ mod tests {
                 "vertex_generate_content",
             ),
         ] {
-            assert_eq!(serde_json::to_value(protocol).expect("protocol"), json!(wire));
+            assert_eq!(
+                serde_json::to_value(protocol).expect("protocol"),
+                json!(wire)
+            );
         }
         assert!(
             serde_json::from_value::<LlmRoute>(json!({
@@ -1692,21 +1706,27 @@ mod tests {
         .expect("run with defaulted maps decodes");
         assert!(run.outputs.is_empty() && run.steps.is_empty());
         assert_eq!(run.status, WorkflowRunStatus::TimedOut);
-        assert!(serde_json::from_value::<WorkflowRun>(json!({
-            "run_id": "01890a5d-ac96-474b-bcce-b302099a8057",
-            "workflow": null, "status": "queued", "created_at": "2026-01-01T00:00:00Z",
-            "started_at": null, "ended_at": null, "error": null,
-        }))
-        .is_err(), "non-v7 run id is rejected");
+        assert!(
+            serde_json::from_value::<WorkflowRun>(json!({
+                "run_id": "01890a5d-ac96-474b-bcce-b302099a8057",
+                "workflow": null, "status": "queued", "created_at": "2026-01-01T00:00:00Z",
+                "started_at": null, "ended_at": null, "error": null,
+            }))
+            .is_err(),
+            "non-v7 run id is rejected"
+        );
         assert_eq!(
             serde_json::to_value(WorkflowStepStatus::Unstarted).expect("status"),
             json!("unstarted")
         );
-        assert!(serde_json::from_value::<CreateWorkflowRunRequest>(json!({
-            "workflow": {"kind": "Workflow", "name": "review", "version": "1.0.0"},
-            "extra": true,
-        }))
-        .is_err(), "request denies unknown fields");
+        assert!(
+            serde_json::from_value::<CreateWorkflowRunRequest>(json!({
+                "workflow": {"kind": "Workflow", "name": "review", "version": "1.0.0"},
+                "extra": true,
+            }))
+            .is_err(),
+            "request denies unknown fields"
+        );
         let request: CreateWorkflowRunRequest = serde_json::from_value(json!({
             "workflow": {"kind": "Workflow", "name": "review", "version": "1.0.0"},
         }))
@@ -1727,40 +1747,228 @@ mod tests {
         // Table-driven pure validation failures.
         type Mutation = fn(&mut WorkflowSpec);
         let cases: Vec<(&str, Mutation, &str, &str)> = vec![
-            ("empty steps", |s| s.steps.clear(), "steps", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("empty id", |s| s.steps[0].id = String::new(), "steps[0].id", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("bad id", |s| s.steps[0].id = "a-b".to_owned(), "steps[0].id", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("duplicate id", |s| s.steps[1].id = "summarize".to_owned(), "steps[1].id", "WYRD_WORKFLOW_422_DUPLICATE_STEP_ID"),
-            ("missing dep", |s| s.steps[1].depends_on = vec!["ghost".to_owned()], "steps[1].depends_on", "WYRD_WORKFLOW_422_MISSING_DEPENDENCY"),
-            ("self dep", |s| s.steps[0].depends_on = vec!["summarize".to_owned()], "steps[0].depends_on", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("duplicate dep", |s| s.steps[1].depends_on.push("summarize".to_owned()), "steps[1].depends_on", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("cycle", |s| s.steps[0].depends_on = vec!["review".to_owned()], "steps", "WYRD_WORKFLOW_422_CYCLE"),
-            ("hidden step", |s| { s.steps[1].depends_on.clear(); }, "steps[1].inputs.summary", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("self reference", |s| { s.steps[1].inputs.insert("own".to_owned(), WorkflowBinding::new("steps.review.output.text").expect("valid")); }, "steps[1].inputs.own", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("undeclared input", |s| { s.steps[0].inputs.insert("x".to_owned(), WorkflowBinding::new("input.nope").expect("valid")); }, "steps[0].inputs.x", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("bad input name", |s| { s.inputs.insert("bad-name".to_owned(), ParameterValue::Int(1)); }, "inputs.bad-name", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("empty outputs", |s| s.outputs.clear(), "outputs", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("bad output name", |s| { s.outputs.insert("bad name".to_owned(), WorkflowBinding::new("input.topic").expect("valid")); }, "outputs.bad name", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("output unknown step", |s| { s.outputs.insert("x".to_owned(), WorkflowBinding::new("steps.ghost.output.text").expect("valid")); }, "outputs.x", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("output undeclared input", |s| { s.outputs.insert("x".to_owned(), WorkflowBinding::new("input.nope").expect("valid")); }, "outputs.x", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("native fallback", |s| s.steps[0].fallback = Some(fallback()), "steps[0].fallback", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("ext fallback", |s| { s.llm_route = Some(ext_route("https://gw.example.com", "x-a")); s.steps[0].fallback = Some(fallback()); }, "steps[0].fallback", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("empty fallback", |s| { s.steps[0].llm_route = Some(LlmRoute::WyrdGateway); s.steps[0].fallback = Some(GatewayFallbackOverride { candidates: Vec::new() }); }, "steps[0].fallback", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("userinfo", |s| s.llm_route = Some(ext_route("https://u:p@gw.example.com", "x-a")), "llm_route.base_url", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("query", |s| s.llm_route = Some(ext_route("https://gw.example.com/v1?k=v", "x-a")), "llm_route.base_url", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("fragment", |s| s.steps[1].llm_route = Some(ext_route("https://gw.example.com/#f", "x-a")), "steps[1].llm_route.base_url", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("authorization header", |s| s.llm_route = Some(ext_route("https://gw.example.com", "Authorization")), "llm_route.headers.Authorization", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("api-key header", |s| s.llm_route = Some(ext_route("https://gw.example.com", "x-api-key")), "llm_route.headers.x-api-key", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("token header", |s| s.llm_route = Some(ext_route("https://gw.example.com", "x-session-token")), "llm_route.headers.x-session-token", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("forwarded header", |s| s.llm_route = Some(ext_route("https://gw.example.com", "X-Forwarded-For")), "llm_route.headers.X-Forwarded-For", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("proxy header", |s| s.llm_route = Some(ext_route("https://gw.example.com", "proxy-authorization")), "llm_route.headers.proxy-authorization", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("host header", |s| s.llm_route = Some(ext_route("https://gw.example.com", "host")), "llm_route.headers.host", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("invalid header", |s| s.llm_route = Some(ext_route("https://gw.example.com", "bad header")), "llm_route.headers.bad header", "WYRD_WORKFLOW_422_VALIDATION"),
-            ("case duplicate header", |s| {
-                if let Some(LlmRoute::ExtGateway { headers, .. }) = &mut s.llm_route {
-                    headers.insert("X-A".to_owned(), "v".to_owned());
-                }
-            }, "llm_route.headers.x-a", "WYRD_WORKFLOW_422_VALIDATION"),
+            (
+                "empty steps",
+                |s| s.steps.clear(),
+                "steps",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "empty id",
+                |s| s.steps[0].id = String::new(),
+                "steps[0].id",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "bad id",
+                |s| s.steps[0].id = "a-b".to_owned(),
+                "steps[0].id",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "duplicate id",
+                |s| s.steps[1].id = "summarize".to_owned(),
+                "steps[1].id",
+                "WYRD_WORKFLOW_422_DUPLICATE_STEP_ID",
+            ),
+            (
+                "missing dep",
+                |s| s.steps[1].depends_on = vec!["ghost".to_owned()],
+                "steps[1].depends_on",
+                "WYRD_WORKFLOW_422_MISSING_DEPENDENCY",
+            ),
+            (
+                "self dep",
+                |s| s.steps[0].depends_on = vec!["summarize".to_owned()],
+                "steps[0].depends_on",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "duplicate dep",
+                |s| s.steps[1].depends_on.push("summarize".to_owned()),
+                "steps[1].depends_on",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "cycle",
+                |s| s.steps[0].depends_on = vec!["review".to_owned()],
+                "steps",
+                "WYRD_WORKFLOW_422_CYCLE",
+            ),
+            (
+                "hidden step",
+                |s| {
+                    s.steps[1].depends_on.clear();
+                },
+                "steps[1].inputs.summary",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "self reference",
+                |s| {
+                    s.steps[1].inputs.insert(
+                        "own".to_owned(),
+                        WorkflowBinding::new("steps.review.output.text").expect("valid"),
+                    );
+                },
+                "steps[1].inputs.own",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "undeclared input",
+                |s| {
+                    s.steps[0].inputs.insert(
+                        "x".to_owned(),
+                        WorkflowBinding::new("input.nope").expect("valid"),
+                    );
+                },
+                "steps[0].inputs.x",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "bad input name",
+                |s| {
+                    s.inputs
+                        .insert("bad-name".to_owned(), ParameterValue::Int(1));
+                },
+                "inputs.bad-name",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "empty outputs",
+                |s| s.outputs.clear(),
+                "outputs",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "bad output name",
+                |s| {
+                    s.outputs.insert(
+                        "bad name".to_owned(),
+                        WorkflowBinding::new("input.topic").expect("valid"),
+                    );
+                },
+                "outputs.bad name",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "output unknown step",
+                |s| {
+                    s.outputs.insert(
+                        "x".to_owned(),
+                        WorkflowBinding::new("steps.ghost.output.text").expect("valid"),
+                    );
+                },
+                "outputs.x",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "output undeclared input",
+                |s| {
+                    s.outputs.insert(
+                        "x".to_owned(),
+                        WorkflowBinding::new("input.nope").expect("valid"),
+                    );
+                },
+                "outputs.x",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "native fallback",
+                |s| s.steps[0].fallback = Some(fallback()),
+                "steps[0].fallback",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "ext fallback",
+                |s| {
+                    s.llm_route = Some(ext_route("https://gw.example.com", "x-a"));
+                    s.steps[0].fallback = Some(fallback());
+                },
+                "steps[0].fallback",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "empty fallback",
+                |s| {
+                    s.steps[0].llm_route = Some(LlmRoute::WyrdGateway);
+                    s.steps[0].fallback = Some(GatewayFallbackOverride {
+                        candidates: Vec::new(),
+                    });
+                },
+                "steps[0].fallback",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "userinfo",
+                |s| s.llm_route = Some(ext_route("https://u:p@gw.example.com", "x-a")),
+                "llm_route.base_url",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "query",
+                |s| s.llm_route = Some(ext_route("https://gw.example.com/v1?k=v", "x-a")),
+                "llm_route.base_url",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "fragment",
+                |s| s.steps[1].llm_route = Some(ext_route("https://gw.example.com/#f", "x-a")),
+                "steps[1].llm_route.base_url",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "authorization header",
+                |s| s.llm_route = Some(ext_route("https://gw.example.com", "Authorization")),
+                "llm_route.headers.Authorization",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "api-key header",
+                |s| s.llm_route = Some(ext_route("https://gw.example.com", "x-api-key")),
+                "llm_route.headers.x-api-key",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "token header",
+                |s| s.llm_route = Some(ext_route("https://gw.example.com", "x-session-token")),
+                "llm_route.headers.x-session-token",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "forwarded header",
+                |s| s.llm_route = Some(ext_route("https://gw.example.com", "X-Forwarded-For")),
+                "llm_route.headers.X-Forwarded-For",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "proxy header",
+                |s| s.llm_route = Some(ext_route("https://gw.example.com", "proxy-authorization")),
+                "llm_route.headers.proxy-authorization",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "host header",
+                |s| s.llm_route = Some(ext_route("https://gw.example.com", "host")),
+                "llm_route.headers.host",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "invalid header",
+                |s| s.llm_route = Some(ext_route("https://gw.example.com", "bad header")),
+                "llm_route.headers.bad header",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
+            (
+                "case duplicate header",
+                |s| {
+                    if let Some(LlmRoute::ExtGateway { headers, .. }) = &mut s.llm_route {
+                        headers.insert("X-A".to_owned(), "v".to_owned());
+                    }
+                },
+                "llm_route.headers.x-a",
+                "WYRD_WORKFLOW_422_VALIDATION",
+            ),
         ];
         for (name, mutate, field, code) in cases {
             let mut spec = bound_spec();
@@ -1781,12 +1989,12 @@ mod tests {
         spec.steps[0].fallback = Some(fallback());
         let mut third = inline_agent_step("third");
         third.depends_on = vec!["review".to_owned()];
-        third.inputs.insert(
-            "topic".to_owned(),
-            binding("steps.summarize.output.text"),
-        );
+        third
+            .inputs
+            .insert("topic".to_owned(), binding("steps.summarize.output.text"));
         spec.steps.push(third);
-        spec.validate().expect("transitive binding and gateway fallback are valid");
+        spec.validate()
+            .expect("transitive binding and gateway fallback are valid");
 
         // Deep chains validate without recursion.
         let mut deep = bound_spec();
@@ -1799,10 +2007,9 @@ mod tests {
                 step
             })
             .collect();
-        deep.steps[9_999].inputs.insert(
-            "first".to_owned(),
-            binding("steps.s0.output.text"),
-        );
+        deep.steps[9_999]
+            .inputs
+            .insert("first".to_owned(), binding("steps.s0.output.text"));
         deep.outputs = BTreeMap::from([("last".to_owned(), binding("steps.s9999.output.text"))]);
         deep.validate().expect("deep chain is valid");
     }

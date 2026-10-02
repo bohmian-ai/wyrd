@@ -676,19 +676,17 @@ mod completeness_tests {
                 route_refs: vec![Ref::Ref(card_ref(CardKind::Service, "route"))],
                 ..ObservationHooks::default()
             }),
-            steps: vec![
-                WorkflowStep {
-                    id: "agent".to_owned(),
-                    action: WorkflowAction::Agent(InlineableRef::Inline(Box::new(agent()))),
-                    depends_on: Vec::new(),
-                    inputs: BTreeMap::new(),
-                    llm_route: None,
-                    fallback: None,
-                    timeout_seconds: None,
-                    retry: None,
-                    display: BTreeMap::new(),
-                },
-            ],
+            steps: vec![WorkflowStep {
+                id: "agent".to_owned(),
+                action: WorkflowAction::Agent(InlineableRef::Inline(Box::new(agent()))),
+                depends_on: Vec::new(),
+                inputs: BTreeMap::new(),
+                llm_route: None,
+                fallback: None,
+                timeout_seconds: None,
+                retry: None,
+                display: BTreeMap::new(),
+            }],
             ..WorkflowSpec::default()
         }
     }

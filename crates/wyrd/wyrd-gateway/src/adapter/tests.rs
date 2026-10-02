@@ -22,11 +22,11 @@ use super::{
     BuiltinEndpoints, HttpProviderDispatch, IngressDialect, MediaRequest, Prepared, prepare,
 };
 use crate::credential::ProviderSecret;
-use skald_providers::EndpointPolicy;
 use crate::engine::{
     AttemptResult, AttemptUsage, FailureClass, ProviderAttempt, ProviderDispatch, ResponseBody,
     ResponseCapture, StreamEnd,
 };
+use skald_providers::EndpointPolicy;
 
 /// Parsed JSON of a buffered answer body.
 ///

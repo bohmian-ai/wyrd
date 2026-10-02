@@ -89,7 +89,11 @@ impl ExternalGatewayClient {
     /// one of the five supported generation dialects, the transport or status
     /// error of the exchange, or a decode error when the answer is not the
     /// dialect's native response.
-    pub async fn send(&self, model: &str, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
+    pub async fn send(
+        &self,
+        model: &str,
+        request: ProviderRequest,
+    ) -> ProviderResult<ProviderResponse> {
         match request {
             ProviderRequest::OpenAiChatCompletion(body) => self
                 .post(&self.url("chat/completions"), &body)

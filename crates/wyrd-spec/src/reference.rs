@@ -862,7 +862,9 @@ mod tests {
         let spec = Spec::Workflow(WorkflowSpec {
             steps: vec![WorkflowStep {
                 id: "nested".to_owned(),
-                action: WorkflowAction::Agent(InlineableRef::Path(PathBuf::from("nested/agent.yaml"))),
+                action: WorkflowAction::Agent(InlineableRef::Path(PathBuf::from(
+                    "nested/agent.yaml",
+                ))),
                 depends_on: Vec::new(),
                 inputs: BTreeMap::new(),
                 llm_route: None,

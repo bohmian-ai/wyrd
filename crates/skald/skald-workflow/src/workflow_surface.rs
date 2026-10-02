@@ -82,7 +82,8 @@ impl From<Map<String, Value>> for WorkflowInput {
 /// The pyclass IS the Python class (per the Wyrd S12C doctrine). Construction
 /// flows through `Workflow::new`, the sugar constructors `Workflow::sequential`
 /// / `Workflow::parallel`, or the `Workflow::builder` DAG primitive. `.run()`
-/// drives the resolved agents through the internal [`DagExecutor`].
+/// validates the resolved graph and drives the Agents through the internal
+/// Workflow executor.
 #[derive(Clone)]
 #[cfg_attr(
     feature = "python",
@@ -615,22 +616,7 @@ impl Workflow {
     fn next_step_id(&self, agent: &Agent) -> String {
         let base = agent.name_str().map_or_else(
             || format!("step_{}", self.spec.steps.len() + 1),
-            |name| {
-                let mut id: String = name
-                    .chars()
-                    .map(|ch| {
-                        if ch.is_ascii_alphanumeric() || ch == '_' {
-                            ch
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                if !id.starts_with(|ch: char| ch.is_ascii_alphabetic() || ch == '_') {
-                    id.insert(0, '_');
-                }
-                id
-            },
+            step_id_for_name,
         );
         if !self.resolved_agents.contains_key(&base) {
             return base;
@@ -753,6 +739,29 @@ impl WorkflowBuilder {
         self.wf.validate()?;
         Ok(self.wf)
     }
+}
+
+/// Map an Agent name onto the step-ID grammar.
+///
+/// Characters outside `[A-Za-z0-9_]` become `_`, and a name that does not
+/// start with a letter or `_` gains a `_` prefix. Builders use this for the
+/// base step ID of a named Agent, so callers can name a predecessor step by
+/// its Agent.
+pub(crate) fn step_id_for_name(name: &str) -> String {
+    let mut id: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if !id.starts_with(|ch: char| ch.is_ascii_alphabetic() || ch == '_') {
+        id.insert(0, '_');
+    }
+    id
 }
 
 /// Require the shared parameter identifier grammar for an authored name.

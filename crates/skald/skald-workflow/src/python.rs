@@ -2,21 +2,22 @@
 
 #![cfg(feature = "python")]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyList, PyModule, PyString};
+use pyo3::types::{PyAny, PyList, PyModule, PyString};
+use serde_json::Value;
 use skald_agent::{Agent, Observer};
+use wyrd_spec::card::common::ParameterValue;
+use wyrd_spec::card::workflow::{WorkflowBinding, WorkflowRun};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, Labels};
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
 
 use crate::error::WorkflowError;
-use crate::run::{TaskEvent, TaskOutcome, WorkflowRun};
-use crate::task::TaskStatus;
-use crate::workflow_surface::{Workflow, WorkflowInput};
+use crate::workflow_surface::{Workflow, WorkflowInput, step_id_for_name};
 
 impl From<WorkflowError> for WyrdPyError {
     /// Widen a workflow failure into the shared Python boundary error.
@@ -37,13 +38,52 @@ fn invalid_argument(name: &str, detail: impl std::fmt::Display) -> WyrdPyError {
     })
 }
 
-fn workflow_input_from_py(value: &Bound<'_, PyAny>) -> Result<WorkflowInput, WorkflowError> {
+/// Convert a Python run input: a string is the declared `input` shorthand,
+/// `None` is an empty object, and a mapping is the JSON input object.
+fn workflow_input_from_py(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<WorkflowInput> {
+    let Some(value) = value else {
+        return Ok(WorkflowInput::from(serde_json::Map::new()));
+    };
     if let Ok(text) = value.extract::<String>() {
         return Ok(WorkflowInput::Text(text));
     }
-    let json = wyrd_utils::py::pyobject_to_json(value)
-        .map_err(|error| WorkflowError::Other(error.to_string()))?;
-    Ok(WorkflowInput::from(json))
+    match wyrd_utils::py::pyobject_to_json(value)? {
+        Value::Object(map) => Ok(WorkflowInput::from(map)),
+        _ => Err(invalid_argument("input", "must be a str or a mapping")),
+    }
+}
+
+/// Convert a Python default value to its native Workflow parameter variant:
+/// `bool`, `int`, `float`, and `str` map to their scalar variants and any
+/// other JSON value is a `json` parameter.
+fn parameter_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<ParameterValue> {
+    Ok(match wyrd_utils::py::pyobject_to_json(value)? {
+        Value::Bool(value) => ParameterValue::Bool(value),
+        Value::Number(number) => match number.as_i64() {
+            Some(value) => ParameterValue::Int(value),
+            None => number.as_f64().map_or(
+                ParameterValue::Json(Value::Number(number)),
+                ParameterValue::Float,
+            ),
+        },
+        Value::String(value) => ParameterValue::Str(value),
+        other => ParameterValue::Json(other),
+    })
+}
+
+/// Parse a `name -> source` mapping into Workflow bindings.
+fn bindings_from_py(
+    argument: &str,
+    bindings: HashMap<String, String>,
+) -> WyrdPyResult<BTreeMap<String, WorkflowBinding>> {
+    bindings
+        .into_iter()
+        .map(|(name, source)| {
+            WorkflowBinding::new(&source)
+                .map(|binding| (name, binding))
+                .map_err(|error| invalid_argument(argument, error))
+        })
+        .collect()
 }
 
 fn coerce_labels(labels: Option<HashMap<String, String>>) -> WyrdPyResult<Labels> {
@@ -122,7 +162,7 @@ fn coerce_after<'py>(py: Python<'py>, after: &Bound<'py, PyAny>) -> WyrdPyResult
         return Ok(vec![text.to_str()?.to_owned()]);
     }
     if let Ok(py_agent) = after.extract::<Py<Agent>>() {
-        return Ok(vec![step_id_from_agent(&py_agent.borrow(py))]);
+        return Ok(vec![step_id_from_agent(&py_agent.borrow(py))?]);
     }
     if let Ok(list) = after.cast::<PyList>() {
         let mut out = Vec::with_capacity(list.len());
@@ -130,7 +170,7 @@ fn coerce_after<'py>(py: Python<'py>, after: &Bound<'py, PyAny>) -> WyrdPyResult
             if let Ok(text) = item.cast::<PyString>() {
                 out.push(text.to_str()?.to_owned());
             } else if let Ok(py_agent) = item.extract::<Py<Agent>>() {
-                out.push(step_id_from_agent(&py_agent.borrow(py)));
+                out.push(step_id_from_agent(&py_agent.borrow(py))?);
             } else {
                 return Err(invalid_argument(
                     "after",
@@ -146,11 +186,12 @@ fn coerce_after<'py>(py: Python<'py>, after: &Bound<'py, PyAny>) -> WyrdPyResult
     ))
 }
 
-fn step_id_from_agent(agent: &Agent) -> String {
+/// Predecessor step ID for an Agent passed as `after`.
+fn step_id_from_agent(agent: &Agent) -> WyrdPyResult<String> {
     agent
         .name_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| agent.id.clone())
+        .map(step_id_for_name)
+        .ok_or_else(|| invalid_argument("after", "an unnamed Agent has no step id; pass the id"))
 }
 
 #[pymethods]
@@ -306,6 +347,92 @@ impl Workflow {
         Ok(slf)
     }
 
+    /// Declare the Workflow inputs and their defaults, replacing any
+    /// previous declaration.
+    ///
+    /// Args:
+    ///     inputs (dict[str, Any]): Input name to default value; `bool`,
+    ///         `int`, `float`, and `str` declare scalar inputs and any other
+    ///         JSON value declares a JSON input.
+    ///
+    /// Returns:
+    ///     Workflow: This workflow (for chaining).
+    ///
+    /// Raises:
+    ///     WyrdError: When a name is not an identifier or a value is not JSON.
+    #[pyo3(name = "with_inputs", signature = (inputs))]
+    pub fn py_with_inputs<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        inputs: HashMap<String, Bound<'py, PyAny>>,
+    ) -> WyrdPyResult<PyRefMut<'py, Self>> {
+        let inputs = inputs
+            .iter()
+            .map(|(name, value)| Ok((name.clone(), parameter_from_py(value)?)))
+            .collect::<WyrdPyResult<BTreeMap<_, _>>>()?;
+        let next = slf.clone().with_inputs(inputs)?;
+        *slf = next;
+        Ok(slf)
+    }
+
+    /// Bind the unresolved Prompt variables of one step, replacing any
+    /// previous bindings for that step.
+    ///
+    /// Args:
+    ///     step_id (str): Step to bind.
+    ///     inputs (dict[str, str]): Variable name to source, either
+    ///         `input.<name>` or a dependency's
+    ///         `steps.<id>.output.text|structured[.<field>...]`.
+    ///
+    /// Returns:
+    ///     Workflow: This workflow (for chaining).
+    ///
+    /// Raises:
+    ///     WyrdError: For an unknown step, a non-identifier name, or an
+    ///         invalid source.
+    #[pyo3(name = "with_step_inputs", signature = (step_id, inputs))]
+    pub fn py_with_step_inputs<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        step_id: &str,
+        inputs: HashMap<String, String>,
+    ) -> WyrdPyResult<PyRefMut<'py, Self>> {
+        let bindings = bindings_from_py("inputs", inputs)?;
+        let next = slf.clone().with_step_inputs(step_id, bindings)?;
+        *slf = next;
+        Ok(slf)
+    }
+
+    /// Declare the named Workflow outputs, replacing any previous declaration.
+    ///
+    /// Args:
+    ///     outputs (dict[str, str]): Output name to source, in the same
+    ///         grammar as step inputs.
+    ///
+    /// Returns:
+    ///     Workflow: This workflow (for chaining).
+    ///
+    /// Raises:
+    ///     WyrdError: For a non-identifier name or an invalid source.
+    #[pyo3(name = "with_outputs", signature = (outputs))]
+    pub fn py_with_outputs<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        outputs: HashMap<String, String>,
+    ) -> WyrdPyResult<PyRefMut<'py, Self>> {
+        let outputs = bindings_from_py("outputs", outputs)?;
+        let next = slf.clone().with_outputs(outputs)?;
+        *slf = next;
+        Ok(slf)
+    }
+
+    /// Validate the complete Workflow against its resolved Agents.
+    ///
+    /// Raises:
+    ///     WyrdError: For any contract, binding, Prompt-variable, output, or
+    ///         route error that would fail a run before dispatch.
+    #[pyo3(name = "validate")]
+    pub fn py_validate(&self) -> WyrdPyResult<()> {
+        Ok(self.validate()?)
+    }
+
     /// Set the workflow's semantic version in place.
     #[pyo3(name = "set_version")]
     pub fn py_set_version(&mut self, version: String) {
@@ -402,135 +529,130 @@ impl Workflow {
     /// Run this workflow against the process-local provider registry.
     ///
     /// Args:
-    ///     input (str | dict): Workflow input. Strings bind as `input`; mappings
-    ///         expose every key as a template variable.
+    ///     input (str | dict[str, Any] | None): Workflow input. A string is
+    ///         shorthand for the declared string input named `input`; a
+    ///         mapping supplies declared inputs by name; `None` uses defaults.
     ///
     /// Returns:
-    ///     WorkflowRun: Final run envelope with per-step outcomes and events.
+    ///     WorkflowRun: Terminal run snapshot with named outputs and
+    ///     namespaced step results. Step failures are recorded in it.
     ///
     /// Raises:
-    ///     WyrdError: When a provider call fails, retries exhaust, or any
-    ///         step's output validation fails.
-    #[pyo3(name = "run", signature = (input))]
-    pub fn py_run(&self, py: Python<'_>, input: &Bound<'_, PyAny>) -> WyrdPyResult<Py<PyAny>> {
-        let input = workflow_input_from_py(input).map_err(WyrdPyError::from)?;
+    ///     WyrdError: When validation, input, or route checks fail before any
+    ///         step is dispatched.
+    #[pyo3(name = "run", signature = (input = None))]
+    pub fn py_run(
+        &self,
+        py: Python<'_>,
+        input: Option<&Bound<'_, PyAny>>,
+    ) -> WyrdPyResult<PyWorkflowRun> {
+        let input = workflow_input_from_py(input)?;
         let providers = skald_runtime::default_registry();
         let run = py.detach(|| {
             wyrd_runtime::runtime().block_on(Workflow::run_with(self, providers.as_ref(), input))
-        });
-        let run = run.map_err(WyrdPyError::from)?;
-        Ok(Py::new(py, run)?.into_any())
+        })?;
+        Ok(PyWorkflowRun { run })
+    }
+}
+
+/// Python view of the portable [`WorkflowRun`] snapshot.
+///
+/// Values are projected from the wire JSON on access, so Python sees exactly
+/// the portable contract: named `outputs`, namespaced `steps`, and the
+/// bounded run `error`.
+#[pyclass(
+    module = "wyrd.agent",
+    name = "WorkflowRun",
+    frozen,
+    skip_from_py_object
+)]
+pub struct PyWorkflowRun {
+    /// Terminal run snapshot.
+    run: WorkflowRun,
+}
+
+impl PyWorkflowRun {
+    /// Project the wire snapshot, or one top-level field of it, to Python.
+    ///
+    /// # Errors
+    /// Returns `WYRD_WORKFLOW_500_INTERNAL` when the snapshot does not
+    /// serialize, or a Python error when conversion fails.
+    fn project(&self, py: Python<'_>, field: Option<&str>) -> WyrdPyResult<Py<PyAny>> {
+        let value = serde_json::to_value(&self.run).map_err(|error| {
+            WyrdPyError::from(WyrdError::WorkflowInternal {
+                message: format!("workflow run does not serialize: {error}"),
+                details: serde_json::json!({}),
+            })
+        })?;
+        let value = match field {
+            Some(name) => &value[name],
+            None => &value,
+        };
+        Ok(wyrd_utils::py::json_to_pyobject(py, value)?)
     }
 }
 
 #[pymethods]
-impl WorkflowRun {
-    /// Return the final step's outcome, when the workflow produced one.
+impl PyWorkflowRun {
+    /// Return the run identifier.
     #[getter]
-    pub fn final_step_id(&self) -> Option<&str> {
-        self.last_task_id.as_deref()
+    pub fn run_id(&self) -> String {
+        self.run.run_id.to_string()
     }
 
-    /// Return per-step outcomes as a `dict[str, StepOutcome]`.
+    /// Return the terminal run status wire name, such as `succeeded`.
+    ///
+    /// # Errors
+    /// Returns the errors of the snapshot projection.
     #[getter]
-    pub fn outcomes(&self, py: Python<'_>) -> WyrdPyResult<Py<PyDict>> {
-        let dict = PyDict::new(py);
-        for (id, outcome) in &self.tasks {
-            let outcome = Py::new(py, outcome.clone())?;
-            dict.set_item(id, outcome)?;
-        }
-        Ok(dict.into())
+    pub fn status(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
+        self.project(py, Some("status"))
     }
 
-    /// Return per-step events as a `list[StepEvent]`.
+    /// Return the named Workflow outputs; empty unless the run succeeded.
+    ///
+    /// # Errors
+    /// Returns the errors of the snapshot projection.
     #[getter]
-    pub fn events(&self, py: Python<'_>) -> WyrdPyResult<Py<PyList>> {
-        let mut items: Vec<Py<TaskEvent>> = Vec::with_capacity(self.events.len());
-        for event in &self.events {
-            items.push(Py::new(py, event.clone())?);
-        }
-        Ok(PyList::new(py, items)?.into())
+    pub fn outputs(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
+        self.project(py, Some("outputs"))
     }
 
-    /// Return accumulated structured-output parameters.
+    /// Return step results keyed by step ID.
+    ///
+    /// # Errors
+    /// Returns the errors of the snapshot projection.
     #[getter]
-    pub fn parameters(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        let value = serde_json::Value::Object(self.parameters.clone());
-        wyrd_utils::py::json_to_pyobject(py, &value).map_err(WyrdPyError::from)
+    pub fn steps(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
+        self.project(py, Some("steps"))
     }
 
-    /// Return terminal assistant output, when present.
+    /// Return the primary run error, or `None`.
+    ///
+    /// # Errors
+    /// Returns the errors of the snapshot projection.
     #[getter]
-    pub fn final_output(&self) -> Option<&str> {
-        self.final_output.as_deref()
-    }
-}
-
-#[pymethods]
-impl TaskOutcome {
-    /// Return the final step status.
-    #[getter]
-    pub fn status(&self) -> TaskStatus {
-        self.status
+    pub fn error(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
+        self.project(py, Some("error"))
     }
 
-    /// Return the number of retries consumed before reaching the final status.
-    #[getter]
-    pub fn retries(&self) -> u32 {
-        self.retries
+    /// Return the complete snapshot as its wire-shaped dictionary.
+    ///
+    /// # Errors
+    /// Returns the errors of the snapshot projection.
+    pub fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
+        self.project(py, None)
     }
 }
 
-#[pymethods]
-impl TaskEvent {
-    /// Step id this event refers to.
-    #[getter]
-    pub fn step_id(&self) -> &str {
-        &self.task_id
-    }
-
-    /// Status recorded for this transition.
-    #[getter]
-    pub fn status(&self) -> TaskStatus {
-        self.status
-    }
-
-    /// Unix epoch milliseconds when the attempt started.
-    #[getter]
-    pub fn started_at(&self) -> i64 {
-        self.started_at
-    }
-
-    /// Unix epoch milliseconds when the attempt ended.
-    #[getter]
-    pub fn ended_at(&self) -> i64 {
-        self.ended_at
-    }
-
-    /// Attempt index, starting at 1.
-    #[getter]
-    pub fn attempt(&self) -> u32 {
-        self.attempt
-    }
-
-    /// Stable error code for failed attempts, or `None` for completed ones.
-    #[getter]
-    pub fn error(&self) -> Option<&str> {
-        self.error.as_deref()
-    }
-}
-
-/// Register Workflow + WorkflowRun + StepOutcome + StepEvent + StepStatus on
-/// the supplied PyO3 module (intended to be the existing `wyrd.agent`
-/// submodule registered by `skald_agent::python_register`).
+/// Register `Workflow` and `WorkflowRun` on the supplied PyO3 module
+/// (intended to be the existing `wyrd.agent` submodule registered by
+/// `skald_agent::python_register`).
 ///
 /// # Errors
 /// Returns `PyErr` when registration on the supplied module fails.
 pub fn python_register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Workflow>()?;
-    module.add_class::<WorkflowRun>()?;
-    module.add_class::<TaskOutcome>()?;
-    module.add_class::<TaskEvent>()?;
-    module.add_class::<TaskStatus>()?;
+    module.add_class::<PyWorkflowRun>()?;
     Ok(())
 }

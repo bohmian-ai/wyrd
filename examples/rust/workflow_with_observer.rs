@@ -1,17 +1,17 @@
 //! Custom observer example attached with Workflow::with_observers.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use serde_json::json;
 use skald_observer::Observer;
 use skald_observer::OtelObserver;
 use skald_spec::{ProviderRequest, ProviderResponse};
-use skald_workflow::{Workflow, WorkflowInput};
+use skald_workflow::Workflow;
 
 mod common;
-use common::{mock_registry, plan_prompt, write_prompt};
+use common::{bindings, mock_registry, plan_prompt, string_input, write_prompt};
 
 #[derive(Default)]
 struct TokenCounter {
@@ -62,10 +62,18 @@ async fn main() -> anyhow::Result<()> {
     let counter = Arc::new(TokenCounter::default());
     let planner = skald_agent::Agent::new(plan_prompt()).name("planner");
     let writer = skald_agent::Agent::new(write_prompt()).name("writer");
-    let wf = Workflow::sequential("research", vec![planner, writer])?.with_observers(vec![
-        Arc::new(OtelObserver::new()) as Arc<dyn Observer>,
-        Arc::clone(&counter) as Arc<dyn Observer>,
-    ]);
+    let wf = Workflow::sequential("research", vec![planner, writer])?
+        .with_inputs(string_input("topic"))?
+        .with_step_inputs("planner", bindings(&[("topic", "input.topic")]))?
+        .with_step_inputs(
+            "writer",
+            bindings(&[("summary", "steps.planner.output.structured.summary")]),
+        )?
+        .with_outputs(bindings(&[("brief", "steps.writer.output.text")]))?
+        .with_observers(vec![
+            Arc::new(OtelObserver::new()) as Arc<dyn Observer>,
+            Arc::clone(&counter) as Arc<dyn Observer>,
+        ]);
     let providers = mock_registry(&[
         r#"{"summary":"mock summary","steps":["read","write"]}"#,
         "Final observed brief",
@@ -73,10 +81,7 @@ async fn main() -> anyhow::Result<()> {
     let run = wf
         .run_with(
             &providers,
-            WorkflowInput::from(HashMap::from([(
-                "topic".to_owned(),
-                "the Rust borrow checker".to_owned(),
-            )])),
+            serde_json::Map::from_iter([("topic".to_owned(), json!("the Rust borrow checker"))]),
         )
         .await?;
     println!("model calls: {}", counter.calls.load(Ordering::Relaxed));
@@ -85,6 +90,6 @@ async fn main() -> anyhow::Result<()> {
         "tokens out:  {}",
         counter.tokens_out.load(Ordering::Relaxed)
     );
-    println!("final:       {:?}", run.final_output);
+    println!("outputs:     {:?}", run.outputs);
     Ok(())
 }

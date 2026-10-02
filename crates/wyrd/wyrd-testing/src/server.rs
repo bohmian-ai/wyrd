@@ -754,12 +754,17 @@ impl WyrdTestServer {
     /// remains tolerated — the bounded budget here is deliberately short and a
     /// slow drain is not the same signal as a panic.
     ///
-    /// An in-process server has no serve task to drain Bifrost, so this method
-    /// cancels its shutdown token and drains Bifrost itself before the
-    /// Postgres fixture is dropped. Dropping the fixture first force-drops the
-    /// database under the still-running Oracle reader epoch, whose failed
-    /// renewal then aborts the test process. A failed drain already falls back
-    /// to Bifrost's abort path and is only logged here.
+    /// A router-only server has no serve task to drain Bifrost, so when no
+    /// serve handle exists this method cancels the shared shutdown token and
+    /// drains Bifrost itself before the Postgres fixture is dropped. Dropping
+    /// the fixture first force-drops the database under the still-running
+    /// Oracle reader epoch, whose failed renewal then aborts the test process.
+    /// A failed drain already falls back to Bifrost's abort path and is only
+    /// logged here. A server that still holds a serve task — a bound server or
+    /// a dedicated Forge worker — is only cancelled and joined: a direct drain
+    /// ahead of that join would find a dedicated worker's Forge supervision
+    /// still live, take Bifrost's abort path, and close storage under the
+    /// worker's claims.
     ///
     /// # Errors
     /// Returns [`WyrdTestServerError::Join`] when the serve task panicked or
@@ -768,7 +773,7 @@ impl WyrdTestServer {
         if let Some(token) = self.shutdown_token.take() {
             token.cancel();
         }
-        if matches!(self.mode, Mode::InProcess) {
+        if self.serve_handle.is_none() {
             self.inner.state.shutdown_token.cancel();
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             if let Err(error) = self.inner.state.bifrost.shutdown(deadline).await {

@@ -810,23 +810,26 @@ struct RunLoopInputs<'a> {
     conversation: Conversation,
     /// Session whose turn is appended on success, when the run is session-bound.
     session_id: Option<&'a SessionId>,
-    /// Resolved model of the Prompt driving the run, recorded on `chat` spans.
+    /// Resolved model of the Prompt driving the run; the `chat` span fallback
+    /// for request wire shapes that carry no model.
     model: &'a str,
 }
 
-/// Open the `chat` span for one provider dispatch of `request` for the
-/// Prompt's resolved `model`.
+/// Open the `chat` span for one provider dispatch of the effective `request`.
 ///
-/// Records the semantic provider name of the typed request and the model; the
-/// caller records the stable provider error code on failure. The optional
+/// Records the semantic provider name of the typed request and the model the
+/// request is actually made to: the request's own model, which reflects any
+/// `before_model` replacement, or the Prompt's resolved `fallback_model` for
+/// wire shapes that omit it (Gemini, Vertex). The caller records the stable
+/// provider error code on failure. The optional
 /// `string[]` finish-reasons attribute is omitted because `tracing` fields are
 /// scalar; finish reasons stay in the journal.
-fn chat_span(request: &ProviderRequest, model: &str) -> Span {
+fn chat_span(request: &ProviderRequest, fallback_model: &str) -> Span {
     info_span!(
         "chat",
         gen_ai.operation.name = "chat",
         gen_ai.provider.name = genai_provider_name(&request.provider()),
-        gen_ai.request.model = model,
+        gen_ai.request.model = request_model(request).unwrap_or(fallback_model),
         error.r#type = field::Empty,
         otel.status_code = field::Empty,
     )

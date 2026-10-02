@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use skald_agent::{
-    Agent, AgentError, FinishReason, Journal, JournalError, JournalEvent, RunConfig,
+    Agent, AgentError, CallbackOutcome, FinishReason, Journal, JournalError, JournalEvent,
+    RunConfig,
 };
 use skald_prompt::Prompt;
 use skald_providers::{ProviderError, ProviderStream};
@@ -262,6 +263,62 @@ async fn agent_run_emits_genai_spans_without_payloads() {
     }
 }
 
+/// A `before_model` callback that replaces the OpenAI request with another
+/// model dispatches the replacement and records the replacement model, not
+/// the Prompt's resolved model, on the `chat` span, which stays payload-free
+/// and omits the scalar finish-reasons attribute.
+#[tokio::test]
+async fn agent_run_chat_span_records_callback_replaced_model() {
+    capture();
+    let provider = RecordingProvider::new(vec![openai_text_response("final-output-pii-marker")]);
+    let providers = registry(provider.clone());
+    let agent = Agent::from_resolved("replaced-model-agent", test_prompt()).before_model(Arc::new(
+        |_ctx, request| {
+            let mut replacement = request.clone();
+            if let ProviderRequest::OpenAiChatCompletion(request) = &mut replacement {
+                request.model = "gpt-4o-mini".to_owned();
+            }
+            CallbackOutcome::ReplaceWith(replacement)
+        },
+    ));
+
+    let run = agent
+        .run_with(&providers, None, "input-pii-marker")
+        .await
+        .expect("run ok");
+
+    assert_eq!(run.output, "final-output-pii-marker");
+    let dispatched = provider.requests();
+    assert!(
+        matches!(
+            dispatched.as_slice(),
+            [ProviderRequest::OpenAiChatCompletion(request)] if request.model == "gpt-4o-mini"
+        ),
+        "{dispatched:?}"
+    );
+    let (_, children) = agent_spans("replaced-model-agent");
+    let chats: Vec<_> = children.iter().filter(|span| span.name == "chat").collect();
+    assert_eq!(chats.len(), 1);
+    for (key, value) in [
+        ("gen_ai.operation.name", "chat"),
+        ("gen_ai.provider.name", "openai"),
+        ("gen_ai.request.model", "gpt-4o-mini"),
+    ] {
+        assert_eq!(
+            chats[0].attributes.get(key).map(String::as_str),
+            Some(value)
+        );
+    }
+    assert!(
+        !chats[0]
+            .attributes
+            .contains_key("gen_ai.response.finish_reasons")
+    );
+    for value in chats[0].attributes.values() {
+        assert!(!value.contains("pii-marker"), "chat: {value}");
+    }
+}
+
 /// Gemini and Vertex runs name the semantic-convention providers
 /// `gcp.gemini` and `gcp.vertex_ai` and the Prompt's resolved model on both
 /// `invoke_agent` and `chat`, keep the `chat` operation, omit the scalar
@@ -379,6 +436,8 @@ impl Journal for RecordingJournal {
 struct RecordingProvider {
     /// Responses still to return, in order, shared by clones.
     responses: Arc<Mutex<VecDeque<ProviderResponse>>>,
+    /// Requests dispatched so far, in order, shared by clones.
+    requests: Arc<Mutex<Vec<ProviderRequest>>>,
 }
 
 impl RecordingProvider {
@@ -386,6 +445,15 @@ impl RecordingProvider {
     fn new(responses: Vec<ProviderResponse>) -> Self {
         Self {
             responses: Arc::new(Mutex::new(responses.into())),
+            requests: Arc::default(),
+        }
+    }
+
+    /// Returns the requests dispatched so far, recovering a poisoned lock.
+    fn requests(&self) -> Vec<ProviderRequest> {
+        match self.requests.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 
@@ -400,12 +468,16 @@ impl RecordingProvider {
 
 #[async_trait]
 impl Provider for RecordingProvider {
-    /// Returns the next scripted response.
+    /// Records `request` and returns the next scripted response.
     ///
     /// # Errors
     ///
     /// Returns [`ProviderError::BadRequest`] once the script is exhausted.
-    async fn send(&self, _request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+    async fn send(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        match self.requests.lock() {
+            Ok(mut guard) => guard.push(request),
+            Err(poisoned) => poisoned.into_inner().push(request),
+        }
         self.responses()
             .pop_front()
             .ok_or_else(|| ProviderError::bad_request("recording", "response queue is empty"))

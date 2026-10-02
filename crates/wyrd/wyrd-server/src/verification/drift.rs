@@ -866,6 +866,7 @@ impl Reader<'_> {
     /// # Errors
     /// Retries a mint, admission, query, or stream failure; terminates on a
     /// malformed aggregate.
+    #[tracing::instrument(name = "verification.evidence_read", skip_all)]
     async fn fold<F>(&self, sql: String, mut fold: F) -> Result<(), EngineOutcome>
     where
         F: FnMut(&RecordBatch) -> Result<(), String>,

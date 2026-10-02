@@ -24,6 +24,8 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "test-support")]
 use tokio::sync::watch::Sender;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
+use tracing::field::{Empty, display};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::operator::VerifierCounts;
 use wyrd_spec::card::verifier::VerifierImplementation;
@@ -84,6 +86,19 @@ pub enum Transition {
     /// Return the run to its queue with its attempt refunded, due after one
     /// poll interval, because an input read met admission backpressure.
     Defer(VerificationError),
+}
+
+/// One claimed run and the attempt span opened before its claim.
+///
+/// The `verification.attempt` span is created before the claim statement
+/// runs and closes when the attempt settles, so one trace covers claim,
+/// Verifier load, evidence read, engine execution, result publication, and
+/// settlement. It carries only scrubbed identifiers and bounded labels.
+pub struct AttemptClaim {
+    /// The claimed run.
+    run: ClaimedRun,
+    /// The attempt's root span.
+    span: tracing::Span,
 }
 
 /// The closed set of engine arms a Verifier run executes through.
@@ -214,18 +229,31 @@ impl VerifierRunner {
     /// Load the Verifier, dispatch it, and publish a completed report.
     ///
     /// Never fails: every failure becomes the [`Transition`] it maps to.
+    ///
+    /// Each owned phase — `load`, `engine`, and `publication` — runs in its
+    /// own child span and records its process-local [`Instant`] duration.
     async fn execute(&self, tenant: DataTenantId, run: &ClaimedRun) -> Transition {
-        let (verifier, implementation) = match self.load_verifier(tenant, run).await {
+        let label = input_implementation(&run.input);
+        let phase = Instant::now();
+        let loaded = self
+            .load_verifier(tenant, run)
+            .instrument(tracing::info_span!("verification.load"))
+            .await;
+        record_phase(label, "load", phase);
+        let (verifier, implementation) = match loaded {
             Ok(loaded) => loaded,
             Err(transition) => return transition,
         };
         let started_at = Utc::now();
-        let outcome = match tokio::time::timeout(
+        let phase = Instant::now();
+        let executed = tokio::time::timeout(
             self.limits.execution_timeout,
             self.dispatch(tenant, run, &verifier, &implementation),
         )
-        .await
-        {
+        .instrument(tracing::info_span!("verification.engine"))
+        .await;
+        record_phase(label, "engine", phase);
+        let outcome = match executed {
             Ok(outcome) => outcome,
             Err(_) => {
                 return Transition::Terminate(
@@ -239,8 +267,13 @@ impl VerifierRunner {
         };
         match outcome {
             EngineOutcome::Completed(report) => {
-                self.publish(tenant, run, &verifier, &report, started_at)
-                    .await
+                let phase = Instant::now();
+                let transition = self
+                    .publish(tenant, run, &verifier, &report, started_at)
+                    .instrument(tracing::info_span!("verification.publish"))
+                    .await;
+                record_phase(label, "publication", phase);
+                transition
             }
             EngineOutcome::Retry(error) => Transition::Retry(error),
             EngineOutcome::AwaitingTrace(error) => Transition::AwaitTrace(error),
@@ -481,7 +514,7 @@ impl VerifierRunner {
 }
 
 impl LeasedWork for VerifierRunner {
-    type Claim = ClaimedRun;
+    type Claim = AttemptClaim;
 
     const CAPABILITY: RuntimeCapability = RuntimeCapability::Runner;
     const ACTIVE_GAUGE: &'static str = crate::app::metrics::VERIFICATION_ACTIVE_RUNS;
@@ -499,12 +532,37 @@ impl LeasedWork for VerifierRunner {
 
     /// Claim the tenant's next runnable run under a fresh lease.
     ///
+    /// Opens the run's `verification.attempt` span before the claim statement
+    /// and records the claimed run's scrubbed identity on it; the span then
+    /// travels with the claim to settlement.
+    ///
     /// # Errors
     /// Returns [`SqlError`] when the claim fails.
-    async fn claim(&self, conn: &mut TenantConn<'_>) -> Result<Option<ClaimedRun>, SqlError> {
+    async fn claim(&self, conn: &mut TenantConn<'_>) -> Result<Option<AttemptClaim>, SqlError> {
         let lease = chrono::Duration::from_std(self.limits.lease)
             .unwrap_or_else(|_| chrono::Duration::minutes(10));
-        Ok(self.queue.claim(conn, lease).await?)
+        let span = tracing::info_span!(
+            "verification.attempt",
+            run_id = Empty,
+            attempt = Empty,
+            implementation = Empty,
+            origin = Empty,
+            outcome = Empty,
+            error_code = Empty,
+            otel.status_code = Empty,
+        );
+        let claimed = self
+            .queue
+            .claim(conn, lease)
+            .instrument(span.clone())
+            .await?;
+        Ok(claimed.map(|run| {
+            span.record("run_id", display(run.lease.run_id));
+            span.record("attempt", run.attempt);
+            span.record("implementation", input_implementation(&run.input));
+            span.record("origin", run.origin.as_str());
+            AttemptClaim { run, span }
+        }))
     }
 
     /// Execute one claimed run and apply its single transition.
@@ -516,32 +574,108 @@ impl LeasedWork for VerifierRunner {
     async fn process(
         self: Arc<Self>,
         tenant: DataTenantId,
-        run: ClaimedRun,
+        claim: AttemptClaim,
         stop: CancellationToken,
         abandon: CancellationToken,
     ) {
+        let AttemptClaim { run, span } = claim;
+        self.attempt(tenant, &run, &stop, &abandon)
+            .instrument(span)
+            .await;
+    }
+
+    /// Release a run claimed after shutdown began, with its attempt refunded
+    /// and without executing it.
+    ///
+    /// Uses the same fenced release transition as the drain. A failed release
+    /// is logged; the lease then expires into a reclaim.
+    async fn release_late(&self, tenant: DataTenantId, claim: &AttemptClaim) {
+        let run = &claim.run;
+        match self.settle(tenant, run, Transition::Release).await {
+            Ok(outcome) => {
+                tracing::info!(run_id = %run.lease.run_id, outcome, "claim committed after shutdown began; released");
+            }
+            Err(error) => {
+                tracing::error!(run_id = %run.lease.run_id, %error, "releasing a claim committed after shutdown failed; the lease will expire");
+            }
+        }
+    }
+}
+
+impl VerifierRunner {
+    /// Execute one claimed run inside its attempt span and settle it.
+    ///
+    /// Records the PostgreSQL-measured queue wait at the start, the
+    /// `settlement` phase around the fenced transition, the outcome and any
+    /// stable error code on the attempt span, the existing attempt, failure,
+    /// and claim-to-settlement series, and — only once a terminal outcome is
+    /// durably settled — the run's trigger-to-terminal latency: its age at
+    /// claim plus this attempt's elapsed [`Instant`] time.
+    async fn attempt(
+        &self,
+        tenant: DataTenantId,
+        run: &ClaimedRun,
+        stop: &CancellationToken,
+        abandon: &CancellationToken,
+    ) {
         let started = Instant::now();
         let implementation = input_implementation(&run.input);
+        let origin = run.origin.as_str();
         metrics::counter!(
             crate::app::metrics::VERIFICATION_RUN_ATTEMPTS_TOTAL,
             "implementation" => implementation
         )
         .increment(1);
+        metrics::histogram!(
+            crate::app::metrics::VERIFICATION_QUEUE_WAIT_SECONDS,
+            "implementation" => implementation,
+            "origin" => origin
+        )
+        .record(run.queue_wait.as_secs_f64());
         let transition = tokio::select! {
             () = abandon.cancelled() => Transition::Release,
-            transition = self.execute(tenant, &run) => transition,
+            transition = self.execute(tenant, run) => transition,
         };
         let transition = match transition {
             Transition::Retry(_) if stop.is_cancelled() => Transition::Release,
             transition => transition,
         };
-        let outcome = match self.settle(tenant, &run, transition).await {
+        if let Some(error) = transition.error() {
+            tracing::Span::current().record("error_code", error.code.as_str());
+        }
+        let phase = Instant::now();
+        let settled = self
+            .settle(tenant, run, transition)
+            .instrument(tracing::info_span!("verification.settle"))
+            .await;
+        record_phase(implementation, "settlement", phase);
+        let outcome = match settled {
             Ok(outcome) => outcome,
             Err(error) => {
                 tracing::error!(run_id = %run.lease.run_id, %error, "verification settlement failed; the lease will expire");
                 "settlement_failed"
             }
         };
+        let span = tracing::Span::current();
+        span.record("outcome", outcome);
+        if !matches!(
+            outcome,
+            "completed" | "released" | "awaiting_trace" | "deferred"
+        ) {
+            span.record("otel.status_code", "ERROR");
+        }
+        if matches!(
+            outcome,
+            "completed" | "exhausted" | "cancelled" | "timed_out" | "errored"
+        ) {
+            metrics::histogram!(
+                crate::app::metrics::VERIFICATION_TRIGGER_TO_TERMINAL_SECONDS,
+                "implementation" => implementation,
+                "origin" => origin,
+                "outcome" => outcome
+            )
+            .record((run.age + started.elapsed()).as_secs_f64());
+        }
         if !matches!(
             outcome,
             "completed" | "released" | "awaiting_trace" | "deferred"
@@ -560,22 +694,29 @@ impl LeasedWork for VerifierRunner {
         )
         .record(started.elapsed().as_secs_f64());
     }
+}
 
-    /// Release a run claimed after shutdown began, with its attempt refunded
-    /// and without executing it.
-    ///
-    /// Uses the same fenced release transition as the drain. A failed release
-    /// is logged; the lease then expires into a reclaim.
-    async fn release_late(&self, tenant: DataTenantId, run: &ClaimedRun) {
-        match self.settle(tenant, run, Transition::Release).await {
-            Ok(outcome) => {
-                tracing::info!(run_id = %run.lease.run_id, outcome, "claim committed after shutdown began; released");
-            }
-            Err(error) => {
-                tracing::error!(run_id = %run.lease.run_id, %error, "releasing a claim committed after shutdown failed; the lease will expire");
-            }
+impl Transition {
+    /// The stable error this transition settles with, when it carries one.
+    fn error(&self) -> Option<&VerificationError> {
+        match self {
+            Self::Retry(error)
+            | Self::AwaitTrace(error)
+            | Self::Terminate(_, error)
+            | Self::Defer(error) => Some(error),
+            Self::Complete { .. } | Self::Release => None,
         }
     }
+}
+
+/// Record one owned attempt phase's elapsed time since `started`.
+fn record_phase(implementation: &'static str, phase: &'static str, started: Instant) {
+    metrics::histogram!(
+        crate::app::metrics::VERIFICATION_PHASE_DURATION_SECONDS,
+        "implementation" => implementation,
+        "phase" => phase
+    )
+    .record(started.elapsed().as_secs_f64());
 }
 
 /// Stable label of a terminal status.

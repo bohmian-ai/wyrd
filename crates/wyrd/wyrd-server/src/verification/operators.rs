@@ -450,7 +450,14 @@ impl LeasedWork for OperatorWorker {
     ///
     /// The claim loop holds its permit until settlement. `abandon` cancels the attempt and
     /// releases the lease; a retryable failure observed after `stop` is also
-    /// released, since the process, not the dispatch, failed.
+    /// released, since the process, not the dispatch, failed. The attempt
+    /// runs in one `operator.dispatch` span naming the scrubbed dispatch and
+    /// failed run identities, which relates it to that run's attempt trace.
+    #[tracing::instrument(
+        name = "operator.dispatch",
+        skip_all,
+        fields(dispatch_id = %dispatch.lease.dispatch_id, run_id = %dispatch.run_id, attempt = dispatch.attempt)
+    )]
     async fn process(
         self: Arc<Self>,
         tenant: DataTenantId,

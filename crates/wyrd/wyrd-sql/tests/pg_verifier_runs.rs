@@ -1545,6 +1545,76 @@ async fn release_requeues_without_consuming_an_attempt() {
     assert_eq!(again.input, first.input);
 }
 
+/// A claim reports how long its run waited past its due time and how long
+/// ago its trigger created it, both measured by the claim statement's
+/// PostgreSQL instant, and a reclaim measures its wait from the lease expiry.
+///
+/// # Panics
+/// Panics when a reported interval does not cover the interval the test
+/// placed in the database, or exceeds it by more than the test's own runtime.
+#[tokio::test]
+async fn claim_reports_postgres_measured_queue_wait_and_age() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierRunQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    let binding = bind(&mut conn, &owner, &verifier, daily(), Vec::new()).await;
+    let run = enqueued(
+        queue
+            .enqueue(&mut conn, &manual_binding(&actor, binding))
+            .await
+            .expect("run enqueues"),
+    );
+    sqlx::query(
+        "UPDATE wyrd.verifier_runs
+            SET created_at = statement_timestamp() - INTERVAL '30 seconds',
+                next_attempt_at = statement_timestamp() - INTERVAL '10 seconds'
+          WHERE run_id = $1",
+    )
+    .bind(run.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("run is backdated");
+    let slack = std::time::Duration::from_secs(5);
+
+    let first = claim(&queue, &mut conn).await;
+    assert!(
+        (std::time::Duration::from_secs(10)..std::time::Duration::from_secs(10) + slack)
+            .contains(&first.queue_wait),
+        "{:?}",
+        first.queue_wait
+    );
+    assert!(
+        (std::time::Duration::from_secs(30)..std::time::Duration::from_secs(30) + slack)
+            .contains(&first.age),
+        "{:?}",
+        first.age
+    );
+
+    sqlx::query(
+        "UPDATE wyrd.verifier_runs
+            SET lease_expires_at = statement_timestamp() - INTERVAL '20 seconds'
+          WHERE run_id = $1",
+    )
+    .bind(run.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("lease expires");
+    let reclaimed = claim(&queue, &mut conn).await;
+    assert_eq!(reclaimed.attempt, 2);
+    assert!(
+        (std::time::Duration::from_secs(20)..std::time::Duration::from_secs(20) + slack)
+            .contains(&reclaimed.queue_wait),
+        "{:?}",
+        reclaimed.queue_wait
+    );
+}
+
 /// A committed observation enqueues one run per active `observations_ready`
 /// binding of its subject: a replay finds the same run, a scheduled binding on
 /// the same subject is untouched, and an inactive owner creates nothing.

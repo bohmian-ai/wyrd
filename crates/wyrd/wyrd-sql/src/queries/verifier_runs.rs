@@ -188,7 +188,7 @@ const EXHAUST_EXPIRED_SQL: &str = r#"
 /// lease the database believes already expired.
 const CLAIM_RUN_SQL: &str = r#"
     WITH candidate AS (
-        SELECT run_id
+        SELECT run_id, COALESCE(next_attempt_at, lease_expires_at) AS due_at
           FROM wyrd.verifier_runs
          WHERE (status IN ('pending', 'retrying') AND next_attempt_at <= statement_timestamp())
             OR (status = 'running' AND lease_expires_at <= statement_timestamp())
@@ -206,7 +206,11 @@ const CLAIM_RUN_SQL: &str = r#"
               r.origin, r.owner_card_uid, r.binding_id, r.trigger_uid,
               r.trigger_digest, r.window_start, r.window_end, r.input_record_id,
               r.input_event_time, r.requested_by_principal_id, r.attempts,
-              r.max_attempts, r.lease_expires_at, r.observation_ordinal
+              r.max_attempts, r.lease_expires_at, r.observation_ordinal,
+              GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - candidate.due_at)
+                           * 1000)::bigint) AS queue_wait_ms,
+              GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - r.created_at)
+                           * 1000)::bigint) AS age_ms
 "#;
 
 /// Complete a leased run, or re-apply the same completion idempotently.
@@ -674,6 +678,13 @@ pub struct ClaimedRun {
     /// at enqueue; `None` for scheduled and manual runs. Eval's `every_nth`
     /// sampling selects on it, so every attempt reaches the same decision.
     pub observation_ordinal: Option<u64>,
+    /// How long the run had been claimable when this claim took it: the
+    /// claim statement's PostgreSQL instant less the run's due time, or its
+    /// lease expiry for a reclaim. Telemetry only; never a coordination input.
+    pub queue_wait: std::time::Duration,
+    /// How long before this claim the run was created by its trigger: the
+    /// claim statement's PostgreSQL instant less `created_at`. Telemetry only.
+    pub age: std::time::Duration,
 }
 
 /// Outcome of a token-fenced settlement.
@@ -1677,6 +1688,10 @@ struct ClaimedRunRow {
     lease_expires_at: DateTime<Utc>,
     /// Stored observation ordinal.
     observation_ordinal: Option<i64>,
+    /// Milliseconds the run was claimable before this claim.
+    queue_wait_ms: i64,
+    /// Milliseconds since the run was created.
+    age_ms: i64,
 }
 
 impl ClaimedRunRow {
@@ -1738,6 +1753,10 @@ impl ClaimedRunRow {
                 .observation_ordinal
                 .map(|ordinal| stored(u64::try_from(ordinal)))
                 .transpose()?,
+            queue_wait: std::time::Duration::from_millis(stored(u64::try_from(
+                self.queue_wait_ms,
+            ))?),
+            age: std::time::Duration::from_millis(stored(u64::try_from(self.age_ms))?),
         })
     }
 }

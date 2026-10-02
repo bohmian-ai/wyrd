@@ -654,6 +654,227 @@ async fn completed_run_publishes_details_then_summary_and_records_metrics() {
     );
 }
 
+/// Every attempt records its PostgreSQL-measured queue wait and its owned
+/// phase durations, every terminal settlement records trigger-to-terminal
+/// latency once, and each attempt is one correlated `verification.attempt`
+/// trace spanning claim, load, evidence read, engine, publication, and
+/// settlement with only bounded, scrubbed attributes.
+///
+/// Run one retries and then completes, run two is cancelled by the engine,
+/// and run three executes the real Drift engine, which reads its evidence
+/// through Bifrost.
+///
+/// # Panics
+/// Panics when a series count differs from the attempts that produced it,
+/// a retry records a terminal latency, an attempt trace lacks a phase span,
+/// or any span attribute carries the tenant ID.
+#[tokio::test]
+async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
+    let (telemetry, traces) =
+        wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())
+            .expect("production-shaped telemetry installs");
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    script.push(EngineOutcome::Retry(VerificationError {
+        code: "engine_unavailable".to_owned(),
+        message: "the engine did not respond".to_owned(),
+    }));
+    script.push(EngineOutcome::Completed(drifting_report()));
+    script.push(EngineOutcome::Terminal(
+        TerminalStatus::Cancelled,
+        VerificationError {
+            code: "cancelled".to_owned(),
+            message: "the engine was cancelled".to_owned(),
+        },
+    ));
+    let runtime = harness.spawn(Harness::limits(), &script);
+
+    let retried = harness.enqueue().await;
+    harness.wait_run(retried, status("retrying")).await;
+    harness.expire(retried).await;
+    harness.wait_run(retried, status("completed")).await;
+    let cancelled = harness.enqueue().await;
+    harness.wait_run(cancelled, status("cancelled")).await;
+    let profiled = harness
+        .seed
+        .custom_drift_verifier("telemetry-drift", "score", 1.0, 0.5)
+        .await
+        .expect("profiled verifier registers");
+    let now = Utc::now();
+    let real = harness
+        .seed
+        .enqueue_direct(
+            &profiled,
+            &harness.subject,
+            DriftWindow {
+                start: now - chrono::Duration::hours(1),
+                end: now,
+            },
+        )
+        .await
+        .expect("run enqueues");
+    let real_row = harness
+        .wait_run(real, |row| {
+            !matches!(row.status.as_str(), "pending" | "running" | "retrying")
+        })
+        .await;
+    runtime.stop().await;
+
+    let rendered = telemetry.prometheus().render();
+    let count = |series: &str| -> u64 {
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(series)?.strip_prefix(' '))
+            .map_or(0, |value| value.parse().expect("a count is an integer"))
+    };
+    let manual = r#"implementation="drift",origin="manual""#;
+    assert_eq!(
+        count(&format!(
+            "wyrd_verification_queue_wait_seconds_count{{{manual}}}"
+        )),
+        4,
+        "one queue wait per attempt:\n{rendered}"
+    );
+    for (phase, attempts) in [("load", 4), ("engine", 4), ("settlement", 4)] {
+        assert_eq!(
+            count(&format!(
+                r#"wyrd_verification_phase_duration_seconds_count{{implementation="drift",phase="{phase}"}}"#
+            )),
+            attempts,
+            "{phase} is timed once per attempt:\n{rendered}"
+        );
+    }
+    let real_published = u64::from(real_row.result_id.is_some());
+    assert_eq!(
+        count(
+            r#"wyrd_verification_phase_duration_seconds_count{implementation="drift",phase="publication"}"#
+        ),
+        1 + real_published,
+        "only completed engine reports publish:\n{rendered}"
+    );
+    let terminal = |outcome: &str| {
+        count(&format!(
+            r#"wyrd_verification_trigger_to_terminal_seconds_count{{{manual},outcome="{outcome}"}}"#
+        ))
+    };
+    assert_eq!(terminal("completed"), 1 + real_published, "{rendered}");
+    assert_eq!(terminal("cancelled"), 1, "{rendered}");
+    assert_eq!(
+        terminal("retrying"),
+        0,
+        "a retry is not terminal:\n{rendered}"
+    );
+    assert!(
+        rendered
+            .lines()
+            .filter(|line| line.starts_with("wyrd_verification_"))
+            .all(|line| !line.contains("tenant")),
+        "no verification series carries a tenant label:\n{rendered}"
+    );
+
+    let spans = traces.finished_since(0);
+    let attempt = |run: VerificationRunId, attempt: &str| {
+        spans
+            .iter()
+            .find(|span| {
+                span.name == "verification.attempt"
+                    && span.attributes.get("run_id") == Some(&run.to_string())
+                    && span.attributes.get("attempt").map(String::as_str) == Some(attempt)
+            })
+            .unwrap_or_else(|| panic!("attempt {attempt} of {run} is traced: {spans:#?}"))
+    };
+    let children = |root: &wyrd_telemetry::CapturedSpan| -> Vec<&str> {
+        spans
+            .iter()
+            .filter(|span| span.trace_id == root.trace_id && span.span_id != root.span_id)
+            .map(|span| span.name.as_str())
+            .collect()
+    };
+
+    let first = attempt(retried, "1");
+    assert_eq!(
+        first.attributes.get("outcome").map(String::as_str),
+        Some("retrying")
+    );
+    assert_eq!(
+        first.attributes.get("error_code").map(String::as_str),
+        Some("engine_unavailable")
+    );
+    assert!(matches!(
+        first.status,
+        wyrd_telemetry::CapturedSpanStatus::Error(_)
+    ));
+    let completed = attempt(retried, "2");
+    assert_ne!(
+        first.trace_id, completed.trace_id,
+        "each attempt is its own trace"
+    );
+    assert_eq!(
+        completed.attributes.get("outcome").map(String::as_str),
+        Some("completed")
+    );
+    assert_eq!(
+        completed.attributes.get("origin").map(String::as_str),
+        Some("manual")
+    );
+    assert_eq!(
+        completed
+            .attributes
+            .get("implementation")
+            .map(String::as_str),
+        Some("drift")
+    );
+    assert!(!matches!(
+        completed.status,
+        wyrd_telemetry::CapturedSpanStatus::Error(_)
+    ));
+    let names = children(completed);
+    for phase in [
+        "claim",
+        "verification.load",
+        "verification.engine",
+        "verification.publish",
+        "verification.settle",
+        "complete",
+    ] {
+        assert!(
+            names.contains(&phase),
+            "{phase} joins the attempt trace: {names:?}"
+        );
+    }
+    let cancel = attempt(cancelled, "1");
+    assert_eq!(
+        cancel.attributes.get("outcome").map(String::as_str),
+        Some("cancelled")
+    );
+    assert_eq!(
+        cancel.attributes.get("error_code").map(String::as_str),
+        Some("cancelled")
+    );
+    assert!(matches!(
+        cancel.status,
+        wyrd_telemetry::CapturedSpanStatus::Error(_)
+    ));
+    assert!(
+        children(attempt(real, "1")).contains(&"verification.evidence_read"),
+        "the real engine's evidence read joins its attempt trace"
+    );
+
+    let tenant = harness.server.pg_fixture().data_tenant_id().to_string();
+    for span in spans
+        .iter()
+        .filter(|span| span.name.starts_with("verification."))
+    {
+        for value in span.attributes.values() {
+            assert!(
+                !value.contains(&tenant),
+                "{} leaks the tenant: {span:?}",
+                span.name
+            );
+        }
+    }
+}
+
 /// An unscored Drift execution publishes only its summary.
 ///
 /// # Panics

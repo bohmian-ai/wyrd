@@ -69,6 +69,16 @@ pub const VERIFICATION_RUN_ATTEMPTS_TOTAL: &str = "wyrd_verification_run_attempt
 pub const VERIFICATION_RUN_FAILURES_TOTAL: &str = "wyrd_verification_run_failures_total";
 /// Claim-to-settlement latency of one Verifier attempt, by `implementation` and `outcome`.
 pub const VERIFICATION_RUN_DURATION_SECONDS: &str = "wyrd_verification_run_duration_seconds";
+/// How long a claimed Verifier run had been claimable before its claim, as
+/// PostgreSQL measured it, by `implementation` and `origin`.
+pub const VERIFICATION_QUEUE_WAIT_SECONDS: &str = "wyrd_verification_queue_wait_seconds";
+/// Run creation to durable terminal settlement, by `implementation`, `origin`,
+/// and terminal `outcome`; its `_count` is the settled terminal runs.
+pub const VERIFICATION_TRIGGER_TO_TERMINAL_SECONDS: &str =
+    "wyrd_verification_trigger_to_terminal_seconds";
+/// Non-overlapping phases of one Verifier attempt, by `implementation` and
+/// `phase` (`load`, `engine`, `publication`, `settlement`).
+pub const VERIFICATION_PHASE_DURATION_SECONDS: &str = "wyrd_verification_phase_duration_seconds";
 /// Scheduler occurrences processed, by `outcome`.
 pub const VERIFICATION_SCHEDULE_TICKS_TOTAL: &str = "wyrd_verification_schedule_ticks_total";
 /// Whether each verification runtime capability task is running, by `capability`.
@@ -82,6 +92,13 @@ pub const OPERATOR_ACTIVE_DISPATCHES: &str = "wyrd_operator_active_dispatches";
 pub const OPERATOR_DISPATCH_ATTEMPTS_TOTAL: &str = "wyrd_operator_dispatch_attempts_total";
 /// Claim-to-settlement latency of one Operator attempt, by `outcome`.
 pub const OPERATOR_DISPATCH_DURATION_SECONDS: &str = "wyrd_operator_dispatch_duration_seconds";
+
+/// Verification latency families added beside the claim-to-settlement histogram.
+const VERIFICATION_DURATION_FAMILIES: &[&str] = &[
+    VERIFICATION_QUEUE_WAIT_SECONDS,
+    VERIFICATION_TRIGGER_TO_TERMINAL_SECONDS,
+    VERIFICATION_PHASE_DURATION_SECONDS,
+];
 
 /// Every production Bifrost duration family whose p99 is consumed by qualification.
 const BIFROST_P99_DURATION_FAMILIES: &[&str] = &[
@@ -210,7 +227,10 @@ pub fn install_recorder() -> Result<PrometheusHandle, MetricsError> {
             BIFROST_DURATION_BUCKETS,
         )
         .map_err(MetricsError::Buckets)?;
-    for family in BIFROST_P99_DURATION_FAMILIES {
+    for family in VERIFICATION_DURATION_FAMILIES
+        .iter()
+        .chain(BIFROST_P99_DURATION_FAMILIES)
+    {
         builder = builder
             .set_buckets_for_metric(
                 Matcher::Full((*family).to_owned()),

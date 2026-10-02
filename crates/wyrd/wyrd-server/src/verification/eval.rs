@@ -550,6 +550,7 @@ impl BifrostReader {
     ///
     /// # Errors
     /// Returns the query failure.
+    #[tracing::instrument(name = "verification.evidence_read", skip_all)]
     async fn query(&self, sql: String) -> Result<Vec<RecordBatch>, WyrdError> {
         let mut batches = Vec::new();
         self.caller

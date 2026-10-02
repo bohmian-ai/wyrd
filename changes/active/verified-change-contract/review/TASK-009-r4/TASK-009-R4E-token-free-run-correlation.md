@@ -265,3 +265,92 @@ Stop and report to the caller, without improvising, if:
 
 A later task review must reassess the complete base-to-remediated-candidate
 range, not only this correction.
+
+## Implementation evidence
+
+Implementation commit: see `git log` on `wyrd/verified-change-contract/TASK-009`
+(`fix(otel): keep the Python Run scope entirely in the OpenTelemetry context`).
+
+Files changed: `sdks/wyrd-sdk-python/python/wyrd/otel.py`,
+`sdks/wyrd-sdk-python/src/observe/mod.rs` (`Run.__enter__`/`__exit__` rustdoc,
+`__exit__` passes the view's pair), and
+`sdks/wyrd-sdk-python/tests/unit/state/test_observe_surface.py`.
+
+Deleted: `_key()` and its double-checked lock, `_scope_key`, the
+`_scope_tokens` `ContextVar`, every `detach` call, the compare-and-reattach
+fallback, the discard-on-failure path, the `_registered` `WeakSet`, the
+`contextvars` import; tests `test_concurrent_first_entries_share_one_scope_key`,
+`_ContentionLock`, `test_detach_failure_restores_the_prior_correlation`,
+`ORIGINAL_DETACH`, and the `threading` import. Added: the import-time
+`_otel_context`/`_otel_trace` bindings and `_SCOPE_KEY`, a
+`WeakKeyDictionary` outcome cache written `False` before the foreign call,
+one shared `_PROCESSOR`, and `_carries_card_ref` (reads `span.attributes`;
+unreadable attributes stamp as before).
+
+New or renamed tests: `test_a_provider_that_raises_after_accepting_is_never_asked_again`,
+`test_exit_context_update_failure_never_blocks_observations`,
+`test_mismatched_exit_changes_nothing`,
+`test_nested_entry_never_overwrites_an_active_span_correlation`. Changed:
+`test_missing_opentelemetry_is_a_no_op` (fresh-interpreter import with
+`opentelemetry` blocked, plus cleared import-time bindings in-process) and
+`test_unsupported_providers_are_refused_without_raising` (raises-before-retention
+provider attempted once).
+
+### AC-032 case-to-test map
+
+| Case | Test |
+|---|---|
+| Sync entry returns Run; active and child spans stamped; conflicting initial attrs on in-scope spans replaced; exit clears | `test_entering_a_run_returns_it_and_correlates_active_and_child_spans` |
+| Nested root/component scopes share run ID, own CardRefs, restore outer | `test_nested_card_scopes_share_the_run_and_restore_the_outer_card` |
+| Nested entry does not overwrite an active span's existing `wyrd.card_ref` | `test_nested_entry_never_overwrites_an_active_span_correlation` |
+| `await` | `test_scope_survives_await_and_isolates_concurrent_tasks` |
+| Concurrent tasks, distinct Run views | `test_scope_survives_await_and_isolates_concurrent_tasks` |
+| Concurrent tasks, identical Run object | `test_concurrent_tasks_entering_the_same_run_exit_independently` |
+| Task created inside the scope | `test_scope_survives_await_and_isolates_concurrent_tasks` |
+| Missing `opentelemetry-api` + explicit observation | `test_missing_opentelemetry_is_a_no_op` (import-time absence) |
+| API-only/no-SDK provider + explicit observation | `test_registration_and_attach_failures_never_block_observations`; `test_unsupported_providers_are_refused_without_raising` |
+| Processor registration failure + explicit observation | `test_registration_and_attach_failures_never_block_observations` |
+| Registration attempted at most once per provider, incl. accept-then-raise | `test_a_provider_that_raises_after_accepting_is_never_asked_again`; `test_unsupported_providers_are_refused_without_raising` |
+| Entry attach failure + explicit observation | `test_registration_and_attach_failures_never_block_observations` |
+| Span enrichment failure + explicit observation | `test_enrichment_failure_never_blocks_observations` |
+| Exit context-update failure + explicit observation | `test_exit_context_update_failure_never_blocks_observations` |
+| Mismatched exit changes nothing | `test_mismatched_exit_changes_nothing` |
+| User exception propagates unchanged | `test_registration_and_attach_failures_never_block_observations`, `test_enrichment_failure_never_blocks_observations`, `test_exit_context_update_failure_never_blocks_observations` |
+| Unknown alias fails before entry | `test_unknown_alias_is_refused`, `test_run_card_refuses_an_unknown_alias` |
+| Provider idempotency (global + private) and private-provider attributes | `test_global_and_private_providers_receive_one_processor_each` |
+| `__exit__` never suppresses; stub parity | `test_run_exit_accepts_conventional_keywords_and_omitted_arguments` |
+| Real SDK→server OTLP export, custom-row and Eval joins, active-span ids, exit not a barrier | `tests/integration/state/test_observe_journey.py::test_scoped_run_emits_drift_eval_and_generic_rows` (unchanged) |
+
+### Acceptance
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| 1. Accept-then-raise provider holds one processor; every call `False`, never re-asked | `otel.py` `install_run_correlation` (outcome cached before `add`) | `test_a_provider_that_raises_after_accepting_is_never_asked_again` | PASS |
+| 2. Healthy global/private providers `True` idempotently, one processor, exact pair | `otel.py` `install_run_correlation`, `_RunCorrelationProcessor.on_start` | `test_global_and_private_providers_receive_one_processor_each` | PASS |
+| 3. No `detach`, token storage, lazy key, or discard path; `_exit_run` gets the view's pair | `otel.py`; `src/observe/mod.rs` `__exit__` | `grep -n detach otel.py` empty; `test_mismatched_exit_changes_nothing` (fails if the pair is not passed) | PASS |
+| 4. Nested entry leaves correlated active span untouched; in-scope spans carry innermost pair | `otel.py` `_enter_run`, `_carries_card_ref` | `test_nested_entry_never_overwrites_an_active_span_correlation` | PASS |
+| 5. Every AC-032 row passes; persisted journey unchanged | table above | focused file (37 passed); journey test | PASS |
+
+Non-goals stayed excluded: no detach, baggage, `ContextVar` store, provider
+wrapper, retry, warning, dependency, Rust/TypeScript projection, stub, Gate,
+Scribe, or Bifrost change. Residual (accepted by the task): an entry whose
+attach fails while an outer scope holds the identical pair lets that exit pop
+the outer entry.
+
+### Verification
+
+All exited 0: `mise run py:setup`; each new or changed test above run exactly
+by node id; the focused file (37 passed); the persisted journey
+`test_scoped_run_emits_drift_eval_and_generic_rows` under
+`scripts/postgres/with-test-postgres.sh`; `mise run py:test:unit`,
+`py:test:integration`, `py:typecheck`, `codegen:check`, `check:pyo3-scope`,
+`fmt`, `lints`, `py:format`, `py:lints`; `git diff --check`.
+
+Diagnosis (transient, not a code defect): **Symptom:** one focused-file run
+failed `test_missing_opentelemetry_is_a_no_op` while `mise run py:test:unit`
+ran at the same time. **Evidence:** the subprocess raised
+`ModuleNotFoundError: No module named 'wyrd'`. **Cause:** that lane's setup
+reinstalls the editable `wyrd` wheel into the same `.venv`, so the
+fresh interpreter started while the package was uninstalled. **Fix site:**
+none, because nothing in the code was wrong. Rerunning after the lane finished
+passed, and so did the lane itself.

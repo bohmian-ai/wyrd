@@ -815,3 +815,130 @@ Primary profiling references for the documented commands:
 - [rustc frame pointers](https://doc.rust-lang.org/rustc/codegen-options/index.html#force-frame-pointers)
 - [perf record](https://raw.githubusercontent.com/torvalds/linux/master/tools/perf/Documentation/perf-record.txt)
 - [perf report](https://raw.githubusercontent.com/torvalds/linux/master/tools/perf/Documentation/perf-report.txt)
+
+## Implementation Evidence (in progress)
+
+| Item | Implementation | Verification | Result |
+|---|---|---|---|
+| Verifier/baseline permit removal (rev 50), Operator permits retained | `89214267d` | six focused anchors listed under Verification and Evidence | PASS |
+| Scenario 1, queued path: closed `kind`/`mode` labels, `input_read`/`prepare` phases, engine overhead from per-execution wait union, per-kind active gauge with drop cleanup, task-start delay on the attempt span, verification bucket set | `35d35c8ec`; `verification/telemetry.rs` (`ExecutionTelemetry`, `WaitSink`, `StreamWaits`), runner, Drift/Eval engines, `app/metrics.rs` | `cargo nextest run -p wyrd-server --features test-support --lib -E 'test(/verification::telemetry::tests::/)'` (classification precedence, nested/concurrent waits, streaming fold time); anchor `attempts_record_queue_wait_phases_terminal_latency_and_one_trace` RED on the pooled label, then GREEN | PASS |
+| Scenario 1 catalog/PromQL docs | `1e8da536a`; `running-the-server.svx`, `telemetry-observations.md` | `mise run docs:check` | PASS |
+| Scenario 1, direct path and real release-exporter scrape | blocked on revision 51 (direct API) and the capacity benchmark | — | OPEN |
+
+Combined lane `--lib --test pg_verification_runtime --test pg_operator_delivery`:
+523/523 on two consecutive runs with `WYRD_LOG=info`.
+
+Diagnosis, `baseline_fits_do_not_wait_for_verifier_executions`:
+- **Symptom:** under the full lane it intermittently asserted `Building == Failed`.
+- **Evidence:** `fitter.rs:224` commits the claim (state `Building`) before a separate transaction fails it (`fitter.rs:256`). The test polled only while the state was `Pending`.
+- **Cause:** the test read the intermediate `Building` state.
+- **Fix site:** the test's wait loop now waits for a terminal state. An independent read-only diagnostician reached the same cause and fix; no other test has this pattern.
+
+Unreproduced: one combined-lane run failed the telemetry anchor
+`attempts_record_queue_wait_phases_terminal_latency_and_one_trace` at its first
+assertion. Its output was not captured, and four later runs with tracing passed.
+If it recurs, capture the trace before changing the test. The real Drift run's
+evidence read retrying under load is a candidate cause, not a diagnosis.
+
+## Proposed Specification Revision 51 (awaiting human approval)
+
+Not authoritative until approved. It closes Material Stop Conditions 1, 3 and
+4. Condition 2 is closed by revision 50.
+
+**REQ-135 amendment.** Add a fourth Verification operation:
+`POST /v1/verification/execute`. Ordinary observations and `POST
+/v1/verification/runs` stay asynchronous (REQ-136 unchanged).
+
+**Request.** The target is exact and untagged: `{ verifier_uid,
+subject_card_uid, input }`. `input` is tagged by `kind`:
+- `eval_record { context: object, media?: [MediaRef] }` for assertion-only and
+  LLM-judge Evals. The judge receives the supplied `context`.
+- `drift_samples { columns: { <feature>: [number | string | null] } }`. PSI and
+  SPC score against the Verifier's `ready` fitted baseline. Custom scores the
+  mean of `profile.metric_name`.
+
+**Response `200`.** `{ execution_id, verifier: CardRef, subject: CardRef, kind,
+verdict: passed | failed | inconclusive, summary, counts, detail: { drift:
+DriftReport } | { eval: EvalReport } }`.
+- `execution_id` is a UUIDv7 that appears only in the response, the audit row
+  and the trace. It is never persisted or queryable.
+- A `failed` verdict is a `200`, not an error.
+
+**Not performed.** No durable run, published result, Operator dispatch,
+Bifrost read or write, or Eval sampling policy. Registry, baseline and judge
+Agent/Prompt resolution and canonical audit still use PostgreSQL.
+
+**Authorization.**
+- Requires `evals:run` with exact Verifier and subject scope, as for the
+  direct-target `POST /runs`.
+- One allowed or denied decision is audited transactionally per request. An
+  audit-append failure refuses the request.
+- Cross-tenant or unknown targets return `404`.
+
+**Bounds.**
+- Request body at most 1 MiB.
+- `drift_samples` at most 64 columns × 100,000 values.
+- `eval_record.context` at most 256 KiB.
+- One 60 s execution deadline per request. No concurrency cap or admission
+  layer.
+
+**Stable errors.**
+
+| Status | Code | Condition |
+|---|---|---|
+| 400 | `verification_input_invalid` | Malformed input |
+| 413 | `verification_input_too_large` | A bound is exceeded |
+| 403 | existing RBAC code | Permission denied |
+| 404 | `verification_target_not_found` | Unknown or cross-tenant target |
+| 409 | `verification_baseline_not_ready` | No `ready` fitted baseline |
+| 409 | `verification_baseline_legacy` | Baseline fitted under an earlier format |
+| 422 | `verification_input_incompatible` | Missing feature or type mismatch |
+| 422 | `verification_input_unsupported` | Eval with trace or agent assertions, refused before any task runs |
+| 502 | `verification_dependency_failed` | Judge provider failure after the task's own `max_retries` |
+| 504 | `verification_execution_timed_out` | The 60 s deadline elapsed |
+
+**Retries and cancellation.**
+- The operation is not idempotent and takes no `Idempotency-Key`.
+- SDKs never retry it automatically.
+- A client disconnect drops the handler and cancels in-flight work. Provider
+  calls already issued may have incurred cost.
+
+**Projections.**
+- `client.verification.execute(...)` in `wyrd-client` and in the Rust, Python
+  and TypeScript SDKs.
+- An MCP write tool `verification_execute` gated on `evals:run`.
+- The served OpenAPI document.
+- Telemetry uses `mode="direct"` with only `load`, `prepare` and `engine` phases.
+
+**CLOSE-05 reference workloads.** One release `wyrd-server` replica plus a
+two-replica repeat.
+
+| Case | Workload |
+|---|---|
+| Assertion Eval | 4 assertion tasks over a 2 KiB context |
+| Custom | 1 metric, 1,000 samples |
+| PSI | 8 numeric features × 1,000 samples, 10 quantile bins, baseline fitted from 10,000 rows |
+| SPC | 4 features × 1,000 samples, subgroup size 5, baseline from 10,000 rows |
+| LLM judge | 1 judge task plus 1 assertion against the local TLS mock with a 200 ms delay |
+
+**Sustainable load** is the highest offered step whose achieved rate is at
+least 95% of offered and whose outstanding work drains within one step.
+
+**Strict proof** is direct-mode paired per-request engine overhead below 10 ms
+at p95. It requires at least 1,000 samples per case per step, solo and mixed,
+at sustainable load, for the four non-judge cases. Judge cases report overhead
+and provider waits separately with no threshold.
+
+**Capacity benchmark defaults.**
+- 30 s steps.
+- Offered totals of 10, 25, 50, 100 and 200 executions/s, split evenly across
+  the five kinds.
+- 1 noisy tenant, 1 quiet tenant and 70 background tenants. This exceeds one
+  64-tenant discovery round.
+
+**Recovery-task alignment.** The capacity benchmark replaces the recovery
+task's fixed observation-traffic profile and its prohibition on synchronous
+execution. Scheduled Drift and observation-triggered Eval stay in queued
+capacity traffic. Manual activations are labelled and never counted as
+scheduler throughput. Existing correctness journeys keep the removed
+custom-table and OTLP coverage.

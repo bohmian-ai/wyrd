@@ -44,6 +44,7 @@ use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::storage::artifact_metadata::{self, NewArtifactMetadata};
 use wyrd_sql::queries::verifier_runs::TerminalStatus;
 use wyrd_testing::WyrdTestServer;
+use wyrd_testing::logs::LogCapture;
 use wyrd_testing::verification::{RunRow, VerificationFixture};
 
 /// Upper bound on every wait for the runtime to make progress.
@@ -1146,14 +1147,20 @@ async fn expired_lease_is_reclaimed_and_the_stale_holder_is_fenced() {
     fresh.stop().await;
 }
 
-/// A crashed runner degrades health, restarts, and — once the lost lease
-/// expires — reclaims and completes the run exactly once.
+/// A crashed runner degrades health, is restarted, and — once the lost lease
+/// expires — reclaims and completes the run exactly once. The exit is visible
+/// through health, one structured `verification capability crashed` error
+/// event naming the runner, and the runtime metrics: one runner restart and
+/// the runner's `capability_up` gauge back at one.
 ///
 /// # Panics
 /// Panics when health does not degrade and recover, the run is not
-/// completed on its second attempt, or more than one summary is written.
+/// completed on its second attempt, more than one summary is written, or the
+/// crash is missing from the captured trace or the rendered metrics.
 #[tokio::test]
 async fn crashed_runner_restarts_and_reclaims_without_duplicates() {
+    let metrics = wyrd_server::app::metrics::install_recorder().expect("recorder installs");
+    let logs = LogCapture::install();
     let harness = Harness::start().await;
     let script = EngineScript::default();
     script.hold();
@@ -1188,7 +1195,101 @@ async fn crashed_runner_restarts_and_reclaims_without_duplicates() {
     let row = harness.wait_run(run, status("completed")).await;
     assert_eq!(row.attempts, 2);
     assert_eq!(harness.writes().await, vec![system_write(RESULTS)]);
+
+    let rendered = metrics.render();
+    assert!(
+        rendered.contains(r#"wyrd_verification_capability_restarts_total{capability="runner"} 1"#),
+        "one runner restart is counted:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(r#"wyrd_verification_capability_up{capability="runner"} 1"#),
+        "the restarted runner reports up:\n{rendered}"
+    );
+    let crashes: Vec<String> = logs
+        .text()
+        .lines()
+        .filter(|line| line.contains("verification capability crashed"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(crashes.len(), 1, "one crash event: {crashes:?}");
+    assert!(
+        crashes[0].contains("ERROR") && crashes[0].contains(r#"capability="runner""#),
+        "the crash event is an error naming the runner: {}",
+        crashes[0]
+    );
     runtime.stop().await;
+}
+
+/// Shutdown stops claiming the moment it begins, drains for at most the
+/// grace, and leaves unfinished work recoverable under its own identity.
+///
+/// One run is executing when shutdown begins and a second is enqueued right
+/// after: the second is never claimed, the first is released with its attempt
+/// refunded once the grace elapses, and the runtime returns within the grace
+/// plus settlement slack. A fresh runtime then claims both under their
+/// original run IDs and completes each on one charged attempt.
+///
+/// # Panics
+/// Panics when the late run is claimed during shutdown, the drain outlives its
+/// bound, a run is not released or not recovered under its own ID, or the
+/// recovered attempts differ.
+#[tokio::test]
+async fn shutdown_stops_claims_drains_bounded_and_restart_recovers_identity() {
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    script.hold();
+    for _ in 0..3 {
+        script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+    }
+    let grace = Duration::from_secs(1);
+    let runtime = harness.spawn(
+        RuntimeLimits {
+            drain_grace: grace,
+            ..Harness::limits()
+        },
+        &script,
+    );
+    let inflight = harness.enqueue().await;
+    wait_until("the in-flight claim", || script.entered() == 1).await;
+
+    let started = tokio::time::Instant::now();
+    let stopping = tokio::spawn(runtime.stop());
+    let late = harness.enqueue().await;
+    stopping.await.expect("the runtime stops");
+    let drained = started.elapsed();
+    assert!(
+        drained >= grace && drained < grace + Duration::from_secs(5),
+        "shutdown waits out the grace and no longer: {drained:?}"
+    );
+    assert_eq!(script.entered(), 1, "no execution starts after shutdown");
+    for run in [inflight, late] {
+        let row = harness.seed.run(run).await.expect("run reads");
+        assert_eq!(
+            (row.status.as_str(), row.attempts),
+            ("pending", 0),
+            "{run} is unclaimed or released with its attempt refunded"
+        );
+        assert_eq!(
+            harness.lease(run).await.1,
+            None,
+            "{run} holds no live lease"
+        );
+    }
+    assert!(harness.writes().await.is_empty());
+
+    script.release();
+    let restarted = harness.spawn(Harness::limits(), &script);
+    for run in [inflight, late] {
+        let row = harness.wait_run(run, status("completed")).await;
+        assert_eq!(row.attempts, 1, "{run} completes on one charged attempt");
+        assert!(row.result_id.is_some());
+    }
+    assert_eq!(
+        harness.seed.runs().await.expect("runs read").len(),
+        2,
+        "recovery reuses the durable identities rather than enqueueing anew"
+    );
+    restarted.stop().await;
 }
 
 /// Shutdown stops claiming and, once the drain grace elapses, releases a run

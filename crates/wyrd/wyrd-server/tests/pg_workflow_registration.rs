@@ -310,7 +310,7 @@ async fn principal_count(server: &WyrdTestServer) -> i64 {
 type SpecMutation = fn(&mut Value);
 
 /// Submit the loaded bundle under `dir` straight to the registration route
-/// with `mutate` applied to its Workflow spec, returning the refusal code.
+/// with `mutate` applied to its Workflow spec, returning the problem body.
 ///
 /// The offline loader already refuses pure Workflow contract violations, so
 /// this bypasses it to prove the server enforces every rule on its own.
@@ -323,7 +323,7 @@ async fn refused_registration(
     jwt: &str,
     dir: &Path,
     mutate: SpecMutation,
-) -> String {
+) -> Value {
     let input = build_registration_input(load(&dir.join("workflow.yaml")).expect("bundle loads"))
         .expect("registration input builds");
     let mut body =
@@ -352,7 +352,7 @@ async fn refused_registration(
         .expect("response body reads");
     let problem: Value = serde_json::from_slice(&bytes).expect("response body is JSON");
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{problem}");
-    problem["code"].as_str().expect("problem code").to_owned()
+    problem
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -591,21 +591,25 @@ async fn registers_only_valid_explicit_workflow_graphs() {
             },
             |yaml| rename_workflow(&yaml, &sibling_name),
         );
-        let sibling_code = refused_registration(&server, &jwt, sibling.path(), mutate).await;
+        let sibling_code =
+            refused_registration(&server, &jwt, sibling.path(), mutate).await["code"].clone();
 
         let external_name = format!("invalid-{label}-external");
         let external = edited_bundle(
             |agent| agent,
             |yaml| rename_workflow(&external_targets(yaml), &external_name),
         );
-        let external_code = refused_registration(&server, &jwt, external.path(), mutate).await;
+        let external_code =
+            refused_registration(&server, &jwt, external.path(), mutate).await["code"].clone();
 
         assert_eq!(
             sibling_code, external_code,
             "{label}: sibling and external dependencies fail identically"
         );
         assert!(
-            sibling_code.starts_with("WYRD_WORKFLOW_422_"),
+            sibling_code
+                .as_str()
+                .is_some_and(|code| code.starts_with("WYRD_WORKFLOW_422_")),
             "{label}: {sibling_code}"
         );
         assert_eq!(operation_count(&server).await, operations, "{label}");
@@ -649,7 +653,55 @@ async fn registers_only_valid_explicit_workflow_graphs() {
     assert_eq!(operation_count(&server).await, operations);
     assert_eq!(card_count(&server, "collision-review").await, 0);
     assert_eq!(card_count(&server, "collision-reviewer").await, 1);
+
+    // A fresh Workflow whose version is omitted or scoped registers at the
+    // version the server allocates and reloads at that exact version, while
+    // an invalid binding under either intent is still refused unwritten.
+    for (name, version_line, allocated) in [
+        ("unversioned-review", "", "0.1.0"),
+        ("scoped-review", "  version: \"2\"\n", "2.0.0"),
+    ] {
+        let dir = tempfile::tempdir().expect("version-intent workspace creates");
+        std::fs::write(
+            dir.path().join("workflow.yaml"),
+            inline_workflow(name, version_line),
+        )
+        .expect("workflow writes");
+        let operations = operation_count(&server).await;
+        let problem = refused_registration(&server, &jwt, dir.path(), |spec| {
+            spec["steps"][0]["inputs"]["extra"] = json!("input.code");
+        })
+        .await;
+        assert_eq!(problem["code"], "WYRD_WORKFLOW_422_VALIDATION", "{name}");
+        assert_eq!(
+            problem["details"]["field"], "steps[0].inputs.extra",
+            "{problem}"
+        );
+        assert_eq!(operation_count(&server).await, operations, "{name}");
+        assert_eq!(card_count(&server, name).await, 0, "{name}");
+
+        let receipt = cards
+            .register_from_path(&dir.path().join("workflow.yaml"))
+            .await
+            .expect("version-intent Workflow registers");
+        assert_eq!(receipt.root.version.to_string(), allocated, "{name}");
+        let workflow = cards
+            .workflow()
+            .load(&CardSelector::exact(receipt.root.clone()))
+            .await
+            .expect("allocated Workflow version reloads");
+        assert_eq!(workflow.as_skald().step_ids(), vec!["summarize"], "{name}");
+    }
     server.shutdown().await.expect("test server shuts down");
+}
+
+/// A singleton Workflow named `name` whose one step runs an inline Agent with
+/// an inline Prompt, so the request has no dependency to resolve.
+/// `version_line` is the authored `metadata.version` line, or empty to omit it.
+fn inline_workflow(name: &str, version_line: &str) -> String {
+    format!(
+        "apiVersion: wyrd/v1\nkind: Workflow\nmetadata:\n  space: engineering\n  name: {name}\n{version_line}spec:\n  llm_route:\n    kind: wyrd_gateway\n  inputs:\n    code:\n      type: str\n      value: \"\"\n  steps:\n    - id: summarize\n      action:\n        type: agent\n        target:\n          prompt:\n            model: gpt-5-5\n            request:\n              model: gpt-5-5\n              messages:\n                - role: user\n                  content: \"Summarize {{{{code}}}}\"\n            variables: [code]\n            response_type: text\n          tool_names: []\n          run_config:\n            max_iterations: 1\n      inputs:\n        code: input.code\n  outputs:\n    summary: steps.summarize.output.text\n"
+    )
 }
 
 #[tokio::test(flavor = "current_thread")]

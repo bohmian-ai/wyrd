@@ -13,6 +13,7 @@ use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, Ver
 use wyrd_spec::card::workflow::WorkflowCard;
 use wyrd_spec::envelope::{Card, CardKind, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::graph::graph_ready_submissions;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::operator_connection::OperatorConnectionStatus;
 use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef, Ref};
@@ -426,8 +427,14 @@ impl EffectiveSpecs {
         conn: &mut TenantConn<'_>,
         submissions: &[CardSubmission],
     ) -> Result<(), WyrdError> {
-        for submission in submissions.iter().filter(|s| s.kind == CardKind::Workflow) {
-            let workflow = WorkflowCard::from_envelope(submission_card(submission)?)?;
+        // A fresh root may omit or scope its version; the server allocates the
+        // pin only at write time. These transient holders carry the graph-only
+        // placeholder pin, which names no dependency and is discarded after
+        // validation; the authored submissions stay untouched.
+        let holders = graph_ready_submissions(submissions)
+            .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
+        for holder in holders.iter().filter(|s| s.kind == CardKind::Workflow) {
+            let workflow = WorkflowCard::from_envelope(submission_card(holder)?)?;
             let mut pending = card_body_dependencies(&Spec::Workflow(workflow.spec.clone()));
             while let Some(dependency) = pending.pop() {
                 if let Ref::Ref(card_ref) = &dependency

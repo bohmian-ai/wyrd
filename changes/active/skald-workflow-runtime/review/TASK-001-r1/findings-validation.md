@@ -266,4 +266,3 @@ The ledger contains bounded implementation and evidence corrections, but
 FIND-TASK-001-3 and FIND-TASK-001-4 cannot be closed without human-approved
 public-seam decisions. All other retained findings have task-local minimum
 corrections using existing owners, mechanisms, dependencies, and checks.
-

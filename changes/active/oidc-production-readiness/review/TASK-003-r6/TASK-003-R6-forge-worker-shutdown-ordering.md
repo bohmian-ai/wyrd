@@ -137,3 +137,32 @@ existing `mise` tasks that cover `wyrd-testing`, Wyrd server shutdown, and the
 Bifrost lifecycle touched by this shared owner. Finish with `mise run fmt`,
 `mise run lints`, and `git diff --check`. Do not rerun unrelated identity or UI
 lanes unless the implementation changes those surfaces.
+
+## Implementation Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| R6-AC-01 | `WyrdTestServer::shutdown` (`crates/wyrd/wyrd-testing/src/server.rs`) runs the direct Bifrost drain under `if self.serve_handle.is_none()`. `Mode` is no longer consulted. | Source; focused tests below | PASS |
+| R6-AC-02 | A dedicated Forge worker keeps its serve handle, so shutdown only cancels and joins it. | `owner_inspection::dedicated_forge_worker_shutdown_drains_its_claim_before_storage_settles`: the worker is bound and held after a durable claim on a seeded task. After ordinary `shutdown()`, its storage owner is still `Open`, the claim was released to `retryable`, and the observer recorded no errors. **RED** against the `Mode::InProcess` predicate: storage was `Closed`, with trace `in-process Bifrost drain fell back to abort ... Forge supervision did not join before shutdown`. GREEN after the fix. | PASS |
+| R6-AC-03 | The router-only in-process path is unchanged: it cancels the token and settles Bifrost before the fixture drops. | `owner_inspection::router_only_shutdown_settles_bifrost_before_fixture_release`: the token is cancelled and storage is `Closed`. **RED** with the direct drain disabled (`shutdown cancels the shared token`); GREEN with it restored. | PASS |
+| R6-AC-04 | The adjacent rustdoc covers the no-serve-task condition, the forced-drop abort it prevents, the abort fallback, and why a server with a serve task is only cancelled and joined. | Review of the rustdoc | PASS |
+| R6-AC-05 | No production, identity, UI or R5 source changed. The diff is limited to `server.rs` (predicate and rustdoc) and two new tests in `tests/bifrost/server/owner_inspection.rs`. | `git diff --stat` | PASS |
+
+Callers checked: bound servers that run `cancel_and_join_for_test` and then `shutdown()` no longer have a serve handle, so they now go through the direct drain as well. They stay green with no abort fallback logged:
+- `published::published_cache_pruning_and_shutdown_are_production_governed`
+- `published::expired_process_shutdown_aborts_storage_and_returns_failure`
+- `resilience::a_pending_invocation_audit_append_drains_before_shutdown_completes`
+
+The cluster and load teardown seam, `shutdown_and_inspect`, is untouched.
+
+Non-goals stayed excluded. There is no new mode variant, trait, coordinator, dependency, sleep, retry, ignore or relaxed timeout. The two new tests carry the binary's existing journey-lane `#[ignore]` marker, and the lane runs them with `--run-ignored=all`.
+
+Verification, all with `CARGO_TARGET_DIR` set to the shared target:
+- The focused `mise exec -- cargo nextest run --locked -p wyrd-testing --test server --test oracle --test gateway -P journey --run-ignored=all -E '<the five exact tests above>'`, under `scripts/postgres/with-test-postgres.sh`, exited 0 with 5 of 5 passed.
+- `mise run fmt` and `mise run lints` exited 0.
+- `mise run test:wyrd` exited 0: 2348 passed.
+- `mise run test:bifrost` exited 0: all 9 lanes passed, including the wyrd-testing `server`, `oracle` and `forge` journey binaries.
+- The Rust gateway journeys (`scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:gateway:native:inner'`) exited 0.
+- `git diff --check` exited 0.
+
+Fix commit: `a14896e34`.

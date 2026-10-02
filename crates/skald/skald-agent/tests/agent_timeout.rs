@@ -269,32 +269,27 @@ async fn agent_run_emits_genai_spans_without_payloads() {
 #[tokio::test]
 async fn agent_run_genai_google_provider_and_model() {
     capture();
-    let gemini = |contents| ProviderRequest::GeminiGenerateContent(google_request(contents));
-    let vertex =
-        |contents| ProviderRequest::Vertex(VertexGenerateContentRequest(google_request(contents)));
-    let cases: [(
-        &str,
-        ProviderName,
-        fn(Vec<GoogleContent>) -> ProviderRequest,
-        &str,
-        &str,
-    ); 2] = [
+    let cases = [
         (
             "gemini-agent",
             ProviderName::Google,
-            gemini,
             "gemini-2.5-pro",
             "gcp.gemini",
         ),
         (
             "vertex-agent",
             ProviderName::Vertex,
-            vertex,
             "gemini-2.5-flash",
             "gcp.vertex_ai",
         ),
     ];
-    for (agent_id, provider, request, model, provider_name) in cases {
+    for (agent_id, provider, model, provider_name) in cases {
+        let request = match provider {
+            ProviderName::Vertex => {
+                ProviderRequest::Vertex(VertexGenerateContentRequest(google_request(Vec::new())))
+            }
+            _ => ProviderRequest::GeminiGenerateContent(google_request(Vec::new())),
+        };
         let answer = google_answer("final-output-pii-marker");
         let response = match provider {
             ProviderName::Vertex => ProviderResponse::VertexGenerateContent(answer),
@@ -305,7 +300,7 @@ async fn agent_run_genai_google_provider_and_model() {
         let mut providers = ProviderRegistry::new();
         providers.register(Arc::new(mock));
         let prompt = Prompt::from_native(
-            SpecPrompt::new(request(Vec::new()), model, None, ResponseType::Text)
+            SpecPrompt::new(request, model, None, ResponseType::Text)
                 .expect("Google prompt builds"),
         );
         let agent = Agent::new(prompt).with_id(agent_id);

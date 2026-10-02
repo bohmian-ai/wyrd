@@ -175,12 +175,11 @@ impl Observe<'_> {
     ) -> Result<(), WyrdError> {
         let record = drift::observation(features, session_id)?;
         let started = self.run.state.started_bifrost()?;
-        let correlation = self.run.correlation();
-        for row in drift::rows(&record)? {
-            started
-                .bifrost
-                .insert_into(&started.drift, row, correlation.clone())?;
-        }
+        started.bifrost.insert_rows_into(
+            &started.drift,
+            drift::rows(&record)?,
+            self.run.correlation(),
+        )?;
         Ok(())
     }
 

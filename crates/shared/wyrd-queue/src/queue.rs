@@ -1,8 +1,11 @@
 //! The bounded staging, sealing, and retry owner for one producer.
 
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -87,6 +90,32 @@ impl SendEntry {
     }
 }
 
+/// One finished sink attempt, carrying its batch owner back for settlement.
+pub(crate) struct Attempt {
+    /// The sealed owner the attempt borrowed, returned untouched.
+    entry: SendEntry,
+    /// The sink settlement, or the elapsed send deadline.
+    result: Result<Result<DurableBatchAck, SinkError>, tokio::time::error::Elapsed>,
+}
+
+/// One sink attempt in flight that owns its sealed batch until it settles.
+///
+/// The future moves the batch owner in, lends it to the sink under the send
+/// deadline, and hands it back in an [`Attempt`]. Its owner can therefore keep
+/// staging and sealing other rows while the network round trip runs, and can
+/// still retain the exact batch identity and bytes when the outcome is
+/// ambiguous.
+pub(crate) struct InFlight(Pin<Box<dyn Future<Output = Attempt> + Send>>);
+
+impl Future for InFlight {
+    type Output = Attempt;
+
+    /// Polls the boxed attempt.
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Attempt> {
+        self.get_mut().0.as_mut().poll(cx)
+    }
+}
+
 /// Result of one sealing pass.
 #[derive(Debug, Default, Clone)]
 pub struct FlushOutcome {
@@ -108,11 +137,15 @@ pub trait Flushable: Send + Sync {
 }
 
 /// Concrete bounded staging and retry owner for one destination table.
+///
+/// Staged rows are sealed synchronously into the outbox, a FIFO of sealed
+/// batches awaiting the sink. A retained ambiguous batch returns to the front
+/// of the outbox, so it is always resent before any newer batch.
 pub struct RecordQueue {
     table: String,
     schema: SchemaRef,
     staging: Arc<ArrayQueue<Row>>,
-    retry: Mutex<VecDeque<RetryEntry>>,
+    outbox: Mutex<VecDeque<SendEntry>>,
     sink: Arc<dyn BatchSink<ClientByteGuard>>,
     config: QueueConfig,
     budget: ClientByteBudget,
@@ -134,7 +167,7 @@ impl RecordQueue {
             table,
             schema,
             staging,
-            retry: Mutex::new(VecDeque::new()),
+            outbox: Mutex::new(VecDeque::new()),
             sink,
             config,
             budget,
@@ -153,57 +186,101 @@ impl RecordQueue {
         self.staging.len()
     }
 
-    /// Returns whether staging or retained ambiguous batches remain.
+    /// Returns the fixed staging capacity, the largest batch a seal can coalesce.
+    #[must_use]
+    pub(crate) fn staging_capacity(&self) -> usize {
+        self.staging.capacity()
+    }
+
+    /// Returns whether staging or the outbox still holds unsettled work.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the outbox lock is poisoned.
     #[must_use]
     pub(crate) fn has_pending(&self) -> bool {
-        !self.staging.is_empty()
-            || !self
-                .retry
-                .lock()
-                .expect("retry lock is not poisoned")
-                .is_empty()
+        !self.staging.is_empty() || !self.outbox_is_empty()
     }
 
-    /// Returns the oldest retained batch identity for deterministic retry scheduling.
+    /// Returns whether no sealed batch is waiting for the sink.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the outbox lock is poisoned.
+    #[must_use]
+    pub(crate) fn outbox_is_empty(&self) -> bool {
+        self.outbox
+            .lock()
+            .expect("outbox lock is not poisoned")
+            .is_empty()
+    }
+
+    /// Returns the retained batch identity at the head of the outbox, if the
+    /// head is a retained ambiguity, for deterministic retry scheduling.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the outbox lock is poisoned.
     #[must_use]
     pub(crate) fn retry_batch_id(&self) -> Option<[u8; 16]> {
-        self.retry
+        match self
+            .outbox
             .lock()
-            .expect("retry lock is not poisoned")
+            .expect("outbox lock is not poisoned")
             .front()
-            .map(|entry| entry.batch.batch_id)
+        {
+            Some(SendEntry::Retained(entry)) => Some(entry.batch.batch_id),
+            _ => None,
+        }
     }
 
-    /// Moves one admitted entry into staging or, for an Arrow batch, seals and sends it.
+    /// Places one admitted entry without awaiting the sink.
     ///
-    /// A JSON row that still cannot be staged after one seal is counted as
-    /// dropped. An Arrow batch reaches the sink immediately; its durable
-    /// identity is recorded in `outcome` on acknowledgement.
+    /// A JSON row enters staging; the caller takes an entry only while staging
+    /// has room. An Arrow batch is sealed alone onto the back of the outbox.
     ///
     /// # Errors
     ///
-    /// Returns an Arrow batch's encode, size, byte-envelope, or transport
-    /// settlement error. A retryable settlement has already retained the exact
-    /// sealed owner for the scheduled retry. JSON rows never fail here.
+    /// Returns an Arrow batch's encode, size, or byte-envelope error after
+    /// settling its rows as lost. JSON rows never fail here.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a JSON row arrives while staging is full, which would mean
+    /// the caller took an entry it had no room to place.
+    pub(crate) fn place(&self, entry: Entry) -> Result<(), WyrdQueueError> {
+        match entry {
+            Entry::Row(row) => {
+                assert!(
+                    self.push(row).is_none(),
+                    "an entry is taken from the channel only while staging has room"
+                );
+                Ok(())
+            }
+            Entry::Batch(batch) => self.seal_batch(batch),
+        }
+    }
+
+    /// Places one admitted entry and sends every sealed batch the outbox holds.
+    ///
+    /// The control path's counterpart to [`Self::place`]: a flush or shutdown
+    /// is already waiting, so it settles an Arrow batch before taking the next
+    /// entry, recording acknowledged identities in `outcome`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::place`]'s error or the first send settlement error; a
+    /// retryable settlement has already retained the exact sealed owner.
     pub(crate) async fn ingest(
         &self,
         entry: Entry,
         outcome: &mut FlushOutcome,
     ) -> Result<(), WyrdQueueError> {
-        let row = match entry {
-            Entry::Row(row) => row,
-            Entry::Batch(batch) => return self.seal_batch(batch, outcome).await,
-        };
-        if let Some(row) = self.push(row) {
-            let _ = self.seal_and_send().await;
-            if self.push(row).is_some() {
-                self.settle_loss(1, None, WyrdQueueError::QueueFull.code());
-            }
-        }
-        Ok(())
+        self.place(entry)?;
+        self.send_outbox(outcome).await
     }
 
-    /// Seals one Arrow batch as its own frame and sends it through the retry owner.
+    /// Seals one Arrow batch as its own frame onto the back of the outbox.
     ///
     /// Before encoding, the array reservation grows to cover the arrays plus a
     /// frame of up to the message ceiling, since both are live while the
@@ -218,13 +295,12 @@ impl RecordQueue {
     /// overlap does not fit, or when the live-batch envelope is full,
     /// [`WyrdQueueError::PayloadTooLarge`] once the frame would exceed the
     /// message ceiling, and [`WyrdQueueError::SchemaParse`] when encoding
-    /// fails; those rows are settled as lost. Transport errors follow
-    /// [`Self::send_one`].
-    async fn seal_batch(
-        &self,
-        owned: OwnedBatch,
-        outcome: &mut FlushOutcome,
-    ) -> Result<(), WyrdQueueError> {
+    /// fails; those rows are settled as lost.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the outbox lock is poisoned.
+    fn seal_batch(&self, owned: OwnedBatch) -> Result<(), WyrdQueueError> {
         let OwnedBatch {
             batch,
             guard,
@@ -248,7 +324,13 @@ impl RecordQueue {
                 })
             });
         match sealed {
-            Ok(sealed) => self.send_one(SendEntry::Fresh(sealed), outcome).await,
+            Ok(sealed) => {
+                self.outbox
+                    .lock()
+                    .expect("outbox lock is not poisoned")
+                    .push_back(SendEntry::Fresh(sealed));
+                Ok(())
+            }
             Err(error) => {
                 self.settle_loss(rows, None, error.code());
                 Err(error)
@@ -282,7 +364,17 @@ impl RecordQueue {
         }
     }
 
-    /// Builds one IPC frame while a conservative frame reservation is live.
+    /// Builds one IPC frame while a frame reservation of the message ceiling
+    /// is live.
+    ///
+    /// The encoder is capped at that ceiling, so it never allocates past the
+    /// reservation that pays for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdQueueError::SchemaParse`] for a row that is not UTF-8 or
+    /// does not fit the schema, and [`WyrdQueueError::PayloadTooLarge`] once
+    /// the frame would exceed `max_message_bytes`.
     fn build_frame(&self, rows: &[Row]) -> Result<Vec<u8>, WyrdQueueError> {
         let mut builder = BatchBuilder::new(self.schema.clone());
         for row in rows {
@@ -291,14 +383,16 @@ impl RecordQueue {
             })?;
             builder.append_json_row(json, row.card_ref.as_ref(), row.run_id.as_ref())?;
         }
-        builder.finish_ipc()
+        encode_ipc(&builder.finish()?, self.config.max_message_bytes)
     }
 
-    /// Adds one ambiguous attempt to the bounded retry set without replacing its permit.
+    /// Returns one ambiguous attempt to the head of the outbox without
+    /// replacing its permit.
     ///
     /// A fresh ambiguity reserves its first retry slot; a retained attempt
-    /// reuses its existing permit. A fresh batch refused a slot is settled as
-    /// lost before its owner is released.
+    /// reuses its existing permit. The head position makes the same identity
+    /// the next batch sent. A fresh batch refused a slot is settled as lost
+    /// before its owner is released.
     ///
     /// # Errors
     ///
@@ -307,7 +401,7 @@ impl RecordQueue {
     ///
     /// # Panics
     ///
-    /// Panics if the retry lock is poisoned.
+    /// Panics if the outbox lock is poisoned.
     fn retain_retry(&self, entry: SendEntry) -> Result<(), WyrdQueueError> {
         let entry = match entry {
             SendEntry::Retained(entry) => entry,
@@ -322,10 +416,10 @@ impl RecordQueue {
                 }
             },
         };
-        self.retry
+        self.outbox
             .lock()
-            .expect("retry lock is not poisoned")
-            .push_back(entry);
+            .expect("outbox lock is not poisoned")
+            .push_front(SendEntry::Retained(entry));
         Ok(())
     }
 
@@ -354,25 +448,48 @@ impl RecordQueue {
         self.budget.report_loss(rows);
     }
 
-    /// Sends a borrowed batch within the configured deadline and records explicit ACKs.
+    /// Takes the head of the outbox into one owned sink attempt.
     ///
-    /// The queue owns `batch` across the entire await. A deadline cancels only
-    /// the borrow-based sink future, then moves that untouched owner into the
-    /// bounded retry state with the same UUIDv7.
+    /// The attempt lends the batch to the sink under the configured send
+    /// deadline. A deadline cancels only the borrowing sink future; the
+    /// untouched owner returns in the [`Attempt`] with the same UUIDv7.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the outbox lock is poisoned.
+    pub(crate) fn start(&self) -> Option<InFlight> {
+        let entry = self
+            .outbox
+            .lock()
+            .expect("outbox lock is not poisoned")
+            .pop_front()?;
+        let sink = Arc::clone(&self.sink);
+        let deadline = self.config.flush_timeout();
+        Some(InFlight(Box::pin(async move {
+            let result = tokio::time::timeout(deadline, sink.send(entry.batch())).await;
+            Attempt { entry, result }
+        })))
+    }
+
+    /// Settles one finished attempt and records an explicit ACK in `outcome`.
+    ///
+    /// An acknowledgement releases the owner. An ambiguous result or an
+    /// elapsed deadline retains the exact owner at the head of the outbox, and
+    /// a terminal refusal settles its rows as lost.
     ///
     /// # Errors
     ///
-    /// Returns [`WyrdQueueError::FlushTimeout`] after retaining the exact batch
-    /// on deadline expiry, a sink error after retry or terminal settlement, or
-    /// backpressure if the bounded retry state cannot retain the batch. Both
-    /// terminal settlement and refused retention settle the rows as lost.
-    async fn send_one(
+    /// Returns [`WyrdQueueError::FlushTimeout`] after retaining the batch on
+    /// deadline expiry, the sink error after retention or terminal
+    /// settlement, or backpressure when the bounded retry state cannot retain
+    /// the batch, which also settles its rows as lost.
+    pub(crate) fn settle(
         &self,
-        entry: SendEntry,
+        attempt: Attempt,
         outcome: &mut FlushOutcome,
     ) -> Result<(), WyrdQueueError> {
-        match tokio::time::timeout(self.config.flush_timeout(), self.sink.send(entry.batch())).await
-        {
+        let Attempt { entry, result } = attempt;
+        match result {
             Ok(Ok(DurableBatchAck { batch_id, rows })) => {
                 outcome.batch_ids.push(batch_id);
                 outcome.rows_flushed += rows as usize;
@@ -393,28 +510,40 @@ impl RecordQueue {
         }
     }
 
-    /// Seals all currently available work, moving rather than cloning each payload.
+    /// Sends every sealed batch in the outbox in order, awaiting each.
     ///
     /// # Errors
     ///
-    /// Returns queue backpressure, serialization, terminal sink, or ambiguous
-    /// transport errors. Retryable sink errors retain the original sealed owner.
-    pub async fn seal_and_send(&self) -> Result<FlushOutcome, WyrdQueueError> {
-        let mut outcome = FlushOutcome::default();
-        loop {
-            let retry = self
-                .retry
-                .lock()
-                .expect("retry lock is not poisoned")
-                .pop_front();
-            if let Some(retry) = retry {
-                self.send_one(SendEntry::Retained(retry), &mut outcome)
-                    .await?;
-                continue;
-            }
-            break;
+    /// Returns the first [`Self::settle`] error; the batches behind it stay
+    /// in the outbox, behind any retained head.
+    async fn send_outbox(&self, outcome: &mut FlushOutcome) -> Result<(), WyrdQueueError> {
+        while let Some(attempt) = self.start() {
+            let attempt = attempt.await;
+            self.settle(attempt, outcome)?;
         }
+        Ok(())
+    }
 
+    /// Seals all staged rows onto the back of the outbox without awaiting the sink.
+    ///
+    /// Each chunk reserves a frame of the message ceiling from the sealing
+    /// headroom before encoding, then shrinks it to the encoded size. A chunk
+    /// that cannot be framed is bisected so every encodable row still seals;
+    /// a single row that cannot be framed is settled as lost. Rows already
+    /// sealed stay in the outbox even when a later chunk fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdQueueError::Backpressure`] when the frame reservation or
+    /// the live-batch envelope is full, restoring every unsealed row to
+    /// staging, and the framing error of a lost row after restoring the rows
+    /// behind it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the outbox lock is poisoned or staging cannot restore rows
+    /// it just drained.
+    pub(crate) fn seal(&self) -> Result<(), WyrdQueueError> {
         let mut rows = self.drain();
         let chunk_size = self.config.flush_max_rows();
         let mut chunks = VecDeque::new();
@@ -427,7 +556,7 @@ impl RecordQueue {
             chunks.push_back(std::mem::replace(&mut rows, rest));
         }
         while let Some(mut chunk) = chunks.pop_front() {
-            let frame_guard = match self.budget.reserve(self.config.max_message_bytes) {
+            let frame_guard = match self.budget.reserve_sealing(self.config.max_message_bytes) {
                 Ok(guard) => guard,
                 Err(error) => {
                     chunk.extend(chunks.into_iter().flatten());
@@ -435,28 +564,24 @@ impl RecordQueue {
                     return Err(error);
                 }
             };
-            let frame = self.build_frame(&chunk);
-            let oversized = frame
-                .as_ref()
-                .is_ok_and(|frame| frame.len() > self.config.max_message_bytes);
-            if frame.is_err() || oversized {
-                drop(frame_guard);
-                if chunk.len() > 1 {
+            let frame = match self.build_frame(&chunk) {
+                Ok(frame) => frame,
+                Err(_) if chunk.len() > 1 => {
+                    drop(frame_guard);
                     let right = chunk.split_off(chunk.len() / 2);
                     chunks.push_front(right);
                     chunks.push_front(chunk);
                     continue;
                 }
-                let error = frame.err().unwrap_or(WyrdQueueError::PayloadTooLarge);
-                drop(chunk);
-                self.settle_loss(1, None, error.code());
-                let later = chunks.into_iter().flatten().collect();
-                self.restore_unsealed(later);
-                return Err(error);
-            }
-            let frame = frame.expect("successful frame result checked above");
-            let frame_guard = frame_guard.resize(frame.len());
-            let frame_guard = match frame_guard.attach_batch() {
+                Err(error) => {
+                    drop(frame_guard);
+                    drop(chunk);
+                    self.settle_loss(1, None, error.code());
+                    self.restore_unsealed(chunks.into_iter().flatten().collect());
+                    return Err(error);
+                }
+            };
+            let frame_guard = match frame_guard.resize(frame.len()).attach_batch() {
                 Ok(guard) => guard,
                 Err(error) => {
                     chunk.extend(chunks.into_iter().flatten());
@@ -472,11 +597,44 @@ impl RecordQueue {
                 request_id: None,
             };
             drop(chunk);
-            if let Err(error) = self.send_one(SendEntry::Fresh(batch), &mut outcome).await {
-                self.restore_unsealed(chunks.into_iter().flatten().collect());
-                return Err(error);
-            }
+            self.outbox
+                .lock()
+                .expect("outbox lock is not poisoned")
+                .push_back(SendEntry::Fresh(batch));
         }
+        Ok(())
+    }
+
+    /// Sends the outbox, seals staging, and sends what that sealed, in order.
+    ///
+    /// Batches sealed before a framing failure are still sent before the
+    /// failure is reported, so one unframeable row never holds back its
+    /// neighbours.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first send settlement error, or [`Self::seal`]'s error once
+    /// every batch it did seal has been sent.
+    pub(crate) async fn flush_into(
+        &self,
+        outcome: &mut FlushOutcome,
+    ) -> Result<(), WyrdQueueError> {
+        self.send_outbox(outcome).await?;
+        let sealed = self.seal();
+        self.send_outbox(outcome).await?;
+        sealed
+    }
+
+    /// Seals and sends all currently available work, moving rather than
+    /// cloning each payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns queue backpressure, serialization, terminal sink, or ambiguous
+    /// transport errors. Retryable sink errors retain the original sealed owner.
+    pub async fn seal_and_send(&self) -> Result<FlushOutcome, WyrdQueueError> {
+        let mut outcome = FlushOutcome::default();
+        self.flush_into(&mut outcome).await?;
         Ok(outcome)
     }
 }

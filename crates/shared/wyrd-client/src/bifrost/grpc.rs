@@ -111,10 +111,10 @@ impl BifrostGrpcTransport {
     /// Returns the shortest send deadline a caller may put around
     /// [`IngestTransport::insert_batch`] without cancelling this transport.
     ///
-    /// The transport settles every batch within its attempt budget; one more
-    /// per-call deadline of slack lets that terminal result reach the caller
-    /// before the caller's own deadline, which would otherwise cancel the
-    /// transport, retain the batch, and later restart its attempts from zero.
+    /// The transport resolves every batch within its attempt budget; one more
+    /// per-call deadline of slack lets that result, terminal or retained
+    /// ambiguity, reach the caller before the caller's own deadline cancels
+    /// the transport mid-budget.
     #[must_use]
     pub(crate) fn send_deadline(&self) -> Duration {
         self.attempt_budget()
@@ -173,17 +173,28 @@ impl BifrostGrpcTransport {
     ///
     /// # Errors
     ///
-    /// Returns the refusal that ended the attempts, or the mapped
-    /// authentication failure when the forced refresh itself fails.
+    /// Returns [`SinkError::Retryable`] when the attempts end on an ambiguous
+    /// or busy refusal, or after any earlier attempt was ambiguous, because
+    /// the server may then hold the batch and only a resend of the same
+    /// identity can tell. Returns [`SinkError::Terminal`] for a definite
+    /// refusal with no earlier ambiguity, including a failed forced refresh.
     async fn send_owned_bytes(
         &self,
         table: &str,
         batch_id: [u8; 16],
         request_id: Option<&RequestId>,
         arrow_ipc: Bytes,
-    ) -> Result<(), WyrdError> {
+    ) -> Result<(), SinkError> {
         let mut retry_number = 0_u32;
         let mut refreshed = false;
+        let mut uncertain = false;
+        let settle = |error: WyrdError, retryable: bool| {
+            if retryable {
+                SinkError::Retryable(error)
+            } else {
+                SinkError::Terminal(error)
+            }
+        };
         loop {
             let request = InsertBatchRequest {
                 table: table.to_owned(),
@@ -198,13 +209,14 @@ impl BifrostGrpcTransport {
                         .auth()
                         .force_refresh()
                         .await
-                        .map_err(auth_error_to_wyrd)?;
+                        .map_err(|error| settle(auth_error_to_wyrd(error), uncertain))?;
                 }
                 Err(error) if error.retryable && retry_number < self.config.max_frame_retries => {
+                    uncertain = true;
                     tokio::time::sleep(retry_delay(retry_number)).await;
                     retry_number = retry_number.saturating_add(1);
                 }
-                Err(error) => return Err(error.error),
+                Err(error) => return Err(settle(error.error, error.retryable || uncertain)),
             }
         }
     }
@@ -263,14 +275,16 @@ impl IngestTransport<ClientByteGuard> for BifrostGrpcTransport {
     ///
     /// # Errors
     ///
-    /// Returns [`SinkError::Terminal`] for frame validation, every permanent
-    /// server refusal, and the last ambiguous unavailability or stable
-    /// `WYRD_VALA_429_INGEST_BUSY` once this transport's bounded retry budget,
-    /// the single retry owner, is exhausted with the same UUID and bytes. The
-    /// whole operation, including authentication waits and refresh, ends
-    /// within that budget, terminally unavailable when it runs out.
-    /// Cancellation before an ACK leaves the queue's borrowed UUID, bytes, and
-    /// permit intact for retry resolution.
+    /// Returns [`SinkError::Terminal`] for frame validation and every definite
+    /// server refusal. Returns [`SinkError::Retryable`] with the last ambiguous
+    /// unavailability or stable `WYRD_VALA_429_INGEST_BUSY` once this
+    /// transport's bounded retry budget is exhausted with the same UUID and
+    /// bytes, and when the whole operation, including authentication waits
+    /// and refresh, outlives that budget: the outcome is then unknown, so the
+    /// queue retains the batch and resends the same identity later rather
+    /// than counting a possibly durable batch as lost. Cancellation before an
+    /// ACK likewise leaves the queue's borrowed UUID, bytes, and permit intact
+    /// for retry resolution.
     async fn insert_batch(
         &self,
         batch: &SealedBatch<ClientByteGuard>,
@@ -289,12 +303,15 @@ impl IngestTransport<ClientByteGuard> for BifrostGrpcTransport {
         );
         tokio::time::timeout(self.attempt_budget(), send)
             .await
-            .unwrap_or_else(|_| Err(transport_unavailable("attempt budget exhausted before ACK")))
+            .unwrap_or_else(|_| {
+                Err(SinkError::Retryable(transport_unavailable(
+                    "attempt budget exhausted before ACK",
+                )))
+            })
             .map(|()| DurableBatchAck {
                 batch_id: batch.batch_id,
                 rows: batch.rows,
             })
-            .map_err(SinkError::Terminal)
     }
 }
 
@@ -637,8 +654,8 @@ mod tests {
             .await
             .expect_err("a sink that stays busy exhausts the retry budget");
         assert!(
-            matches!(&error, SinkError::Terminal(error) if error.code() == "WYRD_VALA_429_INGEST_BUSY"),
-            "exhaustion settles terminally with the last refusal: {error:?}"
+            matches!(&error, SinkError::Retryable(error) if error.code() == "WYRD_VALA_429_INGEST_BUSY"),
+            "exhaustion asks the queue to retain the batch with the last refusal: {error:?}"
         );
         assert_eq!(
             service.attempts.load(Ordering::Acquire),
@@ -712,27 +729,31 @@ mod tests {
         }
     }
 
-    /// Settles `sends` consecutive one-row batches, each enqueued and flushed
-    /// in turn, through a real facade over `credential` against `service`,
-    /// whose producer asks for a 1 ms send deadline, then shuts the facade
-    /// down. `http_timeout_ms` bounds each token exchange and
-    /// so sizes the transport's authentication budget.
+    /// Sends `sends` consecutive one-row batches, each enqueued and flushed in
+    /// turn, through a real facade over `credential` against `service`, whose
+    /// producer asks for a 1 ms send deadline, then shuts the facade down.
+    /// `http_timeout_ms` bounds each token exchange and so sizes the
+    /// transport's authentication budget.
     ///
-    /// Returns the RPC attempts `attempts` counted after the flushes and after
-    /// shutdown, the loss observer's reports, and the facade's auth owner.
+    /// Every send ends without an acknowledgement, so the outcome is
+    /// ambiguous: the queue must retain the oldest batch with its bytes and
+    /// retry slot, report no loss, and refuse to report shutdown as drained.
+    ///
+    /// Returns the RPC attempts `attempts` counted when the flushes returned,
+    /// the loss observer's reports, and the facade's auth owner.
     ///
     /// # Panics
     ///
-    /// Panics when the service, facade, or batch cannot be built, when the
-    /// flush returns an unexpected error, shutdown fails, or the settled batch
-    /// keeps bytes, a live batch, or a retry entry.
-    async fn settle_held_batch<S: BifrostIngestService>(
+    /// Panics when the service, facade, or batch cannot be built, when a
+    /// flush returns an unexpected error, the ambiguous batch releases its
+    /// ownership, or shutdown reports the unacknowledged batch as drained.
+    async fn retain_held_batch<S: BifrostIngestService>(
         service: S,
         attempts: &AtomicUsize,
         credential: ResolvedCredential,
         http_timeout_ms: u64,
         sends: usize,
-    ) -> (usize, usize, Vec<u64>, Arc<AuthMiddleware>) {
+    ) -> (usize, Vec<u64>, Arc<AuthMiddleware>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test port binds");
         let address = listener.local_addr().expect("test address resolves");
         drop(listener);
@@ -790,40 +811,50 @@ mod tests {
                 .expect("batch admitted");
             match bifrost.flush().await {
                 Ok(())
-                | Err(BifrostClientError::Queue(WyrdQueueError::Sink(
-                    WyrdError::ServiceUnavailable { .. },
-                ))) => {}
+                | Err(BifrostClientError::Queue(
+                    WyrdQueueError::Sink(WyrdError::ServiceUnavailable { .. })
+                    | WyrdQueueError::FlushTimeout,
+                )) => {}
                 Err(error) => panic!("unexpected flush failure: {error}"),
             }
         }
         let flushed = attempts.load(Ordering::Acquire);
         let metrics = bifrost.metrics();
-        assert_eq!(metrics.owned_bytes, 0, "loss releases the batch bytes");
-        assert_eq!(metrics.live_batches, 0);
-        assert_eq!(metrics.retry_entries, 0, "loss releases retry ownership");
+        assert!(metrics.owned_bytes > 0, "ambiguity retains the batch bytes");
+        assert!(metrics.live_batches >= 1, "ambiguity retains the batch");
+        assert_eq!(
+            metrics.retry_entries, 1,
+            "the oldest ambiguity holds the retry slot"
+        );
 
-        bifrost.shutdown().await.expect("nothing is left to drain");
+        bifrost
+            .shutdown()
+            .await
+            .expect_err("an unacknowledged batch is not drained");
         server.abort();
         let losses = losses.lock().await.clone();
-        (flushed, attempts.load(Ordering::Acquire), losses, auth)
+        (flushed, losses, auth)
     }
 
     /// A producer whose own send deadline is shorter than one call cannot
     /// cancel and restart the transport's attempt budget: the facade raises it,
-    /// so a batch held at every call's deadline receives exactly the configured
-    /// attempts, settles as one loss that releases its bytes and retry slot,
-    /// and shutdown starts no fresh attempt set.
+    /// so a flushed batch held at every call's deadline receives the full
+    /// configured attempt set, and the ambiguous outcome retains the batch
+    /// instead of reporting a loss.
+    ///
+    /// The upper bound allows the retained batch's scheduled retry, which may
+    /// reach the service before the count is read, but never a second whole
+    /// attempt set inside the one flush.
     ///
     /// # Panics
     ///
-    /// Panics when the batch is attempted other than the configured number of
-    /// times, its loss is reported other than once, ownership is retained, or
-    /// shutdown sends it again.
+    /// Panics when the flush covers other than one attempt set, a loss is
+    /// reported, or the batch's ownership is released.
     #[tokio::test]
-    async fn held_calls_exhaust_one_transport_budget_then_settle_once() {
+    async fn held_calls_exhaust_one_transport_budget_then_retain() {
         let service = HeldIngest::default();
         let attempts = Arc::clone(&service.attempts);
-        let (flushed, shut_down, losses, _auth) = settle_held_batch(
+        let (flushed, losses, _auth) = retain_held_batch(
             service,
             &attempts,
             ResolvedCredential::BearerToken(SecretString::from("test-token")),
@@ -832,12 +863,11 @@ mod tests {
         )
         .await;
         let configured = BifrostTransportConfig::default().max_frame_retries as usize + 1;
-        assert_eq!(flushed, configured, "one attempt set");
-        assert_eq!(
-            shut_down, configured,
-            "shutdown starts no fresh attempt set"
+        assert!(
+            (configured..2 * configured).contains(&flushed),
+            "one attempt set: {flushed}"
         );
-        assert_eq!(losses, vec![1], "exactly one loss settles");
+        assert!(losses.is_empty(), "ambiguity is not a loss: {losses:?}");
     }
 
     /// Real gRPC service refusing the first minted credential as
@@ -876,8 +906,9 @@ mod tests {
     /// slower than a whole call, and every later call held to its deadline,
     /// the refresh spends the transport's one budget instead of extending it
     /// past the producer's send deadline: the accepted batch receives at most
-    /// the configured attempt set, settles as one loss that releases its bytes
-    /// and retry slot, and shutdown starts no fresh attempt set.
+    /// the configured attempt set (plus the retained batch's first scheduled
+    /// retry, which may land before the count is read), and the ambiguous
+    /// outcome retains the batch instead of reporting a loss.
     ///
     /// # Panics
     ///
@@ -885,14 +916,14 @@ mod tests {
     /// the configured attempt set, its loss is reported other than once,
     /// ownership is retained, or shutdown sends it again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn delayed_refresh_spends_one_transport_budget_then_settles_once() {
+    async fn delayed_refresh_spends_one_transport_budget_then_retains() {
         let service = RefreshHeldIngest::default();
         let attempts = Arc::clone(&service.attempts);
         let source = Arc::new(SequencedSource {
             minted: AtomicUsize::new(0),
             refresh_delay: Duration::from_millis(200),
         });
-        let (flushed, shut_down, losses, _auth) = settle_held_batch(
+        let (flushed, losses, _auth) = retain_held_batch(
             service,
             &attempts,
             ResolvedCredential::Renewable(source.clone()),
@@ -907,18 +938,17 @@ mod tests {
             "one forced refresh"
         );
         assert!(
-            (2..=attempt_set).contains(&flushed),
+            (2..=attempt_set + 1).contains(&flushed),
             "the refusal is resent within one attempt set: {flushed}"
         );
-        assert_eq!(shut_down, flushed, "shutdown starts no fresh attempt set");
-        assert_eq!(losses, vec![1], "exactly one loss settles");
+        assert!(losses.is_empty(), "ambiguity is not a loss: {losses:?}");
     }
 
     /// A renewable mint that blocks past the whole transport budget cannot
     /// hold the queue's send: the transport's deadline still fires, so each
-    /// flush completes, every batch settles as one loss that releases its
-    /// bytes and retry slot, and shutdown mints and sends nothing more, all
-    /// before the source is released. A second batch sent after the first
+    /// flush and the shutdown complete, the oldest batch is retained rather
+    /// than reported lost, and no RPC attempt starts, all before the source is
+    /// released. A second batch sent after the first
     /// deadline cancelled its waiter reuses the still-running mint instead of
     /// starting another. Once released, the same auth owner serves that
     /// mint's token and refreshes normally.
@@ -926,10 +956,10 @@ mod tests {
     /// # Panics
     ///
     /// Panics when a flush or shutdown is not bounded, an RPC attempt or a
-    /// second concurrent mint starts, a loss is reported other than once per
-    /// batch, ownership is retained, or the released owner cannot authenticate.
+    /// second concurrent mint starts, a loss is reported, ownership is
+    /// released, or the released owner cannot authenticate.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blocking_mint_spends_one_transport_budget_then_settles_once() {
+    async fn blocking_mint_spends_one_transport_budget_then_retains() {
         for sends in [1, 2] {
             let service = HeldIngest::default();
             let attempts = Arc::clone(&service.attempts);
@@ -938,9 +968,9 @@ mod tests {
                 minted: AtomicUsize::new(0),
                 held: std::sync::Mutex::new(held),
             });
-            let (flushed, shut_down, losses, auth) = tokio::time::timeout(
+            let (flushed, losses, auth) = tokio::time::timeout(
                 Duration::from_secs(30),
-                settle_held_batch(
+                retain_held_batch(
                     service,
                     &attempts,
                     ResolvedCredential::Renewable(source.clone()),
@@ -955,8 +985,8 @@ mod tests {
                 1,
                 "later sends and shutdown reuse the one running mint"
             );
-            assert_eq!((flushed, shut_down), (0, 0), "no RPC attempt starts");
-            assert_eq!(losses, vec![1; sends], "exactly one loss per batch");
+            assert_eq!(flushed, 0, "no RPC attempt starts");
+            assert!(losses.is_empty(), "ambiguity is not a loss: {losses:?}");
 
             drop(release);
             auth.bearer()

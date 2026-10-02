@@ -3657,13 +3657,16 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// The bounded client ingestion queue could not accept the row after bounded backoff.
+    /// The bounded client ingestion queue could not accept a record now.
+    ///
+    /// Admission is immediate and all-or-none, so a refused record admitted
+    /// no row and may be resubmitted whole.
     #[error("[WYRD_CLIENT_429_QUEUE_FULL] {message}")]
     #[wyrd_error(
         code = "WYRD_CLIENT_429_QUEUE_FULL",
         status = 429,
         title = "Client ingestion queue is saturated",
-        remediation = "Slow the producer, raise the queue capacity, or flush more often; every refusal bumps the drop counter."
+        remediation = "No row of the refused record was admitted: flush or back off, then resubmit the same record. Sustained refusals mean the producer outpaces delivery; every refusal bumps the drop counter."
     )]
     ClientQueueFull {
         /// Human-readable error message.

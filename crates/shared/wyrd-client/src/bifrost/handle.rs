@@ -92,7 +92,7 @@ impl WriterPool {
             scope,
             sink,
             config,
-            budget: ClientByteBudget::new(config.client_byte_limit()),
+            budget: ClientByteBudget::for_config(&config),
             producers: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             direct_sends: Mutex::new(0),
@@ -197,6 +197,32 @@ impl WriterPool {
     ) -> Result<(), WyrdQueueError> {
         self.producer_for(table, schema)?
             .enqueue(json, card_ref, run_id)
+    }
+
+    /// Enqueue every row of one logical record, or none of them, propagating
+    /// queue-full.
+    ///
+    /// The multi-row counterpart to [`Self::insert`], for a record that
+    /// projects to several rows sharing one correlation, such as a Drift
+    /// observation's tall feature rows. A refusal admits no row, so the caller
+    /// may resubmit the whole record without duplicating a prefix.
+    ///
+    /// # Errors
+    /// Returns [`WyrdQueueError::QueueFull`] when the pool has closed or the
+    /// producer channel cannot take every row now,
+    /// [`WyrdQueueError::Backpressure`] when the producer ceiling or byte
+    /// budget cannot admit them, and [`WyrdQueueError::PayloadTooLarge`] when
+    /// the record has more rows than the channel can ever hold.
+    pub(crate) fn insert_rows(
+        &self,
+        table: &str,
+        schema: &SchemaRef,
+        rows: Vec<Vec<u8>>,
+        card_ref: Option<CardRef>,
+        run_id: Option<RunId>,
+    ) -> Result<(), WyrdQueueError> {
+        self.producer_for(table, schema)?
+            .enqueue_rows(rows, card_ref, run_id)
     }
 
     /// Enqueue one owned Arrow batch for `table` without awaiting publication.

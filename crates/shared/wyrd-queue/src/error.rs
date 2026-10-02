@@ -12,10 +12,12 @@ use wyrd_spec::error::WyrdError;
 /// Concrete error produced by the producer, queue, and batch builder.
 #[derive(thiserror::Error, Debug)]
 pub enum WyrdQueueError {
-    /// The bounded ingestion channel is saturated and, after bounded backoff,
-    /// still cannot accept the row (or the queue has been drained and is closed).
-    /// Client-tier `WYRD_CLIENT_429_QUEUE_FULL`. Always paired with a drop-counter
-    /// bump — never a silent drop.
+    /// The bounded ingestion channel cannot take every row of the record now,
+    /// or the queue has been drained and is closed. Admission is immediate
+    /// and all-or-none: no row of the refused record was admitted, so the
+    /// caller may flush or back off and resubmit it without duplication.
+    /// Client-tier `WYRD_CLIENT_429_QUEUE_FULL`. Always paired with a
+    /// drop-counter bump — never a silent drop.
     #[error("queue full: ingestion channel saturated")]
     QueueFull,
 
@@ -29,10 +31,12 @@ pub enum WyrdQueueError {
     #[error("flush timed out before the drain deadline")]
     FlushTimeout,
 
-    /// A single sealed batch (or a single row that alone exceeds the ceiling)
-    /// cannot fit under `max_message_bytes`. Client-tier
-    /// `WYRD_CLIENT_413_PAYLOAD_TOO_LARGE`.
-    #[error("payload too large: sealed row exceeds max_message_bytes")]
+    /// A single row alone cannot fit under `max_message_bytes`, or one
+    /// record has more rows than the ingestion channel can ever hold.
+    /// Retrying cannot succeed. Client-tier `WYRD_CLIENT_413_PAYLOAD_TOO_LARGE`.
+    #[error(
+        "payload too large: a row exceeds max_message_bytes or a record exceeds channel capacity"
+    )]
     PayloadTooLarge,
 
     /// A schema could not be mapped, or a row value failed its column's

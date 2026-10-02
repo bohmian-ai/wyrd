@@ -383,6 +383,39 @@ impl Bifrost {
             .map_err(Into::into)
     }
 
+    /// Enqueue every JSON row of one logical record into a described table, or
+    /// none of them.
+    ///
+    /// The multi-row counterpart to [`Self::insert_into`]: every row carries
+    /// the same correlation, and admission is all-or-none, so after a
+    /// `WYRD_CLIENT_429_QUEUE_FULL` refusal the caller may drain with
+    /// [`Self::flush`] or back off and resubmit the whole record without
+    /// duplicating any row. Durable only after [`Self::flush`] or
+    /// [`Self::shutdown`] resolves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostClientError::Queue`] with `WYRD_CLIENT_429_QUEUE_FULL`
+    /// when the producer cannot admit every row now, and with
+    /// `WYRD_CLIENT_413_PAYLOAD_TOO_LARGE` when the record has more rows than
+    /// one producer can ever admit at once.
+    pub fn insert_rows_into(
+        &self,
+        table: &WriterTable,
+        rows: Vec<Vec<u8>>,
+        correlation: Correlation,
+    ) -> Result<(), BifrostClientError> {
+        self.writer
+            .insert_rows(
+                table.fqn(),
+                table.user_schema(),
+                rows,
+                correlation.card_ref,
+                correlation.run_id,
+            )
+            .map_err(Into::into)
+    }
+
     /// The active write binding, if any.
     ///
     /// # Panics

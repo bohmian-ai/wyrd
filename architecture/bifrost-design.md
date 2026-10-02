@@ -971,6 +971,15 @@ streaming, and query lifecycle behavior. Internal `QueryClient` and
 `BifrostGrpcTransport` mechanics are not sibling public clients. Gate is the
 server dispatcher, not a deployment target or language-SDK owner.
 
+Buffered ingestion admits one logical record, such as every tall row of one
+Drift observation, immediately and all-or-none: either every row is admitted
+or none is and the caller receives `WYRD_CLIENT_429_QUEUE_FULL`, so flushing or
+backing off and resubmitting the same record cannot duplicate a prefix.
+Admission never waits on a network send. A send that ends without a definite
+ACK or refusal, including an exhausted transport retry budget, retains its
+batch and stable UUIDv7 for a later retry; only a definite refusal settles the
+batch as a counted loss.
+
 The surface includes:
 
 - table management under `/v1/bifrost/tables`;

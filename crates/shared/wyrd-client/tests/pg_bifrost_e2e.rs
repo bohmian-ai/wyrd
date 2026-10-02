@@ -1344,13 +1344,20 @@ mod pg_tests {
         srv.shutdown().await.expect("server shutdown");
     }
 
-    /// Proves that an ambiguous post-receipt deadline is resolved by the transport
-    /// retry owner alone: the same UUIDv7 is resent inside one sink attempt, the
-    /// server deduplicates the already-durable append, and the exhausted budget
-    /// settles the owner terminally — releasing its bytes and counting the loss
-    /// exactly once instead of leaving a retained owner for a later flush.
+    /// Proves that an ambiguous post-receipt deadline keeps its evidence until
+    /// reconciliation: the transport resends the same UUIDv7 inside one sink
+    /// attempt, its exhausted budget returns the ambiguity to the queue, which
+    /// retains the owner and its bytes instead of counting a loss, and the
+    /// queue's scheduled retry resends that same UUIDv7 until the server
+    /// deduplicates it against the already-durable append and acknowledges.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the first flush is not ambiguous, the queue drops or
+    /// releases the ambiguous owner, a retry changes the batch identity, the
+    /// retry never acknowledges, or the durable table holds other than one row.
     #[tokio::test]
-    async fn public_sdk_owned_batch_timeout_retry_deduplicates_and_settles() {
+    async fn public_sdk_owned_batch_timeout_retry_retains_then_deduplicates() {
         let srv = WyrdTestServer::builder()
             .with_wal_sync_delay(Duration::from_millis(750))
             .start_bound()
@@ -1445,32 +1452,55 @@ mod pg_tests {
             1,
             "the transport owns every resend, so the queue made one sink attempt: {attempts:?}"
         );
+        let retained = bifrost.metrics();
+        assert!(
+            retained.owned_bytes > 0,
+            "the ambiguous owner keeps its bytes: {retained:?}"
+        );
+        assert_eq!(
+            retained.retry_entries, 1,
+            "the queue retains the ambiguous owner for retry: {retained:?}"
+        );
+        assert_eq!(
+            retained.pending_controls, 0,
+            "the failed flush released its control slot: {retained:?}"
+        );
+        assert_eq!(
+            retained.dropped_rows, 0,
+            "ambiguity is not a loss: {retained:?}"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while bifrost.metrics().retry_entries > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the scheduled retry never reconciled the ambiguous batch: {:?}",
+                bifrost.metrics()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let attempts = recording.attempts();
+        assert!(
+            attempts.len() >= 2,
+            "the queue retried the retained owner: {attempts:?}"
+        );
+        assert!(
+            attempts
+                .iter()
+                .all(|(batch_id, _)| *batch_id == attempts[0].0),
+            "every retry carries the original UUIDv7: {attempts:?}"
+        );
         let settled = bifrost.metrics();
         assert_eq!(
-            settled.owned_bytes, 0,
-            "the exhausted retry budget releases the owner's bytes: {settled:?}"
-        );
-        assert_eq!(
-            settled.live_batches, 0,
-            "the exhausted retry budget releases the live batch slot: {settled:?}"
-        );
-        assert_eq!(
-            settled.retry_entries, 0,
-            "the queue never becomes a second retry owner: {settled:?}"
-        );
-        assert_eq!(
-            settled.pending_controls, 0,
-            "the failed flush released its control slot: {settled:?}"
-        );
-        assert_eq!(
-            settled.dropped_rows, 1,
-            "the ambiguous batch is counted lost exactly once: {settled:?}"
+            (settled.live_batches, settled.dropped_rows),
+            (0, 0),
+            "the acknowledged retry released the owner without a loss: {settled:?}"
         );
 
         bifrost
             .flush()
             .await
-            .expect("the settled queue has nothing left to flush");
+            .expect("the reconciled queue has nothing left to flush");
 
         srv.flush_bifrost()
             .await

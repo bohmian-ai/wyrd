@@ -3,7 +3,7 @@ id: TASK-008
 kind: implementation
 status: proposed
 spec: SPEC-verified-change-contract
-spec_revision: 35
+spec_revision: 47
 requirements: [REQ-089, REQ-101, REQ-114, REQ-151, REQ-152, INV-015, AC-017, AC-020, AC-021, AC-022, AC-023, AC-024, AC-030, AC-032, AC-033]
 depends_on: [TASK-005, TASK-006, TASK-007, TASK-009, TASK-010]
 ---
@@ -177,3 +177,49 @@ does not justify weakening proof.
 - `architecture/wyrd-security-posture.md`
 - `architecture/references/languages/testing-workflows.md`
 - `AGENTS.md`
+
+## Implementation Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Rust/Python/TypeScript Service journeys with PSI, SPC, Custom, deterministic Eval, and local LLM-judge Eval bindings, each ending in a delivered failed-result Operator read from Run GET | `sdks/wyrd-sdk-rust/tests/drift_verification.rs`; `sdks/wyrd-sdk-python/tests/integration/test_drift_journey.py`; `sdks/wyrd-sdk-ts/tests/integration/drift-verification.test.ts`; judge rooted at the gateway mock (`WyrdTestServer::with_gateway_provider_root_for_test`) | `service_verifies_drift_and_eval_through_the_sdk`; `test_service_bindings_verify_drift_and_eval_through_an_http_operator`; "verifies one Service through Drift, Eval, and an Operator end to end" | PASS |
+| Python spans inside `state.run(card=...)` carry run ID and CardRef through OTLP; joins to custom rows by `run_id` and Eval rows by span; nested scopes, asyncio isolation, invalid hex, stale-writer fence | `test_observe_journey.py`; `observe_run.rs`; `observe-run.test.ts` | `scoped_run_emits_drift_eval_and_generic_rows`; Python and TS observe journeys | PASS |
+| AC-021 payload-form parity and refusal of values the wire cannot represent | `wyrd-client/src/observe/drift.rs::check_integer_literals` (bounded correction) | `observe::tests::drift_json_refuses_integer_literals_beyond_64_bits`; `test_drift_refuses_unrepresentable_payloads_before_admission`; `test_drift_accepts_a_pydantic_model` | PASS |
+| HTTP/MCP manual and direct runs: requester identity, null direct owner/binding, idempotency, unauthorized and cross-tenant refusals, Bifrost result query | `pg_verification_routes.rs`; MCP `an_agent_runs_a_verifier_directly_and_reads_its_result`; `verification_run.rs::assert_verifier_kind_contract` | `test:wyrd`, `test:bifrost:journey:mcp`, `test:bifrost:journey:sdk` | PASS |
+| Multi-server result writing, SYSTEM identity/table matrix, public principal refusals, one raw observation feeding two bindings | `pg_grpc_ingest_smoke.rs::{forged_tenant_result_writes_are_refused, system_writer_matrix_spans_every_builtin_table, system_owner_token_cannot_write_a_customer_result}`; `verification_runtime.rs::two_bindings_share_one_client_observation`; `pg_verification_routes.rs::system_writer_token_is_refused_by_every_public_token_grant` | `verify:bifrost`, `test:wyrd` | PASS |
+| SYSTEM-token contract violations return client errors, not 500s | `wyrd-auth-verify/src/lib.rs` (SYSTEM_OWNER tenant -> 401); `wyrd-auth/src/exchange_api_key.rs::delegation_chain` (SYSTEM subject -> 400 `WYRD_SPEC_400_VALIDATION`, `details.reason="subject_is_system"`) (bounded corrections) | `tests::into_verified_rejects_every_system_contract_violation`; `system_writer_token_is_refused_by_every_public_token_grant` | PASS |
+| Daily partitions, result Bloom columns, partition and row-group pruning, one result event time across ACKs | `vala-bifrost-redux/src/tables/mod.rs` schema test pins the managed envelope and Bloom union; `verification_runtime.rs::result_layout_partitions_blooms_and_prunes_by_result` | `verify:bifrost` | PASS |
+| Restart, shutdown drain, lease reclaim, retry, saturation fairness, supervisor health, secret-free telemetry | `pg_operator_delivery.rs` and `pg_verification_*` tests listed in the task scope; `wyrd-testing/src/logs.rs::LogCapture` | `test:operators:integration`, `test:wyrd` | PASS |
+| PostgreSQL-owned activity, schedule, claim, lease, and dispatch deadlines | activity stamp bracketed by `statement_timestamp()` in `pg_verification_bindings.rs`; tests move DB rows (`make_binding_due`, `make_retries_due`) | `test:wyrd` | PASS |
+| Operator connection CRUD, rotation, redaction, Slack/PagerDuty/HTTP fixtures, CLI, MCP, cross-tenant | `pg_operator_connection_routes.rs`; `operator_connections.rs` (Rust SDK); `operator-connections.test.ts`; CLI `cli_manages_redacted_operator_connections`; MCP `an_agent_administers_redacted_connections` | `test:operators:integration`, `test:wyrdstate:journey`, `test:cli:journey`, `test:bifrost:journey:typescript` | PASS |
+| Exact Card-bound exchanges activate owners; delegation, SYSTEM mint, and lapse do not | `pg_verification_bindings.rs::runtime_activity_follows_only_qualifying_exchanges` | `test:wyrd` | PASS |
+| Verifier Card contract refusals leave no writes; Workflow Operator refused in `on_failure` | `pg_card_registration_route.rs::verifier_contract_refusals_leave_no_writes`; CLI `cli_enforces_the_verifier_card_contract` | `test:cards:integration`, `test:wyrd`, `test:cli:journey` | PASS |
+| No stale retired route/table/check reference; journeys registered | `vala-sql` migration test asserts `vala.drift_alerts` absent; `EVAL_PROFILE_UID` removed; `vala-core` removed from CI codegen packages; `policy_hook` removed from the pools allowlist; new journeys registered in `mise.toml`; `test:operators:integration` and release-gated `test:operators:smoke:live` lanes added | `codegen:check`, `check:from-pools-allowlist`, every lane below | PASS |
+| REQ-114 architecture and public docs | `architecture/wyrd-design.md` PagerDuty routing; Policy invoke-gate prose removed; shipped Verifier/Trigger/Operator docs; Bifrost verification table schema; Operator connection configuration, CLI, authorization, and how-to pages | `docs:check`, `check:skills-sync` | PASS |
+
+Lanes run sequentially in this session, all exit 0: `fmt`, `py:format`,
+`codegen:check`, `check:client-tier`, `check:pyo3-scope`,
+`check:tenant-isolation`, `check:registry-tx-coupling`,
+`check:from-pools-allowlist`, `check:unwrap-audit`, `lints`, `py:lints`,
+`py:typecheck`, `ts:typecheck`, `ts:napi:check`, `test:cards:integration`,
+`test:principals:integration`, `test:sql`, `test:shared`, `test:vala`,
+`test:wyrd`, `test:wyrd-sdk`, `verify:bifrost`, `test:wyrdstate:journey`,
+`test:platform:journey`, `test:cli:journey`, `test:bifrost:journey:sdk`,
+`test:bifrost:journey:server`, `test:bifrost:journey:mcp`,
+`test:bifrost:journey:python`, `test:bifrost:journey:typescript`,
+`test:operators:integration`, `py:test:unit`, `py:test:integration`,
+`ts:test:unit`, `ts:test:integration`, `docs:check`, `check:skills-sync`,
+`git diff --check`.
+
+Diagnosis (`test:wyrd`):
+- **Symptom:** `wyrd-spec vala::trace::attributes_tests::wyrd_keys_count_locked` failed with `left: 8, right: 9`.
+- **Evidence:** `crates/wyrd-spec/src/vala/trace/mod.rs:408`.
+- **Cause:** this task deliberately removed the retired `EVAL_PROFILE_UID` key from `WYRD_KEYS`, but the count lock still expected the old size.
+- **Fix site:** the lock now expects 8; nothing else references the removed key.
+- **Focused check:** `mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=vala::trace::attributes_tests::wyrd_keys_count_locked)'` passes.
+
+Limits recorded for change review:
+- **Join key wording.** AC-025 is proven through a stand-in stale table config, because no schema-evolution API exists. AC-012, AC-014 and AC-024 name the join key `(data_tenant_id, result_id)`. In the implementation that tenant key is the physical table tenant, not a stored column, so `architecture/logic/table_schema.md` lines 21–22 are wrong. That erratum is pending a human decision.
+- **Card reconciler decode bug.** The nullable JSON decode bug in the card reconciler (`register.rs:36`) is out of scope and also pending a human decision.
+- **Ceilings proven only indirectly.** The 16-binding global ceiling and the real 30s Operator timeout are proven only through the existing per-tenant saturation test and the defaults unit test.
+- **Not run.** Credentialed live smokes (`test:operators:smoke:live`) and the image journeys remain release-gated and were not run here.

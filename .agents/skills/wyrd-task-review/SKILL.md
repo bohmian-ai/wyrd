@@ -386,7 +386,10 @@ For `FIX_REQUIRED`, also write one self-contained remediation task named
    closes the diagnosed gap without relying on repeated downstream guards;
 5. constraints, preserved behavior, and explicit non-goals;
 6. acceptance criteria mapped to every finding; and
-7. focused proof that directly exercises the gap plus broader verification.
+7. focused proof that directly exercises the gap plus only the narrowest
+   lanes covering the remediation's write set. Never require full user-journey
+   suites or broad aggregates in a task remediation; they run once at change
+   review.
 
 Batch bounded documentation corrections with the same remediation task. Keep
 the rustdoc gate intact, but do not create a style-only round while a shared

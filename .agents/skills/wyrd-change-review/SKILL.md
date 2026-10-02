@@ -29,6 +29,11 @@ aggregate behavior, public and durable contracts, security and reliability
 boundaries, required journeys, and integrated regressions. Do not provide an
 intended verdict or rely on implementation summaries.
 
+Change review is where the full user-journey suites and broad aggregates run,
+once, on the integrated candidate. Task verification is deliberately narrow, so
+run the full journey lanes for every surface the change ships before judging
+journey obligations.
+
 ## Audit acceptance
 
 Build a matrix for every `REQ-*`, `INV-*`, `AC-*`, constraint, and non-goal:

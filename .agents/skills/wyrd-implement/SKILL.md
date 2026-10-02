@@ -87,10 +87,11 @@ to the caller instead of building it.
 
 ## Verify and record evidence
 
-Run the smallest complete verification set required by `AGENTS.md`: focused
-tests, applicable owner or capability lanes, required journey or boundary
-checks, format and lint checks, `git diff --check`, and a final tracked and
-untracked diff audit. Derive corrected commands when task text is stale, without
+Run the narrowest verification set that covers your write set: exact
+named tests (journey tests by exact selector), the owner lanes and boundary
+checks your diff touches, format and lint checks, `git diff --check`, and a
+final tracked and untracked diff audit. Do not run full user-journey suites or
+broad aggregates for a task or remediation; they run once at change review. Derive corrected commands when task text is stale, without
 substituting weaker proof.
 
 Append compact evidence to the task or remediation task:

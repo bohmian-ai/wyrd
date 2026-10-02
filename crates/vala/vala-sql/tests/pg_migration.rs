@@ -8,7 +8,13 @@ mod pg_tests {
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_sql::{MIGRATION_LEASE_WAIT, OperatorPool};
 
-    /// Fresh Vala migrations apply repeatedly without schema drift.
+    /// Fresh Vala migrations apply repeatedly without schema drift and leave
+    /// the retired mutable `vala.drift_alerts` table absent.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a migration fails, an owned schema is missing, or
+    /// `vala.drift_alerts` still resolves after migrating.
     #[tokio::test]
     async fn vala_migrations_apply_and_are_idempotent() {
         let Some(owner_url) = std::env::var("WYRD_TEST_DATABASE_ADMIN_URL").ok() else {
@@ -43,6 +49,15 @@ mod pg_tests {
                     .expect("schema query");
             assert!(exists.0, "{schema} schema exists after vala migrate");
         }
+        let drift_alerts: (bool,) =
+            sqlx::query_as("SELECT to_regclass('vala.drift_alerts') IS NULL")
+                .fetch_one(&pool)
+                .await
+                .expect("to_regclass query succeeds");
+        assert!(
+            drift_alerts.0,
+            "the retired vala.drift_alerts table is absent after vala migrate"
+        );
     }
 
     /// Exact migration 13 upgrades a real pre-Oracle schema and Scribe row.

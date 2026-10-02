@@ -215,7 +215,7 @@ impl WorkflowExecutor {
                             index,
                             native: Arc::clone(&self.native),
                             pairs,
-                            run_id: self.ledger.run_id().clone(),
+                            run_id: *self.ledger.run_id(),
                             deadline,
                             cancellation: cancellation.clone(),
                             attempts: Arc::clone(&self.attempts),
@@ -449,7 +449,7 @@ impl StepTask {
             deadline,
             cancellation: self.cancellation.clone(),
             correlation: WorkflowGatewayCorrelation {
-                run_id: self.run_id.clone(),
+                run_id: self.run_id,
                 step_id: step.id.clone(),
                 attempt,
             },
@@ -695,12 +695,16 @@ mod tests {
             .and_then(|b| b.build())
             .expect("peer workflow builds");
         let provider = ScriptedProvider::new();
-        let remote = |code: &str| skald_providers::ProviderError::RemoteProblem {
-            code: code.to_owned(),
-            status: 403,
-            message: format!("{code} refused"),
-            field: None,
-            remediation: "fix it".to_owned(),
+        let remote = |code: &str| {
+            skald_providers::ProviderError::RemoteProblem(Box::new(
+                skald_providers::RemoteProblem {
+                    code: code.to_owned(),
+                    status: 403,
+                    message: format!("{code} refused"),
+                    field: None,
+                    remediation: "fix it".to_owned(),
+                },
+            ))
         };
         provider.on(
             "first peer",
@@ -946,12 +950,16 @@ mod tests {
                 source,
             })
         };
-        let remote = |code: &str| skald_providers::ProviderError::RemoteProblem {
-            code: code.to_owned(),
-            status: 429,
-            message: "gateway".to_owned(),
-            field: Some("model".to_owned()),
-            remediation: "wait".to_owned(),
+        let remote = |code: &str| {
+            skald_providers::ProviderError::RemoteProblem(Box::new(
+                skald_providers::RemoteProblem {
+                    code: code.to_owned(),
+                    status: 429,
+                    message: "gateway".to_owned(),
+                    field: Some("model".to_owned()),
+                    remediation: "wait".to_owned(),
+                },
+            ))
         };
         for (error, retryable) in [
             (
@@ -1286,13 +1294,15 @@ mod tests {
             replies.insert("plain".into(), [Ok(text_response("plain gateway"))].into());
             replies.insert(
                 "remote".into(),
-                [Err(skald_providers::ProviderError::RemoteProblem {
-                    code: "WYRD_GATEWAY_403_MODEL_FORBIDDEN".into(),
-                    status: 403,
-                    message: "model is not permitted".into(),
-                    field: Some("model".into()),
-                    remediation: "grant the model".into(),
-                })]
+                [Err(skald_providers::ProviderError::RemoteProblem(
+                    Box::new(skald_providers::RemoteProblem {
+                        code: "WYRD_GATEWAY_403_MODEL_FORBIDDEN".into(),
+                        status: 403,
+                        message: "model is not permitted".into(),
+                        field: Some("model".into()),
+                        remediation: "grant the model".into(),
+                    }),
+                ))]
                 .into(),
             );
             replies.insert(
@@ -1323,41 +1333,42 @@ mod tests {
         assert_eq!(run.steps["tooling"].text.as_deref(), Some("tool used"));
         assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
 
-        let calls = crate::test_support::lock(&gateway.calls);
-        let by_step = |id: &str| -> Vec<&crate::route::WyrdGatewayCall> {
-            calls
-                .iter()
-                .filter(|call| call.correlation.step_id == id)
-                .collect()
-        };
-        let routed = by_step("routed");
-        assert_eq!(routed.len(), 1);
-        assert_eq!(routed[0].fallback.as_ref(), Some(&fallback));
-        assert!(routed[0].timeout <= Duration::from_secs(30) && !routed[0].timeout.is_zero());
-        assert_eq!(routed[0].correlation.run_id, run.run_id);
-        assert_eq!(routed[0].correlation.attempt, 1);
-        assert!(matches!(
-            &routed[0].request,
-            ProviderRequest::OpenAiChatCompletion(_)
-        ));
-        assert_eq!(
-            crate::test_support::request_text(&routed[0].request),
-            "routed call"
-        );
-        let plain = by_step("plain");
-        assert_eq!(plain.len(), 1);
-        assert!(plain[0].fallback.is_none());
-        assert_eq!(plain[0].timeout, DEFAULT_GATEWAY_CALL_TIMEOUT);
-        let tooling = by_step("tooling");
-        assert_eq!(tooling.len(), 2);
-        assert!(tooling.iter().all(|call| matches!(
-            &call.request,
-            ProviderRequest::OpenAiChatCompletion(request)
-                if request.tools.as_ref().is_some_and(|tools| !tools.is_empty())
-        )));
-        assert!(by_step("local").is_empty());
-        assert_eq!(by_step("remote").len(), 1, "gateway refusals are terminal");
-        drop(calls);
+        {
+            let calls = crate::test_support::lock(&gateway.calls);
+            let by_step = |id: &str| -> Vec<&crate::route::WyrdGatewayCall> {
+                calls
+                    .iter()
+                    .filter(|call| call.correlation.step_id == id)
+                    .collect()
+            };
+            let routed = by_step("routed");
+            assert_eq!(routed.len(), 1);
+            assert_eq!(routed[0].fallback.as_ref(), Some(&fallback));
+            assert!(routed[0].timeout <= Duration::from_secs(30) && !routed[0].timeout.is_zero());
+            assert_eq!(routed[0].correlation.run_id, run.run_id);
+            assert_eq!(routed[0].correlation.attempt, 1);
+            assert!(matches!(
+                &routed[0].request,
+                ProviderRequest::OpenAiChatCompletion(_)
+            ));
+            assert_eq!(
+                crate::test_support::request_text(&routed[0].request),
+                "routed call"
+            );
+            let plain = by_step("plain");
+            assert_eq!(plain.len(), 1);
+            assert!(plain[0].fallback.is_none());
+            assert_eq!(plain[0].timeout, DEFAULT_GATEWAY_CALL_TIMEOUT);
+            let tooling = by_step("tooling");
+            assert_eq!(tooling.len(), 2);
+            assert!(tooling.iter().all(|call| matches!(
+                &call.request,
+                ProviderRequest::OpenAiChatCompletion(request)
+                    if request.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+            )));
+            assert!(by_step("local").is_empty());
+            assert_eq!(by_step("remote").len(), 1, "gateway refusals are terminal");
+        }
 
         let remote = &run.steps["remote"];
         assert_eq!(

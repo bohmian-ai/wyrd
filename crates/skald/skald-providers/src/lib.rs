@@ -20,7 +20,7 @@ pub use clients::{
     VertexClient,
 };
 pub use endpoint::EndpointPolicy;
-pub use error::{ProviderError, ProviderResult};
+pub use error::{ProviderError, ProviderResult, RemoteProblem};
 pub use retry::RetryPolicy;
 pub use trait_::{ProviderClient, ProviderStream};
 pub use transport::{HttpTransport, TransportConfig};

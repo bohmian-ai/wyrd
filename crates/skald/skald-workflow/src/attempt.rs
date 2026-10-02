@@ -154,8 +154,8 @@ fn provider_error_retryable(error: &ProviderError) -> bool {
         ProviderError::Status { status, .. } | ProviderError::Upstream { status, .. } => {
             matches!(status, 408 | 429 | 500..=599)
         }
-        ProviderError::RemoteProblem { code, .. } => {
-            RETRYABLE_GATEWAY_CODES.contains(&code.as_str())
+        ProviderError::RemoteProblem(problem) => {
+            RETRYABLE_GATEWAY_CODES.contains(&problem.code.as_str())
         }
         _ => false,
     }
@@ -170,23 +170,16 @@ fn provider_error_retryable(error: &ProviderError) -> bool {
 pub(crate) fn project_agent_error(error: &AgentError) -> WorkflowRunError {
     match error {
         AgentError::Provider(SkaldRuntimeError::Provider {
-            source:
-                ProviderError::RemoteProblem {
-                    code,
-                    message,
-                    field,
-                    remediation,
-                    ..
-                },
+            source: ProviderError::RemoteProblem(problem),
             ..
         }) => WorkflowRunError {
-            code: code.clone(),
-            message: message.clone(),
-            details: field.as_ref().map_or_else(
+            code: problem.code.clone(),
+            message: problem.message.clone(),
+            details: problem.field.as_ref().map_or_else(
                 || serde_json::json!({}),
                 |field| serde_json::json!({ "field": field }),
             ),
-            remediation: remediation.clone(),
+            remediation: problem.remediation.clone(),
         }
         .bounded(),
         AgentError::Provider(source) => {

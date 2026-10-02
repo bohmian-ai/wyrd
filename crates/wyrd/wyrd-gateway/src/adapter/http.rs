@@ -428,7 +428,7 @@ fn failure(
         | ProviderError::Timeout { .. }
         | ProviderError::Upstream { .. }
         | ProviderError::Decode { .. }
-        | ProviderError::RemoteProblem { .. } => FailureClass::Upstream,
+        | ProviderError::RemoteProblem(_) => FailureClass::Upstream,
     };
     AttemptResult::Failed {
         class,

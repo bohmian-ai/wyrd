@@ -64,19 +64,27 @@ pub enum ProviderError {
     /// remediation. It never carries a response body, prompt, credential, or
     /// arbitrary upstream detail, and it passes through Agent and Workflow
     /// boundaries unchanged.
-    #[error("{message}")]
-    RemoteProblem {
-        /// Stable error code reported by the remote boundary.
-        code: String,
-        /// HTTP status of the remote answer.
-        status: u16,
-        /// Safe diagnostic message.
-        message: String,
-        /// Safe request field the problem names, when present.
-        field: Option<String>,
-        /// Operator-facing remediation.
-        remediation: String,
-    },
+    ///
+    /// The fields are boxed so every `ProviderError` result stays small.
+    #[error("{}", .0.message)]
+    RemoteProblem(Box<RemoteProblem>),
+}
+
+/// Normalized, redacted problem a remote Wyrd boundary reported.
+///
+/// Carried by [`ProviderError::RemoteProblem`]; every field is safe to relay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteProblem {
+    /// Stable error code reported by the remote boundary.
+    pub code: String,
+    /// HTTP status of the remote answer.
+    pub status: u16,
+    /// Safe diagnostic message.
+    pub message: String,
+    /// Safe request field the problem names, when present.
+    pub field: Option<String>,
+    /// Operator-facing remediation.
+    pub remediation: String,
 }
 
 impl ProviderError {
@@ -149,7 +157,7 @@ impl ProviderError {
     /// code, so the result borrows from `self` rather than being static.
     pub fn code(&self) -> &str {
         match self {
-            Self::RemoteProblem { code, .. } => code,
+            Self::RemoteProblem(problem) => &problem.code,
             Self::Auth { .. } => "SKALD_PROVIDERS_401_AUTH",
             Self::Status { status, .. } => match *status {
                 401 | 403 => "SKALD_PROVIDERS_401_AUTH",

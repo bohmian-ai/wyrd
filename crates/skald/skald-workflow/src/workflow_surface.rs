@@ -855,78 +855,8 @@ mod tests {
                 .with_outputs(bindings(&[("out", "steps.second.output.text")]))
                 .expect("outputs declare")
         };
-        let mut cases: Vec<(&str, Workflow, &str, &str)> = Vec::new();
-
-        cases.push((
-            "unbound variable",
-            with_outputs(pair("first ${topic}", "second", false)),
-            VALIDATION,
-            "steps[0].inputs.topic",
-        ));
-        cases.push((
-            "extra binding",
-            with_outputs(
-                pair("first", "second", false)
-                    .with_step_inputs("first", bindings(&[("extra", "input.topic")]))
-                    .expect("binding names are identifiers"),
-            ),
-            VALIDATION,
-            "steps[0].inputs.extra",
-        ));
-        cases.push((
-            "text binding to structured step",
-            with_outputs(
-                pair("first", "second ${v}", true)
-                    .with_step_inputs("second", bindings(&[("v", "steps.first.output.text")]))
-                    .expect("binding names are identifiers"),
-            ),
-            VALIDATION,
-            "steps[1].inputs.v",
-        ));
-        cases.push((
-            "structured binding to text step",
-            with_outputs(
-                pair("first", "second ${v}", false)
-                    .with_step_inputs(
-                        "second",
-                        bindings(&[("v", "steps.first.output.structured.summary")]),
-                    )
-                    .expect("binding names are identifiers"),
-            ),
-            VALIDATION,
-            "steps[1].inputs.v",
-        ));
         let mut missing_agent = with_outputs(pair("first", "second", false));
         missing_agent.resolved_agents.remove("second");
-        cases.push((
-            "missing agent",
-            missing_agent,
-            "WYRD_WORKFLOW_404_AGENT",
-            "second",
-        ));
-        cases.push((
-            "hidden reference",
-            pair("first", "second", false)
-                .with_outputs(bindings(&[("out", "steps.first.output.text")]))
-                .and_then(|w| w.add(agent("third", "third ${v}", None)))
-                .and_then(|w| {
-                    w.with_step_inputs("third", bindings(&[("v", "steps.first.output.text")]))
-                })
-                .expect("fixture builds"),
-            VALIDATION,
-            "steps[2].inputs.v",
-        ));
-        cases.push((
-            "cycle",
-            with_outputs(
-                Workflow::new("cycle")
-                    .add_after(agent("first", "first", None), ["second"])
-                    .and_then(|w| w.add_after(agent("second", "second", None), ["first"]))
-                    .expect("fixture steps append"),
-            ),
-            "WYRD_WORKFLOW_422_CYCLE",
-            "",
-        ));
         let mut external = with_outputs(pair("first", "second", false));
         external.spec.steps[1].llm_route = Some(LlmRoute::ExtGateway {
             protocol: ExternalGatewayProtocol::AnthropicMessages,
@@ -935,12 +865,82 @@ mod tests {
             headers: BTreeMap::new(),
             credential_binding: CredentialBindingName::new("corp").expect("binding name"),
         });
-        cases.push((
-            "external protocol mismatch",
-            external,
-            "WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED",
-            "steps[1].llm_route",
-        ));
+        let cases: Vec<(&str, Workflow, &str, &str)> = vec![
+            (
+                "unbound variable",
+                with_outputs(pair("first ${topic}", "second", false)),
+                VALIDATION,
+                "steps[0].inputs.topic",
+            ),
+            (
+                "extra binding",
+                with_outputs(
+                    pair("first", "second", false)
+                        .with_step_inputs("first", bindings(&[("extra", "input.topic")]))
+                        .expect("binding names are identifiers"),
+                ),
+                VALIDATION,
+                "steps[0].inputs.extra",
+            ),
+            (
+                "text binding to structured step",
+                with_outputs(
+                    pair("first", "second ${v}", true)
+                        .with_step_inputs("second", bindings(&[("v", "steps.first.output.text")]))
+                        .expect("binding names are identifiers"),
+                ),
+                VALIDATION,
+                "steps[1].inputs.v",
+            ),
+            (
+                "structured binding to text step",
+                with_outputs(
+                    pair("first", "second ${v}", false)
+                        .with_step_inputs(
+                            "second",
+                            bindings(&[("v", "steps.first.output.structured.summary")]),
+                        )
+                        .expect("binding names are identifiers"),
+                ),
+                VALIDATION,
+                "steps[1].inputs.v",
+            ),
+            (
+                "missing agent",
+                missing_agent,
+                "WYRD_WORKFLOW_404_AGENT",
+                "second",
+            ),
+            (
+                "hidden reference",
+                pair("first", "second", false)
+                    .with_outputs(bindings(&[("out", "steps.first.output.text")]))
+                    .and_then(|w| w.add(agent("third", "third ${v}", None)))
+                    .and_then(|w| {
+                        w.with_step_inputs("third", bindings(&[("v", "steps.first.output.text")]))
+                    })
+                    .expect("fixture builds"),
+                VALIDATION,
+                "steps[2].inputs.v",
+            ),
+            (
+                "cycle",
+                with_outputs(
+                    Workflow::new("cycle")
+                        .add_after(agent("first", "first", None), ["second"])
+                        .and_then(|w| w.add_after(agent("second", "second", None), ["first"]))
+                        .expect("fixture steps append"),
+                ),
+                "WYRD_WORKFLOW_422_CYCLE",
+                "",
+            ),
+            (
+                "external protocol mismatch",
+                external,
+                "WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED",
+                "steps[1].llm_route",
+            ),
+        ];
 
         for (case, workflow, code, field) in cases {
             let provider = ScriptedProvider::new();

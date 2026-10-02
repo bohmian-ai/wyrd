@@ -220,8 +220,9 @@ mod pg_tests {
         assert_eq!(error.0.code(), "WYRD_AUTH_400_INVALID_STATE");
     }
 
-    /// A verified token for a consumed login issues the session and audits
-    /// success; its authorization code redeems once to a usable session.
+    /// A verified token for a consumed login issues only an authorization
+    /// code; that code redeems once to a usable session, which is minted and
+    /// audited at redemption.
     ///
     /// # Panics
     /// Panics when completion, redemption, or the audit differ.
@@ -250,6 +251,14 @@ mod pg_tests {
         let principal_id = user_for(&fixture, EXTERNAL_SUBJECT)
             .await
             .expect("the user was created");
+        assert_eq!(issued_codes(&fixture).await, 1);
+        assert_eq!(
+            refresh_token_count(&fixture, principal_id).await,
+            0,
+            "the callback mints nothing"
+        );
+        assert!(audit_rows(&fixture).await.is_empty());
+        let redeemed = redeem(&state, &completed).await.expect("the code redeems");
         assert_eq!(refresh_token_count(&fixture, principal_id).await, 1);
         let audit = audit_rows(&fixture).await;
         assert_eq!(audit.len(), 1);
@@ -259,7 +268,6 @@ mod pg_tests {
         assert_eq!(audit[0].2["subject_principal_id"], user.as_str());
         assert_eq!(audit[0].2["actor_principal_id"], user.as_str());
         assert_eq!(audit[0].2["delegation_chain"], serde_json::json!([]));
-        let redeemed = redeem(&state, &completed).await.expect("the code redeems");
         assert_eq!(redeemed.token_type, TokenType::Bearer);
         assert!(!redeemed.access_token.expose().is_empty());
         assert!(redeemed.refresh_token.is_some());
@@ -398,8 +406,8 @@ mod pg_tests {
     }
 
     /// A login that changes the User's durable roles stages exactly one
-    /// `auth.user.roles.sync` event beside its token exchange; a repeat login
-    /// with the same groups stages none.
+    /// `auth.user.roles.sync` event, and its code one token exchange at
+    /// redemption; a repeat login with the same groups stages no sync.
     ///
     /// # Panics
     /// Panics when the role-sync evidence differs.
@@ -413,7 +421,7 @@ mod pg_tests {
         let service = authorization_exchange_service(&state);
         for n in [8, 9] {
             let (hash, login) = pending_login(&fixture, state_hash(n), binding, "nonce").await;
-            service
+            let completed = service
                 .finish_id_token_exchange(
                     &hash,
                     &trusted,
@@ -423,6 +431,7 @@ mod pg_tests {
                 )
                 .await
                 .expect("login completes");
+            redeem(&state, &completed).await.expect("the code redeems");
         }
 
         let user = user_for(&fixture, EXTERNAL_SUBJECT).await.expect("user");
@@ -435,7 +444,7 @@ mod pg_tests {
         assert_eq!(
             audit_rows(&fixture).await.len(),
             2,
-            "one exchange per login"
+            "one exchange per redeemed login"
         );
     }
 

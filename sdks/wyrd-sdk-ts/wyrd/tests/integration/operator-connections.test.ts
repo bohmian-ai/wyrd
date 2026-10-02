@@ -121,6 +121,26 @@ describe("operator connection journey", () => {
       expect((await rejection(outsider.list())).code).toBe(
         "WYRD_PERMISSION_403_DENIED_RBAC",
       );
+
+      // Another tenant's administrator sees none of these connections and
+      // cannot read, rotate, or disable one by its exact ID.
+      const foreign = OperatorConnections.connect({
+        serverUrl: server.baseUrl,
+        credential: server.bootstrapServiceInTenant(
+          server.seedTenant("ts-oc-other"),
+          ["admin"],
+          "ts-oc-foreign",
+        ),
+      });
+      expect(await foreign.list()).toEqual([]);
+      for (const attempt of [
+        () => foreign.get(id),
+        () => foreign.update(id, { provider: "slack", bot_token: "xoxb-foreign" }),
+        () => foreign.disable(id),
+      ]) {
+        expect((await rejection(attempt())).code).toBe("WYRD_OPERATOR_404_CONNECTION_NOT_FOUND");
+      }
+      expect((await admin.get(id)).status, "the foreign attempts changed nothing").toBe("active");
     } finally {
       server.shutdown();
     }

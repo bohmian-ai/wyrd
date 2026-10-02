@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, TypedDict, runtime_checkable
 
 from .._wyrd.agent import (
     Agent,
@@ -15,6 +15,41 @@ from .._wyrd.agent import (
     WorkflowRun,
 )
 from .tool import local_registry, tool
+
+
+class WorkflowRunError(TypedDict):
+    """Bounded primary error of a failed Workflow run or step."""
+
+    code: str
+    message: str
+    details: Any
+    remediation: str
+
+
+class WorkflowStepResult(TypedDict):
+    """One step's result in `WorkflowRun.steps`, keyed by step id."""
+
+    status: Literal["pending", "running", "succeeded", "failed", "cancelled", "unstarted"]
+    text: str | None
+    structured_output: Any
+    attempts: int
+    started_at: str | None
+    ended_at: str | None
+    error: WorkflowRunError | None
+
+
+class WorkflowRunDict(TypedDict):
+    """Complete wire-shaped snapshot returned by `WorkflowRun.to_dict`."""
+
+    run_id: str
+    workflow: dict[str, Any] | None
+    status: Literal["succeeded", "failed", "cancelled", "timed_out"]
+    outputs: dict[str, Any]
+    steps: dict[str, WorkflowStepResult]
+    created_at: str
+    started_at: str | None
+    ended_at: str | None
+    error: WorkflowRunError | None
 
 
 @runtime_checkable
@@ -46,6 +81,9 @@ __all__ = [
     "SessionTurn",
     "Workflow",
     "WorkflowRun",
+    "WorkflowRunDict",
+    "WorkflowRunError",
+    "WorkflowStepResult",
     "local_registry",
     "tool",
 ]

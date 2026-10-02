@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 from wyrd import Agent, Prompt, Workflow, WorkflowRun, WyrdError
+from wyrd.agent import WorkflowRunDict, WorkflowRunError, WorkflowStepResult
 
 
 def _planner() -> Agent:
@@ -54,7 +55,14 @@ def test_explicit_workflow_bindings() -> None:
     assert run.steps["planner"]["structured_output"] == {"foo": "A", "bar": "B"}
     assert run.steps["planner"]["attempts"] == 1
     assert run.steps["writer"]["text"] == "pick A for rust"
-    assert run.to_dict()["outputs"] == run.outputs
+    snapshot: WorkflowRunDict = run.to_dict()
+    planner: WorkflowStepResult = snapshot["steps"]["planner"]
+    assert snapshot["outputs"] == run.outputs
+    assert set(snapshot) == WorkflowRunDict.__required_keys__
+    assert set(planner) == WorkflowStepResult.__required_keys__
+    assert planner["status"] == "succeeded"
+    error: WorkflowRunError | None = snapshot["error"]
+    assert error is None
     assert run.run_id
 
     assert workflow.run().outputs["topic"] == "default"
@@ -69,6 +77,7 @@ def test_workflow_dependencies_inject_no_data() -> None:
         workflow.validate()
 
     assert exc.value.code == "WYRD_WORKFLOW_422_VALIDATION"
+    assert exc.value.details is not None
     assert exc.value.details["field"] == "steps[1].inputs.foo"
 
 

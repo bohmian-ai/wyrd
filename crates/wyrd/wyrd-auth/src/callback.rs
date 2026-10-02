@@ -64,8 +64,9 @@ impl AuthorizationCodeExchange {
     /// tenant the state row is consumed and committed before any provider IO,
     /// so a replayed state never reaches the provider. The bound connection
     /// revision must still be the tenant's Active connection with the recorded
-    /// issuer and client; the provider's fresh discovery decides whether the
-    /// response must carry `iss`, and [`verify_response_issuer`] binds it to
+    /// issuer and client; the provider's cached discovery (refreshed once if
+    /// the ID token names an unknown key) decides whether the response must
+    /// carry `iss`, and [`verify_response_issuer`] binds it to
     /// the recorded issuer before any token-endpoint request; the relying
     /// party exchanges the code with the recorded redirect URI and PKCE
     /// verifier and verifies the ID token, its nonce, and its authorized
@@ -171,7 +172,7 @@ impl AuthorizationCodeExchange {
         } else {
             let trusted = self.bound_connection(tenant_id, &login_state).await?;
             let provider = relying_party
-                .discover(&trusted.issuer)
+                .cached(&trusted.issuer)
                 .await
                 .map_err(relying_party_error)?;
             (trusted, provider)

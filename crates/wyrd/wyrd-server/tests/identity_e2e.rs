@@ -4177,7 +4177,9 @@ async fn tenant_callback_refusal_journey() {
     // A validly signed token whose algorithm discovery did not advertise is
     // refused by the advertised-set check; `HS256` advertised beside an
     // asymmetric algorithm (discovery requires one) passes that check and is
-    // refused by the shared verifier's symmetric-algorithm guard.
+    // refused by the shared verifier's symmetric-algorithm guard. Discovery is
+    // cached per issuer, so each advertised set is its own provider and tenant
+    // C's connection is pointed at it, as a real provider change would be.
     let hmac_key = jsonwebtoken::EncodingKey::from_secret(MOCK_SIGNING_X.as_bytes());
     let algorithm_cases = [
         ("unadvertised EdDSA", &eddsa, None, &["RS256"][..]),
@@ -4189,13 +4191,17 @@ async fn tenant_callback_refusal_journey() {
         ),
     ];
     for (label, header, hmac, advertised) in algorithm_cases {
-        mount_mock_provider(&mock, id_token_reply("unused")).await;
+        let provider = wiremock::MockServer::start().await;
+        seed_mock_connection(&srv, tenant_c, &provider.uri()).await;
+        mount_mock_provider_advertising(&provider, id_token_reply("unused"), advertised).await;
         let (flow, state, nonce) = begin_mock_login(&srv, "test-tenant-3").await;
+        let mut provider_claims = claims(&nonce);
+        provider_claims["iss"] = Value::from(provider.uri());
         let id_token = match hmac {
-            Some(key) => jsonwebtoken::encode(header, &claims(&nonce), key).expect("signs"),
-            None => sign_id_token(header, &claims(&nonce), MOCK_SIGNING_KEY),
+            Some(key) => jsonwebtoken::encode(header, &provider_claims, key).expect("signs"),
+            None => sign_id_token(header, &provider_claims, MOCK_SIGNING_KEY),
         };
-        mount_mock_provider_advertising(&mock, id_token_reply(&id_token), advertised).await;
+        mount_mock_provider_advertising(&provider, id_token_reply(&id_token), advertised).await;
         let (status, body) = finish_callback(&srv, "mock-code", &state, None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{label}: {body}");
         assert_eq!(
@@ -4225,6 +4231,7 @@ async fn tenant_callback_refusal_journey() {
         (0, 0, 0, 0),
         "refused logins persisted no User, identity, role grant, or refresh row"
     );
+    seed_mock_connection(&srv, tenant_c, &issuer).await;
     mount_mock_provider(&mock, id_token_reply("unused")).await;
     let (flow, state, nonce) = begin_mock_login(&srv, "test-tenant-3").await;
     let mut with_azp = claims(&nonce);
@@ -4335,11 +4342,12 @@ async fn token_calls(server: &wiremock::MockServer) -> usize {
         .count()
 }
 
-/// One issuer-binding callback case: its label, the provider's discovery
-/// document, extra provider response parameters, the `iss` sent (if any), and
-/// whether the login must complete.
+/// One issuer-binding callback case: its label, the provider and its
+/// discovery document, extra provider response parameters, the `iss` sent (if
+/// any), and whether the login must complete.
 type IssuerCase<'a> = (
     &'a str,
+    &'a wiremock::MockServer,
     &'a Value,
     &'a [(&'a str, &'a str)],
     Option<&'a str>,
@@ -4357,8 +4365,10 @@ type IssuerCase<'a> = (
 ///      trailing-slash variant of the login's issuer — is refused
 ///      `401 INVALID_TOKEN` and audited as a denied exchange, with no
 ///      token-endpoint request and no completion;
-///   4. once the provider advertises support, a response without `iss` is
-///      refused the same way, and one with the exact `iss` completes.
+///   4. once the connection names a provider that advertises support, a
+///      response without `iss` is refused the same way, and one with the exact
+///      `iss` completes. Discovery is cached per issuer, so the advertising
+///      provider is a second issuer the Active connection is pointed at.
 ///
 /// # Panics
 /// Panics when any step deviates from the contract above.
@@ -4378,12 +4388,14 @@ async fn tenant_callback_issuer_binding_journey() {
     let mock = wiremock::MockServer::start().await;
     let issuer = mock.uri();
     let silent = mock_discovery(&issuer, &["EdDSA"]);
-    let mut advertising = silent.clone();
+    let advertising_mock = wiremock::MockServer::start().await;
+    let advertising_issuer = advertising_mock.uri();
+    let mut advertising = mock_discovery(&advertising_issuer, &["EdDSA"]);
     advertising["authorization_response_iss_parameter_supported"] = Value::Bool(true);
 
     let mut eddsa = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
     eddsa.kid = Some("mock-1".to_owned());
-    let id_token_for = |nonce: &str| {
+    let id_token_for = |issuer: &str, nonce: &str| {
         let now = chrono::Utc::now();
         id_token_reply(&sign_id_token(
             &eddsa,
@@ -4425,7 +4437,7 @@ async fn tenant_callback_issuer_binding_journey() {
         .find(|(name, _)| name == "nonce")
         .map(|(_, value)| value.into_owned())
         .expect("the test sign-in carries a nonce");
-    mount_authorizing_provider(&mock, silent.clone(), id_token_for(&test_nonce)).await;
+    mount_authorizing_provider(&mock, silent.clone(), id_token_for(&issuer, &test_nonce)).await;
     assert_test_completion(&finish_test_sign_in(&srv, &begun).await);
     let (status, active) = call_json(
         &srv,
@@ -4450,10 +4462,18 @@ async fn tenant_callback_issuer_binding_journey() {
     };
     let wrong_slash = format!("{issuer}/");
     let cases: Vec<IssuerCase> = vec![
-        ("unadvertised, no iss", &silent, &[], None, true),
-        ("unadvertised, exact iss", &silent, &[], Some(&issuer), true),
+        ("unadvertised, no iss", &mock, &silent, &[], None, true),
+        (
+            "unadvertised, exact iss",
+            &mock,
+            &silent,
+            &[],
+            Some(&issuer),
+            true,
+        ),
         (
             "unadvertised, unrelated session_state",
+            &mock,
             &silent,
             &[("session_state", "provider-session")],
             Some(&issuer),
@@ -4461,6 +4481,7 @@ async fn tenant_callback_issuer_binding_journey() {
         ),
         (
             "unadvertised, foreign iss",
+            &mock,
             &silent,
             &[],
             Some("https://evil.example.com"),
@@ -4468,14 +4489,23 @@ async fn tenant_callback_issuer_binding_journey() {
         ),
         (
             "unadvertised, trailing-slash iss",
+            &mock,
             &silent,
             &[],
             Some(&wrong_slash),
             false,
         ),
-        ("advertised, no iss", &advertising, &[], None, false),
+        (
+            "advertised, no iss",
+            &advertising_mock,
+            &advertising,
+            &[],
+            None,
+            false,
+        ),
         (
             "advertised, foreign iss",
+            &advertising_mock,
             &advertising,
             &[],
             Some("https://evil.example.com"),
@@ -4483,23 +4513,32 @@ async fn tenant_callback_issuer_binding_journey() {
         ),
         (
             "advertised, exact iss",
+            &advertising_mock,
             &advertising,
             &[],
-            Some(&issuer),
+            Some(&advertising_issuer),
             true,
         ),
     ];
-    for (label, discovery, extra, iss, completes) in cases {
-        mount_mock_provider_discovering(&mock, id_token_reply("unused"), discovery.clone()).await;
+    for (label, provider, discovery, extra, iss, completes) in cases {
+        let provider_issuer = provider.uri();
+        seed_mock_connection(&srv, tenant, &provider_issuer).await;
+        mount_mock_provider_discovering(provider, id_token_reply("unused"), discovery.clone())
+            .await;
         let (flow, state, nonce) = begin_mock_login(&srv, FIXTURE_TENANT_SLUG).await;
-        mount_mock_provider_discovering(&mock, id_token_for(&nonce), discovery.clone()).await;
+        mount_mock_provider_discovering(
+            provider,
+            id_token_for(&provider_issuer, &nonce),
+            discovery.clone(),
+        )
+        .await;
         let denied_before = denied().await;
         let mut params = vec![("code", "mock-code"), ("state", state.as_str())];
         params.extend_from_slice(extra);
         let reply = callback_reply_with(&srv, &params, iss, "test-tenant-1.wyrd.test").await;
         if completes {
             assert_browser_completion(&reply, "mock-code");
-            assert_eq!(token_calls(&mock).await, 1, "{label}: one code exchange");
+            assert_eq!(token_calls(provider).await, 1, "{label}: one code exchange");
             redeem(&srv, tenant, &flow)
                 .await
                 .unwrap_or_else(|error| panic!("{label}: the completion redeems: {error}"));
@@ -4511,7 +4550,7 @@ async fn tenant_callback_issuer_binding_journey() {
                 "WYRD_AUTH_401_INVALID_TOKEN",
             );
             assert_eq!(
-                token_calls(&mock).await,
+                token_calls(provider).await,
                 0,
                 "{label}: the code never reaches a token endpoint"
             );

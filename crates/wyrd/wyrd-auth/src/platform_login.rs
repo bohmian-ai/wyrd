@@ -219,8 +219,9 @@ impl PlatformLogin {
 
     /// Complete a platform login and mint a platform session.
     ///
-    /// Consumes the login state exactly once, freshly discovers the provider,
-    /// and has the relying party exchange the code and verify the ID token —
+    /// Consumes the login state exactly once, reads the provider from the
+    /// relying party's per-issuer cache (re-discovered once when the ID token
+    /// names an unknown key), and has the relying party exchange the code and verify the ID token —
     /// its issuer, the connection's expected audience, signature, expiry,
     /// issued-at, nonce, and authorized party. The subject then resolves to a
     /// pre-registered principal, pinned if this is that principal's first
@@ -256,7 +257,7 @@ impl PlatformLogin {
         let issuer = &connection.verification.issuer;
         let provider = self
             .relying_party
-            .discover(issuer)
+            .cached(issuer)
             .await
             .map_err(provider_unavailable)?;
         let code_verifier = SecretString::from(login_state.code_verifier);

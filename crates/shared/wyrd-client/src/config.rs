@@ -7,8 +7,6 @@
 //! file credentials, then call [`ClientConfig::resolve_credential`] to obtain
 //! the effective [`ResolvedCredential`].
 
-use std::path::PathBuf;
-
 use secrecy::SecretString;
 
 use crate::auth::TokenExchange;
@@ -20,15 +18,14 @@ use crate::transport::{
     credential::{CredentialChain, CredentialSource, ResolvedCredential},
 };
 
-/// Token cache strategy.
-///
-/// Declared here (commit 04); behavior is implemented in commit 05.
+/// Where an API key's exchanged access token is cached.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum TokenCacheMode {
     /// Cache resolved tokens in memory only (default).
     #[default]
     InMemory,
-    /// Persist resolved tokens to disk for reuse across process restarts.
+    /// Also cache an API key's access token in `credentials.toml`, beside
+    /// that `[default].api_key`, so every process using the key reuses it.
     Disk,
 }
 
@@ -58,8 +55,6 @@ pub struct ClientConfig {
     pub tenant: Option<String>,
     /// Token cache mode.
     pub token_cache: TokenCacheMode,
-    /// Path used by the disk token cache.
-    pub token_cache_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for ClientConfig {
@@ -73,7 +68,6 @@ impl std::fmt::Debug for ClientConfig {
             )
             .field("tenant", &self.tenant)
             .field("token_cache", &self.token_cache)
-            .field("token_cache_path", &self.token_cache_path)
             .finish()
     }
 }
@@ -148,14 +142,6 @@ impl ClientConfig {
                 TokenCacheKind::InMemory => TokenCacheMode::InMemory,
                 TokenCacheKind::Disk => TokenCacheMode::Disk,
             });
-        let token_cache_path = configured_cache
-            .and_then(|cache| cache.path.clone())
-            .or_else(|| {
-                std::env::var("WYRD_TOKEN_CACHE_PATH")
-                    .ok()
-                    .map(PathBuf::from)
-            })
-            .or_else(|| wyrd_utils::config_dir::wyrd_config_dir().map(|path| path.join("tokens")));
 
         Self {
             grpc: GrpcConfig {
@@ -169,7 +155,6 @@ impl ClientConfig {
             credential: None,
             tenant,
             token_cache,
-            token_cache_path,
         }
     }
 

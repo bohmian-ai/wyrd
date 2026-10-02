@@ -1,6 +1,6 @@
 //! User-scoped client configuration loaded from `config.toml`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::Deserialize;
 
@@ -35,8 +35,6 @@ pub struct ClientSection {
 pub struct TokenCacheSection {
     /// Cache persistence strategy.
     pub kind: Option<TokenCacheKind>,
-    /// Path used when the cache is persisted to disk.
-    pub path: Option<PathBuf>,
 }
 
 /// Supported access-token cache persistence strategies.
@@ -45,7 +43,7 @@ pub struct TokenCacheSection {
 pub enum TokenCacheKind {
     /// Keep access tokens in memory only.
     InMemory,
-    /// Persist access tokens on disk.
+    /// Also cache an API key's access token in `credentials.toml`.
     Disk,
 }
 
@@ -107,7 +105,7 @@ mod tests {
         let path = directory.path().join("config.toml");
         fs::write(
             &path,
-            "[client]\ngrpc_url = \"grpc\"\nhttp_url = \"http\"\ntenant = \"acme\"\n\n[client.token_cache]\nkind = \"disk\"\npath = \"tokens\"\n",
+            "[client]\ngrpc_url = \"grpc\"\nhttp_url = \"http\"\ntenant = \"acme\"\n\n[client.token_cache]\nkind = \"disk\"\n",
         )
         .unwrap();
 
@@ -117,7 +115,6 @@ mod tests {
         assert_eq!(config.client.tenant.as_deref(), Some("acme"));
         let cache = config.client.token_cache.as_ref().unwrap();
         assert_eq!(cache.kind, Some(TokenCacheKind::Disk));
-        assert_eq!(cache.path.as_deref(), Some(std::path::Path::new("tokens")));
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod bifrost;
 pub mod cards;
 pub mod client;
 pub mod config;
+pub(crate) mod credentials_file;
 pub mod error;
 pub mod gateway;
 pub mod gateway_credential;

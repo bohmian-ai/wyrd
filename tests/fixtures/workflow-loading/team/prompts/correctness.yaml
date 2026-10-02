@@ -7,15 +7,16 @@ metadata:
 spec:
   model: gpt-5-5
   request:
-    model: gpt-5-5
-    messages:
-      - role: system
-        content: |
-          You are a correctness reviewer. Find reachable bugs, data loss, races,
-          and contract violations. Ignore style-only concerns.
-      - role: user
-        content: |
-          Review this change:
-          {{code}}
+    provider:
+      custom: mock
+    request:
+      model: gpt-5-5
+      messages:
+        - role: system
+          content: |
+            You are a correctness reviewer. Find reachable bugs, data loss, races,
+            and contract violations. Ignore style-only concerns.
+        - role: user
+          content: "registered correctness review of {{code}}"
   variables: [code]
   response_type: text

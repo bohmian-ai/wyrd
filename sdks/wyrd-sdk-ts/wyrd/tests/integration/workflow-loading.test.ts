@@ -36,6 +36,16 @@ function uids(receipt: RegistrationReceipt): Record<string, string> {
   );
 }
 
+// The fixture Prompts send their Native Chat request to the built-in `mock`
+// provider, which answers with the rendered user message. Each output therefore
+// shows which Prompt body ran and what was bound into it.
+const LOCAL_REVIEW =
+  "final review of diff | local security review of diff | local correctness review of diff";
+const REGISTERED_REVIEW =
+  "final review of diff" +
+  " | registered security review of diff" +
+  " | registered correctness review of diff";
+
 describe("Workflow loading", () => {
   it("workflow loading journey", async () => {
     const server = startTestServer();
@@ -52,11 +62,24 @@ describe("Workflow loading", () => {
       delete process.env.WYRD_API_KEY;
       delete process.env.WYRD_ACCESS_TOKEN;
 
-      // 1. A wholly local Workflow file loads without credentials.
-      const local = await Workflow.fromPath(
+      // 1. Wholly local Workflow files load and run without credentials.
+      const local = await Workflow.fromPath(join(FIXTURES, "shadowed/local-workflow.yaml"));
+      let run = await local.run({ code: "diff" });
+      expect(run.status).toBe("succeeded");
+      expect(run.outputs).toEqual({
+        security: "local security review of diff",
+        review: LOCAL_REVIEW,
+      });
+
+      // The code-review example calls models through the Wyrd gateway, which a
+      // plain run does not have, so its run is refused before any step starts.
+      const example = await Workflow.fromPath(
         join(REPO, "examples/workflows/code-review/workflow.yaml"),
       );
-      expect(local.stepIds).toEqual(["security", "correctness", "final_review"]);
+      expect(example.stepIds).toEqual(["security", "correctness", "final_review"]);
+      expect((await rejection(example.run({ code: "diff" }))).code).toBe(
+        "WYRD_WORKFLOW_503_BINDING_UNAVAILABLE",
+      );
 
       // 2. The team registers its reviewer Agents.
       const team = {
@@ -76,17 +99,20 @@ describe("Workflow loading", () => {
       );
 
       process.env.WYRD_API_KEY = readerKey;
-      const authored = await Workflow.fromPath(mixed);
-      expect(authored.stepIds).toEqual(["security", "correctness", "final_review"]);
+      run = await (await Workflow.fromPath(mixed)).run({ code: "diff" });
+      expect(run.status).toBe("succeeded");
+      expect(run.outputs).toEqual({ review: REGISTERED_REVIEW });
 
-      // 4. A local sibling and a registered Agent with the same identity load side by side.
+      // 4. A local sibling and the registered Agent with the same identity
+      //    each run their own Prompt.
       const shadowed = await Workflow.fromPath(join(FIXTURES, "shadowed/workflow.yaml"));
-      expect(shadowed.stepIds).toEqual([
-        "security",
-        "registered_security",
-        "correctness",
-        "final_review",
-      ]);
+      run = await shadowed.run({ code: "diff" });
+      expect(run.status).toBe("succeeded");
+      expect(run.outputs).toEqual({
+        security: "local security review of diff",
+        registered_security: "registered security review of diff",
+        review: LOCAL_REVIEW,
+      });
 
       // 5. A reference to a deleted Card is refused.
       const retired = await writer.registerFromPath(join(FIXTURES, "retired/retired-prompt.yaml"));
@@ -95,8 +121,11 @@ describe("Workflow loading", () => {
         (await rejection(Workflow.fromPath(join(FIXTURES, "retired/workflow.yaml")))).code,
       ).toBe("WYRD_REGISTRY_404_CARD_NOT_FOUND");
 
-      // 6. Apply the mixed Workflow and load it back by identity and by UID.
+      // 6. Apply the mixed Workflow, register a newer security Agent, then
+      //    load the applied Workflow by identity and by UID: both stay pinned
+      //    to 1.0.0 and never run the newer Prompt ("v2 security review of diff").
       const workflowUid = uids(await writer.registerFromPath(mixed))["code-review"] ?? "";
+      await writer.registerFromPath(join(FIXTURES, "team-v2/security.yaml"));
       const byIdentity = await reader.workflow.load({
         space: "workflow-loading",
         name: "code-review",
@@ -104,12 +133,11 @@ describe("Workflow loading", () => {
       });
       const byUid = await reader.workflow.load({ uid: workflowUid });
       for (const workflow of [byIdentity, byUid]) {
-        expect(workflow.stepIds).toEqual(["security", "correctness", "final_review"]);
-        // These steps call models through the Wyrd gateway, which a plain
-        // run does not have yet; the run is refused before any step starts.
-        expect((await rejection(workflow.run({ code: "diff" }))).code).toBe(
-          "WYRD_WORKFLOW_503_BINDING_UNAVAILABLE",
-        );
+        run = await workflow.run({ code: "diff" });
+        expect(run.status).toBe("succeeded");
+        expect(run.outputs).toEqual({ review: REGISTERED_REVIEW });
+        expect(run.steps["final_review"]?.text).toBe(REGISTERED_REVIEW);
+        expect(run.workflow?.uid).toBe(workflowUid);
       }
 
       // 7. Mixed, wrong-kind, and unauthorized selectors are refused.

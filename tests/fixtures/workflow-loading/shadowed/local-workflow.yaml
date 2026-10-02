@@ -2,10 +2,10 @@ apiVersion: wyrd/v1
 kind: Workflow
 metadata:
   space: workflow-loading
-  name: code-review
+  name: local-review
   version: "1.0.0"
 spec:
-  description: Team reviewer Agents referenced from the registry, with a local final reviewer.
+  description: The shadowed directory's three local Agents only; loads and runs with no server.
   llm_route:
     kind: native
   inputs:
@@ -17,10 +17,7 @@ spec:
     - id: security
       action:
         type: agent
-        target:
-          kind: Agent
-          name: security-reviewer
-          version: "1.0.0"
+        target: ./agents/security.yaml
       inputs:
         code: input.code
       timeout_seconds: 60
@@ -30,10 +27,7 @@ spec:
     - id: correctness
       action:
         type: agent
-        target:
-          kind: Agent
-          name: correctness-reviewer
-          version: "1.0.0"
+        target: ./agents/correctness.yaml
       inputs:
         code: input.code
       timeout_seconds: 60
@@ -54,4 +48,5 @@ spec:
         max_retries: 1
 
   outputs:
+    security: steps.security.output.text
     review: steps.final_review.output.text

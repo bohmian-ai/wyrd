@@ -11588,7 +11588,6 @@ name = "wyrd-sdk-rust"
 version = "0.0.1"
 dependencies = [
  "arrow",
- "async-trait",
  "base64 0.22.1",
  "chrono",
  "parquet",
@@ -11596,13 +11595,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "skald-providers",
- "skald-runtime",
- "skald-spec",
  "skald-workflow",
  "tempfile",
  "tokio",
- "tokio-util",
  "uuid",
  "workspace-hack",
  "wyrd-client",

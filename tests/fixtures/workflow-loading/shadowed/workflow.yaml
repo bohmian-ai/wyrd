@@ -7,7 +7,7 @@ metadata:
 spec:
   description: A local security sibling and the registered security Agent of the same identity, side by side.
   llm_route:
-    kind: wyrd_gateway
+    kind: native
   inputs:
     code:
       type: str
@@ -61,4 +61,6 @@ spec:
         max_retries: 1
 
   outputs:
+    security: steps.security.output.text
+    registered_security: steps.registered_security.output.text
     review: steps.final_review.output.text

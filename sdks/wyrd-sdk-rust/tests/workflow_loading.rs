@@ -1,119 +1,61 @@
 //! Rust SDK Workflow loading journey through the public `wyrd_sdk` crate.
 //!
 //! Uses the checked-in fixtures in `tests/fixtures/workflow-loading` (see its
-//! README). The journey:
+//! README). Their Prompts send the Native Chat request to the built-in `mock`
+//! provider, which answers with the rendered user message, so every output
+//! shows which Prompt body ran and what was bound into it. The journey:
 //!
-//! 1. loads the wholly local code-review example with `Workflow::from_path`,
+//! 1. loads and runs the wholly local Workflow with `Workflow::from_path`,
 //!    which needs no server or credentials;
-//! 2. registers the team reviewer Agents, then applies the `mixed` Workflow
-//!    that references them;
-//! 3. registers a newer security Agent;
-//! 4. loads the applied Workflow through `cards.workflow()` by exact ref and
+//! 2. registers the team reviewer Agents;
+//! 3. loads authored Workflows that reference them through the ambient
+//!    environment, in a child process, and checks the refusals for no
+//!    credential, a principal without read access, and a deleted Card;
+//! 4. applies the `mixed` Workflow, then registers a newer security Agent;
+//! 5. loads the applied Workflow through `cards.workflow()` by exact ref and
 //!    by UID, runs it, and checks the newer Agent did not float in;
-//! 5. checks wrong, versionless, mismatched, and unauthorized selectors are
-//!    refused without dispatching anything.
-//!
-//! Authored loading with registry refs reads credentials from the process
-//! environment, so it is proved by the Python and TypeScript journeys, where
-//! setting the environment is ordinary test setup.
+//! 6. checks wrong, versionless, mismatched, and unauthorized selectors are
+//!    refused.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::process::Command;
 
-use async_trait::async_trait;
 use secrecy::ExposeSecret;
 use serde_json::{Map, Value, json};
-use skald_providers::ProviderError;
-use skald_spec::ProviderResponse;
-use skald_spec::wire::openai_chat::OpenAiChatResponse;
-use skald_workflow::{
-    WorkflowExecutionDependencies, WorkflowRun, WorkflowRunOptions, WorkflowRunStatus,
-    WyrdGatewayCall, WyrdGatewayCaller,
-};
-use tokio_util::sync::CancellationToken;
+use skald_workflow::{WorkflowRun, WorkflowRunStatus};
 use wyrd_sdk::Workflow;
 use wyrd_sdk::bifrost::client_from_options;
 use wyrd_sdk::cards::{CardKind, CardRef, CardSelector, Cards};
 use wyrd_testing::Bootstrap;
 use wyrd_testing::server::WyrdTestServer;
 
-/// Fake Wyrd gateway that answers each reviewer with a fixed text and records
-/// every request it receives.
-#[derive(Default)]
-struct ReviewGateway {
-    /// Serialized provider requests in arrival order.
-    requests: Mutex<Vec<String>>,
-}
+/// Environment variable naming the Workflow file the child process loads.
+const CHILD_PATH: &str = "WORKFLOW_LOADING_CHILD_PATH";
 
-#[async_trait]
-impl WyrdGatewayCaller for ReviewGateway {
-    /// Record the request and answer with the fixed text for its reviewer.
-    ///
-    /// # Errors
-    /// Never returns an error.
-    ///
-    /// # Panics
-    /// Panics if the static completion fixture stops decoding.
-    async fn call(
-        &self,
-        call: WyrdGatewayCall,
-        _cancellation: &CancellationToken,
-    ) -> Result<ProviderResponse, ProviderError> {
-        let request = serde_json::to_string(&call.request).unwrap_or_default();
-        let text = if request.contains("security reviewer") {
-            "SECURITY-FINDINGS"
-        } else if request.contains("correctness reviewer") {
-            "CORRECTNESS-FINDINGS"
-        } else {
-            "FINAL-REVIEW"
-        };
-        self.requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(request);
-        let response: OpenAiChatResponse = serde_json::from_value(json!({
-            "id": "resp",
-            "object": "chat.completion",
-            "created": 0,
-            "model": "gpt-5-5",
-            "choices": [{
-                "index": 0,
-                "message": { "role": "assistant", "content": text },
-                "finish_reason": "stop"
-            }]
-        }))
-        .expect("static completion decodes");
-        Ok(ProviderResponse::OpenAiChatCompletion(response))
-    }
-}
+/// Prefix of the one stdout line on which the child reports its outcome.
+const CHILD_OUTCOME: &str = "WORKFLOW_LOADING_CHILD_OUTCOME ";
 
-impl ReviewGateway {
-    /// Return a copy of every request recorded so far.
-    fn requests(&self) -> Vec<String> {
-        self.requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-}
+/// The `final_review` output the `mixed` Workflow produces from the
+/// registered 1.0.0 team Agents.
+const REGISTERED_REVIEW: &str = "final review of diff | registered security review of diff | registered correctness review of diff";
 
-/// Run `workflow` with `gateway` as its Wyrd gateway and a fixed `code` input.
+/// Run `workflow` with the fixed input `code = "diff"`.
 ///
 /// # Panics
 /// Panics when the run refuses to start.
-async fn run(workflow: &Workflow, gateway: &Arc<ReviewGateway>) -> WorkflowRun {
-    let dependencies = WorkflowExecutionDependencies::new(skald_runtime::ProviderRegistry::new())
-        .with_wyrd_gateway(Arc::clone(gateway) as Arc<dyn WyrdGatewayCaller>);
-    let input = Map::from_iter([(
-        "code".to_owned(),
-        Value::from("diff --git a/src/auth.rs b/src/auth.rs"),
-    )]);
-    workflow
-        .as_skald()
-        .run_with_options(&dependencies, input, WorkflowRunOptions::default())
-        .await
-        .expect("workflow run starts")
+async fn run(workflow: &Workflow) -> WorkflowRun {
+    let input = Map::from_iter([("code".to_owned(), Value::from("diff"))]);
+    workflow.run(input).await.expect("workflow run starts")
+}
+
+/// Assert that `run` succeeded with exactly the declared `outputs`.
+///
+/// # Panics
+/// Panics when the run did not succeed or an output differs.
+fn assert_succeeded(run: &WorkflowRun, outputs: &Value) {
+    assert_eq!(run.status, WorkflowRunStatus::Succeeded, "{:?}", run.error);
+    assert_eq!(&json!(run.outputs), outputs);
 }
 
 /// Path to a file under the repository root.
@@ -128,12 +70,11 @@ fn fixture(relative: &str) -> PathBuf {
     repo_file("tests/fixtures/workflow-loading").join(relative)
 }
 
-/// Bootstrap a service principal holding `roles` and return a Cards handle
-/// authenticated as it.
+/// Bootstrap a service principal holding `roles` and return its API key.
 ///
 /// # Panics
-/// Panics when the principal cannot bootstrap or the client cannot build.
-async fn cards_as(server: &WyrdTestServer, name: &str, roles: &[&str]) -> Cards {
+/// Panics when the principal cannot bootstrap.
+async fn api_key(server: &WyrdTestServer, name: &str, roles: &[&str]) -> String {
     let Bootstrap::Machine { api_key, .. } = server
         .bootstrap_service(name, roles)
         .await
@@ -141,25 +82,60 @@ async fn cards_as(server: &WyrdTestServer, name: &str, roles: &[&str]) -> Cards 
     else {
         panic!("expected a machine principal");
     };
+    api_key.expose_secret().to_owned()
+}
+
+/// Return a Cards handle authenticated with `api_key`.
+///
+/// # Panics
+/// Panics when the client cannot build.
+fn cards_with(server: &WyrdTestServer, api_key: &str) -> Cards {
     let base_url = server.base_url().expect("bound server has a URL");
-    let client = client_from_options(Some(base_url), Some(api_key.expose_secret()), None)
-        .expect("client builds");
+    let client = client_from_options(Some(base_url), Some(api_key), None).expect("client builds");
     Cards::with_client(client)
 }
 
-/// Exact reference to a Card in the `workflow-loading` space.
+/// Load the authored Workflow at `relative` in a child process whose only
+/// configuration is `WYRD_SERVER_URL` and, when given, `WYRD_API_KEY`.
+///
+/// `Workflow::from_path` reads that configuration from the process
+/// environment. Setting it inside this multithreaded test would need
+/// `unsafe`, so a fresh copy of this test binary runs
+/// [`authored_load_child`] with the environment set instead.
+///
+/// Returns the child's outcome: `{"error": "<code>"}` when loading failed, or
+/// `{"run": <WorkflowRun>}` after running the loaded Workflow.
 ///
 /// # Panics
-/// Panics when the fields do not decode as a Card reference.
-fn card_ref(kind: &str, name: &str, version: &str, uid: Option<&str>) -> CardRef {
-    serde_json::from_value(json!({
-        "kind": kind,
-        "name": name,
-        "version": version,
-        "space": "workflow-loading",
-        "uid": uid,
-    }))
-    .expect("test card reference decodes")
+/// Panics when the child cannot start, fails, or reports no outcome.
+fn load_in_child(server: &WyrdTestServer, api_key: Option<&str>, relative: &str) -> Value {
+    let config_home = tempfile::tempdir().expect("empty config home creates");
+    let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+    command
+        .args(["authored_load_child", "--exact", "--ignored", "--nocapture"])
+        .env(CHILD_PATH, fixture(relative))
+        .env(
+            "WYRD_SERVER_URL",
+            server.base_url().expect("bound server has a URL"),
+        )
+        .env("WYRD_CONFIG_HOME", config_home.path())
+        .env_remove("WYRD_API_KEY")
+        .env_remove("WYRD_ACCESS_TOKEN");
+    if let Some(api_key) = api_key {
+        command.env("WYRD_API_KEY", api_key);
+    }
+    let output = command.output().expect("child process starts");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "child failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let line = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(CHILD_OUTCOME))
+        .unwrap_or_else(|| panic!("child reported no outcome:\n{stdout}"));
+    serde_json::from_str(line).expect("child outcome is JSON")
 }
 
 /// Register the fixture at `relative` and return the UID of every Card it
@@ -179,6 +155,21 @@ async fn register(cards: &Cards, relative: &str) -> HashMap<String, String> {
             (outcome.card_ref.name.to_string(), uid.to_string())
         })
         .collect()
+}
+
+/// Exact reference to a Card in the `workflow-loading` space.
+///
+/// # Panics
+/// Panics when the fields do not decode as a Card reference.
+fn card_ref(kind: &str, name: &str, version: &str, uid: Option<&str>) -> CardRef {
+    serde_json::from_value(json!({
+        "kind": kind,
+        "name": name,
+        "version": version,
+        "space": "workflow-loading",
+        "uid": uid,
+    }))
+    .expect("test card reference decodes")
 }
 
 /// Check that `cards.workflow().load` refuses an Agent selector, a
@@ -232,37 +223,125 @@ async fn assert_selectors_refused(
     assert_eq!(error.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
 }
 
-/// Prove the Rust SDK loads a local Workflow file, and loads an applied
-/// Workflow's exact registered version through Cards.
+/// Check that authored Workflows referencing the registered team Agents load
+/// and run through the ambient configuration with `reader_key`, are refused
+/// with no credential or with `no_roles_key`, and that a reference to a
+/// deleted Card is refused. `writer` registers and deletes that Card.
+///
+/// # Panics
+/// Panics when a load, run, or refusal diverges from the contract.
+async fn assert_authored_loads(
+    server: &WyrdTestServer,
+    writer: &Cards,
+    reader_key: &str,
+    no_roles_key: &str,
+) {
+    assert_eq!(
+        load_in_child(server, None, "mixed/workflow.yaml"),
+        json!({ "error": "WYRD_CLIENT_401_NO_CREDENTIALS" })
+    );
+    assert_eq!(
+        load_in_child(server, Some(no_roles_key), "mixed/workflow.yaml"),
+        json!({ "error": "WYRD_PERMISSION_403_DENIED_RBAC" })
+    );
+    let mixed = load_in_child(server, Some(reader_key), "mixed/workflow.yaml");
+    assert_eq!(mixed["run"]["status"], "succeeded");
+    assert_eq!(
+        mixed["run"]["outputs"],
+        json!({ "review": REGISTERED_REVIEW })
+    );
+
+    // A local sibling and the registered Agent with the same identity each
+    // run their own Prompt.
+    let shadowed = load_in_child(server, Some(reader_key), "shadowed/workflow.yaml");
+    assert_eq!(shadowed["run"]["status"], "succeeded");
+    assert_eq!(
+        shadowed["run"]["outputs"],
+        json!({
+            "security": "local security review of diff",
+            "registered_security": "registered security review of diff",
+            "review": "final review of diff | local security review of diff | local correctness review of diff",
+        })
+    );
+
+    // A reference to a deleted Card is refused.
+    let retired = register(writer, "retired/retired-prompt.yaml").await;
+    writer
+        .delete(CardSelector::uid(
+            CardKind::Prompt,
+            serde_json::from_value(json!(retired["retired-prompt"])).expect("UID decodes"),
+        ))
+        .await
+        .expect("retired Prompt deletes");
+    assert_eq!(
+        load_in_child(server, Some(reader_key), "retired/workflow.yaml"),
+        json!({ "error": "WYRD_REGISTRY_404_CARD_NOT_FOUND" })
+    );
+}
+
+/// Child half of [`load_in_child`]: load the Workflow file named by
+/// `WORKFLOW_LOADING_CHILD_PATH` with the ambient configuration, run it when
+/// it loads, and print the outcome on one prefixed stdout line.
+///
+/// # Panics
+/// Panics when `WORKFLOW_LOADING_CHILD_PATH` is unset, which means this test
+/// was started directly instead of by [`load_in_child`].
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "runs only as the child process of workflow_loading_journey"]
+async fn authored_load_child() {
+    let path = std::env::var(CHILD_PATH).expect("started by load_in_child");
+    let outcome = match Workflow::from_path(path).await {
+        Err(error) => json!({ "error": error.code() }),
+        Ok(workflow) => json!({ "run": run(&workflow).await }),
+    };
+    println!("{CHILD_OUTCOME}{outcome}");
+}
+
+/// Prove the Rust SDK loads and runs local and mixed authored Workflows, and
+/// loads and runs an applied Workflow's exact registered version through
+/// Cards.
 ///
 /// # Panics
 /// Panics when any load, run, pin, or refusal diverges from the contract.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn workflow_loading_journey() {
-    // 1. A wholly local Workflow file loads without any server.
-    let local = Workflow::from_path(repo_file("examples/workflows/code-review/workflow.yaml"))
+    // 1. A wholly local Workflow loads and runs without any server.
+    let local = Workflow::from_path(fixture("shadowed/local-workflow.yaml"))
         .await
-        .expect("local example loads");
-    assert_eq!(
-        local.as_skald().step_ids(),
-        vec!["security", "correctness", "final_review"]
+        .expect("local Workflow loads");
+    assert_succeeded(
+        &run(&local).await,
+        &json!({
+            "security": "local security review of diff",
+            "review": "final review of diff | local security review of diff | local correctness review of diff",
+        }),
     );
 
     let server = Box::pin(WyrdTestServer::start_bound())
         .await
         .expect("test server starts");
-    let writer = cards_as(&server, "workflow_writer", &["writer"]).await;
-    let reader = cards_as(&server, "workflow_reader", &["reader"]).await;
-    let no_roles = cards_as(&server, "workflow_no_roles", &[]).await;
+    let writer = cards_with(
+        &server,
+        &api_key(&server, "workflow_writer", &["writer"]).await,
+    );
+    let reader_key = api_key(&server, "workflow_reader", &["reader"]).await;
+    let reader = cards_with(&server, &reader_key);
+    let no_roles_key = api_key(&server, "workflow_no_roles", &[]).await;
+    let no_roles = cards_with(&server, &no_roles_key);
 
-    // 2. Register the team Agents, then apply the Workflow that references them.
+    // 2. The team registers its reviewer Agents.
     let mut uids = register(&writer, "team/security.yaml").await;
     uids.extend(register(&writer, "team/correctness.yaml").await);
+
+    // 3. Authored files that reference registered Agents load through the
+    //    ambient configuration, which must be able to read them.
+    assert_authored_loads(&server, &writer, &reader_key, &no_roles_key).await;
+
+    // 4. Apply the mixed Workflow; it pins each step to the exact registered
+    //    Agent UID. Then a newer security Agent registers.
     let workflow_uid = register(&writer, "mixed/workflow.yaml").await["code-review"].clone();
     let workflow_ref = card_ref("Workflow", "code-review", "1.0.0", Some(&workflow_uid));
-
-    // The stored Workflow pins each step to the exact registered Agent UID.
     let stored = writer
         .get(CardSelector::exact(workflow_ref.clone()))
         .await
@@ -276,12 +355,10 @@ async fn workflow_loading_journey() {
         stored["steps"][1]["action"]["target"]["uid"],
         json!(uids["correctness-reviewer"])
     );
-
-    // 3. A newer security Agent registers after the Workflow was applied.
     register(&writer, "team-v2/security.yaml").await;
 
-    // 4. Load by exact ref and by UID; both run the pinned 1.0.0 Agents.
-    let gateway = Arc::new(ReviewGateway::default());
+    // 5. Load by exact ref and by UID; both run the pinned 1.0.0 Agents, not
+    //    the newer one ("v2 security review of diff").
     let workflow_selector = CardSelector::uid(
         CardKind::Workflow,
         serde_json::from_value(json!(workflow_uid)).expect("UID decodes"),
@@ -292,25 +369,20 @@ async fn workflow_loading_journey() {
             .load(&selector)
             .await
             .expect("registered Workflow loads");
-        let run = run(&workflow, &gateway).await;
-        assert_eq!(run.status, WorkflowRunStatus::Succeeded);
-        assert_eq!(run.outputs["review"], json!("FINAL-REVIEW"));
+        let run = run(&workflow).await;
+        assert_succeeded(&run, &json!({ "review": REGISTERED_REVIEW }));
+        assert_eq!(
+            run.steps["final_review"].text.as_deref(),
+            Some(REGISTERED_REVIEW)
+        );
         let identity = run.workflow.expect("registered run keeps its Workflow");
         assert_eq!(
             identity.uid.map(|uid| uid.to_string()),
             Some(workflow_uid.clone())
         );
     }
-    let requests = gateway.requests();
-    assert_eq!(requests.len(), 6, "two runs of three steps each");
-    assert!(
-        requests
-            .iter()
-            .all(|request| !request.contains("v2 auditor")),
-        "the newer Agent version must not float into the pinned Workflow"
-    );
 
-    // 5. Refused selectors read nothing they should not and dispatch nothing.
+    // 6. Wrong, versionless, mismatched, and unauthorized selectors are refused.
     assert_selectors_refused(
         &reader,
         &no_roles,
@@ -318,10 +390,5 @@ async fn workflow_loading_journey() {
         &uids["correctness-reviewer"],
     )
     .await;
-    assert_eq!(
-        gateway.requests().len(),
-        6,
-        "refused loads dispatch nothing"
-    );
     server.shutdown().await.expect("test server shuts down");
 }

@@ -260,3 +260,82 @@ Ceilings:
 - Non-goals stayed excluded. No unrelated files changed, apart from the broken
   production-wheel check and the clippy line in `gateway_admin.rs` that this
   task's argument change triggered.
+
+### Review r1 remediation
+
+Human decisions applied, recorded in
+`review/TASK-004-r1/human-direction-FIND-TASK-004-4.md`:
+1. **One credential file (FIND-4).** Saved logins live in
+   `~/.config/wyrd/credentials.toml`; the separate `logins/` store is gone.
+   There is no local encryption. The file is 0600 and user-only, and the
+   client fails closed when it is unsafe. The lock, generation,
+   RefreshPending, LoggedOut and atomic-replace semantics run against that
+   file and preserve the user's other content.
+2. **Tenant key only (FIND-1).** `tenant` is a tenant route key. It selects
+   the saved login and names the tenant for the workload-token exchange,
+   winning over an ambient `WYRD_TENANT`. An explicit credential, an access
+   token, or an API key already names its tenant, so a set `tenant` beside
+   one is refused with `WYRD_CLIENT_400_CONFIG_INVALID` ("this credential
+   already names its tenant"). There is no claim parsing and no id
+   comparison. The id-comparison commit 741449736 was reverted by ce6cc4bab.
+   - Consequence: `client.tenant`/`WYRD_TENANT` feeds the selector, so an
+     ambient `WYRD_TENANT` together with an API key or access token is now
+     refused. Unset it for machine credentials.
+3. **Token cache (follow-up).** `~/.config/wyrd/tokens` is deleted, together
+   with `client.token_cache.path` and `WYRD_TOKEN_CACHE_PATH`. With
+   `kind = "disk"`, the access token exchanged from `[default].api_key` is
+   cached beside that key in `credentials.toml`. The write goes through the
+   shared locked, atomic, 0600, content-preserving writer in
+   `credentials_file.rs`. Workload and renewable tokens stay in memory.
+
+Commits: 2cd10e99f (FIND-4), 6e4c30ec2 (FIND-5), 1f2d50c03 (FIND-6),
+efe624f8c (FIND-7), 914844ef8 (FIND-2), f95131a79 (FIND-3), 741449736 then
+ce6cc4bab (rejected approach and its revert), 05f649dce (FIND-1), fcf5c366a
+(token cache), ab853480f (TS declarations), 2d8e5220f and the following
+commit (lane fixes).
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-4: one credentials file, no separate store, fail-closed on unsafe | `credentials_file.rs::CredentialsFile`; `saved_login.rs::SavedLogins` | `saved_login::tests::logins_live_in_credentials_toml_beside_user_content`; `concurrent_saved_renewal` (unsafe_store) | PASS |
+| FIND-1: key-only selector; refused beside a self-naming credential; selector routes the workload token | `ClientConfig::refuse_selector`; `SavedLogins::select`; `workload_token_from_env` | `config::tests::tenant_selector_is_refused_beside_a_self_naming_credential` (red before green); override phase in the Rust, Python, and TypeScript journeys | PASS |
+| FIND-2: a cached saved-login bearer revalidates the durable generation | `AccessTokenSource::revalidates_cache`; `AuthMiddleware` | `auth::tests::saved_login_cache_revalidates_every_use` | PASS |
+| FIND-3: lost-response renewal and lock timeout fail closed | `LossyProxy` relay in `pg_auth_e2e_against_fixture.rs` | `concurrent_saved_renewal`: one request with `200 OK` then `refresh_pending` and no retry; `lock_timeout` after 30s with no request | PASS |
+| FIND-5: TokenExchange refuses remote cleartext (loopback only) | `TokenExchange::new` reuses the transport policy | `auth::tests::token_exchange_refuses_remote_cleartext`; `cli_oidc_handoff_journey` | PASS |
+| FIND-6: Python constructors and Bifrost wrappers accept and forward `tenant` | `python/wyrd/bifrost/__init__.py`; stubs | `test_every_public_constructor_accepts_and_forwards_tenant`; `py:typecheck` | PASS |
+| FIND-7: canonical transactional audit for CLI refresh-chain revocation | `CliLogins::end` appends `auth.cli_login.logout` via `append_auth_audit` | `cli_logins::pg_tests::logout_revokes_only_its_own_chain`: one event; a refused append rolls back | PASS |
+| Token cache in credentials.toml | `CredentialsFile::{cached_api_key_token, cache_api_key_token}`; `AuthMiddleware::persist` | `auth::tests::disk_cache_writes_token_beside_its_api_key`; `renewable_tokens_are_never_persisted` | PASS |
+
+Lanes (each run alone; every lane's final run exited 0):
+- Identity targets `rust`, `client`, `cli`, `python`, `typescript`, then
+  `test:identity:journey` unfiltered.
+- `fmt`, `lints`, `py:format`, `py:lints`, `codegen:check`,
+  `check:client-tier`, `check:pyo3-scope`, `check:py-wheel-no-testing`,
+  `check:workspace-hack`, `docs:check`.
+- `test:shared`, `test:wyrd-sdk`, `test:cli:journey`,
+  `test:principals:integration`, `test:wyrd` (2352 passed).
+- `py:test:unit` (501 passed), `py:typecheck`, `py:test:integration`.
+- `ts:test:unit`, `ts:typecheck`, `ts:napi:check`, `ts:test:integration`.
+
+r1 diagnoses:
+- **`lints` failed.**
+  - Symptom: clippy `too_many_lines` on `logout_revokes_only_its_own_chain`,
+    and `type_complexity` on the selector tier table.
+  - Fix: seeding moved into `seed_two_cli_logins`, and the tier table was
+    flattened to `Option<(name, value)>`. Assertions are unchanged.
+- **`check:workspace-hack` failed.**
+  - Cause: the `toml_edit` `serde` feature that the new credentials writer
+    uses had not been hoisted.
+  - Fix: ran `cargo hakari generate`.
+- **`docs:check` failed.**
+  - Cause: `api/errors.md` lacked `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE`.
+  - Fix: regenerated it with `docs:generate`.
+- **`py:test:unit` failed.**
+  - Symptom: `test_wyrd_server_url_alone_sets_both_endpoints` used
+    `http://wyrd.internal`, which FIND-5 now refuses on purpose.
+  - Fix: the test now uses `https://`. Its subject, endpoint derivation, is
+    unchanged.
+- **`test:wyrd` exit 124.** The first run hit the 595s shell timeout during a
+  9-minute compile. It was not a test failure; the rerun passed.
+- **Not rerun after the late fixes.** After the workspace-hack and test-only
+  fixes, `lints` was rerun clean, which compiles every target. The other
+  lanes were not rerun.

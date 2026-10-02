@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, TypedDict, runtime_checkable
 
 from .error import WyrdError
 from .header import JsonDict, PathLike
@@ -397,6 +397,38 @@ def local_registry() -> AbstractContextManager[None]:
     """
     ...
 
+class WorkflowRunError(TypedDict):
+    """Bounded primary error of a failed Workflow run or step."""
+
+    code: str
+    message: str
+    details: Any
+    remediation: str
+
+class WorkflowStepResult(TypedDict):
+    """One step's result in `WorkflowRun.steps`, keyed by step id."""
+
+    status: Literal["pending", "running", "succeeded", "failed", "cancelled", "unstarted"]
+    text: str | None
+    structured_output: Any
+    attempts: int
+    started_at: str | None
+    ended_at: str | None
+    error: WorkflowRunError | None
+
+class WorkflowRunDict(TypedDict):
+    """Complete wire-shaped snapshot returned by `WorkflowRun.to_dict`."""
+
+    run_id: str
+    workflow: dict[str, Any] | None
+    status: Literal["succeeded", "failed", "cancelled", "timed_out"]
+    outputs: dict[str, Any]
+    steps: dict[str, WorkflowStepResult]
+    created_at: str
+    started_at: str | None
+    ended_at: str | None
+    error: WorkflowRunError | None
+
 class WorkflowRun:
     """Terminal Workflow run snapshot returned by `Workflow.run`.
 
@@ -420,20 +452,16 @@ class WorkflowRun:
         ...
 
     @property
-    def steps(self) -> dict[str, dict[str, Any]]:
-        """Return step results keyed by step id.
-
-        Each result has `status`, `attempts`, optional `text` or
-        `structured_output`, `started_at`, `ended_at`, and `error`.
-        """
+    def steps(self) -> dict[str, WorkflowStepResult]:
+        """Return step results keyed by step id."""
         ...
 
     @property
-    def error(self) -> dict[str, Any] | None:
-        """Return the primary run error (`code`, `message`, `details`, `remediation`)."""
+    def error(self) -> WorkflowRunError | None:
+        """Return the primary run error, or None."""
         ...
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> WorkflowRunDict:
         """Return the complete snapshot as its wire-shaped dictionary."""
         ...
 
@@ -702,6 +730,9 @@ __all__ = [
     "SessionTurn",
     "Workflow",
     "WorkflowRun",
+    "WorkflowRunDict",
+    "WorkflowRunError",
+    "WorkflowStepResult",
     "local_registry",
     "tool",
 ]

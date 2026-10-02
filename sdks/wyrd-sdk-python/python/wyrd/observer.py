@@ -163,7 +163,13 @@ class Observer:
         step_id: str,
         attempt: int,
     ) -> None:
-        """Workflow step attempt started; attempts count from 1."""
+        """Workflow step attempt started.
+
+        Args:
+            run_id (str): Workflow run identifier.
+            step_id (str): Step identifier.
+            attempt (int): Attempt number, counting from 1.
+        """
 
     def on_workflow_step_result(
         self,
@@ -172,10 +178,14 @@ class Observer:
         attempt: int,
         error_code: str | None,
     ) -> None:
-        """Workflow step attempt ended.
+        """Workflow step attempt ended. Step payloads are never passed to observers.
 
-        ``error_code`` is the stable Wyrd code of a failed attempt and ``None``
-        for success. Step payloads are never passed to observers.
+        Args:
+            run_id (str): Workflow run identifier.
+            step_id (str): Step identifier.
+            attempt (int): Attempt number, counting from 1.
+            error_code (str | None): Stable Wyrd code of a failed attempt, or
+                None for success.
         """
 
     def on_workflow_step_backoff(
@@ -185,4 +195,11 @@ class Observer:
         next_attempt: int,
         delay_ms: int,
     ) -> None:
-        """Workflow step retry backoff scheduled before ``next_attempt``."""
+        """Workflow step retry backoff scheduled.
+
+        Args:
+            run_id (str): Workflow run identifier.
+            step_id (str): Step identifier.
+            next_attempt (int): Attempt number that begins after the delay.
+            delay_ms (int): Backoff delay in milliseconds.
+        """

@@ -20,6 +20,8 @@ mod state;
 mod testing;
 #[cfg(feature = "python")]
 mod verification;
+#[cfg(feature = "python")]
+mod workflow;
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
@@ -45,7 +47,7 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     let agent = PyModule::new(py, "agent")?;
     skald_agent::python_register(&agent)?;
-    skald_workflow::python_register(&agent)?;
+    workflow::register(&agent)?;
     m.add_submodule(&agent)?;
     register_submodule(py, "wyrd._wyrd.agent", &agent)?;
 

@@ -8830,7 +8830,6 @@ dependencies = [
  "uuid",
  "wiremock",
  "workspace-hack",
- "wyrd-runtime",
  "wyrd-spec",
  "wyrd-utils",
 ]

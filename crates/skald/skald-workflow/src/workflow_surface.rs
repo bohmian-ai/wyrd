@@ -1,9 +1,8 @@
 //! User-facing Workflow authoring + run surface.
 //!
-//! Mirrors the [`skald_agent::Agent`] pyclass-is-the-class pattern: one struct
-//! holds envelope metadata, the durable spec body, derived cascade children,
-//! and the resolved per-step agents used at run time. The same struct serves
-//! both the Rust user surface and the Python `wyrd.agent.Workflow` class.
+//! One struct holds envelope metadata, the durable spec body, derived cascade
+//! children, and the resolved per-step agents used at run time. It is the Rust
+//! user surface; the Python SDK wraps it as the `wyrd.agent.Workflow` class.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -79,16 +78,12 @@ impl From<Map<String, Value>> for WorkflowInput {
 
 /// User-facing workflow surface: meta + spec + resolved agents + cascade.
 ///
-/// The pyclass IS the Python class (per the Wyrd S12C doctrine). Construction
+/// The Python SDK wraps this type as `wyrd.agent.Workflow`. Construction
 /// flows through `Workflow::new`, the sugar constructors `Workflow::sequential`
 /// / `Workflow::parallel`, or the `Workflow::builder` DAG primitive. `.run()`
 /// validates the resolved graph and drives the Agents through the internal
 /// Workflow executor.
 #[derive(Clone)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "wyrd.agent", name = "Workflow", skip_from_py_object)
-)]
 pub struct Workflow {
     pub(crate) meta: CardMetadata,
     pub(crate) spec: WorkflowSpec,
@@ -192,6 +187,20 @@ impl Workflow {
     #[must_use]
     pub fn with_space(mut self, space: impl Into<String>) -> Self {
         self.meta.space = Some(space.into());
+        self
+    }
+
+    /// Replace the workflow's queryable labels.
+    #[must_use]
+    pub fn with_labels(mut self, labels: Labels) -> Self {
+        self.meta.labels = labels;
+        self
+    }
+
+    /// Replace the workflow's free-form annotations.
+    #[must_use]
+    pub fn with_annotations(mut self, annotations: Annotations) -> Self {
+        self.meta.annotations = annotations;
         self
     }
 
@@ -746,8 +755,8 @@ impl WorkflowBuilder {
 /// Characters outside `[A-Za-z0-9_]` become `_`, and a name that does not
 /// start with a letter or `_` gains a `_` prefix. Builders use this for the
 /// base step ID of a named Agent, so callers can name a predecessor step by
-/// its Agent.
-pub(crate) fn step_id_for_name(name: &str) -> String {
+/// its Agent. The Python SDK uses it to resolve an Agent passed as `after`.
+pub fn step_id_for_name(name: &str) -> String {
     let mut id: String = name
         .chars()
         .map(|ch| {

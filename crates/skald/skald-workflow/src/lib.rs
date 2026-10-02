@@ -51,11 +51,10 @@ pub use route::{
     WyrdGatewayCall, WyrdGatewayCaller,
 };
 pub use workflow::{DEFAULT_MAX_CONCURRENCY, WorkflowExecutionLimits, WorkflowRunOptions};
-pub use workflow_surface::{AgentResolver, Workflow, WorkflowBuilder, WorkflowInput};
+pub use workflow_surface::{
+    AgentResolver, Workflow, WorkflowBuilder, WorkflowInput, step_id_for_name,
+};
 pub use wyrd_spec::card::workflow::{
     WorkflowBinding, WorkflowRun, WorkflowRunError, WorkflowRunStatus, WorkflowStepResult,
     WorkflowStepStatus,
 };
-
-#[cfg(feature = "python")]
-pub use python::python_register;

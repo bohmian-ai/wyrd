@@ -134,3 +134,26 @@ git diff --check
 A red required lane blocks completion. Route this task directly to
 `$wyrd-implement`; the next immutable review reassesses the complete original
 base-to-candidate range.
+
+## Implementation evidence
+
+Commit: `e39600aa5` (`crates/wyrd/wyrd-testing/src/server.rs` only).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-001-28`: graceful serve/Bifrost work stays bounded | `WyrdTestServer::settle_lifecycle` keeps the `budget` timeout on the serve join and `Bifrost::shutdown` | `server::teardown_tests::shutdown_aborts_and_joins_a_serve_task_that_outlives_its_drain` | PASS |
+| `FIND-TASK-001-28`: every fallback awaits the abort fence; settlement recorded afterward | `settle_lifecycle` awaits `bifrost.abort()` with no deadline, then sets `bifrost_settled` | `server::teardown_tests::dropping_an_in_process_server_settles_bifrost_before_fixture_release` | PASS |
+| `FIND-TASK-001-28`: active-runtime implicit drop cannot release the fixture while a governed storage request is live | Same owner; new test parks a real `exists` at `StorageOperationBarrier(Exists)` and asserts fixture released, `active_requests == 0`, `is_settled()`, and `Closed` terminal | `server::teardown_tests::dropping_an_in_process_server_with_live_storage_work_awaits_abort_before_fixture_release` | PASS |
+
+Commands (all exit 0):
+
+- `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(=server::teardown_tests::shutdown_aborts_and_joins_a_serve_task_that_outlives_its_drain) | test(=server::teardown_tests::dropping_an_in_process_server_settles_bifrost_before_fixture_release) | test(=server::teardown_tests::dropping_an_in_process_server_with_live_storage_work_awaits_abort_before_fixture_release)'"` (3 run, 3 passed)
+- `mise run fmt`, `mise run lints`, `mise run test:wyrd`
+- `git diff --check a51af030b6039eea4b2914f3ebf2c31925d08721..HEAD`
+
+Known limits (lead-accepted):
+
+- The new test is a fix-side proof only; it also passes on the pre-fix code because tokio rounds the zero-budget deadline up to the next 1 ms timer tick, within which the barrier-parked request observes owner cancellation and settles.
+- Governed storage work driven by the dropping thread's own `current_thread` runtime now hangs implicit drop, since the unbounded abort waits on a task that blocked thread can never poll.
+
+Non-goals held: no product code, sleep, retry, timeout change, configuration, dependency, or new abstraction; field order and bound serve-task abort-and-join preserved.

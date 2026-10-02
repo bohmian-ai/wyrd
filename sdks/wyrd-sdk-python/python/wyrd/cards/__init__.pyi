@@ -3,8 +3,9 @@
 #### begin imports ####
 
 from collections.abc import Mapping
-from typing import Protocol, TypeAlias
+from typing import Protocol, TypeAlias, overload
 
+from ..agent import Workflow
 from ..data import DataCard, DataInterface
 from ..model import ModelCard, ModelInterface
 from ..prompt import Prompt, PromptCard, PromptReference
@@ -258,6 +259,11 @@ class Cards:
     @property
     def prompt(self) -> PromptCardRegistry:
         """Return the typed registry view for `PromptCard` operations."""
+        ...
+
+    @property
+    def workflow(self) -> WorkflowCards:
+        """Return the typed view for loading registered Workflows."""
         ...
 
     def register(
@@ -629,6 +635,39 @@ class ModelCardRegistry:
         """
         ...
 
+class WorkflowCards:
+    """Typed loading of registered Workflows.
+
+    Obtain this view from `Cards.workflow`.
+    """
+
+    @overload
+    def load(self, *, space: str, name: str, version: str) -> Workflow: ...
+    @overload
+    def load(self, *, uid: str) -> Workflow: ...
+    def load(
+        self,
+        *,
+        uid: str | None = None,
+        space: str | None = None,
+        name: str | None = None,
+        version: str | None = None,
+    ) -> Workflow:
+        """Load one registered Workflow by exact identity or by UID.
+
+        Pass either `uid` alone or all of `space`, `name`, and `version`.
+        Every Agent and Prompt is read along the Workflow's locked
+        relationships, so later versions never float in.
+
+        Returns:
+            Workflow: A runnable `wyrd.agent.Workflow`.
+
+        Raises:
+            WyrdError: For a mixed or incomplete selector, or when a Card is
+                unreadable, inactive, not a Workflow, or fails validation.
+        """
+        ...
+
 class PromptCardRegistry:
     """Typed operations for registered `PromptCard` objects.
 
@@ -824,4 +863,5 @@ __all__ = [
     "CardList",
     "RegistrationOutcome",
     "RegistrationReceipt",
+    "WorkflowCards",
 ]

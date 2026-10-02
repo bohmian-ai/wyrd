@@ -488,8 +488,8 @@ impl PyWorkflow {
     ///         are missing, or a referenced Card cannot be read.
     #[staticmethod]
     fn from_path(py: Python<'_>, path: PathBuf) -> WyrdPyResult<Self> {
-        let workflow = py
-            .detach(|| wyrd_runtime::runtime().block_on(wyrd_client::Workflow::from_path(path)))?;
+        let workflow =
+            py.detach(|| wyrd_runtime::runtime().block_on(wyrd_client::Workflow::from_path(path)))?;
         Ok(Self::from(workflow.into_skald()))
     }
 

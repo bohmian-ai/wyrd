@@ -42,6 +42,10 @@ from wyrd import Workflow
 wf = Workflow.from_path("research.yaml")
 ```
 
+`Workflow.from_path` loads local Agent and Prompt files next to the Workflow
+without a server. Steps that reference registered Agents, as this file does,
+are read from the Wyrd server using your configured credentials.
+
 ## Run
 
 ```python

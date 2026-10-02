@@ -663,17 +663,24 @@ class Workflow:
         ...
 
     @staticmethod
-    def load(path: PathLike) -> Workflow:
-        """Load a workflow from disk.
+    def from_path(path: PathLike) -> Workflow:
+        """Load an authored Workflow file and the Cards it references.
+
+        Relative paths and sibling Agents and Prompts in the same bundle load
+        locally; a wholly local file needs no server or credentials. Registry
+        Card refs are read exactly through the ambient Wyrd client
+        configuration (`WYRD_SERVER_URL` and `WYRD_API_KEY` or
+        `WYRD_ACCESS_TOKEN`).
 
         Args:
-            path (PathLike): Filesystem path.
+            path (PathLike): Workflow entry file.
 
         Returns:
-            Workflow: Reconstructed workflow with eager inline agent resolution.
+            Workflow: Fully hydrated and validated workflow.
 
         Raises:
-            WyrdError: When IO, codec, or resolution fails.
+            WyrdError: When the file fails to load or validate, credentials
+                are missing, or a referenced Card cannot be read.
         """
         ...
 

@@ -2601,12 +2601,10 @@ impl PyWorkflowCards {
                 CardKind::Workflow,
                 CardUid::new(uid).map_err(|error| WyrdPyError::validation(error.to_string()))?,
             ),
-            (None, Some(space), Some(name), Some(version)) => CardSelector::named(
-                CardKind::Workflow,
-                parse_space(space)?,
-                parse_name(name)?,
-            )
-            .with_version(parse_version(version)?),
+            (None, Some(space), Some(name), Some(version)) => {
+                CardSelector::named(CardKind::Workflow, parse_space(space)?, parse_name(name)?)
+                    .with_version(parse_version(version)?)
+            }
             _ => {
                 return Err(WyrdPyError::validation(
                     "pass either uid alone or space, name, and version",

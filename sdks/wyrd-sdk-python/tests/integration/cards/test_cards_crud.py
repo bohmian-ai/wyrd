@@ -473,7 +473,6 @@ def test_card_registry_enforces_cross_tenant_isolation(wyrd_server) -> None:
     cards.prompt.delete(uid=card.uid)
 
 
-
 _REPO = Path(__file__).parents[5]
 _FIXTURES = _REPO / "tests" / "fixtures" / "workflow-loading"
 
@@ -549,7 +548,9 @@ def test_workflow_loading_journey(wyrd_server, tmp_path: Path, monkeypatch) -> N
     #    the applied Workflow by identity and by UID: both stay pinned to 1.0.0.
     workflow_uid = _uids(writer.register_from_path(mixed))["code-review"]
     newer = _uids(writer.register_from_path(_FIXTURES / "team-v2" / "security.yaml"))
-    by_identity = reader.workflow.load(space="workflow-loading", name="code-review", version="1.0.0")
+    by_identity = reader.workflow.load(
+        space="workflow-loading", name="code-review", version="1.0.0"
+    )
     by_uid = reader.workflow.load(uid=workflow_uid)
     for workflow in [by_identity, by_uid]:
         assert list(workflow.steps) == ["security", "correctness", "final_review"]

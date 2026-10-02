@@ -4,10 +4,11 @@ from wyrd import Agent, Prompt, Workflow
 
 
 def _build_agent(name: str) -> Agent:
+    # Unversioned Agents save inline, so the file loads back without a registry.
+    # A versioned Agent would save as a registry reference instead.
     return Agent(
         prompt=Prompt.openai_chat("gpt-4o-mini", messages=["plan"]),
         name=name,
-        version="0.1.0",
     )
 
 

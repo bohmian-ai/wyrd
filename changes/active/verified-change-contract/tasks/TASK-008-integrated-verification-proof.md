@@ -209,7 +209,7 @@ Lanes run sequentially in this session, all exit 0: `fmt`, `py:format`,
 `test:bifrost:journey:python`, `test:bifrost:journey:typescript`,
 `test:operators:integration`, `py:test:unit`, `py:test:integration`,
 `ts:test:unit`, `ts:test:integration`, `docs:check`, `check:skills-sync`,
-`git diff --check`.
+`git diff --check`. Closeout: `mise run gate` exit 0 (run with `CARGO_BUILD_JOBS=8` after a host low-memory kill of the first attempt).
 
 Diagnosis (`test:wyrd`):
 - **Symptom:** `wyrd-spec vala::trace::attributes_tests::wyrd_keys_count_locked` failed with `left: 8, right: 9`.

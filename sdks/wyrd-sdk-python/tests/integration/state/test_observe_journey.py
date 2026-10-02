@@ -611,7 +611,7 @@ def run_journey(tmp_path: Path, server: WyrdTestServer) -> None:
     root = cards.register_from_path(str(service)).root
     pull_bundle(server, admin, root, bundle)
     credential = server.credential_registered_service(
-        f"{root.space}/Service/{root.name}@{root.version}", ["admin"]
+        f"{root.space}/Service/{root.name}@{root.version}", []
     )
 
     state = WyrdState.from_path(bundle, interfaces={"model": NoopModelInterface()})

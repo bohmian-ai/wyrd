@@ -208,7 +208,7 @@ describe("scoped observation journey", () => {
       // Service: only its card-ref scope covers the component Cards below.
       const credential = server.credentialRegisteredService(
         `${receipt.root.space}/Service/${receipt.root.name}@${receipt.root.version}`,
-        ["admin"],
+        [],
       );
 
       const state = WyrdState.fromPath(bundle);

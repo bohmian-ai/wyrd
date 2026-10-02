@@ -22,12 +22,15 @@ Wyrd?" Skip the explanation; go straight to the code.
 - [Evaluate](/how-to/evaluate/) — score agent runs and models against eval definitions.
 - [Observe](/how-to/observe/) — read metrics, drift, and audit trails from a running system.
 - [Operate](/how-to/operate/) — run, restart, and manage card-governed components.
+- [Operator connections](/how-to/operate/operator-connections/) — encrypted Slack, PagerDuty, and HTTP credentials for failure Operators.
 - [Administer the gateway](/how-to/administer-the-gateway/) — provider credentials, deployments, and gateway policies.
 
 <Aside title="What ships today" data-variant="wyrd">
 
 Agent and Workflow recipes run on the Skald runtime today. Declare recipes are
-available for the three shipped card kinds: Prompt, Model, and Data. Evaluate,
-Observe, and Operate recipes follow as those capability contracts ship.
+available for the three shipped card kinds: Prompt, Model, and Data. Evaluate
+and Observe describe the continuous Eval and Drift Verifiers, and Operator
+connections covers failure Operator credentials. Service deployment recipes
+follow when that capability ships.
 
 </Aside>

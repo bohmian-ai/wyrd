@@ -1,0 +1,203 @@
+---
+title: Operator connections
+description: Store Slack, PagerDuty, and HTTP credentials as encrypted tenant connections that failure Operators reference by name.
+pillar: wyrd
+group: How-to
+order: 33
+---
+
+# Operator connections
+
+An Operator reacts when a bound Verifier run ends with a `failed` verdict. An
+Operator Card never carries a secret. It names a **connection**: a credential
+that belongs to one tenant, is stored encrypted in Postgres, and is looked up by
+provider and name each time the Operator delivers.
+
+This page covers creating, reading, rotating, and disabling connections, and
+how each provider's Operator uses one.
+
+## What a connection is
+
+- **Tenant-bound.** A connection belongs to the tenant that created it. An
+  Operator resolves only a connection in the tenant of the run that failed.
+- **Typed.** The provider is one of `slack`, `pager_duty`, or `http`. Provider
+  and name are fixed at creation, and the name is unique per provider within
+  the tenant.
+- **Identified by a UUIDv7.** The server mints `connection_id` at creation.
+- **Encrypted at rest.** Each secret version is encrypted with its own data
+  key. The data key is wrapped by a key-encryption key held outside Postgres
+  (see [Operator connection keys](/self-hosting/configuration/#operator-connection-keys)).
+  Postgres never holds a plaintext secret.
+- **Write-only secret.** Reads return `connection_id`, `provider`, `name`,
+  `status`, `created_at`, `updated_at`, and the provider's nonsecret settings
+  only: `workspace_id` for Slack, nothing for PagerDuty, and the origin, auth
+  scheme, and custom header name for HTTP. No operation returns a token, key,
+  username, password, or header value.
+
+## Manage connections
+
+Every surface calls the same server operations. Reads need `operators:read`;
+every change needs `operators:write`. Of the built-in roles only `admin` holds
+them (see [Authorization](/concepts/authorization/)).
+
+| Operation | HTTP | CLI |
+|---|---|---|
+| Create | `POST /v1/operator-connections` | `wyrd operator-connection create --body-file <path>` |
+| List | `GET /v1/operator-connections` | `wyrd operator-connection list` |
+| Get | `GET /v1/operator-connections/{connection_id}` | `wyrd operator-connection get --connection-id <uuid>` |
+| Update, rotate, re-enable | `PATCH /v1/operator-connections/{connection_id}` | `wyrd operator-connection update --connection-id <uuid> --body-file <path>` |
+| Disable | `DELETE /v1/operator-connections/{connection_id}` | `wyrd operator-connection disable --connection-id <uuid>` |
+
+The MCP tools `operator_connections.list` and `operator_connections.get` are
+always listed; `operator_connections.create`, `operator_connections.update`, and
+`operator_connections.disable` appear only to a caller holding
+`operators:write`. The Rust, Python, and TypeScript SDKs expose the same
+operations. The CLI reads the request body from a file, or stdin with
+`--body-file -`, so a secret never appears on the command line.
+
+### Rotate a secret
+
+Send a PATCH with the provider tag and the new secret. Omitted fields are kept;
+a supplied secret replaces the stored one atomically. The next delivery attempt
+uses the new secret. No Card revision or server restart is needed.
+
+```yaml
+provider: slack
+bot_token: xoxb-new-token
+```
+
+### Disable and re-enable
+
+DELETE disables a connection. The row is kept for Card, dispatch, and audit
+lineage; it is never physically deleted. While disabled, registration and
+delivery refuse it. Re-enable it with a PATCH:
+
+```yaml
+provider: pager_duty
+status: active
+```
+
+If a connection is missing, disabled, of the wrong provider, or from another
+tenant, registration and delivery fail closed with the same error, so the
+response does not reveal which condition applied.
+
+## Slack
+
+A Slack connection holds one workspace bot token with the `chat:write` scope.
+
+```yaml
+provider: slack
+name: ops-slack
+workspace_id: T0123456789
+bot_token: xoxb-...
+```
+
+A Slack Notify Operator names the connection and a conversation ID:
+
+```yaml
+kind: notify
+channel:
+  kind: slack
+  connection: ops-slack
+  channel_id: C0123456789
+  text: "{{subject_ref}} failed {{verifier_ref}}"
+```
+
+Wyrd calls `chat.postMessage` with the bot token and treats a JSON `ok: false`
+response as a failure, not only a non-2xx status. The Slack app must already be
+allowed to post in that conversation. Wyrd does not need `chat:write.public`,
+does not manage channel membership, and stores no per-channel webhook URL.
+
+## PagerDuty
+
+A PagerDuty connection holds one Events API v2 Global Integration key.
+
+```yaml
+provider: pager_duty
+name: ops-pagerduty
+integration_key: R0123456789ABCDEF...
+```
+
+A PagerDuty Notify Operator names the connection and a route:
+
+```yaml
+kind: notify
+channel:
+  kind: pager_duty
+  connection: ops-pagerduty
+  route: payments-oncall
+  severity: critical
+  summary: "{{subject_ref}} failed {{verifier_ref}}"
+```
+
+Wyrd sends one `trigger` event. The authored `route` is carried as
+`payload.custom_details.wyrd_route`; match on it in PagerDuty Service Routes to
+send the event to the right service. PagerDuty owns routing and escalation;
+Wyrd does no escalation mapping and needs no per-team integration key. The
+`dedup_key` is the rendered `dedup_key` template when you set one, otherwise
+the dispatch ID, and stays the same across retries of one dispatch. An accepted
+event does not prove that PagerDuty opened an incident or paged anyone.
+
+## HTTP
+
+An HTTP connection holds one credential for exactly one origin.
+
+```yaml
+provider: http
+name: hooks-prod
+origin: https://hooks.example.com
+auth:
+  scheme: header
+  name: X-API-Key
+  value: ...
+```
+
+- `origin` is `https://host[:port]` with no path, query, fragment, or userinfo.
+  Plain `http` is accepted only for a loopback host.
+- `auth` is `bearer { token }`, `basic { username, password }`, or
+  `header { name, value }`. A custom header cannot be `Authorization`, `Host`,
+  `Content-Length`, `Transfer-Encoding`, `Connection`, or `Idempotency-Key`.
+
+An HTTP Operator names the connection under the same scheme, and header name
+for `header`, compared case-insensitively:
+
+```yaml
+kind: http
+method: post
+url: https://hooks.example.com/wyrd/{{binding_id}}
+auth:
+  scheme: header
+  name: X-API-Key
+  connection: hooks-prod
+body:
+  run: "{{run_id}}"
+  verdict: "{{verdict}}"
+```
+
+The URL origin is literal; placeholders may appear only in the path and query.
+At registration and before every attempt, the auth scheme, header name, and
+origin of every effective URL must match the connection, or the request fails
+before the secret is decrypted. The destination address is screened and pinned
+before the credential is attached, only same-origin redirects are followed, and
+each request carries `Idempotency-Key: <dispatch_id>`. An unauthenticated HTTP
+Operator omits `auth` and needs no connection.
+
+## Delivery
+
+Each failure Operator gets its own durable dispatch. A dispatch has three
+attempts of up to 30 seconds each, with 30-second then two-minute backoff,
+inside a five-minute deadline. Connection failures, timeouts, an unavailable
+key store, 408, 429, and 5xx responses retry; missing or unauthorized
+credentials, invalid destinations or templates, and other 4xx responses fail
+terminally. Delivery is at least once, so a destination may see a dispatch more
+than once. Dispatch status is readable from
+`GET /v1/verification/runs/{run_id}`.
+
+## What is not available
+
+- **Workflow Operators.** A `workflow` Operator Card registers, but a binding
+  that lists it under `on_failure` is rejected at registration. Wyrd never
+  reports an uninvoked Workflow as delivered.
+- **The old alert router.** The signed-webhook alert router and its
+  configuration were removed. There is no `Alert` resource or second delivery
+  path; a Notify Operator is the alert.

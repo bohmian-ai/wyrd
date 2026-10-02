@@ -8,19 +8,12 @@ order: 32
 
 # Operate
 
-<Aside title="Reserved — coming when ServiceCard ships" data-variant="not">
+## Pages
 
-Operate recipes will be added as the ServiceCard and TriggerCard runtime
-contracts ship. The specs are authored; the runtime implementation is not yet
-available.
+- [Operator connections](/how-to/operate/operator-connections/) — store Slack,
+  PagerDuty, and HTTP credentials that failure Operators reference by name.
 
-</Aside>
-
-Operate capability covers:
-
-- Deploying a service governed by a `ServiceCard`
-- Triggering workflows from `TriggerCard` definitions
-- Managing operator lifecycle within a workflow
-
-These how-to pages will be added alongside the ServiceCard runtime. See what
-runs today in the [Overview](/overview/).
+Verification Triggers and failure Operators run on the server today; see
+[Observe](/how-to/observe/) and [Evaluate](/how-to/evaluate/). Service
+deployment recipes are not written yet: the `Service` card kind is spec-only.
+See what runs today in the [Overview](/overview/).

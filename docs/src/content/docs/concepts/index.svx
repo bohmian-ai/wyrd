@@ -29,6 +29,6 @@ hub](/cards/), [Bifrost](/bifrost/), or [How-to guides](/how-to/) instead.
 ## Pages
 
 - [Card](/concepts/card/) — the envelope, the spec, and the lifecycle.
-- [Card kinds](/concepts/card-kinds/) — the 16 kinds plus External, by domain, with status.
+- [Card kinds](/concepts/card-kinds/) — the 15 registrable kinds plus the non-registrable External discriminator, by domain, with status.
 - [Doctrine](/concepts/doctrine/) — the design rules behind the object model.
 - [Architecture](/concepts/architecture/) — the three products that ship the model.

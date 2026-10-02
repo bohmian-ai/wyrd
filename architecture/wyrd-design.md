@@ -1311,7 +1311,7 @@ protocol-versioned additions):
 | Channel     | Carries                                                                            |
 |-------------|------------------------------------------------------------------------------------|
 | `Slack`     | `connection`, `channel_id`, `text` — `chat.postMessage` with the bot token; success is JSON `ok` |
-| `PagerDuty` | `connection`, `route`, `severity`, `summary`, `dedup_key?` — Events API v2 trigger; the default dedup key is the dispatch ID |
+| `PagerDuty` | `connection`, `route`, `severity`, `summary`, `dedup_key?` — one Events API v2 `trigger` event sent with the tenant connection's PagerDuty Global Integration key. The authored `route` travels as `payload.custom_details.wyrd_route` for the tenant to match in PagerDuty Service Routes; `payload.source` is the subject Card ref. The `dedup_key` is the rendered authored value or, by default, the dispatch ID, and stays the same across retries of one dispatch. PagerDuty owns service routing and escalation; Wyrd maps no escalation, provisions no per-team key, and does not treat Events API acceptance as proof that an incident or page was created |
 
 `HttpMethod`: closed enum — `Get | Post | Put | Patch | Delete`.
 

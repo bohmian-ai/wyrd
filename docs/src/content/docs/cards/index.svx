@@ -75,10 +75,14 @@ ModelCard artifacts. See [Declare a card](/how-to/declare/).
 
 ## Catalog
 
-The card *model* defines 15 native kinds plus `External`. Three are runnable end to
-end today; the rest are specified — their schemas and validation exist — but have
-no holder, Python surface, or runnable example yet. Status is shown honestly so the
-model's breadth is visible without implying more than ships.
+The card *model* defines 15 registrable kinds plus `External`, a non-registrable
+discriminator for foreign schema descriptors. Data, Model, and Prompt have typed
+Python holders and run end to end. Verifier, Trigger, and Operator run on the
+server as the verification runtime: they register as Cards or inline in a
+`verified_by` binding, without a dedicated Python holder page. The rest are
+specified — their schemas and validation exist — but have no runtime behind them
+yet. Status is shown honestly so the model's breadth is visible without implying
+more than ships.
 
 | Kind | What it is | Status |
 |---|---|---|
@@ -89,15 +93,15 @@ model's breadth is visible without implying more than ships.
 | Workflow | A declared multi-step workflow; runnable form is in [Skald](/concepts/architecture/). | ◷ Spec only |
 | Artifact | Durable artifact-metadata record that specs link to via `CardRef`. | ◷ Spec only |
 | Experiment | A grouping of runs and their measured outcomes. | ◷ Spec only |
-| Verifier | One reusable `drift` or `eval` judgment, bound to a Service, component, or Agent through `verified_by`. | ◷ Spec only |
+| **Verifier** | One reusable `drift` or `eval` judgment, bound to a Service, component, or Agent through `verified_by`; the server runs continuous Drift and Eval Verifiers. | ✅ Shipped |
 | Policy | A declared rule that decides whether an action is allowed. | ◷ Spec only |
 | Audit | Declared audit scope, requirements, or an evidence package. | ◷ Spec only |
 | Service | A deployable bundle of declared behavior with a bill of materials. | ◷ Spec only |
-| Operator | One `notify` or `http` reaction to a failed verification. | ◷ Spec only |
+| **Operator** | One reaction to a failed verification: Slack or PagerDuty `notify`, or `http`. A `workflow` Operator registers but cannot yet be used in `on_failure`. | ✅ Shipped |
 | Source | A declared upstream data or artifact source. | ◷ Spec only |
-| Trigger | When a bound Verifier runs: `schedule` or `observations_ready`. | ◷ Spec only |
+| **Trigger** | When a bound Verifier runs: `schedule` or `observations_ready`. | ✅ Shipped |
 | MCP | A declared MCP tool or server surface. | ◷ Spec only |
-| External | An escape hatch for components Wyrd references but does not own. | ◷ Spec only |
+| External | A non-registrable discriminator for foreign schema descriptors; not a registrable kind. | ◷ Spec only |
 
 For the generated, field-by-field schema of every kind, see the
 [Schema reference](/api/schemas/). For what the spec-only kinds need before they

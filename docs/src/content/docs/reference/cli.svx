@@ -180,6 +180,34 @@ WYRD_ACCESS_TOKEN=... wyrd gateway deployment list --server https://acme.wyrd.cl
   ]}
 />
 
+## wyrd operator-connection
+
+Manage the tenant's encrypted [Operator connections](/how-to/operate/operator-connections/).
+`create` and `update` read the whole request body, secret included, from a JSON
+or YAML file, or from stdin with `--body-file -`, so a credential never appears
+in argv or shell history. Every verb prints the server's redacted JSON view.
+Reads require `operators:read`; writes require `operators:write`.
+
+```bash
+wyrd operator-connection create --body-file slack.yaml --server https://acme.wyrd.cloud
+wyrd operator-connection list --server https://acme.wyrd.cloud
+```
+
+<DataTable
+  columns={[
+    { header: 'Command', role: 'name' },
+    { header: 'Meaning' }
+  ]}
+  rows={[
+    ['create --body-file <path>', 'Create a connection from a provider-tagged body.'],
+    ['list', 'List every connection in the tenant, redacted.'],
+    ['get --connection-id <uuid>', 'Read one connection, redacted.'],
+    ['update --connection-id <uuid> --body-file <path>', 'Patch a connection: rotate its secret, change nonsecret configuration, or set status to active or disabled.'],
+    ['disable --connection-id <uuid>', 'Disable a connection. It is retained, never deleted; re-enable it with update.'],
+    ['--server', 'Wyrd server base URL (WYRD_SERVER_URL). The credential resolves from the ambient chain.']
+  ]}
+/>
+
 ## Related
 
 - [Reference](/reference/) — cards, API, and schemas.

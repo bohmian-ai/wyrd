@@ -196,7 +196,7 @@ Services compose foundations instead of inventing private shapes:
 
 - **Registry** stores and validates cards; derives relationships from `CardRef`s; manages version and space isolation.
 - **Lineage** reads derived relationships to answer provenance queries.
-- **Policy** evaluates CEL rules at register-time (classify), deploy-time (gate), and runtime (invoke).
+- **Policy** evaluates CEL rules at register-time (classify) and deploy-time (gate). There is no runtime invoke gate; route access is RBAC.
 - **Bifrost / Observability** records runs and observations through Scribe,
   serves interactive and streamed distributed reads through Oracle, promotes
   and rewrites Iceberg data through Forge, and reads external data through

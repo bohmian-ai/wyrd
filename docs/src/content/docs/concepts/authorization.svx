@@ -83,6 +83,15 @@ The resolution path:
 
 Built-in roles are seeded per tenant at tenant creation.
 
+The `operators` resource has three actions. `operators:invoke` lets a
+principal register a verification binding that names an `on_failure` Operator
+(alongside `cards:write`). `operators:read` lists and reads redacted
+[Operator connections](/how-to/operate/operator-connections/), and
+`operators:write` creates, rotates, updates, disables, and re-enables them. No
+connection operation is authorized by `operators:invoke` alone. Of the
+built-in roles, only `admin` holds `operators:read` and `operators:write`;
+grant them to another role explicitly.
+
 ## Two "kind" concepts
 
 Two distinct "kind" fields appear in auth that are easy to confuse:

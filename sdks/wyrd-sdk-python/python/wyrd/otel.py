@@ -197,9 +197,11 @@ _RUN_ID = "wyrd.run_id"
 # value and never detach, so no token or per-scope state exists outside it.
 _SCOPE_KEY: Any = None if _otel_context is None else _otel_context.create_key("wyrd.run_scope")
 
-# Per-provider registration outcome, written before the foreign call and never
-# discarded, so a provider is asked at most once.
-_outcomes: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
+# Per-provider registration outcome as ``[weakref, outcome]`` pairs matched by
+# referent identity (never equality), written before the foreign call and never
+# discarded while the provider lives, so each provider object is asked at most
+# once. A linear scan suits the handful of providers a process holds.
+_outcomes: list[list[Any]] = []
 _outcomes_lock = Lock()
 
 
@@ -207,10 +209,17 @@ class _RunCorrelationProcessor:
     """Span processor copying the innermost Run scope onto every started span.
 
     Duck-typed rather than subclassing the SDK ``SpanProcessor`` so the OTel SDK
-    stays optional. Stateless; every hook swallows its own failures.
+    stays optional. Each registration attempt owns one instance, inert until
+    ``add_span_processor`` returns normally, so a provider that kept it and then
+    raised never enriches. Every hook swallows its own failures.
     """
 
+    def __init__(self) -> None:
+        self.active = False
+
     def on_start(self, span: Any, parent_context: Any = None) -> None:
+        if not self.active:
+            return
         try:
             stack = _otel_context.get_value(_SCOPE_KEY, parent_context)
             if stack:
@@ -233,7 +242,16 @@ class _RunCorrelationProcessor:
         return True
 
 
-_PROCESSOR = _RunCorrelationProcessor()
+def _outcome_entry(provider: Any) -> list[Any] | None:
+    """Return ``provider``'s outcome entry by identity, pruning dead entries.
+
+    Caller holds ``_outcomes_lock``.
+    """
+    _outcomes[:] = [entry for entry in _outcomes if entry[0]() is not None]
+    for entry in _outcomes:
+        if entry[0]() is provider:
+            return entry
+    return None
 
 
 def install_run_correlation(provider: Any = None) -> bool:
@@ -244,8 +262,8 @@ def install_run_correlation(provider: Any = None) -> bool:
     outcome is cached and returned on every later call. Returns ``True`` when
     the provider accepted the processor, ``False`` when OpenTelemetry is absent
     or the provider cannot be weakly referenced, lacks ``add_span_processor``,
-    or raised while registering. A failed provider is never retried, because it
-    may have kept the processor before raising. Never raises. Pass a framework's
+    or raised while registering. A failed provider is never retried, and a
+    processor it kept before raising stays inert. Never raises. Pass a framework's
     private provider once; the global provider is installed on every ``Run``
     entry.
     """
@@ -255,15 +273,18 @@ def install_run_correlation(provider: Any = None) -> bool:
         if provider is None:
             provider = _otel_trace.get_tracer_provider()
         with _outcomes_lock:
-            outcome = _outcomes.get(provider)
-            if outcome is not None:
-                return outcome
-            _outcomes[provider] = False
+            entry = _outcome_entry(provider)
+            if entry is not None:
+                return entry[1]
+            entry = [weakref.ref(provider), False]
+            _outcomes.append(entry)
             add = getattr(provider, "add_span_processor", None)
             if add is None:
                 return False
-            add(_PROCESSOR)
-            _outcomes[provider] = True
+            processor = _RunCorrelationProcessor()
+            add(processor)
+            processor.active = True
+            entry[1] = True
             return True
     except Exception:  # telemetry must never fail the app
         return False

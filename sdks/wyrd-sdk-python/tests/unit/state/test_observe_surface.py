@@ -436,6 +436,73 @@ def test_a_provider_that_raises_after_accepting_is_never_asked_again(
     assert len(retaining.processors) == 1
 
 
+def test_a_processor_retained_by_a_failed_registration_never_enriches(tmp_path: Path) -> None:
+    """The processor kept by an accept-then-raise provider stays inert in scope."""
+
+    class Retaining:
+        """A provider that retains the supplied processor, then raises."""
+
+        def __init__(self) -> None:
+            self.processors: list[Any] = []
+
+        def add_span_processor(self, processor: Any) -> None:
+            self.processors.append(processor)
+            raise RuntimeError("accepted, then failed")
+
+    class Span:
+        """A span recording every attribute written to it."""
+
+        def __init__(self) -> None:
+            self.attributes: dict[str, Any] = {}
+
+        def set_attribute(self, key: str, value: Any) -> None:
+            self.attributes[key] = value
+
+    retaining = Retaining()
+    assert install_run_correlation(retaining) is False
+    assert install_run_correlation(retaining) is False
+    (processor,) = retaining.processors
+    span = Span()
+    with _state(tmp_path).run(card="model"):
+        processor.on_start(span)
+    assert span.attributes == {}
+
+
+def test_equal_providers_register_independently_by_identity(tmp_path: Path) -> None:
+    """A failed provider never suppresses a distinct healthy provider that equals it."""
+
+    class Equal(TracerProvider):
+        """A provider equal to every other ``Equal``; optionally failing."""
+
+        def __init__(self, fail: bool) -> None:
+            super().__init__()
+            self.fail = fail
+
+        def __eq__(self, other: object) -> bool:
+            return isinstance(other, Equal)
+
+        def __hash__(self) -> int:
+            return 0
+
+        def add_span_processor(self, span_processor: Any) -> None:
+            if self.fail:
+                raise RuntimeError("registration failed")
+            super().add_span_processor(span_processor)
+
+    failing, healthy = Equal(fail=True), Equal(fail=False)
+    exporter = InMemorySpanExporter()
+    healthy.add_span_processor(SimpleSpanProcessor(exporter))
+    assert failing == healthy and failing is not healthy
+    assert install_run_correlation(failing) is False
+    assert install_run_correlation(healthy) is True
+    assert install_run_correlation(healthy) is True
+    assert _wyrd_processors(healthy) == 1
+    run = _state(tmp_path).run(card="model")
+    with run:
+        healthy.get_tracer("framework").start_span("healthy").end()
+    assert _correlation(exporter) == {"healthy": (run.card_ref, run.run_id)}
+
+
 def test_unsupported_providers_are_refused_without_raising() -> None:
     """API-only, proxy, and failing providers report False instead of raising."""
 

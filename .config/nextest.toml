@@ -55,6 +55,12 @@ test-group = 'postgres-fixtures'
 filter = 'package(wyrd-server) and binary(pg_router_smoke)'
 test-group = 'postgres-fixtures'
 
+# The platform administration journeys also boot one WyrdTestServer per test;
+# unbounded default-profile parallelism exhausts Postgres connections at boot.
+[[profile.default.overrides]]
+filter = 'package(wyrd-server) and binary(platform_admin_e2e)'
+test-group = 'postgres-fixtures'
+
 [[profile.default.overrides]]
 filter = 'package(wyrd-sql) and test(/embedded/)'
 test-group = 'embedded-postgres'

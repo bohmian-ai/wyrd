@@ -166,13 +166,14 @@ impl ClientConfig {
     /// 3. `WYRD_WORKLOAD_TOKEN` + `self.tenant`, else `WYRD_TENANT` — tier 2 env
     /// 4. `WYRD_API_KEY` — tier 3 env
     /// 5. the saved user login `wyrd auth login` wrote for this server origin
-    ///    and `self.tenant` ([`SavedLogins::select`]), renewed in place
+    ///    ([`SavedLogins::select`]): the one for `self.tenant` when it is set,
+    ///    otherwise the newest login for the server; renewed in place
     /// 6. `~/.config/wyrd/credentials.toml` `[default].api_key` — file floor
     ///
-    /// A `credentials.toml` that is unsafe or corrupt, or saved logins that
-    /// are ambiguous or have no record for the selected tenant, fail here
-    /// instead of falling through to the floor, so a person's selection is
-    /// never silently replaced by another identity. A tenant selector beside
+    /// A `credentials.toml` that is unsafe or corrupt, or a selected tenant
+    /// with no saved login when the server has others, fails here instead of
+    /// falling through to the floor, so a person's selection is never
+    /// silently replaced by another identity. A tenant selector beside
     /// a bearer or API key (tiers 1, 2, 4, and 6) is refused rather than
     /// ignored, because that credential already names its tenant.
     ///

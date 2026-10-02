@@ -797,8 +797,8 @@ impl WyrdTestServer {
         Ok(())
     }
 
-    /// Log `username` in to `tenant` through the CLI handoff and save the
-    /// credential under the Wyrd configuration directory `config_home`,
+    /// Log `username` in to `tenant` through the RFC 8628 device login and
+    /// save the credential under the Wyrd configuration directory `config_home`,
     /// exactly as `wyrd auth login` does.
     ///
     /// # Errors

@@ -212,8 +212,8 @@ export declare class NativeWyrdTestServer {
    */
   activateHumanSso(tenantSlug?: string | undefined | null): string
   /**
-   * Log `username` in to `tenant` through the CLI handoff and save the
-   * credential under the Wyrd configuration directory `configHome`,
+   * Log `username` in to `tenant` through the RFC 8628 device login and
+   * save the credential under the Wyrd configuration directory `configHome`,
    * exactly as `wyrd auth login` does.
    *
    * # Errors

@@ -754,12 +754,26 @@ impl WyrdTestServer {
     /// remains tolerated — the bounded budget here is deliberately short and a
     /// slow drain is not the same signal as a panic.
     ///
+    /// An in-process server has no serve task to drain Bifrost, so this method
+    /// cancels its shutdown token and drains Bifrost itself before the
+    /// Postgres fixture is dropped. Dropping the fixture first force-drops the
+    /// database under the still-running Oracle reader epoch, whose failed
+    /// renewal then aborts the test process. A failed drain already falls back
+    /// to Bifrost's abort path and is only logged here.
+    ///
     /// # Errors
     /// Returns [`WyrdTestServerError::Join`] when the serve task panicked or
     /// when the final blocking drop cannot be joined.
     pub async fn shutdown(mut self) -> Result<(), WyrdTestServerError> {
         if let Some(token) = self.shutdown_token.take() {
             token.cancel();
+        }
+        if matches!(self.mode, Mode::InProcess) {
+            self.inner.state.shutdown_token.cancel();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            if let Err(error) = self.inner.state.bifrost.shutdown(deadline).await {
+                tracing::warn!(%error, "in-process Bifrost drain fell back to abort during shutdown");
+            }
         }
         if let Some(handle) = self.serve_handle.take()
             && let Ok(join) = tokio::time::timeout(Duration::from_secs(2), handle).await

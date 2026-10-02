@@ -7,20 +7,14 @@
 //! `observations_ready` with a local HTTP Operator for failed verdicts; it
 //! registers the custom dataset table, issues the Service's Card-bound key
 //! through `POST /auth/issue-key`, and hydrates the Service bundle the
-//! application loads offline.
-//!
-//! One step has no public surface: a Card-registered Service principal is
-//! projected with no role, and no route grants one afterwards, so the
-//! database owner grants the built-in `admin` role in one statement before
-//! traffic starts. That is the only direct database write the benchmark
-//! makes, and the report names it as a product gap.
+//! application loads offline. Registration granted the Service principal the
+//! built-in `workload` role, so the key emits and queries with nothing else.
 
 use std::path::{Path, PathBuf};
 
 use reqwest::Method;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
-use sqlx::PgPool;
 use wyrd_client::bifrost::TableConfig;
 use wyrd_client::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode};
 use wyrd_client::config::ClientConfig;
@@ -34,18 +28,6 @@ use crate::Result;
 
 /// Fully qualified custom dataset table every iteration writes one row into.
 pub const TABLE: &str = "vala.datasets.verification_bench";
-
-/// Grants the built-in `admin` role to the principal owning one API key.
-///
-/// The operator setup step standing in for the missing public role grant on
-/// a Card-registered Service principal; see the module docs.
-const GRANT_ADMIN_SQL: &str = "INSERT INTO wyrd.auth_service_account_roles \
-       (data_tenant_id, service_account_id, role_id) \
-     SELECT k.data_tenant_id, k.principal_id, r.id \
-       FROM wyrd.auth_api_keys k \
-       JOIN wyrd.auth_roles r ON r.data_tenant_id = k.data_tenant_id AND r.name = 'admin' \
-      WHERE k.id = $1 \
-     ON CONFLICT DO NOTHING";
 
 /// One provisioned tenant and the identities its traffic and tally use.
 pub struct Tenant {
@@ -76,17 +58,12 @@ struct Count {
 
 impl Tenant {
     /// Provisions `setup`'s tenant under `root`, with its Operator posting to
-    /// `operator_url`, granting the Service key's role through `owner`.
+    /// `operator_url`.
     ///
     /// # Errors
     ///
-    /// Returns a client, registration, hydration, key, or grant failure.
-    pub async fn provision(
-        setup: &SetupTenant,
-        operator_url: &str,
-        owner: &PgPool,
-        root: &Path,
-    ) -> Result<Self> {
+    /// Returns a client, registration, hydration, or key failure.
+    pub async fn provision(setup: &SetupTenant, operator_url: &str, root: &Path) -> Result<Self> {
         let directory = root.join(&setup.slug);
         std::fs::create_dir_all(&directory)?;
         write_graph(&directory, operator_url)?;
@@ -118,10 +95,6 @@ impl Tenant {
                     expires_in_seconds: None,
                 }),
             )
-            .await?;
-        sqlx::query(GRANT_ADMIN_SQL)
-            .bind(issued.key_id)
-            .execute(owner)
             .await?;
 
         let bundle = directory.join("bundle");

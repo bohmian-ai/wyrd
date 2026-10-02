@@ -830,13 +830,11 @@ async fn issued_card_key_writes_and_queries_within_its_scope_only() {
     let outside_receipt = Box::pin(cards.register_from_path(&outside))
         .await
         .expect("outside service registers");
-    Box::pin(
-        CardGraphHydrator::new(cards.registry_context()).hydrate(
-            &CardSelector::exact(outside_receipt.root.clone()),
-            &root.path().join("outside-bundle"),
-            HydrationMode::Complete,
-        ),
-    )
+    Box::pin(CardGraphHydrator::new(cards.registry_context()).hydrate(
+        &CardSelector::exact(outside_receipt.root.clone()),
+        &root.path().join("outside-bundle"),
+        HydrationMode::Complete,
+    ))
     .await
     .expect("outside bundle hydrates");
 

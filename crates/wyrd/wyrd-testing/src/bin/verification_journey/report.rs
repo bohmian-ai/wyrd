@@ -392,12 +392,6 @@ impl Report {
             let verdict = if check.passed { "PASS" } else { "FAIL" };
             let _ = writeln!(text, "| {} | {verdict} | {} |", check.name, check.detail);
         }
-        let _ = writeln!(
-            text,
-            "\nProduct gap: a Card-registered Service principal is projected with no role and \
-             no public route grants one, so the database owner granted `admin` to each \
-             Service's issued key in one statement during setup."
-        );
         text
     }
 

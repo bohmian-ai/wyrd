@@ -109,7 +109,6 @@ async fn benchmark() -> Result<bool> {
             Tenant::provision(
                 setup,
                 &collector.operator_url(&setup.slug),
-                &owner,
                 &output.join("tenants"),
             )
             .await?,

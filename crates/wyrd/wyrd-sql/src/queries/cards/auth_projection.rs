@@ -115,7 +115,10 @@ async fn grant_workload_role(conn: &mut TenantConn<'_>, principal: Uuid) -> Resu
         tracing::error!(%error, "workload role grant failed");
         WyrdError::registry_unavailable("card registry unavailable")
     };
-    let Some(role) = role_by_name(conn, WORKLOAD_ROLE).await.map_err(unavailable)? else {
+    let Some(role) = role_by_name(conn, WORKLOAD_ROLE)
+        .await
+        .map_err(unavailable)?
+    else {
         tracing::warn!("tenant has no built-in workload role; principal projected without it");
         return Ok(());
     };

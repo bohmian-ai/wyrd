@@ -8,12 +8,12 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::PermissionSet;
+use wyrd_runtime::builtin_roles::{BUILTIN_ROLES, WORKLOAD_ROLE, builtin_role_uuid};
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
 use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::{BindingId, CardUid};
 use wyrd_spec::registry::RegistrationOperationId;
-use wyrd_runtime::builtin_roles::{BUILTIN_ROLES, WORKLOAD_ROLE, builtin_role_uuid};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     insert_role, list_service_account_roles, revoke_role_from_service_account,

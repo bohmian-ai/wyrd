@@ -3,7 +3,7 @@ id: TASK-008
 kind: implementation
 status: proposed
 spec: SPEC-verified-change-contract
-spec_revision: 45
+spec_revision: 49
 requirements: [REQ-089, REQ-101, REQ-114, REQ-146, REQ-151, REQ-152, INV-015, AC-017, AC-020, AC-021, AC-022, AC-023, AC-024, AC-030, AC-032, AC-033]
 depends_on: [TASK-005, TASK-006, TASK-009, TASK-010, TASK-012]
 ---

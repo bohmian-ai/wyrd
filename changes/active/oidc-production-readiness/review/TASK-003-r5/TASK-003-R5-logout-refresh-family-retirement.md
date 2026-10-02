@@ -161,3 +161,35 @@ naming it, then the narrowest owning repository tasks for `wyrd-auth`, SQL
 state, tenant isolation, and the identity journey. Finish with `mise run fmt`
 and `mise run lints`; use broader verification only if the implementation
 actually crosses the existing ownership boundaries.
+
+## Implementation Evidence
+
+This round follows `human-direction-FIND-TASK-003-18.md`: logout revokes only this session's refresh chain. That direction replaces the family-wide correction and proof above. Commit: `e776c151d`.
+
+| Acceptance criterion (as directed) | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| OIDC logout takes `lock_refresh_family("user", principal)` and revokes this session's chain (the starting token plus every `rotated_from` descendant), never the whole User family, in the same transaction as the browser-row wipe | `BrowserSessions::logout` with the new `revoke_refresh_chain` (recursive CTE in `wyrd-sql` `refresh_tokens.rs`); `revoke_refresh_family` is not called | `browser_sessions::pg_tests::oidc_logout_retires_only_its_refresh_chain_without_opening_it` (RED against the old logout: `logout revokes the session chain's committed successor`; GREEN) | PASS |
+| Logout does not decrypt the refresh envelope | New non-secret column `refresh_chain_id` (migration `20261001000003`, CHECK that it is set exactly in OIDC mode, composite FK to `auth_refresh_tokens`). It is set at `complete` from the login refresh row; logout reads it from the locked row | Same test: the refresh envelope is replaced with ciphertext under an unheld key before logout | PASS |
+| A successor committed before logout is revoked and cannot rotate; a separate login of the same User stays active | | Same test: the successor's `revoked_at` is set and its rotation returns `RefreshError::Reused`; the other login's refresh row stays `revoked_at IS NULL` | PASS |
+| API-key logout unchanged | `refresh_chain_id` is `None` for API-key sessions, so they only get the browser-row wipe | `browser_session_sealing_rotation_journey` (API-key logout) in `test:identity:journey` | PASS |
+| Idempotence and atomicity | Unchanged missing-row no-op. Any lock, revocation or wipe error returns before commit | Source inspection; `test:wyrd` | PASS |
+
+Non-goals stayed excluded: the only new state is the permitted chain id, and there is no new table, API, abstraction, audit owner, cookie change or BFF change.
+
+Verification, all run with `CARGO_TARGET_DIR` set to the shared target:
+- The focused selector, plus every `browser_sessions::` test (8 passed).
+- Mise lanes: `fmt`, `lints`, `codegen:check`, `check:tenant-isolation`, `test:sql`, `test:wyrd` and `test:identity:journey`.
+- `git diff --check`.
+
+All exited 0 in this round. After the harness fix below, `test:wyrd` ran 2348 tests and all passed. `fmt`, `lints`, `test:identity:journey` and `git diff --check` were re-run after the fix.
+
+### Diagnosis: SIGABRT in `test:wyrd`
+
+- **Symptom.** In the first two `test:wyrd` runs, `wyrd-server::pg_card_registration_route` tests aborted with SIGABRT. The affected tests were `card_reads_list_latest_and_delete_are_tenant_safe`, `completion_audit_failure_keeps_card_pending` and `composite_registration_returns_leaf_first_outcomes_and_root`.
+- **Evidence.** The trace runs in this order:
+  1. `terminating connection due to administrator command`, which is the fixture's `DROP DATABASE ... WITH (FORCE)`.
+  2. `Oracle self-fenced its reader epoch after a failed renewal` (pool timed out).
+  3. `Oracle reader epoch retirement exhausted its shutdown deadline`.
+  4. The process aborts in `AbortingEpochTerminator` (`reader_pins.rs`).
+- **Cause.** An in-process `WyrdTestServer` has neither a shutdown token nor a serve task. As a result, `shutdown()` cancelled nothing and drained nothing, and Bifrost's role tasks outlived the dropped test database.
+- **Fix site.** `WyrdTestServer::shutdown` in `crates/wyrd/wyrd-testing/src/server.rs`, which is the shared owner for every `start_in_process` caller. For an in-process server it now cancels `AppState::shutdown_token` and awaits `bifrost.shutdown(deadline)` before the fixture drops. This follows the boot `rollback_state_roles` pattern; a failed drain already falls back to Bifrost's abort. A read-only diagnostician confirmed the cause and the fix site.

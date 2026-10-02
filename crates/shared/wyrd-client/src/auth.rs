@@ -30,9 +30,9 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use wyrd_spec::auth::{
-    DeviceAuthorization, DeviceAuthorizationRequest, ExchangeTokenType, PlatformTokenRequest,
-    PlatformTokenResponse, RevokeRefreshToken, SecretBearer, TokenAudience, TokenRequest,
-    TokenResponse,
+    DeviceAuthorization, DeviceAuthorizationRequest, ExchangeTokenType, OAuthClientId,
+    OAuthErrorCode, OAuthErrorResponse, SecretBearer, TokenAudience, TokenRequest, TokenResponse,
+    TokenRevocationRequest,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
@@ -202,24 +202,35 @@ impl TokenExchange {
         self.post("/auth/token", request).await
     }
 
-    /// Exchange a platform credential for a short-lived platform session.
+    /// Exchange a platform credential for a short-lived platform session
+    /// through the RFC 8693 token exchange at `/auth/platform/token`.
     ///
     /// The one platform call that reads credential material; every later
     /// platform request presents the returned session on the canonical header.
     ///
     /// # Errors
     /// Returns [`AuthError::Server`] with the plane's indistinguishable
-    /// unauthenticated error for every credential rejection, and
-    /// [`AuthError::Client`] for a transport or decode failure.
+    /// refusal for every credential rejection, and [`AuthError::Client`] for a
+    /// transport or decode failure.
     pub async fn platform_session(
         &self,
-        request: &PlatformTokenRequest,
-    ) -> Result<PlatformTokenResponse, AuthError> {
-        self.post("/auth/platform/token", request).await
+        credential: &SecretBearer,
+    ) -> Result<TokenResponse, AuthError> {
+        self.post(
+            "/auth/platform/token",
+            &TokenRequest::TokenExchange {
+                subject_token: credential.clone(),
+                subject_token_type: ExchangeTokenType::ApiKey,
+                actor_token: None,
+                actor_token_type: None,
+                audience: None,
+            },
+        )
+        .await
     }
 
-    /// Begin a device login at `tenant_route_key` (RFC 8628 §3.1); poll it
-    /// with [`TokenRequest::DeviceCode`] through [`Self::exchange`].
+    /// Begin a device login at `tenant` (RFC 8628 §3.1); poll it with
+    /// [`TokenRequest::DeviceCode`] through [`Self::exchange`].
     ///
     /// # Errors
     /// Returns [`AuthError::Server`] when the tenant offers no SSO login or
@@ -227,51 +238,35 @@ impl TokenExchange {
     /// failure.
     pub async fn device_authorization(
         &self,
-        tenant_route_key: &TenantSlug,
+        tenant: &TenantSlug,
     ) -> Result<DeviceAuthorization, AuthError> {
         self.post(
             "/auth/device_authorization",
             &DeviceAuthorizationRequest {
-                tenant_route_key: tenant_route_key.clone(),
+                tenant: tenant.clone(),
             },
         )
         .await
     }
 
-    /// Ask the server to end the login `refresh_token` belongs to, so neither
+    /// Revoke the login `refresh_token` belongs to (RFC 7009 §2.1), so neither
     /// it nor any successor renews again; idempotent on the server.
     ///
     /// # Errors
-    /// Returns [`AuthError::Server`] when the server fails and
+    /// Returns [`AuthError::Server`] when the server refuses and
     /// [`AuthError::Client`] for a transport failure.
     pub async fn revoke_refresh_token(
         &self,
         refresh_token: &SecretBearer,
     ) -> Result<(), AuthError> {
-        self.post_no_content(
-            "/auth/revoke",
-            &RevokeRefreshToken {
-                refresh_token: refresh_token.clone(),
-            },
-        )
-        .await
-    }
-
-    /// POST a JSON body to one unauthenticated `/auth` path whose success
-    /// carries no body.
-    ///
-    /// # Errors
-    /// Returns [`AuthError::Server`] for a non-success status and
-    /// [`AuthError::Client`] for a transport or decode failure.
-    async fn post_no_content<S: Serialize>(&self, path: &str, body: &S) -> Result<(), AuthError> {
-        let url = format!("{}{path}", self.base_url);
         let response = self
-            .http
-            .post(&url)
-            .json(body)
-            .send()
-            .await
-            .map_err(transport_down)?;
+            .send(
+                "/auth/revoke",
+                &TokenRevocationRequest {
+                    token: refresh_token.clone(),
+                },
+            )
+            .await?;
         if response.status().is_success() {
             return Ok(());
         }
@@ -280,7 +275,8 @@ impl TokenExchange {
             .map(|_| ())
     }
 
-    /// POST a JSON body to one unauthenticated `/auth` path and decode the reply.
+    /// POST `body` as `wyrd-cli`'s form parameters to one unauthenticated
+    /// `/auth` path and decode the reply.
     ///
     /// # Errors
     /// Returns [`AuthError::Server`] for a non-success status and
@@ -290,21 +286,43 @@ impl TokenExchange {
         S: Serialize,
         D: DeserializeOwned,
     {
-        let url = format!("{}{path}", self.base_url);
-        let response = self
-            .http
-            .post(&url)
-            .json(body)
+        Self::decode(self.send(path, body).await?).await
+    }
+
+    /// POST `body` form-encoded, identified as the public `wyrd-cli` client
+    /// by its `client_id` parameter (RFC 6749 §2.3).
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Client`] when the body cannot be encoded or the
+    /// server cannot be reached.
+    async fn send<S: Serialize>(&self, path: &str, body: &S) -> Result<Response, AuthError> {
+        let form = serde_urlencoded::to_string(PublicClientForm {
+            client_id: OAuthClientId::WyrdCli,
+            params: body,
+        })
+        .map_err(|error| {
+            AuthError::Client(WyrdClientError::Config {
+                field: "token_request".to_owned(),
+                reason: error.to_string(),
+            })
+        })?;
+        self.http
+            .post(format!("{}{path}", self.base_url))
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(form)
             .send()
             .await
-            .map_err(transport_down)?;
-        Self::decode(response).await
+            .map_err(transport_down)
     }
 
     /// Map one response onto the catalog or the typed success body.
     ///
-    /// A non-success status is read as `application/problem+json` so every
-    /// caller reports the server's own stable code rather than inventing a
+    /// A non-success status carrying an RFC 6749 §5.2 body is mapped through
+    /// [`oauth_error`]; any other is read as `application/problem+json`, so
+    /// every caller reports the server's own refusal rather than inventing a
     /// status-shaped error of its own.
     ///
     /// # Errors
@@ -316,10 +334,69 @@ impl TokenExchange {
                 .json::<serde_json::Value>()
                 .await
                 .map_err(transport_down)?;
-            return Err(AuthError::Server(from_problem_json(&body)));
+            return Err(AuthError::Server(
+                match serde_json::from_value::<OAuthErrorResponse>(body.clone()) {
+                    Ok(error) => oauth_error(error),
+                    Err(_) => from_problem_json(&body),
+                },
+            ));
         }
         response.json::<D>().await.map_err(transport_down)
     }
+}
+
+/// Form parameters of one `wyrd-cli` request: its `client_id` beside the
+/// endpoint's own parameters.
+#[derive(Serialize)]
+struct PublicClientForm<'a, S> {
+    /// Always `wyrd-cli`.
+    client_id: OAuthClientId,
+    /// The endpoint's parameters.
+    #[serde(flatten)]
+    params: &'a S,
+}
+
+/// The catalog error for an RFC 6749 §5.2 / RFC 8628 §3.5 refusal.
+///
+/// The device-flow codes become [`WyrdError::DeviceAuthorization`] carrying
+/// the code in `details.error`, so a poller can keep polling; the rest map to
+/// the nearest catalog error with the server's description as its message.
+fn oauth_error(error: OAuthErrorResponse) -> WyrdError {
+    let message = error
+        .error_description
+        .unwrap_or_else(|| "the authorization server refused the request".to_owned());
+    let details = serde_json::json!({ "error": error.error });
+    match error.error {
+        OAuthErrorCode::AuthorizationPending
+        | OAuthErrorCode::SlowDown
+        | OAuthErrorCode::AccessDenied
+        | OAuthErrorCode::ExpiredToken => WyrdError::DeviceAuthorization { message, details },
+        OAuthErrorCode::InvalidGrant => WyrdError::InvalidToken { message, details },
+        OAuthErrorCode::InvalidClient | OAuthErrorCode::UnauthorizedClient => {
+            WyrdError::Unauthenticated { message, details }
+        }
+        OAuthErrorCode::UnsupportedGrantType => {
+            WyrdError::UnsupportedGrantType { message, details }
+        }
+        OAuthErrorCode::InvalidRequest | OAuthErrorCode::UnsupportedResponseType => {
+            WyrdError::Validation { message, details }
+        }
+        OAuthErrorCode::TemporarilyUnavailable => {
+            WyrdError::AuthVerifyUnavailable { message, details }
+        }
+        OAuthErrorCode::ServerError => WyrdError::Internal { message, details },
+    }
+}
+
+/// The instant an access token issued now with `expires_in` seconds of
+/// lifetime expires (RFC 6749 §5.1); saturates at the latest representable
+/// instant.
+pub(crate) fn expires_at(expires_in: u64) -> DateTime<Utc> {
+    i64::try_from(expires_in)
+        .ok()
+        .and_then(chrono::TimeDelta::try_seconds)
+        .and_then(|lifetime| Utc::now().checked_add_signed(lifetime))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
 }
 
 /// Single, `Arc`-shared auth path: token exchange, cache, and refresh.
@@ -709,8 +786,12 @@ impl AuthMiddleware {
 
     /// Exchange the API key for an access token at `/auth/token`.
     async fn exchange(&self, api_key: &SecretString) -> Result<CachedToken, AuthError> {
-        let request = TokenRequest::WyrdApiKey {
-            api_key: SecretBearer::new(api_key.expose_secret().to_owned()),
+        let request = TokenRequest::TokenExchange {
+            subject_token: SecretBearer::new(api_key.expose_secret().to_owned()),
+            subject_token_type: ExchangeTokenType::ApiKey,
+            actor_token: None,
+            actor_token_type: None,
+            audience: None,
         };
         self.post_token_request(request).await
     }
@@ -755,28 +836,29 @@ impl AuthMiddleware {
             subject_token_type: ExchangeTokenType::AccessToken,
             // Boxed because the actor may itself be delegated, which makes
             // `bearer` recursive.
-            actor_token: Box::pin(actor.bearer()).await?,
-            actor_token_type: ExchangeTokenType::AccessToken,
-            audience,
+            actor_token: Some(Box::pin(actor.bearer()).await?),
+            actor_token_type: Some(ExchangeTokenType::AccessToken),
+            audience: Some(audience),
         };
         self.post_token_request(request).await
     }
 
-    /// POST a token request to `/auth/token`, map a non-2xx body via
-    /// [`from_problem_json`] into [`AuthError::Server`], and decode the success
+    /// POST a token request to `/auth/token`, map a refusal into
+    /// [`AuthError::Server`], and decode the success
     /// body into a [`CachedToken`]. The shared POST/decode tail of every grant.
     ///
     /// # Errors
     /// Returns the [`AuthError`] the exchange produced: a transport failure, or
-    /// [`AuthError::Server`] carrying the server's problem-json refusal.
+    /// [`AuthError::Server`] carrying the server's refusal.
     async fn post_token_request(&self, request: TokenRequest) -> Result<CachedToken, AuthError> {
         let token = self.exchange.exchange(&request).await?;
-        self.warn_if_short_ttl(token.expires_at);
+        let expires_at = expires_at(token.expires_in);
+        self.warn_if_short_ttl(expires_at);
         // `token.refresh_token` is intentionally dropped here: never cached,
         // never written to disk. The durable secret is re-exchanged instead.
         Ok(CachedToken {
             access_token: token.access_token,
-            expires_at: token.expires_at,
+            expires_at,
         })
     }
 

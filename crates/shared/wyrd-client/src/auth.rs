@@ -143,6 +143,10 @@ impl TokenExchange {
     /// refused, HTTPS and loopback HTTP are accepted. This one check covers
     /// every caller, including the CLI login, logout, and refresh commands.
     ///
+    /// The client follows no redirect, as OAuth clients do: a `307`/`308`
+    /// would replay the secret body at the redirect target, so a redirect is
+    /// returned to the caller as an ordinary non-success response.
+    ///
     /// Installs Wyrd's process TLS provider next, for the same reason the
     /// authenticated transport does: the provider is process-global and the
     /// first client to build must be the one that sets it.
@@ -165,6 +169,7 @@ impl TokenExchange {
         })?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_millis(timeout_ms))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|err| WyrdClientError::TransportDown {
                 transport: "http".to_owned(),
@@ -847,7 +852,7 @@ mod tests {
     use crate::error::WyrdClientError;
     use crate::saved_login::{SavedLogin, SavedLogins};
     use crate::transport::credential::{AccessTokenSource, MintedAccessToken, ResolvedCredential};
-    use wyrd_spec::auth::SecretBearer;
+    use wyrd_spec::auth::{SecretBearer, TokenRequest};
     use wyrd_spec::ids::TenantSlug;
 
     struct MockServer {
@@ -856,7 +861,7 @@ mod tests {
         _handle: tokio::task::JoinHandle<()>,
     }
 
-    async fn spawn_mock(status_line: &'static str, body: String) -> MockServer {
+    async fn spawn_mock(status_line: &str, body: String) -> MockServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let hits = Arc::new(AtomicUsize::new(0));
@@ -1482,7 +1487,12 @@ mod tests {
     /// stay usable.
     #[test]
     fn token_exchange_refuses_remote_cleartext() {
-        for remote in ["http://wyrd.example.com", "http://10.0.0.5:8080/"] {
+        for remote in [
+            "http://wyrd.example.com",
+            "http://10.0.0.5:8080/",
+            "HTTP://wyrd.example.com",
+            "Http://10.0.0.5:8080/",
+        ] {
             let error = TokenExchange::new(remote, 30_000).expect_err("remote http is refused");
             assert!(
                 matches!(&error, WyrdClientError::Config { reason, .. } if reason.contains("cleartext")),
@@ -1494,9 +1504,44 @@ mod tests {
             "http://localhost:8080",
             "http://127.0.0.1:9000/",
             "http://[::1]:8080",
+            "HTTPS://Wyrd.Example.com",
         ] {
             TokenExchange::new(allowed, 30_000).expect("allowed target builds");
         }
+    }
+
+    /// A `307` or `308` from the token or revocation route fails the call and
+    /// never replays its secret body at the redirect target.
+    #[tokio::test]
+    async fn token_exchange_never_follows_a_redirect() {
+        let target = spawn_mock("HTTP/1.1 200 OK", token_body("stolen", 3600)).await;
+        for status in ["307 Temporary Redirect", "308 Permanent Redirect"] {
+            let redirect = spawn_mock(
+                &format!(
+                    "HTTP/1.1 {status}\r\nlocation: {}/auth/token",
+                    target.base_url
+                ),
+                String::new(),
+            )
+            .await;
+            let exchange = TokenExchange::new(&redirect.base_url, 30_000).expect("builds");
+            exchange
+                .exchange(&TokenRequest::RefreshToken {
+                    refresh_token: SecretBearer::new("refresh-secret".to_owned()),
+                })
+                .await
+                .expect_err("a redirected exchange fails");
+            exchange
+                .revoke_refresh_token(&SecretBearer::new("refresh-secret".to_owned()))
+                .await
+                .expect_err("a redirected revocation fails");
+            assert_eq!(redirect.hits.load(Ordering::SeqCst), 2);
+        }
+        assert_eq!(
+            target.hits.load(Ordering::SeqCst),
+            0,
+            "no body was replayed"
+        );
     }
 
     #[test]

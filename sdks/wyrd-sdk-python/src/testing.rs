@@ -815,7 +815,7 @@ impl WyrdTestServer {
         password: &str,
     ) -> WyrdPyResult<()> {
         let sso = HumanSso::new(&self.base_url()?);
-        py.detach(|| {
+        py.detach(move || {
             wyrd_runtime::runtime().block_on(sso.save_login(
                 &config_home,
                 tenant,
@@ -835,8 +835,14 @@ impl WyrdTestServer {
     /// # Panics
     /// Panics (a Python `PanicException`) when the login is missing or not
     /// ready.
-    fn expire_saved_login(&self, config_home: PathBuf, tenant: &str) -> WyrdPyResult<u64> {
-        Ok(HumanSso::new(&self.base_url()?).expire_saved(&config_home, tenant))
+    fn expire_saved_login(
+        &self,
+        py: Python<'_>,
+        config_home: PathBuf,
+        tenant: &str,
+    ) -> WyrdPyResult<u64> {
+        let sso = HumanSso::new(&self.base_url()?);
+        Ok(py.detach(move || sso.expire_saved(&config_home, tenant)))
     }
 
     /// Generation of the saved login for `tenant` under `config_home`.
@@ -846,8 +852,14 @@ impl WyrdTestServer {
     ///
     /// # Panics
     /// Panics (a Python `PanicException`) when the login is missing.
-    fn saved_login_generation(&self, config_home: PathBuf, tenant: &str) -> WyrdPyResult<u64> {
-        Ok(HumanSso::new(&self.base_url()?).saved_generation(&config_home, tenant))
+    fn saved_login_generation(
+        &self,
+        py: Python<'_>,
+        config_home: PathBuf,
+        tenant: &str,
+    ) -> WyrdPyResult<u64> {
+        let sso = HumanSso::new(&self.base_url()?);
+        Ok(py.detach(move || sso.saved_generation(&config_home, tenant)))
     }
 
     /// Revoke the server-side refresh chain of the saved login for `tenant`
@@ -867,7 +879,9 @@ impl WyrdTestServer {
         tenant: &str,
     ) -> WyrdPyResult<()> {
         let sso = HumanSso::new(&self.base_url()?);
-        py.detach(|| wyrd_runtime::runtime().block_on(sso.revoke_saved(&config_home, tenant)));
+        py.detach(move || {
+            wyrd_runtime::runtime().block_on(sso.revoke_saved(&config_home, tenant));
+        });
         Ok(())
     }
 }

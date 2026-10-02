@@ -605,6 +605,7 @@ impl NativeWyrdTestServer {
             &username,
             &password,
         ));
+        drop((config_home, tenant, username, password));
         Ok(())
     }
 
@@ -619,6 +620,7 @@ impl NativeWyrdTestServer {
     pub fn expire_saved_login(&self, config_home: String, tenant: String) -> Result<i64> {
         let generation =
             HumanSso::new(&self.base_url).expire_saved(Path::new(&config_home), &tenant);
+        drop((config_home, tenant));
         i64::try_from(generation).map_err(reason)
     }
 
@@ -632,6 +634,7 @@ impl NativeWyrdTestServer {
     pub fn saved_login_generation(&self, config_home: String, tenant: String) -> Result<i64> {
         let generation =
             HumanSso::new(&self.base_url).saved_generation(Path::new(&config_home), &tenant);
+        drop((config_home, tenant));
         i64::try_from(generation).map_err(reason)
     }
 
@@ -647,6 +650,7 @@ impl NativeWyrdTestServer {
     pub fn revoke_saved_login(&self, config_home: String, tenant: String) -> Result<()> {
         wyrd_runtime::runtime()
             .block_on(HumanSso::new(&self.base_url).revoke_saved(Path::new(&config_home), &tenant));
+        drop((config_home, tenant));
         Ok(())
     }
 

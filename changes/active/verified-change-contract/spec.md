@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 52
+revision: 53
 status: approved
 ---
 
@@ -1719,6 +1719,73 @@ table on `(data_tenant_id, result_id)`.
     scheduler throughput. Scheduled Drift and observation-triggered Eval
     correctness stays proven by the existing journeys.
 
+### Client ingestion throughput and memory (revision 53)
+
+The client queue behind `observe.*` and `Bifrost.insert*` follows the
+established producer model of Kafka and librdkafka: per-destination batching
+lazily created under one shared memory budget, byte- and linger-triggered
+batches, several idempotent sends in flight, and immediate refusal at the
+call site when the budget is exhausted.
+
+- **REQ-172**: One `Bifrost` handle MUST bound every client-owned ingestion
+  byte with one configurable handle-wide budget, `client_byte_limit_bytes`.
+  Every byte counts against it, from admission until the server acknowledges
+  it or a definite refusal settles it as a counted loss:
+  - admitted rows;
+  - sealed batches;
+  - in-flight batches;
+  - retained ambiguous batches.
+
+  This budget is the only memory bound. In particular:
+  - Any number of destination tables may be written, each through one lazily
+    created producer per (scope, table).
+  - There is no producer-count limit, no per-producer share of the budget, and
+    no row-count capacity.
+  - Configured values are honoured without library ceilings. The current 32
+    MiB, 64-entry, 1,024-row, 4,096-row, and 50,000-row clamps are removed.
+  - Sealing keeps one maximum-message headroom that admission cannot consume,
+    so admitted rows can always be sealed.
+  - The default budget is 256 MiB. A user MUST be able to override it when
+    connecting Bifrost or starting a `WyrdState`'s Bifrost in Rust, Python,
+    and TypeScript. An override smaller than one maximum message plus its
+    sealing headroom is refused at connect time.
+- **REQ-173**: The queue MUST NOT preallocate. No buffer, slot array, or
+  channel storage is sized from a configured capacity or budget before rows
+  arrive. Memory grows with admitted rows and is released on settlement. An
+  idle producer reserves no budget bytes beyond its own bounded bookkeeping.
+- **REQ-174**: A producer MUST seal a batch when either of these occurs:
+  - its staged rows reach the configured `max_message_bytes` frame target; or
+  - the configured linger has elapsed since the first staged row. The linger
+    default is 5 ms.
+
+  An explicit flush or shutdown seals immediately. Row-count triggers and the
+  1-second default interval are removed. Intake MUST continue while sends are
+  in flight as long as the budget has room.
+- **REQ-175**: Each producer MUST allow up to a configurable number of
+  concurrent sends, `max_in_flight`.
+  - Every batch keeps one UUIDv7 for all its retries, and Scribe's batch
+    deduplication absorbs replays.
+  - Retained ambiguous batches retry with backoff without blocking other
+    sends.
+  - Batches of one producer carry no delivery-order guarantee; rows within
+    one batch keep admission order. Consumers order by row timestamps, never
+    by arrival.
+  - The default `max_in_flight` is the smallest value that meets AC-041,
+    recorded with the benchmark evidence.
+- **REQ-176**: Admission MUST be immediate and all-or-none per logical record.
+  For example, every tall row of one Drift observation is admitted, or none is.
+  - A record that cannot fit in the remaining budget returns
+    `WYRD_CLIENT_429_QUEUE_FULL` and admits no row, so the caller may flush or
+    back off and then resubmit the same record.
+  - A record larger than the whole admission budget returns
+    `WYRD_CLIENT_413_PAYLOAD_TOO_LARGE`.
+  - Admission never waits on the network.
+  - No blocking or awaitable admission API is added.
+- **REQ-177**: A send that ends without a definite ACK or refusal, including
+  an exhausted transport retry budget or deadline, MUST retain its batch and
+  identity until it is reconciled. Only a definite refusal settles a batch as
+  a counted loss.
+
 ## Invariants
 
 - **INV-001**: The shipped continuous user model is an existing Service/Agent
@@ -1766,6 +1833,10 @@ table on `(data_tenant_id, result_id)`.
   credential. No separate migrator or catalog role or password is required.
 - **INV-018**: A multi-replica Wyrd deployment shares one authoritative object
   namespace while each Scribe owns its own durable WAL/staging identity.
+- **INV-019**: Client-owned ingestion bytes never exceed one handle's
+  `client_byte_limit_bytes`. A refused record admits no row. A batch is
+  released only by a durable ACK or a definite refusal, and never by
+  ambiguity.
 
 ## Acceptance obligations
 
@@ -2211,10 +2282,44 @@ published image pinned by an immutable registry digest before release.
   below 10 ms at p95, from at least 1,000 samples per case per step. Judge
   cases report overhead and provider waits separately, with no threshold.
   Mixed slowdown is reported without a contractual bound.
+- **AC-041**: A release-build Rust benchmark against a real server, Postgres,
+  and the RustFS emulator MUST drive one `WyrdState` emitting 500 Drift
+  observations per second × 100 features (50,000 rows/s) for 60 s with
+  default queue configuration.
+
+  It MUST prove:
+  - zero `QUEUE_FULL` refusals;
+  - client-owned bytes that do not grow from step to step;
+  - backlog that drains within one second after load stops;
+  - exactly 3,000,000 durable rows, with 100 per `record_id`.
+
+  It MUST report, without a threshold:
+  - a 1,000 observations/s headroom step;
+  - a step under a 50 ms injected server acknowledgement delay;
+  - the batch-size distribution, send latency, client CPU per row, and the
+    chosen `max_in_flight`.
+- **AC-042**: Queue and journey tests MUST prove:
+  - all-or-none admission with resubmission and no duplicates;
+  - a record larger than the budget refused as too large;
+  - intake continuing during an in-flight send;
+  - linger and byte sealing;
+  - retention of ambiguous sends, reconciled by the same batch UUID;
+  - no producer-count limit, with at least 1,000 tables written through one
+    handle;
+  - an idle producer reserving no budget bytes.
+
+  Rust, Python, and TypeScript journeys MUST each prove an uninterrupted
+  1,000-observation × 9-feature Drift burst with QUEUE_FULL resubmission
+  after flush, durably reading back exactly 9,000 rows, 1,000 distinct
+  `record_id`s, and 9 rows per id. Each SDK MUST also prove that a
+  byte-budget override is honoured and that an override too small to seal a
+  message is refused at connect time.
 
 ## Open material decisions
 
-None. Revision 39 records the user's narrow deletion: remove the always-allow
+None for revision 53.
+
+Revision 39 records the user's narrow deletion: remove the always-allow
 hook and its fake `invoke` policy attribution without redesigning delegation.
 
 ## Material authority links
@@ -2247,6 +2352,27 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 - [PagerDuty Global Integrations and Service Routes](https://support.pagerduty.com/main/docs/event-orchestration)
 
 ## Revision history
+
+- **Revision 53 client ingestion throughput and memory (2026-10-02,
+  approved):** The capacity benchmark's 1,000-observation Drift seed failed with
+  `WYRD_CLIENT_429_QUEUE_FULL`.
+  - **Causes:**
+    - Intake awaited each network send.
+    - Admission was row by row, so a refusal could split one observation.
+    - The size trigger was unreachable.
+    - A 32 MiB budget was pre-divided across 64 potential producers, leaving
+      about 465 staging rows per table.
+    - Ambiguous gRPC exhaustion was settled as a loss.
+  - **New requirement:** the user requires 500 requests/s × 100 features
+    (50,000 rows/s) and directs that no cap exists without justification and
+    that nothing is preallocated.
+  - **Changes:** REQ-172 to REQ-177 adopt the shared-budget producer model
+    from Kafka and librdkafka.
+  - **Proof:** AC-041 and AC-042 make sustained throughput and memory
+    behaviour acceptance evidence.
+  - **Decided:** the default budget is 256 MiB, overridable in every
+    first-class SDK. Batches carry no delivery-order guarantee. No blocking
+    admission API is added.
 
 - **Revision 52 non-blocking direct-execution audit (2026-10-02):** The user
   directed that permissions are blocking and audits are non-blocking.

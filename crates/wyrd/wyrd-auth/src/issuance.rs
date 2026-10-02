@@ -291,7 +291,7 @@ impl IssuanceError {
     /// other variant (store, audit, signing, corrupt role, system-principal
     /// state) is an internal failure that must roll back and stay retryable.
     #[must_use]
-    pub fn is_refusal(&self) -> bool {
+    pub(crate) fn is_refusal(&self) -> bool {
         matches!(
             self,
             Self::TenantNotAdmitting | Self::PrincipalInactive | Self::ConnectionInactive

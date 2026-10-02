@@ -752,9 +752,14 @@ fn seal(keyring: &SealingKeyring, plaintext: &str) -> Result<Vec<u8>, WyrdError>
 
 /// Open a sealed UTF-8 credential.
 ///
+/// Only opens; the session lifecycle consequence of a failure belongs to the
+/// caller. A stored access token that cannot be opened is reported as an
+/// ended session, while renewal maps the same failure to a retryable internal
+/// failure through `open_credential`.
+///
 /// # Errors
-/// Returns [`WyrdError::InvalidToken`] when no held key opens it or it is not
-/// UTF-8: a credential sealed under a retired key ends its session.
+/// Returns [`WyrdError::InvalidToken`] when no held key opens the envelope or
+/// its plaintext is not UTF-8.
 fn open_text(keyring: &SealingKeyring, sealed: &[u8]) -> Result<SecretString, WyrdError> {
     let opened = keyring.open(sealed).map_err(|_| session_ended())?;
     String::from_utf8(opened)
@@ -832,17 +837,47 @@ fn unusable(message: &str) -> WyrdError {
 mod tests {
     use secrecy::SecretString;
 
-    use super::{lower_hex_256, random_hex_256, session_hash};
+    use wyrd_crypt::{SealingKeyring, SecretKey};
+    use wyrd_spec::error::WyrdError;
+
+    use super::{Renewal, lower_hex_256, open_credential, random_hex_256, seal, session_hash};
     use crate::exchange_api_key::ExchangeError;
     use crate::issuance::IssuanceError;
     use crate::refresh::RefreshError;
 
+    /// A renewal credential the session cannot produce is a retryable
+    /// internal failure, never a refusal that ends the session.
+    ///
+    /// Both a mode with no stored envelope and an envelope sealed under a key
+    /// the active keyring does not hold must yield
+    /// `Renewal::Failed(WyrdError::Internal)`, so a repaired keyring or
+    /// envelope lets the same session renew.
+    #[test]
+    fn missing_or_unopenable_renewal_credential_is_retryable_failure() {
+        let held = SealingKeyring::new(SecretKey::from_bytes([1_u8; 32]));
+        let unheld = SealingKeyring::new(SecretKey::from_bytes([2_u8; 32]));
+        let foreign = seal(&unheld, "credential").expect("test credential seals");
+        assert!(open_credential(&unheld, Some(&foreign)).is_ok());
+        for (case, sealed) in [("missing", None), ("unopenable", Some(foreign.as_slice()))] {
+            assert!(
+                matches!(
+                    open_credential(&held, sealed),
+                    Err(Renewal::Failed(WyrdError::Internal { .. }))
+                ),
+                "a {case} renewal credential must be a retryable internal failure"
+            );
+        }
+    }
+
     /// Renewal ends a session only on an ordinary lifecycle refusal.
     ///
     /// Every producer's classification must agree: an inactive tenant,
-    /// principal, or connection and an unusable credential are refusals
-    /// wherever they surface; a replay is not a refusal (its containment
-    /// commits); store, corrupt-role, and signing failures are internal.
+    /// principal, or connection and a credential the producer rejects
+    /// (unknown, cross-tenant, or wrong-secret) are refusals wherever they
+    /// surface; a replay is not a refusal (its containment commits); store,
+    /// corrupt-role, and signing failures are internal. A stored envelope that
+    /// cannot be opened never reaches a producer and is covered by
+    /// `missing_or_unopenable_renewal_credential_is_retryable_failure`.
     #[test]
     fn only_lifecycle_refusals_end_a_renewing_session() {
         for refusal in [

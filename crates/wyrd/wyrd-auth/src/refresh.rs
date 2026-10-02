@@ -61,7 +61,7 @@ impl RefreshError {
     /// containment writes must commit — and every other variant is an
     /// internal failure that must roll back.
     #[must_use]
-    pub fn is_refusal(&self) -> bool {
+    pub(crate) fn is_refusal(&self) -> bool {
         match self {
             Self::NotFound => true,
             Self::Issuance(error) => error.is_refusal(),

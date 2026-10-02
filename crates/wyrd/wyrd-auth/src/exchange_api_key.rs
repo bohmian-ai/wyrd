@@ -94,7 +94,7 @@ impl ExchangeError {
     /// A verification-task, store, or other issuance failure is internal and
     /// must roll back rather than end a session.
     #[must_use]
-    pub fn is_refusal(&self) -> bool {
+    pub(crate) fn is_refusal(&self) -> bool {
         match self {
             Self::CrossTenant
             | Self::NotFound

@@ -1,6 +1,6 @@
 ---
 id: SPEC-skald-workflow-runtime
-revision: 11
+revision: 12
 status: approved
 ---
 
@@ -17,6 +17,134 @@ for single-agent and multi-agent DAGs. A user can test a code-review workflow
 locally, register the same card and its referenced Agents and Prompts, then
 choose local execution or tenant-bound server execution without rewriting the
 workflow.
+
+## Revision 12 client loading and reuse contract
+
+Approved by the user on 2026-10-02 after reviewing the full remediation
+recommendation: stop TASK-002, replace it with TASK-002-cleanup, revise all
+remaining tasks, and update the skills. This section fixes public behavior and
+ownership; local helper and fixture structure remains implementation-owned.
+
+### Public APIs
+
+```python
+from wyrd.agent import Workflow
+from wyrd.cards import Cards
+
+workflow = Workflow.from_path("./workflow.yaml")
+result = workflow.run({"diff": diff})
+
+# After: wyrd apply -f workflow.yaml
+cards = Cards()
+workflow = cards.workflow.load(space="my-team", name="code-review", version="1.0.0")
+result = workflow.run({"diff": diff})
+workflow = cards.workflow.load(uid=workflow_uid)
+```
+
+Python `Workflow.from_path(path: str | os.PathLike[str]) -> Workflow` is
+synchronous. `cards.workflow.load` accepts either required `space`, `name`, and
+exact `version`, or required `uid`, never both. It returns `Workflow`.
+`Workflow.run(input: Mapping[str, Any] | None = None) -> WorkflowRun` retains
+the existing string-input shorthand and uses only the shared runtime bridge.
+Replace the old static `Workflow.load(path)` surface and update consumers;
+add no compatibility alias. Keep pure inline-native `from_yaml` authoring.
+
+```typescript
+import { Cards, Workflow } from "@wyrd/sdk";
+
+const workflow = await Workflow.fromPath("./workflow.yaml");
+const result = await workflow.run({ diff });
+const cards = new Cards();
+const registered = await cards.workflow.load({
+  space: "my-team", name: "code-review", version: "1.0.0",
+});
+const registeredResult = await registered.run({ diff });
+const byUid = await cards.workflow.load({ uid: workflowUid });
+```
+
+TypeScript `Workflow.fromPath(path: string): Promise<Workflow>` and
+`cards.workflow.load(selector): Promise<Workflow>` use async native projections.
+The selector is exactly `{space: string, name: string, version: string}` or
+`{uid: string}`; reject mixed selectors at runtime and through declarations.
+`workflow.run(input?: Record<string, JsonValue>): Promise<WorkflowRun>` returns
+the native portable snapshot. No generic arbitrary-input executor is added.
+
+```rust
+use wyrd_sdk::{Workflow, cards::{Cards, CardSelector, CardKind}};
+
+let workflow = Workflow::from_path("./workflow.yaml").await?;
+let result = workflow.run(serde_json::json!({ "diff": diff })).await?;
+let cards = Cards::new(None, None)?;
+let selector = CardSelector::named(
+    CardKind::Workflow, "my-team".parse()?, "code-review".parse()?,
+).with_version("1.0.0".parse()?);
+let registered = cards.workflow().load(&selector).await?;
+let result = registered.run(serde_json::json!({ "diff": diff })).await?;
+```
+
+Rust's shared-client `Workflow::from_path(path: impl AsRef<Path>)` is async and
+returns `Result<Workflow, WyrdError>`. The Cards Workflow view's async
+`load(&CardSelector)` returns the same type; use the existing exact/UID/named
+selector contracts, rejecting wrong kinds and versionless named selectors.
+`Workflow::run(input: impl Into<WorkflowInput>)` is async and returns
+`WorkflowResult<WorkflowRun>`. Preserve existing explicit runtime dependency and
+builder behavior by delegation to Skald.
+
+### Resolution, authority, and ownership
+
+Local paths and inline bodies load without constructing an authenticated client
+or making registry requests. The first external ref lazily resolves the same
+ambient Wyrd client configuration/credentials as Cards; no `cards=` argument,
+credential prompt, registration, or implicit update occurs. Registered Agents
+and Prompts, including transitive Prompt refs, are supported. Missing credentials,
+missing/inactive Cards, identity conflicts, and denied reads fail before
+execution through existing errors. A local sibling cannot satisfy an authored
+external ref at the same identity. References pin exact versions; server-bound
+relationships pin UIDs. Later versions never float into a loaded graph.
+
+`wyrd_loader::load` retains authored parsing, relative paths, sandboxing and
+canonical slot projection. The existing Cards hydration graph owner retains
+registered exact traversal and gains necessary in-memory composition. Do not
+force execution through disk publication or artifact download. Skald retains
+its Agent/Prompt resolver boundary, resolved validation, and one executor.
+Server effective-spec resolution retains SQL, tenancy and transaction ownership;
+it calls synchronous Skald validation, not client HTTP loading. Registration
+never binds execution tools, resolves provider/gateway secrets, or executes.
+
+The shared client may expose one thin client Workflow facade delegating to the
+existing Skald Workflow: Rust cannot attach client IO methods to a foreign
+Skald type without violating dependency direction. Python's existing wrapper
+and TypeScript's native wrapper project this boundary. The facade owns no
+second graph, traversal, parser, validation rules, executor, or registry cache.
+`cards.workflow` is a typed view over the existing Cards context, not a new
+transport. CardGraphHydrator remains internal to the user journey; no public
+WorkflowLoader, WorkflowGraph, or standalone hydrator requirement is introduced.
+
+WyrdState stays Service-rooted. Workflow has Card identity when registered but
+no principal, credential, role, or independent authority. Execution uses the
+invoker's authority and existing tool registry; reusing an Agent transfers no
+privileges. Shared client composition owns local provider/gateway dependencies
+and GlobalConfig.workflow bindings for SDKs and CLI. Resolve only selected
+secrets at execution, never during loading/apply. Keep explicit runtime
+injection for native callers; do not store per-call context in global registries.
+
+At reference slots, use existing untagged Ref/InlineableRef forms: CardRef
+mapping for external refs, path string for local paths, and native child body
+for inline. Do not add keyed ref/path/inline wrapper normalization. A field
+named `ref` in an owning spec remains a field, not discriminator sugar. Preserve
+existing !file, diagnostics, confinement, Sibling projection, and canonical
+ReferenceSlotVisitor. Align architecture prose and examples with this contract.
+
+### Replacement and preservation
+
+Stop the original TASK-002 without rewriting history. TASK-002-cleanup replaces
+its duplicate loading/graph machinery and retargets consumers/tests in one
+complete outcome. Preserve pure Workflow validation, sibling/external source
+separation, the write-time preflight UID replacement fence, versioned Prompt
+Cards, and their negative journey proof. Delete obsolete parser discriminator
+machinery and its slot metadata, not unrelated existing loader behavior.
+CardRefIdentity serves shared graph/server owners and remains. Do not reset to
+a2cea54e0: it already contains the original implementation. Use forward changes.
 
 ## Research baseline
 
@@ -207,8 +335,7 @@ spec:
     - id: security
       action:
         type: agent
-        target:
-          path: ./agents/security.yaml
+        target: ./agents/security.yaml
       inputs:
         code: input.code
       timeout_seconds: 60
@@ -218,8 +345,7 @@ spec:
     - id: correctness
       action:
         type: agent
-        target:
-          path: ./agents/correctness.yaml
+        target: ./agents/correctness.yaml
       inputs:
         code: input.code
       timeout_seconds: 60
@@ -229,8 +355,7 @@ spec:
     - id: final_review
       action:
         type: agent
-        target:
-          path: ./agents/final-reviewer.yaml
+        target: ./agents/final-reviewer.yaml
       depends_on: [security, correctness]
       inputs:
         code: input.code
@@ -308,22 +433,7 @@ metadata:
   name: security-reviewer
   version: "1.0.0"
 spec:
-  prompt:
-    inline:
-      model: gpt-5-5
-      request:
-        model: gpt-5-5
-        messages:
-          - role: system
-            content: |
-              You are a security reviewer. Report only exploitable security findings.
-              For every finding, identify the affected code and a concrete failure path.
-          - role: user
-            content: |
-              Review this change:
-              {{code}}
-      variables: [code]
-      response_type: text
+  prompt: ../prompts/security.yaml
   tool_names: []
   run_config:
     max_iterations: 1
@@ -358,22 +468,7 @@ metadata:
   name: correctness-reviewer
   version: "1.0.0"
 spec:
-  prompt:
-    inline:
-      model: gpt-5-5
-      request:
-        model: gpt-5-5
-        messages:
-          - role: system
-            content: |
-              You are a correctness reviewer. Find reachable bugs, data loss, races,
-              and contract violations. Ignore style-only concerns.
-          - role: user
-            content: |
-              Review this change:
-              {{code}}
-      variables: [code]
-      response_type: text
+  prompt: ../prompts/correctness.yaml
   tool_names: []
   run_config:
     max_iterations: 1
@@ -391,33 +486,93 @@ metadata:
   name: final-reviewer
   version: "1.0.0"
 spec:
-  prompt:
-    inline:
-      model: gpt-5-5
-      request:
-        model: gpt-5-5
-        messages:
-          - role: system
-            content: |
-              You are the final reviewer. Validate each proposed finding against the
-              supplied code, remove duplicates and unsupported claims, and return one
-              prioritized review.
-          - role: user
-            content: |
-              Code:
-              {{code}}
-
-              Security review:
-              {{security_review}}
-
-              Correctness review:
-              {{correctness_review}}
-      variables: [code, security_review, correctness_review]
-      response_type: text
+  prompt: ../prompts/final-reviewer.yaml
   tool_names: []
   run_config:
     max_iterations: 1
     timeout_ms: 60000
+```
+
+The three paths above target versioned Prompt Card files under `prompts/`.
+Their native bodies are unchanged:
+
+```yaml
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  space: engineering
+  name: security-review
+  version: "1.0.0"
+spec:
+  model: gpt-5-5
+  request:
+    model: gpt-5-5
+    messages:
+      - role: system
+        content: |
+          You are a security reviewer. Report only exploitable security findings.
+          For every finding, identify the affected code and a concrete failure path.
+      - role: user
+        content: |
+          Review this change:
+          {{code}}
+  variables: [code]
+  response_type: text
+```
+
+```yaml
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  space: engineering
+  name: correctness-review
+  version: "1.0.0"
+spec:
+  model: gpt-5-5
+  request:
+    model: gpt-5-5
+    messages:
+      - role: system
+        content: |
+          You are a correctness reviewer. Find reachable bugs, data loss, races,
+          and contract violations. Ignore style-only concerns.
+      - role: user
+        content: |
+          Review this change:
+          {{code}}
+  variables: [code]
+  response_type: text
+```
+
+```yaml
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  space: engineering
+  name: final-reviewer-review
+  version: "1.0.0"
+spec:
+  model: gpt-5-5
+  request:
+    model: gpt-5-5
+    messages:
+      - role: system
+        content: |
+          You are the final reviewer. Validate each proposed finding against the
+          supplied code, remove duplicates and unsupported claims, and return one
+          prioritized review.
+      - role: user
+        content: |
+          Code:
+          {{code}}
+
+          Security review:
+          {{security_review}}
+
+          Correctness review:
+          {{correctness_review}}
+  variables: [code, security_review, correctness_review]
+  response_type: text
 ```
 
 `input.json` is the invocation payload:
@@ -558,14 +713,12 @@ spec:
     - id: security
       action:
         type: agent
-        target:
-          path: ./agents/security.yaml
+        target: ./agents/security.yaml
 
     - id: correctness
       action:
         type: agent
-        target:
-          path: ./agents/correctness.yaml
+        target: ./agents/correctness.yaml
       llm_route:
         kind: native
 ```
@@ -1693,8 +1846,9 @@ retried after restart.
   Skald runtime: load and run an unregistered local YAML bundle; fetch, hydrate,
   and run a registered Workflow locally; and submit, inspect, and cancel a
   registered Workflow run on the server. This revision ships YAML, Rust, HTTP,
-  and CLI remote invocation surfaces only. It adds no Python, TypeScript, or
-  MCP remote Workflow surface. Existing Rust/Python local builders, bindings,
+  and CLI remote invocation surfaces only. Python and TypeScript also ship
+  authored-file and registered-local loading/execution under REQ-054–059;
+  neither gains server-run lifecycle methods. MCP gains no new Workflow surface. Existing Rust/Python local builders, bindings,
   and result wrappers MUST align with the explicit input/output model and the
   single WorkflowRun contract. The unshipped implicit forwarding, shared
   `parameters`, and last-step `final_output` behavior MUST NOT be preserved;
@@ -1702,8 +1856,9 @@ retried after restart.
   No migration documentation or compatibility aliases are required.
 - **REQ-025:** Local YAML loading MUST use the shared loader's `path`, `inline`,
   and `ref` semantics. `path` dependencies are loaded from disk without being
-  registered. A `ref` requires registry access and MUST fail clearly when no
-  registry client is available.
+  registered. An external ref MUST automatically use lazy existing ambient
+  client configuration and MUST fail clearly when credentials or authorized
+  exact dependencies cannot be resolved; no client argument is required.
 - **REQ-026:** The CLI MUST expose `wyrd workflow run`,
   `wyrd workflow status <run-id>`, and `wyrd workflow cancel <run-id>`.
   `wyrd workflow run` MUST
@@ -1943,7 +2098,7 @@ retried after restart.
   polling future and MUST NOT cancel the run.
 - **REQ-047:** Skald MUST have one asynchronous Workflow execution engine. Pure
   parsing, validation, binding selection, planning, status construction, and
-  output projection MUST remain synchronous. Local Rust and CLI execution MUST
+  output projection MUST remain synchronous. Local Rust, TypeScript, and CLI execution MUST
   await that engine directly; the retained Python synchronous API MAY use only
   the repository's existing runtime bridge. This change MUST NOT add a second
   synchronous engine, a `run_blocking` Rust API, or an ad hoc async runtime.
@@ -2005,6 +2160,28 @@ retried after restart.
   previously proven through observer tests MUST retain equivalent coverage. No
   local telemetry-initialization API is added in this change.
 
+- **REQ-054:** The three SDKs MUST expose the exact authored-file and registered
+  loading APIs in the Revision 12 contract, returning one client Workflow over
+  the existing Skald engine. Every shipped language owns its runtime tests.
+- **REQ-055:** Authored loading MUST auto-resolve registered Agent/Prompt refs
+  and transitive dependencies through lazy existing client configuration, while
+  wholly local bundles make no registry request and require no credential.
+- **REQ-056:** Loading MUST preserve external-versus-sibling provenance, exact
+  versions, locked UID relationships, active-state checks and read authority.
+  Loading never registers or resolves execution secrets; failures dispatch no
+  provider or tool.
+- **REQ-057:** Workflow MUST NOT become a principal or WyrdState root. Shared
+  loading MUST extend existing loader/Cards graph owners, and resolved validation
+  MUST reuse Skald. No second graph store/traversal/parser/validator/executor or
+  public loader/hydrator is authorized.
+- **REQ-058:** Local execution dependency/configuration assembly MUST be shared
+  by Rust, Python, TypeScript and CLI. Preserve explicit native injection,
+  resolve only selected secrets at execution, and retain existing route rules.
+- **REQ-059:** Cleanup MUST remove obsolete TASK-002 machinery and references
+  while preserving the provenance and exact-preflight-UID protections, pure
+  validation, versioned Prompt examples and negative proof. Reference authoring
+  MUST use existing untagged types without discriminator wrapper machinery.
+
 ## Invariants and boundaries
 
 - **INV-001:** Skald owns the reusable workflow runtime. `wyrd-server` hosts
@@ -2030,9 +2207,9 @@ retried after restart.
   caches, and returned results. Invocation input never selects tenant identity.
 - **INV-007:** Every shipped public surface projects the same WorkflowRun and
   stable error semantics. CLI or Rust convenience must not create a competing
-  durable contract. This capability's deliberate YAML/Rust/HTTP/CLI rollout
-  does not weaken the repository-wide first-class language rule; Python,
-  TypeScript, and MCP gain no new Workflow surface in this revision.
+  durable contract. Rust, Python, and TypeScript ship the same authored-file and registered-local
+  journeys under REQ-054–059. Server-run lifecycle submission remains Rust,
+  HTTP, and CLI only; MCP gains no new Workflow surface.
 - **INV-008:** An Agent may invoke only its declared tool names resolved by the
   execution environment's registry. Local execution uses the caller's existing
   registry; server execution offers only `bifrost.query` and `cards.get` in
@@ -2184,9 +2361,9 @@ retried after restart.
     rejects `Native` before the graph starts. Server `ExtGateway` is direct
     bounded egress through an operator-configured credential binding; it does
     not enter `wyrd-gateway`.
-11. New invocation journeys ship through YAML, Rust, HTTP, and CLI. Existing
-    Python local surfaces align with the same explicit model; no new Python,
-    TypeScript, or MCP remote Workflow invocation surface is added.
+11. Authored-file and registered-local loading/execution ship through Rust,
+    Python, TypeScript, and CLI. Server-run lifecycle submission remains Rust,
+    HTTP, and CLI only. No new MCP Workflow surface is added.
 12. Server execution resolves declared Agent tools against a run-bound
     registry containing built-in `bifrost.query` and `cards.get`. Both use their
     owning Wyrd services with per-call permission and audit. Local execution
@@ -2203,7 +2380,7 @@ retried after restart.
     defined in this revision; implementations do not invent wrapper envelopes
     or a second client facade.
 16. Workflow execution has one async engine. Pure phases stay synchronous,
-    local Rust and CLI await it, and Python's synchronous local boundary uses
+    local Rust, TypeScript, and CLI await it, and Python's synchronous local boundary uses
     only the existing runtime bridge. Its data/result semantics change to the
     explicit model without compatibility aliases. No Rust `run_blocking`
     surface is added.
@@ -2253,7 +2430,7 @@ retried after restart.
 
 - **AC-001:** A checked-in code-review Workflow YAML with two independent
   reviewer Agents and one dependent final-review Agent loads and executes
-  locally through Rust and CLI, with both reviewers running in the same DAG
+  locally through Rust, Python, TypeScript, and CLI, with both reviewers running in the same DAG
   stage and their distinct outputs assigned to the final reviewer's declared
   Prompt variables through the existing Prompt binder. The actual example
   bundle MUST parse/round-trip against the existing loader and native Prompt
@@ -2262,7 +2439,7 @@ retried after restart.
 - **AC-002:** The same YAML bundle registers through `wyrd apply`; its stored
   Workflow relationships point to the exact Agent and Prompt Card versions.
 - **AC-003:** The registered code-review Workflow can be fetched and executed
-  locally through Rust and CLI with results equivalent in shape and binding
+  locally through Rust, Python, TypeScript, and CLI with results equivalent in shape and binding
   semantics to unregistered execution.
 - **AC-004:** A real Rust client submits the registered Workflow through a real
   `wyrd-server`, receives `202 Accepted`, polls by run ID, and receives final
@@ -2459,9 +2636,28 @@ retried after restart.
   bounded, and failure/cancellation/deadline can always produce a complete
   terminal snapshot from the reserved budget even near the output ceiling.
 
+- **AC-029:** Each of Rust, Python, and TypeScript tests the real public path:
+  authored file (local and mixed registered refs) → local run → CLI apply →
+  registered load → local run. Team Agents/Prompts are reused alongside a new
+  repository-local Agent. Assert exact relationships, equal output/binding
+  semantics, no dispatch during apply, and no dependency floating.
+- **AC-030:** Each language proves lazy credential resolution, zero registry IO
+  for fully local bundles, missing/denied/inactive dependencies, wrong/mixed
+  selectors, and sibling/external identity collision refusal before dispatch.
+  Server journey proof retains no partial writes and UID replacement refusal;
+  registration creates no Workflow principal. Existing Service hydration stays
+  valid.
+- **AC-031:** Source review proves obsolete WorkflowLoader/WorkflowGraph and
+  keyed normalization were removed, consumers use existing owners, declarations
+  regenerate, and SDKs/CLI share local route configuration without duplicating
+  transport, validation, or runtime behavior.
+
 ## Open material decisions
 
-None in approved Revision 11; Revisions 10 and 11 (see Revision history) were approved by the user on 2026-10-02. The user approved all seven readiness-review
+None in approved Revision 12. The user approved the complete remediation
+recommendation and explicitly requested skill, spec, task and review updates
+on 2026-10-02. Production implementation is not part of that request.
+Historical approval context: Revisions 10 and 11 (see Revision history) were approved by the user on 2026-10-02. The user approved all seven readiness-review
 recommendations on 2026-10-01, including replacement of unshipped implicit
 local behavior without migration documentation, and requested their explicit
 incorporation, then explicitly instructed approval of the revised spec before
@@ -2491,6 +2687,13 @@ or asynchronous server lifecycle requires another material spec revision
 before implementation planning.
 
 ## Revision history
+
+- **Revision 12 — approved (2026-10-02):** User-approved automatic client loading
+  APIs for Rust/Python/TypeScript, registered Agent/Prompt reuse, existing-owner
+  graph/validation composition, untagged authoring, no Workflow principal or
+  WyrdState root, shared local execution configuration, and replacement
+  TASK-002-cleanup with provenance/UID-fence preservation. TASK-003–005 are
+  revised under this authority; prior implementation reviews remain historical.
 
 - **Revision 11 — approved (2026-10-02):** Deletes the Skald Observer plugin
   system in favor of plain `tracing` spans exported through `wyrd-telemetry`

@@ -469,22 +469,28 @@ impl PyWorkflow {
         Ok(self.inner.save(path)?)
     }
 
-    /// Load a workflow from disk.
+    /// Load an authored Workflow file and the Cards it references.
+    ///
+    /// Relative paths and loaded sibling Agents and Prompts resolve locally
+    /// through the shared loader; a wholly local file needs no server or
+    /// credentials. External Card refs are read exactly through the ambient
+    /// Wyrd client configuration. The GIL is released while the shared Wyrd
+    /// runtime drives loading.
     ///
     /// Args:
-    ///     path (str): Filesystem path.
+    ///     path (str | os.PathLike[str]): Workflow entry file.
     ///
     /// Returns:
-    ///     Workflow: Reconstructed workflow with eager inline agent resolution.
+    ///     Workflow: Fully hydrated and validated workflow.
     ///
     /// Raises:
-    ///     `WyrdError`: When IO, codec, or resolution fails.
+    ///     `WyrdError`: When the file fails to load or validate, credentials
+    ///         are missing, or a referenced Card cannot be read.
     #[staticmethod]
-    fn load(path: PathBuf) -> WyrdPyResult<Self> {
-        let tool_resolver = skald_tool::default_registry();
-        let prompt_resolver = skald_agent::default_prompt_resolver();
-        let inner = Workflow::load(path, tool_resolver, prompt_resolver)?;
-        Ok(Self { inner })
+    fn from_path(py: Python<'_>, path: PathBuf) -> WyrdPyResult<Self> {
+        let workflow = py
+            .detach(|| wyrd_runtime::runtime().block_on(wyrd_client::Workflow::from_path(path)))?;
+        Ok(Self::from(workflow.into_skald()))
     }
 
     /// Parse a workflow from a canonical envelope YAML string.
@@ -530,6 +536,13 @@ impl PyWorkflow {
             wyrd_runtime::runtime().block_on(self.inner.run_with(providers.as_ref(), input))
         })?;
         Ok(PyWorkflowRun { run })
+    }
+}
+
+impl From<Workflow> for PyWorkflow {
+    /// Wrap a hydrated native Workflow for Python.
+    fn from(inner: Workflow) -> Self {
+        Self { inner }
     }
 }
 

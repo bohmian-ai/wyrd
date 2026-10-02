@@ -21,7 +21,7 @@ def test_workflow_save_load_round_trips_yaml(tmp_path: Path) -> None:
     workflow.set_version("0.1.0")
 
     workflow.save(path)
-    loaded = Workflow.load(path)
+    loaded = Workflow.from_path(path)
 
     yaml_body = path.read_text()
     assert "apiVersion: wyrd/v1" in yaml_body

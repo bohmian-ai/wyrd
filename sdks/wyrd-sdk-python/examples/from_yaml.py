@@ -6,7 +6,7 @@ from wyrd import Workflow
 
 
 def main() -> None:
-    wf = Workflow.load(Path(__file__).parent / "workflows" / "research.yaml")
+    wf = Workflow.from_path(Path(__file__).parent / "workflows" / "research.yaml")
     print(f"workflow: {wf.name}")
     print(f"steps: {', '.join(wf.steps)}")
 

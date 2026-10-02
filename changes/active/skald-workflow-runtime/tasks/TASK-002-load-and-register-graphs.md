@@ -1,7 +1,7 @@
 ---
 id: TASK-002
 kind: implementation
-status: ready
+status: superseded
 spec: SPEC-skald-workflow-runtime
 spec_revision: 11
 requirements: [REQ-001, REQ-002, REQ-003, REQ-013, REQ-013A, REQ-014, REQ-024, REQ-025, REQ-028, REQ-029, REQ-040, REQ-052, INV-002, INV-003, INV-005, INV-008, INV-014, AC-001, AC-002, AC-003, AC-006, AC-013]
@@ -11,6 +11,14 @@ depends_on: [TASK-001]
 # Load and register exact runnable graphs
 
 Implementation skill: `$wyrd-implement`.
+
+## Supersession
+
+Stopped by the user on 2026-10-02. Revision 12 and
+[TASK-002-cleanup](TASK-002-cleanup.md) replace this task. Its prescribed loading
+seam and WyrdState non-goal are historical, not implementation instructions.
+Keep prior evidence/reviews as history; retain valid provenance and UID-fence
+protections through cleanup. This task is not complete or accepted.
 
 ## Outcome and Value
 

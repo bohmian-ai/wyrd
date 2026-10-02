@@ -410,6 +410,27 @@ spec:
   details: { string: NonSecretValue }
 ```
 
+Workflow is a declarative Card, not a principal. It owns no credential, role,
+or authority; invocation uses the caller's identity. WyrdState remains a
+Service-root hydrated state and is not required for standalone Workflow loading.
+
+Clients expose `Workflow.from_path(path)` (Python), `Workflow.fromPath(path)`
+(TypeScript), and async `Workflow::from_path(path)` (Rust), including hydration.
+Fully local paths/inline bodies require no registry or credential; external
+Agent/Prompt refs and their transitive dependencies automatically use lazy
+existing default client configuration. Loading never registers, executes, or
+resolves execution secrets. Missing/denied/inactive dependencies fail before
+execution. Registered loading is `cards.workflow.load` (Python/TypeScript) or
+`cards.workflow().load` (Rust), selecting an exact named version or UID and
+following locked relationships. No loaded dependency floats to a newer version.
+
+The shared client composes existing wyrd-loader, Cards hydration, and Skald
+resolved validation/execution. Its thin Workflow facade adds the client IO
+boundary without duplicating graph state, traversal, parsing, validation, or
+runtime logic. Language SDKs project that facade; no public loader or hydrator
+is required. Shared local execution configuration serves SDKs and CLI, while
+Skald remains independent of registry IO and server tenancy.
+
 ### Mcp
 MCP server registration. The server enumerates its own tools at runtime; we do
 not shadow them as cards.
@@ -1526,8 +1547,8 @@ serialization across HTTP, Python, TypeScript, MCP, and CLI surfaces.
 ## Spec-file authoring
 
 Two complementary mechanisms — `wyrd apply -f file.yaml` reads + registers in
-one move, and reference slots accept `Ref` or `InlineableRef<T>`. A `path:` is
-loader-only authoring syntax resolved to a durable `ref:` before send; inline
+one move, and reference slots accept `Ref` or `InlineableRef<T>`. A path string is
+loader-only authoring syntax projected to a Ref/Sibling before send; inline
 is available only at `InlineableRef<T>` slots.
 
 ### Pre-registration matrix (Rule 16)
@@ -1549,45 +1570,48 @@ ship in one file.
 
 ### Reference forms
 
-A reference slot accepts `ref` or `path`; an inlineable slot also accepts
-`inline`. The key is the discriminator. `path` and `inline` are authored
-locally; only `ref` and inline child bodies cross the wire.
+`Ref` and `InlineableRef<T>` are untagged values. A CardRef mapping is an
+external reference, a string is a loader-local path, and an inlineable slot may
+contain its native child body directly. There is no additional keyed
+`ref`/`path`/`inline` discriminator wrapper around a slot value.
 
 ```yaml
-# 1. ref — points at a registered card by identity.
-#    kind, name, one version field, optional space, optional uid.
-#    No labels/annotations here.
-ref: { kind: Policy, name: pii-redaction, version: "1.0.0", space: prod }
+# Registered Prompt reference at Agent.prompt.
+prompt: { kind: Prompt, name: triage, version: "1.0.0", space: prod }
 
-# 2. path — authoring sugar. Targets a FULL card envelope on disk
-#    (apiVersion + kind + metadata + spec). The loader registers it as an
-#    independent card and rewrites this slot to `ref: CardRef`.
-path: ./policies/pii-redaction.yaml
+# Local full Card envelope, resolved relative to the containing file.
+prompt: ./prompts/triage.yaml
 
-# 3. inline — full spec body embedded in the parent. No card identity.
-inline:
-  description: inline workflow agent
-  prompt: { kind: Prompt, name: triage, version: "1.0.0", space: prod }
+# Inline native Prompt body: no independent Card identity.
+prompt:
+  model: example-model
+  request:
+    model: example-model
+    messages: [{role: user, content: "Hello"}]
+  variables: []
+  response_type: text
 ```
 
-`CardRef` carries `kind`, `name`, one `version` field, optional `space`, and
-optional `uid`. It never carries labels, annotations, or a separate version
-requirement. When `space` is omitted, resolution uses the enclosing authored
-context; when present, it is preserved verbatim.
-
-In context — `Service.components[]` mixing durable and loader-local forms plus a heavy-card ref:
+The owning spec may itself name a field `ref`; this does not introduce a
+reference discriminator. Service components retain that field for every form:
 
 ```yaml
 components:
   - alias: agent
-    ref:  { kind: Agent, name: support-triage,   version: "1.0.0", space: prod }
+    ref: { kind: Agent, name: support-triage, version: "1.0.0", space: prod }
   - alias: model
     ref: { kind: Model, name: churn-classifier, version: "1.0.0", space: prod }
   - alias: prompt
-    path: ./prompts/triage-system.yaml
-  - alias: pii-policy
-    ref: { kind: Policy, name: pii-redaction, version: "1.0.0", space: prod }
+    ref: ./prompts/triage-system.yaml
 ```
+
+`CardRef` carries `kind`, `name`, one `version`, optional `space`, and optional
+`uid`; never labels, annotations, or a version requirement. An omitted space
+inherits the containing authored context. Local loading never registers. Apply
+registers path-loaded Cards in the same composite request, projects paths to
+Sibling references, and preserves external refs even at matching identities.
+Inline bodies remain embedded. Only resolved Ref/Sibling and inline bodies
+cross registration; durable persistence contains no Path or Sibling.
 
 ### Reference-slot inventory
 
@@ -1612,9 +1636,9 @@ relationship tests all project from it:
 
 ### Path resolution rules (loader contract)
 
-`path:` is **client-side authoring sugar**, not a wire variant. It targets a
-full card envelope on disk; the loader registers that envelope as an
-independent card and rewrites the referring slot to an explicit
+A path string is **client-side authoring sugar**, not a durable wire variant.
+It targets a full Card envelope on disk; the loader reads it without registering.
+Apply submits it as an independent Card and rewrites the referring slot to an explicit
 registration reference. When the target is part of the same composite
 submission, the registration reference is `Sibling { sibling: CardRef }`;
 an authored external `ref: CardRef` remains `Ref(CardRef)`. This preserves

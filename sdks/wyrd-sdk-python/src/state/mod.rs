@@ -31,6 +31,7 @@ use wyrd_client::state::WyrdState;
 
 use crate::bifrost::PyTableConfig;
 use crate::observe::PyRun;
+use crate::workflow::PyWorkflow;
 
 /// Python state hydration boundary and all-or-nothing holder owner.
 mod hydrator;
@@ -1635,6 +1636,18 @@ impl PyCards {
         }
     }
 
+    /// Return the typed view for loading registered Workflows.
+    ///
+    /// Use `cards.workflow.load` to read a registered Workflow and its locked
+    /// Agent and Prompt closure into a runnable `wyrd.agent.Workflow`. The view
+    /// uses the parent client's connection and tenant context.
+    #[getter]
+    fn workflow(&self) -> PyWorkflowCards {
+        PyWorkflowCards {
+            inner: self.inner.clone(),
+        }
+    }
+
     /// Register a caller-owned `DataCard`, `ModelCard`, or `PromptCard`.
     ///
     /// Registration serializes the complete Card envelope, saves `DataCard` or
@@ -2541,6 +2554,72 @@ impl PyPromptCardRegistry {
     }
 }
 
+/// Typed loading of registered Workflows.
+///
+/// Obtain this view from `Cards.workflow`. It uses the connection and tenant
+/// context from the parent `Cards` object. Callers normally do not construct
+/// this type directly.
+#[pyclass(module = "wyrd.cards", name = "WorkflowCards")]
+pub struct PyWorkflowCards {
+    /// Parent `Cards` handle clone carrying the connection and tenant context.
+    inner: Cards,
+}
+
+#[pymethods]
+impl PyWorkflowCards {
+    /// Load one registered Workflow by exact identity or by UID.
+    ///
+    /// Pass either `uid` alone or all of `space`, `name`, and `version`; a
+    /// mixed or versionless selector is refused before any read. Every Agent
+    /// and Prompt is read along the Workflow's locked relationships, so later
+    /// versions never float in. The GIL is released while loading.
+    ///
+    /// # Arguments
+    /// * `uid` - Exact server-assigned Workflow UID.
+    /// * `space` - Workflow space.
+    /// * `name` - Workflow name.
+    /// * `version` - Exact Workflow version.
+    ///
+    /// # Returns
+    /// A runnable `wyrd.agent.Workflow`.
+    ///
+    /// # Errors
+    /// Returns a validation error for a mixed or incomplete selector, and a
+    /// Wyrd error when a Card is unreadable, inactive, not a Workflow, or
+    /// fails hydration or validation.
+    #[pyo3(signature = (*, uid=None, space=None, name=None, version=None))]
+    fn load(
+        &self,
+        py: Python<'_>,
+        uid: Option<&str>,
+        space: Option<&str>,
+        name: Option<&str>,
+        version: Option<&str>,
+    ) -> CardPyResult<PyWorkflow> {
+        let selector = match (uid, space, name, version) {
+            (Some(uid), None, None, None) => CardSelector::uid(
+                CardKind::Workflow,
+                CardUid::new(uid).map_err(|error| WyrdPyError::validation(error.to_string()))?,
+            ),
+            (None, Some(space), Some(name), Some(version)) => CardSelector::named(
+                CardKind::Workflow,
+                parse_space(space)?,
+                parse_name(name)?,
+            )
+            .with_version(parse_version(version)?),
+            _ => {
+                return Err(WyrdPyError::validation(
+                    "pass either uid alone or space, name, and version",
+                ));
+            }
+        };
+        let workflow = py
+            .detach(|| wyrd_runtime::runtime().block_on(self.inner.workflow().load(&selector)))
+            .map_err(WyrdPyError::from)?;
+        Ok(PyWorkflow::from(workflow.into_skald()))
+    }
+}
+
 /// Saved Python holder state awaiting native manifest construction.
 struct SavedPythonCard {
     /// Validated envelope carrying one coherent server-native version intent.
@@ -3119,6 +3198,7 @@ pub fn register_cards(module: &Bound<'_, PyModule>) -> CardPyResult<()> {
     module.add_class::<PyDataCardRegistry>()?;
     module.add_class::<PyModelCardRegistry>()?;
     module.add_class::<PyPromptCardRegistry>()?;
+    module.add_class::<PyWorkflowCards>()?;
     module.add_class::<PyCardSummary>()?;
     module.add_class::<PyCardList>()?;
     module.add_class::<PyRegistrationOutcome>()?;

@@ -378,6 +378,16 @@ uuid7_id_type!(
 );
 
 uuid7_id_type!(
+    /// Identity of one Workflow run, minted by the executing environment.
+    ///
+    /// Local and server Workflow runs both mint a fresh `UUIDv7` before
+    /// execution starts. It is Workflow-specific rather than a widening of the
+    /// Vala run identity, and it correlates every step attempt and gateway call
+    /// the run makes.
+    WorkflowRunId
+);
+
+uuid7_id_type!(
     /// Durable identity of one tenant Operator connection.
     ///
     /// The server mints it on create; secret rotation, metadata updates,

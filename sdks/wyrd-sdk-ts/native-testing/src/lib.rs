@@ -3,6 +3,7 @@
 #![deny(missing_docs)]
 
 use std::fmt::Display;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{DataType, Field};
@@ -11,6 +12,7 @@ use napi_derive::napi;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_testing::Bootstrap;
+use wyrd_testing::human_login::{HUMAN_PUBLIC_ORIGIN, HumanSso};
 use wyrd_testing::server::WyrdTestServer;
 use wyrd_testing::verification::VerificationFixture;
 
@@ -542,6 +544,112 @@ impl NativeWyrdTestServer {
         Ok(())
     }
 
+    /// Activate the identity lane's Keycloak sign-in for one tenant and
+    /// return its id: the fixture tenant when `tenantSlug` is absent, else a
+    /// newly seeded tenant of that slug with its own administrator.
+    ///
+    /// Needs `startTestServer(..., humanSso: true)` and the identity lane's
+    /// Keycloak.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed, seeding fails, or any
+    /// served activation step panics.
+    #[napi(catch_unwind)]
+    pub fn activate_human_sso(&self, tenant_slug: Option<String>) -> Result<String> {
+        let guard = self
+            .server
+            .lock()
+            .map_err(|_| napi::Error::from_reason("test server lock poisoned".to_owned()))?;
+        let server = guard
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
+        let sso = HumanSso::new(&self.base_url);
+        wyrd_runtime::runtime().block_on(async {
+            let Some(slug) = tenant_slug else {
+                sso.activate_keycloak(&self.api_key).await;
+                return Ok(server.data_tenant_id().to_string());
+            };
+            let tenant = server.seed_tenant(&slug).await.map_err(reason)?;
+            let admin = server
+                .bootstrap_service_in_tenant(tenant, &format!("{slug}-admin"), &["admin"])
+                .await
+                .map_err(reason)?;
+            let Bootstrap::Machine { api_key, .. } = admin else {
+                return Err(reason("service bootstrap returned a user principal"));
+            };
+            sso.activate_keycloak(secrecy::ExposeSecret::expose_secret(&api_key))
+                .await;
+            Ok(tenant.to_string())
+        })
+    }
+
+    /// Log `username` in to `tenant` through the CLI handoff and save the
+    /// credential under the Wyrd configuration directory `configHome`,
+    /// exactly as `wyrd auth login` does.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the login or the save panics.
+    #[napi(catch_unwind)]
+    pub fn save_human_login(
+        &self,
+        config_home: String,
+        tenant: String,
+        username: String,
+        password: String,
+    ) -> Result<()> {
+        wyrd_runtime::runtime().block_on(HumanSso::new(&self.base_url).save_login(
+            Path::new(&config_home),
+            &tenant,
+            &username,
+            &password,
+        ));
+        Ok(())
+    }
+
+    /// Make the saved login for `tenant` under `configHome` stale, so the
+    /// next client renews it; returns the generation the renewal starts from.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the login is missing or not ready, or the
+    /// generation does not fit a JavaScript number.
+    #[napi(catch_unwind)]
+    pub fn expire_saved_login(&self, config_home: String, tenant: String) -> Result<i64> {
+        let generation =
+            HumanSso::new(&self.base_url).expire_saved(Path::new(&config_home), &tenant);
+        i64::try_from(generation).map_err(reason)
+    }
+
+    /// Generation of the saved login for `tenant` under `configHome`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the login is missing or the generation does
+    /// not fit a JavaScript number.
+    #[napi(catch_unwind)]
+    pub fn saved_login_generation(&self, config_home: String, tenant: String) -> Result<i64> {
+        let generation =
+            HumanSso::new(&self.base_url).saved_generation(Path::new(&config_home), &tenant);
+        i64::try_from(generation).map_err(reason)
+    }
+
+    /// Revoke the server-side refresh chain of the saved login for `tenant`
+    /// under `configHome` without touching the record, as another device's
+    /// logout would.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the login is not ready or the server refuses
+    /// the revocation.
+    #[napi(catch_unwind)]
+    pub fn revoke_saved_login(&self, config_home: String, tenant: String) -> Result<()> {
+        wyrd_runtime::runtime()
+            .block_on(HumanSso::new(&self.base_url).revoke_saved(Path::new(&config_home), &tenant));
+        Ok(())
+    }
+
     /// Gracefully shuts down the in-process server once.
     ///
     /// # Errors
@@ -568,6 +676,8 @@ impl NativeWyrdTestServer {
 /// `auditPublication: false` keeps staged audit rows for assertions.
 /// `verificationRuntime: true` runs Drift baseline fitting and Verifier runs.
 /// `providerBaseUrl` roots built-in gateway adapters at a local mock upstream.
+/// `humanSso: true` serves the public origin the identity lane's Keycloak
+/// clients register, for saved user login journeys.
 ///
 /// # Errors
 ///
@@ -577,6 +687,7 @@ pub fn start_test_server(
     provider_base_url: Option<String>,
     audit_publication: Option<bool>,
     verification_runtime: Option<bool>,
+    human_sso: Option<bool>,
 ) -> napi::Result<NativeWyrdTestServer> {
     let provider_root = provider_base_url
         .as_deref()
@@ -591,6 +702,7 @@ pub fn start_test_server(
         provider_root,
         audit_publication.unwrap_or(true),
         verification_runtime.unwrap_or(false),
+        human_sso.unwrap_or(false),
     )))
 }
 
@@ -603,8 +715,12 @@ async fn start_test_server_async(
     provider_root: Option<url::Url>,
     audit_publication: bool,
     verification_runtime: bool,
+    human_sso: bool,
 ) -> napi::Result<NativeWyrdTestServer> {
     let mut builder = WyrdTestServer::builder();
+    if human_sso {
+        builder = builder.with_public_origin(url::Url::parse(HUMAN_PUBLIC_ORIGIN).map_err(reason)?);
+    }
     if !audit_publication {
         builder = builder.without_audit_publication_for_test();
     }

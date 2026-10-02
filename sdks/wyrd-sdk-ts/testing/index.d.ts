@@ -198,6 +198,60 @@ export declare class NativeWyrdTestServer {
    */
   failNextQueryAfterBatch(): void
   /**
+   * Activate the identity lane's Keycloak sign-in for one tenant and
+   * return its id: the fixture tenant when `tenantSlug` is absent, else a
+   * newly seeded tenant of that slug with its own administrator.
+   *
+   * Needs `startTestServer(..., humanSso: true)` and the identity lane's
+   * Keycloak.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed, seeding fails, or any
+   * served activation step panics.
+   */
+  activateHumanSso(tenantSlug?: string | undefined | null): string
+  /**
+   * Log `username` in to `tenant` through the CLI handoff and save the
+   * credential under the Wyrd configuration directory `configHome`,
+   * exactly as `wyrd auth login` does.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the login or the save panics.
+   */
+  saveHumanLogin(configHome: string, tenant: string, username: string, password: string): void
+  /**
+   * Make the saved login for `tenant` under `configHome` stale, so the
+   * next client renews it; returns the generation the renewal starts from.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the login is missing or not ready, or the
+   * generation does not fit a JavaScript number.
+   */
+  expireSavedLogin(configHome: string, tenant: string): number
+  /**
+   * Generation of the saved login for `tenant` under `configHome`.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the login is missing or the generation does
+   * not fit a JavaScript number.
+   */
+  savedLoginGeneration(configHome: string, tenant: string): number
+  /**
+   * Revoke the server-side refresh chain of the saved login for `tenant`
+   * under `configHome` without touching the record, as another device's
+   * logout would.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the login is not ready or the server refuses
+   * the revocation.
+   */
+  revokeSavedLogin(configHome: string, tenant: string): void
+  /**
    * Gracefully shuts down the in-process server once.
    *
    * # Errors
@@ -213,9 +267,11 @@ export declare class NativeWyrdTestServer {
  * `auditPublication: false` keeps staged audit rows for assertions.
  * `verificationRuntime: true` runs Drift baseline fitting and Verifier runs.
  * `providerBaseUrl` roots built-in gateway adapters at a local mock upstream.
+ * `humanSso: true` serves the public origin the identity lane's Keycloak
+ * clients register, for saved user login journeys.
  *
  * # Errors
  *
  * Returns a napi error for an invalid provider URL or server setup failure.
  */
-export declare function startTestServer(providerBaseUrl?: string | undefined | null, auditPublication?: boolean | undefined | null, verificationRuntime?: boolean | undefined | null): NativeWyrdTestServer
+export declare function startTestServer(providerBaseUrl?: string | undefined | null, auditPublication?: boolean | undefined | null, verificationRuntime?: boolean | undefined | null, humanSso?: boolean | undefined | null): NativeWyrdTestServer

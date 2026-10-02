@@ -56,6 +56,27 @@ pub enum ProviderError {
     /// Request variant did not match the concrete provider client.
     #[error("request variant {sent} does not match provider {provider}")]
     VariantMismatch { sent: String, provider: String },
+    /// A remote Wyrd boundary answered with a normalized, redacted problem.
+    ///
+    /// Gateway callers build this from a protocol-native error envelope or an
+    /// in-process Wyrd error, retaining only the HTTP status, a safe message,
+    /// the stable code, an optional safe field name, and the catalog
+    /// remediation. It never carries a response body, prompt, credential, or
+    /// arbitrary upstream detail, and it passes through Agent and Workflow
+    /// boundaries unchanged.
+    #[error("{message}")]
+    RemoteProblem {
+        /// Stable error code reported by the remote boundary.
+        code: String,
+        /// HTTP status of the remote answer.
+        status: u16,
+        /// Safe diagnostic message.
+        message: String,
+        /// Safe request field the problem names, when present.
+        field: Option<String>,
+        /// Operator-facing remediation.
+        remediation: String,
+    },
 }
 
 impl ProviderError {
@@ -123,8 +144,12 @@ impl ProviderError {
     }
 
     /// Returns the stable machine-readable error code.
-    pub const fn code(&self) -> &'static str {
+    ///
+    /// A [`ProviderError::RemoteProblem`] returns the remote boundary's own
+    /// code, so the result borrows from `self` rather than being static.
+    pub fn code(&self) -> &str {
         match self {
+            Self::RemoteProblem { code, .. } => code,
             Self::Auth { .. } => "SKALD_PROVIDERS_401_AUTH",
             Self::Status { status, .. } => match *status {
                 401 | 403 => "SKALD_PROVIDERS_401_AUTH",

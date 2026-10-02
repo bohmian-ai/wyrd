@@ -404,7 +404,8 @@ const fn refusal_class(status: u16) -> FailureClass {
 /// Failures before any connection never dispatched. Timeouts, broken
 /// exchanges, redirects (never followed), and undecodable answers may have
 /// reached the provider; an invalid credential header also lands there
-/// because Skald reports it as a decode failure.
+/// because Skald reports it as a decode failure. A relayed remote Wyrd
+/// problem is likewise treated as possibly reaching the provider.
 fn failure(
     error: ProviderError,
     translated: bool,
@@ -426,7 +427,8 @@ fn failure(
         ProviderError::Status { .. }
         | ProviderError::Timeout { .. }
         | ProviderError::Upstream { .. }
-        | ProviderError::Decode { .. } => FailureClass::Upstream,
+        | ProviderError::Decode { .. }
+        | ProviderError::RemoteProblem { .. } => FailureClass::Upstream,
     };
     AttemptResult::Failed {
         class,

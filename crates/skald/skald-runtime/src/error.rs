@@ -66,7 +66,7 @@ impl SkaldRuntimeError {
     ///
     /// Provider and cache wrappers delegate to the inner error code so
     /// downstream boundaries can preserve the original transport/cache reason.
-    pub fn code(&self) -> &'static str {
+    pub fn code(&self) -> &str {
         match self {
             Self::ProviderNotRegistered { .. } => "SKALD_RUNTIME_404_PROVIDER",
             Self::Provider { source, .. } => source.code(),

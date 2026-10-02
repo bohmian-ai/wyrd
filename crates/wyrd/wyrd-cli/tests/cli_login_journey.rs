@@ -250,8 +250,8 @@ pub(crate) async fn cli_oidc_handoff_journey() {
         .await
         .expect("handoff begins");
     sqlx::query(
-        "UPDATE wyrd.auth_cli_handoffs SET expires_at = statement_timestamp() - interval '1 \
-         second' WHERE handoff_id = $1",
+        "UPDATE wyrd.auth_cli_handoffs SET created_at = statement_timestamp() - interval '6 \
+         minutes', expires_at = statement_timestamp() - interval '1 minute' WHERE handoff_id = $1",
     )
     .bind(expiring.handoff_id)
     .execute(

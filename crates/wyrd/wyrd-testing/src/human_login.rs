@@ -152,10 +152,11 @@ impl HumanSso {
     ///
     /// # Panics
     /// Panics when any step fails or the claim never completes.
-    pub async fn cli_login(&self, tenant: &TenantSlug, username: &str, password: &str) -> CliLogin {
+    pub async fn cli_login(&self, tenant: &str, username: &str, password: &str) -> CliLogin {
+        let tenant: TenantSlug = tenant.parse().expect("tenant route key parses");
         let handoff = self
             .exchange
-            .begin_cli_handoff(tenant)
+            .begin_cli_handoff(&tenant)
             .await
             .expect("the CLI handoff begins");
         let login_url: Url = handoff
@@ -165,7 +166,7 @@ impl HumanSso {
             .expect("login URL parses");
         self.sign_in(&login_url, username, password).await;
         let proof = CliHandoffProof {
-            tenant_route_key: tenant.clone(),
+            tenant_route_key: tenant,
             poll_verifier: handoff.poll_verifier,
         };
         for _ in 0..30 {
@@ -190,14 +191,14 @@ impl HumanSso {
     pub async fn save_login(
         &self,
         config_home: &Path,
-        tenant: &TenantSlug,
+        tenant: &str,
         username: &str,
         password: &str,
     ) -> SavedLogin {
         let login = self.cli_login(tenant, username, password).await;
         let record = SavedLogin::from_cli_login(
             canonical_origin(&self.server).expect("server origin parses"),
-            tenant.clone(),
+            tenant.parse().expect("tenant route key parses"),
             login,
         );
         saved_logins(config_home)

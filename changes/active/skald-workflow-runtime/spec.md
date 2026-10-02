@@ -1,7 +1,7 @@
 ---
 id: SPEC-skald-workflow-runtime
-revision: 6
-status: draft
+revision: 9
+status: approved
 ---
 
 # Skald workflow runtime
@@ -27,7 +27,10 @@ workflow engine:
   steps, dependencies, step inputs, conditions, timeouts, retries, outputs,
   governance, and observation hooks.
 - `skald-workflow::Workflow` already loads Workflow Card YAML and executes
-  locally through `DagExecutor`.
+  locally through the asynchronous `DagExecutor`; Rust `run` and `run_with`
+  are already async. Python's synchronous boundary uses the shared runtime
+  bridge. This change completes that engine rather than replacing a
+  synchronous engine.
 - `DagExecutor` already validates and executes dependency-ready steps in
   concurrent topological stages, invokes Skald Agents through a supplied
   `ProviderRegistry`, retries calls, emits observer events, and captures task
@@ -40,7 +43,10 @@ workflow engine:
 - Skald already has native request and client coverage for OpenAI Chat,
   OpenAI Responses, Anthropic Messages, Google GenerateContent, and Vertex
   GenerateContent.
-- Wyrd gateway Revision 21 is approved and implemented. `wyrd-server` exposes
+- The current Wyrd gateway is implemented; its port is recorded in
+  `changes/completed/2026/wyrd-gateway-port.md`. Current architecture and
+  gateway contracts, not the removed active gateway spec, govern this change.
+  `wyrd-server` exposes
   OpenAI-compatible, Anthropic Messages, and Gemini GenerateContent ingress;
   every governed call converges on one in-process gateway invocation pipeline.
   The gateway supports OpenAI, Anthropic, Gemini, Vertex, and tenant-defined
@@ -60,10 +66,11 @@ workflow engine:
   audit rule.
 - `wyrd apply` and the shared loader already resolve Card-level `path`,
   `inline`, and `ref` forms and register Cards in dependency order.
-- `wyrd-server` already owns process-local, tenant-qualified run state for Eval
-  and tracked background work for MCP and gateway calls. Those lifecycle
-  patterns are the bounded precedent for asynchronous Workflow execution; this
-  change does not add a durable queue or scheduler.
+- `wyrd-server` already owns tracked background work for MCP and gateway calls.
+  Those task-lifecycle patterns support asynchronous Workflow execution.
+  Current Eval uses a durable verification queue, not a process-local run
+  precedent; Workflow's ephemeral lifecycle is an explicit independent choice.
+  This change does not add a durable queue or scheduler.
 - `wyrd-client` already owns stable `Idempotency-Key` submission and safe
   transport retry. Workflow creation reuses it rather than adding a second
   retry protocol.
@@ -78,7 +85,8 @@ partial run; Workflow DAG validation is not enforced during loading or
 registration; and no CLI or server invocation surface exists. The gateway is
 therefore an implemented upstream dependency; this change owns only the
 workflow contracts, the existing Skald runtime's missing semantics, and a thin
-server lifecycle around that runtime.
+server lifecycle around that runtime. It also connects declared Agent tools to
+that lifecycle, starting with two existing Wyrd read capabilities.
 
 ## Implemented gateway boundary consumed by this change
 
@@ -152,6 +160,11 @@ The workflow runtime does not recreate gateway behavior:
   lifecycle state for one asynchronously executing registered Workflow. It is
   available after the creating HTTP request disconnects but is not durable
   across process restart and is not a persisted Wyrd run registry.
+- **Run execution authority:** an immutable server-owned context captured from
+  the authenticated submission, containing tenant, effective principal,
+  permission/resource and Card scopes, credential attribution, and delegation
+  chain. It authorizes only the accepted run within its pinned graph and
+  deadline; it is not a retained bearer token or reusable access credential.
 
 ## User ergonomics
 
@@ -239,13 +252,51 @@ conversion, and passes the resulting `(name, value)` pairs to the existing
 Prompt binding API. Prompt binding remains the only `${name}` / `{{name}}`
 renderer.
 
+In the example, the caller submits `{"code": "..."}`. Both reviewer steps bind
+their Prompt variable `code` from `input.code`. The final reviewer binds
+`security_review` and `correctness_review` from the two completed steps' text
+outputs, then renders those values through its ordinary Prompt placeholders.
+`depends_on` controls readiness; the `inputs` map controls data injection.
+Neither step order nor dependency declaration automatically forwards values.
+
 Workflow bindings are plain source paths, not expressions. V1 permits
-`input.<name>`, `steps.<step_id>.output.text`, and
+`input.<name>`, `steps.<step_id>.output.text`,
+`steps.<step_id>.output.structured`, and
 `steps.<step_id>.output.structured.<field>...`; path components use the
 existing identifier grammar and arrays are not addressable. A Workflow binding
 cannot contain surrounding text or compose multiple sources. Constants belong
 in the Prompt or in `WorkflowSpec.inputs` defaults. Workflow `outputs` use the
 same exact source-path shape and preserve the selected JSON value's type.
+
+For a structured predecessor result, a downstream binding may select a field
+such as `feedback: steps.security.output.structured.summary`, or select the
+whole object with `feedback: steps.security.output.structured`. The downstream
+Prompt declares `feedback` in `variables` and uses `${feedback}` or
+`{{feedback}}` in its request text. Strings pass through unchanged; null binds
+as an empty string; objects, arrays, numbers, and booleans bind as compact JSON.
+A missing selected field fails that step before its model call. Combining
+multiple values into instructions belongs in the Prompt's text, not in binding
+expressions. Workflow outputs retain the selected JSON type rather than this
+Prompt-text conversion.
+
+### Prompt request formats
+
+The existing Skald Prompt envelope contains `request`, `model`, declared
+`variables`/`media_variables`, and `response_type`. `request` holds a supported
+provider-native body: for example, OpenAI Chat uses role/content `messages`,
+OpenAI Responses uses `input`, Anthropic Messages uses its `messages` and
+`system`, and Gemini/Vertex GenerateContent uses `contents`. Users may author
+the format appropriate to their provider/API; this change does not force every
+provider through an OpenAI format. Provider selection follows the existing
+typed request/provider contract, not a new Workflow-level `provider` field.
+The examples supply the same model in the envelope and OpenAI request body.
+Local helpers may construct a native request, but serialized Card examples
+MUST use the existing Prompt schema.
+Existing standalone `PromptSpec` declarative authoring through `PromptDraft`
+remains supported and compiles to that native shape. An Agent's inline Prompt
+is the native `skald_spec::Prompt`, not the standalone PromptSpec draft parser;
+the inline examples below therefore include `request`. This change neither
+removes existing authoring formats nor adds a second Workflow-specific parser.
 
 Each Agent owns its instruction Prompt. `agents/security.yaml` is representative:
 
@@ -259,15 +310,18 @@ metadata:
 spec:
   prompt:
     inline:
-      provider: openai
       model: gpt-5-5
-      system: |
-        You are a security reviewer. Report only exploitable security findings.
-        For every finding, identify the affected code and a concrete failure path.
-      messages:
-        - |
-          Review this change:
-          {{code}}
+      request:
+        model: gpt-5-5
+        messages:
+          - role: system
+            content: |
+              You are a security reviewer. Report only exploitable security findings.
+              For every finding, identify the affected code and a concrete failure path.
+          - role: user
+            content: |
+              Review this change:
+              {{code}}
       variables: [code]
       response_type: text
   tool_names: []
@@ -275,6 +329,23 @@ spec:
     max_iterations: 1
     timeout_ms: 60000
 ```
+
+An Agent that needs Wyrd data declares runtime tool names in the same field:
+
+```yaml
+spec:
+  tool_names: [bifrost.query, cards.get]
+  run_config:
+    max_iterations: 4
+    timeout_ms: 60000
+```
+
+The Workflow references this Agent through its ordinary Agent step. It does
+not list tools or pass tool arguments in the Workflow Card. During execution,
+the Agent may request `bifrost.query` and `cards.get`; their JSON results enter
+the existing Agent tool loop and can inform the step output. The YAML names
+select capabilities only; SQL, Card references, tenant identity, and
+credentials are never inferred from the names.
 
 `agents/correctness.yaml` changes the instruction while preserving the same
 input contract:
@@ -289,15 +360,18 @@ metadata:
 spec:
   prompt:
     inline:
-      provider: openai
       model: gpt-5-5
-      system: |
-        You are a correctness reviewer. Find reachable bugs, data loss, races,
-        and contract violations. Ignore style-only concerns.
-      messages:
-        - |
-          Review this change:
-          {{code}}
+      request:
+        model: gpt-5-5
+        messages:
+          - role: system
+            content: |
+              You are a correctness reviewer. Find reachable bugs, data loss, races,
+              and contract violations. Ignore style-only concerns.
+          - role: user
+            content: |
+              Review this change:
+              {{code}}
       variables: [code]
       response_type: text
   tool_names: []
@@ -319,22 +393,25 @@ metadata:
 spec:
   prompt:
     inline:
-      provider: openai
       model: gpt-5-5
-      system: |
-        You are the final reviewer. Validate each proposed finding against the
-        supplied code, remove duplicates and unsupported claims, and return one
-        prioritized review.
-      messages:
-        - |
-          Code:
-          {{code}}
+      request:
+        model: gpt-5-5
+        messages:
+          - role: system
+            content: |
+              You are the final reviewer. Validate each proposed finding against the
+              supplied code, remove duplicates and unsupported claims, and return one
+              prioritized review.
+          - role: user
+            content: |
+              Code:
+              {{code}}
 
-          Security review:
-          {{security_review}}
+              Security review:
+              {{security_review}}
 
-          Correctness review:
-          {{correctness_review}}
+              Correctness review:
+              {{correctness_review}}
       variables: [code, security_review, correctness_review]
       response_type: text
   tool_names: []
@@ -515,6 +592,65 @@ behind `wyrd-server`. Server execution accepts `WyrdGateway` and `ExtGateway`
 and rejects `Native`. Registration validates the declarative route but performs
 no network call and resolves no secret.
 
+### Resolve named Agent tools
+
+`AgentSpec.tool_names` remains the sole declaration of tools an Agent may use.
+Tools are Skald runtime registry entries, not Cards or Workflow actions. The
+server execution environment supplies a run-bound registry for the verified
+Workflow caller. It resolves every declared name in the pinned Agent graph
+before accepting a run. The server supplies two built-in read tools:
+
+| Name | JSON arguments | Result and authority |
+|---|---|---|
+| `bifrost.query` | Required `sql`; optional `deadline_ms`, `max_rows`, and `max_bytes`, using the current bounded MCP query contract. Unknown fields are rejected. | A complete bounded JSON query result through the existing Bifrost query service, with its SELECT-only floor, tenant and table scopes, `bifrost_query:read` authorization, and canonical read-decision audit. |
+| `cards.get` | One exact `CardRef` (`kind`, `name`, `version`, optional `space` and `uid`); omitted space inherits the executing Agent Card's space. | The authorized public Card envelope through the existing Cards read boundary, with `cards:read` authorization and canonical transactional audit. |
+
+`bifrost.query` accepts no visibility, freshness, source, class, topology, or
+execution-path selector. SQL is limited to 65,536 UTF-8 bytes; `deadline_ms`,
+when present, is in `1..=u32::MAX`. `max_rows` defaults to 1,000 with a ceiling
+of 10,000; `max_bytes` defaults to 4 MiB with a ceiling of 16 MiB; both must be
+positive. A lower remaining step/run deadline or Workflow result budget still
+applies. Crossing a result ceiling fails rather than truncating rows. A result
+is successful only after validating the query stream's terminal outcome;
+partial rows without a valid successful terminal are not successful tool data.
+The implementation reuses the current bounded query collection semantics.
+Cards resolution must use the existing authorized/audited read boundary, not
+assume that the raw CardRef lookup helper performs authorization or audit.
+
+Both built-ins use Skald's existing `AgentTool` contract: stable name and
+description, JSON input/output schemas, JSON argument/result values, and a
+structured tool error. Workflow execution passes the resolved Agent tools to
+the existing Agent tool loop; it does not implement a second tool loop. The
+same contract is the extension point for later host, MCP, and direct HTTP API
+tools. Their different registration and transport mechanisms must remain
+outside the Workflow DAG and Agent YAML contract.
+
+The server binds built-in tool instances to the run execution authority. Each
+invocation validates model-supplied arguments and uses the owning Cards or
+Bifrost service's authorization, audit, tenant, and result limits. The model
+cannot select tenant, principal, credential, service endpoint, or a tool name
+the Agent did not declare. The effective step deadline and cancellation cover
+tool calls; their results and errors obey Workflow payload limits and redact
+secrets and unauthorized data. Unknown or unavailable declared names fail
+before `202`; a denied or failed invocation becomes a redacted terminal
+Agent/step error. Local execution uses only tools supplied by its caller's
+existing registry; the server's built-ins are not silently installed locally.
+
+Permission checks use the captured run scopes, not a retained or renewed
+submission token. Dynamic model arguments still undergo the owning service's
+resource-specific authorization and audit: authenticated submission does not
+allow the model to read every Card or Bifrost table in the tenant.
+
+This revision does not create a user registration API for remote tools. A
+subsequent change can add tenant-registered MCP servers whose discovered tools
+adapt to `AgentTool`; another can add explicit HTTP API tools without requiring
+users to host an MCP proxy. Locally authored Rust and Python function tools
+already use Skald's registry, while server-installed custom code requires a
+separate deployment and isolation decision. Those later changes must specify
+namespacing, schemas, credentials, per-tool authorization and audit, network
+controls, write approval where needed, and retry effects before enabling
+their tools in server workflows.
+
 ### Host registered workflows asynchronously
 
 `wyrd-server` does not currently host Skald Workflow runs. This change adds a
@@ -537,6 +673,37 @@ HTTP connection but not process restart. Status and cancellation require the
 owning process, so multi-replica deployments provide request affinity. There is
 no database table, durable queue, recovery protocol, ownership lease, or replay
 machinery in this change.
+
+### Accepted-job authority and token lifetime
+
+Successful authenticated and audited submission authorizes the bounded job,
+not merely the lifetime of its HTTP connection or five-minute access token.
+Acceptance captures one immutable run execution authority for the pinned graph
+and accepted total deadline. The server MUST NOT retain the bearer token,
+refresh token, API-key secret, or a token-renewal task for execution. Submission
+token expiry, disconnect, or subsequent grant/credential changes do not by
+themselves cancel the accepted job or change its captured scopes. This is an
+explicit accepted-job authority boundary, not an extension of access-token
+validity for new requests.
+
+Every internal gateway or tool call still enforces the run's captured resource
+permissions, tenant/Card scope, delegation, and audit attribution. Current
+gateway deployment eligibility, credential availability, limits, budgets,
+fallback, and audit remain live under their existing owner; a captured context
+does not bypass them. Execution authority cannot widen, transfer to another
+run, create arbitrary server requests, or survive terminalization/restart. It
+is bounded by completion, failure, cancellation, shutdown, or the accepted
+deadline, with only already-issued gateway calls allowed their bounded
+gateway-owned settlement. It is never returned in WorkflowRun.
+
+Create/replay, GET, and cancel each require fresh request authentication and
+their normal permission/audit decisions. A replay neither refreshes nor
+replaces the original run's authority, even if the caller's grants changed.
+An owner whose current permission was removed may therefore fail to poll or
+cancel an otherwise continuing run. Local execution through public gateway
+ingress retains ordinary client authentication per request; the accepted-job
+rule applies only to server-hosted runs. Architecture and security authority
+must explicitly record this distinction before implementation completes.
 
 ### Public WorkflowRun contract
 
@@ -656,16 +823,32 @@ total-deadline, explicit cancellation, or aggregate-size terminal transition
 that wins the atomic terminal compare-and-set determines the run status before
 ordinary step-error selection.
 
-Size accounting uses canonical payload bytes rather than allocator size:
+Size accounting uses canonical serialized bytes rather than allocator size:
 `max_input_bytes` counts the JCS UTF-8 serialization of the decoded input map;
 `max_step_result_bytes` counts UTF-8 text plus JCS-serialized structured output;
-`max_run_bytes` counts the sum of retained step payloads plus JCS-serialized
-declared workflow outputs. Metadata and stable errors are outside this payload
-budget. Oversized decoded input fails before acceptance. An oversized step
+`max_run_bytes` bounds the JCS UTF-8 serialization of the complete WorkflowRun,
+including step IDs, statuses, attempts, timestamps, text, structured output,
+declared outputs, and run/step errors. Metadata and errors are not exempt.
+The server reserves enough of this budget during preparation for a complete
+payload-free terminal snapshot of every declared step, including bounded error
+projections and terminal metadata. A graph whose mandatory snapshot cannot fit
+is rejected before acceptance; provider data cannot consume that reserve.
+No terminal transition may fail because it lacks room for statuses or errors.
+
+Each projected run/step error is capped at 2 KiB of JCS UTF-8, preserving its
+stable catalog code and remediation. Diagnostic message text is safely
+shortened and optional details omitted when necessary; secrets and raw
+upstream responses are never diagnostic fallbacks. The supported catalog
+code/remediation projections must fit that ceiling, and terminal snapshot
+capacity reserves the ceiling for one run error and one error per step.
+This bound concerns snapshot diagnostics, not a second error catalog.
+
+Oversized decoded input fails before acceptance. An oversized step
 payload is discarded, the step fails with
 `WYRD_WORKFLOW_413_STEP_RESULT_TOO_LARGE`, and ordinary primary-error selection
-applies. Exceeding the aggregate payload budget discards the candidate payload
-that crossed the bound and fails the run with
+applies. A transition whose candidate full snapshot plus remaining mandatory
+reserve exceeds the aggregate budget discards the candidate provider payload
+or output projection and fails the run with
 `WYRD_WORKFLOW_413_RUN_TOO_LARGE`. No oversized provider payload is retained in
 the snapshot, log, observation, or error details.
 
@@ -688,13 +871,14 @@ already describe the failure.
 | `WYRD_WORKFLOW_422_RUN_REQUEST` | 422 | Invalid input, timeout, CardRef, or request shape |
 | `WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED` | 422 | Route/protocol combination unsupported in this environment |
 | `WYRD_WORKFLOW_422_SERVER_NATIVE_UNSUPPORTED` | 422 | Server graph resolves a `Native` step |
-| `WYRD_WORKFLOW_422_SERVER_TOOLS_UNSUPPORTED` | 422 | Server graph contains an Agent with tools |
+| `WYRD_WORKFLOW_422_TOOL_UNAVAILABLE` | 422 | Server graph declares an unknown, disallowed, or duplicate tool name |
 | `WYRD_WORKFLOW_429_RUN_CAPACITY` | 429 | Global or tenant active-run capacity is exhausted |
 | `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` | 503 | Required execution-environment credential binding is absent or unavailable |
 | `WYRD_WORKFLOW_503_RUN_UNAVAILABLE` | 503 | Server is shutting down or cannot accept tracked work |
 | `WYRD_WORKFLOW_413_INPUT_TOO_LARGE` | 413 | Decoded Workflow input exceeds the configured input bound |
+| `WYRD_WORKFLOW_413_GRAPH_TOO_LARGE` | 413 | Step/edge count, resolved graph bytes, or mandatory terminal snapshot exceeds server admission bounds |
 | `WYRD_WORKFLOW_413_STEP_RESULT_TOO_LARGE` | terminal snapshot | A normalized step result exceeds its configured bound |
-| `WYRD_WORKFLOW_413_RUN_TOO_LARGE` | terminal snapshot | Aggregate retained output payload exceeds its configured bound |
+| `WYRD_WORKFLOW_413_RUN_TOO_LARGE` | terminal snapshot | Complete retained snapshot plus mandatory terminal reserve exceeds its configured bound |
 | `WYRD_WORKFLOW_504_STEP_TIMEOUT` | terminal snapshot | A step exhausted retries after an attempt timeout |
 | `WYRD_WORKFLOW_504_RUN_TIMEOUT` | terminal snapshot | The total Workflow deadline expired |
 
@@ -912,10 +1096,35 @@ deadline, and preserves the existing absence of local input/result-size caps.
 requires another route fails with the stable binding/route error. Callers and
 the CLI use `run_with_options` when they require WyrdGateway, ExtGateway,
 cancellation, or server-equivalent bounds.
-Existing synchronous Python behavior remains a compatibility adapter over the
-repository's shared async runtime bridge and the same Skald executor; this
-revision adds no new Python method or second execution implementation. The CLI
-runs inside its existing Tokio process boundary and awaits the same Rust APIs.
+Existing Python local execution remains a synchronous adapter over the
+repository's shared async runtime bridge and the same Skald executor, but its
+unshipped legacy data/result semantics are replaced by the explicit model.
+The CLI runs inside its existing Tokio process boundary and awaits the same
+Rust APIs.
+
+### Unshipped local API alignment
+
+No compatibility layer, migration guide, deprecation period, legacy executor,
+or implicit-binding translation is required. Retained Rust and Python local
+builders MUST let authors supply declared Workflow inputs/defaults, explicit
+step bindings, dependencies, and named Workflow outputs using the same native
+contracts as YAML. Sequential/parallel convenience may construct dependency
+edges, but MUST NOT infer data bindings from Prompt variables or predecessor
+outputs, create a shared parameter map, or select a last-step result. A builder
+with incomplete bindings or outputs fails the same validation as YAML.
+
+Local Rust's existing text-input convenience MAY normalize text to the JSON
+object `{"input": "..."}` only when the Workflow declares a string input named
+`input`; this does not declare an input or bind a Prompt variable implicitly.
+Other invocation inputs follow the JSON-object/type rules. Python local
+execution uses that same rule if its retained surface accepts text.
+Local result wrappers expose named `outputs` and namespaced `steps` from the
+new WorkflowRun. The old accumulated `parameters`, last-task selection, and
+implicit `final_output` result are removed rather than retained as aliases.
+Affected Python exports/stubs/tests and Rust builder tests MUST move with the
+contract; Python-only behavior is tested through Python, not a Rust-hosted
+interpreter. These are updates to existing local surfaces, not new remote
+Python/TypeScript/MCP Workflow invocation surfaces.
 
 ### Workflow retry and deadline contract
 
@@ -967,12 +1176,14 @@ timeout, which wins over the Agent timeout. No retry begins after cancellation
 or total deadline, and the existing atomic terminal compare-and-set still
 settles a true completion race.
 
-Retrying a complete local Agent attempt can repeat tool effects performed by a
-prior attempt. This is an explicit consequence of authoring `max_retries > 0`;
-the runtime provides no compensation or exactly-once tool guarantee. Server
-execution rejects Agent tools in V1, so server retries cannot repeat tool
-effects. Observer events record every Workflow attempt start and terminal
-outcome plus the scheduled backoff duration; provider and gateway internal
+Retrying a complete Agent attempt can repeat tool calls performed by a prior
+attempt. This is an explicit consequence of authoring `max_retries > 0`; the
+runtime provides no compensation or exactly-once tool guarantee. The two
+server built-ins are read-only, and each repeated call makes its own
+authorization and audit decision. Local caller-supplied tools may have
+effects and are subject to repetition. Observer events record every Workflow
+attempt start and terminal outcome plus the scheduled backoff duration;
+provider and gateway internal
 attempts remain visible only through their existing observation boundaries.
 
 One parent Workflow future owns a bounded task set for active Skald steps. The
@@ -1002,15 +1213,33 @@ The DNS screening, address pinning, redirect refusal, no-proxy behavior, TLS,
 and connection/request bounds currently owned by
 `wyrd_gateway::EndpointPolicy` move to the existing lower-level
 `skald-providers` transport owner. Its consumers are the existing gateway HTTP
-dispatch, gateway Vault transport, server admin endpoint validation, their
-current boot/test composition sites, and the new local and server ExtGateway
-paths. Existing Native OpenAI, Anthropic, Google, and Vertex clients retain
+provider dispatch, server admin provider-endpoint validation, their current
+boot/test composition sites, and the new local and server ExtGateway paths.
+Existing Native OpenAI, Anthropic, Google, and Vertex clients retain
 their current transport behavior in this revision. Skald MUST NOT depend on
-`wyrd-gateway` or `wyrd-client`, and no second SSRF implementation is
-permitted. This is an ownership move within existing Rust crates, not a new
-crate or dependency; enabling the existing workspace Tokio dependency's `net`
-feature in `skald-providers` is the one permitted manifest change required by
-the moved resolver.
+`wyrd-gateway` or `wyrd-client`, and these provider/ExtGateway consumers MUST
+NOT introduce a second SSRF implementation. This is an ownership move within
+existing Rust crates, not a new crate or third-party package. Existing-workspace
+dependency declarations required by the approved interfaces are permitted:
+in particular, production `skald-workflow` consumes `skald-providers` and
+`tokio-util`, and `wyrd-client` consumes `skald-workflow` for its public caller
+adapter. Narrow existing-workspace edges for the stated transport/value types
+are permitted within the approved owners; no dependency cycle, upward Skald
+application dependency, shared-Vault relocation, or unrelated dependency
+centralization is allowed. Enabling the existing workspace Tokio dependency's
+`net` feature in `skald-providers` is the only new feature needed for the moved
+resolver; “no new dependency” does not prohibit these already-approved
+workspace owner edges or their existing feature requirements.
+
+`wyrd-vault::VaultKv2` already owns shared screened/pinned Vault reads used by
+both gateway credentials and Operator encryption-key handling. That owner,
+its dependencies, its internal configured-address policy, and all Vault and
+Operator consumers remain unchanged. Vault is not an external-provider egress
+consumer in this migration. The one-implementation invariant is scoped to
+provider/ExtGateway endpoint screening, not a consolidation of every network
+security boundary in Wyrd. In particular, this change MUST NOT apply the
+external production private-address prohibition to configured internal Vault
+servers or make the shared Vault crate depend on Skald.
 
 The runtime-only credential shape is fixed as follows and is never a Card,
 schema-generated wire payload, result, or loggable secret container:
@@ -1105,6 +1334,9 @@ following exact serialized fields and defaults:
 | `max_active_per_tenant` | 4 |
 | `max_retained_global` | 128 |
 | `max_retained_per_tenant` | 32 |
+| `max_steps_per_run` | 1,024 |
+| `max_dependency_edges_per_run` | 4,096 |
+| `max_resolved_graph_bytes` | 8 MiB |
 | `max_input_bytes` | 1 MiB |
 | `max_step_result_bytes` | 1 MiB |
 | `max_run_bytes` | 4 MiB |
@@ -1120,6 +1352,9 @@ pub struct ServerWorkflowConfig {
     pub max_active_per_tenant: usize,
     pub max_retained_global: usize,
     pub max_retained_per_tenant: usize,
+    pub max_steps_per_run: usize,
+    pub max_dependency_edges_per_run: usize,
+    pub max_resolved_graph_bytes: usize,
     pub max_input_bytes: usize,
     pub max_step_result_bytes: usize,
     pub max_run_bytes: usize,
@@ -1134,12 +1369,39 @@ container-level `serde(default)` applies them to omitted fields; operators may
 override fields under `[workflow]`. It MUST NOT derive zero-valued `Default`.
 
 Terminal retention is fixed at 24 hours rather than exposed as another
-operator knob. The default retained-run and aggregate-size bounds cap retained
-payloads at approximately 512 MiB before ordinary map and task overhead.
-Configuration MUST reject zero timeout, concurrency, active, retained, or byte
-ceilings; a default timeout above the maximum; a per-tenant active or retained
+operator knob. The default retained-run and full-snapshot bounds cap retained
+serialized snapshots at approximately 512 MiB before ordinary allocator and
+task overhead; completed runs release their resolved graph and execution
+dependencies. Active graph memory is bounded separately by active-run counts
+and `max_resolved_graph_bytes`, not charged to the terminal snapshot budget.
+Configuration MUST reject zero timeout, concurrency, active, retained, byte,
+or graph-count ceilings; a default timeout above the maximum; a per-tenant
+active or retained
 ceiling above its matching global ceiling; or a step-result bound above the
 aggregate run bound.
+
+Graph admission counts declared steps and every dependency edge, including
+duplicate edges before semantic rejection. Resolved graph bytes are the JCS
+UTF-8 size of the Workflow and unique pinned Agent/Prompt bodies required for
+execution, including native requests and schema data. The graph budget is
+enforced incrementally while resolving, before retaining an oversized body;
+the step/edge ceilings are enforced before costly DAG traversal or per-step
+runtime construction. Transport body limits and Card-reference depth limits
+do not substitute for these bounds. Registry fetches use their existing
+bounded transport, and preparation must not duplicate graph material without
+accounting for it.
+
+Preparation and validation of even a deep graph within the allowed counts
+MUST be stack-safe and MUST NOT monopolize the server's request executor.
+The implementation may select the repository-native blocking/cooperative
+strategy appropriate to bounded pure work; validation itself remains
+synchronous, no graph IO or traversal occurs under the run-state lock, and
+no new queue/scheduler is introduced. Oversized/deep-graph negative evidence
+must also prove ordinary gateway, Cards, and Bifrost traffic remains serviceable
+under the normal test lane, without synthetic host load. Graph admission
+failure creates no run, calls no provider/tool, and releases its preparation
+reservation. A graph below count/byte ceilings that cannot fit its mandatory
+terminal snapshot is rejected with the same graph-size error.
 
 ### Normative create and replay flow
 
@@ -1169,9 +1431,10 @@ contract:
    run and exposes no additional Workflow status.
 7. The tracked preparation future, not the HTTP handler, resolves and pins the
    exact active Workflow/Agent/Prompt graph outside the lock, validates it,
-   applies policy and server suitability, resolves the exact tenant ExtGateway
-   binding declarations, and enforces input and projected result limits. No
-   provider or tool call may occur.
+   applies server suitability and bounded graph admission, resolves the exact
+   tenant ExtGateway binding declarations, and enforces input and mandatory
+   terminal-snapshot reserve limits. No runtime Invoke policy gate is added.
+   No provider or tool call may occur.
 8. On ordinary failure or shutdown cancellation, the preparation owner uses
    one idempotent completion path to remove its reservation and capacity,
    notify all matching waiters, and publish the structured failure without
@@ -1179,8 +1442,12 @@ contract:
    flow and may become the next preparer; failed preparations are not cached.
    Cancellation of any waiting HTTP handler only drops that waiter and cannot
    cancel or strand the tracked preparation.
-9. Construct the queued snapshot, run cancellation token, pinned execution
-   environment, and a tracked executor future held behind a start signal.
+9. Construct the queued snapshot, run cancellation token, immutable run
+   execution authority captured from step 1's verified scopes and step 3's
+   audited submission, pinned execution environment, and a tracked executor
+   future held behind a start signal. Retain attribution/scopes, not the
+   credential token or a renewal path; later token expiry does not revoke this
+   already-authorized preparation or accepted job.
    Tracked Tokio task creation is treated as infallible after shutdown
    admission; the plan MUST NOT invent a persistent spawn-failure record.
 10. Under the lock, recheck that admission remains open. If shutdown has
@@ -1201,7 +1468,8 @@ contract:
 
 The replay's fresh permission decision is a new audit event because a
 permission was evaluated. It does not repeat provider work, create a second run,
-or repeat any accepted-run lineage/observation event.
+or repeat any accepted-run lineage/observation event, and does not replace the
+accepted run's graph or execution authority.
 
 ### Normative execution, cancellation, retention, and shutdown flow
 
@@ -1277,6 +1545,8 @@ retried after restart.
   resolve each declared step input to one Prompt variable value and invoke the
   existing Prompt binding API. A Workflow MUST NOT introduce a parallel
   template renderer, system-prompt schema, or provider-request schema.
+  Authored Prompt bodies MUST use the existing `request` envelope and supported
+  provider-native format; examples MUST load through that same schema.
 - **REQ-004:** Direct Prompt and MCP workflow actions MUST NOT be executable
   step kinds. The unimplemented `WorkflowAction::Prompt` and
   `WorkflowAction::Mcp` contract variants and the untyped, unimplemented step
@@ -1346,8 +1616,9 @@ retried after restart.
   MUST both run at the earliest boundary that has the required information:
   local bundle loading, composite Card registration, registered local loading,
   and server acceptance. Execution environments MAY then apply an explicit
-  suitability check, including the server's rejection of `Native` and Agent
-  tools; they MUST NOT silently reinterpret an otherwise valid graph.
+  suitability check, including the server's rejection of `Native` and tools
+  outside its supported catalog; they MUST accept the two declared built-ins
+  when otherwise authorized and MUST NOT silently reinterpret a valid graph.
 - **REQ-015:** The Skald runtime MUST execute the same validated workflow plan
   locally and on the server when every resolved step route is `WyrdGateway` or
   `ExtGateway`.
@@ -1369,7 +1640,11 @@ retried after restart.
   `timeout_seconds`; omission uses the default. Local Rust callers MUST be able
   to supply equivalent execution limits. Server admission and execution MUST
   also enforce configured global and per-tenant active-run limits plus input,
-  step-result, and aggregate WorkflowRun size limits.
+  step-result, complete WorkflowRun, and graph count/byte limits. Preparation
+  MUST enforce graph limits before costly work, remain stack-safe, and reserve
+  bounded terminal metadata/error space as specified above. Metadata and errors
+  MUST NOT be exempt from run accounting. Terminal runs MUST release their
+  pinned execution graph/dependencies while retaining the bounded snapshot.
 - **REQ-018:** On a terminal step failure, already-running peers in the same
   stage MAY finish, but no new step may start. The runtime MUST return a failed
   WorkflowRun containing every completed, failed, and unstarted step rather
@@ -1417,9 +1692,13 @@ retried after restart.
   Skald runtime: load and run an unregistered local YAML bundle; fetch, hydrate,
   and run a registered Workflow locally; and submit, inspect, and cancel a
   registered Workflow run on the server. This revision ships YAML, Rust, HTTP,
-  and CLI surfaces only. It adds no Python, TypeScript, or MCP Workflow surface
-  and MUST preserve the compilation and existing behavior of retained Python
-  Workflow bindings.
+  and CLI remote invocation surfaces only. It adds no Python, TypeScript, or
+  MCP remote Workflow surface. Existing Rust/Python local builders, bindings,
+  and result wrappers MUST align with the explicit input/output model and the
+  single WorkflowRun contract. The unshipped implicit forwarding, shared
+  `parameters`, and last-step `final_output` behavior MUST NOT be preserved;
+  affected exports, generated stubs, and language-owned tests MUST be updated.
+  No migration documentation or compatibility aliases are required.
 - **REQ-025:** Local YAML loading MUST use the shared loader's `path`, `inline`,
   and `ref` semantics. `path` dependencies are loaded from disk without being
   registered. A `ref` requires registry access and MUST fail clearly when no
@@ -1457,8 +1736,9 @@ retried after restart.
   versioned Workflow Card. The server MUST resolve the locked Agent and Prompt
   graph within the authenticated tenant before starting the first step. An
   accepted run pins that resolved Card graph for its lifetime; later Card
-  updates or deactivation do not mutate or implicitly cancel it. Gateway policy,
-  deployment eligibility, and credential resolution remain governed at each
+  updates or deactivation do not mutate or implicitly cancel it. Gateway
+  deployment eligibility, credential resolution, limits, budgets, and fallback
+  remain governed at each
   gateway call under the existing gateway contract.
 - **REQ-030:** `wyrd-server` MUST expose an asynchronous Workflow-run resource:
   `POST /v1/workflow-runs` accepts an exact Workflow CardRef, JSON-object
@@ -1488,8 +1768,8 @@ retried after restart.
   roles MUST receive it; `admin` continues to cover it through wildcard, while
   `reader` and `runtime_admin` MUST NOT receive it. The server MUST derive
   tenant and actor from verified credentials. Create MUST enforce active Card
-  state and invocation policy and fail closed before provider or tool side
-  effects when identity, authorization, policy, dependency resolution, or
+  state and fail closed before provider or tool side
+  effects when identity, authorization, dependency resolution, validation, or
   acceptance audit fails. Get and cancel MUST authorize the caller's current
   permission and run ownership without re-resolving or revalidating the Card
   graph. Run lookup and cancellation MUST be tenant- and owner-qualified before
@@ -1498,6 +1778,19 @@ retried after restart.
   indistinguishable as the same not-found result. Every evaluated permission
   decision uses the repository's canonical audit path; polling does not create
   an audit exception.
+- **REQ-032A:** Successful authenticated/audited submission MUST capture the
+  immutable run execution authority defined above. An accepted job MUST
+  continue within its pinned graph, captured scopes, and total deadline after
+  the submission token expires or its grants/credential later change; no
+  bearer-token retention, renewal, or automatic privilege widening is allowed.
+  Internal gateway/tool calls MUST still enforce resource-specific permissions
+  and audit under that authority and current owner-controlled admission rules.
+  Fresh requests to create/replay, GET, or cancel MUST authenticate normally
+  and evaluate current request authority; replay MUST NOT replace run authority.
+  Execution authority ends with the run, apart from already-issued calls'
+  bounded gateway settlement, and MUST NOT be exposed or reused outside it.
+  This accepted-job boundary MUST be reflected in security authority before
+  completion; no runtime cross-service Invoke policy gate is introduced.
 - **REQ-033:** The server's `workflows:run` acceptance authorization decision
   MUST use the canonical transactional audit path and fail closed before the
   first step when that decision cannot be recorded. Acceptance MUST complete
@@ -1514,10 +1807,28 @@ retried after restart.
   nor receive their plaintext. An `ExtGateway` step MUST resolve only its named
   execution-environment credential binding after verifying the binding's exact
   endpoint origin and secret-header contract. Server suitability validation
-  MUST reject every resolved Agent whose `tool_names` is non-empty before the
-  run is accepted; local execution retains the existing caller-supplied tool
-  registry. Invocation input and Workflow Cards MUST NOT contain secret values
+  MUST resolve every Agent's declared `tool_names` against the server catalog
+  before accepting the run and reject unknown or unavailable names. Local
+  execution retains the existing caller-supplied tool registry. Invocation
+  input and Workflow Cards MUST NOT contain secret values
   or secret-provider coordinates.
+- **REQ-052:** Workflow lowering and execution MUST preserve each resolved
+  Agent's declared tool names and bind the execution environment's registry to
+  that Agent's existing tool loop. Registration MUST accept the built-in names
+  and MUST NOT treat every nonempty `tool_names` list as runtime-local and
+  unregistrable. Server suitability rejects names outside its built-in catalog
+  before acceptance; local callers may provide additional tools explicitly.
+  Server execution MUST provide the two built-in read tools defined above.
+  Each invocation MUST validate its
+  JSON arguments, use the captured run execution authority's tenant, effective
+  principal, and resource scopes through the existing authorized Cards or
+  Bifrost boundary, enforce that
+  service's authorization, audit, query, and result bounds, and return a
+  structured, redacted tool result or error. A tool failure MUST obey the
+  existing non-retryable tool-failure rule. Neither a Workflow nor a model
+  response may select a different tenant, principal, credential, or tool.
+  Bifrost arguments and complete-result/terminal validation MUST follow the
+  bounded contract above, with no removed visibility/freshness selectors.
 - **REQ-034A:** Accepted server runs MUST execute as tracked process-owned work
   after the creating response disconnects. Process-local state MUST be bounded
   by operator-configured global and per-tenant active and retained-run ceilings.
@@ -1623,7 +1934,7 @@ retried after restart.
   the direct `WorkflowRun` value, without a route-specific wrapper, and public
   failures MUST use the listed stable error codes and the derive-backed Wyrd
   error projection. Status-specific field presence, attempt counts, concurrent
-  failure selection, and payload-size accounting MUST follow the snapshot
+  failure selection, and complete-snapshot size accounting MUST follow the snapshot
   invariants above.
 - **REQ-046:** `wyrd_client::Workflows` MUST expose the exact asynchronous
   `create`, `get`, `cancel`, and `wait` methods defined above. `wait` MUST poll
@@ -1647,14 +1958,19 @@ retried after restart.
   is terminal. No Skald step task may outlive its Workflow executor. A
   WyrdGateway caller MUST signal cancellation but MUST NOT claim ownership of
   or wait for the gateway's separately tracked settlement task.
-- **REQ-049:** External endpoint validation and DNS/address pinning MUST have
-  one implementation in the existing `skald-providers` transport boundary.
+- **REQ-049:** Provider/ExtGateway endpoint validation and DNS/address pinning
+  MUST have one implementation in the existing `skald-providers` transport
+  boundary.
   The exact existing and new consumers enumerated above MUST consume that
   lower-level policy rather than depending on one another or implementing a
-  second SSRF check. Existing Native provider transports MUST remain unchanged.
+  second SSRF check. Existing Native provider transports and the shared
+  `wyrd-vault::VaultKv2` owner, internal-address policy, dependencies, gateway
+  Vault consumers, and Operator key consumers MUST remain unchanged.
   Runtime bindings and configuration MUST use the exact contracts above; this
-  revision MUST NOT add a new crate, resolver trait, or dependency cycle, and
-  MAY enable only Tokio's existing `net` feature for the moved resolver.
+  revision MUST NOT add a new crate, third-party package, resolver trait, or
+  dependency cycle. It MAY add the existing-workspace dependency declarations
+  required by the approved interfaces and enable Tokio's existing `net`
+  feature for the moved resolver, under the scope rules above.
 - **REQ-050:** Server Workflow-run configuration MUST expose the exact fields,
   defaults, and validation rules listed above, with a fixed 24-hour terminal
   retention. Local and server external bindings MUST use the exact config DTOs,
@@ -1691,17 +2007,18 @@ retried after restart.
   Workflow, Agent, and Prompt versions; resolution must not silently float to a
   newer dependency.
 - **INV-006:** Server execution preserves tenant isolation across registry
-  reads, policy, provider/tool configuration, audit, observations, caches, and
-  returned results. Invocation input never selects tenant identity.
+  reads, authorization, provider/tool configuration, audit, observations,
+  caches, and returned results. Invocation input never selects tenant identity.
 - **INV-007:** Every shipped public surface projects the same WorkflowRun and
   stable error semantics. CLI or Rust convenience must not create a competing
   durable contract. This capability's deliberate YAML/Rust/HTTP/CLI rollout
   does not weaken the repository-wide first-class language rule; Python,
   TypeScript, and MCP gain no new Workflow surface in this revision.
-- **INV-008:** Local execution may use only the tools declared by the Agent and
-  supplied by the caller's existing tool registry. Server execution rejects
-  every Agent with declared tools in this revision. A workflow is not an
-  arbitrary code or shell execution engine.
+- **INV-008:** An Agent may invoke only its declared tool names resolved by the
+  execution environment's registry. Local execution uses the caller's existing
+  registry; server execution offers only `bifrost.query` and `cards.get` in
+  this revision, bound to the verified run creator and the owning services.
+  A workflow is not an arbitrary code or shell execution engine.
 - **INV-009:** `LlmRoute` is declarative, versioned Workflow behavior. Runtime
   provider registries implement the stored choice but cannot silently replace
   it.
@@ -1731,25 +2048,30 @@ retried after restart.
 - **INV-015:** Before implementation completes, the repository's architecture
   authority MUST be synchronized with this approved revision for the
   capability-scoped surface rollout, execution-local `ExtGateway` meaning, and
-  bounded ephemeral server-run lifecycle. The Wyrd gateway authority and
+  bounded ephemeral server-run lifecycle, explicit local API semantics,
+  provider-native Prompt envelope, and accepted-job execution authority
+  distinct from request-token lifetime. In particular,
+  `architecture/wyrd-security-posture.md` MUST record the run's bounded scope
+  snapshot and lack of token renewal or automatic grant-change cancellation.
+  The Wyrd gateway authority and
   generated public operations MUST also record the authenticated fallback
   header without changing unmodified-client behavior.
 - **INV-016:** There is one Workflow execution algorithm. Async orchestration
   owns IO and task lifetimes; pure work stays synchronous, and synchronous
   language ergonomics remain boundary adapters rather than alternate engines.
-- **INV-017:** There is one external-endpoint security implementation below
-  both Skald and the Wyrd gateway. A higher application crate MUST NOT become a
+- **INV-017:** There is one provider/ExtGateway endpoint security implementation
+  below both Skald and the Wyrd gateway. A higher application crate MUST NOT become a
   dependency of Skald to share egress policy. Its consumer set is the narrow
-  enumerated migration above; Native provider transport is not broadened by
-  this change.
+  enumerated migration above; Native provider transport and shared Vault/
+  Operator security boundaries are not broadened or consolidated by this change.
 - **INV-018:** Accepted work is either represented by one tracked run or not
   accepted. Every preparation reservation is owned by one tracked preparation
   future until atomic promotion or exact-once cleanup. Idempotency entries,
   active accounting, and terminal snapshots MUST not expose a state in which
   duplicate work can start or untracked work can survive.
 - **INV-019:** Server run-state locks protect only short in-memory mutations.
-  Registry, policy, audit, provider, binding-resolution, polling, and task-drain
-  IO MUST occur outside those locks.
+  Registry, authorization, audit, provider, binding-resolution, polling, and
+  task-drain IO MUST occur outside those locks.
 - **INV-020:** WyrdGateway fallback, deadline, cancellation, and correlation are
   immutable per-call values. They are never stored in a shared adapter or
   inferred from a Prompt/provider request, and public ingress consumes rather
@@ -1758,12 +2080,25 @@ retried after restart.
   A signalled WyrdGateway task remains gateway-owned until its required bounded
   settlement completes and has no capability to mutate the terminal
   WorkflowRun or retain Workflow admission.
+- **INV-022:** An accepted server job's authority is scoped execution context,
+  not a retained request token. Submission authenticates once; every performed
+  resource permission decision still uses the captured scopes and canonical
+  audit boundary. Token expiry does not stop the job, and subsequent requests
+  do not inherit its authority.
+- **INV-023:** Every server graph and retained snapshot is bounded. Step/edge
+  and graph-byte admission precedes execution; complete snapshots count
+  metadata/errors and preserve reserved space for terminalization. Async IO
+  alone is not evidence that graph preparation is bounded or stack-safe.
 
 ## Non-goals
 
-- Python, TypeScript, or MCP workflow invocation surfaces. This change
-  intentionally ships YAML authoring, Rust, and CLI only; any later projection
-  must reuse the same contracts and runtime/client boundaries.
+- New Python, TypeScript, or MCP remote Workflow invocation surfaces. This
+  change ships YAML authoring, Rust, HTTP, and CLI remote invocation; existing
+  Python local adapters are updated to the explicit contract rather than
+  preserved as a legacy model. Later remote projections must reuse the same
+  contracts and runtime/client boundaries.
+- Compatibility shims, implicit binding inference, migration documentation,
+  or a second legacy result contract for unshipped local Workflow behavior.
 - A durable workflow queue, scheduler, background job service, persisted or
   cross-replica run registry, ownership transfer, restart recovery, or
   resume/replay service. The bounded process-local lifecycle required above is
@@ -1785,8 +2120,11 @@ retried after restart.
   configuration, not Workflow resources.
 - A Gateway Card kind, route registry, named route catalog, or mutable
   invocation-time route override.
-- Direct Prompt or MCP workflow steps; Agents already own Prompt execution and
-  MCP tool use.
+- A Tool Card, uploaded executable code, generic plugin system, or direct
+  database handle in Skald. Tenant MCP onboarding, direct HTTP API tool
+  registration, and server-installed custom code require separate contracts.
+- Direct Prompt or MCP workflow steps; Agents own Prompt execution and any
+  future MCP tool use.
 - Provider-specific raw responses as a cross-language or server wire contract.
 - A second synchronous Workflow executor, public Rust `run_blocking` API, new
   Tokio runtime, or configurable polling subsystem. Existing boundary adapters
@@ -1827,10 +2165,15 @@ retried after restart.
     rejects `Native` before the graph starts. Server `ExtGateway` is direct
     bounded egress through an operator-configured credential binding; it does
     not enter `wyrd-gateway`.
-11. This capability ships YAML, Rust, HTTP, and CLI only. It does not add
-    Python, TypeScript, or MCP Workflow invocation surfaces.
-12. Server execution rejects Agent tools in V1. Local execution continues to
-    use the existing caller-provided tool registry.
+11. New invocation journeys ship through YAML, Rust, HTTP, and CLI. Existing
+    Python local surfaces align with the same explicit model; no new Python,
+    TypeScript, or MCP remote Workflow invocation surface is added.
+12. Server execution resolves declared Agent tools against a run-bound
+    registry containing built-in `bifrost.query` and `cards.get`. Both use their
+    owning Wyrd services with per-call permission and audit. Local execution
+    continues to use the caller-provided tool registry. The shared `AgentTool`
+    contract can later admit MCP, direct HTTP API, and deployed host tools
+    without changing Workflow or Agent YAML semantics.
 13. Server create uses the existing idempotency-key contract, but deduplication
     lasts only as long as the owning process and retained run.
 14. Acceptance pins the resolved Workflow/Agent/Prompt graph. Later Card state
@@ -1841,13 +2184,17 @@ retried after restart.
     defined in this revision; implementations do not invent wrapper envelopes
     or a second client facade.
 16. Workflow execution has one async engine. Pure phases stay synchronous,
-    local Rust and CLI await it, and retained Python sync behavior uses only the
-    existing runtime bridge. No Rust `run_blocking` surface is added.
+    local Rust and CLI await it, and Python's synchronous local boundary uses
+    only the existing runtime bridge. Its data/result semantics change to the
+    explicit model without compatibility aliases. No Rust `run_blocking`
+    surface is added.
 17. External endpoint policy moves down to the existing `skald-providers`
-    transport boundary for the enumerated gateway, Vault, admin-validation, and
-    ExtGateway consumers. Native provider transports remain unchanged; no new
-    crate, trait, or upward dependency is introduced, and only Tokio's existing
-    `net` feature is enabled for the moved resolver.
+    transport boundary for the enumerated gateway provider, admin provider-
+    validation, and ExtGateway consumers. Native provider transports and shared
+    Vault/Operator behavior remain unchanged; no new
+    crate, third-party package, trait, or upward dependency is introduced.
+    Existing-workspace owner edges required by the approved interfaces are
+    permitted; only Tokio's existing `net` feature is added for the moved resolver.
 18. Server acceptance uses a private preparation reservation and atomically
     publishes a queued run, idempotency entry, and active accounting. A tracked
     preparation future owns the reservation across IO and cleans it exactly
@@ -1867,12 +2214,21 @@ retried after restart.
 21. Workflow retry repeats a whole Agent step attempt, uses the exact typed
     eligibility and deterministic exponential schedule above, and composes
     per-attempt step timeout, Agent timeout, provider-internal retry, and total
-    Workflow deadline in the fixed order above. Local tool effects may repeat;
-    server tools remain rejected.
+    Workflow deadline in the fixed order above. Tool calls may repeat; server
+    built-ins are read-only, while local caller-supplied tools may have effects.
 22. Workflow cancellation drains only Skald-owned work. It signals a
     WyrdGateway caller boundary, after which the gateway's tracked owner may
     finish bounded provider cancellation and settlement without holding a
     Workflow slot or mutating its terminal snapshot.
+23. Accepted server jobs capture scoped execution authority once and do not
+    retain or renew submission tokens. They continue after token expiry or
+    grant changes until their bounded terminal outcome; resource checks still
+    use captured scopes and owner-controlled admission remains live. New
+    create/replay, status, and cancel requests authenticate independently.
+24. Server admission caps steps, edges, resolved graph bytes, and mandatory
+    snapshot size. Complete run-size accounting includes metadata/errors and
+    reserves terminal capacity; bounded pure preparation must be stack-safe
+    and leave sibling request handling serviceable.
 
 ## Acceptance criteria and evidence
 
@@ -1880,7 +2236,10 @@ retried after restart.
   reviewer Agents and one dependent final-review Agent loads and executes
   locally through Rust and CLI, with both reviewers running in the same DAG
   stage and their distinct outputs assigned to the final reviewer's declared
-  Prompt variables through the existing Prompt binder.
+  Prompt variables through the existing Prompt binder. The actual example
+  bundle MUST parse/round-trip against the existing loader and native Prompt
+  schema, including its provider-shaped `request` bodies; prose-only or
+  substitute simplified Prompt fixtures do not supply that proof.
 - **AC-002:** The same YAML bundle registers through `wyrd apply`; its stored
   Workflow relationships point to the exact Agent and Prompt Card versions.
 - **AC-003:** The registered code-review Workflow can be fetched and executed
@@ -1911,9 +2270,9 @@ retried after restart.
   status and prove a terminal run contains no pending or running step.
 - **AC-009:** Server journeys prove unregistered/inactive/cross-tenant Workflow
   refs, under-privileged callers, unresolved dependencies, excessive input,
-  excessive concurrency, Agent tools, and deadline expiry are rejected without
-  unauthorized provider/tool execution. Cancellation evidence proves no new
-  step starts and active operations receive cancellation where supported.
+  excessive concurrency, unavailable Agent tools, and deadline expiry are
+  rejected without unauthorized provider/tool execution. Cancellation evidence
+  proves no new step starts and active operations receive cancellation where supported.
 - **AC-010:** Audit evidence proves create, get, and cancel authorization under
   `workflows:run` is recorded through the canonical audit path, correlated, and
   redacted, and that acceptance-audit failure prevents run creation. A workflow
@@ -1936,10 +2295,13 @@ retried after restart.
   separate in-process cancellation, trace-only Workflow correlation, parsing
   of all three native error envelopes, and identical smallest-common
   `WorkflowRunError` fields without inventing a canonical public problem body.
-- **AC-012:** Generated Workflow schema, OpenAPI, error catalog, and CLI JSON
-  output agree with the Rust source contract and regenerate without drift. The
-  affected gateway OpenAPI operations document the optional fallback header
-  and its encoding.
+- **AC-012:** Generated Workflow schemas and error catalog regenerate without
+  drift through `mise run codegen:check`; CLI JSON agrees with the Rust contract.
+  The served `/openapi.json`, composed from runtime route registrations, agrees
+  with the actual Workflow endpoints and documents the optional gateway
+  fallback header and encoding on affected operations. Prove the served
+  document through `mise run test:principals:integration`; OpenAPI is not a
+  checked-in generated file, and codegen alone does not prove those routes.
 - **AC-013:** Focused unit and integration evidence covers pure validation,
   Skald runtime execution, loader hydration, registration, client transport,
   server authorization/audit, and CLI behavior. Real Rust/CLI
@@ -1998,14 +2360,19 @@ retried after restart.
   cancellation and total deadline during backoff, step/Agent/run timeout
   precedence, provider-internal versus Workflow attempt accounting, and no
   retry after a terminal outcome. A local-tool fixture proves an authored
-  Workflow retry may repeat a tool effect; the server suitability test proves
-  that risk is rejected there. No Skald-owned step or Native/ExtGateway IO
+  Workflow retry may repeat a tool call; server tool evidence proves repeated
+  reads each authorize and audit. No Skald-owned step or Native/ExtGateway IO
   future remains after the executor completes. WyrdGateway tests prove caller
   connection/token cancellation, no later WorkflowRun mutation, release of the
   Workflow admission slot, and completion through the gateway's existing
   authoritative cancellation/settlement evidence. Existing Python Workflow
-  tests prove the retained synchronous boundary still works without a second
-  engine.
+  tests MUST be rewritten for explicit input declarations, step bindings,
+  namespaced outputs, and the new result fields; they prove the synchronous
+  boundary uses the same engine, not preservation of implicit legacy behavior.
+  Rust/Python builder evidence proves dependencies alone do not forward input
+  or results, incomplete bindings/outputs fail validation, and explicit text
+  and structured predecessor bindings work. Python-owned tests use public
+  package exports; affected stubs regenerate and public typing checks pass.
 - **AC-021:** Concurrent-create tests prove that matching idempotency requests
   share one preparation and one accepted run, conflicting requests fail, and a
   failed preparation releases its reservation and capacity without caching the
@@ -2025,24 +2392,79 @@ retried after restart.
   local bindings retain their explicit private-address allowance, config
   secrets resolve only at the stated boundary, and Skald does not depend on
   `wyrd-gateway` or a Wyrd application crate. The boundary check permits only
-  the existing Tokio dependency's added `net` feature.
+  the explicitly approved existing-workspace owner edges and Tokio dependency's
+  added `net` feature, not new third-party packages or cycles. Scope/regression
+  evidence proves the shared Vault reader and gateway/Operator consumers are
+  unchanged, including configured internal Vault address reachability; Vault
+  is not migrated to the external-provider production profile.
 - **AC-024:** The cohesive contract-and-runtime change passes its focused tests,
   retained Python-feature compilation, workspace all-feature lint gate, and
   generated-contract checks before any later server or CLI task begins. No
   accepted task boundary relies on a subsequent task to restore compilation.
+- **AC-025:** A checked-in YAML Workflow references a registered Agent whose
+  `tool_names` lists both `bifrost.query` and `cards.get`. A real client →
+  server → client journey runs it with a controlled model that calls both
+  tools, reads a seeded tenant Bifrost row and an exact registered Card, and
+  uses both JSON results in the final step output. Evidence proves the tool
+  calls reach the existing service authorization/audit paths under the run
+  creator, obey query and result bounds, and finish within cancellation and
+  deadline limits. A second tenant, a caller lacking either tool's permission,
+  malformed or forbidden SQL, an inaccessible Card, and an undeclared or
+  unavailable tool produce no unauthorized data; an unavailable declared
+  name fails before `202`, while a denied invocation yields a redacted
+  terminal step error. Local execution proves the same Agent declaration
+  resolves only tools explicitly supplied by its caller.
+- **AC-026:** A local Rust workflow executes an Agent declaring a caller-
+  registered custom tool with the same `AgentTool` schema, argument, result,
+  and error contract used by the built-ins. The result reaches the Workflow
+  output; an undeclared or unregistered name cannot run. Existing Python
+  callable-tool behavior remains available to local Agents and is not treated
+  as server-side code registration.
+- **AC-027:** A server journey starts with a valid authenticated submission,
+  expires its submission token before a later step, and proves that step still
+  executes with the original run's captured scopes and audit attribution.
+  Controlled grant changes after acceptance neither cancel nor widen the job;
+  a resource outside its original scopes remains denied. Fresh GET/cancel/
+  replay requests require valid current credentials and current permission;
+  a newly authorized replay cannot expand the accepted run's authority. No
+  token refresh or retained bearer secret is required. Evidence also proves
+  current gateway deployment/credential refusal is not bypassed by the run.
+- **AC-028:** Server journeys reject graphs exceeding step, dependency-edge,
+  resolved-byte, or mandatory-snapshot limits with
+  `WYRD_WORKFLOW_413_GRAPH_TOO_LARGE`, without provider/tool calls, leaked
+  reservations, or retained oversized graphs. Deep graphs within the admitted
+  counts validate without stack exhaustion. Large graph preparation must leave
+  ordinary gateway calls, Cards reads, and Bifrost queries serviceable using
+  normal repository-managed lanes, not synthetic host load. Snapshot evidence
+  proves metadata/errors count toward `max_run_bytes`, long diagnostics are
+  bounded, and failure/cancellation/deadline can always produce a complete
+  terminal snapshot from the reserved budget even near the output ceiling.
 
 ## Open material decisions
 
-None in proposed Revision 6. Revision 5 remains the last approved authority;
-Revision 6 is draft until its exact text receives explicit human approval. The
+None in approved Revision 9. The user approved all seven readiness-review
+recommendations on 2026-10-01, including replacement of unshipped implicit
+local behavior without migration documentation, and requested their explicit
+incorporation, then explicitly instructed approval of the revised spec before
+delegated task planning and readiness review. Revision 9 is approved under
+that instruction; it supersedes Revision 5 as the active change authority. The
 new material decisions are the exact public run/client interfaces, one async
 execution engine and concrete route-dependency owner, local/server binding
 configuration, lower ownership and narrow consumers of shared egress policy,
 normative server preparation/acceptance and terminal-state ordering,
 deterministic snapshot errors, per-call WyrdGateway fallback projection,
 Workflow retry/deadline composition, cross-owner cancellation/drain semantics,
-fixed server defaults, and the cohesive contract-plus-consumer implementation
-boundary. Any later change to those
+fixed server defaults, the cohesive contract-plus-consumer implementation
+boundary, and the two built-in server tools with run-bound resolution and
+per-call authorization. Revision 9 additionally fixes the current native
+Prompt examples, current bounded Bifrost tool contract, no runtime Invoke
+policy gate, shared Vault exclusion, explicit local builder/result semantics,
+acceptance-scoped execution authority, and graph/full-snapshot resource bounds.
+The new capacity defaults are conservative operator-overridable ceilings,
+not measured performance claims; implementation must provide the required
+boundedness and sibling-service evidence. MCP, direct HTTP API, and server
+custom-code onboarding require separate decisions and are not authorized by
+this revision. Any later change to those
 decisions, the `LlmRoute` variants, route precedence, server route boundary,
 external-gateway credential binding, registered-route immutability, action
 kinds, binding roots, Prompt-binding ownership, execution failure semantics,
@@ -2051,6 +2473,33 @@ before implementation planning.
 
 ## Revision history
 
+- **Revision 9 — approved (2026-10-01):** Rebases against the current parent and
+  incorporates all seven user-approved readiness recommendations. Uses native
+  Prompt `request` examples and explains original-input, predecessor-text, and
+  structured-field injection through explicit bindings; aligns built-in tools
+  with current Bifrost/Card contracts; removes runtime invocation policy;
+  excludes the shared Vault/Operator boundary from provider-egress migration;
+  replaces unshipped implicit Rust/Python local semantics without compatibility
+  or migration documentation; defines accepted-job authority independent of
+  submission token expiry; and bounds graph preparation plus full snapshots,
+  metadata/errors, and terminal reserve. Corrects the async/Eval baseline,
+  gateway authority link, and served-OpenAPI verification. No tasks or
+  implementation are created by this revision. The user explicitly requested
+  approval followed by delegated planning and iterative readiness review.
+  Planning clarification: the already-approved interface owner edges may be
+  declared in manifests; the dependency prohibition concerns new third-party
+  packages and unrelated ownership changes, not those existing-workspace edges.
+- **Revision 8 — draft (2026-09-24):** Narrows the first server-tool slice to
+  two built-in read tools and Skald's shared `AgentTool` contract. Adds a local
+  custom-tool execution check. Defers tenant MCP, direct HTTP API, and server
+  custom-code onboarding until their registration, credentials, permissions,
+  network security, and write/retry semantics can be specified separately.
+- **Revision 7 — draft (2026-09-24):** Adds run-bound Agent tool resolution on
+  the server for built-in `bifrost.query` and `cards.get` and tenant-registered
+  remote MCP tools. Keeps declarations on Agent Cards and execution in Skald's
+  existing tool loop; requires typed MCP registration, explicit allowlisting,
+  per-call authorization, audit, and bounds; and adds YAML-to-server journeys
+  using built-in and registered tools plus denied and unavailable-tool cases.
 - **Revision 6 — draft (2026-09-20):** Makes the approved direction
   decision-complete for planning. Defines the exact WorkflowRun wire and Rust
   client interfaces and stable errors; selects one async Skald engine with
@@ -2121,4 +2570,11 @@ before implementation planning.
 - `architecture/references/languages/rust-core.md`
 - `architecture/references/languages/testing-workflows.md`
 - `architecture/references/languages/spec-driven-development.md`
-- `changes/active/wyrd-gateway-v1/spec.md` Revision 21
+- `architecture/bifrost-design.md` §§Query contract, Audit publication
+- `changes/completed/2026/wyrd-gateway-port.md` (delivery history, not a
+  replacement for current architecture authority)
+- Current owning contracts: `crates/skald/skald-spec/src/prompt.rs`,
+  `crates/skald/skald-spec/src/request.rs`,
+  `crates/wyrd-spec/src/vala/api.rs`, and
+  `crates/wyrd/wyrd-server/src/mcp/bifrost.rs`
+- Current shared Vault owner: `crates/shared/wyrd-vault/src/lib.rs`

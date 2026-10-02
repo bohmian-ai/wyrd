@@ -6,6 +6,7 @@ belongs to the gated journey lanes, not here.
 """
 
 import asyncio
+import inspect
 import sys
 import threading
 from dataclasses import dataclass
@@ -388,6 +389,18 @@ def test_unsupported_providers_are_refused_without_raising() -> None:
     assert install_run_correlation(failing) is False
 
 
+def test_run_exit_accepts_conventional_keywords_and_omitted_arguments(tmp_path: Path) -> None:
+    """``Run.__exit__`` names and defaults match the public stub; it never suppresses."""
+    run = _state(tmp_path).run()
+    assert list(inspect.signature(run.__exit__).parameters) == ["exc_type", "exc_value", "traceback"]
+    run.__enter__()
+    assert run.__exit__(exc_type=None, exc_value=None, traceback=None) is False
+    run.__enter__()
+    assert run.__exit__() is False
+    run.__enter__()
+    assert run.__exit__(ValueError, ValueError("app"), None) is False
+
+
 def test_missing_opentelemetry_is_a_no_op(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Without the optional package a run still enters, exits, and emits normally."""
     for module in ("opentelemetry", "opentelemetry.context", "opentelemetry.trace"):
@@ -414,11 +427,28 @@ def _broken(*_args: object, **_kwargs: object) -> None:
 def test_registration_and_attach_failures_never_block_observations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An API-only provider or a failing attach leaves explicit emits untouched."""
+    """API-only, raising-registration, and failing-attach providers leave emits untouched."""
     run = _state(tmp_path).run(card="model")
     monkeypatch.setattr(trace, "get_tracer_provider", lambda: object())
     with run as entered:
         _drift_reaches_the_ordinary_boundary(entered)
+
+    attempts: list[object] = []
+
+    class Raising:
+        """A global provider whose processor registration raises."""
+
+        def add_span_processor(self, processor: object) -> None:
+            attempts.append(processor)
+            raise RuntimeError("registration failed")
+
+    monkeypatch.setattr(trace, "get_tracer_provider", Raising)
+    with run as entered:
+        _drift_reaches_the_ordinary_boundary(entered)
+    assert len(attempts) == 1
+    with pytest.raises(ValueError, match="app"), run:
+        raise ValueError("app")
+    assert len(attempts) == 2
 
     monkeypatch.setattr(otel_context, "attach", _broken)
     with run as entered:

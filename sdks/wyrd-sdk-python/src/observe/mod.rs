@@ -222,13 +222,16 @@ impl PyRun {
     /// Detach failure is swallowed, and the method always returns `False` so an
     /// exception raised inside the block propagates unchanged. Exiting is not a
     /// flush, shutdown, or durability acknowledgement.
-    #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
+    #[pyo3(signature = (exc_type=None, exc_value=None, traceback=None))]
     fn __exit__(
         slf: &Bound<'_, Self>,
-        _exc_type: Option<&Bound<'_, PyAny>>,
-        _exc_value: Option<&Bound<'_, PyAny>>,
-        _traceback: Option<&Bound<'_, PyAny>>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        exc_value: Option<&Bound<'_, PyAny>>,
+        traceback: Option<&Bound<'_, PyAny>>,
     ) -> bool {
+        // The exception triple is accepted only to mirror the protocol; it
+        // never changes cleanup or suppresses the exception.
+        let _ = (exc_type, exc_value, traceback);
         let _ = slf
             .py()
             .import("wyrd.otel")

@@ -646,6 +646,11 @@ fn unknown_alias_fails_without_network_io() {
 }
 
 /// An initial Card selection opens the run on that Card and later views share its id.
+///
+/// # Panics
+/// Panics if the fixture bundle does not load, if `model` or `backup` fails to
+/// resolve, or if the initial view's Card, the shared invocation id, or the
+/// distinct id of a second selection does not hold.
 #[test]
 fn run_for_card_selects_the_initial_view_and_shares_its_invocation() {
     let (_bundle, state) = state_fixture();
@@ -672,6 +677,10 @@ fn run_for_card_selects_the_initial_view_and_shares_its_invocation() {
 }
 
 /// An unknown initial alias fails locally and opens nothing.
+///
+/// # Panics
+/// Panics if the fixture bundle does not load, if the unknown alias resolves,
+/// or if the refusal code is not `WYRD_SDK_404_UNKNOWN_ALIAS`.
 #[test]
 fn run_for_card_refuses_an_unknown_alias_without_network_io() {
     let (_bundle, state) = state_fixture();

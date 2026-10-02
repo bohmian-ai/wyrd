@@ -18,6 +18,7 @@ wyrd-client = { workspace = true }
 [dev-dependencies]
 workspace-hack.workspace = true
 arrow = { workspace = true }
+async-trait = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 parquet = { workspace = true, features = ["arrow"] }
@@ -25,8 +26,13 @@ secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+skald-providers = { workspace = true }
+skald-runtime = { workspace = true }
+skald-spec = { workspace = true }
+skald-workflow = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-util = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 wyrd-testing = { workspace = true }
 

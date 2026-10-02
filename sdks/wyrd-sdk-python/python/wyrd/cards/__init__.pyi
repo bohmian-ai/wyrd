@@ -672,8 +672,8 @@ class WorkflowCards:
             WyrdError: `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no such
                 Workflow exists or it was deleted;
                 `WYRD_PERMISSION_403_DENIED_RBAC` when the credential cannot
-                read Cards; `WYRD_DATA_400_VALIDATION` when `version` is
-                missing or a field is malformed; a Workflow validation error
+                read Cards; `WYRD_WORKFLOW_400_INVALID_CARD_REF` when
+                `version` is missing or a field is malformed; a Workflow validation error
                 when the stored graph is invalid.
         """
         ...
@@ -692,8 +692,9 @@ class WorkflowCards:
         Raises:
             WyrdError: `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no Workflow has
                 this UID; `WYRD_PERMISSION_403_DENIED_RBAC` when the
-                credential cannot read Cards; `WYRD_DATA_400_VALIDATION` when
-                `uid` is combined with `space`, `name`, or `version`.
+                credential cannot read Cards;
+                `WYRD_WORKFLOW_400_INVALID_CARD_REF` when `uid` is combined
+                with `space`, `name`, or `version`.
         """
         ...
 

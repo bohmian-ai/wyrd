@@ -148,7 +148,7 @@ describe("Workflow loading", () => {
         space: "workflow-loading",
       } as unknown as WorkflowSelector;
       expect((await rejection(reader.workflow.load(mixedSelector))).code).toBe(
-        "WYRD_SPEC_400_VALIDATION",
+        "WYRD_WORKFLOW_400_INVALID_CARD_REF",
       );
       // An Agent's UID names no Workflow.
       expect(

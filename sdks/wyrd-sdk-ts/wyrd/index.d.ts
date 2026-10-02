@@ -244,7 +244,7 @@ export declare class NativeCards {
    *
    * `selector_json` is `{ "space", "name", "version" }` or `{ "uid" }`; any
    * other shape, including a mix of both, is refused with
-   * `WYRD_SPEC_400_VALIDATION` before any read. A valid selector delegates
+   * `WYRD_WORKFLOW_400_INVALID_CARD_REF` before any read. A valid selector delegates
    * to the shared [`wyrd_client::WorkflowCards::load`], which reads every
    * Card at its locked version.
    *

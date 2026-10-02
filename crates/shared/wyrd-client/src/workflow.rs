@@ -133,27 +133,30 @@ impl WorkflowCards<'_> {
     /// Workflow is returned and nothing durable is written.
     ///
     /// # Errors
-    /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for a selector of
-    /// another kind, `WYRD_REGISTRY_400_VERSION_REQUIRED` for a versionless
-    /// named selector, the Cards read and traversal errors,
+    /// Returns `WYRD_WORKFLOW_400_INVALID_CARD_REF` before any read for a
+    /// selector of another kind or a versionless named selector, the Cards
+    /// read and traversal errors,
     /// `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` for an inactive Card, and the
     /// hydration and validation errors of [`SkaldWorkflow::from_card_bodies`].
     pub async fn load(&self, selector: &CardSelector) -> Result<Workflow, WyrdError> {
         let kind = match selector {
             CardSelector::Named { version: None, .. } => {
-                return Err(WyrdError::RegistryVersionRequired {
+                return Err(WyrdError::WorkflowInvalidCardRef {
                     message: "registered Workflow loading requires an exact version".to_owned(),
-                    details: serde_json::json!({}),
+                    details: serde_json::json!({ "field": "version" }),
                 });
             }
             CardSelector::Named { kind, .. } | CardSelector::Uid { kind, .. } => kind,
             CardSelector::Exact(card_ref) => &card_ref.kind,
         };
         if *kind != CardKind::Workflow {
-            return Err(WyrdError::registry_invalid_card_spec(format!(
-                "registered Workflow loading requires a Workflow selector, not {}",
-                kind.wire_name()
-            )));
+            return Err(WyrdError::WorkflowInvalidCardRef {
+                message: format!(
+                    "registered Workflow loading requires a Workflow selector, not {}",
+                    kind.wire_name()
+                ),
+                details: serde_json::json!({ "field": "kind" }),
+            });
         }
         CardGraphHydrator::new(self.cards.registry_context())
             .load_workflow(selector)

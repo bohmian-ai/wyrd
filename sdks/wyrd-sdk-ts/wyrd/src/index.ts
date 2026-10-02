@@ -1234,7 +1234,8 @@ export class WorkflowCards {
    *
    * @throws {WyrdError} `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no such
    * Workflow exists, `WYRD_PERMISSION_403_DENIED_RBAC` when the credential
-   * cannot read Cards, or `WYRD_SPEC_400_VALIDATION` for a mixed selector.
+   * cannot read Cards, or `WYRD_WORKFLOW_400_INVALID_CARD_REF` for a mixed
+   * or incomplete selector or a malformed field.
    */
   async load(selector: WorkflowSelector): Promise<Workflow> {
     const loaded = await this.#native.loadWorkflow(JSON.stringify(selector));

@@ -2588,8 +2588,9 @@ impl PyWorkflowCards {
     /// A runnable `wyrd.agent.Workflow`.
     ///
     /// # Errors
-    /// Returns `WYRD_DATA_400_VALIDATION` for a mixed or incomplete selector
-    /// or a malformed field, before any read. Otherwise returns the error of
+    /// Returns `WYRD_WORKFLOW_400_INVALID_CARD_REF` for a mixed or incomplete
+    /// selector or a malformed field, before any read, with `details.field`
+    /// naming the field. Otherwise returns the error of
     /// the shared [`wyrd_client::WorkflowCards::load`]:
     /// `WYRD_PERMISSION_403_DENIED_RBAC` when the credential cannot read
     /// Cards, `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no Workflow matches, and
@@ -2604,18 +2605,30 @@ impl PyWorkflowCards {
         name: Option<&str>,
         version: Option<&str>,
     ) -> CardPyResult<PyWorkflow> {
+        let invalid = |field: &str, reason: String| {
+            WyrdPyError::from(WyrdError::WorkflowInvalidCardRef {
+                message: format!("invalid Workflow {field}: {reason}"),
+                details: serde_json::json!({ "field": field }),
+            })
+        };
         let selector = match (uid, space, name, version) {
             (Some(uid), None, None, None) => CardSelector::uid(
                 CardKind::Workflow,
-                CardUid::new(uid).map_err(|error| WyrdPyError::validation(error.to_string()))?,
+                CardUid::new(uid).map_err(|error| invalid("uid", error.to_string()))?,
             ),
-            (None, Some(space), Some(name), Some(version)) => {
-                CardSelector::named(CardKind::Workflow, parse_space(space)?, parse_name(name)?)
-                    .with_version(parse_version(version)?)
-            }
+            (None, Some(space), Some(name), Some(version)) => CardSelector::named(
+                CardKind::Workflow,
+                SpaceName::new(space).map_err(|error| invalid("space", error.to_string()))?,
+                CardName::new(name).map_err(|error| invalid("name", error.to_string()))?,
+            )
+            .with_version(
+                VersionBlock::parse(version)
+                    .map_err(|error| invalid("version", error.to_string()))?,
+            ),
             _ => {
-                return Err(WyrdPyError::validation(
-                    "pass either uid alone or space, name, and version",
+                return Err(invalid(
+                    "selector",
+                    "pass either uid alone or space, name, and version".to_owned(),
                 ));
             }
         };

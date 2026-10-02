@@ -190,7 +190,7 @@ async fn assert_selectors_refused(
         .load(&agent_selector)
         .await
         .expect_err("not a Workflow");
-    assert_eq!(error.code(), "WYRD_REGISTRY_400_INVALID_CARD_SPEC");
+    assert_eq!(error.code(), "WYRD_WORKFLOW_400_INVALID_CARD_REF");
 
     let versionless = CardSelector::named(
         CardKind::Workflow,
@@ -202,7 +202,7 @@ async fn assert_selectors_refused(
         .load(&versionless)
         .await
         .expect_err("no version");
-    assert_eq!(error.code(), "WYRD_REGISTRY_400_VERSION_REQUIRED");
+    assert_eq!(error.code(), "WYRD_WORKFLOW_400_INVALID_CARD_REF");
 
     let wrong_uid = card_ref("Workflow", "code-review", "1.0.0", Some(other_uid));
     let error = reader

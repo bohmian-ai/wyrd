@@ -171,11 +171,25 @@ Commits on `wyrd/skald-workflow-runtime/TASK-002` after reviewed candidate
 
 ### Observed during remediation
 
-- Python selector validation (`cards.workflow.load` mixed or versionless) raises
-  the existing Python boundary code `WYRD_DATA_400_VALIDATION`, as every Python
-  Cards selector does; the stub previously claimed `WYRD_SPEC_400_VALIDATION`.
-  The stub and journey now state the real code. TS keeps
-  `WYRD_SPEC_400_VALIDATION`; Rust has no client-side selector parse.
+- Registered Workflow loading refused a malformed reference with a code from
+  another family in every language: Python `WYRD_DATA_400_VALIDATION` (the
+  DataCard helper `WyrdPyError::validation`), TS `WYRD_SPEC_400_VALIDATION`,
+  Rust `WYRD_REGISTRY_400_VERSION_REQUIRED` /
+  `WYRD_REGISTRY_400_INVALID_CARD_SPEC`. Added
+  `WyrdError::WorkflowInvalidCardRef` (`WYRD_WORKFLOW_400_INVALID_CARD_REF`,
+  `details.field` names the field), returned by `wyrd-client`
+  `WorkflowCards::load` (versionless, wrong kind), Python
+  `PyWorkflowCards::load` and TS `parse_workflow_selector` (mixed,
+  incomplete, malformed field). RED: Python journey got
+  `WYRD_DATA_400_VALIDATION`, TS journey got `WYRD_SPEC_400_VALIDATION`.
+  GREEN: Rust, Python, TS journeys 1 passed each; `fmt`, `lints`,
+  `codegen:check`, `ts:napi:check`, `ts:typecheck`, `py:typecheck`,
+  `py:format`, `py:lints`, `test:shared`, `test:wyrd-sdk`,
+  `check:client-tier`, `check:sdk-client-tier`, `check:pyo3-scope` PASS.
+  Not changed: other Python Cards selectors still raise the DataCard helper
+  code for non-Data input through `parse_space`/`parse_name`/`parse_version`
+  (same defect class, outside this task); `from_path` keeps
+  `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for a malformed file.
 - `check:workspace-hack` (not in this task's lanes) fails on an `opentelemetry`
   `spec_unstable_logs_enabled` feature drift that is present with or without
   this change's dev-dependency removal. Not fixed here; route to the owner of

@@ -586,10 +586,10 @@ def test_workflow_loading_journey(wyrd_server, tmp_path: Path, monkeypatch) -> N
     # 7. Incomplete, mixed, wrong-kind, and unauthorized selectors are refused.
     with pytest.raises(WyrdError) as versionless:
         reader.workflow.load(space="workflow-loading", name="code-review")
-    assert versionless.value.code == "WYRD_DATA_400_VALIDATION"
+    assert versionless.value.code == "WYRD_WORKFLOW_400_INVALID_CARD_REF"
     with pytest.raises(WyrdError) as mixed_selector:
         reader.workflow.load(uid=workflow_uid, space="workflow-loading")
-    assert mixed_selector.value.code == "WYRD_DATA_400_VALIDATION"
+    assert mixed_selector.value.code == "WYRD_WORKFLOW_400_INVALID_CARD_REF"
     # An Agent's UID names no Workflow.
     with pytest.raises(WyrdError) as wrong_kind:
         reader.workflow.load(uid=team["security-reviewer"])

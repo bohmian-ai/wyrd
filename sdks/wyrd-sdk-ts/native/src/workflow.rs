@@ -70,10 +70,11 @@ struct WorkflowSelectorJson {
 ///
 /// # Errors
 ///
-/// Returns `WYRD_SPEC_400_VALIDATION` when the JSON is neither `{ uid }` nor
-/// `{ space, name, version }`, including a mix of both, or a field is invalid.
+/// Returns `WYRD_WORKFLOW_400_INVALID_CARD_REF` when the JSON is neither
+/// `{ uid }` nor `{ space, name, version }`, including a mix of both, or a
+/// field is invalid.
 pub(crate) fn parse_workflow_selector(selector_json: &str) -> StdResult<CardSelector, WyrdError> {
-    let invalid = |reason: &str| WyrdError::Validation {
+    let invalid = |reason: &str| WyrdError::WorkflowInvalidCardRef {
         message: format!(
             "Workflow selector must be {{ uid }} or {{ space, name, version }}: {reason}"
         ),

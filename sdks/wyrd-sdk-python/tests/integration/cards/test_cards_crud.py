@@ -471,3 +471,101 @@ def test_card_registry_enforces_cross_tenant_isolation(wyrd_server) -> None:
         cards_b.prompt.delete(uid=card.uid)
 
     cards.prompt.delete(uid=card.uid)
+
+
+
+_REPO = Path(__file__).parents[5]
+_FIXTURES = _REPO / "tests" / "fixtures" / "workflow-loading"
+
+
+def _uids(receipt) -> dict[str, str]:
+    return {outcome.card_ref.name: outcome.card_ref.uid for outcome in receipt.outcomes}
+
+
+@pytest.mark.integration
+def test_workflow_loading_journey(wyrd_server, tmp_path: Path, monkeypatch) -> None:
+    """Load Workflow files and registered Workflows; see tests/fixtures/workflow-loading."""
+    from wyrd.agent import Workflow
+
+    writer_key = wyrd_server.bootstrap_service(["writer"], name=_name("workflow-writer"))
+    reader_key = wyrd_server.bootstrap_service(["reader"], name=_name("workflow-reader"))
+    no_roles_key = wyrd_server.bootstrap_service([], name=_name("workflow-no-roles"))
+    writer = Cards(server_url=wyrd_server.base_url, credential=writer_key)
+    reader = Cards(server_url=wyrd_server.base_url, credential=reader_key)
+    no_roles = Cards(server_url=wyrd_server.base_url, credential=no_roles_key)
+
+    # Workflow.from_path reads credentials from the environment, so start with none.
+    monkeypatch.setenv("WYRD_SERVER_URL", wyrd_server.base_url)
+    monkeypatch.setenv("WYRD_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.delenv("WYRD_API_KEY", raising=False)
+    monkeypatch.delenv("WYRD_ACCESS_TOKEN", raising=False)
+
+    # 1. A wholly local Workflow file loads without credentials.
+    local = Workflow.from_path(_REPO / "examples" / "workflows" / "code-review" / "workflow.yaml")
+    assert list(local.steps) == ["security", "correctness", "final_review"]
+
+    # 2. The team registers its reviewer Agents.
+    team = _uids(writer.register_from_path(_FIXTURES / "team" / "security.yaml"))
+    team.update(_uids(writer.register_from_path(_FIXTURES / "team" / "correctness.yaml")))
+
+    # 3. A file referencing registered Agents needs a credential that can read them.
+    mixed = _FIXTURES / "mixed" / "workflow.yaml"
+    with pytest.raises(WyrdError) as missing:
+        Workflow.from_path(mixed)
+    assert missing.value.code == "WYRD_CLIENT_401_NO_CREDENTIALS"
+
+    monkeypatch.setenv("WYRD_API_KEY", no_roles_key)
+    with pytest.raises(WyrdError) as denied:
+        Workflow.from_path(mixed)
+    assert denied.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
+
+    monkeypatch.setenv("WYRD_API_KEY", reader_key)
+    authored = Workflow.from_path(str(mixed))
+    assert list(authored.steps) == ["security", "correctness", "final_review"]
+
+    # 4. A local sibling and a registered Agent with the same identity load side by side.
+    shadowed = Workflow.from_path(_FIXTURES / "shadowed" / "workflow.yaml")
+    assert list(shadowed.steps) == [
+        "security",
+        "registered_security",
+        "correctness",
+        "final_review",
+    ]
+
+    # 5. A reference to a deleted Card is refused.
+    retired = PromptCard(
+        Prompt.openai_chat("gpt-5-5", messages="You are a security reviewer. {{code}}"),
+        space="workflow-loading",
+        name="retired-prompt",
+        version="1.0.0",
+    )
+    writer.register(retired)
+    writer.prompt.delete(uid=retired.uid)
+    with pytest.raises(WyrdError) as inactive:
+        Workflow.from_path(_FIXTURES / "retired" / "workflow.yaml")
+    assert inactive.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"
+
+    # 6. Apply the mixed Workflow, register a newer security Agent, then load
+    #    the applied Workflow by identity and by UID: both stay pinned to 1.0.0.
+    workflow_uid = _uids(writer.register_from_path(mixed))["code-review"]
+    newer = _uids(writer.register_from_path(_FIXTURES / "team-v2" / "security.yaml"))
+    by_identity = reader.workflow.load(space="workflow-loading", name="code-review", version="1.0.0")
+    by_uid = reader.workflow.load(uid=workflow_uid)
+    for workflow in [by_identity, by_uid]:
+        assert list(workflow.steps) == ["security", "correctness", "final_review"]
+        assert workflow.version == "1.0.0"
+        stored = workflow.to_yaml()
+        assert team["security-reviewer"] in stored
+        assert team["correctness-reviewer"] in stored
+        assert newer["security-reviewer"] not in stored
+
+    # 7. Incomplete, mixed, wrong-kind, and unauthorized selectors are refused.
+    with pytest.raises(WyrdError):
+        reader.workflow.load(space="workflow-loading", name="code-review")
+    with pytest.raises(WyrdError):
+        reader.workflow.load(uid=workflow_uid, space="workflow-loading")
+    with pytest.raises(WyrdError):
+        reader.workflow.load(uid=team["security-reviewer"])
+    with pytest.raises(WyrdError) as unauthorized:
+        no_roles.workflow.load(uid=workflow_uid)
+    assert unauthorized.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"

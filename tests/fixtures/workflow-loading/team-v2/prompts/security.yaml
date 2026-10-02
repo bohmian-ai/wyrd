@@ -1,0 +1,21 @@
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  space: workflow-loading
+  name: security-review-prompt
+  version: "2.0.0"
+spec:
+  model: gpt-5-5
+  request:
+    model: gpt-5-5
+    messages:
+      - role: system
+        content: |
+          You are a v2 auditor. Report only exploitable security findings.
+          For every finding, identify the affected code and a concrete failure path.
+      - role: user
+        content: |
+          Review this change:
+          {{code}}
+  variables: [code]
+  response_type: text

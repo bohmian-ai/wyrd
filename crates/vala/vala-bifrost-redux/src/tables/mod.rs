@@ -1019,15 +1019,38 @@ mod tests {
         ]
     }
 
+    /// The managed envelope Bifrost appends after a verification table's
+    /// authored columns, in physical order.
+    ///
+    /// This is the `CorrelationPolicy::Observation` envelope the Bifrost design
+    /// fixes for every table: nullable `run_id` and `card_uid`, the required
+    /// publisher `principal_id`, and the required request, event-time,
+    /// ingestion-time, and batch identity columns. The tenant is a property of
+    /// the physical table and of each Parquet footer, never a row column, and
+    /// Bifrost stamps no per-row position.
+    fn verification_managed_envelope() -> Vec<Field> {
+        vec![
+            utf8(RUN_ID, true),
+            utf8(CARD_UID, true),
+            utf8(PRINCIPAL_ID, false),
+            utf8(wyrd_spec::vala::WYRD_REQUEST_ID, false),
+            ts_us_utc(WYRD_EVENT_TIME, false),
+            ts_us_utc(WYRD_INGESTED_AT, false),
+            Field::new(WYRD_BATCH_ID, DataType::FixedSizeBinary(16), false),
+        ]
+    }
+
     /// The five verification tables carry exactly their approved physical
-    /// contract: authored columns, order, types, nullability, daily partition,
-    /// Observation correlation, and Bloom intent.
+    /// contract: authored columns, the appended managed envelope, order, types,
+    /// nullability, daily partition, Observation correlation, and the resolved
+    /// Bloom-column union.
     ///
     /// These schemas are a published contract — three SDKs project rows into
     /// them and dashboards query them — so a reordered, retyped, renamed, or
     /// newly nullable column is a breaking change rather than an
-    /// implementation detail. Pinning the whole authored list here is what
-    /// makes that break fail in this crate instead of at a caller's insert.
+    /// implementation detail. Pinning the whole physical list here, including
+    /// nullable `owner_card_uid` and Drift `details`, is what makes that break
+    /// fail in this crate instead of at a caller's insert.
     ///
     /// # Panics
     ///
@@ -1047,6 +1070,17 @@ mod tests {
                 (definition.arrow_fields)(),
                 columns,
                 "vala.{namespace}.{name} authored columns, order, types, and nullability"
+            );
+            let mut physical = columns.clone();
+            physical.extend(verification_managed_envelope());
+            assert_eq!(
+                (definition.schema)()
+                    .fields()
+                    .iter()
+                    .map(|field| field.as_ref().clone())
+                    .collect::<Vec<_>>(),
+                physical,
+                "vala.{namespace}.{name} complete physical schema"
             );
             assert_eq!(
                 definition.correlation_policy,
@@ -1073,12 +1107,18 @@ mod tests {
                 Some(&layout),
             )
             .expect("verification layout resolves");
-            for column in crate::catalog::layout::MANAGED_BLOOM_FLOOR {
-                assert!(
-                    canonical.bloom_columns().contains(&(*column).to_owned()),
-                    "vala.{namespace}.{name} Bloom union omits {column}"
-                );
-            }
+            let mut resolved = canonical.bloom_columns().to_vec();
+            resolved.sort();
+            let mut union: Vec<String> = crate::catalog::layout::MANAGED_BLOOM_FLOOR
+                .iter()
+                .chain(blooms)
+                .map(|column| (*column).to_owned())
+                .collect();
+            union.sort();
+            assert_eq!(
+                resolved, union,
+                "vala.{namespace}.{name} resolves exactly the managed floor plus its Bloom columns"
+            );
         }
     }
 

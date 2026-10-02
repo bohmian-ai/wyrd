@@ -3103,15 +3103,18 @@ impl ShardOwner {
     ///
     /// Each ACK carries the rows its batch accounted for and whether this group
     /// inserted that batch; a replay suppressed by the fence or the memtable
-    /// identity reports no first commit. Reservations drop with each append.
-    fn acknowledge_visible(state: GroupWalState) {
+    /// identity reports no first commit. When one batch was resent within the
+    /// group, only its first copy in group order reports the first commit.
+    /// Reservations drop with each append.
+    fn acknowledge_visible(mut state: GroupWalState) {
         for append in state.prepared {
+            let batch_id = append.batch_id.as_bytes();
+            let first_commit = state.inserted_batch_ids.remove(batch_id);
             if let Some(sender) = append.durable_ack {
-                let batch_id = append.batch_id.as_bytes();
                 let rows = state.rows_by_append.get(batch_id).copied().unwrap_or(0);
                 let _ = sender.send(Ok(crate::scribe::preprocess::DurableCompletion {
                     rows,
-                    first_commit: state.inserted_batch_ids.contains(batch_id),
+                    first_commit,
                 }));
             }
             drop(append.reservation);
@@ -3660,10 +3663,18 @@ impl ShardOwner {
 
     /// Prepares one group for WAL synchronization without acknowledging it.
     ///
+    /// A client that resends a batch while its original is still queued can
+    /// put both copies of one tenant/table/batch identity in the same group.
+    /// Neither the memtable nor `synced_not_inserted` sees the first copy until
+    /// after the group commits, so only the first copy writes WAL slices; a
+    /// later copy whose slice identities match is dropped here and shares the
+    /// first copy's row count and outcome when the group acknowledges.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when duplicate detection, WAL append, memory
-    /// reservation, or retry bookkeeping fails.
+    /// reservation, or retry bookkeeping fails, or when an in-group copy reuses
+    /// a batch identity with contradictory slices.
     async fn write_group(
         &mut self,
         mut prepared: Vec<PreparedAppend>,
@@ -3679,16 +3690,43 @@ impl ShardOwner {
         let fixed_durable_capacity = durable.capacity();
         let mut touched = HashMap::<std::path::PathBuf, Arc<crate::scribe::wal::WalSegment>>::new();
         let mut rows_by_append = HashMap::<[u8; 16], u64>::new();
+        let mut group_batches = HashMap::<
+            (DataTenantId, TableRef, [u8; 16]),
+            Vec<crate::scribe::wal::ScribeAppendPayloadIdentity>,
+        >::new();
         for append in &mut prepared {
             if let Some(memory) = append.memory.as_mut() {
                 memory.transfer_category(MemoryCategory::Prepared)?;
             }
             let batch_id = *append.batch_id.as_bytes();
+            let group_key = (append.tenant, append.table.clone(), batch_id);
+            if let Some(first) = group_batches.get(&group_key) {
+                let PreparedSliceSet::Materialized(slices) = &mut append.slices;
+                let resent = slices
+                    .drain(..)
+                    .map(|slice| slice.wal_append.payload_identity())
+                    .collect::<Result<Vec<_>, _>>();
+                let error = match resent {
+                    Ok(resent) if resent == *first => continue,
+                    Ok(_) => ScribeError::Internal {
+                        detail: "in-group Scribe batch ID was reused with contradictory payload identity"
+                            .to_owned(),
+                    },
+                    Err(error) => error,
+                };
+                if let Err(cleanup_error) = self.release_active_reservations(&durable) {
+                    tracing::error!(error = %cleanup_error, "active cleanup failed after in-group duplicate error");
+                }
+                Self::notify_prepared_error(&mut prepared, &error);
+                return Err(error);
+            }
+            let first = group_batches.entry(group_key).or_default();
             loop {
                 let Some(slice) = Self::next_prepared_slice(append) else {
                     break;
                 };
                 let identity = slice.wal_append.payload_identity()?;
+                first.push(identity);
                 match self.memtable.retained_batch_rows(&slice.seal_key, identity) {
                     Ok(Some(rows)) => {
                         let entry = rows_by_append.entry(batch_id).or_default();
@@ -6870,6 +6908,61 @@ mod tests {
         owner.process_group(group).await.expect("group commits");
 
         assert_eq!(owner.wal_io.sync_submissions_for_test(), 2);
+    }
+
+    /// A batch resent while its original is still queued commits once in one group.
+    ///
+    /// A client retry reuses the batch ID, and both copies can land in the same
+    /// shard group before either is visible. The group must commit the batch's
+    /// rows once, acknowledge both copies with the same row count, and report a
+    /// first commit to exactly one, without failing the unrelated batch beside
+    /// them.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the isolated owner cannot be built, the group fails, an ACK is
+    /// missing, or the visible rows or first-commit reports diverge.
+    #[tokio::test]
+    async fn same_batch_resent_within_one_group_commits_once() {
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(Memtable::new(), &wal, wal_handle, stream);
+        let key = owner_key();
+        let resent = uuid::Uuid::now_v7();
+        let (group, acks) =
+            acked_group_for_key(&budget, &key, &[resent, uuid::Uuid::now_v7(), resent]);
+
+        owner.process_group(group).await.expect("group commits");
+
+        let mut completions = Vec::new();
+        for ack in acks {
+            completions.push(ack.await.expect("ACK delivered").expect("batch commits"));
+        }
+        assert_eq!(completions[0].rows, completions[2].rows);
+        assert!(completions[1].first_commit);
+        assert_eq!(
+            [completions[0].first_commit, completions[2].first_commit],
+            [true, false],
+            "only the first copy of a resent batch is its first commit"
+        );
+        let visible = owner.memtable.stats().expect("query-visible rows");
+        assert_eq!(
+            u64::try_from(visible.writable_rows + visible.immutable_rows)
+                .expect("test row count fits u64"),
+            completions[0].rows + completions[1].rows
+        );
     }
 
     /// A crash after the group COMMIT sync but before the last fence replays once.

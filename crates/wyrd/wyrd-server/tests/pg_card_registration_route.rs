@@ -20,12 +20,14 @@ use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_loader::{build_registration_input, load};
+use wyrd_spec::auth::TokenAudience;
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::{CardName, CardUid, DataTenantId, SpaceName};
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::registry::{CardLifecycleStatus, RegistrationOutcomeKind};
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verification::{InactivityTimeout, binding_activity};
+use wyrd_sql::queries::verifier_runs::{ScheduleOutcome, ScheduleSkip, VerifierRunQueue};
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -3561,12 +3563,16 @@ fn machine_auth(server: &WyrdTestServer, key: &SecretString) -> Arc<AuthMiddlewa
 /// through `/auth/token`. The first API-key exchange activates only the exact
 /// version, arms its schedule cursor, and — through the component binding —
 /// activates every binding of that Service. A cached-token request, an idle
-/// client whose token went stale, delegation to the other version, and a
-/// Card-free automation principal's exchange write no activity. A second
-/// replica sharing the principal and a request-driven stale-token re-exchange
-/// renew the one shared timestamp without moving the armed cursor. The other
-/// version stays independently gated until its own exchange. Idle expiry after
-/// the default window, suspension, and Card deletion each close the gate.
+/// client whose token went stale, a Card-free automation principal's
+/// exchange, a delegation exchange in which the owner acts for a user, and a
+/// SYSTEM token
+/// mint write no activity. A second replica sharing the principal and a
+/// request-driven stale-token re-exchange renew the one shared timestamp
+/// without moving the armed cursor. The other version stays independently
+/// gated until its own exchange. Idle expiry after the default window closes
+/// the gate; reauthentication reopens it, and the occurrences missed during
+/// the lapse are skipped without backfill so the schedule resumes at the next
+/// future boundary. Suspension and Card deletion each close the gate.
 ///
 /// # Panics
 /// Panics when the server fails to start or stop, a fixture or route call
@@ -3666,7 +3672,33 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
         vec![(automation_id, None)],
         "a Card-free automation exchange records no activity"
     );
-    assert_eq!(owner_principal(&server, a_owner).await.1, Some(first));
+    server
+        .delegate(&jwt, token.expose(), TokenAudience::Wyrd)
+        .await
+        .expect("delegation exchanges");
+    let verifier = <CardRef as std::str::FromStr>::from_str(&format!(
+        "default/Verifier/vb-drift@1.0.0#{}",
+        Uuid::now_v7()
+    ))
+    .expect("verifier card ref parses");
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    server
+        .state()
+        .auth
+        .tenant_issuer()
+        .expect("test state has a tenant issuer")
+        .issue_system_token(&mut conn, &verifier)
+        .await
+        .expect("SYSTEM token mints");
+    conn.commit().await.expect("SYSTEM mint commits");
+    assert_eq!(
+        owner_principal(&server, a_owner).await.1,
+        Some(first),
+        "delegation and SYSTEM minting never renew owner activity"
+    );
     assert_eq!(
         owner_principal(&server, b_owner).await.1,
         None,
@@ -3730,6 +3762,63 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
         owner_gates(&server, a_owner).await.iter().all(|g| !g),
         "the default inactivity window closes the gate"
     );
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    sqlx::query(
+        "UPDATE wyrd.verification_bindings \
+            SET next_run_at = statement_timestamp() - INTERVAL '3 days' \
+          WHERE owner_card_uid = $1 AND activation = 'schedule'",
+    )
+    .bind(a_owner)
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("cursor ages through the lapse");
+    conn.commit().await.expect("cursor commits");
+    server
+        .exchange_api_key(&replica_one)
+        .await
+        .expect("reauthentication after the lapse exchanges");
+    let reactivated = owner_principal(&server, a_owner)
+        .await
+        .1
+        .expect("reauthentication records activity");
+    assert!(reactivated > lapsed);
+    assert!(owner_gates(&server, a_owner).await.iter().all(|g| *g));
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let mut outcomes = Vec::new();
+    while let Some(tick) = VerifierRunQueue::default()
+        .schedule_next_due(&mut conn)
+        .await
+        .expect("scheduler ticks")
+    {
+        outcomes.push(tick.outcome);
+    }
+    let (runs, cursor_ahead): (i64, f64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM wyrd.verifier_runs WHERE owner_card_uid = $1), \
+                (SELECT EXTRACT(EPOCH FROM next_run_at - statement_timestamp())::float8 \
+                   FROM wyrd.verification_bindings \
+                  WHERE owner_card_uid = $1 AND activation = 'schedule')",
+    )
+    .bind(a_owner)
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("schedule state reads");
+    conn.commit().await.expect("scheduler commits");
+    assert_eq!(
+        outcomes,
+        vec![ScheduleOutcome::Skipped(ScheduleSkip::Missed)],
+        "the lapsed occurrences are skipped, not backfilled"
+    );
+    assert_eq!(runs, 0, "no run is created for a missed occurrence");
+    assert!(
+        cursor_ahead > 0.0 && cursor_ahead <= 86_400.0,
+        "the schedule resumes at the next future daily boundary: {cursor_ahead}s"
+    );
 
     let revoke = server
         .oneshot_authenticated(
@@ -3751,7 +3840,7 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
         "suspension closes the gate on the next read"
     );
     assert!(server.exchange_api_key(&replica_one).await.is_err());
-    assert_eq!(owner_principal(&server, a_owner).await.1, Some(lapsed));
+    assert_eq!(owner_principal(&server, a_owner).await.1, Some(reactivated));
 
     let delete = server
         .oneshot_authenticated(

@@ -1041,14 +1041,16 @@ impl SystemWriterHarness {
 /// Drives the full path: the tenant's provisioned writer mints a
 /// Verifier-scoped token through the one internal issuer, writes a result row
 /// over public gRPC, and is refused every non-result table, while a wildcard
-/// administrator is refused the result table. Each admission stages exactly one
+/// administrator is refused the reserved result table with Gate's
+/// reserved-table refusal and its denied decision. Each admission stages exactly one
 /// canonical `bifrost:record:write` decision carrying the true principal kind.
 ///
 /// # Panics
 ///
 /// Panics when fixture setup or minting fails, when the SYSTEM result write is
 /// refused, when either forbidden write is admitted or answered with anything
-/// but `PermissionDenied`, or when the staged decisions differ from one row per
+/// but `PermissionDenied`, when the administrator's refusal is not the
+/// reserved-table refusal, or when the staged decisions differ from one row per
 /// request in order.
 #[tokio::test]
 async fn system_writer_alone_writes_verification_results() {
@@ -1074,6 +1076,10 @@ async fn system_writer_alone_writes_verification_results() {
     .await
     .expect_err("a wildcard administrator is refused the result table");
     assert_eq!(admin.code(), Code::PermissionDenied, "{admin:?}");
+    assert!(
+        admin.message().contains("reserved built-in table"),
+        "Gate answers the reserved-table refusal, not a generic RBAC denial: {admin:?}"
+    );
     let other = insert_as(
         bind,
         &system_jwt,

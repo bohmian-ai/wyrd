@@ -4,6 +4,7 @@ pub mod bifrost;
 pub mod interleaving;
 pub mod keys;
 pub mod load;
+pub mod logs;
 pub mod oidc_fixture;
 pub mod principal;
 pub mod server;

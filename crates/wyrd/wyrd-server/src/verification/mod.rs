@@ -559,4 +559,31 @@ mod tests {
             Duration::from_secs(14)
         );
     }
+
+    /// The production defaults are REQ-146's server ceilings: 16 global and 4
+    /// per-tenant executions shared by Verifier runs and baseline fits and
+    /// again for Operator deliveries, a 30-second drain, and Operator
+    /// dispatches of three attempts, each capped at 30 seconds, retried after
+    /// 30 seconds and then two minutes, inside a five-minute deadline.
+    #[test]
+    fn production_defaults_are_the_specified_ceilings() {
+        let limits = RuntimeLimits::default();
+        assert_eq!((limits.global_permits, limits.tenant_permits), (16, 4));
+        assert_eq!(limits.drain_grace, Duration::from_secs(30));
+        assert_eq!(limits.operator_attempts, 3);
+        assert_eq!(limits.operator_attempt_timeout, Duration::from_secs(30));
+        assert_eq!(limits.operator_deadline, Duration::from_secs(300));
+        assert_eq!(
+            [1, 2, 3].map(|attempt| limits.operator_backoff(attempt)),
+            [
+                Duration::from_secs(30),
+                Duration::from_secs(120),
+                Duration::from_secs(120)
+            ]
+        );
+        assert!(
+            limits.operator_lease > limits.operator_attempt_timeout,
+            "a live attempt settles before its lease can be reclaimed"
+        );
+    }
 }

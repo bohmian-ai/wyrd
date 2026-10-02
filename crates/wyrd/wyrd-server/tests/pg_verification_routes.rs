@@ -292,15 +292,28 @@ async fn run_identity(
 /// # Panics
 /// Panics when the audit rows cannot be read.
 async fn start_decisions(server: &WyrdTestServer, principal: Uuid) -> Vec<(String, String)> {
+    decisions(server, "verification.run.start", principal).await
+}
+
+/// List `principal`'s staged `operation` decisions as (permission, outcome).
+///
+/// # Panics
+/// Panics when the audit rows cannot be read.
+async fn decisions(
+    server: &WyrdTestServer,
+    operation: &str,
+    principal: Uuid,
+) -> Vec<(String, String)> {
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
         .await
         .expect("tenant connection opens");
     let rows = sqlx::query_as(
         "SELECT permission, outcome FROM vala.audit_staging \
-          WHERE operation = 'verification.run.start' AND principal_id = $1 \
+          WHERE operation = $1 AND principal_id = $2 \
           ORDER BY outcome",
     )
+    .bind(operation)
     .bind(principal)
     .fetch_all(&mut **conn.transaction())
     .await
@@ -530,6 +543,74 @@ async fn manual_run_refusals_fail_before_enqueue() {
     let (status, problem) = get(&server, &jwt, "/v1/verification/runs/not-a-uuid").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
     assert_eq!(run_count(&server, tenant).await, 0);
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Binding and run status reads each authorize and audit `cards:read`: a
+/// reader is allowed and stages one allowed decision per read, while a
+/// principal whose only role lacks `cards:read` is refused with the stable
+/// RBAC code and stages one denied decision per read, before any lookup.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route fails
+/// to respond, or any status, code, or audit expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn status_reads_audit_cards_read_decisions() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server, server.data_tenant_id()).await;
+    let (_, writer) = user(&server, "vr-status-writer", &["writer"]).await;
+    let (status, run) = post_run(
+        &server,
+        &writer,
+        &run_body(binding_target(fixture.ready_binding)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{run}");
+    let binding_uri = format!("/v1/verification/bindings/{}", fixture.ready_binding);
+    let run_uri = format!(
+        "/v1/verification/runs/{}",
+        run["run_id"].as_str().expect("run_id is a string")
+    );
+
+    let (reader, reader_jwt) = user(&server, "vr-status-reader", &["reader"]).await;
+    for uri in [&binding_uri, &run_uri] {
+        let (status, body) = get(&server, &reader_jwt, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    }
+    let allowed = vec![("cards:read".to_owned(), "allowed".to_owned())];
+    assert_eq!(
+        decisions(&server, "verification.binding.read", reader).await,
+        allowed
+    );
+    assert_eq!(
+        decisions(&server, "verification.run.read", reader).await,
+        allowed
+    );
+
+    let (outsider, outsider_jwt) = user(&server, "vr-status-outsider", &["runtime_admin"]).await;
+    for uri in [&binding_uri, &run_uri] {
+        let (status, problem) = get(&server, &outsider_jwt, uri).await;
+        assert_eq!(
+            (status, problem["code"].as_str()),
+            (
+                StatusCode::FORBIDDEN,
+                Some("WYRD_PERMISSION_403_DENIED_RBAC")
+            ),
+            "{uri}"
+        );
+    }
+    let denied = vec![("cards:read".to_owned(), "denied".to_owned())];
+    assert_eq!(
+        decisions(&server, "verification.binding.read", outsider).await,
+        denied
+    );
+    assert_eq!(
+        decisions(&server, "verification.run.read", outsider).await,
+        denied
+    );
     server.shutdown().await.expect("test server shuts down");
 }
 

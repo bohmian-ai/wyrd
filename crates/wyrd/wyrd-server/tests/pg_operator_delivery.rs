@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
+use chrono::Utc;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
@@ -33,7 +34,8 @@ use wyrd_server::verification::{CapabilityCrash, RuntimeLimits, VerificationRunt
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::drift::DriftMethod;
 use wyrd_spec::ids::{CardUid, FeatureName, VerificationRunId};
-use wyrd_spec::verification::FrozenTarget;
+use wyrd_spec::verification::{DriftWindow, FrozenTarget};
+use wyrd_testing::logs::LogCapture;
 use wyrd_testing::verification::VerificationFixture;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -162,6 +164,20 @@ impl Delivery {
     /// # Panics
     /// Panics when the request fails or the response is not JSON.
     async fn call(&self, method: Method, uri: &str, body: Option<&Value>) -> (StatusCode, Value) {
+        self.call_as(&self.jwt, method, uri, body).await
+    }
+
+    /// Send `method uri` with an optional JSON body as `jwt`.
+    ///
+    /// # Panics
+    /// Panics when the request fails or the response is not JSON.
+    async fn call_as(
+        &self,
+        jwt: &str,
+        method: Method,
+        uri: &str,
+        body: Option<&Value>,
+    ) -> (StatusCode, Value) {
         let request = Request::builder()
             .method(method)
             .uri(uri)
@@ -171,7 +187,7 @@ impl Delivery {
             .expect("request builds");
         let response = self
             .server
-            .oneshot_authenticated(&self.jwt, request)
+            .oneshot_authenticated(jwt, request)
             .await
             .expect("request responds");
         let status = response.status();
@@ -244,6 +260,53 @@ impl Delivery {
             }
             assert!(tokio::time::Instant::now() < deadline, "no run scheduled");
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Seed a second tenant named `name` whose Drift Verifier binding is due
+    /// and dispatches one unauthenticated HTTP Operator to the mock `/quick`.
+    ///
+    /// # Panics
+    /// Panics when the tenant or its binding cannot be seeded.
+    async fn quiet_tenant(&self, name: &str) -> QuietTenant {
+        let tenant = DataTenantId::new_v7();
+        self.server
+            .pg_fixture()
+            .seed_additional_tenant_with_uuid(tenant, name)
+            .await
+            .expect("second tenant seeds");
+        let seed = VerificationFixture::provision(self.server.state().postgres.wyrd(), tenant)
+            .await
+            .expect("second tenant provisions");
+        let verifier = seed.drift_verifier("drift").await.expect("verifier seeds");
+        let quick = seed
+            .operator(
+                "quick",
+                &json!({ "kind": "http", "method": "post",
+                         "url": format!("{}/quick", self.mock.uri()) }),
+            )
+            .await
+            .expect("operator seeds");
+        let (owner, principal) = seed.service("quiet").await.expect("owner seeds");
+        let binding = seed
+            .bind_schedule(
+                &owner,
+                &owner,
+                &verifier,
+                "0 2 * * *",
+                vec![FrozenTarget::Uid(quick)],
+            )
+            .await
+            .expect("binding projects");
+        seed.activate(principal).await.expect("owner activates");
+        seed.make_binding_due(binding)
+            .await
+            .expect("binding is due");
+        QuietTenant {
+            tenant,
+            seed,
+            verifier,
+            owner,
         }
     }
 
@@ -383,6 +446,18 @@ impl Delivery {
     }
 }
 
+/// A second tenant seeded by [`Delivery::quiet_tenant`].
+struct QuietTenant {
+    /// The tenant's identity.
+    tenant: DataTenantId,
+    /// Seeded verification state of the tenant.
+    seed: VerificationFixture,
+    /// The tenant's Drift Verifier.
+    verifier: CardUid,
+    /// Owner Service of the tenant's due binding, also a direct-run subject.
+    owner: CardUid,
+}
+
 /// A spawned runtime and the token that stops it.
 struct Running {
     /// Cancels the runtime.
@@ -468,12 +543,15 @@ async fn wait_until(what: &str, ready: impl Fn() -> bool) {
 /// tenant credential and authored target, and every dispatch settles on its
 /// own — delivered, terminal provider refusal, rate-limited retry honoring
 /// `Retry-After`, or an origin-changing redirect refused — without touching
-/// the completed Verifier run.
+/// the completed Verifier run. No credential appears in any log line emitted
+/// while the connections are created and every attempt settles.
 ///
 /// # Panics
-/// Panics when a dispatch settles differently or a provider request differs.
+/// Panics when a dispatch settles differently, a provider request differs,
+/// or a credential is logged.
 #[tokio::test]
 async fn failed_verdict_fans_out_to_every_provider_independently() {
+    let logs = LogCapture::install();
     let delivery = Delivery::start().await;
     let origin = delivery.mock.uri();
     Mock::given(method("POST"))
@@ -626,6 +704,15 @@ async fn failed_verdict_fans_out_to_every_provider_independently() {
     let settled_run = delivery.seed.run(run).await.expect("run reads");
     assert_eq!(settled_run.status, "completed");
     assert_eq!(delivery.seed.runs().await.expect("runs read"), vec![run]);
+
+    let logged = logs.text();
+    assert!(
+        logged.contains("operator dispatch attempt settled"),
+        "the capture observed the delivery worker"
+    );
+    for secret in [SLACK_TOKEN, PAGER_KEY, HOOK_KEY] {
+        assert!(!logged.contains(secret), "a credential was logged");
+    }
 }
 
 /// A transient failure retries after the 30-second backoff; the credential is
@@ -775,11 +862,14 @@ async fn next_attempt_on_another_replica_uses_the_rotated_credential() {
 
 /// A slow endpoint times out each attempt, retries after 30 seconds and then
 /// two minutes, and fails once the three-attempt budget is spent, without
-/// rerunning the Verifier; a crashed worker restarts, and shutdown releases an
-/// in-flight attempt with its attempt refunded.
+/// rerunning the Verifier; a crashed worker restarts, shutdown releases an
+/// in-flight attempt with its attempt refunded, and a restarted worker
+/// delivers that released dispatch under the same dispatch identity and
+/// Idempotency-Key.
 ///
 /// # Panics
-/// Panics when the timeout, schedule, exhaustion, restart, or release differs.
+/// Panics when the timeout, schedule, exhaustion, restart, release, or
+/// recovered delivery differs.
 #[tokio::test]
 async fn slow_endpoint_exhausts_the_budget_and_shutdown_releases() {
     let delivery = Delivery::start().await;
@@ -860,6 +950,40 @@ async fn slow_endpoint_exhausts_the_budget_and_shutdown_releases() {
         (row.status.as_str(), row.attempts),
         ("pending", 0),
         "shutdown releases the in-flight attempt with its attempt refunded"
+    );
+
+    let parked_id = row.dispatch_id;
+    let resumed = delivery.spawn(
+        delivery.server.state(),
+        draining,
+        &EngineScript::default(),
+        &CapabilityCrash::default(),
+    );
+    let rows = delivery
+        .wait_dispatches(run, 1, |row| row.status == "delivered")
+        .await;
+    resumed.stop().await;
+    let row = &rows[&parked.as_uuid()];
+    assert_eq!(
+        (row.dispatch_id, row.attempts),
+        (parked_id, 1),
+        "the restarted worker delivers the released dispatch under its identity"
+    );
+    let parked_posts = delivery.requests("/hook/parked").await;
+    assert!(!parked_posts.is_empty());
+    for post in &parked_posts {
+        assert_eq!(
+            post.headers
+                .get("idempotency-key")
+                .and_then(|v| v.to_str().ok()),
+            Some(parked_id.to_string().as_str()),
+            "every attempt carries the same Idempotency-Key"
+        );
+    }
+    assert_eq!(
+        delivery.seed.runs().await.expect("runs read"),
+        vec![first, run],
+        "redelivery never reruns the Verifier"
     );
 }
 
@@ -946,6 +1070,274 @@ async fn revoked_connection_fails_closed_and_key_outage_retries() {
             .expect("recorded")
             .is_empty(),
         "no provider is called without an authorized, decrypted credential"
+    );
+}
+
+/// Under the production Operator defaults a transient failure retries after
+/// 30 seconds, a later retry is clipped to the dispatch's five-minute
+/// deadline, and once PostgreSQL's clock passes that deadline the dispatch
+/// fails `deadline_exceeded` without another provider call. The test moves
+/// `created_at` back instead of waiting, because the deadline is measured
+/// from it in the database.
+///
+/// # Panics
+/// Panics when the schedule, clipping, or deadline failure differs.
+#[tokio::test]
+async fn production_schedule_retries_within_the_delivery_deadline() {
+    let delivery = Delivery::start().await;
+    let origin = delivery.mock.uri();
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&delivery.mock)
+        .await;
+    let flaky = delivery
+        .operator("flaky", hook(&origin, "/hook/flaky"))
+        .await;
+    delivery.fail_binding("owner", &[&flaky]).await;
+    let limits = Delivery::limits();
+    assert_eq!(
+        (limits.operator_deadline, limits.operator_attempts),
+        (Duration::from_secs(300), 3),
+        "production Operator defaults"
+    );
+    let running = delivery.spawn(
+        delivery.server.state(),
+        limits,
+        &failing_script(1),
+        &CapabilityCrash::default(),
+    );
+    let run = delivery.new_run(&[]).await;
+    let backdate = |seconds: i32| {
+        let pool = delivery.assertion.clone();
+        async move {
+            sqlx::query(
+                "UPDATE wyrd.operator_dispatches \
+                    SET created_at = created_at - make_interval(secs => $2), \
+                        next_attempt_at = statement_timestamp() \
+                  WHERE run_id = $1",
+            )
+            .bind(run.as_uuid())
+            .bind(f64::from(seconds))
+            .execute(&pool)
+            .await
+            .expect("dispatch backdates");
+        }
+    };
+
+    let rows = delivery
+        .wait_dispatches(run, 1, |row| row.status == "retrying" && row.attempts == 1)
+        .await;
+    let row = &rows[&flaky.as_uuid()];
+    assert_eq!(row.error_code.as_deref(), Some("provider_transient"));
+    assert_eq!(row.delay.expect("retry is scheduled").round(), 30.0);
+
+    backdate(290).await;
+    let rows = delivery
+        .wait_dispatches(run, 1, |row| row.status == "retrying" && row.attempts == 2)
+        .await;
+    let clipped = rows[&flaky.as_uuid()].delay.expect("retry is scheduled");
+    assert!(
+        (5.0..=10.5).contains(&clipped),
+        "the two-minute backoff is clipped to the deadline: {clipped}"
+    );
+
+    backdate(15).await;
+    let rows = delivery
+        .wait_dispatches(run, 1, |row| row.status == "failed")
+        .await;
+    running.stop().await;
+    let row = &rows[&flaky.as_uuid()];
+    assert_eq!(
+        (row.attempts, row.error_code.as_deref()),
+        (2, Some("deadline_exceeded"))
+    );
+    assert_eq!(delivery.requests("/hook/flaky").await.len(), 2);
+}
+
+/// An attempt that times out after PagerDuty accepted it is ambiguous: the
+/// retry resends the same `dedup_key`, so PagerDuty collapses the duplicate,
+/// and the completed Verifier run and its result are untouched. No Alert row
+/// or table exists anywhere in the database or the Bifrost catalog.
+///
+/// # Panics
+/// Panics when the retry changes the dedup key, the run or result changes, or
+/// an Alert table exists.
+#[tokio::test]
+async fn ambiguous_pagerduty_retry_reuses_the_dedup_key() {
+    let delivery = Delivery::start().await;
+    Mock::given(method("POST"))
+        .and(path("/pagerduty"))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .set_body_json(json!({ "status": "success" }))
+                .set_delay(Duration::from_secs(2)),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&delivery.mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/pagerduty"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "status": "success" })))
+        .mount(&delivery.mock)
+        .await;
+    let paged = delivery
+        .operator(
+            "paged",
+            json!({ "kind": "notify", "channel": { "kind": "pager_duty",
+                    "connection": "ops-pagerduty", "route": "retention",
+                    "severity": "warning", "summary": "{{verifier_ref}} failed" } }),
+        )
+        .await;
+    delivery.fail_binding("owner", &[&paged]).await;
+    let limits = RuntimeLimits {
+        operator_attempt_timeout: Duration::from_millis(500),
+        ..Delivery::limits()
+    };
+    let running = delivery.spawn(
+        delivery.server.state(),
+        limits,
+        &failing_script(1),
+        &CapabilityCrash::default(),
+    );
+    let run = delivery.new_run(&[]).await;
+    let rows = delivery
+        .wait_dispatches(run, 1, |row| row.status == "retrying")
+        .await;
+    assert_eq!(
+        rows[&paged.as_uuid()].error_code.as_deref(),
+        Some("attempt_timed_out")
+    );
+    let before = delivery.seed.run(run).await.expect("run reads");
+    assert_eq!(before.status, "completed");
+    delivery.make_retries_due(run).await;
+    let rows = delivery
+        .wait_dispatches(run, 1, |row| row.status == "delivered")
+        .await;
+    running.stop().await;
+    let dispatch_id = rows[&paged.as_uuid()].dispatch_id.to_string();
+    assert_eq!(rows[&paged.as_uuid()].attempts, 2);
+
+    let keys: Vec<Value> = delivery
+        .requests("/pagerduty")
+        .await
+        .iter()
+        .map(|page| page.body_json::<Value>().expect("pagerduty JSON")["dedup_key"].clone())
+        .collect();
+    assert_eq!(
+        keys,
+        vec![json!(dispatch_id), json!(dispatch_id)],
+        "both attempts carry the stable dispatch ID"
+    );
+    let after = delivery.seed.run(run).await.expect("run reads");
+    assert_eq!(
+        (after.status, after.result_id),
+        (before.status, before.result_id),
+        "delivery never changes the Verifier result"
+    );
+    assert_eq!(delivery.seed.runs().await.expect("runs read"), vec![run]);
+
+    let alert_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name ILIKE '%alert%'",
+    )
+    .fetch_one(&delivery.assertion)
+    .await
+    .expect("catalog reads");
+    let alert_datasets: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM vala.bifrost_tables WHERE fqn ILIKE '%alert%'")
+            .fetch_one(&delivery.assertion)
+            .await
+            .expect("bifrost catalog reads");
+    assert_eq!(
+        (alert_tables, alert_datasets),
+        (0, 0),
+        "no Alert table exists"
+    );
+}
+
+/// Connection authority is resolved per attempt inside the dispatch's tenant:
+/// an Operator naming a connection that exists only in another tenant, and
+/// one naming no connection at all, each fail `connection_unavailable` at
+/// delivery time without a provider call.
+///
+/// # Panics
+/// Panics when either dispatch settles differently or a provider is called.
+#[tokio::test]
+async fn foreign_or_missing_connection_fails_at_delivery() {
+    let delivery = Delivery::boot().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+        .mount(&delivery.mock)
+        .await;
+    let other = delivery
+        .server
+        .seed_tenant("operator-foreign")
+        .await
+        .expect("tenant seeds");
+    let foreign_admin = delivery
+        .server
+        .bootstrap_service_in_tenant(other, "operator-foreign-admin", &["admin"])
+        .await
+        .expect("foreign admin bootstraps");
+    let foreign_jwt = delivery
+        .server
+        .exchange_api_key(foreign_admin.api_key().expect("api key"))
+        .await
+        .expect("api key exchanges");
+    let (status, view) = delivery
+        .call_as(
+            &foreign_jwt,
+            Method::POST,
+            "/v1/operator-connections",
+            Some(&json!({ "provider": "slack", "name": "ops-elsewhere",
+                          "workspace_id": "T0002", "bot_token": SLACK_TOKEN })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    let channel = |connection: &str| {
+        json!({ "kind": "notify", "channel": { "kind": "slack", "connection": connection,
+                "channel_id": "C0123456789", "text": "{{verifier_ref}} failed" } })
+    };
+    let foreign = delivery
+        .seed
+        .operator("foreign", &channel("ops-elsewhere"))
+        .await
+        .expect("operator seeds");
+    let missing = delivery
+        .seed
+        .operator("missing", &channel("ops-missing"))
+        .await
+        .expect("operator seeds");
+    delivery.fail_binding("owner", &[&foreign, &missing]).await;
+    let running = delivery.spawn(
+        delivery.server.state(),
+        Delivery::limits(),
+        &failing_script(1),
+        &CapabilityCrash::default(),
+    );
+    let run = delivery.new_run(&[]).await;
+    let rows = delivery
+        .wait_dispatches(run, 2, |row| {
+            row.status != "pending" && row.status != "running"
+        })
+        .await;
+    running.stop().await;
+    for uid in [&foreign, &missing] {
+        let row = &rows[&uid.as_uuid()];
+        assert_eq!(
+            (row.status.as_str(), row.error_code.as_deref()),
+            ("failed", Some("connection_unavailable")),
+            "{row:?}"
+        );
+    }
+    assert!(
+        delivery
+            .mock
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "no provider is called without a connection in the dispatch's tenant"
     );
 }
 
@@ -1115,38 +1507,8 @@ async fn operator_permits_cap_each_tenant_without_starving_another() {
         .fail_binding("busy", &busy.iter().collect::<Vec<_>>())
         .await;
 
-    let other_tenant = DataTenantId::new_v7();
-    delivery
-        .server
-        .pg_fixture()
-        .seed_additional_tenant_with_uuid(other_tenant, "operator-other")
-        .await
-        .expect("second tenant seeds");
-    let other =
-        VerificationFixture::provision(delivery.server.state().postgres.wyrd(), other_tenant)
-            .await
-            .expect("second tenant provisions");
-    let other_verifier = other.drift_verifier("drift").await.expect("verifier seeds");
-    let quick = other
-        .operator("quick", &unauthenticated("/quick"))
-        .await
-        .expect("operator seeds");
-    let (owner, principal) = other.service("quiet").await.expect("owner seeds");
-    let binding = other
-        .bind_schedule(
-            &owner,
-            &owner,
-            &other_verifier,
-            "0 2 * * *",
-            vec![FrozenTarget::Uid(quick.clone())],
-        )
-        .await
-        .expect("binding projects");
-    other.activate(principal).await.expect("owner activates");
-    other
-        .make_binding_due(binding)
-        .await
-        .expect("binding is due");
+    let quiet = delivery.quiet_tenant("operator-other").await;
+    let other_tenant = quiet.tenant;
 
     let script = failing_script(2);
     let running = delivery.spawn(
@@ -1204,6 +1566,179 @@ async fn operator_permits_cap_each_tenant_without_starving_another() {
     );
 }
 
+/// Running Verifier runs and running Operator dispatches of `tenant`.
+///
+/// # Panics
+/// Panics when either table cannot be read.
+async fn running(pool: &PgPool, tenant: DataTenantId) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM wyrd.verifier_runs \
+                  WHERE data_tenant_id = $1 AND status = 'running'), \
+                (SELECT COUNT(*) FROM wyrd.operator_dispatches \
+                  WHERE data_tenant_id = $1 AND status = 'running')",
+    )
+    .bind(tenant.as_uuid())
+    .fetch_one(pool)
+    .await
+    .expect("running counts read")
+}
+
+/// Under the production permit defaults one tenant saturates both pools at
+/// once — four Verifier executions and four Operator deliveries — while a
+/// second tenant's Verifier runs and dispatch still progress; neither
+/// process-wide pool exceeds sixteen, and all held work completes on release.
+///
+/// # Panics
+/// Panics when a tenant or global ceiling is exceeded, the quiet tenant is
+/// starved, or held work does not complete.
+#[tokio::test]
+async fn verifier_and_operator_pools_saturate_one_tenant_without_starving_another() {
+    let delivery = Delivery::boot().await;
+    let origin = delivery.mock.uri();
+    Mock::given(method("POST"))
+        .and(path("/slow"))
+        .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_secs(8)))
+        .mount(&delivery.mock)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&delivery.mock)
+        .await;
+    let mut slow = Vec::new();
+    for index in 0..6 {
+        slow.push(
+            delivery
+                .seed
+                .operator(
+                    &format!("slow-{index}"),
+                    &json!({ "kind": "http", "method": "post", "url": format!("{origin}/slow") }),
+                )
+                .await
+                .expect("operator seeds"),
+        );
+    }
+    let busy_owner = delivery
+        .fail_binding("busy", &slow.iter().collect::<Vec<_>>())
+        .await;
+    let quiet = delivery.quiet_tenant("pools-quiet").await;
+    let busy = delivery.seed.tenant();
+    let limits = RuntimeLimits {
+        drain_grace: Duration::from_millis(200),
+        ..Delivery::limits()
+    };
+    assert_eq!(
+        (limits.global_permits, limits.tenant_permits),
+        (16, 4),
+        "production permit defaults"
+    );
+    let script = failing_script(2);
+    let runtime = delivery.spawn(
+        delivery.server.state(),
+        limits,
+        &script,
+        &CapabilityCrash::default(),
+    );
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let quiet_dispatches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM wyrd.operator_dispatches WHERE data_tenant_id = $1",
+        )
+        .bind(quiet.tenant.as_uuid())
+        .fetch_one(&delivery.assertion)
+        .await
+        .expect("dispatches read");
+        if running(&delivery.assertion, busy).await.1 == 4 && quiet_dispatches == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "binding runs never fanned out"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    script.hold();
+    for _ in 0..8 {
+        script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+    }
+    let now = Utc::now();
+    let window = || DriftWindow {
+        start: now - chrono::Duration::hours(1),
+        end: now,
+    };
+    let mut held = Vec::new();
+    for _ in 0..6 {
+        held.push((
+            &delivery.seed,
+            delivery
+                .seed
+                .enqueue_direct(&delivery.verifier, &busy_owner, window())
+                .await
+                .expect("busy run enqueues"),
+        ));
+    }
+    for _ in 0..2 {
+        held.push((
+            &quiet.seed,
+            quiet
+                .seed
+                .enqueue_direct(&quiet.verifier, &quiet.owner, window())
+                .await
+                .expect("quiet run enqueues"),
+        ));
+    }
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let (busy_runs, busy_dispatches) = running(&delivery.assertion, busy).await;
+        let (quiet_runs, quiet_dispatches) = running(&delivery.assertion, quiet.tenant).await;
+        assert!(
+            busy_runs <= 4 && busy_dispatches <= 4,
+            "the busy tenant exceeded a ceiling: {busy_runs} runs, {busy_dispatches} dispatches"
+        );
+        assert!(
+            busy_runs + quiet_runs <= 16 && busy_dispatches + quiet_dispatches <= 16,
+            "a process-wide ceiling was exceeded"
+        );
+        if (busy_runs, busy_dispatches, quiet_runs) == (4, 4, 2) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pools never saturated: busy {busy_runs}/{busy_dispatches}, quiet {quiet_runs}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let quiet_delivered: String =
+        sqlx::query_scalar("SELECT status FROM wyrd.operator_dispatches WHERE data_tenant_id = $1")
+            .bind(quiet.tenant.as_uuid())
+            .fetch_one(&delivery.assertion)
+            .await
+            .expect("quiet dispatch reads");
+    assert_eq!(
+        quiet_delivered, "delivered",
+        "the quiet tenant delivered while the busy tenant was saturated"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        script.entered(),
+        2 + 4 + 2,
+        "the busy tenant's held runs stay at its ceiling across polls"
+    );
+
+    script.release();
+    for (seed, run) in held {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while seed.run(run).await.expect("run reads").status != "completed" {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "held run never completed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    runtime.stop().await;
+}
+
 /// Key versions of every Operator connection of `tenant`.
 ///
 /// # Panics
@@ -1233,7 +1768,6 @@ async fn key_versions(pool: &PgPool, tenant: DataTenantId) -> Vec<i32> {
 async fn slow_rewrap_never_holds_back_another_tenants_delivery() {
     use base64::Engine as _;
     let delivery = Delivery::start().await;
-    let origin = delivery.mock.uri();
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(204))
         .mount(&delivery.mock)
@@ -1244,41 +1778,7 @@ async fn slow_rewrap_never_holds_back_another_tenants_delivery() {
         vec![1, 1, 1]
     );
 
-    let other_tenant = DataTenantId::new_v7();
-    delivery
-        .server
-        .pg_fixture()
-        .seed_additional_tenant_with_uuid(other_tenant, "operator-rewrap-other")
-        .await
-        .expect("second tenant seeds");
-    let other =
-        VerificationFixture::provision(delivery.server.state().postgres.wyrd(), other_tenant)
-            .await
-            .expect("second tenant provisions");
-    let other_verifier = other.drift_verifier("drift").await.expect("verifier seeds");
-    let quick = other
-        .operator(
-            "quick",
-            &json!({ "kind": "http", "method": "post", "url": format!("{origin}/quick") }),
-        )
-        .await
-        .expect("operator seeds");
-    let (owner, principal) = other.service("quiet").await.expect("owner seeds");
-    let binding = other
-        .bind_schedule(
-            &owner,
-            &owner,
-            &other_verifier,
-            "0 2 * * *",
-            vec![FrozenTarget::Uid(quick.clone())],
-        )
-        .await
-        .expect("binding projects");
-    other.activate(principal).await.expect("owner activates");
-    other
-        .make_binding_due(binding)
-        .await
-        .expect("binding is due");
+    let other_tenant = delivery.quiet_tenant("operator-rewrap-other").await.tenant;
 
     let vault = MockServer::start().await;
     Mock::given(method("GET"))

@@ -226,3 +226,37 @@ git diff --check
 
 Record commands, selected test counts, outcomes, and any genuine verification
 limit in the implementation report. A red required lane blocks completion.
+
+## Implementation evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-001-20` | `skald-workflow/src/workflow.rs` `StepTask::run`: fixed `agent_deadline` arm after cancellation, total, and step arms; expiry classified through `AttemptOutcome::from_agent(Err(AgentError::Timeout))` | `workflow::tests::agent_deadline_bounds_settlement` (terminal journal held pending; two retryable `WYRD_AGENT_504_TIMEOUT` attempts, both spans failed, zero held appends, zero in-flight calls; equal step timeout and equal total deadline each win) | PASS |
+| `FIND-TASK-001-21` | `StepTask::run` wraps the complete attempt future in `AssertUnwindSafe(..).catch_unwind()` (`futures-util`, workspace) while the span guard is alive; panic becomes non-retryable `WorkflowInternal` | `workflow::tests::attempt_panic_matches_span` (run, step, and span all `WYRD_WORKFLOW_500_INTERNAL`, one attempt); cancellation control in `workflow::tests::run_tracing_spans` | PASS |
+| `FIND-TASK-001-22` | `skald-providers/src/clients/external.rs` `post`/`reflects_credential`/`contains_any`: typed 2xx re-encoded and checked against sensitive header values (strings and member names) after provider retries; fixed `BadRequest`; decode detail also withheld because serde quotes offending values | `workflow::tests::external_gateway_success_reflection` (assistant text, `c`-escaped canary, tool-call arguments, Gemini member name refused once; ignored unknown member and non-sensitive header accepted; decode error carries no canary; Workflow refusal is one attempt with no credential in the run); `workflow::tests::bound_external_gateway_security` (clean 2xx, 401 control) | PASS |
+| `FIND-TASK-001-23` | `skald-agent/src/loop_runtime.rs` `invoke_agent_span(&Prompt)`, `chat_span(request, model)`, `genai_provider_name` (`gcp.gemini`, `gcp.vertex_ai`); finish-reasons span field deleted; journal labels unchanged | `agent_timeout::agent_run_genai_google_provider_and_model`, `agent_timeout::agent_run_emits_genai_spans_without_payloads` | PASS |
+| `FIND-TASK-001-24` | rustdoc on `run_with`, `run_prompt`, moved Agent methods, `validate_prompt_loop_request`, `request_from_conversation`, `assistant_message`, every `agent_timeout.rs` fixture/field/method, and new Workflow test fixtures | `mise run lints`; source review | PASS |
+| `FIND-TASK-001-25` | free `run`/`run_prompt` and every `this: &Agent` helper are now inherent `Agent` methods in `loop_runtime.rs`; `Agent::run` delegates to `run_with`; public signatures unchanged | `mise run test:skald`; `cargo check -p skald-agent --all-features` | PASS |
+| `FIND-TASK-001-26` | `output.rs` refusal is `SchemaResolverError::new(std::io::Error::new(Unsupported, ..))`; direct `anyhow` removed from `skald-workflow/Cargo.toml` | `mise run test:skald` (schema tests) | PASS |
+| `FIND-TASK-001-27` | `docs/architecture/skald.md`, `CHANGELOG.md`, `examples/rust/README.md` | `mise run docs:check`, `mise run check:examples`, grep for deleted names | PASS |
+
+### Commands
+
+All commands ran with `CARGO_TARGET_DIR=/home/thorrester/Documents/GitHub/wyrd/target`.
+
+- `mise exec -- cargo nextest run --locked -p skald-workflow --lib -E 'test(=workflow::tests::agent_deadline_bounds_settlement) | test(=workflow::tests::attempt_panic_matches_span)'` — 2 passed
+- `mise exec -- cargo nextest run --locked -p skald-workflow --lib -E 'test(=workflow::tests::external_gateway_success_reflection) | test(=workflow::tests::bound_external_gateway_security)'` — 2 passed
+- `mise exec -- cargo nextest run --locked -p skald-agent --test agent_timeout -E 'test(=agent_run_genai_google_provider_and_model) | test(=agent_run_emits_genai_spans_without_payloads)'` — 2 passed (whole binary: 4 passed)
+- `mise run fmt` — 0; `mise run lints` — 0 (after splitting a clippy `type_complexity` test tuple)
+- `mise run test:skald` — 336 passed; `mise run docs:check` — 0; `mise run check:examples` — 0
+- `mise run test:shared` — 702 passed, 13 skipped
+- `mise run test:wyrd` — first run aborted 4 `pg_card_registration_route` tests (diagnosis below); after the harness fix (`516d0fbcc`): 2282 passed, 161 skipped, exit 0
+- `git diff --check` — 0
+
+### Diagnosis: `test:wyrd` SIGABRT in `pg_card_registration_route`
+
+- **Symptom:** first full `test:wyrd` run aborted 4 in-process tests of `wyrd-server::pg_card_registration_route` with SIGABRT; the binary alone passed 28/28.
+- **Evidence:** each test logs `terminating connection due to administrator command` about 5 s after its own last request (the 5 s Oracle renewal interval), then pool timeouts, Oracle reader-epoch self-fence, and `AbortingEpochTerminator` abort.
+- **Cause (independent read-only diagnostician):** in-process `WyrdTestServer` has no serve token, so neither `shutdown()` nor `Drop` cancelled `state.shutdown_token`; Oracle/Scribe roles kept running while `fixture` (first struct field) dropped the database `WITH (FORCE)` first. Under suite load the process lived until the next renewal, which failed and correctly aborted.
+- **Fix site:** `crates/wyrd/wyrd-testing/src/server.rs` — `shutdown()` and `Drop` cancel the state token for every mode, and `fixture` is declared last so the database drops after every runtime owner. Callers: every in-process `WyrdTestServer` user and servers dropped without `shutdown()`.
+- **Result:** committed as `516d0fbcc` (rustdoc on the moved `fixture` field and the `Drop` impl); `mise run fmt` — 0; full `mise run test:wyrd` rerun green (2282 passed, 161 skipped).

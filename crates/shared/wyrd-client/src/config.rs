@@ -182,10 +182,10 @@ impl ClientConfig {
     ///    and `self.tenant` ([`SavedLogins::select`]), renewed in place
     /// 6. `~/.config/wyrd/credentials.toml` `[default].api_key` — file floor
     ///
-    /// A saved-login store that is unsafe, corrupt, ambiguous, or has no
-    /// record for the selected tenant fails here instead of falling through
-    /// to the floor, so a person's selection is never silently replaced by
-    /// another identity.
+    /// A `credentials.toml` that is unsafe or corrupt, or saved logins that
+    /// are ambiguous or have no record for the selected tenant, fail here
+    /// instead of falling through to the floor, so a person's selection is
+    /// never silently replaced by another identity.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::SavedLogin`] for the saved-login refusals
@@ -607,8 +607,10 @@ mod tests {
     }
 
     /// A saved user login ranks below every environment tier and above the
-    /// `credentials.toml` floor, and a tenant selector naming no saved login
-    /// for the server fails instead of falling through to the floor.
+    /// `credentials.toml` floor, a `credentials.toml` other users can read
+    /// fails closed, and a tenant selector naming no saved login for the
+    /// server fails instead of falling through to the floor.
+    #[cfg(unix)]
     #[test]
     fn saved_login_ranks_between_env_and_credentials_file() {
         let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
@@ -628,6 +630,16 @@ mod tests {
         let mut cfg = ClientConfig::from_env();
         cfg.http.base_url = "https://wyrd.example.com/".to_owned();
         cfg.tenant = None;
+        let chmod = |mode: u32| {
+            std::fs::set_permissions(
+                home.path().join("credentials.toml"),
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(mode),
+            )
+            .expect("chmod");
+        };
+        chmod(0o644);
+        let exposed = cfg.resolve_credential().map(|_| ());
+        chmod(0o600);
         let floor = cfg.resolve_credential().expect("floor resolves");
 
         let store = SavedLogins::locate().expect("config home");
@@ -657,6 +669,8 @@ mod tests {
             std::env::remove_var("WYRD_CONFIG_HOME");
         }
 
+        let error = exposed.expect_err("a credential file others can read fails closed");
+        assert!(error.to_string().contains("unsafe_store"), "{error}");
         assert!(matches!(floor, ResolvedCredential::ApiKey(_)), "{floor:?}");
         match saved {
             ResolvedCredential::Renewable(source) => {

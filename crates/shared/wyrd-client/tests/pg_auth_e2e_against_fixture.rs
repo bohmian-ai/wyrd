@@ -268,11 +268,7 @@ async fn concurrent_saved_renewal() {
     sso.save_login(config.path(), FIXTURE_TENANT_SLUG, "bob", "wyrd-test")
         .await;
     {
-        let record = std::fs::read_dir(config.path().join("logins"))
-            .expect("lists")
-            .map(|entry| entry.expect("entry").path())
-            .find(|path| path.extension().is_some_and(|ext| ext == "json"))
-            .expect("record file");
+        let record = config.path().join("credentials.toml");
         std::fs::set_permissions(
             &record,
             <std::fs::Permissions as PermissionsExt>::from_mode(0o644),

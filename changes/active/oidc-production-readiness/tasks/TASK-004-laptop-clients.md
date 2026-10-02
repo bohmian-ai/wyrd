@@ -49,9 +49,12 @@ Throttle polling and audit completion/refusal. No second IdP app is used.
 `wyrd-client` owns a versioned user credential record keyed by canonical
 server origin and stable tenant ID: `{format_version, origin, tenant_id,
 tenant_key, principal_id, access_token, access_expires_at, refresh_token,
-generation}`. The CLI writes it under the user's config directory with a
-private directory and file, rejects symlinks/unsafe ownership or permissions,
-and uses atomic replacement. `wyrd auth logout` removes the selected local
+generation}`. The CLI writes it into the one Wyrd credential file,
+`~/.config/wyrd/credentials.toml` (human direction FIND-TASK-004-4), as a
+`[[logins]]` table beside the user's other content, which every write
+preserves. The file is user-owned `0600`; symlinks and unsafe ownership or
+permissions fail closed; writes use atomic replacement. There is no other
+credential file and no local encryption. `wyrd auth logout` removes the selected local
 record and asks the server to revoke its refresh family; local deletion still
 occurs if the server is unavailable, with a clear revocation warning.
 Different tenants on one server remain separate records. Never print tokens
@@ -71,11 +74,12 @@ credential still wins. Python and TS constructors expose `tenant` alongside
 their existing `server_url/serverUrl` and `credential` options; both delegate
 to `wyrd-client` and update public types/stubs from source.
 
-For renewal, all processes take an exclusive OS lock on a stable per-record
-lock path, then reread the on-disk generation and refresh token. Before any
+For renewal, all processes take an exclusive OS lock on the stable Wyrd
+configuration directory, then reread the on-disk generation and refresh token. Before any
 network refresh, persist `RefreshPending { generation, started_at }` by fsync
-plus atomic replace while holding the lock; its refresh token is sealed in
-that record but must never be sent again by a later process. The owner uses
+plus atomic replace while holding the lock; its refresh token stays in that
+record, protected only by the file's `0600` user-only mode, so logout can
+revoke its chain, but must never be sent again by a later process. The owner uses
 the token once, persists the returned access/refresh pair and incremented
 `Ready` generation by fsync plus atomic replace, then releases the lock.
 An in-memory cache must revalidate generation before reuse across processes.
@@ -83,7 +87,7 @@ A loser observes the winner's new generation and does not replay its old
 token. Crash or uncertain timeout leaves `RefreshPending`; a later process
 must fail closed and require login because it cannot know whether the server
 accepted the old token. It never retries that token or silently overwrites a
-newer generation. Logout takes the same per-record lock, first persists a
+newer generation. Logout takes the same lock, first persists a
 `LoggedOut` tombstone, then revokes remotely and deletes the secret. A
 concurrent renewal cannot recreate a logged-out record; a crash after the
 tombstone still blocks reuse. Lock timeout, corrupt/unsafe store, revoked

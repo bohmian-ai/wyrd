@@ -178,6 +178,7 @@ jsonpath-rust = "0.7"
 tracing-opentelemetry = "0.32"
 pyo3 = { version = "0.28", features = ["abi3-py310", "chrono", "py-clone"] }
 toml = "0.8"
+toml_edit = "0.22"
 shellexpand = "3"
 ipnetwork = "0.20"
 wyrd-telemetry = { path = "crates/shared/wyrd-telemetry", version = "0.0.1" }

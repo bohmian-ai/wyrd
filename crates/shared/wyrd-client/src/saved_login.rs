@@ -2,15 +2,18 @@
 //! credential every SDK resolves through the shared credential chain.
 //!
 //! `wyrd auth login` writes one [`SavedLogin`] record per canonical server
-//! origin and tenant under `{wyrd_config_dir}/logins`. The directory is
-//! private to the user (`0700`), every record and lock file is `0600`, and a
-//! symlinked, foreign-owned, or group/world-accessible entry is refused rather
-//! than read. Records are only ever replaced atomically (temporary file,
-//! `fsync`, rename, directory `fsync`).
+//! origin and tenant into the `[[logins]]` tables of the one Wyrd credential
+//! file, `{wyrd_config_dir}/credentials.toml`, beside the user's own content
+//! such as `[default].api_key`. Protection is the file's user-only ownership
+//! and mode (`0600`) inside a directory only the user can change; a
+//! symlinked, foreign-owned, or group/world-accessible file is refused rather
+//! than read. The file is only ever replaced atomically (temporary file,
+//! `fsync`, rename, directory `fsync`), and every write carries the user's
+//! other keys and comments through unchanged.
 //!
-//! Every read-modify-write of a record — renewal, login, logout — holds an
-//! exclusive OS lock on that record's stable lock file, which is never
-//! deleted. Renewal rereads the record under the lock, so a process that lost
+//! Every read-modify-write — renewal, login, logout — holds an exclusive OS
+//! lock on the configuration directory itself, which no rename replaces.
+//! Renewal rereads the record under the lock, so a process that lost
 //! a race uses the winner's newer generation instead of replaying its rotated
 //! refresh token. Before a refresh token is sent, the record is durably moved
 //! to [`SavedLoginState::RefreshPending`]; only a successful rotation moves it
@@ -21,7 +24,7 @@
 //! [`SavedLoginState::LoggedOut`] tombstone under the lock, so no concurrent
 //! renewal can resurrect the login, then revokes it remotely and deletes it.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,7 +32,6 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{CliLogin, PrincipalId, SecretBearer, TokenRequest};
 use wyrd_spec::ids::TenantSlug;
@@ -155,6 +157,11 @@ impl SavedLogin {
         }
     }
 
+    /// Whether this is the login for `origin` and `tenant_id`.
+    fn is_for(&self, origin: &str, tenant_id: DataTenantId) -> bool {
+        self.origin == origin && self.tenant_id == tenant_id
+    }
+
     /// Whether `selector` (a tenant route key or tenant id) names this
     /// record's tenant.
     #[must_use]
@@ -180,73 +187,91 @@ pub fn canonical_origin(server_url: &str) -> Result<String, WyrdClientError> {
     Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 
-/// The saved-login store under one directory.
+/// File name of the one Wyrd credential file, under the configuration
+/// directory.
+const CREDENTIALS_FILE: &str = "credentials.toml";
+
+/// The `credentials.toml` array of tables holding saved logins.
+const LOGINS_KEY: &str = "logins";
+
+/// The saved-login part of `credentials.toml`; every other key is the
+/// user's and is only ever carried through unchanged.
+#[derive(Deserialize)]
+struct StoredLogins {
+    /// Every saved login, `[[logins]]`; absent means none.
+    #[serde(default)]
+    logins: Vec<SavedLogin>,
+}
+
+/// The borrowed form of [`StoredLogins`] a write renders.
+#[derive(Serialize)]
+struct StoredLoginsRef<'a> {
+    /// Every saved login to keep.
+    logins: &'a [SavedLogin],
+}
+
+/// The saved logins in one Wyrd configuration directory's
+/// `credentials.toml`.
 #[derive(Debug, Clone)]
 pub struct SavedLogins {
-    /// `{wyrd_config_dir}/logins`, or a caller-chosen directory.
+    /// `{wyrd_config_dir}`, or a caller-chosen directory.
     dir: PathBuf,
 }
 
-/// An exclusive hold on one record's lock file, released on drop.
-struct RecordLock {
-    /// The open lock file; the OS lock lives as long as this handle.
-    _file: File,
+/// An exclusive hold on the configuration directory's OS lock, released on
+/// drop.
+struct StoreLock {
+    /// The open directory; the OS lock lives as long as this handle.
+    _dir: File,
 }
 
 impl SavedLogins {
-    /// The store under the user's Wyrd configuration directory, or `None`
-    /// when no configuration directory can be resolved.
+    /// The saved logins in the user's Wyrd configuration directory, or
+    /// `None` when no configuration directory can be resolved.
     #[must_use]
     pub fn locate() -> Option<Self> {
-        wyrd_utils::config_dir::wyrd_config_dir().map(|dir| Self::at(dir.join("logins")))
+        wyrd_utils::config_dir::wyrd_config_dir().map(Self::at)
     }
 
-    /// The store under `dir`.
+    /// The saved logins in `dir/credentials.toml`.
     #[must_use]
     pub fn at(dir: PathBuf) -> Self {
         Self { dir }
     }
 
-    /// Save a login the CLI just completed, replacing any earlier record for
-    /// the same origin and tenant under its lock.
+    /// Save a login the CLI just completed, replacing any earlier login for
+    /// the same origin and tenant under the store lock.
     ///
     /// The new record continues the old record's generation, so a process
     /// holding the old generation rereads instead of reusing it.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::SavedLogin`] when the store is unsafe or
+    /// Returns [`WyrdClientError::SavedLogin`] when the file is unsafe or
     /// corrupt, the lock cannot be taken in time, or the write fails.
     pub fn save(&self, mut login: SavedLogin) -> Result<(), WyrdClientError> {
-        self.prepare_dir(true)?;
-        let stem = record_stem(&login.origin, login.tenant_id);
-        let _lock = self.lock(&stem)?;
-        if let Some(previous) = self.read(&stem)? {
-            login.generation = previous.generation.saturating_add(1);
+        let _lock = self.lock()?;
+        let mut logins = self.read()?;
+        match logins
+            .iter_mut()
+            .find(|saved| saved.is_for(&login.origin, login.tenant_id))
+        {
+            Some(previous) => {
+                login.generation = previous.generation.saturating_add(1);
+                *previous = login;
+            }
+            None => logins.push(login),
         }
-        self.write(&stem, &login)
+        self.write(&logins)
     }
 
-    /// Every saved record, in no particular order. An absent store is empty.
+    /// Every saved login, in file order. An absent file or configuration
+    /// directory holds none.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::SavedLogin`] when the store or a record is
-    /// unsafe or corrupt.
+    /// Returns [`WyrdClientError::SavedLogin`] when the file or directory is
+    /// unsafe or a login is corrupt.
     pub fn list(&self) -> Result<Vec<SavedLogin>, WyrdClientError> {
-        if !self.prepare_dir(false)? {
-            return Ok(Vec::new());
-        }
-        let entries = std::fs::read_dir(&self.dir).map_err(|error| io_failure(&error))?;
-        let mut logins = Vec::new();
-        for entry in entries {
-            let path = entry.map_err(|error| io_failure(&error))?.path();
-            if path.extension().is_some_and(|ext| ext == "json")
-                && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
-                && let Some(login) = self.read(stem)?
-            {
-                logins.push(login);
-            }
-        }
-        Ok(logins)
+        self.read()
     }
 
     /// Select the saved login for `origin` and the optional tenant selector.
@@ -300,29 +325,33 @@ impl SavedLogins {
     pub fn source(&self, login: &SavedLogin, exchange: TokenExchange) -> Arc<SavedLoginSource> {
         Arc::new(SavedLoginSource {
             store: self.clone(),
-            stem: record_stem(&login.origin, login.tenant_id),
+            origin: login.origin.clone(),
+            tenant_id: login.tenant_id,
             identity: format!("saved-login:{}:{}", login.origin, login.tenant_id),
             exchange,
         })
     }
 
-    /// Mark the record for `origin` and `tenant_id` logged out and return the
-    /// refresh token to revoke, if the record carried one.
+    /// Mark the login for `origin` and `tenant_id` logged out and return the
+    /// refresh token to revoke, if the login carried one.
     ///
     /// The tombstone is durable before this returns, so no renewal that
     /// starts afterwards can use or resurrect the login.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::SavedLogin`] when the store is unsafe or
+    /// Returns [`WyrdClientError::SavedLogin`] when the file is unsafe or
     /// corrupt, the lock cannot be taken in time, or the write fails.
     pub fn begin_logout(
         &self,
         origin: &str,
         tenant_id: DataTenantId,
     ) -> Result<Option<SecretBearer>, WyrdClientError> {
-        let stem = record_stem(origin, tenant_id);
-        let _lock = self.lock(&stem)?;
-        let Some(mut login) = self.read(&stem)? else {
+        let _lock = self.lock()?;
+        let mut logins = self.read()?;
+        let Some(login) = logins
+            .iter_mut()
+            .find(|login| login.is_for(origin, tenant_id))
+        else {
             return Ok(None);
         };
         let refresh = match std::mem::replace(&mut login.state, SavedLoginState::LoggedOut) {
@@ -330,50 +359,56 @@ impl SavedLogins {
             | SavedLoginState::RefreshPending { refresh_token, .. } => Some(refresh_token),
             SavedLoginState::LoggedOut => None,
         };
-        self.write(&stem, &login)?;
+        self.write(&logins)?;
         Ok(refresh)
     }
 
-    /// Delete the logged-out record for `origin` and `tenant_id`.
+    /// Remove the logged-out login for `origin` and `tenant_id`.
     ///
-    /// A record a new login replaced in the meantime is kept.
+    /// A login a new `wyrd auth login` saved in the meantime is kept.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::SavedLogin`] when the store is unsafe or
-    /// corrupt, the lock cannot be taken in time, or the delete fails.
+    /// Returns [`WyrdClientError::SavedLogin`] when the file is unsafe or
+    /// corrupt, the lock cannot be taken in time, or the write fails.
     pub fn finish_logout(
         &self,
         origin: &str,
         tenant_id: DataTenantId,
     ) -> Result<(), WyrdClientError> {
-        let stem = record_stem(origin, tenant_id);
-        let _lock = self.lock(&stem)?;
-        if let Some(login) = self.read(&stem)?
-            && login.state == SavedLoginState::LoggedOut
-        {
-            std::fs::remove_file(self.record_path(&stem)).map_err(|error| io_failure(&error))?;
-            sync_dir(&self.dir)?;
+        let _lock = self.lock()?;
+        let mut logins = self.read()?;
+        let before = logins.len();
+        logins.retain(|login| {
+            !(login.is_for(origin, tenant_id) && login.state == SavedLoginState::LoggedOut)
+        });
+        if logins.len() == before {
+            return Ok(());
         }
-        Ok(())
+        self.write(&logins)
     }
 
-    /// Renew under the record lock and return a usable access token.
+    /// Renew under the store lock and return a usable access token.
     ///
     /// # Errors
     /// See [`SavedLoginSource::mint`].
     fn renew(
         &self,
-        stem: &str,
+        origin: &str,
+        tenant_id: DataTenantId,
         exchange: &TokenExchange,
     ) -> Result<MintedAccessToken, WyrdClientError> {
-        let _lock = self.lock(stem)?;
-        let mut login = self.read(stem)?.ok_or_else(|| {
-            saved_login(
-                "logged_out",
-                "the saved login was removed; run `wyrd auth login`",
-            )
-        })?;
-        let refresh_token = match &login.state {
+        let _lock = self.lock()?;
+        let mut logins = self.read()?;
+        let index = logins
+            .iter()
+            .position(|login| login.is_for(origin, tenant_id))
+            .ok_or_else(|| {
+                saved_login(
+                    "logged_out",
+                    "the saved login was removed; run `wyrd auth login`",
+                )
+            })?;
+        let refresh_token = match &logins[index].state {
             SavedLoginState::Ready {
                 access_token,
                 access_expires_at,
@@ -398,11 +433,11 @@ impl SavedLogins {
                 ));
             }
         };
-        login.state = SavedLoginState::RefreshPending {
+        logins[index].state = SavedLoginState::RefreshPending {
             started_at: Utc::now(),
             refresh_token: refresh_token.clone(),
         };
-        self.write(stem, &login)?;
+        self.write(&logins)?;
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             saved_login(
                 "refresh_pending",
@@ -433,38 +468,50 @@ impl SavedLogins {
                 "the server renewed the saved login without a refresh token",
             )
         })?;
-        if access_token_tenant(&rotated.access_token) != Some(login.tenant_id) {
+        if access_token_tenant(&rotated.access_token) != Some(tenant_id) {
             return Err(saved_login(
                 "tenant_mismatch",
                 "the server renewed the saved login for another tenant; run `wyrd auth login`",
             ));
         }
+        let login = &mut logins[index];
         login.generation = login.generation.saturating_add(1);
         login.state = SavedLoginState::Ready {
             access_token: rotated.access_token.clone(),
             access_expires_at: rotated.expires_at,
             refresh_token,
         };
-        self.write(stem, &login)?;
+        self.write(&logins)?;
         Ok(MintedAccessToken {
             access_token: rotated.access_token,
             expires_at: rotated.expires_at,
         })
     }
 
-    /// Check the store directory, creating it when `create` is set, and
-    /// report whether it exists.
+    /// Path of `credentials.toml`.
+    fn path(&self) -> PathBuf {
+        self.dir.join(CREDENTIALS_FILE)
+    }
+
+    /// Check the configuration directory, creating it private to the user
+    /// when `create` is set, and report whether it exists.
+    ///
+    /// The directory may be readable by others and writable by the user's
+    /// group (a plain `~/.config/wyrd` under a `002` umask is): the file's
+    /// own ownership, mode, and symlink checks are what keep the secrets
+    /// private, so the directory need only be the user's and not
+    /// world-writable.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::SavedLogin`] with reason `unsafe_store` for
-    /// a symlinked, foreign-owned, or group/world-accessible directory.
-    fn prepare_dir(&self, create: bool) -> Result<bool, WyrdClientError> {
+    /// a symlinked, foreign-owned, or world-writable directory.
+    fn check_dir(&self, create: bool) -> Result<bool, WyrdClientError> {
         match std::fs::symlink_metadata(&self.dir) {
             Ok(metadata) => {
                 if !metadata.is_dir() {
                     return Err(unsafe_store(&self.dir, "is not a directory"));
                 }
-                check_private(&self.dir, &metadata)?;
+                check_owned(&self.dir, &metadata, 0o002)?;
                 Ok(true)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -478,57 +525,60 @@ impl SavedLogins {
         }
     }
 
-    /// Path of the record file `stem` names.
-    fn record_path(&self, stem: &str) -> PathBuf {
-        self.dir.join(format!("{stem}.json"))
-    }
-
-    /// Take the exclusive OS lock on `stem`'s lock file, waiting at most
-    /// [`LOCK_DEADLINE`] for another holder.
+    /// Take the exclusive OS lock on the configuration directory, waiting at
+    /// most [`LOCK_DEADLINE`] for another holder.
+    ///
+    /// The directory, not `credentials.toml`, carries the lock: every write
+    /// atomically replaces the file with a new inode, while the directory is
+    /// stable and adds no file of its own.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::SavedLogin`] with reason `lock_timeout`
-    /// when the deadline passes, `unsafe_store` for an unsafe lock file, and
-    /// an IO failure otherwise.
-    fn lock(&self, stem: &str) -> Result<RecordLock, WyrdClientError> {
-        self.prepare_dir(true)?;
-        let path = self.dir.join(format!("{stem}.lock"));
-        if let Ok(metadata) = std::fs::symlink_metadata(&path) {
-            check_private(&path, &metadata)?;
-        }
-        let file = private_options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|error| io_failure(&error))?;
-        let deadline = Instant::now() + LOCK_DEADLINE;
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(RecordLock { _file: file }),
-                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                    std::thread::sleep(LOCK_RETRY);
+    /// when the deadline passes, `unsafe_store` for an unsafe directory or a
+    /// platform without POSIX file permissions, and an IO failure otherwise.
+    fn lock(&self) -> Result<StoreLock, WyrdClientError> {
+        self.check_dir(true)?;
+        // ponytail: Windows cannot prove a user-only file or lock a directory;
+        // saved logins fail closed there until a Windows ACL check is added.
+        #[cfg(not(unix))]
+        return Err(unsafe_store(
+            &self.dir,
+            "cannot hold saved logins on a platform without POSIX file permissions",
+        ));
+        #[cfg(unix)]
+        {
+            let dir = File::open(&self.dir).map_err(|error| io_failure(&error))?;
+            let deadline = Instant::now() + LOCK_DEADLINE;
+            loop {
+                match dir.try_lock() {
+                    Ok(()) => return Ok(StoreLock { _dir: dir }),
+                    Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                        std::thread::sleep(LOCK_RETRY);
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        return Err(saved_login(
+                            "lock_timeout",
+                            "another Wyrd process held the saved logins too long",
+                        ));
+                    }
+                    Err(std::fs::TryLockError::Error(error)) => return Err(io_failure(&error)),
                 }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    return Err(saved_login(
-                        "lock_timeout",
-                        "another Wyrd process held the saved login too long",
-                    ));
-                }
-                Err(std::fs::TryLockError::Error(error)) => return Err(io_failure(&error)),
             }
         }
     }
 
-    /// Read the record `stem` names, `None` when it does not exist.
+    /// The text of `credentials.toml`, `None` when it or the configuration
+    /// directory does not exist.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::SavedLogin`] with reason `unsafe_store` for
-    /// an unsafe file and `corrupt` for an undecodable or unknown-version
-    /// record.
-    fn read(&self, stem: &str) -> Result<Option<SavedLogin>, WyrdClientError> {
-        let path = self.record_path(stem);
+    /// Returns [`WyrdClientError::SavedLogin`] with reason `unsafe_store`
+    /// when the directory is unsafe or the file is not a regular file owned
+    /// by and private to the user (`0600`), and `io` when it cannot be read.
+    fn read_text(&self) -> Result<Option<String>, WyrdClientError> {
+        if !self.check_dir(false)? {
+            return Ok(None);
+        }
+        let path = self.path();
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -537,34 +587,91 @@ impl SavedLogins {
         if !metadata.is_file() {
             return Err(unsafe_store(&path, "is not a regular file"));
         }
-        check_private(&path, &metadata)?;
-        let bytes = std::fs::read(&path).map_err(|error| io_failure(&error))?;
-        let login: SavedLogin = serde_json::from_slice(&bytes)
-            .map_err(|_| saved_login("corrupt", format!("{} does not decode", path.display())))?;
-        if login.format_version != SAVED_LOGIN_FORMAT_VERSION {
-            return Err(saved_login(
-                "corrupt",
-                format!("{} has an unknown format version", path.display()),
-            ));
-        }
-        Ok(Some(login))
+        check_owned(&path, &metadata, 0o077)?;
+        std::fs::read_to_string(&path)
+            .map(Some)
+            .map_err(|error| io_failure(&error))
     }
 
-    /// Atomically replace the record `stem` names with `login`.
+    /// Every saved login in `credentials.toml`.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::SavedLogin`] when any write, `fsync`, or
-    /// rename fails; the previous record is then unchanged.
-    fn write(&self, stem: &str, login: &SavedLogin) -> Result<(), WyrdClientError> {
+    /// The errors of [`Self::read_text`], and `corrupt` when the file is not
+    /// TOML, a login does not decode, or a login has an unknown format
+    /// version.
+    fn read(&self) -> Result<Vec<SavedLogin>, WyrdClientError> {
+        let Some(text) = self.read_text()? else {
+            return Ok(Vec::new());
+        };
+        let path = self.path();
+        let stored: StoredLogins = toml::from_str(&text).map_err(|_| {
+            saved_login(
+                "corrupt",
+                format!("{} has saved logins that do not decode", path.display()),
+            )
+        })?;
+        if stored
+            .logins
+            .iter()
+            .any(|login| login.format_version != SAVED_LOGIN_FORMAT_VERSION)
+        {
+            return Err(saved_login(
+                "corrupt",
+                format!(
+                    "{} has a saved login of an unknown format version",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(stored.logins)
+    }
+
+    /// Atomically replace `credentials.toml` with its current content and
+    /// `logins` as its saved logins.
+    ///
+    /// The current file is reread and edited in place, so every other key,
+    /// comment, and layout the user wrote survives; an empty `logins`
+    /// removes the `[[logins]]` tables. The new text goes to a `0600`
+    /// temporary file in the same directory, is `fsync`ed, renamed over the
+    /// file, and the directory is `fsync`ed. Callers hold the store lock.
+    ///
+    /// # Errors
+    /// Returns [`WyrdClientError::SavedLogin`] with the errors of
+    /// [`Self::read_text`], `corrupt` when the current file is not TOML or a
+    /// login does not encode, and `io` when any write, `fsync`, or rename
+    /// fails; the previous file is then unchanged.
+    fn write(&self, logins: &[SavedLogin]) -> Result<(), WyrdClientError> {
+        let corrupt = || {
+            saved_login(
+                "corrupt",
+                format!("{} is not valid TOML", self.path().display()),
+            )
+        };
+        let mut document = match self.read_text()? {
+            Some(text) => text
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|_| corrupt())?,
+            None => toml_edit::DocumentMut::new(),
+        };
+        if logins.is_empty() {
+            document.remove(LOGINS_KEY);
+        } else {
+            let mut rendered = toml::to_string(&StoredLoginsRef { logins })
+                .map_err(|_| saved_login("corrupt", "the saved logins do not encode"))?
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|_| saved_login("corrupt", "the saved logins do not encode"))?;
+            if let Some(item) = rendered.remove(LOGINS_KEY) {
+                document.insert(LOGINS_KEY, item);
+            }
+        }
         let mut temp =
             tempfile::NamedTempFile::new_in(&self.dir).map_err(|error| io_failure(&error))?;
-        let bytes = serde_json::to_vec(login)
-            .map_err(|_| saved_login("corrupt", "the saved login does not encode"))?;
-        temp.write_all(&bytes).map_err(|error| io_failure(&error))?;
+        temp.write_all(document.to_string().as_bytes())
+            .map_err(|error| io_failure(&error))?;
         temp.as_file()
             .sync_all()
             .map_err(|error| io_failure(&error))?;
-        temp.persist(self.record_path(stem))
+        temp.persist(self.path())
             .map_err(|error| io_failure(&error.error))?;
         sync_dir(&self.dir)
     }
@@ -576,8 +683,10 @@ impl SavedLogins {
 pub struct SavedLoginSource {
     /// The store holding the record.
     store: SavedLogins,
-    /// The record's file stem.
-    stem: String,
+    /// Canonical origin the record is saved under.
+    origin: String,
+    /// Tenant the record belongs to.
+    tenant_id: DataTenantId,
     /// Non-secret identity: origin and tenant id.
     identity: String,
     /// The unauthenticated `/auth` surface renewal exchanges through.
@@ -602,7 +711,7 @@ impl AccessTokenSource for SavedLoginSource {
     /// Return the saved access token, renewing it first when it is near
     /// expiry.
     ///
-    /// Runs on the middleware's blocking pool: it takes the record's OS lock,
+    /// Runs on the middleware's blocking pool: it takes the store's OS lock,
     /// rereads the record, and returns a fresh access token as stored, which
     /// may be another process's newer generation. A stale `Ready` record is
     /// durably moved to `RefreshPending`, its refresh token is exchanged once
@@ -617,7 +726,8 @@ impl AccessTokenSource for SavedLoginSource {
     /// `tenant_mismatch` when it renews into another tenant, `lock_timeout`, `unsafe_store`, or `corrupt`. A failed renewal leaves
     /// the record `RefreshPending`, so it never retries the token.
     fn mint(&self) -> Result<MintedAccessToken, WyrdClientError> {
-        self.store.renew(&self.stem, &self.exchange)
+        self.store
+            .renew(&self.origin, self.tenant_id, &self.exchange)
     }
 }
 
@@ -646,13 +756,6 @@ fn access_token_tenant(token: &SecretBearer) -> Option<DataTenantId> {
     serde_json::from_slice::<Claims>(&bytes)
         .ok()
         .map(|claims| claims.principal.tenant_id)
-}
-
-/// File stem of the record for `origin` and `tenant_id`: a hash, so neither
-/// value has to be a safe file name.
-fn record_stem(origin: &str, tenant_id: DataTenantId) -> String {
-    let digest = Sha256::digest(format!("{origin}\n{tenant_id}").as_bytes());
-    hex::encode(&digest[..16])
 }
 
 /// The client-local saved-login error.
@@ -689,14 +792,6 @@ fn sync_dir(dir: &Path) -> Result<(), WyrdClientError> {
     Ok(())
 }
 
-/// Open options that create files readable and writable by the owner only.
-fn private_options() -> OpenOptions {
-    let mut options = OpenOptions::new();
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    options
-}
-
 /// Create `dir` (and its parents) with the leaf private to the owner.
 ///
 /// # Errors
@@ -709,21 +804,27 @@ fn create_private_dir(dir: &Path) -> Result<(), WyrdClientError> {
     builder.create(dir).map_err(|error| io_failure(&error))
 }
 
-/// Refuse an entry that is a symlink, owned by another user, or accessible to
-/// the group or others.
+/// Refuse an entry that is a symlink, owned by another user, or has any of
+/// the `forbidden` group/other mode bits set.
 ///
 /// # Errors
 /// Returns [`WyrdClientError::SavedLogin`] with reason `unsafe_store`.
-fn check_private(path: &Path, metadata: &std::fs::Metadata) -> Result<(), WyrdClientError> {
+fn check_owned(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    forbidden: u32,
+) -> Result<(), WyrdClientError> {
     if metadata.file_type().is_symlink() {
         return Err(unsafe_store(path, "is a symlink"));
     }
+    #[cfg(not(unix))]
+    let _ = forbidden;
     #[cfg(unix)]
     {
         if std::os::unix::fs::MetadataExt::uid(metadata) != rustix::process::geteuid().as_raw() {
             return Err(unsafe_store(path, "is owned by another user"));
         }
-        if std::os::unix::fs::MetadataExt::mode(metadata) & 0o077 != 0 {
+        if std::os::unix::fs::MetadataExt::mode(metadata) & forbidden != 0 {
             return Err(unsafe_store(path, "is accessible to other users"));
         }
     }
@@ -809,7 +910,7 @@ mod tests {
     #[test]
     fn selection_is_exact_and_never_guesses_a_tenant() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SavedLogins::at(dir.path().join("logins"));
+        let store = SavedLogins::at(dir.path().to_path_buf());
         let origin = "https://wyrd.example.com";
         let acme = login(origin, "acme");
         store.save(acme.clone()).expect("saves");
@@ -851,7 +952,7 @@ mod tests {
     #[test]
     fn logout_tombstones_before_deleting() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SavedLogins::at(dir.path().join("logins"));
+        let store = SavedLogins::at(dir.path().to_path_buf());
         let record = login("https://wyrd.example.com", "acme");
         store.save(record.clone()).expect("saves");
 
@@ -874,51 +975,105 @@ mod tests {
         assert_eq!(store.list().expect("lists").len(), 1);
     }
 
-    /// A record that does not decode and a store or record other users can
-    /// read are refused, never skipped.
-    #[cfg(unix)]
+    /// The saved logins share `credentials.toml` with the user's own
+    /// content: a save and a logout carry every other key and comment
+    /// through, and no other file or directory is left behind.
     #[test]
-    fn unsafe_and_corrupt_stores_fail_closed() {
+    fn logins_live_in_credentials_toml_beside_user_content() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SavedLogins::at(dir.path().join("logins"));
-        let record = login("https://wyrd.example.com", "acme");
-        store.save(record.clone()).expect("saves");
-        let file = std::fs::read_dir(dir.path().join("logins"))
-            .expect("lists")
-            .map(|entry| entry.expect("entry").path())
-            .find(|path| path.extension().is_some_and(|ext| ext == "json"))
-            .expect("record file");
-
-        std::fs::set_permissions(
-            &file,
-            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
-        )
-        .expect("chmod");
-        let error = store.select(&record.origin, None).expect_err("unsafe");
-        assert!(error.to_string().contains("unsafe_store"), "{error}");
-
+        let file = dir.path().join("credentials.toml");
+        let user = "# my machine key\n[default]\napi_key = \"wyrd_sk_user\" # keep\n";
+        std::fs::write(&file, user).expect("writes");
+        #[cfg(unix)]
         std::fs::set_permissions(
             &file,
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
         )
         .expect("chmod");
-        std::fs::write(&file, b"{not json").expect("corrupts");
+        let store = SavedLogins::at(dir.path().to_path_buf());
+        let origin = "https://wyrd.example.com";
+        let acme = login(origin, "acme");
+        let globex = login(origin, "globex");
+        store.save(acme.clone()).expect("saves");
+        store.save(globex.clone()).expect("saves");
+
+        let text = std::fs::read_to_string(&file).expect("reads");
+        assert!(text.starts_with(user), "{text}");
+        assert_eq!(
+            store.list().expect("lists"),
+            vec![
+                SavedLogin {
+                    generation: acme.generation,
+                    ..acme.clone()
+                },
+                globex.clone()
+            ]
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("lists dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, ["credentials.toml"]);
+
+        for record in [&acme, &globex] {
+            store
+                .begin_logout(&record.origin, record.tenant_id)
+                .expect("tombstones");
+            store
+                .finish_logout(&record.origin, record.tenant_id)
+                .expect("removes");
+        }
+        assert_eq!(std::fs::read_to_string(&file).expect("reads"), user);
+    }
+
+    /// A file that does not decode, a file other users can read, a
+    /// symlinked file, and a world-writable directory are refused,
+    /// never skipped.
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_and_corrupt_stores_fail_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SavedLogins::at(dir.path().to_path_buf());
+        let record = login("https://wyrd.example.com", "acme");
+        store.save(record.clone()).expect("saves");
+        let file = dir.path().join("credentials.toml");
+        let chmod = |path: &std::path::Path, mode: u32| {
+            std::fs::set_permissions(
+                path,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(mode),
+            )
+            .expect("chmod");
+        };
+
+        chmod(&file, 0o644);
+        let error = store.select(&record.origin, None).expect_err("unsafe");
+        assert!(error.to_string().contains("unsafe_store"), "{error}");
+        let error = store.save(record.clone()).expect_err("unsafe write");
+        assert!(error.to_string().contains("unsafe_store"), "{error}");
+
+        chmod(&file, 0o600);
+        std::fs::write(&file, b"[[logins]]\nformat_version = 1\n").expect("corrupts");
         let error = store.select(&record.origin, None).expect_err("corrupt");
         assert!(error.to_string().contains("corrupt"), "{error}");
 
         std::fs::remove_file(&file).expect("removes");
-        let link = file.clone();
-        std::os::unix::fs::symlink(dir.path(), &link).expect("links");
+        let target = dir.path().join("elsewhere.toml");
+        std::fs::write(&target, b"").expect("writes");
+        chmod(&target, 0o600);
+        std::os::unix::fs::symlink(&target, &file).expect("links");
         let error = store.select(&record.origin, None).expect_err("symlink");
         assert!(error.to_string().contains("unsafe_store"), "{error}");
-        std::fs::remove_file(&link).expect("unlinks");
+        std::fs::remove_file(&file).expect("unlinks");
 
-        std::fs::set_permissions(
-            dir.path().join("logins"),
-            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
-        )
-        .expect("chmod");
+        chmod(dir.path(), 0o777);
         let error = store.select(&record.origin, None).expect_err("open dir");
         assert!(error.to_string().contains("unsafe_store"), "{error}");
+        chmod(dir.path(), 0o775);
+        assert!(
+            store
+                .select(&record.origin, None)
+                .expect("readable dir")
+                .is_none()
+        );
     }
 }

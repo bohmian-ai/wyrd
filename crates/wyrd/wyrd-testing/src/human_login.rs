@@ -302,11 +302,11 @@ impl HumanSso {
     }
 }
 
-/// The saved-login store under the Wyrd configuration directory
-/// `config_home`, the one `WYRD_CONFIG_HOME` names.
+/// The saved logins in `credentials.toml` under the Wyrd configuration
+/// directory `config_home`, the one `WYRD_CONFIG_HOME` names.
 #[must_use]
 pub fn saved_logins(config_home: &Path) -> SavedLogins {
-    SavedLogins::at(config_home.join("logins"))
+    SavedLogins::at(config_home.to_path_buf())
 }
 
 /// The saved login for `tenant` at `origin` under `config_home`.

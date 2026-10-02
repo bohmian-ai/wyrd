@@ -27,6 +27,13 @@ const BIFROST_DURATION_BUCKETS: &[f64] = &[
     600.0, 1800.0,
 ];
 
+/// Verification execution, queue, phase, and overhead buckets (seconds),
+/// resolving sub-millisecond preparation and the 10 ms scoring objective.
+const VERIFICATION_DURATION_BUCKETS: &[f64] = &[
+    0.0005, 0.001, 0.0025, 0.005, 0.0075, 0.009, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+    10.0, 30.0, 60.0, 300.0,
+];
+
 /// Wyrd metric names. Keep these stable — dashboards depend on them.
 pub const HTTP_REQUESTS_TOTAL: &str = "wyrd_http_requests_total";
 /// Histogram of HTTP request latency in seconds, labelled like [`HTTP_REQUESTS_TOTAL`].
@@ -61,24 +68,29 @@ pub const WYRD_STORAGE_OPERATION_DURATION_SECONDS: &str = "wyrd_storage_operatio
 
 /// Non-terminal Verifier runs and Operator dispatches, by `queue` and `status`.
 pub const VERIFICATION_QUEUE_DEPTH: &str = "wyrd_verification_queue_depth";
-/// Verifier executions currently in flight in this process.
+/// Verifier executions currently in flight in this process, by `kind` and `mode`.
 pub const VERIFICATION_ACTIVE_RUNS: &str = "wyrd_verification_active_runs";
-/// Verifier run attempts this process claimed, by `implementation`.
+/// Claimed queued attempts and admitted direct executions, by `kind` and `mode`.
 pub const VERIFICATION_RUN_ATTEMPTS_TOTAL: &str = "wyrd_verification_run_attempts_total";
-/// Verifier attempts that did not complete, by `implementation` and `status`.
+/// Unsuccessful execution outcomes, by `kind`, `mode`, and `outcome`; a
+/// completed failed judgment is not one.
 pub const VERIFICATION_RUN_FAILURES_TOTAL: &str = "wyrd_verification_run_failures_total";
-/// Claim-to-settlement latency of one Verifier attempt, by `implementation` and `outcome`.
+/// Queued claim-to-settlement or direct entry-to-result latency, by `kind`,
+/// `mode`, and `outcome`.
 pub const VERIFICATION_RUN_DURATION_SECONDS: &str = "wyrd_verification_run_duration_seconds";
 /// How long a claimed Verifier run had been claimable before its claim, as
-/// PostgreSQL measured it, by `implementation` and `origin`.
+/// PostgreSQL measured it, by `kind` and `origin`.
 pub const VERIFICATION_QUEUE_WAIT_SECONDS: &str = "wyrd_verification_queue_wait_seconds";
-/// Run creation to durable terminal settlement, by `implementation`, `origin`,
-/// and terminal `outcome`; its `_count` is the settled terminal runs.
+/// Run creation to durable terminal settlement, by `kind`, `origin`, and
+/// terminal `outcome`; its `_count` is the settled terminal runs.
 pub const VERIFICATION_TRIGGER_TO_TERMINAL_SECONDS: &str =
     "wyrd_verification_trigger_to_terminal_seconds";
-/// Non-overlapping phases of one Verifier attempt, by `implementation` and
-/// `phase` (`load`, `engine`, `publication`, `settlement`).
+/// Overlapping phases of one execution, by `kind`, `mode`, and `phase`
+/// (`load`, `input_read`, `prepare`, `engine`, `publication`, `settlement`).
 pub const VERIFICATION_PHASE_DURATION_SECONDS: &str = "wyrd_verification_phase_duration_seconds";
+/// Engine elapsed time less the union of its measured waits, by `kind`,
+/// `mode`, and `outcome`; wall time, not CPU.
+pub const VERIFICATION_ENGINE_OVERHEAD_SECONDS: &str = "wyrd_verification_engine_overhead_seconds";
 /// Scheduler occurrences processed, by `outcome`.
 pub const VERIFICATION_SCHEDULE_TICKS_TOTAL: &str = "wyrd_verification_schedule_ticks_total";
 /// Whether each verification runtime capability task is running, by `capability`.
@@ -93,11 +105,13 @@ pub const OPERATOR_DISPATCH_ATTEMPTS_TOTAL: &str = "wyrd_operator_dispatch_attem
 /// Claim-to-settlement latency of one Operator attempt, by `outcome`.
 pub const OPERATOR_DISPATCH_DURATION_SECONDS: &str = "wyrd_operator_dispatch_duration_seconds";
 
-/// Verification latency families added beside the claim-to-settlement histogram.
+/// Verification latency families sharing [`VERIFICATION_DURATION_BUCKETS`].
 const VERIFICATION_DURATION_FAMILIES: &[&str] = &[
+    VERIFICATION_RUN_DURATION_SECONDS,
     VERIFICATION_QUEUE_WAIT_SECONDS,
     VERIFICATION_TRIGGER_TO_TERMINAL_SECONDS,
     VERIFICATION_PHASE_DURATION_SECONDS,
+    VERIFICATION_ENGINE_OVERHEAD_SECONDS,
 ];
 
 /// Every production Bifrost duration family whose p99 is consumed by qualification.
@@ -218,19 +232,19 @@ pub fn install_recorder() -> Result<PrometheusHandle, MetricsError> {
         )
         .map_err(MetricsError::Buckets)?
         .set_buckets_for_metric(
-            Matcher::Full(VERIFICATION_RUN_DURATION_SECONDS.to_owned()),
-            BIFROST_DURATION_BUCKETS,
-        )
-        .map_err(MetricsError::Buckets)?
-        .set_buckets_for_metric(
             Matcher::Full(OPERATOR_DISPATCH_DURATION_SECONDS.to_owned()),
             BIFROST_DURATION_BUCKETS,
         )
         .map_err(MetricsError::Buckets)?;
-    for family in VERIFICATION_DURATION_FAMILIES
-        .iter()
-        .chain(BIFROST_P99_DURATION_FAMILIES)
-    {
+    for family in VERIFICATION_DURATION_FAMILIES {
+        builder = builder
+            .set_buckets_for_metric(
+                Matcher::Full((*family).to_owned()),
+                VERIFICATION_DURATION_BUCKETS,
+            )
+            .map_err(MetricsError::Buckets)?;
+    }
+    for family in BIFROST_P99_DURATION_FAMILIES {
         builder = builder
             .set_buckets_for_metric(
                 Matcher::Full((*family).to_owned()),

@@ -36,6 +36,7 @@ use arrow::array::{Array, Float64Array, Int64Array, RecordBatch};
 use chrono::{DateTime, SecondsFormat, Utc};
 use datafusion::sql::sqlparser::ast::Value;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 use vala_drift::psi::BinType;
 use vala_drift::{
     DriftReport, DriftScoreError, FITTED_FORMAT, FittedBaseline, PsiBaseline, SpcBaseline,
@@ -55,6 +56,7 @@ use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::verifier_runs::{ClaimedRun, RunInput, TerminalStatus};
 
 use super::engines::{EngineOutcome, VerifierReport};
+use super::telemetry::{ExecutionTelemetry, Phase, StreamWaits};
 use crate::components::auth::Caller;
 use crate::query::scheduled::ScheduledQueryCaller;
 use crate::state::AppState;
@@ -671,7 +673,10 @@ impl DriftEngine {
     ///
     /// Loads the fitted baseline (PSI/SPC), runs one fixed aggregate
     /// statement as the tenant's SYSTEM Drift reader, and scores the folded
-    /// aggregates. Never fails: every failure is the [`EngineOutcome`] it
+    /// aggregates. Baseline retrieval and statement construction are the
+    /// `prepare` phase, the streaming read is `input_read`, and the baseline
+    /// read, token mint, and gaps between streamed batches are waits on
+    /// `telemetry`. Never fails: every failure is the [`EngineOutcome`] it
     /// maps to.
     pub async fn verify(
         &self,
@@ -679,8 +684,12 @@ impl DriftEngine {
         verifier: &CardRef,
         run: &ClaimedRun,
         spec: &DriftSpec,
+        telemetry: &ExecutionTelemetry,
     ) -> EngineOutcome {
-        match self.try_verify(tenant, verifier, run, spec).await {
+        match self
+            .try_verify(tenant, verifier, run, spec, telemetry)
+            .await
+        {
             Ok(report) => EngineOutcome::Completed(VerifierReport::Drift(report)),
             Err(outcome) => outcome,
         }
@@ -696,6 +705,7 @@ impl DriftEngine {
         verifier: &CardRef,
         run: &ClaimedRun,
         spec: &DriftSpec,
+        telemetry: &ExecutionTelemetry,
     ) -> Result<Option<vala_drift::DriftReport>, EngineOutcome> {
         let RunInput::DriftWindow(window) = &run.input else {
             return Err(terminal(
@@ -712,42 +722,59 @@ impl DriftEngine {
             engine: self,
             tenant,
             verifier,
+            telemetry,
         };
         match spec.profile.as_ref() {
             Some(DriftProfile::Custom(profile)) => {
+                let sql = telemetry
+                    .prepare(async { window.custom(&profile.metric_name) })
+                    .await;
                 let mut row = None;
                 reader
-                    .fold(window.custom(&profile.metric_name), |batch| {
-                        fold_custom(batch, &mut row)
-                    })
+                    .fold(sql, |batch| fold_custom(batch, &mut row))
                     .await?;
+                let _score = tracing::info_span!("verification.score").entered();
                 match row.flatten() {
                     Some(mean) => scored(score_custom_mean(mean, profile)),
                     None => Ok(None),
                 }
             }
             Some(DriftProfile::Psi(profile)) => {
-                let FittedBaseline::Psi(baseline) = self.fitted(tenant, &run.verifier_uid).await?
-                else {
-                    return Err(invalid(
-                        "the fitted baseline is not a PSI baseline".to_owned(),
-                    ));
-                };
-                let sql = window.psi_statement(&baseline).map_err(&invalid)?;
+                let (baseline, sql) = telemetry
+                    .prepare(async {
+                        let FittedBaseline::Psi(baseline) =
+                            self.fitted(tenant, &run.verifier_uid, telemetry).await?
+                        else {
+                            return Err(invalid(
+                                "the fitted baseline is not a PSI baseline".to_owned(),
+                            ));
+                        };
+                        let sql = window.psi_statement(&baseline).map_err(&invalid)?;
+                        Ok((baseline, sql))
+                    })
+                    .await?;
                 let mut fold = DistributionFold::psi(&baseline, profile);
                 reader.fold(sql, |batch| fold.fold(batch)).await?;
+                let _score = tracing::info_span!("verification.score").entered();
                 fold.finish().map_err(|error| invalid(error.to_string()))
             }
             Some(DriftProfile::Spc(_)) => {
-                let FittedBaseline::Spc(baseline) = self.fitted(tenant, &run.verifier_uid).await?
-                else {
-                    return Err(invalid(
-                        "the fitted baseline is not an SPC baseline".to_owned(),
-                    ));
-                };
-                let sql = window.spc_statement(&baseline).map_err(&invalid)?;
+                let (baseline, sql) = telemetry
+                    .prepare(async {
+                        let FittedBaseline::Spc(baseline) =
+                            self.fitted(tenant, &run.verifier_uid, telemetry).await?
+                        else {
+                            return Err(invalid(
+                                "the fitted baseline is not an SPC baseline".to_owned(),
+                            ));
+                        };
+                        let sql = window.spc_statement(&baseline).map_err(&invalid)?;
+                        Ok((baseline, sql))
+                    })
+                    .await?;
                 let mut fold = DistributionFold::spc(&baseline);
                 reader.fold(sql, |batch| fold.fold(batch)).await?;
+                let _score = tracing::info_span!("verification.score").entered();
                 fold.finish().map_err(|error| invalid(error.to_string()))
             }
             None => Err(invalid("the Drift Verifier has no profile".to_owned())),
@@ -756,6 +783,7 @@ impl DriftEngine {
 
     /// Load the ready fitted baseline of `verifier_uid`.
     ///
+    /// The registry read is one wait on `telemetry`; decoding is local work.
     /// A PSI or SPC profile whose `format` is not [`FITTED_FORMAT`] was fitted
     /// under earlier semantics and is refused before decoding; it is never
     /// rescored or migrated.
@@ -768,21 +796,26 @@ impl DriftEngine {
         &self,
         tenant: DataTenantId,
         verifier_uid: &CardUid,
+        telemetry: &ExecutionTelemetry,
     ) -> Result<FittedBaseline, EngineOutcome> {
         let unavailable =
             |error: &dyn std::fmt::Display| retry(DRIFT_QUERY_FAILED, error.to_string());
-        let mut conn = self
-            .state
-            .postgres
-            .wyrd()
-            .tenant_conn(tenant)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        let fitted = self
-            .baselines
-            .fitted(&mut conn, verifier_uid)
-            .await
-            .map_err(|error| unavailable(&error))?
+        let fitted = telemetry
+            .wait(async {
+                let mut conn = self
+                    .state
+                    .postgres
+                    .wyrd()
+                    .tenant_conn(tenant)
+                    .await
+                    .map_err(|error| unavailable(&error))?;
+                self.baselines
+                    .fitted(&mut conn, verifier_uid)
+                    .await
+                    .map_err(|error| unavailable(&error))
+            })
+            .instrument(tracing::info_span!("verification.baseline"))
+            .await?
             .ok_or_else(|| terminal(BASELINE_NOT_READY, "the Drift baseline is not fitted"))?;
         let format = fitted
             .as_object()
@@ -808,6 +841,8 @@ struct Reader<'a> {
     tenant: DataTenantId,
     /// Exact Verifier the read token is attributed to.
     verifier: &'a CardRef,
+    /// The execution whose input-read phase and waits this reader records.
+    telemetry: &'a ExecutionTelemetry,
 }
 
 impl Reader<'_> {
@@ -861,17 +896,36 @@ impl Reader<'_> {
     ///
     /// A tenant with no observation table reads nothing and `fold` is never
     /// called. The stream is consumed and settled by the shared scheduled
-    /// consumer; a batch `fold` refuses terminates the run as invalid.
+    /// consumer; a batch `fold` refuses terminates the run as invalid. The
+    /// whole read is the `input_read` phase; the token mint and the gaps
+    /// between streamed batches are waits, while folding stays local work.
     ///
     /// # Errors
     /// Retries a mint, admission, query, or stream failure; terminates on a
     /// malformed aggregate.
-    #[tracing::instrument(name = "verification.evidence_read", skip_all)]
-    async fn fold<F>(&self, sql: String, mut fold: F) -> Result<(), EngineOutcome>
+    async fn fold<F>(&self, sql: String, fold: F) -> Result<(), EngineOutcome>
     where
         F: FnMut(&RecordBatch) -> Result<(), String>,
     {
-        let Some(caller) = self.caller().await? else {
+        self.telemetry
+            .phase(
+                Phase::InputRead,
+                self.read(sql, fold)
+                    .instrument(tracing::info_span!("verification.evidence_read")),
+            )
+            .await
+    }
+
+    /// The body of [`fold`](Self::fold): mint, query, and fold the stream.
+    ///
+    /// # Errors
+    /// Retries a mint, admission, query, or stream failure; terminates on a
+    /// malformed aggregate.
+    async fn read<F>(&self, sql: String, mut fold: F) -> Result<(), EngineOutcome>
+    where
+        F: FnMut(&RecordBatch) -> Result<(), String>,
+    {
+        let Some(caller) = self.telemetry.wait(self.caller()).await? else {
             return Ok(());
         };
         let failed = |error: WyrdError| retry(DRIFT_QUERY_FAILED, error.to_string());
@@ -888,14 +942,19 @@ impl Reader<'_> {
             ),
         };
         let mut malformed = None;
+        let mut waits = StreamWaits::open(self.telemetry);
         let settled = query
             .run_with(request, |batch| {
-                fold(&batch).map_err(|message| {
+                waits.folding();
+                let folded = fold(&batch).map_err(|message| {
                     malformed = Some(message);
                     WyrdError::from(BifrostError::QueryStreamProtocol)
-                })
+                });
+                waits.folded();
+                folded
             })
             .await;
+        waits.close();
         if let Some(message) = malformed {
             return Err(terminal(DRIFT_INVALID, message));
         }

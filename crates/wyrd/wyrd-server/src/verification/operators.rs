@@ -428,7 +428,8 @@ impl LeasedWork for OperatorWorker {
     type Claim = ClaimedDispatch;
 
     const CAPABILITY: RuntimeCapability = RuntimeCapability::OperatorWorker;
-    const ACTIVE_GAUGE: &'static str = crate::app::metrics::OPERATOR_ACTIVE_DISPATCHES;
+    const ACTIVE_GAUGE: Option<&'static str> =
+        Some(crate::app::metrics::OPERATOR_ACTIVE_DISPATCHES);
 
     /// Tenants with due dispatches, most overdue first.
     ///
@@ -464,6 +465,7 @@ impl LeasedWork for OperatorWorker {
         dispatch: ClaimedDispatch,
         stop: CancellationToken,
         abandon: CancellationToken,
+        _spawned_at: Instant,
     ) {
         let started = Instant::now();
         let timeout = self.limits.operator_attempt_timeout.min(dispatch.remaining);

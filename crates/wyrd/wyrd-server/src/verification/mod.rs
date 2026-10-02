@@ -22,6 +22,7 @@ pub mod publisher;
 pub mod results;
 pub mod runner;
 pub mod scheduler;
+pub mod telemetry;
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;

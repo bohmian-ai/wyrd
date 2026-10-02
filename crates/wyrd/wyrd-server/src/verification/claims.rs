@@ -11,7 +11,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -38,8 +38,9 @@ pub(super) trait LeasedWork: Send + Sync + 'static {
 
     /// Health slot, crash switch, and log label of this capability.
     const CAPABILITY: RuntimeCapability;
-    /// Gauge publishing this capability's in-flight items.
-    const ACTIVE_GAUGE: &'static str;
+    /// Gauge the loop sets to this capability's in-flight items, or `None`
+    /// when the capability accounts for its own activity.
+    const ACTIVE_GAUGE: Option<&'static str>;
 
     /// Up to `limit` tenants with claimable work, most overdue first.
     ///
@@ -63,12 +64,15 @@ pub(super) trait LeasedWork: Send + Sync + 'static {
     ///
     /// `abandon` cancels the item past the drain grace; a retryable failure
     /// observed after `stop` should be released rather than charged.
+    /// `spawned_at` is the process-monotonic instant the loop spawned the
+    /// item, so its first poll can measure task-start delay.
     fn process(
         self: Arc<Self>,
         tenant: DataTenantId,
         claim: Self::Claim,
         stop: CancellationToken,
         abandon: CancellationToken,
+        spawned_at: Instant,
     ) -> impl Future<Output = ()> + Send;
 
     /// Release an item whose claim committed after shutdown began, with its
@@ -236,7 +240,13 @@ impl ClaimLoop {
                 break;
             }
             claimed += 1;
-            let process = Arc::clone(work).process(tenant, claim, stop.clone(), abandon.clone());
+            let process = Arc::clone(work).process(
+                tenant,
+                claim,
+                stop.clone(),
+                abandon.clone(),
+                Instant::now(),
+            );
             spawned.spawn(async move {
                 let _permit = permit;
                 process.await;
@@ -276,7 +286,9 @@ impl ClaimLoop {
 
     /// Publish the in-flight gauge of `W`.
     fn record_active<W: LeasedWork>(&self, active: usize) {
-        metrics::gauge!(W::ACTIVE_GAUGE).set(f64::from(u32::try_from(active).unwrap_or(u32::MAX)));
+        if let Some(gauge) = W::ACTIVE_GAUGE {
+            metrics::gauge!(gauge).set(f64::from(u32::try_from(active).unwrap_or(u32::MAX)));
+        }
     }
 }
 

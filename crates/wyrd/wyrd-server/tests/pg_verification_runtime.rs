@@ -648,7 +648,8 @@ async fn completed_run_publishes_details_then_summary_and_records_metrics() {
         assert!(rendered.contains(name), "{name} is exported:\n{rendered}");
     }
     assert!(
-        rendered.contains(r#"wyrd_verification_run_attempts_total{implementation="drift"} 1"#),
+        rendered
+            .contains(r#"wyrd_verification_run_attempts_total{kind="unknown",mode="queued"} 1"#),
         "{rendered}"
     );
 }
@@ -726,42 +727,102 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
             .find_map(|line| line.strip_prefix(series)?.strip_prefix(' '))
             .map_or(0, |value| value.parse().expect("a count is an integer"))
     };
-    let manual = r#"implementation="drift",origin="manual""#;
-    assert_eq!(
-        count(&format!(
-            "wyrd_verification_queue_wait_seconds_count{{{manual}}}"
-        )),
-        4,
-        "one queue wait per attempt:\n{rendered}"
-    );
-    for (phase, attempts) in [("load", 4), ("engine", 4), ("settlement", 4)] {
+    // The scripted attempts execute the fixture's profile-less Drift
+    // Verifier, which cannot be classified; the real run is a Custom Drift.
+    let real_published = u64::from(real_row.result_id.is_some());
+    for (kind, attempts, published, completed) in [
+        ("unknown", 3, 1, 1),
+        ("drift_custom", 1, real_published, real_published),
+    ] {
+        let manual = format!(r#"kind="{kind}",origin="manual""#);
+        let queued = format!(r#"kind="{kind}",mode="queued""#);
         assert_eq!(
             count(&format!(
-                r#"wyrd_verification_phase_duration_seconds_count{{implementation="drift",phase="{phase}"}}"#
+                "wyrd_verification_queue_wait_seconds_count{{{manual}}}"
             )),
             attempts,
-            "{phase} is timed once per attempt:\n{rendered}"
+            "one queue wait per {kind} attempt:\n{rendered}"
+        );
+        assert_eq!(
+            count(&format!("wyrd_verification_run_attempts_total{{{queued}}}")),
+            attempts,
+            "one {kind} attempt per claim:\n{rendered}"
+        );
+        for phase in ["load", "engine", "settlement"] {
+            assert_eq!(
+                count(&format!(
+                    r#"wyrd_verification_phase_duration_seconds_count{{{queued},phase="{phase}"}}"#
+                )),
+                attempts,
+                "{kind} {phase} is timed once per attempt:\n{rendered}"
+            );
+        }
+        for phase in ["input_read", "prepare"] {
+            assert_eq!(
+                count(&format!(
+                    r#"wyrd_verification_phase_duration_seconds_count{{{queued},phase="{phase}"}}"#
+                )),
+                u64::from(kind == "drift_custom"),
+                "only the real engine reads evidence and prepares:\n{rendered}"
+            );
+        }
+        assert_eq!(
+            count(&format!(
+                r#"wyrd_verification_phase_duration_seconds_count{{{queued},phase="publication"}}"#
+            )),
+            published,
+            "only completed {kind} reports publish:\n{rendered}"
+        );
+        let overhead: u64 = ["completed", "retrying", "cancelled"]
+            .iter()
+            .map(|outcome| {
+                count(&format!(
+                    r#"wyrd_verification_engine_overhead_seconds_count{{{queued},outcome="{outcome}"}}"#
+                ))
+            })
+            .sum();
+        assert_eq!(
+            overhead, attempts,
+            "every {kind} engine execution reports its overhead once:\n{rendered}"
+        );
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line == format!("wyrd_verification_active_runs{{{queued}}} 0")),
+            "the {kind} active gauge returns to zero:\n{rendered}"
+        );
+        assert_eq!(
+            count(&format!(
+                r#"wyrd_verification_trigger_to_terminal_seconds_count{{{manual},outcome="completed"}}"#
+            )),
+            completed,
+            "{rendered}"
         );
     }
-    let real_published = u64::from(real_row.result_id.is_some());
-    assert_eq!(
-        count(
-            r#"wyrd_verification_phase_duration_seconds_count{implementation="drift",phase="publication"}"#
-        ),
-        1 + real_published,
-        "only completed engine reports publish:\n{rendered}"
-    );
+    let unknown = r#"kind="unknown",mode="queued""#;
+    for outcome in ["retrying", "cancelled"] {
+        assert_eq!(
+            count(&format!(
+                r#"wyrd_verification_run_failures_total{{{unknown},outcome="{outcome}"}}"#
+            )),
+            1,
+            "{outcome} is an unsuccessful execution outcome:\n{rendered}"
+        );
+    }
     let terminal = |outcome: &str| {
         count(&format!(
-            r#"wyrd_verification_trigger_to_terminal_seconds_count{{{manual},outcome="{outcome}"}}"#
+            r#"wyrd_verification_trigger_to_terminal_seconds_count{{kind="unknown",origin="manual",outcome="{outcome}"}}"#
         ))
     };
-    assert_eq!(terminal("completed"), 1 + real_published, "{rendered}");
     assert_eq!(terminal("cancelled"), 1, "{rendered}");
     assert_eq!(
         terminal("retrying"),
         0,
         "a retry is not terminal:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("implementation="),
+        "the pooled implementation label is gone:\n{rendered}"
     );
     assert!(
         rendered
@@ -817,11 +878,16 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
         Some("manual")
     );
     assert_eq!(
-        completed
-            .attributes
-            .get("implementation")
-            .map(String::as_str),
-        Some("drift")
+        completed.attributes.get("kind").map(String::as_str),
+        Some("unknown")
+    );
+    assert_eq!(
+        completed.attributes.get("mode").map(String::as_str),
+        Some("queued")
+    );
+    assert!(
+        completed.attributes.contains_key("task_start_delay_us"),
+        "the queued attempt records its spawn-to-first-execution delay: {completed:?}"
     );
     assert!(!matches!(
         completed.status,
@@ -854,10 +920,18 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
         cancel.status,
         wyrd_telemetry::CapturedSpanStatus::Error(_)
     ));
-    assert!(
-        children(attempt(real, "1")).contains(&"verification.evidence_read"),
-        "the real engine's evidence read joins its attempt trace"
+    let real_attempt = attempt(real, "1");
+    assert_eq!(
+        real_attempt.attributes.get("kind").map(String::as_str),
+        Some("drift_custom")
     );
+    let real_children = children(real_attempt);
+    for child in ["verification.evidence_read", "verification.prepare"] {
+        assert!(
+            real_children.contains(&child),
+            "the real engine's {child} joins its attempt trace: {real_children:?}"
+        );
+    }
 
     let tenant = harness.server.pg_fixture().data_tenant_id().to_string();
     for span in spans
@@ -1277,17 +1351,21 @@ async fn baseline_fits_do_not_wait_for_verifier_executions() {
         (&other, &other_verifier),
     ] {
         let deadline = tokio::time::Instant::now() + WAIT;
-        while baseline_state(&harness.server, seed, verifier).await == DriftBaselineState::Pending {
+        let state = loop {
+            let state = baseline_state(&harness.server, seed, verifier).await;
+            if !matches!(
+                state,
+                DriftBaselineState::Pending | DriftBaselineState::Building
+            ) {
+                break state;
+            }
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "held Verifier runs blocked a baseline fit"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(
-            baseline_state(&harness.server, seed, verifier).await,
-            DriftBaselineState::Failed
-        );
+        };
+        assert_eq!(state, DriftBaselineState::Failed);
     }
     script.release();
     for run in busy {

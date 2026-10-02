@@ -21,12 +21,14 @@ use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
 use skald_runtime::ProviderRegistry;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 use vala_bifrost_redux::oracle::AuthorizedQueryContext;
+
 use vala_eval::orchestrator::{
     AgentCardResolver, MediaResolver, PromptCardResolver, ScenarioScoring, SkaldJudgeInvoker,
 };
 use vala_eval::sampling::RecordSample;
-use vala_eval::{EvalReport, InMemoryTraceSource, JudgeError};
+use vala_eval::{EvalReport, InMemoryTraceSource, JudgeError, JudgeInvoker, MediaBindings};
 use vala_sql::queries::olap_catalog::get_by_fqn;
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
@@ -35,12 +37,14 @@ use wyrd_runtime::{
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::agent::AgentSpec;
+
 use wyrd_spec::card::eval::EvalSpec;
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::VerificationRunId;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::reference::CardRefScope;
+use wyrd_spec::reference::InlineableRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::storage::StorageBackendKind;
 use wyrd_spec::vala::api::{AuthMethod, BifrostQueryRequest};
@@ -62,6 +66,7 @@ use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValueList, any_value};
 use wyrd_tonic::prost::Message as _;
 
 use super::engines::{EngineOutcome, VerifierReport};
+use super::telemetry::{ExecutionTelemetry, Phase, WaitSink};
 use crate::query::scheduled::ScheduledQueryCaller;
 use crate::state::AppState;
 
@@ -129,12 +134,15 @@ impl EvalEngine {
     /// waits for its trace when a trace task needs it, then scores it and maps
     /// the report to the common verdict. Read, sampling, and scoring failures
     /// retry, except that a read refused at Bifrost admission defers; a
-    /// non-Eval input or an unplannable spec terminates `errored`.
+    /// non-Eval input or an unplannable spec terminates `errored`. The record
+    /// and trace reads are `input_read` intervals on `telemetry` and their
+    /// query streams are waits.
     pub async fn execute(
         &self,
         tenant: DataTenantId,
         run: &ClaimedRun,
         spec: &EvalSpec,
+        telemetry: &ExecutionTelemetry,
     ) -> EngineOutcome {
         let RunInput::EvalRecord {
             record_id,
@@ -147,9 +155,21 @@ impl EvalEngine {
             ));
         };
         let run_id = run.lease.run_id;
-        let reader = match BifrostReader::new(&self.state, tenant).await {
-            Ok(reader) => reader,
-            Err(error) => {
+        let read = telemetry
+            .phase(Phase::InputRead, async {
+                let reader = BifrostReader::new(&self.state, tenant, telemetry.waits())
+                    .await
+                    .map_err(ReadStart::Authority)?;
+                let record = reader
+                    .record(&run.subject_card_uid.to_string(), record_id, *event_time)
+                    .await
+                    .map_err(ReadStart::Record)?;
+                Ok::<_, ReadStart>((reader, record))
+            })
+            .await;
+        let (reader, record) = match read {
+            Ok(read) => read,
+            Err(ReadStart::Authority(error)) => {
                 return EngineOutcome::Retry(failed(
                     run_id,
                     RECORD_UNAVAILABLE,
@@ -157,13 +177,7 @@ impl EvalEngine {
                     &error,
                 ));
             }
-        };
-        let record = match reader
-            .record(&run.subject_card_uid.to_string(), record_id, *event_time)
-            .await
-        {
-            Ok(record) => record,
-            Err(error) => {
+            Err(ReadStart::Record(error)) => {
                 return error.outcome(run_id, RECORD_UNAVAILABLE, "the Eval record cannot be read");
             }
         };
@@ -186,7 +200,13 @@ impl EvalEngine {
         }
         let traces = InMemoryTraceSource::new();
         if let Some(trace_id) = record.trace_id.filter(|_| needs_trace(spec)) {
-            match reader.spans(trace_id, *event_time, self.trace_window).await {
+            match telemetry
+                .phase(
+                    Phase::InputRead,
+                    reader.spans(trace_id, *event_time, self.trace_window),
+                )
+                .await
+            {
                 Ok(spans) if spans.is_empty() => {
                     return EngineOutcome::AwaitingTrace(failure(
                         AWAITING_TRACE,
@@ -205,13 +225,16 @@ impl EvalEngine {
                 }
             }
         }
-        self.score(tenant, run, spec, &record, traces).await
+        self.score(tenant, run, spec, &record, traces, telemetry)
+            .await
     }
 
     /// Score `record` through the one Eval execution path and map its report.
     ///
     /// A trace that is still missing when a task needs it waits; every other
-    /// execution error retries and never becomes a failed assertion.
+    /// execution error retries and never becomes a failed assertion. Plan
+    /// construction is the `prepare` phase and every judge invocation is a
+    /// wait on `telemetry`.
     async fn score(
         &self,
         tenant: DataTenantId,
@@ -219,6 +242,7 @@ impl EvalEngine {
         spec: &EvalSpec,
         record: &EvalRecordObservation,
         traces: InMemoryTraceSource,
+        telemetry: &ExecutionTelemetry,
     ) -> EngineOutcome {
         let registry = Arc::new(TenantRegistry {
             state: self.state.clone(),
@@ -234,12 +258,21 @@ impl EvalEngine {
             registry,
         )
         .with_media_resolver(media);
-        let scoring = match ScenarioScoring::new(
-            Arc::new(spec.clone()),
-            Arc::new(judge),
-            Arc::new(traces),
-            Duration::from_millis(READ_DEADLINE_MS),
-        ) {
+        let judge = TimedJudge {
+            inner: judge,
+            waits: telemetry.waits(),
+        };
+        let planned = telemetry
+            .prepare(async {
+                ScenarioScoring::new(
+                    Arc::new(spec.clone()),
+                    Arc::new(judge),
+                    Arc::new(traces),
+                    Duration::from_millis(READ_DEADLINE_MS),
+                )
+            })
+            .await;
+        let scoring = match planned {
             Ok(scoring) => scoring,
             Err(error) => {
                 return terminal(failed(
@@ -251,7 +284,11 @@ impl EvalEngine {
             }
         };
         let eval_run = RunId::from_string(run.lease.run_id.to_string());
-        match scoring.score_record(eval_run, None, record).await {
+        match scoring
+            .score_record(eval_run, None, record)
+            .instrument(tracing::info_span!("verification.score"))
+            .await
+        {
             Ok(report) => match VerifierReport::eval(report, spec) {
                 Ok(report) => EngineOutcome::Completed(report),
                 Err(error) => EngineOutcome::Retry(failed(
@@ -527,22 +564,32 @@ impl EvalReadAuthority {
 struct BifrostReader {
     /// Caller bound to the tenant System principal's Eval input read authority.
     caller: ScheduledQueryCaller,
+    /// The executing run's wait sink every query stream is recorded on.
+    waits: WaitSink,
 }
 
 impl BifrostReader {
-    /// Bind a reader for `tenant` to its [`EvalReadAuthority`].
+    /// Bind a reader for `tenant` to its [`EvalReadAuthority`], recording
+    /// the authority resolution and every later query on `waits`.
     ///
     /// # Errors
     /// Returns every [`EvalReadAuthority::resolve`] failure; no read is
     /// attempted without the System principal's authority.
-    async fn new(state: &AppState, tenant: DataTenantId) -> Result<Self, EvalReadAuthorityError> {
-        let authority = EvalReadAuthority::resolve(state, tenant).await?;
+    async fn new(
+        state: &AppState,
+        tenant: DataTenantId,
+        waits: WaitSink,
+    ) -> Result<Self, EvalReadAuthorityError> {
+        let authority = waits
+            .wait(EvalReadAuthority::resolve(state, tenant))
+            .await?;
         Ok(Self {
             caller: ScheduledQueryCaller::new(
                 state.clone(),
                 authority.context,
                 CancellationToken::new(),
             ),
+            waits,
         })
     }
 
@@ -553,8 +600,8 @@ impl BifrostReader {
     #[tracing::instrument(name = "verification.evidence_read", skip_all)]
     async fn query(&self, sql: String) -> Result<Vec<RecordBatch>, WyrdError> {
         let mut batches = Vec::new();
-        self.caller
-            .run_with(
+        self.waits
+            .wait(self.caller.run_with(
                 BifrostQueryRequest {
                     sql,
                     deadline_ms: i64::try_from(READ_DEADLINE_MS).ok(),
@@ -563,7 +610,7 @@ impl BifrostReader {
                     batches.push(batch);
                     Ok(())
                 },
-            )
+            ))
             .await?;
         Ok(batches)
     }
@@ -978,6 +1025,49 @@ fn int32(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<i32>, Str
         .downcast_ref::<Int32Array>()
         .ok_or_else(|| format!("column {name} is not an integer"))?;
     Ok(column.is_valid(row).then(|| column.value(row)))
+}
+
+/// The first failure of an Eval input read: authority or record.
+enum ReadStart {
+    /// The System principal's read authority could not be resolved.
+    Authority(EvalReadAuthorityError),
+    /// The frozen record could not be read.
+    Record(ReadError),
+}
+
+/// The production judge invoker, recording each invocation as one wait.
+///
+/// Wraps the Skald invoker the executor fans out on its task set; the
+/// shared [`WaitSink`] lets a wait measured inside a spawned task join its
+/// execution's overhead accounting.
+// ponytail: the wait spans the whole invocation, so judge Agent/Prompt
+// resolution and prompt rendering count as wait; split at the provider call
+// if that preparation ever shows up in profiles.
+struct TimedJudge {
+    /// The Skald invoker that resolves, renders, and calls the provider.
+    inner: SkaldJudgeInvoker,
+    /// The executing run's wait sink.
+    waits: WaitSink,
+}
+
+#[async_trait]
+impl JudgeInvoker for TimedJudge {
+    /// Invoke the inner judge once inside a `verification.judge` span,
+    /// recording the call as one wait.
+    ///
+    /// # Errors
+    /// Returns the inner invoker's [`JudgeError`] unchanged.
+    async fn invoke(
+        &self,
+        judge: &InlineableRef<AgentSpec>,
+        context: Value,
+        media: &MediaBindings,
+    ) -> Result<Value, JudgeError> {
+        self.waits
+            .wait(self.inner.invoke(judge, context, media))
+            .instrument(tracing::info_span!("verification.judge"))
+            .await
+    }
 }
 
 /// Resolves judge Agent and Prompt Cards from the run tenant's registry.

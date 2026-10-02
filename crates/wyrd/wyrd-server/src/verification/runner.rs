@@ -34,7 +34,7 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::verification::{VerificationError, VerificationVerdict};
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verifier_runs::{
-    ClaimedRun, RetryOutcome, RunInput, TerminalStatus, TraceWaitOutcome, VerifierRunQueue,
+    ClaimedRun, RetryOutcome, TerminalStatus, TraceWaitOutcome, VerifierRunQueue,
 };
 use wyrd_sql::{OperatorPool, SqlError, TenantConn, WyrdPostgres};
 
@@ -48,6 +48,7 @@ use super::eval::EvalEngine;
 use super::health::RuntimeCapability;
 use super::publisher::ResultPublisher;
 use super::results::{ResultPayloadBuilder, ResultRun};
+use super::telemetry::{ExecutionMode, ExecutionTelemetry, Phase, VerifierKind};
 
 /// Stable error code when the exact Verifier Card cannot be loaded or is not
 /// a Verifier.
@@ -120,20 +121,27 @@ impl VerifierEngines {
     /// Executes one claimed run through the arm its implementation names.
     ///
     /// Drift reads as the SYSTEM principal scoped to the exact `verifier`;
-    /// Eval executes the run's continuous evaluation for `tenant`. Every
-    /// failure is carried in the returned [`EngineOutcome`], not raised.
+    /// Eval executes the run's continuous evaluation for `tenant`. Each arm
+    /// records its input-read, preparation, and wait intervals on
+    /// `telemetry`. Every failure is carried in the returned
+    /// [`EngineOutcome`], not raised.
     async fn execute(
         &self,
         tenant: DataTenantId,
         run: &ClaimedRun,
         verifier: &CardRef,
         implementation: &VerifierImplementation,
+        telemetry: &ExecutionTelemetry,
     ) -> EngineOutcome {
         match implementation {
             VerifierImplementation::Drift(spec) => {
-                self.drift.verify(tenant, verifier, run, spec).await
+                self.drift
+                    .verify(tenant, verifier, run, spec, telemetry)
+                    .await
             }
-            VerifierImplementation::Eval(spec) => self.eval.execute(tenant, run, spec).await,
+            VerifierImplementation::Eval(spec) => {
+                self.eval.execute(tenant, run, spec, telemetry).await
+            }
         }
     }
 }
@@ -228,28 +236,37 @@ impl VerifierRunner {
     /// Never fails: every failure becomes the [`Transition`] it maps to.
     ///
     /// Each owned phase — `load`, `engine`, and `publication` — runs in its
-    /// own child span and records its process-local [`Instant`] duration.
-    async fn execute(&self, tenant: DataTenantId, run: &ClaimedRun) -> Transition {
-        let label = input_implementation(&run.input);
-        let phase = Instant::now();
-        let loaded = self
-            .load_verifier(tenant, run)
-            .instrument(tracing::info_span!("verification.load"))
+    /// own child span and is recorded on `telemetry`; the execution is
+    /// classified by its exact Verifier as soon as that loads.
+    async fn execute(
+        &self,
+        tenant: DataTenantId,
+        run: &ClaimedRun,
+        telemetry: &ExecutionTelemetry,
+    ) -> Transition {
+        let loaded = telemetry
+            .phase(
+                Phase::Load,
+                self.load_verifier(tenant, run)
+                    .instrument(tracing::info_span!("verification.load")),
+            )
             .await;
-        record_phase(label, "load", phase);
         let (verifier, implementation) = match loaded {
             Ok(loaded) => loaded,
             Err(transition) => return transition,
         };
+        telemetry.classify(VerifierKind::of(&implementation));
         let started_at = Utc::now();
-        let phase = Instant::now();
-        let executed = tokio::time::timeout(
-            self.limits.execution_timeout,
-            self.dispatch(tenant, run, &verifier, &implementation),
-        )
-        .instrument(tracing::info_span!("verification.engine"))
-        .await;
-        record_phase(label, "engine", phase);
+        let executed = telemetry
+            .phase(
+                Phase::Engine,
+                tokio::time::timeout(
+                    self.limits.execution_timeout,
+                    self.dispatch(tenant, run, &verifier, &implementation, telemetry),
+                )
+                .instrument(tracing::info_span!("verification.engine")),
+            )
+            .await;
         let outcome = match executed {
             Ok(outcome) => outcome,
             Err(_) => {
@@ -264,13 +281,13 @@ impl VerifierRunner {
         };
         match outcome {
             EngineOutcome::Completed(report) => {
-                let phase = Instant::now();
-                let transition = self
-                    .publish(tenant, run, &verifier, &report, started_at)
-                    .instrument(tracing::info_span!("verification.publish"))
-                    .await;
-                record_phase(label, "publication", phase);
-                transition
+                telemetry
+                    .phase(
+                        Phase::Publication,
+                        self.publish(tenant, run, &verifier, &report, started_at)
+                            .instrument(tracing::info_span!("verification.publish")),
+                    )
+                    .await
             }
             EngineOutcome::Retry(error) => Transition::Retry(error),
             EngineOutcome::AwaitingTrace(error) => Transition::AwaitTrace(error),
@@ -339,6 +356,7 @@ impl VerifierRunner {
         run: &ClaimedRun,
         verifier: &CardRef,
         implementation: &VerifierImplementation,
+        telemetry: &ExecutionTelemetry,
     ) -> EngineOutcome {
         #[cfg(feature = "test-support")]
         if let Some(script) = &self.script
@@ -347,7 +365,7 @@ impl VerifierRunner {
             return outcome;
         }
         self.engines
-            .execute(tenant, run, verifier, implementation)
+            .execute(tenant, run, verifier, implementation, telemetry)
             .await
     }
 
@@ -514,7 +532,8 @@ impl LeasedWork for VerifierRunner {
     type Claim = AttemptClaim;
 
     const CAPABILITY: RuntimeCapability = RuntimeCapability::Runner;
-    const ACTIVE_GAUGE: &'static str = crate::app::metrics::VERIFICATION_ACTIVE_RUNS;
+    /// Verifier activity is counted per kind by [`ExecutionTelemetry`].
+    const ACTIVE_GAUGE: Option<&'static str> = None;
 
     /// Tenants with runnable runs, most overdue first.
     ///
@@ -542,8 +561,10 @@ impl LeasedWork for VerifierRunner {
             "verification.attempt",
             run_id = Empty,
             attempt = Empty,
-            implementation = Empty,
+            kind = Empty,
+            mode = ExecutionMode::Queued.as_str(),
             origin = Empty,
+            task_start_delay_us = Empty,
             outcome = Empty,
             error_code = Empty,
             otel.status_code = Empty,
@@ -556,7 +577,6 @@ impl LeasedWork for VerifierRunner {
         Ok(claimed.map(|run| {
             span.record("run_id", display(run.lease.run_id));
             span.record("attempt", run.attempt);
-            span.record("implementation", input_implementation(&run.input));
             span.record("origin", run.origin.as_str());
             AttemptClaim { run, span }
         }))
@@ -564,7 +584,8 @@ impl LeasedWork for VerifierRunner {
 
     /// Execute one claimed run and apply its single transition.
     ///
-    /// The claim loop tracks the task until settlement. Cancellation through `abandon`
+    /// Records the spawn-to-first-execution delay since `spawned_at` on the
+    /// attempt span. The claim loop tracks the task until settlement. Cancellation through `abandon`
     /// (shutdown past its grace) stops the execution and releases the lease;
     /// a retryable failure observed after `stop` is also released rather than
     /// charged an attempt, since the process, not the run, failed.
@@ -574,8 +595,13 @@ impl LeasedWork for VerifierRunner {
         claim: AttemptClaim,
         stop: CancellationToken,
         abandon: CancellationToken,
+        spawned_at: Instant,
     ) {
         let AttemptClaim { run, span } = claim;
+        span.record(
+            "task_start_delay_us",
+            u64::try_from(spawned_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+        );
         self.attempt(tenant, &run, &stop, &abandon)
             .instrument(span)
             .await;
@@ -602,12 +628,13 @@ impl LeasedWork for VerifierRunner {
 impl VerifierRunner {
     /// Execute one claimed run inside its attempt span and settle it.
     ///
-    /// Records the PostgreSQL-measured queue wait at the start, the
-    /// `settlement` phase around the fenced transition, the outcome and any
-    /// stable error code on the attempt span, the existing attempt, failure,
-    /// and claim-to-settlement series, and — only once a terminal outcome is
-    /// durably settled — the run's trigger-to-terminal latency: its age at
-    /// claim plus this attempt's elapsed [`Instant`] time.
+    /// One [`ExecutionTelemetry`] owns the attempt's metrics: it counts the
+    /// attempt once classified, holds the per-kind active gauge until it
+    /// drops, and emits the phase, overhead, failure, and claim-to-settlement
+    /// series. This method adds the queued-only series: the
+    /// PostgreSQL-measured queue wait, the `settlement` phase, and — only once
+    /// a terminal outcome is durably settled — the run's trigger-to-terminal
+    /// latency: its age at claim plus this attempt's elapsed [`Instant`] time.
     async fn attempt(
         &self,
         tenant: DataTenantId,
@@ -616,22 +643,11 @@ impl VerifierRunner {
         abandon: &CancellationToken,
     ) {
         let started = Instant::now();
-        let implementation = input_implementation(&run.input);
+        let telemetry = ExecutionTelemetry::start(ExecutionMode::Queued);
         let origin = run.origin.as_str();
-        metrics::counter!(
-            crate::app::metrics::VERIFICATION_RUN_ATTEMPTS_TOTAL,
-            "implementation" => implementation
-        )
-        .increment(1);
-        metrics::histogram!(
-            crate::app::metrics::VERIFICATION_QUEUE_WAIT_SECONDS,
-            "implementation" => implementation,
-            "origin" => origin
-        )
-        .record(run.queue_wait.as_secs_f64());
         let transition = tokio::select! {
             () = abandon.cancelled() => Transition::Release,
-            transition = self.execute(tenant, run) => transition,
+            transition = self.execute(tenant, run, &telemetry) => transition,
         };
         let transition = match transition {
             Transition::Retry(_) if stop.is_cancelled() => Transition::Release,
@@ -640,12 +656,13 @@ impl VerifierRunner {
         if let Some(error) = transition.error() {
             tracing::Span::current().record("error_code", error.code.as_str());
         }
-        let phase = Instant::now();
-        let settled = self
-            .settle(tenant, run, transition)
-            .instrument(tracing::info_span!("verification.settle"))
+        let settled = telemetry
+            .phase(
+                Phase::Settlement,
+                self.settle(tenant, run, transition)
+                    .instrument(tracing::info_span!("verification.settle")),
+            )
             .await;
-        record_phase(implementation, "settlement", phase);
         let outcome = match settled {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -655,41 +672,33 @@ impl VerifierRunner {
         };
         let span = tracing::Span::current();
         span.record("outcome", outcome);
-        if !matches!(
+        let failed = !matches!(
             outcome,
             "completed" | "released" | "awaiting_trace" | "deferred"
-        ) {
+        );
+        if failed {
             span.record("otel.status_code", "ERROR");
         }
+        let kind = telemetry.kind().as_str();
+        metrics::histogram!(
+            crate::app::metrics::VERIFICATION_QUEUE_WAIT_SECONDS,
+            "kind" => kind,
+            "origin" => origin
+        )
+        .record(run.queue_wait.as_secs_f64());
         if matches!(
             outcome,
             "completed" | "exhausted" | "cancelled" | "timed_out" | "errored"
         ) {
             metrics::histogram!(
                 crate::app::metrics::VERIFICATION_TRIGGER_TO_TERMINAL_SECONDS,
-                "implementation" => implementation,
+                "kind" => kind,
                 "origin" => origin,
                 "outcome" => outcome
             )
             .record((run.age + started.elapsed()).as_secs_f64());
         }
-        if !matches!(
-            outcome,
-            "completed" | "released" | "awaiting_trace" | "deferred"
-        ) {
-            metrics::counter!(
-                crate::app::metrics::VERIFICATION_RUN_FAILURES_TOTAL,
-                "implementation" => implementation,
-                "outcome" => outcome
-            )
-            .increment(1);
-        }
-        metrics::histogram!(
-            crate::app::metrics::VERIFICATION_RUN_DURATION_SECONDS,
-            "implementation" => implementation,
-            "outcome" => outcome
-        )
-        .record(started.elapsed().as_secs_f64());
+        telemetry.finish(outcome, failed);
     }
 }
 
@@ -706,30 +715,12 @@ impl Transition {
     }
 }
 
-/// Record one owned attempt phase's elapsed time since `started`.
-fn record_phase(implementation: &'static str, phase: &'static str, started: Instant) {
-    metrics::histogram!(
-        crate::app::metrics::VERIFICATION_PHASE_DURATION_SECONDS,
-        "implementation" => implementation,
-        "phase" => phase
-    )
-    .record(started.elapsed().as_secs_f64());
-}
-
 /// Stable label of a terminal status.
 const fn terminal_label(status: TerminalStatus) -> &'static str {
     match status {
         TerminalStatus::Cancelled => "cancelled",
         TerminalStatus::TimedOut => "timed_out",
         TerminalStatus::Errored => "errored",
-    }
-}
-
-/// The implementation a frozen input belongs to, for telemetry labels.
-const fn input_implementation(input: &RunInput) -> &'static str {
-    match input {
-        RunInput::DriftWindow(_) => "drift",
-        RunInput::EvalRecord { .. } => "eval",
     }
 }
 

@@ -81,7 +81,9 @@ struct Cli {
     /// Capture every step with `perf`; the report is then diagnostic.
     #[arg(long)]
     profile: bool,
-    /// The `wyrd-server` binary; defaults to the one built beside this one.
+    /// The `wyrd-server` binary, resolved to an absolute path because each
+    /// replica runs from its own working directory; defaults to the one built
+    /// beside this one.
     #[arg(long)]
     server_binary: Option<PathBuf>,
     /// Shared object store every replica serves, as peer mode requires.
@@ -111,7 +113,7 @@ async fn benchmark(cli: Cli) -> Result<bool> {
         .prefix("wyrd-capacity-")
         .tempdir()?;
     let binary = match cli.server_binary {
-        Some(binary) => binary,
+        Some(binary) => std::fs::canonicalize(binary)?,
         None => release_binary()?,
     };
     let collector = Arc::new(Collector::start().await?);

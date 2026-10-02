@@ -334,7 +334,7 @@ impl TokenGrants<'_> {
     /// §6).
     ///
     /// Replay is the one refusal that also writes: detection revoked the
-    /// whole family and appended the canonical revocation event on this
+    /// rotation chain and appended the canonical revocation event on this
     /// transaction, so it commits before the refusal returns — rolling it
     /// back would tell the legitimate holder the theft was contained while
     /// leaving the attacker's successor usable.

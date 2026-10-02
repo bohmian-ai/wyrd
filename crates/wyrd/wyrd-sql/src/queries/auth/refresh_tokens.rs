@@ -50,7 +50,6 @@ const ACTIVE_REFRESH_SQL: &str = r#"
            human_connection_id, human_connection_revision, client_id
       FROM wyrd.auth_refresh_tokens
      WHERE token_hash = $1
-       AND data_tenant_id = $2
        AND revoked_at IS NULL
        AND expires_at > statement_timestamp()
 "#;
@@ -112,7 +111,7 @@ pub async fn consume_active_refresh(
 /// Takes a transaction-scoped advisory lock keyed by tenant, principal kind,
 /// and principal id, so it is released only when the caller commits or rolls
 /// back. Row locks alone cannot serialize a replay of an ancestor row against
-/// rotation of the current one: the family revocation's snapshot would miss a
+/// rotation of the current one: the replay's chain revocation would miss a
 /// successor inserted by the concurrent rotation. Callers take this before
 /// classifying the presented row and before [`crate::queries::auth::lock_human_connection_slot`],
 /// keeping one fixed order: family first, connection second.
@@ -170,10 +169,8 @@ pub async fn active_refresh(
     conn: &mut TenantConn<'_>,
     token_hash: &str,
 ) -> Result<Option<RefreshTokenRow>, sqlx::Error> {
-    let tenant_id = conn.data_tenant_id().as_uuid();
     sqlx::query_as::<_, RefreshTokenRow>(ACTIVE_REFRESH_SQL)
         .bind(token_hash)
-        .bind(tenant_id)
         .fetch_optional(&mut **conn.transaction())
         .await
 }

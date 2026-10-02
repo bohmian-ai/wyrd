@@ -11,7 +11,9 @@ use crate::storage::upload::reader::SourceReader;
 /// Executes a single-PUT upload via presigned URL.
 ///
 /// Streams the source body directly to the storage backend with the plan's
-/// required headers plus the idempotency key. No retry—transport failures
+/// required headers plus the idempotency key. A known source size is sent as
+/// `Content-Length`, because S3 `PutObject` refuses a chunked body without
+/// one; an unknown size streams chunked. No retry—transport failures
 /// propagate immediately.
 ///
 /// # Errors
@@ -47,6 +49,10 @@ pub(crate) async fn upload(
         .map(|h| (h.name.as_str(), h.value.as_str()))
         .collect();
     headers.push(("Idempotency-Key", hooks.idempotency_key));
+    let length = total.map(|total| total.to_string());
+    if let Some(length) = &length {
+        headers.push(("Content-Length", length));
+    }
 
     let body = if let Some(progress) = hooks.progress.clone() {
         let mut uploaded = 0_u64;

@@ -119,3 +119,42 @@ async fn over_range_dimensions_fail_before_request_dispatch() {
         .expect_err("over-range dimensions must be rejected");
     assert!(matches!(error, StorageClientError::PlanInvalid(_)));
 }
+
+/// A single PUT of a sized source declares its `Content-Length` instead of
+/// streaming chunked, so S3-compatible backends accept it.
+///
+/// # Panics
+///
+/// Panics when the backend sees no matching length or the upload fails.
+#[tokio::test]
+async fn single_put_declares_the_known_content_length() {
+    use wiremock::matchers::{header, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let backend = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(header("content-length", "5"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&backend)
+        .await;
+    let plan = wyrd_spec::storage::UploadPlan::SinglePut {
+        put_url: format!("{}/bucket/object", backend.uri()),
+        ttl_secs: 60,
+        required_headers: Vec::new(),
+    };
+    let wyrd = client();
+    let outcome = WyrdStorageClient::new(&wyrd)
+        .upload(
+            &plan,
+            b"bytes".to_vec(),
+            UploadHooks {
+                idempotency_key: "key",
+                progress: None,
+                part_url_minter: None,
+            },
+        )
+        .await
+        .expect("a sized single PUT is accepted");
+    assert!(matches!(outcome, UploadOutcome::Uploaded));
+}

@@ -196,3 +196,66 @@ Stop if safe renewal needs changed server replay semantics, credentials cannot b
 ## Authority Links
 
 [Approved spec](../spec.md); [AGENTS.md](../../../../AGENTS.md); [agent rules](../../../../architecture/agent-rules.md); [security posture](../../../../architecture/wyrd-security-posture.md); [Python API](../../../../architecture/references/languages/python-api-and-stubs.md); [TypeScript guide](../../../../architecture/references/languages/typescript-guide.md).
+
+## Implementation Evidence
+
+Commits: d4f4775e6, e7b7bfc01 (server handoff and per-chain revoke), 15a1790fc
+(saved-login store), e73f0163e (credential precedence and SDK `tenant`),
+7fa2f995b (`wyrd auth login/logout/status`), 4bbdfe90f (CLI journey and identity
+targets), 4d6a72c3d (Rust SDK journey), ed50a2e61 (concurrent renewal), 00529eef2
+(Python journey), 5bcb2b618 (TypeScript journey), c0c1d6053 (clippy), feac127a0
+(production-wheel check).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| CLI browser login: one-use handoff, wrong verifier/tenant, replay, expiry refused; no token in output, page, or URL (AC-004/007) | `wyrd-server` CLI handoff routes; `crates/wyrd/wyrd-cli/src/auth/login.rs` | `cli_oidc_handoff_journey` (identity target `cli`) | PASS |
+| Logout revokes only its own refresh chain; offline logout still removes the record and warns (FIND-TASK-003-18) | `SavedLogins::{begin_logout, finish_logout}`; `auth::login::logout` | `cli_oidc_handoff_journey` | PASS |
+| Private store: 0700/0600, owner-checked, symlink-refusing, atomic, fail-closed on unsafe or corrupt | `crates/shared/wyrd-client/src/saved_login.rs` | `saved_login::tests::*` (5); `concurrent_saved_renewal` (unsafe_store) | PASS |
+| Precedence: explicit > env tiers > saved login > credentials file; explicit machine credential overrides | `ClientConfig::resolve_credential` | `config::tests::saved_login_ranks_between_env_and_credentials_file`; override phase in all three SDK journeys | PASS |
+| Same-server multi-tenant selection: ambiguous and unmatched refused, selection by route key or tenant id | `SavedLogins::select`; `tenant` option on every Rust/Python/TypeScript constructor | Rust, Python, and TypeScript `saved user auth` journeys | PASS |
+| Allowed read, denied write as the CLI-established reader; renewal through Wyrd only, exactly one generation | `SavedLoginSource`, `SavedLogins::renew` | three SDK journeys (generation == before + 1) | PASS |
+| Revoked login fails closed (`refresh_refused`), never retried (`refresh_pending`) | `SavedLogins::renew` persists RefreshPending before exchanging | three SDK journeys | PASS |
+| Concurrent processes: one rotation, winner generation, no family revocation, crash-uncertain and unsafe stores fail closed, logout racing renewal never restores a record (AC-004) | per-record lock; reread under lock; `access_token_tenant` reads `principal.tenant_id` | `concurrent_saved_renewal` (identity target `client`) | PASS |
+| Generated artifacts current | error catalog, `.pyi`, `index.d.ts`, `error-codes.ts` | `codegen:check`, `ts:napi:check` | PASS |
+
+Lanes (each run alone, all exit 0): `test:identity:journey` unfiltered and each
+target (`cli`, `rust`, `client`, `python`, `typescript`); `test:cli:journey`;
+`test:shared`; `test:wyrd-sdk`; `py:test:unit`; `py:test:integration` (72
+passed); `py:typecheck`; `ts:test:unit`; `ts:test:integration` (25 passed);
+`ts:typecheck`; `ts:napi:check`; `codegen:check`; `check:client-tier`;
+`check:pyo3-scope`; `check:py-wheel-no-testing`; `check:workspace-hack`;
+`test:principals:integration`; `fmt`; `lints`; `py:format`; `py:lints`.
+
+Diagnoses:
+- **Renewal refused as `tenant_mismatch`.** Evidence: the Rust SDK journey's
+  renew phase failed with `(tenant_mismatch)`. Cause: `access_token_tenant`
+  read a top-level `tenant_id`, but `AccessTokenClaims` carries the tenant at
+  `principal.tenant_id`. Fix site: `saved_login.rs::access_token_tenant`, whose
+  only caller is `SavedLogins::renew`. Unit test added.
+- **The CLI journey's second login could not renew.** Evidence: `RefreshReused`
+  after the logged-out token was presented. Cause: the journey presented the
+  revoked token before renewing the second login. The server treats that as a
+  replay and revokes every chain of the principal, which is the intended
+  containment. Fix site: journey step order only.
+- **`check:py-wheel-no-testing` always failed.** Cause: the check depended on
+  `py:setup`, which installs the testing build. Fix site: the check now builds
+  the default wheel and imports it in an isolated environment, with a positive
+  `import wyrd` control.
+- Python and TypeScript journeys need Keycloak. They carry the `identity`
+  pytest marker or are excluded from `ts:test:integration`, so only the
+  identity lane runs them.
+
+Ceilings:
+- The tenant selector is not enforced on the env-variable credential tiers.
+- Lock timeout and Ctrl-C cancel have no journey coverage; they are covered by
+  unit tests and code paths only.
+- The SDK journeys establish the login through the `HumanSso` handoff helper,
+  which uses the same server handoff and `SavedLogin::from_cli_login` as the
+  CLI, rather than through the `wyrd` binary. The CLI journey covers the binary.
+- The "uncertain timeout" case shares the RefreshPending state with the crash
+  case; only the crash state is driven.
+- The focused `concurrent_saved_renewal` command needs `--run-ignored=all`; the
+  identity target supplies it.
+- Non-goals stayed excluded. No unrelated files changed, apart from the broken
+  production-wheel check and the clippy line in `gateway_admin.rs` that this
+  task's argument change triggered.

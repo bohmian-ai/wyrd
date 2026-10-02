@@ -74,8 +74,8 @@ mod pg_tests {
     };
     use wyrd_sql::queries::auth::{
         HumanConnectionWrite, LoginState, consume_login_state, human_connection_in_state,
-        insert_human_candidate, insert_login_state, insert_role, insert_user, list_user_roles,
-        lock_refresh_family, replace_user_roles, user_id_by_identity,
+        insert_device_authorization, insert_human_candidate, insert_login_state, insert_role,
+        insert_user, list_user_roles, lock_refresh_family, replace_user_roles, user_id_by_identity,
     };
     use wyrd_sql::row_types::auth::HumanConnectionBinding;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
@@ -316,8 +316,8 @@ mod pg_tests {
     }
 
     /// A verified token for a consumed login issues only an authorization
-    /// code; that code redeems once to a usable session, which is minted and
-    /// audited at redemption.
+    /// code and records one `auth.login` outcome; that code redeems once to a
+    /// usable session, which is minted and audited at redemption.
     ///
     /// # Panics
     /// Panics when completion, redemption, or the audit differ.
@@ -353,6 +353,15 @@ mod pg_tests {
             "the callback mints nothing"
         );
         assert!(audit_rows(&fixture).await.is_empty());
+        assert_eq!(
+            operation_rows(&fixture, "auth.login").await,
+            vec![(
+                principal_id,
+                "allowed".to_owned(),
+                format!("principal:{principal_id}")
+            )],
+            "the callback records its login outcome once"
+        );
         let redeemed = redeem(&state, &completed).await.expect("the code redeems");
         assert_eq!(refresh_token_count(&fixture, principal_id).await, 1);
         let audit = audit_rows(&fixture).await;
@@ -501,8 +510,9 @@ mod pg_tests {
     }
 
     /// A login that changes the User's durable roles stages exactly one
-    /// `auth.user.roles.sync` event, and its code one token exchange at
-    /// redemption; a repeat login with the same groups stages no sync.
+    /// `auth.user.roles.sync` event beside its `auth.login` outcome, and its
+    /// code one token exchange at redemption; a repeat login with the same
+    /// groups stages its login outcome and no sync.
     ///
     /// # Panics
     /// Panics when the role-sync evidence differs.
@@ -541,6 +551,118 @@ mod pg_tests {
             2,
             "one exchange per redeemed login"
         );
+        assert_eq!(
+            operation_rows(&fixture, "auth.login").await.len(),
+            2,
+            "one login outcome per callback"
+        );
+    }
+
+    /// A device login with unchanged roles records one `auth.login` outcome
+    /// with its approval and no role sync.
+    ///
+    /// # Panics
+    /// Panics when the login fails or its audit differs.
+    #[tokio::test]
+    async fn an_unchanged_role_device_login_is_audited_once() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let server = jwks_server().await;
+        let state = test_state_with_human_connections(&fixture).await;
+        let trusted =
+            trusted_issuer_with_jwks(tenant, jwks_uri(&server), HashMap::new(), Vec::new());
+        let binding = committed_active_binding(&fixture).await;
+        let (hash, login, device_id) = pending_device_login(&fixture, 12, binding).await;
+
+        let completed = authorization_exchange_service(&state)
+            .finish_id_token_exchange(
+                &hash,
+                &trusted,
+                &login,
+                &identity(EXTERNAL_SUBJECT, None, &[]),
+                "req-device-login",
+            )
+            .await
+            .expect("device login completes");
+
+        assert!(matches!(completed, LoginCompletion::DeviceApproved));
+        let user = user_for(&fixture, EXTERNAL_SUBJECT).await.expect("user");
+        assert_eq!(device_approval(&fixture, device_id).await, Some(user));
+        assert_eq!(
+            operation_rows(&fixture, "auth.login").await,
+            vec![(user, "allowed".to_owned(), format!("principal:{user}"))]
+        );
+        assert!(
+            operation_rows(&fixture, "auth.user.roles.sync")
+                .await
+                .is_empty()
+        );
+    }
+
+    /// When the login outcome cannot be staged, the User, its role change,
+    /// and the authorization code or device approval all roll back together.
+    ///
+    /// # Panics
+    /// Panics when either login succeeds or leaves anything behind.
+    #[tokio::test]
+    async fn a_failed_login_audit_rolls_back_the_whole_login() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let server = jwks_server().await;
+        let state = test_state_with_human_connections(&fixture).await;
+        let trusted = sync_trusted(&fixture, &server).await;
+        let binding = committed_active_binding(&fixture).await;
+        let superuser = fixture
+            .superuser_pool()
+            .await
+            .expect("superuser pool opens");
+        sqlx::query(
+            r#"CREATE OR REPLACE FUNCTION vala.test_fail_login_audit()
+               RETURNS trigger LANGUAGE plpgsql AS $$
+               BEGIN
+                 IF NEW.operation = 'auth.login' THEN
+                   RAISE EXCEPTION 'injected login audit failure';
+                 END IF;
+                 RETURN NEW;
+               END;
+               $$;"#,
+        )
+        .execute(&superuser)
+        .await
+        .expect("failure function installs");
+        sqlx::query(
+            r#"CREATE TRIGGER test_fail_login_audit
+               BEFORE INSERT ON vala.audit_staging
+               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_login_audit()"#,
+        )
+        .execute(&superuser)
+        .await
+        .expect("failure trigger installs");
+
+        let (hash, login) = pending_login(&fixture, state_hash(13), binding, "nonce").await;
+        let (device_hash, device_login, device_id) =
+            pending_device_login(&fixture, 14, binding).await;
+        for (hash, login) in [(&hash, &login), (&device_hash, &device_login)] {
+            let error = authorization_exchange_service(&state)
+                .finish_id_token_exchange(
+                    hash,
+                    &trusted,
+                    login,
+                    &identity(EXTERNAL_SUBJECT, None, &["admins"]),
+                    "req-login-audit-fail",
+                )
+                .await
+                .expect_err("an unrecordable login is refused");
+            assert_eq!(error.code(), "WYRD_AUDIT_503_UNAVAILABLE");
+        }
+
+        assert_nothing_persisted(&fixture).await;
+        assert_eq!(device_approval(&fixture, device_id).await, None);
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let role_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wyrd.auth_user_roles")
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("role count runs");
+        assert_eq!(role_rows, 0, "the role assignment rolled back");
     }
 
     /// Two concurrent callbacks for one existing User with disjoint mapped
@@ -1242,6 +1364,55 @@ mod pg_tests {
             .expect("state is pending");
         conn.commit().await.expect("state commits");
         (state_hash, consumed)
+    }
+
+    /// Record a pending device authorization and a consumed device login
+    /// bound to it, as `POST /auth/device` and the callback do, returning the
+    /// login's state hash, consumed row, and device id.
+    ///
+    /// # Panics
+    /// Panics when the device row or login state cannot be written.
+    async fn pending_device_login(
+        fixture: &PgFixture,
+        n: u8,
+        connection: HumanConnectionBinding,
+    ) -> (Sha256Hex, LoginState, Uuid) {
+        let device_id = Uuid::now_v7();
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        insert_device_authorization(
+            &mut conn,
+            device_id,
+            &Sha256Hex::digest(format!("device-code-{n}").as_bytes()),
+            &format!("USER-{n:04}"),
+            StdDuration::from_mins(5),
+        )
+        .await
+        .expect("device authorization inserts");
+        conn.commit().await.expect("device authorization commits");
+        let (hash, login) = pending_login_with(
+            fixture,
+            state_hash(n),
+            connection,
+            "nonce",
+            LoginInitiation::Device(device_id),
+        )
+        .await;
+        (hash, login, device_id)
+    }
+
+    /// The principal a device authorization's approval recorded, if any.
+    ///
+    /// # Panics
+    /// Panics when the row cannot be read.
+    async fn device_approval(fixture: &PgFixture, device_id: Uuid) -> Option<Uuid> {
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        sqlx::query_scalar(
+            "SELECT principal_id FROM wyrd.auth_device_authorizations WHERE device_id = $1",
+        )
+        .bind(device_id)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("device authorization reads")
     }
 
     /// Seed and commit the tenant's Active human connection, returning the

@@ -37,16 +37,17 @@ use wyrd_spec::auth::{
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
 use wyrd_sql::queries::auth::{
-    LoginState, approve_device_authorization, consume_login_state, delete_user, insert_user,
-    issue_authorization_code, lock_refresh_family, redeem_authorization_code, replace_user_roles,
-    upsert_user_identity, user_id_by_identity,
+    LoginState, approve_device_authorization, consume_login_state, delete_user,
+    human_connection_is_active, insert_user, issue_authorization_code, lock_human_connection_slot,
+    lock_refresh_family, redeem_authorization_code, replace_user_roles, upsert_user_identity,
+    user_id_by_identity,
 };
-use wyrd_sql::row_types::auth::HumanSessionBinding;
+use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanSessionBinding};
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
 
 use crate::audit::{
-    TOKEN_EXCHANGE_OPERATION, USER_ROLES_SYNC_OPERATION, append_auth_audit, auth_event,
-    auth_failure_code, principal_event, record_auth_audit_best_effort,
+    LOGIN_OPERATION, TOKEN_EXCHANGE_OPERATION, USER_ROLES_SYNC_OPERATION, append_auth_audit,
+    auth_event, auth_failure_code, principal_event, record_auth_audit_best_effort,
 };
 use crate::connections::HumanConnections;
 use crate::error::{relying_party_error, store_error};
@@ -320,10 +321,14 @@ impl AuthorizationCodeExchange {
     /// The tenant's Active connection is re-read and must still be the exact
     /// revision, issuer, and client the login bound. One tenant transaction
     /// then resolves the user by (issuer, `sub`) only and takes the User's
-    /// tenant-qualified refresh-family lock, held through commit and taken
-    /// before the connection slot lock as every refresh path orders them, so
+    /// tenant-qualified refresh-family lock, held through commit, so
     /// concurrent callbacks for one User serialize and the final durable roles
-    /// equal one callback's mapping. It then replaces the user's roles with
+    /// equal one callback's mapping. It then takes the tenant's connection
+    /// slot lock — after the family lock, as every refresh path orders them —
+    /// and requires the bound revision to still be Active, so a lifecycle
+    /// mutation that won the lock leaves no User, role, code, or approval
+    /// behind, and one that waits commits only after this login. It then
+    /// replaces the user's roles with
     /// those the verified groups map to (unmapped groups and unknown role
     /// names grant nothing; connection default roles are never applied to
     /// human login) and, when that changed the user's durable roles, stages
@@ -336,6 +341,10 @@ impl AuthorizationCodeExchange {
     ///   consumed state row, and returns the code once;
     /// - a device login records the principal and connection as the approval
     ///   of its device authorization, which must still be pending.
+    ///
+    /// Either outcome appends one allowed `auth.login` event for the User on
+    /// the same transaction, so the login, its roles, and its code or
+    /// approval commit together with their audit or not at all.
     ///
     /// No token is minted here; the token endpoint mints the session when the
     /// code or device code is redeemed.
@@ -398,6 +407,7 @@ impl AuthorizationCodeExchange {
         lock_refresh_family(&mut conn, "user", principal_id)
             .await
             .map_err(store_error)?;
+        fence_bound_connection(&mut conn, login_state.connection).await?;
         let roles = role_names_to_refs(trusted, &identity.groups)?;
         // The provider just asserted this human's authority, and nothing else
         // in Wyrd grants a user a role. Recording it here is what makes the
@@ -454,6 +464,7 @@ impl AuthorizationCodeExchange {
                 ));
             }
         };
+        append_auth_audit(&mut conn, &login_event(request_id, principal_id)).await?;
         conn.commit().await.map_err(store_error)?;
         Ok(completion)
     }
@@ -598,6 +609,37 @@ impl AuthorizationCodeExchange {
     }
 }
 
+/// Take the tenant's connection slot lock on `conn` and require the login's
+/// bound connection revision to still be Active.
+///
+/// Every connection lifecycle mutation takes the slot lock, so with it held
+/// until `conn` ends a replacement, deactivation, or removal either committed
+/// before this check — and the login is refused — or waits until the login
+/// commits or rolls back. Callers take the User's refresh-family lock first.
+///
+/// # Errors
+/// Returns [`WyrdError::InvalidToken`] when the bound revision is no longer
+/// Active, and [`WyrdError::AuthVerifyUnavailable`] when a statement fails.
+async fn fence_bound_connection(
+    conn: &mut TenantConn<'_>,
+    binding: HumanConnectionBinding,
+) -> Result<(), WyrdError> {
+    lock_human_connection_slot(conn)
+        .await
+        .map_err(store_error)?;
+    let active =
+        human_connection_is_active(conn, binding.connection_id, binding.connection_revision)
+            .await
+            .map_err(store_error)?;
+    if active {
+        Ok(())
+    } else {
+        Err(invalid_token(
+            "the login connection changed while the login was in progress",
+        ))
+    }
+}
+
 /// Resolve the local user for a trusted external identity or create it once.
 ///
 /// Keyed by (issuer, subject) only: the same email under another issuer is a
@@ -696,6 +738,22 @@ fn provider_refusal(error: &str) -> WyrdError {
         "server_error" => WyrdError::Internal { message, details },
         _ => WyrdError::InvalidToken { message, details },
     }
+}
+
+/// The allowed `auth.login` event recording that a provider callback signed
+/// the User in and committed its authorization code or device approval.
+///
+/// The resource is the User principal and the event carries no detail: the
+/// provider's claims stay out of audit history.
+fn login_event(request_id: &str, principal_id: Uuid) -> AuditEvent {
+    principal_event(
+        request_id,
+        LOGIN_OPERATION,
+        PrincipalId::new(principal_id),
+        PrincipalKindTag::User,
+        None,
+        AuditOutcome::Allowed,
+    )
 }
 
 /// The allowed `auth.user.roles.sync` event recording that a login's

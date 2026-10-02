@@ -3419,10 +3419,11 @@ async fn assert_refresh_cut_off(srv: &WyrdTestServer, session: &Value, label: &s
 ///   2. B replaces the Active connection, and A refuses the old session;
 ///   3. B deactivates, and A refuses the session minted by the replacement;
 ///   4. B removes a freshly activated connection, and A refuses its session;
-///   5. a callback paused after provider authentication — held by a lock on
-///      the user-role table while B's deactivation commits — hands the client
-///      a code that redeems to `invalid_grant` and inserts no refresh row,
-///      because sessions are minted only at redemption.
+///   5. a callback paused after provider authentication — held on the User's
+///      refresh-family lock while B's deactivation commits — then fences on
+///      the connection slot, refuses the login back to the client with
+///      `access_denied`, and commits no code, role change, login audit, or
+///      refresh row.
 ///
 /// # Panics
 /// Panics when any step deviates from the contract above.
@@ -3487,15 +3488,34 @@ async fn tenant_connection_session_cutoff_journey() {
     assert_eq!(status, StatusCode::NO_CONTENT, "B removes: {body}");
     assert_refresh_cut_off(&replica_a, &third, "removal").await;
 
-    // 5. A login paused after provider IO redeems nothing once deactivation
-    // commits.
+    // 5. A login paused after provider IO is refused once deactivation
+    // commits, and commits nothing.
     activate_keycloak_connection(&replica_b, &admin, PUBLIC_HUMAN_CLIENT, "Public", None).await;
     let principal = principal_id_of(
         sign_in().await["access_token"]
             .as_str()
             .expect("access token"),
     );
-    let before = refresh_rows(&replica_a, &principal).await;
+    let superuser = replica_a
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    let committed = || async {
+        sqlx::query_as::<_, (i64, i64, i64, i64)>(
+            "SELECT (SELECT count(*) FROM wyrd.auth_refresh_tokens
+                      WHERE principal_id = $1::uuid),
+                    (SELECT count(*) FROM wyrd.auth_login_state WHERE code_hash IS NOT NULL),
+                    (SELECT count(*) FROM wyrd.auth_user_roles WHERE user_id = $1::uuid),
+                    (SELECT count(*) FROM vala.audit_staging
+                      WHERE operation IN ('auth.login', 'auth.user.roles.sync'))",
+        )
+        .bind(&principal)
+        .fetch_one(&superuser)
+        .await
+        .expect("committed effects read")
+    };
+    let before = committed().await;
     let provider = authorization_code(
         &replica_a,
         &keycloak,
@@ -3504,32 +3524,40 @@ async fn tenant_connection_session_cutoff_journey() {
         "alice-password",
     )
     .await;
-    let superuser = replica_a
-        .pg_fixture()
-        .superuser_pool()
-        .await
-        .expect("superuser pool opens");
+    // The same key `lock_refresh_family` derives for this User.
+    let family: i64 = sqlx::query_scalar(
+        "SELECT hashtextextended(
+             'wyrd.auth_refresh_tokens:' || $1::uuid::text || ':user:' || $2::uuid::text, 0)",
+    )
+    .bind(tenant.as_uuid())
+    .bind(&principal)
+    .fetch_one(&superuser)
+    .await
+    .expect("family lock key derives");
     let mut hold = superuser.begin().await.expect("hold transaction begins");
-    sqlx::query("LOCK TABLE wyrd.auth_user_roles IN EXCLUSIVE MODE")
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(family)
         .execute(&mut *hold)
         .await
-        .expect("user-role table locks");
+        .expect("the User's refresh family locks");
     let release = async {
         let deadline = tokio::time::Instant::now() + StdDuration::from_secs(30);
         loop {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
-                  WHERE c.relname = 'auth_user_roles' AND NOT l.granted",
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks
+                  WHERE locktype = 'advisory' AND NOT granted
+                    AND ((classid::bigint << 32) | objid::bigint) = $1)",
             )
+            .bind(family)
             .fetch_one(&superuser)
             .await
             .expect("lock waiters read");
-            if waiting > 0 {
+            if waiting {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the callback never reached issuance"
+                "the callback never reached its family lock"
             );
             tokio::time::sleep(StdDuration::from_millis(20)).await;
         }
@@ -3552,17 +3580,15 @@ async fn tenant_connection_session_cutoff_journey() {
         ),
         release
     );
-    let code = authorized_code(&reply, &provider.code);
-    let (status, body) = redeem(&replica_a, &code, &provider.verifier).await;
     assert_eq!(
-        (status, &body["error"]),
-        (StatusCode::BAD_REQUEST, &serde_json::json!("invalid_grant")),
-        "the in-flight login's code redeems nothing: {body}"
+        callback_refusal(&reply),
+        "access_denied",
+        "the in-flight login is refused back to the client"
     );
     assert_eq!(
-        refresh_rows(&replica_a, &principal).await,
+        committed().await,
         before,
-        "the in-flight login issued no session"
+        "the in-flight login committed no session, code, role, or login audit"
     );
 
     replica_b.shutdown().await.expect("replica B shuts down");

@@ -283,7 +283,7 @@ mod pg_tests {
         ))
         .await?;
         let emitter = server
-            .credential_registered_service(service_ref, &["admin"])
+            .credential_registered_service(service_ref, &[])
             .await?;
         let key = emitter
             .api_key()

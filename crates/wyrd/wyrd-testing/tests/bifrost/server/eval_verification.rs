@@ -623,7 +623,7 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
     let receipt = register(&connect(&server, &admin), &service, &bundle).await;
     let writer = api_key(
         server
-            .credential_registered_service(&receipt.root, &["admin"])
+            .credential_registered_service(&receipt.root, &[])
             .await?,
     );
     let client = connect(&server, &writer);
@@ -1100,7 +1100,7 @@ async fn sealed_replay_on_a_later_day_activates_once() -> Result<(), ServerJourn
     let receipt = register(&connect(&server, &admin), &service, &bundle).await;
     let writer = api_key(
         server
-            .credential_registered_service(&receipt.root, &["admin"])
+            .credential_registered_service(&receipt.root, &[])
             .await?,
     );
     let client = connect(&server, &writer);
@@ -1264,7 +1264,7 @@ async fn integrated_enqueue_failure_preserves_ack() -> Result<(), ServerJourneyE
     let receipt = register(&connect(&server, &admin), &service, &bundle).await;
     let writer = api_key(
         server
-            .credential_registered_service(&receipt.root, &["admin"])
+            .credential_registered_service(&receipt.root, &[])
             .await?,
     );
     let client = connect(&server, &writer);
@@ -1475,7 +1475,7 @@ impl TraceJourney {
         let receipt = register(&connect(&server, &admin), &service, &bundle).await;
         let writer = api_key(
             server
-                .credential_registered_service(&receipt.root, &["admin"])
+                .credential_registered_service(&receipt.root, &[])
                 .await?,
         );
         let client = connect(&server, &writer);
@@ -2160,7 +2160,7 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
     let receipt = register(&connect(&server, &admin), &service, &bundle).await;
     let writer = api_key(
         server
-            .credential_registered_service(&receipt.root, &["admin"])
+            .credential_registered_service(&receipt.root, &[])
             .await?,
     );
     let client = connect(&server, &writer);

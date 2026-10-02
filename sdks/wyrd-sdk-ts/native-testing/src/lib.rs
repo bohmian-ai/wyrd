@@ -332,6 +332,82 @@ impl NativeWyrdTestServer {
         }
     }
 
+    /// Provision a second active tenant so a journey can prove cross-tenant
+    /// isolation, returning its tenant ID.
+    ///
+    /// The tenant is seeded through the same operator path the Rust harness
+    /// uses, so the journey observes the production tenancy boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed or seeding fails.
+    #[napi]
+    pub fn seed_tenant(&self, slug: String) -> Result<String> {
+        let result = self.with_server(|server| {
+            wyrd_runtime::runtime()
+                .block_on(server.seed_tenant(&slug))
+                .map(|tenant| tenant.to_string())
+                .map_err(reason)
+        });
+        drop(slug);
+        result
+    }
+
+    /// Bootstrap a service principal holding `roles` in tenant `tenant_id` and
+    /// return its API key.
+    ///
+    /// Pairs with [`Self::seed_tenant`]: the key is the foreign caller a
+    /// cross-tenant journey uses to prove the fixture tenant is unreachable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when `tenant_id` is not a tenant ID, the harness
+    /// is closed, or bootstrapping fails.
+    #[napi]
+    pub fn bootstrap_service_in_tenant(
+        &self,
+        tenant_id: String,
+        roles: Vec<String>,
+        name: String,
+    ) -> Result<String> {
+        let tenant = tenant_id.parse::<wyrd_spec::DataTenantId>().map_err(reason);
+        let result = tenant.and_then(|tenant| {
+            self.with_server(|server| {
+                let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
+                let bootstrap = wyrd_runtime::runtime()
+                    .block_on(server.bootstrap_service_in_tenant(tenant, &name, &roles))
+                    .map_err(reason)?;
+                match bootstrap {
+                    Bootstrap::Machine { api_key, .. } => {
+                        Ok(secrecy::ExposeSecret::expose_secret(&api_key).to_owned())
+                    }
+                    Bootstrap::User { .. } => Err(napi::Error::from_reason(
+                        "expected a machine bootstrap".to_owned(),
+                    )),
+                }
+            })
+        });
+        drop((tenant_id, roles, name));
+        result
+    }
+
+    /// Run `call` against the open harness while holding its lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the lock is poisoned, the server is shut
+    /// down, or `call` fails.
+    fn with_server<T>(&self, call: impl FnOnce(&WyrdTestServer) -> Result<T>) -> Result<T> {
+        let guard = self
+            .server
+            .lock()
+            .map_err(|_| napi::Error::from_reason("test server lock poisoned".to_owned()))?;
+        let server = guard
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
+        call(server)
+    }
+
     /// Issue an API key for the principal a registered Service Card projects.
     ///
     /// `card_ref` is the canonical `space/Kind/name@version` identity a
@@ -504,6 +580,25 @@ impl NativeWyrdTestServer {
             .map_err(|error| napi::Error::from_reason(error.to_string()))
     }
 
+    /// Rewrite table `fqn`'s registered schema fingerprint, as a server-side
+    /// schema change leaves it, so a writer holding the earlier describe is
+    /// refused with `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed, the table is not
+    /// registered, or the update fails.
+    #[napi]
+    pub fn change_table_fingerprint(&self, fqn: String) -> Result<()> {
+        let result = self.with_server(|server| {
+            wyrd_runtime::runtime()
+                .block_on(server.change_table_fingerprint_for_test(&fqn))
+                .map_err(reason)
+        });
+        drop(fqn);
+        result
+    }
+
     /// Truncate the next query after its schema frame.
     ///
     /// # Errors
@@ -567,7 +662,9 @@ impl NativeWyrdTestServer {
 ///
 /// `auditPublication: false` keeps staged audit rows for assertions.
 /// `verificationRuntime: true` runs Drift baseline fitting and Verifier runs.
-/// `providerBaseUrl` roots built-in gateway adapters at a local mock upstream.
+/// `providerBaseUrl` roots built-in gateway adapters at a local mock upstream;
+/// its `/v1` segment also serves the verification runtime's `OpenAI` Eval
+/// judge, which calls `<providerBaseUrl>/v1/chat/completions`.
 ///
 /// # Errors
 ///

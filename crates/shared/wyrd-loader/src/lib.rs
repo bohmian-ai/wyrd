@@ -267,7 +267,10 @@ mod tests {
                 panic!("path targets become sibling projections");
             };
             assert_eq!(
-                sibling.space.as_ref().map(|space| space.as_str()),
+                sibling
+                    .space
+                    .as_ref()
+                    .map(wyrd_spec::ids::SpaceName::as_str),
                 Some("engineering")
             );
         }

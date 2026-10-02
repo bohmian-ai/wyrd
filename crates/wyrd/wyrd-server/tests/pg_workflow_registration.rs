@@ -256,6 +256,9 @@ async fn card_count(server: &WyrdTestServer, name: &str) -> i64 {
     .await
 }
 
+/// One invalidating edit applied to a submitted Workflow spec body.
+type SpecMutation = fn(&mut Value);
+
 /// Submit the loaded bundle under `dir` straight to the registration route
 /// with `mutate` applied to its Workflow spec, returning the refusal code.
 ///
@@ -269,7 +272,7 @@ async fn refused_registration(
     server: &WyrdTestServer,
     jwt: &str,
     dir: &Path,
-    mutate: fn(&mut Value),
+    mutate: SpecMutation,
 ) -> String {
     let input = build_registration_input(load(&dir.join("workflow.yaml")).expect("bundle loads"))
         .expect("registration input builds");
@@ -447,7 +450,7 @@ async fn registers_only_valid_explicit_workflow_graphs() {
     assert_eq!(operation_count(&server).await, operations);
     assert_eq!(card_count(&server, "client-refused").await, 0);
 
-    let invalid: [(&str, fn(&mut Value)); 4] = [
+    let invalid: [(&str, SpecMutation); 4] = [
         ("binding", |spec| {
             spec["steps"][0]["inputs"]["extra"] = json!("input.code");
         }),

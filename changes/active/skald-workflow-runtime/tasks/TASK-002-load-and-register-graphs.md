@@ -177,3 +177,21 @@ resolution during registration or inability to reuse native resolver boundaries.
 - `AGENTS.md`; `architecture/agent-rules.md`
 - `architecture/wyrd-design.md` §§Workflow, Spec-file authoring, Reference slots
 - `architecture/references/languages/{spec-driven-development,implementation-execution,testing-workflows,errors}.md`
+
+## Implementation Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Actual YAML bundle parses and hydrates locally without registration | `examples/workflows/code-review/`; `wyrd-loader` `parse.rs` keyed `ref`/`path`/`inline` slot normalization; `wyrd_client::WorkflowLoader::load_file` | `wyrd-loader tests::load_explicit_workflow_bundle`; `wyrd-client workflow_loader::tests::hydrate_local_workflow_graph` | PASS |
+| Actual YAML executes on the one Skald runtime | `WorkflowGraph::hydrate` → `Workflow::from_card_with_agent_resolver` | `hydrate_local_workflow_graph` (3 gateway calls, final request carries both reviews) | PASS |
+| Pure/resolved validation at local load | `wyrd-loader validate.rs` (`WorkflowSpec::validate`); `WorkflowGraph::validate` | `load_explicit_workflow_bundle` (cycle); `hydrate_local_workflow_graph` (extra binding, route dialect, ref without client) | PASS |
+| Pure/resolved validation at registration, identical for sibling and external deps, no partial writes | `components/cards/resolve.rs` `EffectiveSpecs::validate_workflows` before the write tx | `pg_workflow_registration registers_only_valid_explicit_workflow_graphs` (binding/output/graph/route matrix; RED confirmed with the call disabled) | PASS |
+| Exact relationships and locked Agent/Prompt refs survive registration | existing `bind_card_references`; relationships | same test: step refs carry Agent UIDs, 3 Agent@1.0.0 relationships, Prompt ref UID | PASS |
+| Native and built-in tools declaratively registrable | `WorkflowGraph::validate` leaves tool names unbound | same test: `tool_names: [bifrost.query, cards.get]` registers Active | PASS |
+| Registered local load fetches exact versions, stays pinned, keeps identity | `WorkflowLoader::load_registered` via `Cards::get(CardSelector::exact)` | `pg_workflow_registration fetches_and_executes_locked_workflow_graph` (v2 Agent never used; `run.workflow` UID = registered) | PASS |
+| Missing/inactive/foreign/mismatched refs refused, no dispatch | `WorkflowLoader::read` active check; Cards exact-read contracts | same test: 404 missing/foreign/deleted, 400 UID mismatch/invalid version/wrong kind, 422 pending; 0 extra gateway calls | PASS |
+| Authored external refs share exact-read behavior | `WorkflowLoader::load_file` → `fetch_missing` | same test: authored `ref:` bundle runs with equal outputs/steps | PASS |
+| No Skald registry dependency, WyrdState unchanged, no observer surfaces | Skald change is doc-only (`workflow_surface.rs`) | `check:client-tier`, `check:pyo3-scope`, `check:registry-tx-coupling` | PASS |
+| Repository gates | — | `test:shared` (705/705), `test:skald` (337/337), `test:cards:integration`, `codegen:check`, `fmt`, `lints`, `git diff --check` all exit 0 | PASS |
+
+Decisions: keyed reference forms (`ref:`/`path:`/`inline:`) are normalized in the loader at inlineable slots per the architecture's reference-form section. Registration validation leaves tool names unbound; server suitability stays with TASK-004. The pure-rule registration matrix posts directly to `/v1/cards` because the client loader already refuses those violations locally. One client end-to-end refusal case also goes through `Cards::register_from_path`. Lint remediation: `mise run lints` first failed on `clippy::redundant_closure_for_method_calls` (`wyrd-loader/src/lib.rs` test) and `clippy::type_complexity` (new PG test). Fixed with a method path and a `SpecMutation` alias, then reran lints, fmt, and both focused tests green.

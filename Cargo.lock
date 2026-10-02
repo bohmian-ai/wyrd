@@ -11619,17 +11619,22 @@ dependencies = [
  "arrow",
  "base64 0.22.1",
  "chrono",
+ "hex",
  "parquet",
  "secrecy",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "skald-prompt",
  "tempfile",
  "tokio",
+ "url",
  "uuid",
+ "wiremock",
  "workspace-hack",
  "wyrd-client",
  "wyrd-testing",
+ "wyrd-tonic",
 ]
 
 [[package]]

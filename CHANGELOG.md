@@ -2,16 +2,15 @@
 
 ## Unreleased
 
-- skald-agentic: `skald-agent` (live agent, bounded tool loop, Observer hook,
-  and `SKALD_AGENT_*` catalog) and `skald-workflow` (DAG executor,
+- skald-agentic: `skald-agent` (live agent, bounded tool loop, and `SKALD_AGENT_*` catalog) and `skald-workflow` (DAG executor,
   `execute_task`, retries, and cross-provider handoff via shared
   `MessageConversion` with stable Wyrd workflow validation codes) land as independent
   skald sub-package crates. The engine remains PyO3-free, observability is
-  injected through the `Observer` trait and tracing spans, and skald does not
+  plain `tracing` spans, and skald does not
   depend on `wyrd-*` or `vala-*`.
-- workflow-card-docs: replaced global Python observer installation with
-  `Workflow(observers=[...])`, refreshed workflow/agent docs, stubs, and
-  examples, and removed public `WyrdInstrumentor` / `set_observer`.
+- skald-workflow-runtime: removed the Skald Observer system (`skald-observer`,
+  Agent/Workflow observer hooks, and Python `Observer`/`OtelObserver`/
+  `observers=`). Workflow and Agent runs emit payload-free `tracing` spans.
 
 ## PR3 - PromptCard + Skald Native-Canonical Surface
 

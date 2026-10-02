@@ -1,7 +1,6 @@
 //! Bounded tool loop for `skald-agent`.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use futures::StreamExt;
 use futures::stream;
@@ -9,7 +8,7 @@ use skald_prompt::Prompt;
 use skald_runtime::{ProviderRegistry, dispatch};
 use skald_spec::{ProviderName, ProviderRequest, ProviderResponse, ResponseType, ToolDescriptor};
 use skald_tool::AgentTool;
-use tracing::{Instrument, debug_span};
+use tracing::{Instrument, Span, field, info_span};
 
 use crate::agent::Agent;
 use crate::callbacks::{
@@ -23,7 +22,6 @@ use crate::journal::JournalEvent;
 use crate::request_builder::{assistant_message, extract_messages, request_from_conversation};
 use crate::run::{AgentRun, FinishReason};
 use crate::session::{Role, SessionId, SessionTurn, session_turn_to_conversation_turn};
-use skald_observer::{Observer, current};
 
 #[derive(Debug, Clone)]
 struct ToolCall {
@@ -40,16 +38,7 @@ pub(crate) async fn run(
     input: &str,
 ) -> AgentResult<AgentRun> {
     let providers = this.effective_providers(providers);
-    let run_id = uuid::Uuid::now_v7().to_string();
-    let observer = current();
-    let started_at = Instant::now();
-    let span = debug_span!(
-        "skald_agent.run",
-        agent_id = this.id.as_str(),
-        provider = ?this.prompt.native().request.provider(),
-        cap = this.run_config.max_iterations,
-        entry = "input",
-    );
+    let span = invoke_agent_span(this);
     async move {
         const MAX_JOURNAL_INPUT_CHARS: usize = 4096;
 
@@ -67,15 +56,6 @@ pub(crate) async fn run(
                 })
                 .await
                 .map_err(|source| AgentError::JournalAppendFailed { source })?;
-            observer
-                .on_agent_start(
-                    &run_id,
-                    None,
-                    &this.id,
-                    input,
-                    session_id.as_ref().map(crate::session::SessionId::as_str),
-                )
-                .await;
 
             let mut conversation = Conversation::new();
             if let Some(session_id) = session_id.as_ref() {
@@ -128,12 +108,10 @@ pub(crate) async fn run(
                 this,
                 providers,
                 RunLoopInputs {
-                    run_id: &run_id,
                     template: rendered,
                     seed_messages,
                     conversation,
                     session_id: session_id.as_ref(),
-                    observer: Arc::clone(&observer),
                 },
             )
             .await
@@ -150,8 +128,7 @@ pub(crate) async fn run(
         if let Err(e) = append_terminal_journal_event(this, &result).await {
             tracing::warn!("failed to append terminal journal event: {e}");
         }
-        append_terminal_observer_event(&run_id, &*observer, this, &result, started_at.elapsed())
-            .await;
+        record_agent_outcome(&result);
         result
     }
     .instrument(span)
@@ -164,19 +141,9 @@ pub(crate) async fn run_prompt(
     providers: &ProviderRegistry,
     prompt: &Prompt,
     vars: &[(&str, &str)],
-    parent_run_id: Option<&str>,
 ) -> AgentResult<AgentRun> {
     let providers = this.effective_providers(providers);
-    let run_id = uuid::Uuid::now_v7().to_string();
-    let observer = current();
-    let started_at = Instant::now();
-    let span = debug_span!(
-        "skald_agent.run_prompt",
-        agent_id = this.id.as_str(),
-        provider = ?this.prompt.native().request.provider(),
-        cap = this.run_config.max_iterations,
-        entry = "prompt",
-    );
+    let span = invoke_agent_span(this);
     async move {
         let result = async {
             this.journal
@@ -187,9 +154,6 @@ pub(crate) async fn run_prompt(
                 })
                 .await
                 .map_err(|source| AgentError::JournalAppendFailed { source })?;
-            observer
-                .on_agent_start(&run_id, parent_run_id, &this.id, "", None)
-                .await;
 
             let rendered = prompt
                 .render_native(vars)
@@ -211,12 +175,10 @@ pub(crate) async fn run_prompt(
                 this,
                 providers,
                 RunLoopInputs {
-                    run_id: &run_id,
                     template: rendered,
                     seed_messages,
                     conversation: Conversation::new(),
                     session_id: None,
-                    observer: Arc::clone(&observer),
                 },
             )
             .await
@@ -233,35 +195,48 @@ pub(crate) async fn run_prompt(
         if let Err(e) = append_terminal_journal_event(this, &result).await {
             tracing::warn!("failed to append terminal journal event: {e}");
         }
-        append_terminal_observer_event(&run_id, &*observer, this, &result, started_at.elapsed())
-            .await;
+        record_agent_outcome(&result);
         result
     }
     .instrument(span)
     .await
 }
 
+/// Prepared per-run state handed from `run_prompt` into the bounded loop.
+///
+/// Built once after Prompt rendering and session seeding so `run_loop` owns
+/// the conversation it mutates and never re-reads the session.
 struct RunLoopInputs<'a> {
-    run_id: &'a str,
+    /// Rendered provider request whose messages are replaced each iteration.
     template: ProviderRequest,
+    /// Native seed messages prepended to every dispatched conversation.
     seed_messages: Vec<skald_spec::MessageNum>,
+    /// Conversation accumulated across model and tool turns.
     conversation: Conversation,
+    /// Session whose turn is appended on success, when the run is session-bound.
     session_id: Option<&'a SessionId>,
-    observer: Arc<dyn Observer>,
 }
 
+/// Runs the bounded model/tool loop inside the caller's `invoke_agent` span.
+///
+/// Each iteration dispatches under a `chat` span, journals the call and
+/// result, and runs requested tools concurrently under `execute_tool` spans
+/// until the model stops calling tools or the iteration budget is spent.
+///
+/// # Errors
+///
+/// Returns `AgentError` for a zero or exhausted iteration budget, a provider,
+/// tool, journal, session, or structured-output failure.
 async fn run_loop(
     this: &Agent,
     providers: &ProviderRegistry,
     inputs: RunLoopInputs<'_>,
 ) -> AgentResult<AgentRun> {
     let RunLoopInputs {
-        run_id,
         template,
         seed_messages,
         mut conversation,
         session_id,
-        observer,
     } = inputs;
     if this.run_config.max_iterations == 0 {
         return Err(AgentError::max_iterations(
@@ -278,7 +253,6 @@ async fn run_loop(
             .append(JournalEvent::Iteration { index: iteration })
             .await
             .map_err(|source| AgentError::JournalAppendFailed { source })?;
-        observer.on_iteration(run_id, &this.id, iteration).await;
 
         let ctx = agent_context_with_session(this, session_id, iteration, &conversation);
         let mut request =
@@ -294,7 +268,6 @@ async fn run_loop(
             "before_model",
         )? {
             ChainResult::Abort(error) => {
-                let synthetic_resp = synthetic_null_response();
                 append_model_journal_call_result(
                     this,
                     ModelJournalCallRecord {
@@ -302,9 +275,6 @@ async fn run_loop(
                         request: &request,
                         finish_reason: "callback_aborted".to_owned(),
                         synthetic: true,
-                        run_id,
-                        observer: &*observer,
-                        response: &synthetic_resp,
                     },
                 )
                 .await?;
@@ -324,31 +294,22 @@ async fn run_loop(
             ChainResult::Replaced(replacement) => replacement,
         };
 
-        append_model_journal_call(this, iteration, &request, run_id, &*observer).await?;
-        let response = dispatch(providers, request).await;
+        append_model_journal_call(this, iteration, &request).await?;
+        let chat = chat_span(&request);
+        let response = dispatch(providers, request).instrument(chat.clone()).await;
         match &response {
             Ok(response) => {
-                append_model_journal_result(
-                    this,
-                    iteration,
-                    response_finish_reason(response),
-                    false,
-                    run_id,
-                    &*observer,
-                    response,
-                )
-                .await?;
+                let finish_reason = response_finish_reason(response);
+                chat.record("gen_ai.response.finish_reasons", finish_reason.as_str());
+                append_model_journal_result(this, iteration, finish_reason, false).await?;
             }
             Err(error) => {
-                let synthetic_resp = synthetic_null_response();
+                record_error(&chat, error.code());
                 append_model_journal_result(
                     this,
                     iteration,
                     format!("provider_error:{error}"),
                     true,
-                    run_id,
-                    &*observer,
-                    &synthetic_resp,
                 )
                 .await?;
             }
@@ -432,7 +393,15 @@ async fn run_loop(
                 let journal = Arc::clone(&journal);
                 let session = Arc::clone(&session);
                 let session_id = session_id_owned.clone();
-                let observer = Arc::clone(&observer);
+                let span = info_span!(
+                    "execute_tool",
+                    gen_ai.operation.name = "execute_tool",
+                    gen_ai.tool.name = %call.name,
+                    gen_ai.tool.call.id = %call.id,
+                    error.r#type = field::Empty,
+                    otel.status_code = field::Empty,
+                );
+                let tool_span = span.clone();
                 async move {
                     let tool = tools_snapshot
                         .iter()
@@ -450,9 +419,6 @@ async fn run_loop(
                         })
                         .await
                         .map_err(|source| AgentError::JournalAppendFailed { source })?;
-                    observer
-                        .on_tool_call(run_id, &ctx.agent_id, iteration, &call.id, &call.name)
-                        .await;
                     let args = match apply_chain_with_panic_catch_tool(
                         &before_tool,
                         &ctx,
@@ -471,9 +437,6 @@ async fn run_loop(
                                 })
                                 .await
                                 .map_err(|source| AgentError::JournalAppendFailed { source })?;
-                            observer
-                                .on_tool_result(run_id, &ctx.agent_id, iteration, &call.id, true)
-                                .await;
                             return Ok((
                                 idx,
                                 ConversationTurn::ToolResult {
@@ -503,13 +466,16 @@ async fn run_loop(
                     };
                     let (ok, content) = match result {
                         Ok(value) => (true, value),
-                        Err(error) => (
-                            false,
-                            serde_json::json!({
-                                "code": error.code(),
-                                "error": error.to_string(),
-                            }),
-                        ),
+                        Err(error) => {
+                            record_error(&tool_span, &error.code());
+                            (
+                                false,
+                                serde_json::json!({
+                                    "code": error.code(),
+                                    "error": error.to_string(),
+                                }),
+                            )
+                        }
                     };
                     journal
                         .append(JournalEvent::ToolResult {
@@ -520,9 +486,6 @@ async fn run_loop(
                         })
                         .await
                         .map_err(|source| AgentError::JournalAppendFailed { source })?;
-                    observer
-                        .on_tool_result(run_id, &ctx.agent_id, iteration, &call.id, ok)
-                        .await;
                     if ok && let Some(session_id) = session_id.as_ref() {
                         session
                             .append(
@@ -548,6 +511,7 @@ async fn run_loop(
                         },
                     ))
                 }
+                .instrument(span)
             })
             .buffer_unordered(concurrency_cap)
             .collect::<Vec<AgentResult<(usize, ConversationTurn)>>>()
@@ -623,43 +587,72 @@ async fn append_terminal_journal_event(
         .map_err(|source| AgentError::JournalAppendFailed { source })
 }
 
-async fn append_terminal_observer_event(
-    run_id: &str,
-    observer: &dyn Observer,
-    this: &Agent,
-    result: &AgentResult<AgentRun>,
-    duration: std::time::Duration,
-) {
-    match result {
-        Ok(run) => {
-            observer
-                .on_agent_finish(
-                    run_id,
-                    &this.id,
-                    &format!("{:?}", run.finish_reason).to_lowercase(),
-                    run.iterations,
-                    duration,
-                )
-                .await;
-        }
-        Err(error) => {
-            observer
-                .on_agent_error(run_id, &this.id, error.code(), &error.to_string())
-                .await;
-        }
+/// Open the `invoke_agent` span for one Agent run.
+///
+/// Carries the OpenTelemetry GenAI operation, agent, provider, and model
+/// identifiers only; [`record_agent_outcome`] fills `error.type` with the
+/// stable Agent error code when the run fails. No prompt or input payload is
+/// recorded.
+fn invoke_agent_span(this: &Agent) -> Span {
+    let request = &this.prompt.native().request;
+    info_span!(
+        "invoke_agent",
+        gen_ai.operation.name = "invoke_agent",
+        gen_ai.agent.id = %this.id,
+        gen_ai.provider.name = %provider_label(&request.provider()),
+        gen_ai.request.model = request_model(request).unwrap_or_default(),
+        error.r#type = field::Empty,
+        otel.status_code = field::Empty,
+    )
+}
+
+/// Open the `chat` span for one provider dispatch of `request`.
+///
+/// Records the provider and requested model; the caller records the finish
+/// reason on success or the stable provider error code on failure.
+fn chat_span(request: &ProviderRequest) -> Span {
+    info_span!(
+        "chat",
+        gen_ai.operation.name = "chat",
+        gen_ai.provider.name = %provider_label(&request.provider()),
+        gen_ai.request.model = request_model(request).unwrap_or_default(),
+        gen_ai.response.finish_reasons = field::Empty,
+        error.r#type = field::Empty,
+        otel.status_code = field::Empty,
+    )
+}
+
+/// Record the run's stable error code on the current `invoke_agent` span.
+fn record_agent_outcome(result: &AgentResult<AgentRun>) {
+    if let Err(error) = result {
+        record_error(&Span::current(), error.code());
     }
 }
 
-struct ModelJournalCallRecord<'a> {
-    iteration: u32,
-    request: &'a ProviderRequest,
-    finish_reason: String,
-    synthetic: bool,
-    run_id: &'a str,
-    observer: &'a dyn Observer,
-    response: &'a ProviderResponse,
+/// Mark `span` failed with the stable error `code` as its `error.type`.
+fn record_error(span: &Span, code: &str) {
+    span.record("error.type", code);
+    span.record("otel.status_code", "ERROR");
 }
 
+/// One model call and its result, journaled together after dispatch.
+struct ModelJournalCallRecord<'a> {
+    /// Loop iteration that issued the call.
+    iteration: u32,
+    /// Request whose provider and model are journaled.
+    request: &'a ProviderRequest,
+    /// Provider finish reason recorded for the result.
+    finish_reason: String,
+    /// Whether the result was synthesized rather than returned by a provider.
+    synthetic: bool,
+}
+
+/// Journals a `ModelCall` followed by its `ModelResult`.
+///
+/// # Errors
+///
+/// Returns `AgentError::JournalAppendFailed` when either append fails; the
+/// result is not appended when the call append fails.
 async fn append_model_journal_call_result(
     this: &Agent,
     record: ModelJournalCallRecord<'_>,
@@ -669,82 +662,50 @@ async fn append_model_journal_call_result(
         request,
         finish_reason,
         synthetic,
-        run_id,
-        observer,
-        response,
     } = record;
-    append_model_journal_call(this, iteration, request, run_id, observer).await?;
-    append_model_journal_result(
-        this,
-        iteration,
-        finish_reason,
-        synthetic,
-        run_id,
-        observer,
-        response,
-    )
-    .await
+    append_model_journal_call(this, iteration, request).await?;
+    append_model_journal_result(this, iteration, finish_reason, synthetic).await
 }
 
+/// Journals the provider and model of one dispatched request.
+///
+/// # Errors
+///
+/// Returns `AgentError::JournalAppendFailed` when the journal rejects the event.
 async fn append_model_journal_call(
     this: &Agent,
     iteration: u32,
     request: &ProviderRequest,
-    run_id: &str,
-    observer: &dyn Observer,
 ) -> AgentResult<()> {
-    let request_provider = request.provider();
-    let request_model = request_model(request).unwrap_or_default().to_owned();
-    let provider = provider_label(&request_provider);
     this.journal
         .append(JournalEvent::ModelCall {
             iteration,
-            provider: provider.clone(),
-            model: request_model.clone(),
+            provider: provider_label(&request.provider()),
+            model: request_model(request).unwrap_or_default().to_owned(),
         })
         .await
-        .map_err(|source| AgentError::JournalAppendFailed { source })?;
-    observer
-        .on_model_call(
-            run_id,
-            &this.id,
-            iteration,
-            &provider,
-            &request_model,
-            request,
-        )
-        .await;
-    Ok(())
+        .map_err(|source| AgentError::JournalAppendFailed { source })
 }
 
+/// Journals the finish reason of one model result.
+///
+/// # Errors
+///
+/// Returns `AgentError::JournalAppendFailed` when the journal rejects the event.
 async fn append_model_journal_result(
     this: &Agent,
     iteration: u32,
     finish_reason: String,
     synthetic: bool,
-    run_id: &str,
-    observer: &dyn Observer,
-    response: &ProviderResponse,
 ) -> AgentResult<()> {
     this.journal
         .append(JournalEvent::ModelResult {
             iteration,
-            finish_reason: finish_reason.clone(),
+            finish_reason,
             synthetic,
         })
         .await
-        .map_err(|source| AgentError::JournalAppendFailed { source })?;
-    observer
-        .on_model_result(
-            run_id,
-            &this.id,
-            iteration,
-            &finish_reason,
-            synthetic,
-            response,
-        )
-        .await;
-    Ok(())
+        .map_err(|source| AgentError::JournalAppendFailed { source })
 }
 
 fn tool_descriptors(tools: &[Arc<dyn AgentTool>]) -> Vec<ToolDescriptor> {
@@ -914,14 +875,5 @@ fn redact_in_place(value: &mut serde_json::Value) {
             }
         }
         _ => {}
-    }
-}
-
-fn synthetic_null_response() -> ProviderResponse {
-    match serde_json::value::RawValue::from_string("null".to_owned()) {
-        Ok(raw) => ProviderResponse::RawV1(raw),
-        // Invariant: the literal "null" is valid JSON; RawValue::from_string
-        // only rejects non-JSON inputs.
-        Err(_) => unreachable!("'null' is valid JSON"),
     }
 }

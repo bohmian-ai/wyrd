@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use serde_json::{Map, Value};
-use skald_agent::{Agent, Observer};
+use skald_agent::Agent;
 use wyrd_spec::card::common::ParameterValue;
 use wyrd_spec::card::prompt::is_valid_parameter_name;
 use wyrd_spec::card::workflow::{
@@ -89,8 +89,6 @@ pub struct Workflow {
     pub(crate) spec: WorkflowSpec,
     pub(crate) cascade_children: Vec<CardRef>,
     pub(crate) resolved_agents: HashMap<String, Arc<Agent>>,
-    /// Runtime-only observers attached to this workflow instance.
-    pub(crate) observers: Vec<Arc<dyn Observer>>,
 }
 
 impl std::fmt::Debug for Workflow {
@@ -121,7 +119,6 @@ impl Workflow {
             spec: WorkflowSpec::default(),
             cascade_children: Vec::new(),
             resolved_agents: HashMap::new(),
-            observers: Vec::new(),
         }
     }
 
@@ -150,22 +147,6 @@ impl Workflow {
             wf.append_agent_step(agent, Vec::new())?;
         }
         Ok(wf)
-    }
-
-    /// Return a copy with runtime observers attached.
-    ///
-    /// Observers are runtime-only state. They are not serialized into the
-    /// workflow card and must be reattached after loading from YAML.
-    #[must_use]
-    pub fn with_observers(mut self, observers: Vec<Arc<dyn Observer>>) -> Self {
-        self.observers = observers;
-        self
-    }
-
-    /// Borrow the runtime observers attached to this workflow.
-    #[must_use]
-    pub fn observers(&self) -> &[Arc<dyn Observer>] {
-        &self.observers
     }
 
     /// Open a fluent builder for explicit DAG construction.
@@ -451,7 +432,6 @@ impl Workflow {
             spec: card.spec,
             cascade_children: card.cascade_children,
             resolved_agents: resolved,
-            observers: Vec::new(),
         })
     }
 
@@ -557,7 +537,6 @@ impl Workflow {
         input: impl Into<WorkflowInput>,
         options: WorkflowRunOptions,
     ) -> WorkflowResult<WorkflowRun> {
-        skald_observer::init();
         let plan = ExecutionPlan::build(
             &self.spec,
             &self.resolved_agents,
@@ -576,16 +555,7 @@ impl Workflow {
             .unwrap_or_else(|| "workflow".to_owned());
         let executor =
             WorkflowExecutor::new(workflow_id, workflow, plan, dependencies.native(), options)?;
-        let run = executor.execute();
-        Ok(match self.observers.as_slice() {
-            [] => run.await,
-            [one] => skald_observer::with_observer(Arc::clone(one), run).await,
-            many => {
-                let composite: Arc<dyn Observer> =
-                    Arc::new(skald_observer::CompositeObserver::new(many.to_vec()));
-                skald_observer::with_observer(composite, run).await
-            }
-        })
+        Ok(executor.execute().await)
     }
 
     fn append_agent_step(&mut self, agent: Agent, deps: Vec<String>) -> WorkflowResult<String> {

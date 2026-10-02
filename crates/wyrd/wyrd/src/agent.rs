@@ -14,10 +14,6 @@ pub use skald_agent::{
     NoSession, NoopJournal, PromptResolver, Role, RunConfig, SessionId, SessionMemory, SessionTurn,
     clear_prompt_card_registry, default_prompt_resolver, register_prompt_card,
 };
-#[cfg(feature = "otel")]
-pub use skald_observer::OtelObserver;
-pub use skald_observer::{CompositeObserver, set_global, with_observer};
-pub use skald_observer::{NoopObserver, Observer};
 pub use skald_prompt::{
     AnthropicOptions, GeminiOptions, OpenAiChatOptions, Prompt, anthropic, gemini, openai_chat,
 };

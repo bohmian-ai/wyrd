@@ -14,7 +14,6 @@ path = "src/lib.rs"
 
 [features]
 default = []
-otel = ["skald-observer/otel"]
 python = [
     "dep:pyo3",
     "dep:wyrd-utils",
@@ -23,7 +22,6 @@ python = [
 
 [dependencies]
 skald-spec = { workspace = true }
-skald-observer = { workspace = true }
 skald-prompt = { workspace = true }
 skald-runtime = { workspace = true }
 skald-agent = { workspace = true }
@@ -50,5 +48,6 @@ pyo3 = { workspace = true, optional = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
+wyrd-telemetry = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 wiremock = { workspace = true }

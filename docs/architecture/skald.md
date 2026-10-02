@@ -23,7 +23,7 @@ Skald does not depend on `wyrd-*` or `vala-*`.
   requests to registered providers and returns native `ProviderResponse`.
   `MockProvider` is public here for offline runtime tests.
 - `skald-agent`: live agent runtime. It owns `Agent`, `AgentDef`, the bounded
-  tool loop, `Observer`, `AgentTool`, `ToolRegistry`, and the
+  tool loop, `AgentTool`, `ToolRegistry`, and the
   `SKALD_AGENT_*` error catalog.
 - `skald-workflow`: workflow runtime. It owns `Workflow`, `WorkflowDef`,
   `Task`/`TaskDef`, `Context`, the DAG executor, `execute_task`,
@@ -62,9 +62,9 @@ read provider output through `ResponseAdapter`.
 `MockProvider` is a public `skald-runtime` type so runtime behavior can be
 tested without credentials or live provider calls.
 
-`skald-agent` and `skald-workflow` observe runtime activity through the injected
-`Observer` trait and `tracing` spans. They never link `vala-client`; Wyrd/Vala
-consumers provide observer implementations from their own layer.
+`skald-agent` and `skald-workflow` report runtime activity only through plain
+`tracing` spans without payloads. They never link `vala-client`; consumers
+collect the spans with their own `tracing` subscriber.
 
 ## PyO3 Scope
 

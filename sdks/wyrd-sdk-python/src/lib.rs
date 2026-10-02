@@ -102,8 +102,6 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_submodule(&providers)?;
     register_submodule(py, "wyrd._wyrd.providers", &providers)?;
 
-    skald_observer::python::python_register(m)?;
-
     let client = PyModule::new(py, "client")?;
     client::register_client(&client)?;
     m.add_submodule(&client)?;

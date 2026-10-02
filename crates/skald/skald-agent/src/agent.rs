@@ -691,9 +691,8 @@ impl Agent {
         providers: &ProviderRegistry,
         prompt: &Prompt,
         vars: &[(&str, &str)],
-        parent_run_id: Option<&str>,
     ) -> AgentResult<AgentRun> {
-        crate::loop_runtime::run_prompt(self, providers, prompt, vars, parent_run_id).await
+        crate::loop_runtime::run_prompt(self, providers, prompt, vars).await
     }
 
     fn from_resolved_parts(

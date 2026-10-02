@@ -8,7 +8,7 @@ order: 20
 
 # Build an Agent
 
-An Agent runs a bounded loop over a Prompt with tools, callbacks, and session memory. Provider and model live on the Prompt; the Agent owns execution policy. Observers attach to Workflows, not Agents.
+An Agent runs a bounded loop over a Prompt with tools, callbacks, and session memory. Provider and model live on the Prompt; the Agent owns execution policy.
 
 ## Minimal Agent
 
@@ -44,7 +44,7 @@ Tools are runtime-local callables. Python uses the `@tool` decorator. Rust uses 
 
 ## Callbacks
 
-Callbacks mutate inline behavior. They can replace a request, transform a response, or abort. Observers watch lifecycle events and ignore return values. Agent hooks include `before_agent_callback`, `after_agent_callback`, `before_model_callback`, `after_model_callback`, `before_tool_callback`, and `after_tool_callback`. `before_model_callback` receives `ProviderRequest`; `after_model_callback` receives `ProviderResponse`.
+Callbacks mutate inline behavior. They can replace a request, transform a response, or abort. Agent hooks include `before_agent_callback`, `after_agent_callback`, `before_model_callback`, `after_model_callback`, `before_tool_callback`, and `after_tool_callback`. `before_model_callback` receives `ProviderRequest`; `after_model_callback` receives `ProviderResponse`.
 
 <LangTabs>
 <LangTab lang="python">

@@ -7,12 +7,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyList, PyModule, PyString};
 use serde_json::Value;
-use skald_agent::{Agent, Observer};
+use skald_agent::Agent;
 use skald_workflow::{Workflow, WorkflowInput, step_id_for_name};
 use wyrd_spec::card::common::ParameterValue;
 use wyrd_spec::card::workflow::{WorkflowBinding, WorkflowRun};
@@ -153,40 +152,6 @@ fn extract_agents(py: Python<'_>, agents: Vec<Py<PyAny>>) -> WyrdPyResult<Vec<Ag
     Ok(out)
 }
 
-/// Bridge Python `wyrd.observer.Observer` instances into native observers.
-///
-/// # Errors
-///
-/// Returns `WYRD_WORKFLOW_422_VALIDATION` naming `observers` for a value that
-/// is not an `Observer` subclass, or a Python error when `wyrd.observer`
-/// cannot be imported.
-fn extract_observers(
-    py: Python<'_>,
-    observers: Option<Vec<Py<PyAny>>>,
-) -> WyrdPyResult<Vec<Arc<dyn Observer>>> {
-    let Some(observers) = observers else {
-        return Ok(Vec::new());
-    };
-    let observer_cls = py
-        .import("wyrd.observer")
-        .and_then(|module| module.getattr("Observer"))?;
-    let mut out: Vec<Arc<dyn Observer>> = Vec::with_capacity(observers.len());
-    for observer in observers {
-        let bound = observer.bind(py);
-        if !bound.is_instance(&observer_cls)? {
-            let type_name = bound.get_type().name()?;
-            return Err(invalid_argument(
-                "observers",
-                format!("expected Observer subclass, got {type_name}"),
-            ));
-        }
-        out.push(
-            Arc::new(skald_observer::python::PythonObserver::new(observer)) as Arc<dyn Observer>,
-        );
-    }
-    Ok(out)
-}
-
 /// Resolve `after` (an id, an Agent, or a list of either) into step ids.
 ///
 /// # Errors
@@ -266,20 +231,16 @@ impl PyWorkflow {
         space = None,
         labels = None,
         annotations = None,
-        observers = None,
     ))]
     fn __new__(
-        py: Python<'_>,
         name: String,
         version: Option<String>,
         space: Option<String>,
         labels: Option<HashMap<String, String>>,
         annotations: Option<HashMap<String, String>>,
-        observers: Option<Vec<Py<PyAny>>>,
     ) -> WyrdPyResult<Self> {
         let labels = coerce_labels(labels)?;
         let annotations = coerce_annotations(annotations)?;
-        let observers = extract_observers(py, observers)?;
         let mut wf = Workflow::new(name);
         if let Some(version) = version {
             wf = wf.with_version(version);
@@ -287,10 +248,7 @@ impl PyWorkflow {
         if let Some(space) = space {
             wf = wf.with_space(space);
         }
-        let inner = wf
-            .with_labels(labels)
-            .with_annotations(annotations)
-            .with_observers(observers);
+        let inner = wf.with_labels(labels).with_annotations(annotations);
         Ok(Self { inner })
     }
 
@@ -299,7 +257,6 @@ impl PyWorkflow {
     /// Args:
     ///     name (str): Workflow name.
     ///     *agents (Agent): One or more Agent values to chain.
-    ///     observers (list[Observer] | None): Optional runtime observers.
     ///
     /// Returns:
     ///     Workflow: Workflow with each agent depending on the previous one.
@@ -307,16 +264,10 @@ impl PyWorkflow {
     /// Raises:
     ///     `WyrdError`: When the resulting DAG is invalid.
     #[staticmethod]
-    #[pyo3(signature = (name, *agents, observers = None))]
-    fn sequential(
-        py: Python<'_>,
-        name: String,
-        agents: Vec<Py<PyAny>>,
-        observers: Option<Vec<Py<PyAny>>>,
-    ) -> WyrdPyResult<Self> {
+    #[pyo3(signature = (name, *agents))]
+    fn sequential(py: Python<'_>, name: String, agents: Vec<Py<PyAny>>) -> WyrdPyResult<Self> {
         let agents = extract_agents(py, agents)?;
-        let observers = extract_observers(py, observers)?;
-        let inner = Workflow::sequential(name, agents)?.with_observers(observers);
+        let inner = Workflow::sequential(name, agents)?;
         Ok(Self { inner })
     }
 
@@ -325,7 +276,6 @@ impl PyWorkflow {
     /// Args:
     ///     name (str): Workflow name.
     ///     *agents (Agent): One or more Agent values to run in parallel.
-    ///     observers (list[Observer] | None): Optional runtime observers.
     ///
     /// Returns:
     ///     Workflow: Workflow with each agent as an independent root step.
@@ -333,16 +283,10 @@ impl PyWorkflow {
     /// Raises:
     ///     `WyrdError`: When the resulting DAG is invalid.
     #[staticmethod]
-    #[pyo3(signature = (name, *agents, observers = None))]
-    fn parallel(
-        py: Python<'_>,
-        name: String,
-        agents: Vec<Py<PyAny>>,
-        observers: Option<Vec<Py<PyAny>>>,
-    ) -> WyrdPyResult<Self> {
+    #[pyo3(signature = (name, *agents))]
+    fn parallel(py: Python<'_>, name: String, agents: Vec<Py<PyAny>>) -> WyrdPyResult<Self> {
         let agents = extract_agents(py, agents)?;
-        let observers = extract_observers(py, observers)?;
-        let inner = Workflow::parallel(name, agents)?.with_observers(observers);
+        let inner = Workflow::parallel(name, agents)?;
         Ok(Self { inner })
     }
 

@@ -8,6 +8,11 @@
 //! cancellation or the total deadline aborts and drains the set. Dropping the
 //! executor's future drops the `JoinSet`, which aborts every step task, so no
 //! step outlives its run.
+//!
+//! Telemetry is plain synchronous `tracing`: one `workflow.run` span per run,
+//! one child `workflow.step` span per attempt, and a `workflow.step.backoff`
+//! event before each retry. They carry identifiers, counts, statuses, and
+//! stable Wyrd error codes, never payloads, and cannot affect the run.
 
 use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroUsize;
@@ -15,19 +20,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use skald_observer::{Observer, current};
 use skald_runtime::ProviderRegistry;
 use tokio::task::{Id, JoinError, JoinSet};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use wyrd_spec::card::workflow::WorkflowRun;
+use tracing::{Instrument, Span, field, info_span};
+use wyrd_spec::card::workflow::{WorkflowRun, WorkflowRunStatus};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::WorkflowRunId;
 use wyrd_spec::reference::CardRef;
 
 use crate::attempt::AttemptOutcome;
 use crate::error::WorkflowResult;
-use crate::observe::{RunEvents, StepResultCeiling, sleep_until};
 use crate::plan::ExecutionPlan;
 use crate::route::{AttemptRouteContext, WorkflowGatewayCorrelation};
 use crate::run::{RunEnding, RunLedger};
@@ -80,7 +84,7 @@ pub struct WorkflowRunOptions {
 
 /// Owner of one Workflow run's scheduling and settlement.
 pub(crate) struct WorkflowExecutor {
-    /// Workflow identifier reported to observers.
+    /// Workflow identifier reported on the `workflow.run` span.
     workflow_id: String,
     /// Immutable plan shared with step tasks.
     plan: Arc<ExecutionPlan>,
@@ -128,8 +132,6 @@ struct StepTask {
     attempts: Arc<[AtomicU32]>,
     /// Step result size limit.
     max_step_result_bytes: Option<usize>,
-    /// Best-effort Workflow event delivery for the run.
-    events: RunEvents,
 }
 
 impl WorkflowExecutor {
@@ -192,25 +194,40 @@ impl WorkflowExecutor {
         })
     }
 
-    /// Execute the run to a terminal snapshot.
+    /// Execute the run to a terminal snapshot inside its `workflow.run` span.
     ///
     /// Never fails after preparation: step, cancellation, deadline, and size
-    /// outcomes are all recorded in the returned snapshot. Workflow events go
-    /// through [`RunEvents`], so observers cannot fail or stall the run past
-    /// its cancellation or deadline.
-    pub(crate) async fn execute(mut self) -> WorkflowRun {
-        let observer = current();
-        let run_id = self.ledger.run_id().to_string();
-        let started = Instant::now();
+    /// outcomes are all recorded in the returned snapshot. The span records
+    /// the terminal status and, for an unsuccessful run, the primary error
+    /// code.
+    pub(crate) async fn execute(self) -> WorkflowRun {
+        let span = info_span!(
+            "workflow.run",
+            wyrd.workflow.id = %self.workflow_id,
+            wyrd.workflow.run_id = %self.ledger.run_id(),
+            wyrd.workflow.step_count = self.plan.steps.len(),
+            wyrd.workflow.status = field::Empty,
+            error.r#type = field::Empty,
+            otel.status_code = field::Empty,
+        );
+        let run = self.drive().instrument(span.clone()).await;
+        span.record("wyrd.workflow.status", status_name(run.status));
+        if let Some(error) = &run.error {
+            span.record("error.type", error.code.as_str());
+        }
+        if run.status != WorkflowRunStatus::Succeeded {
+            span.record("otel.status_code", "ERROR");
+        }
+        run
+    }
+
+    /// Schedule, settle, and terminalize the run.
+    ///
+    /// Step tasks inherit the current `workflow.run` span so their attempt
+    /// spans are its children.
+    async fn drive(mut self) -> WorkflowRun {
         let deadline = self.deadline;
         let cancellation = self.options.cancellation.clone();
-        let events = RunEvents::new(
-            Arc::clone(&observer),
-            &run_id,
-            cancellation.clone(),
-            deadline,
-        );
-        events.start(&self.workflow_id, self.plan.steps.len()).await;
         self.ledger.start();
         let mut tasks: JoinSet<StepReport> = JoinSet::new();
         let mut running: HashMap<Id, usize> = HashMap::new();
@@ -235,15 +252,6 @@ impl WorkflowExecutor {
                 match self.bind(index) {
                     Ok(pairs) => {
                         self.ledger.step_started(index);
-                        let max_step_result_bytes = self.options.limits.max_step_result_bytes;
-                        let step_observer: Arc<dyn Observer> = match max_step_result_bytes {
-                            Some(limit) => Arc::new(StepResultCeiling::new(
-                                Arc::clone(&observer),
-                                limit,
-                                self.plan.steps[index].validator.is_some(),
-                            )),
-                            None => Arc::clone(&observer),
-                        };
                         let task = StepTask {
                             plan: Arc::clone(&self.plan),
                             index,
@@ -253,18 +261,14 @@ impl WorkflowExecutor {
                             deadline,
                             cancellation: cancellation.clone(),
                             attempts: Arc::clone(&self.attempts),
-                            max_step_result_bytes,
-                            events: events.clone(),
+                            max_step_result_bytes: self.options.limits.max_step_result_bytes,
                         };
-                        let scoped = skald_observer::with_observer(step_observer, task.run());
-                        let handle = tasks.spawn(scoped);
+                        let handle = tasks.spawn(task.run().instrument(Span::current()));
                         running.insert(handle.id(), index);
                     }
                     Err(error) => {
-                        let step_id = &self.plan.steps[index].id;
                         self.attempts[index].store(1, Ordering::Release);
-                        events.attempt(step_id, 1, None).await;
-                        events.result(step_id, 1, Some(error.code())).await;
+                        AttemptSpan::new(&self.plan.steps[index].id, 1).failed(error.code());
                         self.ledger.step_failed(
                             index,
                             wyrd_spec::card::workflow::WorkflowRunError::from_wyrd(&error),
@@ -301,9 +305,7 @@ impl WorkflowExecutor {
             };
             stopping |= self.settle(index, report);
         }
-        let run = self.ledger.finish(ending, &self.plan);
-        events.finish(&self.workflow_id, started.elapsed()).await;
-        run
+        self.ledger.finish(ending, &self.plan)
     }
 
     /// Record one joined step task in the ledger; returns whether new
@@ -410,10 +412,11 @@ impl StepTask {
     /// Run attempts until success, a terminal failure, retry exhaustion, or
     /// interruption.
     ///
-    /// Each attempt fixes its own and the Agent's deadlines before reporting
-    /// its start, then races, in order, cancellation, the total deadline, the
-    /// step attempt timeout, and the attempt itself. Retryable failures wait
-    /// the deterministic backoff, which also races cancellation and the total
+    /// Each attempt fixes its own and the Agent's deadlines, opens its
+    /// `workflow.step` span, then races, in order, cancellation, the total
+    /// deadline, the step attempt timeout, and the attempt itself. Retryable
+    /// failures emit a `workflow.step.backoff` event and wait the
+    /// deterministic backoff, which also races cancellation and the total
     /// deadline. No attempt begins after either fires.
     async fn run(self) -> StepReport {
         let step = &self.plan.steps[self.index];
@@ -430,19 +433,15 @@ impl StepTask {
             self.attempts[self.index].store(attempt, Ordering::Release);
             let deadlines = deadline_after(step.timeout)
                 .and_then(|attempt| Ok((attempt, deadline_after(step.agent.run_config.timeout)?)));
+            let span = AttemptSpan::new(&step.id, attempt);
             let Ok((attempt_deadline, agent_deadline)) = deadlines else {
                 let error = WyrdError::WorkflowInternal {
                     message: format!("step '{}' timeout is not representable", step.id),
                     details: serde_json::json!({ "step": step.id }),
                 };
-                self.events
-                    .result(&step.id, attempt, Some(error.code()))
-                    .await;
+                span.failed(error.code());
                 return StepReport::Finished(AttemptOutcome::failed(&error, false));
             };
-            self.events
-                .attempt(&step.id, attempt, attempt_deadline)
-                .await;
             let outcome = tokio::select! {
                 biased;
                 () = self.cancellation.cancelled() => return StepReport::Interrupted,
@@ -458,23 +457,28 @@ impl StepTask {
                         true,
                     )
                 }
-                outcome = self.attempt(attempt, attempt_deadline, agent_deadline) => outcome,
+                outcome = self
+                    .attempt(attempt, attempt_deadline, agent_deadline)
+                    .instrument(span.span.clone()) => outcome,
             };
             let (error, retryable) = match outcome {
                 AttemptOutcome::Succeeded(payload) => {
-                    self.events.result(&step.id, attempt, None).await;
+                    span.succeeded();
                     return StepReport::Finished(AttemptOutcome::Succeeded(payload));
                 }
                 AttemptOutcome::Failed { error, retryable } => (error, retryable),
             };
-            self.events
-                .result(&step.id, attempt, Some(&error.code))
-                .await;
+            span.failed(&error.code);
             if !retryable || attempt > step.max_retries {
                 return StepReport::Finished(AttemptOutcome::Failed { error, retryable });
             }
             let delay = backoff(step.initial_backoff_ms, attempt);
-            self.events.backoff(&step.id, attempt + 1, delay).await;
+            tracing::info!(
+                wyrd.workflow.step.id = %step.id,
+                wyrd.workflow.step.next_attempt = attempt + 1,
+                wyrd.workflow.step.delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                "workflow.step.backoff"
+            );
             tokio::select! {
                 biased;
                 () = self.cancellation.cancelled() => return StepReport::Interrupted,
@@ -527,10 +531,7 @@ impl StepTask {
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str()))
             .collect();
-        let run_id = self.run_id.to_string();
-        let result = agent
-            .run_prompt(&self.native, &agent.prompt, &pairs, Some(&run_id))
-            .await;
+        let result = agent.run_prompt(&self.native, &agent.prompt, &pairs).await;
         AttemptOutcome::from_agent(
             &step.id,
             result,
@@ -559,6 +560,79 @@ fn deadline_after(timeout: Option<Duration>) -> Result<Option<Instant>, Duration
         .transpose()
 }
 
+/// Sleep until `deadline`, or forever when there is none.
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Wire name of a run status, as recorded on the `workflow.run` span.
+const fn status_name(status: WorkflowRunStatus) -> &'static str {
+    match status {
+        WorkflowRunStatus::Queued => "queued",
+        WorkflowRunStatus::Running => "running",
+        WorkflowRunStatus::Succeeded => "succeeded",
+        WorkflowRunStatus::Failed => "failed",
+        WorkflowRunStatus::Cancelled => "cancelled",
+        WorkflowRunStatus::TimedOut => "timed_out",
+    }
+}
+
+/// The `workflow.step` span of one attempt and whether its outcome is
+/// recorded.
+///
+/// An attempt dropped before it settles — interrupted by cancellation or the
+/// total deadline, or aborted with its task — records outcome `cancelled`
+/// when the span closes, so every attempt span carries an outcome.
+struct AttemptSpan {
+    /// The attempt's span, a child of the current `workflow.run` span.
+    span: Span,
+    /// Whether [`Self::succeeded`] or [`Self::failed`] recorded the outcome.
+    settled: bool,
+}
+
+impl AttemptSpan {
+    /// Open the span for attempt `attempt` (one-based) of `step_id`.
+    fn new(step_id: &str, attempt: u32) -> Self {
+        Self {
+            span: info_span!(
+                "workflow.step",
+                wyrd.workflow.step.id = step_id,
+                wyrd.workflow.step.attempt = attempt,
+                wyrd.workflow.step.outcome = field::Empty,
+                error.r#type = field::Empty,
+                otel.status_code = field::Empty,
+            ),
+            settled: false,
+        }
+    }
+
+    /// Record a successful attempt.
+    fn succeeded(mut self) {
+        self.span.record("wyrd.workflow.step.outcome", "succeeded");
+        self.settled = true;
+    }
+
+    /// Record a failed attempt with its stable Wyrd error `code`.
+    fn failed(mut self, code: &str) {
+        self.span.record("wyrd.workflow.step.outcome", "failed");
+        self.span.record("error.type", code);
+        self.span.record("otel.status_code", "ERROR");
+        self.settled = true;
+    }
+}
+
+impl Drop for AttemptSpan {
+    /// Record outcome `cancelled` for an attempt that never settled.
+    fn drop(&mut self) {
+        if !self.settled {
+            self.span.record("wyrd.workflow.step.outcome", "cancelled");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -584,9 +658,13 @@ mod tests {
     };
     use wyrd_spec::gateway::{GatewayFallbackOverride, ModelRef};
     use wyrd_spec::ids::CredentialBindingName;
+    use wyrd_telemetry::{
+        CapturedSpan, CapturedSpanStatus, TelemetryConfig, TelemetryGuard, TestTraceCapture,
+        init_test_capture,
+    };
 
     use super::{
-        JoinError, JoinSet, Observer, StepReport, WorkflowExecutionLimits, WorkflowExecutor,
+        JoinError, JoinSet, StepReport, WorkflowExecutionLimits, WorkflowExecutor,
         WorkflowRunOptions, backoff,
     };
     use crate::attempt::{agent_error_retryable, project_agent_error};
@@ -597,8 +675,8 @@ mod tests {
     };
     use crate::run::RunEnding;
     use crate::test_support::{
-        HostileObserver, RecordingObserver, RecordingTool, Reply, ScriptedProvider, agent,
-        bindings, string_schema, text_response, tool_call_response,
+        RecordingTool, Reply, ScriptedProvider, agent, bindings, string_schema, text_response,
+        tool_call_response,
     };
     use crate::workflow_surface::{Workflow, WorkflowInput};
 
@@ -928,7 +1006,7 @@ mod tests {
         assert_eq!(provider.peak(), 2);
         assert_eq!(WorkflowExecutionLimits::default().max_concurrency.get(), 8);
 
-        // Eligible failures retry with exponential backoff, observed per attempt.
+        // Eligible failures retry with exponential backoff.
         let workflow = with_policy(
             independent("retry", &[("flaky", "flaky call")]),
             "flaky",
@@ -941,8 +1019,6 @@ mod tests {
             "flaky call",
             vec![status(503), status(429), Reply::Text("ok".into())],
         );
-        let observer = Arc::new(RecordingObserver::default());
-        let workflow = workflow.with_observers(vec![observer.clone()]);
         let started = tokio::time::Instant::now();
         let run = run_limited(
             &workflow,
@@ -954,19 +1030,6 @@ mod tests {
         assert_eq!(run.status, WorkflowRunStatus::Succeeded);
         assert_eq!(run.steps["flaky"].attempts, 3);
         assert!(started.elapsed() >= Duration::from_millis(300));
-        assert_eq!(
-            observer.events(),
-            vec![
-                "attempt:flaky:1",
-                "result:flaky:1:WYRD_AGENT_502_PROVIDER",
-                "backoff:flaky:2:100",
-                "attempt:flaky:2",
-                "result:flaky:2:WYRD_AGENT_502_PROVIDER",
-                "backoff:flaky:3:200",
-                "attempt:flaky:3",
-                "result:flaky:3:ok",
-            ]
-        );
 
         // Retry exhaustion keeps the final eligible error; the provider body
         // never reaches the snapshot.
@@ -1329,80 +1392,161 @@ mod tests {
             (WorkflowStepStatus::Cancelled, 1)
         );
         assert!(begun.started_at.is_some() && begun.ended_at.is_some());
+    }
 
-        // Panicking Workflow callbacks are contained: a retried step and a
-        // binding failure keep their authoritative outcomes.
-        let panicking = || -> Arc<dyn Observer> {
-            Arc::new(HostileObserver {
-                panic: true,
-                spare_start: false,
+    /// Process-wide trace capture and the guard that keeps its provider alive.
+    static CAPTURE: std::sync::OnceLock<(TelemetryGuard, TestTraceCapture)> =
+        std::sync::OnceLock::new();
+
+    /// Install the production-shaped capture pipeline once and return it.
+    ///
+    /// # Panics
+    /// Panics when another global subscriber is already installed.
+    fn capture() -> &'static TestTraceCapture {
+        &CAPTURE
+            .get_or_init(|| {
+                init_test_capture(TelemetryConfig::default()).expect("trace capture installs once")
             })
-        };
+            .1
+    }
+
+    /// The finished `workflow.run` span of `run` and its direct children.
+    ///
+    /// # Panics
+    /// Panics unless exactly one `workflow.run` span carries the run's ID.
+    fn run_spans(
+        run: &wyrd_spec::card::workflow::WorkflowRun,
+    ) -> (CapturedSpan, Vec<CapturedSpan>) {
+        let run_id = run.run_id.to_string();
+        let spans = capture().finished_since(0);
+        let mut roots = spans.iter().filter(|span| {
+            span.name == "workflow.run"
+                && span.attributes.get("wyrd.workflow.run_id") == Some(&run_id)
+        });
+        let root = roots.next().expect("one workflow.run span").clone();
+        assert!(roots.next().is_none(), "one workflow.run span per run");
+        let children = spans
+            .into_iter()
+            .filter(|span| span.parent_span_id == root.span_id)
+            .collect();
+        (root, children)
+    }
+
+    /// `(attempt, outcome, error code)` of each `workflow.step` span, by
+    /// attempt.
+    fn attempts(children: &[CapturedSpan]) -> Vec<(String, String, Option<String>)> {
+        let mut attempts: Vec<_> = children
+            .iter()
+            .filter(|span| span.name == "workflow.step")
+            .map(|span| {
+                (
+                    span.attributes["wyrd.workflow.step.attempt"].clone(),
+                    span.attributes["wyrd.workflow.step.outcome"].clone(),
+                    span.attributes.get("error.type").cloned(),
+                )
+            })
+            .collect();
+        attempts.sort();
+        attempts
+    }
+
+    /// REQ-053: a run emits one `workflow.run` span with its identity, step
+    /// count, and terminal status; one child `workflow.step` span per attempt,
+    /// so a retry is a sibling span carrying the failed attempt's stable code;
+    /// a `workflow.step.backoff` event with the next attempt and delay; and
+    /// the Agent's `invoke_agent` and `chat` spans beneath each attempt.
+    /// Cancelled attempts close with outcome `cancelled`, and no span carries
+    /// Workflow input or model output.
+    #[tokio::test(start_paused = true)]
+    async fn run_tracing_spans() {
+        capture();
         let workflow = with_policy(
-            independent("panicky", &[("flaky", "flaky call")]),
+            Workflow::builder("traced")
+                .add(agent("flaky", "flaky about ${topic}", None))
+                .and_then(|b| b.with_inputs(string_inputs(&[("topic", "rust")])))
+                .and_then(|b| b.with_step_inputs("flaky", bindings(&[("topic", "input.topic")])))
+                .and_then(|b| b.with_outputs(bindings(&[("out", "steps.flaky.output.text")])))
+                .and_then(|b| b.build())
+                .expect("traced workflow builds"),
             "flaky",
             1,
             Some(100),
             None,
-        )
-        .with_observers(vec![panicking()]);
+        );
         let provider = ScriptedProvider::new();
-        provider.on("flaky call", vec![status(503), Reply::Text("ok".into())]);
-        let run = run_limited(
-            &workflow,
-            &provider,
-            WorkflowExecutionLimits::default(),
-            CancellationToken::new(),
-        )
-        .await;
+        provider.on(
+            "flaky about",
+            vec![status(503), Reply::Text("output-pii-marker".into())],
+        );
+        let run = run_local(&workflow, &provider, json!({ "topic": "input-pii-marker" })).await;
         assert_eq!(run.status, WorkflowRunStatus::Succeeded);
-        assert_eq!(run.steps["flaky"].attempts, 2);
-        let optional = json!({
-            "type": "object",
-            "properties": { "summary": { "type": "string" }, "extra": { "type": "string" } },
-            "required": ["summary"]
-        });
-        let workflow = Workflow::builder("panicky_binding")
-            .add(agent("src", "src call", Some(optional)))
-            .and_then(|b| b.add_after(agent("use", "use ${v}", None), ["src"]))
-            .and_then(|b| {
-                b.with_step_inputs(
-                    "use",
-                    bindings(&[("v", "steps.src.output.structured.extra")]),
+
+        let (root, children) = run_spans(&run);
+        for (key, value) in [
+            ("wyrd.workflow.id", "traced"),
+            ("wyrd.workflow.step_count", "1"),
+            ("wyrd.workflow.status", "succeeded"),
+        ] {
+            assert_eq!(root.attributes.get(key).map(String::as_str), Some(value));
+        }
+        assert!(!root.attributes.contains_key("error.type"));
+        assert_eq!(
+            attempts(&children),
+            [
+                (
+                    "1".to_owned(),
+                    "failed".to_owned(),
+                    Some("WYRD_AGENT_502_PROVIDER".to_owned())
+                ),
+                ("2".to_owned(), "succeeded".to_owned(), None),
+            ]
+        );
+        let backoff: Vec<_> = root
+            .events
+            .iter()
+            .filter(|event| event.name == "workflow.step.backoff")
+            .map(|event| {
+                (
+                    event.attributes["wyrd.workflow.step.id"].as_str(),
+                    event.attributes["wyrd.workflow.step.next_attempt"].as_str(),
+                    event.attributes["wyrd.workflow.step.delay_ms"].as_str(),
                 )
             })
-            .and_then(|b| b.with_outputs(bindings(&[("out", "steps.use.output.text")])))
-            .and_then(|b| b.build())
-            .expect("binding workflow builds")
-            .with_observers(vec![panicking()]);
-        let provider = ScriptedProvider::new();
-        provider.on("src call", vec![Reply::Text(r#"{"summary":"s"}"#.into())]);
-        let run = run_limited(
-            &workflow,
-            &provider,
-            WorkflowExecutionLimits::default(),
-            CancellationToken::new(),
-        )
-        .await;
-        assert_eq!(
-            run.error.as_ref().map(|e| e.code.as_str()),
-            Some("WYRD_WORKFLOW_422_MISSING_PARAMETER")
-        );
-        assert_eq!(run.steps["use"].attempts, 1);
-        assert_eq!(provider.count("use"), 0);
+            .collect();
+        assert_eq!(backoff, [("flaky", "2", "100")]);
+        let all = capture().finished_since(0);
+        let trace: Vec<_> = all
+            .iter()
+            .filter(|span| span.trace_id == root.trace_id)
+            .collect();
+        for step in children.iter().filter(|span| span.name == "workflow.step") {
+            let agents: Vec<_> = trace
+                .iter()
+                .filter(|span| span.parent_span_id == step.span_id)
+                .collect();
+            assert_eq!(agents.len(), 1);
+            assert_eq!(agents[0].name, "invoke_agent");
+            assert!(
+                trace
+                    .iter()
+                    .any(|span| span.name == "chat" && span.parent_span_id == agents[0].span_id)
+            );
+        }
+        for span in &trace {
+            for value in span.attributes.values() {
+                assert!(!value.contains("pii-marker"), "{}: {value}", span.name);
+            }
+            for event in &span.events {
+                for value in event.attributes.values() {
+                    assert!(!value.contains("pii-marker"), "{}: {value}", event.name);
+                }
+            }
+        }
 
-        // A run-start callback that never completes cannot hold off
-        // cancellation: the run returns a complete cancelled snapshot and no
-        // step begins.
-        let workflow =
-            independent("stalled", &[("held", "held call")]).with_observers(vec![Arc::new(
-                HostileObserver {
-                    panic: false,
-                    spare_start: false,
-                },
-            )]);
+        // An attempt interrupted by cancellation closes as cancelled, and the
+        // run span records the terminal status.
         let provider = ScriptedProvider::new();
-        provider.on("held call", vec![Reply::Text("ok".into())]);
+        provider.on("flaky about", vec![Reply::Hang]);
         let cancellation = CancellationToken::new();
         let trigger = cancellation.clone();
         let cancel_task = tokio::spawn(async move {
@@ -1418,44 +1562,18 @@ mod tests {
         .await;
         cancel_task.await.expect("cancel task completes");
         assert_eq!(run.status, WorkflowRunStatus::Cancelled);
-        let held = &run.steps["held"];
+        let (root, children) = run_spans(&run);
         assert_eq!(
-            (held.status, held.attempts),
-            (WorkflowStepStatus::Unstarted, 0)
+            root.attributes
+                .get("wyrd.workflow.status")
+                .map(String::as_str),
+            Some("cancelled")
         );
-        assert_eq!(provider.count("held call"), 0);
-
-        // Hanging attempt, result, backoff, and finish callbacks are bounded:
-        // the attempt-start callback consumes the attempt's own timeout, the
-        // result callback ends at the total deadline, no later attempt
-        // begins, and the timed-out snapshot returns at that deadline.
-        let workflow = with_policy(
-            independent("stalled_attempt", &[("held", "held call")]),
-            "held",
-            1,
-            None,
-            Some(1),
-        )
-        .with_observers(vec![Arc::new(HostileObserver {
-            panic: false,
-            spare_start: true,
-        })]);
-        let provider = ScriptedProvider::new();
-        provider.on("held call", vec![Reply::Text("ok".into())]);
-        let limits = WorkflowExecutionLimits {
-            deadline: Some(Duration::from_secs(10)),
-            ..WorkflowExecutionLimits::default()
-        };
-        let started = tokio::time::Instant::now();
-        let run = run_limited(&workflow, &provider, limits, CancellationToken::new()).await;
-        assert_eq!(started.elapsed(), Duration::from_secs(10));
-        assert_eq!(run.status, WorkflowRunStatus::TimedOut);
-        let held = &run.steps["held"];
+        assert!(matches!(root.status, CapturedSpanStatus::Error(_)));
         assert_eq!(
-            (held.status, held.attempts),
-            (WorkflowStepStatus::Cancelled, 1)
+            attempts(&children),
+            [("1".to_owned(), "cancelled".to_owned(), None)]
         );
-        assert_eq!(provider.count("held call"), 0);
     }
 
     /// Gateway fake answering per step from scripted replies and recording
@@ -2103,35 +2221,6 @@ mod tests {
             run.error.as_ref().map(|e| e.code.as_str()),
             Some("WYRD_WORKFLOW_413_STEP_RESULT_TOO_LARGE")
         );
-
-        // Over-limit output never reaches a payload-bearing observation, while
-        // in-limit output stays observable.
-        let observer = Arc::new(RecordingObserver::default());
-        let observed = workflow.clone().with_observers(vec![observer.clone()]);
-        let limits = WorkflowExecutionLimits {
-            max_step_result_bytes: Some(100),
-            ..WorkflowExecutionLimits::default()
-        };
-        for (reply, code) in [
-            (big.clone(), Some("WYRD_WORKFLOW_413_STEP_RESULT_TOO_LARGE")),
-            ("short".to_owned(), None),
-        ] {
-            let provider = ScriptedProvider::new();
-            provider.on("write go", vec![Reply::Text(reply)]);
-            let run = observed
-                .run_with_options(
-                    &WorkflowExecutionDependencies::new(provider.registry()),
-                    serde_json::Map::from_iter([("topic".to_owned(), json!("go"))]),
-                    WorkflowRunOptions {
-                        limits,
-                        cancellation: CancellationToken::new(),
-                    },
-                )
-                .await
-                .expect("runs");
-            assert_eq!(run.error.as_ref().map(|e| e.code.as_str()), code);
-        }
-        assert_eq!(observer.model_results(), vec!["short".to_owned()]);
 
         // A payload that would overflow the run snapshot is discarded and the
         // aggregate-size error decides the run.

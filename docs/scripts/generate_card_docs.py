@@ -96,7 +96,7 @@ LIFECYCLE_NOTES = {
         "registry, and constructing the live agent via `Agent::from_def`.",
         "",
         "See [agent runtime](/concepts/agent-runtime/) for the layering and the",
-        "`Observer` hook surface.",
+        "`tracing` spans it emits.",
     ],
     "workflow": [
         "A `WorkflowCard` is the declarative spec; the local engine lives in",

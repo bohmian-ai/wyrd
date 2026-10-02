@@ -61,8 +61,6 @@ loaded = Workflow.load("research.yaml")
 assert Workflow.from_yaml(wf.to_yaml()).to_yaml() == wf.to_yaml()
 ```
 
-Observers are not serialized. Reattach them after `load`.
-
 ## Custom DAG
 
 ```python
@@ -97,21 +95,14 @@ Use `parallel` when steps do not depend on each other. Use `add_after` to fan ba
 
 ## Observe
 
-Observers attach to workflows. Attach one to capture lifecycle events, spans, and
-structured output across every step of the run.
+Workflow and Agent runs emit plain `tracing` spans and carry no prompt, response, or tool payloads. Install any `tracing` subscriber (for example through `wyrd_telemetry`) to collect them.
 
-<LangTabs>
-<LangTab lang="python">
+- `workflow.run` records `wyrd.workflow.id`, `wyrd.workflow.run_id`, `wyrd.workflow.step_count`, and the terminal `wyrd.workflow.status`.
+- `workflow.step` is a child span per attempt with `wyrd.workflow.step.id`, `wyrd.workflow.step.attempt`, `wyrd.workflow.step.outcome`, and `error.type` on failure.
+- A `workflow.step.backoff` event records `wyrd.workflow.step.next_attempt` and `wyrd.workflow.step.delay_ms` before a retry.
+- Each step's Agent emits `invoke_agent`, `chat`, and `execute_tool` spans with OpenTelemetry GenAI attribute names.
 
-<CodeFromFile file="sdks/wyrd-sdk-python/examples/with_observer.py" lang="python" />
-
-</LangTab>
-<LangTab lang="rust">
-
-<CodeFromFile file="examples/rust/workflow_with_observer.rs" lang="rust" />
-
-</LangTab>
-</LangTabs>
+Telemetry never changes a run's outcome.
 
 ## Typed Callback Wire
 

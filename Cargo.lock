@@ -6412,17 +6412,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "opentelemetry-stdout"
-version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc8887887e169414f637b18751487cce4e095be787d23fad13c454e2fb1b3811"
-dependencies = [
- "chrono",
- "opentelemetry",
- "opentelemetry_sdk",
-]
-
-[[package]]
 name = "opentelemetry_sdk"
 version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8657,7 +8646,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "skald-observer",
  "skald-prompt",
  "skald-providers",
  "skald-runtime",
@@ -8670,6 +8658,7 @@ dependencies = [
  "workspace-hack",
  "wyrd-runtime",
  "wyrd-spec",
+ "wyrd-telemetry",
  "wyrd-utils",
 ]
 
@@ -8685,24 +8674,6 @@ dependencies = [
  "skald-spec",
  "thiserror 2.0.18",
  "workspace-hack",
-]
-
-[[package]]
-name = "skald-observer"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "opentelemetry",
- "opentelemetry_sdk",
- "pyo3",
- "serde",
- "serde_json",
- "skald-prompt",
- "skald-spec",
- "tokio",
- "workspace-hack",
- "wyrd-spec",
- "wyrd-utils",
 ]
 
 [[package]]
@@ -8816,7 +8787,6 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "skald-agent",
- "skald-observer",
  "skald-prompt",
  "skald-providers",
  "skald-runtime",
@@ -8831,6 +8801,7 @@ dependencies = [
  "wiremock",
  "workspace-hack",
  "wyrd-spec",
+ "wyrd-telemetry",
  "wyrd-utils",
 ]
 
@@ -11115,15 +11086,10 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 name = "wyrd"
 version = "0.0.1"
 dependencies = [
- "async-trait",
- "opentelemetry",
- "opentelemetry-stdout",
- "opentelemetry_sdk",
  "schemars 0.8.22",
  "serde",
  "serde_json",
  "skald-agent",
- "skald-observer",
  "skald-prompt",
  "skald-runtime",
  "skald-spec",
@@ -11563,15 +11529,11 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "opentelemetry",
- "opentelemetry-stdout",
- "opentelemetry_sdk",
  "reqwest 0.13.4",
  "schemars 0.8.22",
  "serde",
  "serde_json",
  "skald-agent",
- "skald-observer",
  "skald-prompt",
  "skald-runtime",
  "skald-spec",
@@ -11596,7 +11558,6 @@ dependencies = [
  "serde",
  "serde_json",
  "skald-agent",
- "skald-observer",
  "skald-prompt",
  "skald-runtime",
  "skald-tool",

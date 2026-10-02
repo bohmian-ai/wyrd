@@ -13,8 +13,6 @@ Mock-provider examples run without credentials:
 - `workflow_from_yaml.rs` loads `workflows/research.yaml`.
 - `workflow_parallel.rs` runs two researchers in parallel, then fans into one
   synthesizer step.
-- `workflow_with_observer.rs` attaches `OtelObserver` and a custom token
-  counter.
 
 Provider examples require the matching provider credentials:
 

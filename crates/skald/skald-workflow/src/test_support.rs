@@ -3,7 +3,6 @@
 //! [`ScriptedProvider`] answers OpenAI Chat requests from per-needle reply
 //! queues, so results stay deterministic under any completion order, and it
 //! records requests, in-flight concurrency, and abandoned calls.
-//! [`RecordingObserver`] captures Workflow step events.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,7 +11,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use skald_agent::{Agent, Observer};
+use skald_agent::Agent;
 use skald_prompt::{OpenAiChatOptions, ResponseFormat, openai_chat};
 use skald_providers::{ProviderError, ProviderStream};
 use skald_runtime::{Provider, ProviderRegistry};
@@ -318,135 +317,5 @@ impl AgentTool for RecordingTool {
     async fn invoke(&self, _args: Value) -> Result<Value, ToolError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(json!({ "tool": "answered" }))
-    }
-}
-
-/// Observer recording Workflow step events as compact strings.
-#[derive(Default)]
-pub(crate) struct RecordingObserver {
-    /// Recorded events.
-    pub(crate) events: Mutex<Vec<String>>,
-    /// Text of every observed model result.
-    pub(crate) model_results: Mutex<Vec<String>>,
-}
-
-impl RecordingObserver {
-    /// Recorded events.
-    pub(crate) fn events(&self) -> Vec<String> {
-        lock(&self.events).clone()
-    }
-
-    /// Text of every observed model result, in order.
-    pub(crate) fn model_results(&self) -> Vec<String> {
-        lock(&self.model_results).clone()
-    }
-}
-
-#[async_trait]
-impl Observer for RecordingObserver {
-    /// Record the result text, the payload a model-result observation carries.
-    async fn on_model_result(
-        &self,
-        _run_id: &str,
-        _agent_id: &str,
-        _iteration: u32,
-        _finish_reason: &str,
-        _synthetic: bool,
-        response: &ProviderResponse,
-    ) {
-        let text = response.adapter().text().unwrap_or_default().into_owned();
-        lock(&self.model_results).push(text);
-    }
-
-    /// Record `attempt:<step>:<n>`.
-    async fn on_workflow_step_attempt(&self, _run_id: &str, step_id: &str, attempt: u32) {
-        lock(&self.events).push(format!("attempt:{step_id}:{attempt}"));
-    }
-
-    /// Record `result:<step>:<n>:<code|ok>`.
-    async fn on_workflow_step_result(
-        &self,
-        _run_id: &str,
-        step_id: &str,
-        attempt: u32,
-        error_code: Option<&str>,
-    ) {
-        lock(&self.events).push(format!(
-            "result:{step_id}:{attempt}:{}",
-            error_code.unwrap_or("ok")
-        ));
-    }
-
-    /// Record `backoff:<step>:<next>:<ms>`.
-    async fn on_workflow_step_backoff(
-        &self,
-        _run_id: &str,
-        step_id: &str,
-        next_attempt: u32,
-        delay: Duration,
-    ) {
-        lock(&self.events).push(format!(
-            "backoff:{step_id}:{next_attempt}:{}",
-            delay.as_millis()
-        ));
-    }
-}
-
-/// Observer whose every Workflow callback misbehaves: it panics, or it never
-/// completes (optionally sparing the run-start callback).
-pub(crate) struct HostileObserver {
-    /// Panic instead of hanging.
-    pub(crate) panic: bool,
-    /// When hanging, let the run-start callback complete.
-    pub(crate) spare_start: bool,
-}
-
-impl HostileObserver {
-    /// Misbehave for callback `hook`.
-    async fn misbehave(&self, hook: &str) {
-        assert!(!self.panic, "hostile observer panics in {hook}");
-        if !(self.spare_start && hook == "start") {
-            std::future::pending::<()>().await;
-        }
-    }
-}
-
-#[async_trait]
-impl Observer for HostileObserver {
-    /// Misbehave at run start.
-    async fn on_workflow_start(&self, _run_id: &str, _workflow_id: &str, _step_count: usize) {
-        self.misbehave("start").await;
-    }
-
-    /// Misbehave at run finish.
-    async fn on_workflow_finish(&self, _run_id: &str, _workflow_id: &str, _duration: Duration) {
-        self.misbehave("finish").await;
-    }
-
-    /// Misbehave at attempt start.
-    async fn on_workflow_step_attempt(&self, _run_id: &str, _step_id: &str, _attempt: u32) {
-        self.misbehave("attempt").await;
-    }
-
-    /// Misbehave at attempt result.
-    async fn on_workflow_step_result(
-        &self,
-        _run_id: &str,
-        _step_id: &str,
-        _attempt: u32,
-        _error_code: Option<&str>,
-    ) {
-        self.misbehave("result").await;
-    }
-
-    /// Misbehave at backoff.
-    async fn on_workflow_step_backoff(
-        &self,
-        _run_id: &str,
-        _step_id: &str,
-        _next_attempt: u32,
-        _delay: Duration,
-    ) {
-        self.misbehave("backoff").await;
     }
 }

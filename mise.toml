@@ -1193,7 +1193,7 @@ run = "cargo run --locked -p wyrd-cli --example registration_progress"
 hide = true
 description = "Build all example binaries"
 run = [
-  "cargo build -p skald-workflow --examples --features otel",
+  "cargo build --locked -p wyrd-rust-examples",
   "cargo check --locked -p wyrd-cli --example registration_progress",
 ]
 

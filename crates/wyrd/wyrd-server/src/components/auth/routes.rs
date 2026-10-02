@@ -39,12 +39,14 @@ use utoipa_axum::routes;
 
 /// Build the tenant-plane auth router.
 ///
-/// Mounts the four auth surfaces — human login initiation
-/// (`POST /auth/login`), the common OIDC provider callback
-/// (`GET /auth/callback`), credential exchange (`POST /auth/token`), and API
-/// key issuance (`POST /auth/issue-key`) — behind one shared per-peer-IP governor,
-/// so credential guessing and login-state churn draw on a single admission
-/// budget rather than one per route.
+/// Mounts the auth surfaces — human login initiation (`POST /auth/login`),
+/// the CLI login handoff (`POST /auth/cli-handoffs` and its `claim` and
+/// `cancel` routes), the common OIDC provider callback (`GET /auth/callback`),
+/// credential exchange (`POST /auth/token`), refresh revocation
+/// (`POST /auth/revoke`), and API key issuance (`POST /auth/issue-key`) —
+/// behind one shared per-peer-IP governor, so credential guessing, handoff
+/// polling, and login-state churn draw on a single admission budget rather
+/// than one per route.
 ///
 /// # Panics
 /// Panics when the static governor configuration is invalid (a zero period
@@ -61,6 +63,10 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
 
     OpenApiRouter::new()
         .routes(routes!(crate::auth::login::login))
+        .routes(routes!(crate::auth::cli_login::begin_cli_handoff))
+        .routes(routes!(crate::auth::cli_login::claim_cli_handoff))
+        .routes(routes!(crate::auth::cli_login::cancel_cli_handoff))
+        .routes(routes!(crate::auth::cli_login::revoke_refresh_token))
         .routes(routes!(callback))
         .routes(routes!(token))
         .routes(routes!(issue_key))

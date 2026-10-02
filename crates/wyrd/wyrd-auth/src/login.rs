@@ -28,7 +28,9 @@ use wyrd_spec::auth::{
     AbsoluteUrl, BeginLogin, BeginLoginResponse, LoginInitiation, Sha256Hex, TokenResponse,
 };
 use wyrd_spec::error::WyrdError;
-use wyrd_sql::queries::auth::{LoginState, insert_login_state, redeem_login_completion};
+use wyrd_sql::queries::auth::{
+    LoginState, cli_handoff_is_open, insert_login_state, redeem_login_completion,
+};
 
 use crate::callback::discover_provider;
 use crate::connections::HumanConnections;
@@ -58,7 +60,7 @@ impl HumanConnections {
     /// provider IO or state write: exactly one initiation binding
     /// ([`BeginLogin::initiation`]), a configured public origin, a deployment
     /// sealing keyring (completed logins are sealed at rest, so a keyless
-    /// deployment cannot offer human SSO), and a known CLI handoff
+    /// deployment cannot offer human SSO), and an admissible binding
     /// ([`known_initiation`]). The route key then resolves the tenant, and
     /// the tenant must have an Active connection; an unknown tenant and a
     /// tenant without one fail with the same generic refusal, so the endpoint
@@ -69,7 +71,11 @@ impl HumanConnections {
     /// URI is always the deployment's configured callback. The state row binds
     /// the exact connection revision, issuer, and client id, the PKCE verifier,
     /// the nonce, and the initiation binding; only the SHA-256 of the random
-    /// state is stored, and the raw state is returned only inside the URL.
+    /// state is stored, and the raw state is returned only inside the URL. A
+    /// CLI handoff id is admitted only when the same tenant transaction sees
+    /// that handoff unexpired (written by
+    /// [`crate::cli_logins::CliLogins::begin`]); the unique binding index then
+    /// lets it name at most one login.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] when both or neither binding is
@@ -128,6 +134,13 @@ impl HumanConnections {
             .tenant_conn(tenant)
             .await
             .map_err(store_error)?;
+        if let LoginInitiation::Cli(handoff_id) = row.initiation
+            && !cli_handoff_is_open(&mut conn, handoff_id)
+                .await
+                .map_err(store_error)?
+        {
+            return Err(unknown_cli_handoff());
+        }
         let state_hash = Sha256Hex::digest(state_key.as_bytes());
         if !insert_login_state(&mut conn, &state_hash, &row, LOGIN_STATE_TTL)
             .await
@@ -207,35 +220,38 @@ pub(crate) fn seal_completion(
     keyring.seal(&plaintext).map_err(|_| completion_unusable())
 }
 
-/// Admit a begin request's initiation binding for storage.
+/// Admit a begin request's initiation binding for storage, before any
+/// provider IO.
 ///
-/// This is the one place a CLI handoff is checked. CLI handoffs are issued by
-/// a server-owned handoff table that does not exist yet, so every handoff id
-/// is unknown and refused here — before any provider IO or state write. The
-/// handoff owner replaces the `Cli` arm with a lookup of its row, leaving the
-/// browser path and the rest of login unchanged.
+/// A browser flow and a CLI handoff are admitted; the handoff row itself is
+/// checked inside [`HumanConnections::begin_login`]'s state transaction,
+/// because only that tenant transaction can see it.
 ///
 /// # Errors
-/// Returns [`WyrdError::InvalidState`] with reason `unknown_cli_handoff` for
-/// every CLI handoff id, and with reason `connection_test` for a connection
-/// test binding, which only [`HumanConnections::begin_test`] writes.
+/// Returns [`WyrdError::InvalidState`] with reason `connection_test` for a
+/// connection test binding, which only [`HumanConnections::begin_test`]
+/// writes.
 pub(crate) fn known_initiation(initiation: LoginInitiation) -> Result<LoginInitiation, WyrdError> {
     match initiation {
-        LoginInitiation::Browser(_) => Ok(initiation),
+        LoginInitiation::Browser(_) | LoginInitiation::Cli(_) => Ok(initiation),
         LoginInitiation::ConnectionTest(_) => Err(WyrdError::InvalidState {
             message: "a connection test is begun through the candidate test route".to_owned(),
             details: json!({ "reason": "connection_test" }),
         }),
-        LoginInitiation::Cli(_) => Err(WyrdError::InvalidState {
-            message: "the CLI login handoff is unknown or expired; start a new login".to_owned(),
-            details: json!({ "reason": "unknown_cli_handoff" }),
-        }),
+    }
+}
+
+/// The refusal for a CLI handoff id this tenant has no unexpired handoff for.
+fn unknown_cli_handoff() -> WyrdError {
+    WyrdError::InvalidState {
+        message: "the CLI login handoff is unknown or expired; start a new login".to_owned(),
+        details: json!({ "reason": "unknown_cli_handoff" }),
     }
 }
 
 /// The one refusal for a route key that names no active tenant or a tenant
 /// with no Active connection, so neither can be told apart.
-fn login_unavailable() -> WyrdError {
+pub(crate) fn login_unavailable() -> WyrdError {
     WyrdError::InvalidToken {
         message: "SSO login is not available for this tenant".to_owned(),
         details: json!({}),
@@ -292,7 +308,7 @@ fn pkce_challenge(verifier: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
-fn random_b64url(bytes: usize) -> String {
+pub(crate) fn random_b64url(bytes: usize) -> String {
     let mut buf = vec![0_u8; bytes];
     rand::rng().fill_bytes(&mut buf);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
@@ -434,13 +450,14 @@ mod pg_tests {
         assert_eq!(state_rows(&fixture).await, 0);
     }
 
-    /// Both bindings, neither binding, and an unknown CLI handoff are refused
-    /// before any tenant resolution, provider IO, or state write.
+    /// Both bindings and neither binding are refused before any tenant
+    /// resolution, provider IO, or state write. An unknown CLI handoff is
+    /// proven in `cli_logins`, where a provider is reachable.
     ///
     /// # Panics
     /// Panics when any of them is accepted or refused differently.
     #[tokio::test]
-    async fn begin_refuses_ambiguous_bindings_and_unknown_handoffs() {
+    async fn begin_refuses_ambiguous_bindings() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let owner = connections(&fixture, Some(keyring()));
         let slug = fixture.tenant_slug();
@@ -452,12 +469,6 @@ mod pg_tests {
             let error = owner.begin_login(&request).await.expect_err("refused");
             assert!(matches!(error, WyrdError::Validation { .. }), "{error:?}");
         }
-        let error = owner
-            .begin_login(&begin(slug, None, Some(Uuid::now_v7())))
-            .await
-            .expect_err("an unknown handoff is refused");
-        assert!(matches!(error, WyrdError::InvalidState { .. }));
-        assert_eq!(reason(&error).as_deref(), Some("unknown_cli_handoff"));
         assert_eq!(state_rows(&fixture).await, 0);
     }
 

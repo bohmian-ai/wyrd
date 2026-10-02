@@ -1,0 +1,54 @@
+apiVersion: wyrd/v1
+kind: Workflow
+metadata:
+  space: engineering
+  name: code-review
+  version: "1.0.0"
+spec:
+  description: Review a change concurrently, then validate and consolidate findings.
+  llm_route:
+    kind: wyrd_gateway
+  inputs:
+    code:
+      type: str
+      value: ""
+
+  steps:
+    - id: security
+      action:
+        type: agent
+        target:
+          path: ./agents/security.yaml
+      inputs:
+        code: input.code
+      timeout_seconds: 60
+      retry:
+        max_retries: 1
+
+    - id: correctness
+      action:
+        type: agent
+        target:
+          path: ./agents/correctness.yaml
+      inputs:
+        code: input.code
+      timeout_seconds: 60
+      retry:
+        max_retries: 1
+
+    - id: final_review
+      action:
+        type: agent
+        target:
+          path: ./agents/final-reviewer.yaml
+      depends_on: [security, correctness]
+      inputs:
+        code: input.code
+        security_review: steps.security.output.text
+        correctness_review: steps.correctness.output.text
+      timeout_seconds: 60
+      retry:
+        max_retries: 1
+
+  outputs:
+    review: steps.final_review.output.text

@@ -220,6 +220,88 @@ mod tests {
         )
     }
 
+    /// Return the checked-in code-review Workflow bundle entry file.
+    fn code_review_workflow() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../examples/workflows/code-review/workflow.yaml")
+    }
+
+    /// Load the checked-in code-review bundle: its sibling Agent paths load
+    /// relative to the Workflow file, inherit the containing space, and land
+    /// before the Workflow in dependency order with native Prompt bodies. A
+    /// copy with a dependency cycle is refused by the pure Workflow contract.
+    #[test]
+    fn load_explicit_workflow_bundle() {
+        use wyrd_spec::card::workflow::WorkflowAction;
+        use wyrd_spec::reference::InlineableRef;
+
+        let tree = load(&code_review_workflow()).expect("code-review bundle loads");
+        let names = tree
+            .cards
+            .iter()
+            .map(|card| card.submission.metadata.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 4);
+        assert_eq!(names.last(), Some(&"code-review"));
+        for card in &tree.cards[..3] {
+            let Spec::Agent(agent) =
+                Spec::from_kind_and_value(&card.submission.kind, card.submission.spec.clone())
+                    .expect("agent spec decodes")
+            else {
+                panic!("bundle dependencies are Agent Cards");
+            };
+            let InlineableRef::Inline(prompt) = &agent.prompt else {
+                panic!("example Agents carry inline native Prompts");
+            };
+            assert_eq!(prompt.model, "gpt-5-5");
+            assert!(prompt.variables.contains(&"code".to_owned()));
+        }
+        let workflow = &tree.cards[3].submission;
+        let Spec::Workflow(spec) =
+            Spec::from_kind_and_value(&workflow.kind, workflow.spec.clone())
+                .expect("workflow spec decodes")
+        else {
+            panic!("entry is the Workflow Card");
+        };
+        for step in &spec.steps {
+            let WorkflowAction::Agent(InlineableRef::Sibling { sibling }) = &step.action else {
+                panic!("path targets become sibling projections");
+            };
+            assert_eq!(
+                sibling.space.as_ref().map(|space| space.as_str()),
+                Some("engineering")
+            );
+        }
+
+        let temp = TempDir::new().expect("temp directory creates");
+        std::fs::create_dir(temp.path().join("agents")).expect("agents directory creates");
+        let bundle = code_review_workflow();
+        let bundle = bundle.parent().expect("bundle directory exists");
+        for agent in ["security", "correctness", "final-reviewer"] {
+            std::fs::copy(
+                bundle.join(format!("agents/{agent}.yaml")),
+                temp.path().join(format!("agents/{agent}.yaml")),
+            )
+            .expect("agent copies");
+        }
+        let cyclic = std::fs::read_to_string(code_review_workflow())
+            .expect("workflow reads")
+            .replace(
+                "      inputs:\n        code: input.code\n      timeout_seconds: 60\n      retry:\n        max_retries: 1\n\n    - id: correctness",
+                "      depends_on: [final_review]\n      inputs:\n        code: input.code\n      timeout_seconds: 60\n      retry:\n        max_retries: 1\n\n    - id: correctness",
+            );
+        std::fs::write(temp.path().join("workflow.yaml"), cyclic).expect("workflow writes");
+        let error = load(&temp.path().join("workflow.yaml")).expect_err("cycle is refused");
+        assert!(
+            error
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "WYRD_WORKFLOW_422_CYCLE"),
+            "{:?}",
+            error.diagnostics
+        );
+    }
+
     #[test]
     fn load_reads_multiple_files_in_deterministic_order() {
         let temp = TempDir::new().expect("temp directory creates");

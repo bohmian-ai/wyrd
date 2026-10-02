@@ -251,12 +251,18 @@ fn materialize_inline_files(
                 .and_then(serde_yaml::Value::as_str)
                 .is_some_and(|kind| kind == "agent");
             for (key, value) in mapping {
+                let slot = key
+                    .as_str()
+                    .is_some_and(|key| is_inlineable_slot(key, agent_action));
                 let nested_inline = inside_inline
                     || key.as_str().is_some_and(|key| {
                         key.eq_ignore_ascii_case("inline")
                             || is_inlineable_body(key, value, agent_action)
                     });
                 materialize_inline_files(value, source_path, nested_inline, sandbox)?;
+                if slot {
+                    unwrap_reference_form(value, source_path)?;
+                }
             }
         }
         serde_yaml::Value::Tagged(tagged) if tagged.tag == "!file" => {
@@ -307,10 +313,52 @@ fn materialize_inline_files(
     Ok(())
 }
 
+/// Return whether `key` names an `InlineableRef` slot: `prompt`,
+/// `judge_ref`, or the `target` of an agent action mapping.
+fn is_inlineable_slot(key: &str, agent_action: bool) -> bool {
+    matches!(key, "prompt" | "judge_ref") || (agent_action && key == "target")
+}
+
+/// Collapse the authored keyed reference form at an inlineable slot.
+///
+/// The authoring contract discriminates a slot by its single key: `ref:`
+/// wraps a Card reference, `path:` a loader-local file, and `inline:` an
+/// embedded body. The wire shape carries the unwrapped value, so this rewrite
+/// keeps one spec schema while accepting the documented authored form. A
+/// mapping without any of those keys is already in wire shape and is left
+/// untouched.
+///
+/// # Errors
+/// Returns an invalid-envelope diagnostic when one slot combines more than
+/// one of `ref`, `path`, and `inline`.
+fn unwrap_reference_form(
+    value: &mut serde_yaml::Value,
+    source_path: &Path,
+) -> Result<(), Diagnostic> {
+    let Some(mapping) = value.as_mapping_mut() else {
+        return Ok(());
+    };
+    let forms = ["ref", "path", "inline"]
+        .into_iter()
+        .filter(|form| mapping.contains_key(*form))
+        .collect::<Vec<_>>();
+    match forms.as_slice() {
+        [] => Ok(()),
+        [form] if mapping.len() == 1 => {
+            if let Some(inner) = mapping.remove(*form) {
+                *value = inner;
+            }
+            Ok(())
+        }
+        _ => Err(Diagnostic::invalid_envelope(
+            source_path.to_path_buf(),
+            "a reference slot must use exactly one of ref, path, or inline".to_owned(),
+        )),
+    }
+}
+
 fn is_inlineable_body(key: &str, value: &serde_yaml::Value, agent_action: bool) -> bool {
-    let is_inlineable_slot =
-        matches!(key, "prompt" | "judge_ref") || (agent_action && key == "target");
-    if !is_inlineable_slot {
+    if !is_inlineable_slot(key, agent_action) {
         return false;
     }
     let Some(mapping) = value.as_mapping() else {
@@ -351,6 +399,25 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    /// A slot that combines two authored reference forms is refused rather
+    /// than guessed at.
+    #[test]
+    fn parse_rejects_combined_reference_forms() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: test\n  space: default\n  version: \"1.0.0\"\nspec:\n  prompt:\n    path: ./prompt.yaml\n    inline:\n      model: m\n"
+        )
+        .unwrap();
+
+        let error = parse_file(file.path()).expect_err("combined forms are refused");
+        assert!(
+            error.diagnostics[0]
+                .message
+                .contains("exactly one of ref, path, or inline")
+        );
+    }
 
     #[test]
     fn parse_rejects_missing_api_version() {

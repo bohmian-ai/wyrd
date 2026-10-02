@@ -1,0 +1,27 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  space: engineering
+  name: security-reviewer
+  version: "1.0.0"
+spec:
+  prompt:
+    inline:
+      model: gpt-5-5
+      request:
+        model: gpt-5-5
+        messages:
+          - role: system
+            content: |
+              You are a security reviewer. Report only exploitable security findings.
+              For every finding, identify the affected code and a concrete failure path.
+          - role: user
+            content: |
+              Review this change:
+              {{code}}
+      variables: [code]
+      response_type: text
+  tool_names: []
+  run_config:
+    max_iterations: 1
+    timeout_ms: 60000

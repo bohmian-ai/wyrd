@@ -1,0 +1,27 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  space: engineering
+  name: correctness-reviewer
+  version: "1.0.0"
+spec:
+  prompt:
+    inline:
+      model: gpt-5-5
+      request:
+        model: gpt-5-5
+        messages:
+          - role: system
+            content: |
+              You are a correctness reviewer. Find reachable bugs, data loss, races,
+              and contract violations. Ignore style-only concerns.
+          - role: user
+            content: |
+              Review this change:
+              {{code}}
+      variables: [code]
+      response_type: text
+  tool_names: []
+  run_config:
+    max_iterations: 1
+    timeout_ms: 60000

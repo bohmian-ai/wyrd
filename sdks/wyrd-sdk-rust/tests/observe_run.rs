@@ -9,7 +9,9 @@
 //! alias, and an Eval span without its trace or with malformed media. The
 //! server's staged describe decisions prove a repeated dynamic write and every
 //! fixed-table emit reuse the cached schema, and the writer's owner activity
-//! proves ordinary observations never renew runtime activity.
+//! proves ordinary observations never renew runtime activity. A span exported
+//! over OTLP/gRPC under the Eval emit's trace and span identity joins the
+//! persisted Eval row by the typed binary identity columns.
 
 use std::path::{Path, PathBuf};
 
@@ -24,6 +26,13 @@ use wyrd_sdk::state::WyrdState;
 use wyrd_sdk::{Bifrost, QueueConfig, WyrdClient};
 use wyrd_testing::Bootstrap;
 use wyrd_testing::server::WyrdTestServer;
+use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
+use wyrd_tonic::otlp::resource::v1::Resource;
+use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
+use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
+use wyrd_tonic::otlp::trace_service::trace_service_client::TraceServiceClient;
+use wyrd_tonic::tonic::Request;
+use wyrd_tonic::tonic::transport::Channel;
 
 /// Payload of the single Prompt artifact the bundle carries verbatim.
 const PROMPT_ARTIFACT: &[u8] = b"observe-prompt-artifact";
@@ -81,6 +90,18 @@ struct EvalRow {
     card_uid: Option<String>,
     /// The managed invocation id every row of one run shares.
     run_id: Option<String>,
+}
+
+/// Name of the span exported under the Eval emit's trace and span identity.
+const EXPLICIT_SPAN_NAME: &str = "observe-judge-call";
+
+/// One Eval row joined to its span by typed trace and span identity.
+#[derive(Debug, Deserialize)]
+struct EvalSpanRow {
+    /// The JSON context text of the joined Eval row.
+    context: String,
+    /// The name of the span sharing the row's trace and span identity.
+    span_name: String,
 }
 
 /// The rows the generic-table read-back selects.
@@ -325,6 +346,85 @@ async fn assert_read_back(
             assert_eq!(row.card_uid.as_deref(), Some(subject));
         }
     }
+}
+
+/// Export one span under [`EXPLICIT_TRACE`] and [`EXPLICIT_SPAN`] over the
+/// server's OTLP/gRPC collector, authenticated by the bearer `token`.
+///
+/// This is the path any stock OTLP exporter takes, so the span lands in
+/// `vala.traces.spans` exactly as an instrumented agent's would.
+///
+/// # Panics
+/// Panics when the fixtures are not hex, the collector cannot be dialed, or
+/// it refuses the export.
+async fn export_explicit_span(server: &WyrdTestServer, token: &str) {
+    let start = u64::try_from(chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default())
+        .expect("now is after the epoch");
+    let channel = Channel::from_shared(server.grpc_url().expect("bound server serves gRPC"))
+        .expect("the gRPC URL is a valid endpoint")
+        .connect()
+        .await
+        .expect("the OTLP exporter dials the collector");
+    let mut request = Request::new(ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "service.name".to_owned(),
+                    value: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue("observe-journey".to_owned())),
+                    }),
+                }],
+                ..Resource::default()
+            }),
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: hex::decode(EXPLICIT_TRACE).expect("the trace fixture is hex"),
+                    span_id: hex::decode(EXPLICIT_SPAN).expect("the span fixture is hex"),
+                    name: EXPLICIT_SPAN_NAME.to_owned(),
+                    kind: 3,
+                    start_time_unix_nano: start,
+                    end_time_unix_nano: start + 1_000_000,
+                    ..Span::default()
+                }],
+                ..ScopeSpans::default()
+            }],
+            ..ResourceSpans::default()
+        }],
+    });
+    request.metadata_mut().insert(
+        "x-wyrd-access-token",
+        format!("Bearer {token}")
+            .parse()
+            .expect("the bearer is valid metadata"),
+    );
+    TraceServiceClient::new(channel)
+        .export(request)
+        .await
+        .expect("the collector accepts the span");
+}
+
+/// Prove the run's Eval row joins `vala.traces.spans` by its typed identity.
+///
+/// The Eval row's `FixedSizeBinary(16)` trace and `FixedSizeBinary(8)` span
+/// columns are compared directly with the span ledger's, with no hex or text
+/// conversion, so a width or encoding mismatch yields no joined row.
+///
+/// # Panics
+/// Panics when the query fails or the run's Eval row does not join exactly
+/// the exported span.
+async fn assert_eval_joins_span(client: &WyrdClient, run_id: &str) {
+    let joined: Vec<EvalSpanRow> = Bifrost::query_only(client)
+        .sql_as(&format!(
+            "SELECT e.context, s.name AS span_name \
+             FROM vala.eval.observations e JOIN vala.traces.spans s \
+               ON e.trace_id = s.trace_id AND e.span_id = s.span_id \
+             WHERE e.run_id = '{run_id}'"
+        ))
+        .await
+        .expect("eval rows join spans");
+    assert_eq!(joined.len(), 1, "one Eval row joins its span: {joined:?}");
+    assert_eq!(joined[0].context, r#"{"answer":"yes"}"#);
+    assert_eq!(joined[0].span_name, EXPLICIT_SPAN_NAME);
 }
 
 /// Drive the refusals a real caller hits on one started run.
@@ -632,5 +732,13 @@ async fn scoped_run_emits_drift_eval_and_generic_rows() {
         (&dataset, &dataset_b),
     )
     .await;
+
+    let token = server
+        .exchange_api_key(&secrecy::SecretString::from(admin.clone()))
+        .await
+        .expect("admin key exchanges for a bearer");
+    export_explicit_span(&server, &token).await;
+    server.flush_bifrost().await.expect("flush server Scribe");
+    assert_eval_joins_span(&connect(&server, &admin), &run_id).await;
     server.shutdown().await.expect("test server shuts down");
 }

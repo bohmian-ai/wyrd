@@ -442,3 +442,45 @@ policy, remote language surface or inability to close direct consumer compilatio
 - `architecture/wyrd-design.md`; `architecture/wyrd-doctrine.mdx`
 - `architecture/references/{doctrine/architecture-constraints,architecture/patterns}.md`
 - `architecture/references/languages/{rust-core,errors,spec-driven-development,implementation-execution,testing-workflows}.md`
+
+## Implementation Evidence
+
+Commits `dbf640c26..286218a68` on `wyrd/skald-workflow-runtime/TASK-001`.
+RED: each scenario selector was written against the old implicit engine
+(flat context, edge message handoff, `parameters`/`final_output`, Prompt/Mcp
+actions, condition) and failed to compile or assert before GREEN.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| S1 declared graph is the contract | `wyrd-spec/src/card/workflow.rs` (bindings, routes, run DTOs, derive codes); `skald-workflow/src/{plan,workflow_surface}.rs` | `card::workflow::tests::explicit_workflow_contract` (1/1); `workflow_surface::tests::resolved_bindings_reject_before_dispatch` | PASS |
+| S2 explicit injection, deterministic results | `skald-workflow/src/workflow.rs` executor, namespaced context, output projection | `workflow::tests::explicit_namespaced_results` | PASS |
+| S3 retries, one deadline, owned lifetime | `workflow.rs`/`attempt.rs` JoinSet, backoff, precedence, classification | `workflow::tests::bounded_attempt_lifecycle` | PASS |
+| S4 isolated route calls, RemoteProblem | `skald-workflow/src/route.rs`; `skald-providers/src/error.rs` `RemoteProblem` | `workflow::tests::isolated_route_calls` | PASS |
+| S5 ExtGateway secure transport | `skald-providers` endpoint policy (moved from `wyrd-gateway`), binding validation, pinning | `workflow::tests::bound_external_gateway_security`; gateway endpoint tests in `test:wyrd` | PASS |
+| S6 terminal budget reserve | `workflow.rs` canonical accounting and terminal reserve | `workflow::tests::terminal_budget_reserve` | PASS |
+| S7 Rust/Python explicit authoring | `workflow_surface.rs` `with_*`; `skald-workflow/src/python.rs` `PyWorkflowRun`; stubs and exports | `workflow_surface::tests::explicit_builder_contract`; `test_workflow_parameter_injection.py::test_explicit_workflow_bindings` | PASS |
+| Local tools reach outputs; undeclared tools never run | `workflow_surface.rs` tests | `explicit_builder_contract` (tool result reaches `outputs["found"]`; undeclared gives `WYRD_AGENT_404_TOOL_NOT_IN_AGENT`, zero calls) | PASS |
+| Workspace builds with retained Python features | all consumers in commit range | `cargo check --locked -p skald-workflow --features python`; `mise run lints` (all features) | PASS |
+| Scoped lanes | — | `test:skald`, `test:shared` (702 passed), `test:wyrd` (2285 passed), `py:test:unit`, `py:typecheck`, `codegen:check`, `check:client-tier`, `check:pyo3-scope`, `check:unwrap-audit`, `fmt`, `lints`, `py:format`, `py:lints`, `git diff --check`: all exit 0 | PASS |
+
+Deviations and limits:
+- `ExternalGatewayBinding.secret_headers` is a `HashMap<HeaderName, SecretString>`,
+  because `HeaderName` is not `Ord`. Its iteration order is never observable.
+- `DEFAULT_MAX_RETRIES = 3` for the local executor.
+- OpenAI Responses Prompts are still refused by the existing
+  `validate_prompt_loop_request`. That Agent-loop gap is outside this task.
+- `ProviderError::RemoteProblem` boxes its payload as `Box<RemoteProblem>`
+  because of clippy `result_large_err`. The fields match the spec.
+- Six catalog codes that no remaining path emits were removed: `404_TASK`,
+  `500_AGENT_RESPONSE_MISSING`, `500_LOCK`, `500_MAX_RETRIES`, `500_STALLED`,
+  and `501_UNSUPPORTED_HANDOFF`, all prefixed `WYRD_WORKFLOW_`.
+  `MISSING_PARAMETER` was retitled.
+- `tests/parameter_injection.rs` was superseded by the inline scenario tests.
+- Added the `workflow_run` and `create_workflow_run_request` schemas.
+- Real registered route journeys remain TASK-004/005 closure.
+
+Non-goals stayed excluded:
+- No remote Python, TypeScript, or MCP Workflow surface.
+- No compatibility aliases or migration docs.
+- No new crates or third-party dependencies.
+- Native transport and Vault/Operator policies are unchanged.

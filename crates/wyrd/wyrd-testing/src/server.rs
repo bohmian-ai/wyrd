@@ -180,7 +180,18 @@ pub struct WyrdTestServer {
     /// binds. Off by default so ordinary journeys never race a background
     /// scheduler or runner over the queue they assert on.
     verification_runtime: bool,
+    /// Whether this server's Bifrost owner has been drained or aborted.
+    ///
+    /// Set when a bound production serve task returns its drain report, or
+    /// when [`Self::settle_lifecycle`] runs the Bifrost shutdown or abort
+    /// itself, so teardown never releases the fixture under live role work and
+    /// never drains the same owner twice.
+    bifrost_settled: bool,
 }
+
+/// Bounded graceful budget for each teardown stage: the serve-task drain and
+/// the Bifrost shutdown that follows it. Expiry falls through to an abort.
+const TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
 
 struct WyrdTestServerInner {
     /// Lifetime guard of the generated Operator key directory, when used.
@@ -742,36 +753,99 @@ impl WyrdTestServer {
         Self::builder().start_bound().await
     }
 
-    /// Shut down the server, cancelling the serve task and dropping fixtures.
+    /// Shut down the server, settling its lifecycle owners before dropping fixtures.
+    ///
+    /// Runs [`Self::settle_lifecycle`] with the graceful [`TEARDOWN_BUDGET`],
+    /// so every serve task and Bifrost role is drained or aborted and joined
+    /// before the fixture database is released.
     ///
     /// A serve task that panicked is a real production defect, so its
     /// [`JoinError`](tokio::task::JoinError) is propagated rather than discarded: swallowing it lets a
     /// panic on a `tokio-runtime-worker` thread finish the run green, which is
-    /// precisely the failure mode this seam exists to catch. A join *timeout*
-    /// remains tolerated — the bounded budget here is deliberately short and a
-    /// slow drain is not the same signal as a panic.
+    /// precisely the failure mode this seam exists to catch. A drain that
+    /// exceeds the budget is aborted rather than reported — a slow drain is
+    /// not the same signal as a panic.
     ///
     /// # Errors
     /// Returns [`WyrdTestServerError::Join`] when the serve task panicked or
     /// when the final blocking drop cannot be joined.
     pub async fn shutdown(mut self) -> Result<(), WyrdTestServerError> {
+        let settled = self.settle_lifecycle(TEARDOWN_BUDGET).await;
+        tokio::task::spawn_blocking(move || drop(self))
+            .await
+            .map_err(|error| WyrdTestServerError::Join(error.to_string()))?;
+        settled
+    }
+
+    /// Drain or abort every owned database-using task before fixture release.
+    ///
+    /// The one teardown path for bound and in-process servers, used by
+    /// [`Self::shutdown`], startup rollback, and [`Drop`]. It cancels the serve
+    /// and state tokens, waits up to `budget` for a retained serve task, and
+    /// aborts and joins that task when the budget expires so it is never
+    /// detached. Unless a bound production serve task already returned its
+    /// drain report, it then runs the existing [`Bifrost::shutdown`] against a
+    /// `budget` deadline, whose failure path aborts every selected role, and
+    /// falls back to [`Bifrost::abort`] when that shutdown does not finish in
+    /// time. A zero `budget` skips the graceful Bifrost drain and aborts
+    /// directly. Repeated calls are no-ops once both owners have settled.
+    ///
+    /// [`Bifrost::shutdown`]: wyrd_server::state::Bifrost::shutdown
+    /// [`Bifrost::abort`]: wyrd_server::state::Bifrost::abort
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Join`] when the serve task panicked. The
+    /// Bifrost owner is still settled first, so the fixture can be released.
+    async fn settle_lifecycle(&mut self, budget: Duration) -> Result<(), WyrdTestServerError> {
         if let Some(token) = self.shutdown_token.take() {
             token.cancel();
         }
         // An in-process server holds no serve token, but its composed Oracle
-        // and Scribe roles still watch the state token; stop them before the
-        // fixture database is dropped.
+        // and Scribe roles still watch the state token.
         self.inner.state.shutdown_token.cancel();
-        if let Some(handle) = self.serve_handle.take()
-            && let Ok(join) = tokio::time::timeout(Duration::from_secs(2), handle).await
-            && let Err(exit) = serve_task_outcome(join)?
-        {
-            tracing::warn!(?exit, "bound serve task exited terminally during shutdown");
+        let mut outcome = Ok(());
+        if let Some(mut handle) = self.serve_handle.take() {
+            match tokio::time::timeout(budget, &mut handle).await {
+                Ok(join) => match serve_task_outcome(join) {
+                    Ok(Ok(_report)) => {
+                        self.bifrost_settled |= matches!(self.mode, Mode::Bound { .. });
+                    }
+                    Ok(Err(exit)) => {
+                        tracing::warn!(?exit, "bound serve task exited terminally during shutdown");
+                    }
+                    Err(error) => outcome = Err(error),
+                },
+                Err(_) => {
+                    tracing::warn!("serve task did not drain within the teardown budget; aborting");
+                    handle.abort();
+                    if let Err(error) = handle.await
+                        && error.is_panic()
+                    {
+                        outcome = Err(WyrdTestServerError::Join(format!(
+                            "bound serve task: {error}"
+                        )));
+                    }
+                }
+            }
         }
-        tokio::task::spawn_blocking(move || drop(self))
-            .await
-            .map_err(|error| WyrdTestServerError::Join(error.to_string()))?;
-        Ok(())
+        if !self.bifrost_settled {
+            self.bifrost_settled = true;
+            let bifrost = &self.inner.state.bifrost;
+            let deadline = tokio::time::Instant::now() + budget;
+            let drained = !budget.is_zero()
+                && matches!(
+                    tokio::time::timeout_at(deadline, bifrost.shutdown(deadline.into_std())).await,
+                    Ok(Ok(_))
+                );
+            if !drained
+                && tokio::time::timeout_at(deadline, bifrost.abort())
+                    .await
+                    .is_err()
+            {
+                tracing::warn!("Bifrost storage did not settle within the teardown budget");
+            }
+        }
+        outcome
     }
 
     /// Shut this server down, then boot `builder` as a fresh bound server over
@@ -843,16 +917,18 @@ impl WyrdTestServer {
             .map_err(|_| {
                 WyrdTestServerError::Join("serve task did not join before its deadline".to_owned())
             })?;
-        serve_task_outcome(join)?.map_err(|exit| {
+        let report = serve_task_outcome(join)?.map_err(|exit| {
             WyrdTestServerError::Start(format!("server exited terminally: {exit:?}"))
-        })
+        })?;
+        self.bifrost_settled |= matches!(self.mode, Mode::Bound { .. });
+        Ok(report)
     }
 
     /// Abruptly terminate the test server without running graceful Scribe drain.
     ///
-    /// This test-tier seam aborts the bound supervisor after cancellation and
-    /// then drops the server, leaving configured WAL and storage roots owned by
-    /// the caller's cluster fixture for replay assertions.
+    /// This test-tier seam aborts the bound supervisor and the Bifrost roles after
+    /// cancellation and then drops the server, leaving configured WAL and storage
+    /// roots owned by the caller's cluster fixture for replay assertions.
     ///
     /// # Errors
     ///
@@ -866,6 +942,9 @@ impl WyrdTestServer {
             handle.abort();
             let _ = handle.await;
         }
+        // A zero budget aborts the Bifrost roles without a graceful drain, so
+        // nothing of this server outlives the abrupt stop.
+        let _ = self.settle_lifecycle(Duration::ZERO).await;
         Ok(())
     }
 
@@ -904,6 +983,9 @@ impl WyrdTestServer {
             )),
             Err(exit) => Ok(format!("{exit:?}")),
         };
+        // The production drain already ran its abort path; repeat that abort
+        // without a graceful budget before releasing the fixture.
+        let _ = self.settle_lifecycle(Duration::ZERO).await;
         tokio::task::spawn_blocking(move || drop(self))
             .await
             .map_err(|error| WyrdTestServerError::Join(error.to_string()))?;
@@ -967,6 +1049,10 @@ impl WyrdTestServer {
             supervised_tasks: self.supervised_task_count_for_test() as u64,
             storage,
         };
+        if listeners_stopped {
+            self.bifrost_settled |= matches!(self.mode, Mode::Bound { .. });
+        }
+        self.settle_lifecycle(TEARDOWN_BUDGET).await?;
         tokio::task::spawn_blocking(move || drop(self))
             .await
             .map_err(|error| WyrdTestServerError::Join(error.to_string()))?;
@@ -3460,28 +3546,8 @@ impl WyrdTestServer {
         &mut self,
         primary: WyrdTestServerError,
     ) -> WyrdTestServerError {
-        if let Some(token) = self.shutdown_token.take() {
-            token.cancel();
-        }
-        let Some(mut handle) = self.serve_handle.take() else {
-            return primary;
-        };
-        if tokio::time::timeout(Duration::from_secs(2), &mut handle)
-            .await
-            .is_ok()
-        {
-            return primary;
-        }
-        handle.abort();
-        if tokio::time::timeout(Duration::from_secs(2), handle)
-            .await
-            .is_err()
-        {
-            tracing::warn!("bound test server did not terminate after startup rollback abort");
-        } else {
-            tracing::warn!(
-                "bound test server did not drain before startup rollback deadline; aborted"
-            );
+        if let Err(error) = self.settle_lifecycle(TEARDOWN_BUDGET).await {
+            tracing::warn!(?error, "bound test server failed during startup rollback");
         }
         primary
     }
@@ -3564,7 +3630,7 @@ impl WyrdTestServer {
                     }
 
                     let _observation = AbortObservation(aborted);
-                    let _bound = bound;
+                    let _report = bound.run().await;
                     std::future::pending::<()>().await;
                     // Invariant: `pending()` never resolves, so this arm only ever
                     // leaves the future by abort. Fabricating a `BifrostShutdownReport`
@@ -3607,33 +3673,38 @@ impl WyrdTestServer {
 }
 
 impl Drop for WyrdTestServer {
-    /// Stop background roles, then cancel and briefly join a bound serve task.
+    /// Settle every lifecycle owner before the fields, and thus the fixture, drop.
     ///
-    /// The state token is cancelled for every mode, so composed Oracle and
-    /// Scribe roles stop before the fixture database is dropped; an
-    /// in-process server has no serve task and returns after that.
+    /// Runs [`WyrdTestServer::settle_lifecycle`] on a scoped thread driving the
+    /// shared Wyrd runtime and joins it, so the serve task and Bifrost roles are
+    /// drained or aborted before the runtime owners and the fixture database
+    /// are released in field order. Off a Tokio runtime the graceful
+    /// [`TEARDOWN_BUDGET`] applies. On an active runtime the dropping thread
+    /// cannot make progress while it blocks, so the budget is zero and the
+    /// owners are aborted and joined directly.
     fn drop(&mut self) {
-        self.inner.state.shutdown_token.cancel();
-        let Some(token) = self.shutdown_token.take() else {
+        if self.serve_handle.is_none() && self.bifrost_settled {
             return;
+        }
+        let budget = if tokio::runtime::Handle::try_current().is_ok() {
+            tracing::warn!(
+                "WyrdTestServer dropped on an active Tokio runtime without explicit \
+                 shutdown(); aborting its lifecycle owners. Prefer `srv.shutdown().await` \
+                 in async tests."
+            );
+            Duration::ZERO
+        } else {
+            TEARDOWN_BUDGET
         };
-        token.cancel();
-        match tokio::runtime::Handle::try_current() {
-            Ok(_) => {
-                tracing::warn!(
-                    "WyrdTestServer dropped on an active Tokio runtime without explicit \
-                     shutdown(); cancelling shared token only. Prefer `srv.shutdown().await` \
-                     in async tests."
-                );
-            }
-            Err(_) => {
-                let runtime = wyrd_runtime::runtime();
-                if let Some(handle) = self.serve_handle.take() {
-                    let _ = runtime.block_on(async {
-                        tokio::time::timeout(Duration::from_secs(2), handle).await
-                    });
-                }
-            }
+        let settled = std::thread::scope(|scope| {
+            scope
+                .spawn(|| wyrd_runtime::runtime().block_on(self.settle_lifecycle(budget)))
+                .join()
+        });
+        match settled {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(?error, "test server teardown reported a failure"),
+            Err(_) => tracing::warn!("test server teardown thread panicked"),
         }
     }
 }
@@ -3825,10 +3896,12 @@ impl WyrdTestServerBuilder {
         self
     }
 
-    /// Make the bound serve task ignore shutdown until the rollback aborts it.
+    /// Make the bound serve task refuse to complete until teardown aborts it.
     ///
-    /// The supplied flag is set when the stalled task is dropped, allowing a
-    /// smoke test to prove that a timed-out drain was followed by an abort.
+    /// The task serves and runs the production drain normally, then never
+    /// returns, so teardown's graceful budget always expires. The supplied
+    /// flag is set when the stalled task is dropped, allowing a test to prove
+    /// that a timed-out drain was followed by an abort and join.
     #[must_use]
     pub fn with_stalled_drain_for_test(mut self, aborted: Arc<AtomicBool>) -> Self {
         self.stalled_drain_for_test = Some(aborted);
@@ -4593,6 +4666,7 @@ impl WyrdTestServerBuilder {
             shutdown_drain_for_test: self.shutdown_drain_for_test,
             verification_runtime: self.verification_runtime,
             serve_task_panic_for_test: self.serve_task_panic_for_test,
+            bifrost_settled: false,
         })
     }
 
@@ -5366,6 +5440,67 @@ mod production_composition_tests {
         assert!(
             builder.bind_addrs.is_none(),
             "the harness must let the production server path bind and own its listeners"
+        );
+    }
+}
+
+/// Proves teardown settles every owned database-using task before the fixture
+/// database can be released.
+#[cfg(test)]
+mod teardown_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::WyrdTestServer;
+
+    /// A bound serve task that outlives the graceful drain budget is aborted
+    /// and joined by `shutdown` rather than detached, so it can no longer run
+    /// once the fixture database is dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_aborts_and_joins_a_serve_task_that_outlives_its_drain() {
+        let aborted = Arc::new(AtomicBool::new(false));
+        let server = WyrdTestServer::builder()
+            .with_stalled_drain_for_test(Arc::clone(&aborted))
+            .start_bound()
+            .await
+            .expect("bound test server starts");
+
+        server
+            .shutdown()
+            .await
+            .expect("shutdown settles the server");
+
+        assert!(
+            aborted.load(Ordering::SeqCst),
+            "the stalled serve task must be aborted and joined before shutdown returns"
+        );
+    }
+
+    /// Dropping an in-process server off a Tokio runtime runs the existing
+    /// Bifrost shutdown and abort path before its fields, and therefore the
+    /// fixture, are released: the node's storage owner, which that path settles
+    /// only after every selected role is drained or aborted, is closed and
+    /// quiescent once the drop returns.
+    #[test]
+    fn dropping_an_in_process_server_settles_bifrost_before_fixture_release() {
+        let runtime = wyrd_runtime::runtime();
+        let server = runtime
+            .block_on(WyrdTestServer::start_in_process())
+            .expect("in-process test server starts");
+        let storage = Arc::clone(
+            server
+                .inner
+                .state
+                .bifrost_storage()
+                .expect("the default server owns Bifrost storage"),
+        );
+        assert!(!storage.inspect().is_settled());
+
+        drop(server);
+
+        assert!(
+            storage.inspect().is_settled(),
+            "Bifrost-owned work must be drained or aborted before the fixture drops"
         );
     }
 }

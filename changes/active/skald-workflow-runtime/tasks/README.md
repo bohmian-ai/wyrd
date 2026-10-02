@@ -1,4 +1,4 @@
-# Workflow Revision 10 task packet
+# Workflow Revision 11 task packet
 
 Status: READY — independent plan-readiness re-review passed on 2026-10-01:
 architecture PASS, executability PASS, rehearsal PASS, 0 Critical/0 Major.

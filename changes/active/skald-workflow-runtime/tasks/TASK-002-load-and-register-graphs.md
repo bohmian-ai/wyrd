@@ -3,7 +3,7 @@ id: TASK-002
 kind: implementation
 status: ready
 spec: SPEC-skald-workflow-runtime
-spec_revision: 10
+spec_revision: 11
 requirements: [REQ-001, REQ-002, REQ-003, REQ-013, REQ-013A, REQ-014, REQ-024, REQ-025, REQ-028, REQ-029, REQ-040, REQ-052, INV-002, INV-003, INV-005, INV-008, INV-014, AC-001, AC-002, AC-003, AC-006, AC-013]
 depends_on: [TASK-001]
 ---
@@ -173,7 +173,7 @@ resolution during registration or inability to reuse native resolver boundaries.
 
 ## Authority Links
 
-- [Approved Revision 10](../spec.md); [TASK-001](TASK-001-explicit-local-runtime.md)
+- [Approved Revision 11](../spec.md); [TASK-001](TASK-001-explicit-local-runtime.md)
 - `AGENTS.md`; `architecture/agent-rules.md`
 - `architecture/wyrd-design.md` §§Workflow, Spec-file authoring, Reference slots
 - `architecture/references/languages/{spec-driven-development,implementation-execution,testing-workflows,errors}.md`

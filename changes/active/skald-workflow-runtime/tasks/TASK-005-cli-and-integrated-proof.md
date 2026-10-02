@@ -3,7 +3,7 @@ id: TASK-005
 kind: implementation
 status: ready
 spec: SPEC-skald-workflow-runtime
-spec_revision: 10
+spec_revision: 11
 requirements: [REQ-024, REQ-026, REQ-027, REQ-028, REQ-031, REQ-044, REQ-047, REQ-050, INV-004, INV-007, INV-015, INV-016, AC-001, AC-002, AC-003, AC-004, AC-012, AC-013, AC-014, AC-015, AC-016, AC-017, AC-018, AC-023, AC-024, AC-026]
 depends_on: [TASK-001, TASK-002, TASK-003, TASK-004]
 ---
@@ -228,7 +228,7 @@ silently narrowing required scenarios.
 
 ## Authority Links
 
-- [Approved Revision 10](../spec.md); TASK-001 through TASK-004
+- [Approved Revision 11](../spec.md); TASK-001 through TASK-004
 - `AGENTS.md`; `architecture/agent-rules.md`
 - `architecture/wyrd-design.md`; `architecture/wyrd-doctrine.mdx`
 - `architecture/wyrd-security-posture.md`; `architecture/bifrost-design.md`

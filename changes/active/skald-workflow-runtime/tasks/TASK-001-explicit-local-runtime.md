@@ -3,8 +3,8 @@ id: TASK-001
 kind: implementation
 status: ready
 spec: SPEC-skald-workflow-runtime
-spec_revision: 10
-requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-013A, REQ-015, REQ-016, REQ-017, REQ-018, REQ-019, REQ-020, REQ-021, REQ-022, REQ-023, REQ-024, REQ-035, REQ-036, REQ-036A, REQ-037, REQ-038, REQ-039, REQ-040, REQ-042, REQ-043, REQ-045, REQ-047, REQ-048, REQ-049, REQ-051, REQ-052, INV-001, INV-002, INV-003, INV-004, INV-007, INV-008, INV-009, INV-010, INV-010A, INV-011, INV-012, INV-014, INV-016, INV-017, INV-020, INV-021, INV-023, AC-005, AC-006, AC-007, AC-008, AC-011, AC-011A, AC-016, AC-019, AC-020, AC-023, AC-024, AC-026]
+spec_revision: 11
+requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-013A, REQ-015, REQ-016, REQ-017, REQ-018, REQ-019, REQ-020, REQ-021, REQ-022, REQ-023, REQ-024, REQ-035, REQ-036, REQ-036A, REQ-037, REQ-038, REQ-039, REQ-040, REQ-042, REQ-043, REQ-045, REQ-047, REQ-048, REQ-049, REQ-051, REQ-052, REQ-053, INV-001, INV-002, INV-003, INV-004, INV-007, INV-008, INV-009, INV-010, INV-010A, INV-011, INV-012, INV-014, INV-016, INV-017, INV-020, INV-021, INV-023, AC-005, AC-006, AC-007, AC-008, AC-011, AC-011A, AC-016, AC-019, AC-020, AC-023, AC-024, AC-026]
 depends_on: []
 ---
 
@@ -371,7 +371,7 @@ near the output ceiling. Server graph admission proof belongs to TASK-004.
 
 **GREEN.** Apply the specified canonical accounting and reserved terminal
 space at candidate transitions/output projection without copying raw payloads
-into diagnostics or observers.
+into diagnostics or telemetry spans.
 
 **REFACTOR.** Share synchronous size/error projection on its natural owner;
 no allocator-size heuristic or second error catalog.
@@ -438,7 +438,7 @@ policy, remote language surface or inability to close direct consumer compilatio
 
 ## Authority Links
 
-- [Approved Revision 10](../spec.md)
+- [Approved Revision 11](../spec.md)
 - `AGENTS.md` §§2–12, 14–16; `architecture/agent-rules.md`
 - `architecture/wyrd-design.md`; `architecture/wyrd-doctrine.mdx`
 - `architecture/references/{doctrine/architecture-constraints,architecture/patterns}.md`

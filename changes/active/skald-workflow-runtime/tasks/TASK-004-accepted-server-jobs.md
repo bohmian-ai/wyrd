@@ -3,7 +3,7 @@ id: TASK-004
 kind: implementation
 status: ready
 spec: SPEC-skald-workflow-runtime
-spec_revision: 10
+spec_revision: 11
 requirements: [REQ-014, REQ-015, REQ-017, REQ-018, REQ-019, REQ-020, REQ-021, REQ-022, REQ-023, REQ-029, REQ-030, REQ-032, REQ-032A, REQ-033, REQ-034, REQ-034A, REQ-034B, REQ-034C, REQ-036A, REQ-038, REQ-039, REQ-041, REQ-042, REQ-043, REQ-045, REQ-048, REQ-050, REQ-052, INV-001, INV-005, INV-006, INV-008, INV-009, INV-010, INV-010A, INV-011, INV-012, INV-013, INV-018, INV-019, INV-020, INV-021, INV-022, INV-023, AC-004, AC-008, AC-009, AC-010, AC-011A, AC-012, AC-014, AC-015, AC-016, AC-017, AC-018, AC-019, AC-020, AC-021, AC-022, AC-025, AC-027, AC-028]
 depends_on: [TASK-001, TASK-002, TASK-003]
 ---
@@ -408,7 +408,7 @@ size/count defaults/accounting or gateway credential/settlement ownership.
 
 ## Authority Links
 
-- [Approved Revision 10](../spec.md); TASK-001, TASK-002, TASK-003
+- [Approved Revision 11](../spec.md); TASK-001, TASK-002, TASK-003
 - `AGENTS.md`; `architecture/agent-rules.md`
 - `architecture/wyrd-design.md`; `architecture/wyrd-security-posture.md`
 - `architecture/bifrost-design.md` §§Query contract, Read audit and terminal

@@ -6,7 +6,7 @@ caller_approval: approved
 planning_result: SPEC_REVISION_REQUIRED
 spec: SPEC-verified-change-contract
 spec_revision: 49
-requirements: [REQ-089, REQ-101, REQ-114, REQ-115, REQ-135, REQ-136, REQ-137, REQ-145, REQ-146, REQ-151, REQ-152, INV-015, AC-017, AC-020, AC-021, AC-022, AC-023, AC-024, AC-030, AC-032, AC-033]
+requirements: [REQ-089, REQ-101, REQ-114, REQ-115, REQ-135, REQ-136, REQ-137, REQ-145, REQ-146, REQ-151, REQ-152, INV-015, AC-017, AC-020, AC-021, AC-022, AC-023, AC-024, AC-030, AC-032, AC-033, REQ-172, REQ-173, REQ-174, REQ-175, REQ-176, REQ-177, INV-019, AC-041, AC-042]
 depends_on: [TASK-005, TASK-006, TASK-009, TASK-010, TASK-012]
 continues: TASK-008
 intended_to_replace: task-008-recovery.md
@@ -815,6 +815,167 @@ Primary profiling references for the documented commands:
 - [rustc frame pointers](https://doc.rust-lang.org/rustc/codegen-options/index.html#force-frame-pointers)
 - [perf record](https://raw.githubusercontent.com/torvalds/linux/master/tools/perf/Documentation/perf-record.txt)
 - [perf report](https://raw.githubusercontent.com/torvalds/linux/master/tools/perf/Documentation/perf-report.txt)
+
+## Amendment A — Client ingestion throughput and memory (spec revision 53)
+
+### Outcome and value
+
+The capacity benchmark's Drift seed exposed the client queue as the
+bottleneck. This amendment makes the shared client queue meet REQ-172 to
+REQ-177 and INV-019, and proves AC-041 and AC-042, inside this task.
+
+Already committed in `9e6464d2d`:
+- intake no longer awaits sends;
+- all-or-none record admission, used by Drift;
+- sealing headroom;
+- ambiguous gRPC outcomes retained.
+
+The amendment finishes the memory model, batching, concurrency, SDK override,
+journeys, and throughput proof, then resumes the closeout benchmarks.
+
+### Owners, scope, and prohibited changes
+
+**Owners:**
+- `crates/shared/wyrd-queue`: budget, producer, staging, sealing, sends;
+- `crates/shared/wyrd-client/src/bifrost`: `WriterPool` and facade;
+- the SDK budget option in `sdks/wyrd-sdk-python` and `sdks/wyrd-sdk-ts`;
+- a throughput benchmark in `crates/wyrd/wyrd-testing`.
+
+**Prohibited:**
+- blocking or awaitable admission;
+- inter-batch ordering machinery;
+- any server or Scribe change, unless AC-041 proves the server is the limit,
+  in which case stop and report;
+- new Python or TypeScript queue settings other than the byte budget;
+- a compatibility alias for removed `QueueConfig` fields.
+
+### Approach
+
+1. Replace the per-producer partition, fixed-slot charge, `ArrayQueue`
+   staging, producer-count limit, and row clamps with one shared byte budget
+   charged per admitted byte. Default 256 MiB; configured values honoured.
+2. Seal on `max_message_bytes` or a 5 ms linger since the first staged row;
+   flush and shutdown seal immediately.
+3. Allow up to `max_in_flight` concurrent sends per producer with stable batch
+   UUIDs; retained ambiguity retries without blocking other sends.
+4. Expose the budget override on Python and TypeScript `start_bifrost` and
+   Bifrost connect; refuse too-small budgets at connect.
+5. Add the three-SDK 1,000×9 Drift burst journeys and the AC-041 benchmark.
+   Set the `max_in_flight` default from it.
+6. Fix the capacity benchmark seed to resubmit on `QUEUE_FULL` after flush and
+   to count `SAMPLES × 9` tenant-scoped rows. Resume the closeout benchmarks.
+
+### Scenario A1 — One shared budget, no caps, no preallocation
+
+**Behavior.** One handle writes through at least 1,000 table producers. An
+idle producer reserves no budget bytes. A producer may stage up to the whole
+admission budget. Configured capacities are not clamped. (REQ-172, REQ-173,
+INV-019)
+
+**RED.** These wyrd-queue and wyrd-client tests fail today on the 64-producer
+limit and the fixed-slot charge:
+- one handle registering 1,000 tables;
+- an idle producer's `owned_bytes == 0`;
+- a single producer admitting more than 465 rows.
+
+**GREEN.** Shared byte budget only; staging grows with admitted rows. Rerun
+the all-or-none and sealing-headroom tests.
+
+**REFACTOR.** Delete `ProducerCapacities`, `MAX_LIVE_ENTRIES`, and the row
+clamps, along with their accounting and tests that pinned them.
+
+### Scenario A2 — Byte and linger sealing
+
+**Behavior.** A producer seals when staged bytes reach `max_message_bytes` or
+5 ms after its first staged row. A record larger than the admission budget is
+`PAYLOAD_TOO_LARGE`. (REQ-174, REQ-176)
+
+**RED.** Tests that fail on the current row-count and 1 s triggers:
+- a batch seals at the byte target without a flush;
+- a single row seals within the linger;
+- a record larger than the budget is refused as too large.
+
+**GREEN.** Byte and linger triggers replace `flush_max_rows` and
+`flush_interval_ms`.
+
+**REFACTOR.** Remove the row-count trigger code and configuration.
+
+### Scenario A3 — Concurrent sends with stable identity
+
+**Behavior.** With a held sink, up to `max_in_flight` batches are in flight at
+once. Intake continues while the budget has room. A retained ambiguous batch
+retries under the same UUID while other batches proceed. (REQ-175, REQ-177)
+
+**RED.** These fail with one send in flight:
+- a held sink observes `max_in_flight` concurrent batches;
+- a retained batch does not block a later batch's ACK.
+
+**GREEN.** Bounded concurrent sends in the producer task. Rerun the gRPC
+retention tests and `public_sdk_owned_batch_timeout_retry_retains_then_deduplicates`.
+
+**REFACTOR.** Keep one owner task per producer; no new trait.
+
+### Scenario A4 — SDK budget override and three-language bursts
+
+**Behavior.** Rust, Python, and TypeScript accept a byte-budget override,
+refuse one too small to seal a message, and survive an uninterrupted
+1,000×9 Drift burst with resubmit-after-flush on `QUEUE_FULL`. Each reads back
+exactly 9,000 rows, 1,000 `record_id`s, and 9 rows per id. (REQ-172, REQ-176,
+AC-042)
+
+**RED.** New journeys in `sdks/wyrd-sdk-rust/tests/observe_run.rs`, Python
+`tests/integration/state/test_observe_journey.py`, and TypeScript
+`wyrd/tests/integration/observe-run.test.ts` fail on the missing option.
+
+**GREEN.** Add the option through `wyrd-client` and the SDK wrappers, then
+regenerate stubs.
+
+**REFACTOR.** None beyond the wrappers.
+
+### Scenario A5 — 50,000 rows/s sustained
+
+**Behavior.** AC-041. A release benchmark runs 500 obs/s × 100 features for
+60 s with defaults against a real server, Postgres, and RustFS.
+- It must show zero refusals, flat client bytes, drain within 1 s, and
+  exactly 3,000,000 rows with 100 per id.
+- It reports a 1,000 obs/s step, a 50 ms ack-delay step, batch sizes, send
+  latency, CPU per row, and `max_in_flight`.
+
+**RED.** The run on the current queue misses the bar; record the numbers.
+
+**GREEN.** Choose the smallest `max_in_flight` that passes and make it the
+default.
+
+**REFACTOR.** Reuse the capacity benchmark's server harness; no
+benchmark-only fast path.
+
+### Acceptance criteria
+
+- REQ-172 to REQ-177, INV-019, AC-041, and AC-042 each have passing evidence in
+  the table below.
+- Existing `wyrd-queue`, `wyrd-client`, and SDK journeys stay green.
+
+### Verification
+
+**Format and lints:** `mise run fmt`, `mise run lints`, `mise run py:format`,
+`mise run py:lints`.
+
+**Tests and checks:**
+- `mise exec -- cargo nextest run --locked -p wyrd-queue`
+- `mise exec -- cargo nextest run --locked -p wyrd-client --lib`
+- `mise run test:bifrost:journey:sdk`
+- `mise run test:bifrost:journey:observe`
+- `mise run py:test:integration`
+- `mise run ts:test:integration`
+- `mise run codegen:check`
+
+**Benchmark:** the AC-041 benchmark command, recorded with its report.
+
+### Stop conditions
+
+- AC-041 fails because the server cannot ingest 50,000 rows/s.
+- Meeting AC-041 would require ordering, blocking admission, or a
+  persisted-format change.
 
 ## Implementation Evidence (in progress)
 

@@ -585,17 +585,22 @@ mod tests {
     use wyrd_spec::gateway::{GatewayFallbackOverride, ModelRef};
     use wyrd_spec::ids::CredentialBindingName;
 
-    use super::{WorkflowExecutionLimits, WorkflowRunOptions, backoff};
+    use super::{
+        JoinError, JoinSet, Observer, StepReport, WorkflowExecutionLimits, WorkflowExecutor,
+        WorkflowRunOptions, backoff,
+    };
     use crate::attempt::{agent_error_retryable, project_agent_error};
+    use crate::plan::ExecutionPlan;
     use crate::route::{
         DEFAULT_GATEWAY_CALL_TIMEOUT, ExternalEndpointProfile, ExternalGatewayBinding,
         ExternalGatewayBindings, WorkflowExecutionDependencies,
     };
+    use crate::run::RunEnding;
     use crate::test_support::{
-        RecordingObserver, RecordingTool, Reply, ScriptedProvider, agent, bindings, string_schema,
-        text_response, tool_call_response,
+        HostileObserver, RecordingObserver, RecordingTool, Reply, ScriptedProvider, agent,
+        bindings, string_schema, text_response, tool_call_response,
     };
-    use crate::workflow_surface::Workflow;
+    use crate::workflow_surface::{Workflow, WorkflowInput};
 
     /// Declared string inputs with the given defaults.
     fn string_inputs(pairs: &[(&str, &str)]) -> BTreeMap<String, ParameterValue> {
@@ -1272,6 +1277,185 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!((provider.in_flight(), provider.abandoned()), (0, 1));
+
+        // A step task aborted before its first poll never began: it is
+        // unstarted with no attempts or timestamps, while a task aborted after
+        // its attempt began is cancelled with that attempt.
+        let workflow = independent("prepoll", &[("begun", "begun call"), ("idle", "idle call")]);
+        let provider = ScriptedProvider::new();
+        let dependencies = WorkflowExecutionDependencies::new(provider.registry());
+        let plan = ExecutionPlan::build(
+            &workflow.spec,
+            &workflow.resolved_agents,
+            &dependencies,
+            WorkflowInput::from(serde_json::Map::new()),
+            None,
+        )
+        .expect("prepoll plans");
+        let mut executor = WorkflowExecutor::new(
+            "prepoll".to_owned(),
+            None,
+            plan,
+            dependencies.native(),
+            WorkflowRunOptions::default(),
+        )
+        .expect("prepoll prepares");
+        let mut aborted = Vec::new();
+        for _ in 0..2 {
+            let mut tasks = JoinSet::new();
+            tasks.spawn(std::future::pending::<StepReport>());
+            tasks.abort_all();
+            let joined = tasks.join_next().await.expect("one aborted task");
+            assert!(joined.as_ref().is_err_and(JoinError::is_cancelled));
+            aborted.push(joined);
+        }
+        let (begun, idle) = (0, 1);
+        executor.ledger.start();
+        executor.ledger.step_started(begun);
+        executor.ledger.step_started(idle);
+        executor.attempts[begun].store(1, Ordering::Release);
+        assert!(!executor.settle(idle, aborted.pop().expect("aborted idle")));
+        assert!(!executor.settle(begun, aborted.pop().expect("aborted begun")));
+        let run = executor.ledger.finish(RunEnding::Cancelled, &executor.plan);
+        let idle = &run.steps["idle"];
+        assert_eq!(
+            (idle.status, idle.attempts),
+            (WorkflowStepStatus::Unstarted, 0)
+        );
+        assert!(idle.started_at.is_none() && idle.ended_at.is_none());
+        let begun = &run.steps["begun"];
+        assert_eq!(
+            (begun.status, begun.attempts),
+            (WorkflowStepStatus::Cancelled, 1)
+        );
+        assert!(begun.started_at.is_some() && begun.ended_at.is_some());
+
+        // Panicking Workflow callbacks are contained: a retried step and a
+        // binding failure keep their authoritative outcomes.
+        let panicking = || -> Arc<dyn Observer> {
+            Arc::new(HostileObserver {
+                panic: true,
+                spare_start: false,
+            })
+        };
+        let workflow = with_policy(
+            independent("panicky", &[("flaky", "flaky call")]),
+            "flaky",
+            1,
+            Some(100),
+            None,
+        )
+        .with_observers(vec![panicking()]);
+        let provider = ScriptedProvider::new();
+        provider.on("flaky call", vec![status(503), Reply::Text("ok".into())]);
+        let run = run_limited(
+            &workflow,
+            &provider,
+            WorkflowExecutionLimits::default(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(run.status, WorkflowRunStatus::Succeeded);
+        assert_eq!(run.steps["flaky"].attempts, 2);
+        let optional = json!({
+            "type": "object",
+            "properties": { "summary": { "type": "string" }, "extra": { "type": "string" } },
+            "required": ["summary"]
+        });
+        let workflow = Workflow::builder("panicky_binding")
+            .add(agent("src", "src call", Some(optional)))
+            .and_then(|b| b.add_after(agent("use", "use ${v}", None), ["src"]))
+            .and_then(|b| {
+                b.with_step_inputs(
+                    "use",
+                    bindings(&[("v", "steps.src.output.structured.extra")]),
+                )
+            })
+            .and_then(|b| b.with_outputs(bindings(&[("out", "steps.use.output.text")])))
+            .and_then(|b| b.build())
+            .expect("binding workflow builds")
+            .with_observers(vec![panicking()]);
+        let provider = ScriptedProvider::new();
+        provider.on("src call", vec![Reply::Text(r#"{"summary":"s"}"#.into())]);
+        let run = run_limited(
+            &workflow,
+            &provider,
+            WorkflowExecutionLimits::default(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(
+            run.error.as_ref().map(|e| e.code.as_str()),
+            Some("WYRD_WORKFLOW_422_MISSING_PARAMETER")
+        );
+        assert_eq!(run.steps["use"].attempts, 1);
+        assert_eq!(provider.count("use"), 0);
+
+        // A run-start callback that never completes cannot hold off
+        // cancellation: the run returns a complete cancelled snapshot and no
+        // step begins.
+        let workflow =
+            independent("stalled", &[("held", "held call")]).with_observers(vec![Arc::new(
+                HostileObserver {
+                    panic: false,
+                    spare_start: false,
+                },
+            )]);
+        let provider = ScriptedProvider::new();
+        provider.on("held call", vec![Reply::Text("ok".into())]);
+        let cancellation = CancellationToken::new();
+        let trigger = cancellation.clone();
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            trigger.cancel();
+        });
+        let run = run_limited(
+            &workflow,
+            &provider,
+            WorkflowExecutionLimits::default(),
+            cancellation,
+        )
+        .await;
+        cancel_task.await.expect("cancel task completes");
+        assert_eq!(run.status, WorkflowRunStatus::Cancelled);
+        let held = &run.steps["held"];
+        assert_eq!(
+            (held.status, held.attempts),
+            (WorkflowStepStatus::Unstarted, 0)
+        );
+        assert_eq!(provider.count("held call"), 0);
+
+        // Hanging attempt, result, backoff, and finish callbacks are bounded:
+        // the attempt-start callback consumes the attempt's own timeout, the
+        // result callback ends at the total deadline, no later attempt
+        // begins, and the timed-out snapshot returns at that deadline.
+        let workflow = with_policy(
+            independent("stalled_attempt", &[("held", "held call")]),
+            "held",
+            1,
+            None,
+            Some(1),
+        )
+        .with_observers(vec![Arc::new(HostileObserver {
+            panic: false,
+            spare_start: true,
+        })]);
+        let provider = ScriptedProvider::new();
+        provider.on("held call", vec![Reply::Text("ok".into())]);
+        let limits = WorkflowExecutionLimits {
+            deadline: Some(Duration::from_secs(10)),
+            ..WorkflowExecutionLimits::default()
+        };
+        let started = tokio::time::Instant::now();
+        let run = run_limited(&workflow, &provider, limits, CancellationToken::new()).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+        assert_eq!(run.status, WorkflowRunStatus::TimedOut);
+        let held = &run.steps["held"];
+        assert_eq!(
+            (held.status, held.attempts),
+            (WorkflowStepStatus::Cancelled, 1)
+        );
+        assert_eq!(provider.count("held call"), 0);
     }
 
     /// Gateway fake answering per step from scripted replies and recording
@@ -1919,6 +2103,35 @@ mod tests {
             run.error.as_ref().map(|e| e.code.as_str()),
             Some("WYRD_WORKFLOW_413_STEP_RESULT_TOO_LARGE")
         );
+
+        // Over-limit output never reaches a payload-bearing observation, while
+        // in-limit output stays observable.
+        let observer = Arc::new(RecordingObserver::default());
+        let observed = workflow.clone().with_observers(vec![observer.clone()]);
+        let limits = WorkflowExecutionLimits {
+            max_step_result_bytes: Some(100),
+            ..WorkflowExecutionLimits::default()
+        };
+        for (reply, code) in [
+            (big.clone(), Some("WYRD_WORKFLOW_413_STEP_RESULT_TOO_LARGE")),
+            ("short".to_owned(), None),
+        ] {
+            let provider = ScriptedProvider::new();
+            provider.on("write go", vec![Reply::Text(reply)]);
+            let run = observed
+                .run_with_options(
+                    &WorkflowExecutionDependencies::new(provider.registry()),
+                    serde_json::Map::from_iter([("topic".to_owned(), json!("go"))]),
+                    WorkflowRunOptions {
+                        limits,
+                        cancellation: CancellationToken::new(),
+                    },
+                )
+                .await
+                .expect("runs");
+            assert_eq!(run.error.as_ref().map(|e| e.code.as_str()), code);
+        }
+        assert_eq!(observer.model_results(), vec!["short".to_owned()]);
 
         // A payload that would overflow the run snapshot is discarded and the
         // aggregate-size error decides the run.

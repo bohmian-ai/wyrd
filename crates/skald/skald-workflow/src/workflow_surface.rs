@@ -793,12 +793,13 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use serde_json::{Value, json};
     use wyrd_spec::auth::AbsoluteUrl;
     use wyrd_spec::card::common::ParameterValue;
     use wyrd_spec::card::workflow::{
-        ExternalGatewayProtocol, LlmRoute, WorkflowRun, WorkflowRunStatus,
+        ExternalGatewayProtocol, LlmRoute, WorkflowRetryPolicy, WorkflowRun, WorkflowRunStatus,
     };
     use wyrd_spec::ids::CredentialBindingName;
 
@@ -808,7 +809,7 @@ mod tests {
     use crate::test_support::{
         RecordingTool, Reply, ScriptedProvider, agent, bindings, string_schema,
     };
-    use crate::workflow::WorkflowRunOptions;
+    use crate::workflow::{WorkflowExecutionLimits, WorkflowRunOptions};
 
     /// Run `workflow` against `provider` with default local options.
     async fn run_local(
@@ -854,8 +855,10 @@ mod tests {
     /// Scenario 1: every resolved-graph defect fails with a safe,
     /// field-specific stable error before any provider call: unbound and extra
     /// Prompt variables, payload-kind mismatches in either direction, an
-    /// unresolved Agent, a hidden (undeclared) step reference, a cycle, and an
-    /// external route whose protocol differs from the Prompt dialect.
+    /// unresolved Agent, a hidden (undeclared) step reference, a cycle, an
+    /// external route whose protocol differs from the Prompt dialect, a retry
+    /// count whose final attempt cannot fit `u32`, and step timeouts or a run
+    /// deadline that cannot be represented as an instant.
     #[tokio::test]
     async fn resolved_bindings_reject_before_dispatch() {
         const VALIDATION: &str = "WYRD_WORKFLOW_422_VALIDATION";
@@ -874,6 +877,16 @@ mod tests {
             headers: BTreeMap::new(),
             credential_binding: CredentialBindingName::new("corp").expect("binding name"),
         });
+        let retry = |max_retries: u32| {
+            let mut workflow = with_outputs(pair("first", "second", false));
+            workflow.spec.steps[1].retry = Some(WorkflowRetryPolicy {
+                max_retries,
+                initial_backoff_ms: None,
+            });
+            workflow
+        };
+        let mut timeout = with_outputs(pair("first", "second", false));
+        timeout.spec.steps[1].timeout_seconds = Some(u64::MAX);
         let cases: Vec<(&str, Workflow, &str, &str)> = vec![
             (
                 "unbound variable",
@@ -949,6 +962,18 @@ mod tests {
                 "WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED",
                 "steps[1].llm_route",
             ),
+            (
+                "unrepresentable retry count",
+                retry(u32::MAX),
+                VALIDATION,
+                "steps[1].retry.max_retries",
+            ),
+            (
+                "unrepresentable step timeout",
+                timeout,
+                VALIDATION,
+                "steps[1].timeout_seconds",
+            ),
         ];
 
         for (case, workflow, code, field) in cases {
@@ -965,6 +990,33 @@ mod tests {
             }
             assert!(provider.requests().is_empty(), "{case} dispatched");
         }
+
+        // The largest representable retry count is accepted.
+        retry(u32::MAX - 1)
+            .validate()
+            .expect("u32::MAX - 1 retries validate");
+
+        // An unrepresentable local run deadline is refused before dispatch.
+        let provider = ScriptedProvider::new();
+        let error = with_outputs(pair("first", "second", false))
+            .run_with_options(
+                &WorkflowExecutionDependencies::new(provider.registry()),
+                serde_json::Map::new(),
+                WorkflowRunOptions {
+                    limits: WorkflowExecutionLimits {
+                        deadline: Some(Duration::MAX),
+                        ..WorkflowExecutionLimits::default()
+                    },
+                    ..WorkflowRunOptions::default()
+                },
+            )
+            .await
+            .expect_err("deadline is not representable");
+        assert_eq!(
+            code_and_field(&error),
+            ("WYRD_WORKFLOW_422_RUN_REQUEST", "deadline".to_owned())
+        );
+        assert!(provider.requests().is_empty());
     }
 
     /// Scenario 7: the Rust builder declares inputs, step bindings, and

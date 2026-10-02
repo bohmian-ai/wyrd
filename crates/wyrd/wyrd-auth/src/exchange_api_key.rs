@@ -537,6 +537,10 @@ impl From<DelegateError> for WyrdError {
     }
 }
 
+/// Postgres-backed API-key and token-exchange behavior, and the shared
+/// fixtures that seed users, service accounts, live API keys, and a
+/// [`BrowserSessions`](crate::browser_sessions::BrowserSessions) owner for the
+/// sibling browser-session tests.
 #[cfg(test)]
 pub(crate) mod pg_tests {
     use std::collections::HashMap;
@@ -863,21 +867,17 @@ pub(crate) mod pg_tests {
         assert_eq!(flat[1], b.principal.id.to_string());
     }
 
-    /// A machine credential exchange mints no refresh token and no refresh row.
+    /// Seed a live API key for `principal_id` in `conn`'s open transaction and
+    /// return its row id and presentable secret.
     ///
-    /// Machine clients renew by presenting their durable API key again, so the
-    /// grant has nothing to rotate. The response field has to stay absent and —
-    /// the half a response assertion cannot see — the transaction must leave
-    /// `wyrd.auth_refresh_tokens` empty, because a stored row would be a
-    /// long-lived credential nobody ever asked for and nobody rotates.
+    /// Generates a tenant-bound key, stores its Argon2 hash and prefix in
+    /// `wyrd.auth_api_keys` with a one-day expiry, and writes nothing else; the
+    /// caller commits. The row id is what a grant record and the browser
+    /// session tests' key-use reads must name, so callers need it rather than a
+    /// fresh UUID.
     ///
     /// # Panics
-    ///
-    /// Panics when the fixture cannot start or any assertion fails.
-    /// Seed a live API key for a principal and return its row id and secret.
-    ///
-    /// The row id is what a grant record must name, so the attribution tests
-    /// need it rather than a fresh UUID.
+    /// Panics when the generated secret cannot be hashed or the insert fails.
     pub(crate) async fn insert_live_api_key(
         conn: &mut TenantConn<'_>,
         tenant: DataTenantId,

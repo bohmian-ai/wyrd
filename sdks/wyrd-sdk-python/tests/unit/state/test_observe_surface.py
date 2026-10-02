@@ -345,6 +345,44 @@ def test_scope_survives_await_and_isolates_concurrent_tasks(
     }
 
 
+def test_concurrent_tasks_entering_the_same_run_exit_independently(
+    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+) -> None:
+    """Two tasks share one Run object; each exit clears only its own task's scope."""
+    provider, exporter = spans
+    tracer = provider.get_tracer("framework")
+    run = _state(tmp_path).run(card="model")
+
+    async def main() -> None:
+        first_entered, second_entered, first_exited = (asyncio.Event() for _ in range(3))
+
+        async def first() -> None:
+            with run:
+                first_entered.set()
+                await second_entered.wait()
+            tracer.start_span("first-exited").end()
+            first_exited.set()
+
+        async def second() -> None:
+            await first_entered.wait()
+            with run:
+                second_entered.set()
+                await first_exited.wait()
+                tracer.start_span("second-entered").end()
+            tracer.start_span("second-exited").end()
+
+        await asyncio.gather(first(), second())
+
+    asyncio.run(main())
+    tracer.start_span("after").end()
+    assert _correlation(exporter) == {
+        "first-exited": None,
+        "second-entered": (run.card_ref, run.run_id),
+        "second-exited": None,
+        "after": None,
+    }
+
+
 async def _span_later(tracer: Any, name: str) -> None:
     """Yield once, then start and end one span in this task's context."""
     await asyncio.sleep(0)
@@ -484,7 +522,7 @@ def test_detach_failure_restores_the_prior_correlation(
     spans: tuple[TracerProvider, InMemorySpanExporter],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A raising or silently swallowed detach still restores the preceding pair."""
+    """A raising or silently swallowed detach restores the preceding pair and never blocks emits."""
     provider, exporter = spans
     tracer = provider.get_tracer("framework")
     run = _state(tmp_path).run()
@@ -494,8 +532,10 @@ def test_detach_failure_restores_the_prior_correlation(
             # OTel's public ``detach`` logs and swallows a failed reset.
             monkeypatch.setattr(otel_context, "detach", lambda _token: None)
             _drift_reaches_the_ordinary_boundary(entered)
+        _drift_reaches_the_ordinary_boundary(model)
         tracer.start_span("outer").end()
         monkeypatch.setattr(otel_context, "detach", _broken)
+    _drift_reaches_the_ordinary_boundary(run)
     monkeypatch.setattr(otel_context, "detach", ORIGINAL_DETACH)
     tracer.start_span("after").end()
     assert _correlation(exporter) == {"outer": (run.card_ref, run.run_id), "after": None}

@@ -173,3 +173,23 @@ git diff --check
 
 A red gate blocks completion. Diagnose and correct it without weakening the
 gate.
+
+## Implementation Evidence
+
+Commit: `262136474`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| R4-AC-01 | `IssuanceError::is_refusal`, `RefreshError::is_refusal` and `ExchangeError::is_refusal` are now `pub(crate)`. The error enums stay public; matches, callers and behaviour are unchanged | `wyrd-auth` builds; `mise run lints`; `only_lifecycle_refusals_end_a_renewing_session` | PASS |
+| R4-AC-02 | `open_text` rustdoc now covers its raw `InvalidToken` error and says the lifecycle consequence belongs to the caller. The classification-test prose limits refusals to producer-rejected credentials and lifecycle outcomes | Source inspection; `mise run fmt` and `mise run lints` | PASS |
+| R4-AC-03 | `browser_sessions::tests::missing_or_unopenable_renewal_credential_is_retryable_failure` (absent envelope, and ciphertext sealed under an unheld key) | RED: with `open_credential` temporarily restored to the old terminal `ok_or(Renewal::Refused)`, it failed with `a missing renewal credential must be a retryable internal failure`. GREEN with the correction | PASS |
+| R4-AC-04 | No runtime change | The four `browser_sessions::pg_tests` renewal selectors (replay containment, ordinary refusal, refresh and API-key internal failure) | PASS |
+
+Non-goals stayed excluded: no change to error variants, HTTP mapping, lifetimes, cookies or sealing; no new fixtures, harness or public contract.
+
+Verification, all run with `CARGO_TARGET_DIR` set to the shared target:
+- Both unit selectors and the four Postgres selectors.
+- Mise lanes: `fmt`, `lints`, `check:tenant-isolation`, `test:wyrd` and `test:identity:journey`.
+- `git diff --check`.
+
+All exited 0.

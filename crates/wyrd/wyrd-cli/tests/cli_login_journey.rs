@@ -67,16 +67,16 @@ fn transcript(output: &Output) -> String {
     )
 }
 
-/// The RFC 8628 `error` of a refused device-code poll.
+/// The RFC 6749 §5.2 / RFC 8628 §3.5 `error` of a refused device-code poll,
+/// which the client carries in the problem's `details.error`.
 ///
 /// # Panics
-/// Panics when the poll succeeded or was refused otherwise.
+/// Panics when the poll succeeded or the refusal names no RFC error.
 fn device_error<T: std::fmt::Debug>(result: Result<T, AuthError>) -> String {
     let problem = result
         .expect_err("the poll is refused")
         .into_wyrd()
         .problem();
-    assert_eq!(problem.code, "WYRD_AUTH_400_DEVICE_AUTHORIZATION");
     problem.details["error"]
         .as_str()
         .expect("the refusal names its error")

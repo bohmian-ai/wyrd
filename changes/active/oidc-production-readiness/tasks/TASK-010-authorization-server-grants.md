@@ -235,3 +235,86 @@ listed section would change tenancy, authorization, or token contents.
 [RFC 7523](https://www.rfc-editor.org/rfc/rfc7523);
 [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414);
 [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700).
+
+## Implementation Evidence
+
+Commits `15ed2e342..HEAD` on `wyrd/oidc-production-readiness/TASK-010`. Every
+command ran with `CARGO_TARGET_DIR=<repo>/target`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `oauth2` crate completes device login and refresh | `auth/cli_login.rs`, `components/auth/routes.rs` (`TokenGrants`), `wyrd-auth/src/cli_logins.rs` | `human_oidc_login_journey` (oauth2 5.0.0 `exchange_device_code`, `exchange_device_access_token`, `exchange_refresh_token`) | PASS |
+| `openid-client` completes code + PKCE | `auth/authorize.rs`, `auth/callback.rs`, `AuthorizationCodeExchange::redeem_code` | Server side proven by `tenant_human_login_journey`, `tenant_callback_refusal_journey` (RFC 6749 form requests); the `openid-client` driver is TASK-011's BFF journey | PASS (server); client deferred to TASK-011 |
+| Wrong / expired / replayed code, PKCE mismatch, wrong `redirect_uri` → `invalid_grant`; wrong secret → `401 invalid_client`; JSON body → `invalid_request` | `auth/oauth.rs` (`OAuthForm`, `OAuthError`, `OAuthClients`) | `tenant_callback_refusal_journey` steps 2–3; `complete_login` replay assertion; `auth::oauth::tests` | PASS |
+| Device `authorization_pending`, `slow_down`, `access_denied`, `expired_token`; denied/expired/deleted/redeemed grants issue nothing; live grant issues once | `wyrd-auth/src/cli_logins.rs::redeem_in`, `device_authorizations.rs` | `device_grant_refusal_journey`; `cli_logins::pg_tests::device_codes_poll_approve_deny_and_expire`, `an_approved_device_code_issues_exactly_once`; `issuance::pg_tests::a_suspended_principal_is_refused_by_every_grant` | PASS |
+| CLI refresh reuse → family revoked; BFF (`wyrd-ui`) refresh not rotated | `wyrd-auth/src/refresh.rs` | `human_oidc_login_journey` steps 8–9; `revoking_a_human_kills_the_session_refresh_authority`; `refresh::pg_tests::reuse_detection_revokes_family` | PASS |
+| RFC 8414 metadata served; form bodies and RFC 6749 §5 bodies on every listed endpoint | `auth/authorize.rs::metadata`, utoipa form `request_body`s | `device_grant_refusal_journey` step 1; `pg_openapi_contract::tenant_login_operations_publish_their_contract`, `an_unstageable_exchange_audit_answers_with_an_error_the_token_operation_documents` | PASS |
+| Existing API-key (RFC 8693), RFC 7523, and workload journeys pass | `TokenRequest` token-exchange with `urn:wyrd:oauth:token-type:api_key`; jwt-bearer form | `workload_jwt_bearer_*`, `service_account_issuer_full_chain`, `federated_cloud_journey_cli_authored_keycloak`, `test:platform:journey`, `test:cli:journey`, `oracle mcp::pg_tests::agent_runs_three_table_analytical_query_through_mcp` | PASS |
+| `bff.rs`, browser-session code and migrations, sealed completion, session/completion/bootstrap rewrap columns gone | deleted `components/auth/bff.rs`, `auth/login.rs`, `queries/auth/browser_sessions.rs`, migrations `20261001000001`, `20261001000003`; `SealedSecretTable::ALL` is connection and issuer secrets only | `test:sql` (`pg_migration`), `cargo check --workspace --all-features --tests` | PASS |
+
+### Commands
+
+| Command | Result |
+|---|---|
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=discovery_resolves_keycloak mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=discovery_resolves_dex mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=trust_layer_config_driven_keycloak mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=trust_layer_config_driven_dex mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=workload_token_keycloak_claims mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=workload_token_wrong_aud_absent_keycloak mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=workload_jwt_bearer_journey_keycloak mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=workload_jwt_bearer_unbound_subject_returns_404_keycloak mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=workload_jwt_bearer_activates_only_its_exact_owner_keycloak mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=ttl_expiry_journey mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=revocation_journey mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=revocation_requires_admin_permission mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=service_account_issuer_full_chain mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=human_oidc_login_journey mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=revoking_a_human_kills_the_session_refresh_authority mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=a_withdrawn_oidc_group_invalidates_the_roles_it_granted mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=tenant_connection_admin_journey mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=tenant_connection_rotation_journey mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=tenant_connection_session_cutoff_journey mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=tenant_human_login_journey mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=tenant_callback_refusal_journey mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=tenant_callback_issuer_binding_journey mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=tenant_connection_test_sign_in_journey mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=tenant_provider_switch_journey mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=tenant_machine_independence_journey mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=federated_cloud_journey_cli_authored_keycloak mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=same_issuer_two_tenant_isolation_keycloak mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=conformance_untrusted_issuer_rejected mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=conformance_login_rejects_bare_localhost_host mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=key_rotation_keycloak_admin_api mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=device_grant_refusal_journey mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=cli WYRD_IDENTITY_FILTER='cli_device_login_journey' mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=rust WYRD_IDENTITY_FILTER='saved_user_auth_journey' mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=client WYRD_IDENTITY_FILTER='concurrent_saved_renewal' mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=python WYRD_IDENTITY_FILTER='test_saved_user_auth_journey' mise run test:identity:journey` | exit 0 |
+| `mise exec -- env WYRD_IDENTITY_TARGET=typescript WYRD_IDENTITY_FILTER='saved user auth journey' mise run test:identity:journey` | exit 0 |
+| `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --lib -E 'test(/^auth::/) \| test(/^components::auth::/) \| test(/^components::platform::/)'"` | 54 passed (after the two callback redemption fixes, `auth::callback::pg_tests` 18/18) |
+| same wrapper, `cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^cli_logins::/) \| test(/^refresh::/) \| test(/^callback::/) \| test(/^issuance::/)'` | 34 passed |
+| same wrapper, `cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E 'test(=mcp::pg_tests::agent_runs_three_table_analytical_query_through_mcp)'` | PASS |
+| `mise exec -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=secret_sources::refresh_reads_the_refresh_token_from_the_environment)'` | PASS |
+| `mise run test:principals:integration` (incl. `pg_openapi_contract` 21/21) | exit 0 |
+| `mise run test:sql` | exit 0 |
+| `mise run test:platform:journey` | exit 0 |
+| `mise run test:cli:journey` | exit 0 (33 passed) |
+| `mise run codegen:check` (after `codegen:regen`) | exit 0 |
+| `mise run docs:check` | exit 0 |
+| `mise run check:client-tier`, `check:unwrap-audit` | exit 0 |
+| `mise run fmt`, `lints`, `py:lints`, `ts:typecheck`, `git diff --check` | exit 0 |
+
+### Deferred lanes
+
+- TASK-011 (BFF on `openid-client`): `identity_ui_e2e::production_ui_bff_journey`
+  and `wyrd-ui` `production-auth.integration.test.ts` / `session.test.ts` /
+  `server-sessions.ts` still drive the deleted `/internal/bff/v1/*` channel
+  and `WYRD_BFF_SERVICE_KEY`; only those consumers fail.
+- TASK-012 (`wyrd-client`/CLI on `oauth2`): no lane fails on this task; the
+  saved-login journeys above pass on the current hand-written client and are
+  re-proven once TASK-012 moves it onto the `oauth2` crate.
+
+Non-goals stayed excluded: no new authorization-server library, no
+compatibility route for `/auth/login`, `/internal/bff/v1/*`, or the
+`wyrd_api_key` grant.

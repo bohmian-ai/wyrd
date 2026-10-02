@@ -769,3 +769,331 @@ fn require_identifier(field: &str, name: &str) -> Result<(), WorkflowValidationE
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use serde_json::{Value, json};
+    use wyrd_spec::card::common::ParameterValue;
+    use wyrd_spec::card::workflow::{WorkflowRun, WorkflowRunStatus};
+
+    use super::{Workflow, WorkflowInput};
+    use crate::error::{WorkflowError, WorkflowResult};
+    use crate::route::WorkflowExecutionDependencies;
+    use crate::test_support::{
+        RecordingTool, Reply, ScriptedProvider, agent, bindings, string_schema,
+    };
+    use crate::workflow::WorkflowRunOptions;
+
+    /// Run `workflow` against `provider` with default local options.
+    async fn run_local(
+        workflow: &Workflow,
+        provider: &Arc<ScriptedProvider>,
+        input: impl Into<WorkflowInput>,
+    ) -> WorkflowResult<WorkflowRun> {
+        workflow
+            .run_with_options(
+                &WorkflowExecutionDependencies::new(provider.registry()),
+                input,
+                WorkflowRunOptions::default(),
+            )
+            .await
+    }
+
+    /// Stable code and offending field of a pre-dispatch failure.
+    fn code_and_field(error: &WorkflowError) -> (&'static str, String) {
+        let field = match error {
+            WorkflowError::Spec(error) => error.field().to_owned(),
+            WorkflowError::Wyrd(error) => {
+                let details = &error.as_problem_json()["details"];
+                details["field"]
+                    .as_str()
+                    .or_else(|| details["step"].as_str())
+                    .unwrap_or_default()
+                    .to_owned()
+            }
+            WorkflowError::AgentNotFound(step) => step.clone(),
+        };
+        (error.code(), field)
+    }
+
+    /// Two-step text Workflow `first -> second` without bindings or outputs.
+    fn pair(first: &str, second: &str, structured_first: bool) -> Workflow {
+        let schema = structured_first.then(|| string_schema(&["summary"]));
+        Workflow::new("pair")
+            .add(agent("first", first, schema))
+            .and_then(|w| w.add_after(agent("second", second, None), ["first"]))
+            .expect("fixture steps append")
+    }
+
+    /// Scenario 1: every resolved-graph defect fails with a safe,
+    /// field-specific stable error before any provider call: unbound and extra
+    /// Prompt variables, payload-kind mismatches in either direction, an
+    /// unresolved Agent, a hidden (undeclared) step reference, a cycle, and an
+    /// external route whose protocol differs from the Prompt dialect.
+    #[tokio::test]
+    async fn resolved_bindings_reject_before_dispatch() {
+        use wyrd_spec::auth::AbsoluteUrl;
+        use wyrd_spec::card::workflow::{ExternalGatewayProtocol, LlmRoute};
+        use wyrd_spec::ids::CredentialBindingName;
+
+        const VALIDATION: &str = "WYRD_WORKFLOW_422_VALIDATION";
+        let with_outputs = |workflow: Workflow| {
+            workflow
+                .with_outputs(bindings(&[("out", "steps.second.output.text")]))
+                .expect("outputs declare")
+        };
+        let mut cases: Vec<(&str, Workflow, &str, &str)> = Vec::new();
+
+        cases.push((
+            "unbound variable",
+            with_outputs(pair("first ${topic}", "second", false)),
+            VALIDATION,
+            "steps[0].inputs.topic",
+        ));
+        cases.push((
+            "extra binding",
+            with_outputs(
+                pair("first", "second", false)
+                    .with_step_inputs("first", bindings(&[("extra", "input.topic")]))
+                    .expect("binding names are identifiers"),
+            ),
+            VALIDATION,
+            "steps[0].inputs.extra",
+        ));
+        cases.push((
+            "text binding to structured step",
+            with_outputs(
+                pair("first", "second ${v}", true)
+                    .with_step_inputs("second", bindings(&[("v", "steps.first.output.text")]))
+                    .expect("binding names are identifiers"),
+            ),
+            VALIDATION,
+            "steps[1].inputs.v",
+        ));
+        cases.push((
+            "structured binding to text step",
+            with_outputs(
+                pair("first", "second ${v}", false)
+                    .with_step_inputs(
+                        "second",
+                        bindings(&[("v", "steps.first.output.structured.summary")]),
+                    )
+                    .expect("binding names are identifiers"),
+            ),
+            VALIDATION,
+            "steps[1].inputs.v",
+        ));
+        let mut missing_agent = with_outputs(pair("first", "second", false));
+        missing_agent.resolved_agents.remove("second");
+        cases.push((
+            "missing agent",
+            missing_agent,
+            "WYRD_WORKFLOW_404_AGENT",
+            "second",
+        ));
+        cases.push((
+            "hidden reference",
+            pair("first", "second", false)
+                .with_outputs(bindings(&[("out", "steps.first.output.text")]))
+                .and_then(|w| w.add(agent("third", "third ${v}", None)))
+                .and_then(|w| {
+                    w.with_step_inputs("third", bindings(&[("v", "steps.first.output.text")]))
+                })
+                .expect("fixture builds"),
+            VALIDATION,
+            "steps[2].inputs.v",
+        ));
+        cases.push((
+            "cycle",
+            with_outputs(
+                Workflow::new("cycle")
+                    .add_after(agent("first", "first", None), ["second"])
+                    .and_then(|w| w.add_after(agent("second", "second", None), ["first"]))
+                    .expect("fixture steps append"),
+            ),
+            "WYRD_WORKFLOW_422_CYCLE",
+            "",
+        ));
+        let mut external = with_outputs(pair("first", "second", false));
+        external.spec.steps[1].llm_route = Some(LlmRoute::ExtGateway {
+            protocol: ExternalGatewayProtocol::AnthropicMessages,
+            base_url: AbsoluteUrl::new("https://llm.example.com/v1".to_owned())
+                .expect("absolute url"),
+            headers: BTreeMap::new(),
+            credential_binding: CredentialBindingName::new("corp").expect("binding name"),
+        });
+        cases.push((
+            "external protocol mismatch",
+            external,
+            "WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED",
+            "steps[1].llm_route",
+        ));
+
+        for (case, workflow, code, field) in cases {
+            let provider = ScriptedProvider::new();
+            let validated = workflow.validate().expect_err(case);
+            let error = run_local(&workflow, &provider, serde_json::Map::new())
+                .await
+                .expect_err(case);
+            let (actual_code, actual_field) = code_and_field(&error);
+            assert_eq!(actual_code, code, "{case}: {error}");
+            assert_eq!(validated.code(), code, "{case}");
+            if !field.is_empty() {
+                assert_eq!(actual_field, field, "{case}: {error}");
+            }
+            assert!(provider.requests().is_empty(), "{case} dispatched");
+        }
+    }
+
+    /// Scenario 7: the Rust builder declares inputs, step bindings, and
+    /// outputs; `build` refuses an incomplete graph; edges inject no data;
+    /// text shorthand needs a declared string `input`; unknown or mistyped
+    /// input fails as a run request while defaults fill missing keys; and a
+    /// local tool runs only when declared on the Agent, and a model request
+    /// for an undeclared tool fails that step without executing anything.
+    #[tokio::test]
+    async fn explicit_builder_contract() {
+        let declared = Workflow::builder("explicit")
+            .add(agent("draft", "draft ${input} at ${level}", None))
+            .and_then(|b| b.add_after(agent("review", "review only", None), ["draft"]));
+        let incomplete = declared
+            .and_then(|b| b.with_outputs(bindings(&[("out", "steps.review.output.text")])))
+            .expect("fixture builds");
+        let error = incomplete.build().expect_err("draft variables are unbound");
+        assert_eq!(code_and_field(&error).1, "steps[0].inputs.input");
+
+        let unknown_step = Workflow::builder("explicit")
+            .add(agent("draft", "draft", None))
+            .and_then(|b| b.with_step_inputs("nope", bindings(&[("x", "input.x")])))
+            .err()
+            .expect("unknown step is refused");
+        assert_eq!(code_and_field(&unknown_step).1, "steps.nope");
+
+        let inputs: BTreeMap<String, ParameterValue> = [
+            ("input".to_owned(), ParameterValue::Str(String::new())),
+            ("level".to_owned(), ParameterValue::Int(2)),
+        ]
+        .into();
+        let workflow = Workflow::builder("explicit")
+            .add(agent("draft", "draft ${input} at ${level}", None))
+            .and_then(|b| b.add_after(agent("review", "review only", None), ["draft"]))
+            .and_then(|b| b.with_inputs(inputs))
+            .and_then(|b| {
+                b.with_step_inputs(
+                    "draft",
+                    bindings(&[("input", "input.input"), ("level", "input.level")]),
+                )
+            })
+            .and_then(|b| {
+                b.with_outputs(bindings(&[
+                    ("review", "steps.review.output.text"),
+                    ("level", "input.level"),
+                ]))
+            })
+            .and_then(|b| b.build())
+            .expect("explicit workflow builds");
+
+        let provider = ScriptedProvider::new();
+        provider.on("draft", vec![Reply::Text("drafted".into())]);
+        provider.on("review", vec![Reply::Text("approved".into())]);
+        let run = run_local(&workflow, &provider, "essay")
+            .await
+            .expect("text shorthand binds the declared input");
+        assert_eq!(run.status, WorkflowRunStatus::Succeeded, "{run:?}");
+        assert_eq!(run.outputs["review"], json!("approved"));
+        assert_eq!(run.outputs["level"], json!(2));
+        assert_eq!(
+            provider.requests(),
+            vec!["draft essay at 2".to_owned(), "review only".to_owned()],
+            "the edge injects nothing into review"
+        );
+
+        let refusals: [(&str, Value, &str); 2] = [
+            ("unknown input", json!({ "other": "x" }), "input.other"),
+            ("mistyped input", json!({ "level": "two" }), "input.level"),
+        ];
+        for (case, input, field) in refusals {
+            let Value::Object(input) = input else {
+                panic!("fixture input must be an object");
+            };
+            let provider = ScriptedProvider::new();
+            let error = run_local(&workflow, &provider, input)
+                .await
+                .expect_err(case);
+            assert_eq!(
+                code_and_field(&error),
+                ("WYRD_WORKFLOW_422_RUN_REQUEST", field.to_owned()),
+                "{case}"
+            );
+            assert!(provider.requests().is_empty(), "{case} dispatched");
+        }
+
+        let undeclared_text = Workflow::builder("no_input")
+            .add(agent("only", "static", None))
+            .and_then(|b| b.with_outputs(bindings(&[("out", "steps.only.output.text")])))
+            .and_then(|b| b.build())
+            .expect("static workflow builds");
+        let provider = ScriptedProvider::new();
+        let error = run_local(&undeclared_text, &provider, "loose text")
+            .await
+            .expect_err("text shorthand needs a declared string input");
+        assert_eq!(
+            code_and_field(&error),
+            ("WYRD_WORKFLOW_422_RUN_REQUEST", "input".to_owned())
+        );
+
+        let declared_tool = Arc::new(RecordingTool {
+            name: "lookup".to_owned(),
+            calls: AtomicUsize::new(0),
+        });
+        let tooled = Workflow::builder("tooled")
+            .add(agent("lookup_step", "lookup call", None).with_tool(declared_tool.clone()))
+            .and_then(|b| b.add(agent("plain_step", "plain call", None)))
+            .and_then(|b| {
+                b.with_outputs(bindings(&[
+                    ("found", "steps.lookup_step.output.text"),
+                    ("plain", "steps.plain_step.output.text"),
+                ]))
+            })
+            .and_then(|b| b.build())
+            .expect("tooled workflow builds");
+        let provider = ScriptedProvider::new();
+        provider.on(
+            "lookup call",
+            vec![
+                Reply::ToolCall("lookup".into(), json!({})),
+                Reply::Text("found it".into()),
+            ],
+        );
+        provider.on(
+            "plain call",
+            vec![
+                Reply::ToolCall("lookup".into(), json!({})),
+                Reply::Text("no tool".into()),
+            ],
+        );
+        let run = run_local(&tooled, &provider, serde_json::Map::new())
+            .await
+            .expect("tooled workflow starts");
+        assert_eq!(
+            run.steps["lookup_step"].text.as_deref(),
+            Some("found it"),
+            "{run:?}"
+        );
+        let refused = run.steps["plain_step"]
+            .error
+            .as_ref()
+            .map(|error| error.code.as_str());
+        assert_eq!(refused, Some("WYRD_AGENT_404_TOOL_NOT_IN_AGENT"));
+        assert_eq!(run.status, WorkflowRunStatus::Failed);
+        assert_eq!(
+            declared_tool.calls.load(Ordering::SeqCst),
+            1,
+            "only the step that declares the tool executes it"
+        );
+    }
+}

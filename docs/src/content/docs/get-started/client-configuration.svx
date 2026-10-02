@@ -111,11 +111,17 @@ order, stopping at the first available source:
 
 1. An API key supplied explicitly on `ClientConfig::api_key`.
 2. `WYRD_ACCESS_TOKEN`.
-3. `WYRD_WORKLOAD_TOKEN` with `WYRD_TENANT`, or with `client.tenant` from the
-   global profile when `WYRD_TENANT` is unset.
+3. `WYRD_WORKLOAD_TOKEN` with the selected tenant (`client.tenant`, else
+   `WYRD_TENANT`).
 4. `WYRD_API_KEY`.
 5. `[default].api_key` in `credentials.toml` under the selected config
    directory.
+
+When a tenant is selected, every credential must act in it. A credential that
+acts in another tenant fails with reason `tenant_mismatch` before any request is
+sent, and no lower source is tried. Workload exchanges carry the selected tenant
+key. Other credentials can be verified only against a tenant id, so select the
+tenant by id when you use them.
 
 For local development, the credentials file can look like this:
 

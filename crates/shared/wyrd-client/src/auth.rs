@@ -30,6 +30,7 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     CliHandoff, CliHandoffClaim, CliHandoffProof, CreateCliHandoff, ExchangeTokenType,
     PlatformTokenRequest, PlatformTokenResponse, RevokeRefreshToken, SecretBearer, TokenAudience,
@@ -40,6 +41,7 @@ use wyrd_spec::ids::TenantSlug;
 
 use crate::config::{ClientConfig, TokenCacheMode};
 use crate::error::{WyrdClientError, from_problem_json};
+use crate::saved_login::access_token_tenant;
 use crate::transport::HttpConfig;
 use crate::transport::credential::{AccessTokenSource, MintedAccessToken, ResolvedCredential};
 use reqwest::{Client, Response};
@@ -356,6 +358,9 @@ impl TokenExchange {
 /// Single, `Arc`-shared auth path: token exchange, cache, and refresh.
 pub struct AuthMiddleware {
     credential: ResolvedCredential,
+    /// The configured tenant selector ([`ClientConfig::tenant`]) every bearer
+    /// this middleware returns must belong to; see [`Self::bind_tenant`].
+    tenant: Option<String>,
     /// The unauthenticated `/auth` surface this middleware exchanges against.
     exchange: TokenExchange,
     /// Total deadline of one `/auth/token` exchange, the same
@@ -433,6 +438,7 @@ impl AuthMiddleware {
 
         Ok(Arc::new(Self {
             credential,
+            tenant: config.tenant.clone(),
             exchange,
             exchange_timeout,
             cache: Mutex::new(initial),
@@ -474,6 +480,7 @@ impl AuthMiddleware {
                 audience,
                 actor: Arc::clone(self),
             },
+            tenant: None,
             exchange: self.exchange.clone(),
             exchange_timeout: self.exchange_timeout,
             cache: Mutex::new(None),
@@ -533,10 +540,24 @@ impl AuthMiddleware {
     /// unless it [revalidates](AccessTokenSource::revalidates_cache) every
     /// use against durable state other processes change.
     ///
+    /// Every returned bearer — passed through, exchanged, or cached in memory
+    /// or on disk — is first [bound](Self::bind_tenant) to the configured
+    /// tenant selector, so no application request leaves under another tenant.
+    ///
     /// # Errors
-    /// Returns [`AuthError::Client`] on transport failure or an invalid tenant
-    /// slug, or [`AuthError::Server`] when the server rejects the credential.
+    /// Returns [`AuthError::Client`] on transport failure, an invalid tenant
+    /// slug, or a bearer outside the selected tenant (`tenant_mismatch`), or
+    /// [`AuthError::Server`] when the server rejects the credential.
     pub async fn bearer(&self) -> Result<SecretBearer, AuthError> {
+        let bearer = self.current_bearer().await?;
+        self.bind_tenant(bearer)
+    }
+
+    /// The cache-or-exchange body of [`Self::bearer`], before tenant binding.
+    ///
+    /// # Errors
+    /// The errors of [`Self::bearer`] other than `tenant_mismatch`.
+    async fn current_bearer(&self) -> Result<SecretBearer, AuthError> {
         match &self.credential {
             ResolvedCredential::Renewable(source) => {
                 let mut cache = self.cache.lock().await;
@@ -595,10 +616,24 @@ impl AuthMiddleware {
     /// rejected request, then retries once. Takes the same single-flight gate
     /// as [`AuthMiddleware::bearer`].
     ///
+    /// The fresh bearer is [bound](Self::bind_tenant) to the configured
+    /// tenant selector like every [`Self::bearer`] result.
+    ///
     /// # Errors
-    /// Returns [`AuthError::Client`] on transport failure or an unsupported
-    /// credential, or [`AuthError::Server`] when the server rejects the key.
+    /// Returns [`AuthError::Client`] on transport failure, an unsupported
+    /// credential, or a bearer outside the selected tenant
+    /// (`tenant_mismatch`), or [`AuthError::Server`] when the server rejects
+    /// the key.
     pub async fn force_refresh(&self) -> Result<SecretBearer, AuthError> {
+        let bearer = self.refreshed_bearer().await?;
+        self.bind_tenant(bearer)
+    }
+
+    /// The re-exchange body of [`Self::force_refresh`], before tenant binding.
+    ///
+    /// # Errors
+    /// The errors of [`Self::force_refresh`] other than `tenant_mismatch`.
+    async fn refreshed_bearer(&self) -> Result<SecretBearer, AuthError> {
         match &self.credential {
             ResolvedCredential::Renewable(source) => {
                 let mut cache = self.cache.lock().await;
@@ -628,6 +663,43 @@ impl AuthMiddleware {
                 Ok(self.store(entry, &mut cache))
             }
         }
+    }
+
+    /// Refuse `bearer` unless it belongs to the configured tenant selector.
+    ///
+    /// Without a selector every bearer passes. A tenant-id selector is
+    /// compared with the token's `principal.tenant_id` claim. A tenant-key
+    /// selector is bound only where the server binds it: the workload grant
+    /// carries it, so a workload credential routed to that key passes. Any
+    /// other credential's token names only a tenant id, so a key selector
+    /// cannot be verified and is refused rather than trusted. Saved logins
+    /// enforce their selector at selection and renewal, and a delegated
+    /// token inherits its actor's binding, so both pass here.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Client`] wrapping [`WyrdClientError::SavedLogin`]
+    /// with reason `tenant_mismatch` when the bearer is outside the selected
+    /// tenant or cannot be shown to be inside it.
+    fn bind_tenant(&self, bearer: SecretBearer) -> Result<SecretBearer, AuthError> {
+        let Some(selector) = self.tenant.as_deref() else {
+            return Ok(bearer);
+        };
+        let bound = match (&self.credential, selector.parse::<DataTenantId>()) {
+            (ResolvedCredential::Renewable(_) | ResolvedCredential::Delegated { .. }, _) => true,
+            (_, Ok(tenant_id)) => access_token_tenant(&bearer) == Some(tenant_id),
+            (ResolvedCredential::WorkloadJwt { tenant, .. }, Err(_)) => tenant == selector,
+            (_, Err(_)) => false,
+        };
+        if bound {
+            return Ok(bearer);
+        }
+        Err(AuthError::Client(WyrdClientError::SavedLogin {
+            reason: "tenant_mismatch",
+            message: format!(
+                "the credential does not act in the selected tenant {selector}; select the \
+                 tenant by id or supply that tenant's credential"
+            ),
+        }))
     }
 
     /// Exchange the API key, persist the result, and replace the in-memory
@@ -1557,6 +1629,222 @@ mod tests {
             parsed.get_version_num(),
             7,
             "minted request id must be UUIDv7"
+        );
+    }
+
+    /// A Wyrd-shaped access token whose `principal.tenant_id` claim names
+    /// `tenant`; the signature is never checked client-side.
+    fn tenant_token(tenant: DataTenantId) -> String {
+        let claims = serde_json::json!({
+            "sub": "principal",
+            "principal": { "id": "principal", "tenant_id": tenant },
+        });
+        let payload = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            claims.to_string(),
+        );
+        format!("e30.{payload}.sig")
+    }
+
+    /// Resolve the credential `config` selects with exactly the given
+    /// credential environment set (and every other credential variable and
+    /// the configuration home removed), under the crate's environment lock.
+    ///
+    /// # Panics
+    /// Panics when no credential resolves.
+    fn resolve_with_env(config: &ClientConfig, env: &[(&str, &str)]) -> ResolvedCredential {
+        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let names = [
+            "WYRD_ACCESS_TOKEN",
+            "WYRD_WORKLOAD_TOKEN",
+            "WYRD_TENANT",
+            "WYRD_API_KEY",
+            "WYRD_CONFIG_HOME",
+        ];
+        // SAFETY: ENV_MUTEX serializes environment mutation in this test binary.
+        unsafe {
+            for name in names {
+                std::env::remove_var(name);
+            }
+            for (name, value) in env {
+                std::env::set_var(name, value);
+            }
+        }
+        let resolved = config.resolve_credential();
+        // SAFETY: ENV_MUTEX serializes environment mutation in this test binary.
+        unsafe {
+            for name in names {
+                std::env::remove_var(name);
+            }
+        }
+        resolved.expect("a credential resolves")
+    }
+
+    /// A tenant selector binds every credential tier: the explicit bearer
+    /// and API key, `WYRD_ACCESS_TOKEN`, `WYRD_API_KEY`, the
+    /// `credentials.toml` floor, and a token cached on disk are each refused
+    /// as `tenant_mismatch` when they act in another tenant, without any
+    /// application request and without falling to a lower tier; the
+    /// matching tenant id is accepted; a tenant-key selector, which only the
+    /// workload grant lets the server bind, is refused for the others; and
+    /// the selector routes the workload exchange over an ambient
+    /// `WYRD_TENANT`.
+    ///
+    /// # Panics
+    /// Panics when a tier is accepted outside its tenant, falls through,
+    /// or reaches the application route.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tenant_selector_binds_every_credential_tier() {
+        const API_KEY: &str =
+            "wyrd_sk_4d5e1c3a9b7f4e2d8a6c0b1e2f3a4b5c_1a2b3c4d_9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+        let selected = DataTenantId::new_v7();
+        let issued = DataTenantId::new_v7();
+        let issued_token = tenant_token(issued);
+        let server = spawn_mock("HTTP/1.1 200 OK", token_body(&issued_token, 3600)).await;
+        let home = tempfile::tempdir().expect("tempdir");
+        let floor = home.path().join("credentials.toml");
+        std::fs::write(&floor, format!("[default]\napi_key = \"{API_KEY}\"\n"))
+            .expect("writes floor");
+        std::fs::set_permissions(
+            &floor,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .expect("chmod");
+        let config = |selector: &str, credential: Option<&str>| {
+            let mut config = config_for(server.base_url.clone(), TokenCacheMode::InMemory);
+            config.tenant = Some(selector.to_owned());
+            config.credential = credential.map(|value| value.to_owned().into());
+            config
+        };
+        let home_env = home.path().to_str().expect("utf-8 home");
+        let tiers = [
+            (
+                "explicit bearer",
+                Some(issued_token.as_str()),
+                Vec::new(),
+                0,
+            ),
+            ("explicit API key", Some(API_KEY), Vec::new(), 1),
+            (
+                "WYRD_ACCESS_TOKEN",
+                None,
+                vec![("WYRD_ACCESS_TOKEN", issued_token.as_str())],
+                0,
+            ),
+            ("WYRD_API_KEY", None, vec![("WYRD_API_KEY", API_KEY)], 1),
+            ("credentials.toml floor", None, Vec::new(), 1),
+        ];
+        for (tier, credential, env, exchanges) in tiers {
+            for (selector, accepted) in [
+                (selected.to_string(), false),
+                ("acme".to_owned(), false),
+                (issued.to_string(), true),
+            ] {
+                let config = config(&selector, credential);
+                let mut env = env.clone();
+                env.push(("WYRD_CONFIG_HOME", home_env));
+                let resolved = resolve_with_env(&config, &env);
+                assert!(
+                    !matches!(resolved, ResolvedCredential::Renewable(_)),
+                    "{tier} resolves itself"
+                );
+                let auth = AuthMiddleware::new(&config, resolved).expect("auth builds");
+                let http = crate::transport::HttpTransport::new(&config.http, Arc::clone(&auth))
+                    .expect("transport builds");
+                let before = server.hits.load(Ordering::SeqCst);
+                let outcome = http
+                    .request_json::<serde_json::Value, serde_json::Value>(
+                        reqwest::Method::GET,
+                        "/v1/cards",
+                        None,
+                    )
+                    .await;
+                let hits = server.hits.load(Ordering::SeqCst) - before;
+                if accepted {
+                    assert_eq!(hits, exchanges + 1, "{tier} reaches the application route");
+                    continue;
+                }
+                let error = outcome.expect_err("a foreign tenant is refused");
+                assert!(
+                    error.to_string().contains("tenant_mismatch"),
+                    "{tier} under {selector}: {error}"
+                );
+                assert_eq!(hits, exchanges, "{tier} sends no application request");
+                assert!(
+                    matches!(
+                        auth.force_refresh().await,
+                        Err(AuthError::Client(WyrdClientError::SavedLogin {
+                            reason: "tenant_mismatch",
+                            ..
+                        }))
+                    ),
+                    "{tier} refresh is refused too"
+                );
+            }
+        }
+
+        let cache = home.path().join("token_cache.json");
+        let cached = config_for(server.base_url.clone(), TokenCacheMode::Disk);
+        AuthMiddleware::new_with_cache_path(&cached, api_key_credential(), Some(cache.clone()))
+            .expect("auth builds")
+            .bearer()
+            .await
+            .expect("an unselected client caches the issued token");
+        let mut selecting = cached;
+        selecting.tenant = Some(selected.to_string());
+        let before = server.hits.load(Ordering::SeqCst);
+        let refused =
+            AuthMiddleware::new_with_cache_path(&selecting, api_key_credential(), Some(cache))
+                .expect("auth builds")
+                .bearer()
+                .await;
+        assert!(
+            matches!(
+                refused,
+                Err(AuthError::Client(WyrdClientError::SavedLogin {
+                    reason: "tenant_mismatch",
+                    ..
+                }))
+            ),
+            "a disk-cached token from another tenant is refused"
+        );
+        assert_eq!(
+            server.hits.load(Ordering::SeqCst),
+            before,
+            "served from disk"
+        );
+
+        let routed = resolve_with_env(
+            &config("acme", None),
+            &[
+                ("WYRD_WORKLOAD_TOKEN", "workload-oidc-assertion"),
+                ("WYRD_TENANT", "globex"),
+            ],
+        );
+        assert!(
+            matches!(&routed, ResolvedCredential::WorkloadJwt { tenant, .. } if tenant == "acme"),
+            "the selector routes the workload exchange: {routed:?}"
+        );
+        AuthMiddleware::new(&config("acme", None), routed)
+            .expect("auth builds")
+            .bearer()
+            .await
+            .expect("the server binds the selected workload tenant");
+        let rerouted =
+            AuthMiddleware::new(&config("acme", None), workload_jwt_credential("globex"))
+                .expect("auth builds")
+                .bearer()
+                .await;
+        assert!(
+            matches!(
+                rerouted,
+                Err(AuthError::Client(WyrdClientError::SavedLogin {
+                    reason: "tenant_mismatch",
+                    ..
+                }))
+            ),
+            "a workload routed to another tenant key is refused"
         );
     }
 }

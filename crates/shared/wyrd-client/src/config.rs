@@ -51,8 +51,10 @@ pub struct ClientConfig {
     /// `credentials.toml` floor.
     pub credential: Option<SecretString>,
     /// Optional tenant selector: the slug paired with workload identity
-    /// credentials, and the tenant slug or id that picks one saved user login
-    /// for this server.
+    /// credentials (ahead of an ambient `WYRD_TENANT`), and the tenant slug
+    /// or id that picks one saved user login for this server. Every other
+    /// credential's access token must act in the tenant with this id; a slug
+    /// selector cannot be verified for them and fails `tenant_mismatch`.
     pub tenant: Option<String>,
     /// Token cache mode.
     pub token_cache: TokenCacheMode,
@@ -176,7 +178,7 @@ impl ClientConfig {
     /// Precedence (lowest index wins):
     /// 1. `self.credential` — explicit credential set by caller
     /// 2. `WYRD_ACCESS_TOKEN` — tier 1 env
-    /// 3. `WYRD_WORKLOAD_TOKEN` + `WYRD_TENANT` — tier 2 env
+    /// 3. `WYRD_WORKLOAD_TOKEN` + `self.tenant`, else `WYRD_TENANT` — tier 2 env
     /// 4. `WYRD_API_KEY` — tier 3 env
     /// 5. the saved user login `wyrd auth login` wrote for this server origin
     ///    and `self.tenant` ([`SavedLogins::select`]), renewed in place
@@ -185,7 +187,9 @@ impl ClientConfig {
     /// A `credentials.toml` that is unsafe or corrupt, or saved logins that
     /// are ambiguous or have no record for the selected tenant, fail here
     /// instead of falling through to the floor, so a person's selection is
-    /// never silently replaced by another identity.
+    /// never silently replaced by another identity. The selector then binds
+    /// whatever resolves here at the auth middleware, before any application
+    /// request.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::SavedLogin`] for the saved-login refusals

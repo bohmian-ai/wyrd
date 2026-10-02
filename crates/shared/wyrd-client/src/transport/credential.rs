@@ -320,18 +320,18 @@ fn explicit_token_from_env() -> Option<CredentialSource> {
 /// Environment-based credential sources for the ADC chain.
 /// WYRD_WORKLOAD_TOKEN + WYRD_TENANT is a workload identity token, which is the second-highest-priority source.
 /// Often used in cloud-native environments where the workload identity provider issues a JWT that can be exchanged for a Wyrd access token.
+///
+/// A configured tenant selector (`tenant_override`) routes the exchange ahead
+/// of an ambient `WYRD_TENANT`, so the tenant the caller selected is the one
+/// the server binds.
 fn workload_token_from_env(tenant_override: Option<&str>) -> Option<CredentialSource> {
     let jwt = std::env::var("WYRD_WORKLOAD_TOKEN")
         .ok()
         .filter(|v| !v.is_empty())?;
-    let tenant = std::env::var("WYRD_TENANT")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| {
-            tenant_override
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-        })?;
+    let tenant = tenant_override
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| std::env::var("WYRD_TENANT").ok().filter(|v| !v.is_empty()))?;
     Some(CredentialSource::WorkloadToken {
         jwt: SecretString::from(jwt),
         tenant,

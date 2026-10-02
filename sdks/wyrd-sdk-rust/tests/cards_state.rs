@@ -301,12 +301,13 @@ const SCRIPT_PHASE: &str = "WYRD_SAVED_LOGIN_PHASE";
 
 /// Run one phase of [`saved_user_auth_script`] as a separate local process,
 /// the way a person's script uses the CLI-established login: only the
-/// configuration directory and server URL reach it, plus the machine key the
-/// override phase presents explicitly.
+/// configuration directory and server URL reach it, plus both tenant ids and
+/// the fixture tenant's machine key the override phase presents explicitly.
 ///
 /// # Panics
 /// Panics when the child cannot run or its phase fails.
-async fn run_script(phase: &str, config: &Path, base_url: &str, second: &str, machine: &str) {
+async fn run_script(phase: &str, config: &Path, base_url: &str, tenants: [&str; 2], machine: &str) {
+    let [first, second] = tenants;
     let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
     command
         .args([
@@ -318,6 +319,7 @@ async fn run_script(phase: &str, config: &Path, base_url: &str, second: &str, ma
         .env(SCRIPT_PHASE, phase)
         .env("WYRD_CONFIG_HOME", config)
         .env("WYRD_SAVED_LOGIN_SERVER", base_url)
+        .env("WYRD_SAVED_LOGIN_FIRST_TENANT", first)
         .env("WYRD_SAVED_LOGIN_SECOND_TENANT", second)
         .env("WYRD_SAVED_LOGIN_MACHINE_KEY", machine)
         .env_remove("WYRD_ACCESS_TOKEN")
@@ -343,7 +345,9 @@ async fn run_script(phase: &str, config: &Path, base_url: &str, second: &str, ma
 /// selector naming no saved login fails, the reader's saved login lists Cards
 /// and is denied a registration, and the second tenant's login resolves by
 /// tenant id. `renew`: a stale login renews through Wyrd. `override`: an
-/// explicit machine credential wins over the saved reader. `revoked`: a
+/// explicit machine credential wins over the saved reader in its own tenant,
+/// and selecting the other tenant refuses it as `tenant_mismatch` before any
+/// request, without falling back to that tenant's saved login. `revoked`: a
 /// revoked login fails renewal, and the uncertain record is never retried.
 ///
 /// # Panics
@@ -397,10 +401,22 @@ async fn saved_user_auth_script() {
         }
         "override" => {
             let machine = std::env::var("WYRD_SAVED_LOGIN_MACHINE_KEY").expect("machine key");
-            let cards = connect(Some(machine), Some(FIXTURE_TENANT_SLUG)).expect("resolves");
+            let first = std::env::var("WYRD_SAVED_LOGIN_FIRST_TENANT").expect("tenant id");
+            let second = std::env::var("WYRD_SAVED_LOGIN_SECOND_TENANT").expect("tenant id");
+            let cards = connect(Some(machine.clone()), Some(&first)).expect("resolves");
             Box::pin(cards.register_from_path(&prompt_card()))
                 .await
                 .expect("the explicit machine credential overrides the saved reader");
+            let crossed = connect(Some(machine), Some(&second))
+                .expect("resolves")
+                .list(card_listing())
+                .await
+                .expect_err("the fixture tenant's key is refused under the second tenant");
+            assert_eq!(crossed.code(), "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE");
+            assert!(
+                crossed.to_string().contains("(tenant_mismatch)"),
+                "{crossed}"
+            );
         }
         "revoked" => {
             let revoked = connect(None, Some(FIXTURE_TENANT_SLUG))
@@ -488,9 +504,17 @@ async fn saved_user_auth_journey() {
     assert_eq!(bob.tenant_id, server.data_tenant_id());
     sso.save_login(config.path(), "saved-login-two", "alice", "alice-password")
         .await;
+    let first = server.data_tenant_id().to_string();
     let second = second.to_string();
-    let script =
-        |phase: &'static str| run_script(phase, config.path(), &base_url, &second, &admin_key);
+    let script = |phase: &'static str| {
+        run_script(
+            phase,
+            config.path(),
+            &base_url,
+            [&first, &second],
+            &admin_key,
+        )
+    };
 
     script("select").await;
 

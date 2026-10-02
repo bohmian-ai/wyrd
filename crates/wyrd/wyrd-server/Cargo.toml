@@ -52,6 +52,7 @@ rmcp = { workspace = true, features = [
 vala-drift = { workspace = true }
 vala-eval = { workspace = true }
 skald-prompt = { workspace = true }
+skald-providers = { workspace = true }
 skald-runtime = { workspace = true }
 skald-spec = { workspace = true }
 wyrd-telemetry = { workspace = true }

@@ -1,7 +1,8 @@
-//! Network policy for provider endpoints.
+//! Network policy for provider and external-gateway endpoints.
 //!
-//! Provider calls go through Skald provider clients; this module owns only the
-//! egress policy those clients run under. [`EndpointPolicy::admits`] screens a
+//! This is the single provider/ExtGateway egress owner: the Wyrd gateway's
+//! provider dispatch, server admin endpoint validation, and Workflow external
+//! gateway calls all build their transport here. [`EndpointPolicy::admits`] screens a
 //! base URL's scheme, port, and literal address before an attempt, and
 //! [`EndpointPolicy::transport`] builds the Skald transport whose DNS resolver
 //! screens every resolved address at connection time, so a rebinding answer
@@ -15,7 +16,8 @@ use std::time::Duration;
 use reqwest::ClientBuilder;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect::Policy;
-use skald_providers::{HttpTransport, ProviderResult, TransportConfig};
+use crate::error::ProviderResult;
+use crate::transport::{HttpTransport, TransportConfig};
 use url::{Host, Url};
 
 /// Bound on one DNS resolution.
@@ -84,7 +86,7 @@ impl EndpointPolicy {
     /// the address is permitted; hostnames are left to the screening
     /// resolver.
     #[must_use]
-    pub(crate) fn permits_host(self, url: &Url) -> bool {
+    fn permits_host(self, url: &Url) -> bool {
         match url.host() {
             Some(Host::Domain(_)) => true,
             Some(Host::Ipv4(ip)) => self.permits(IpAddr::V4(ip)),
@@ -120,7 +122,7 @@ impl EndpointPolicy {
     /// those screened answers; redirects are not followed and no proxy is
     /// consulted. Literal addresses bypass resolvers, so callers screen them
     /// with [`EndpointPolicy::permits_host`] before sending.
-    pub(crate) fn screened(self, builder: ClientBuilder) -> ClientBuilder {
+    fn screened(self, builder: ClientBuilder) -> ClientBuilder {
         builder
             .dns_resolver(Arc::new(ScreeningResolver { policy: self }))
             .redirect(Policy::none())

@@ -22,7 +22,7 @@ use super::{
     BuiltinEndpoints, HttpProviderDispatch, IngressDialect, MediaRequest, Prepared, prepare,
 };
 use crate::credential::ProviderSecret;
-use crate::endpoint::EndpointPolicy;
+use skald_providers::EndpointPolicy;
 use crate::engine::{
     AttemptResult, AttemptUsage, FailureClass, ProviderAttempt, ProviderDispatch, ResponseBody,
     ResponseCapture, StreamEnd,

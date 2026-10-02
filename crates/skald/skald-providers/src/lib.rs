@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod clients;
+pub mod endpoint;
 pub mod error;
 pub mod raw;
 pub mod retry;
@@ -17,6 +18,7 @@ pub use clients::{
     AnthropicClient, GoogleClient, MediaAnswer, OpenAiBatchRoute, OpenAiClient, OpenAiMediaRoute,
     OpenAiRoute, ProviderByteStream, UploadContent, UploadFile, VertexClient,
 };
+pub use endpoint::EndpointPolicy;
 pub use error::{ProviderError, ProviderResult};
 pub use retry::RetryPolicy;
 pub use trait_::{ProviderClient, ProviderStream};

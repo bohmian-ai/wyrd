@@ -24,7 +24,7 @@ use super::{
     BatchAction, MediaRequest, Prepared, Wire, complete, faithful_embeddings, prepare, refusal,
 };
 use crate::credential::ProviderSecret;
-use crate::endpoint::EndpointPolicy;
+use skald_providers::EndpointPolicy;
 use crate::engine::{
     AttemptResult, AttemptUsage, FailureClass, ProviderAttempt, ProviderDispatch, ResponseBody,
     ResponseCapture,

@@ -4515,7 +4515,7 @@ impl WyrdTestServerBuilder {
                 wyrd_gateway::DeploymentHealth::default(),
                 Arc::new(
                     wyrd_gateway::HttpProviderDispatch::new(
-                        wyrd_gateway::EndpointPolicy::new(false),
+                        skald_providers::EndpointPolicy::new(false),
                         endpoints,
                     )
                     .map_err(|error| start(error.to_string()))?,

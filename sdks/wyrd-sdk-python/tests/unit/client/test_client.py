@@ -60,11 +60,11 @@ def test_wyrd_server_url_alone_sets_both_endpoints(monkeypatch: pytest.MonkeyPat
     from wyrd import WyrdClient
 
     monkeypatch.delenv("WYRD_GRPC_URL", raising=False)
-    monkeypatch.setenv("WYRD_SERVER_URL", "http://wyrd.internal:8080")
+    monkeypatch.setenv("WYRD_SERVER_URL", "https://wyrd.internal:8080")
 
     client = WyrdClient(credential="wyrd_test_actor")
-    assert client.server_url == "http://wyrd.internal:8080"
-    assert client.grpc_url == "http://wyrd.internal:50051"
+    assert client.server_url == "https://wyrd.internal:8080"
+    assert client.grpc_url == "https://wyrd.internal:50051"
 
 
 def test_every_public_constructor_accepts_and_forwards_tenant():

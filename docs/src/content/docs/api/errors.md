@@ -18,6 +18,7 @@ This page is the generated error catalog. For how an agent should act on these e
 |---|---:|---|---|
 | `WYRD_CLIENT_400_CONFIG_INVALID` | 400 | Client transport configuration failed validation | Fix the `details.field` named on the error, then reconstruct the client. Not a retry path. |
 | `WYRD_CLIENT_401_NO_CREDENTIALS` | 401 | Credential chain produced no usable credential | Set `WYRD_ACCESS_TOKEN`, `WYRD_WORKLOAD_TOKEN`+`WYRD_TENANT`, or `WYRD_API_KEY`. Not a retry path. |
+| `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` | 401 | Saved user login is ambiguous, names another tenant, or cannot renew safely | Run `wyrd auth login` again or select the tenant. `details.reason` names the failure. Not a retry path. |
 | `WYRD_CLIENT_503_TRANSPORT_DOWN` | 503 | Client transport is unavailable | Retry with backoff once the network or server health recovers. |
 
 ## Error fields

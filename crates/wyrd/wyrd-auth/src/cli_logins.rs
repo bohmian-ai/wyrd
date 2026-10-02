@@ -606,18 +606,14 @@ mod pg_tests {
         assert_eq!(reason(&error), Some("unknown_cli_handoff"));
     }
 
-    /// Logout from a stale refresh token revokes its live successor, while the
-    /// same User's other login keeps renewing, and records exactly one
-    /// logout audit event; an audit store that refuses the append rolls the
-    /// revocation back.
+    /// Seed one User with two CLI logins: a stale refresh token and its live
+    /// successor (one chain), plus an unrelated second chain.
+    ///
+    /// Returns the User id and the three refresh JWTs in that order.
     ///
     /// # Panics
-    /// Panics when the wrong rows are revoked or the audit differs.
-    #[tokio::test]
-    async fn logout_revokes_only_its_own_chain() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let provider = MockServer::start().await;
-        let logins = owner(&fixture, &provider).await;
+    /// Panics when a seed row cannot be written.
+    async fn seed_two_cli_logins(fixture: &PgFixture) -> (Uuid, Vec<String>) {
         let tenant = fixture.data_tenant_id();
         let key = issuing_key();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
@@ -662,6 +658,23 @@ mod pg_tests {
             ids.push(id);
         }
         conn.commit().await.expect("seed commits");
+        (user, tokens)
+    }
+
+    /// Logout from a stale refresh token revokes its live successor, while the
+    /// same User's other login keeps renewing, and records exactly one
+    /// logout audit event; an audit store that refuses the append rolls the
+    /// revocation back.
+    ///
+    /// # Panics
+    /// Panics when the wrong rows are revoked or the audit differs.
+    #[tokio::test]
+    async fn logout_revokes_only_its_own_chain() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let provider = MockServer::start().await;
+        let logins = owner(&fixture, &provider).await;
+        let tenant = fixture.data_tenant_id();
+        let (user, tokens) = seed_two_cli_logins(&fixture).await;
 
         let admin = fixture.superuser_pool().await.expect("superuser pool");
         let logouts = || async {

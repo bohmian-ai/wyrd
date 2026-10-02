@@ -18,11 +18,7 @@ pub use wyrd_spec::registry::{
 use crate::cards::{CardSelector, RegistryContext};
 
 pub(crate) use self::workflow::WorkflowBodies;
-use self::{
-    bundle::HydrationBundleWriter,
-    graph::{GraphScope, resolve_graph},
-    workspace::HydrationWorkspace,
-};
+use self::{bundle::HydrationBundleWriter, graph::GraphScope, workspace::HydrationWorkspace};
 
 /// Machine-readable result of a published hydration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,7 +77,7 @@ impl CardGraphHydrator {
         destination: &Path,
         mode: HydrationMode,
     ) -> Result<HydrationSummary, WyrdError> {
-        let graph = resolve_graph(&self.context.engine, selector, GraphScope::Bundle).await?;
+        let graph = self.resolve_graph(selector, GraphScope::Bundle).await?;
         let workspace = HydrationWorkspace::prepare(destination)?;
         let write_result = {
             let writer = HydrationBundleWriter::new(&self.context, workspace.staging(), mode);

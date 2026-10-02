@@ -22,7 +22,7 @@ use wyrd_spec::registry::CardSubmission;
 
 use crate::cards::{CardGraphHydrator, CardSelector};
 
-use super::graph::{GraphScope, ResolvedCard, resolve_graph, resolve_refs};
+use super::graph::{GraphScope, ResolvedCard};
 
 /// Exact Agent and Prompt bodies one Workflow hydration consumes, by
 /// provenance.
@@ -176,7 +176,7 @@ impl CardGraphHydrator {
         bodies: &mut WorkflowBodies,
         refs: &[CardRef],
     ) -> Result<(), WyrdError> {
-        let cards = resolve_refs(&self.context.engine, refs, GraphScope::Runtime).await?;
+        let cards = self.resolve_refs(refs, GraphScope::Runtime).await?;
         bodies.extend_registered(cards)
     }
 
@@ -197,7 +197,7 @@ impl CardGraphHydrator {
         &self,
         selector: &CardSelector,
     ) -> Result<Workflow, WyrdError> {
-        let graph = resolve_graph(&self.context.engine, selector, GraphScope::Runtime).await?;
+        let graph = self.resolve_graph(selector, GraphScope::Runtime).await?;
         let root = graph
             .cards
             .iter()

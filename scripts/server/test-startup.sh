@@ -160,8 +160,9 @@ curl -fsS "$http/openapi.json" | grep -q 'authz/check' && fail "authz check stil
 bff="$(curl -fsS "$http/")"
 grep -qi '<html' <<<"$bff" || fail "BFF did not serve the UI"
 grep -q WYRD_SPEC_502_UPSTREAM_FAILURE <<<"$bff" && fail "BFF could not reach the Rust server"
-token="$(curl -fsS -H 'content-type: application/json' \
-  -d "{\"grant_type\":\"wyrd_api_key\",\"api_key\":\"$api_key\"}" "$http/auth/token" \
+token="$(curl -fsS -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+  --data-urlencode "subject_token=$api_key" \
+  -d subject_token_type=urn:wyrd:oauth:token-type:api_key "$http/auth/token" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
 # `/v1` authenticates before routing, so only an authenticated probe can see 404.
 authz_check="$(curl -s -w '\n%{http_code}' -X POST -H "x-wyrd-access-token: Bearer $token" \

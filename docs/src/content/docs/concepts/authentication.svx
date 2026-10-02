@@ -57,74 +57,83 @@ single thing to revoke to end its access.
     { header: 'Issues refresh?' }
   ]}
   rows={[
-    ['wyrd_api_key', 'POST /auth/token', 'No — re-exchange the key'],
+    ['token-exchange (API key)', 'POST /auth/token', 'No — re-exchange the key'],
     ['jwt-bearer (workload)', 'POST /auth/token', 'No — re-assert the platform JWT'],
-    ['Human OIDC login', 'POST /auth/login → GET /auth/callback', 'Yes'],
+    ['authorization_code (web app)', 'GET /auth/authorize → POST /auth/token', 'Yes'],
+    ['device_code (CLI)', 'POST /auth/device_authorization → POST /auth/token', 'Yes'],
     ['token-exchange (delegation)', 'POST /auth/token', 'No'],
-    ['refresh_token', 'POST /auth/token', 'Yes (rotated) · human sessions only']
+    ['refresh_token', 'POST /auth/token', 'CLI: rotated · web app: not rotated']
   ]}
 />
 
 ## Human OIDC login flow
 
-A person signs in through their tenant's **Active** OIDC connection. The tenant
-comes from the request body's tenant route key, never from `Host` or forwarded
-headers, and only that connection can authenticate the login. The flow uses
-PKCE S256, and the login state lives server-side for at most 5 minutes.
+Wyrd is the OAuth 2.0 authorization server for its own clients and an OpenID
+Connect relying party of each tenant's IdP. A person signs in through their
+tenant's **Active** OIDC connection. The tenant comes from the `tenant`
+request parameter, never from `Host` or forwarded headers, and only that
+connection can authenticate the login. Every token endpoint takes an
+`application/x-www-form-urlencoded` body and answers refusals with the RFC 6749
+§5.2 `{"error": …}` body. The server publishes its endpoints at
+`GET /.well-known/oauth-authorization-server` (RFC 8414).
 
 <WyrdSequenceDiagram
   title="Human OIDC login"
   participants={['Wyrd web app', 'Wyrd server', 'IdP']}
   messages={[
-    { from: 'Wyrd web app', to: 'Wyrd server', label: 'POST /auth/login · route key + flow binding' },
-    { from: 'Wyrd server', to: 'IdP', label: 'OIDC discovery' },
-    { from: 'IdP', to: 'Wyrd server', label: 'authorization_endpoint', dashed: true },
-    { from: 'Wyrd server', to: 'Wyrd server', label: 'store PKCE + nonce + hashed state (300s)' },
-    { from: 'Wyrd server', to: 'Wyrd web app', label: 'authorization_url', dashed: true },
-    { from: 'Wyrd web app', to: 'IdP', label: 'browser authorizes' },
+    { from: 'Wyrd web app', to: 'Wyrd server', label: 'GET /auth/authorize · client_id + PKCE S256 + state + tenant' },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'store login state (300s)' },
+    { from: 'Wyrd server', to: 'IdP', label: '303 provider sign-in', dashed: true },
     { from: 'IdP', to: 'Wyrd server', label: 'GET /auth/callback?code&state' },
-    { from: 'Wyrd server', to: 'Wyrd server', label: 'consume login state once' },
     { from: 'Wyrd server', to: 'IdP', label: 'exchange code' },
     { from: 'IdP', to: 'Wyrd server', label: 'id_token', dashed: true },
-    { from: 'Wyrd server', to: 'Wyrd server', label: 'verify · map groups · issue + seal session' },
-    { from: 'Wyrd server', to: 'Wyrd web app', label: '303 /login/complete', dashed: true }
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'verify · map groups · store hashed code (60s)' },
+    { from: 'Wyrd server', to: 'Wyrd web app', label: '303 /login/callback?code&state', dashed: true },
+    { from: 'Wyrd web app', to: 'Wyrd server', label: 'POST /auth/token · authorization_code + code_verifier' },
+    { from: 'Wyrd server', to: 'Wyrd web app', label: 'access + refresh', dashed: true }
   ]}
 />
 
-1. The web app sends `POST /auth/login` with `tenant_route_key` and
-   `browser_flow_hash` (the SHA-256 of a secret the web app keeps for this
-   browser flow). An unknown tenant and a tenant without an Active connection get the same
-   `401` refusal. The response carries only `authorization_url`.
-2. The server stores the hashed state, PKCE verifier, nonce, connection, and
-   binding in Postgres with a 300 s TTL. The raw state exists only in the
-   authorization URL.
-3. The IdP returns the browser to the deployment's single
-   `GET /auth/callback?code=…&state=…`.
-4. The server consumes the login state exactly once, and commits that before
+1. The web app, the confidential `wyrd-ui` client, sends the browser to
+   `GET /auth/authorize` with `response_type=code`, `client_id=wyrd-ui`, its
+   registered `redirect_uri` (`{WYRD_PUBLIC_ORIGIN}/login/callback`), an S256
+   `code_challenge`, `state`, and `tenant`. An unknown client or redirect URI
+   gets an error page and is never redirected; every other refusal redirects
+   back with an RFC 6749 §4.1.2.1 `error`.
+2. The server stores the login state in Postgres with a 300 s TTL and redirects
+   the browser to the tenant's IdP. The IdP returns it to the deployment's
+   single `GET /auth/callback?code=…&state=…`.
+3. The server consumes the login state exactly once and commits that before
    contacting the IdP. Missing, expired, or reused state → `400`
    (`WYRD_AUTH_400_INVALID_STATE`).
-5. It exchanges the code, verifies the ID token (JWKS, issuer, audience,
-   expiry, nonce) against the connection the login began with, and confirms
-   that connection is still Active.
-6. It resolves the user by the provider's issuer and subject — never by email —
-   maps the connection's group rules to roles, and issues **access + refresh**
-   tokens. The tokens are sealed into the login row in the same transaction as
-   the canonical audit event; if the audit write fails, nothing is issued.
-7. The browser is redirected (`303`) to `/login/complete`, where the web app
-   redeems the sealed session once with its flow secret. No token ever appears
-   in a URL.
+4. It exchanges the code, verifies the ID token (JWKS, issuer, audience,
+   expiry, nonce) against the connection the login began with, confirms that
+   connection is still Active, resolves the user by the provider's issuer and
+   subject — never by email — and maps the connection's group rules to roles.
+   It then redirects the browser to the web app's redirect URI with a
+   single-use authorization code valid for 60 s and the client's `state`.
+5. The web app redeems the code at `POST /auth/token` with
+   `grant_type=authorization_code`, its `client_secret_basic` credentials, the
+   same `redirect_uri`, and the `code_verifier`. The server issues **access +
+   refresh** tokens in the same transaction as the canonical audit event; if
+   the audit write fails, nothing is issued. A wrong, expired, or reused code, a
+   PKCE mismatch, or another `redirect_uri` → `invalid_grant`; a wrong client
+   secret → `401 invalid_client`. No token ever appears in a URL.
 
-Human sessions require a configured sealing key; without one, login is refused
-before any state is stored. An access token is a five-minute snapshot:
-deactivating or replacing the connection stops refresh immediately, while an
-access token already issued remains valid until it expires.
+An access token is a five-minute snapshot: deactivating or replacing the
+connection stops refresh immediately, while an access token already issued
+remains valid until it expires. The web app's refresh token is not rotated: the
+confidential client authenticates every refresh, and RFC 9700 §4.14.2 requires
+rotation only for public clients. The public CLI client's refresh token rotates
+on every use, and replaying a consumed one revokes the whole login.
 
 ## CLI login (device authorization)
 
 `wyrd auth login --server <url> --tenant <key>` uses the OAuth 2.0 device
 authorization grant (RFC 8628), with Wyrd as the authorization server:
 
-1. The CLI sends `POST /auth/device_authorization` with `tenant_route_key`. The
+1. The CLI sends `POST /auth/device_authorization` with `client_id=wyrd-cli`
+   and `tenant`. The
    response carries a secret `device_code`, a short `user_code` such as
    `BCDF-GHJK`, `verification_uri_complete`, `expires_in` (600 s), and
    `interval` (5 s).
@@ -134,10 +143,10 @@ authorization grant (RFC 8628), with Wyrd as the authorization server:
    tenant's normal browser login. Deny ends the login.
 3. Meanwhile the CLI polls `POST /auth/token` with
    `grant_type=urn:ietf:params:oauth:grant-type:device_code` every `interval`
-   seconds. Until the sign-in completes, the server answers
-   `WYRD_AUTH_400_DEVICE_AUTHORIZATION` with `details.error` set to an RFC 8628
-   error: `authorization_pending`, `slow_down` (poll 5 s slower),
-   `access_denied`, `expired_token`, or `invalid_grant`.
+   seconds. Until the sign-in completes, the server answers `400` with an RFC
+   8628 §3.5 `error`: `authorization_pending`, `slow_down` (poll 5 s slower),
+   `access_denied`, `expired_token`, or `invalid_grant`. A denied, expired, or
+   already redeemed device code issues nothing.
 4. Once the sign-in completes, the next poll returns the access and refresh
    tokens, audited as `auth.device_code.grant`. The device code is single-use
    and bound to its tenant; the server stores only its SHA-256.
@@ -163,7 +172,7 @@ hash.
     { from: 'Client', to: 'Wyrd server', label: 'POST /auth/issue-key · service_accounts:write' },
     { from: 'Wyrd server', to: 'Wyrd server', label: 'mint wyrd_sk_… · store Argon2 hash' },
     { from: 'Wyrd server', to: 'Client', label: 'plaintext key (shown once)', dashed: true },
-    { from: 'Client', to: 'Wyrd server', label: 'POST /auth/token · wyrd_api_key' },
+    { from: 'Client', to: 'Wyrd server', label: 'POST /auth/token · token-exchange (API key)' },
     { from: 'Wyrd server', to: 'Wyrd server', label: 'verify hash · tenant · active · resolve roles' },
     { from: 'Wyrd server', to: 'Client', label: 'access only · re-exchange to renew', dashed: true }
   ]}
@@ -172,8 +181,10 @@ hash.
 1. Admin sends `POST /auth/issue-key` (requires `service_accounts:write`). The
    server mints a `wyrd_sk_<tenant>_<secret>` key, stores the Argon2 hash, and
    returns the plaintext once.
-2. Caller sends `POST /auth/token` with `grant_type: wyrd_api_key` and the
-   raw key.
+2. Caller sends `POST /auth/token` with
+   `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`,
+   `subject_token_type=urn:wyrd:oauth:token-type:api_key`, and the raw key as
+   `subject_token` (RFC 8693). A refused key answers `400 invalid_request`.
 3. Server parses the tenant prefix, verifies the Argon2 hash, checks the
    principal is active and scoped to the request tenant, resolves roles.
 4. Server issues an **access token only**. The key itself is the renewable

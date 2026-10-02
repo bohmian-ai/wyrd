@@ -187,3 +187,25 @@ git diff --check
 
 A red gate blocks completion. Diagnose and correct it without weakening the
 gate.
+
+## Implementation Evidence
+
+Commits: `c2264672c` (FIND-15) and `28eb626a9` (FIND-14).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| R3-AC-01 | `Renewal::Contained` in `browser_sessions.rs`. `RefreshError::Reused` maps to Contained. Before expiry, `current` commits the containment transaction, relocks, and serves the stored token; at or after expiry it revokes the row in the same transaction. Family revocation and audit still come only from `RefreshTokens` | `browser_sessions::pg_tests::proactive_refresh_replay_commits_containment_and_preserves_authority_until_expiry` (RED: `the attacker's successor is revoked in committed state` failed, because the containment was rolled back; GREEN) | PASS |
+| R3-AC-02 | Each shared error owner classifies its own errors: `IssuanceError::is_refusal`, `RefreshError::is_refusal` and `ExchangeError::is_refusal`. Every other variant, plus a missing or unopenable stored credential (`open_credential`), becomes `Renewal::Failed`, which returns the error and drops (rolls back) the transaction before and after expiry | `refresh_renewal_internal_failure_rolls_back_and_remains_retryable` and `api_key_renewal_internal_failure_rolls_back_and_remains_retryable`, each injecting a corrupt role and then repairing it. RED: both served the old token (`an internal renewal failure fails the request`); GREEN | PASS |
+| R3-AC-03 | Ordinary refusals keep the existing rollback/relock and post-expiry end | `proactive_renewal_refusal_preserves_authority_until_expiry` (still green). `browser_sessions::tests::only_lifecycle_refusals_end_a_renewing_session` covers the inactive tenant, principal and connection and unusable-key classification. The UI journey `production provider replacement settings` covers the inactive connection end to end | PASS |
+| R3-AC-04 | Module rustdoc on `exchange_api_key::pg_tests`. `insert_live_api_key` now documents its seed contract and the panics for both hashing and the insert | Source inspection; `mise run fmt` and `mise run lints` | PASS |
+
+Non-goals stayed excluded:
+- No migration, persistent marker, dependency, public contract or second owner of refresh audit.
+- No change to token lifetime or renewal margin.
+
+Verification, all run with `CARGO_TARGET_DIR` set to the shared target:
+- The four focused Postgres selectors above (4 passed) and the unit selector (1 passed).
+- Mise lanes: `fmt`, `lints`, `check:tenant-isolation`, `test:wyrd` and `test:identity:journey`.
+- `git diff --check`.
+
+All exited 0.

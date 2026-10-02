@@ -243,8 +243,7 @@ impl ExecutionPlan {
         let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); order.len()];
         for step in &spec.steps {
             for dependency in &step.depends_on {
-                if let (Some(&parent), Some(&child)) =
-                    (index.get(dependency), index.get(&step.id))
+                if let (Some(&parent), Some(&child)) = (index.get(dependency), index.get(&step.id))
                 {
                     dependents[parent].push(child);
                 }
@@ -306,7 +305,11 @@ fn stages(spec: &WorkflowSpec) -> Vec<usize> {
         .enumerate()
         .map(|(index, step)| (step.id.as_str(), index))
         .collect();
-    let mut remaining: Vec<usize> = spec.steps.iter().map(|step| step.depends_on.len()).collect();
+    let mut remaining: Vec<usize> = spec
+        .steps
+        .iter()
+        .map(|step| step.depends_on.len())
+        .collect();
     let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); spec.steps.len()];
     for (index, step) in spec.steps.iter().enumerate() {
         for dependency in &step.depends_on {
@@ -375,7 +378,10 @@ pub(crate) fn resolve_input(
             ParameterValue::Json(_) => true,
         };
         if !matches {
-            return Err(run_request(&field, "input value does not match its declared type"));
+            return Err(run_request(
+                &field,
+                "input value does not match its declared type",
+            ));
         }
         resolved.insert(name, value);
     }

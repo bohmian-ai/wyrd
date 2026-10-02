@@ -12,7 +12,7 @@
 //! carrying its own fallback, deadline, cancellation, and correlation, so no
 //! route context is shared between steps or attempts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -105,7 +105,10 @@ pub struct ExternalGatewayBinding {
     /// Exact permitted origin: scheme, host, and effective port.
     pub origin: Url,
     /// Secret request headers, never logged or displayed.
-    pub secret_headers: BTreeMap<HeaderName, SecretString>,
+    ///
+    /// A hash map because [`HeaderName`] has no ordering; names are already
+    /// case-normalized and unique.
+    pub secret_headers: HashMap<HeaderName, SecretString>,
 }
 
 impl fmt::Debug for ExternalGatewayBinding {
@@ -116,7 +119,10 @@ impl fmt::Debug for ExternalGatewayBinding {
             .field("name", &self.name)
             .field("protocol", &self.protocol)
             .field("origin", &self.origin.as_str())
-            .field("secret_headers", &self.secret_headers.keys().collect::<Vec<_>>())
+            .field(
+                "secret_headers",
+                &self.secret_headers.keys().collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -146,7 +152,10 @@ impl ExternalGatewayBindings {
     pub fn insert(&mut self, binding: ExternalGatewayBinding) -> Result<(), WyrdError> {
         let name = binding.name.as_str();
         if self.inner.contains_key(&binding.name) {
-            return Err(binding_unavailable(name, "binding name is already configured"));
+            return Err(binding_unavailable(
+                name,
+                "binding name is already configured",
+            ));
         }
         let origin = &binding.origin;
         if !matches!(origin.scheme(), "http" | "https")
@@ -264,12 +273,13 @@ impl WorkflowExecutionDependencies {
         match route {
             LlmRoute::Native => Ok(StepRoute::Native),
             LlmRoute::WyrdGateway => {
-                let caller = self.gateway.as_ref().ok_or_else(|| {
-                    WyrdError::WorkflowBindingUnavailable {
-                        message: format!("{field}: no Wyrd gateway is available"),
-                        details: serde_json::json!({ "field": field }),
-                    }
-                })?;
+                let caller =
+                    self.gateway
+                        .as_ref()
+                        .ok_or_else(|| WyrdError::WorkflowBindingUnavailable {
+                            message: format!("{field}: no Wyrd gateway is available"),
+                            details: serde_json::json!({ "field": field }),
+                        })?;
                 Ok(StepRoute::WyrdGateway {
                     caller: Arc::clone(caller),
                     fallback: fallback.cloned(),
@@ -293,10 +303,14 @@ impl WorkflowExecutionDependencies {
                 let url = Url::parse(base_url.as_str())
                     .map_err(|_| route_unsupported(field, "base_url is not an absolute URL"))?;
                 if binding.protocol != *protocol {
-                    return Err(route_unsupported(field, "binding protocol differs from route").into());
+                    return Err(
+                        route_unsupported(field, "binding protocol differs from route").into(),
+                    );
                 }
                 if url.origin() != binding.origin.origin() {
-                    return Err(route_unsupported(field, "base_url origin differs from binding").into());
+                    return Err(
+                        route_unsupported(field, "base_url origin differs from binding").into(),
+                    );
                 }
                 if url.scheme() != "https"
                     && !(self.profile == ExternalEndpointProfile::Local && is_loopback(&url))
@@ -308,7 +322,8 @@ impl WorkflowExecutionDependencies {
                     .into());
                 }
                 let headers = merged_headers(field, headers, binding)?;
-                let policy = EndpointPolicy::new(self.profile == ExternalEndpointProfile::Production);
+                let policy =
+                    EndpointPolicy::new(self.profile == ExternalEndpointProfile::Production);
                 let client = ExternalGatewayClient::new(policy, url, headers)
                     .map_err(|_| route_unsupported(field, "endpoint policy refuses base_url"))?;
                 Ok(StepRoute::External {
@@ -358,7 +373,10 @@ impl StepRoute {
     /// Returns `None` for native routes, which use the shared native registry
     /// unchanged. Gateway routes get a one-adapter registry keyed by the
     /// Prompt's provider, so the existing Agent loop dispatches to it.
-    pub(crate) fn attempt_registry(&self, context: AttemptRouteContext) -> Option<ProviderRegistry> {
+    pub(crate) fn attempt_registry(
+        &self,
+        context: AttemptRouteContext,
+    ) -> Option<ProviderRegistry> {
         let adapter: Arc<dyn Provider> = match self {
             Self::Native => return None,
             Self::WyrdGateway { caller, fallback } => Arc::new(WyrdGatewayProvider {
@@ -380,17 +398,28 @@ impl StepRoute {
 }
 
 /// Return true when `request`'s native dialect is the one `protocol` accepts.
-pub(crate) fn protocol_matches(protocol: ExternalGatewayProtocol, request: &ProviderRequest) -> bool {
+pub(crate) fn protocol_matches(
+    protocol: ExternalGatewayProtocol,
+    request: &ProviderRequest,
+) -> bool {
     matches!(
         (protocol, request),
-        (ExternalGatewayProtocol::OpenAiChat, ProviderRequest::OpenAiChatCompletion(_))
-            | (ExternalGatewayProtocol::OpenAiResponses, ProviderRequest::OpenAiResponses(_))
-            | (ExternalGatewayProtocol::AnthropicMessages, ProviderRequest::AnthropicMessage(_))
-            | (
-                ExternalGatewayProtocol::GeminiGenerateContent,
-                ProviderRequest::GeminiGenerateContent(_)
-            )
-            | (ExternalGatewayProtocol::VertexGenerateContent, ProviderRequest::Vertex(_))
+        (
+            ExternalGatewayProtocol::OpenAiChat,
+            ProviderRequest::OpenAiChatCompletion(_)
+        ) | (
+            ExternalGatewayProtocol::OpenAiResponses,
+            ProviderRequest::OpenAiResponses(_)
+        ) | (
+            ExternalGatewayProtocol::AnthropicMessages,
+            ProviderRequest::AnthropicMessage(_)
+        ) | (
+            ExternalGatewayProtocol::GeminiGenerateContent,
+            ProviderRequest::GeminiGenerateContent(_)
+        ) | (
+            ExternalGatewayProtocol::VertexGenerateContent,
+            ProviderRequest::Vertex(_)
+        )
     )
 }
 
@@ -448,10 +477,15 @@ fn merged_headers(
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| route_unsupported(field, "header name is not a valid HTTP field name"))?;
         if headers.contains_key(&header_name) {
-            return Err(route_unsupported(field, "authored header collides with a bound secret header").into());
+            return Err(route_unsupported(
+                field,
+                "authored header collides with a bound secret header",
+            )
+            .into());
         }
-        let header_value = HeaderValue::from_str(value)
-            .map_err(|_| route_unsupported(field, "header value is not a valid HTTP field value"))?;
+        let header_value = HeaderValue::from_str(value).map_err(|_| {
+            route_unsupported(field, "header value is not a valid HTTP field value")
+        })?;
         headers.insert(header_name, header_value);
     }
     Ok(headers)

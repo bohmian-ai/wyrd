@@ -148,13 +148,15 @@ pub(crate) fn agent_error_retryable(error: &AgentError) -> bool {
 /// Return whether a provider-layer failure is retryable.
 fn provider_error_retryable(error: &ProviderError) -> bool {
     match error {
-        ProviderError::Connect { .. } | ProviderError::Timeout { .. } | ProviderError::Decode { .. } => {
-            true
-        }
+        ProviderError::Connect { .. }
+        | ProviderError::Timeout { .. }
+        | ProviderError::Decode { .. } => true,
         ProviderError::Status { status, .. } | ProviderError::Upstream { status, .. } => {
             matches!(status, 408 | 429 | 500..=599)
         }
-        ProviderError::RemoteProblem { code, .. } => RETRYABLE_GATEWAY_CODES.contains(&code.as_str()),
+        ProviderError::RemoteProblem { code, .. } => {
+            RETRYABLE_GATEWAY_CODES.contains(&code.as_str())
+        }
         _ => false,
     }
 }
@@ -180,9 +182,10 @@ pub(crate) fn project_agent_error(error: &AgentError) -> WorkflowRunError {
         }) => WorkflowRunError {
             code: code.clone(),
             message: message.clone(),
-            details: field
-                .as_ref()
-                .map_or_else(|| serde_json::json!({}), |field| serde_json::json!({ "field": field })),
+            details: field.as_ref().map_or_else(
+                || serde_json::json!({}),
+                |field| serde_json::json!({ "field": field }),
+            ),
             remediation: remediation.clone(),
         }
         .bounded(),

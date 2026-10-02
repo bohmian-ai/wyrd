@@ -273,7 +273,10 @@ impl Workflow {
     /// # Errors
     /// Returns a validation error for a name outside the parameter identifier
     /// grammar.
-    pub fn with_outputs(mut self, outputs: BTreeMap<String, WorkflowBinding>) -> WorkflowResult<Self> {
+    pub fn with_outputs(
+        mut self,
+        outputs: BTreeMap<String, WorkflowBinding>,
+    ) -> WorkflowResult<Self> {
         for name in outputs.keys() {
             require_identifier(&format!("outputs.{name}"), name)?;
         }
@@ -556,7 +559,11 @@ impl Workflow {
             Some(_) => Some(self.to_card()?.card_ref()?),
             None => None,
         };
-        let workflow_id = self.meta.name.clone().unwrap_or_else(|| "workflow".to_owned());
+        let workflow_id = self
+            .meta
+            .name
+            .clone()
+            .unwrap_or_else(|| "workflow".to_owned());
         let executor =
             WorkflowExecutor::new(workflow_id, workflow, plan, dependencies.native(), options)?;
         let run = executor.execute();
@@ -611,7 +618,13 @@ impl Workflow {
             |name| {
                 let mut id: String = name
                     .chars()
-                    .map(|ch| if ch.is_ascii_alphanumeric() || ch == '_' { ch } else { '_' })
+                    .map(|ch| {
+                        if ch.is_ascii_alphanumeric() || ch == '_' {
+                            ch
+                        } else {
+                            '_'
+                        }
+                    })
                     .collect();
                 if !id.starts_with(|ch: char| ch.is_ascii_alphabetic() || ch == '_') {
                     id.insert(0, '_');

@@ -165,7 +165,10 @@ impl Provider for ScriptedProvider {
 
     /// Streaming is not scripted.
     async fn stream(&self, _request: ProviderRequest) -> Result<ProviderStream, ProviderError> {
-        Err(ProviderError::bad_request("scripted", "streaming is not scripted"))
+        Err(ProviderError::bad_request(
+            "scripted",
+            "streaming is not scripted",
+        ))
     }
 
     /// Serves OpenAI prompts.
@@ -192,11 +195,15 @@ pub(crate) fn request_text(request: &ProviderRequest) -> String {
 
 /// OpenAI Chat assistant answer with `text`.
 pub(crate) fn text_response(text: &str) -> ProviderResponse {
-    chat_response(Some(OpenAiMessageContent::Text(text.to_owned())), None, "stop")
+    chat_response(
+        Some(OpenAiMessageContent::Text(text.to_owned())),
+        None,
+        "stop",
+    )
 }
 
 /// OpenAI Chat assistant answer requesting tool `name`.
-fn tool_call_response(name: &str, args: &Value) -> ProviderResponse {
+pub(crate) fn tool_call_response(name: &str, args: &Value) -> ProviderResponse {
     let call = OpenAiToolCall {
         id: format!("call_{name}"),
         kind: "function".to_owned(),
@@ -240,7 +247,8 @@ fn chat_response(
 /// JSON-schema response when `schema` is set.
 pub(crate) fn agent(name: &str, template: &str, schema: Option<Value>) -> Agent {
     let output = schema.map(|schema| {
-        ResponseFormat::json_schema(name, schema).expect("fixture schema is a valid response format")
+        ResponseFormat::json_schema(name, schema)
+            .expect("fixture schema is a valid response format")
     });
     let prompt = openai_chat(
         "gpt-test",

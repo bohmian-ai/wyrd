@@ -149,7 +149,11 @@ impl WorkflowExecutor {
             &plan,
             options.limits.max_run_bytes,
         )?;
-        let waiting: Vec<usize> = plan.steps.iter().map(|step| step.dependency_count).collect();
+        let waiting: Vec<usize> = plan
+            .steps
+            .iter()
+            .map(|step| step.dependency_count)
+            .collect();
         let ready = waiting
             .iter()
             .enumerate()
@@ -218,7 +222,8 @@ impl WorkflowExecutor {
                             max_step_result_bytes: self.options.limits.max_step_result_bytes,
                             observer: Arc::clone(&observer),
                         };
-                        let scoped = skald_observer::with_observer(Arc::clone(&observer), task.run());
+                        let scoped =
+                            skald_observer::with_observer(Arc::clone(&observer), task.run());
                         let handle = tasks.spawn(scoped);
                         running.insert(handle.id(), index);
                     }
@@ -229,8 +234,11 @@ impl WorkflowExecutor {
                         observer
                             .on_workflow_step_result(&run_id, step_id, 1, Some(error.code()))
                             .await;
-                        self.ledger
-                            .step_failed(index, wyrd_spec::card::workflow::WorkflowRunError::from_wyrd(&error), 1);
+                        self.ledger.step_failed(
+                            index,
+                            wyrd_spec::card::workflow::WorkflowRunError::from_wyrd(&error),
+                            1,
+                        );
                         stopping = true;
                     }
                 }
@@ -257,7 +265,9 @@ impl WorkflowExecutor {
                 Ok((id, report)) => (id, Ok(report)),
                 Err(error) => (error.id(), Err(error)),
             };
-            let Some(index) = running.remove(&id) else { continue };
+            let Some(index) = running.remove(&id) else {
+                continue;
+            };
             let attempts = self.attempts[index].load(Ordering::Acquire);
             match report {
                 Ok(StepReport::Finished(AttemptOutcome::Succeeded(payload))) => {
@@ -308,16 +318,20 @@ impl WorkflowExecutor {
         step.bindings
             .iter()
             .map(|(name, binding)| {
-                let value = self.ledger.select(&self.plan.input, binding).ok_or_else(|| {
-                    WyrdError::WorkflowMissingParameter {
-                        message: format!("step '{}' binding '{name}' selects a missing value", step.id),
+                let value = self
+                    .ledger
+                    .select(&self.plan.input, binding)
+                    .ok_or_else(|| WyrdError::WorkflowMissingParameter {
+                        message: format!(
+                            "step '{}' binding '{name}' selects a missing value",
+                            step.id
+                        ),
                         details: serde_json::json!({
                             "step": step.id,
                             "field": format!("inputs.{name}"),
                             "binding": binding.as_str(),
                         }),
-                    }
-                })?;
+                    })?;
                 let text = match value {
                     serde_json::Value::String(text) => text,
                     serde_json::Value::Null => String::new(),
@@ -354,7 +368,9 @@ impl StepTask {
         let mut attempt: u32 = 0;
         loop {
             if self.cancellation.is_cancelled()
-                || self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                || self
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
             {
                 return StepReport::Interrupted;
             }
@@ -540,8 +556,18 @@ mod tests {
             "required": ["summary", "detail"]
         });
         let workflow = Workflow::builder("namespaced")
-            .add(agent("alpha", "alpha about ${topic}", Some(detail_schema.clone())))
-            .and_then(|b| b.add(agent("beta", "beta about ${topic}", Some(string_schema(&["summary"])))))
+            .add(agent(
+                "alpha",
+                "alpha about ${topic}",
+                Some(detail_schema.clone()),
+            ))
+            .and_then(|b| {
+                b.add(agent(
+                    "beta",
+                    "beta about ${topic}",
+                    Some(string_schema(&["summary"])),
+                ))
+            })
             .and_then(|b| b.add_after(agent("echo", "echo static", None), ["alpha"]))
             .and_then(|b| {
                 b.add_after(
@@ -578,10 +604,15 @@ mod tests {
             "alpha about",
             vec![Reply::After(
                 std::time::Duration::from_millis(30),
-                Box::new(Reply::Text(r#"{"summary":"A-sum","detail":{"n":7}}"#.to_owned())),
+                Box::new(Reply::Text(
+                    r#"{"summary":"A-sum","detail":{"n":7}}"#.to_owned(),
+                )),
             )],
         );
-        provider.on("beta about", vec![Reply::Text(r#"{"summary":"B-sum"}"#.to_owned())]);
+        provider.on(
+            "beta about",
+            vec![Reply::Text(r#"{"summary":"B-sum"}"#.to_owned())],
+        );
         provider.on("echo static", vec![Reply::Text("echoed".to_owned())]);
         provider.on("final", vec![Reply::Text("the report".to_owned())]);
 
@@ -596,7 +627,10 @@ mod tests {
             run.steps["alpha"].structured_output,
             Some(json!({ "summary": "A-sum", "detail": { "n": 7 } }))
         );
-        assert_eq!(run.steps["beta"].structured_output, Some(json!({ "summary": "B-sum" })));
+        assert_eq!(
+            run.steps["beta"].structured_output,
+            Some(json!({ "summary": "B-sum" }))
+        );
         assert!(run.steps["alpha"].text.is_none());
         assert_eq!(run.steps["final"].text.as_deref(), Some("the report"));
         assert!(run.steps["final"].structured_output.is_none());
@@ -620,7 +654,10 @@ mod tests {
             .and_then(|b| b.with_inputs(string_inputs(&[("topic", "rust")])))
             .and_then(|b| b.with_step_inputs("alpha", bindings(&[("topic", "input.topic")])))
             .and_then(|b| {
-                b.with_step_inputs("final", bindings(&[("gone", "steps.alpha.output.structured.absent")]))
+                b.with_step_inputs(
+                    "final",
+                    bindings(&[("gone", "steps.alpha.output.structured.absent")]),
+                )
             })
             .and_then(|b| b.with_outputs(bindings(&[("report", "steps.final.output.text")])))
             .and_then(|b| b.build())
@@ -636,9 +673,15 @@ mod tests {
         let final_step = &run.steps["final"];
         assert_eq!(final_step.status, WorkflowStepStatus::Failed);
         assert_eq!(final_step.attempts, 1);
-        let error = final_step.error.as_ref().expect("failed step carries its error");
+        let error = final_step
+            .error
+            .as_ref()
+            .expect("failed step carries its error");
         assert_eq!(error.code, "WYRD_WORKFLOW_422_MISSING_PARAMETER");
-        assert_eq!(run.error.as_ref().map(|e| e.code.as_str()), Some(error.code.as_str()));
+        assert_eq!(
+            run.error.as_ref().map(|e| e.code.as_str()),
+            Some(error.code.as_str())
+        );
         assert_eq!(provider.count("final"), 0);
 
         // Same-stage failures complete in reverse ID order; the primary error
@@ -669,15 +712,1048 @@ mod tests {
         provider.on("last peer", vec![Reply::Fail(remote("TEST_Z_FORBIDDEN"))]);
         let run = run_local(&peers, &provider, json!({})).await;
         assert_eq!(run.status, WorkflowRunStatus::Failed);
-        assert_eq!(run.error.as_ref().map(|e| e.code.as_str()), Some("TEST_A_FORBIDDEN"));
+        assert_eq!(
+            run.error.as_ref().map(|e| e.code.as_str()),
+            Some("TEST_A_FORBIDDEN")
+        );
         assert_eq!(
             run.steps["z_last"].error.as_ref().map(|e| e.code.as_str()),
             Some("TEST_Z_FORBIDDEN")
         );
-        assert_eq!(run.steps["a_first"].attempts, 1, "remote problems are terminal");
+        assert_eq!(
+            run.steps["a_first"].attempts, 1,
+            "remote problems are terminal"
+        );
         let after = &run.steps["after"];
         assert_eq!(after.status, WorkflowStepStatus::Unstarted);
         assert_eq!(after.attempts, 0);
         assert!(after.started_at.is_none() && after.ended_at.is_none());
+    }
+
+    /// Build a workflow of independent text steps named by `prompts`, with
+    /// `out` selecting the first step's text.
+    fn independent(name: &str, prompts: &[(&str, &str)]) -> Workflow {
+        let mut builder = Workflow::builder(name);
+        for (step, prompt) in prompts {
+            builder = builder
+                .add(agent(step, prompt, None))
+                .expect("step appends");
+        }
+        let first = format!("steps.{}.output.text", prompts[0].0);
+        builder
+            .with_outputs(bindings(&[("out", first.as_str())]))
+            .and_then(|b| b.build())
+            .expect("independent workflow builds")
+    }
+
+    /// Return `workflow` with `retry` and `timeout_seconds` set on `step`.
+    fn with_policy(
+        mut workflow: Workflow,
+        step: &str,
+        max_retries: u32,
+        initial_backoff_ms: Option<u64>,
+        timeout_seconds: Option<u64>,
+    ) -> Workflow {
+        let target = workflow
+            .spec
+            .steps
+            .iter_mut()
+            .find(|candidate| candidate.id == step)
+            .expect("step exists");
+        target.retry = Some(wyrd_spec::card::workflow::WorkflowRetryPolicy {
+            max_retries,
+            initial_backoff_ms,
+        });
+        target.timeout_seconds = timeout_seconds;
+        workflow
+    }
+
+    /// Provider HTTP status failure.
+    fn status(code: u16) -> Reply {
+        Reply::Fail(skald_providers::ProviderError::Status {
+            provider: "scripted".to_owned(),
+            status: code,
+            body: "SECRET-BODY".to_owned(),
+            retry_after_ms: None,
+        })
+    }
+
+    /// Run with explicit limits and cancellation.
+    async fn run_limited(
+        workflow: &Workflow,
+        provider: &Arc<ScriptedProvider>,
+        limits: WorkflowExecutionLimits,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> wyrd_spec::card::workflow::WorkflowRun {
+        workflow
+            .run_with_options(
+                &WorkflowExecutionDependencies::new(provider.registry()),
+                serde_json::Map::new(),
+                WorkflowRunOptions {
+                    limits,
+                    cancellation,
+                },
+            )
+            .await
+            .expect("workflow passes pre-dispatch validation")
+    }
+
+    /// Scenario 3: concurrency ceiling, retry classification and attempts,
+    /// saturating backoff and its cap, step timeout precedence, ordinary peer
+    /// drain, cancel and deadline abort-and-drain, and parent-drop cleanup,
+    /// all on paused virtual time.
+    #[tokio::test(start_paused = true)]
+    async fn bounded_attempt_lifecycle() {
+        use std::time::Duration;
+
+        use tokio_util::sync::CancellationToken;
+
+        use super::backoff;
+        use crate::attempt::{agent_error_retryable, project_agent_error};
+
+        // Concurrency ceiling: five ready steps never exceed two in flight.
+        let names = ["s1", "s2", "s3", "s4", "s5"];
+        let prompts: Vec<(&str, String)> = names
+            .iter()
+            .map(|name| (*name, format!("work {name}")))
+            .collect();
+        let prompt_refs: Vec<(&str, &str)> = prompts
+            .iter()
+            .map(|(name, prompt)| (*name, prompt.as_str()))
+            .collect();
+        let workflow = independent("ceiling", &prompt_refs);
+        let provider = ScriptedProvider::new();
+        for name in names {
+            provider.on(
+                &format!("work {name}"),
+                vec![Reply::After(
+                    Duration::from_millis(10),
+                    Box::new(Reply::Text("ok".into())),
+                )],
+            );
+        }
+        let limits = WorkflowExecutionLimits {
+            max_concurrency: std::num::NonZeroUsize::new(2).expect("two is nonzero"),
+            ..WorkflowExecutionLimits::default()
+        };
+        let run = run_limited(&workflow, &provider, limits, CancellationToken::new()).await;
+        assert_eq!(run.status, WorkflowRunStatus::Succeeded);
+        assert_eq!(provider.peak(), 2);
+        assert_eq!(WorkflowExecutionLimits::default().max_concurrency.get(), 8);
+
+        // Eligible failures retry with exponential backoff, observed per attempt.
+        let workflow = with_policy(
+            independent("retry", &[("flaky", "flaky call")]),
+            "flaky",
+            2,
+            Some(100),
+            None,
+        );
+        let provider = ScriptedProvider::new();
+        provider.on(
+            "flaky call",
+            vec![status(503), status(429), Reply::Text("ok".into())],
+        );
+        let observer = Arc::new(RecordingObserver::default());
+        let workflow = workflow.with_observers(vec![observer.clone()]);
+        let started = tokio::time::Instant::now();
+        let run = run_limited(
+            &workflow,
+            &provider,
+            WorkflowExecutionLimits::default(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(run.status, WorkflowRunStatus::Succeeded);
+        assert_eq!(run.steps["flaky"].attempts, 3);
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert_eq!(
+            observer.events(),
+            vec![
+                "attempt:flaky:1",
+                "result:flaky:1:WYRD_AGENT_502_PROVIDER",
+                "backoff:flaky:2:100",
+                "attempt:flaky:2",
+                "result:flaky:2:WYRD_AGENT_502_PROVIDER",
+                "backoff:flaky:3:200",
+                "attempt:flaky:3",
+                "result:flaky:3:ok",
+            ]
+        );
+
+        // Retry exhaustion keeps the final eligible error; the provider body
+        // never reaches the snapshot.
+        let workflow = with_policy(
+            independent("exhaust", &[("down", "down call")]),
+            "down",
+            1,
+            None,
+            None,
+        );
+        let provider = ScriptedProvider::new();
+        provider.on("down call", vec![status(500), status(502)]);
+        let run = run_limited(
+            &workflow,
+            &provider,
+            WorkflowExecutionLimits::default(),
+            CancellationToken::new(),
+        )
+        .await;
+        let step = &run.steps["down"];
+        assert_eq!(
+            (step.status, step.attempts),
+            (WorkflowStepStatus::Failed, 2)
+        );
+        let error = step.error.as_ref().expect("failed step has an error");
+        assert_eq!(error.code, "WYRD_AGENT_502_PROVIDER");
+        assert_eq!(
+            error.details,
+            json!({ "provider_code": "SKALD_PROVIDERS_5XX_UPSTREAM" })
+        );
+        assert!(
+            !serde_json::to_string(&run)
+                .expect("run serializes")
+                .contains("SECRET-BODY")
+        );
+
+        // Terminal failures never retry even when retries remain.
+        let workflow = with_policy(
+            independent("terminal", &[("denied", "denied call")]),
+            "denied",
+            3,
+            None,
+            None,
+        );
+        let provider = ScriptedProvider::new();
+        provider.on(
+            "denied call",
+            vec![status(401), Reply::Text("unused".into())],
+        );
+        let run = run_limited(
+            &workflow,
+            &provider,
+            WorkflowExecutionLimits::default(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(run.steps["denied"].attempts, 1);
+        assert_eq!(provider.count("denied call"), 1);
+
+        // Classification table for the typed provider and gateway outcomes.
+        let provider_error = |source| {
+            skald_agent::AgentError::Provider(skald_runtime::SkaldRuntimeError::Provider {
+                provider: skald_spec::ProviderName::OpenAi,
+                source,
+            })
+        };
+        let remote = |code: &str| skald_providers::ProviderError::RemoteProblem {
+            code: code.to_owned(),
+            status: 429,
+            message: "gateway".to_owned(),
+            field: Some("model".to_owned()),
+            remediation: "wait".to_owned(),
+        };
+        for (error, retryable) in [
+            (
+                provider_error(remote("WYRD_GATEWAY_429_LIMIT_EXCEEDED")),
+                true,
+            ),
+            (
+                provider_error(remote("WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE")),
+                true,
+            ),
+            (
+                provider_error(remote("WYRD_GATEWAY_504_DEADLINE_EXCEEDED")),
+                true,
+            ),
+            (
+                provider_error(remote("WYRD_GATEWAY_429_BUDGET_EXCEEDED")),
+                false,
+            ),
+            (provider_error(remote("WYRD_GATEWAY_403_FORBIDDEN")), false),
+            (
+                provider_error(skald_providers::ProviderError::Timeout {
+                    provider: "p".into(),
+                }),
+                true,
+            ),
+            (
+                provider_error(skald_providers::ProviderError::Connect {
+                    provider: "p".into(),
+                    detail: "refused".into(),
+                }),
+                true,
+            ),
+            (
+                provider_error(skald_providers::ProviderError::Upstream {
+                    provider: "p".into(),
+                    status: 408,
+                    body: String::new(),
+                }),
+                true,
+            ),
+            (
+                provider_error(skald_providers::ProviderError::Status {
+                    provider: "p".into(),
+                    status: 404,
+                    body: String::new(),
+                    retry_after_ms: None,
+                }),
+                false,
+            ),
+            (
+                skald_agent::AgentError::Provider(
+                    skald_runtime::SkaldRuntimeError::ProviderNotRegistered {
+                        provider: skald_spec::ProviderName::OpenAi,
+                    },
+                ),
+                false,
+            ),
+            (
+                skald_agent::AgentError::Timeout {
+                    duration: Duration::from_secs(1),
+                },
+                true,
+            ),
+            (
+                skald_agent::AgentError::StructuredOutputDecode {
+                    agent: "a".into(),
+                    detail: "bad".into(),
+                },
+                true,
+            ),
+            (skald_agent::AgentError::max_iterations("a", 3), false),
+            (
+                skald_agent::AgentError::ToolNotFound { name: "t".into() },
+                false,
+            ),
+        ] {
+            assert_eq!(agent_error_retryable(&error), retryable, "{error:?}");
+        }
+        let projected = project_agent_error(&provider_error(remote("WYRD_GATEWAY_403_FORBIDDEN")));
+        assert_eq!(projected.code, "WYRD_GATEWAY_403_FORBIDDEN");
+        assert_eq!(projected.details, json!({ "field": "model" }));
+        assert_eq!(projected.remediation, "wait");
+
+        // Saturating exponential backoff with a 30 s cap; zero is immediate.
+        assert_eq!(backoff(0, 5), Duration::ZERO);
+        assert_eq!(backoff(250, 1), Duration::from_millis(250));
+        assert_eq!(backoff(250, 3), Duration::from_millis(1_000));
+        assert_eq!(backoff(1_000, 10), Duration::from_millis(30_000));
+        assert_eq!(backoff(u64::MAX, u32::MAX), Duration::from_millis(30_000));
+
+        // The step attempt timeout wins over a hanging call and is retryable.
+        let workflow = with_policy(
+            independent("timeout", &[("slow", "slow call")]),
+            "slow",
+            1,
+            None,
+            Some(1),
+        );
+        let provider = ScriptedProvider::new();
+        provider.on("slow call", vec![Reply::Hang, Reply::Hang]);
+        let run = run_limited(
+            &workflow,
+            &provider,
+            WorkflowExecutionLimits::default(),
+            CancellationToken::new(),
+        )
+        .await;
+        let step = &run.steps["slow"];
+        assert_eq!(
+            (step.status, step.attempts),
+            (WorkflowStepStatus::Failed, 2)
+        );
+        assert_eq!(
+            step.error.as_ref().map(|e| e.code.as_str()),
+            Some("WYRD_WORKFLOW_504_STEP_TIMEOUT")
+        );
+        assert_eq!(provider.in_flight(), 0);
+        assert_eq!(provider.abandoned(), 2);
+
+        // An ordinary failure drains running peers and starts nothing new.
+        let workflow = Workflow::builder("drain")
+            .add(agent("fail_fast", "fail fast", None))
+            .and_then(|b| b.add(agent("slow_ok", "slow ok", None)))
+            .and_then(|b| b.add_after(agent("later", "later call", None), ["slow_ok"]))
+            .and_then(|b| b.with_outputs(bindings(&[("out", "steps.later.output.text")])))
+            .and_then(|b| b.build())
+            .expect("drain workflow builds");
+        let provider = ScriptedProvider::new();
+        provider.on("fail fast", vec![status(400)]);
+        provider.on(
+            "slow ok",
+            vec![Reply::After(
+                Duration::from_secs(5),
+                Box::new(Reply::Text("done".into())),
+            )],
+        );
+        let run = run_limited(
+            &workflow,
+            &provider,
+            WorkflowExecutionLimits::default(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(run.status, WorkflowRunStatus::Failed);
+        assert_eq!(run.steps["slow_ok"].status, WorkflowStepStatus::Succeeded);
+        assert_eq!(run.steps["slow_ok"].text.as_deref(), Some("done"));
+        assert_eq!(run.steps["later"].status, WorkflowStepStatus::Unstarted);
+        assert_eq!(provider.count("later call"), 0);
+
+        // Explicit cancellation aborts and drains: the active step is
+        // cancelled with its attempt count, dependents are unstarted.
+        let workflow = Workflow::builder("cancel")
+            .add(agent("held", "held call", None))
+            .and_then(|b| b.add(agent("quick", "quick call", None)))
+            .and_then(|b| b.add_after(agent("next", "next call", None), ["held"]))
+            .and_then(|b| b.with_outputs(bindings(&[("out", "steps.next.output.text")])))
+            .and_then(|b| b.build())
+            .expect("cancel workflow builds");
+        let provider = ScriptedProvider::new();
+        provider.on("held call", vec![Reply::Hang]);
+        provider.on("quick call", vec![Reply::Text("fast".into())]);
+        let cancellation = CancellationToken::new();
+        let trigger = cancellation.clone();
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            trigger.cancel();
+        });
+        let run = run_limited(
+            &workflow,
+            &provider,
+            WorkflowExecutionLimits::default(),
+            cancellation,
+        )
+        .await;
+        cancel_task.await.expect("cancel task completes");
+        assert_eq!(run.status, WorkflowRunStatus::Cancelled);
+        assert!(run.error.is_none() && run.outputs.is_empty() && run.ended_at.is_some());
+        let held = &run.steps["held"];
+        assert_eq!(
+            (held.status, held.attempts),
+            (WorkflowStepStatus::Cancelled, 1)
+        );
+        assert!(held.error.is_none() && held.started_at.is_some() && held.ended_at.is_some());
+        assert_eq!(run.steps["quick"].status, WorkflowStepStatus::Succeeded);
+        assert_eq!(run.steps["next"].status, WorkflowStepStatus::Unstarted);
+        assert_eq!((provider.in_flight(), provider.abandoned()), (0, 1));
+
+        // The total deadline aborts and drains with the exact timeout error,
+        // and it wins over a later step attempt timeout and a pending backoff.
+        let workflow = with_policy(
+            independent("deadline", &[("held", "held call")]),
+            "held",
+            5,
+            Some(10_000),
+            Some(60),
+        );
+        let provider = ScriptedProvider::new();
+        provider.on("held call", vec![Reply::Hang]);
+        let limits = WorkflowExecutionLimits {
+            deadline: Some(Duration::from_secs(2)),
+            ..WorkflowExecutionLimits::default()
+        };
+        let run = run_limited(&workflow, &provider, limits, CancellationToken::new()).await;
+        assert_eq!(run.status, WorkflowRunStatus::TimedOut);
+        assert_eq!(
+            run.error.as_ref().map(|e| e.code.as_str()),
+            Some("WYRD_WORKFLOW_504_RUN_TIMEOUT")
+        );
+        assert_eq!(run.steps["held"].status, WorkflowStepStatus::Cancelled);
+        assert_eq!(run.steps["held"].attempts, 1);
+        assert_eq!(provider.in_flight(), 0);
+
+        // Dropping the parent future aborts every owned step task.
+        let workflow = independent("dropped", &[("held", "held call")]);
+        let provider = ScriptedProvider::new();
+        provider.on("held call", vec![Reply::Hang]);
+        let dependencies = WorkflowExecutionDependencies::new(provider.registry());
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            workflow.run_with_options(
+                &dependencies,
+                serde_json::Map::new(),
+                WorkflowRunOptions::default(),
+            ),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the run is still held when its parent is dropped"
+        );
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!((provider.in_flight(), provider.abandoned()), (0, 1));
+    }
+
+    /// Gateway fake answering per step from scripted replies and recording
+    /// every call.
+    #[derive(Default)]
+    struct FakeGateway {
+        /// Recorded calls.
+        calls: std::sync::Mutex<Vec<crate::route::WyrdGatewayCall>>,
+        /// Replies keyed by step ID.
+        replies: std::sync::Mutex<
+            BTreeMap<
+                String,
+                std::collections::VecDeque<
+                    Result<skald_spec::ProviderResponse, skald_providers::ProviderError>,
+                >,
+            >,
+        >,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::route::WyrdGatewayCaller for FakeGateway {
+        /// Record the call and pop the step's next reply.
+        async fn call(
+            &self,
+            call: crate::route::WyrdGatewayCall,
+            _cancellation: &tokio_util::sync::CancellationToken,
+        ) -> Result<skald_spec::ProviderResponse, skald_providers::ProviderError> {
+            let step = call.correlation.step_id.clone();
+            crate::test_support::lock(&self.calls).push(call);
+            crate::test_support::lock(&self.replies)
+                .get_mut(&step)
+                .and_then(std::collections::VecDeque::pop_front)
+                .unwrap_or_else(|| {
+                    Err(skald_providers::ProviderError::bad_request(
+                        "fake",
+                        "unscripted",
+                    ))
+                })
+        }
+    }
+
+    /// Scenario 4: step routes resolve with step-over-workflow precedence;
+    /// each gateway call carries its own immutable fallback, deadline-derived
+    /// timeout, and run/step/attempt correlation; native steps never reach the
+    /// gateway; tool declarations survive the route; remote problems keep only
+    /// safe metadata; a missing gateway refuses the run before dispatch.
+    #[tokio::test(start_paused = true)]
+    async fn isolated_route_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        use skald_spec::ProviderRequest;
+        use wyrd_spec::card::workflow::{LlmRoute, WorkflowRetryPolicy};
+        use wyrd_spec::gateway::{GatewayFallbackOverride, ModelRef};
+
+        use crate::route::DEFAULT_GATEWAY_CALL_TIMEOUT;
+        use crate::test_support::{RecordingTool, text_response, tool_call_response};
+
+        let tool = Arc::new(RecordingTool {
+            name: "lookup".to_owned(),
+            calls: AtomicUsize::new(0),
+        });
+        let mut workflow = Workflow::builder("routes")
+            .add(agent("routed", "routed call", None))
+            .and_then(|b| b.add(agent("plain", "plain call", None)))
+            .and_then(|b| b.add(agent("local", "local call", None)))
+            .and_then(|b| b.add(agent("remote", "remote call", None)))
+            .and_then(|b| b.add(agent("tooling", "tooling call", None).with_tool(tool.clone())))
+            .and_then(|b| b.with_outputs(bindings(&[("out", "steps.routed.output.text")])))
+            .and_then(|b| b.build())
+            .expect("route workflow builds");
+        let fallback = GatewayFallbackOverride {
+            candidates: vec![ModelRef::from_projection("openai/gpt-backup").expect("model ref")],
+        };
+        workflow.spec.llm_route = Some(LlmRoute::WyrdGateway);
+        for step in &mut workflow.spec.steps {
+            match step.id.as_str() {
+                "routed" => {
+                    step.fallback = Some(fallback.clone());
+                    step.timeout_seconds = Some(30);
+                }
+                "local" => step.llm_route = Some(LlmRoute::Native),
+                "remote" => {
+                    step.retry = Some(WorkflowRetryPolicy {
+                        max_retries: 2,
+                        initial_backoff_ms: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+        workflow.validate().expect("routed workflow validates");
+
+        let gateway = Arc::new(FakeGateway::default());
+        {
+            let mut replies = crate::test_support::lock(&gateway.replies);
+            replies.insert("routed".into(), [Ok(text_response("via gateway"))].into());
+            replies.insert("plain".into(), [Ok(text_response("plain gateway"))].into());
+            replies.insert(
+                "remote".into(),
+                [Err(skald_providers::ProviderError::RemoteProblem {
+                    code: "WYRD_GATEWAY_403_MODEL_FORBIDDEN".into(),
+                    status: 403,
+                    message: "model is not permitted".into(),
+                    field: Some("model".into()),
+                    remediation: "grant the model".into(),
+                })]
+                .into(),
+            );
+            replies.insert(
+                "tooling".into(),
+                [
+                    Ok(tool_call_response("lookup", &json!({}))),
+                    Ok(text_response("tool used")),
+                ]
+                .into(),
+            );
+        }
+        let native = ScriptedProvider::new();
+        native.on("local call", vec![Reply::Text("native answer".into())]);
+        let dependencies = WorkflowExecutionDependencies::new(native.registry())
+            .with_wyrd_gateway(gateway.clone());
+        let run = workflow
+            .run_with_options(
+                &dependencies,
+                serde_json::Map::new(),
+                WorkflowRunOptions::default(),
+            )
+            .await
+            .expect("routes are available");
+
+        assert_eq!(native.requests(), vec!["local call".to_owned()]);
+        assert_eq!(run.steps["local"].text.as_deref(), Some("native answer"));
+        assert_eq!(run.steps["routed"].text.as_deref(), Some("via gateway"));
+        assert_eq!(run.steps["tooling"].text.as_deref(), Some("tool used"));
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+
+        let calls = crate::test_support::lock(&gateway.calls);
+        let by_step = |id: &str| -> Vec<&crate::route::WyrdGatewayCall> {
+            calls
+                .iter()
+                .filter(|call| call.correlation.step_id == id)
+                .collect()
+        };
+        let routed = by_step("routed");
+        assert_eq!(routed.len(), 1);
+        assert_eq!(routed[0].fallback.as_ref(), Some(&fallback));
+        assert!(routed[0].timeout <= Duration::from_secs(30) && !routed[0].timeout.is_zero());
+        assert_eq!(routed[0].correlation.run_id, run.run_id);
+        assert_eq!(routed[0].correlation.attempt, 1);
+        assert!(matches!(
+            &routed[0].request,
+            ProviderRequest::OpenAiChatCompletion(_)
+        ));
+        assert_eq!(
+            crate::test_support::request_text(&routed[0].request),
+            "routed call"
+        );
+        let plain = by_step("plain");
+        assert_eq!(plain.len(), 1);
+        assert!(plain[0].fallback.is_none());
+        assert_eq!(plain[0].timeout, DEFAULT_GATEWAY_CALL_TIMEOUT);
+        let tooling = by_step("tooling");
+        assert_eq!(tooling.len(), 2);
+        assert!(tooling.iter().all(|call| matches!(
+            &call.request,
+            ProviderRequest::OpenAiChatCompletion(request)
+                if request.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+        )));
+        assert!(by_step("local").is_empty());
+        assert_eq!(by_step("remote").len(), 1, "gateway refusals are terminal");
+        drop(calls);
+
+        let remote = &run.steps["remote"];
+        assert_eq!(
+            (remote.status, remote.attempts),
+            (WorkflowStepStatus::Failed, 1)
+        );
+        let error = remote.error.as_ref().expect("remote step failed");
+        assert_eq!(error.code, "WYRD_GATEWAY_403_MODEL_FORBIDDEN");
+        assert_eq!(error.message, "model is not permitted");
+        assert_eq!(error.details, json!({ "field": "model" }));
+        assert_eq!(error.remediation, "grant the model");
+        assert_eq!(run.status, WorkflowRunStatus::Failed);
+
+        // Without a gateway caller the run is refused before any dispatch.
+        let native = ScriptedProvider::new();
+        let refused = workflow
+            .run_with_options(
+                &WorkflowExecutionDependencies::new(native.registry()),
+                serde_json::Map::new(),
+                WorkflowRunOptions::default(),
+            )
+            .await
+            .expect_err("gateway route needs a caller");
+        assert_eq!(refused.code(), "WYRD_WORKFLOW_503_BINDING_UNAVAILABLE");
+        assert!(native.requests().is_empty());
+    }
+
+    /// Scenario 5: an external gateway route reaches only its bound origin
+    /// with authored and secret headers, refuses missing bindings, protocol
+    /// and origin mismatches, header collisions, plain HTTP in production, and
+    /// dialect mismatches before dispatch, never follows redirects, and never
+    /// displays secret values.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bound_external_gateway_security() {
+        use secrecy::SecretString;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wyrd_spec::auth::AbsoluteUrl;
+        use wyrd_spec::card::workflow::{ExternalGatewayProtocol, LlmRoute};
+        use wyrd_spec::ids::CredentialBindingName;
+
+        use crate::route::{
+            ExternalEndpointProfile, ExternalGatewayBinding, ExternalGatewayBindings,
+        };
+
+        let server = MockServer::start().await;
+        let origin = url::Url::parse(&server.uri()).expect("mock server uri parses");
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("x-org-secret", "s3cret"))
+            .and(header("x-team", "ml"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "r",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "gpt-test",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "external answer" },
+                    "finish_reason": "stop"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let name = CredentialBindingName::new("corp").expect("binding name");
+        let binding = |protocol, origin: &url::Url| ExternalGatewayBinding {
+            name: name.clone(),
+            protocol,
+            origin: origin.clone(),
+            secret_headers: [(
+                http::HeaderName::from_static("x-org-secret"),
+                SecretString::from("s3cret"),
+            )]
+            .into(),
+        };
+        let bindings_for = |protocol, origin: &url::Url| {
+            let mut bindings = ExternalGatewayBindings::new();
+            bindings
+                .insert(binding(protocol, origin))
+                .expect("binding inserts");
+            bindings
+        };
+        let workflow_for = |protocol, base: &str, header_name: &str, binding_name: &str| {
+            let mut workflow = Workflow::builder("external")
+                .add(agent("ext", "external call", None))
+                .and_then(|b| b.with_outputs(bindings(&[("out", "steps.ext.output.text")])))
+                .and_then(|b| b.build())
+                .expect("external workflow builds");
+            workflow.spec.steps[0].llm_route = Some(LlmRoute::ExtGateway {
+                protocol,
+                base_url: AbsoluteUrl::new(base.to_owned()).expect("absolute url"),
+                headers: [(header_name.to_owned(), "ml".to_owned())].into(),
+                credential_binding: CredentialBindingName::new(binding_name).expect("binding name"),
+            });
+            workflow
+        };
+        let base = format!("{}/v1", server.uri());
+        let native = ScriptedProvider::new();
+        let deps = |bindings, profile| {
+            WorkflowExecutionDependencies::new(native.registry())
+                .with_external_gateways(bindings)
+                .with_endpoint_profile(profile)
+        };
+
+        let good = workflow_for(ExternalGatewayProtocol::OpenAiChat, &base, "x-team", "corp");
+        let run = good
+            .run_with_options(
+                &deps(
+                    bindings_for(ExternalGatewayProtocol::OpenAiChat, &origin),
+                    ExternalEndpointProfile::Local,
+                ),
+                serde_json::Map::new(),
+                WorkflowRunOptions::default(),
+            )
+            .await
+            .expect("bound route is available");
+        assert_eq!(run.status, WorkflowRunStatus::Succeeded, "{run:?}");
+        assert_eq!(run.steps["ext"].text.as_deref(), Some("external answer"));
+        assert!(native.requests().is_empty());
+
+        let debug = format!(
+            "{:?}",
+            binding(ExternalGatewayProtocol::OpenAiChat, &origin)
+        );
+        assert!(
+            debug.contains("x-org-secret") && !debug.contains("s3cret"),
+            "{debug}"
+        );
+
+        let refusals = [
+            (
+                good.clone(),
+                ExternalGatewayBindings::new(),
+                ExternalEndpointProfile::Local,
+                "WYRD_WORKFLOW_503_BINDING_UNAVAILABLE",
+            ),
+            (
+                good.clone(),
+                bindings_for(ExternalGatewayProtocol::AnthropicMessages, &origin),
+                ExternalEndpointProfile::Local,
+                "WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED",
+            ),
+            (
+                good.clone(),
+                bindings_for(
+                    ExternalGatewayProtocol::OpenAiChat,
+                    &url::Url::parse("http://127.0.0.1:1").expect("origin parses"),
+                ),
+                ExternalEndpointProfile::Local,
+                "WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED",
+            ),
+            (
+                workflow_for(
+                    ExternalGatewayProtocol::OpenAiChat,
+                    &base,
+                    "X-Org-Secret",
+                    "corp",
+                ),
+                bindings_for(ExternalGatewayProtocol::OpenAiChat, &origin),
+                ExternalEndpointProfile::Local,
+                "WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED",
+            ),
+            (
+                good.clone(),
+                bindings_for(ExternalGatewayProtocol::OpenAiChat, &origin),
+                ExternalEndpointProfile::Production,
+                "WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED",
+            ),
+            (
+                workflow_for(
+                    ExternalGatewayProtocol::AnthropicMessages,
+                    &base,
+                    "x-team",
+                    "corp",
+                ),
+                bindings_for(ExternalGatewayProtocol::AnthropicMessages, &origin),
+                ExternalEndpointProfile::Local,
+                "WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED",
+            ),
+        ];
+        for (workflow, bindings, profile, code) in refusals {
+            let error = workflow
+                .run_with_options(
+                    &deps(bindings, profile),
+                    serde_json::Map::new(),
+                    WorkflowRunOptions::default(),
+                )
+                .await
+                .expect_err("route is refused before dispatch");
+            assert_eq!(error.code(), code, "{error}");
+        }
+        server.verify().await;
+
+        // A redirect is answered, never followed.
+        let redirecting = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(307).insert_header(
+                "location",
+                format!("{}/elsewhere", redirecting.uri()).as_str(),
+            ))
+            .expect(1)
+            .mount(&redirecting)
+            .await;
+        Mock::given(path("/elsewhere"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&redirecting)
+            .await;
+        let redirect_origin = url::Url::parse(&redirecting.uri()).expect("uri parses");
+        let run = workflow_for(
+            ExternalGatewayProtocol::OpenAiChat,
+            &format!("{}/v1", redirecting.uri()),
+            "x-team",
+            "corp",
+        )
+        .run_with_options(
+            &deps(
+                bindings_for(ExternalGatewayProtocol::OpenAiChat, &redirect_origin),
+                ExternalEndpointProfile::Local,
+            ),
+            serde_json::Map::new(),
+            WorkflowRunOptions::default(),
+        )
+        .await
+        .expect("bound route is available");
+        assert_eq!(run.status, WorkflowRunStatus::Failed);
+        assert_eq!(run.steps["ext"].attempts, 1);
+        redirecting.verify().await;
+
+        // Binding configuration is checked on insert.
+        let mut bindings = bindings_for(ExternalGatewayProtocol::OpenAiChat, &origin);
+        let duplicate = bindings
+            .insert(binding(ExternalGatewayProtocol::OpenAiChat, &origin))
+            .expect_err("duplicate binding name");
+        assert_eq!(duplicate.code(), "WYRD_WORKFLOW_503_BINDING_UNAVAILABLE");
+        let mut fresh = ExternalGatewayBindings::new();
+        let with_path = url::Url::parse(&base).expect("base parses");
+        assert!(
+            fresh
+                .insert(binding(ExternalGatewayProtocol::OpenAiChat, &with_path))
+                .is_err()
+        );
+    }
+
+    /// Scenario 6: input, step-result, and run budgets use canonical sizes;
+    /// the payload-free terminal reserve is checked before dispatch; an
+    /// oversized payload is discarded with the exact 413 projection; and a
+    /// cancelled or timed-out run near the ceiling still fits.
+    #[tokio::test(start_paused = true)]
+    async fn terminal_budget_reserve() {
+        use std::time::Duration;
+
+        use tokio_util::sync::CancellationToken;
+
+        let big = "x".repeat(10_000);
+        let workflow = Workflow::builder("budget")
+            .add(agent("writer", "write ${topic}", None))
+            .and_then(|b| b.with_inputs(string_inputs(&[("topic", "rust")])))
+            .and_then(|b| b.with_step_inputs("writer", bindings(&[("topic", "input.topic")])))
+            .and_then(|b| b.with_outputs(bindings(&[("out", "steps.writer.output.text")])))
+            .and_then(|b| b.build())
+            .expect("budget workflow builds");
+        let run_with = |limits: WorkflowExecutionLimits,
+                        cancellation: CancellationToken,
+                        provider: &Arc<ScriptedProvider>| {
+            let dependencies = WorkflowExecutionDependencies::new(provider.registry());
+            let workflow = workflow.clone();
+            async move {
+                workflow
+                    .run_with_options(
+                        &dependencies,
+                        serde_json::Map::from_iter([("topic".to_owned(), json!("go"))]),
+                        WorkflowRunOptions {
+                            limits,
+                            cancellation,
+                        },
+                    )
+                    .await
+            }
+        };
+
+        // Input above its cap is refused before dispatch.
+        let provider = ScriptedProvider::new();
+        let limits = WorkflowExecutionLimits {
+            max_input_bytes: Some(8),
+            ..WorkflowExecutionLimits::default()
+        };
+        let error = run_with(limits, CancellationToken::new(), &provider)
+            .await
+            .expect_err("input exceeds its cap");
+        assert_eq!(error.code(), "WYRD_WORKFLOW_413_INPUT_TOO_LARGE");
+
+        // A run cap below the payload-free reserve is refused before dispatch.
+        let limits = WorkflowExecutionLimits {
+            max_run_bytes: Some(4_096),
+            ..WorkflowExecutionLimits::default()
+        };
+        let error = run_with(limits, CancellationToken::new(), &provider)
+            .await
+            .expect_err("graph cannot reserve its terminal snapshot");
+        assert_eq!(error.code(), "WYRD_WORKFLOW_413_GRAPH_TOO_LARGE");
+        assert!(provider.requests().is_empty());
+
+        // A step result above its cap is terminal and discarded.
+        let provider = ScriptedProvider::new();
+        provider.on(
+            "write go",
+            vec![Reply::Text(big.clone()), Reply::Text(big.clone())],
+        );
+        let limits = WorkflowExecutionLimits {
+            max_step_result_bytes: Some(100),
+            ..WorkflowExecutionLimits::default()
+        };
+        let run = run_with(limits, CancellationToken::new(), &provider)
+            .await
+            .expect("runs");
+        let writer = &run.steps["writer"];
+        assert_eq!(
+            (writer.status, writer.attempts),
+            (WorkflowStepStatus::Failed, 1)
+        );
+        assert!(writer.text.is_none());
+        assert_eq!(
+            run.error.as_ref().map(|e| e.code.as_str()),
+            Some("WYRD_WORKFLOW_413_STEP_RESULT_TOO_LARGE")
+        );
+
+        // A payload that would overflow the run snapshot is discarded and the
+        // aggregate-size error decides the run.
+        let ceiling = 8_000;
+        let provider = ScriptedProvider::new();
+        provider.on("write go", vec![Reply::Text(big)]);
+        let limits = WorkflowExecutionLimits {
+            max_run_bytes: Some(ceiling),
+            ..WorkflowExecutionLimits::default()
+        };
+        let run = run_with(limits, CancellationToken::new(), &provider)
+            .await
+            .expect("runs");
+        assert_eq!(run.status, WorkflowRunStatus::Failed);
+        assert_eq!(
+            run.error.as_ref().map(|e| e.code.as_str()),
+            Some("WYRD_WORKFLOW_413_RUN_TOO_LARGE")
+        );
+        assert!(run.steps["writer"].text.is_none());
+        assert!(run.canonical_len() <= ceiling, "{}", run.canonical_len());
+
+        // A small payload fits under the same ceiling.
+        let provider = ScriptedProvider::new();
+        provider.on("write go", vec![Reply::Text("short".into())]);
+        let run = run_with(limits, CancellationToken::new(), &provider)
+            .await
+            .expect("runs");
+        assert_eq!(run.status, WorkflowRunStatus::Succeeded);
+        assert!(run.canonical_len() <= ceiling);
+
+        // Cancellation and timeout near the ceiling still fit.
+        for (deadline, cancel_after) in [(None, Some(1)), (Some(Duration::from_secs(1)), None)] {
+            let provider = ScriptedProvider::new();
+            provider.on("write go", vec![Reply::Hang]);
+            let cancellation = CancellationToken::new();
+            if let Some(seconds) = cancel_after {
+                let trigger = cancellation.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(seconds)).await;
+                    trigger.cancel();
+                });
+            }
+            let limits = WorkflowExecutionLimits {
+                max_run_bytes: Some(ceiling),
+                deadline,
+                ..WorkflowExecutionLimits::default()
+            };
+            let run = run_with(limits, cancellation, &provider)
+                .await
+                .expect("runs");
+            assert!(matches!(
+                run.status,
+                WorkflowRunStatus::Cancelled | WorkflowRunStatus::TimedOut
+            ));
+            assert!(run.canonical_len() <= ceiling);
+        }
+
+        // Local defaults: eight concurrent steps and no caps.
+        assert_eq!(
+            WorkflowExecutionLimits::default(),
+            WorkflowExecutionLimits {
+                max_concurrency: std::num::NonZeroUsize::new(8).expect("nonzero"),
+                deadline: None,
+                max_input_bytes: None,
+                max_step_result_bytes: None,
+                max_run_bytes: None,
+            }
+        );
     }
 }

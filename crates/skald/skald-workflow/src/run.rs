@@ -130,7 +130,12 @@ impl RunLedger {
     /// Returns `false` when the payload would exceed the run budget; the
     /// payload is discarded, the step fails with
     /// `WYRD_WORKFLOW_413_RUN_TOO_LARGE`, and that error becomes the run error.
-    pub(crate) fn step_succeeded(&mut self, index: usize, payload: StepPayload, attempts: u32) -> bool {
+    pub(crate) fn step_succeeded(
+        &mut self,
+        index: usize,
+        payload: StepPayload,
+        attempts: u32,
+    ) -> bool {
         let charged = payload.charged_bytes();
         if !self.admit(charged) {
             let error = self.run_too_large();
@@ -172,7 +177,11 @@ impl RunLedger {
     /// Text selects a step's text; structured selects its whole structured
     /// value or a nested object field. Returns `None` when the step has not
     /// succeeded or the field is absent.
-    pub(crate) fn select(&self, input: &BTreeMap<String, Value>, binding: &WorkflowBinding) -> Option<Value> {
+    pub(crate) fn select(
+        &self,
+        input: &BTreeMap<String, Value>,
+        binding: &WorkflowBinding,
+    ) -> Option<Value> {
         match binding.source() {
             WorkflowBindingSource::Input(name) => input.get(name).cloned(),
             WorkflowBindingSource::StepText(step) => self
@@ -201,7 +210,10 @@ impl RunLedger {
     /// output field or an over-budget projection fails the run.
     pub(crate) fn finish(mut self, ending: RunEnding, plan: &ExecutionPlan) -> WorkflowRun {
         for step in self.run.steps.values_mut() {
-            if matches!(step.status, WorkflowStepStatus::Pending | WorkflowStepStatus::Running) {
+            if matches!(
+                step.status,
+                WorkflowStepStatus::Pending | WorkflowStepStatus::Running
+            ) {
                 step.status = WorkflowStepStatus::Unstarted;
                 step.started_at = None;
                 step.attempts = 0;
@@ -215,10 +227,12 @@ impl RunLedger {
             }
             RunEnding::TimedOut => {
                 self.run.status = WorkflowRunStatus::TimedOut;
-                self.run.error = Some(WorkflowRunError::from_wyrd(&WyrdError::WorkflowRunTimeout {
-                    message: "workflow run exceeded its total deadline".to_owned(),
-                    details: serde_json::json!({}),
-                }));
+                self.run.error = Some(WorkflowRunError::from_wyrd(
+                    &WyrdError::WorkflowRunTimeout {
+                        message: "workflow run exceeded its total deadline".to_owned(),
+                        details: serde_json::json!({}),
+                    },
+                ));
                 return self.run;
             }
             RunEnding::Settled => {}

@@ -76,6 +76,18 @@ async fn problem_json(response: Response) -> Value {
     serde_json::from_slice(&body).expect("problem JSON")
 }
 
+/// The RFC 8693 form body that exchanges a Wyrd API key for an access token.
+fn api_key_exchange(api_key: &str) -> String {
+    url::form_urlencoded::Serializer::new(String::new())
+        .append_pair(
+            "grant_type",
+            "urn:ietf:params:oauth:grant-type:token-exchange",
+        )
+        .append_pair("subject_token", api_key)
+        .append_pair("subject_token_type", "urn:wyrd:oauth:token-type:api_key")
+        .finish()
+}
+
 /// Pull every `WYRD_…` stable code named in a response description.
 ///
 /// Descriptions are prose with codes in parentheses rather than a structured
@@ -269,39 +281,34 @@ async fn identity_connection_operations_publish_their_contract() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// Tenant human login publishes its header-free contract.
+/// Tenant human login publishes its OAuth authorization-server contract.
 ///
-/// Login begins only with an anonymous `POST /auth/login` whose typed body
-/// carries the tenant route key and binding and whose response is the
-/// authorization URL alone; the retired `GET` form is not served. The common
-/// callback publishes the browser's `303` to the completion page (with its
-/// `Location`) and the CLI's `text/html` page, never a token body, and the
-/// token grant no longer offers `authorization_code`.
+/// The browser begins at `GET /auth/authorize`, which answers `303`; the
+/// retired `/auth/login` is not served. The common callback publishes the
+/// browser's `303` back to the client (with its `Location`) and the CLI's
+/// `text/html` page, never a token body. The token endpoint takes an RFC 6749
+/// form body that offers the authorization-code grant, and RFC 8414 metadata
+/// is served.
 #[tokio::test]
 async fn tenant_login_operations_publish_their_contract() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
     let document = served_document(&server).await;
-    let login = &document["paths"]["/auth/login"];
 
-    assert!(login.get("get").is_none(), "GET /auth/login is retired");
-    let begin = &login["post"];
-    assert_eq!(begin["security"], serde_json::json!([{}]));
-    assert_eq!(
-        begin["requestBody"]["content"]["application/json"]["schema"]["$ref"],
-        "#/components/schemas/BeginLogin"
+    assert!(
+        document["paths"]["/auth/login"].is_null(),
+        "/auth/login is retired"
     );
-    assert_eq!(
-        begin["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
-        "#/components/schemas/BeginLoginResponse"
+    let authorize = &document["paths"]["/auth/authorize"]["get"];
+    assert_eq!(authorize["security"], serde_json::json!([{}]));
+    assert!(
+        authorize["responses"]["303"].is_object(),
+        "authorize redirects: {authorize}"
     );
-    let response_fields = document["components"]["schemas"]["BeginLoginResponse"]["properties"]
-        .as_object()
-        .expect("BeginLoginResponse publishes its properties");
-    assert_eq!(
-        response_fields.keys().collect::<Vec<_>>(),
-        vec!["authorization_url"]
+    assert!(
+        document["paths"]["/.well-known/oauth-authorization-server"]["get"].is_object(),
+        "RFC 8414 metadata is published"
     );
 
     let callback = &document["paths"]["/auth/callback"]["get"]["responses"];
@@ -317,11 +324,16 @@ async fn tenant_login_operations_publish_their_contract() {
         callback["200"]["content"]["application/json"].is_null(),
         "the callback never returns a token body: {callback}"
     );
+    let token = &document["paths"]["/auth/token"]["post"]["requestBody"]["content"];
     assert!(
-        !document["components"]["schemas"]["TokenRequest"]
+        token["application/x-www-form-urlencoded"].is_object(),
+        "the token endpoint takes a form body: {token}"
+    );
+    assert!(
+        document["components"]["schemas"]["TokenRequest"]
             .to_string()
             .contains("authorization_code"),
-        "the authorization-code grant is retired"
+        "the token endpoint offers the authorization-code grant"
     );
 
     server.shutdown().await.expect("server shuts down");
@@ -1572,10 +1584,8 @@ async fn a_malformed_administrative_identifier_answers_with_a_documented_problem
             Request::builder()
                 .method("POST")
                 .uri("/auth/platform/token")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::json!({ "credential": root.expose_secret() }).to_string(),
-                ))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(api_key_exchange(root.expose_secret())))
                 .expect("request builds"),
         )
         .await
@@ -1719,18 +1729,18 @@ async fn an_unavailable_audit_store_answers_with_a_code_the_operation_documents(
 }
 
 /// A credential exchange whose audit cannot be staged fails closed with the
-/// stable code `/auth/token` documents.
+/// RFC 6749 §5.2 error `/auth/token` documents.
 ///
 /// `/auth/token` is the one operation every caller reaches before it has a
 /// session, so the set of refusals it declares is the set a client has to be
-/// able to branch on. The audit-unavailable arm is the one that used to go
-/// undeclared: it is reachable from a perfectly valid credential, and it is the
-/// arm that proves the grant and its audit commit together.
+/// able to branch on. The audit-unavailable arm is reachable from a perfectly
+/// valid credential, and it is the arm that proves the grant and its audit
+/// commit together: it answers `temporarily_unavailable` and no token.
 ///
 /// The failure is injected at the store — the canonical staging table is
 /// renamed out from under the append — so no handler seam has to be stubbed.
 #[tokio::test]
-async fn an_unstageable_exchange_audit_answers_with_a_code_the_token_operation_documents() {
+async fn an_unstageable_exchange_audit_answers_with_an_error_the_token_operation_documents() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1759,27 +1769,25 @@ async fn an_unstageable_exchange_audit_answers_with_a_code_the_token_operation_d
             Request::builder()
                 .method("POST")
                 .uri("/auth/token")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "grant_type": "wyrd_api_key",
-                        "api_key": api_key,
-                    })
-                    .to_string(),
-                ))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(api_key_exchange(&api_key)))
                 .expect("request builds"),
         )
         .await
         .expect("router responds");
 
     let status = response.status();
-    let problem = problem_json(response).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{problem}");
-    let code = problem["code"].as_str().expect("problem carries a code");
-    assert_eq!(code, "WYRD_AUDIT_503_UNAVAILABLE");
+    let body = problem_json(response).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], "temporarily_unavailable", "{body}");
     assert!(
-        documented_description(&document, "/auth/token", "post", 503).contains(code),
-        "the token operation names {code} on its 503"
+        body.get("access_token").is_none(),
+        "no token is served: {body}"
+    );
+    assert!(
+        documented_description(&document, "/auth/token", "post", 503)
+            .contains("temporarily_unavailable"),
+        "the token operation names temporarily_unavailable on its 503"
     );
 
     sqlx::query("ALTER TABLE vala.audit_staging_offline RENAME TO audit_staging")

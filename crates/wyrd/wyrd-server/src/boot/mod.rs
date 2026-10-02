@@ -36,9 +36,7 @@ use vala_bifrost_redux::scribe::{
     ScribeBuildConfig, ScribeExecutionPools, ScribeImpl, ScribeIngressCpuPool,
     ScribePersistenceConfig, ScribePersistenceCpuPool, ScribeWalIoPool,
 };
-use wyrd_auth::browser_sessions::BrowserSessions;
 use wyrd_auth::connections::HumanConnections;
-use wyrd_auth::issuance::TenantTokenIssuer;
 use wyrd_auth::platform_login::PlatformLogin;
 use wyrd_auth::platform_sessions::PlatformSessions;
 use wyrd_auth::sealing::SealedSecretRewrap;
@@ -57,9 +55,9 @@ use wyrd_sql::OperatorPool;
 use wyrd_sql::dsn::{DsnError, ResolvedDsns};
 use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 
+use crate::auth::oauth::OAuthClients;
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use crate::boot::data_root::{BifrostDataRoot, BifrostDataRootError};
-use crate::components::auth::bff::BffChannel;
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::operators::keys::{KeyError, KeyFailure, OperatorKeys};
 use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry, WyrdServerConfig};
@@ -1602,20 +1600,6 @@ async fn install_auth(
         )
     });
     let token_exchange_settings = wyrd_auth::issuance::TokenExchangeSettings::default();
-    // The BFF channel exists only when the deployment provisions its key.
-    let bff = (!config.auth.bff_service_key_hashes.is_empty()).then(|| BffChannel {
-        sessions: BrowserSessions::new(
-            postgres.wyrd().clone(),
-            sealing_key.clone(),
-            TenantTokenIssuer::new(
-                Arc::clone(&handles.issuing_key),
-                token_exchange_settings.clone(),
-            ),
-            Arc::clone(&handles.token_verifier),
-            human_connections.clone(),
-        ),
-        key_hashes: config.auth.bff_service_key_hashes.clone(),
-    });
 
     Ok(ServerAuth {
         issuing_key: Some(handles.issuing_key),
@@ -1625,7 +1609,7 @@ async fn install_auth(
         workload_binding_resolver: Some(binding_resolver),
         human_connections: Some(human_connections),
         platform_login,
-        bff,
+        oauth_clients: OAuthClients::new(config.auth.ui_client_secret_hashes.clone()),
         sealing_key: sealing_key.clone(),
         token_exchange_settings,
     })
@@ -2833,14 +2817,7 @@ pub(crate) mod pg_tests {
 
 #[cfg(test)]
 mod sealing_boot_pg_tests {
-    use std::time::Duration;
-
-    use chrono::Utc;
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
-    use wyrd_spec::auth::Sha256Hex;
-    use wyrd_sql::queries::auth::{
-        BrowserSessionMode, BrowserSessionWrite, insert_browser_session, revoke_browser_session,
-    };
 
     use super::*;
 
@@ -2884,165 +2861,5 @@ mod sealing_boot_pg_tests {
             matches!(refused, ServerBootError::SealingKey(_)),
             "{refused:?}"
         );
-    }
-
-    /// A keyless deployment refuses to boot while a live browser session still
-    /// holds sealed credentials, and boots once that session is revoked, since
-    /// revocation wipes every sealed value of the row.
-    ///
-    /// # Panics
-    /// Panics when the session cannot be stored or revoked, or either boot
-    /// outcome differs.
-    #[tokio::test]
-    async fn keyless_boot_refuses_while_a_browser_session_envelope_remains() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let operator = fixture.operator_pool().clone();
-        let id_hash = Sha256Hex::digest(b"keyless-boot-browser-session");
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        insert_browser_session(
-            &mut conn,
-            &id_hash,
-            &BrowserSessionWrite {
-                principal_id: uuid::Uuid::new_v4(),
-                connection_id: None,
-                mode: BrowserSessionMode::ApiKeyExchange,
-                refresh_chain_id: None,
-                access_token_sealed: vec![1, 2],
-                access_expires_at: Utc::now(),
-                refresh_token_sealed: None,
-                refresh_expires_at: None,
-                api_key_sealed: Some(vec![3, 4]),
-                csrf_hash: Sha256Hex::digest(b"csrf"),
-                csrf_token_sealed: vec![5, 6],
-                lifetime: Duration::from_hours(8),
-            },
-        )
-        .await
-        .expect("session stores")
-        .expect("session id is new");
-        conn.commit().await.expect("session commits");
-
-        let refused = rewrap_sealed_secrets(Some(operator.clone()), None)
-            .await
-            .expect_err("a keyless deployment with a live session envelope refuses to boot");
-        assert!(
-            matches!(refused, ServerBootError::SealingKey(_)),
-            "{refused:?}"
-        );
-
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        assert!(
-            revoke_browser_session(&mut conn, &id_hash)
-                .await
-                .expect("session revokes")
-        );
-        conn.commit().await.expect("revocation commits");
-        rewrap_sealed_secrets(Some(operator), None)
-            .await
-            .expect("a revoked session holds no ciphertext, so keyless boot proceeds");
-    }
-
-    /// Absolute expiry makes a browser session unreachable but does not delete
-    /// its row, so an expired, non-revoked session still stores ciphertext
-    /// until the tenant's next session insertion purges it. The canonical
-    /// rewrap pass must count and reseal those envelopes, and a keyless
-    /// deployment must refuse to boot until they are wiped.
-    ///
-    /// The session is stored with K1 envelopes for each sealed column of an
-    /// API-key session (access token, API key, CSRF token), then backdated past
-    /// its absolute expiry. A K2-write/K1-retained pass must reseal all three,
-    /// keyless boot must refuse while they remain, and wiping them through
-    /// revocation must let keyless boot proceed.
-    ///
-    /// # Panics
-    /// Panics when the session cannot be stored, backdated, or revoked, when
-    /// the rewrap pass fails or reports other counts, or when either boot
-    /// outcome differs.
-    #[tokio::test]
-    async fn keyless_boot_refuses_while_an_expired_browser_session_envelope_remains() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let operator = fixture.operator_pool().clone();
-        let k1 = SealingKeyring::new(SecretKey::from_bytes([1_u8; 32]));
-        let seal = |plaintext: &[u8]| k1.seal(plaintext).expect("K1 seals");
-        let id_hash = Sha256Hex::digest(b"keyless-boot-expired-browser-session");
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        insert_browser_session(
-            &mut conn,
-            &id_hash,
-            &BrowserSessionWrite {
-                principal_id: uuid::Uuid::new_v4(),
-                connection_id: None,
-                mode: BrowserSessionMode::ApiKeyExchange,
-                refresh_chain_id: None,
-                access_token_sealed: seal(b"access"),
-                access_expires_at: Utc::now(),
-                refresh_token_sealed: None,
-                refresh_expires_at: None,
-                api_key_sealed: Some(seal(b"api-key")),
-                csrf_hash: Sha256Hex::digest(b"csrf"),
-                csrf_token_sealed: seal(b"csrf"),
-                lifetime: Duration::from_hours(8),
-            },
-        )
-        .await
-        .expect("session stores")
-        .expect("session id is new");
-        conn.commit().await.expect("session commits");
-        let superuser = fixture
-            .superuser_pool()
-            .await
-            .expect("superuser pool opens");
-        let backdated = sqlx::query(
-            "UPDATE wyrd.auth_browser_sessions \
-             SET absolute_expires_at = statement_timestamp() - interval '1 hour' \
-             WHERE id_hash = $1",
-        )
-        .bind(id_hash.as_bytes().as_slice())
-        .execute(&superuser)
-        .await
-        .expect("session is backdated past its absolute expiry");
-        assert_eq!(backdated.rows_affected(), 1);
-
-        let rotated = Arc::new(
-            SealingKeyring::new(SecretKey::from_bytes([2_u8; 32]))
-                .with_retained(SecretKey::from_bytes([1_u8; 32])),
-        );
-        let report = SealedSecretRewrap::new(operator.clone(), Some(Arc::clone(&rotated)))
-            .run()
-            .await
-            .expect("rewrap pass runs");
-        assert_eq!(
-            (report.rewrapped, report.current, report.remaining),
-            (3, 0, 0),
-            "every expired-session envelope is resealed under K2"
-        );
-        let report = SealedSecretRewrap::new(operator.clone(), Some(rotated))
-            .run()
-            .await
-            .expect("verification pass runs");
-        assert_eq!(
-            (report.rewrapped, report.current, report.remaining),
-            (0, 3, 0),
-            "the verification pass sees every expired-session envelope current"
-        );
-
-        let refused = rewrap_sealed_secrets(Some(operator.clone()), None)
-            .await
-            .expect_err("a keyless deployment with an expired session envelope refuses to boot");
-        assert!(
-            matches!(refused, ServerBootError::SealingKey(_)),
-            "{refused:?}"
-        );
-
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        assert!(
-            revoke_browser_session(&mut conn, &id_hash)
-                .await
-                .expect("expired session revokes")
-        );
-        conn.commit().await.expect("revocation commits");
-        rewrap_sealed_secrets(Some(operator), None)
-            .await
-            .expect("wiped envelopes leave no ciphertext, so keyless boot proceeds");
     }
 }

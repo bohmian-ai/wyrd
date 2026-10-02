@@ -28,9 +28,9 @@ use wyrd_runtime::Permission;
 use wyrd_spec::auth::{
     ConfigurePlatformOidcRequest, IssuerUrl, LoginInitResponse, PlatformCallbackRequest,
     PlatformClientAuth, PlatformLoginRequest, PlatformOidcConnectionView,
-    PlatformPrincipalListResponse, PlatformPrincipalSummary, PlatformTokenResponse, PrincipalId,
-    PrincipalKindTag, RegisterPlatformAdminRequest, RegisterPlatformAdminResponse, SecretBearer,
-    SetPlatformPrincipalStatusRequest,
+    PlatformPrincipalListResponse, PlatformPrincipalSummary, PrincipalId, PrincipalKindTag,
+    RegisterPlatformAdminRequest, RegisterPlatformAdminResponse, SetPlatformPrincipalStatusRequest,
+    TokenResponse,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
@@ -722,7 +722,7 @@ async fn begin_login(
     request_body = PlatformCallbackRequest,
     responses(
         (status = 200, description = "Platform session for the resolved administrator",
-         body = PlatformTokenResponse),
+         body = TokenResponse),
         (status = 401, description = "Identity not accepted, indistinguishably for every cause \
           (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 503, description = "Identity provider unavailable \
@@ -740,7 +740,7 @@ async fn complete_login(
     State(state): State<AppState>,
     request_id: Option<Extension<RequestId>>,
     Json(request): Json<PlatformCallbackRequest>,
-) -> Result<Json<PlatformTokenResponse>, WyrdErrorResponse> {
+) -> Result<Json<TokenResponse>, WyrdErrorResponse> {
     let fallback_request_id: String;
     let req_id = match request_id.as_ref() {
         Some(axum::Extension(id)) => id.as_str(),
@@ -759,14 +759,9 @@ async fn complete_login(
         .await
         .map_err(login_error)?;
 
-    Ok(Json(PlatformTokenResponse {
-        access_token: SecretBearer::new(token.expose_secret().to_owned()),
-        token_type: "Bearer".to_owned(),
-        expires_in: u64::try_from(
-            wyrd_auth::platform_sessions::DEFAULT_PLATFORM_TOKEN_TTL_MINUTES * 60,
-        )
-        .unwrap_or(900),
-    }))
+    Ok(Json(
+        crate::components::platform::routes::platform_session_response(token.expose_secret()),
+    ))
 }
 
 /// Project a platform authorization failure onto the public catalog.

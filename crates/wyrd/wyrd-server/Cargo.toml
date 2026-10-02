@@ -106,6 +106,7 @@ utoipa-axum = { workspace = true }
 workspace-hack.workspace = true
 tracing-subscriber = { workspace = true }
 insta = { workspace = true }
+oauth2 = { workspace = true }
 reqwest = { workspace = true }
 wyrd-storage = { workspace = true }
 temp-env = { workspace = true }

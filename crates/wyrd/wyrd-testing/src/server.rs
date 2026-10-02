@@ -84,9 +84,7 @@ use wyrd_telemetry::TelemetryGuard;
 
 use crate::bifrost::ForgeObjectStoreControl;
 
-use wyrd_spec::auth::{
-    ExchangeTokenType, SecretBearer, TokenAudience, TokenRequest, TokenResponse,
-};
+use wyrd_spec::auth::{TokenAudience, TokenResponse};
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
@@ -406,9 +404,9 @@ pub struct WyrdTestServerBuilder {
     sealing_keyring: Option<Arc<SealingKeyring>>,
     /// Deployment public origin the human-connection callback URL derives from.
     public_origin: Option<Url>,
-    /// SHA-256 of the raw BFF service key; `Some` mounts the private
-    /// browser-session channel.
-    bff_service_key_hash: Option<wyrd_spec::auth::Sha256Hex>,
+    /// SHA-256 of the `wyrd-ui` client secret; `None` leaves `wyrd-ui`
+    /// unable to authenticate.
+    ui_client_secret_hash: Option<wyrd_spec::auth::Sha256Hex>,
     forge_interval: Duration,
     /// Executor slots composed into the production Forge worker.
     wal_sync_delay: Duration,
@@ -578,7 +576,7 @@ impl Default for WyrdTestServerBuilder {
             workload_binding_configs: Vec::new(),
             sealing_keyring: None,
             public_origin: None,
-            bff_service_key_hash: None,
+            ui_client_secret_hash: None,
             forge_interval: Duration::from_secs(60),
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
@@ -3133,22 +3131,15 @@ impl WyrdTestServer {
         &self,
         key: &SecretString,
     ) -> Result<String, WyrdTestServerError> {
-        let body = serde_json::to_vec(&TokenRequest::WyrdApiKey {
-            api_key: SecretBearer::new(key.expose_secret().to_owned()),
-        })
-        .map_err(|error| WyrdTestServerError::Io(error.to_string()))?;
-        let response = self
-            .raw_call(
-                Request::builder()
-                    .method("POST")
-                    .uri("/auth/token")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(body))
-                    .map_err(|error| WyrdTestServerError::Io(error.to_string()))?,
-            )
-            .await?;
-        let token = parse_success::<TokenResponse>(response).await?;
-        Ok(token.access_token.expose().to_owned())
+        self.token(&[
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            ("subject_token", key.expose_secret()),
+            ("subject_token_type", "urn:wyrd:oauth:token-type:api_key"),
+        ])
+        .await
     }
 
     /// Exchange `subject_jwt` and `actor_jwt` through `/auth/token` for a
@@ -3166,20 +3157,37 @@ impl WyrdTestServer {
         actor_jwt: &str,
         audience: TokenAudience,
     ) -> Result<String, WyrdTestServerError> {
-        let body = serde_json::to_vec(&TokenRequest::TokenExchange {
-            subject_token: SecretBearer::new(subject_jwt.to_owned()),
-            subject_token_type: ExchangeTokenType::AccessToken,
-            actor_token: SecretBearer::new(actor_jwt.to_owned()),
-            actor_token_type: ExchangeTokenType::AccessToken,
-            audience,
-        })
-        .map_err(|error| WyrdTestServerError::Io(error.to_string()))?;
+        let access_token = "urn:ietf:params:oauth:token-type:access_token";
+        self.token(&[
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            ("subject_token", subject_jwt),
+            ("subject_token_type", access_token),
+            ("actor_token", actor_jwt),
+            ("actor_token_type", access_token),
+            ("audience", audience.as_str()),
+        ])
+        .await
+    }
+
+    /// POST the form `params` to the real `/auth/token` route and return the
+    /// issued access token.
+    ///
+    /// # Errors
+    /// Returns an error when the route refuses the grant or response parsing
+    /// fails.
+    async fn token(&self, params: &[(&str, &str)]) -> Result<String, WyrdTestServerError> {
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(params)
+            .finish();
         let response = self
             .raw_call(
                 Request::builder()
                     .method("POST")
                     .uri("/auth/token")
-                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                     .body(Body::from(body))
                     .map_err(|error| WyrdTestServerError::Io(error.to_string()))?,
             )
@@ -4030,12 +4038,11 @@ impl WyrdTestServerBuilder {
         self
     }
 
-    /// Provision the deployment BFF service key, mounting the private
-    /// `/internal/bff/v1/*` browser-session channel exactly as
-    /// `WYRD_BFF_SERVICE_KEY_SHA256` does in production.
+    /// Register the `wyrd-ui` confidential client with `secret`, exactly as
+    /// `WYRD_UI_CLIENT_SECRET_SHA256` does in production.
     #[must_use]
-    pub fn with_bff_service_key(mut self, raw_key: &str) -> Self {
-        self.bff_service_key_hash = Some(wyrd_spec::auth::Sha256Hex::digest(raw_key.as_bytes()));
+    pub fn with_ui_client_secret(mut self, secret: &str) -> Self {
+        self.ui_client_secret_hash = Some(wyrd_spec::auth::Sha256Hex::digest(secret.as_bytes()));
         self
     }
 
@@ -4422,21 +4429,6 @@ impl WyrdTestServerBuilder {
             )),
             DeploymentProfile::Development.screened_http(),
         );
-        let bff =
-            self.bff_service_key_hash
-                .map(|hash| wyrd_server::components::auth::bff::BffChannel {
-                    sessions: wyrd_auth::browser_sessions::BrowserSessions::new(
-                        runtime_wyrd.clone(),
-                        Some(Arc::clone(&sealing_key)),
-                        wyrd_auth::issuance::TenantTokenIssuer::new(
-                            Arc::clone(&issuing_key),
-                            exchange_settings.clone(),
-                        ),
-                        Arc::clone(&verifier),
-                        human_connections.clone(),
-                    ),
-                    key_hashes: vec![hash],
-                });
         let postgres = Arc::new(ServerPostgres::from_parts(runtime_wyrd, runtime_vala));
         let resource_roles = self
             .bifrost_roles
@@ -4636,7 +4628,9 @@ impl WyrdTestServerBuilder {
                 sealing_key: Some(sealing_key),
                 human_connections: Some(human_connections),
                 platform_login: Some(platform_login),
-                bff,
+                oauth_clients: wyrd_server::auth::oauth::OAuthClients::new(
+                    self.ui_client_secret_hash.into_iter().collect(),
+                ),
             })
             .with_gateway(test_gateway_config(
                 fixture.data_tenant_id(),

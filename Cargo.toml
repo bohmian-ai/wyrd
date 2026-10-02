@@ -98,6 +98,9 @@ http = "1"
 # validation). Its `reqwest` feature stays off: provider HTTP runs through the
 # screened transport in `wyrd-auth-oidc`.
 openidconnect = { version = "=4.0.1", default-features = false }
+# Off-the-shelf OAuth client the identity journeys drive the device and
+# refresh grants with (test-only).
+oauth2 = { version = "=5.0.0", default-features = false }
 http-body = "1"
 serde = { version = "1", features = ["derive"] }
 serde_jcs = "0.1"

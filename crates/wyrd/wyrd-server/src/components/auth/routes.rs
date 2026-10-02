@@ -1,24 +1,29 @@
-//! HTTP routes for the tenant auth surfaces: tenant human login initiation,
-//! token exchange, OIDC callback, and Card-bound API key issuance.
+//! HTTP routes for the tenant auth surfaces: the OAuth authorization
+//! server (authorization, token, device authorization, revocation, and
+//! metadata endpoints), the OIDC provider callback, and Card-bound API key
+//! issuance.
 
 use axum::Json;
 use axum::extract::{Extension, Query, State};
-use axum::http::HeaderMap;
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
 use std::sync::Arc;
 
 use base64::Engine;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use tower_governor::GovernorLayer;
 use tower_governor::governor::GovernorConfigBuilder;
 use uuid::Uuid;
+use wyrd_auth::callback::{AuthorizationCodeExchange, LoginCompletion};
 use wyrd_auth_verify::AccessTokenClaims;
 use wyrd_spec::auth::{
-    CallbackQuery, IssueKeyRequest, LoginInitiation, TokenRequest, TokenResponse,
+    CallbackQuery, ExchangeTokenType, IssueKeyRequest, OAuthClientId, OAuthErrorCode,
+    OAuthErrorResponse, SecretBearer, TokenAudience, TokenRequest, TokenResponse,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
 
+use crate::auth::authorize::{client_redirect, error_name};
 use crate::auth::callback::exchange_authorization_code;
 use crate::auth::card_scope::{
     MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_REFRESH, audit_scope_mint_failure_best_effort,
@@ -29,6 +34,7 @@ use crate::auth::exchange_api_key::{
 };
 use crate::auth::issue_api_key::{IssueApiKey, WyrdApiKey};
 use crate::auth::jwt_bearer::exchange_jwt_bearer;
+use crate::auth::oauth::{GRANT_TYPES, OAuthError, OAuthForm, no_store};
 use crate::auth::refresh::{RefreshError, RefreshTokens, tenant_from_refresh_jwt};
 use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::http::error::WyrdErrorResponse;
@@ -39,14 +45,15 @@ use utoipa_axum::routes;
 
 /// Build the tenant-plane auth router.
 ///
-/// Mounts the auth surfaces — human login initiation (`POST /auth/login`),
-/// the CLI device authorization (`POST /auth/device_authorization`) and its
-/// verification page (`GET`/`POST /auth/device`), the common OIDC provider
-/// callback (`GET /auth/callback`), credential exchange (`POST /auth/token`),
-/// refresh revocation (`POST /auth/revoke`), and API key issuance
-/// (`POST /auth/issue-key`) — behind one shared per-peer-IP governor, so
-/// credential guessing, device-code polling, and login-state churn draw on a
-/// single admission budget rather than one per route.
+/// Mounts the auth surfaces — the authorization endpoint
+/// (`GET /auth/authorize`), the CLI device authorization
+/// (`POST /auth/device_authorization`) and its verification page
+/// (`GET`/`POST /auth/device`), the common OIDC provider callback
+/// (`GET /auth/callback`), the token endpoint (`POST /auth/token`), token
+/// revocation (`POST /auth/revoke`), authorization server metadata, and API
+/// key issuance (`POST /auth/issue-key`) — behind one shared per-peer-IP
+/// governor, so credential guessing, device-code polling, and login-state
+/// churn draw on a single admission budget rather than one per route.
 ///
 /// # Panics
 /// Panics when the static governor configuration is invalid (a zero period
@@ -62,65 +69,54 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
     );
 
     OpenApiRouter::new()
-        .routes(routes!(crate::auth::login::login))
+        .routes(routes!(crate::auth::authorize::authorize))
+        .routes(routes!(crate::auth::authorize::metadata))
         .routes(routes!(crate::auth::cli_login::device_authorization))
         .routes(routes!(
             crate::auth::cli_login::device_page,
             crate::auth::cli_login::device_decision
         ))
-        .routes(routes!(crate::auth::cli_login::revoke_refresh_token))
+        .routes(routes!(crate::auth::cli_login::revoke))
         .routes(routes!(callback))
         .routes(routes!(token))
         .routes(routes!(issue_key))
         .layer(GovernorLayer::new(auth_governor))
 }
 
-/// `POST /auth/token` — exchange a credential for a short-lived access token.
+/// `POST /auth/token` — the OAuth token endpoint.
 ///
-/// The one tenant-plane entry point: a Wyrd API key, an external JWT bearer
-/// bound to a workload, a refresh token, an RFC 8628 device code, or an RFC
-/// 8693 delegation all arrive here and leave with the same [`TokenResponse`]. Tenant and principal are
-/// derived from the verified credential, never from a client-supplied header.
-///
-/// Every invalid-credential condition returns one indistinguishable `401` so
-/// the response cannot be used to probe which part was wrong.
+/// Every tenant grant arrives here as form parameters and leaves with the
+/// same RFC 6749 §5.1 [`TokenResponse`]: an authorization code (RFC 6749
+/// §4.1.3, `wyrd-ui`), a refresh token (§6), an RFC 8628 device code
+/// (`wyrd-cli`), an RFC 8693 token exchange — a Wyrd API key as subject, or
+/// a delegation — and an RFC 7523 workload assertion. The human grants
+/// require their client: `wyrd-ui` authenticates with its Basic secret and
+/// `wyrd-cli` names itself with `client_id`. Tenant and principal are derived
+/// from the verified credential, never from a client-supplied header.
 ///
 /// # Errors
-/// Returns a `400` when a token exchange's identity input is malformed or its
-/// delegation would exceed the configured chain depth, a `401` for every
-/// unusable credential — including a reused, revoked, or expired refresh token
-/// and an invalid subject or actor token — a `404` when the actor's principal or
-/// the presented workload assertion matches no principal, and a `503` when the
-/// auth backend or the audit path is unavailable. The grant and its exchange
-/// audit commit together, so a refusal serves no token.
+/// Answers the RFC 6749 §5.2 body: `invalid_request` for a malformed
+/// request — and, per RFC 8693 §2.2.2, an unusable subject or actor token —
+/// `invalid_client` (`401`) for a missing or refused client,
+/// `unauthorized_client` for a grant another client must use,
+/// `unsupported_grant_type`, `invalid_grant` for every unusable code,
+/// refresh token, device code, or assertion, the RFC 8628 §3.5 device codes,
+/// and `server_error` or `temporarily_unavailable` when issuance, the store,
+/// or the audit path fails. The grant and its audit commit together, so a
+/// refusal serves no token.
 #[utoipa::path(
     post,
     path = "/auth/token",
-    request_body = TokenRequest,
+    request_body(content = TokenRequest, content_type = "application/x-www-form-urlencoded"),
     responses(
         (status = 200, description = "Access token issued", body = TokenResponse),
-        (status = 400, description = "The token exchange's identity input is malformed — a \
-          delegated or Card-free actor token, or a party exchanging with itself \
-          (WYRD_SPEC_400_VALIDATION) — or the delegation would exceed the configured chain \
-          depth (WYRD_AUTH_400_DELEGATION_DEPTH_EXCEEDED); or a device code issued no \
-          credential, with the RFC 8628 error in `details.error`: `authorization_pending`, \
-          `slow_down`, `access_denied`, `expired_token`, or `invalid_grant` \
-          (WYRD_AUTH_400_DEVICE_AUTHORIZATION)", body = WyrdProblem),
-        (status = 401, description = "The presented credential is not usable. Every \
-          invalid-credential condition renders one indistinguishable refusal \
-          (WYRD_AUTH_401_API_KEY_INVALID); a refresh token that was already consumed reports \
-          the reuse it contained (WYRD_AUTH_401_REFRESH_REUSED), one that is revoked, expired, \
-          or malformed reports that (WYRD_AUTH_401_REFRESH_REVOKED), and a subject token whose \
-          delegation chain is already at the limit reports that \
-          (WYRD_AUTH_401_DELEGATION_DEPTH_EXCEEDED)", body = WyrdProblem),
-        (status = 404, description = "No principal in this tenant matches the token \
-          exchange's actor or the presented workload assertion \
-          (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "Token issuance or the server's own auth configuration \
-          failed, so no token was served (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
-        (status = 503, description = "The auth backend is unavailable \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE), or the exchange audit could not be staged, which \
-          fails the grant closed (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+        (status = 400, description = "RFC 6749 §5.2 or RFC 8628 §3.5 refusal: \
+          `invalid_request`, `invalid_grant`, `unauthorized_client`, \
+          `unsupported_grant_type`, `authorization_pending`, `slow_down`, `access_denied`, \
+          or `expired_token`", body = OAuthErrorResponse),
+        (status = 401, description = "`invalid_client`", body = OAuthErrorResponse),
+        (status = 500, description = "`server_error`", body = OAuthErrorResponse),
+        (status = 503, description = "`temporarily_unavailable`", body = OAuthErrorResponse)
     ),
     // No session exists yet at this operation, so it clears the document-wide
     // requirement instead of inheriting it.
@@ -132,168 +128,274 @@ async fn token(
     State(state): State<AppState>,
     headers: HeaderMap,
     request_id: Option<Extension<RequestId>>,
-    Json(request): Json<TokenRequest>,
-) -> Result<Json<TokenResponse>, WyrdErrorResponse> {
-    let request_id_str: String;
-    let req_id = match request_id.as_ref() {
-        Some(Extension(id)) => id.as_str(),
-        None => {
-            request_id_str = Uuid::new_v4().to_string();
-            &request_id_str
+    form: OAuthForm,
+) -> Result<Response, OAuthError> {
+    let client = state.auth.oauth_clients.identify(&headers, &form)?;
+    match form.get("grant_type") {
+        None => return Err(OAuthError(OAuthErrorCode::InvalidRequest)),
+        Some(grant) if !GRANT_TYPES.contains(&grant) => {
+            return Err(OAuthError(OAuthErrorCode::UnsupportedGrantType));
         }
+        Some(_) => {}
+    }
+    let request_id = request_id.map_or_else(RequestId::now_v7, |Extension(id)| id);
+    let grants = TokenGrants {
+        state: &state,
+        request_id: request_id.as_str(),
     };
-    match request {
-        TokenRequest::WyrdApiKey { api_key } => {
-            // A key that does not parse names no tenant, so there is no
-            // connection to reach and no row to verify against — and returning
-            // here for free is exactly what makes a malformed key
-            // distinguishable by clock from a live prefix with a wrong tail.
-            // One verification against the fixed dummy costs what the real
-            // comparison costs, and the refusal is the same one every invalid
-            // key earns.
-            let parsed = match WyrdApiKey::parse(api_key.expose()) {
-                Ok(parsed) => parsed,
-                Err(_) => {
-                    verify_presented(&SecretString::from(api_key.expose().to_owned()), None)
-                        .await
-                        .map_err(|error| {
-                            WyrdErrorResponse::from(internal_failure(
-                                "api key verification failed",
-                                &error,
-                            ))
-                        })?;
-                    return Err(WyrdErrorResponse::from(api_key_invalid()));
-                }
-            };
-            let issuer = state.auth.tenant_issuer().ok_or_else(auth_not_configured)?;
-            let mut conn = state
-                .postgres
-                .tenant_conn(parsed.tenant_id)
-                .await
-                .map_err(sql_error)?;
-            let prefix = parsed.prefix.clone();
-            let exchanged = ExchangeApiKey { issuer }
-                .execute(
-                    &mut conn,
-                    SecretString::from(api_key.expose().to_owned()),
-                    req_id,
-                )
-                .await;
-            let exchanged = match exchanged {
-                Ok(exchanged) => exchanged,
-                Err(error) => {
-                    let wyrd = map_exchange_error_to_wyrd(&mut conn, &prefix, error).await;
-                    audit_scope_mint_failure_best_effort(
-                        state.postgres.wyrd(),
-                        parsed.tenant_id,
-                        req_id,
-                        MINT_KIND_API_KEY_EXCHANGE,
-                        &wyrd,
-                    )
-                    .await;
-                    return Err(WyrdErrorResponse::from(wyrd));
-                }
-            };
-            conn.commit().await.map_err(sql_error)?;
-            Ok(Json(exchanged.into_response()))
+    let required = client.ok_or(OAuthError(OAuthErrorCode::InvalidClient));
+    let response = match form.decode()? {
+        TokenRequest::AuthorizationCode {
+            code,
+            redirect_uri,
+            code_verifier,
+        } => grants
+            .authorization_code(&code, required?, &redirect_uri, &code_verifier)
+            .await
+            .map_err(OAuthError::from)?,
+        TokenRequest::RefreshToken { refresh_token } => grants
+            .refresh(&refresh_token, required?)
+            .await
+            .map_err(OAuthError::from)?,
+        TokenRequest::DeviceCode { device_code } => {
+            if required? != OAuthClientId::WyrdCli {
+                return Err(OAuthError(OAuthErrorCode::UnauthorizedClient));
+            }
+            crate::auth::cli_login::cli_logins(&state)?
+                .redeem(&device_code, request_id.as_str())
+                .await?
         }
         TokenRequest::TokenExchange {
             subject_token,
-            subject_token_type: _,
-            actor_token,
-            actor_token_type: _,
-            audience,
-        } => {
-            let issuer = state.auth.tenant_issuer().ok_or_else(auth_not_configured)?;
-            let verifier = state
-                .auth
-                .token_verifier
-                .clone()
-                .ok_or_else(auth_not_configured)?;
-            // Both tokens are verified against this tenant, so an actor token
-            // from any other tenant is refused.
-            let tenant_id = tenant_from_unverified_access_token(subject_token.expose())?;
-            let conn = state
-                .postgres
-                .tenant_conn(tenant_id)
-                .await
-                .map_err(sql_error)?;
-            // The exchange commits its own authorization decision, so a
-            // refusal after the policy decision is still durably audited.
-            let exchanged = DelegateToken { issuer, verifier }
-                .execute(
-                    conn,
-                    SecretString::from(subject_token.expose().to_owned()),
-                    SecretString::from(actor_token.expose().to_owned()),
-                    audience,
-                    req_id,
-                )
-                .await
-                .map_err(|error| WyrdErrorResponse::from(WyrdError::from(error)))?;
-            Ok(Json(exchanged.into_response()))
-        }
-        TokenRequest::RefreshToken { refresh_token } => {
-            let secret = refresh_token.expose().to_owned();
-            let tenant_id = tenant_from_refresh_jwt(&secret)?;
-            let mut conn = state
-                .postgres
-                .tenant_conn(tenant_id)
-                .await
-                .map_err(sql_error)?;
-            let issuer = state.auth.tenant_issuer().ok_or_else(auth_not_configured)?;
-            let exchanged = RefreshTokens { issuer }
-                .execute(&mut conn, SecretString::from(secret), req_id)
-                .await;
-            let exchanged = match exchanged {
-                Ok(exchanged) => exchanged,
-                Err(error) => {
-                    // Replay is the one refusal that also writes. Detection
-                    // revoked the whole family and appended the canonical
-                    // revocation event on this transaction; rolling that back
-                    // with every other error would tell the legitimate holder
-                    // the theft was contained while leaving the attacker's
-                    // successor usable. Committing first makes the containment
-                    // durable, and the 401 is rendered from the typed outcome
-                    // exactly as before.
-                    if matches!(error, RefreshError::Reused) {
-                        conn.commit().await.map_err(sql_error)?;
-                    }
-                    let wyrd = WyrdError::from(error);
-                    audit_scope_mint_failure_best_effort(
-                        state.postgres.wyrd(),
-                        tenant_id,
-                        req_id,
-                        MINT_KIND_REFRESH,
-                        &wyrd,
-                    )
-                    .await;
-                    return Err(WyrdErrorResponse::from(wyrd));
-                }
-            };
-            conn.commit().await.map_err(sql_error)?;
-            Ok(Json(exchanged.into_response()))
-        }
-        TokenRequest::DeviceCode { device_code } => crate::auth::cli_login::cli_logins(&state)?
-            .redeem(&device_code, req_id)
+            subject_token_type: ExchangeTokenType::ApiKey,
+            actor_token: None,
+            actor_token_type: None,
+            audience: None,
+        } => grants
+            .api_key(&subject_token)
             .await
-            .map(Json)
-            .map_err(WyrdErrorResponse::from),
-        TokenRequest::JwtBearer { assertion, tenant } => {
-            let exchanged = exchange_jwt_bearer(
-                &state,
-                &headers,
-                assertion.into_secret_string(),
-                tenant,
-                req_id,
+            .map_err(OAuthError::request)?,
+        TokenRequest::TokenExchange {
+            subject_token,
+            subject_token_type: ExchangeTokenType::AccessToken,
+            actor_token: Some(actor_token),
+            actor_token_type: Some(ExchangeTokenType::AccessToken),
+            audience: Some(audience),
+        } => grants
+            .delegate(&subject_token, &actor_token, audience)
+            .await
+            .map_err(OAuthError::request)?,
+        TokenRequest::TokenExchange { .. } => {
+            return Err(OAuthError(OAuthErrorCode::InvalidRequest));
+        }
+        TokenRequest::JwtBearer { assertion, tenant } => exchange_jwt_bearer(
+            &state,
+            &headers,
+            assertion.into_secret_string(),
+            tenant,
+            request_id.as_str(),
+        )
+        .await
+        .map_err(|error| OAuthError::from(error.0))?
+        .into_response(),
+    };
+    Ok(no_store(StatusCode::OK, Json(response)))
+}
+
+/// The tenant grants of one token-endpoint request, over the server's auth
+/// configuration and the request's id.
+struct TokenGrants<'a> {
+    /// Server state holding the auth owners and the runtime store.
+    state: &'a AppState,
+    /// The request id every audit event of the grant carries.
+    request_id: &'a str,
+}
+
+impl TokenGrants<'_> {
+    /// Redeem an authorization code issued to `client` (RFC 6749 §4.1.3).
+    ///
+    /// # Errors
+    /// The refusals of [`AuthorizationCodeExchange::redeem_code`], and
+    /// [`WyrdError::Internal`] when auth is not configured.
+    async fn authorization_code(
+        &self,
+        code: &SecretBearer,
+        client: OAuthClientId,
+        redirect_uri: &str,
+        code_verifier: &SecretBearer,
+    ) -> Result<TokenResponse, WyrdError> {
+        AuthorizationCodeExchange {
+            issuer: self.issuer()?,
+            connections: self
+                .state
+                .auth
+                .human_connections
+                .clone()
+                .ok_or_else(not_configured)?,
+        }
+        .redeem_code(code, client, redirect_uri, code_verifier, self.request_id)
+        .await
+    }
+
+    /// Exchange a Wyrd API key for an access token of its own principal.
+    ///
+    /// A key that does not parse names no tenant, so there is no connection
+    /// to reach and no row to verify against — and returning for free is
+    /// exactly what would make a malformed key distinguishable by clock from
+    /// a live prefix with a wrong tail. One verification against the fixed
+    /// dummy costs what the real comparison costs, and the refusal is the
+    /// same one every invalid key earns.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::ApiKeyInvalid`] for every unusable key, audited
+    /// best-effort when it names a tenant, and a store or issuance error.
+    async fn api_key(&self, api_key: &SecretBearer) -> Result<TokenResponse, WyrdError> {
+        let presented = SecretString::from(api_key.expose().to_owned());
+        let Ok(parsed) = WyrdApiKey::parse(api_key.expose()) else {
+            verify_presented(&presented, None)
+                .await
+                .map_err(|error| internal_failure("api key verification failed", &error))?;
+            return Err(api_key_invalid());
+        };
+        let issuer = self.issuer()?;
+        let mut conn = self
+            .state
+            .postgres
+            .tenant_conn(parsed.tenant_id)
+            .await
+            .map_err(store_unavailable)?;
+        let exchanged = match (ExchangeApiKey { issuer })
+            .execute(&mut conn, presented, self.request_id)
+            .await
+        {
+            Ok(exchanged) => exchanged,
+            Err(error) => {
+                let wyrd = map_exchange_error_to_wyrd(&mut conn, &parsed.prefix, error).await;
+                audit_scope_mint_failure_best_effort(
+                    self.state.postgres.wyrd(),
+                    parsed.tenant_id,
+                    self.request_id,
+                    MINT_KIND_API_KEY_EXCHANGE,
+                    &wyrd,
+                )
+                .await;
+                return Err(wyrd);
+            }
+        };
+        conn.commit().await.map_err(store_unavailable)?;
+        Ok(exchanged.into_exchange_response())
+    }
+
+    /// Run an RFC 8693 delegation: the holder of `actor_token` acts for the
+    /// holder of `subject_token`, bound to `audience`.
+    ///
+    /// Both tokens are verified against the subject's tenant, so an actor
+    /// token from any other tenant is refused. The exchange commits its own
+    /// authorization decision, so a refusal after the policy decision is
+    /// still durably audited.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::BadTokenFormat`] for a subject token that is not
+    /// a compact JWT, and the refusals of [`DelegateToken::execute`].
+    async fn delegate(
+        &self,
+        subject_token: &SecretBearer,
+        actor_token: &SecretBearer,
+        audience: TokenAudience,
+    ) -> Result<TokenResponse, WyrdError> {
+        let issuer = self.issuer()?;
+        let verifier = self
+            .state
+            .auth
+            .token_verifier
+            .clone()
+            .ok_or_else(not_configured)?;
+        let tenant_id = tenant_from_unverified_access_token(subject_token.expose())?;
+        let conn = self
+            .state
+            .postgres
+            .tenant_conn(tenant_id)
+            .await
+            .map_err(store_unavailable)?;
+        let exchanged = DelegateToken { issuer, verifier }
+            .execute(
+                conn,
+                SecretString::from(subject_token.expose().to_owned()),
+                SecretString::from(actor_token.expose().to_owned()),
+                audience,
+                self.request_id,
             )
             .await?;
-            Ok(Json(exchanged.into_response()))
-        }
+        Ok(exchanged.into_exchange_response())
+    }
+
+    /// Renew a human session with its refresh token for `client` (RFC 6749
+    /// §6).
+    ///
+    /// Replay is the one refusal that also writes: detection revoked the
+    /// whole family and appended the canonical revocation event on this
+    /// transaction, so it commits before the refusal returns — rolling it
+    /// back would tell the legitimate holder the theft was contained while
+    /// leaving the attacker's successor usable.
+    ///
+    /// # Errors
+    /// Returns the refusals of [`RefreshTokens::execute`], audited
+    /// best-effort, and a store error.
+    async fn refresh(
+        &self,
+        refresh_token: &SecretBearer,
+        client: OAuthClientId,
+    ) -> Result<TokenResponse, WyrdError> {
+        let tenant_id = tenant_from_refresh_jwt(refresh_token.expose())?;
+        let mut conn = self
+            .state
+            .postgres
+            .tenant_conn(tenant_id)
+            .await
+            .map_err(store_unavailable)?;
+        let exchanged = match (RefreshTokens {
+            issuer: self.issuer()?,
+        })
+        .execute(
+            &mut conn,
+            SecretString::from(refresh_token.expose().to_owned()),
+            client,
+            self.request_id,
+        )
+        .await
+        {
+            Ok(exchanged) => exchanged,
+            Err(error) => {
+                if matches!(error, RefreshError::Reused) {
+                    conn.commit().await.map_err(store_unavailable)?;
+                }
+                let wyrd = WyrdError::from(error);
+                audit_scope_mint_failure_best_effort(
+                    self.state.postgres.wyrd(),
+                    tenant_id,
+                    self.request_id,
+                    MINT_KIND_REFRESH,
+                    &wyrd,
+                )
+                .await;
+                return Err(wyrd);
+            }
+        };
+        conn.commit().await.map_err(store_unavailable)?;
+        Ok(exchanged.into_response())
+    }
+
+    /// The tenant issuance owner.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Internal`] when no signing key is configured.
+    fn issuer(&self) -> Result<wyrd_auth::issuance::TenantTokenIssuer, WyrdError> {
+        self.state.auth.tenant_issuer().ok_or_else(not_configured)
     }
 }
 
 /// Static page a device-code login's browser tab shows once the callback
-/// has issued and stored the session. It carries no token, code, or state.
+/// has recorded the approval. It carries no token, code, or state.
 const CLI_LOGIN_COMPLETE_PAGE: &str = "<!doctype html><html><head><meta charset=\"utf-8\">\
 <title>Wyrd sign-in complete</title></head><body><p>Sign-in complete. You can return to your \
 terminal.</p></body></html>";
@@ -311,17 +413,18 @@ Wyrd settings to activate the connection.</p></body></html>";
 /// yet. The opaque `state` generated at initiation is the only input that
 /// selects the tenant and connection; no header is consulted. The RFC 9207
 /// `iss` parameter, when sent, is forwarded so the exchange can bind the
-/// response to the login's issuer before any token request. On success the
-/// session is stored sealed for one-use redemption by the login's initiator,
-/// and the response carries neither a token nor the provider code: a browser
-/// login is redirected (`303`) to the fixed `{public_origin}/login/complete`
-/// route with no query string, and a device-code login receives a static page. A
-/// candidate connection test marks its bound candidate revision tested,
-/// issues no session, and receives a static page.
+/// response to the login's issuer before any token request. The response
+/// carries no token and not the provider code: a login begun at
+/// `GET /auth/authorize` is redirected (`303`) back to its client's redirect
+/// URI with a single-use Wyrd authorization code and the client's `state`
+/// (RFC 6749 §4.1.2), or with an RFC 6749 §4.1.2.1 error once its state was
+/// consumed; a device-code login records its approval and receives a static
+/// page; a candidate connection test marks its bound candidate revision
+/// tested, issues nothing, and receives a static page.
 ///
 /// # Errors
 /// Returns problem JSON for every refusal of
-/// [`exchange_authorization_code`].
+/// [`exchange_authorization_code`] that cannot be returned to a client.
 #[utoipa::path(
     get,
     path = "/auth/callback",
@@ -333,16 +436,16 @@ Wyrd settings to activate the connection.</p></body></html>";
           provider's discovery advertises `authorization_response_iss_parameter_supported`")
     ),
     responses(
-        (status = 200, description = "A device-code login completed and the CLI's token poll \
-          redeems the session, or a candidate connection test sign-in marked that candidate revision tested \
-          and issued no session; the browser shows a static page", content_type = "text/html",
-          body = String),
-        (status = 303, description = "A browser login completed; redirect to the fixed \
-          `/login/complete` route, which redeems the session with its flow cookie",
-          headers(("Location" = String, description = "`{public_origin}/login/complete`"))),
+        (status = 200, description = "A device-code login was approved and the CLI's token \
+          poll issues the session, or a candidate connection test sign-in marked that \
+          candidate revision tested and issued no session; the browser shows a static page",
+          content_type = "text/html", body = String),
+        (status = 303, description = "An authorization-request login completed: redirect to \
+          the client's redirect URI with `code` and `state`, or with an RFC 6749 §4.1.2.1 \
+          `error`", headers(("Location" = String, description = "The client's redirect URI"))),
         (status = 400, description = "The login state is unknown, expired, or replayed \
           (WYRD_AUTH_400_INVALID_STATE), the ID token nonce does not match \
-          (WYRD_AUTH_400_INVALID_NONCE), or the deployment has no sealing key or public origin \
+          (WYRD_AUTH_400_INVALID_NONCE), or the deployment has no public origin \
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The code or ID token is not usable, the response `iss` \
           does not match the login's issuer or is missing while the provider advertises it, or \
@@ -367,39 +470,30 @@ async fn callback(
     request_id: Option<Extension<RequestId>>,
     Query(query): Query<CallbackQuery>,
 ) -> Result<Response, WyrdErrorResponse> {
-    let request_id_str;
-    let req_id = match request_id.as_ref() {
-        Some(Extension(id)) => id.as_str(),
-        None => {
-            request_id_str = Uuid::new_v4().to_string();
-            &request_id_str
-        }
-    };
+    let request_id = request_id.map_or_else(RequestId::now_v7, |Extension(id)| id);
     let completed = exchange_authorization_code(
         &state,
         query.code.into_secret_string(),
         &query.state,
         query.iss.as_deref(),
-        req_id,
+        request_id.as_str(),
     )
     .await?;
-    match completed {
-        LoginInitiation::Browser(_) => {
-            let connections = state
-                .auth
-                .human_connections
-                .as_ref()
-                .ok_or_else(auth_not_configured)?;
-            let location = connections
-                .completion_url()
-                .map_err(WyrdErrorResponse::from)?;
-            Ok(Redirect::to(location.as_str()).into_response())
-        }
-        LoginInitiation::Device(_) => Ok(Html(CLI_LOGIN_COMPLETE_PAGE).into_response()),
-        LoginInitiation::ConnectionTest(_) => {
-            Ok(Html(CONNECTION_TEST_COMPLETE_PAGE).into_response())
-        }
-    }
+    Ok(match completed {
+        LoginCompletion::Authorized {
+            authorization,
+            code,
+        } => client_redirect(&authorization, &[("code", code.expose_secret())]),
+        LoginCompletion::Refused {
+            authorization,
+            error,
+        } => client_redirect(
+            &authorization,
+            &[("error", error_name(OAuthError::authorization(error)))],
+        ),
+        LoginCompletion::DeviceApproved => Html(CLI_LOGIN_COMPLETE_PAGE).into_response(),
+        LoginCompletion::ConnectionTested => Html(CONNECTION_TEST_COMPLETE_PAGE).into_response(),
+    })
 }
 
 /// `POST /auth/issue-key` — mint a Card-bound API key for an existing principal.
@@ -470,7 +564,7 @@ async fn issue_key(
         .postgres
         .tenant_conn(tenant)
         .await
-        .map_err(sql_error)?;
+        .map_err(|error| WyrdErrorResponse::from(store_unavailable(error)))?;
     crate::audit::append_on(&mut conn, &decision)
         .await
         .map_err(WyrdErrorResponse::from)?;
@@ -483,29 +577,35 @@ async fn issue_key(
         .audit(&mut conn, &issued, caller.principal(), req_id)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    conn.commit().await.map_err(sql_error)?;
+    conn.commit()
+        .await
+        .map_err(|error| WyrdErrorResponse::from(store_unavailable(error)))?;
 
     Ok(Json(issued.response))
 }
 
-fn auth_not_configured() -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::Internal {
-        message: "auth signing or verification handle is not configured".to_owned(),
-        details: serde_json::json!({}),
-    })
+/// The refusal of a grant the server lacks the auth configuration for.
+fn not_configured() -> WyrdError {
+    crate::auth::auth_not_configured().0
 }
 
-fn sql_error(error: wyrd_sql::SqlError) -> WyrdErrorResponse {
+/// The refusal of a grant whose tenant store is unavailable; the cause is
+/// logged, never returned.
+fn store_unavailable(error: wyrd_sql::SqlError) -> WyrdError {
     tracing::warn!(error = %error, "auth db unavailable");
-    WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
+    WyrdError::AuthVerifyUnavailable {
         message: "auth backend unavailable".to_owned(),
         details: serde_json::json!({}),
-    })
+    }
 }
 
-fn tenant_from_unverified_access_token(
-    token: &str,
-) -> Result<wyrd_spec::DataTenantId, WyrdErrorResponse> {
+/// The tenant an access token's unverified claims name, which routes a
+/// delegation to the tenant both tokens are then verified against.
+///
+/// # Errors
+/// Returns [`WyrdError::BadTokenFormat`] when `token` is not a compact JWT
+/// with decodable claims.
+fn tenant_from_unverified_access_token(token: &str) -> Result<wyrd_spec::DataTenantId, WyrdError> {
     let payload = token
         .split('.')
         .nth(1)
@@ -518,11 +618,12 @@ fn tenant_from_unverified_access_token(
     Ok(claims.principal.tenant_id)
 }
 
-fn bad_subject_token_format() -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::BadTokenFormat {
+/// The refusal of a subject token that is not a compact JWT.
+fn bad_subject_token_format() -> WyrdError {
+    WyrdError::BadTokenFormat {
         message: "subject_token is not a compact JWT".to_owned(),
         details: serde_json::json!({}),
-    })
+    }
 }
 
 #[cfg(test)]

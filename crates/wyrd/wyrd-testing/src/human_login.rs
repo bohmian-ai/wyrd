@@ -309,7 +309,14 @@ impl HumanSso {
         let body: Value = self
             .http
             .post(format!("{}/auth/token", self.server))
-            .json(&json!({ "grant_type": "wyrd_api_key", "api_key": api_key }))
+            .form(&[
+                (
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                ),
+                ("subject_token", api_key),
+                ("subject_token_type", "urn:wyrd:oauth:token-type:api_key"),
+            ])
             .send()
             .await
             .expect("token endpoint answers")

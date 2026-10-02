@@ -11810,6 +11810,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "mimalloc",
+ "oauth2 5.0.0",
  "opendal 0.57.0",
  "rand 0.9.5",
  "reqwest 0.13.4",

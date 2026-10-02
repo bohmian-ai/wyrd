@@ -60,7 +60,7 @@ fn print_tokens(token: &TokenResponse) {
     if let Some(refresh_token) = &token.refresh_token {
         println!("refresh_token: {}", refresh_token.expose());
     }
-    println!("expires_at:    {}", token.expires_at);
+    println!("expires_in:    {}", token.expires_in);
 }
 
 #[cfg(test)]

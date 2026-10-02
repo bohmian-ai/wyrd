@@ -24,7 +24,9 @@ use vala_sql::queries::olap_catalog::get_by_fqn;
 use wyrd_auth_issue::{AccessGrant, IssueError, IssuingKey};
 use wyrd_auth_verify::{ActClaim, TokenAudience, TokenPrincipalRef};
 use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef};
-use wyrd_spec::auth::{OAuthClientId, PrincipalKindTag, SecretBearer, TokenResponse, TokenType};
+use wyrd_spec::auth::{
+    ExchangeTokenType, OAuthClientId, PrincipalKindTag, SecretBearer, TokenResponse, TokenType,
+};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{CardRef, CardRefScope};
@@ -104,6 +106,16 @@ impl ExchangedToken {
                 .refresh_token
                 .map(|token| SecretBearer::new(token.expose_secret().to_owned())),
             issued_token_type: None,
+        }
+    }
+
+    /// Convert to the RFC 8693 §2.2.1 token-exchange response: the RFC 6749
+    /// §5.1 response with `issued_token_type` naming the access token.
+    #[must_use]
+    pub fn into_exchange_response(self) -> TokenResponse {
+        TokenResponse {
+            issued_token_type: Some(ExchangeTokenType::AccessToken),
+            ..self.into_response()
         }
     }
 }

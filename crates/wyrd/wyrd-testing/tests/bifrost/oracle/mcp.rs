@@ -55,9 +55,14 @@ async fn bearer(
         .ok_or("the pod serves no public HTTP listener")?;
     let response = reqwest::Client::new()
         .post(format!("{base_url}/auth/token"))
-        .json(&wyrd_spec::auth::TokenRequest::WyrdApiKey {
-            api_key: wyrd_spec::auth::SecretBearer::new(api_key.expose_secret().to_owned()),
-        })
+        .form(&[
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            ("subject_token", api_key.expose_secret()),
+            ("subject_token_type", "urn:wyrd:oauth:token-type:api_key"),
+        ])
         .send()
         .await?;
     let status = response.status();

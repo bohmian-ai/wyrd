@@ -140,4 +140,36 @@ impl Observer for CompositeObserver {
             obs.on_workflow_finish(run_id, workflow_id, duration).await;
         }
     }
+
+    async fn on_workflow_step_attempt(&self, run_id: &str, step_id: &str, attempt: u32) {
+        for obs in &self.0 {
+            obs.on_workflow_step_attempt(run_id, step_id, attempt).await;
+        }
+    }
+
+    async fn on_workflow_step_result(
+        &self,
+        run_id: &str,
+        step_id: &str,
+        attempt: u32,
+        error_code: Option<&str>,
+    ) {
+        for obs in &self.0 {
+            obs.on_workflow_step_result(run_id, step_id, attempt, error_code)
+                .await;
+        }
+    }
+
+    async fn on_workflow_step_backoff(
+        &self,
+        run_id: &str,
+        step_id: &str,
+        next_attempt: u32,
+        delay: Duration,
+    ) {
+        for obs in &self.0 {
+            obs.on_workflow_step_backoff(run_id, step_id, next_attempt, delay)
+                .await;
+        }
+    }
 }

@@ -151,8 +151,38 @@ class Observer:
         workflow_id: str,
         duration_ms: int,
     ) -> None:
-        """Workflow run finished successfully.
+        """Workflow run reached a terminal status.
 
-        Use this hook to close the workflow-level span or finalize a successful
-        workflow record after all DAG steps complete.
+        Use this hook to close the workflow-level span or finalize the workflow
+        record after the run settles; read the returned run for its status.
         """
+
+    def on_workflow_step_attempt(
+        self,
+        run_id: str,
+        step_id: str,
+        attempt: int,
+    ) -> None:
+        """Workflow step attempt started; attempts count from 1."""
+
+    def on_workflow_step_result(
+        self,
+        run_id: str,
+        step_id: str,
+        attempt: int,
+        error_code: str | None,
+    ) -> None:
+        """Workflow step attempt ended.
+
+        ``error_code`` is the stable Wyrd code of a failed attempt and ``None``
+        for success. Step payloads are never passed to observers.
+        """
+
+    def on_workflow_step_backoff(
+        self,
+        run_id: str,
+        step_id: str,
+        next_attempt: int,
+        delay_ms: int,
+    ) -> None:
+        """Workflow step retry backoff scheduled before ``next_attempt``."""

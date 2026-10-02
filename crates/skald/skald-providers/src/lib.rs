@@ -15,7 +15,7 @@ pub mod trait_;
 pub mod transport;
 
 pub use clients::{
-    AnthropicClient, GoogleClient, MediaAnswer, OpenAiBatchRoute, OpenAiClient, OpenAiMediaRoute,
+    AnthropicClient, ExternalGatewayClient, GoogleClient, MediaAnswer, OpenAiBatchRoute, OpenAiClient, OpenAiMediaRoute,
     OpenAiRoute, ProviderByteStream, UploadContent, UploadFile, VertexClient,
 };
 pub use endpoint::EndpointPolicy;

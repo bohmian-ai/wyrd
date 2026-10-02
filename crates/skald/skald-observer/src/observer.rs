@@ -100,8 +100,32 @@ pub trait Observer: Send + Sync {
     /// Workflow run started.
     async fn on_workflow_start(&self, _run_id: &str, _workflow_id: &str, _step_count: usize) {}
 
-    /// Workflow run finished.
+    /// Workflow run reached a terminal status.
     async fn on_workflow_finish(&self, _run_id: &str, _workflow_id: &str, _duration: Duration) {}
+
+    /// Workflow step attempt started; `attempt` counts from 1.
+    async fn on_workflow_step_attempt(&self, _run_id: &str, _step_id: &str, _attempt: u32) {}
+
+    /// Workflow step attempt ended; `error_code` is the stable Wyrd code of a
+    /// failed attempt and `None` for success. Payloads are never observed.
+    async fn on_workflow_step_result(
+        &self,
+        _run_id: &str,
+        _step_id: &str,
+        _attempt: u32,
+        _error_code: Option<&str>,
+    ) {
+    }
+
+    /// Workflow step backoff scheduled before `next_attempt` begins.
+    async fn on_workflow_step_backoff(
+        &self,
+        _run_id: &str,
+        _step_id: &str,
+        _next_attempt: u32,
+        _delay: Duration,
+    ) {
+    }
 }
 
 /// Observer implementation that drops every event.

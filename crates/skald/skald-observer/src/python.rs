@@ -276,6 +276,68 @@ impl Observer for PythonObserver {
         .await
         .ok();
     }
+
+    async fn on_workflow_step_attempt(&self, run_id: &str, step_id: &str, attempt: u32) {
+        let run_id = run_id.to_owned();
+        let step_id = step_id.to_owned();
+        let inner = Arc::clone(&self.0);
+        tokio::task::spawn_blocking(move || {
+            Python::attach(|py| {
+                let _ =
+                    inner.call_method1(py, "on_workflow_step_attempt", (run_id, step_id, attempt));
+            });
+        })
+        .await
+        .ok();
+    }
+
+    async fn on_workflow_step_result(
+        &self,
+        run_id: &str,
+        step_id: &str,
+        attempt: u32,
+        error_code: Option<&str>,
+    ) {
+        let run_id = run_id.to_owned();
+        let step_id = step_id.to_owned();
+        let error_code = error_code.map(str::to_owned);
+        let inner = Arc::clone(&self.0);
+        tokio::task::spawn_blocking(move || {
+            Python::attach(|py| {
+                let _ = inner.call_method1(
+                    py,
+                    "on_workflow_step_result",
+                    (run_id, step_id, attempt, error_code),
+                );
+            });
+        })
+        .await
+        .ok();
+    }
+
+    async fn on_workflow_step_backoff(
+        &self,
+        run_id: &str,
+        step_id: &str,
+        next_attempt: u32,
+        delay: Duration,
+    ) {
+        let run_id = run_id.to_owned();
+        let step_id = step_id.to_owned();
+        let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        let inner = Arc::clone(&self.0);
+        tokio::task::spawn_blocking(move || {
+            Python::attach(|py| {
+                let _ = inner.call_method1(
+                    py,
+                    "on_workflow_step_backoff",
+                    (run_id, step_id, next_attempt, delay_ms),
+                );
+            });
+        })
+        .await
+        .ok();
+    }
 }
 
 /// Initialize the Rust observer bridge.

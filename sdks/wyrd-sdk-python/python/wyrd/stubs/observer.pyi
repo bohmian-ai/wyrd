@@ -218,15 +218,65 @@ class Observer:
         workflow_id: str,
         duration_ms: int,
     ) -> None:
-        """Workflow run finished successfully.
+        """Workflow run reached a terminal status.
 
-        Use this hook to close the workflow-level span or finalize a successful
-        workflow record after all DAG steps complete.
+        Use this hook to close the workflow-level span or finalize the workflow
+        record after the run settles; read the returned run for its status.
 
         Args:
             run_id (str): Workflow run identifier.
             workflow_id (str): Workflow identifier.
             duration_ms (int): Wall-clock milliseconds for the run.
+        """
+        ...
+
+    def on_workflow_step_attempt(
+        self,
+        run_id: str,
+        step_id: str,
+        attempt: int,
+    ) -> None:
+        """Workflow step attempt started.
+
+        Args:
+            run_id (str): Workflow run identifier.
+            step_id (str): Step identifier.
+            attempt (int): Attempt number, counting from 1.
+        """
+        ...
+
+    def on_workflow_step_result(
+        self,
+        run_id: str,
+        step_id: str,
+        attempt: int,
+        error_code: str | None,
+    ) -> None:
+        """Workflow step attempt ended. Step payloads are never observed.
+
+        Args:
+            run_id (str): Workflow run identifier.
+            step_id (str): Step identifier.
+            attempt (int): Attempt number, counting from 1.
+            error_code (str | None): Stable Wyrd code of a failed attempt, or
+                None for success.
+        """
+        ...
+
+    def on_workflow_step_backoff(
+        self,
+        run_id: str,
+        step_id: str,
+        next_attempt: int,
+        delay_ms: int,
+    ) -> None:
+        """Workflow step retry backoff scheduled.
+
+        Args:
+            run_id (str): Workflow run identifier.
+            step_id (str): Step identifier.
+            next_attempt (int): Attempt number that begins after the delay.
+            delay_ms (int): Backoff delay in milliseconds.
         """
         ...
 

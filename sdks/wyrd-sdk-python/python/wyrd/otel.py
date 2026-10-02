@@ -10,11 +10,17 @@ from __future__ import annotations
 
 import warnings
 import weakref
-from contextvars import ContextVar
 from threading import Lock
 from typing import Any
 
 from wyrd.observer import Observer
+
+try:
+    from opentelemetry import context as _otel_context
+    from opentelemetry import trace as _otel_trace
+except ImportError:  # optional: run correlation becomes a no-op
+    _otel_context = None
+    _otel_trace = None
 
 
 class OtelObserver(Observer):
@@ -186,34 +192,19 @@ class OtelObserver(Observer):
 _CARD_REF = "wyrd.card_ref"
 _RUN_ID = "wyrd.run_id"
 
-# One execution-local stack of ``(token, prior)`` entries (``None`` when an entry
-# attached nothing), so nested and concurrent scopes of one immutable Run each
-# detach exactly the token their own entry installed and restore the
-# correlation that preceded it.
-_scope_tokens: ContextVar[tuple[tuple[object, Any] | None, ...]] = ContextVar(
-    "wyrd_run_scope_tokens", default=()
-)
-_scope_key: Any = None
-_registered: weakref.WeakSet[Any] = weakref.WeakSet()
-_registered_lock = Lock()
+# The Run scope stack lives entirely in this one context value: a tuple of
+# ``(card_ref, run_id)`` pairs, innermost last. Entry and exit each attach a new
+# value and never detach, so no token or per-scope state exists outside it.
+_SCOPE_KEY: Any = None if _otel_context is None else _otel_context.create_key("wyrd.run_scope")
 
-
-def _key() -> Any:
-    """Return the private OTel context key holding ``(card_ref, run_id)``."""
-    global _scope_key
-    if _scope_key is None:
-        # ``create_key`` mints a distinct key per call; one lock-held creation
-        # keeps concurrent first entries attaching under the key spans read.
-        with _registered_lock:
-            if _scope_key is None:
-                from opentelemetry.context import create_key
-
-                _scope_key = create_key("wyrd.run_scope")
-    return _scope_key
+# Per-provider registration outcome, written before the foreign call and never
+# discarded, so a provider is asked at most once.
+_outcomes: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
+_outcomes_lock = Lock()
 
 
 class _RunCorrelationProcessor:
-    """Span processor copying the scoped Run correlation onto every started span.
+    """Span processor copying the innermost Run scope onto every started span.
 
     Duck-typed rather than subclassing the SDK ``SpanProcessor`` so the OTel SDK
     stays optional. Stateless; every hook swallows its own failures.
@@ -221,12 +212,11 @@ class _RunCorrelationProcessor:
 
     def on_start(self, span: Any, parent_context: Any = None) -> None:
         try:
-            from opentelemetry.context import get_value
-
-            scope = get_value(_key(), parent_context)
-            if scope is not None:
-                span.set_attribute(_CARD_REF, scope[0])
-                span.set_attribute(_RUN_ID, scope[1])
+            stack = _otel_context.get_value(_SCOPE_KEY, parent_context)
+            if stack:
+                card_ref, run_id = stack[-1]
+                span.set_attribute(_CARD_REF, card_ref)
+                span.set_attribute(_RUN_ID, run_id)
         except Exception:  # telemetry must never fail the app
             pass
 
@@ -243,84 +233,81 @@ class _RunCorrelationProcessor:
         return True
 
 
+_PROCESSOR = _RunCorrelationProcessor()
+
+
 def install_run_correlation(provider: Any = None) -> bool:
     """Register the Wyrd Run-correlation span processor on ``provider``.
 
     ``provider`` defaults to the global tracer provider. Registration is
-    thread-safe and idempotent per provider. Returns ``True`` when the provider
-    holds the processor, ``False`` when OpenTelemetry is absent or the provider
-    cannot accept span processors. Never raises. Pass a framework's private
-    provider once; the global provider is installed on every ``Run`` entry.
+    thread-safe, idempotent, and attempted at most once per provider: the
+    outcome is cached and returned on every later call. Returns ``True`` when
+    the provider accepted the processor, ``False`` when OpenTelemetry is absent
+    or the provider cannot be weakly referenced, lacks ``add_span_processor``,
+    or raised while registering. A failed provider is never retried, because it
+    may have kept the processor before raising. Never raises. Pass a framework's
+    private provider once; the global provider is installed on every ``Run``
+    entry.
     """
+    if _otel_trace is None:
+        return False
     try:
         if provider is None:
-            from opentelemetry import trace
-
-            provider = trace.get_tracer_provider()
-        add = getattr(provider, "add_span_processor", None)
-        if add is None:
-            return False
-        with _registered_lock:
-            if provider in _registered:
-                return True
-            # Track first: a provider that cannot be weakly referenced fails
-            # here, before it could receive a processor on every entry.
-            _registered.add(provider)
-            try:
-                add(_RunCorrelationProcessor())
-            except Exception:
-                _registered.discard(provider)
-                raise
-        return True
+            provider = _otel_trace.get_tracer_provider()
+        with _outcomes_lock:
+            outcome = _outcomes.get(provider)
+            if outcome is not None:
+                return outcome
+            _outcomes[provider] = False
+            add = getattr(provider, "add_span_processor", None)
+            if add is None:
+                return False
+            add(_PROCESSOR)
+            _outcomes[provider] = True
+            return True
     except Exception:  # telemetry must never fail the app
         return False
 
 
 def _enter_run(card_ref: str, run_id: str) -> None:
-    """Attach one Run scope; called by ``Run.__enter__``. Never raises.
+    """Push one Run scope; called by ``Run.__enter__``. Never raises.
 
-    Always pushes exactly one stack entry so ``_exit_run`` stays paired.
+    Stamps the already-active recording span unless it already carries
+    ``wyrd.card_ref``, so a nested scope never overwrites an outer correlation.
     """
-    entry = None
+    if _otel_context is None:
+        return
     try:
-        from opentelemetry import context, trace
-
         install_run_correlation()
-        prior = context.get_value(_key())
-        entry = (context.attach(context.set_value(_key(), (card_ref, run_id))), prior)
-        span = trace.get_current_span()
-        if span.is_recording():
+        stack = _otel_context.get_value(_SCOPE_KEY) or ()
+        _otel_context.attach(_otel_context.set_value(_SCOPE_KEY, (*stack, (card_ref, run_id))))
+        span = _otel_trace.get_current_span()
+        if span.is_recording() and not _carries_card_ref(span):
             span.set_attribute(_CARD_REF, card_ref)
             span.set_attribute(_RUN_ID, run_id)
     except Exception:  # telemetry must never fail the app
         pass
-    _scope_tokens.set((*_scope_tokens.get(), entry))
 
 
-def _exit_run() -> None:
-    """Restore the correlation preceding the innermost scope. Never raises.
+def _carries_card_ref(span: Any) -> bool:
+    """Whether ``span``'s readable attributes already hold ``wyrd.card_ref``."""
+    try:
+        return _CARD_REF in span.attributes
+    except Exception:  # unreadable attributes: stamp as usual
+        return False
 
-    Detaches the entry's exact token; when OTel raises or silently swallows the
-    reset, the recorded prior correlation is re-attached instead so no later
-    span in this execution context carries the exited scope's pair.
+
+def _exit_run(card_ref: str, run_id: str) -> None:
+    """Pop this view's Run scope; called by ``Run.__exit__``. Never raises.
+
+    Pops only when the innermost scope is exactly ``(card_ref, run_id)``; a
+    mismatched top, empty stack, or failing context call changes nothing.
     """
-    tokens = _scope_tokens.get()
-    if not tokens:
-        return
-    _scope_tokens.set(tokens[:-1])
-    if tokens[-1] is None:
-        return
-    token, prior = tokens[-1]
-    try:
-        from opentelemetry import context
-    except Exception:  # telemetry must never fail the app
+    if _otel_context is None:
         return
     try:
-        context.detach(token)
-    except Exception:  # telemetry must never fail the app
-        pass
-    try:
-        if context.get_value(_key()) != prior:
-            context.attach(context.set_value(_key(), prior))
+        stack = _otel_context.get_value(_SCOPE_KEY)
+        if stack and stack[-1] == (card_ref, run_id):
+            _otel_context.attach(_otel_context.set_value(_SCOPE_KEY, stack[:-1]))
     except Exception:  # telemetry must never fail the app
         pass

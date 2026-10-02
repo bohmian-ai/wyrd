@@ -194,14 +194,15 @@ impl PyRun {
 
     /// Enter this view's ambient OpenTelemetry span correlation.
     ///
-    /// Delegates to `wyrd.otel`, which attaches this view's exact `CardRef` and
-    /// `run_id` to Python's execution-local OpenTelemetry context, stamps an
-    /// already-active recording span, and ensures the global provider has the
-    /// Wyrd span processor. The token lives in that module's execution-local
-    /// stack, never on this immutable view, so one run may be entered by nested
-    /// or concurrent scopes. Telemetry is optional: any failure, including a
-    /// missing `opentelemetry` package, is swallowed and the run is returned.
-    /// Entering never flushes, starts a span, or calls the server.
+    /// Delegates to `wyrd.otel`, which pushes this view's exact `CardRef` and
+    /// `run_id` onto the scope stack held in Python's execution-local
+    /// OpenTelemetry context value, stamps an already-active recording span
+    /// that does not yet carry `wyrd.card_ref`, and ensures the global provider
+    /// has the Wyrd span processor. No scope state is stored on this immutable
+    /// view, so one run may be entered by nested or concurrent scopes.
+    /// Telemetry is optional: any failure, including a missing `opentelemetry`
+    /// package, is swallowed and the run is returned. Entering never flushes,
+    /// starts a span, or calls the server.
     fn __enter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
         let run = slf.get();
         let _ = slf.py().import("wyrd.otel").and_then(|otel| {
@@ -218,10 +219,12 @@ impl PyRun {
 
     /// Restore the correlation that was ambient before the matching entry.
     ///
-    /// Detaches the token pushed by this execution context's innermost entry.
-    /// Detach failure is swallowed, and the method always returns `False` so an
-    /// exception raised inside the block propagates unchanged. Exiting is not a
-    /// flush, shutdown, or durability acknowledgement.
+    /// Passes this view's `CardRef` and `run_id` to `wyrd.otel`, which pops the
+    /// current execution context's innermost scope only when it equals that
+    /// pair; a mismatched or failing exit changes nothing. Failures are
+    /// swallowed, and the method always returns `False` so an exception raised
+    /// inside the block propagates unchanged. Exiting is not a flush, shutdown,
+    /// or durability acknowledgement.
     #[pyo3(signature = (exc_type=None, exc_value=None, traceback=None))]
     fn __exit__(
         slf: &Bound<'_, Self>,
@@ -232,10 +235,16 @@ impl PyRun {
         // The exception triple is accepted only to mirror the protocol; it
         // never changes cleanup or suppresses the exception.
         let _ = (exc_type, exc_value, traceback);
-        let _ = slf
-            .py()
-            .import("wyrd.otel")
-            .and_then(|otel| otel.call_method0("_exit_run"));
+        let run = slf.get();
+        let _ = slf.py().import("wyrd.otel").and_then(|otel| {
+            otel.call_method1(
+                "_exit_run",
+                (
+                    run.inner.card_ref().to_string(),
+                    run.inner.run_id().as_str(),
+                ),
+            )
+        });
         false
     }
 

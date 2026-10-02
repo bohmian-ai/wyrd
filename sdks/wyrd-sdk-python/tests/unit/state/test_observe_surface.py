@@ -7,8 +7,8 @@ belongs to the gated journey lanes, not here.
 
 import asyncio
 import inspect
+import subprocess
 import sys
-import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -47,7 +47,7 @@ def _state(tmp_path: Path) -> WyrdState:
 
 
 ORIGINAL_GET_VALUE = otel_context.get_value
-ORIGINAL_DETACH = otel_context.detach
+ORIGINAL_ATTACH = otel_context.attach
 
 
 def _code(error: BaseException) -> str:
@@ -411,13 +411,41 @@ def test_global_and_private_providers_receive_one_processor_each(
     assert _correlation(private_exporter) == {"private": (run.card_ref, run.run_id)}
 
 
+def test_a_provider_that_raises_after_accepting_is_never_asked_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provider that keeps the processor and then raises holds exactly one."""
+
+    class Retaining:
+        """A provider that retains the supplied processor, then raises."""
+
+        def __init__(self) -> None:
+            self.processors: list[object] = []
+
+        def add_span_processor(self, processor: object) -> None:
+            self.processors.append(processor)
+            raise RuntimeError("accepted, then failed")
+
+    retaining = Retaining()
+    assert install_run_correlation(retaining) is False
+    assert install_run_correlation(retaining) is False
+    monkeypatch.setattr(trace, "get_tracer_provider", lambda: retaining)
+    with _state(tmp_path).run() as entered:
+        _drift_reaches_the_ordinary_boundary(entered)
+    assert install_run_correlation() is False
+    assert len(retaining.processors) == 1
+
+
 def test_unsupported_providers_are_refused_without_raising() -> None:
     """API-only, proxy, and failing providers report False instead of raising."""
 
+    attempts: list[object] = []
+
     class Failing:
-        """A provider whose registration raises."""
+        """A provider whose registration raises before retaining anything."""
 
         def add_span_processor(self, processor: object) -> None:
+            attempts.append(processor)
             raise RuntimeError("registration failed")
 
     assert install_run_correlation(object()) is False
@@ -425,6 +453,7 @@ def test_unsupported_providers_are_refused_without_raising() -> None:
     failing = Failing()
     assert install_run_correlation(failing) is False
     assert install_run_correlation(failing) is False
+    assert len(attempts) == 1
 
 
 def test_run_exit_accepts_conventional_keywords_and_omitted_arguments(tmp_path: Path) -> None:
@@ -445,8 +474,15 @@ def test_run_exit_accepts_conventional_keywords_and_omitted_arguments(tmp_path: 
 
 def test_missing_opentelemetry_is_a_no_op(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Without the optional package a run still enters, exits, and emits normally."""
-    for module in ("opentelemetry", "opentelemetry.context", "opentelemetry.trace"):
-        monkeypatch.setitem(sys.modules, module, None)
+    # The bindings are resolved at import, so absence is proven in a fresh
+    # interpreter and simulated here by clearing the import-time bindings.
+    blocked = (
+        "import sys; sys.modules['opentelemetry'] = None; import wyrd.otel as otel; "
+        "assert otel._SCOPE_KEY is None and otel.install_run_correlation() is False"
+    )
+    subprocess.run([sys.executable, "-c", blocked], check=True)
+    monkeypatch.setattr(wyrd.otel, "_otel_context", None)
+    monkeypatch.setattr(wyrd.otel, "_otel_trace", None)
     assert install_run_correlation() is False
     run = _state(tmp_path).run(card="model")
     with run as entered, pytest.raises(wyrd.WyrdError) as raised:
@@ -517,86 +553,62 @@ def test_enrichment_failure_never_blocks_observations(
     assert run.__exit__(None, None, None) is False
 
 
-def test_detach_failure_restores_the_prior_correlation(
-    tmp_path: Path,
-    spans: tuple[TracerProvider, InMemorySpanExporter],
-    monkeypatch: pytest.MonkeyPatch,
+def test_exit_context_update_failure_never_blocks_observations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A raising or silently swallowed detach restores the preceding pair and never blocks emits."""
+    """A failing exit attach never raises, masks a user error, or blocks emits."""
+    run = _state(tmp_path).run(card="model")
+    with run:
+        monkeypatch.setattr(otel_context, "attach", _broken)
+    _drift_reaches_the_ordinary_boundary(run)
+    with pytest.raises(ValueError, match="app"):
+        with run:
+            raise ValueError("app")
+    _drift_reaches_the_ordinary_boundary(run)
+    monkeypatch.setattr(otel_context, "attach", ORIGINAL_ATTACH)
+    # The failed exit left this execution context's scope in place; clear it.
+    run.__exit__()
+
+
+def test_mismatched_exit_changes_nothing(
+    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+) -> None:
+    """Exiting a view that is not the innermost scope keeps the outer pair."""
+    provider, exporter = spans
+    tracer = provider.get_tracer("framework")
+    run = _state(tmp_path).run()
+    run.__enter__()
+    run.for_card("model").__exit__()
+    tracer.start_span("mismatched").end()
+    run.__exit__()
+    tracer.start_span("cleared").end()
+    assert _correlation(exporter) == {
+        "mismatched": (run.card_ref, run.run_id),
+        "cleared": None,
+    }
+
+
+def test_nested_entry_never_overwrites_an_active_span_correlation(
+    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+) -> None:
+    """A nested Card scope leaves already-correlated active spans untouched."""
     provider, exporter = spans
     tracer = provider.get_tracer("framework")
     run = _state(tmp_path).run()
     model = run.for_card("model")
-    with run:
-        with model as entered:
-            # OTel's public ``detach`` logs and swallows a failed reset.
-            monkeypatch.setattr(otel_context, "detach", lambda _token: None)
-            _drift_reaches_the_ordinary_boundary(entered)
-        _drift_reaches_the_ordinary_boundary(model)
-        tracer.start_span("outer").end()
-        monkeypatch.setattr(otel_context, "detach", _broken)
-    _drift_reaches_the_ordinary_boundary(run)
-    monkeypatch.setattr(otel_context, "detach", ORIGINAL_DETACH)
-    tracer.start_span("after").end()
-    assert _correlation(exporter) == {"outer": (run.card_ref, run.run_id), "after": None}
-
-
-def test_concurrent_first_entries_share_one_scope_key(
-    tmp_path: Path,
-    spans: tuple[TracerProvider, InMemorySpanExporter],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Two threads entering their first scopes at once attach under one key."""
-    provider, exporter = spans
-    tracer = provider.get_tracer("framework")
-    run = _state(tmp_path).run()
-    views = {"model": run.for_card("model"), "backup": run.for_card("backup")}
-    lock = _ContentionLock()
-    created: list[object] = []
-    creating = threading.Event()
-    original_create_key = otel_context.create_key
-
-    def create_key(name: str) -> object:
-        # Hold the first creation open until another entry contends for the
-        # lock; without serialization the second entry mints its own key.
-        created.append(name)
-        creating.set()
-        if len(created) == 1:
-            lock.contended.wait(timeout=5)
-        return original_create_key(name)
-
-    monkeypatch.setattr(wyrd.otel, "_scope_key", None)
-    monkeypatch.setattr(wyrd.otel, "_registered_lock", lock)
-    monkeypatch.setattr(otel_context, "create_key", create_key)
-
-    def scoped(alias: str) -> None:
-        with views[alias]:
-            tracer.start_span(alias).end()
-
-    first = threading.Thread(target=scoped, args=("model",))
-    second = threading.Thread(target=scoped, args=("backup",))
-    first.start()
-    assert creating.wait(timeout=5)
-    second.start()
-    first.join()
-    second.join()
-    assert len(created) == 1
+    with tracer.start_as_current_span("outer"):
+        with run:
+            with model:
+                tracer.start_span("nested").end()
+            with tracer.start_as_current_span("child"):
+                with model:
+                    tracer.start_span("inner").end()
+            tracer.start_span("restored").end()
+    root, nested = (run.card_ref, run.run_id), (model.card_ref, run.run_id)
     assert _correlation(exporter) == {
-        alias: (view.card_ref, run.run_id) for alias, view in views.items()
+        "nested": nested,
+        "inner": nested,
+        "child": root,
+        "restored": root,
+        "outer": root,
     }
-
-
-class _ContentionLock:
-    """A lock recording when a second caller had to wait for it."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.contended = threading.Event()
-
-    def __enter__(self) -> None:
-        if not self._lock.acquire(blocking=False):
-            self.contended.set()
-            self._lock.acquire()
-
-    def __exit__(self, *_exc: object) -> None:
-        self._lock.release()

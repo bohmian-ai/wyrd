@@ -786,8 +786,12 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use serde_json::{Value, json};
+    use wyrd_spec::auth::AbsoluteUrl;
     use wyrd_spec::card::common::ParameterValue;
-    use wyrd_spec::card::workflow::{WorkflowRun, WorkflowRunStatus};
+    use wyrd_spec::card::workflow::{
+        ExternalGatewayProtocol, LlmRoute, WorkflowRun, WorkflowRunStatus,
+    };
+    use wyrd_spec::ids::CredentialBindingName;
 
     use super::{Workflow, WorkflowInput};
     use crate::error::{WorkflowError, WorkflowResult};
@@ -845,10 +849,6 @@ mod tests {
     /// external route whose protocol differs from the Prompt dialect.
     #[tokio::test]
     async fn resolved_bindings_reject_before_dispatch() {
-        use wyrd_spec::auth::AbsoluteUrl;
-        use wyrd_spec::card::workflow::{ExternalGatewayProtocol, LlmRoute};
-        use wyrd_spec::ids::CredentialBindingName;
-
         const VALIDATION: &str = "WYRD_WORKFLOW_422_VALIDATION";
         let with_outputs = |workflow: Workflow| {
             workflow

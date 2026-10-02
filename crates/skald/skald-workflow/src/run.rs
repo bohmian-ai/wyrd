@@ -127,6 +127,10 @@ impl RunLedger {
 
     /// Record a succeeded step, admitting its payload against the run budget.
     ///
+    /// The charge is the exact JCS growth of the step's `text` and
+    /// `structured_output` fields over the `null` the terminal reserve already
+    /// counts, so escaped text is charged at its serialized size.
+    ///
     /// Returns `false` when the payload would exceed the run budget; the
     /// payload is discarded, the step fails with
     /// `WYRD_WORKFLOW_413_RUN_TOO_LARGE`, and that error becomes the run error.
@@ -136,7 +140,9 @@ impl RunLedger {
         payload: StepPayload,
         attempts: u32,
     ) -> bool {
-        let charged = payload.charged_bytes();
+        let charged = jcs_len(&payload.text)
+            .saturating_add(jcs_len(&payload.structured))
+            .saturating_sub(2 * NULL_BYTES);
         if !self.admit(charged) {
             let error = self.run_too_large();
             self.step_failed(index, error, attempts);

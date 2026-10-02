@@ -498,17 +498,39 @@ async fn sleep_until_deadline(deadline: Option<Instant>) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
+    use secrecy::SecretString;
     use serde_json::json;
+    use skald_prompt::{OpenAiResponsesOptions, openai_responses};
+    use skald_spec::wire::openai_responses::{
+        OpenAiResponseContentPart, OpenAiResponseItem, OpenAiResponsesResponse,
+    };
+    use skald_spec::{ProviderRequest, ProviderResponse};
+    use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wyrd_spec::auth::AbsoluteUrl;
     use wyrd_spec::card::common::ParameterValue;
-    use wyrd_spec::card::workflow::{WorkflowRunStatus, WorkflowStepStatus};
+    use wyrd_spec::card::workflow::{
+        ExternalGatewayProtocol, LlmRoute, WorkflowRetryPolicy, WorkflowRunStatus,
+        WorkflowStepStatus,
+    };
+    use wyrd_spec::gateway::{GatewayFallbackOverride, ModelRef};
+    use wyrd_spec::ids::CredentialBindingName;
 
-    use super::{WorkflowExecutionLimits, WorkflowRunOptions};
-    use crate::route::WorkflowExecutionDependencies;
+    use super::{WorkflowExecutionLimits, WorkflowRunOptions, backoff};
+    use crate::attempt::{agent_error_retryable, project_agent_error};
+    use crate::route::{
+        DEFAULT_GATEWAY_CALL_TIMEOUT, ExternalEndpointProfile, ExternalGatewayBinding,
+        ExternalGatewayBindings, WorkflowExecutionDependencies,
+    };
     use crate::test_support::{
-        RecordingObserver, Reply, ScriptedProvider, agent, bindings, string_schema,
+        RecordingObserver, RecordingTool, Reply, ScriptedProvider, agent, bindings, string_schema,
+        text_response, tool_call_response,
     };
     use crate::workflow_surface::Workflow;
 
@@ -808,13 +830,6 @@ mod tests {
     /// all on paused virtual time.
     #[tokio::test(start_paused = true)]
     async fn bounded_attempt_lifecycle() {
-        use std::time::Duration;
-
-        use tokio_util::sync::CancellationToken;
-
-        use super::backoff;
-        use crate::attempt::{agent_error_retryable, project_agent_error};
-
         // Concurrency ceiling: five ready steps never exceed two in flight.
         let names = ["s1", "s2", "s3", "s4", "s5"];
         let prompts: Vec<(&str, String)> = names
@@ -1243,20 +1258,6 @@ mod tests {
     /// only safe metadata; a missing gateway refuses the run before dispatch.
     #[tokio::test(start_paused = true)]
     async fn isolated_route_calls() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::Duration;
-
-        use skald_prompt::{OpenAiResponsesOptions, openai_responses};
-        use skald_spec::wire::openai_responses::{
-            OpenAiResponseContentPart, OpenAiResponseItem, OpenAiResponsesResponse,
-        };
-        use skald_spec::{ProviderRequest, ProviderResponse};
-        use wyrd_spec::card::workflow::{LlmRoute, WorkflowRetryPolicy};
-        use wyrd_spec::gateway::{GatewayFallbackOverride, ModelRef};
-
-        use crate::route::DEFAULT_GATEWAY_CALL_TIMEOUT;
-        use crate::test_support::{RecordingTool, text_response, tool_call_response};
-
         let tool = Arc::new(RecordingTool {
             name: "lookup".to_owned(),
             calls: AtomicUsize::new(0),
@@ -1470,17 +1471,6 @@ mod tests {
     /// displays secret values.
     #[tokio::test(flavor = "multi_thread")]
     async fn bound_external_gateway_security() {
-        use secrecy::SecretString;
-        use wiremock::matchers::{header, method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-        use wyrd_spec::auth::AbsoluteUrl;
-        use wyrd_spec::card::workflow::{ExternalGatewayProtocol, LlmRoute};
-        use wyrd_spec::ids::CredentialBindingName;
-
-        use crate::route::{
-            ExternalEndpointProfile, ExternalGatewayBinding, ExternalGatewayBindings,
-        };
-
         let server = MockServer::start().await;
         let origin = url::Url::parse(&server.uri()).expect("mock server uri parses");
         Mock::given(method("POST"))
@@ -1689,10 +1679,6 @@ mod tests {
     /// cancelled or timed-out run near the ceiling still fits.
     #[tokio::test(start_paused = true)]
     async fn terminal_budget_reserve() {
-        use std::time::Duration;
-
-        use tokio_util::sync::CancellationToken;
-
         let big = "x".repeat(10_000);
         let workflow = Workflow::builder("budget")
             .add(agent("writer", "write ${topic}", None))
@@ -1794,6 +1780,38 @@ mod tests {
             .expect("runs");
         assert_eq!(run.status, WorkflowRunStatus::Succeeded);
         assert!(run.canonical_len() <= ceiling);
+
+        // Text that JSON escaping expands is charged at its serialized size:
+        // around the ceiling every run either retains it within the limit or
+        // discards it with the aggregate-size error.
+        let wide_ceiling = 60_000;
+        let wide = WorkflowExecutionLimits {
+            max_run_bytes: Some(wide_ceiling),
+            ..WorkflowExecutionLimits::default()
+        };
+        let mut outcomes = BTreeSet::new();
+        for repeats in (0..=3_000).step_by(100) {
+            let provider = ScriptedProvider::new();
+            provider.on("write go", vec![Reply::Text("\"\\\u{1}".repeat(repeats))]);
+            let run = run_with(wide, CancellationToken::new(), &provider)
+                .await
+                .expect("runs");
+            assert!(
+                run.canonical_len() <= wide_ceiling,
+                "{repeats}: {}",
+                run.canonical_len()
+            );
+            if run.status == WorkflowRunStatus::Failed {
+                assert_eq!(
+                    run.error.as_ref().map(|e| e.code.as_str()),
+                    Some("WYRD_WORKFLOW_413_RUN_TOO_LARGE")
+                );
+            } else {
+                assert_eq!(run.status, WorkflowRunStatus::Succeeded);
+            }
+            outcomes.insert(run.status == WorkflowRunStatus::Succeeded);
+        }
+        assert_eq!(outcomes.len(), 2, "the sweep crosses the ceiling");
 
         // Cancellation and timeout near the ceiling still fit.
         for (deadline, cancel_after) in [(None, Some(1)), (Some(Duration::from_secs(1)), None)] {

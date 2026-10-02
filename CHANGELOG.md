@@ -2,12 +2,13 @@
 
 ## Unreleased
 
-- skald-agentic: `skald-agent` (live agent, bounded tool loop, and `SKALD_AGENT_*` catalog) and `skald-workflow` (DAG executor,
-  `execute_task`, retries, and cross-provider handoff via shared
-  `MessageConversion` with stable Wyrd workflow validation codes) land as independent
-  skald sub-package crates. The engine remains PyO3-free, observability is
-  plain `tracing` spans, and skald does not
-  depend on `wyrd-*` or `vala-*`.
+- skald-agentic: `skald-agent` (live agent, bounded tool loop, and `SKALD_AGENT_*` catalog) and `skald-workflow` (explicit-binding
+  Agent DAG with native, Wyrd gateway, and bound external gateway routes,
+  bounded execution with retries, deadlines, and cancellation, and the
+  portable `WorkflowRun` result with stable Wyrd workflow codes) land as
+  independent skald sub-package crates. Observability is plain payload-free
+  `tracing` spans, and skald does not depend on Wyrd server or `vala-*`
+  crates.
 - skald-workflow-runtime: removed the Skald Observer system (`skald-observer`,
   Agent/Workflow observer hooks, and Python `Observer`/`OtelObserver`/
   `observers=`). Workflow and Agent runs emit payload-free `tracing` spans.

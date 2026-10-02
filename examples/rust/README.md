@@ -22,4 +22,3 @@ Provider examples require the matching provider credentials:
 - `workflow_gemini.rs`
 - `workflow_gateway.rs`
 - `workflow_structured_output.rs`
-- `tracing_stdout.rs`

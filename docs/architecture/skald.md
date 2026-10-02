@@ -25,9 +25,17 @@ Skald does not depend on `wyrd-*` or `vala-*`.
 - `skald-agent`: live agent runtime. It owns `Agent`, `AgentDef`, the bounded
   tool loop, `AgentTool`, `ToolRegistry`, and the
   `SKALD_AGENT_*` error catalog.
-- `skald-workflow`: workflow runtime. It owns `Workflow`, `WorkflowDef`,
-  `Task`/`TaskDef`, `Context`, the DAG executor, `execute_task`,
-  `MessageConversion`-routed handoff, and stable Wyrd workflow error codes.
+- `skald-workflow`: explicit-binding Agent DAG runtime. It owns `Workflow`,
+  `WorkflowBuilder`, and `WorkflowExecutionDependencies`. Steps are Agents
+  whose Prompt variables bind to exact `input.<name>` or
+  `steps.<id>.output.text|structured` sources; dependency edges only order
+  execution. Each step's model calls follow its `LlmRoute`: the native
+  provider registry, a governed Wyrd gateway, or a bound external gateway.
+  Runs execute in one owned, bounded task set with Workflow retries,
+  per-attempt and total deadlines, cancellation, and size limits, and always
+  return the portable `wyrd_spec` `WorkflowRun` snapshot with stable Wyrd
+  workflow error codes. It depends on `wyrd-spec` for the Workflow Card and
+  run contracts.
 - `skald-prompt`: Python authoring boundary. It builds native prompt/request
   values and exposes the `wyrd.prompt.Prompt` Python class.
 

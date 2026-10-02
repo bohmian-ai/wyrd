@@ -183,7 +183,6 @@ pub struct WyrdTestServer {
 }
 
 struct WyrdTestServerInner {
-    fixture: Arc<PgFixture>,
     /// Lifetime guard of the generated Operator key directory, when used.
     operator_keys_dir: Option<TempDir>,
     /// Lifetime guard retained only for local storage-backed servers.
@@ -234,6 +233,12 @@ struct WyrdTestServerInner {
     /// released in the same struct drop order: an admitted plan runner must not
     /// be abandoned between writing its outputs and Preparing its operation.
     _compaction_runtime: wyrd_server::state::ForgeCompactionRuntime,
+    /// Postgres fixture whose ephemeral database this server uses.
+    ///
+    /// Declared after every runtime owner so struct drop order releases the
+    /// database last: dropping it force-terminates every remaining backend,
+    /// and a still-running Oracle that loses its database aborts the process.
+    fixture: Arc<PgFixture>,
 }
 
 /// Concrete lifecycle evidence returned after one test server stops.
@@ -753,6 +758,10 @@ impl WyrdTestServer {
         if let Some(token) = self.shutdown_token.take() {
             token.cancel();
         }
+        // An in-process server holds no serve token, but its composed Oracle
+        // and Scribe roles still watch the state token; stop them before the
+        // fixture database is dropped.
+        self.inner.state.shutdown_token.cancel();
         if let Some(handle) = self.serve_handle.take()
             && let Ok(join) = tokio::time::timeout(Duration::from_secs(2), handle).await
             && let Err(exit) = serve_task_outcome(join)?
@@ -3598,7 +3607,13 @@ impl WyrdTestServer {
 }
 
 impl Drop for WyrdTestServer {
+    /// Stop background roles, then cancel and briefly join a bound serve task.
+    ///
+    /// The state token is cancelled for every mode, so composed Oracle and
+    /// Scribe roles stop before the fixture database is dropped; an
+    /// in-process server has no serve task and returns after that.
     fn drop(&mut self) {
+        self.inner.state.shutdown_token.cancel();
         let Some(token) = self.shutdown_token.take() else {
             return;
         };

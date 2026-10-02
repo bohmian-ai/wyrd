@@ -532,14 +532,8 @@ def test_workflow_loading_journey(wyrd_server, tmp_path: Path, monkeypatch) -> N
     ]
 
     # 5. A reference to a deleted Card is refused.
-    retired = PromptCard(
-        Prompt.openai_chat("gpt-5-5", messages="You are a security reviewer. {{code}}"),
-        space="workflow-loading",
-        name="retired-prompt",
-        version="1.0.0",
-    )
-    writer.register(retired)
-    writer.prompt.delete(uid=retired.uid)
+    retired = _uids(writer.register_from_path(_FIXTURES / "retired" / "retired-prompt.yaml"))
+    writer.prompt.delete(uid=retired["retired-prompt"])
     with pytest.raises(WyrdError) as inactive:
         Workflow.from_path(_FIXTURES / "retired" / "workflow.yaml")
     assert inactive.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"

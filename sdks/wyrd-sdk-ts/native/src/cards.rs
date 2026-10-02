@@ -16,6 +16,7 @@ use wyrd_client::state::WyrdState;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{CardRef, CardRefParseError};
 
+use crate::workflow::{NativeWorkflowLoad, parse_workflow_selector};
 use crate::{NativeLifecycleResult, NativeTableConfig, NativeWyrdError};
 
 /// Tenant-scoped Card registry handle over the shared `wyrd_client` Cards.
@@ -147,6 +148,19 @@ impl NativeCards {
             Err(error) => Err(error),
         };
         NativeLifecycleResult::outcome(result)
+    }
+
+    /// Loads one registered Workflow and its locked Agents and Prompts.
+    ///
+    /// `selector_json` is `{ "space", "name", "version" }` or `{ "uid" }`; any
+    /// other shape, including a mix of both, is refused before any read.
+    #[napi]
+    pub async fn load_workflow(&self, selector_json: String) -> NativeWorkflowLoad {
+        let outcome = match parse_workflow_selector(&selector_json) {
+            Ok(selector) => self.cards.workflow().load(&selector).await,
+            Err(error) => Err(error),
+        };
+        NativeWorkflowLoad::from_outcome(outcome)
     }
 
     /// Soft-deletes one Card by exact reference.

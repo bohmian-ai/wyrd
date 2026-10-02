@@ -717,12 +717,12 @@ saved_login_journey() {
     python)
       mise run py:setup
       selector="tests/integration/auth/test_saved_user_auth.py::$name"
-      count="$(cd sdks/wyrd-sdk-python && uv run python -m pytest -q --collect-only -m integration "$selector" | grep -c "::$name" || true)"
+      count="$(cd sdks/wyrd-sdk-python && uv run python -m pytest -q --collect-only -m identity "$selector" | grep -c "::$name" || true)"
       if [ "$count" != 1 ]; then
         echo "Python journey $name selects $count tests; expected exactly 1" >&2
         exit 1
       fi
-      (cd sdks/wyrd-sdk-python && uv run python -m pytest -q -m integration "$selector")
+      (cd sdks/wyrd-sdk-python && uv run python -m pytest -q -m identity "$selector")
       ;;
     typescript)
       mise run ts:build
@@ -1216,7 +1216,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 hide = true
 description = "Run wyrd.testing integration journeys against a live Postgres-backed server"
 dir = "sdks/wyrd-sdk-python"
-run = "uv run python -m pytest -q -m integration"
+run = "uv run python -m pytest -q -m 'integration and not identity'"
 
 [tasks."py:test:cards:integration"]
 hide = true
@@ -1598,7 +1598,9 @@ seeds a tenant, mints a key, and drives @wyrd/sdk against it, tearing down via s
 in finally — symmetric with the Python journey.
 """
 dir = "sdks/wyrd-sdk-ts/wyrd"
-run = "pnpm exec vitest run tests/integration"
+# The saved user login journey needs the identity lane's Keycloak; only
+# test:identity:journey runs it.
+run = "pnpm exec vitest run tests/integration --exclude tests/integration/saved-user-auth.test.ts"
 
 [tasks."check:single-into-response-impl"]
 hide = true

@@ -197,7 +197,7 @@ impl HumanSso {
     ) -> SavedLogin {
         let login = self.cli_login(tenant, username, password).await;
         let record = SavedLogin::from_cli_login(
-            canonical_origin(&self.server).expect("server origin parses"),
+            self.origin(),
             tenant.parse().expect("tenant route key parses"),
             login,
         );
@@ -217,6 +217,48 @@ impl HumanSso {
             .revoke_refresh_token(refresh_token)
             .await
             .expect("the refresh chain revokes");
+    }
+
+    /// Make this server's saved login for `tenant` under `config_home` stale;
+    /// returns the generation the renewal starts from.
+    ///
+    /// # Panics
+    /// Panics when the login is missing or not ready, or cannot be saved.
+    #[must_use]
+    pub fn expire_saved(&self, config_home: &Path, tenant: &str) -> u64 {
+        expire_saved_access(config_home, &self.origin(), tenant)
+    }
+
+    /// Generation of this server's saved login for `tenant` under
+    /// `config_home`.
+    ///
+    /// # Panics
+    /// Panics when the login is missing.
+    #[must_use]
+    pub fn saved_generation(&self, config_home: &Path, tenant: &str) -> u64 {
+        saved_login(config_home, &self.origin(), tenant).generation
+    }
+
+    /// Revoke the server-side refresh chain of this server's saved login for
+    /// `tenant` under `config_home`, keeping the record, as another device's
+    /// logout would.
+    ///
+    /// # Panics
+    /// Panics when the login is not ready or the server refuses.
+    pub async fn revoke_saved(&self, config_home: &Path, tenant: &str) {
+        let login = saved_login(config_home, &self.origin(), tenant);
+        let SavedLoginState::Ready { refresh_token, .. } = login.state else {
+            panic!("the saved login is ready: {:?}", login.summary());
+        };
+        self.revoke(&refresh_token).await;
+    }
+
+    /// The canonical origin this server's saved logins are keyed by.
+    ///
+    /// # Panics
+    /// Panics when the server URL is not a usable origin.
+    fn origin(&self) -> String {
+        canonical_origin(&self.server).expect("server origin parses")
     }
 
     /// Exchange an API key for an access token.

@@ -133,21 +133,16 @@ its identity-lane wiring.
 
 Run every new or changed named test with its exact focused command. The UI
 journey runs with
-`mise exec -- env WYRD_IDENTITY_TARGET=ui WYRD_IDENTITY_FILTER=production_ui_bff_journey mise run test:identity:journey`.
+`mise exec -- env WYRD_IDENTITY_TARGET=ui WYRD_IDENTITY_FILTER=production_ui_bff_journey mise run test:identity:journey`;
+UI Vitest tests run by exact file and name with
+`mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run <file> -t '<name>'`.
 
-Then run: `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check`,
-`mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test`,
-`mise run test:identity:journey` unfiltered (targets `server`, `ui`, `cli`,
-`rust`, `client`, `python`, `typescript`), `mise run test:shared`,
-`mise run test:wyrd-sdk`, `mise run test:cli:journey`,
-`mise run test:principals:integration`, `mise run py:test:integration`,
-`mise run ts:test:integration`, `mise run test:wyrd`,
-`mise run codegen:check`, `mise run docs:check`, `mise run fmt`,
-`mise run lints`, `mise run py:format`, `mise run py:lints`,
-`mise run py:test:unit`, `mise run py:typecheck`, `mise run ts:test:unit`,
-`mise run ts:typecheck`, `mise run ts:napi:check`, and the boundary checks
-`mise run check:client-tier`, `mise run check:pyo3-scope`,
-`mise run check:unwrap-audit`, and `mise run check:workspace-hack`.
+Then run only the lanes covering this write set:
+`mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check`,
+`mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test`, and, for
+`identity_ui_e2e.rs` and its lane wiring, `mise run fmt` and `mise run lints`.
+Unfiltered identity journeys and every-language sweeps run once at change
+review.
 
 ## Material Stop Conditions
 

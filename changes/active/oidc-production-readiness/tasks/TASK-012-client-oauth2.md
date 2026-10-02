@@ -158,18 +158,18 @@ mise exec -- env WYRD_IDENTITY_TARGET=typescript WYRD_IDENTITY_FILTER='saved use
 ```
 
 Run every other new or changed named test with its exact `mise exec --`
-selector. Then run: `mise run test:identity:journey` unfiltered (targets
-`server`, `ui`, `cli`, `rust`, `client`, `python`, `typescript`),
-`mise run test:shared`, `mise run test:wyrd-sdk`, `mise run test:cli:journey`,
-`mise run test:principals:integration`, `mise run py:test:integration`,
-`mise run ts:test:integration`, `mise run test:wyrd`,
-`mise run codegen:check`, `mise run docs:check`, `mise run fmt`,
-`mise run lints`, `mise run py:format`, `mise run py:lints`,
-`mise run py:test:unit`, `mise run py:typecheck`, `mise run ts:test:unit`,
-`mise run ts:typecheck`, `mise run ts:napi:check`, and the boundary checks
-`mise run check:client-tier`, `mise run check:pyo3-scope`,
-`mise run check:unwrap-audit`, and `mise run check:workspace-hack`. Prove the
-Windows path with a Windows-target `cargo check` of `wyrd-cli`.
+selector. Then run only the lanes covering this write set:
+`mise run test:shared` (`wyrd-client`),
+`mise exec -- cargo nextest run --locked -p wyrd-cli --lib`,
+`mise run codegen:check` and `mise run ts:napi:check` (regenerated stubs and
+declarations), `mise run check:client-tier`, `mise run check:cli-client-tier`,
+`mise run check:sdk-client-tier`, `mise run check:workspace-hack` (new
+dependencies), `mise run check:unwrap-audit`, `mise run fmt`, and
+`mise run lints`; add `mise run py:format`, `mise run py:lints`, and
+`mise run py:typecheck` when Python journey or stub files change, and
+`mise run ts:typecheck` when TypeScript journey files change. Prove the
+Windows path with a Windows-target `cargo check` of `wyrd-cli`. Unfiltered
+identity journeys and every-language sweeps run once at change review.
 
 ## Material Stop Conditions
 

@@ -85,22 +85,20 @@ from their sources.
 
 ## Verification and Evidence
 
-Before the aggregate, list each journey selection:
+List each acceptance criterion's owning journey selection without running the
+suite:
 `mise exec -- cargo nextest list --locked -p wyrd-server --test identity_e2e --run-ignored=all`
 and the equivalent CLI, UI Vitest, Python pytest collection, and TS Vitest
-listings. Then run: `mise run test:identity:journey` unfiltered (targets
-`server`, `ui`, `cli`, `rust`, `client`, `python`, `typescript`),
-`mise run test:shared`, `mise run test:wyrd-sdk`, `mise run test:cli:journey`,
-`mise run test:principals:integration`, `mise run py:test:integration`,
-`mise run ts:test:integration`, `mise run test:wyrd`,
-`mise run codegen:check`, `mise run docs:check`, `mise run fmt`,
-`mise run lints`, `mise run py:format`, `mise run py:lints`,
-`mise run py:test:unit`, `mise run py:typecheck`, `mise run ts:test:unit`,
-`mise run ts:typecheck`, `mise run ts:napi:check`, the boundary checks
-`mise run check:client-tier`, `mise run check:pyo3-scope`,
-`mise run check:unwrap-audit`, and `mise run check:workspace-hack`, and
-`mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check` and `test`
-for UI text changes. Record each acceptance criterion's test and result.
+listings. Record each acceptance criterion's owner test and its result from
+the owning task's evidence; the unfiltered journeys run once at change review.
+
+Then run only the lanes covering this write set: `mise run docs:check`,
+`mise run codegen:check` and `mise run ts:napi:check` (generated artifacts
+and the TypeScript declaration), `mise run fmt` and `mise run lints` (CLI help
+text and Rust source docs), `mise run py:format` and `mise run py:lints` when
+Python source docs change, and
+`mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check` for UI text
+changes.
 
 ## Material Stop Conditions
 

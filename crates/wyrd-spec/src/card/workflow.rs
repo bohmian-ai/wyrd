@@ -584,10 +584,25 @@ fn is_http_token(name: &str) -> bool {
 
 /// Return true when a lowercase header name may not appear in a Card route.
 ///
-/// These names either control transport framing or proxying, or carry
-/// credentials that belong only to an execution-environment binding.
+/// These names either control transport, routing, or Wyrd-internal behavior
+/// ([`is_reserved_transport_header`]), or carry credentials that belong only
+/// to an execution-environment binding.
 #[must_use]
 pub fn is_forbidden_route_header(lower: &str) -> bool {
+    is_reserved_transport_header(lower)
+        || lower == "authorization"
+        || lower.contains("api-key")
+        || lower.contains("token")
+}
+
+/// Return true when a lowercase header name controls transport framing,
+/// virtual-host routing, forwarding or proxying, or carries Wyrd-internal
+/// identity.
+///
+/// No Card route or execution-environment binding may set these names; a
+/// binding may still supply the credential names a Card route may not.
+#[must_use]
+pub fn is_reserved_transport_header(lower: &str) -> bool {
     matches!(
         lower,
         "host"
@@ -600,11 +615,8 @@ pub fn is_forbidden_route_header(lower: &str) -> bool {
             | "forwarded"
             | "x-wyrd-access-token"
             | "wyrd-request-id"
-            | "authorization"
     ) || lower.starts_with("x-forwarded-")
         || lower.starts_with("proxy-")
-        || lower.contains("api-key")
-        || lower.contains("token")
 }
 
 /// Request dialect accepted by an external gateway.

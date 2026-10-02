@@ -26,7 +26,7 @@ use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
-use wyrd_spec::card::workflow::{ExternalGatewayProtocol, LlmRoute};
+use wyrd_spec::card::workflow::{ExternalGatewayProtocol, LlmRoute, is_reserved_transport_header};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::GatewayFallbackOverride;
 use wyrd_spec::ids::{CredentialBindingName, WorkflowRunId};
@@ -147,8 +147,9 @@ impl ExternalGatewayBindings {
     ///
     /// Returns `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` when the name is already
     /// bound, the origin is not a bare `http`/`https` origin (no userinfo,
-    /// path, query, or fragment), or a secret header value is not a valid HTTP
-    /// field value. The error never includes a secret value.
+    /// path, query, or fragment), a secret header name is reserved for
+    /// transport, routing, forwarding, proxying, or Wyrd-internal use, or a
+    /// secret header value is not a valid HTTP field value. The error never includes a secret value.
     pub fn insert(&mut self, binding: ExternalGatewayBinding) -> Result<(), WyrdError> {
         let name = binding.name.as_str();
         if self.inner.contains_key(&binding.name) {
@@ -169,6 +170,16 @@ impl ExternalGatewayBindings {
             return Err(binding_unavailable(
                 name,
                 "origin must be a bare http or https scheme, host, and port",
+            ));
+        }
+        if binding
+            .secret_headers
+            .keys()
+            .any(|header| is_reserved_transport_header(header.as_str()))
+        {
+            return Err(binding_unavailable(
+                name,
+                "secret headers may not set transport, routing, forwarding, proxy, or Wyrd-internal names",
             ));
         }
         if binding

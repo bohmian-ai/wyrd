@@ -125,10 +125,11 @@ model across synchronous and asynchronous use.
 ### Scenario 3 — Optional OpenTelemetry fails open
 
 **Behavior.** Missing OpenTelemetry packages, an API-only or unsupported
-provider, registration failure, span enrichment failure, and detach failure do
-not escape or block explicit Wyrd observations. A user exception propagates
-unchanged. Unknown Card aliases still fail. Global and explicitly supplied
-private providers receive at most one Wyrd processor each.
+provider, registration failure, span enrichment failure, and exit
+context-update failure do not escape or block explicit Wyrd observations. A
+user exception propagates unchanged. Unknown Card aliases still fail. Global
+and explicitly supplied private providers receive at most one Wyrd processor
+each, and registration is attempted at most once per provider.
 
 **RED.** Add failure-injection cases beside the Python Run surface cases. They
 fail until optional integration failures are contained and provider

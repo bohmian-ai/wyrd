@@ -139,22 +139,28 @@ Card scope, and resolve the authoritative Card UID.
 
 Entering a Python run performs three best-effort local operations:
 
-1. Attach the run's exact CardRef and `run_id` to Python OpenTelemetry's
-   execution-local context.
+1. Push the run's exact `(card_ref, run_id)` onto the Wyrd scope stack held
+   in Python OpenTelemetry's execution-local context, by one context attach.
 2. Set both attributes on the recording span already active at entry, when one
-   exists.
+   exists and does not already carry `wyrd.card_ref`. A nested scope therefore
+   never re-stamps a span that an outer scope or its processor already
+   correlated.
 3. Ensure the current global tracer provider has one idempotently registered
    Wyrd span processor. On every later span start, that processor reads the
-   parent context and copies the two values onto the new span. Scoped values
-   replace conflicting initial values for those two Wyrd keys.
+   parent context and copies the innermost scope's pair onto the new span.
+   Scoped values replace conflicting initial values for those two Wyrd keys.
 
 Setting attributes only on the span active at entry is insufficient because
 OpenTelemetry span attributes are not inherited by child spans. The processor
 is therefore required for spans created by an agent framework inside the run
 scope. It is stateless apart from provider-registration bookkeeping and wraps
 its complete `on_start` path so an import, context lookup, provider, or span
-error never escapes into application code. Registration is thread-safe and
-idempotent per provider. The scope uses a local OpenTelemetry context value,
+error never escapes into application code. Registration is thread-safe,
+idempotent, and attempted at most once per provider; the outcome is cached. A
+provider whose registration fails, including one that raises after accepting
+the processor, never receives another attempt and simply gets no enrichment,
+because the foreign exception makes the side effect unknowable and a retry
+could install a duplicate processor. The scope uses a local OpenTelemetry context value,
 not baggage or resource attributes: baggage is not projected automatically and
 may cross process boundaries, while Bifrost extracts these keys from each
 record.
@@ -170,18 +176,36 @@ OpenTelemetry integration is optional and fail-open:
 - Unknown or out-of-graph Card aliases still fail normally before a context is
   entered. Fail-open applies only to optional telemetry enrichment, never to
   Card identity, authorization, validation, or Wyrd writes.
-- Exiting always attempts to detach the exact token installed by that entry
-  and never masks an exception raised by the user's block. Detach failure is
-  swallowed because telemetry enrichment cannot take down the application.
+- Exiting pops this view's scope from the stack held in the OpenTelemetry
+  context value, by one context attach, only when the top of the stack equals
+  that view's own `(card_ref, run_id)`. A mismatched or failed exit changes
+  nothing and never masks an exception raised by the user's block, because
+  telemetry enrichment cannot take down the application.
 
-The Python boundary owns attach/detach because Python OpenTelemetry context is
+The scope stack is a tuple of `(card_ref, run_id)` pairs, innermost last,
+under one private context key created at module import when OpenTelemetry is
+present. Entry and exit each attach a new context value and never call
+detach; no detach token exists. This deliberately departs from the usual
+OpenTelemetry guidance to pair every attach with a detach. `ContextVar.reset`
+and OpenTelemetry `detach` fail when a token crosses contexts or is reused, and
+each earlier token-based design accumulated its own failure and recovery path.
+Attach cannot fail that way, and a later attach does not disturb other code's
+own attach/detach pairs, so spans that were current before the scope remain
+current after it. The known residual is improper nesting: a framework that
+attaches inside the block and detaches only after the block exits restores a
+context captured while the scope was active, which can resurface the exited
+correlation. Reviewers should treat attach-without-detach as this documented
+decision rather than a defect.
+
+The Python boundary owns context attach because Python OpenTelemetry context is
 not Rust OpenTelemetry context. Shared Rust continues to own `Run`, UUIDv7
 `RunId`, hydrated Card lookup, and immutable Card-scoped views. The PyO3
 `Run.__enter__` / `Run.__exit__` methods delegate the optional runtime work to
-the Python SDK's `wyrd.otel` module. That module uses execution-local context
-tokens rather than storing a token on `Run`, so the same immutable run may be
-nested or used concurrently by different asyncio tasks without one task
-detaching another task's scope.
+the Python SDK's `wyrd.otel` module, passing the view's CardRef and `run_id`
+to both. That module keeps the scope stack in the OpenTelemetry context value
+itself; no token exists and nothing is stored on `Run`, so the same immutable
+run may be nested or used concurrently by different asyncio tasks without one
+task removing another task's scope.
 
 Normal `contextvars` propagation carries the scope across `await` and into
 asyncio tasks created inside it. Nested Card views restore the outer Card when
@@ -200,8 +224,8 @@ it after the creating block exits. Raw threads or framework-private execution
 contexts are not implicitly covered. A framework that uses the global tracer
 provider needs no setup beyond the context manager. A framework using a
 private provider must pass it once to
-`wyrd.otel.install_run_correlation(provider)`; registration is idempotent and
-fail-open. No OpenTelemetry SDK dependency becomes mandatory: the helper uses
+`wyrd.otel.install_run_correlation(provider)`; registration is idempotent,
+attempted at most once per provider, and fail-open. No OpenTelemetry SDK dependency becomes mandatory: the helper uses
 the optional API when present and duck-types provider registration. The
 existing `otel` extra remains optional.
 

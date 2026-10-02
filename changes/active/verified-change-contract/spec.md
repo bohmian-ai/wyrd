@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 45
+revision: 46
 status: approved
 ---
 
@@ -316,18 +316,29 @@ flows are listed in its "Input and queue boundary" section.
   MUST best-effort attach the selected CardRef and invocation ID to Python's
   execution-local OpenTelemetry context under the exact Bifrost attributes
   `wyrd.card_ref` and `wyrd.run_id`, set both attributes on an already-active
-  recording span, and ensure one idempotently registered span processor copies
-  both values from the parent context to every span started inside the scope.
-  Exiting MUST restore the prior context, including nested Card scopes, and
-  MUST NOT suppress a user exception. Normal context propagation MUST work
-  across `await` and asyncio task creation without storing one shared attach
-  token on the immutable Run. A framework using the global provider MUST need
-  no setup beyond `with state.run(...)`; the Python SDK MUST expose an
-  idempotent `wyrd.otel.install_run_correlation(provider)` escape hatch for a
-  framework-owned private provider. Missing OpenTelemetry packages, an
-  unsupported or absent provider, no active recording span, invalid runtime
-  context, processor failure, and attach/detach failure MUST all fail open as
-  no enrichment: they MUST NOT fail Run construction or entry/exit, application
+  recording span only when that span does not already carry `wyrd.card_ref`,
+  and ensure one idempotently registered span processor copies the innermost
+  scope's pair from the parent context to every span started inside the scope.
+  The Wyrd scope stack lives inside the OpenTelemetry context value itself: a
+  tuple of `(card_ref, run_id)` pairs, innermost last, under one private
+  context key created at module import when OpenTelemetry is present. Entry
+  pushes and exit pops, each by a single context attach; no detach token
+  exists and detach is never called. Exit pops only when the top of the stack
+  equals that view's own `(card_ref, run_id)`; a mismatched or failed exit
+  changes nothing. Exiting MUST restore the prior Wyrd correlation in the
+  current context, including nested Card scopes, and MUST NOT suppress or mask
+  a user exception. Normal context propagation MUST work across `await` and
+  asyncio task creation without storing per-scope state on the immutable Run.
+  A framework using the global provider MUST need no setup beyond
+  `with state.run(...)`; the Python SDK MUST expose an idempotent
+  `wyrd.otel.install_run_correlation(provider)` escape hatch for a
+  framework-owned private provider. Registration is idempotent and attempted
+  at most once per provider; its outcome is cached, and a provider whose
+  registration fails, including one that raises after accepting the processor,
+  never receives another attempt and simply gets no enrichment. Missing
+  OpenTelemetry packages, an unsupported or absent provider, no active
+  recording span, invalid runtime context, processor failure, and
+  context-update failure MUST all fail open as no enrichment: they MUST NOT fail Run construction or entry/exit, application
   execution, or explicit Wyrd observation emission. Unknown Card aliases,
   authorization, validation, and Wyrd writes remain fail-closed. The client
   MUST inject only CardRef and run ID; tenant, principal, Card UID, and request
@@ -1824,10 +1835,13 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   exit. Async evidence MUST cover an `await`, concurrent tasks using the same
   immutable Run, and a task created inside the scope. Focused Python tests MUST
   prove that missing `opentelemetry-api`, an API-only/no-SDK provider,
-  processor registration failure, span enrichment failure, and detach failure
-  do not escape or block explicit observations; a user exception from the
-  block MUST propagate unchanged. Unknown aliases MUST still fail before
-  entry. Provider registration MUST be idempotent, and an explicitly installed
+  processor registration failure, span enrichment failure, and exit
+  context-update failure do not escape or block explicit observations; a user
+  exception from the block MUST propagate unchanged. Unknown aliases MUST
+  still fail before entry. Provider registration MUST be idempotent and
+  attempted at most once per provider, including a provider that raises after
+  accepting the processor. A nested scope MUST NOT overwrite `wyrd.card_ref`
+  on an already-active span that carries one, and an explicitly installed
   private provider MUST receive the same attributes. Context exit MUST NOT be
   treated as a telemetry or Bifrost durability barrier. No test may infer
   automatic log or metric enrichment from this span contract.
@@ -2095,6 +2109,23 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 - [PagerDuty Global Integrations and Service Routes](https://support.pagerduty.com/main/docs/event-orchestration)
 
 ## Revision history
+
+- **Revision 46 token-free Python Run correlation (2026-10-01):** Resolved
+  `FIND-TASK-009-8` by keeping the Python Wyrd scope stack inside the
+  OpenTelemetry context value (one private key minted at import, a tuple of
+  `(card_ref, run_id)` pairs, innermost last). Entry pushes and exit pops by a
+  single context attach each; detach tokens and detach calls are removed, and
+  a mismatched or failed exit changes nothing. Replaced "attach/detach
+  failure" with "context-update failure" in REQ-151 and "detach failure" with
+  "exit context-update failure" in AC-032; exiting restores the prior Wyrd
+  correlation in the current context. Registration is attempted at most once
+  per provider with a cached outcome, so a provider that raises after
+  accepting the processor never receives a second one. New behavior: entry
+  stamps the already-active recording span only when it does not already
+  carry `wyrd.card_ref`; spans created inside the scope are still stamped by
+  the processor with the innermost scope's pair. Rationale is recorded in
+  `architecture/logic/run_api.md`. The user explicitly
+  approved revision 46 on 2026-10-01.
 
 - **Revision 45 Operator key source correction (2026-10-01):** Replaced the
   nonexistent shared external-secret resolver requirement with server-owned

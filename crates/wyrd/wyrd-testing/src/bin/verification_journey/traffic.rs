@@ -189,6 +189,13 @@ pub struct Client {
     http: reqwest::Client,
     /// The Service bearer an OTLP exporter sends.
     bearer: SecretString,
+    /// This client's OTLP `service.instance.id`.
+    ///
+    /// Both clients of a tenant share one principal, and Bifrost identifies an
+    /// OTLP export by its content so an exporter's retry converges. Distinct
+    /// emitters must therefore say so, as OpenTelemetry's single-writer rule
+    /// requires, or two same-instant records collapse into one.
+    instance: String,
     /// Iterations this client has started.
     sequence: u64,
     /// Evidence handed to the server so far.
@@ -216,6 +223,7 @@ impl Client {
             state,
             http: reqwest::Client::new(),
             bearer,
+            instance: uuid::Uuid::new_v4().to_string(),
             sequence: 0,
             evidence: Evidence::default(),
         })
@@ -225,7 +233,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns the tally construction failure; traffic failures are counted.
+    /// Returns the tally construction or latency-recording failure; traffic
+    /// failures are counted.
     pub async fn drive(
         &mut self,
         phase: Phase,
@@ -258,7 +267,7 @@ impl Client {
             load.submitted += 1;
             self.iterate(&mut load).await;
             let micros = u64::try_from(now.elapsed().as_micros()).unwrap_or(u64::MAX);
-            load.latency_us.saturating_record(micros);
+            load.latency_us.record(micros)?;
         }
         Ok(load)
     }
@@ -282,7 +291,7 @@ impl Client {
     async fn iterate(&mut self, load: &mut PhaseLoad) {
         let sequence = self.sequence;
         self.sequence += 1;
-        let failing = sequence % FAIL_EVERY == 0;
+        let failing = sequence.is_multiple_of(FAIL_EVERY);
         let run = self.state.run();
         let drift = run.for_card("model").and_then(|model| {
             model.observe().drift(
@@ -315,9 +324,9 @@ impl Client {
         }
         let now = unix_nanos();
         let bodies = [
-            ("/v1/traces", trace_export(now)),
-            ("/v1/logs", log_export(now)),
-            ("/v1/metrics", metric_export(now)),
+            ("/v1/traces", trace_export(now, &self.instance)),
+            ("/v1/logs", log_export(now, &self.instance)),
+            ("/v1/metrics", metric_export(now, &self.instance)),
         ];
         for (path, body) in bodies {
             if self.export(load, path, body).await {
@@ -377,28 +386,29 @@ fn unix_nanos() -> u64 {
         })
 }
 
-/// The resource every export names.
-fn resource() -> Option<Resource> {
+/// The resource every export of the client `instance` names.
+fn resource(instance: &str) -> Option<Resource> {
+    let attribute = |key: &str, value: &str| KeyValue {
+        key: key.to_owned(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(value.to_owned())),
+        }),
+    };
     Some(Resource {
-        attributes: vec![KeyValue {
-            key: "service.name".to_owned(),
-            value: Some(AnyValue {
-                value: Some(any_value::Value::StringValue(
-                    "verification-bench".to_owned(),
-                )),
-            }),
-            ..KeyValue::default()
-        }],
+        attributes: vec![
+            attribute("service.name", "verification-bench"),
+            attribute("service.instance.id", instance),
+        ],
         ..Resource::default()
     })
 }
 
-/// One span with fresh random identity, encoded as OTLP protobuf.
-fn trace_export(now: u64) -> Vec<u8> {
+/// One span with fresh random identity from `instance`, encoded as OTLP protobuf.
+fn trace_export(now: u64, instance: &str) -> Vec<u8> {
     let identity = uuid::Uuid::new_v4();
     ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
-            resource: resource(),
+            resource: resource(instance),
             scope_spans: vec![ScopeSpans {
                 spans: vec![Span {
                     trace_id: identity.as_bytes().to_vec(),
@@ -416,11 +426,11 @@ fn trace_export(now: u64) -> Vec<u8> {
     .encode_to_vec()
 }
 
-/// One log record, encoded as OTLP protobuf.
-fn log_export(now: u64) -> Vec<u8> {
+/// One log record from `instance`, encoded as OTLP protobuf.
+fn log_export(now: u64, instance: &str) -> Vec<u8> {
     ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
-            resource: resource(),
+            resource: resource(instance),
             scope_logs: vec![ScopeLogs {
                 log_records: vec![LogRecord {
                     time_unix_nano: now,
@@ -439,11 +449,11 @@ fn log_export(now: u64) -> Vec<u8> {
     .encode_to_vec()
 }
 
-/// One gauge point, encoded as OTLP protobuf.
-fn metric_export(now: u64) -> Vec<u8> {
+/// One gauge point from `instance`, encoded as OTLP protobuf.
+fn metric_export(now: u64, instance: &str) -> Vec<u8> {
     ExportMetricsServiceRequest {
         resource_metrics: vec![ResourceMetrics {
-            resource: resource(),
+            resource: resource(instance),
             scope_metrics: vec![ScopeMetrics {
                 metrics: vec![Metric {
                     name: "bench.iteration.score".to_owned(),

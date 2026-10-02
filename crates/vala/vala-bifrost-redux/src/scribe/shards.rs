@@ -3701,18 +3701,8 @@ impl ShardOwner {
             let batch_id = *append.batch_id.as_bytes();
             let group_key = (append.tenant, append.table.clone(), batch_id);
             if let Some(first) = group_batches.get(&group_key) {
-                let PreparedSliceSet::Materialized(slices) = &mut append.slices;
-                let resent = slices
-                    .drain(..)
-                    .map(|slice| slice.wal_append.payload_identity())
-                    .collect::<Result<Vec<_>, _>>();
-                let error = match resent {
-                    Ok(resent) if resent == *first => continue,
-                    Ok(_) => ScribeError::Internal {
-                        detail: "in-group Scribe batch ID was reused with contradictory payload identity"
-                            .to_owned(),
-                    },
-                    Err(error) => error,
+                let Err(error) = Self::drop_resent_copy(append, first) else {
+                    continue;
                 };
                 if let Err(cleanup_error) = self.release_active_reservations(&durable) {
                     tracing::error!(error = %cleanup_error, "active cleanup failed after in-group duplicate error");
@@ -3782,6 +3772,33 @@ impl ShardOwner {
             spent_batch_ids: HashSet::new(),
             inserted_batch_ids: HashSet::new(),
         })
+    }
+
+    /// Drops the slices of a batch copy resent within one group.
+    ///
+    /// The first copy of the batch already wrote its WAL slices in this group;
+    /// this copy writes none and is acknowledged with the first copy's outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when a slice lacks its retry identity
+    /// or the copy's slice identities differ from `first`.
+    fn drop_resent_copy(
+        append: &mut PreparedAppend,
+        first: &[crate::scribe::wal::ScribeAppendPayloadIdentity],
+    ) -> Result<(), ScribeError> {
+        let PreparedSliceSet::Materialized(slices) = &mut append.slices;
+        let resent = slices
+            .drain(..)
+            .map(|slice| slice.wal_append.payload_identity())
+            .collect::<Result<Vec<_>, _>>()?;
+        if resent != first {
+            return Err(ScribeError::Internal {
+                detail: "in-group Scribe batch ID was reused with contradictory payload identity"
+                    .to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Takes the next prepared slice of one append, in order.

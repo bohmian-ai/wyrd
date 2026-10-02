@@ -338,3 +338,48 @@ Run the filtered identity journey commands required by the new named tests and
 the narrow official gateway/server startup check selected from `mise.toml`.
 Do not run or require the unfiltered identity suite, broad language sweeps, or
 `mise run gate`; those belong to integrated change review.
+
+## Implementation evidence (r1 remediation)
+
+Commits on `wyrd/oidc-production-readiness/TASK-010`: `6f036b80c`, `a971708e8`,
+`e5ad14ec5`, `c98a4c39d`, `4ed5a9cdb`. `FIND-TASK-010-1` is routed to TASK-011
+(`lead-direction-FIND-TASK-010-1.md`) and is not implemented here.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-010-2` | No production change; race proofs in `wyrd-auth/src/cli_logins.rs` pg_tests (gate holds an uncommitted login state on the device binding's unique index; wait observed with `pg_blocking_pids`) | `cli_logins::pg_tests::a_denial_during_approval_wins`, `::an_expiry_deleted_during_approval_wins`, `::an_approved_device_code_issues_exactly_once`, `::device_codes_poll_approve_deny_and_expire` | PASS |
+| `FIND-TASK-010-3` | `OAuthErrorCode::InvalidTarget`; `OAuthForm::token_request` classifies an unsupported exchange `audience` | `wyrd-spec auth::token::tests::response_bodies_follow_rfc_6749_section_5`; `wyrd-server auth::oauth::tests::token_exchange_audience_is_classified_before_decoding` | PASS |
+| `FIND-TASK-010-4` | `authorize.rs` `unique_param`: binding params must be unique, so a duplicate non-binding param redirects back with `invalid_request` | `auth::authorize::pg_tests::duplicate_parameters_redirect_back_to_the_registered_client`, `::an_unregistered_redirect_is_never_followed` | PASS |
+| `FIND-TASK-010-5` | `CallbackQuery::response` / `ProviderResponse`; `callback.rs` `provider_refusal` consumes state, checks the issuer, refuses | `wyrd-spec auth::oidc::tests::callback_query_carries_exactly_one_provider_response`; `auth::callback::pg_tests::a_provider_error_consumes_state_and_refuses_to_the_client`; `tenant_callback_refusal_journey` | PASS |
+| `FIND-TASK-010-6` | `OAuthClients` matches the Basic scheme with `eq_ignore_ascii_case` | `auth::oauth::tests::basic_scheme_matches_case_insensitively` | PASS |
+| `FIND-TASK-010-7` | Rustdoc on the cited items | `mise run lints` | PASS |
+| `FIND-TASK-010-8` | `ACTIVE_REFRESH_SQL` relies on RLS only | `refresh::pg_tests::active_refresh_resolves_only_this_tenants_active_row`; `mise run test:sql` | PASS |
+| `FIND-TASK-010-9` | `oauth::ClientForm<T>` (optional `client_id`); `oauthClientBasic` HTTP Basic scheme in `SecurityAddon`; token, device_authorization and revoke declare `security((), ("oauthClientBasic" = []))` | `pg_openapi_contract::tenant_login_operations_publish_their_contract`, `::every_authenticated_path_declares_the_one_wyrd_scheme`; `mise run test:principals:integration` | PASS |
+| `FIND-TASK-010-10` | `tower_governor`/`governor` removed (server, workspace, lock); journey 429 retry removed; NGINX `limit_req_zone` keyed `$binary_remote_addr` only for `POST /auth/device` (10r/m, burst 5) | `mise run test:server:startup`: the 7th attempt from one address gets 429; the token endpoint, `GET /auth/device` and a second client address (in-container loopback) are not limited | PASS (limit below) |
+| `FIND-TASK-010-11` | `refresh.rs`: only a `rotated` row triggers `revoke_refresh_chain`; other inactive rows return `NotFound` with no writes | `refresh::pg_tests::rotated_replay_revokes_only_its_chain`, `::inactive_rows_are_refused_without_containment`; `revoking_a_human_kills_the_session_refresh_authority` | PASS |
+| `FIND-TASK-010-12` | `finish_id_token_exchange` takes the connection slot lock and checks `human_connection_is_active` after the family lock | `tenant_connection_session_cutoff_journey` (multi-replica, deactivation wins: `access_denied`, nothing committed); callback pg tests | PASS |
+| `FIND-TASK-010-13` | One `auth.login` event appended in the final callback transaction | `auth::callback::pg_tests::finish_issues_seals_and_audits_the_session`, `::an_unchanged_role_device_login_is_audited_once`, `::a_failed_login_audit_rolls_back_the_whole_login` | PASS |
+
+Lanes: `test:principals:integration`, `test:sql`, `codegen:check` (after
+`codegen:regen` for `auth_callback_query.json`), `check:client-tier`,
+`check:tenant-isolation`, `check:unwrap-audit`, `fmt`, `lints` and
+`test:server:startup` all exit 0. These filtered identity journeys pass:
+`human_oidc_login_journey`, `device_grant_refusal_journey`,
+`tenant_human_login_journey`, `tenant_callback_refusal_journey`,
+`tenant_callback_issuer_binding_journey`,
+`tenant_connection_session_cutoff_journey`,
+`tenant_connection_test_sign_in_journey`,
+`revoking_a_human_kills_the_session_refresh_authority`, and the
+`cli` (`cli_device_login_journey`) journey.
+
+Notes:
+- `test:server:startup` was red before reaching the new checks, for two reasons:
+  - The 0644 bind-mounted signing key was refused by the owner-only secret-file rule.
+  - The production restart was refused by multi-tenant production's Vault-only operator-KEK rule.
+
+  The lane now writes owner-only keys into a volume as the image user, and runs
+  as the single-tenant `acme` deployment with a file KEK.
+- Limit: the official image has one Wyrd backend, so this lane cannot show two
+  replicas. The NGINX zone is gateway shared memory, applied before any
+  upstream is chosen, so the replica count cannot reset it.
+- The login outcome uses the new audit operation `auth.login`.

@@ -1,4 +1,4 @@
--- Header-free tenant login state and sealed login completions.
+-- Header-free tenant login state and Wyrd authorization codes.
 --
 -- The common provider callback carries no tenant selector: `Host`, forwarded
 -- headers, and paths never choose a tenant. Tenant and connection come only
@@ -6,15 +6,16 @@
 -- now keyed globally by the SHA-256 of its random state value. The raw state
 -- lives only in the provider authorization URL; the database never stores it.
 --
--- A row records how the login was initiated by which one binding it carries: a
--- browser login binds the hash of the BFF's random flow id; a CLI login binds its
--- device authorization id (RFC 8628). The binding is unique, so a flow id or device
--- can be recorded against exactly one login. The callback consumes the row (consumed_at) before any provider
--- IO and, once it has issued a Wyrd session, stores that session sealed under
--- the deployment keyring in completion_sealed with a fresh, short
--- expires_at. The BFF or the device-code poll redeems the completion once by its binding; the
--- redemption deletes the row. Neither the provider code nor a Wyrd token ever
--- reaches the browser.
+-- A row records how the login was initiated by which one binding it carries.
+-- A login begun at `GET /auth/authorize` (RFC 6749 §4.1.1) binds the OAuth
+-- client, its exact redirect URI, its PKCE S256 challenge (RFC 7636 §4.3),
+-- and its optional `state`. A CLI login binds its device authorization id
+-- (RFC 8628); the device id is unique, so a device approves at most one login.
+-- The callback consumes the row (consumed_at) before any provider IO. For an
+-- authorize login it then records the signed-in principal and the SHA-256 of
+-- a fresh Wyrd authorization code with a 60-second expiry; the token endpoint
+-- deletes the row when it redeems the code (RFC 6749 §4.1.2), so a code is
+-- used once. No token is stored: tokens are minted at redemption.
 --
 -- In-flight login state is transient (five minutes) and keyed by the raw
 -- state, so it is discarded rather than migrated.
@@ -30,17 +31,27 @@ CREATE TABLE wyrd.auth_login_state (
     redirect_uri        TEXT        NOT NULL,
     code_verifier       TEXT        NOT NULL,
     nonce               TEXT        NOT NULL,
-    browser_flow_hash   BYTEA       CHECK (octet_length(browser_flow_hash) = 32),
+    oauth_client_id     TEXT        CHECK (oauth_client_id IN ('wyrd-ui', 'wyrd-cli')),
+    client_redirect_uri TEXT,
+    code_challenge      TEXT,
+    client_state        TEXT,
     device_id           UUID,
     consumed_at         TIMESTAMPTZ,
-    completion_sealed   BYTEA,
+    code_hash           BYTEA       UNIQUE CHECK (octet_length(code_hash) = 32),
+    principal_id        UUID,
     expires_at          TIMESTAMPTZ NOT NULL,
-    CHECK (num_nonnulls(browser_flow_hash, device_id) = 1),
-    CHECK (completion_sealed IS NULL OR consumed_at IS NOT NULL)
+    CONSTRAINT auth_login_state_initiation
+        CHECK (num_nonnulls(oauth_client_id, device_id) = 1),
+    CONSTRAINT auth_login_state_authorize
+        CHECK ((oauth_client_id IS NULL) = (client_redirect_uri IS NULL)
+               AND (oauth_client_id IS NULL) = (code_challenge IS NULL)
+               AND (oauth_client_id IS NOT NULL OR client_state IS NULL)),
+    CONSTRAINT auth_login_state_code
+        CHECK ((code_hash IS NULL) = (principal_id IS NULL)
+               AND (code_hash IS NULL
+                    OR (oauth_client_id IS NOT NULL AND consumed_at IS NOT NULL)))
 );
 
-CREATE UNIQUE INDEX auth_login_state_browser_flow
-    ON wyrd.auth_login_state (browser_flow_hash) WHERE browser_flow_hash IS NOT NULL;
 CREATE UNIQUE INDEX auth_login_state_device
     ON wyrd.auth_login_state (device_id) WHERE device_id IS NOT NULL;
 CREATE INDEX auth_login_state_expires_at

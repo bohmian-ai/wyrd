@@ -227,47 +227,6 @@ impl WyrdPostgres {
             .await
     }
 
-    /// Resolve the tenant owning a completed, unexpired browser login.
-    ///
-    /// BFF login completion presents only the SHA-256 of its `HttpOnly` flow
-    /// id. The SECURITY DEFINER function `wyrd.auth_login_completion_tenant`
-    /// answers which tenant holds a completed login bound to exactly that
-    /// flow hash, or `None`; redemption then runs under that tenant's RLS.
-    ///
-    /// # Errors
-    /// Returns [`SqlError::Query`] when Postgres rejects the lookup and
-    /// [`SqlError::InvalidDataTenantId`] when the stored tenant id violates the
-    /// Wyrd tenant-id contract.
-    pub async fn login_completion_tenant(
-        &self,
-        browser_flow_hash: &Sha256Hex,
-    ) -> Result<Option<DataTenantId>, SqlError> {
-        self.definer_tenant(
-            "SELECT wyrd.auth_login_completion_tenant($1)",
-            browser_flow_hash,
-        )
-        .await
-    }
-
-    /// Resolve the tenant owning a live browser session.
-    ///
-    /// The BFF presents only the raw session id; its SHA-256 is all the
-    /// SECURITY DEFINER function `wyrd.auth_browser_session_tenant` accepts.
-    /// It answers which tenant holds an unrevoked, unexpired session with that
-    /// hash, or `None`, and exposes no other column.
-    ///
-    /// # Errors
-    /// Returns [`SqlError::Query`] when Postgres rejects the lookup and
-    /// [`SqlError::InvalidDataTenantId`] when the stored tenant id violates the
-    /// Wyrd tenant-id contract.
-    pub async fn browser_session_tenant(
-        &self,
-        id_hash: &Sha256Hex,
-    ) -> Result<Option<DataTenantId>, SqlError> {
-        self.definer_tenant("SELECT wyrd.auth_browser_session_tenant($1)", id_hash)
-            .await
-    }
-
     /// Read a tenant's route key and display name from the tenant directory.
     ///
     /// The directory is not tenant data, so the read runs on the audited

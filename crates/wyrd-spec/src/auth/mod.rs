@@ -21,7 +21,7 @@ pub use admin::{
     IssuerTokenPolicy, TrustedIssuerView, WorkloadBindingView,
 };
 pub use card_scope::CardScope;
-pub use device::{DeviceAuthorization, DeviceAuthorizationRequest, RevokeRefreshToken};
+pub use device::{DeviceAuthorization, DeviceAuthorizationRequest, TokenRevocationRequest};
 pub use human_connection::{
     ConnectionActivate, ConnectionInput, ConnectionTestRequest, ConnectionTestResponse,
     HUMAN_SUBJECT_CLAIM, HumanClientAuth, HumanConnectionState, HumanConnectionView,
@@ -29,7 +29,7 @@ pub use human_connection::{
 };
 pub use issue_key::{IssueKeyRequest, IssueKeyResponse};
 pub use oidc::{
-    AbsoluteUrl, BeginLogin, BeginLoginResponse, CallbackQuery, ConnectionTester, IssuerUrl,
+    AbsoluteUrl, CallbackQuery, ClientAuthorization, ConnectionTester, IssuerUrl,
     LoginInitResponse, LoginInitiation, Sha256Hex, Sha256HexError, UrlParseError,
 };
 pub use permission_scope::{
@@ -47,13 +47,15 @@ pub use principal_kind::PrincipalKindTag;
 pub use revoke::{REASON_MAX_BYTES, RevokePrincipalRequest};
 pub use secret_bearer::SecretBearer;
 pub use tenant_admin::{
-    CreateTenantRequest, CreateTenantResponse, PlatformTokenRequest, PlatformTokenResponse,
-    ProvisionedTenant, ProvisionedTenantAdmin, RecoverTenantAdminRequest, SetTenantStatusRequest,
-    TenantListResponse,
+    CreateTenantRequest, CreateTenantResponse, ProvisionedTenant, ProvisionedTenantAdmin,
+    RecoverTenantAdminRequest, SetTenantStatusRequest, TenantListResponse,
 };
 pub use tenant_principals::{
     CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListResponse,
     CredentialMetadata, CredentialRevoked, IssuedCredential, ListCredentialsArgs,
     RevokeCredentialArgs,
 };
-pub use token::{ExchangeTokenType, TokenAudience, TokenRequest, TokenResponse, TokenType};
+pub use token::{
+    AuthorizationServerMetadata, ExchangeTokenType, OAuthClientId, OAuthErrorCode,
+    OAuthErrorResponse, TokenAudience, TokenRequest, TokenResponse, TokenType,
+};

@@ -1,40 +1,68 @@
-//! Auth token request and response contracts.
+//! OAuth 2.0 authorization-server wire contracts.
+//!
+//! `POST /auth/token` takes `application/x-www-form-urlencoded` parameters
+//! (RFC 6749 §4.1.3, §6; RFC 8628 §3.4; RFC 8693 §2.1; RFC 7523 §2.1) and
+//! answers the RFC 6749 §5.1 [`TokenResponse`] or the §5.2
+//! [`OAuthErrorResponse`]. Unrecognized parameters are ignored (RFC 6749
+//! §3.2). The client is identified by HTTP Basic authentication or the
+//! `client_id` parameter, never by a [`TokenRequest`] field.
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::SecretBearer;
+use crate::auth::{AbsoluteUrl, SecretBearer};
 use crate::ids::TenantSlug;
 
-/// Body of `POST /auth/token`.
+/// Parameters of `POST /auth/token`, discriminated by `grant_type`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(tag = "grant_type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "grant_type")]
 pub enum TokenRequest {
-    /// Wyrd-native API key exchange.
-    WyrdApiKey {
-        /// API key from the deployment secret store.
-        api_key: SecretBearer,
+    /// RFC 6749 §4.1.3: redeem a Wyrd authorization code with its PKCE
+    /// verifier (RFC 7636 §4.5).
+    #[serde(rename = "authorization_code")]
+    AuthorizationCode {
+        /// The code `GET /auth/authorize` returned to the redirect URI.
+        code: SecretBearer,
+        /// The exact redirect URI the authorization request carried.
+        redirect_uri: String,
+        /// The PKCE code verifier whose S256 challenge the request carried.
+        code_verifier: SecretBearer,
     },
-    /// RFC 8693 token exchange: the actor acts on behalf of the subject.
+    /// RFC 6749 §6: renew a human session.
+    #[serde(rename = "refresh_token")]
+    RefreshToken {
+        /// The Wyrd refresh token.
+        refresh_token: SecretBearer,
+    },
+    /// RFC 8628 §3.4: poll with the device code from
+    /// `POST /auth/device_authorization`.
+    #[serde(rename = "urn:ietf:params:oauth:grant-type:device_code")]
+    DeviceCode {
+        /// The device code.
+        device_code: SecretBearer,
+    },
+    /// RFC 8693 §2.1 token exchange.
     ///
-    /// The issued token names the subject as its top-level principal, the actor
-    /// as the outermost `act` layer, and `audience` as its `aud`. Its authority
-    /// is the intersection of both parties' permissions.
+    /// With an [`ExchangeTokenType::ApiKey`] subject and no actor, the Wyrd
+    /// API key is exchanged for an access token of its own principal. With an
+    /// [`ExchangeTokenType::AccessToken`] subject and actor, the actor acts on
+    /// behalf of the subject: the issued token names the subject as its
+    /// principal, the actor as its outermost `act`, and `audience` as its
+    /// `aud`, with the intersection of both parties' permissions.
     #[serde(rename = "urn:ietf:params:oauth:grant-type:token-exchange")]
     TokenExchange {
-        /// Wyrd access token of the party being acted for (the subject).
+        /// The API key, or the access token of the party acted for.
         subject_token: SecretBearer,
         /// Type of `subject_token`.
         subject_token_type: ExchangeTokenType,
-        /// Wyrd access token of the party doing the work (the actor).
-        actor_token: SecretBearer,
+        /// Access token of the party doing the work; delegation only.
+        actor_token: Option<SecretBearer>,
         /// Type of `actor_token`.
-        actor_token_type: ExchangeTokenType,
-        /// Wyrd resource the delegated token is issued for.
-        audience: TokenAudience,
+        actor_token_type: Option<ExchangeTokenType>,
+        /// Wyrd resource a delegated token is issued for; delegation only.
+        audience: Option<TokenAudience>,
     },
-    /// Workload identity: platform-attested OIDC assertion.
+    /// RFC 7523 §2.1: a platform-attested workload assertion.
     #[serde(rename = "urn:ietf:params:oauth:grant-type:jwt-bearer")]
     JwtBearer {
         /// Kubernetes service-account token, SPIFFE JWT-SVID, or cloud token.
@@ -42,28 +70,18 @@ pub enum TokenRequest {
         /// Tenant selector fallback when the request host does not carry tenant.
         tenant: Option<TenantSlug>,
     },
-    /// RFC 8628 device-code poll: the device code from
-    /// `POST /auth/device_authorization`, redeemed once the person approved
-    /// it.
-    #[serde(rename = "urn:ietf:params:oauth:grant-type:device_code")]
-    DeviceCode {
-        /// The device code.
-        device_code: SecretBearer,
-    },
-    /// Wyrd refresh-token rotation.
-    RefreshToken {
-        /// Signed Wyrd refresh token.
-        refresh_token: SecretBearer,
-    },
 }
 
-/// Supported RFC 8693 token type for a subject or actor token.
+/// RFC 8693 §3 token type of a subject, actor, or issued token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub enum ExchangeTokenType {
     /// OAuth access token.
     #[serde(rename = "urn:ietf:params:oauth:token-type:access_token")]
     AccessToken,
+    /// A Wyrd API key (`wyrd_sk_…`) or platform credential.
+    #[serde(rename = "urn:wyrd:oauth:token-type:api_key")]
+    ApiKey,
 }
 
 /// Audience (`aud`) of a Wyrd tenant access token.
@@ -92,26 +110,27 @@ impl TokenAudience {
     }
 }
 
-/// Response from `POST /auth/token`.
+/// RFC 6749 §5.1 successful token response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
 pub struct TokenResponse {
     /// Signed Wyrd access token.
     pub access_token: SecretBearer,
-    /// Refresh token. Present only for human sessions: a human OIDC login
-    /// completed through the common callback and human refresh rotation
-    /// (`refresh_token`). Absent for every machine grant — API-key exchange
-    /// (`wyrd_api_key`), the workload `jwt-bearer` grant, and `token-exchange`
-    /// delegation — whose clients re-present their durable credential to
-    /// obtain a fresh access token instead of holding a long-lived refresh
-    /// secret.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refresh_token: Option<SecretBearer>,
     /// Token type.
     pub token_type: TokenType,
-    /// Access-token expiry timestamp.
-    pub expires_at: DateTime<Utc>,
+    /// Seconds until the access token expires.
+    pub expires_in: u64,
+    /// Refresh token. Issued only for a human session: at authorization-code
+    /// and device-code redemption, and when `wyrd-cli` rotates its refresh
+    /// token. `wyrd-ui` keeps presenting its original refresh token, and no
+    /// machine grant issues one: those clients re-present their durable
+    /// credential instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<SecretBearer>,
+    /// RFC 8693 §2.2.1 type of the issued token; present on token-exchange
+    /// responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_token_type: Option<ExchangeTokenType>,
 }
 
 /// Bearer token marker.
@@ -123,137 +142,227 @@ pub enum TokenType {
     Bearer,
 }
 
+/// The registered OAuth clients of a Wyrd deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub enum OAuthClientId {
+    /// The UI's backend-for-frontend: a confidential client authenticating
+    /// with `client_secret_basic` (RFC 6749 §2.3.1).
+    #[serde(rename = "wyrd-ui")]
+    WyrdUi,
+    /// The CLI and SDK saved logins: a public client.
+    #[serde(rename = "wyrd-cli")]
+    WyrdCli,
+}
+
+impl OAuthClientId {
+    /// The `client_id` value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WyrdUi => "wyrd-ui",
+            Self::WyrdCli => "wyrd-cli",
+        }
+    }
+
+    /// The client a `client_id` value names, if any.
+    #[must_use]
+    pub fn parse(client_id: &str) -> Option<Self> {
+        match client_id {
+            "wyrd-ui" => Some(Self::WyrdUi),
+            "wyrd-cli" => Some(Self::WyrdCli),
+            _ => None,
+        }
+    }
+}
+
+/// An OAuth error code: RFC 6749 §4.1.2.1 and §5.2, and RFC 8628 §3.5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthErrorCode {
+    /// A required parameter is missing, invalid, or repeated.
+    InvalidRequest,
+    /// Client authentication failed.
+    InvalidClient,
+    /// The grant or refresh token is invalid, expired, revoked, or was
+    /// issued to another client or redirect URI.
+    InvalidGrant,
+    /// The client may not use this grant or endpoint.
+    UnauthorizedClient,
+    /// The grant type is not supported.
+    UnsupportedGrantType,
+    /// The response type is not supported.
+    UnsupportedResponseType,
+    /// The resource owner or the server denied the request.
+    AccessDenied,
+    /// The device authorization is still pending.
+    AuthorizationPending,
+    /// The device code was polled too often.
+    SlowDown,
+    /// The device code expired.
+    ExpiredToken,
+    /// The server failed.
+    ServerError,
+    /// The server is temporarily unavailable.
+    TemporarilyUnavailable,
+}
+
+/// RFC 6749 §5.2 error response body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct OAuthErrorResponse {
+    /// The error code.
+    pub error: OAuthErrorCode,
+    /// Human-readable detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_description: Option<String>,
+}
+
+/// RFC 8414 §2 authorization server metadata, served at
+/// `/.well-known/oauth-authorization-server`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct AuthorizationServerMetadata {
+    /// The deployment's public origin.
+    pub issuer: AbsoluteUrl,
+    /// `GET /auth/authorize`.
+    pub authorization_endpoint: AbsoluteUrl,
+    /// `POST /auth/token`.
+    pub token_endpoint: AbsoluteUrl,
+    /// RFC 8628 §4: `POST /auth/device_authorization`.
+    pub device_authorization_endpoint: AbsoluteUrl,
+    /// RFC 7009: `POST /auth/revoke`.
+    pub revocation_endpoint: AbsoluteUrl,
+    /// `["code"]`.
+    pub response_types_supported: Vec<String>,
+    /// Every grant `POST /auth/token` accepts.
+    pub grant_types_supported: Vec<String>,
+    /// `client_secret_basic` for `wyrd-ui` and `none` for `wyrd-cli`.
+    pub token_endpoint_auth_methods_supported: Vec<String>,
+    /// The same methods at the revocation endpoint.
+    pub revocation_endpoint_auth_methods_supported: Vec<String>,
+    /// `["S256"]`.
+    pub code_challenge_methods_supported: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ExchangeTokenType, TokenAudience, TokenRequest, TokenResponse, TokenType};
+    use super::{
+        ExchangeTokenType, OAuthClientId, OAuthErrorCode, OAuthErrorResponse, TokenAudience,
+        TokenRequest, TokenResponse, TokenType,
+    };
     use crate::auth::SecretBearer;
-    use chrono::Utc;
 
+    /// Decode form-shaped parameters, as the token endpoint does.
+    fn parse(pairs: &[(&str, &str)]) -> Result<TokenRequest, serde_json::Error> {
+        let map = pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), serde_json::json!(value)))
+            .collect::<serde_json::Map<_, _>>();
+        serde_json::from_value(serde_json::Value::Object(map))
+    }
+
+    /// Every grant decodes from its RFC parameters and ignores parameters it
+    /// does not define (RFC 6749 §3.2); an unknown grant type does not decode.
+    ///
+    /// # Panics
+    /// Panics when a grant decodes differently.
     #[test]
-    fn token_response_has_no_card_ref_wire_field() {
+    fn grants_decode_from_rfc_parameters() {
+        assert_eq!(
+            parse(&[
+                ("grant_type", "authorization_code"),
+                ("code", "c"),
+                ("redirect_uri", "https://wyrd.example.com/login/callback"),
+                ("code_verifier", "v"),
+                ("client_id", "wyrd-ui"),
+            ])
+            .expect("code grant decodes"),
+            TokenRequest::AuthorizationCode {
+                code: SecretBearer::new("c".to_owned()),
+                redirect_uri: "https://wyrd.example.com/login/callback".to_owned(),
+                code_verifier: SecretBearer::new("v".to_owned()),
+            }
+        );
+        assert_eq!(
+            parse(&[
+                (
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:token-exchange"
+                ),
+                ("subject_token", "wyrd_sk_key"),
+                ("subject_token_type", "urn:wyrd:oauth:token-type:api_key"),
+            ])
+            .expect("api-key exchange decodes"),
+            TokenRequest::TokenExchange {
+                subject_token: SecretBearer::new("wyrd_sk_key".to_owned()),
+                subject_token_type: ExchangeTokenType::ApiKey,
+                actor_token: None,
+                actor_token_type: None,
+                audience: None,
+            }
+        );
+        assert_eq!(
+            parse(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "r"),
+                ("scope", "ignored"),
+            ])
+            .expect("refresh decodes"),
+            TokenRequest::RefreshToken {
+                refresh_token: SecretBearer::new("r".to_owned()),
+            }
+        );
+        assert!(parse(&[("grant_type", "password"), ("username", "u")]).is_err());
+        assert!(parse(&[("grant_type", "wyrd_api_key"), ("api_key", "k")]).is_err());
+    }
+
+    /// The success body carries `expires_in` and omits absent optional
+    /// members; the error body carries the snake-case RFC code.
+    ///
+    /// # Panics
+    /// Panics when a body serializes differently.
+    #[test]
+    fn response_bodies_follow_rfc_6749_section_5() {
         let response = TokenResponse {
             access_token: SecretBearer::new("access".to_owned()),
-            refresh_token: Some(SecretBearer::new("refresh".to_owned())),
             token_type: TokenType::Bearer,
-            expires_at: Utc::now(),
+            expires_in: 300,
+            refresh_token: None,
+            issued_token_type: Some(ExchangeTokenType::AccessToken),
         };
-
-        let json = serde_json::to_value(response).expect("serializes");
-
-        assert!(json.get("card_ref").is_none());
+        assert_eq!(
+            serde_json::to_value(&response).expect("serializes"),
+            serde_json::json!({
+                "access_token": "access",
+                "token_type": "Bearer",
+                "expires_in": 300,
+                "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            })
+        );
+        let error = OAuthErrorResponse {
+            error: OAuthErrorCode::AuthorizationPending,
+            error_description: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&error).expect("serializes"),
+            serde_json::json!({ "error": "authorization_pending" })
+        );
+        assert_eq!(
+            OAuthClientId::parse("wyrd-cli"),
+            Some(OAuthClientId::WyrdCli)
+        );
+        assert_eq!(OAuthClientId::WyrdUi.as_str(), "wyrd-ui");
+        assert_eq!(OAuthClientId::parse("other"), None);
     }
 
-    /// A token-exchange request serializes the RFC 8693 `grant_type` URN.
+    /// Secret-bearing parameters never reach `Debug`.
     ///
     /// # Panics
-    /// Panics when serialization fails or `grant_type` is not the token-exchange
-    /// URN.
+    /// Panics when the assertion is printed.
     #[test]
-    fn token_exchange_uses_rfc_8693_grant_type() {
-        let request = exchange_request();
-
-        let json = serde_json::to_value(request).expect("serializes");
-
-        assert_eq!(
-            json["grant_type"],
-            "urn:ietf:params:oauth:grant-type:token-exchange"
-        );
-    }
-
-    /// Every `TokenRequest` variant serializes its `grant_type` discriminator
-    /// and round-trips back to the same variant.
-    ///
-    /// # Panics
-    /// Panics when a variant fails to serialize or deserialize, emits the wrong
-    /// `grant_type`, or does not round-trip to an equal request.
-    #[test]
-    fn serde_grant_type_discriminator() {
-        let api_key_request = TokenRequest::WyrdApiKey {
-            api_key: SecretBearer::new("key".to_owned()),
-        };
-        let exchange_request = exchange_request();
-        let jwt_bearer_request = TokenRequest::JwtBearer {
-            assertion: SecretBearer::new("assertion".to_owned()),
-            tenant: Some(crate::ids::TenantSlug::new("acme").expect("static slug is valid")),
-        };
-        let refresh_request = TokenRequest::RefreshToken {
-            refresh_token: SecretBearer::new("refresh".to_owned()),
-        };
-
-        let api_key_json = serde_json::to_value(&api_key_request).expect("serializes");
-        let exchange_json = serde_json::to_value(&exchange_request).expect("serializes");
-        let jwt_bearer_json = serde_json::to_value(&jwt_bearer_request).expect("serializes");
-        let refresh_json = serde_json::to_value(&refresh_request).expect("serializes");
-
-        assert_eq!(api_key_json["grant_type"], "wyrd_api_key");
-        assert_eq!(
-            exchange_json["grant_type"],
-            "urn:ietf:params:oauth:grant-type:token-exchange"
-        );
-        assert_eq!(
-            jwt_bearer_json["grant_type"],
-            "urn:ietf:params:oauth:grant-type:jwt-bearer"
-        );
-        assert_eq!(refresh_json["grant_type"], "refresh_token");
-        assert_eq!(
-            serde_json::from_value::<TokenRequest>(api_key_json).expect("deserializes"),
-            api_key_request
-        );
-        assert_eq!(
-            serde_json::from_value::<TokenRequest>(exchange_json).expect("deserializes"),
-            exchange_request
-        );
-        assert_eq!(
-            serde_json::from_value::<TokenRequest>(jwt_bearer_json).expect("deserializes"),
-            jwt_bearer_request
-        );
-        assert_eq!(
-            serde_json::from_value::<TokenRequest>(refresh_json).expect("deserializes"),
-            refresh_request
-        );
-    }
-
-    /// The retired `authorization_code` grant no longer parses: the common
-    /// callback is the only authorization-code exchange, so no code/state pair
-    /// can be traded for tokens on `POST /auth/token`.
-    #[test]
-    fn authorization_code_grant_is_retired() {
-        let request = serde_json::json!({
-            "grant_type": "authorization_code",
-            "code": "code",
-            "state": "state-123"
-        });
-
-        assert!(serde_json::from_value::<TokenRequest>(request).is_err());
-        let schema =
-            serde_json::to_string(&schemars::schema_for!(TokenRequest)).expect("schema serializes");
-        assert!(!schema.contains("authorization_code"));
-    }
-
-    /// Proves the surviving `jwt-bearer` and `refresh_token` request variants
-    /// reject unknown fields now that the public authorization-code grant is
-    /// retired, so an extra member cannot smuggle input past the typed
-    /// token-exchange contract.
-    #[test]
-    fn new_grant_variants_reject_unknown_fields() {
-        let jwt_bearer = serde_json::json!({
-            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-            "assertion": "assertion",
-            "tenant": "acme",
-            "extra": true
-        });
-        let refresh_token = serde_json::json!({
-            "grant_type": "refresh_token",
-            "refresh_token": "refresh",
-            "extra": true
-        });
-
-        assert!(serde_json::from_value::<TokenRequest>(jwt_bearer).is_err());
-        assert!(serde_json::from_value::<TokenRequest>(refresh_token).is_err());
-    }
-
-    #[test]
-    fn new_secret_grants_redact_debug() {
+    fn secret_grants_redact_debug() {
         let request = TokenRequest::JwtBearer {
             assertion: SecretBearer::new("top-secret-assertion".to_owned()),
             tenant: None,
@@ -265,96 +374,17 @@ mod tests {
         assert!(!debug.contains("top-secret-assertion"));
     }
 
-    #[test]
-    fn jwt_bearer_without_tenant_roundtrips() {
-        let request = TokenRequest::JwtBearer {
-            assertion: SecretBearer::new("assertion".to_owned()),
-            tenant: None,
-        };
-        let value = serde_json::to_value(&request).unwrap();
-        assert_eq!(value["tenant"], serde_json::Value::Null);
-        assert_eq!(
-            serde_json::from_value::<TokenRequest>(value).unwrap(),
-            request
-        );
-    }
-
-    #[test]
-    fn token_response_roundtrips() {
-        let response = TokenResponse {
-            access_token: SecretBearer::new("access".to_owned()),
-            refresh_token: Some(SecretBearer::new("refresh".to_owned())),
-            token_type: TokenType::Bearer,
-            expires_at: Utc::now(),
-        };
-        let value = serde_json::to_value(&response).unwrap();
-        assert_eq!(value["token_type"], "Bearer");
-        assert!(value["expires_at"].as_str().is_some());
-        assert_eq!(
-            serde_json::from_value::<TokenResponse>(value).unwrap(),
-            response
-        );
-    }
-
-    #[test]
-    fn token_response_without_refresh_omits_field_and_roundtrips() {
-        let response = TokenResponse {
-            access_token: SecretBearer::new("access".to_owned()),
-            refresh_token: None,
-            token_type: TokenType::Bearer,
-            expires_at: Utc::now(),
-        };
-        let value = serde_json::to_value(&response).unwrap();
-        assert!(
-            value.get("refresh_token").is_none(),
-            "a grant that issues no refresh token must omit the wire field"
-        );
-        assert_eq!(
-            serde_json::from_value::<TokenResponse>(value).unwrap(),
-            response
-        );
-    }
-
-    /// Build one Bifrost-audience exchange with placeholder bearers.
-    fn exchange_request() -> TokenRequest {
-        TokenRequest::TokenExchange {
-            subject_token: SecretBearer::new("subject".to_owned()),
-            subject_token_type: ExchangeTokenType::AccessToken,
-            actor_token: SecretBearer::new("actor".to_owned()),
-            actor_token_type: ExchangeTokenType::AccessToken,
-            audience: TokenAudience::Bifrost,
-        }
-    }
-
-    /// The exchange wire carries RFC 8693 subject/actor fields and a closed
-    /// audience set; an unsupported audience or a stale `requested_subject`
-    /// field is rejected at deserialization.
+    /// The audience wire values are the `aud` claim values.
     ///
     /// # Panics
-    /// Panics when the token-type or audience fields serialize wrongly, or an
-    /// unsupported audience, a `requested_subject` field, or a missing
-    /// `actor_token` deserializes successfully.
+    /// Panics when they differ.
     #[test]
-    fn token_exchange_wire_is_rfc_8693_subject_actor_audience() {
-        let json = serde_json::to_value(exchange_request()).expect("serializes");
-        let token_type = "urn:ietf:params:oauth:token-type:access_token";
-        assert_eq!(json["subject_token_type"], token_type);
-        assert_eq!(json["actor_token_type"], token_type);
-        assert_eq!(json["audience"], "bifrost");
-
-        let mut unsupported = json.clone();
-        unsupported["audience"] = serde_json::json!("storage");
-        assert!(serde_json::from_value::<TokenRequest>(unsupported).is_err());
-
-        let mut stale = json.clone();
-        stale["requested_subject"] = serde_json::json!({"kind": "principal_id"});
-        assert!(serde_json::from_value::<TokenRequest>(stale).is_err());
-
-        let mut missing_actor = json;
-        missing_actor
-            .as_object_mut()
-            .expect("request is an object")
-            .remove("actor_token");
-        assert!(serde_json::from_value::<TokenRequest>(missing_actor).is_err());
+    fn audience_wire_values_are_claim_values() {
+        for audience in [TokenAudience::Wyrd, TokenAudience::Bifrost] {
+            assert_eq!(
+                serde_json::to_value(audience).expect("serializes"),
+                audience.as_str()
+            );
+        }
     }
 }

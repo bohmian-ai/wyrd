@@ -185,6 +185,10 @@ ALTER TABLE wyrd.auth_trusted_issuers
 -- every replica. The foreign key keeps a removed connection's tombstone for
 -- as long as a session names it.
 --
+-- A human refresh row also names the OAuth client it was issued to (RFC 6749
+-- §6): `wyrd-cli` rotates its token on every refresh, while `wyrd-ui`
+-- presents the same token until its absolute expiry.
+--
 -- In-flight login state is transient (five minutes) and names no connection,
 -- so it is discarded. Legacy refresh rows record no issuer provenance, so
 -- every pre-existing human refresh family stays unbound and can no longer
@@ -199,7 +203,10 @@ ALTER TABLE wyrd.auth_refresh_tokens
     ADD COLUMN human_connection_id UUID
         REFERENCES wyrd.auth_human_connections(connection_id),
     ADD COLUMN human_connection_revision BIGINT,
+    ADD COLUMN client_id TEXT CHECK (client_id IN ('wyrd-ui', 'wyrd-cli')),
     ADD CONSTRAINT auth_refresh_tokens_human_connection_pair
         CHECK ((human_connection_id IS NULL) = (human_connection_revision IS NULL)),
+    ADD CONSTRAINT auth_refresh_tokens_human_client
+        CHECK ((human_connection_id IS NULL) = (client_id IS NULL)),
     ADD CONSTRAINT auth_refresh_tokens_human_connection_user
         CHECK (human_connection_id IS NULL OR principal_kind = 'user');

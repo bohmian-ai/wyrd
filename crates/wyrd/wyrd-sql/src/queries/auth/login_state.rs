@@ -1,16 +1,18 @@
 //! Tenant-scoped login state queries for the OIDC authorization-code flow.
 //!
 //! A row is keyed by the SHA-256 of its random state value and moves through
-//! three steps, each one statement on the caller's RLS [`TenantConn`]:
+//! up to three steps, each one statement on the caller's RLS [`TenantConn`]:
 //! [`insert_login_state`] when a login begins, [`consume_login_state`] when the
-//! callback arrives (before any provider IO), and [`complete_login_state`] when
-//! the callback has issued a session. [`redeem_login_completion`] then deletes
-//! the completed row once, by the initiation binding the login recorded. A
-//! candidate connection test is bound to the principal that began it instead;
-//! it is consumed like any login but never completed or redeemed.
-//! Forced RLS is the only tenant selection; `data_tenant_id` is written as the
-//! row's owner and never repeated as a predicate. `PostgreSQL` owns every
-//! expiry: callers bind lifetimes, never instants.
+//! provider callback arrives (before any provider IO), and, for a login that
+//! answers an OAuth authorization request, [`issue_authorization_code`] once
+//! the callback has verified the sign-in. [`redeem_authorization_code`] then
+//! deletes that row once at the token endpoint (RFC 6749 §4.1.2). A device
+//! login records its approval on the device authorization instead, and a
+//! candidate connection test is bound to the principal that began it; neither
+//! ever carries a code. Forced RLS is the only tenant selection;
+//! `data_tenant_id` is written as the row's owner and never repeated as a
+//! predicate. `PostgreSQL` owns every expiry: callers bind lifetimes, never
+//! instants.
 // raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use std::time::Duration;
@@ -18,7 +20,8 @@ use std::time::Duration;
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 use wyrd_spec::auth::{
-    ConnectionTester, LoginInitiation, PrincipalId, PrincipalKindTag, Sha256Hex,
+    ClientAuthorization, ConnectionTester, LoginInitiation, OAuthClientId, PrincipalId,
+    PrincipalKindTag, Sha256Hex,
 };
 
 use crate::TenantConn;
@@ -34,16 +37,16 @@ const PURGE_EXPIRED_LOGIN_STATE_SQL: &str = r#"
 ///
 /// Forced RLS's `WITH CHECK` refuses a `data_tenant_id` other than the
 /// connection's tenant. `ON CONFLICT DO NOTHING` never overwrites: a reused
-/// state hash, browser flow hash, or device id inserts nothing, so one
-/// binding names at most one login. `PostgreSQL` derives `expires_at` from the
-/// bound lifetime in seconds.
+/// state hash or device id inserts nothing, so one binding names at most one
+/// login. `PostgreSQL` derives `expires_at` from the bound lifetime in seconds.
 const INSERT_LOGIN_STATE_SQL: &str = r#"
     INSERT INTO wyrd.auth_login_state (
         state_hash, data_tenant_id, connection_id, connection_revision, issuer,
-        client_id, redirect_uri, code_verifier, nonce, browser_flow_hash,
-        device_id, tester_principal_id, tester_principal_kind, expires_at
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-              statement_timestamp() + ($14 * interval '1 second'))
+        client_id, redirect_uri, code_verifier, nonce, oauth_client_id,
+        client_redirect_uri, code_challenge, client_state, device_id,
+        tester_principal_id, tester_principal_kind, expires_at
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+              statement_timestamp() + ($17 * interval '1 second'))
     ON CONFLICT DO NOTHING
 "#;
 
@@ -60,44 +63,55 @@ const CONSUME_LOGIN_STATE_SQL: &str = r#"
        AND consumed_at IS NULL
        AND expires_at > statement_timestamp()
     RETURNING connection_id, connection_revision, issuer, client_id, redirect_uri,
-              code_verifier, nonce, browser_flow_hash, device_id,
-              tester_principal_id, tester_principal_kind
+              code_verifier, nonce, oauth_client_id, client_redirect_uri,
+              code_challenge, client_state, device_id, tester_principal_id,
+              tester_principal_kind
 "#;
 
-/// Attach the sealed session to a consumed login, once.
+/// Attach an authorization code and its principal to a consumed
+/// authorization-request login, once.
 ///
-/// Matches only a consumed row of the RLS tenant with no completion yet, so a
-/// completion is written at most once and never before consumption. Resets
-/// `expires_at` to a fresh, short `PostgreSQL`-derived redemption window.
-const COMPLETE_LOGIN_STATE_SQL: &str = r#"
+/// Matches only a consumed row of the RLS tenant that answers an OAuth client
+/// and has no code yet, so a code is issued at most once and never before
+/// consumption. Resets `expires_at` to the code's short `PostgreSQL`-derived
+/// lifetime.
+const ISSUE_AUTHORIZATION_CODE_SQL: &str = r#"
     UPDATE wyrd.auth_login_state
-       SET completion_sealed = $2,
-           expires_at = statement_timestamp() + ($3 * interval '1 second')
+       SET code_hash = $2,
+           principal_id = $3,
+           expires_at = statement_timestamp() + ($4 * interval '1 second')
      WHERE state_hash = $1
        AND consumed_at IS NOT NULL
-       AND completion_sealed IS NULL
+       AND oauth_client_id IS NOT NULL
+       AND code_hash IS NULL
 "#;
 
-/// Redeem a completed login once by its initiation binding.
+/// Redeem an authorization code once.
 ///
-/// Deletes the RLS tenant's completed, unexpired row bound to either the
-/// browser flow hash or the device id and returns its sealed session and
-/// the connection the login went through. Deletion is the one-use guarantee:
-/// a second redemption matches nothing.
-const REDEEM_LOGIN_COMPLETION_SQL: &str = r#"
+/// Deletes the RLS tenant's row whose code hashes to `$1` and returns its
+/// client binding, principal, and connection, with whether it was still
+/// unexpired. Deletion is the one-use guarantee: a second redemption matches
+/// nothing, and an expired code is removed as it is refused.
+const REDEEM_AUTHORIZATION_CODE_SQL: &str = r#"
     DELETE FROM wyrd.auth_login_state
-     WHERE (browser_flow_hash = $1 OR device_id = $2)
-       AND completion_sealed IS NOT NULL
-       AND expires_at > statement_timestamp()
-    RETURNING completion_sealed, connection_id
+     WHERE code_hash = $1
+    RETURNING oauth_client_id, client_redirect_uri, code_challenge, principal_id,
+              connection_id, connection_revision,
+              expires_at > statement_timestamp() AS live
 "#;
 
 /// The stored binding columns of one initiation; exactly one binding is set,
 /// which is how the stored row records its kind.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct InitiationColumns<'a> {
-    /// Browser flow hash, for a browser login.
-    browser_flow_hash: Option<&'a [u8]>,
+    /// The OAuth client, for an authorization-request login.
+    oauth_client_id: Option<&'static str>,
+    /// That client's redirect URI.
+    client_redirect_uri: Option<&'a str>,
+    /// That client's PKCE S256 challenge.
+    code_challenge: Option<&'a str>,
+    /// That client's opaque `state`, when it sent one.
+    client_state: Option<&'a str>,
     /// Device authorization id, for a device-code login.
     device_id: Option<Uuid>,
     /// Principal that began a candidate connection test.
@@ -109,8 +123,11 @@ struct InitiationColumns<'a> {
 /// Project an initiation onto its stored binding columns.
 fn initiation_columns(initiation: &LoginInitiation) -> InitiationColumns<'_> {
     match initiation {
-        LoginInitiation::Browser(hash) => InitiationColumns {
-            browser_flow_hash: Some(hash.as_bytes().as_slice()),
+        LoginInitiation::Authorize(authorization) => InitiationColumns {
+            oauth_client_id: Some(authorization.client.as_str()),
+            client_redirect_uri: Some(&authorization.redirect_uri),
+            code_challenge: Some(&authorization.code_challenge),
+            client_state: authorization.state.as_deref(),
             ..InitiationColumns::default()
         },
         LoginInitiation::Device(device_id) => InitiationColumns {
@@ -125,29 +142,46 @@ fn initiation_columns(initiation: &LoginInitiation) -> InitiationColumns<'_> {
     }
 }
 
-/// Rebuild the initiation from its stored binding columns, in
-/// [`ConsumedRow`] order.
+/// The stored client column decoded, refusing a value no client is named by.
+///
+/// # Errors
+/// Returns [`sqlx::Error::Decode`] for an unknown client id.
+fn stored_client(client_id: &str) -> Result<OAuthClientId, sqlx::Error> {
+    OAuthClientId::parse(client_id)
+        .ok_or_else(|| sqlx::Error::Decode("login state client is corrupt".into()))
+}
+
+/// Rebuild the initiation from its stored binding columns.
 ///
 /// # Errors
 /// Returns [`sqlx::Error::Decode`] when the columns do not describe exactly
-/// one binding, the flow hash is not 32 bytes, or the tester kind is not a
+/// one complete binding, the client is unknown, or the tester kind is not a
 /// principal kind label.
-fn initiation_from_columns(
-    flow_hash: Option<Vec<u8>>,
-    device_id: Option<Uuid>,
-    tester_id: Option<Uuid>,
-    tester_kind: Option<String>,
-) -> Result<LoginInitiation, sqlx::Error> {
+fn initiation_from_columns(row: &ConsumedRow) -> Result<LoginInitiation, sqlx::Error> {
     let corrupt = || sqlx::Error::Decode("login state binding is corrupt".into());
-    match (flow_hash, device_id, tester_id, tester_kind) {
-        (Some(hash), None, None, None) => {
-            let bytes: [u8; 32] = hash.try_into().map_err(|_| corrupt())?;
-            Ok(LoginInitiation::Browser(Sha256Hex::from(bytes)))
+    match (
+        &row.oauth_client_id,
+        row.device_id,
+        row.tester_principal_id,
+        &row.tester_principal_kind,
+    ) {
+        (Some(client), None, None, None) => {
+            let (Some(redirect_uri), Some(code_challenge)) =
+                (&row.client_redirect_uri, &row.code_challenge)
+            else {
+                return Err(corrupt());
+            };
+            Ok(LoginInitiation::Authorize(ClientAuthorization {
+                client: stored_client(client)?,
+                redirect_uri: redirect_uri.clone(),
+                code_challenge: code_challenge.clone(),
+                state: row.client_state.clone(),
+            }))
         }
         (None, Some(device_id), None, None) => Ok(LoginInitiation::Device(device_id)),
         (None, None, Some(principal_id), Some(kind)) => {
-            let principal_kind =
-                serde_json::from_value::<PrincipalKindTag>(kind.into()).map_err(|_| corrupt())?;
+            let principal_kind = serde_json::from_value::<PrincipalKindTag>(kind.clone().into())
+                .map_err(|_| corrupt())?;
             Ok(LoginInitiation::ConnectionTest(ConnectionTester {
                 principal_id: PrincipalId::new(principal_id),
                 principal_kind,
@@ -168,26 +202,33 @@ pub struct LoginState {
     pub connection: HumanConnectionBinding,
     /// Exact issuer of that connection revision.
     pub issuer: String,
-    /// Exact OAuth client id of that connection revision.
+    /// Exact provider OAuth client id of that connection revision.
     pub client_id: String,
     /// The deployment-controlled callback the provider redirects to.
     pub redirect_uri: String,
-    /// Server-generated PKCE verifier.
+    /// Server-generated PKCE verifier for the provider.
     pub code_verifier: SecretString,
     /// Server-generated nonce the ID token must echo.
     pub nonce: String,
-    /// How the login was initiated and what redeems its completion.
+    /// How the login was initiated and what its sign-in grants.
     pub initiation: LoginInitiation,
 }
 
-/// A completed login removed by [`redeem_login_completion`].
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct RedeemedLogin {
-    /// The issued session, sealed under the deployment keyring.
-    #[sqlx(rename = "completion_sealed")]
-    pub sealed: Vec<u8>,
-    /// The human connection the login went through.
-    pub connection_id: Uuid,
+/// An authorization code removed by [`redeem_authorization_code`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedeemedCode {
+    /// The client the code was issued to.
+    pub client: OAuthClientId,
+    /// The redirect URI the authorization request named.
+    pub redirect_uri: String,
+    /// The PKCE S256 challenge the authorization request carried.
+    pub code_challenge: String,
+    /// The signed-in principal.
+    pub principal_id: Uuid,
+    /// The connection revision the sign-in went through.
+    pub connection: HumanConnectionBinding,
+    /// Whether the code was still unexpired.
+    pub live: bool,
 }
 
 /// Raw consumed row as returned by [`CONSUME_LOGIN_STATE_SQL`].
@@ -198,7 +239,7 @@ struct ConsumedRow {
     connection: HumanConnectionBinding,
     /// Exact issuer.
     issuer: String,
-    /// Exact client id.
+    /// Exact provider client id.
     client_id: String,
     /// Callback URI.
     redirect_uri: String,
@@ -206,8 +247,14 @@ struct ConsumedRow {
     code_verifier: String,
     /// Nonce.
     nonce: String,
-    /// Browser flow hash, for a browser login.
-    browser_flow_hash: Option<Vec<u8>>,
+    /// OAuth client, for an authorization-request login.
+    oauth_client_id: Option<String>,
+    /// That client's redirect URI.
+    client_redirect_uri: Option<String>,
+    /// That client's PKCE challenge.
+    code_challenge: Option<String>,
+    /// That client's `state`.
+    client_state: Option<String>,
     /// Device authorization id, for a device-code login.
     device_id: Option<Uuid>,
     /// Test principal id, for a candidate connection test.
@@ -216,14 +263,32 @@ struct ConsumedRow {
     tester_principal_kind: Option<String>,
 }
 
+/// Raw redeemed row as returned by [`REDEEM_AUTHORIZATION_CODE_SQL`].
+#[derive(sqlx::FromRow)]
+struct RedeemedRow {
+    /// The client the code was issued to.
+    oauth_client_id: Option<String>,
+    /// The client's redirect URI.
+    client_redirect_uri: Option<String>,
+    /// The client's PKCE challenge.
+    code_challenge: Option<String>,
+    /// The signed-in principal.
+    principal_id: Option<Uuid>,
+    /// Bound connection id and revision.
+    #[sqlx(flatten)]
+    connection: HumanConnectionBinding,
+    /// Whether the code was unexpired.
+    live: bool,
+}
+
 /// Insert a login-state row keyed by `state_hash` whose expiry `PostgreSQL`
 /// derives from `ttl`.
 ///
 /// First purges this tenant's rows that are past their expiry, so abandoned
-/// logins and unredeemed completions do not accumulate; RLS confines the purge
-/// to the connection's tenant. The insert refuses to overwrite: when the state
-/// hash or the initiation binding is already recorded the row is not written
-/// and `false` is returned, so a binding is never shared by two logins.
+/// logins and unredeemed codes do not accumulate; RLS confines the purge to
+/// the connection's tenant. The insert refuses to overwrite: when the state
+/// hash or the device id is already recorded the row is not written and
+/// `false` is returned, so a device is never bound to two logins.
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the purge or the insert.
@@ -248,7 +313,10 @@ pub async fn insert_login_state(
         .bind(&row.redirect_uri)
         .bind(row.code_verifier.expose_secret())
         .bind(&row.nonce)
-        .bind(columns.browser_flow_hash)
+        .bind(columns.oauth_client_id)
+        .bind(columns.client_redirect_uri)
+        .bind(columns.code_challenge)
+        .bind(columns.client_state)
         .bind(columns.device_id)
         .bind(columns.tester_principal_id)
         .bind(columns.tester_principal_kind)
@@ -261,7 +329,7 @@ pub async fn insert_login_state(
 /// Consume an unconsumed, unexpired login-state row exactly once.
 ///
 /// Marks the row consumed rather than deleting it, so the callback can later
-/// attach the sealed completion to the same row. A missing, expired, already
+/// attach an authorization code to the same row. A missing, expired, already
 /// consumed, or other tenant's row returns `None`.
 ///
 /// # Errors
@@ -277,12 +345,7 @@ pub async fn consume_login_state(
         .await?;
     row.map(|row| {
         Ok(LoginState {
-            initiation: initiation_from_columns(
-                row.browser_flow_hash,
-                row.device_id,
-                row.tester_principal_id,
-                row.tester_principal_kind,
-            )?,
+            initiation: initiation_from_columns(&row)?,
             connection: row.connection,
             issuer: row.issuer,
             client_id: row.client_id,
@@ -294,49 +357,71 @@ pub async fn consume_login_state(
     .transpose()
 }
 
-/// Attach a sealed completion to a consumed row and restart its expiry at
-/// `ttl`, the redemption window.
+/// Attach the authorization code hashing to `code_hash` and the signed-in
+/// `principal_id` to a consumed authorization-request login, and restart its
+/// expiry at `ttl`, the code lifetime.
 ///
-/// Returns `false` when this tenant has no consumed, uncompleted row with
-/// this hash.
+/// Returns `false` when this tenant has no consumed, code-less
+/// authorization-request row with this state hash.
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the update.
-pub async fn complete_login_state(
+pub async fn issue_authorization_code(
     conn: &mut TenantConn<'_>,
     state_hash: &Sha256Hex,
-    sealed: &[u8],
+    code_hash: &Sha256Hex,
+    principal_id: Uuid,
     ttl: Duration,
 ) -> Result<bool, sqlx::Error> {
-    let updated = sqlx::query(COMPLETE_LOGIN_STATE_SQL)
+    let updated = sqlx::query(ISSUE_AUTHORIZATION_CODE_SQL)
         .bind(state_hash.as_bytes().as_slice())
-        .bind(sealed)
+        .bind(code_hash.as_bytes().as_slice())
+        .bind(principal_id)
         .bind(ttl.as_secs_f64())
         .execute(&mut **conn.transaction())
         .await?;
     Ok(updated.rows_affected() == 1)
 }
 
-/// Delete this tenant's completed, unexpired row recorded for `initiation`
-/// and return its sealed completion and login connection; `None` when there
-/// is none.
+/// Delete this tenant's row holding the authorization code that hashes to
+/// `code_hash` and return what the code was bound to; `None` when no row
+/// holds it.
 ///
-/// The delete is the single use: a second redemption finds nothing. A
-/// connection test has neither redeemable binding and is never completed, so
-/// redeeming one matches nothing.
+/// The delete is the single use: a second redemption finds nothing, and an
+/// expired code is returned with `live == false` and removed all the same.
 ///
 /// # Errors
-/// Returns a SQLx error when Postgres rejects the delete.
-pub async fn redeem_login_completion(
+/// Returns a SQLx error when Postgres rejects the delete or the stored
+/// binding is corrupt.
+pub async fn redeem_authorization_code(
     conn: &mut TenantConn<'_>,
-    initiation: &LoginInitiation,
-) -> Result<Option<RedeemedLogin>, sqlx::Error> {
-    let columns = initiation_columns(initiation);
-    sqlx::query_as::<_, RedeemedLogin>(REDEEM_LOGIN_COMPLETION_SQL)
-        .bind(columns.browser_flow_hash)
-        .bind(columns.device_id)
+    code_hash: &Sha256Hex,
+) -> Result<Option<RedeemedCode>, sqlx::Error> {
+    let row = sqlx::query_as::<_, RedeemedRow>(REDEEM_AUTHORIZATION_CODE_SQL)
+        .bind(code_hash.as_bytes().as_slice())
         .fetch_optional(&mut **conn.transaction())
-        .await
+        .await?;
+    row.map(|row| {
+        let (Some(client), Some(redirect_uri), Some(code_challenge), Some(principal_id)) = (
+            row.oauth_client_id,
+            row.client_redirect_uri,
+            row.code_challenge,
+            row.principal_id,
+        ) else {
+            return Err(sqlx::Error::Decode(
+                "authorization code binding is corrupt".into(),
+            ));
+        };
+        Ok(RedeemedCode {
+            client: stored_client(&client)?,
+            redirect_uri,
+            code_challenge,
+            principal_id,
+            connection: row.connection,
+            live: row.live,
+        })
+    })
+    .transpose()
 }
 
 #[cfg(test)]
@@ -344,59 +429,88 @@ mod tests {
     use secrecy::SecretString;
     use uuid::Uuid;
     use wyrd_spec::auth::{
-        ConnectionTester, LoginInitiation, PrincipalId, PrincipalKindTag, Sha256Hex,
+        ClientAuthorization, ConnectionTester, LoginInitiation, OAuthClientId, PrincipalId,
+        PrincipalKindTag,
     };
 
-    use super::{InitiationColumns, LoginState, initiation_columns, initiation_from_columns};
+    use super::{ConsumedRow, LoginState, initiation_columns, initiation_from_columns};
     use crate::row_types::auth::HumanConnectionBinding;
 
-    /// Rebuild an initiation from the columns it projects to.
-    fn round_trip(initiation: &LoginInitiation) -> Result<LoginInitiation, sqlx::Error> {
-        let InitiationColumns {
-            browser_flow_hash,
-            device_id,
-            tester_principal_id,
-            tester_principal_kind,
-        } = initiation_columns(initiation);
-        initiation_from_columns(
-            browser_flow_hash.map(<[u8]>::to_vec),
-            device_id,
-            tester_principal_id,
-            tester_principal_kind.map(str::to_owned),
-        )
+    /// A consumed row carrying exactly the binding columns `initiation`
+    /// projects to.
+    fn row(initiation: &LoginInitiation) -> ConsumedRow {
+        let columns = initiation_columns(initiation);
+        ConsumedRow {
+            connection: HumanConnectionBinding {
+                connection_id: Uuid::now_v7(),
+                connection_revision: 1,
+            },
+            issuer: String::new(),
+            client_id: String::new(),
+            redirect_uri: String::new(),
+            code_verifier: String::new(),
+            nonce: String::new(),
+            oauth_client_id: columns.oauth_client_id.map(str::to_owned),
+            client_redirect_uri: columns.client_redirect_uri.map(str::to_owned),
+            code_challenge: columns.code_challenge.map(str::to_owned),
+            client_state: columns.client_state.map(str::to_owned),
+            device_id: columns.device_id,
+            tester_principal_id: columns.tester_principal_id,
+            tester_principal_kind: columns.tester_principal_kind.map(str::to_owned),
+        }
+    }
+
+    /// An authorization request from `wyrd-ui`.
+    fn authorize() -> LoginInitiation {
+        LoginInitiation::Authorize(ClientAuthorization {
+            client: OAuthClientId::WyrdUi,
+            redirect_uri: "https://wyrd.example.com/login/callback".to_owned(),
+            code_challenge: "challenge".to_owned(),
+            state: Some("client-state".to_owned()),
+        })
     }
 
     /// Every initiation round-trips through its stored columns, and a stored
-    /// row naming several or no bindings, a short hash, or an unknown tester
-    /// kind is refused as corrupt.
+    /// row naming several or no bindings, an incomplete client binding, an
+    /// unknown client, or an unknown tester kind is refused as corrupt.
+    ///
+    /// # Panics
+    /// Panics when a binding round-trips differently.
     #[test]
     fn initiation_columns_round_trip_and_refuse_ambiguity() {
         let tester = LoginInitiation::ConnectionTest(ConnectionTester {
             principal_id: PrincipalId::new(Uuid::now_v7()),
             principal_kind: PrincipalKindTag::TenantAdmin,
         });
-        for initiation in [
-            LoginInitiation::Browser(Sha256Hex::digest(b"flow")),
-            LoginInitiation::Device(Uuid::now_v7()),
-            tester,
-        ] {
+        for initiation in [authorize(), LoginInitiation::Device(Uuid::now_v7()), tester] {
             assert_eq!(
-                round_trip(&initiation).expect("binding rebuilds"),
+                initiation_from_columns(&row(&initiation)).expect("binding rebuilds"),
                 initiation
             );
         }
 
-        let id = Some(Uuid::now_v7());
-        let kind = || Some("user".to_owned());
-        assert!(initiation_from_columns(Some(vec![1; 32]), id, None, None).is_err());
-        assert!(initiation_from_columns(None, id, id, kind()).is_err());
-        assert!(initiation_from_columns(None, None, None, None).is_err());
-        assert!(initiation_from_columns(Some(vec![1; 3]), None, None, None).is_err());
-        assert!(initiation_from_columns(None, None, id, None).is_err());
-        assert!(initiation_from_columns(None, None, id, Some("root".to_owned())).is_err());
+        let mut both = row(&authorize());
+        both.device_id = Some(Uuid::now_v7());
+        let mut none = row(&LoginInitiation::Device(Uuid::now_v7()));
+        none.device_id = None;
+        let mut incomplete = row(&authorize());
+        incomplete.code_challenge = None;
+        let mut unknown_client = row(&authorize());
+        unknown_client.oauth_client_id = Some("other".to_owned());
+        let mut unknown_kind = row(&LoginInitiation::ConnectionTest(ConnectionTester {
+            principal_id: PrincipalId::new(Uuid::now_v7()),
+            principal_kind: PrincipalKindTag::User,
+        }));
+        unknown_kind.tester_principal_kind = Some("root".to_owned());
+        for corrupt in [both, none, incomplete, unknown_client, unknown_kind] {
+            assert!(initiation_from_columns(&corrupt).is_err());
+        }
     }
 
     /// Formatting a login state never prints its PKCE verifier.
+    ///
+    /// # Panics
+    /// Panics when the verifier is printed.
     #[test]
     fn login_state_debug_redacts_the_pkce_verifier() {
         let sentinel = "pkce-verifier-sentinel-7f3a";
@@ -410,7 +524,7 @@ mod tests {
             redirect_uri: "https://wyrd.example.com/auth/callback".to_owned(),
             code_verifier: SecretString::from(sentinel),
             nonce: "nonce".to_owned(),
-            initiation: LoginInitiation::Browser(Sha256Hex::digest(b"flow")),
+            initiation: authorize(),
         };
 
         let printed = format!("{state:?} {state:#?}");

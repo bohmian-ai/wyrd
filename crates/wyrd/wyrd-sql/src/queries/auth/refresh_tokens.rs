@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use sqlx::types::Uuid;
 
 use crate::TenantConn;
-use crate::row_types::auth::{HumanConnectionBinding, RefreshTokenRow};
+use crate::row_types::auth::{HumanSessionBinding, RefreshTokenRow};
 
 const CONSUME_ACTIVE_REFRESH_SQL: &str = r#"
     UPDATE wyrd.auth_refresh_tokens
@@ -21,7 +21,7 @@ const CONSUME_ACTIVE_REFRESH_SQL: &str = r#"
        AND expires_at > statement_timestamp()
     RETURNING id, data_tenant_id, principal_kind, principal_id, token_hash,
               issued_at, expires_at, rotated_from, revoked_at, revoked_reason,
-              human_connection_id, human_connection_revision
+              human_connection_id, human_connection_revision, client_id
 "#;
 
 /// Serializes every refresh operation for one stored principal family in the
@@ -36,20 +36,33 @@ const REFRESH_ISSUANCE_INSTANT_SQL: &str = r#"
 const REFRESH_BY_HASH_SQL: &str = r#"
     SELECT id, data_tenant_id, principal_kind, principal_id, token_hash,
            issued_at, expires_at, rotated_from, revoked_at, revoked_reason,
-           human_connection_id, human_connection_revision
+           human_connection_id, human_connection_revision, client_id
       FROM wyrd.auth_refresh_tokens
      WHERE token_hash = $1
        AND data_tenant_id = $2
      LIMIT 1
 "#;
 
-/// Inserts one human refresh row bound to the login connection revision.
+/// The unrevoked, unexpired row with this hash, left unconsumed.
+const ACTIVE_REFRESH_SQL: &str = r#"
+    SELECT id, data_tenant_id, principal_kind, principal_id, token_hash,
+           issued_at, expires_at, rotated_from, revoked_at, revoked_reason,
+           human_connection_id, human_connection_revision, client_id
+      FROM wyrd.auth_refresh_tokens
+     WHERE token_hash = $1
+       AND data_tenant_id = $2
+       AND revoked_at IS NULL
+       AND expires_at > statement_timestamp()
+"#;
+
+/// Inserts one human refresh row bound to the login connection revision and
+/// the OAuth client it is issued to.
 const INSERT_HUMAN_REFRESH_TOKEN_SQL: &str = r#"
     INSERT INTO wyrd.auth_refresh_tokens (
         id, data_tenant_id, principal_kind, principal_id,
         token_hash, expires_at, rotated_from,
-        human_connection_id, human_connection_revision
-    ) VALUES ($1, $2, 'user', $3, $4, $5, $6, $7, $8)
+        human_connection_id, human_connection_revision, client_id
+    ) VALUES ($1, $2, 'user', $3, $4, $5, $6, $7, $8, $9)
 "#;
 
 /// Sample the `PostgreSQL` issuance instant for a refresh token, truncated to a
@@ -138,6 +151,27 @@ pub async fn refresh_by_hash(
 ) -> Result<Option<RefreshTokenRow>, sqlx::Error> {
     let tenant_id = conn.data_tenant_id().as_uuid();
     sqlx::query_as::<_, RefreshTokenRow>(REFRESH_BY_HASH_SQL)
+        .bind(token_hash)
+        .bind(tenant_id)
+        .fetch_optional(&mut **conn.transaction())
+        .await
+}
+
+/// Resolve the unrevoked, unexpired refresh row with `token_hash` without
+/// consuming it; `None` when the token is unknown, revoked, or expired.
+///
+/// A `wyrd-ui` refresh token does not rotate: each refresh presents the same
+/// token, so the refresh grant reads it here under the family lock instead
+/// of consuming it, and `PostgreSQL` decides its expiry.
+///
+/// # Errors
+/// Returns a SQLx error when the lookup statement fails.
+pub async fn active_refresh(
+    conn: &mut TenantConn<'_>,
+    token_hash: &str,
+) -> Result<Option<RefreshTokenRow>, sqlx::Error> {
+    let tenant_id = conn.data_tenant_id().as_uuid();
+    sqlx::query_as::<_, RefreshTokenRow>(ACTIVE_REFRESH_SQL)
         .bind(token_hash)
         .bind(tenant_id)
         .fetch_optional(&mut **conn.transaction())
@@ -239,13 +273,14 @@ pub async fn revoke_refresh_family(
     Ok(result.rows_affected())
 }
 
-/// Insert one human session refresh row bound to its login connection.
+/// Insert one human session refresh row bound to its login connection and
+/// client.
 ///
 /// `rotated_from` is `None` at first login and names the consumed predecessor
 /// on rotation, which must already be revoked (via `consume_active_refresh`)
-/// in the same transaction. `connection` names the
-/// exact tenant human connection the session was established through: the
-/// login's connection at first issuance, copied from the predecessor on
+/// in the same transaction. `session` names the exact tenant human connection
+/// the session was established through and the OAuth client it was issued
+/// to: the login's at first issuance, copied from the predecessor on
 /// rotation, so every successor in a family carries the same provenance.
 ///
 /// # Errors
@@ -258,7 +293,7 @@ pub async fn insert_human_refresh_token(
     token_hash: &str,
     expires_at: DateTime<Utc>,
     rotated_from: Option<Uuid>,
-    connection: HumanConnectionBinding,
+    session: HumanSessionBinding,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(INSERT_HUMAN_REFRESH_TOKEN_SQL)
         .bind(id)
@@ -267,8 +302,9 @@ pub async fn insert_human_refresh_token(
         .bind(token_hash)
         .bind(expires_at)
         .bind(rotated_from)
-        .bind(connection.connection_id)
-        .bind(connection.connection_revision)
+        .bind(session.connection.connection_id)
+        .bind(session.connection.connection_revision)
+        .bind(session.client.as_str())
         .execute(&mut **conn.transaction())
         .await?;
     Ok(())

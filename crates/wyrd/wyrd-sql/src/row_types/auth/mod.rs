@@ -9,7 +9,7 @@ mod users;
 mod workload_bindings;
 
 pub use api_keys::ApiKeyRow;
-pub use human_connections::{HumanConnectionBinding, HumanConnectionRow};
+pub use human_connections::{HumanConnectionBinding, HumanConnectionRow, HumanSessionBinding};
 pub use refresh_tokens::RefreshTokenRow;
 pub use roles::RoleRow;
 pub use trusted_issuers::TrustedIssuerRow;

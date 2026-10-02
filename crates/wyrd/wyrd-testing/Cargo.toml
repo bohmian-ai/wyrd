@@ -146,3 +146,11 @@ rmcp = { workspace = true, features = [
 name = "bifrost_query_capacity"
 path = "src/bin/bifrost_query_capacity/main.rs"
 bench = false
+
+# The opt-in multi-tenant verification journey benchmark. Run only through
+# `mise run bench:verification:journey`; only its unit tests run in a lane,
+# with the crate's other tests.
+[[bin]]
+name = "verification_journey"
+path = "src/bin/verification_journey/main.rs"
+bench = false

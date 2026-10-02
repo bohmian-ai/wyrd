@@ -508,6 +508,10 @@ run = "cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run
 description = "Opt-in benchmark: one release wyrd-server started through the local-development journey (migrate, serve, setup) in an 8-CPU/16-GiB systemd user scope, driven through the public Rust client: write 10M events, check every answer, selective and small-aggregate sweeps, medium, table, broad-window and full-scan reads, reads while writing, and a full query queue. `-- --heavy` writes 100M rows and runs the broad window and full scan. Fails on any FAIL row. Linux with a delegating systemd user manager; part of no gate or verify lane."
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'cargo build --locked --release -p wyrd-server && cargo run --locked --release -p wyrd-testing --bin bifrost_query_capacity -- \"$@\"' _"
 
+[tasks."bench:verification:journey"]
+description = "Opt-in benchmark: one release wyrd-server started through the local-development journey for eight tenants in an 8-CPU/16-GiB systemd user scope, with two public Rust clients per tenant driving Run, Drift and Eval observations, custom rows and OTLP signals through warmup (50/s), steady (100/s), burst (150/s) and drain, beside scheduled and manual Drift and a local Operator endpoint. Reconciles offered, acknowledged, activated, settled and backlog work and fails on any mismatch. Linux with a delegating systemd user manager; part of no gate or verify lane."
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'cargo build --locked --release -p wyrd-server && cargo run --locked --release -p wyrd-testing --bin verification_journey -- \"$@\"' _"
+
 [tasks."test:bifrost:journey:otlp"]
 description = "Tier-1 journeys: OTLP trace, log, metric, mixed-batch and negative protocol surfaces"
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:otlp:inner'"

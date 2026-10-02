@@ -9,6 +9,7 @@ import asyncio
 import inspect
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -381,6 +382,25 @@ def test_concurrent_tasks_entering_the_same_run_exit_independently(
         "second-exited": None,
         "after": None,
     }
+
+
+def test_captured_otel_context_carries_the_scope_into_a_plain_thread(
+    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+) -> None:
+    """A thread attaching a context captured in scope stamps the scope's exact pair."""
+    provider, exporter = spans
+    tracer = provider.get_tracer("framework")
+    run = _state(tmp_path).run(card="model")
+
+    def worker(captured: Any) -> None:
+        otel_context.attach(captured)
+        tracer.start_span("threaded").end()
+
+    with run:
+        thread = threading.Thread(target=worker, args=(otel_context.get_current(),))
+        thread.start()
+        thread.join()
+    assert _correlation(exporter) == {"threaded": (run.card_ref, run.run_id)}
 
 
 async def _span_later(tracer: Any, name: str) -> None:

@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use skald_agent::{Agent, FinishReason};
+use skald_agent::{
+    Agent, ConversationTurn, FinishReason, Role, SessionError, SessionId, SessionMemory,
+    SessionTurn,
+};
 use skald_prompt::Prompt;
 use skald_runtime::{MockProvider, ProviderRegistry};
 use skald_spec::wire::openai_responses::{
@@ -12,7 +15,7 @@ use skald_spec::wire::openai_responses::{
     OpenAiResponsesSettings, OpenAiResponsesTool,
 };
 use skald_spec::{
-    Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
+    MessageNum, Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
 };
 use skald_tool::{AgentTool, ToolError};
 
@@ -161,5 +164,89 @@ async fn agent_run_executes_openai_responses_tool_loop() {
     assert_eq!(run.finish_reason, FinishReason::ModelStopped);
     assert_eq!(run.iterations, 2);
     assert_eq!(run.output, "done");
+    assert_eq!(mock.remaining(), 0);
+    assert!(run.conversation.turns().iter().all(|turn| !matches!(
+        turn,
+        ConversationTurn::Assistant { message } if !matches!(message, MessageNum::OpenAiResponses(_))
+    )));
+}
+
+/// Session memory replaying one prior assistant turn.
+struct PriorTurnSession;
+
+#[async_trait]
+impl SessionMemory for PriorTurnSession {
+    /// The single prior assistant turn.
+    async fn recent(
+        &self,
+        _session_id: &SessionId,
+        _limit: usize,
+    ) -> Result<Vec<SessionTurn>, SessionError> {
+        Ok(vec![SessionTurn {
+            role: Role::Assistant,
+            content: "earlier".to_owned(),
+            call_id: None,
+        }])
+    }
+
+    /// Drops appended turns.
+    async fn append(
+        &self,
+        _session_id: &SessionId,
+        _turn: SessionTurn,
+    ) -> Result<(), SessionError> {
+        Ok(())
+    }
+}
+
+/// A Responses Agent seeds prior session turns as native Responses output
+/// messages ahead of the new user input.
+#[tokio::test]
+async fn responses_session_turns_seed_native_items() {
+    let mock = MockProvider::new(ProviderName::OpenAi)
+        .expect_request(responses_request(
+            vec![
+                message(
+                    "assistant",
+                    OpenAiResponseContentPart::OutputText {
+                        text: "earlier".to_owned(),
+                    },
+                ),
+                message(
+                    "user",
+                    OpenAiResponseContentPart::InputText {
+                        text: "hello".to_owned(),
+                    },
+                ),
+            ],
+            false,
+        ))
+        .respond_with(responses_answer(vec![message(
+            "assistant",
+            OpenAiResponseContentPart::OutputText {
+                text: "again".to_owned(),
+            },
+        )]));
+    let mut providers = ProviderRegistry::new();
+    providers.register(Arc::new(mock.clone()));
+    let prompt = Prompt::from_native(
+        SpecPrompt::new(
+            responses_request(Vec::new(), false),
+            "gpt-4o",
+            None,
+            ResponseType::Text,
+        )
+        .expect("Responses prompt builds"),
+    );
+    let agent = Agent::new(prompt)
+        .with_id("r")
+        .with_session(Arc::new(PriorTurnSession));
+
+    let run = agent
+        .run_with(&providers, Some(SessionId::new("s")), "hello")
+        .await
+        .expect("Responses session run");
+
+    assert_eq!(run.output, "again");
     assert_eq!(mock.remaining(), 0);
 }

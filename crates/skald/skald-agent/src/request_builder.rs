@@ -4,9 +4,7 @@ use skald_spec::wire::anthropic_messages::{
     AnthropicContentBlock, AnthropicMessage, AnthropicToolResultContent,
 };
 use skald_spec::wire::google_generate::{GoogleContent, GoogleFunctionResponse, GooglePart};
-use skald_spec::wire::openai_chat::{
-    OpenAiChatMessage, OpenAiMessageContent, OpenAiToolCall, OpenAiToolFunctionCall,
-};
+use skald_spec::wire::openai_chat::{OpenAiChatMessage, OpenAiMessageContent};
 use skald_spec::wire::openai_responses::{OpenAiResponseContentPart, OpenAiResponseItem};
 use skald_spec::{MessageNum, ProviderName, ProviderRequest, ProviderResponse};
 
@@ -18,9 +16,7 @@ use crate::error::{AgentError, AgentResult};
 pub enum PromptLoopSupport {
     /// `ProviderRequest::OpenAiChatCompletion`.
     OpenAiChat,
-    /// `ProviderRequest::OpenAiResponses`. Loop turns are held as OpenAI Chat
-    /// messages and lowered to Responses input items when the request is
-    /// rebuilt.
+    /// `ProviderRequest::OpenAiResponses`, held as native `input` items.
     OpenAiResponses,
     /// `ProviderRequest::AnthropicMessage`.
     Anthropic,
@@ -66,11 +62,8 @@ pub fn validate_prompt_loop_request(
     }
 }
 
-/// Extract the messages embedded in a rendered provider request.
-///
-/// OpenAI Responses input items have no [`MessageNum`] form, so they stay in
-/// the request template and this returns no seed messages for them;
-/// [`rebuild_request_messages`] appends loop history after those items.
+/// Extract the messages embedded in a rendered provider request; each
+/// OpenAI Responses `input` item becomes one native Responses message.
 ///
 /// # Errors
 ///
@@ -78,7 +71,13 @@ pub fn validate_prompt_loop_request(
 pub fn extract_messages(agent: &str, request: &ProviderRequest) -> AgentResult<Vec<MessageNum>> {
     let kind = validate_prompt_loop_request(agent, request)?;
     match (kind, request) {
-        (PromptLoopSupport::OpenAiResponses, _) => Ok(Vec::new()),
+        (PromptLoopSupport::OpenAiResponses, ProviderRequest::OpenAiResponses(req)) => Ok(req
+            .input
+            .items()
+            .iter()
+            .cloned()
+            .map(|item| MessageNum::OpenAiResponses(vec![item]))
+            .collect()),
         (PromptLoopSupport::OpenAiChat, ProviderRequest::OpenAiChatCompletion(req))
         | (
             PromptLoopSupport::OpenAiChat,
@@ -160,9 +159,17 @@ pub fn assistant_message(agent: &str, response: &ProviderResponse) -> AgentResul
                     })?;
             Ok(MessageNum::Gemini(candidate.content.clone().into()))
         }
-        ProviderResponse::OpenAiResponses(_) => {
-            Ok(MessageNum::OpenAi(Box::new(responses_assistant(response))))
-        }
+        // ponytail: reasoning items are not replayed because the wire type
+        // drops their item id; replay them (or chain `previous_response_id`)
+        // if reasoning-model tool loops need it.
+        ProviderResponse::OpenAiResponses(response) => Ok(MessageNum::OpenAiResponses(
+            response
+                .output
+                .iter()
+                .filter(|item| !matches!(item, OpenAiResponseItem::Reasoning { .. }))
+                .cloned()
+                .collect(),
+        )),
         ProviderResponse::OpenAiEmbeddings(_)
         | ProviderResponse::GoogleBatchEmbed(_)
         | ProviderResponse::VertexPredict(_)
@@ -176,8 +183,8 @@ pub fn assistant_message(agent: &str, response: &ProviderResponse) -> AgentResul
 
 /// Replace the messages of a provider-native request with accumulated history.
 ///
-/// An OpenAI Responses template keeps its own input items, and the OpenAI
-/// Chat-shaped history is lowered to Responses items appended after them.
+/// An OpenAI Responses request's `input` becomes the concatenated items of
+/// its native Responses messages.
 ///
 /// # Errors
 ///
@@ -241,15 +248,14 @@ pub fn rebuild_request_messages(
             }
         }
         ProviderRequest::OpenAiResponses(req) => {
-            let items = req.input.items_mut();
+            let mut items = Vec::new();
             for msg in new_messages {
                 match msg {
-                    MessageNum::OpenAi(message) => items.extend(
-                        responses_items(message).ok_or_else(|| mismatch(ProviderName::OpenAi))?,
-                    ),
+                    MessageNum::OpenAiResponses(message) => items.extend(message.iter().cloned()),
                     _ => return Err(mismatch(ProviderName::OpenAi)),
                 }
             }
+            req.input = items.into();
         }
         ProviderRequest::OpenAiEmbeddings(_)
         | ProviderRequest::GoogleBatchEmbed(_)
@@ -308,10 +314,12 @@ fn validate_message_provider(
 ) -> AgentResult<()> {
     let valid = matches!(
         (provider, message),
-        (
-            PromptLoopSupport::OpenAiChat | PromptLoopSupport::OpenAiResponses,
-            MessageNum::OpenAi(_)
-        ) | (PromptLoopSupport::Anthropic, MessageNum::Anthropic(_))
+        (PromptLoopSupport::OpenAiChat, MessageNum::OpenAi(_))
+            | (
+                PromptLoopSupport::OpenAiResponses,
+                MessageNum::OpenAiResponses(_)
+            )
+            | (PromptLoopSupport::Anthropic, MessageNum::Anthropic(_))
             | (PromptLoopSupport::Gemini, MessageNum::Gemini(_))
             | (PromptLoopSupport::Vertex, MessageNum::Gemini(_))
     );
@@ -333,9 +341,10 @@ fn validate_message_provider(
 
 fn system_message(provider: PromptLoopSupport, content: &str) -> MessageNum {
     match provider {
-        PromptLoopSupport::OpenAiChat | PromptLoopSupport::OpenAiResponses => {
+        PromptLoopSupport::OpenAiChat => {
             MessageNum::OpenAi(Box::new(openai_message("system", content)))
         }
+        PromptLoopSupport::OpenAiResponses => responses_message("system", content),
         PromptLoopSupport::Anthropic => MessageNum::Anthropic(AnthropicMessage {
             role: "system".to_owned(),
             content: vec![AnthropicContentBlock::Text {
@@ -357,9 +366,10 @@ fn system_message(provider: PromptLoopSupport, content: &str) -> MessageNum {
 
 fn user_message(provider: PromptLoopSupport, content: &str) -> MessageNum {
     match provider {
-        PromptLoopSupport::OpenAiChat | PromptLoopSupport::OpenAiResponses => {
+        PromptLoopSupport::OpenAiChat => {
             MessageNum::OpenAi(Box::new(openai_message("user", content)))
         }
+        PromptLoopSupport::OpenAiResponses => responses_message("user", content),
         PromptLoopSupport::Anthropic => MessageNum::Anthropic(AnthropicMessage {
             role: "user".to_owned(),
             content: vec![AnthropicContentBlock::Text {
@@ -387,7 +397,13 @@ fn tool_result_message(
 ) -> MessageNum {
     let content_text = content.to_string();
     match provider {
-        PromptLoopSupport::OpenAiChat | PromptLoopSupport::OpenAiResponses => {
+        PromptLoopSupport::OpenAiResponses => {
+            MessageNum::OpenAiResponses(vec![OpenAiResponseItem::FunctionCallOutput {
+                call_id: call_id.to_owned(),
+                output: content_text,
+            }])
+        }
+        PromptLoopSupport::OpenAiChat => {
             let mut message = openai_message("tool", &content_text);
             message.tool_call_id = Some(call_id.to_owned());
             MessageNum::OpenAi(Box::new(message))
@@ -415,73 +431,14 @@ fn tool_result_message(
     }
 }
 
-/// OpenAI Chat-shaped assistant turn for a Responses answer: its output text
-/// and function calls.
-///
-/// ponytail: reasoning items are not replayed; the next request resends the
-/// full history statelessly, as every other dialect does. Replay reasoning (or
-/// chain `previous_response_id`) if reasoning-model tool loops need it.
-fn responses_assistant(response: &ProviderResponse) -> OpenAiChatMessage {
-    let adapter = response.adapter();
-    let tool_calls: Vec<OpenAiToolCall> = adapter
-        .tool_calls()
-        .into_iter()
-        .map(|call| OpenAiToolCall {
-            id: call.id.into_owned(),
-            kind: "function".to_owned(),
-            function: OpenAiToolFunctionCall {
-                name: call.name.into_owned(),
-                arguments: call.arguments.into_owned(),
-            },
-        })
-        .collect();
-    OpenAiChatMessage {
-        role: "assistant".to_owned(),
-        content: adapter
-            .text()
-            .map(|text| OpenAiMessageContent::Text(text.into_owned())),
-        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
-        ..Default::default()
-    }
-}
-
-/// Lower one OpenAI Chat-shaped loop turn to Responses input items: a tool
-/// result becomes a function-call output; other turns become a text message
-/// followed by their function calls. `None` for multipart content, which loop
-/// turns never carry.
-fn responses_items(message: &OpenAiChatMessage) -> Option<Vec<OpenAiResponseItem>> {
-    let text = match &message.content {
-        Some(OpenAiMessageContent::Text(text)) => text.as_str(),
-        Some(OpenAiMessageContent::Parts(_)) => return None,
-        None => "",
-    };
-    if message.role == "tool" {
-        return Some(vec![OpenAiResponseItem::FunctionCallOutput {
-            call_id: message.tool_call_id.clone().unwrap_or_default(),
-            output: text.to_owned(),
-        }]);
-    }
-    let mut items = Vec::new();
-    if !text.is_empty() {
-        let text = text.to_owned();
-        let part = if message.role == "assistant" {
-            OpenAiResponseContentPart::OutputText { text }
-        } else {
-            OpenAiResponseContentPart::InputText { text }
-        };
-        items.push(OpenAiResponseItem::Message {
-            role: message.role.clone(),
-            content: vec![part],
-        });
-    }
-    items.extend(message.tool_calls.iter().flatten().map(|call| {
-        OpenAiResponseItem::FunctionCall {
-            call_id: call.id.clone(),
-            name: call.function.name.clone(),
-            arguments: call.function.arguments.clone(),
-        }
-    }));
-    Some(items)
+/// Native Responses message item with one `input_text` part.
+fn responses_message(role: &str, content: &str) -> MessageNum {
+    MessageNum::OpenAiResponses(vec![OpenAiResponseItem::Message {
+        role: role.to_owned(),
+        content: vec![OpenAiResponseContentPart::InputText {
+            text: content.to_owned(),
+        }],
+    }])
 }
 
 fn openai_message(role: &str, content: &str) -> OpenAiChatMessage {

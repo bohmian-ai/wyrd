@@ -459,7 +459,7 @@ actions, condition) and failed to compile or assert before GREEN.
 | S5 ExtGateway secure transport | `skald-providers` endpoint policy (moved from `wyrd-gateway`), binding validation, pinning | `workflow::tests::bound_external_gateway_security`; gateway endpoint tests in `test:wyrd` | PASS |
 | S6 terminal budget reserve | `workflow.rs` canonical accounting and terminal reserve | `workflow::tests::terminal_budget_reserve` | PASS |
 | S7 Rust/Python explicit authoring | `workflow_surface.rs` `with_*`; `skald-workflow/src/python.rs` `PyWorkflowRun`; stubs and exports | `workflow_surface::tests::explicit_builder_contract`; `test_workflow_parameter_injection.py::test_explicit_workflow_bindings` | PASS |
-| OpenAI Responses Agents run their tool loop (REQ-039) | `skald-agent/src/request_builder.rs` `PromptLoopSupport::OpenAiResponses`, `responses_assistant`, `responses_items` | RED: the loop refused with "not yet supported"; `-p skald-agent --test loop_responses -E 'test(=agent_run_executes_openai_responses_tool_loop)'`; `isolated_route_calls` `responses` step over WyrdGateway | PASS |
+| OpenAI Responses Agents run their tool loop (REQ-039) | `skald-spec` `MessageNum::OpenAiResponses`; `skald-agent/src/request_builder.rs` (`PromptLoopSupport::OpenAiResponses`, native extract/assistant/rebuild/tool-result); `session.rs` dialect-aware seeding | RED: the loop refused with "not yet supported". `-p skald-agent --test loop_responses` (`agent_run_executes_openai_responses_tool_loop`, `responses_session_turns_seed_native_items`); `-p skald-spec --lib` `request::round_trip::messages_roundtrip`, `request::untagged_dispatch::message_num_untagged_dispatch_per_provider`; the `isolated_route_calls` `responses` step over WyrdGateway | PASS |
 | Local tools reach outputs; undeclared tools never run | `workflow_surface.rs` tests | `explicit_builder_contract` (tool result reaches `outputs["found"]`; undeclared gives `WYRD_AGENT_404_TOOL_NOT_IN_AGENT`, zero calls) | PASS |
 | Workspace builds with retained Python features | all consumers in commit range | `cargo check --locked -p skald-workflow --features python`; `mise run lints` (all features) | PASS |
 | Scoped lanes | — | `test:skald`, `test:shared` (702 passed), `test:wyrd` (2285 passed), `py:test:unit`, `py:typecheck`, `codegen:check`, `check:client-tier`, `check:pyo3-scope`, `check:unwrap-audit`, `fmt`, `lints`, `py:format`, `py:lints`, `git diff --check`: all exit 0 | PASS |
@@ -468,11 +468,16 @@ Deviations and limits:
 - `ExternalGatewayBinding.secret_headers` is a `HashMap<HeaderName, SecretString>`,
   because `HeaderName` is not `Ord`. Its iteration order is never observable.
 - `DEFAULT_MAX_RETRIES = 3` for the local executor.
-- The OpenAI Responses Agent loop was added in `skald-agent`, at the lead's
-  direction (write set extended to `skald-agent/src/request_builder.rs`).
-  Loop turns stay OpenAI Chat-shaped and are lowered to Responses input items
-  on rebuild. History is replayed statelessly, the same as every other
-  dialect. Reasoning items and `previous_response_id` are not round-tripped.
+- The OpenAI Responses Agent loop was added at the lead's direction. The
+  write set now includes `skald-spec/src/message.rs` (new native
+  `MessageNum::OpenAiResponses(Vec<OpenAiResponseItem>)`, the only
+  array-shaped variant) and `skald-agent/src/{request_builder,session,loop_runtime}.rs`.
+  Loop history uses native Responses `input` items (message, function_call,
+  function_call_output) with no cross-dialect translation. Session-seeded
+  assistant turns use Responses output messages. History is replayed
+  statelessly, the same as every other dialect. Reasoning items are not
+  replayed, because the wire type drops their item id. `previous_response_id`
+  is left as authored.
 - `ProviderError::RemoteProblem` boxes its payload as `Box<RemoteProblem>`
   because of clippy `result_large_err`. The fields match the spec.
 - Six catalog codes that no remaining path emits were removed: `404_TASK`,

@@ -368,6 +368,7 @@ pub(crate) mod common {
             MessageNum::OpenAi(Box::new(openai_message())),
             MessageNum::Anthropic(anthropic_message()),
             MessageNum::Gemini(google_message()),
+            MessageNum::OpenAiResponses(openai_responses_response().output),
         ]
     }
 

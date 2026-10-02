@@ -576,9 +576,9 @@ impl Agent {
             session_id: session_id.as_str().to_owned(),
             source,
         })?;
-        let provider = self.prompt.native().request.provider();
+        let request = &self.prompt.native().request;
         for turn in recent {
-            conversation.push(session_turn_to_conversation_turn(turn, provider.clone()));
+            conversation.push(session_turn_to_conversation_turn(turn, request));
         }
         Ok(())
     }

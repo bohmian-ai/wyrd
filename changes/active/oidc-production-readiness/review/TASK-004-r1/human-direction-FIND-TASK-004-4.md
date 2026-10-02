@@ -16,3 +16,14 @@ REQ-012's "user-protected credential store" is satisfied as below.
   generation, `RefreshPending`, `LoggedOut` tombstone, atomic replace), now
   against `credentials.toml`. Writes must preserve the user's other content in
   that file.
+
+## Addendum: tenant selector and token cache (same date)
+
+- The `tenant` selector takes a **tenant key only** (the `/t/{tenantKey}/login`
+  slug). It picks the saved login, and for a workload token it is the tenant
+  the jwt-bearer exchange requests. With an explicit, bearer, or API-key
+  credential, a set `tenant` is refused: that credential already names its
+  tenant. No tenant-id selector. This resolves FIND-TASK-004-1 per REQ-012.
+- Delete `~/.config/wyrd/tokens`. The access token exchanged from an API key
+  is cached in `credentials.toml` next to that key, through the same locked
+  writer as saved logins.

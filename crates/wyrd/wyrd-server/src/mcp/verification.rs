@@ -222,7 +222,7 @@ impl WyrdMcpHandler {
             ExecuteVerificationRequest::decode(JsonValue::Object(arguments.unwrap_or_default()))?;
         structured(
             &VerificationControl::new(&self.state)
-                .execute(&caller, &request)
+                .execute(&caller, &request, None)
                 .await?,
         )
     }

@@ -12,7 +12,7 @@ use crate::AppState;
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::http::error::permission_deny_reason_to_wyrd;
-use crate::http::middleware::edge_timeout::QueryEdgeTimer;
+use crate::http::middleware::edge_timeout::EdgeTimer;
 
 /// Authorization and audit owner for one authenticated query-plane operation.
 ///
@@ -247,7 +247,7 @@ pub(crate) fn oracle_context(caller: &Caller) -> Result<AuthorizedQueryContext, 
 /// availability. The returned stream owns admission, cancellation, and cleanup
 /// guards, so dropping it on transport cancellation stops query work.
 ///
-/// An HTTP caller passes its [`QueryEdgeTimer`]; it is handed off only after
+/// An HTTP caller passes its [`EdgeTimer`]; it is handed off only after
 /// capability admission, immediately before Gate dispatch synchronously reaches
 /// the forwarder that captures the request's query deadline. Earlier work stays
 /// bounded by the generic edge timeout. gRPC and MCP callers pass `None`.
@@ -260,13 +260,13 @@ pub async fn stream_query(
     state: AppState,
     caller: Caller,
     request: BifrostQueryRequest,
-    edge_timer: Option<&QueryEdgeTimer>,
+    edge_timer: Option<&EdgeTimer>,
 ) -> Result<OracleQueryStream, WyrdError> {
     let authority = QueryAuthority::new(&state, &caller, "vala.query.sync", "vala.query");
     authority.admit_capability().await?;
     let context = oracle_context(&caller)?;
     if let Some(edge_timer) = edge_timer {
-        edge_timer.hand_off_to_oracle();
+        edge_timer.hand_off();
     }
     match state.bifrost.query_sql(context, request).await {
         Ok(stream) => Ok(stream),

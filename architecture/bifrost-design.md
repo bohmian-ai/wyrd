@@ -850,11 +850,13 @@ No cleanup infers safety from age or path shape alone.
 - Catalog compare-and-swap and lease fences own publication authority. An
   object-store PUT alone never makes data visible or safe to delete.
 - Audit records authorization decisions. Every boundary that evaluates a
-  principal's permission appends exactly one allowed or denied event before the
-  operation proceeds or refuses, in the operation's own commit transaction where
-  one exists, and fails closed when that append fails. Oracle read decisions
-  commit to the same staging outbox from a non-blocking task and do not hold
-  rows for that commit.
+  principal's permission records exactly one allowed or denied event.
+  Permissions are blocking; audits are non-blocking: the check completes before
+  the operation proceeds or refuses, and the event is staged on the shared
+  audit outbox without the operation waiting for its commit. Oracle read
+  decisions do not hold rows for that commit. Surfaces not yet converted still
+  append in the operation's own commit transaction and fail closed until they
+  move to the outbox.
 - Engine-internal transitions — Scribe batch commits, Forge maintenance, audit
   publication, reconciliation, storage lifecycle — evaluate no permission. They
   record lineage in their own operational tables and structured diagnostics,

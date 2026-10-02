@@ -871,8 +871,10 @@ Agent/Prompt resolution and canonical audit still use PostgreSQL.
 **Authorization.**
 - Requires `evals:run` with exact Verifier and subject scope, as for the
   direct-target `POST /runs`.
-- One allowed or denied decision is audited transactionally per request. An
-  audit-append failure refuses the request.
+- The permission check blocks; the audit does not (revision 52). One allowed
+  or denied decision per request is staged on the audit outbox shared with
+  Oracle; an audit-append failure is logged and counted and never refuses the
+  request.
 - Cross-tenant or unknown targets return `404`.
 
 **Bounds.**

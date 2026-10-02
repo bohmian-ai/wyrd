@@ -485,6 +485,15 @@ impl Oracle {
         self.role_shutdown.is_cancelled() && self.engine.process_shutdown_observed_for_test()
     }
 
+    /// Returns the audit outbox writer this role stages its decisions on.
+    ///
+    /// [`AppState::new`] shares it so one writer per process carries every
+    /// non-blocking decision.
+    #[must_use]
+    pub(crate) const fn audit(&self) -> &Arc<crate::oracle::OracleQueryAudit> {
+        &self.audit
+    }
+
     /// Returns the exact registered Oracle role identity and fence.
     #[must_use]
     pub(crate) const fn registered_role(&self) -> &RegisteredRole {
@@ -2209,6 +2218,13 @@ pub struct AppState {
     pub verification: Arc<VerificationHealth>,
     /// Key-encryption keys that seal and open Operator connection credentials.
     pub operator_keys: Arc<OperatorKeys>,
+    /// Non-blocking audit outbox writer every request-path decision of this
+    /// process stages on without waiting for its commit.
+    ///
+    /// The Oracle role's writer when this process runs Oracle, otherwise one
+    /// built for the process; drained by `BoundServer::run` after Bifrost
+    /// shutdown.
+    pub audit_outbox: Arc<crate::oracle::OracleQueryAudit>,
     /// Model providers Eval judges call, in queued runs and direct execution.
     ///
     /// The environment-built process default unless a test or embedding
@@ -2224,6 +2240,13 @@ pub struct AppState {
 
 impl AppState {
     /// Build runtime state from production-ready Postgres handles.
+    ///
+    /// Shares the Oracle role's audit outbox writer when `bifrost` runs
+    /// Oracle, and otherwise starts one for the process.
+    ///
+    /// # Panics
+    /// Panics when called outside a Tokio runtime without an Oracle role,
+    /// because the outbox writer task is spawned immediately.
     #[must_use]
     pub fn new(
         postgres: Arc<ServerPostgres>,
@@ -2232,7 +2255,12 @@ impl AppState {
         shutdown_token: CancellationToken,
     ) -> Self {
         let (reporter, _service) = wyrd_tonic::tonic_health::server::health_reporter();
+        let audit_outbox = bifrost.oracle().map_or_else(
+            || crate::oracle::OracleQueryAudit::new(postgres.vala().clone()),
+            |oracle| Arc::clone(oracle.audit()),
+        );
         Self {
+            audit_outbox,
             postgres,
             storage,
             bifrost,

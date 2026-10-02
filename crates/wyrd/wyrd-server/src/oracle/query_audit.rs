@@ -1,10 +1,12 @@
-//! Oracle read-decision and tenant-tripwire audit written to the audit outbox.
+//! Non-blocking audit outbox writer for Oracle read decisions, tenant
+//! tripwires, and direct verification decisions.
 //!
-//! Oracle records its authorization decisions the one way every boundary does:
-//! a committed append into `vala.audit_staging`, which the
+//! Decisions are recorded the one way every boundary does: a committed append
+//! into `vala.audit_staging`, which the
 //! [`crate::audit::publication::AuditPublisher`] later moves into retained
-//! history. A query is never held behind that commit: its decision joins a
-//! bounded in-memory queue and the query continues.
+//! history. A request is never held behind that commit: its decision joins a
+//! bounded in-memory queue and the request continues. One writer serves the
+//! process, shared through [`crate::state::AppState::audit_outbox`].
 //!
 //! One background writer drains the queue. It takes everything waiting, groups
 //! it by tenant, and commits each tenant's events in one transaction through
@@ -91,7 +93,7 @@ impl OracleQueryAudit {
     ///
     /// When the queue is full the decision is dropped, counted in
     /// `oracle_audit_commit_failures_total`, and logged.
-    fn stage(&self, tenant: DataTenantId, event: AuditEvent) {
+    pub(crate) fn stage(&self, tenant: DataTenantId, event: AuditEvent) {
         self.pending.fetch_add(1, Ordering::AcqRel);
         if let Err(error) = self.queue.try_send((tenant, event)) {
             self.pending.fetch_sub(1, Ordering::AcqRel);

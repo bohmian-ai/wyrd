@@ -30,6 +30,8 @@ use wyrd_sql::{CardStatus, ParsedCardRow, TenantConn};
 
 use crate::audit;
 use crate::components::auth::Caller;
+use crate::http::error::permission_deny_reason_to_wyrd;
+use crate::http::middleware::edge_timeout::EdgeTimer;
 use crate::state::{AppState, registry_db_error};
 use crate::verification::direct::{self, DirectExecutor, EXECUTION_DEADLINE};
 use crate::verification::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
@@ -362,20 +364,22 @@ impl<'a> VerificationControl<'a> {
 
     /// Execute one exact Verifier over supplied input and return its judgment.
     ///
-    /// Checks input bounds, then evaluates `evals:run`; a denial is audited
-    /// standalone. One tenant transaction then resolves both Cards, checks a
-    /// Card-bound caller's signed scope over the exact subject, and commits
-    /// the single allow or deny decision before any engine work, so an
-    /// unrecorded decision never executes. The engine runs under
-    /// [`EXECUTION_DEADLINE`] as a `direct` execution on its own telemetry;
-    /// nothing else is persisted. Dropping the future cancels the execution.
+    /// Checks input bounds, then evaluates `evals:run`, then resolves both
+    /// Cards and checks a Card-bound caller's signed scope over the exact
+    /// subject. Permission blocks; audit does not: the single allow or deny
+    /// decision is staged on [`AppState::audit_outbox`] and the request never
+    /// waits for its commit. The engine runs under [`EXECUTION_DEADLINE`] as
+    /// a `direct` execution on its own telemetry; nothing else is persisted.
+    /// Dropping the future cancels the execution. An HTTP caller passes its
+    /// [`EdgeTimer`], handed off once the target is authorized and resolved
+    /// so the deadline, not the generic edge timeout, governs the engine; MCP
+    /// passes `None`.
     ///
     /// # Errors
     /// Returns [`WyrdError::VerificationInputTooLarge`] for an exceeded bound,
     /// [`WyrdError::PermissionDeniedRbac`] without `evals:run` or subject
     /// scope, [`WyrdError::VerificationTargetNotFound`] for an unknown,
-    /// inactive, or non-Verifier target, [`WyrdError::AuditUnavailable`]
-    /// when the decision cannot be recorded,
+    /// inactive, or non-Verifier target,
     /// [`WyrdError::VerificationExecutionTimedOut`] past the deadline, a
     /// registry unavailability error when a read fails, and every engine
     /// refusal of [`DirectExecutor::execute`].
@@ -388,6 +392,7 @@ impl<'a> VerificationControl<'a> {
         &self,
         caller: &Caller,
         request: &ExecuteVerificationRequest,
+        edge_timer: Option<&EdgeTimer>,
     ) -> Result<ExecuteVerificationResponse, WyrdError> {
         request.validate()?;
         let execution_id = VerificationExecutionId::new_v7();
@@ -397,24 +402,27 @@ impl<'a> VerificationControl<'a> {
             "verifier:{}/subject:{}/execution:{execution_id}",
             request.verifier_uid, request.subject_card_uid
         );
-        let allowed = audit::authorize_recording_denial(
-            self.state,
-            caller,
-            &Permission::eval_run(),
-            EXECUTE,
-            &resource,
-        )
-        .await?;
+        if let Err(reason) = self
+            .state
+            .authz
+            .permission_check
+            .check(&caller.principal, &Permission::eval_run())
+            .into_result()
+        {
+            self.stage_execute_decision(caller, &resource, AuditOutcome::Denied);
+            return Err(permission_deny_reason_to_wyrd(reason));
+        }
         let telemetry = ExecutionTelemetry::start(ExecutionMode::Direct);
-        let resolved = telemetry
+        let target = telemetry
             .phase(
                 Phase::Load,
-                self.resolve_direct(caller, request, &allowed, &resource)
+                self.resolve_direct(caller, request, &resource)
                     .instrument(tracing::info_span!("verification.load")),
             )
-            .await;
-        let target =
-            audit::record_unless_committed(self.state, caller, &allowed, resolved).await??;
+            .await?;
+        if let Some(edge_timer) = edge_timer {
+            edge_timer.hand_off();
+        }
         let kind = VerifierKind::of(&target.implementation);
         telemetry.classify(kind);
         let executed = telemetry
@@ -460,36 +468,41 @@ impl<'a> VerificationControl<'a> {
         })
     }
 
-    /// Resolve a direct execution's Cards and commit its decision.
+    /// Resolve a direct execution's Cards, check subject scope, and stage
+    /// its decision.
     ///
-    /// The outer result is `Err` only when nothing committed; the inner
-    /// result is the committed answer, including committed refusals.
+    /// Reads both Cards in one read-only tenant transaction. A Card-bound
+    /// caller without signed scope over the exact subject stages a denial;
+    /// every other caller stages the allowed decision before the target is
+    /// judged usable, so an unknown target still records who asked.
     ///
     /// # Errors
-    /// Returns the registry or audit error of a transaction that did not commit.
+    /// Returns a registry error when a read fails,
+    /// [`WyrdError::PermissionDeniedRbac`] without subject scope, and
+    /// [`WyrdError::VerificationTargetNotFound`] for an unknown, inactive, or
+    /// non-Verifier target.
     async fn resolve_direct(
         &self,
         caller: &Caller,
         request: &ExecuteVerificationRequest,
-        allowed: &AuditEvent,
         resource: &str,
-    ) -> Result<Result<DirectTarget, WyrdError>, WyrdError> {
+    ) -> Result<DirectTarget, WyrdError> {
         let mut conn = self
             .state
             .registry_tenant_conn(caller.data_tenant_id)
             .await?;
         let verifier = Self::card(&mut conn, &request.verifier_uid).await?;
         let subject = Self::card(&mut conn, &request.subject_card_uid).await?;
+        drop(conn);
         if let Some(subject) = &subject
             && caller.principal.card_ref().is_some()
             && !caller.principal.authorizes_card(&exact_ref(subject))
         {
-            drop(conn);
-            return Ok(self.deny_scope(caller, EXECUTE, resource).await);
+            self.stage_execute_decision(caller, resource, AuditOutcome::Denied);
+            return Err(Self::scope_denied(resource));
         }
-        audit::append_on(&mut conn, allowed).await?;
-        conn.commit().await.map_err(registry_db_error)?;
-        Ok(match (verifier, subject) {
+        self.stage_execute_decision(caller, resource, AuditOutcome::Allowed);
+        match (verifier, subject) {
             (Some(verifier), Some(subject)) if available(&verifier) && available(&subject) => {
                 let reference = exact_ref(&verifier);
                 match verifier.spec {
@@ -502,7 +515,33 @@ impl<'a> VerificationControl<'a> {
                 }
             }
             _ => Err(Self::target_not_found(request)),
-        })
+        }
+    }
+
+    /// Stage one direct execution decision on the process audit outbox
+    /// without waiting for its commit.
+    ///
+    /// A decision the outbox cannot commit is logged and counted by the
+    /// writer, never returned: audit does not block execution.
+    fn stage_execute_decision(&self, caller: &Caller, resource: &str, outcome: AuditOutcome) {
+        self.state.audit_outbox.stage(
+            caller.data_tenant_id,
+            audit::audit_event(
+                caller,
+                EXECUTE,
+                resource,
+                &Permission::eval_run().to_string(),
+                outcome,
+            ),
+        );
+    }
+
+    /// The refusal of a Card-bound caller without scope over the subject.
+    fn scope_denied(resource: &str) -> WyrdError {
+        WyrdError::PermissionDeniedRbac {
+            message: "the caller's Card scope does not cover the verified subject".to_owned(),
+            details: serde_json::json!({ "resource": resource }),
+        }
     }
 
     /// Record a Card-scope denial standalone and return the refusal.
@@ -533,10 +572,7 @@ impl<'a> VerificationControl<'a> {
             &denied,
         )
         .await?;
-        Err(WyrdError::PermissionDeniedRbac {
-            message: "the caller's Card scope does not cover the verified subject".to_owned(),
-            details: serde_json::json!({ "resource": resource }),
-        })
+        Err(Self::scope_denied(resource))
     }
 
     /// Read one Card of the caller's tenant, or `None` when it is absent.

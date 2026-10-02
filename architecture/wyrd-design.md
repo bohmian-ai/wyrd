@@ -491,8 +491,11 @@ platform plane, and neither plane's credential or token is accepted by the
 other.
 
 Both planes write their authorization decisions to the one canonical audit
-path: `vala.audit_staging` in the deciding transaction, then `AuditPublisher`
-into `vala.system.audit_log`. A decision records the deciding principal's
+path: `vala.audit_staging`, then `AuditPublisher` into
+`vala.system.audit_log`. Permissions are blocking; audits are non-blocking:
+a decision is staged on the shared audit outbox and never delays the
+operation, while surfaces not yet converted still append in the deciding
+transaction. A decision records the deciding principal's
 stored kind and, when its token was minted from a credential, that
 credential's non-secret id.
 

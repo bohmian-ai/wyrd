@@ -296,6 +296,25 @@ async fn start_decisions(server: &WyrdTestServer, principal: Uuid) -> Vec<(Strin
     decisions(server, "verification.run.start", principal).await
 }
 
+/// List `principal`'s `verification.execute` decisions as (permission,
+/// outcome) once the non-blocking audit outbox has committed every staged
+/// decision.
+///
+/// # Panics
+/// Panics when the outbox does not drain within ten seconds or the audit rows
+/// cannot be read.
+async fn execute_decisions(server: &WyrdTestServer, principal: Uuid) -> Vec<(String, String)> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while server.state().audit_outbox.pending() != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "audit outbox drains"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    decisions(server, "verification.execute", principal).await
+}
+
 /// List `principal`'s staged `operation` decisions as (permission, outcome).
 ///
 /// # Panics
@@ -1157,7 +1176,7 @@ async fn direct_execution_judges_inline_without_runs() {
         assert!(response["summary"].is_string());
     }
     assert_eq!(run_count(&server, server.data_tenant_id()).await, 0);
-    let decisions = decisions(&server, "verification.execute", caller).await;
+    let decisions = execute_decisions(&server, caller).await;
     assert_eq!(decisions.len(), requests, "one decision per request");
     assert!(
         decisions
@@ -1303,7 +1322,7 @@ async fn direct_execution_refusals_are_stable() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
     assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
     assert_eq!(
-        decisions(&server, "verification.execute", reader).await,
+        execute_decisions(&server, reader).await,
         vec![("evals:run".to_owned(), "denied".to_owned())]
     );
     let machine = server
@@ -1315,23 +1334,24 @@ async fn direct_execution_refusals_are_stable() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
     assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
     assert_eq!(
-        decisions(&server, "verification.execute", machine.id().as_uuid()).await,
+        execute_decisions(&server, machine.id().as_uuid()).await,
         vec![("evals:run".to_owned(), "denied".to_owned())]
     );
     assert_eq!(run_count(&server, server.data_tenant_id()).await, 0);
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// A direct execution whose decision cannot be audited is refused with the
-/// stable audit code before any engine work, on both the allowed and the
-/// Card-scope denied path, and leaves no decision row behind.
+/// A direct execution whose decision cannot be audited still executes: audit
+/// is non-blocking, so the allowed caller gets its judgment and the Card-bound
+/// caller without subject scope gets its permission refusal, while neither
+/// decision reaches the outbox.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, the failure
 /// trigger cannot be installed, a route fails to respond, or any status, code,
 /// or audit expectation fails.
 #[tokio::test(flavor = "current_thread")]
-async fn direct_execution_fails_closed_when_audit_fails() {
+async fn direct_execution_does_not_wait_on_audit() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1347,28 +1367,21 @@ async fn direct_execution_fails_closed_when_audit_fails() {
         .superuser_pool()
         .await
         .expect("superuser pool opens");
-    // Every decision of the user fails, but only denials of the machine: a
-    // failed scope denial must never fall back to recording an allowance.
-    let function = format!(
+    for statement in [
         r#"CREATE OR REPLACE FUNCTION vala.test_fail_execute_audit()
            RETURNS trigger LANGUAGE plpgsql AS $$
            BEGIN
-             IF NEW.operation = 'verification.execute'
-                AND (NEW.outcome = 'denied' OR NEW.principal_id = '{caller}') THEN
+             IF NEW.operation = 'verification.execute' THEN
                RAISE EXCEPTION 'injected execute audit failure';
              END IF;
              RETURN NEW;
            END;
-           $$;"#
-    );
-    for statement in [
-        function,
+           $$;"#,
         r#"CREATE TRIGGER test_fail_execute_audit
            BEFORE INSERT ON vala.audit_staging
-           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_execute_audit()"#
-            .to_owned(),
+           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_execute_audit()"#,
     ] {
-        sqlx::query(sqlx::AssertSqlSafe(statement))
+        sqlx::query(statement)
             .execute(&superuser)
             .await
             .expect("failure trigger installs");
@@ -1380,15 +1393,14 @@ async fn direct_execution_fails_closed_when_audit_fails() {
         json!({ "kind": "eval_record", "context": { "x": 1 } }),
     )
     .to_string();
-    for (principal, token) in [(caller, &jwt), (machine.id().as_uuid(), &machine_token)] {
-        let (status, problem) = post_execute(&server, token, body.clone()).await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{problem}");
-        assert_eq!(problem["code"], "WYRD_VALA_500_AUDIT_UNAVAILABLE");
-        assert!(
-            decisions(&server, "verification.execute", principal)
-                .await
-                .is_empty()
-        );
+    let (status, judged) = post_execute(&server, &jwt, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{judged}");
+    assert_eq!(judged["verdict"], "passed", "{judged}");
+    let (status, problem) = post_execute(&server, &machine_token, body).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+    for principal in [caller, machine.id().as_uuid()] {
+        assert!(execute_decisions(&server, principal).await.is_empty());
     }
     server.shutdown().await.expect("test server shuts down");
 }

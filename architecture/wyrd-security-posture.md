@@ -19,7 +19,10 @@ controls required to operate those boundaries.
 - Tenant-scoped SQL runs through `TenantConn` under Postgres RLS. Cross-tenant
   work runs only through the explicitly privileged `OperatorPool` capability.
 - Security uncertainty fails closed. Verification, authorization, policy,
-  tenant binding, fencing, and audit failures deny the operation.
+  tenant binding, and fencing failures deny the operation. Audit is
+  non-blocking: a decision that fails to commit is logged and counted and does
+  not deny the operation, except on surfaces not yet converted to the audit
+  outbox.
 - Secrets are resolved from a deployment secret provider at runtime. They are
   never Card fields, generated artifacts, logs, traces, errors, or audit
   payloads.
@@ -352,9 +355,11 @@ is not an SSRF control.
 ## Audit integrity and privacy
 
 Audit cardinality follows authorization decisions, not HTTP requests and not
-engine mechanics. Except for the explicitly non-blocking Oracle read and
-gateway invocation paths below, every decision that evaluates a principal's
-permission appends its audit row in the same transaction that made it. Scribe
+engine mechanics. Permissions are blocking; audits are non-blocking. Oracle
+reads, gateway invocations, and direct verification execution stage their
+decisions on the shared audit outbox without waiting for the commit; surfaces
+not yet converted still append their audit row in the same transaction that
+made the decision. Scribe
 batch commits and Forge maintenance transitions evaluate no permission: they
 are recorded as lineage in `vala.scribe_batch_commits` and
 `vala.forge_operations` and emit no audit event.
@@ -372,6 +377,12 @@ is metered and logged, and shutdown drains tracked work. Gateway administration
 decisions remain transactional with their mutations. No gateway-specific audit
 WAL, disk spool, durable queue, relay, table, publisher, or sink exists; abrupt
 process loss may therefore lose an invocation event that has not committed.
+
+Direct verification execution evaluates `evals:run` and subject scope
+synchronously, then stages its one allowed or denied decision on the process
+audit outbox shared with Oracle. A full queue or failed commit is counted in
+`oracle_audit_commit_failures_total` and logged; the execution proceeds, and
+server shutdown drains the outbox.
 
 `vala.audit_staging` is transient transactional write-ahead state with no
 external consumer. Retained audit history lives in the

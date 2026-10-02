@@ -882,6 +882,15 @@ impl BoundServer {
                 }),
             )
         };
+        // Every request has finished and Oracle has drained, so no decision
+        // can still be staged; commit what the shared outbox holds.
+        let uncommitted = self.state.audit_outbox.shutdown(deadline).await;
+        if uncommitted != 0 {
+            tracing::warn!(
+                uncommitted,
+                "audit outbox did not drain before the shutdown deadline"
+            );
+        }
 
         tracing::info!("wyrd-server shutdown complete");
         server_shutdown_result(terminal, bifrost_shutdown_error, report)

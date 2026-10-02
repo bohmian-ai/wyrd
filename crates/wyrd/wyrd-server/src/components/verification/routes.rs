@@ -7,11 +7,11 @@
 //! from Bifrost by `result_id`, so there is no result endpoint here; a direct
 //! execution returns its judgment inline and persists none.
 
-use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::{Extension, Json};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::{BindingId, VerificationRunId};
 use wyrd_spec::verification::{
@@ -24,6 +24,7 @@ use super::service::{VerificationControl, decode_start_request};
 use crate::components::auth::Caller;
 use crate::components::storage::routes::extract_idempotency_key;
 use crate::http::error::{WyrdErrorResponse, path_rejection};
+use crate::http::middleware::edge_timeout::EdgeTimer;
 use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -188,7 +189,9 @@ async fn get_run(
 /// Execute one exact Verifier over supplied input and return its judgment.
 ///
 /// The body is read up to [`MAX_EXECUTE_BODY_BYTES`]; a larger body is
-/// refused before decoding. Not idempotent: a retry executes again.
+/// refused before decoding. Not idempotent: a retry executes again. Body
+/// collection, authentication, and resolution are bounded by the server
+/// request timeout; the engine by the 60-second execution deadline.
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the body is too large or malformed, the
@@ -219,8 +222,6 @@ async fn get_run(
         (status = 422, description = "The input does not fit the Verifier, or the Verifier \
           needs a trace or agent run (WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE, \
           WYRD_VERIFICATION_422_INPUT_UNSUPPORTED)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 502, description = "A judge provider failed after the task's retries \
           (WYRD_VERIFICATION_502_DEPENDENCY_FAILED)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
@@ -234,6 +235,7 @@ async fn get_run(
 #[tracing::instrument(skip(state, caller, body), fields(operation = "verification.execute"))]
 async fn execute(
     State(state): State<AppState>,
+    edge_timer: Option<Extension<EdgeTimer>>,
     caller: Caller,
     body: Body,
 ) -> Result<Json<ExecuteVerificationResponse>, WyrdErrorResponse> {
@@ -251,7 +253,11 @@ async fn execute(
     let request = ExecuteVerificationRequest::decode(body)?;
     Ok(Json(
         VerificationControl::new(&state)
-            .execute(&caller, &request)
+            .execute(
+                &caller,
+                &request,
+                edge_timer.map(|Extension(timer)| timer).as_ref(),
+            )
             .await?,
     ))
 }

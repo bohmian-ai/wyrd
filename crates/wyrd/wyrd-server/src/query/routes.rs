@@ -22,7 +22,7 @@ use wyrd_tonic::frame_codec::FrameEncoder;
 
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
-use crate::http::middleware::edge_timeout::QueryEdgeTimer;
+use crate::http::middleware::edge_timeout::EdgeTimer;
 use crate::query::service;
 use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
@@ -291,7 +291,7 @@ pub(crate) async fn cancel_running_query(
 /// request timeout; once the query is dispatched, its own deadline governs.
 pub(crate) async fn sync_query(
     State(state): State<AppState>,
-    edge_timer: Option<Extension<QueryEdgeTimer>>,
+    edge_timer: Option<Extension<EdgeTimer>>,
     caller: Caller,
     Json(body): Json<BifrostQueryRequest>,
 ) -> Response {

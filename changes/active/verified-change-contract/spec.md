@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 51
+revision: 52
 status: approved
 ---
 
@@ -1654,10 +1654,12 @@ table on `(data_tenant_id, result_id)`.
   or apply the Eval sampling policy. Registry, baseline, and judge
   Agent/Prompt resolution and canonical audit still use PostgreSQL.
 - **REQ-168**: Direct execution MUST require `evals:run` with exact Verifier
-  and subject scope, exactly as the direct-target run start does. It MUST
-  transactionally audit one allowed or denied decision per request and
-  refuse the request when the audit append fails. Unknown or cross-tenant
-  targets return `404 verification_target_not_found`. Bounds:
+  and subject scope, exactly as the direct-target run start does. The
+  permission check blocks; the audit does not. It MUST stage exactly one
+  allowed or denied decision per request on the process audit outbox shared
+  with Oracle, without waiting for its commit; a decision that fails to
+  commit is logged and counted and never refuses the request. Unknown or
+  cross-tenant targets return `404 verification_target_not_found`. Bounds:
   - a request body of at most 1 MiB;
   - `drift_samples` of at most 64 columns × 100,000 values;
   - `eval_record.context` of at most 256 KiB;
@@ -2190,7 +2192,8 @@ published image pinned by an immutable registry digest before release.
   malformed, oversized, incompatible, and unsupported input, and timeout. They
   MUST also prove that no durable run, result, dispatch, or Bifrost evidence
   operation occurs. An isolated test MUST prove that an audit-append failure
-  refuses the request.
+  neither refuses nor delays an authorized execution or changes a permission
+  refusal.
 - **AC-040**: The reference workloads are:
 
   | Case | Workload |
@@ -2245,6 +2248,14 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 
 ## Revision history
 
+- **Revision 52 non-blocking direct-execution audit (2026-10-02):** The user
+  directed that permissions are blocking and audits are non-blocking.
+  - REQ-168 stages the direct-execution decision on the shared audit outbox
+    instead of committing it transactionally; an audit failure no longer
+    refuses the request.
+  - AC-039's isolated audit test proves that non-blocking behavior.
+  - Converting the remaining transactional audit surfaces is a separate
+    change.
 - **Revision 51 direct execution, telemetry, and capacity (2026-10-02):** The
   user approved the TASK-008 closeout amendments.
   - REQ-135 gains a fourth operation.

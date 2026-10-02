@@ -1,7 +1,8 @@
 //! Verification capacity benchmark (REQ-171, AC-040).
 //!
 //! An operator starts release `wyrd-server` replicas the way the
-//! local-development guide says (`migrate`, serve, `setup`), in peer mode,
+//! local-development guide says (`migrate`, serve, `setup`), in peer mode
+//! over one shared S3-compatible store, as the kind deployment runs them,
 //! with the server's own sampled traces exported to a local OTLP collector
 //! and its LLM provider pointed at a local TLS judge that answers after a
 //! fixed delay. Tenant administrators register the AC-040 reference
@@ -83,6 +84,12 @@ struct Cli {
     /// The `wyrd-server` binary; defaults to the one built beside this one.
     #[arg(long)]
     server_binary: Option<PathBuf>,
+    /// Shared object store every replica serves, as peer mode requires.
+    #[arg(long, env = "WYRD_STORAGE_URL")]
+    storage_url: String,
+    /// S3-compatible endpoint of that store.
+    #[arg(long, env = "WYRD_STORAGE_ENDPOINT_URL")]
+    storage_endpoint_url: String,
 }
 
 /// The benchmark: start, provision, run every replica count, report.
@@ -122,21 +129,23 @@ async fn benchmark(cli: Cli) -> Result<bool> {
         .collect::<Result<Vec<_>>>()?;
     let ca_file = judge.ca_file().display().to_string();
     let env = |ordinal: u16| -> Vec<(&str, &str)> {
-        let mut env = vec![
+        vec![
             ("WYRD_OTLP_ENDPOINT", collector.trace_endpoint()),
             ("WYRD_OTLP_PROTOCOL", "grpc"),
             ("WYRD_OTLP_SAMPLE_RATIO", SAMPLE_RATIO),
             ("OPENAI_API_KEY", "verification-capacity"),
             ("OPENAI_BASE_URL", judge.base_url()),
             ("SSL_CERT_FILE", ca_file.as_str()),
-        ];
-        if max_replicas > 1 {
-            env.push((
+            ("WYRD_STORAGE_URL", cli.storage_url.as_str()),
+            (
+                "WYRD_STORAGE_ENDPOINT_URL",
+                cli.storage_endpoint_url.as_str(),
+            ),
+            (
                 "WYRD_PEER_TLS_DIR",
                 peer_dirs[usize::from(ordinal)].as_str(),
-            ));
-        }
-        env
+            ),
+        ]
     };
 
     let slugs: Vec<String> = ["m0".to_owned(), "m1".to_owned()]

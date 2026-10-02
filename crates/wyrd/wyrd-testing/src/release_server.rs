@@ -381,14 +381,22 @@ impl LocalServer {
     ///
     /// # Errors
     ///
-    /// Returns an error when the process exits or the timeout passes.
+    /// Returns an error when the process exits, carrying the last lines of
+    /// its log, or the timeout passes.
     async fn await_ready(&mut self) -> Result<()> {
         let deadline = Instant::now() + READY_TIMEOUT;
         while Instant::now() < deadline {
             if let Some(child) = self.child.as_mut()
                 && let Some(status) = child.try_wait()?
             {
-                return Err(format!("wyrd-server exited during boot with {status}").into());
+                let log = std::fs::read_to_string(self.root.path().join("server.log"))
+                    .unwrap_or_default();
+                let tail: Vec<&str> = log.lines().rev().take(20).collect();
+                return Err(format!(
+                    "wyrd-server exited during boot with {status}; log tail:\n{}",
+                    tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+                )
+                .into());
             }
             if reqwest::get(format!("{}/readyz", self.url()))
                 .await

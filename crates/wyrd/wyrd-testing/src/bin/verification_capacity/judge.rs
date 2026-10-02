@@ -55,13 +55,16 @@ impl Judge {
         std::fs::create_dir_all(directory)?;
         let ca_file = directory.join("judge-ca.pem");
         std::fs::write(&ca_file, authority.ca_certificate_pem())?;
-        let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                CertificateDer::pem_slice_iter(leaf.certificate_pem().as_bytes())
-                    .collect::<std::result::Result<Vec<_>, _>>()?,
-                PrivateKeyDer::from_pem_slice(leaf.private_key_pem().as_bytes())?,
-            )?;
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(
+            CertificateDer::pem_slice_iter(leaf.certificate_pem().as_bytes())
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            PrivateKeyDer::from_pem_slice(leaf.private_key_pem().as_bytes())?,
+        )?;
         let tcp = TcpListener::bind("127.0.0.1:0").await?;
         let base_url = format!("https://{HOST}:{}/v1", tcp.local_addr()?.port());
         let calls = Arc::new(AtomicU64::new(0));

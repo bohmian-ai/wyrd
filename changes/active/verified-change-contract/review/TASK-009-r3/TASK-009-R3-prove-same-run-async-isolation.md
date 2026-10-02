@@ -158,3 +158,43 @@ git diff --check
 Route this remediation directly to `$wyrd-implement`. A later task review must
 reassess the complete original base-to-remediated-candidate range, not only this
 test correction.
+
+## Implementation evidence
+
+Commits: `8ed262e2d` plus this evidence record. Test-only; no production change.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| 1. Two coordinated asyncio tasks enter the exact same `Run` concurrently | `tests/unit/state/test_observe_surface.py::test_concurrent_tasks_entering_the_same_run_exit_independently`: both tasks close over one `run = state.run(card="model")`; `asyncio.Event`s order first-enter, second-enter, first-exit | `uv run python -m pytest -q tests/unit/state/test_observe_surface.py::test_concurrent_tasks_entering_the_same_run_exit_independently` (1 passed) | PASS |
+| 2. After one exits, its new span is uncorrelated; the still-entered task's span has the exact pair | spans `first-exited` == `None`, `second-entered` == `(run.card_ref, run.run_id)` | same | PASS |
+| 3. After both exit, a new span has no correlation | spans `second-exited` (inside task B after its exit) and `after` (post-loop) == `None` | same | PASS |
+| 4. Deterministic; fails if one token is stored on the shared `PyRun` | events only, no sleeps/timeouts. Scratch mutation (not committed) monkeypatched `wyrd.otel._enter_run`/`_exit_run` to keep one token slot per Run object: the new test failed (`first-exited`/`second-exited` kept the pair) while `test_scope_survives_await_and_isolates_concurrent_tasks` stayed green, confirming the gap and its closure | scratch `pytest -p conftest_mut` run | PASS |
+| 5. Existing behavior stays green | no other behavior change | full `test_observe_surface.py` (35 passed); journey `test_scoped_run_emits_drift_eval_and_generic_rows` (1 passed); `py:test:unit` (514 passed); `py:test:integration` (72 passed); `py:typecheck`, `py:format`, `py:lints`, `git diff --check` exit 0 | PASS |
+
+### AC-032 / REQ-151 case-to-test mapping
+
+All in `sdks/wyrd-sdk-python/tests/unit/state/test_observe_surface.py` unless noted. Each assertion would fail on a regression of its case.
+
+| Case | Test |
+|---|---|
+| Sync entry returns Run; active recording span and child spans stamped; existing attrs overwritten; exit clears | `test_entering_a_run_returns_it_and_correlates_active_and_child_spans` |
+| Nested root/component scopes share run ID, own CardRefs, restore outer | `test_nested_card_scopes_share_the_run_and_restore_the_outer_card` |
+| `await` | `test_scope_survives_await_and_isolates_concurrent_tasks` (`*-late` spans after await) |
+| Concurrent tasks, distinct Run views | `test_scope_survives_await_and_isolates_concurrent_tasks` |
+| Concurrent tasks, identical Run object | `test_concurrent_tasks_entering_the_same_run_exit_independently` (new) |
+| Task created inside the scope | `test_scope_survives_await_and_isolates_concurrent_tasks` (`spawned`) |
+| Missing `opentelemetry-api` + explicit observation | `test_missing_opentelemetry_is_a_no_op` |
+| API-only/no-SDK provider + explicit observation | `test_registration_and_attach_failures_never_block_observations` (`object()` provider); `test_unsupported_providers_are_refused_without_raising` |
+| Processor registration failure + explicit observation | `test_registration_and_attach_failures_never_block_observations` (`Raising`, attempt counted) |
+| Attach failure + explicit observation | `test_registration_and_attach_failures_never_block_observations` (broken `attach`) |
+| Span enrichment failure + explicit observation | `test_enrichment_failure_never_blocks_observations` |
+| Detach failure (swallowed and raising) + explicit observation | `test_detach_failure_restores_the_prior_correlation`. Gap closed in `8ed262e2d`: before, the Drift ran only before the failing exit; it now also runs after the swallowed-detach exit (`model`) and after the raising-detach exit (`run`) |
+| User exception propagates unchanged | `test_registration_and_attach_failures_never_block_observations`, `test_enrichment_failure_never_blocks_observations` |
+| Unknown alias fails before entry | `test_unknown_alias_is_refused`, `test_run_card_refuses_an_unknown_alias` |
+| Provider idempotency (global + private) and private provider attributes | `test_global_and_private_providers_receive_one_processor_each` |
+| Concurrent first entry shares one key | `test_concurrent_first_entries_share_one_scope_key` |
+| Exit restoration incl. failed detach | `test_nested_card_scopes_*`, `test_detach_failure_restores_the_prior_correlation` |
+| `__exit__` never suppresses; stub parity | `test_run_exit_accepts_conventional_keywords_and_omitted_arguments` |
+| Real SDK→server OTLP export, custom-row and Eval joins, active-span ids, exit not a barrier | `tests/integration/state/test_observe_journey.py::test_scoped_run_emits_drift_eval_and_generic_rows` (unchanged) |
+
+Non-goals stayed excluded: no `wyrd.otel` or other production change, no helper/fixture/dependency/harness, no sleeps/timeouts, no second journey; only the focused test file and this record changed.

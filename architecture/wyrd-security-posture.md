@@ -77,6 +77,11 @@ replaces the invocation caller in audit.
 
 Card-bound identities are provisioned idempotently by tenant, principal kind,
 Card kind, and Card UID. Re-applying a Card preserves the principal identity.
+The first projection grants the built-in `workload` role (`bifrost_table:read`,
+`bifrost_record:write`, `bifrost_query:read`) in the registration transaction,
+so the workload can emit and read back its evidence; its Card scope still
+bounds which Cards it may emit for. Re-applying a Card never grants the role
+again, so an administrator's revocation stands.
 Credential issuance is a separate privileged operation and is policy-gated.
 The verification runtime also provisions one UUIDv7 `system` principal per
 tenant, the server's own identity for continuous verification work that has no

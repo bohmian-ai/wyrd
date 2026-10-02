@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 48
+revision: 49
 status: approved
 ---
 
@@ -794,7 +794,13 @@ multi-table transaction design survives as an alternative.
   operations MUST be owned by `wyrd-sql`. Registration uses those operations
   through the caller-owned `TenantConn` so the Card, card-bound principal,
   binding projection, baseline work row, and connection validation share one
-  transaction. Vala consumers use the `vala-sql` re-export rather than import
+  transaction. A Service or Agent principal's first projection also grants it
+  the built-in `workload` role (`bifrost_table:read`, `bifrost_record:write`,
+  `bifrost_query:read`) in that transaction, so a key issued for it through
+  `POST /auth/issue-key` can emit and read back its evidence without a manual
+  grant. Its Card scope still bounds which Cards it may emit for. Re-applying
+  the Card never grants the role again, so an administrator's revocation
+  stands; existing tenants receive the role row by migration. Vala consumers use the `vala-sql` re-export rather than import
   `wyrd-sql` directly. All five tables MUST carry `data_tenant_id`, enable and
   force RLS, use the existing `wyrd.current_tenant()` policy, and be reachable
   by tenant runtime paths only through `TenantConn`; cross-tenant maintenance,
@@ -2122,6 +2128,17 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 - [PagerDuty Global Integrations and Service Routes](https://support.pagerduty.com/main/docs/event-orchestration)
 
 ## Revision history
+
+- **Revision 49 default workload role (2026-10-02):** A Card-bound Service or
+  Agent principal now receives the new built-in `workload` role at first
+  projection, in the registration transaction. The role holds
+  `bifrost_table:read`, `bifrost_record:write`, and `bifrost_query:read`; table
+  read is the describe every writer performs before admission. Card scope still
+  bounds emission, re-registration never re-grants a revoked role, and a
+  migration seeds the role row for existing tenants. This replaces the
+  direct-SQL role grant benchmarks and journeys used because no public route
+  grants a role to a Card-bound principal. The user explicitly approved
+  revision 49 on 2026-10-02.
 
 - **Revision 48 verification table schema erratum (2026-10-02):** Removed the
   `wyrd_row_ordinal` and `data_tenant_id` rows from the shared managed columns

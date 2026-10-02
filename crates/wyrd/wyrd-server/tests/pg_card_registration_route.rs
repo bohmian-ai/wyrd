@@ -1211,6 +1211,312 @@ async fn referenced_binding_refusals_leave_no_writes() {
     server.shutdown().await.expect("test server shuts down");
 }
 
+/// Build a one-Agent registration whose `verified_by` list is posted verbatim.
+///
+/// The Agent's prompt is the seeded `vc-prompt`. Taking the raw list lets a
+/// test send wrong-kind or duplicated references that a local loader would
+/// refuse before they could reach the server.
+fn agent_with_bindings(name: &str, verified_by: Value, idempotency_key: &str) -> Request<Body> {
+    request_with_body(
+        idempotency_key,
+        json!({ "submissions": [{
+            "apiVersion": "wyrd/v1",
+            "kind": "Agent",
+            "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+            "spec": {
+                "prompt": {
+                    "kind": "Prompt", "name": "vc-prompt",
+                    "version": "1.0.0", "space": "default"
+                },
+                "verified_by": verified_by,
+            },
+            "artifacts": []
+        }] }),
+    )
+}
+
+/// Build a one-Card registration for a standalone Card of `kind`.
+fn standalone_card_request(kind: &str, name: &str, spec: Value, key: &str) -> Request<Body> {
+    request_with_body(
+        key,
+        json!({ "submissions": [{
+            "apiVersion": "wyrd/v1",
+            "kind": kind,
+            "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+            "spec": spec,
+            "artifacts": []
+        }] }),
+    )
+}
+
+/// The authenticated registration route enforces the shared Verifier contract.
+///
+/// Through the public HTTP route, with real registered targets behind every
+/// reference, this proves: the retired `kind: Drift` and `kind: Eval` Cards
+/// are refused; a standalone Workflow Operator Card registers, while binding
+/// it to `on_failure` is refused; a `verifier`, `runs_on`, or `on_failure`
+/// reference that resolves to a Card of the wrong kind is refused with its
+/// stable kind error; a repeated Verifier or Operator in one binding is
+/// refused as a duplicate; and an Operator carrying literal credential
+/// material (an `Authorization` header, an unknown token field, or an
+/// environment-variable template) is refused. Every refusal leaves no
+/// operation, Card, relationship, principal, or binding behind.
+///
+/// # Panics
+/// Panics when the server fails to start or stop, the bootstrap returns a
+/// non-user principal, a fixture write or route call fails, or any status,
+/// stable error code, or no-write assertion does not hold.
+#[tokio::test(flavor = "current_thread")]
+async fn verifier_contract_refusals_leave_no_writes() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("verifier-contract-writer", &["writer"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let tenant = server.data_tenant_id();
+    seed_dependency(&server, tenant, "vc-prompt", "active").await;
+    seed_card(
+        &server,
+        tenant,
+        "Workflow",
+        "vc-rollback-workflow",
+        json!({ "steps": [] }),
+        "active",
+    )
+    .await;
+    let card_ref = |kind: &str, name: &str| json!({ "kind": kind, "name": name, "version": "1.0.0", "space": "default" });
+    let register = |kind: &'static str, name: &'static str, spec: Value| {
+        let server = &server;
+        let jwt = jwt.as_str();
+        async move {
+            let response = server
+                .oneshot_authenticated(
+                    jwt,
+                    standalone_card_request(kind, name, spec, &format!("{name}-operation")),
+                )
+                .await
+                .expect("standalone registration responds");
+            let status = response.status();
+            let body = response_json(response).await;
+            assert_eq!(status, StatusCode::CREATED, "{kind} {name}: {body}");
+        }
+    };
+    register(
+        "Verifier",
+        "vc-eval-verifier",
+        json!({ "implementation": { "kind": "eval", "spec": { "tasks": {} } } }),
+    )
+    .await;
+    register(
+        "Trigger",
+        "vc-observations-trigger",
+        json!({ "kind": "observations_ready" }),
+    )
+    .await;
+    register(
+        "Operator",
+        "vc-hook",
+        json!({ "kind": "http", "method": "post",
+                "url": "https://hooks.example.test/verification-failed" }),
+    )
+    .await;
+    register(
+        "Operator",
+        "vc-workflow-operator",
+        json!({ "kind": "workflow",
+                "workflow_ref": card_ref("Workflow", "vc-rollback-workflow") }),
+    )
+    .await;
+
+    let refuse = |label: &str, request: Request<Body>, status: StatusCode, code: &str| {
+        let server = &server;
+        let jwt = jwt.as_str();
+        let label = label.to_owned();
+        let code = code.to_owned();
+        async move {
+            let response = server
+                .oneshot_authenticated(jwt, request)
+                .await
+                .expect("refused registration responds");
+            let actual = response.status();
+            let problem = response_json(response).await;
+            assert_eq!(actual, status, "{label}: {problem}");
+            assert_eq!(problem["code"], code.as_str(), "{label}: {problem}");
+        }
+    };
+
+    // The registration body is decoded by the plain JSON extractor, whose
+    // rejection is a 422 text body naming the failure rather than a Wyrd
+    // problem document; the refusal and its no-write boundary are what hold.
+    let undecodable = |label: &str, request: Request<Body>, needle: &str| {
+        let server = &server;
+        let jwt = jwt.as_str();
+        let label = label.to_owned();
+        let needle = needle.to_owned();
+        async move {
+            let response = server
+                .oneshot_authenticated(jwt, request)
+                .await
+                .expect("undecodable registration responds");
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("response body reads");
+            let text = String::from_utf8_lossy(&bytes);
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{label}: {text}");
+            assert!(text.contains(needle.as_str()), "{label}: {text}");
+        }
+    };
+
+    for kind in ["Drift", "Eval"] {
+        let name = format!("vc-retired-{}", kind.to_lowercase());
+        let operation = format!("{name}-operation");
+        undecodable(
+            kind,
+            standalone_card_request(kind, &name, json!({}), &operation),
+            &format!("unknown card kind: {kind}"),
+        )
+        .await;
+        assert_no_registration_writes(&server, &operation, &name).await;
+    }
+
+    let binding = |verifier: Value, runs_on: Value, on_failure: Value| json!({ "verifier": verifier, "runs_on": runs_on, "on_failure": on_failure });
+    let eval = card_ref("Verifier", "vc-eval-verifier");
+    let trigger = card_ref("Trigger", "vc-observations-trigger");
+    let hook = card_ref("Operator", "vc-hook");
+    let cases = [
+        (
+            "workflow-operator",
+            json!([binding(
+                eval.clone(),
+                trigger.clone(),
+                json!([card_ref("Operator", "vc-workflow-operator")])
+            )]),
+            "WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION",
+        ),
+        (
+            "verifier-wrong-kind",
+            json!([binding(trigger.clone(), trigger.clone(), json!([]))]),
+            "WYRD_SPEC_400_INVALID_VERIFIER_REF_KIND",
+        ),
+        (
+            "runs-on-wrong-kind",
+            json!([binding(eval.clone(), eval.clone(), json!([]))]),
+            "WYRD_SPEC_400_INVALID_BINDING_REF_KIND",
+        ),
+        (
+            "operator-wrong-kind",
+            json!([binding(
+                eval.clone(),
+                trigger.clone(),
+                json!([trigger.clone()])
+            )]),
+            "WYRD_SPEC_400_INVALID_BINDING_REF_KIND",
+        ),
+        (
+            "duplicate-binding",
+            json!([
+                binding(eval.clone(), trigger.clone(), json!([])),
+                binding(
+                    eval.clone(),
+                    json!({ "kind": "observations_ready" }),
+                    json!([])
+                ),
+            ]),
+            "WYRD_SPEC_400_DUPLICATE_VERIFICATION_BINDING",
+        ),
+        (
+            "duplicate-referenced-operator",
+            json!([binding(
+                eval.clone(),
+                trigger.clone(),
+                json!([hook.clone(), hook.clone()])
+            )]),
+            "WYRD_SPEC_400_DUPLICATE_BINDING_OPERATOR",
+        ),
+        (
+            "duplicate-inline-operator",
+            json!([binding(
+                eval.clone(),
+                trigger.clone(),
+                json!([
+                    { "kind": "http", "method": "post", "url": "https://hooks.example.test/a" },
+                    { "kind": "http", "method": "post", "url": "https://hooks.example.test/a" },
+                ])
+            )]),
+            "WYRD_SPEC_400_DUPLICATE_BINDING_OPERATOR",
+        ),
+        (
+            "secret-authorization-header",
+            json!([binding(
+                eval.clone(),
+                trigger.clone(),
+                json!([{ "kind": "http", "method": "post",
+                         "url": "https://hooks.example.test/a",
+                         "headers": { "Authorization": "Bearer sk-live-0123456789abcdef" } }])
+            )]),
+            "WYRD_SPEC_400_INVALID_OPERATOR",
+        ),
+        (
+            "secret-env-template",
+            json!([binding(
+                eval.clone(),
+                trigger.clone(),
+                json!([{ "kind": "notify", "channel": {
+                    "kind": "slack", "connection": "ops-slack", "channel_id": "C1",
+                    "text": "{{env.SLACK_BOT_TOKEN}}"
+                } }])
+            )]),
+            "WYRD_SPEC_400_INVALID_OPERATOR",
+        ),
+    ];
+    for (label, verified_by, code) in cases {
+        let name = format!("vc-{label}-agent");
+        let operation = format!("vc-case-{label}-operation");
+        refuse(
+            label,
+            agent_with_bindings(&name, verified_by, &operation),
+            StatusCode::BAD_REQUEST,
+            code,
+        )
+        .await;
+        assert_no_registration_writes(&server, &operation, &name).await;
+    }
+
+    let token_field = json!([binding(
+        eval.clone(),
+        trigger.clone(),
+        json!([{ "kind": "notify", "channel": {
+            "kind": "slack", "connection": "ops-slack", "channel_id": "C1",
+            "text": "failed", "bot_token": "xoxb-0123456789-abcdefghij"
+        } }])
+    )]);
+    refuse(
+        "secret-token-field",
+        agent_with_bindings(
+            "vc-secret-token-agent",
+            token_field,
+            "vc-secret-token-operation",
+        ),
+        StatusCode::BAD_REQUEST,
+        "WYRD_REGISTRY_400_INVALID_CARD_SPEC",
+    )
+    .await;
+    assert_no_registration_writes(
+        &server,
+        "vc-secret-token-operation",
+        "vc-secret-token-agent",
+    )
+    .await;
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// Confirm a rejected dependency did not append any durable registration state.
 ///
 /// Counts the registration operation under `operation_key` and, for Cards
@@ -2806,8 +3112,9 @@ async fn owner_activity(server: &WyrdTestServer, owner: Uuid) -> Vec<BindingActi
 /// observations-ready binding; checks the referenced Trigger is frozen by UID
 /// and the inline Operator by digest; then reads `status.verification.binding_ids`
 /// through the public route, re-applies the identical graph, and checks the
-/// under-privileged and cross-tenant reads. Finally it exchanges an API key
-/// for the Service's own projected principal through `/auth/token` and proves
+/// under-privileged and cross-tenant reads. Before any exchange it proves
+/// registration wrote no `wyrd.verifier_runs` row for the owner. Finally it
+/// exchanges an API key for the Service's own projected principal through `/auth/token` and proves
 /// that exchange stamped the owner's activity and armed only the schedule
 /// cursor. An unarmable schedule and a repeated component alias are refused
 /// before any write.
@@ -2815,7 +3122,7 @@ async fn owner_activity(server: &WyrdTestServer, owner: Uuid) -> Vec<BindingActi
 /// # Panics
 /// Panics when the server fails to start or stop, a bootstrap or fixture
 /// write fails, a route fails to respond, or any status, error code, binding
-/// identity, or activity assertion does not hold.
+/// identity, run-absence, or activity assertion does not hold.
 #[tokio::test(flavor = "current_thread")]
 async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
     let server = WyrdTestServer::start_in_process()
@@ -3048,6 +3355,19 @@ async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
             .all(|(seen, _, cursor)| seen.is_none() && cursor.is_none()),
         "registration alone never activates the owner"
     );
+    let mut conn = server
+        .tenant_conn_for(tenant)
+        .await
+        .expect("tenant connection opens");
+    let registered_runs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.verifier_runs WHERE owner_card_uid = $1 OR subject_card_uid = $1",
+    )
+    .bind(service_uid)
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("verifier run count reads");
+    conn.commit().await.expect("assertion transaction commits");
+    assert_eq!(registered_runs, 0, "registration alone never starts a run");
 
     server
         .exchange_api_key(&api_key)

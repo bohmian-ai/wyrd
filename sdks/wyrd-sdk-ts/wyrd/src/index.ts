@@ -1242,6 +1242,15 @@ export class WorkflowCards {
   }
 }
 
+/** Any value JSON can carry: Workflow inputs, outputs, and error details. */
+export type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | readonly JsonValue[]
+  | { readonly [key: string]: JsonValue };
+
 /** Lifecycle status of a Workflow run. */
 export type WorkflowRunStatus =
   | "queued"
@@ -1250,6 +1259,45 @@ export type WorkflowRunStatus =
   | "failed"
   | "cancelled"
   | "timed_out";
+
+/** Lifecycle status of one Workflow step. */
+export type WorkflowStepStatus =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "unstarted";
+
+/** Catalog error recorded on a failed run or step. */
+export interface WorkflowRunError {
+  /** Stable Wyrd error code. */
+  readonly code: string;
+  /** Safe diagnostic message. */
+  readonly message: string;
+  /** Safe structured details. */
+  readonly details: JsonValue;
+  /** Operator-facing remediation. */
+  readonly remediation: string;
+}
+
+/** Result of one Workflow step. */
+export interface WorkflowStepResult {
+  /** Step lifecycle status. */
+  readonly status: WorkflowStepStatus;
+  /** Final text output, present only for a succeeded step. */
+  readonly text: string | null;
+  /** Structured output, present only for a succeeded step. */
+  readonly structured_output: JsonValue | null;
+  /** Number of attempts begun. */
+  readonly attempts: number;
+  /** RFC 3339 first attempt start time, `null` if the step never started. */
+  readonly started_at: string | null;
+  /** RFC 3339 terminal time, `null` while the step is active. */
+  readonly ended_at: string | null;
+  /** Terminal error, present only for a failed step. */
+  readonly error: WorkflowRunError | null;
+}
 
 /** Snapshot of one Workflow run. */
 export interface WorkflowRun {
@@ -1260,17 +1308,17 @@ export interface WorkflowRun {
   /** Run lifecycle status. */
   readonly status: WorkflowRunStatus;
   /** Declared outputs, populated only for a succeeded run. */
-  readonly outputs: Record<string, unknown>;
+  readonly outputs: Record<string, JsonValue>;
   /** Step results keyed by step ID. */
-  readonly steps: Record<string, unknown>;
+  readonly steps: Record<string, WorkflowStepResult>;
   /** RFC 3339 creation time. */
   readonly created_at: string;
   /** RFC 3339 start time, `null` before the run starts. */
   readonly started_at: string | null;
   /** RFC 3339 terminal time, `null` while the run is active. */
   readonly ended_at: string | null;
-  /** Stable catalog code and message for a `failed` or `timed_out` run. */
-  readonly error: { readonly code: string; readonly message: string } | null;
+  /** Primary error for a `failed` or `timed_out` run. */
+  readonly error: WorkflowRunError | null;
 }
 
 /**
@@ -1318,7 +1366,7 @@ export class Workflow {
    * Validation and route refusals throw before any step runs; step failures
    * are recorded in the returned run.
    */
-  async run(input: Record<string, unknown> = {}): Promise<WorkflowRun> {
+  async run(input: Record<string, JsonValue> = {}): Promise<WorkflowRun> {
     return lifecycleValue<WorkflowRun>(
       await this.#native.run(JSON.stringify(input)),
     );

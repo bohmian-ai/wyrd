@@ -14,6 +14,13 @@
 //! dispatches through the same Operator path. Negative flows cover an unready
 //! Verifier, a non-Parquet baseline, a retired SPC profile field, a caller
 //! without `evals:run`, and a second tenant.
+//!
+//! A separate integrated journey registers one Service whose Model component
+//! binds the PSI, SPC, and Custom Verifiers and whose Agent component binds a
+//! deterministic plus LLM-judge Eval Verifier, and proves the whole path:
+//! exact-principal authentication, the locked run API, Scribe
+//! acknowledgement, runtime execution, Bifrost result query, Run GET status,
+//! and HTTP Operator delivery of the one failed verdict.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -32,8 +39,9 @@ use wyrd_sdk::bifrost::client_from_options;
 use wyrd_sdk::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode, RegistrationReceipt};
 use wyrd_sdk::state::WyrdState;
 use wyrd_sdk::verification::{
-    BindingId, OperatorDispatchState, StartVerificationRunRequest, Verification,
-    VerificationExecutionStatus, VerificationResultId, VerificationRunId, VerificationRunStatus,
+    BindingId, OperatorDispatchState, OperatorDispatchStatus, StartVerificationRunRequest,
+    Verification, VerificationExecutionStatus, VerificationResultId, VerificationRunId,
+    VerificationRunStatus,
 };
 use wyrd_sdk::{Bifrost, QueueConfig, WyrdClient};
 use wyrd_testing::Bootstrap;
@@ -70,6 +78,8 @@ struct ResultRow {
     subject_card_uid: String,
     /// Binding of a binding-created run; null for a direct run.
     binding_id: Option<String>,
+    /// Binding owner of a binding-created run; null for a direct run.
+    owner_card_uid: Option<String>,
 }
 
 /// One feature row joined to its parent result.
@@ -357,8 +367,10 @@ async fn complete(
     read_result(server, query, &result_id.to_string()).await
 }
 
-/// Flush Scribe, then read one result and its feature rows joined on result
-/// identity within the caller's tenant-scoped view.
+/// Flush Scribe, then read one result and its feature rows joined on
+/// (`data_tenant_id`, `result_id`): Bifrost keys the tenant physically, with
+/// no per-row column, so the caller's tenant-scoped view supplies
+/// `data_tenant_id` and the SQL joins on `result_id`.
 ///
 /// A tenant that has never scored a report has no feature table yet, which
 /// reads as no feature rows.
@@ -374,7 +386,8 @@ async fn read_result(
     server.flush_bifrost().await.expect("flush server Scribe");
     let mut results: Vec<ResultRow> = query
         .sql_as(&format!(
-            "SELECT execution_status, verdict, details, subject_card_uid, binding_id \
+            "SELECT execution_status, verdict, details, subject_card_uid, binding_id, \
+                    owner_card_uid \
              FROM vala.verification.results WHERE result_id = '{result_id}'"
         ))
         .await
@@ -1176,6 +1189,10 @@ async fn assert_direct_scores(
     assert_eq!(result.subject_card_uid, subject);
     assert!(result.binding_id.is_none(), "a direct run has no binding");
     assert!(
+        result.owner_card_uid.is_none(),
+        "a direct run copies no caller, subject, or Verifier as its owner"
+    );
+    assert!(
         result.details.is_some(),
         "a scored report persists its details"
     );
@@ -1365,15 +1382,20 @@ impl SharedTrigger<'_> {
             );
             let (result, _) = read_result(self.server, self.query, &run.result.to_string()).await;
             assert_spc_evidence(&result, 24, 24);
+            let owner = service
+                .root
+                .uid
+                .as_ref()
+                .expect("service has a UID")
+                .to_string();
             assert_eq!(
-                result.subject_card_uid,
-                service
-                    .root
-                    .uid
-                    .as_ref()
-                    .expect("service has a UID")
-                    .to_string(),
+                result.subject_card_uid, owner,
                 "each binding verifies its own Service"
+            );
+            assert_eq!(
+                result.owner_card_uid.as_deref(),
+                Some(owner.as_str()),
+                "a binding result names its owner"
             );
         }
         assert_ne!(settled[0].binding, settled[1].binding);
@@ -1561,7 +1583,8 @@ async fn assert_refusals(
     );
     let leaked = Bifrost::query_only(&other)
         .sql_as::<ResultRow>(
-            "SELECT execution_status, verdict, details, subject_card_uid, binding_id \
+            "SELECT execution_status, verdict, details, subject_card_uid, binding_id, \
+                    owner_card_uid \
              FROM vala.verification.results",
         )
         .await
@@ -1571,4 +1594,768 @@ async fn assert_refusals(
         "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
         "no result crosses tenants: {leaked:?}"
     );
+}
+
+/// Name of the registered Service of the integrated journey.
+const INTEGRATED_SERVICE: &str = "integrated-service";
+
+/// Path the failed Eval verdict's HTTP Operator posts to on the local mock.
+const OPERATOR_PATH: &str = "/integrated-operator";
+
+/// Path the bound runtime's `OpenAI` Eval judge calls on the local mock.
+const JUDGE_PATH: &str = "/v1/chat/completions";
+
+/// The Agent's observed exchange, emitted as a typed Eval context.
+#[derive(Serialize)]
+struct Exchange {
+    /// The question the Agent answered.
+    question: String,
+    /// The Agent's answer; the deterministic task expects `yes`.
+    answer: String,
+}
+
+/// One canonical result of a binding owned by the integrated Service.
+#[derive(Debug, Deserialize)]
+struct OwnedResult {
+    /// Stable result identity.
+    result_id: String,
+    /// Managed Verifier run that published the result.
+    run_id: String,
+    /// Managed exact Verifier Card UID.
+    card_uid: String,
+    /// `drift` or `eval`.
+    implementation: String,
+    /// Common verdict.
+    verdict: String,
+    /// Exact subject Card the binding verifies.
+    subject_card_uid: String,
+    /// Binding that created the run.
+    binding_id: Option<String>,
+    /// Committed Eval input record; null for Drift.
+    source_record_id: Option<String>,
+}
+
+/// One Eval task outcome joined to its parent result.
+#[derive(Debug, Deserialize)]
+struct ItemRow {
+    /// The task the outcome belongs to.
+    task_id: String,
+    /// Whether the task passed; null for a skipped task.
+    passed: Option<bool>,
+}
+
+/// Rows of one observation table grouped by managed subject.
+#[derive(Debug, Deserialize)]
+struct SubjectCount {
+    /// Managed subject Card UID stamped from the authorized scope.
+    card_uid: Option<String>,
+    /// Rows the invocation wrote for that subject.
+    row_count: i64,
+}
+
+/// One Eval observation of the journey's invocation.
+#[derive(Debug, Deserialize)]
+struct EvalObservationRow {
+    /// Logical record identity a run's `source_record_id` names.
+    record_id: String,
+    /// The emitted JSON context.
+    context: String,
+    /// Managed subject Card UID stamped from the authorized scope.
+    card_uid: Option<String>,
+}
+
+/// Write the integrated Service graph next to the Drift fixtures.
+///
+/// A Model component binds the registered PSI, SPC, and Custom Verifiers on
+/// the shared `drift-daily` Trigger; an Agent component binds one
+/// `observations_ready` Eval Verifier with a deterministic task and an LLM
+/// judge, gated on both, whose HTTP Operator posts to `operator`. The judge
+/// Prompt is native `OpenAI` Chat with a JSON-schema response, built through
+/// Skald. Returns the Service path.
+///
+/// # Panics
+/// Panics when the judge Prompt cannot be built or a file cannot be written.
+fn write_integrated_graph(root: &Path, operator: &str) -> std::path::PathBuf {
+    let judge = skald_prompt::openai_chat(
+        "gpt-test",
+        skald_prompt::OpenAiChatOptions {
+            messages: vec!["Grade the answer ${answer}.".to_owned()],
+            variables: vec!["answer".to_owned()],
+            output: Some(
+                skald_prompt::ResponseFormat::json_schema(
+                    "judge_result",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": { "passed": { "type": "boolean" } },
+                        "required": ["passed"],
+                        "additionalProperties": false
+                    }),
+                )
+                .expect("the judge response format builds"),
+            ),
+            ..skald_prompt::OpenAiChatOptions::default()
+        },
+    )
+    .expect("the judge prompt builds");
+    let judge = serde_json::json!({
+        "apiVersion": "wyrd/v1",
+        "kind": "Prompt",
+        "metadata": { "name": "integrated-judge", "version": "1.0.0", "space": "default" },
+        "spec": judge.into_native(),
+    });
+    let drift_binding = |verifier: &str| {
+        format!(
+            "        - verifier: {{kind: Verifier, name: {verifier}, version: 1.0.0, space: default}}\n          runs_on: {{kind: Trigger, name: drift-daily, version: 1.0.0, space: default}}\n"
+        )
+    };
+    let files = [
+        ("integrated-judge.json", judge.to_string()),
+        (
+            "integrated-agent-prompt.yaml",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: integrated-agent-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-test\n  messages: [answer the question]\n".to_owned(),
+        ),
+        (
+            "integrated-agent.yaml",
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: integrated-agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: ./integrated-agent-prompt.yaml\n  run_config:\n    max_iterations: 1\n".to_owned(),
+        ),
+        (
+            "integrated-model.yaml",
+            "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: integrated-model\n  version: 1.0.0\n  space: default\nspec:\n  interface:\n    kind: Custom\n    meta:\n      framework_version: 0.1.0\n      loader_module: fixture\n      loader_class: TinyModel\n      extra: {}\n  task_type: Other\n  signature:\n    inputs:\n      - name: latency\n        dtype: float64\n    outputs:\n      - name: score\n        dtype: float64\n  card_refs: []\n".to_owned(),
+        ),
+        (
+            "integrated-operator.yaml",
+            format!(
+                "apiVersion: wyrd/v1\nkind: Operator\nmetadata:\n  name: integrated-operator\n  version: 1.0.0\n  space: default\nspec:\n  kind: http\n  method: post\n  url: {operator}\n"
+            ),
+        ),
+        (
+            "integrated-eval.yaml",
+            "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: integrated-eval\n  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: eval\n    spec:\n      pass_gate: {kind: all_pass}\n      tasks:\n        answer: {kind: assertion, id: answer, context_path: $.answer, operator: equals, expected: \"yes\"}\n        judge:\n          kind: llm_judge\n          id: judge\n          judge_ref: {prompt: ./integrated-judge.json, tool_names: [], run_config: {max_iterations: 1}}\n          context_path: $.answer\n          operator: equals\n          expected: {passed: true}\n          max_retries: 0\n".to_owned(),
+        ),
+        (
+            "integrated-service.yaml",
+            format!(
+                "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: {INTEGRATED_SERVICE}\n  version: 1.0.0\n  space: default\nspec:\n  service_type: agent\n  components:\n    - alias: model\n      ref: ./integrated-model.yaml\n      verified_by:\n{}{}{}    - alias: agent\n      ref: ./integrated-agent.yaml\n      verified_by:\n        - verifier: ./integrated-eval.yaml\n          runs_on: {{kind: observations_ready}}\n          on_failure: [./integrated-operator.yaml]\n",
+                drift_binding("drift-psi"),
+                drift_binding("drift-spc"),
+                drift_binding("drift-custom"),
+            ),
+        ),
+    ];
+    for (name, body) in files {
+        std::fs::write(root.join(name), body).expect("integrated fixture writes");
+    }
+    root.join("integrated-service.yaml")
+}
+
+/// Start the local mock serving both the `OpenAI` judge and the HTTP
+/// Operator endpoint.
+///
+/// The judge always grades `{"passed": true}`, so only the deterministic
+/// task decides a verdict; the Operator endpoint accepts every delivery.
+///
+/// # Panics
+/// Panics when a mock cannot be mounted.
+async fn start_upstream() -> wiremock::MockServer {
+    let upstream = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(JUDGE_PATH))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl_integrated", "object": "chat.completion",
+                "created": 1_700_000_000, "model": "gpt-test",
+                "choices": [{ "index": 0, "finish_reason": "stop",
+                    "message": { "role": "assistant", "content": "{\"passed\":true}" } }],
+                "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
+            })),
+        )
+        .mount(&upstream)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(OPERATOR_PATH))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .mount(&upstream)
+        .await;
+    upstream
+}
+
+/// The number of requests `upstream` received on `path`.
+///
+/// # Panics
+/// Panics when the mock does not record requests.
+async fn requests_to(upstream: &wiremock::MockServer, path: &str) -> usize {
+    upstream
+        .received_requests()
+        .await
+        .expect("the mock records requests")
+        .iter()
+        .filter(|request| request.url.path() == path)
+        .count()
+}
+
+/// Prove one registered Service carrying PSI, SPC, Custom, and deterministic
+/// plus LLM-judge Eval bindings verifies end to end through the public SDK.
+///
+/// The Service graph registers from real YAML; its own Card-bound
+/// credential authenticates as the exact registered principal; one
+/// invocation switches between the Model and Agent views, emitting typed and
+/// mapping Drift feature maps and Eval contexts through the state-owned
+/// Bifrost queue, drained at shutdown after Scribe acknowledges every row.
+/// The runtime executes each Drift binding at one due occurrence and each
+/// Eval record after its acknowledgement, judging through a local
+/// `OpenAI`-compatible mock. Results, feature rows, and task outcomes are read
+/// back through the SDK's tenant-scoped Bifrost query joined on `result_id`,
+/// each run's status through Run GET, and the one failed Eval
+/// verdict's HTTP Operator delivers to the local endpoint with its dispatch
+/// reported `delivered` by Run GET.
+///
+/// # Panics
+/// Panics when any journey step or expectation fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn service_verifies_drift_and_eval_through_the_sdk() {
+    let root = tempfile::tempdir().expect("fixture root creates");
+    write_baseline(root.path());
+    write_verifiers(root.path());
+    let upstream = start_upstream().await;
+    let service_path =
+        write_integrated_graph(root.path(), &format!("{}{OPERATOR_PATH}", upstream.uri()));
+    let server = Box::pin(
+        WyrdTestServer::builder()
+            .with_verification_runtime_for_test()
+            .with_gateway_provider_root_for_test(
+                url::Url::parse(&upstream.uri()).expect("the mock URI parses"),
+            )
+            .start_bound(),
+    )
+    .await
+    .expect("test server starts");
+    let admin = connect(
+        &server,
+        &api_key(
+            server
+                .bootstrap_service("rust_integrated_admin", &["admin"])
+                .await
+                .expect("admin bootstraps"),
+        ),
+    );
+    let cards = Cards::with_client(WyrdClient::clone(&admin));
+    register(&cards, &root.path().join("baseline.yaml")).await;
+    let psi = register(&cards, &root.path().join("drift-psi.yaml")).await;
+    let spc = register(&cards, &root.path().join("drift-spc.yaml")).await;
+    let custom = register(&cards, &root.path().join("drift-custom.yaml")).await;
+    assert_eq!(wait_baseline(&cards, &psi, "ready").await, None);
+    assert_eq!(wait_baseline(&cards, &spc, "ready").await, None);
+    register(&cards, &root.path().join("trigger.yaml")).await;
+    let service = register(&cards, &service_path).await;
+
+    let journey = IntegratedJourney::start(&server, &admin, &service, root.path()).await;
+    let invocation = journey.emit().await;
+    journey.assert_observations(&invocation).await;
+    let evals = journey.owned_results(2).await;
+    journey.make_drift_bindings_due(&cards, &evals).await;
+    let results = journey.owned_results(5).await;
+    journey
+        .assert_drift_results(
+            &results,
+            [(&psi, "Psi"), (&spc, "Spc"), (&custom, "Custom")],
+        )
+        .await;
+    journey.assert_eval_results(&results, &invocation).await;
+    assert!(
+        requests_to(&upstream, JUDGE_PATH).await >= 2,
+        "the LLM judge graded each Eval record through the local provider"
+    );
+    assert_eq!(
+        requests_to(&upstream, OPERATOR_PATH).await,
+        1,
+        "only the failed Eval verdict reaches its Operator"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// The SDK handles and identities of the integrated Service journey.
+struct IntegratedJourney<'a> {
+    /// Bound server running the production verification runtime.
+    server: &'a WyrdTestServer,
+    /// The registered Service owning every binding.
+    service: &'a RegistrationReceipt,
+    /// Public client authenticated as the exact registered Service principal.
+    client: WyrdClient,
+    /// Run GET handle on the Service's own credential.
+    verification: Verification,
+    /// SDK query handle over the tenant's verification tables.
+    query: Bifrost,
+    /// Complete hydrated bundle the invocation loads offline.
+    bundle: std::path::PathBuf,
+    /// Exact Model component UID, the Drift subject.
+    model_uid: String,
+    /// Exact Agent component UID, the Eval subject.
+    agent_uid: String,
+}
+
+/// One emitted invocation of the integrated journey.
+struct Invocation {
+    /// The client invocation `run_id` every observation row carries.
+    run_id: String,
+}
+
+impl<'a> IntegratedJourney<'a> {
+    /// Hydrate the Service bundle, credential the exact registered Service
+    /// principal, and resolve both component subjects offline.
+    ///
+    /// # Panics
+    /// Panics when hydration or credentialing fails, or a component alias
+    /// does not resolve to a UID.
+    async fn start(
+        server: &'a WyrdTestServer,
+        admin: &WyrdClient,
+        service: &'a RegistrationReceipt,
+        root: &Path,
+    ) -> Self {
+        let bundle = root.join("integrated-bundle");
+        Box::pin(
+            CardGraphHydrator::new(Cards::with_client(WyrdClient::clone(admin)).registry_context())
+                .hydrate(
+                    &CardSelector::exact(service.root.clone()),
+                    &bundle,
+                    HydrationMode::Complete,
+                ),
+        )
+        .await
+        .expect("service bundle hydrates");
+        let credential = api_key(
+            server
+                .credential_registered_service(&service.root, &["admin"])
+                .await
+                .expect("service credential issues"),
+        );
+        let client = connect(server, &credential);
+        let state = WyrdState::from_path(&bundle).expect("bundle loads offline");
+        let uid = |alias: &str| {
+            state
+                .run_for_card(alias)
+                .expect("component alias resolves")
+                .card_ref()
+                .uid
+                .as_ref()
+                .expect("hydrated Card carries its UID")
+                .to_string()
+        };
+        let (model_uid, agent_uid) = (uid("model"), uid("agent"));
+        Self {
+            server,
+            service,
+            verification: Verification::with_client(WyrdClient::clone(&client)),
+            query: Bifrost::query_only(admin),
+            client,
+            bundle,
+            model_uid,
+            agent_uid,
+        }
+    }
+
+    /// The registered Service's exact UID, the owner of every binding.
+    ///
+    /// # Panics
+    /// Panics when the receipt carries no UID.
+    fn owner(&self) -> String {
+        self.service
+            .root
+            .uid
+            .as_ref()
+            .expect("service has a UID")
+            .to_string()
+    }
+
+    /// Emit one invocation through the locked run API and drain it.
+    ///
+    /// Starting Bifrost exchanges the exact Card-bound credential, which the
+    /// journey proves activated the owner. The Model view emits sixty typed
+    /// and sixty mapping Drift feature maps whose latency, tier, and score
+    /// all drift from the baseline; the Agent view then emits a typed Eval
+    /// context the deterministic task fails and a mapping context it passes.
+    /// No call names a Verifier, Card UID, record ID, or timestamp. Shutdown
+    /// drains every producer, so Scribe has acknowledged each row on return.
+    ///
+    /// # Panics
+    /// Panics when startup, a view, an emit, the drain, or the owner
+    /// activity read fails, or the exchange did not activate the owner.
+    async fn emit(&self) -> Invocation {
+        let state = WyrdState::from_path(&self.bundle).expect("bundle loads offline");
+        state
+            .start_bifrost_with_config(&self.client, None, QueueConfig::default())
+            .await
+            .expect("bifrost starts");
+        let owner = self.service.root.uid.as_ref().expect("service has a UID");
+        assert!(
+            self.server
+                .last_authenticated_at(owner)
+                .await
+                .expect("owner activity reads")
+                .is_some(),
+            "the exact Card-bound credential exchange activates its owner"
+        );
+        let run = state.run();
+        let model = run.for_card("model").expect("model view resolves");
+        for row in 0..60_u32 {
+            model
+                .observe()
+                .drift(
+                    &Features {
+                        latency: 150.0 + f64::from(row),
+                        tier: "bronze".to_owned(),
+                        score: 1.5,
+                    },
+                    None,
+                )
+                .expect("typed drift emits");
+            model
+                .observe()
+                .drift(
+                    &serde_json::json!({
+                        "latency": 210.0 + f64::from(row),
+                        "tier": "bronze",
+                        "score": 2.5,
+                    }),
+                    None,
+                )
+                .expect("mapping drift emits");
+        }
+        let agent = run.for_card("agent").expect("agent view resolves");
+        agent
+            .observe()
+            .eval(
+                &Exchange {
+                    question: "is the service healthy?".to_owned(),
+                    answer: "no".to_owned(),
+                },
+                wyrd_sdk::observe::EvalObservationOptions::default(),
+            )
+            .expect("typed eval emits");
+        agent
+            .observe()
+            .eval(
+                &serde_json::json!({ "question": "is the service healthy?", "answer": "yes" }),
+                wyrd_sdk::observe::EvalObservationOptions::default(),
+            )
+            .expect("mapping eval emits");
+        let invocation = Invocation {
+            run_id: run.run_id().as_str().to_owned(),
+        };
+        state.shutdown().await.expect("state drains");
+        invocation
+    }
+
+    /// Prove every observation carries its view's exact subject and the one
+    /// invocation `run_id`, read back through the SDK query.
+    ///
+    /// # Panics
+    /// Panics when a query fails or any row's subject or count differs.
+    async fn assert_observations(&self, invocation: &Invocation) {
+        self.server
+            .flush_bifrost()
+            .await
+            .expect("flush server Scribe");
+        let drift: Vec<SubjectCount> = self
+            .query
+            .sql_as(&format!(
+                "SELECT card_uid, CAST(COUNT(*) AS BIGINT) AS row_count \
+                 FROM vala.drift.observations WHERE run_id = '{}' GROUP BY card_uid",
+                invocation.run_id
+            ))
+            .await
+            .expect("drift observations read");
+        assert_eq!(drift.len(), 1, "one subject for every Drift row: {drift:?}");
+        assert_eq!(drift[0].card_uid.as_deref(), Some(self.model_uid.as_str()));
+        assert_eq!(
+            drift[0].row_count, 360,
+            "one tall row per feature of 120 maps"
+        );
+        let evals = self.eval_observations(invocation).await;
+        assert_eq!(evals.len(), 2, "{evals:?}");
+        assert!(
+            evals
+                .iter()
+                .all(|row| row.card_uid.as_deref() == Some(self.agent_uid.as_str())),
+            "every Eval row carries the Agent view's subject: {evals:?}"
+        );
+    }
+
+    /// The Eval observations of `invocation`.
+    ///
+    /// # Panics
+    /// Panics when the query fails.
+    async fn eval_observations(&self, invocation: &Invocation) -> Vec<EvalObservationRow> {
+        self.query
+            .sql_as(&format!(
+                "SELECT record_id, context, card_uid FROM vala.eval.observations \
+                 WHERE run_id = '{}'",
+                invocation.run_id
+            ))
+            .await
+            .expect("eval observations read")
+    }
+
+    /// Bring every scheduled Drift binding of the Service to one due
+    /// occurrence.
+    ///
+    /// The Eval binding is the one every result in `evals` names; it is
+    /// activated by observations and carries no schedule cursor, so the
+    /// remaining three bindings are the scheduled Drift bindings.
+    ///
+    /// # Panics
+    /// Panics when the Service status or a cursor update fails, `evals` do
+    /// not share one binding, or the Service does not project four bindings.
+    async fn make_drift_bindings_due(&self, cards: &Cards, evals: &[OwnedResult]) {
+        let eval_binding = evals[0]
+            .binding_id
+            .as_deref()
+            .expect("an Eval binding run names its binding");
+        assert!(
+            evals.iter().all(|result| result.implementation == "eval"
+                && result.binding_id.as_deref() == Some(eval_binding)),
+            "both Eval records ran under the one Eval binding: {evals:?}"
+        );
+        let bindings = cards
+            .get(CardSelector::exact(self.service.root.clone()))
+            .await
+            .expect("service reads")
+            .status
+            .and_then(|status| status.verification)
+            .expect("the binding owner serves verification status")
+            .binding_ids;
+        assert_eq!(bindings.len(), 4, "three Drift and one Eval binding");
+        let seed = VerificationFixture::provision(
+            self.server.state().postgres.wyrd(),
+            self.server.pg_fixture().data_tenant_id(),
+        )
+        .await
+        .expect("fixture tenant opens");
+        for binding in bindings
+            .into_iter()
+            .filter(|binding| binding.to_string() != eval_binding)
+        {
+            seed.make_binding_due(binding)
+                .await
+                .expect("binding is due");
+        }
+    }
+
+    /// Poll the SDK query until the Service owns `count` results.
+    ///
+    /// Before the tenant's first result the table does not exist, which
+    /// reads as no results yet.
+    ///
+    /// # Panics
+    /// Panics when a flush or query fails, more than `count` results appear,
+    /// or `count` never appear within [`WAIT`].
+    async fn owned_results(&self, count: usize) -> Vec<OwnedResult> {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            self.server
+                .flush_bifrost()
+                .await
+                .expect("flush server Scribe");
+            let results: Vec<OwnedResult> = match self
+                .query
+                .sql_as(&format!(
+                    "SELECT result_id, run_id, card_uid, implementation, verdict, \
+                            subject_card_uid, binding_id, source_record_id \
+                     FROM vala.verification.results WHERE owner_card_uid = '{}'",
+                    self.owner()
+                ))
+                .await
+            {
+                Ok(results) => results,
+                Err(error)
+                    if wyrd_sdk::verification::WyrdError::from(&error).code()
+                        == "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND" =>
+                {
+                    Vec::new()
+                }
+                Err(error) => panic!("owned results read: {error:?}"),
+            };
+            if results.len() >= count {
+                assert_eq!(results.len(), count, "{results:?}");
+                return results;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the Service owns only {results:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Read `result`'s run through Run GET and prove it completed with this
+    /// result and no manual requester.
+    ///
+    /// # Panics
+    /// Panics when the run id does not parse, the run cannot be read, or it
+    /// reports another state or result.
+    async fn completed_run(&self, result: &OwnedResult) -> VerificationRunStatus {
+        let run: VerificationRunId = result.run_id.parse().expect("run id parses");
+        let status = wait_settled(&self.verification, &run).await;
+        assert_eq!(
+            status.status,
+            VerificationExecutionStatus::Completed,
+            "{status:?}"
+        );
+        assert_eq!(
+            status.result_id.map(|id| id.to_string()).as_deref(),
+            Some(result.result_id.as_str())
+        );
+        assert!(
+            status.requested_by_principal_id.is_none(),
+            "a runtime-created run has no manual requester"
+        );
+        status
+    }
+
+    /// Prove each Drift binding ran once on the Model subject, failed with
+    /// its method's feature rows, and dispatched nothing.
+    ///
+    /// Each pair is a Verifier and its method; feature rows are joined to
+    /// their result on `result_id` within the tenant-scoped view.
+    ///
+    /// # Panics
+    /// Panics when a Verifier has no single failed result, its run status is
+    /// wrong, or its feature rows differ.
+    async fn assert_drift_results(
+        &self,
+        results: &[OwnedResult],
+        verifiers: [(&RegistrationReceipt, &str); 3],
+    ) {
+        for (verifier, method) in verifiers {
+            let uid = verifier
+                .root
+                .uid
+                .as_ref()
+                .expect("verifier has a UID")
+                .to_string();
+            let owned: Vec<_> = results
+                .iter()
+                .filter(|result| result.card_uid == uid)
+                .collect();
+            assert_eq!(owned.len(), 1, "{method} ran once: {results:?}");
+            let result = owned[0];
+            assert_eq!(result.implementation, "drift");
+            assert_eq!(result.verdict, "failed", "{result:?}");
+            assert_eq!(result.subject_card_uid, self.model_uid);
+            assert!(
+                result.binding_id.is_some(),
+                "a binding run names its binding"
+            );
+            let status = self.completed_run(result).await;
+            assert!(
+                status.dispatches.is_empty(),
+                "a Drift binding without Operators dispatches nothing"
+            );
+            let (row, features) = read_result(self.server, &self.query, &result.result_id).await;
+            assert_eq!(row.owner_card_uid.as_deref(), Some(self.owner().as_str()));
+            assert!(!features.is_empty(), "{method} wrote feature rows");
+            assert!(
+                features
+                    .iter()
+                    .all(|feature| feature.method == method && feature.verdict == "drift"),
+                "{features:?}"
+            );
+        }
+    }
+
+    /// Prove each Eval record ran once through the deterministic task and
+    /// the local LLM judge, and only the failed verdict delivered.
+    ///
+    /// The typed context answering `no` fails the deterministic task while
+    /// the judge passes; the mapping context answering `yes` passes both.
+    /// Task outcomes are joined to their result on `result_id` within the
+    /// tenant-scoped view; the failed run's dispatch reaches `delivered` through
+    /// Run GET.
+    ///
+    /// # Panics
+    /// Panics when a record has no single result, a verdict or task outcome
+    /// differs, or the dispatch never delivers within [`WAIT`].
+    async fn assert_eval_results(&self, results: &[OwnedResult], invocation: &Invocation) {
+        for observation in self.eval_observations(invocation).await {
+            let owned: Vec<_> = results
+                .iter()
+                .filter(|result| {
+                    result.source_record_id.as_deref() == Some(observation.record_id.as_str())
+                })
+                .collect();
+            assert_eq!(owned.len(), 1, "one run per record: {results:?}");
+            let result = owned[0];
+            assert_eq!(result.implementation, "eval");
+            assert_eq!(result.subject_card_uid, self.agent_uid);
+            let failed = observation.context.contains("\"answer\":\"no\"");
+            assert_eq!(
+                result.verdict,
+                if failed { "failed" } else { "passed" },
+                "{result:?}"
+            );
+            let items: Vec<ItemRow> = self
+                .query
+                .sql_as(&format!(
+                    "SELECT i.task_id, i.passed \
+                     FROM vala.eval.result_items i JOIN vala.verification.results r \
+                       ON i.result_id = r.result_id \
+                     WHERE r.result_id = '{}' ORDER BY i.task_id",
+                    result.result_id
+                ))
+                .await
+                .expect("task outcomes read");
+            assert_eq!(
+                items
+                    .iter()
+                    .map(|item| (item.task_id.as_str(), item.passed))
+                    .collect::<Vec<_>>(),
+                [("answer", Some(!failed)), ("judge", Some(true))],
+                "{items:?}"
+            );
+            let status = self.completed_run(result).await;
+            if failed {
+                self.assert_delivered(&status.run_id).await;
+            } else {
+                assert!(
+                    status.dispatches.is_empty(),
+                    "a passing gate dispatches nothing"
+                );
+            }
+        }
+    }
+
+    /// Poll Run GET until the failed run's one Operator dispatch is
+    /// `delivered`.
+    ///
+    /// # Panics
+    /// Panics when the run cannot be read, carries other than one dispatch,
+    /// or the dispatch fails or never delivers within [`WAIT`].
+    async fn assert_delivered(&self, run: &VerificationRunId) {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let status = self.verification.get_run(run).await.expect("run reads");
+            assert_eq!(
+                status.dispatches.len(),
+                1,
+                "one configured Operator: {status:?}"
+            );
+            let dispatch = &status.dispatches[0];
+            match dispatch.status {
+                OperatorDispatchStatus::Delivered => {
+                    assert!(dispatch.error.is_none(), "{dispatch:?}");
+                    return;
+                }
+                OperatorDispatchStatus::Failed => panic!("the dispatch failed: {dispatch:?}"),
+                OperatorDispatchStatus::Pending
+                | OperatorDispatchStatus::Running
+                | OperatorDispatchStatus::Retrying => {}
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the dispatch never delivered: {dispatch:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
 }

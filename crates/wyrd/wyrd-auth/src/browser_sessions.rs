@@ -38,7 +38,9 @@ use wyrd_sql::{TenantConn, WyrdPostgres};
 use crate::connections::HumanConnections;
 use crate::credential_verify::verify_presented;
 use crate::error::{auth_error_to_wyrd, store_error};
-use crate::exchange_api_key::{ExchangeApiKey, api_key_invalid, token_hash};
+use crate::exchange_api_key::{
+    ExchangeApiKey, api_key_invalid, map_exchange_error_to_wyrd, token_hash,
+};
 use crate::issuance::{ExchangedToken, TenantTokenIssuer};
 use crate::refresh::{RefreshError, RefreshTokens, claims_from_refresh_jwt};
 
@@ -438,21 +440,33 @@ impl BrowserSessions {
     /// A concurrent replica blocks on the row lock and then sees the winner's
     /// rotated credential as fresh, so one renewal serves both.
     ///
-    /// A renewal the issuance path refuses — a revoked or reused refresh
-    /// token, a deactivated or replaced connection, a revoked API key, a
-    /// suspended principal — is decided by the stored token's expiry under
-    /// `PostgreSQL`'s clock. While that token is still valid inside the
-    /// renewal margin, the transaction holding the refused attempt is rolled
-    /// back (no tentative refresh, key-use, or revocation write commits), the
-    /// row is locked again, and the already-issued token is served unchanged
-    /// until its stored expiry. Once it has expired, the refusal revokes the
-    /// session in the same transaction and commits; no other credential is
-    /// tried. The relock happens at most once per call.
+    /// A renewal that does not issue keeps its owner's transaction meaning
+    /// ([`Renewal`]), decided against the stored token's expiry under
+    /// `PostgreSQL`'s clock:
+    ///
+    /// - An ordinary refusal — an unknown or revoked refresh token, a
+    ///   deactivated or replaced connection, a revoked API key, a suspended
+    ///   principal — while the token is still valid inside the renewal margin
+    ///   rolls the attempt back (no tentative refresh, key-use, or revocation
+    ///   write commits).
+    /// - A replayed refresh token while the token is still valid commits the
+    ///   attempt, so the family revocation and containment audit
+    ///   [`RefreshTokens`] staged survive; the session row is left live.
+    /// - In both cases the row is then locked again and the already-issued
+    ///   token is served unchanged until its stored expiry; the relock happens
+    ///   at most once per call. Once the token has expired, either outcome
+    ///   revokes the session in the same transaction and commits; no other
+    ///   credential is tried.
+    /// - An internal failure returns the error before or after expiry; the
+    ///   dropped transaction rolls back every tentative write, the old token
+    ///   is not served, and the session stays renewable on retry.
     ///
     /// # Errors
     /// Returns [`WyrdError::InvalidToken`] for an unknown, revoked, expired, or
     /// no-longer-renewable session, [`WyrdError::Validation`] without a
-    /// keyring, and [`WyrdError::AuthVerifyUnavailable`] when the store fails.
+    /// keyring, [`WyrdError::AuthVerifyUnavailable`] when the store fails, and
+    /// the internal renewal failure (for example [`WyrdError::RoleCorrupt`] or
+    /// [`WyrdError::Internal`]) otherwise.
     async fn current(
         &self,
         session_id: &SecretString,
@@ -488,8 +502,14 @@ impl BrowserSessions {
             }
             let renewed = match self.renew(&mut conn, keyring, &row, request_id).await {
                 Ok(renewed) => renewed,
-                Err(Renewal::Refused) if !row.access_expired && !renewal_refused => {
-                    conn.rollback().await.map_err(store_error)?;
+                Err(outcome @ (Renewal::Refused | Renewal::Contained))
+                    if !row.access_expired && !renewal_refused =>
+                {
+                    if matches!(outcome, Renewal::Contained) {
+                        conn.commit().await.map_err(store_error)?;
+                    } else {
+                        conn.rollback().await.map_err(store_error)?;
+                    }
                     renewal_refused = true;
                     tracing::info!(
                         tenant_id = %tenant,
@@ -497,7 +517,7 @@ impl BrowserSessions {
                     );
                     continue;
                 }
-                Err(Renewal::Refused) => {
+                Err(Renewal::Refused | Renewal::Contained) => {
                     revoke_browser_session(&mut conn, &id_hash)
                         .await
                         .map_err(store_error)?;
@@ -540,10 +560,19 @@ impl BrowserSessions {
     /// Mint a successor access token for a locked session through the
     /// ordinary issuance path for its mode.
     ///
+    /// The stored credential is opened under the keyring and handed to the
+    /// mode's owner — [`RefreshTokens`] or [`ExchangeApiKey`] — whose error
+    /// classification ([`RefreshError::is_refusal`],
+    /// [`crate::exchange_api_key::ExchangeError::is_refusal`]) decides the
+    /// outcome. Nothing is committed here.
+    ///
     /// # Errors
     /// Returns [`Renewal::Refused`] when the stored credential no longer
-    /// issues (the session must end) and [`Renewal::Failed`] for store, audit,
-    /// or keyring failures that leave the session as it was.
+    /// issues, [`Renewal::Contained`] when the stored refresh token was
+    /// replayed and its family revocation and audit are staged in `conn`,
+    /// and [`Renewal::Failed`] when the stored credential is missing or
+    /// cannot be opened, or for a store, audit, signing, corrupt-role, or
+    /// verification-task failure.
     async fn renew(
         &self,
         conn: &mut TenantConn<'_>,
@@ -554,34 +583,30 @@ impl BrowserSessions {
         let issuer = self.issuer.clone();
         match row.mode {
             BrowserSessionMode::OidcRefresh => {
-                let sealed = row
-                    .refresh_token_sealed
-                    .as_deref()
-                    .ok_or(Renewal::Refused)?;
-                let refresh = open_text(keyring, sealed).map_err(|_| Renewal::Refused)?;
+                let refresh = open_credential(keyring, row.refresh_token_sealed.as_deref())?;
                 RefreshTokens { issuer }
                     .execute(conn, refresh, request_id)
                     .await
                     .map_err(|error| match error {
-                        RefreshError::Database(_)
-                        | RefreshError::Issuance(crate::issuance::IssuanceError::Database(_)) => {
-                            Renewal::Failed(WyrdError::from(error))
-                        }
-                        _ => Renewal::Refused,
+                        RefreshError::Reused => Renewal::Contained,
+                        error if error.is_refusal() => Renewal::Refused,
+                        error => Renewal::Failed(WyrdError::from(error)),
                     })
             }
             BrowserSessionMode::ApiKeyExchange => {
-                let sealed = row.api_key_sealed.as_deref().ok_or(Renewal::Refused)?;
-                let api_key = open_text(keyring, sealed).map_err(|_| Renewal::Refused)?;
-                ExchangeApiKey { issuer }
+                let api_key = open_credential(keyring, row.api_key_sealed.as_deref())?;
+                let exchanged = ExchangeApiKey { issuer }
                     .execute(conn, api_key, request_id)
-                    .await
-                    .map_err(|error| match error {
-                        crate::exchange_api_key::ExchangeError::Database(error) => {
-                            Renewal::Failed(store_error(error))
-                        }
-                        _ => Renewal::Refused,
-                    })
+                    .await;
+                match exchanged {
+                    Ok(exchanged) => Ok(exchanged),
+                    Err(error) if error.is_refusal() => Err(Renewal::Refused),
+                    // A failure never reaches the prefix-keyed refusal
+                    // logging, so no prefix is needed to render it.
+                    Err(error) => Err(Renewal::Failed(
+                        map_exchange_error_to_wyrd(conn, "", error).await,
+                    )),
+                }
             }
         }
     }
@@ -662,11 +687,18 @@ impl BrowserSessions {
     }
 }
 
-/// Why a renewal did not produce a token.
+/// Why a renewal did not produce a token, kept distinct because each
+/// outcome has its own transaction meaning in [`BrowserSessions::current`].
 enum Renewal {
-    /// The stored credential no longer issues; the session must end.
+    /// The stored credential no longer issues; the attempt rolls back and the
+    /// session ends at its access token's expiry.
     Refused,
-    /// An infrastructure failure; the session is left as it was.
+    /// The stored refresh token was replayed: its family revocation and
+    /// containment audit are staged in the attempt's transaction, which must
+    /// commit; the session ends at its access token's expiry.
+    Contained,
+    /// An internal failure; the attempt rolls back and the session is left
+    /// renewable.
     Failed(WyrdError),
 }
 
@@ -730,6 +762,21 @@ fn open_text(keyring: &SealingKeyring, sealed: &[u8]) -> Result<SecretString, Wy
         .map_err(|_| session_ended())
 }
 
+/// Open the sealed credential a session renews through.
+///
+/// # Errors
+/// Returns [`Renewal::Failed`] with [`WyrdError::Internal`] when the session
+/// stores no credential for its mode or no held key opens it: both are
+/// corrupt state the renewal must not turn into the end of the session.
+fn open_credential(
+    keyring: &SealingKeyring,
+    sealed: Option<&[u8]>,
+) -> Result<SecretString, Renewal> {
+    sealed
+        .and_then(|sealed| open_text(keyring, sealed).ok())
+        .ok_or_else(|| Renewal::Failed(unusable("browser session credential could not be opened")))
+}
+
 /// Open and decode a sealed login completion.
 ///
 /// # Errors
@@ -786,6 +833,53 @@ mod tests {
     use secrecy::SecretString;
 
     use super::{lower_hex_256, random_hex_256, session_hash};
+    use crate::exchange_api_key::ExchangeError;
+    use crate::issuance::IssuanceError;
+    use crate::refresh::RefreshError;
+
+    /// Renewal ends a session only on an ordinary lifecycle refusal.
+    ///
+    /// Every producer's classification must agree: an inactive tenant,
+    /// principal, or connection and an unusable credential are refusals
+    /// wherever they surface; a replay is not a refusal (its containment
+    /// commits); store, corrupt-role, and signing failures are internal.
+    #[test]
+    fn only_lifecycle_refusals_end_a_renewing_session() {
+        for refusal in [
+            IssuanceError::TenantNotAdmitting,
+            IssuanceError::PrincipalInactive,
+            IssuanceError::ConnectionInactive,
+        ] {
+            assert!(refusal.is_refusal(), "{refusal:?}");
+        }
+        assert!(RefreshError::NotFound.is_refusal());
+        assert!(RefreshError::Issuance(IssuanceError::ConnectionInactive).is_refusal());
+        assert!(ExchangeError::from(IssuanceError::PrincipalInactive).is_refusal());
+        assert!(ExchangeError::from(IssuanceError::ConnectionInactive).is_refusal());
+        for refusal in [
+            ExchangeError::CrossTenant,
+            ExchangeError::NotFound,
+            ExchangeError::HashMismatch,
+        ] {
+            assert!(refusal.is_refusal(), "{refusal:?}");
+        }
+
+        assert!(!RefreshError::Reused.is_refusal());
+        assert!(!RefreshError::Database(sqlx::Error::PoolTimedOut).is_refusal());
+        assert!(
+            !RefreshError::Issuance(IssuanceError::RoleCorrupt {
+                role: "r".to_owned()
+            })
+            .is_refusal()
+        );
+        assert!(!ExchangeError::Database(sqlx::Error::PoolTimedOut).is_refusal());
+        assert!(
+            !ExchangeError::from(IssuanceError::RoleCorrupt {
+                role: "r".to_owned()
+            })
+            .is_refusal()
+        );
+    }
 
     /// Generated ids are exactly the shape the channel accepts, and anything
     /// else is refused: uppercase, short, or non-hex values never reach a
@@ -811,20 +905,30 @@ mod tests {
 mod pg_tests {
     use chrono::{DateTime, Utc};
     use secrecy::{ExposeSecret, SecretString};
+    use serde_json::json;
     use uuid::Uuid;
-    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
+    use wyrd_spec::auth::Sha256Hex;
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::TenantSlug;
-    use wyrd_sql::queries::auth::revoke_api_key;
+    use wyrd_sql::queries::auth::{
+        BrowserSessionMode, BrowserSessionWrite, grant_role_to_service_account,
+        insert_browser_session, insert_role, replace_user_roles, revoke_api_key,
+    };
 
+    use super::{
+        BrowserSessions, SSO_SESSION_LIFETIME, random_hex_256, refresh_expiry, seal, token_hash,
+    };
+    use crate::audit::REFRESH_FAMILY_REVOKE_OPERATION;
     use crate::exchange_api_key::pg_tests::{
         browser_sessions, insert_live_api_key, insert_test_service_account, insert_test_user,
         test_service_card_ref,
     };
+    use crate::refresh::{RefreshError, RefreshTokens};
 
-    /// The stored lifecycle columns a refused early renewal must leave as
-    /// they were: sealed access token, its expiry, revocation, and the
-    /// backing API key's last use.
+    /// The stored lifecycle columns a renewal that commits nothing must leave
+    /// as they were: sealed access token, its expiry, the session's
+    /// revocation, and the backing credential's tentative write.
     type StoredState = (
         Option<Vec<u8>>,
         DateTime<Utc>,
@@ -832,26 +936,201 @@ mod pg_tests {
         Option<DateTime<Utc>>,
     );
 
-    /// Read the one stored session's lifecycle columns and its API key's
-    /// last use as the superuser, outside tenant RLS.
+    /// The credential a session renews through, naming the column its
+    /// renewal tentatively writes.
+    enum Backing<'a> {
+        /// An API-key session: renewal stamps the key's `last_used_at`.
+        ApiKey(Uuid),
+        /// An OIDC session: renewal retires the refresh row with this token
+        /// hash by setting its `revoked_at`.
+        Refresh(&'a str),
+    }
+
+    /// Read the one stored session's lifecycle columns and its backing
+    /// credential's tentative-write column as the superuser, outside tenant
+    /// RLS.
     ///
     /// # Panics
     /// Panics when the superuser pool cannot open or the read fails.
-    async fn stored_state(fixture: &PgFixture, api_key_id: Uuid) -> StoredState {
-        sqlx::query_as(
-            "SELECT s.access_token_sealed, s.access_expires_at, s.revoked_at, k.last_used_at
-               FROM wyrd.auth_browser_sessions s, wyrd.auth_api_keys k
-              WHERE k.id = $1",
-        )
-        .bind(api_key_id)
-        .fetch_one(
-            &fixture
-                .superuser_pool()
+    async fn stored_state(fixture: &PgFixture, backing: &Backing<'_>) -> StoredState {
+        let pool = fixture
+            .superuser_pool()
+            .await
+            .expect("superuser pool opens");
+        let query = match backing {
+            Backing::ApiKey(api_key_id) => sqlx::query_as(
+                "SELECT s.access_token_sealed, s.access_expires_at, s.revoked_at, k.last_used_at
+                   FROM wyrd.auth_browser_sessions s, wyrd.auth_api_keys k
+                  WHERE k.id = $1",
+            )
+            .bind(*api_key_id),
+            Backing::Refresh(hash) => sqlx::query_as(
+                "SELECT s.access_token_sealed, s.access_expires_at, s.revoked_at, r.revoked_at
+                   FROM wyrd.auth_browser_sessions s, wyrd.auth_refresh_tokens r
+                  WHERE r.token_hash = $1",
+            )
+            .bind(*hash),
+        };
+        query
+            .fetch_one(&pool)
+            .await
+            .expect("stored session state reads")
+    }
+
+    /// A seeded OIDC browser session and the values its tests compare.
+    struct OidcSession {
+        /// The raw session id the BFF cookie carries.
+        session_id: SecretString,
+        /// The access token the session stores.
+        access_token: SecretString,
+        /// The refresh token the session stores.
+        refresh_token: SecretString,
+        /// The signed-in user.
+        user_id: Uuid,
+        /// The one role the user holds, so a test can corrupt it.
+        role_id: Uuid,
+    }
+
+    /// Sign a user in the way a completed SSO login does and store the
+    /// browser session `complete` would.
+    ///
+    /// Seeds an active user holding one empty role and the tenant's Active
+    /// human connection, mints the first access/refresh pair through the
+    /// session owner's issuer bound to that connection, and stores both
+    /// sealed under the owner's keyring in one committed transaction.
+    ///
+    /// # Panics
+    /// Panics when a seed, issuance, seal, or the commit fails.
+    async fn oidc_session(fixture: &PgFixture, sessions: &BrowserSessions) -> OidcSession {
+        let tenant = fixture.data_tenant_id();
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+        let role_id = Uuid::new_v4();
+        insert_role(&mut conn, role_id, "runtime_admin", &json!([]), false)
+            .await
+            .expect("role seeds");
+        replace_user_roles(&mut conn, user_id, &["runtime_admin"])
+            .await
+            .expect("role assigns");
+        let binding = seed_active_human_connection(&mut conn)
+            .await
+            .expect("connection seeds");
+        let issued = sessions
+            .issuer
+            .issue_human_session(&mut conn, user_id, None, binding, "req-login")
+            .await
+            .expect("login issues a pair");
+        let refresh_token = issued
+            .refresh_token
+            .expect("a login issues a refresh token");
+        let keyring = sessions.require_keyring().expect("test keyring");
+        let csrf = random_hex_256();
+        let session_id = random_hex_256();
+        let write = BrowserSessionWrite {
+            principal_id: user_id,
+            connection_id: Some(binding.connection_id),
+            mode: BrowserSessionMode::OidcRefresh,
+            access_token_sealed: seal(keyring, issued.access_token.expose_secret())
+                .expect("access token seals"),
+            access_expires_at: issued.expires_at,
+            refresh_token_sealed: Some(
+                seal(keyring, refresh_token.expose_secret()).expect("refresh token seals"),
+            ),
+            refresh_expires_at: Some(
+                refresh_expiry(refresh_token.expose_secret()).expect("refresh expiry reads"),
+            ),
+            api_key_sealed: None,
+            csrf_hash: Sha256Hex::digest(csrf.as_bytes()),
+            csrf_token_sealed: seal(keyring, &csrf).expect("csrf seals"),
+            lifetime: SSO_SESSION_LIFETIME,
+        };
+        insert_browser_session(&mut conn, &Sha256Hex::digest(session_id.as_bytes()), &write)
+            .await
+            .expect("session stores")
+            .expect("session id is fresh");
+        conn.commit().await.expect("sign-in commits");
+        OidcSession {
+            session_id: SecretString::from(session_id),
+            access_token: issued.access_token,
+            refresh_token,
+            user_id,
+            role_id,
+        }
+    }
+
+    /// Replace role `role_id`'s stored permission document as the superuser,
+    /// outside tenant RLS; a document the permission schema rejects makes
+    /// every issuance for its holders fail as corrupt state.
+    ///
+    /// # Panics
+    /// Panics when the superuser pool cannot open or the update fails.
+    async fn set_role_permissions(
+        fixture: &PgFixture,
+        role_id: Uuid,
+        permissions: serde_json::Value,
+    ) {
+        let updated = sqlx::query("UPDATE wyrd.auth_roles SET permissions = $2 WHERE id = $1")
+            .bind(role_id)
+            .bind(permissions)
+            .execute(
+                &fixture
+                    .superuser_pool()
+                    .await
+                    .expect("superuser pool opens"),
+            )
+            .await
+            .expect("role permissions update");
+        assert_eq!(updated.rows_affected(), 1);
+    }
+
+    /// Drive one session through an injected internal renewal failure and
+    /// prove it stays retryable.
+    ///
+    /// Corrupts role `role_id`, then uses the session with its token inside
+    /// the renewal margin and again after its expiry: both uses must fail
+    /// with the corrupt-role error, not serve the stored token and not end
+    /// the session, and must leave the session row and the backing
+    /// credential's tentative-write column exactly as stored. Once the role
+    /// is repaired the next use renews to a new token.
+    ///
+    /// # Panics
+    /// Panics when a seed or update fails or any assertion fails.
+    async fn assert_internal_failure_is_retryable(
+        fixture: &PgFixture,
+        sessions: &BrowserSessions,
+        session_id: &SecretString,
+        role_id: Uuid,
+        backing: &Backing<'_>,
+        issued: &SecretString,
+    ) {
+        set_role_permissions(fixture, role_id, json!([{ "resource": "not-a-resource" }])).await;
+        for (offset, phase) in [("30 seconds", "early"), ("-1 second", "expired")] {
+            set_access_expiry(fixture, offset).await;
+            let before = stored_state(fixture, backing).await;
+            let failed = sessions
+                .authority(session_id, &format!("req-{phase}"))
                 .await
-                .expect("superuser pool opens"),
-        )
-        .await
-        .expect("stored session state reads")
+                .expect_err("an internal renewal failure fails the request");
+            assert!(
+                matches!(failed, WyrdError::RoleCorrupt { .. }),
+                "{phase}: the failure is reported, not turned into a refusal: {failed:?}"
+            );
+            assert_eq!(
+                stored_state(fixture, backing).await,
+                before,
+                "{phase}: no tentative credential or session write commits"
+            );
+        }
+        set_role_permissions(fixture, role_id, json!([])).await;
+        let renewed = sessions
+            .authority(session_id, "req-repaired")
+            .await
+            .expect("the session renews once the failure is removed");
+        assert_ne!(
+            renewed.access_token.expose_secret(),
+            issued.expose_secret(),
+            "the repaired renewal issues a successor"
+        );
     }
 
     /// Move the one stored session's access-token expiry to `offset` from
@@ -924,7 +1203,8 @@ mod pg_tests {
         );
         conn.commit().await.expect("key revocation commits");
         set_access_expiry(&fixture, "30 seconds").await;
-        let before = stored_state(&fixture, api_key_id).await;
+        let backing = Backing::ApiKey(api_key_id);
+        let before = stored_state(&fixture, &backing).await;
 
         let early = sessions
             .authority(&created.session_id, "req-early")
@@ -941,7 +1221,7 @@ mod pg_tests {
             .await
             .expect("the session still reads before its token expires");
         assert_eq!(
-            stored_state(&fixture, api_key_id).await,
+            stored_state(&fixture, &backing).await,
             before,
             "no renewal, key-use, or revocation write commits before expiry"
         );
@@ -952,10 +1232,190 @@ mod pg_tests {
             .await
             .expect_err("the first use after expiry is refused");
         assert!(matches!(ended, WyrdError::InvalidToken { .. }), "{ended:?}");
-        let (sealed, _, revoked_at, _) = stored_state(&fixture, api_key_id).await;
+        let (sealed, _, revoked_at, _) = stored_state(&fixture, &backing).await;
         assert!(
             sealed.is_none() && revoked_at.is_some(),
             "the refused post-expiry renewal revokes the session"
         );
+    }
+    /// A proactive renewal that presents an already-rotated refresh token
+    /// commits the family containment and keeps the issued token until its
+    /// stored expiry.
+    ///
+    /// An OIDC session is signed in, then an attacker holding its refresh
+    /// token rotates it first and commits. With the stored access token inside
+    /// the renewal margin, `authority` must still serve that same token while
+    /// the replay's family revocation and canonical containment audit commit:
+    /// the attacker's successor is revoked as reused in committed state and
+    /// cannot itself rotate. The session row stays live until the token's
+    /// expiry; the first use after it is refused and revokes the row.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot start, a seed or update fails, or any
+    /// assertion fails.
+    #[tokio::test]
+    async fn proactive_refresh_replay_commits_containment_and_preserves_authority_until_expiry() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let sessions = browser_sessions(&fixture);
+        let session = oidc_session(&fixture, &sessions).await;
+        let refresh = RefreshTokens {
+            issuer: sessions.issuer.clone(),
+        };
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let stolen = refresh
+            .execute(&mut conn, session.refresh_token.clone(), "req-attacker")
+            .await
+            .expect("the attacker's rotation succeeds")
+            .refresh_token
+            .expect("rotation issues a successor");
+        conn.commit()
+            .await
+            .expect("the attacker's rotation commits");
+        let stolen_hash = token_hash(stolen.expose_secret());
+        let backing = Backing::Refresh(&stolen_hash);
+
+        set_access_expiry(&fixture, "30 seconds").await;
+        let early = sessions
+            .authority(&session.session_id, "req-early")
+            .await
+            .expect("a contained replay still serves the unexpired token");
+        assert_eq!(
+            early.access_token.expose_secret(),
+            session.access_token.expose_secret(),
+            "the already-issued token is served, not a successor"
+        );
+        let (sealed, _, session_revoked, successor_revoked) =
+            stored_state(&fixture, &backing).await;
+        assert!(
+            sealed.is_some() && session_revoked.is_none(),
+            "the browser session stays live until its token expires"
+        );
+        assert!(
+            successor_revoked.is_some(),
+            "the attacker's successor is revoked in committed state"
+        );
+        let contained: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_staging
+              WHERE data_tenant_id = $1 AND operation = $2 AND principal_id = $3",
+        )
+        .bind(tenant.as_uuid())
+        .bind(REFRESH_FAMILY_REVOKE_OPERATION)
+        .bind(session.user_id)
+        .fetch_one(
+            &fixture
+                .superuser_pool()
+                .await
+                .expect("superuser pool opens"),
+        )
+        .await
+        .expect("audit query runs");
+        assert!(contained >= 1, "the containment audit commits");
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let replayed = refresh.execute(&mut conn, stolen, "req-successor").await;
+        assert!(
+            matches!(replayed, Err(RefreshError::Reused)),
+            "the attacker's successor cannot rotate: {replayed:?}"
+        );
+        drop(conn);
+
+        set_access_expiry(&fixture, "-1 second").await;
+        let ended = sessions
+            .authority(&session.session_id, "req-expired")
+            .await
+            .expect_err("the first use after expiry is refused");
+        assert!(matches!(ended, WyrdError::InvalidToken { .. }), "{ended:?}");
+        let (sealed, _, session_revoked, _) = stored_state(&fixture, &backing).await;
+        assert!(
+            sealed.is_none() && session_revoked.is_some(),
+            "the contained post-expiry renewal revokes the session"
+        );
+    }
+
+    /// An internal failure while renewing an OIDC session fails the request,
+    /// commits nothing, and leaves the session renewable.
+    ///
+    /// The user's role is corrupted so refresh issuance fails after the
+    /// stored refresh row was tentatively consumed; both before and after the
+    /// access token's expiry the use must fail without serving the token,
+    /// retiring the refresh row, or ending the session, and the repaired role
+    /// renews it.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot start, a seed or update fails, or any
+    /// assertion fails.
+    #[tokio::test]
+    async fn refresh_renewal_internal_failure_rolls_back_and_remains_retryable() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let sessions = browser_sessions(&fixture);
+        let session = oidc_session(&fixture, &sessions).await;
+        let refresh_hash = token_hash(session.refresh_token.expose_secret());
+        assert_internal_failure_is_retryable(
+            &fixture,
+            &sessions,
+            &session.session_id,
+            session.role_id,
+            &Backing::Refresh(&refresh_hash),
+            &session.access_token,
+        )
+        .await;
+    }
+
+    /// An internal failure while renewing an API-key session fails the
+    /// request, commits nothing, and leaves the session renewable.
+    ///
+    /// The service account's role is corrupted so issuance fails after the
+    /// key's use was tentatively stamped; both before and after the access
+    /// token's expiry the use must fail without serving the token, stamping
+    /// the key, or ending the session, and the repaired role renews it.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot start, a seed or update fails, or any
+    /// assertion fails.
+    #[tokio::test]
+    async fn api_key_renewal_internal_failure_rolls_back_and_remains_retryable() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let route = TenantSlug::new(fixture.tenant_slug().to_owned()).expect("fixture slug");
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+        let sa_id =
+            insert_test_service_account(&mut conn, tenant, user_id, &test_service_card_ref()).await;
+        let role_id = Uuid::new_v4();
+        insert_role(&mut conn, role_id, "runtime_reader", &json!([]), false)
+            .await
+            .expect("role seeds");
+        assert!(
+            grant_role_to_service_account(&mut conn, sa_id, role_id)
+                .await
+                .expect("role grants")
+        );
+        let (api_key_id, api_key) = insert_live_api_key(&mut conn, tenant, sa_id, user_id).await;
+        conn.commit().await.expect("seed commits");
+
+        let sessions = browser_sessions(&fixture);
+        let created = sessions
+            .exchange_api_key(
+                &route,
+                &api_key,
+                &SecretString::from("ab".repeat(32)),
+                "req-sign-in",
+            )
+            .await
+            .expect("the live key signs in");
+        let issued = sessions
+            .authority(&created.session_id, "req-fresh")
+            .await
+            .expect("a fresh session yields its token");
+        assert_internal_failure_is_retryable(
+            &fixture,
+            &sessions,
+            &created.session_id,
+            role_id,
+            &Backing::ApiKey(api_key_id),
+            &issued.access_token,
+        )
+        .await;
     }
 }

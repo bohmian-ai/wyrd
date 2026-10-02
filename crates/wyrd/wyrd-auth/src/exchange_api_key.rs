@@ -85,6 +85,28 @@ pub enum ExchangeError {
     Issuance(IssuanceError),
 }
 
+impl ExchangeError {
+    /// Whether this is the ordinary refusal of an API key that no longer
+    /// exchanges: malformed, cross-tenant, unknown, revoked, expired, or
+    /// wrong-secret, or an inactive tenant or principal, including an
+    /// issuance lifecycle refusal ([`IssuanceError::is_refusal`]).
+    ///
+    /// A verification-task, store, or other issuance failure is internal and
+    /// must roll back rather than end a session.
+    #[must_use]
+    pub fn is_refusal(&self) -> bool {
+        match self {
+            Self::CrossTenant
+            | Self::NotFound
+            | Self::AccountDisabled
+            | Self::TenantNotAdmitting
+            | Self::HashMismatch => true,
+            Self::Issuance(error) => error.is_refusal(),
+            Self::Join(_) | Self::Database(_) => false,
+        }
+    }
+}
+
 impl From<IssuanceError> for ExchangeError {
     fn from(error: IssuanceError) -> Self {
         match error {

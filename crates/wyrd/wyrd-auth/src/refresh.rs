@@ -52,6 +52,24 @@ pub enum RefreshError {
     Wyrd(#[from] WyrdError),
 }
 
+impl RefreshError {
+    /// Whether this is the ordinary refusal of a refresh token that no longer
+    /// issues: an unknown, expired, or revoked token, or an issuance
+    /// lifecycle refusal ([`IssuanceError::is_refusal`]).
+    ///
+    /// [`RefreshError::Reused`] is neither a refusal nor a failure — its
+    /// containment writes must commit — and every other variant is an
+    /// internal failure that must roll back.
+    #[must_use]
+    pub fn is_refusal(&self) -> bool {
+        match self {
+            Self::NotFound => true,
+            Self::Issuance(error) => error.is_refusal(),
+            Self::Reused | Self::Database(_) | Self::Wyrd(_) => false,
+        }
+    }
+}
+
 impl From<RefreshError> for WyrdError {
     fn from(error: RefreshError) -> Self {
         match error {

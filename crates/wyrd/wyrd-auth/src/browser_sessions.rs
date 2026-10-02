@@ -30,8 +30,8 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_sql::queries::auth::{
     BrowserSessionMode, BrowserSessionWrite, LockedBrowserSession, insert_browser_session,
-    lock_browser_session, redeem_login_completion, refresh_by_hash, revoke_browser_session,
-    revoke_refresh, rotate_browser_session,
+    lock_browser_session, lock_refresh_family, redeem_login_completion, refresh_by_hash,
+    revoke_browser_session, revoke_refresh_chain, rotate_browser_session,
 };
 use wyrd_sql::{TenantConn, WyrdPostgres};
 
@@ -190,9 +190,11 @@ impl BrowserSessions {
     /// `flow_id` is the raw value of the BFF's `HttpOnly` flow cookie; its
     /// SHA-256 is the binding login began with, and the only thing that names
     /// the tenant. One tenant transaction redeems the sealed completion (the
-    /// delete is its single use), stores the session with its token pair and
-    /// the CSRF token sealed under the deployment keyring, and commits. A
-    /// completion that cannot be opened is still consumed.
+    /// delete is its single use), resolves the stored row of the login's
+    /// refresh token by its hash as the session's refresh chain id, stores the
+    /// session with that id, its token pair and the CSRF token sealed under the
+    /// deployment keyring, and commits. A completion that cannot be opened is
+    /// still consumed.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] (`sealing_key_missing`) without a
@@ -235,11 +237,17 @@ impl BrowserSessions {
             .as_ref()
             .ok_or_else(|| unusable("login completion carries no refresh token"))?;
         let refresh_expires_at = refresh_expiry(refresh.expose())?;
+        let refresh_chain_id = refresh_by_hash(&mut conn, &token_hash(refresh.expose()))
+            .await
+            .map_err(store_error)?
+            .ok_or_else(|| unusable("login completion's refresh token is not stored"))?
+            .id;
         let principal_id = self.principal_of(tenant, token.access_token.expose())?;
         let write = BrowserSessionWrite {
             principal_id,
             connection_id: Some(redeemed.connection_id),
             mode: BrowserSessionMode::OidcRefresh,
+            refresh_chain_id: Some(refresh_chain_id),
             access_token_sealed: seal(keyring, token.access_token.expose())?,
             access_expires_at: token.expires_at,
             refresh_token_sealed: Some(seal(keyring, refresh.expose())?),
@@ -307,6 +315,7 @@ impl BrowserSessions {
             principal_id,
             connection_id: None,
             mode: BrowserSessionMode::ApiKeyExchange,
+            refresh_chain_id: None,
             access_token_sealed: seal(keyring, exchanged.access_token.expose_secret())?,
             access_expires_at: exchanged.expires_at,
             refresh_token_sealed: None,
@@ -395,12 +404,18 @@ impl BrowserSessions {
     /// End the session `session_id` names. Idempotent: an unknown, expired,
     /// or already revoked session is a no-op.
     ///
-    /// An SSO session's current refresh token is revoked with it, so its
-    /// rotation chain cannot continue; an API-key session's stored key is
-    /// wiped, while the operator's API key itself stays valid.
+    /// For an SSO session, under the User's refresh-family lock, every active
+    /// row of the session's refresh chain — the login's first refresh token
+    /// and each descendant through `rotated_from` — is revoked with it, so
+    /// neither the stored token nor a successor rotated from a copy can
+    /// continue; the chain is named by the row's stored id, so no sealed
+    /// value is opened, and the User's other logins stay valid. An API-key
+    /// session's stored key is wiped, while the operator's API key itself
+    /// stays valid. Both happen in one transaction with the browser-row wipe.
     ///
     /// # Errors
-    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the store fails.
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the store fails;
+    /// nothing is committed then.
     pub async fn logout(&self, session_id: &SecretString) -> Result<(), WyrdError> {
         let id_hash = session_hash(session_id)?;
         let Some(tenant) = self
@@ -418,13 +433,11 @@ impl BrowserSessions {
         else {
             return Ok(());
         };
-        if let (Some(sealed), Some(keyring)) = (&row.refresh_token_sealed, &self.keyring)
-            && let Ok(refresh) = open_text(keyring, sealed)
-            && let Some(stored) = refresh_by_hash(&mut conn, &token_hash(refresh.expose_secret()))
+        if let Some(chain) = row.refresh_chain_id {
+            lock_refresh_family(&mut conn, "user", row.principal_id)
                 .await
-                .map_err(store_error)?
-        {
-            revoke_refresh(&mut conn, stored.id, "browser_logout")
+                .map_err(store_error)?;
+            revoke_refresh_chain(&mut conn, chain, "browser_logout")
                 .await
                 .map_err(store_error)?;
         }
@@ -948,7 +961,7 @@ mod pg_tests {
     use wyrd_spec::ids::TenantSlug;
     use wyrd_sql::queries::auth::{
         BrowserSessionMode, BrowserSessionWrite, grant_role_to_service_account,
-        insert_browser_session, insert_role, replace_user_roles, revoke_api_key,
+        insert_browser_session, insert_role, refresh_by_hash, replace_user_roles, revoke_api_key,
     };
 
     use super::{
@@ -960,6 +973,7 @@ mod pg_tests {
         test_service_card_ref,
     };
     use crate::refresh::{RefreshError, RefreshTokens};
+    use wyrd_crypt::{SealingKeyring, SecretKey};
 
     /// The stored lifecycle columns a renewal that commits nothing must leave
     /// as they were: sealed access token, its expiry, the session's
@@ -1032,7 +1046,8 @@ mod pg_tests {
     /// Seeds an active user holding one empty role and the tenant's Active
     /// human connection, mints the first access/refresh pair through the
     /// session owner's issuer bound to that connection, and stores both
-    /// sealed under the owner's keyring in one committed transaction.
+    /// sealed under the owner's keyring, with that refresh row as the
+    /// session's chain, in one committed transaction.
     ///
     /// # Panics
     /// Panics when a seed, issuance, seal, or the commit fails.
@@ -1058,6 +1073,12 @@ mod pg_tests {
         let refresh_token = issued
             .refresh_token
             .expect("a login issues a refresh token");
+        let refresh_chain_id =
+            refresh_by_hash(&mut conn, &token_hash(refresh_token.expose_secret()))
+                .await
+                .expect("refresh row reads")
+                .expect("the login's refresh row is stored")
+                .id;
         let keyring = sessions.require_keyring().expect("test keyring");
         let csrf = random_hex_256();
         let session_id = random_hex_256();
@@ -1065,6 +1086,7 @@ mod pg_tests {
             principal_id: user_id,
             connection_id: Some(binding.connection_id),
             mode: BrowserSessionMode::OidcRefresh,
+            refresh_chain_id: Some(refresh_chain_id),
             access_token_sealed: seal(keyring, issued.access_token.expose_secret())
                 .expect("access token seals"),
             access_expires_at: issued.expires_at,
@@ -1452,5 +1474,96 @@ mod pg_tests {
             &issued.access_token,
         )
         .await;
+    }
+    /// OIDC logout retires its own login's refresh chain under the family
+    /// lock without opening the stored refresh envelope, and leaves the
+    /// User's other logins alive.
+    ///
+    /// An OIDC session is signed in and the same User signs in separately a
+    /// second time. A copy of the session's refresh token is rotated through
+    /// the ordinary refresh owner and its successor committed outside the
+    /// browser row, then the row's refresh envelope is replaced by ciphertext
+    /// the serving keyring cannot open. Logout must still revoke the browser
+    /// row and wipe its sealed values, revoke every row of the session's
+    /// chain so the successor cannot rotate, and leave the separate login's
+    /// refresh token active.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot start, a seed, update, or logout fails,
+    /// or any assertion fails.
+    #[tokio::test]
+    async fn oidc_logout_retires_only_its_refresh_chain_without_opening_it() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let sessions = browser_sessions(&fixture);
+        let session = oidc_session(&fixture, &sessions).await;
+        let refresh = RefreshTokens {
+            issuer: sessions.issuer.clone(),
+        };
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let binding = seed_active_human_connection(&mut conn)
+            .await
+            .expect("connection reads");
+        let other_login = sessions
+            .issuer
+            .issue_human_session(&mut conn, session.user_id, None, binding, "req-other-login")
+            .await
+            .expect("a separate login issues a pair")
+            .refresh_token
+            .expect("a login issues a refresh token");
+        let successor = refresh
+            .execute(&mut conn, session.refresh_token.clone(), "req-copy")
+            .await
+            .expect("the copied refresh token rotates")
+            .refresh_token
+            .expect("rotation issues a successor");
+        conn.commit().await.expect("login and rotation commit");
+
+        let unheld = SealingKeyring::new(SecretKey::from_bytes([3_u8; 32]));
+        let superuser = fixture
+            .superuser_pool()
+            .await
+            .expect("superuser pool opens");
+        let updated =
+            sqlx::query("UPDATE wyrd.auth_browser_sessions SET refresh_token_sealed = $1")
+                .bind(seal(&unheld, "unreadable").expect("foreign envelope seals"))
+                .execute(&superuser)
+                .await
+                .expect("refresh envelope replaces");
+        assert_eq!(updated.rows_affected(), 1);
+
+        sessions
+            .logout(&session.session_id)
+            .await
+            .expect("logout succeeds");
+
+        let successor_hash = token_hash(successor.expose_secret());
+        let (sealed, _, session_revoked, successor_revoked) =
+            stored_state(&fixture, &Backing::Refresh(&successor_hash)).await;
+        assert!(
+            sealed.is_none() && session_revoked.is_some(),
+            "logout revokes the browser row and wipes its envelopes"
+        );
+        assert!(
+            successor_revoked.is_some(),
+            "logout revokes the session chain's committed successor"
+        );
+        let other_revoked: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT revoked_at FROM wyrd.auth_refresh_tokens WHERE token_hash = $1",
+        )
+        .bind(token_hash(other_login.expose_secret()))
+        .fetch_one(&superuser)
+        .await
+        .expect("the other login's refresh row reads");
+        assert!(
+            other_revoked.is_none(),
+            "the User's separate login keeps its refresh token"
+        );
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let replayed = refresh.execute(&mut conn, successor, "req-successor").await;
+        assert!(
+            matches!(replayed, Err(RefreshError::Reused)),
+            "the logged-out chain's successor cannot rotate: {replayed:?}"
+        );
     }
 }

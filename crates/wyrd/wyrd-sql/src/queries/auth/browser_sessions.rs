@@ -29,15 +29,16 @@ const PURGE_EXPIRED_BROWSER_SESSIONS_SQL: &str = r#"
 ///
 /// The absolute expiry is `PostgreSQL`'s clock plus the bound fixed lifetime
 /// in seconds (`$13`); the refresh-token expiry (`$10`) is stored separately
-/// as issued. The id hash is the primary key, so a reused id inserts nothing.
+/// as issued, and an SSO session's refresh chain id (`$14`) as given. The id
+/// hash is the primary key, so a reused id inserts nothing.
 const INSERT_BROWSER_SESSION_SQL: &str = r#"
     INSERT INTO wyrd.auth_browser_sessions (
         id_hash, data_tenant_id, principal_id, connection_id, mode,
         access_token_sealed, refresh_token_sealed, api_key_sealed,
         access_expires_at, refresh_expires_at, csrf_hash, csrf_token_sealed,
-        absolute_expires_at
+        absolute_expires_at, refresh_chain_id
     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-              statement_timestamp() + ($13 * interval '1 second'))
+              statement_timestamp() + ($13 * interval '1 second'), $14)
     ON CONFLICT DO NOTHING
     RETURNING absolute_expires_at
 "#;
@@ -52,7 +53,7 @@ const INSERT_BROWSER_SESSION_SQL: &str = r#"
 /// renewal margin. A concurrent caller blocks on the row lock and, once the
 /// holder commits, re-reads the holder's rotated or revoked row.
 const LOCK_BROWSER_SESSION_SQL: &str = r#"
-    SELECT principal_id, connection_id, mode, access_token_sealed,
+    SELECT principal_id, connection_id, mode, refresh_chain_id, access_token_sealed,
            refresh_token_sealed, api_key_sealed, access_expires_at,
            absolute_expires_at, csrf_token_sealed,
            access_expires_at > statement_timestamp() + ($2 * interval '1 second')
@@ -136,6 +137,9 @@ pub struct BrowserSessionWrite {
     pub connection_id: Option<Uuid>,
     /// How the session renews.
     pub mode: BrowserSessionMode,
+    /// Id of the first refresh token an SSO session's login issued, naming
+    /// the rotation chain its logout retires; `None` for an API-key session.
+    pub refresh_chain_id: Option<Uuid>,
     /// Sealed current access token.
     pub access_token_sealed: Vec<u8>,
     /// Expiry of that access token, as issued.
@@ -164,6 +168,9 @@ pub struct LockedBrowserSession {
     pub connection_id: Option<Uuid>,
     /// How the session renews.
     pub mode: BrowserSessionMode,
+    /// Id of the first refresh token an SSO session's login issued; `None`
+    /// for an API-key session.
+    pub refresh_chain_id: Option<Uuid>,
     /// Sealed current access token.
     pub access_token_sealed: Vec<u8>,
     /// Sealed refresh token of an SSO session.
@@ -193,6 +200,8 @@ struct LockedRow {
     connection_id: Option<Uuid>,
     /// Stored mode text.
     mode: String,
+    /// First refresh token id of an SSO session's chain.
+    refresh_chain_id: Option<Uuid>,
     /// Sealed access token; non-null on a live row by table constraint.
     access_token_sealed: Option<Vec<u8>>,
     /// Sealed refresh token.
@@ -243,6 +252,7 @@ pub async fn insert_browser_session(
         .bind(row.csrf_hash.as_bytes().as_slice())
         .bind(&row.csrf_token_sealed)
         .bind(row.lifetime.as_secs_f64())
+        .bind(row.refresh_chain_id)
         .fetch_optional(&mut **conn.transaction())
         .await
 }
@@ -275,6 +285,7 @@ pub async fn lock_browser_session(
             principal_id: row.principal_id,
             connection_id: row.connection_id,
             mode: BrowserSessionMode::parse(&row.mode)?,
+            refresh_chain_id: row.refresh_chain_id,
             access_token_sealed: row.access_token_sealed.ok_or_else(corrupt)?,
             refresh_token_sealed: row.refresh_token_sealed,
             api_key_sealed: row.api_key_sealed,

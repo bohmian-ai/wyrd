@@ -41,7 +41,7 @@ pub use login_state::{
 };
 pub use refresh_tokens::{
     consume_active_refresh, insert_human_refresh_token, lock_refresh_family, refresh_by_hash,
-    refresh_issuance_instant, revoke_refresh, revoke_refresh_family,
+    refresh_issuance_instant, revoke_refresh, revoke_refresh_chain, revoke_refresh_family,
 };
 pub use revocation::{suspend_service_account_principal, suspend_user_principal};
 pub use role_assignments::{

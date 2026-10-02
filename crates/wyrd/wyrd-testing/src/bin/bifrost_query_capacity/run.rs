@@ -20,8 +20,8 @@ use wyrd_client::{Bifrost, WyrdClient};
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalOutcome};
 
 use crate::Result;
-use crate::server::{LocalServer, MemoryPeak};
 use crate::workload::{self, Case, Fixture, Rows};
+use wyrd_testing::release_server::{LocalServer, MemoryPeak};
 
 /// Untimed load before each window, so connection setup is not measured.
 const WARMUP: Duration = Duration::from_secs(2);

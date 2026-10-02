@@ -1,15 +1,19 @@
 //! One release `wyrd-server`, started the way the local-development guide
 //! (`docs/src/content/docs/self-hosting/local-development.svx`) tells an
-//! operator to.
+//! operator to, for the opt-in benchmark binaries.
 //!
 //! The operator steps are: the database owner runs `wyrd-server migrate`;
 //! `wyrd-server` serves with the environment the Postgres wrapper exported;
-//! `wyrd-server setup --tenant` prints the first tenant's admin credential.
-//! The benchmark adds only what the guide leaves to the operator:
+//! `wyrd-server setup --tenant` prints each tenant's admin credential, the
+//! first run also disclosing the platform credential the later runs present.
+//! The benchmarks add only what the guide leaves to the operator:
 //! `WYRD_STORAGE_URL`, which has no default, pointing at a `file://`
 //! directory; a working directory so the server's `.wyrd/` state lands in a
-//! temporary root; and a systemd scope that gives the process the
-//! 4-CPU/8-GiB pod envelope. Every other setting is the server's default.
+//! temporary root; a systemd scope that gives the process the
+//! 8-CPU/16-GiB pod envelope; and any extra environment a benchmark names.
+//! The wrapper's test-fixture `WYRD_DB_MAX_CONNECTIONS` cap is removed, so
+//! the pool runs at the server's default. Every other setting is the server's
+//! default.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -20,17 +24,12 @@ use std::time::{Duration, Instant};
 
 use secrecy::SecretString;
 
-use crate::Result;
-
 /// The server's default public HTTP address, as the guide exports it in
 /// `WYRD_SERVER_URL`.
 pub const SERVER_URL: &str = "http://127.0.0.1:8080";
 
 /// The server's default metrics listener: loopback on the HTTP port plus one.
 const METRICS_URL: &str = "http://127.0.0.1:8081/metrics";
-
-/// Tenant `setup` creates for the benchmark application.
-const TENANT: &str = "bench";
 
 /// CPUs of quota in the pod envelope.
 pub const CPUS: u64 = 8;
@@ -46,7 +45,51 @@ const READY_TIMEOUT: Duration = Duration::from_secs(120);
 /// shutdown drain budget.
 const STOP_GRACE: Duration = Duration::from_secs(45);
 
-/// A running `wyrd-server` and the credential its `setup` printed.
+/// Why starting, observing, or stopping the release server failed.
+#[derive(Debug, thiserror::Error)]
+pub enum ReleaseServerError {
+    /// A process, file, or cgroup operation failed.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    /// A `/readyz` or `/metrics` request failed.
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
+    /// A cgroup file held a non-integer value.
+    #[error(transparent)]
+    Parse(#[from] std::num::ParseIntError),
+    /// The server or an operator subcommand misbehaved.
+    #[error("{0}")]
+    Server(String),
+}
+
+impl From<&str> for ReleaseServerError {
+    /// Wraps a static failure description.
+    fn from(message: &str) -> Self {
+        Self::Server(message.to_owned())
+    }
+}
+
+impl From<String> for ReleaseServerError {
+    /// Wraps a formatted failure description.
+    fn from(message: String) -> Self {
+        Self::Server(message)
+    }
+}
+
+/// Result of every release-server operation.
+pub type Result<T> = std::result::Result<T, ReleaseServerError>;
+
+/// One tenant `wyrd-server setup` provisioned.
+pub struct SetupTenant {
+    /// The tenant slug passed to `setup --tenant`.
+    pub slug: String,
+    /// The data tenant id `setup` printed.
+    pub tenant_id: String,
+    /// The tenant's admin credential, as the guide exports it in `WYRD_API_KEY`.
+    pub api_key: SecretString,
+}
+
+/// A running `wyrd-server` and the tenants its `setup` runs provisioned.
 ///
 /// Dropping it kills the process; [`LocalServer::stop`] is the clean exit.
 pub struct LocalServer {
@@ -56,22 +99,28 @@ pub struct LocalServer {
     child: Option<Child>,
     /// The process's cgroup-v2 directory, where its envelope is enforced.
     cgroup: PathBuf,
-    /// Admin credential of the benchmark tenant.
-    api_key: SecretString,
+    /// Tenants in the order `setup` provisioned them.
+    tenants: Vec<SetupTenant>,
 }
 
 impl LocalServer {
-    /// Migrates, serves, and sets up `binary`, returning once `/readyz`
-    /// answers 200, the cgroup enforces the envelope, and `setup` printed the
-    /// tenant's credential.
+    /// Migrates and serves `binary` with `env` added, then runs `setup` once
+    /// per slug in `tenants`, returning once `/readyz` answers 200, the
+    /// cgroup enforces the envelope, and every tenant's credential was
+    /// printed.
+    ///
+    /// The first `setup` initializes the platform root and discloses its
+    /// credential; later runs present it as `WYRD_PLATFORM_CREDENTIAL`, as
+    /// the guide tells an operator adding a tenant to do.
     ///
     /// # Errors
     ///
     /// Returns an error when `WYRD_TEST_DATABASE_ADMIN_URL` is unset (the
-    /// benchmark is not running under the Postgres wrapper), `migrate` or
-    /// `setup` fails, the server exits or never becomes ready, or its cgroup
-    /// does not enforce the [`CPUS`]/[`MEMORY_BYTES`] envelope.
-    pub async fn start(binary: &Path) -> Result<Self> {
+    /// benchmark is not running under the Postgres wrapper), `migrate` or a
+    /// `setup` fails or prints no credential, the server exits or never
+    /// becomes ready, or its cgroup does not enforce the
+    /// [`CPUS`]/[`MEMORY_BYTES`] envelope.
+    pub async fn start(binary: &Path, tenants: &[&str], env: &[(&str, &str)]) -> Result<Self> {
         let owner_url = std::env::var("WYRD_TEST_DATABASE_ADMIN_URL")
             .map_err(|_| "WYRD_TEST_DATABASE_ADMIN_URL is unset; run through mise")?;
         let root = tempfile::Builder::new().prefix("wyrd-bench-").tempdir()?;
@@ -83,7 +132,9 @@ impl LocalServer {
             let mut command = Command::new(program);
             command
                 .current_dir(&workdir)
-                .env("WYRD_STORAGE_URL", &storage_url);
+                .env("WYRD_STORAGE_URL", &storage_url)
+                .env_remove("WYRD_DB_MAX_CONNECTIONS")
+                .envs(env.iter().copied());
             command
         };
 
@@ -107,25 +158,59 @@ impl LocalServer {
             cgroup: PathBuf::new(),
             child: Some(child),
             root,
-            api_key: SecretString::from(String::new()),
+            tenants: Vec::new(),
         };
         server.await_ready().await?;
         server.cgroup = server.find_cgroup()?;
         server.confirm_envelope()?;
 
-        let setup = run(operator(binary).args(["setup", "--tenant", TENANT]))?;
-        let key = setup
-            .lines()
-            .find_map(|line| line.strip_prefix("admin_credential: "))
-            .ok_or("`wyrd-server setup` printed no admin_credential")?;
-        server.api_key = SecretString::from(key.trim().to_owned());
+        let mut platform: Option<String> = None;
+        for slug in tenants {
+            let mut setup = operator(binary);
+            setup.args(["setup", "--tenant", slug]);
+            if let Some(credential) = &platform {
+                setup.env("WYRD_PLATFORM_CREDENTIAL", credential);
+            }
+            let printed = run(&mut setup)?;
+            let field = |name: &str| {
+                printed
+                    .lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .map(|value| value.trim().to_owned())
+                    .ok_or_else(|| format!("`wyrd-server setup --tenant {slug}` printed no {name}"))
+            };
+            if platform.is_none() {
+                platform = printed
+                    .lines()
+                    .find(|line| line.starts_with("wyrd_global_"))
+                    .map(str::to_owned);
+            }
+            server.tenants.push(SetupTenant {
+                slug: (*slug).to_owned(),
+                tenant_id: field("tenant_id: ")?,
+                api_key: SecretString::from(field("admin_credential: ")?),
+            });
+        }
         Ok(server)
     }
 
-    /// The admin credential `setup` printed, as the guide exports it in
+    /// The first tenant's admin credential, as the guide exports it in
     /// `WYRD_API_KEY`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the server was started with no tenant.
     pub fn api_key(&self) -> &SecretString {
-        &self.api_key
+        &self
+            .tenants
+            .first()
+            .expect("the server was started with at least one tenant")
+            .api_key
+    }
+
+    /// Every tenant `setup` provisioned, in order.
+    pub fn tenants(&self) -> &[SetupTenant] {
+        &self.tenants
     }
 
     /// The `file://` store the server publishes into.
@@ -343,6 +428,37 @@ impl Metrics {
             .map(|(_, value)| value)
             .sum()
     }
+
+    /// The cumulative `le` buckets of histogram `family`, summed across every
+    /// series whose labels contain each of `labels`, in ascending bound
+    /// order; `+Inf` reads as infinity.
+    pub fn buckets(&self, family: &str, labels: &[&str]) -> Vec<(f64, f64)> {
+        let mut buckets: BTreeMap<u64, (f64, f64)> = BTreeMap::new();
+        let prefix = format!("{family}_bucket{{");
+        for (series, value) in &self.0 {
+            let Some(rest) = series.strip_prefix(&prefix) else {
+                continue;
+            };
+            if !labels.iter().all(|label| rest.contains(label)) {
+                continue;
+            }
+            let Some(bound) = rest
+                .split("le=\"")
+                .nth(1)
+                .and_then(|tail| tail.split('"').next())
+                .and_then(|bound| match bound {
+                    "+Inf" => Some(f64::INFINITY),
+                    finite => finite.parse::<f64>().ok(),
+                })
+            else {
+                continue;
+            };
+            buckets.entry(bound.to_bits()).or_insert((bound, 0.0)).1 += value;
+        }
+        let mut sorted: Vec<(f64, f64)> = buckets.into_values().collect();
+        sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        sorted
+    }
 }
 
 /// Runs an operator subcommand to completion and returns its stdout.
@@ -383,5 +499,26 @@ mod tests {
         assert_eq!(metrics.sum("oracle_queries_queued", &[]), 7.0);
         assert_eq!(metrics.sum("slots", &["kind=\"limit\""]), 8.0);
         assert_eq!(metrics.sum("absent", &[]), 0.0);
+    }
+
+    /// Histogram buckets sum across matching series in bound order, `+Inf`
+    /// last, and other label sets stay out.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a bucket is missing, misordered, or misattributed.
+    #[test]
+    fn metrics_buckets_merge_matching_series_in_bound_order() {
+        let metrics = Metrics::parse(
+            "w_bucket{origin=\"a\",le=\"+Inf\"} 5\nw_bucket{origin=\"a\",le=\"0.5\"} 2\n\
+             w_bucket{origin=\"b\",le=\"0.5\"} 1\nw_bucket{origin=\"b\",le=\"+Inf\"} 1\n\
+             w_bucket{origin=\"c\",le=\"0.5\"} 9\nw_count{origin=\"a\"} 5\n",
+        );
+        assert_eq!(
+            metrics.buckets("w", &["origin=\"a\""]),
+            vec![(0.5, 2.0), (f64::INFINITY, 5.0)]
+        );
+        let ab: Vec<(f64, f64)> = metrics.buckets("w", &[]).into_iter().collect();
+        assert_eq!(ab, vec![(0.5, 12.0), (f64::INFINITY, 6.0)]);
     }
 }

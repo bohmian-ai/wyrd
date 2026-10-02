@@ -7,6 +7,7 @@ pub mod load;
 pub mod logs;
 pub mod oidc_fixture;
 pub mod principal;
+pub mod release_server;
 pub mod server;
 pub mod time;
 pub mod verification;

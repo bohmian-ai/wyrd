@@ -9,8 +9,8 @@ use std::path::Path;
 
 use crate::Result;
 use crate::run::{Measured, Overload, QUEUE_FULL, QUEUE_PLACES, Usage};
-use crate::server::{CPUS, MEMORY_BYTES};
 use crate::workload::{Case, Fixture, Target};
+use wyrd_testing::release_server::{CPUS, MEMORY_BYTES};
 
 /// Peak server memory every step must stay below: the pod limit less the
 /// server's 1-GiB default headroom.

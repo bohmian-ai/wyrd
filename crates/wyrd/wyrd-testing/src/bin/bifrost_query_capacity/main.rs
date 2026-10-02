@@ -16,7 +16,6 @@
 
 mod report;
 mod run;
-mod server;
 mod workload;
 
 use std::path::{Path, PathBuf};
@@ -28,8 +27,8 @@ use wyrd_client::{GlobalConfig, WyrdClient};
 
 use report::Report;
 use run::Bench;
-use server::{LocalServer, SERVER_URL};
 use workload::{Case, Fixture, TABLE};
+use wyrd_testing::release_server::{LocalServer, SERVER_URL};
 
 /// Error type of every benchmark step: the binary only reports it.
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -74,7 +73,7 @@ async fn benchmark(heavy: bool) -> Result<bool> {
     }
     std::fs::create_dir_all(&output)?;
 
-    let server = LocalServer::start(&release_binary()?).await?;
+    let server = LocalServer::start(&release_binary()?, &["bench"], &[]).await?;
     let client = WyrdClient::with_config(ClientConfig {
         credential: Some(server.api_key().clone()),
         ..ClientConfig::from_global_with_overrides(&GlobalConfig::default(), Some(SERVER_URL), None)
@@ -118,7 +117,7 @@ async fn benchmark(heavy: bool) -> Result<bool> {
         report.overload(bench.overload_queue().await?);
     }
 
-    report.shutdown(&server.stop(&output.join("server.log")));
+    report.shutdown(&server.stop(&output.join("server.log")).map_err(Into::into));
     report.write_to(&output)?;
     Ok(report.passed())
 }

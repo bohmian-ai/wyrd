@@ -5,8 +5,7 @@ metadata:
   name: final-reviewer
   version: "1.0.0"
 spec:
-  prompt:
-    path: ../prompts/final-reviewer.yaml
+  prompt: ../prompts/final-reviewer.yaml
   tool_names: []
   run_config:
     max_iterations: 1

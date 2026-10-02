@@ -17,8 +17,7 @@ spec:
     - id: security
       action:
         type: agent
-        target:
-          path: ./agents/security.yaml
+        target: ./agents/security.yaml
       inputs:
         code: input.code
       timeout_seconds: 60
@@ -28,8 +27,7 @@ spec:
     - id: correctness
       action:
         type: agent
-        target:
-          path: ./agents/correctness.yaml
+        target: ./agents/correctness.yaml
       inputs:
         code: input.code
       timeout_seconds: 60
@@ -39,8 +37,7 @@ spec:
     - id: final_review
       action:
         type: agent
-        target:
-          path: ./agents/final-reviewer.yaml
+        target: ./agents/final-reviewer.yaml
       depends_on: [security, correctness]
       inputs:
         code: input.code

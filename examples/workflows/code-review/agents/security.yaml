@@ -5,8 +5,7 @@ metadata:
   name: security-reviewer
   version: "1.0.0"
 spec:
-  prompt:
-    path: ../prompts/security.yaml
+  prompt: ../prompts/security.yaml
   tool_names: []
   run_config:
     max_iterations: 1

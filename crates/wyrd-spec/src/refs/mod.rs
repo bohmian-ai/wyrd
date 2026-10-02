@@ -157,68 +157,6 @@ impl ReferenceSlotVisitor {
     }
 }
 
-/// Serialized field holding an inlineable reference slot, for raw authored
-/// documents that have not yet decoded into a typed [`Spec`].
-///
-/// Authors may wrap an inlineable slot in a keyed `ref`/`path`/`inline` form
-/// that the typed wire shape does not accept, so a loader must recognize the
-/// slot on raw YAML before deserialization. [`InlineableSlotField::ALL`] is the
-/// field-level projection of every inlineable slot [`ReferenceSlotVisitor`]
-/// yields; the visitor completeness tests pin the two together, so a new
-/// inlineable slot participates in raw recognition only through this owner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InlineableSlotField {
-    /// Serialized field name holding the slot.
-    pub field: &'static str,
-    /// `type` discriminator the enclosing mapping must carry, when the field
-    /// name alone also appears outside a reference slot.
-    pub mapping_type: Option<&'static str>,
-    /// Whether the field holds a list whose every element is one slot.
-    pub list: bool,
-}
-
-impl InlineableSlotField {
-    /// Every inlineable slot field the canonical visitor yields: an Agent's
-    /// `prompt`, an LLM judge's `judge_ref`, an Agent action's `target`, a
-    /// binding's `runs_on`, and each element of a binding's `on_failure`.
-    pub const ALL: &'static [Self] = &[
-        Self::single("prompt"),
-        Self::single("judge_ref"),
-        Self {
-            field: "target",
-            mapping_type: Some("agent"),
-            list: false,
-        },
-        Self::single("runs_on"),
-        Self {
-            field: "on_failure",
-            mapping_type: None,
-            list: true,
-        },
-    ];
-
-    /// Build a single-slot field recognized by name in any mapping.
-    const fn single(field: &'static str) -> Self {
-        Self {
-            field,
-            mapping_type: None,
-            list: false,
-        }
-    }
-
-    /// Return the slot field `key` names inside a mapping whose `type`
-    /// discriminator is `mapping_type`, or `None` when `key` is not a slot.
-    #[must_use]
-    pub fn find(key: &str, mapping_type: Option<&str>) -> Option<Self> {
-        Self::ALL.iter().copied().find(|slot| {
-            slot.field == key
-                && slot
-                    .mapping_type
-                    .is_none_or(|required| Some(required) == mapping_type)
-        })
-    }
-}
-
 /// Trait for specs that carry reference slots.
 pub trait Visit {
     /// Visit every reference slot on this spec, invoking `f` for each.
@@ -593,10 +531,10 @@ where
 mod completeness_tests {
     use std::collections::{BTreeMap, HashMap};
 
-    use serde_json::{Value, json};
+    use serde_json::json;
     use skald_spec::Prompt;
 
-    use super::{InlineableSlotField, ReferenceSlotVisitor, SlotValue};
+    use super::{ReferenceSlotVisitor, SlotValue};
     use crate::card::agent::{AgentRunConfigSpec, AgentSpec};
     use crate::card::artifact::ArtifactSpec;
     use crate::card::audit::AuditSpec;
@@ -819,64 +757,6 @@ mod completeness_tests {
             paths.push((entry.path, kind));
         });
         paths
-    }
-
-    /// Count the slots [`InlineableSlotField`] recognizes in a serialized spec,
-    /// walking every mapping with its own `type` discriminator.
-    fn raw_slot_count(value: &Value) -> usize {
-        match value {
-            Value::Object(mapping) => {
-                let mapping_type = mapping.get("type").and_then(Value::as_str);
-                mapping
-                    .iter()
-                    .map(|(key, value)| {
-                        let slots = match InlineableSlotField::find(key, mapping_type) {
-                            Some(slot) if slot.list => value.as_array().map_or(0, Vec::len),
-                            Some(_) => 1,
-                            None => 0,
-                        };
-                        slots + raw_slot_count(value)
-                    })
-                    .sum()
-            }
-            Value::Array(values) => values.iter().map(raw_slot_count).sum(),
-            _ => 0,
-        }
-    }
-
-    /// Pin the raw-document slot projection to the visitor: every inlineable
-    /// slot the visitor yields is recognized by its serialized field, and no
-    /// other field is, across Agent prompts, judge Agents, Workflow targets,
-    /// and every binding's `runs_on` and `on_failure` elements.
-    ///
-    /// # Panics
-    /// Panics when a fixture fails to serialize or the counts diverge.
-    #[test]
-    fn inlineable_slot_fields_project_every_inlineable_slot() {
-        let agent = AgentSpec {
-            verified_by: vec![binding("agent-quality")],
-            ..agent()
-        };
-        let service = ServiceSpec {
-            verified_by: vec![binding("service-quality")],
-            ..ServiceSpec::default()
-        };
-        for spec in [
-            Spec::Agent(agent),
-            Spec::Workflow(workflow()),
-            Spec::Verifier(VerifierSpec {
-                description: None,
-                implementation: VerifierImplementation::Eval(eval()),
-            }),
-            Spec::Service(service),
-        ] {
-            let visited = visit_paths(spec.clone())
-                .iter()
-                .filter(|(_, shape)| *shape != "durable")
-                .count();
-            let raw = raw_slot_count(&serde_json::to_value(&spec).expect("fixture serializes"));
-            assert_eq!(raw, visited, "{}", spec.kind().wire_name());
-        }
     }
 
     /// Confirm the canonical visitor exposes every supported reference slot exactly once.

@@ -5,15 +5,27 @@ emit is proven by the error it raises before admission. Durable emit behavior
 belongs to the gated journey lanes, not here.
 """
 
+import asyncio
+import inspect
+import subprocess
+import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import pytest
 import wyrd
+import wyrd.otel
+from opentelemetry import context as otel_context
+from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from wyrd.eval import MediaRef
 from wyrd.observe import Observe, Run
+from wyrd.otel import install_run_correlation
 from wyrd.state import WyrdState
 
 from .support import TinyDataInterface, TinyModelInterface, build_complete_bundle
@@ -33,6 +45,10 @@ def _state(tmp_path: Path) -> WyrdState:
             "training_data": TinyDataInterface(),
         },
     )
+
+
+ORIGINAL_GET_VALUE = otel_context.get_value
+ORIGINAL_ATTACH = otel_context.attach
 
 
 def _code(error: BaseException) -> str:
@@ -192,3 +208,393 @@ def test_active_span_reaches_the_writer(tmp_path: Path) -> None:
     with tracer.start_as_current_span("unit"), pytest.raises(wyrd.WyrdError) as raised:
         _state(tmp_path).run().observe.eval({"answer": "yes"})
     assert _code(raised.value) == "WYRD_SDK_400_BIFROST_NOT_STARTED"
+
+
+# ── Initial Card selection ──────────────────────────────────────────────────
+
+
+def test_run_card_selects_the_initial_view_and_shares_its_invocation(tmp_path: Path) -> None:
+    """``run(card=...)`` opens on that Card; later views share its invocation."""
+    state = _state(tmp_path)
+    model = state.run(card="model")
+    assert model.card_ref == state.run().for_card("model").card_ref
+    assert UUID(model.run_id).version == 7
+    backup = model.for_card("backup")
+    assert backup.run_id == model.run_id
+    assert model.card_ref != backup.card_ref
+    assert state.run(card=None).card_ref.startswith("default/Service/service@1.0.0")
+
+
+def test_run_card_refuses_an_unknown_alias(tmp_path: Path) -> None:
+    """An unknown initial alias fails locally, before any scope is entered."""
+    with pytest.raises(wyrd.WyrdError) as raised:
+        _state(tmp_path).run(card="missing")
+    assert _code(raised.value) == "WYRD_SDK_404_UNKNOWN_ALIAS"
+
+
+# ── Run scope: ambient OpenTelemetry span correlation ───────────────────────
+
+
+@pytest.fixture
+def spans(monkeypatch: pytest.MonkeyPatch) -> tuple[TracerProvider, InMemorySpanExporter]:
+    """A real SDK provider standing in as the global one, exporting to memory.
+
+    Patching the global lookup rather than calling ``set_tracer_provider``
+    keeps each test's provider private: OpenTelemetry sets the global once.
+    """
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(trace, "get_tracer_provider", lambda: provider)
+    return provider, exporter
+
+
+def _correlation(exporter: InMemorySpanExporter) -> dict[str, tuple[str, str] | None]:
+    """Map each finished span name to its Wyrd correlation, if any."""
+    out: dict[str, tuple[str, str] | None] = {}
+    for span in exporter.get_finished_spans():
+        attributes = span.attributes or {}
+        card_ref, run_id = attributes.get("wyrd.card_ref"), attributes.get("wyrd.run_id")
+        out[span.name] = None if card_ref is None else (str(card_ref), str(run_id))
+    return out
+
+
+def _wyrd_processors(provider: TracerProvider) -> int:
+    """Count the Wyrd correlation processors registered on ``provider``."""
+    return sum(
+        type(processor).__name__ == "_RunCorrelationProcessor"
+        for processor in provider._active_span_processor._span_processors
+    )
+
+
+def test_entering_a_run_returns_it_and_correlates_active_and_child_spans(
+    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+) -> None:
+    """The active span and every span started in scope carry the exact identity."""
+    provider, exporter = spans
+    tracer = provider.get_tracer("framework")
+    run = _state(tmp_path).run(card="model")
+    with tracer.start_as_current_span("outer"):
+        with run as entered:
+            assert entered is run
+            with tracer.start_as_current_span("child"):
+                tracer.start_span("grandchild", attributes={"wyrd.card_ref": "x"}).end()
+        tracer.start_span("after").end()
+    expected = (run.card_ref, run.run_id)
+    assert _correlation(exporter) == {
+        "grandchild": expected,
+        "child": expected,
+        "after": None,
+        "outer": expected,
+    }
+
+
+def test_nested_card_scopes_share_the_run_and_restore_the_outer_card(
+    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+) -> None:
+    """An inner Card scope restores the outer Card when it exits."""
+    provider, exporter = spans
+    tracer = provider.get_tracer("framework")
+    run = _state(tmp_path).run()
+    model = run.for_card("model")
+    with run:
+        tracer.start_span("service").end()
+        with model:
+            tracer.start_span("model").end()
+        tracer.start_span("restored").end()
+    tracer.start_span("outside").end()
+    assert _correlation(exporter) == {
+        "service": (run.card_ref, run.run_id),
+        "model": (model.card_ref, run.run_id),
+        "restored": (run.card_ref, run.run_id),
+        "outside": None,
+    }
+
+
+def test_scope_survives_await_and_isolates_concurrent_tasks(
+    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+) -> None:
+    """Context follows ``await`` and tasks; concurrent scopes never cross."""
+    provider, exporter = spans
+    tracer = provider.get_tracer("framework")
+    run = _state(tmp_path).run()
+    views = {"model": run.for_card("model"), "backup": run.for_card("backup")}
+
+    async def scoped(alias: str) -> None:
+        with views[alias]:
+            await asyncio.sleep(0)
+            tracer.start_span(f"task-{alias}").end()
+            await asyncio.sleep(0)
+            tracer.start_span(f"task-{alias}-late").end()
+
+    async def main() -> None:
+        with run:
+            await asyncio.gather(scoped("model"), scoped("backup"))
+            spawned = asyncio.create_task(_span_later(tracer, "spawned"))
+        await spawned
+        tracer.start_span("after").end()
+
+    asyncio.run(main())
+    root = (run.card_ref, run.run_id)
+    assert _correlation(exporter) == {
+        "task-model": (views["model"].card_ref, run.run_id),
+        "task-model-late": (views["model"].card_ref, run.run_id),
+        "task-backup": (views["backup"].card_ref, run.run_id),
+        "task-backup-late": (views["backup"].card_ref, run.run_id),
+        "spawned": root,
+        "after": None,
+    }
+
+
+def test_concurrent_tasks_entering_the_same_run_exit_independently(
+    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+) -> None:
+    """Two tasks share one Run object; each exit clears only its own task's scope."""
+    provider, exporter = spans
+    tracer = provider.get_tracer("framework")
+    run = _state(tmp_path).run(card="model")
+
+    async def main() -> None:
+        first_entered, second_entered, first_exited = (asyncio.Event() for _ in range(3))
+
+        async def first() -> None:
+            with run:
+                first_entered.set()
+                await second_entered.wait()
+            tracer.start_span("first-exited").end()
+            first_exited.set()
+
+        async def second() -> None:
+            await first_entered.wait()
+            with run:
+                second_entered.set()
+                await first_exited.wait()
+                tracer.start_span("second-entered").end()
+            tracer.start_span("second-exited").end()
+
+        await asyncio.gather(first(), second())
+
+    asyncio.run(main())
+    tracer.start_span("after").end()
+    assert _correlation(exporter) == {
+        "first-exited": None,
+        "second-entered": (run.card_ref, run.run_id),
+        "second-exited": None,
+        "after": None,
+    }
+
+
+def test_captured_otel_context_carries_the_scope_into_a_plain_thread(
+    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+) -> None:
+    """A thread attaching a context captured in scope stamps the scope's exact pair."""
+    provider, exporter = spans
+    tracer = provider.get_tracer("framework")
+    run = _state(tmp_path).run(card="model")
+
+    def worker(captured: Any) -> None:
+        otel_context.attach(captured)
+        tracer.start_span("threaded").end()
+
+    with run:
+        thread = threading.Thread(target=worker, args=(otel_context.get_current(),))
+        thread.start()
+        thread.join()
+    assert _correlation(exporter) == {"threaded": (run.card_ref, run.run_id)}
+
+
+async def _span_later(tracer: Any, name: str) -> None:
+    """Yield once, then start and end one span in this task's context."""
+    await asyncio.sleep(0)
+    tracer.start_span(name).end()
+
+
+def test_repeated_entry_registers_once_on_a_marked_provider(
+    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+) -> None:
+    """The provider marker skips re-registration, through entry or the explicit hook."""
+    provider, exporter = spans
+    run = _state(tmp_path).run()
+    with run, run:
+        pass
+    assert install_run_correlation() is True
+    assert _wyrd_processors(provider) == 1
+
+    private = TracerProvider()
+    private_exporter = InMemorySpanExporter()
+    private.add_span_processor(SimpleSpanProcessor(private_exporter))
+    assert install_run_correlation(private) is True
+    assert install_run_correlation(private) is True
+    assert _wyrd_processors(private) == 1
+    with run:
+        private.get_tracer("framework").start_span("private").end()
+    assert _correlation(private_exporter) == {"private": (run.card_ref, run.run_id)}
+
+
+class _Raising:
+    """A provider whose processor registration raises."""
+
+    def add_span_processor(self, processor: object) -> None:
+        raise RuntimeError("registration failed")
+
+
+class _Unmarkable:
+    """A provider that accepts processors but cannot carry the Wyrd marker."""
+
+    __slots__ = ()
+
+    def add_span_processor(self, processor: object) -> None:
+        raise AssertionError("an unmarkable provider is never registered")
+
+
+def test_unsupported_providers_are_refused_without_raising() -> None:
+    """API-only, proxy, unmarkable, and failing providers report False instead of raising."""
+    assert install_run_correlation(object()) is False
+    assert install_run_correlation(trace.ProxyTracerProvider()) is False
+    assert install_run_correlation(trace.ProxyTracerProvider()) is False
+    assert install_run_correlation(_Unmarkable()) is False
+    assert install_run_correlation(_Raising()) is False
+
+
+def test_run_exit_accepts_conventional_keywords_and_omitted_arguments(tmp_path: Path) -> None:
+    """``Run.__exit__`` names and defaults match the public stub; it never suppresses."""
+    run = _state(tmp_path).run()
+    assert list(inspect.signature(run.__exit__).parameters) == [
+        "exc_type",
+        "exc_value",
+        "traceback",
+    ]
+    run.__enter__()
+    assert run.__exit__(exc_type=None, exc_value=None, traceback=None) is False
+    run.__enter__()
+    assert run.__exit__() is False
+    run.__enter__()
+    assert run.__exit__(ValueError, ValueError("app"), None) is False
+
+
+def test_missing_opentelemetry_is_a_no_op(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without the optional package a run still enters, exits, and emits normally."""
+    # The bindings are resolved at import, so absence is proven in a fresh
+    # interpreter and simulated here by clearing the import-time bindings.
+    blocked = (
+        "import sys; sys.modules['opentelemetry'] = None; import wyrd.otel as otel; "
+        "assert otel._SCOPE_KEY is None and otel.install_run_correlation() is False"
+    )
+    subprocess.run([sys.executable, "-c", blocked], check=True)
+    monkeypatch.setattr(wyrd.otel, "_otel_context", None)
+    monkeypatch.setattr(wyrd.otel, "_otel_trace", None)
+    assert install_run_correlation() is False
+    run = _state(tmp_path).run(card="model")
+    with run as entered, pytest.raises(wyrd.WyrdError) as raised:
+        entered.observe.drift({"latency_ms": 1.0})
+    assert _code(raised.value) == "WYRD_SDK_400_BIFROST_NOT_STARTED"
+
+
+def _drift_reaches_the_ordinary_boundary(run: Run) -> None:
+    """Emit one explicit Drift observation and assert its ordinary offline error."""
+    with pytest.raises(wyrd.WyrdError) as raised:
+        run.observe.drift({"latency_ms": 1.0})
+    assert _code(raised.value) == "WYRD_SDK_400_BIFROST_NOT_STARTED"
+
+
+def _broken(*_args: object, **_kwargs: object) -> None:
+    """Stand in for an OpenTelemetry call that fails."""
+    raise RuntimeError("telemetry broke")
+
+
+def test_registration_and_attach_failures_never_block_observations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """API-only, unmarkable, raising, and failing-attach paths leave emits untouched."""
+    run = _state(tmp_path).run(card="model")
+    for provider in (object(), _Unmarkable(), _Raising()):
+        monkeypatch.setattr(trace, "get_tracer_provider", lambda provider=provider: provider)
+        with run as entered:
+            _drift_reaches_the_ordinary_boundary(entered)
+        with pytest.raises(ValueError, match="app"), run:
+            raise ValueError("app")
+
+    monkeypatch.setattr(otel_context, "attach", _broken)
+    with run as entered:
+        _drift_reaches_the_ordinary_boundary(entered)
+
+
+def test_enrichment_failure_never_blocks_observations(
+    tmp_path: Path,
+    spans: tuple[TracerProvider, InMemorySpanExporter],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing span-start lookup is contained; user errors propagate."""
+    provider, exporter = spans
+    run = _state(tmp_path).run()
+    with run as entered:
+        monkeypatch.setattr(otel_context, "get_value", _broken)
+        provider.get_tracer("framework").start_span("unenriched").end()
+        _drift_reaches_the_ordinary_boundary(entered)
+        monkeypatch.setattr(otel_context, "get_value", ORIGINAL_GET_VALUE)
+    assert _correlation(exporter) == {"unenriched": None}
+
+    with pytest.raises(ValueError, match="user failure"), run:
+        raise ValueError("user failure")
+    assert run.__exit__(None, None, None) is False
+
+
+def test_exit_context_update_failure_never_blocks_observations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing exit attach never raises, masks a user error, or blocks emits."""
+    run = _state(tmp_path).run(card="model")
+    with run:
+        monkeypatch.setattr(otel_context, "attach", _broken)
+    _drift_reaches_the_ordinary_boundary(run)
+    with pytest.raises(ValueError, match="app"):
+        with run:
+            raise ValueError("app")
+    _drift_reaches_the_ordinary_boundary(run)
+    monkeypatch.setattr(otel_context, "attach", ORIGINAL_ATTACH)
+    # The failed exit left this execution context's scope in place; clear it.
+    run.__exit__()
+
+
+def test_mismatched_exit_changes_nothing(
+    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+) -> None:
+    """Exiting a view that is not the innermost scope keeps the outer pair."""
+    provider, exporter = spans
+    tracer = provider.get_tracer("framework")
+    run = _state(tmp_path).run()
+    run.__enter__()
+    run.for_card("model").__exit__()
+    tracer.start_span("mismatched").end()
+    run.__exit__()
+    tracer.start_span("cleared").end()
+    assert _correlation(exporter) == {
+        "mismatched": (run.card_ref, run.run_id),
+        "cleared": None,
+    }
+
+
+def test_nested_entry_never_overwrites_an_active_span_correlation(
+    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+) -> None:
+    """A nested Card scope leaves already-correlated active spans untouched."""
+    provider, exporter = spans
+    tracer = provider.get_tracer("framework")
+    run = _state(tmp_path).run()
+    model = run.for_card("model")
+    with tracer.start_as_current_span("outer"):
+        with run:
+            with model:
+                tracer.start_span("nested").end()
+            with tracer.start_as_current_span("child"):
+                with model:
+                    tracer.start_span("inner").end()
+            tracer.start_span("restored").end()
+    root, nested = (run.card_ref, run.run_id), (model.card_ref, run.run_id)
+    assert _correlation(exporter) == {
+        "nested": nested,
+        "inner": nested,
+        "child": root,
+        "restored": root,
+        "outer": root,
+    }

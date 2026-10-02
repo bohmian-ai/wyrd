@@ -125,14 +125,16 @@ model across synchronous and asynchronous use.
 ### Scenario 3 — Optional OpenTelemetry fails open
 
 **Behavior.** Missing OpenTelemetry packages, an API-only or unsupported
-provider, registration failure, span enrichment failure, and detach failure do
-not escape or block explicit Wyrd observations. A user exception propagates
-unchanged. Unknown Card aliases still fail. Global and explicitly supplied
-private providers receive at most one Wyrd processor each.
+provider, registration failure, span enrichment failure, and exit
+context-update failure do not escape or block explicit Wyrd observations. A
+user exception propagates unchanged. Unknown Card aliases still fail. Run
+entry marks the global provider, and `install_run_correlation` marks an
+explicitly supplied private provider, so repeated entry registers once; a
+duplicate from a concurrent first entry is harmless.
 
 **RED.** Add failure-injection cases beside the Python Run surface cases. They
-fail until optional integration failures are contained and provider
-registration is idempotent. Use the same focused Python command from Scenario
+fail until optional integration failures are contained and repeated entry
+skips a marked provider. Use the same focused Python command from Scenario
 2.
 
 **GREEN.** Contain only the optional telemetry integration failures while
@@ -252,3 +254,36 @@ installation hook; do not monkey-patch it.
 - `architecture/references/domain/telemetry-observations.md`
 - `architecture/references/languages/testing-workflows.md`
 - `AGENTS.md`
+
+## Implementation Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `state.run(card=...)` is the single-Card form; `for_card`/`forCard` stays the same-run multi-Card form | `crates/shared/wyrd-client/src/state.rs` (`WyrdState::run_for_card`), `observe/mod.rs` (`Run::new(state, subject)`); Python `src/state/mod.rs` `run(*, card=None)`; TS `native/src/cards.rs` + `wyrd/src/index.ts` `run(card?)`; Rust SDK re-exports the shared state | `observe::tests::run_for_card_selects_the_initial_view_and_shares_its_invocation`, `observe::tests::run_for_card_refuses_an_unknown_alias_without_network_io`; Python `test_run_card_*`; TS `observe-run.test.ts`; Rust SDK `observe_run::scoped_run_emits_drift_eval_and_generic_rows` (`assert_initial_card_selection`) | PASS |
+| Python framework spans in a Run scope carry `wyrd.card_ref`/`wyrd.run_id`; Bifrost resolves Card UID under the signed scope | `sdks/wyrd-sdk-python/src/observe/mod.rs` `__enter__`/`__exit__` delegate to `python/wyrd/otel.py` (`_enter_run`, `_exit_run`, `_RunCorrelationProcessor`, `install_run_correlation`) | `test_entering_a_run_returns_it_and_correlates_active_and_child_spans`; journey `assert_scope_joins` (persisted `card_uid`, asserted CardRef from the lossless `attributes` payload) | PASS |
+| Real Python journey exports via authenticated `/v1/traces` and proves trace-to-custom and trace-to-Eval joins | `tests/integration/state/test_observe_journey.py` (`otlp_provider`, `emit_framework_scope`, `assert_scope_joins`); dev group adds `opentelemetry-exporter-otlp-proto-http` | exact journey command (Scenario 4) exit 0; `py:test:integration` 72 passed | PASS |
+| Optional OTel failures never escape or block explicit observations; Card identity stays strict | `otel.py` contains every optional failure; Rust boundary swallows only the `wyrd.otel` call result | `test_missing_opentelemetry_is_a_no_op`, `test_unsupported_providers_are_refused_without_raising`, `test_enrichment_and_detach_failures_never_escape`, `test_run_card_refuses_an_unknown_alias` | PASS |
+| Nested and asyncio scopes restore and isolate correlation | execution-local `ContextVar` token stack in `otel.py`; nothing stored on `Run` | `test_nested_card_scopes_share_the_run_and_restore_the_outer_card`, `test_scope_survives_await_and_isolates_concurrent_tasks` | PASS |
+| Context exit is not a flush, shutdown, or durability acknowledgement | `__exit__` only detaches; journey flushes the provider, calls `state.shutdown()`, then `server.flush_bifrost()` before reading | journey ordering; stub docs | PASS |
+| No required dependency, second pipeline, wrapper span, or log/metric promise | production `dependencies` unchanged (`otel` extra still optional); processor duck-typed, registered on the caller's provider | `py:test:unit`, `check:client-tier`, `check:pyo3-scope` | PASS |
+
+Verification (all exit 0): focused Rust `cargo nextest run --locked -p wyrd-client --lib -E 'test(/observe::tests::run_for_card/)'`;
+`uv run python -m pytest -q tests/unit/state/test_observe_surface.py` (30 passed); the Scenario 4 journey command;
+`cargo nextest run --locked -p wyrd-sdk-rust --test observe_run -P journey --run-ignored=all -E 'test(=scoped_run_emits_drift_eval_and_generic_rows)'` under the Postgres wrapper;
+`mise run test:shared`, `test:wyrd-sdk`, `py:test:unit`, `py:test:integration`, `py:typecheck`, `ts:test:unit`, `ts:test:integration`, `ts:typecheck`, `ts:napi:check`, `codegen:check`, `check:client-tier`, `check:pyo3-scope`, `fmt`, `py:format`, `lints`, `py:lints`, `git diff --check`.
+
+Exact named Rust proof (TASK-009-R5, all exit 0):
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-client --lib \
+  -E 'test(=observe::tests::run_for_card_selects_the_initial_view_and_shares_its_invocation)'
+mise exec -- cargo nextest run --locked -p wyrd-client --lib \
+  -E 'test(=observe::tests::run_for_card_refuses_an_unknown_alias_without_network_io)'
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && \
+  mise exec -- cargo nextest run --locked -p wyrd-sdk-rust --test observe_run \
+  -P journey --run-ignored=all -E 'test(=scoped_run_emits_drift_eval_and_generic_rows)'"
+```
+
+Notes: `vala.traces.spans` persists no `card_ref` column; Scribe resolves the asserted ref to `card_uid`, so the journey reads the asserted CardRef back from the span's lossless `attributes` payload. The journey uses a private provider with `install_run_correlation(provider)` because OpenTelemetry's global provider is set-once per process; unit tests cover the global-provider path. Non-goals (server Run resource, second exporter/queue, wrapper span, global Card scope, log/metric enrichment, client-authored identity) remain excluded.
+
+Revision 47 simplification (2026-10-02, human-approved, review waived): `otel.py` registration is now a private `_wyrd_run_correlation` marker on the provider object plus one stateless `_RunCorrelationProcessor`; the outcomes registry, weakrefs, lock, and inert processors are removed, and TASK-009-R6 is superseded. Tests for dropped guarantees (accept-then-raise attempt counts, inert retained processor, equal-provider identity) were deleted; `test_repeated_entry_registers_once_on_a_marked_provider`, `test_unsupported_providers_are_refused_without_raising` (adds an unmarkable provider), and `test_registration_and_attach_failures_never_block_observations` (each failing provider paired with an explicit Drift observation and a propagated user exception) cover the three guarantees. All exit 0: `uv run python -m pytest -q tests/unit/state/test_observe_surface.py` (36 passed); the Scenario 4 journey command after `mise run py:setup`; `py:test:unit` (515 passed); `py:test:integration` (72 passed); `py:typecheck`; `codegen:check`; `check:pyo3-scope`; `fmt`; `lints`; `py:format`; `py:lints`; `git diff --check`.

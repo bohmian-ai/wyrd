@@ -1852,9 +1852,17 @@ export class WyrdState {
     );
   }
 
-  /** Open one invocation over this state, targeting the root Service Card. */
-  run(): Run {
-    return Run.fromOpen(this.#native.run());
+  /**
+   * Open one invocation over this state, targeting `card` or the root Service.
+   *
+   * Local only: no network IO and no server-side Run resource. `card` selects
+   * a registered alias before the run mints its `runId`; later
+   * {@link Run.forCard} views share that id.
+   *
+   * @throws a {@link WyrdError} when `card` is not registered in this bundle.
+   */
+  run(card?: string): Run {
+    return Run.fromOpen(this.#native.run(card));
   }
 
   /**

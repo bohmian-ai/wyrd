@@ -49,14 +49,19 @@ pub struct Run {
     state: WyrdState,
     /// The invocation identity every observation of every view correlates to.
     run_id: RunId,
-    /// The exact Card this view observes; the root Service until `for_card`.
+    /// The exact Card this view observes: the root Service for
+    /// `WyrdState::run`, the initially selected Card for
+    /// `WyrdState::run_for_card`, or the selected sibling for `for_card`.
     subject: CardRef,
 }
 
 impl Run {
-    /// Open a run over `state`, targeting its root Service Card.
-    pub(crate) fn new(state: WyrdState) -> Self {
-        let subject = state.root_ref().clone();
+    /// Open a run over `state` whose first view observes `subject`.
+    ///
+    /// Mints the invocation's UUIDv7 `run_id`; every later [`Run::for_card`]
+    /// view shares it. The caller has already resolved `subject` from the
+    /// state's hydrated graph, so opening never fails and performs no IO.
+    pub(crate) fn new(state: WyrdState, subject: CardRef) -> Self {
         Self {
             state,
             run_id: RunId::new(),

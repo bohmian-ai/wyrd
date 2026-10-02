@@ -218,6 +218,12 @@ describe("scoped observation journey", () => {
       const fixedDescribes = FIXED_TABLES.map((table) => server.tableDescribeCount(table));
 
       const run = state.run();
+      // With no Card argument the run targets the root Service.
+      expect(
+        run.cardRef.startsWith(
+          `${receipt.root.space}/Service/${receipt.root.name}@${receipt.root.version}`,
+        ),
+      ).toBe(true);
       const model = run.forCard("model");
       const agent = run.forCard("agent");
       expect(model.runId).toBe(run.runId);
@@ -263,6 +269,15 @@ describe("scoped observation journey", () => {
       );
       expect(absent.code).toBe("WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND");
       expect(() => run.forCard("missing")).toThrow(
+        expect.objectContaining({ code: "WYRD_SDK_404_UNKNOWN_ALIAS" }),
+      );
+      // The concise single-Card form opens its own invocation on that Card.
+      const agentRun = state.run("agent");
+      expect(agentRun.cardRef).toBe(agent.cardRef);
+      expect(agentRun.runId).not.toBe(run.runId);
+      expect(agentRun.forCard("model").runId).toBe(agentRun.runId);
+      expect(agentRun.cardRef).toBe(agent.cardRef);
+      expect(() => state.run("missing")).toThrow(
         expect.objectContaining({ code: "WYRD_SDK_404_UNKNOWN_ALIAS" }),
       );
 

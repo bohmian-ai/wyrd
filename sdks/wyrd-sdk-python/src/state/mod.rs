@@ -174,12 +174,23 @@ impl PyWyrdState {
         .map_err(WyrdPyError::from)
     }
 
-    /// Open one invocation over this state, targeting the root Service Card.
+    /// Open one invocation over this state, targeting `card` or the root Service.
     ///
     /// Local only: no network IO, no server-side Run resource, and no Verifier
-    /// execution.
-    fn run(&self) -> PyRun {
-        PyRun::new(self.inner.run())
+    /// execution. A `card` alias resolves in the hydrated graph before the run
+    /// mints its `run_id`; omitting it targets the root Service Card.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WYRD_SDK_404_UNKNOWN_ALIAS` when `card` is not registered in this
+    /// bundle; nothing is opened.
+    #[pyo3(signature = (*, card=None))]
+    fn run(&self, card: Option<&str>) -> CardPyResult<PyRun> {
+        let run = match card {
+            Some(alias) => self.inner.run_for_card(alias).map_err(WyrdPyError::from)?,
+            None => self.inner.run(),
+        };
+        Ok(PyRun::new(run))
     }
 
     /// Drain every producer of this state's writer without closing it.

@@ -375,6 +375,43 @@ async fn assert_negative_flows(run: &Run, agent: &Run) {
     );
 }
 
+/// The single-Card form opens its own invocation on the selected Card.
+///
+/// A plain `run()` targets the root Service; `run_for_card` selects the alias
+/// before minting a fresh `run_id` that later views share, and an unknown
+/// alias is refused locally.
+///
+/// # Panics
+/// Panics when any selection resolves the wrong subject or invocation, or an
+/// unknown alias is accepted.
+fn assert_initial_card_selection(state: &WyrdState, run: &Run, agent: &Run) {
+    assert_eq!(
+        run.card_ref(),
+        state.root_ref(),
+        "no Card argument targets the root"
+    );
+    let agent_run = state
+        .run_for_card("agent")
+        .expect("the single-Card form resolves");
+    assert_eq!(agent_run.card_ref(), agent.card_ref());
+    assert_ne!(agent_run.run_id(), run.run_id(), "its own invocation");
+    assert_eq!(
+        agent_run
+            .for_card("model")
+            .expect("model view resolves")
+            .run_id(),
+        agent_run.run_id(),
+        "later views share the initial view's invocation"
+    );
+    assert_eq!(
+        state
+            .run_for_card("missing")
+            .expect_err("an unknown initial alias is refused locally")
+            .code(),
+        "WYRD_SDK_404_UNKNOWN_ALIAS"
+    );
+}
+
 /// The server-observed describe count for each of `tables`, in order.
 ///
 /// # Panics
@@ -542,6 +579,7 @@ async fn scoped_run_emits_drift_eval_and_generic_rows() {
     let model = run.for_card("model").expect("model view resolves");
     let agent = run.for_card("agent").expect("agent view resolves");
     assert_eq!(model.run_id().as_str(), run_id, "one invocation, two views");
+    assert_initial_card_selection(&state, &run, &agent);
     let model_uid = model
         .card_ref()
         .uid

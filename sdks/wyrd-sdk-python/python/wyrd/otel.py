@@ -1,11 +1,25 @@
-"""OTel observer for workflow-scoped Wyrd instrumentation."""
+"""OTel observer for workflow-scoped Wyrd instrumentation, and Run span correlation.
+
+``Run.__enter__``/``__exit__`` delegate here so spans created inside
+``with state.run(...)`` carry the record-level ``wyrd.card_ref`` and
+``wyrd.run_id`` attributes Bifrost extracts. Everything in that path is
+optional and fail-open: without ``opentelemetry-api`` it is a no-op.
+"""
 
 from __future__ import annotations
 
 import warnings
 from threading import Lock
+from typing import Any
 
 from wyrd.observer import Observer
+
+try:
+    from opentelemetry import context as _otel_context
+    from opentelemetry import trace as _otel_trace
+except ImportError:  # optional: run correlation becomes a no-op
+    _otel_context = None
+    _otel_trace = None
 
 
 class OtelObserver(Observer):
@@ -172,3 +186,118 @@ class OtelObserver(Observer):
         if span is not None:
             span.set_attribute("wyrd.duration_ms", duration_ms)
             span.end()
+
+
+_CARD_REF = "wyrd.card_ref"
+_RUN_ID = "wyrd.run_id"
+
+# The Run scope stack lives entirely in this one context value: a tuple of
+# ``(card_ref, run_id)`` pairs, innermost last. Entry and exit each attach a new
+# value and never detach, so no token or per-scope state exists outside it.
+_SCOPE_KEY: Any = None if _otel_context is None else _otel_context.create_key("wyrd.run_scope")
+
+# Private marker set on a provider object once the Wyrd processor is offered,
+# so later Run entries skip it. Best effort: a concurrent first entry may add a
+# second processor, which is harmless because the processor is stateless and
+# setting the same two attributes again is idempotent.
+_MARKER = "_wyrd_run_correlation"
+
+
+class _RunCorrelationProcessor:
+    """Stateless span processor copying the innermost Run scope onto started spans.
+
+    Duck-typed rather than subclassing the SDK ``SpanProcessor`` so the OTel SDK
+    stays optional. Every hook swallows its own failures.
+    """
+
+    def on_start(self, span: Any, parent_context: Any = None) -> None:
+        try:
+            stack = _otel_context.get_value(_SCOPE_KEY, parent_context)
+            if stack:
+                card_ref, run_id = stack[-1]
+                span.set_attribute(_CARD_REF, card_ref)
+                span.set_attribute(_RUN_ID, run_id)
+        except Exception:  # telemetry must never fail the app
+            pass
+
+    def _on_ending(self, span: Any) -> None:
+        pass
+
+    def on_end(self, span: Any) -> None:
+        pass
+
+    def shutdown(self) -> None:
+        pass
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return True
+
+
+def install_run_correlation(provider: Any = None) -> bool:
+    """Register the Wyrd Run-correlation span processor on ``provider``.
+
+    ``provider`` defaults to the global tracer provider. The provider object is
+    marked before registration so repeated calls skip it. Returns ``True`` when
+    the provider is already marked or accepted the processor, ``False`` when
+    OpenTelemetry is absent, the provider lacks ``add_span_processor``, cannot
+    be marked, or raised while registering. Never raises. Pass a framework's
+    private provider once; the global provider is installed on every ``Run``
+    entry.
+    """
+    if _otel_trace is None:
+        return False
+    try:
+        if provider is None:
+            provider = _otel_trace.get_tracer_provider()
+        if getattr(provider, _MARKER, False):
+            return True
+        add = provider.add_span_processor
+        setattr(provider, _MARKER, True)
+        add(_RunCorrelationProcessor())
+        return True
+    except Exception:  # telemetry must never fail the app
+        return False
+
+
+def _enter_run(card_ref: str, run_id: str) -> None:
+    """Push one Run scope; called by ``Run.__enter__``. Never raises.
+
+    Stamps the already-active recording span unless it already carries
+    ``wyrd.card_ref``, so a nested scope never overwrites an outer correlation.
+    """
+    if _otel_context is None:
+        return
+    try:
+        install_run_correlation()
+        stack = _otel_context.get_value(_SCOPE_KEY) or ()
+        _otel_context.attach(_otel_context.set_value(_SCOPE_KEY, (*stack, (card_ref, run_id))))
+        span = _otel_trace.get_current_span()
+        if span.is_recording() and not _carries_card_ref(span):
+            span.set_attribute(_CARD_REF, card_ref)
+            span.set_attribute(_RUN_ID, run_id)
+    except Exception:  # telemetry must never fail the app
+        pass
+
+
+def _carries_card_ref(span: Any) -> bool:
+    """Whether ``span``'s readable attributes already hold ``wyrd.card_ref``."""
+    try:
+        return _CARD_REF in span.attributes
+    except Exception:  # unreadable attributes: stamp as usual
+        return False
+
+
+def _exit_run(card_ref: str, run_id: str) -> None:
+    """Pop this view's Run scope; called by ``Run.__exit__``. Never raises.
+
+    Pops only when the innermost scope is exactly ``(card_ref, run_id)``; a
+    mismatched top, empty stack, or failing context call changes nothing.
+    """
+    if _otel_context is None:
+        return
+    try:
+        stack = _otel_context.get_value(_SCOPE_KEY)
+        if stack and stack[-1] == (card_ref, run_id):
+            _otel_context.attach(_otel_context.set_value(_SCOPE_KEY, stack[:-1]))
+    except Exception:  # telemetry must never fail the app
+        pass

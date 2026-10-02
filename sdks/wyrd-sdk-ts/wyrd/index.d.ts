@@ -642,12 +642,14 @@ export declare class NativeWyrdState {
    */
   startBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): Promise<NativeLifecycleResult>
   /**
-   * Opens one invocation over this state, targeting the root Service Card.
+   * Opens one invocation over this state, targeting `card` or the root Service.
    *
    * Local only: no network IO, no server-side Run resource, and no Verifier
-   * execution.
+   * execution. A `card` alias resolves in the hydrated graph before the run
+   * mints its `run_id`; an unknown alias is returned as the outcome's
+   * `WYRD_SDK_404_UNKNOWN_ALIAS` error and nothing is opened.
    */
-  run(): NativeRunOpen
+  run(card?: string | undefined | null): NativeRunOpen
   /**
    * Drains every producer of this state's writer without closing it.
    *

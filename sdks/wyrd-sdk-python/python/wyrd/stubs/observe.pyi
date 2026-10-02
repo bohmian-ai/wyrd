@@ -1,6 +1,7 @@
 #### begin imports ####
 from collections.abc import Mapping, Sequence
-from typing import Any
+from types import TracebackType
+from typing import Any, Literal
 
 from .bifrost import Bifrost, Correlation
 from .eval import MediaRef
@@ -37,6 +38,32 @@ class Run:
         Raises:
             WyrdError: ``WYRD_SDK_404_UNKNOWN_ALIAS`` when the bundle does not
                 register ``alias``. No network IO occurs.
+        """
+        ...
+
+    def __enter__(self) -> Run:
+        """Enter this view's ambient OpenTelemetry span correlation.
+
+        Best-effort and execution-local: attaches this view's ``card_ref`` and
+        ``run_id`` as ``wyrd.card_ref`` / ``wyrd.run_id`` to the active
+        recording span and to every span started inside the block on a
+        provider holding the Wyrd processor (the global provider is installed
+        automatically; see ``wyrd.otel.install_run_correlation``). Never raises
+        for missing or failing OpenTelemetry, never starts a span, flushes, or
+        calls the server. Explicit ``observe`` calls do not need ``with``.
+        """
+        ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> Literal[False]:
+        """Restore the correlation that was ambient before the matching entry.
+
+        Always returns ``False`` so an exception from the block propagates.
+        Exiting is not a flush, shutdown, or durability acknowledgement.
         """
         ...
 

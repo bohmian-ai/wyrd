@@ -492,7 +492,22 @@ impl WyrdState {
     /// execution. The run mints a UUIDv7 `run_id` that every view of it shares.
     #[must_use]
     pub fn run(&self) -> Run {
-        Run::new(self.clone())
+        Run::new(self.clone(), self.root_ref().clone())
+    }
+
+    /// Open one invocation over this state whose first view observes `alias`.
+    ///
+    /// The concise single-Card form of `run().for_card(alias)`: the alias is
+    /// resolved locally in the hydrated graph before the run mints its UUIDv7
+    /// `run_id`, so no root view is constructed. Later [`Run::for_card`] views
+    /// share that `run_id`. No network IO and no server-side Run resource.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` when the alias is not registered in
+    /// this bundle; nothing is opened.
+    pub fn run_for_card(&self, alias: &str) -> Result<Run, WyrdError> {
+        let subject = self.card_ref(alias)?.clone();
+        Ok(Run::new(self.clone(), subject))
     }
 
     /// Drain every producer of this state's writer without closing it.

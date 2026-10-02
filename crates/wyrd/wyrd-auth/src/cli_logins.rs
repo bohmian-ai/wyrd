@@ -410,3 +410,261 @@ fn completion_unusable() -> WyrdError {
         details: json!({}),
     }
 }
+
+/// CLI handoff begin, claim, cancel, and logout revocation against a real
+/// tenant store and a mock provider.
+#[cfg(test)]
+mod pg_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use chrono::{Duration, Utc};
+    use secrecy::SecretString;
+    use url::Url;
+    use uuid::Uuid;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wyrd_auth_issue::IssuingKey;
+    use wyrd_auth_oidc::ScreenedHttp;
+    use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
+    use wyrd_crypt::{SealingKeyring, SecretKey};
+    use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
+    use wyrd_spec::auth::{
+        BeginLogin, CliHandoffClaim, PrincipalId, PrincipalKindTag, SecretBearer,
+    };
+    use wyrd_spec::error::WyrdError;
+    use wyrd_spec::ids::TenantSlug;
+    use wyrd_sql::queries::auth::{insert_human_refresh_token, refresh_by_hash};
+
+    use super::CliLogins;
+    use crate::connections::HumanConnections;
+    use crate::exchange_api_key::token_hash;
+
+    /// A CLI login owner over `fixture` whose tenant's Active connection
+    /// points at `provider`, a mock discovery document.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot be seeded.
+    async fn owner(fixture: &PgFixture, provider: &MockServer) -> CliLogins {
+        let issuer = provider.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "jwks_uri": format!("{issuer}/jwks"),
+                "id_token_signing_alg_values_supported": ["EdDSA"],
+            })))
+            .mount(provider)
+            .await;
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let binding = seed_active_human_connection(&mut conn)
+            .await
+            .expect("connection seeds");
+        conn.commit().await.expect("seed commits");
+        sqlx::query(
+            "UPDATE wyrd.auth_human_connections SET issuer_url = $1 WHERE connection_id = $2",
+        )
+        .bind(&issuer)
+        .bind(binding.connection_id)
+        .execute(&fixture.superuser_pool().await.expect("superuser pool"))
+        .await
+        .expect("connection points at the mock provider");
+        let origin = Url::parse("https://wyrd.example.com").expect("origin parses");
+        CliLogins::new(
+            HumanConnections::new(
+                fixture.wyrd_postgres().clone(),
+                Some(Arc::new(SealingKeyring::new(SecretKey::from_bytes(
+                    [5_u8; 32],
+                )))),
+                ScreenedHttp::allowing_internal(),
+                Some(&origin),
+            ),
+            Arc::new(verifier()),
+        )
+    }
+
+    /// The test signing key.
+    ///
+    /// # Panics
+    /// Panics when the fixed key does not load.
+    fn issuing_key() -> IssuingKey {
+        IssuingKey::from_ed_pem(
+            SecretString::from(
+                "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n",
+            ),
+            Kid::new("k1").expect("kid"),
+            "wyrd",
+        )
+        .expect("key loads")
+    }
+
+    /// A verifier for tokens [`issuing_key`] signs.
+    ///
+    /// # Panics
+    /// Panics when the verifying key does not encode.
+    fn verifier() -> TokenVerifier {
+        let pem = issuing_key().verifying_key_pem().expect("key encodes");
+        let key = public_key_from_pem(pem.as_bytes()).expect("key decodes");
+        let keys = HashMap::from([(Kid::new("k1").expect("kid"), Arc::new(key))]);
+        TokenVerifier::new(keys, "wyrd", WyrdAuthVerifySettings::default())
+    }
+
+    /// The stable `details.reason` of a state refusal.
+    fn reason(error: &WyrdError) -> Option<&str> {
+        let WyrdError::InvalidState { details, .. } = error else {
+            return None;
+        };
+        details.get("reason").and_then(serde_json::Value::as_str)
+    }
+
+    /// A begun handoff carries a provider URL without its verifier; before
+    /// the callback completes, only the verifier holder at the handoff's
+    /// tenant is told to keep polling. A wrong verifier, an unknown tenant,
+    /// a cancelled handoff, and a handoff id `POST /auth/login` never issued
+    /// all get the one refusal, and cancellation removes the bound login.
+    ///
+    /// # Panics
+    /// Panics when any step is accepted or refused differently.
+    #[tokio::test]
+    async fn only_the_verifier_holder_polls_and_cancel_ends_the_login() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let provider = MockServer::start().await;
+        let logins = owner(&fixture, &provider).await;
+        let slug = TenantSlug::new(fixture.tenant_slug()).expect("slug");
+
+        let handoff = logins.begin(&slug).await.expect("handoff begins");
+        assert!(
+            !handoff
+                .login_url
+                .as_str()
+                .contains(handoff.poll_verifier.expose())
+        );
+        let wrong = SecretBearer::new("wrong".to_owned());
+        let other = TenantSlug::new("no-such-tenant").expect("slug");
+        let pending = logins
+            .claim(&slug, handoff.handoff_id, &handoff.poll_verifier, "req")
+            .await
+            .expect("the holder polls");
+        assert!(matches!(pending, CliHandoffClaim::Pending { .. }));
+        for (tenant, verifier) in [(&slug, &wrong), (&other, &handoff.poll_verifier)] {
+            let error = logins
+                .claim(tenant, handoff.handoff_id, verifier, "req")
+                .await
+                .expect_err("refused");
+            assert_eq!(reason(&error), Some("cli_handoff_unavailable"));
+        }
+
+        logins
+            .cancel(&slug, handoff.handoff_id, &handoff.poll_verifier)
+            .await
+            .expect("cancel succeeds");
+        let error = logins
+            .claim(&slug, handoff.handoff_id, &handoff.poll_verifier, "req")
+            .await
+            .expect_err("a cancelled handoff is gone");
+        assert_eq!(reason(&error), Some("cli_handoff_unavailable"));
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let states: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wyrd.auth_login_state")
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("count runs");
+        assert_eq!(states, 0, "cancel removes the bound login state");
+        drop(conn);
+
+        let error = logins
+            .connections
+            .begin_login(&BeginLogin {
+                tenant_route_key: slug,
+                browser_flow_hash: None,
+                cli_handoff_id: Some(Uuid::now_v7()),
+            })
+            .await
+            .expect_err("an unissued handoff id is refused");
+        assert_eq!(reason(&error), Some("unknown_cli_handoff"));
+    }
+
+    /// Logout from a stale refresh token revokes its live successor, while the
+    /// same User's other login keeps renewing.
+    ///
+    /// # Panics
+    /// Panics when the wrong rows are revoked.
+    #[tokio::test]
+    async fn logout_revokes_only_its_own_chain() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let provider = MockServer::start().await;
+        let logins = owner(&fixture, &provider).await;
+        let tenant = fixture.data_tenant_id();
+        let key = issuing_key();
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO wyrd.auth_users (id, data_tenant_id, email, auth_type, status)
+             VALUES ($1, $2, 'cli@example.com', 'oidc', 'active')",
+        )
+        .bind(user)
+        .bind(tenant.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("user inserts");
+        let binding = seed_active_human_connection(&mut conn)
+            .await
+            .expect("connection reads");
+        let mut tokens = Vec::new();
+        let mut ids = Vec::new();
+        for rotated_from in [None, Some(0), None] {
+            let jwt = key
+                .issue_refresh_token(
+                    PrincipalKindTag::User,
+                    PrincipalId::new(user),
+                    tenant,
+                    Utc::now(),
+                    Duration::days(1),
+                )
+                .expect("refresh issues");
+            let id = Uuid::now_v7();
+            insert_human_refresh_token(
+                &mut conn,
+                id,
+                user,
+                &token_hash(&jwt),
+                Utc::now() + Duration::days(1),
+                rotated_from.map(|index: usize| ids[index]),
+                binding,
+            )
+            .await
+            .expect("refresh row inserts");
+            tokens.push(jwt);
+            ids.push(id);
+        }
+        conn.commit().await.expect("seed commits");
+
+        logins
+            .end(&SecretBearer::new(tokens[0].clone()))
+            .await
+            .expect("logout revokes");
+        logins
+            .end(&SecretBearer::new("not-a-jwt".to_owned()))
+            .await
+            .expect("an unusable token is a no-op");
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let mut revoked = Vec::new();
+        for jwt in &tokens {
+            let row = refresh_by_hash(&mut conn, &token_hash(jwt))
+                .await
+                .expect("lookup")
+                .expect("row exists");
+            revoked.push(row.revoked_reason);
+        }
+        assert_eq!(
+            revoked,
+            vec![
+                Some("cli_logout".to_owned()),
+                Some("cli_logout".to_owned()),
+                None
+            ]
+        );
+    }
+}

@@ -1,72 +1,61 @@
-//! Tenant human OIDC login: initiation, one-use login state, and redemption
-//! of completed logins.
+//! Tenant human OIDC login initiation.
 //!
-//! A login begins with [`HumanConnections::begin_login`], which resolves the
-//! tenant from its route key, requires its Active connection, and writes a
+//! A login begins at the authorization endpoint
+//! ([`HumanConnections::authorize`]), at a device verification page
+//! ([`crate::cli_logins::CliLogins::approve`]), or as a candidate connection
+//! test ([`HumanConnections::begin_test`]). Each resolves the tenant from its
+//! route key, requires the connection it signs in through, and writes a
 //! login-state row keyed by the SHA-256 of a random state value that exists
-//! only in the returned authorization URL. The common callback
-//! ([`crate::callback::AuthorizationCodeExchange`]) consumes that row, issues
-//! the session, and stores it sealed against the login's initiation binding;
-//! [`HumanConnections::redeem_completion`] hands it once to the BFF holding
-//! that binding; a device-code login is redeemed by its token poll
-//! ([`crate::cli_logins::CliLogins::redeem`]). No request header ever selects
-//! a tenant, connection, or redirect. A candidate connection test
-//! ([`HumanConnections::begin_test`]) writes the same login state, bound to its
-//! tester instead of a browser flow or device authorization, and has no
-//! completion.
+//! only in the returned provider authorization URL, bound to how the login
+//! was initiated. The common callback
+//! ([`crate::callback::AuthorizationCodeExchange`]) consumes that row and
+//! records the outcome: an authorization code for the OAuth client, an
+//! approval on the device authorization, or a tested candidate. No tokens are
+//! minted until a code or device code is redeemed at the token endpoint. No
+//! request header ever selects a tenant, connection, or redirect.
 
 use std::time::Duration;
 
 use serde_json::json;
-use wyrd_crypt::SealingKeyring;
-use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{
-    AbsoluteUrl, BeginLogin, BeginLoginResponse, LoginInitiation, Sha256Hex, TokenResponse,
-};
+use wyrd_spec::auth::{AbsoluteUrl, ClientAuthorization, LoginInitiation, Sha256Hex};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
-use wyrd_sql::queries::auth::{LoginState, insert_login_state, redeem_login_completion};
+use wyrd_sql::queries::auth::{LoginState, insert_login_state};
 
 use crate::connections::HumanConnections;
 use crate::error::{relying_party_error, store_error};
-
-/// Path of the fixed same-origin BFF route a completed browser login is
-/// redirected to: `{public_origin}/login/complete`, with no query string.
-///
-/// The redirect carries no capability. The BFF redeems the completion with
-/// its `HttpOnly` flow cookie through [`HumanConnections::redeem_completion`].
-pub const LOGIN_COMPLETE_PATH: &str = "/login/complete";
 
 /// Lifetime of a persisted login-state row: the browser must complete the `IdP`
 /// round-trip and reach `/auth/callback` within this window or the state is
 /// gone. A candidate test sign-in's state shares it.
 pub(crate) const LOGIN_STATE_TTL: Duration = Duration::from_mins(5);
 
-/// Redemption window of a completed login: the BFF or device poll must redeem the
-/// sealed session within this window after the callback issues it.
-pub(crate) const LOGIN_COMPLETION_TTL: Duration = Duration::from_mins(2);
-
 impl HumanConnections {
-    /// Begin a tenant human SSO login for the BFF's browser flow and return
-    /// the provider authorization URL.
+    /// Begin the tenant login that answers an OAuth authorization request
+    /// (RFC 6749 §4.1.1) and return the provider authorization URL to send
+    /// the browser to.
+    ///
+    /// The caller has already matched `authorization`'s client and exact
+    /// redirect URI against the client registration and required an S256
+    /// PKCE challenge; this binds them to the login so the callback can issue
+    /// the code to exactly that client, redirect URI, and challenge.
     ///
     /// # Errors
     /// Returns the refusals of [`Self::begin_bound`].
-    pub async fn begin_login(&self, request: &BeginLogin) -> Result<BeginLoginResponse, WyrdError> {
-        self.begin_bound(
-            &request.tenant_route_key,
-            LoginInitiation::Browser(request.browser_flow_hash),
-        )
-        .await
+    pub async fn authorize(
+        &self,
+        tenant_route_key: &TenantSlug,
+        authorization: ClientAuthorization,
+    ) -> Result<AbsoluteUrl, WyrdError> {
+        self.begin_bound(tenant_route_key, LoginInitiation::Authorize(authorization))
+            .await
     }
 
     /// Begin a tenant human SSO login bound to `initiation` and return the
     /// provider authorization URL.
     ///
     /// Everything that can refuse without the network runs first, before any
-    /// provider IO or state write: a configured public origin and a deployment
-    /// sealing keyring (completed logins are sealed at rest, so a keyless
-    /// deployment cannot offer human SSO). The route key then resolves the
+    /// provider IO or state write: a configured public origin. The route key then resolves the
     /// tenant, and the tenant must have an Active connection; an unknown
     /// tenant and a tenant without one fail with the same generic refusal, so
     /// the endpoint cannot enumerate tenants or their login configuration.
@@ -79,12 +68,12 @@ impl HumanConnections {
     /// exact connection revision, issuer, and client id, the PKCE verifier,
     /// the nonce, and the initiation binding; only the SHA-256 of the state is
     /// stored, and the raw state is returned only inside the URL. The
-    /// unique binding index lets a browser flow or device authorization name
-    /// at most one login.
+    /// unique binding index lets a device authorization name at most one
+    /// login.
     ///
     /// # Errors
-    /// Returns [`WyrdError::Validation`] when no public origin or no sealing
-    /// keyring is configured; [`WyrdError::InvalidState`] for a binding
+    /// Returns [`WyrdError::Validation`] when no public origin is configured;
+    /// [`WyrdError::InvalidState`] for a binding
     /// already recorded for another login; [`WyrdError::InvalidToken`] when
     /// the route key names no active tenant or the tenant has no Active
     /// connection; [`WyrdError::DiscoveryUnavailable`] when the issuer is
@@ -96,9 +85,8 @@ impl HumanConnections {
         &self,
         tenant_route_key: &TenantSlug,
         initiation: LoginInitiation,
-    ) -> Result<BeginLoginResponse, WyrdError> {
+    ) -> Result<AbsoluteUrl, WyrdError> {
         let redirect_uri = self.require_callback()?.clone();
-        self.require_keyring()?;
         let tenant = self
             .postgres()
             .resolve_tenant_slug(tenant_route_key)
@@ -146,72 +134,8 @@ impl HumanConnections {
             });
         }
         conn.commit().await.map_err(store_error)?;
-        Ok(BeginLoginResponse { authorization_url })
+        Ok(authorization_url)
     }
-}
-
-impl HumanConnections {
-    /// Redeem the completed login bound to `initiation` in `tenant`, once.
-    ///
-    /// The callback stores each issued session sealed under the deployment
-    /// keyring against the login's initiation binding. The BFF redeems a
-    /// browser login with the flow id hash from its `HttpOnly` cookie; this is
-    /// the primitive the BFF completion route wraps, and it has no HTTP route
-    /// of its own.
-    ///
-    /// One tenant transaction deletes the completed, unexpired row recorded
-    /// for exactly this binding and returns its sealed session, which is then
-    /// opened. The delete commits before the session is opened, so a second
-    /// redemption finds nothing even if this one fails afterwards; that login
-    /// is then lost and the person signs in again.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] with reason `sealing_key_missing`
-    /// when no sealing keyring is configured, [`WyrdError::InvalidState`] when
-    /// no completed, unexpired login is recorded for the binding (never
-    /// completed, already redeemed, expired, or another tenant's),
-    /// [`WyrdError::AuthVerifyUnavailable`] when the store fails, and
-    /// [`WyrdError::Internal`] when the sealed session cannot be opened with
-    /// this keyring or decoded.
-    pub async fn redeem_completion(
-        &self,
-        tenant: DataTenantId,
-        initiation: LoginInitiation,
-    ) -> Result<TokenResponse, WyrdError> {
-        let keyring = self.require_keyring()?;
-        let mut conn = self
-            .postgres()
-            .tenant_conn(tenant)
-            .await
-            .map_err(store_error)?;
-        let sealed = redeem_login_completion(&mut conn, &initiation)
-            .await
-            .map_err(store_error)?
-            .map(|redeemed| redeemed.sealed);
-        conn.commit().await.map_err(store_error)?;
-        let sealed = sealed.ok_or_else(|| WyrdError::InvalidState {
-            message: "no completed login is waiting for this binding".to_owned(),
-            details: json!({ "reason": "login_completion_missing" }),
-        })?;
-        let opened = keyring.open(&sealed).map_err(|_| {
-            tracing::error!(tenant_id = %tenant, "login completion could not be opened");
-            completion_unusable()
-        })?;
-        serde_json::from_slice(&opened).map_err(|_| completion_unusable())
-    }
-}
-
-/// Seal an issued session for storage until its redemption.
-///
-/// # Errors
-/// Returns [`WyrdError::Internal`] when the session cannot be serialized or
-/// sealed.
-pub(crate) fn seal_completion(
-    keyring: &SealingKeyring,
-    token: &TokenResponse,
-) -> Result<Vec<u8>, WyrdError> {
-    let plaintext = serde_json::to_vec(token).map_err(|_| completion_unusable())?;
-    keyring.seal(&plaintext).map_err(|_| completion_unusable())
 }
 
 /// The one refusal for a route key that names no active tenant or a tenant
@@ -223,14 +147,6 @@ pub(crate) fn login_unavailable() -> WyrdError {
     }
 }
 
-/// A stored completion that this process cannot open or decode.
-fn completion_unusable() -> WyrdError {
-    WyrdError::Internal {
-        message: "the login completion could not be processed; start a new login".to_owned(),
-        details: json!({}),
-    }
-}
-
 fn invalid_token(message: &str) -> WyrdError {
     WyrdError::InvalidToken {
         message: message.to_owned(),
@@ -238,58 +154,38 @@ fn invalid_token(message: &str) -> WyrdError {
     }
 }
 
-/// Login initiation refusals and one-use completion redemption against a real
-/// tenant store.
+/// Login initiation refusals against a real tenant store.
 #[cfg(test)]
 mod pg_tests {
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use secrecy::SecretString;
     use url::Url;
-    use uuid::Uuid;
     use wyrd_auth_oidc::ScreenedHttp;
-    use wyrd_crypt::{SealingKeyring, SecretKey};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::TenantSlug;
-    use wyrd_spec::auth::{BeginLogin, LoginInitiation, Sha256Hex, TokenResponse, TokenType};
-    use wyrd_spec::error::WyrdError;
-    use wyrd_sql::queries::auth::{
-        LoginState, complete_login_state, consume_login_state, insert_login_state,
-    };
-    use wyrd_sql::row_types::auth::HumanConnectionBinding;
+    use wyrd_spec::auth::{ClientAuthorization, OAuthClientId};
 
-    use super::{LOGIN_COMPLETION_TTL, seal_completion};
     use crate::connections::HumanConnections;
 
-    /// The deterministic keyring these tests seal completions under.
-    fn keyring() -> Arc<SealingKeyring> {
-        Arc::new(SealingKeyring::new(SecretKey::from_bytes([9_u8; 32])))
-    }
-
-    /// A connection owner over `fixture` with the given keyring and a public
-    /// origin.
+    /// A connection owner over `fixture` with a public origin and no keyring.
     ///
     /// # Panics
     /// Panics when the fixed origin does not parse.
-    fn connections(fixture: &PgFixture, keyring: Option<Arc<SealingKeyring>>) -> HumanConnections {
+    fn connections(fixture: &PgFixture) -> HumanConnections {
         let origin = Url::parse("https://wyrd.example.com").expect("origin parses");
         HumanConnections::new(
             fixture.wyrd_postgres().clone(),
-            keyring,
+            None,
             ScreenedHttp::allowing_internal(),
             Some(&origin),
         )
     }
 
-    /// A begin request for `slug` bound to the browser flow `flow`.
-    ///
-    /// # Panics
-    /// Panics when `slug` is not a valid tenant slug.
-    fn begin(slug: &str, flow: &[u8]) -> BeginLogin {
-        BeginLogin {
-            tenant_route_key: TenantSlug::new(slug).expect("slug is valid"),
-            browser_flow_hash: Sha256Hex::digest(flow),
+    /// A `wyrd-ui` authorization request with a fixed S256 challenge.
+    fn authorization() -> ClientAuthorization {
+        ClientAuthorization {
+            client: OAuthClientId::WyrdUi,
+            redirect_uri: "https://wyrd.example.com/login/callback".to_owned(),
+            code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_owned(),
+            state: None,
         }
     }
 
@@ -305,250 +201,34 @@ mod pg_tests {
             .expect("state count runs")
     }
 
-    /// The stable `details.reason` of a validation or state refusal.
-    fn reason(error: &WyrdError) -> Option<String> {
-        let (WyrdError::Validation { details, .. } | WyrdError::InvalidState { details, .. }) =
-            error
-        else {
-            return None;
-        };
-        details
-            .get("reason")
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned)
-    }
-
-    /// A deployment without a sealing keyring refuses to begin a human login
-    /// with `sealing_key_missing`, before resolving the tenant or writing
-    /// state. The journey server always configures a keyring, so this refusal
-    /// is proven here.
-    ///
-    /// # Panics
-    /// Panics when the begin is accepted or refused differently.
-    #[tokio::test]
-    async fn begin_without_a_sealing_key_is_refused_before_any_state() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let error = connections(&fixture, None)
-            .begin_login(&begin(fixture.tenant_slug(), b"flow"))
-            .await
-            .expect_err("a keyless deployment refuses login");
-
-        assert!(matches!(error, WyrdError::Validation { .. }));
-        assert_eq!(reason(&error).as_deref(), Some("sealing_key_missing"));
-        assert_eq!(state_rows(&fixture).await, 0);
-    }
-
     /// An unknown tenant and a tenant with no Active connection get the same
-    /// generic refusal, so the endpoint does not enumerate tenants.
+    /// generic refusal, so the authorization endpoint does not enumerate
+    /// tenants, and neither writes login state.
     ///
     /// # Panics
-    /// Panics when either begin is accepted or the refusals differ.
+    /// Panics when either authorization is accepted or the refusals differ.
     #[tokio::test]
     async fn unknown_tenant_and_no_connection_are_indistinguishable() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let owner = connections(&fixture, Some(keyring()));
+        let owner = connections(&fixture);
 
         let unknown = owner
-            .begin_login(&begin("no-such-tenant", b"flow-a"))
+            .authorize(
+                &TenantSlug::new("no-such-tenant").expect("slug is valid"),
+                authorization(),
+            )
             .await
             .expect_err("unknown tenant refuses");
         let unconfigured = owner
-            .begin_login(&begin(fixture.tenant_slug(), b"flow-b"))
+            .authorize(
+                &TenantSlug::new(fixture.tenant_slug()).expect("slug is valid"),
+                authorization(),
+            )
             .await
             .expect_err("tenant without a connection refuses");
 
         assert_eq!(unknown.code(), unconfigured.code());
         assert_eq!(unknown.to_string(), unconfigured.to_string());
         assert_eq!(state_rows(&fixture).await, 0);
-    }
-
-    /// A completed login is redeemed exactly once, only by its own binding,
-    /// and opens to the sealed session; a flow binding cannot be recorded
-    /// twice.
-    ///
-    /// # Panics
-    /// Panics when any step of the store round-trip misbehaves.
-    #[tokio::test]
-    async fn a_completed_login_is_redeemed_once_by_its_binding() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let keyring = keyring();
-        let flow = Sha256Hex::digest(b"flow-id");
-        let hash = Sha256Hex::digest(b"raw-state");
-        let row = LoginState {
-            connection: HumanConnectionBinding {
-                connection_id: Uuid::now_v7(),
-                connection_revision: 1,
-            },
-            issuer: "https://idp.example.com".to_owned(),
-            client_id: "wyrd".to_owned(),
-            redirect_uri: "https://wyrd.example.com/auth/callback".to_owned(),
-            code_verifier: SecretString::from("verifier"),
-            nonce: "nonce".to_owned(),
-            initiation: LoginInitiation::Browser(flow),
-        };
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        assert!(
-            insert_login_state(&mut conn, &hash, &row, Duration::from_mins(5))
-                .await
-                .expect("state inserts")
-        );
-        assert!(
-            !insert_login_state(
-                &mut conn,
-                &Sha256Hex::digest(b"other-state"),
-                &row,
-                Duration::from_mins(5)
-            )
-            .await
-            .expect("duplicate binding is a no-op"),
-            "a flow binding is recorded against one login only"
-        );
-        let consumed = consume_login_state(&mut conn, &hash)
-            .await
-            .expect("consume runs")
-            .expect("state is pending");
-        assert_eq!(consumed.nonce, "nonce");
-        assert!(
-            consume_login_state(&mut conn, &hash)
-                .await
-                .expect("replay runs")
-                .is_none(),
-            "a state is consumed once"
-        );
-        let token: TokenResponse = serde_json::from_value(serde_json::json!({
-            "access_token": "access",
-            "token_type": "Bearer",
-            "expires_at": "2030-01-01T00:00:00Z",
-        }))
-        .expect("token response decodes");
-        let sealed = seal_completion(&keyring, &token).expect("completion seals");
-        assert!(
-            complete_login_state(&mut conn, &hash, &sealed, LOGIN_COMPLETION_TTL)
-                .await
-                .expect("completion stores")
-        );
-        conn.commit().await.expect("commit");
-
-        let completions = connections(&fixture, Some(keyring));
-        let wrong = completions
-            .redeem_completion(
-                tenant,
-                LoginInitiation::Browser(Sha256Hex::digest(b"other")),
-            )
-            .await
-            .expect_err("another binding redeems nothing");
-        assert!(matches!(wrong, WyrdError::InvalidState { .. }));
-        let redeemed = completions
-            .redeem_completion(tenant, LoginInitiation::Browser(flow))
-            .await
-            .expect("the binding redeems its completion");
-        assert_eq!(redeemed.token_type, TokenType::Bearer);
-        assert_eq!(redeemed.access_token.expose(), "access");
-        let again = completions
-            .redeem_completion(tenant, LoginInitiation::Browser(flow))
-            .await
-            .expect_err("a completion is redeemed once");
-        assert!(matches!(again, WyrdError::InvalidState { .. }));
-        assert_eq!(state_rows(&fixture).await, 0);
-    }
-
-    /// Record a consumed login for the browser flow `label` and attach a
-    /// completion sealed under `keyring` that expires after `ttl`, returning
-    /// the flow binding that redeems it.
-    ///
-    /// # Panics
-    /// Panics when any store step fails.
-    async fn store_completion(
-        fixture: &PgFixture,
-        keyring: &SealingKeyring,
-        label: &str,
-        ttl: Duration,
-    ) -> Sha256Hex {
-        let flow = Sha256Hex::digest(format!("flow-{label}").as_bytes());
-        let hash = Sha256Hex::digest(format!("state-{label}").as_bytes());
-        let row = LoginState {
-            connection: HumanConnectionBinding {
-                connection_id: Uuid::now_v7(),
-                connection_revision: 1,
-            },
-            issuer: "https://idp.example.com".to_owned(),
-            client_id: "wyrd".to_owned(),
-            redirect_uri: "https://wyrd.example.com/auth/callback".to_owned(),
-            code_verifier: SecretString::from("verifier"),
-            nonce: "nonce".to_owned(),
-            initiation: LoginInitiation::Browser(flow),
-        };
-        let token: TokenResponse = serde_json::from_value(serde_json::json!({
-            "access_token": format!("access-{label}"),
-            "token_type": "Bearer",
-            "expires_at": "2030-01-01T00:00:00Z",
-        }))
-        .expect("token response decodes");
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        assert!(
-            insert_login_state(&mut conn, &hash, &row, Duration::from_mins(5))
-                .await
-                .expect("state inserts")
-        );
-        consume_login_state(&mut conn, &hash)
-            .await
-            .expect("consume runs")
-            .expect("state is pending");
-        let sealed = seal_completion(keyring, &token).expect("completion seals");
-        assert!(
-            complete_login_state(&mut conn, &hash, &sealed, ttl)
-                .await
-                .expect("completion stores")
-        );
-        conn.commit().await.expect("commit");
-        flow
-    }
-
-    /// A completion sealed before a key rotation is still redeemed by the
-    /// rotated keyring that retains the old key; one whose key was dropped
-    /// fails closed as unusable and is consumed anyway; an expired completion
-    /// is not redeemable.
-    ///
-    /// # Panics
-    /// Panics when any redemption succeeds or fails differently.
-    #[tokio::test]
-    async fn completions_survive_rotation_and_fail_closed_on_unusable_or_expired() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let old = || SecretKey::from_bytes([9_u8; 32]);
-        let new = || SecretKey::from_bytes([10_u8; 32]);
-        let before = SealingKeyring::new(old());
-        let in_flight =
-            store_completion(&fixture, &before, "in-flight", LOGIN_COMPLETION_TTL).await;
-        let orphaned = store_completion(&fixture, &before, "orphaned", LOGIN_COMPLETION_TTL).await;
-        let expired = store_completion(&fixture, &before, "expired", Duration::ZERO).await;
-
-        let rotated = connections(
-            &fixture,
-            Some(Arc::new(SealingKeyring::new(new()).with_retained(old()))),
-        );
-        let redeemed = rotated
-            .redeem_completion(tenant, LoginInitiation::Browser(in_flight))
-            .await
-            .expect("the retained key opens an in-flight completion");
-        assert_eq!(redeemed.access_token.expose(), "access-in-flight");
-        let error = rotated
-            .redeem_completion(tenant, LoginInitiation::Browser(expired))
-            .await
-            .expect_err("an expired completion is not redeemable");
-        assert!(matches!(error, WyrdError::InvalidState { .. }), "{error:?}");
-
-        let dropped = connections(&fixture, Some(Arc::new(SealingKeyring::new(new()))));
-        let error = dropped
-            .redeem_completion(tenant, LoginInitiation::Browser(orphaned))
-            .await
-            .expect_err("a completion under a dropped key is unusable");
-        assert!(matches!(error, WyrdError::Internal { .. }), "{error:?}");
-        let error = rotated
-            .redeem_completion(tenant, LoginInitiation::Browser(orphaned))
-            .await
-            .expect_err("an unusable completion was still consumed");
-        assert!(matches!(error, WyrdError::InvalidState { .. }), "{error:?}");
     }
 }

@@ -61,7 +61,7 @@ use crate::audit::{append_auth_audit, principal_event, principal_kind_tag};
 use crate::error::{relying_party_error, store_error};
 use crate::exchange_api_key::{ExchangeError, role_refs, verify_api_key};
 use crate::issuance::resolve_permissions;
-use crate::login::{LOGIN_COMPLETE_PATH, LOGIN_STATE_TTL};
+use crate::login::LOGIN_STATE_TTL;
 use crate::pg_resolvers::{human_connection_trusted_issuer, seal_secret};
 
 /// How long a successful candidate test authorizes activation.
@@ -100,8 +100,6 @@ pub struct HumanConnections {
     relying_party: RelyingParty,
     /// `{public_origin}/auth/callback`, or `None` without a public origin.
     callback_url: Option<Url>,
-    /// `{public_origin}/login/complete`, or `None` without a public origin.
-    completion_url: Option<Url>,
 }
 
 impl Debug for HumanConnections {
@@ -149,8 +147,7 @@ impl HumanConnections {
     /// Build the owner over the runtime store, keyring, screened HTTP, and
     /// public origin.
     ///
-    /// The callback URL is `{public_origin}/auth/callback` and the browser
-    /// completion URL `{public_origin}/login/complete`; both are `None` when
+    /// The callback URL is `{public_origin}/auth/callback`; it is `None` when
     /// the deployment configures no public origin, in which case staging,
     /// testing, and login refuse.
     #[must_use]
@@ -165,7 +162,6 @@ impl HumanConnections {
             keyring,
             relying_party: RelyingParty::new(http),
             callback_url: public_origin.and_then(|origin| origin.join(CALLBACK_PATH).ok()),
-            completion_url: public_origin.and_then(|origin| origin.join(LOGIN_COMPLETE_PATH).ok()),
         }
     }
 
@@ -315,9 +311,7 @@ impl HumanConnections {
     /// the provider authorization URL that completes it.
     ///
     /// Everything that can refuse without the network runs first: a public
-    /// origin (the callback the sign-in returns to) and a sealing keyring (the
-    /// callback refuses every login on a keyless deployment, which can never
-    /// activate). The candidate must exist at `expected_revision`. Holding no
+    /// origin (the callback the sign-in returns to). The candidate must exist at `expected_revision`. Holding no
     /// transaction or lock, screened discovery must then name exactly the
     /// candidate's issuer, its JWKS must decode to at least one key the
     /// verifier can use, and the authorization endpoint must pass the
@@ -330,9 +324,9 @@ impl HumanConnections {
     /// its state row is durable.
     ///
     /// # Errors
-    /// Returns [`WyrdError::Validation`] when no public origin or sealing
-    /// keyring is configured, [`WyrdError::ConnectionConflict`] when no
-    /// candidate exists at `expected_revision`,
+    /// Returns [`WyrdError::Validation`] when no public origin is configured,
+    /// [`WyrdError::ConnectionConflict`] when no candidate exists at
+    /// `expected_revision`,
     /// [`WyrdError::ConnectionNotTested`] with `details.reason`
     /// `issuer_mismatch` or `jwks_unusable`, [`WyrdError::DiscoveryUnavailable`]
     /// when the provider or its authorization endpoint is refused by
@@ -346,7 +340,6 @@ impl HumanConnections {
         tester: ConnectionTester,
     ) -> Result<ConnectionTestResponse, WyrdError> {
         let redirect_uri = self.require_callback()?.clone();
-        self.require_keyring()?;
         let target = self.test_target(tenant, expected_revision).await?;
         let provider = self
             .relying_party
@@ -528,17 +521,8 @@ impl HumanConnections {
     /// Allowed or Denied decision on `identity_connections:write`, appended
     /// before promotion or the committed refusal.
     ///
-    /// A keyless deployment is refused right after the lock and decision are
-    /// taken, before any candidate or recovery-key read: the activated
-    /// connection could not complete a human login, secretless providers
-    /// included, because completions are sealed by the keyring. The refusal
-    /// commits the caller's appended decision, so the evaluated permission
-    /// is audited.
-    ///
     /// # Errors
-    /// Returns [`WyrdError::Validation`] with reason `sealing_key_missing`
-    /// when no sealing keyring is configured,
-    /// [`WyrdError::ConnectionConflict`] for a missing or stale
+    /// Returns [`WyrdError::ConnectionConflict`] for a missing or stale
     /// candidate or an invalid recovery key, [`WyrdError::ConnectionNotTested`]
     /// when the stamp is missing or expired, [`WyrdError::AuditUnavailable`]
     /// when either decision cannot be appended — leaving the Active and
@@ -550,9 +534,6 @@ impl HumanConnections {
         decision: &AuditEvent,
     ) -> Result<HumanConnectionView, WyrdError> {
         let mut conn = self.begin_locked(tenant, decision).await?;
-        if let Err(refusal) = self.require_keyring() {
-            return commit_refusal(conn, refusal).await;
-        }
         let recovery_key = request.recovery_api_key.into_secret_string();
         let candidate =
             human_connection_in_state(&mut conn, HumanConnectionState::Candidate.as_str())
@@ -685,26 +666,10 @@ impl HumanConnections {
         Ok(Some(ActiveHumanConnection { trusted, binding }))
     }
 
-    /// The fixed same-origin BFF route a completed browser login is sent to.
-    ///
-    /// `{public_origin}/login/complete` (see [`LOGIN_COMPLETE_PATH`]): no query
-    /// string and no capability, so the redirect carries nothing a browser,
-    /// log, or referrer could replay.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] naming the missing public origin.
-    pub fn completion_url(&self) -> Result<&Url, WyrdError> {
-        self.completion_url
-            .as_ref()
-            .ok_or_else(public_origin_missing)
-    }
-
     /// The deployment sealing keyring, required wherever this owner seals.
     ///
-    /// A provider client secret is sealed before it is stored, and a completed
-    /// human login is sealed until the BFF or CLI redeems it, so a keyless
-    /// deployment can neither store a secret nor complete a human login, and
-    /// refuses to begin one.
+    /// A provider client secret is sealed before it is stored, so a keyless
+    /// deployment can stage only public-client connections.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] with reason `sealing_key_missing`
@@ -712,7 +677,7 @@ impl HumanConnections {
     pub(crate) fn require_keyring(&self) -> Result<&Arc<SealingKeyring>, WyrdError> {
         self.keyring.as_ref().ok_or_else(|| WyrdError::Validation {
             message: "a deployment sealing key (WYRD_SEALING_KEY_FILE) is required to seal \
-                      provider client secrets and completed human logins at rest"
+                      provider client secrets at rest"
                 .to_owned(),
             details: json!({ "reason": "sealing_key_missing" }),
         })
@@ -979,8 +944,7 @@ fn conflict(message: &str) -> WyrdError {
     }
 }
 
-/// The deployment configures no public origin, so it has no callback or
-/// completion URL.
+/// The deployment configures no public origin, so it has no callback URL.
 fn public_origin_missing() -> WyrdError {
     WyrdError::Validation {
         message: "the deployment has no public origin configured (WYRD_PUBLIC_ORIGIN), so no \
@@ -1004,83 +968,5 @@ fn internal(cause: impl Display) -> WyrdError {
     WyrdError::Internal {
         message: "tenant connection operation failed".to_owned(),
         details: json!({}),
-    }
-}
-
-/// Candidate activation against a real tenant store.
-#[cfg(test)]
-mod pg_tests {
-    use url::Url;
-    use uuid::Uuid;
-    use wyrd_auth_oidc::ScreenedHttp;
-    use wyrd_dev_fixtures::pg::PgFixture;
-    use wyrd_spec::error::WyrdError;
-
-    use super::HumanConnections;
-
-    /// A keyless deployment cannot activate even a secretless (public-client)
-    /// candidate: the refusal names the missing sealing key and happens
-    /// before any candidate or recovery key is consulted. The caller's
-    /// evaluated decision still commits as exactly one canonical staged row
-    /// that carries no recovery-key material, and no connection is promoted.
-    ///
-    /// # Panics
-    /// Panics when the fixture cannot start, activation is not refused, or
-    /// the staged audit and connection state disagree with that contract.
-    #[tokio::test]
-    async fn activation_without_a_sealing_key_is_refused_for_a_secretless_provider() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let connections = HumanConnections::new(
-            fixture.wyrd_postgres().clone(),
-            None,
-            ScreenedHttp::allowing_internal(),
-            Some(&Url::parse("https://wyrd.example.com").expect("origin parses")),
-        );
-        let decision = crate::audit::principal_event(
-            "req-activate",
-            "identity.oidc.candidate.activate",
-            wyrd_runtime::PrincipalId::new(Uuid::new_v4()),
-            wyrd_spec::auth::PrincipalKindTag::User,
-            None,
-            super::AuditOutcome::Allowed,
-        );
-        let recovery_secret = "wyrd_recovery_never_staged";
-        let request = wyrd_spec::auth::ConnectionActivate {
-            expected_revision: 1,
-            recovery_api_key: wyrd_spec::auth::SecretBearer::new(recovery_secret.to_owned()),
-        };
-
-        let outcome = connections
-            .activate(fixture.data_tenant_id(), request, &decision)
-            .await;
-        match outcome {
-            Err(WyrdError::Validation { details, .. }) => {
-                assert_eq!(details["reason"], "sealing_key_missing");
-            }
-            other => panic!("expected sealing_key_missing, got {other:?}"),
-        }
-
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let staged: Vec<String> = sqlx::query_scalar(
-            "SELECT row_to_json(s)::text FROM vala.audit_staging s
-              WHERE data_tenant_id = $1 AND operation = $2 AND outcome = 'allowed'",
-        )
-        .bind(fixture.data_tenant_id().as_uuid())
-        .bind("identity.oidc.candidate.activate")
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .expect("staged decisions read");
-        assert_eq!(staged.len(), 1, "the allowed decision commits once");
-        assert!(
-            !staged[0].contains(recovery_secret),
-            "the staged decision carries no recovery key"
-        );
-        let active = super::human_connection_in_state(
-            &mut conn,
-            wyrd_spec::auth::HumanConnectionState::Active.as_str(),
-        )
-        .await
-        .expect("active connection reads");
-        assert!(active.is_none(), "no connection is promoted");
     }
 }

@@ -1,5 +1,6 @@
-//! CLI human login: the RFC 8628 device authorization grant with Wyrd as the
-//! authorization server, and refresh-chain revocation at logout.
+//! Human logins for OAuth clients that are not the browser: the RFC 8628
+//! device authorization grant with Wyrd as the authorization server, and
+//! RFC 7009 refresh-token revocation at logout.
 //!
 //! `wyrd auth login` cannot receive the provider redirect itself.
 //! [`CliLogins::authorize`] records a device authorization: a random device
@@ -7,45 +8,43 @@
 //! user code the person confirms. On the verification page the person
 //! approves that code ([`CliLogins::approve`]), which begins an ordinary
 //! tenant login bound to the device id, or denies it ([`CliLogins::deny`]).
-//! The common callback issues the session and stores it sealed against the
-//! device id, exactly as for a browser login; the browser receives only a
-//! static page. The CLI's token poll ([`CliLogins::redeem`]) redeems that
-//! completion and deletes the device authorization in one tenant
-//! transaction, so the credential is handed out once and only to the device
-//! code holder. [`CliLogins::end`] revokes a saved login's refresh chain at
-//! logout.
+//! The common callback records only the approval — the signed-in principal
+//! and the connection revision — on the device authorization; the browser
+//! receives only a static page. The CLI's token poll ([`CliLogins::redeem`])
+//! mints the session from that approval and deletes the device authorization
+//! in one tenant transaction, so the credential exists once and only for the
+//! device code holder. [`CliLogins::revoke`] revokes a login's refresh chain
+//! at logout for either client.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
 use rand::{Rng as _, RngCore as _};
-use secrecy::SecretString;
 use serde_json::json;
 use uuid::Uuid;
-use wyrd_auth_verify::TokenVerifier;
-use wyrd_crypt::SealingKeyring;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
-    AbsoluteUrl, DeviceAuthorization, LoginInitiation, PrincipalId, PrincipalKindTag, SecretBearer,
-    Sha256Hex, TokenResponse,
+    AbsoluteUrl, DeviceAuthorization, LoginInitiation, OAuthClientId, PrincipalId,
+    PrincipalKindTag, SecretBearer, Sha256Hex, TokenResponse,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::queries::auth::{
     delete_device_authorization, deny_device_authorization, insert_device_authorization,
-    lock_refresh_family, pending_device_authorization, poll_device_authorization,
-    redeem_login_completion, refresh_by_hash, revoke_refresh_chain,
+    lock_refresh_family, pending_device_authorization, poll_device_authorization, refresh_by_hash,
+    revoke_refresh_chain,
 };
+use wyrd_sql::row_types::auth::HumanSessionBinding;
 
 use crate::audit::{
     append_auth_audit, auth_event, auth_failure_code, principal_event, principal_kind_tag,
     record_auth_audit_best_effort,
 };
 use crate::connections::HumanConnections;
-use crate::error::{auth_error_to_wyrd, store_error};
+use crate::error::store_error;
 use crate::exchange_api_key::token_hash;
+use crate::issuance::TenantTokenIssuer;
 use crate::login::login_unavailable;
 use crate::refresh::tenant_from_refresh_jwt;
 
@@ -53,8 +52,8 @@ use crate::refresh::tenant_from_refresh_jwt;
 /// login's credential.
 pub const DEVICE_CODE_GRANT_OPERATION: &str = "auth.device_code.grant";
 
-/// Operation for a CLI logout that revoked one login's refresh chain.
-pub const CLI_LOGOUT_OPERATION: &str = "auth.cli_login.logout";
+/// Operation for a logout that revoked one login's refresh chain (RFC 7009).
+pub const TOKEN_REVOCATION_OPERATION: &str = "auth.token.revoke";
 
 /// Path of the verification page the person approves a user code on.
 pub const DEVICE_VERIFICATION_PATH: &str = "/auth/device";
@@ -73,19 +72,18 @@ const USER_CODE_ALPHABET: &[u8] = b"BCDFGHJKLMNPQRSTVWXZ";
 /// Letters in a user code, shown as two groups of four.
 const USER_CODE_LEN: usize = 8;
 
-/// Owner of CLI logins: device authorization, approval, denial, redemption,
-/// and refresh-chain revocation.
+/// Owner of device logins and logout revocation: device authorization,
+/// approval, denial, redemption, and refresh-chain revocation.
 ///
 /// Composed per request from the server's human-connection owner, which
-/// carries the runtime store, sealing keyring, and public origin, and the
-/// verifier of the server's own access tokens, which names the principal a
-/// redeemed credential acts as.
+/// carries the runtime store and public origin, and the tenant issuance owner
+/// that mints a redeemed device login's session.
 #[derive(Clone)]
 pub struct CliLogins {
-    /// Tenant human-connection owner logins begin and redeem through.
+    /// Tenant human-connection owner logins begin through.
     connections: HumanConnections,
-    /// Verifier for the server's own access tokens.
-    verifier: Arc<TokenVerifier>,
+    /// Tenant issuance owner that mints the session at redemption.
+    issuer: TenantTokenIssuer,
 }
 
 impl std::fmt::Debug for CliLogins {
@@ -99,12 +97,12 @@ impl std::fmt::Debug for CliLogins {
 }
 
 impl CliLogins {
-    /// Build the owner over the human-connection owner and token verifier.
+    /// Build the owner over the human-connection owner and issuance owner.
     #[must_use]
-    pub fn new(connections: HumanConnections, verifier: Arc<TokenVerifier>) -> Self {
+    pub fn new(connections: HumanConnections, issuer: TenantTokenIssuer) -> Self {
         Self {
             connections,
-            verifier,
+            issuer,
         }
     }
 
@@ -112,7 +110,7 @@ impl CliLogins {
     ///
     /// Resolves the tenant and requires its Active connection (an unknown
     /// tenant and one without a connection get the same generic refusal as
-    /// `POST /auth/login`), then commits a device authorization holding the
+    /// the authorization endpoint), then commits a device authorization holding the
     /// SHA-256 of a fresh device code and a random user code, with a
     /// ten-minute `PostgreSQL`-derived expiry. The device code is
     /// `{tenant_id}.{256-bit secret}`, so a token poll routes itself to its
@@ -120,8 +118,8 @@ impl CliLogins {
     /// stored.
     ///
     /// # Errors
-    /// Returns [`WyrdError::Validation`] without a public origin or sealing
-    /// keyring, [`WyrdError::InvalidToken`] when the route key names no active
+    /// Returns [`WyrdError::Validation`] without a public origin,
+    /// [`WyrdError::InvalidToken`] when the route key names no active
     /// tenant or the tenant has no Active connection, and
     /// [`WyrdError::AuthVerifyUnavailable`] when the store fails, including
     /// the negligible chance of a user code already live in the tenant.
@@ -134,7 +132,6 @@ impl CliLogins {
             .require_callback()?
             .origin()
             .ascii_serialization();
-        self.connections.require_keyring()?;
         let tenant = self
             .tenant(tenant_route_key)
             .await?
@@ -182,8 +179,8 @@ impl CliLogins {
     /// Finds the tenant's unexpired, undenied device authorization with that
     /// user code, then begins the tenant login bound to its device id
     /// ([`HumanConnections::begin_bound`]). The sign-in completes the
-    /// approval: until the callback has stored the session, a token poll
-    /// stays pending. The unique binding index lets one device authorization
+    /// approval: until the callback has recorded it, a token poll stays
+    /// pending. The unique binding index lets one device authorization
     /// begin at most one login.
     ///
     /// # Errors
@@ -216,11 +213,11 @@ impl CliLogins {
         self.connections
             .begin_bound(tenant_route_key, LoginInitiation::Device(device_id))
             .await
-            .map(|begun| begun.authorization_url)
     }
 
     /// Deny `user_code` at `tenant_route_key`, so the CLI's next poll ends
-    /// the login with `access_denied`.
+    /// the login with `access_denied`. An approved code can no longer be
+    /// denied.
     ///
     /// # Errors
     /// Returns [`WyrdError::InvalidState`] with reason `user_code_unavailable`
@@ -251,28 +248,29 @@ impl CliLogins {
         conn.commit().await.map_err(store_error)
     }
 
-    /// Redeem `device_code` for the Wyrd user credential (RFC 8628 §3.4).
+    /// Redeem `device_code` for the Wyrd user session (RFC 8628 §3.4–3.5).
     ///
     /// The device code's tenant prefix only routes the request; the code hash
     /// under tenant RLS is the authority. One tenant transaction locks the
     /// device authorization and records the poll. An expired or denied one is
     /// deleted and refused; a poll within the interval of the previous one is
-    /// told to slow down; while the callback has not completed the login the
-    /// poll is pending. Once it has, the poll redeems the sealed completion,
-    /// deletes the device authorization, appends one allowed
-    /// `auth.device_code.grant` audit event for the User, and commits, so a
-    /// second poll finds nothing. A completion that cannot be used is still
-    /// consumed.
+    /// told to slow down; until the callback has recorded an approval the
+    /// poll is pending. Once it has, the poll deletes the device
+    /// authorization, mints the `wyrd-cli` session for the approving
+    /// principal through the connection revision it signed in with
+    /// ([`TenantTokenIssuer::issue_human_session`], with its canonical
+    /// token-exchange audit), appends one allowed `auth.device_code.grant`
+    /// audit event for the User, and commits, so a second poll finds nothing
+    /// and the session is issued exactly once.
     ///
     /// # Errors
     /// Returns [`WyrdError::DeviceAuthorization`] with `details.error`
     /// `invalid_grant` for a malformed, unknown, or already redeemed code,
     /// `expired_token`, `access_denied`, `slow_down`, or
-    /// `authorization_pending`; [`WyrdError::Validation`] without a sealing
-    /// keyring; [`WyrdError::Internal`] when the completion cannot be opened
-    /// or carries no refresh token; [`WyrdError::InvalidToken`] when its
-    /// access token does not verify; [`WyrdError::AuthVerifyUnavailable`] when
-    /// the store fails; and [`WyrdError::AuditUnavailable`] when the audit
+    /// `authorization_pending`; the issuance errors, including a connection
+    /// that is no longer Active or a suspended User, which leave the approval
+    /// in place until it expires; [`WyrdError::AuthVerifyUnavailable`] when
+    /// the store fails; and [`WyrdError::AuditUnavailable`] when an audit
     /// append fails. Every refusal that ends a known device code is audited
     /// best-effort.
     pub async fn redeem(
@@ -280,15 +278,12 @@ impl CliLogins {
         device_code: &SecretBearer,
         request_id: &str,
     ) -> Result<TokenResponse, WyrdError> {
-        let keyring = self.connections.require_keyring()?;
         let tenant = device_code
             .expose()
             .split_once('.')
             .and_then(|(tenant, _)| tenant.parse::<DataTenantId>().ok())
             .ok_or_else(|| device_error("invalid_grant", "the device code is not valid"))?;
-        let result = self
-            .redeem_in(tenant, device_code, keyring, request_id)
-            .await;
+        let result = self.redeem_in(tenant, device_code, request_id).await;
         if let Err(error) = &result
             && audits_refusal(error)
         {
@@ -316,7 +311,6 @@ impl CliLogins {
         &self,
         tenant: DataTenantId,
         device_code: &SecretBearer,
-        keyring: &SealingKeyring,
         request_id: &str,
     ) -> Result<TokenResponse, WyrdError> {
         let mut conn = self
@@ -354,11 +348,7 @@ impl CliLogins {
             conn.commit().await.map_err(store_error)?;
             return Err(device_error("slow_down", "poll less often"));
         }
-        let Some(redeemed) =
-            redeem_login_completion(&mut conn, &LoginInitiation::Device(poll.device_id))
-                .await
-                .map_err(store_error)?
-        else {
+        let Some((principal_id, connection)) = poll.approval() else {
             conn.commit().await.map_err(store_error)?;
             return Err(device_error(
                 "authorization_pending",
@@ -368,56 +358,57 @@ impl CliLogins {
         delete_device_authorization(&mut conn, poll.device_id)
             .await
             .map_err(store_error)?;
-        let token = match open_login(keyring, &redeemed.sealed) {
-            Ok(token) => token,
-            Err(error) => {
-                // The completion is single-use even when it is refused.
-                conn.commit().await.map_err(store_error)?;
-                return Err(error);
-            }
-        };
-        let principal_id = self
-            .verifier
-            .verify(
-                &SecretString::from(token.access_token.expose().to_owned()),
-                &tenant,
+        let session = self
+            .issuer
+            .issue_human_session(
+                &mut conn,
+                principal_id,
+                None,
+                HumanSessionBinding {
+                    connection,
+                    client: OAuthClientId::WyrdCli,
+                },
+                request_id,
             )
-            .map_err(auth_error_to_wyrd)?
-            .principal
-            .id;
+            .await?;
         let event = principal_event(
             request_id,
             DEVICE_CODE_GRANT_OPERATION,
-            principal_id,
+            PrincipalId::new(principal_id),
             PrincipalKindTag::User,
             None,
             AuditOutcome::Allowed,
         );
         append_auth_audit(&mut conn, &event).await?;
         conn.commit().await.map_err(store_error)?;
-        Ok(token)
+        Ok(session.into_response())
     }
 
-    /// End the login `refresh_token` belongs to. Idempotent.
+    /// Revoke the login `refresh_token` belongs to for the authenticated
+    /// `client` (RFC 7009 §2.1). Idempotent.
     ///
     /// The token's unverified tenant claim only routes the request; the hash
-    /// lookup under tenant RLS is the authority. Under the User's
-    /// refresh-family lock, the presented row and every row rotated from it
-    /// are revoked, so the presented token and any successor stop renewing,
-    /// while the User's other logins stay valid. One allowed
-    /// `auth.cli_login.logout` audit event naming the row's principal, and no
-    /// token, is appended on that same transaction under `request_id`, so the
-    /// revocation commits exactly when its audit row does. A malformed or
-    /// unknown token revokes and records nothing (RFC 7009); an already
-    /// revoked one revokes nothing but is still recorded.
+    /// lookup under tenant RLS is the authority. A token issued to another
+    /// client is refused. Under the User's refresh-family lock, the presented
+    /// row and every row rotated from it are revoked, so the presented token
+    /// and any successor stop renewing, while the User's other logins stay
+    /// valid. One allowed `auth.token.revoke` audit event naming the row's
+    /// principal, and no token, is appended on that same transaction under
+    /// `request_id`, so the revocation commits exactly when its audit row
+    /// does. A malformed or unknown token revokes and records nothing (RFC
+    /// 7009 §2.2); an already revoked one revokes nothing but is still
+    /// recorded.
     ///
     /// # Errors
-    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the store fails and
+    /// Returns [`WyrdError::Validation`] with reason `token_client_mismatch`
+    /// for a token issued to another client,
+    /// [`WyrdError::AuthVerifyUnavailable`] when the store fails, and
     /// [`WyrdError::AuditUnavailable`] when the audit append fails; nothing is
     /// committed then.
-    pub async fn end(
+    pub async fn revoke(
         &self,
         refresh_token: &SecretBearer,
+        client: OAuthClientId,
         request_id: &str,
     ) -> Result<(), WyrdError> {
         let Ok(tenant) = tenant_from_refresh_jwt(refresh_token.expose()) else {
@@ -435,15 +426,24 @@ impl CliLogins {
         else {
             return Ok(());
         };
+        if row
+            .human_session()
+            .is_none_or(|session| session.client != client)
+        {
+            return Err(WyrdError::Validation {
+                message: "the token was not issued to this client".to_owned(),
+                details: json!({ "reason": "token_client_mismatch" }),
+            });
+        }
         lock_refresh_family(&mut conn, &row.principal_kind, row.principal_id)
             .await
             .map_err(store_error)?;
-        revoke_refresh_chain(&mut conn, row.id, "cli_logout")
+        revoke_refresh_chain(&mut conn, row.id, "logout")
             .await
             .map_err(store_error)?;
         let event = principal_event(
             request_id,
-            CLI_LOGOUT_OPERATION,
+            TOKEN_REVOCATION_OPERATION,
             PrincipalId::new(row.principal_id),
             principal_kind_tag(&row.principal_kind),
             None,
@@ -537,29 +537,6 @@ fn absolute(url: String) -> Result<AbsoluteUrl, WyrdError> {
     })
 }
 
-/// Open a sealed device login completion into its session.
-///
-/// # Errors
-/// Returns [`WyrdError::Internal`] when the completion cannot be opened with
-/// `keyring`, does not decode, or carries no refresh token.
-fn open_login(keyring: &SealingKeyring, sealed: &[u8]) -> Result<TokenResponse, WyrdError> {
-    let opened = keyring.open(sealed).map_err(|_| completion_unusable())?;
-    let token: TokenResponse =
-        serde_json::from_slice(&opened).map_err(|_| completion_unusable())?;
-    if token.refresh_token.is_none() {
-        return Err(completion_unusable());
-    }
-    Ok(token)
-}
-
-/// A sealed completion this process cannot open, decode, or use.
-fn completion_unusable() -> WyrdError {
-    WyrdError::Internal {
-        message: "the login completion could not be processed; start a new login".to_owned(),
-        details: json!({}),
-    }
-}
-
 /// Device authorization, approval, denial, polling, and logout revocation
 /// against a real
 /// tenant store and a mock provider.
@@ -579,14 +556,19 @@ mod pg_tests {
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
     use wyrd_crypt::{SealingKeyring, SecretKey};
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
-    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag, SecretBearer};
+    use wyrd_spec::auth::{OAuthClientId, PrincipalId, PrincipalKindTag, SecretBearer};
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::TenantSlug;
-    use wyrd_sql::queries::auth::{insert_human_refresh_token, refresh_by_hash};
+    use wyrd_sql::queries::auth::{
+        approve_device_authorization, deny_device_authorization, insert_human_refresh_token,
+        pending_device_authorization, refresh_by_hash,
+    };
+    use wyrd_sql::row_types::auth::HumanSessionBinding;
 
-    use super::{CLI_LOGOUT_OPERATION, CliLogins};
+    use super::{CliLogins, TOKEN_REVOCATION_OPERATION};
     use crate::connections::HumanConnections;
     use crate::exchange_api_key::token_hash;
+    use crate::issuance::{TenantTokenIssuer, TokenExchangeSettings};
 
     /// A CLI login owner over `fixture` whose tenant's Active connection
     /// points at `provider`, a mock discovery document.
@@ -638,7 +620,7 @@ mod pg_tests {
                 ScreenedHttp::allowing_internal(),
                 Some(&origin),
             ),
-            Arc::new(verifier()),
+            TenantTokenIssuer::new(Arc::new(issuing_key()), TokenExchangeSettings::default()),
         )
     }
 
@@ -800,6 +782,106 @@ mod pg_tests {
         assert_eq!(reason(&error), Some("user_code_unavailable"));
     }
 
+    /// The device code of an approved device authorization is redeemed for
+    /// a `wyrd-cli` session exactly once: the approval stores no token, the
+    /// first poll after it mints the session for the approving User with one
+    /// refresh row, and every later poll is an invalid grant. An approved
+    /// code can no longer be denied, and a denied code can no longer be
+    /// approved, so a sign-in that finishes after a denial records nothing.
+    ///
+    /// # Panics
+    /// Panics when any step is accepted or refused differently.
+    #[tokio::test]
+    async fn an_approved_device_code_issues_exactly_once() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let provider = MockServer::start().await;
+        let logins = owner(&fixture, &provider).await;
+        let slug = TenantSlug::new(fixture.tenant_slug()).expect("slug");
+        let tenant = fixture.data_tenant_id();
+        let approved = logins.authorize(&slug).await.expect("authorizes");
+        let denied = logins.authorize(&slug).await.expect("authorizes");
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO wyrd.auth_users (id, data_tenant_id, email, auth_type, status)
+             VALUES ($1, $2, 'device@example.com', 'oidc', 'active')",
+        )
+        .bind(user)
+        .bind(tenant.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("user inserts");
+        let binding = seed_active_human_connection(&mut conn)
+            .await
+            .expect("connection reads");
+        let approved_id = pending_device_authorization(&mut conn, &approved.user_code)
+            .await
+            .expect("lookup runs")
+            .expect("code is pending");
+        let denied_id = pending_device_authorization(&mut conn, &denied.user_code)
+            .await
+            .expect("lookup runs")
+            .expect("code is pending");
+        assert!(
+            approve_device_authorization(&mut conn, approved_id, user, binding)
+                .await
+                .expect("approval runs")
+        );
+        assert!(
+            !deny_device_authorization(&mut conn, &approved.user_code)
+                .await
+                .expect("denial runs"),
+            "an approved code cannot be denied"
+        );
+        assert!(
+            deny_device_authorization(&mut conn, &denied.user_code)
+                .await
+                .expect("denial runs")
+        );
+        assert!(
+            !approve_device_authorization(&mut conn, denied_id, user, binding)
+                .await
+                .expect("approval runs"),
+            "a denied code cannot be approved"
+        );
+        conn.commit().await.expect("approval commits");
+        let refresh_rows = || async {
+            let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM wyrd.auth_refresh_tokens WHERE principal_id = $1",
+            )
+            .bind(user)
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("count runs")
+        };
+        assert_eq!(refresh_rows().await, 0, "the approval minted nothing");
+
+        let session = logins
+            .redeem(&approved.device_code, "req-redeem")
+            .await
+            .expect("the approved code redeems");
+        assert!(session.refresh_token.is_some());
+        let claims = verifier()
+            .verify(
+                &SecretString::from(session.access_token.expose().to_owned()),
+                &tenant,
+            )
+            .expect("the access token verifies");
+        assert_eq!(claims.principal.id, PrincipalId::new(user));
+        assert_eq!(refresh_rows().await, 1);
+        assert_eq!(
+            device_error(logins.redeem(&approved.device_code, "req-again").await),
+            "invalid_grant"
+        );
+        assert_eq!(
+            device_error(logins.redeem(&denied.device_code, "req-denied").await),
+            "access_denied"
+        );
+        assert_eq!(refresh_rows().await, 1, "the session was issued once");
+    }
+
     /// Seed one User with two CLI logins: a stale refresh token and its live
     /// successor (one chain), plus an unrelated second chain.
     ///
@@ -844,7 +926,10 @@ mod pg_tests {
                 &token_hash(&jwt),
                 Utc::now() + Duration::days(1),
                 rotated_from.map(|index: usize| ids[index]),
-                binding,
+                HumanSessionBinding {
+                    connection: binding,
+                    client: OAuthClientId::WyrdCli,
+                },
             )
             .await
             .expect("refresh row inserts");
@@ -877,7 +962,7 @@ mod pg_tests {
                   WHERE data_tenant_id = $1 AND operation = $2 AND principal_id = $3",
             )
             .bind(tenant.as_uuid())
-            .bind(CLI_LOGOUT_OPERATION)
+            .bind(TOKEN_REVOCATION_OPERATION)
             .bind(user)
             .fetch_one(&admin)
             .await
@@ -888,7 +973,11 @@ mod pg_tests {
             .await
             .expect("append privilege revoked");
         let refused = logins
-            .end(&SecretBearer::new(tokens[0].clone()), "req-refused")
+            .revoke(
+                &SecretBearer::new(tokens[0].clone()),
+                OAuthClientId::WyrdCli,
+                "req-refused",
+            )
             .await;
         sqlx::query("GRANT INSERT ON vala.audit_staging TO wyrd_app")
             .execute(&admin)
@@ -908,11 +997,19 @@ mod pg_tests {
         assert_eq!(logouts().await, 0);
 
         logins
-            .end(&SecretBearer::new(tokens[0].clone()), "req-logout")
+            .revoke(
+                &SecretBearer::new(tokens[0].clone()),
+                OAuthClientId::WyrdCli,
+                "req-logout",
+            )
             .await
             .expect("logout revokes");
         logins
-            .end(&SecretBearer::new("not-a-jwt".to_owned()), "req-noop")
+            .revoke(
+                &SecretBearer::new("not-a-jwt".to_owned()),
+                OAuthClientId::WyrdCli,
+                "req-noop",
+            )
             .await
             .expect("an unusable token is a no-op");
         assert_eq!(logouts().await, 1, "exactly one logout is recorded");
@@ -928,11 +1025,7 @@ mod pg_tests {
         }
         assert_eq!(
             revoked,
-            vec![
-                Some("cli_logout".to_owned()),
-                Some("cli_logout".to_owned()),
-                None
-            ]
+            vec![Some("logout".to_owned()), Some("logout".to_owned()), None]
         );
     }
 }

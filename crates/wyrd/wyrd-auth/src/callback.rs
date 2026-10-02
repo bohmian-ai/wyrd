@@ -6,24 +6,42 @@
 //! redirect, PKCE verifier, nonce, and initiation binding. No request header
 //! takes part. A present `iss` must name that recorded issuer.
 //!
+//! A verified login mints no token. A login that answers an OAuth
+//! authorization request gets a short-lived, single-use authorization code
+//! bound to its client, redirect URI, PKCE challenge, tenant, and principal
+//! (RFC 6749 §4.1.2), which [`AuthorizationCodeExchange::redeem_code`]
+//! exchanges for the session at the token endpoint (RFC 6749 §4.1.3; RFC
+//! 7636 §4.6). A device login records only the approval on its device
+//! authorization; the CLI's token poll mints the session.
+//!
 //! A candidate connection test's state takes the same path against its bound
 //! candidate instead of the Active connection: the code is redeemed and the ID
 //! token verified exactly as a login, and then only that candidate revision is
 //! marked tested. A test issues no session, credential, or User.
 
-use secrecy::SecretString;
+use std::time::Duration;
+
+use base64::Engine as _;
+use rand::RngCore as _;
+use secrecy::{ExposeSecret as _, SecretString};
+use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 use wyrd_auth_oidc::{CodeRedemption, MappedClaims, TrustedIssuer};
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
-use wyrd_spec::auth::{IssuerUrl, LoginInitiation, Sha256Hex};
+use wyrd_spec::auth::{
+    ClientAuthorization, IssuerUrl, LoginInitiation, OAuthClientId, SecretBearer, Sha256Hex,
+    TokenResponse,
+};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
 use wyrd_sql::queries::auth::{
-    LoginState, complete_login_state, consume_login_state, delete_user, insert_user,
-    lock_refresh_family, replace_user_roles, upsert_user_identity, user_id_by_identity,
+    LoginState, approve_device_authorization, consume_login_state, delete_user, insert_user,
+    issue_authorization_code, lock_refresh_family, redeem_authorization_code, replace_user_roles,
+    upsert_user_identity, user_id_by_identity,
 };
+use wyrd_sql::row_types::auth::HumanSessionBinding;
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
 
 use crate::audit::{
@@ -34,7 +52,40 @@ use crate::connections::HumanConnections;
 use crate::error::{relying_party_error, store_error};
 use crate::exchange_api_key::role_refs;
 use crate::issuance::TenantTokenIssuer;
-use crate::login::{LOGIN_COMPLETION_TTL, seal_completion};
+
+/// Lifetime of an authorization code: the client must redeem it within this
+/// window (RFC 6749 §4.1.2 recommends at most ten minutes).
+const AUTHORIZATION_CODE_TTL: Duration = Duration::from_mins(1);
+
+/// What a completed provider callback recorded, which decides the callback's
+/// response.
+#[derive(Debug)]
+pub enum LoginCompletion {
+    /// An authorization-request login succeeded: redirect the browser to the
+    /// client's redirect URI with `code` and the client's `state` (RFC 6749
+    /// §4.1.2).
+    Authorized {
+        /// The client request the login answers.
+        authorization: ClientAuthorization,
+        /// The single-use authorization code; only its hash is stored.
+        code: SecretString,
+    },
+    /// An authorization-request login was refused after its state was
+    /// consumed: redirect the browser to the client's redirect URI with an
+    /// RFC 6749 §4.1.2.1 error. The refusal has already been audited.
+    Refused {
+        /// The client request the login answers.
+        authorization: ClientAuthorization,
+        /// Why the login was refused; it names the RFC error and the log line.
+        error: WyrdError,
+    },
+    /// A device login was approved; the CLI's next token poll mints the
+    /// session.
+    DeviceApproved,
+    /// A candidate connection test sign-in succeeded and marked the
+    /// candidate tested.
+    ConnectionTested,
+}
 
 /// Human OIDC authorization-code exchange service behind the common callback.
 #[derive(Clone)]
@@ -70,11 +121,12 @@ impl AuthorizationCodeExchange {
     /// the recorded issuer before any token-endpoint request; the relying
     /// party exchanges the code with the recorded redirect URI and PKCE
     /// verifier and verifies the ID token, its nonce, and its authorized
-    /// party; and [`Self::finish_id_token_exchange`] issues and seals the
-    /// session. Returns how the login was
-    /// initiated, which decides the callback's response: a browser login is
-    /// redirected to the BFF completion route, a CLI login and a candidate
-    /// connection test get a static page.
+    /// party; and [`Self::finish_id_token_exchange`] records the outcome.
+    /// Returns what the callback recorded, which decides its response: an
+    /// authorization-request login is redirected back to its client with a
+    /// code, or with an error when it is refused after its state was
+    /// consumed; a device login and a candidate connection test get a static
+    /// page.
     ///
     /// A connection test's state is bound to a candidate revision, not the
     /// Active connection: the provider is discovered from the recorded issuer
@@ -84,8 +136,7 @@ impl AuthorizationCodeExchange {
     ///
     /// # Errors
     /// Returns [`WyrdError::InvalidState`] when the state is unknown, expired,
-    /// or replayed; [`WyrdError::Validation`] when no sealing keyring is
-    /// configured; [`WyrdError::InvalidToken`] when the bound connection is no
+    /// or replayed; [`WyrdError::InvalidToken`] when the bound connection is no
     /// longer Active (or, for a test, the bound candidate changed), the
     /// response issuer is mismatched or required and missing, the provider
     /// refuses the code, or the ID token fails verification;
@@ -94,15 +145,17 @@ impl AuthorizationCodeExchange {
     /// [`WyrdError::AuthVerifyUnavailable`] when the provider or store is
     /// unavailable; and the errors of [`Self::finish_id_token_exchange`].
     /// Every refusal after the tenant is known is audited best-effort before
-    /// it is returned. A failure after the consume commit leaves the state
-    /// spent: the person starts a new login.
+    /// it is returned, and an authorization-request login's refusal after
+    /// its state was consumed is returned as [`LoginCompletion::Refused`]
+    /// instead. A failure after the consume commit leaves the state spent:
+    /// the person starts a new login.
     pub async fn execute(
         &self,
         code: SecretString,
         state_key: &str,
         response_issuer: Option<&str>,
         request_id: &str,
-    ) -> Result<LoginInitiation, WyrdError> {
+    ) -> Result<LoginCompletion, WyrdError> {
         let postgres = self.connections.postgres();
         let state_hash = Sha256Hex::digest(state_key.as_bytes());
         let Some(tenant_id) = postgres
@@ -118,19 +171,24 @@ impl AuthorizationCodeExchange {
         let result = self
             .complete(tenant_id, &state_hash, code, response_issuer, request_id)
             .await;
-        if let Err(error) = &result {
-            // A refusal rolls back any user it resolved, so the denied event
-            // names no principal.
-            audit_authorization_code_failure(postgres, tenant_id, request_id, error).await;
+        // A refusal rolls back any user it resolved, so the denied event
+        // names no principal.
+        match &result {
+            Err(error) | Ok(LoginCompletion::Refused { error, .. }) => {
+                audit_authorization_code_failure(postgres, tenant_id, request_id, error).await;
+            }
+            Ok(_) => {}
         }
         result
     }
 
-    /// Consume the state, exchange the code, and finish the login for
+    /// Consume the state, then verify and finish the login for
     /// [`Self::execute`] once the tenant is known.
     ///
     /// # Errors
-    /// Returns the errors [`Self::execute`] documents after tenant resolution.
+    /// Returns the errors [`Self::execute`] documents after tenant
+    /// resolution, except an authorization-request login's refusal after its
+    /// state was consumed, which becomes [`LoginCompletion::Refused`].
     async fn complete(
         &self,
         tenant_id: DataTenantId,
@@ -138,8 +196,7 @@ impl AuthorizationCodeExchange {
         code: SecretString,
         response_issuer: Option<&str>,
         request_id: &str,
-    ) -> Result<LoginInitiation, WyrdError> {
-        self.connections.require_keyring()?;
+    ) -> Result<LoginCompletion, WyrdError> {
         let postgres = self.connections.postgres();
         let mut conn = postgres.tenant_conn(tenant_id).await.map_err(store_error)?;
         let login_state = consume_login_state(&mut conn, state_hash)
@@ -148,6 +205,41 @@ impl AuthorizationCodeExchange {
         conn.commit().await.map_err(store_error)?;
         let login_state = login_state
             .ok_or_else(|| invalid_state("login state is missing, expired, or already consumed"))?;
+        let result = self
+            .verify_and_finish(
+                tenant_id,
+                state_hash,
+                &login_state,
+                code,
+                response_issuer,
+                request_id,
+            )
+            .await;
+        match (result, login_state.initiation) {
+            (Err(error), LoginInitiation::Authorize(authorization)) => {
+                Ok(LoginCompletion::Refused {
+                    authorization,
+                    error,
+                })
+            }
+            (result, _) => result,
+        }
+    }
+
+    /// Exchange the provider code and verify the ID token for a consumed
+    /// login, then finish it.
+    ///
+    /// # Errors
+    /// Returns the errors [`Self::execute`] documents after the consume.
+    async fn verify_and_finish(
+        &self,
+        tenant_id: DataTenantId,
+        state_hash: &Sha256Hex,
+        login_state: &LoginState,
+        code: SecretString,
+        response_issuer: Option<&str>,
+        request_id: &str,
+    ) -> Result<LoginCompletion, WyrdError> {
         let relying_party = self.connections.relying_party();
         let (trusted, provider) = if let LoginInitiation::ConnectionTest(_) = login_state.initiation
         {
@@ -163,14 +255,14 @@ impl AuthorizationCodeExchange {
                 .map_err(relying_party_error)?;
             let trusted = self
                 .connections
-                .tested_candidate(tenant_id, &login_state, provider.jwks_uri().url())
+                .tested_candidate(tenant_id, login_state, provider.jwks_uri().url())
                 .await?
                 .ok_or_else(|| {
                     invalid_token("the login connection changed while the login was in progress")
                 })?;
             (trusted, provider)
         } else {
-            let trusted = self.bound_connection(tenant_id, &login_state).await?;
+            let trusted = self.bound_connection(tenant_id, login_state).await?;
             let provider = relying_party
                 .cached(&trusted.issuer)
                 .await
@@ -199,7 +291,7 @@ impl AuthorizationCodeExchange {
         self.finish_id_token_exchange(
             state_hash,
             &trusted,
-            &login_state,
+            login_state,
             &verified.identity,
             request_id,
         )
@@ -209,37 +301,44 @@ impl AuthorizationCodeExchange {
     /// Finish a consumed login in `trusted.tenant_id` once the relying party
     /// has verified the provider's ID token and mapped it to `identity`.
     ///
-    /// The tenant's Active connection is re-read and must still be the exact revision,
-    /// issuer, and client the login bound. One tenant transaction then
-    /// resolves the user by (issuer, `sub`) only and takes the User's
+    /// The tenant's Active connection is re-read and must still be the exact
+    /// revision, issuer, and client the login bound. One tenant transaction
+    /// then resolves the user by (issuer, `sub`) only and takes the User's
     /// tenant-qualified refresh-family lock, held through commit and taken
     /// before the connection slot lock as every refresh path orders them, so
-    /// concurrent callbacks for one User serialize and each issued session and
-    /// the final durable roles equal one callback's mapping. It then replaces
-    /// the user's roles with those the verified groups map to (unmapped groups and unknown role
+    /// concurrent callbacks for one User serialize and the final durable roles
+    /// equal one callback's mapping. It then replaces the user's roles with
+    /// those the verified groups map to (unmapped groups and unknown role
     /// names grant nothing; connection default roles are never applied to
     /// human login) and, when that changed the user's durable roles, stages
-    /// one allowed `auth.user.roles.sync` audit event for the User, issues the
-    /// session under the connection slot lock, and stores it sealed on the
-    /// consumed state row with a fresh redemption expiry. The session never
-    /// leaves this method except sealed. Returns how the login was initiated.
+    /// one allowed `auth.user.roles.sync` audit event for the User. Finally it
+    /// records the outcome and commits:
     ///
-    /// A connection test stops here: instead of the Active
-    /// connection re-check and any user or session work,
+    /// - an authorization-request login attaches a fresh authorization code
+    ///   `{tenant}.{256-bit secret}` — stored only as its SHA-256, with a
+    ///   one-minute `PostgreSQL`-derived expiry — and the principal to its
+    ///   consumed state row, and returns the code once;
+    /// - a device login records the principal and connection as the approval
+    ///   of its device authorization, which must still be pending.
+    ///
+    /// No token is minted here; the token endpoint mints the session when the
+    /// code or device code is redeemed.
+    ///
+    /// A connection test stops before any of that: instead of the Active
+    /// connection re-check and any user work,
     /// [`HumanConnections::stamp_test_sign_in`] re-checks the tester's
     /// authority and marks only the bound candidate revision tested with
     /// `trusted`'s JWKS URI. The consumed test state is left for expiry
-    /// purge; it never carries a completion.
+    /// purge.
     ///
     /// # Errors
     /// Returns [`WyrdError::InvalidToken`] when the bound connection is no
-    /// longer Active, [`WyrdError::InvalidState`] when the state row is no longer consumed
-    /// and awaiting completion, [`WyrdError::Validation`] when no sealing
-    /// keyring is configured, the errors of
+    /// longer Active, [`WyrdError::InvalidState`] when the state row no longer
+    /// awaits a code or the device authorization was denied, expired, or
+    /// deleted meanwhile, the errors of
     /// [`HumanConnections::stamp_test_sign_in`] for a connection test, and the
-    /// store, issuance, audit, and sealing errors; nothing commits unless every step succeeds, so a failed audit
-    /// append — role sync or token exchange — leaves no role change, session,
-    /// refresh row, or completion.
+    /// store and audit errors; nothing commits unless every step succeeds, so
+    /// a failed audit append leaves no role change, code, or approval.
     pub async fn finish_id_token_exchange(
         &self,
         state_hash: &Sha256Hex,
@@ -247,9 +346,8 @@ impl AuthorizationCodeExchange {
         login_state: &LoginState,
         identity: &MappedClaims,
         request_id: &str,
-    ) -> Result<LoginInitiation, WyrdError> {
+    ) -> Result<LoginCompletion, WyrdError> {
         let tenant_id = trusted.tenant_id;
-        let keyring = self.connections.require_keyring()?;
         if let LoginInitiation::ConnectionTest(tester) = login_state.initiation {
             self.connections
                 .stamp_test_sign_in(
@@ -260,7 +358,7 @@ impl AuthorizationCodeExchange {
                     request_id,
                 )
                 .await?;
-            return Ok(login_state.initiation);
+            return Ok(LoginCompletion::ConnectionTested);
         }
         self.bound_connection(tenant_id, login_state).await?;
 
@@ -287,7 +385,7 @@ impl AuthorizationCodeExchange {
         let roles = role_names_to_refs(trusted, &identity.groups)?;
         // The provider just asserted this human's authority, and nothing else
         // in Wyrd grants a user a role. Recording it here is what makes the
-        // grant table the truth a later refresh rotation can re-read.
+        // grant table the truth every later token is minted from.
         let role_names = roles.iter().map(RoleRef::as_str).collect::<Vec<_>>();
         if replace_user_roles(&mut conn, principal_id, &role_names)
             .await
@@ -295,27 +393,164 @@ impl AuthorizationCodeExchange {
         {
             append_auth_audit(&mut conn, &roles_sync_event(request_id, principal_id)).await?;
         }
-        let exchanged = self
+        let completion = match &login_state.initiation {
+            LoginInitiation::Authorize(authorization) => {
+                let code = SecretString::from(format!("{tenant_id}.{}", new_code_secret()));
+                if !issue_authorization_code(
+                    &mut conn,
+                    state_hash,
+                    &Sha256Hex::digest(code.expose_secret().as_bytes()),
+                    principal_id,
+                    AUTHORIZATION_CODE_TTL,
+                )
+                .await
+                .map_err(store_error)?
+                {
+                    return Err(invalid_state(
+                        "login state is missing, expired, or already consumed",
+                    ));
+                }
+                LoginCompletion::Authorized {
+                    authorization: authorization.clone(),
+                    code,
+                }
+            }
+            LoginInitiation::Device(device_id) => {
+                if !approve_device_authorization(
+                    &mut conn,
+                    *device_id,
+                    principal_id,
+                    login_state.connection,
+                )
+                .await
+                .map_err(store_error)?
+                {
+                    return Err(invalid_state(
+                        "the device code was denied or expired; start a new login",
+                    ));
+                }
+                LoginCompletion::DeviceApproved
+            }
+            // Returned above; a test state never carries a code or approval.
+            LoginInitiation::ConnectionTest(_) => {
+                return Err(invalid_state(
+                    "login state is missing, expired, or already consumed",
+                ));
+            }
+        };
+        conn.commit().await.map_err(store_error)?;
+        Ok(completion)
+    }
+
+    /// Redeem an authorization code at the token endpoint for the
+    /// authenticated `client` (RFC 6749 §4.1.3–4.1.4; RFC 7636 §4.6).
+    ///
+    /// The code's tenant prefix only routes the request; the code hash under
+    /// tenant RLS is the authority. One tenant transaction deletes the row
+    /// holding the code — the delete is its single use — and requires it to
+    /// be unexpired, issued to `client`, issued for exactly `redirect_uri`,
+    /// and that `BASE64URL(SHA-256(code_verifier))` equals its S256
+    /// challenge. A refused code stays deleted. A live code then mints the
+    /// session through [`TenantTokenIssuer::issue_human_session`], bound to
+    /// the login's connection and `client`, with its canonical token-exchange
+    /// audit, and commits.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::InvalidToken`] for a malformed, unknown, expired,
+    /// already redeemed, or mismatched code or verifier;
+    /// [`WyrdError::AuthVerifyUnavailable`] when the store fails; and the
+    /// issuance errors, including a connection that is no longer Active or a
+    /// suspended User. Every refusal for a routed tenant is audited
+    /// best-effort.
+    pub async fn redeem_code(
+        &self,
+        code: &SecretBearer,
+        client: OAuthClientId,
+        redirect_uri: &str,
+        code_verifier: &SecretBearer,
+        request_id: &str,
+    ) -> Result<TokenResponse, WyrdError> {
+        let tenant_id = code
+            .expose()
+            .split_once('.')
+            .and_then(|(tenant, _)| tenant.parse::<DataTenantId>().ok())
+            .ok_or_else(|| invalid_token("the authorization code is not valid"))?;
+        let result = self
+            .redeem_code_in(
+                tenant_id,
+                code,
+                client,
+                redirect_uri,
+                code_verifier,
+                request_id,
+            )
+            .await;
+        if let Err(error) = &result {
+            audit_authorization_code_failure(
+                self.connections.postgres(),
+                tenant_id,
+                request_id,
+                error,
+            )
+            .await;
+        }
+        result
+    }
+
+    /// The tenant transaction of [`Self::redeem_code`] once the tenant is
+    /// routed.
+    ///
+    /// # Errors
+    /// Returns the errors [`Self::redeem_code`] documents after routing.
+    async fn redeem_code_in(
+        &self,
+        tenant_id: DataTenantId,
+        code: &SecretBearer,
+        client: OAuthClientId,
+        redirect_uri: &str,
+        code_verifier: &SecretBearer,
+        request_id: &str,
+    ) -> Result<TokenResponse, WyrdError> {
+        let mut conn = self
+            .connections
+            .postgres()
+            .tenant_conn(tenant_id)
+            .await
+            .map_err(store_error)?;
+        let redeemed =
+            redeem_authorization_code(&mut conn, &Sha256Hex::digest(code.expose().as_bytes()))
+                .await
+                .map_err(store_error)?
+                .ok_or_else(|| invalid_token("the authorization code is not valid"))?;
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(code_verifier.expose().as_bytes()));
+        if !redeemed.live
+            || redeemed.client != client
+            || redeemed.redirect_uri != redirect_uri
+            || redeemed.code_challenge != challenge
+        {
+            // The code is spent even when refused.
+            conn.commit().await.map_err(store_error)?;
+            return Err(invalid_token(
+                "the authorization code is expired or does not match this client, redirect \
+                 URI, or code verifier",
+            ));
+        }
+        let session = self
             .issuer
             .issue_human_session(
                 &mut conn,
-                principal_id,
+                redeemed.principal_id,
                 None,
-                login_state.connection,
+                HumanSessionBinding {
+                    connection: redeemed.connection,
+                    client,
+                },
                 request_id,
             )
             .await?;
-        let sealed = seal_completion(keyring, &exchanged.into_response())?;
-        if !complete_login_state(&mut conn, state_hash, &sealed, LOGIN_COMPLETION_TTL)
-            .await
-            .map_err(store_error)?
-        {
-            return Err(invalid_state(
-                "login state is missing, expired, or already consumed",
-            ));
-        }
         conn.commit().await.map_err(store_error)?;
-        Ok(login_state.initiation)
+        Ok(session.into_response())
     }
 
     /// Require the tenant's Active connection to be exactly the one the login
@@ -473,6 +708,14 @@ pub fn role_names_to_refs(
         message: "trusted issuer role mapping is invalid".to_owned(),
         details: serde_json::json!({}),
     })
+}
+
+/// A fresh unguessable authorization-code secret: 32 random bytes,
+/// base64url without padding (RFC 6749 §10.10).
+fn new_code_secret() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 fn invalid_state(message: &str) -> WyrdError {

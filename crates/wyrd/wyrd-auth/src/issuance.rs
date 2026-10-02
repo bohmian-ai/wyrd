@@ -24,7 +24,7 @@ use vala_sql::queries::olap_catalog::get_by_fqn;
 use wyrd_auth_issue::{AccessGrant, IssueError, IssuingKey};
 use wyrd_auth_verify::{ActClaim, TokenAudience, TokenPrincipalRef};
 use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef};
-use wyrd_spec::auth::{PrincipalKindTag, SecretBearer, TokenResponse, TokenType};
+use wyrd_spec::auth::{OAuthClientId, PrincipalKindTag, SecretBearer, TokenResponse, TokenType};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{CardRef, CardRefScope};
@@ -37,7 +37,7 @@ use wyrd_sql::queries::auth::{
 };
 use wyrd_sql::queries::platform::tenant_resolver::tenant_admits_credentials;
 use wyrd_sql::queries::verification::record_machine_authentication;
-use wyrd_sql::row_types::auth::HumanConnectionBinding;
+use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanSessionBinding};
 use wyrd_sql::{SqlError, TenantConn};
 
 use crate::audit::{TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event};
@@ -48,6 +48,11 @@ use crate::card_scope::{
 use crate::error::store_error;
 use crate::exchange_api_key::{principal_kind_wire, role_refs, token_hash};
 
+/// Absolute lifetime of a `wyrd-ui` session: its refresh token does not
+/// rotate (RFC 9700 §4.14.2 applies rotation to public clients only), so the
+/// row's expiry, fixed at login, is the session's hard end.
+pub const UI_SESSION_LIFETIME: Duration = Duration::hours(12);
+
 /// Canonical Bifrost table the SYSTEM Drift reader may read.
 const DRIFT_OBSERVATIONS: &str = "vala.drift.observations";
 
@@ -57,7 +62,7 @@ pub struct TokenExchangeSettings {
     /// Access token lifetime: the bound on how long a revoked credential,
     /// suspended principal, or withdrawn grant stays spendable.
     pub access_ttl: Duration,
-    /// Human refresh token lifetime.
+    /// Lifetime of a `wyrd-cli` refresh token; each rotation starts a new one.
     pub refresh_ttl: Duration,
 }
 
@@ -87,16 +92,18 @@ pub struct ExchangedToken {
 }
 
 impl ExchangedToken {
-    /// Convert to public token response.
+    /// Convert to the RFC 6749 §5.1 token response, with `expires_in` the
+    /// whole seconds left until the access token's expiry.
     #[must_use]
     pub fn into_response(self) -> TokenResponse {
         TokenResponse {
             access_token: SecretBearer::new(self.access_token.expose_secret().to_owned()),
+            token_type: self.token_type,
+            expires_in: u64::try_from((self.expires_at - Utc::now()).num_seconds()).unwrap_or(0),
             refresh_token: self
                 .refresh_token
                 .map(|token| SecretBearer::new(token.expose_secret().to_owned())),
-            token_type: self.token_type,
-            expires_at: self.expires_at,
+            issued_token_type: None,
         }
     }
 }
@@ -118,7 +125,8 @@ pub enum TenantGrant {
     OidcLogin,
     /// A consumed human refresh token.
     Refresh {
-        /// The refresh row consumed by this rotation.
+        /// The refresh row presented: consumed by a `wyrd-cli` rotation, or
+        /// the unrotated `wyrd-ui` session row.
         consumed: Uuid,
     },
     /// A verified workload `jwt-bearer` assertion.
@@ -280,23 +288,6 @@ pub enum IssuanceError {
     /// The requested SYSTEM scope is not a UID-bearing Verifier Card.
     #[error("system token scope must be one UID-bearing Verifier card")]
     SystemScopeInvalid,
-}
-
-impl IssuanceError {
-    /// Whether this is the ordinary lifecycle refusal of a credential that no
-    /// longer issues — an inactive tenant, principal, or exact login
-    /// connection — rather than an internal failure.
-    ///
-    /// A renewing caller ends the credential's session on a refusal; every
-    /// other variant (store, audit, signing, corrupt role, system-principal
-    /// state) is an internal failure that must roll back and stay retryable.
-    #[must_use]
-    pub(crate) fn is_refusal(&self) -> bool {
-        matches!(
-            self,
-            Self::TenantNotAdmitting | Self::PrincipalInactive | Self::ConnectionInactive
-        )
-    }
 }
 
 impl From<IssuanceError> for WyrdError {
@@ -629,40 +620,103 @@ impl TenantTokenIssuer {
         })
     }
 
-    /// Establish or renew a human session: an access token from [`Self::issue`]
-    /// plus a rotated refresh token bound to the connection it logged in through.
+    /// Establish or renew a human session: an access token from
+    /// [`Self::issue_human_access`] plus a new refresh token bound to the
+    /// connection and OAuth client it logged in through.
     ///
-    /// `rotated_from` is absent at first login and carries the consumed refresh
-    /// row on renewal; it is both the family back-link that makes reuse
-    /// detectable and the credential attribution of the renewed access token.
-    /// `connection` is the exact human-connection id and revision the session
-    /// belongs to. Before anything is read or minted this takes the User's
-    /// tenant-qualified refresh-family lock — the lock rotation and
-    /// administrative User revocation hold through their commits — so first
-    /// login and renewal alike either commit before a revocation, whose family
-    /// snapshot then retires the new row, or wait for it and re-read the User
-    /// as suspended. The lock is transaction-scoped and held until the
-    /// caller's commit or rollback; rotation already holds it, and the owning
-    /// transaction reacquires it without waiting. It then takes the tenant's
-    /// connection slot lock — the lock every lifecycle mutation takes — and requires that
-    /// exact revision to still be Active, so replacement, deactivation, or
-    /// removal committed on any replica cuts the session off: once the mutation
-    /// commits no successor can be written, and a mutation waiting on the lock
-    /// commits only after this transaction does. The new refresh row carries
-    /// the same binding, so a rotation inherits it. Only human sessions get a
-    /// refresh token — a machine re-exchanges its durable credential instead.
+    /// `rotated_from` is absent at first login and carries the consumed
+    /// refresh row on a `wyrd-cli` rotation; it is both the family back-link
+    /// that makes reuse detectable and the credential attribution of the
+    /// renewed access token. The refresh token lives for the configured
+    /// `refresh_ttl` for `wyrd-cli`, and for [`UI_SESSION_LIFETIME`] for
+    /// `wyrd-ui`, whose token never rotates. One `PostgreSQL` instant feeds
+    /// both its signed `exp` and its durable row expiry. Only human sessions
+    /// get a refresh token — a machine re-exchanges its durable credential
+    /// instead.
     ///
     /// # Errors
-    /// Returns [`IssuanceError::ConnectionInactive`] when the bound connection
-    /// revision is no longer Active, every [`Self::issue`] error,
+    /// Returns every [`Self::issue_human_access`] error,
     /// [`IssuanceError::Issue`] when the refresh token cannot be signed, and
-    /// [`IssuanceError::Database`] or [`IssuanceError::Wyrd`] when a lock or
-    /// store step fails. Nothing is committed here.
+    /// [`IssuanceError::Database`] when a store step fails. Nothing is
+    /// committed here.
     pub async fn issue_human_session(
         &self,
         conn: &mut TenantConn<'_>,
         principal_id: Uuid,
         rotated_from: Option<Uuid>,
+        session: HumanSessionBinding,
+        request_id: &str,
+    ) -> Result<ExchangedToken, IssuanceError> {
+        let access = self
+            .issue_human_access(
+                conn,
+                principal_id,
+                rotated_from,
+                session.connection,
+                request_id,
+            )
+            .await?;
+        let lifetime = match session.client {
+            OAuthClientId::WyrdCli => self.settings.refresh_ttl,
+            OAuthClientId::WyrdUi => UI_SESSION_LIFETIME,
+        };
+        // One PostgreSQL instant, sampled in the caller's transaction, feeds both
+        // the signed `exp` and the durable row expiry that PostgreSQL later
+        // evaluates, so the two can never disagree.
+        let issued_at = refresh_issuance_instant(conn).await?;
+        let refresh_token = self.issuing_key.issue_refresh_token(
+            PrincipalKindTag::User,
+            PrincipalId::new(principal_id),
+            conn.data_tenant_id(),
+            issued_at,
+            lifetime,
+        )?;
+        insert_human_refresh_token(
+            conn,
+            Uuid::new_v4(),
+            principal_id,
+            &token_hash(&refresh_token),
+            issued_at + lifetime,
+            rotated_from,
+            session,
+        )
+        .await?;
+        Ok(ExchangedToken {
+            refresh_token: Some(SecretString::from(refresh_token)),
+            ..access
+        })
+    }
+
+    /// Mint a human access token from [`Self::issue`] for a session bound to
+    /// `connection`, without a refresh token.
+    ///
+    /// This alone is a `wyrd-ui` refresh, whose refresh token does not
+    /// rotate; [`Self::issue_human_session`] builds every new refresh token
+    /// on it. `refresh_row` is the refresh row presented, if any: it makes
+    /// the grant a refresh and attributes the access token to it; `None` is
+    /// a login. Before anything is read or minted this takes the User's
+    /// tenant-qualified refresh-family lock — the lock rotation and
+    /// administrative User revocation hold through their commits — so login
+    /// and renewal alike either commit before a revocation, whose family
+    /// snapshot then retires the new row, or wait for it and re-read the User
+    /// as suspended. The lock is transaction-scoped and held until the
+    /// caller's commit or rollback; the owning transaction reacquires it
+    /// without waiting. It then takes the tenant's connection slot lock — the
+    /// lock every lifecycle mutation takes — and requires that exact revision
+    /// to still be Active, so replacement, deactivation, or removal committed
+    /// on any replica cuts the session off: once the mutation commits no
+    /// token can be minted, and a mutation waiting on the lock commits only
+    /// after this transaction does.
+    ///
+    /// # Errors
+    /// Returns [`IssuanceError::ConnectionInactive`] when the bound connection
+    /// revision is no longer Active, every [`Self::issue`] error, and
+    /// [`IssuanceError::Wyrd`] when a lock fails. Nothing is committed here.
+    pub async fn issue_human_access(
+        &self,
+        conn: &mut TenantConn<'_>,
+        principal_id: Uuid,
+        refresh_row: Option<Uuid>,
         connection: HumanConnectionBinding,
         request_id: &str,
     ) -> Result<ExchangedToken, IssuanceError> {
@@ -682,38 +736,11 @@ impl TenantTokenIssuer {
         if !active {
             return Err(IssuanceError::ConnectionInactive);
         }
-        let grant = match rotated_from {
+        let grant = match refresh_row {
             Some(consumed) => TenantGrant::Refresh { consumed },
             None => TenantGrant::OidcLogin,
         };
-        let access = self.issue(conn, principal_id, grant, request_id).await?;
-        // One PostgreSQL instant, sampled in the caller's transaction, feeds both
-        // the signed `exp` and the durable row expiry that PostgreSQL later
-        // evaluates, so the two can never disagree.
-        let issued_at = refresh_issuance_instant(conn).await?;
-        let refresh_token = self.issuing_key.issue_refresh_token(
-            PrincipalKindTag::User,
-            PrincipalId::new(principal_id),
-            conn.data_tenant_id(),
-            issued_at,
-            self.settings.refresh_ttl,
-        )?;
-        let refresh_expires_at = issued_at + self.settings.refresh_ttl;
-        let hash = token_hash(&refresh_token);
-        insert_human_refresh_token(
-            conn,
-            Uuid::new_v4(),
-            principal_id,
-            &hash,
-            refresh_expires_at,
-            rotated_from,
-            connection,
-        )
-        .await?;
-        Ok(ExchangedToken {
-            refresh_token: Some(SecretString::from(refresh_token)),
-            ..access
-        })
+        self.issue(conn, principal_id, grant, request_id).await
     }
 }
 
@@ -989,7 +1016,7 @@ mod pg_tests {
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
     use wyrd_runtime::{Permission, PermissionSet, PrincipalId, PrincipalKind};
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::PrincipalKindTag;
+    use wyrd_spec::auth::{OAuthClientId, PrincipalKindTag};
     use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::CardUid;
@@ -1004,7 +1031,7 @@ mod pg_tests {
     use wyrd_sql::queries::verification::{
         BindingActivation, FrozenTarget, NewBinding, project_bindings,
     };
-    use wyrd_sql::row_types::auth::HumanConnectionBinding;
+    use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanSessionBinding};
 
     use super::{IssuanceError, TenantGrant, TenantTokenIssuer, TokenExchangeSettings};
     use crate::revoke::pg_tests::wait_for_advisory_lock_wait;
@@ -1013,6 +1040,14 @@ mod pg_tests {
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
     /// The test signing key, shared by the issuer and the verifier.
+    /// A `wyrd-cli` session bound to `connection`.
+    fn cli(connection: HumanConnectionBinding) -> HumanSessionBinding {
+        HumanSessionBinding {
+            connection,
+            client: OAuthClientId::WyrdCli,
+        }
+    }
+
     fn issuing_key() -> Arc<IssuingKey> {
         Arc::new(
             IssuingKey::from_ed_pem(
@@ -1385,7 +1420,7 @@ mod pg_tests {
             .expect("connection seeds");
 
         let session = issuer()
-            .issue_human_session(&mut conn, user, None, binding, "req-session")
+            .issue_human_session(&mut conn, user, None, cli(binding), "req-session")
             .await
             .expect("session issues");
 
@@ -1610,7 +1645,7 @@ mod pg_tests {
             .await
             .expect("connection seeds");
         let session = issuer()
-            .issue_human_session(&mut conn, writer, None, binding, "req-system-session")
+            .issue_human_session(&mut conn, writer, None, cli(binding), "req-system-session")
             .await;
         assert!(
             matches!(session, Err(IssuanceError::PrincipalInactive)),
@@ -1634,7 +1669,7 @@ mod pg_tests {
         };
 
         let result = issuer()
-            .issue_human_session(&mut conn, user, None, stale, "req-stale")
+            .issue_human_session(&mut conn, user, None, cli(stale), "req-stale")
             .await;
 
         assert!(
@@ -1699,7 +1734,7 @@ mod pg_tests {
 
         let mut issuing = fixture.tenant_conn().await.expect("issuing conn opens");
         issuer()
-            .issue_human_session(&mut issuing, early, None, binding, "req-first-login")
+            .issue_human_session(&mut issuing, early, None, cli(binding), "req-first-login")
             .await
             .expect("first login issues");
         let mut revoking = fixture.tenant_conn().await.expect("revoking conn opens");
@@ -1737,7 +1772,13 @@ mod pg_tests {
         let issue_pid = backend_pid(&mut issuing).await;
         let late_issuer = issuer();
         let (issued, ()) = tokio::join!(
-            late_issuer.issue_human_session(&mut issuing, late, None, binding, "req-late-login"),
+            late_issuer.issue_human_session(
+                &mut issuing,
+                late,
+                None,
+                cli(binding),
+                "req-late-login"
+            ),
             async {
                 wait_for_advisory_lock_wait(&fixture, issue_pid).await;
                 revoking.commit().await.expect("revocation commits");

@@ -126,7 +126,7 @@ pub(crate) mod pg_tests {
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
     use wyrd_runtime::PrincipalId;
     use wyrd_semver::VersionBlock;
-    use wyrd_spec::auth::PrincipalKindTag;
+    use wyrd_spec::auth::{OAuthClientId, PrincipalKindTag};
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::{CardName, SpaceName};
@@ -135,6 +135,7 @@ pub(crate) mod pg_tests {
         insert_human_refresh_token, insert_refresh_token, insert_service_account, insert_user,
         refresh_by_hash, service_account_by_id, user_by_id,
     };
+    use wyrd_sql::row_types::auth::HumanSessionBinding;
 
     use super::revoke_principal_in_conn;
     use crate::exchange_api_key::token_hash;
@@ -523,7 +524,10 @@ pub(crate) mod pg_tests {
             &token_hash(current.expose_secret()),
             Utc::now() + Duration::days(30),
             None,
-            binding,
+            HumanSessionBinding {
+                connection: binding,
+                client: OAuthClientId::WyrdCli,
+            },
         )
         .await
         .expect("B inserts");
@@ -594,7 +598,12 @@ pub(crate) mod pg_tests {
         // The legitimate rotation of B, held open with C written.
         let mut rotating = fixture.tenant_conn().await.expect("rotating conn opens");
         let successor = service
-            .execute(&mut rotating, current, "req-rotate-b")
+            .execute(
+                &mut rotating,
+                current,
+                OAuthClientId::WyrdCli,
+                "req-rotate-b",
+            )
             .await
             .expect("B rotates to C")
             .refresh_token

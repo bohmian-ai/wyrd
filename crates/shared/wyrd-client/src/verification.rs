@@ -23,13 +23,17 @@ pub use wyrd_spec::ids::{
     BindingId, VerificationExecutionId, VerificationResultId, VerificationRunId,
 };
 pub use wyrd_spec::verification::{
-    DirectVerificationInput, DriftSample, DriftWindow, ExecuteVerificationRequest,
-    ExecuteVerificationResponse, OperatorDispatchState, OperatorDispatchStatus,
-    StartVerificationRunRequest, StartVerificationRunResponse, VerificationBindingStatus,
-    VerificationError, VerificationExecutionDetail, VerificationExecutionStatus,
-    VerificationRunInput, VerificationRunStatus, VerificationRunTarget, VerificationVerdict,
-    VerifierKind, VerifierReadiness,
+    DirectVerificationInput, DriftSample, DriftWindow, EXECUTION_DEADLINE,
+    ExecuteVerificationRequest, ExecuteVerificationResponse, OperatorDispatchState,
+    OperatorDispatchStatus, StartVerificationRunRequest, StartVerificationRunResponse,
+    VerificationBindingStatus, VerificationError, VerificationExecutionDetail,
+    VerificationExecutionStatus, VerificationRunInput, VerificationRunStatus,
+    VerificationRunTarget, VerificationVerdict, VerifierKind, VerifierReadiness,
 };
+
+/// Time an execute response may take to arrive after the server's
+/// [`EXECUTION_DEADLINE`] elapses: upload, audit, and the 504 answer itself.
+pub const EXECUTE_RESPONSE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Cheap-to-clone, tenant-scoped Verification control-plane handle.
 ///
@@ -134,7 +138,10 @@ impl Verification {
     /// its deadline; nothing is enqueued, published, or dispatched. A `failed`
     /// verdict is a successful response. The request carries no
     /// `Idempotency-Key`, so an ambiguous transport failure is surfaced rather
-    /// than replayed: a judge call is never silently repeated.
+    /// than replayed: a judge call is never silently repeated. The client
+    /// waits [`EXECUTION_DEADLINE`] plus [`EXECUTE_RESPONSE_GRACE`] even when
+    /// its configured timeout is shorter, so a slow judgment ends in the
+    /// server's `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT`.
     ///
     /// # Errors
     /// Returns a Wyrd error when the input is malformed, oversized,
@@ -147,6 +154,7 @@ impl Verification {
         request: &ExecuteVerificationRequest,
     ) -> Result<ExecuteVerificationResponse, WyrdError> {
         self.client
+            .with_min_request_timeout(EXECUTION_DEADLINE + EXECUTE_RESPONSE_GRACE)
             .request_json(Method::POST, "/v1/verification/execute", Some(request))
             .await
     }

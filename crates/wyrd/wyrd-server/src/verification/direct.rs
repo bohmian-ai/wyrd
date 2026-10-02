@@ -34,8 +34,7 @@ use super::eval::{EvalEngine, ScoreFailure};
 use super::telemetry::ExecutionTelemetry;
 use crate::state::AppState;
 
-/// Deadline of one direct execution, from Verifier load through judgment.
-pub const EXECUTION_DEADLINE: Duration = Duration::from_secs(60);
+pub use wyrd_spec::verification::EXECUTION_DEADLINE;
 
 /// Owner of the engine half of a direct execution.
 ///

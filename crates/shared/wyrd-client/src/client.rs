@@ -110,6 +110,20 @@ impl WyrdClient {
         }
     }
 
+    /// Copy this client with an HTTP per-attempt deadline of at least `floor`.
+    ///
+    /// Shares the auth path, connection pool, and gRPC configuration; only a
+    /// capability whose server-side deadline exceeds the configured default
+    /// uses it.
+    #[must_use]
+    pub(crate) fn with_min_request_timeout(&self, floor: std::time::Duration) -> Self {
+        Self {
+            auth: Arc::clone(&self.auth),
+            http: self.http.with_min_request_timeout(floor),
+            grpc_config: self.grpc_config.clone(),
+        }
+    }
+
     /// Send a JSON request and decode the JSON response body.
     ///
     /// Delegates to [`HttpTransport::request_json`].

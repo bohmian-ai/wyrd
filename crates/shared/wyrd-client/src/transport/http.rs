@@ -165,6 +165,21 @@ impl HttpTransport {
         })
     }
 
+    /// Copy this transport with a per-attempt deadline of at least `floor`,
+    /// sharing its connection pool and auth path.
+    ///
+    /// Used by a request whose server-side deadline exceeds the configured
+    /// default, so the server's timeout answer reaches the caller.
+    #[must_use]
+    pub(crate) fn with_min_request_timeout(&self, floor: Duration) -> Self {
+        Self {
+            client: self.client.clone(),
+            request_timeout: self.request_timeout.max(floor),
+            auth: Arc::clone(&self.auth),
+            base_url: self.base_url.clone(),
+        }
+    }
+
     /// Rebind this transport to another auth path, sharing its connection pool.
     ///
     /// Used by [`WyrdClient::on_behalf_of`](crate::WyrdClient::on_behalf_of),

@@ -387,6 +387,13 @@ pub const MAX_DRIFT_SAMPLE_VALUES: usize = 100_000;
 /// Largest serialized `eval_record.context`: 256 KiB.
 pub const MAX_EVAL_CONTEXT_BYTES: usize = 256 * 1024;
 
+/// Server deadline of one direct execution, from Verifier load through
+/// judgment; past it the server answers `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT`.
+///
+/// Clients wait at least this long for an execute response so the server's
+/// timeout, not the client's, decides a slow judgment.
+pub const EXECUTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The closed `kind` of a Verifier execution.
 ///
 /// Classifies an exact Verifier by its Drift profile or Eval task graph. It is

@@ -433,6 +433,12 @@ impl SavedLogins {
                 "the server renewed the saved login without a refresh token",
             )
         })?;
+        if access_token_tenant(&rotated.access_token) != Some(login.tenant_id) {
+            return Err(saved_login(
+                "tenant_mismatch",
+                "the server renewed the saved login for another tenant; run `wyrd auth login`",
+            ));
+        }
         login.generation = login.generation.saturating_add(1);
         login.state = SavedLoginState::Ready {
             access_token: rotated.access_token.clone(),
@@ -608,11 +614,31 @@ impl AccessTokenSource for SavedLoginSource {
     /// removed or logged-out record, `refresh_pending` for a record an earlier
     /// renewal left uncertain or a renewal whose outcome is unknown,
     /// `refresh_refused` when the server refuses the refresh token,
-    /// `lock_timeout`, `unsafe_store`, or `corrupt`. A failed renewal leaves
+    /// `tenant_mismatch` when it renews into another tenant, `lock_timeout`, `unsafe_store`, or `corrupt`. A failed renewal leaves
     /// the record `RefreshPending`, so it never retries the token.
     fn mint(&self) -> Result<MintedAccessToken, WyrdClientError> {
         self.store.renew(&self.stem, &self.exchange)
     }
+}
+
+/// The `tenant_id` claim of a Wyrd access token, read without verifying it.
+///
+/// Only a consistency check on a token the server just issued over TLS: the
+/// server still verifies every token it receives. `None` when the token is
+/// not a decodable JWT with that claim.
+fn access_token_tenant(token: &SecretBearer) -> Option<DataTenantId> {
+    /// The one claim this check reads.
+    #[derive(Deserialize)]
+    struct TenantClaim {
+        /// Tenant the token acts in.
+        tenant_id: DataTenantId,
+    }
+    let payload = token.expose().split('.').nth(1)?;
+    let bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload).ok()?;
+    serde_json::from_slice::<TenantClaim>(&bytes)
+        .ok()
+        .map(|claim| claim.tenant_id)
 }
 
 /// File stem of the record for `origin` and `tenant_id`: a hash, so neither

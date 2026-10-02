@@ -11,8 +11,10 @@ use std::path::PathBuf;
 
 use secrecy::SecretString;
 
+use crate::auth::TokenExchange;
 use crate::error::WyrdClientError;
 use crate::global_config::{GlobalConfig, TokenCacheKind};
+use crate::saved_login::{SavedLogins, canonical_origin};
 use crate::transport::{
     config::{GrpcConfig, HTTP_DEFAULT_BASE_URL, HttpConfig, grpc_endpoint_for},
     credential::{CredentialChain, CredentialSource, ResolvedCredential},
@@ -174,20 +176,38 @@ impl ClientConfig {
     /// 2. `WYRD_ACCESS_TOKEN` — tier 1 env
     /// 3. `WYRD_WORKLOAD_TOKEN` + `WYRD_TENANT` — tier 2 env
     /// 4. `WYRD_API_KEY` — tier 3 env
-    /// 5. `~/.config/wyrd/credentials.toml` `[default].api_key` — file floor
+    /// 5. the saved user login `wyrd auth login` wrote for this server origin
+    ///    and `self.tenant` ([`SavedLogins::select`]), renewed in place
+    /// 6. `~/.config/wyrd/credentials.toml` `[default].api_key` — file floor
+    ///
+    /// A saved-login store that is unsafe, corrupt, ambiguous, or has no
+    /// record for the selected tenant fails here instead of falling through
+    /// to the floor, so a person's selection is never silently replaced by
+    /// another identity.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::NoCredentials`] when the chain (including the
-    /// file floor) yields nothing.
+    /// Returns [`WyrdClientError::SavedLogin`] for the saved-login refusals
+    /// above, [`WyrdClientError::Config`] for an unparsable server URL, and
+    /// [`WyrdClientError::NoCredentials`] when no tier yields a credential.
     pub fn resolve_credential(&self) -> Result<ResolvedCredential, WyrdClientError> {
         let mut chain = CredentialChain::default();
         if let Some(credential) = &self.credential {
             chain.push(CredentialSource::explicit(credential.clone()));
         }
-        chain.extend(CredentialChain::from_env_with_tenant(
-            self.tenant.as_deref(),
-        ));
-        chain.resolve()
+        chain.extend(CredentialChain::env_only(self.tenant.as_deref()));
+        if !chain.is_empty() {
+            return chain.resolve();
+        }
+        if let Some(store) = SavedLogins::locate() {
+            let origin = canonical_origin(&self.http.base_url)?;
+            if let Some(login) = store.select(&origin, self.tenant.as_deref())? {
+                let exchange = TokenExchange::new(&self.http.base_url, self.http.timeout_ms)?;
+                return Ok(ResolvedCredential::Renewable(
+                    store.source(&login, exchange),
+                ));
+            }
+        }
+        CredentialChain::credentials_file().resolve()
     }
 }
 
@@ -203,7 +223,16 @@ mod tests {
     const API_KEY_FIXTURE: &str =
         "wyrd_sk_4d5e1c3a9b7f4e2d8a6c0b1e2f3a4b5c_1a2b3c4d_9f8e7d6c5b4a39281706f5e4d3c2b1a0";
 
+    use std::str::FromStr;
+
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::ids::TenantSlug;
+
     use crate::global_config::{ClientSection, GlobalConfig};
+    use crate::saved_login::{
+        SAVED_LOGIN_FORMAT_VERSION, SavedLogin, SavedLoginState, SavedLogins,
+    };
 
     use super::{ClientConfig, TokenCacheMode};
     use crate::transport::{
@@ -573,5 +602,75 @@ mod tests {
             "Debug must not expose the raw credential"
         );
         assert!(debug.contains("REDACTED"));
+    }
+
+    /// A saved user login ranks below every environment tier and above the
+    /// `credentials.toml` floor, and a tenant selector naming no saved login
+    /// for the server fails instead of falling through to the floor.
+    #[test]
+    fn saved_login_ranks_between_env_and_credentials_file() {
+        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            home.path().join("credentials.toml"),
+            format!("[default]\napi_key = \"{API_KEY_FIXTURE}\"\n"),
+        )
+        .expect("writes floor");
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
+        unsafe {
+            std::env::set_var("WYRD_CONFIG_HOME", home.path());
+            std::env::remove_var("WYRD_ACCESS_TOKEN");
+            std::env::remove_var("WYRD_WORKLOAD_TOKEN");
+            std::env::remove_var("WYRD_API_KEY");
+        }
+        let mut cfg = ClientConfig::from_env();
+        cfg.http.base_url = "https://wyrd.example.com/".to_owned();
+        cfg.tenant = None;
+        let floor = cfg.resolve_credential().expect("floor resolves");
+
+        let store = SavedLogins::locate().expect("config home");
+        let tenant_key = TenantSlug::from_str("acme").expect("slug");
+        store
+            .save(SavedLogin {
+                format_version: SAVED_LOGIN_FORMAT_VERSION,
+                origin: "https://wyrd.example.com".to_owned(),
+                tenant_id: DataTenantId::new_v7(),
+                tenant_key,
+                principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+                generation: 1,
+                state: SavedLoginState::LoggedOut,
+            })
+            .expect("saves");
+        let saved = cfg.resolve_credential().expect("saved login resolves");
+        cfg.tenant = Some("globex".to_owned());
+        let mismatch = cfg.resolve_credential().map(|_| ());
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
+        unsafe {
+            std::env::set_var("WYRD_API_KEY", "env_api_key_value");
+        }
+        let env = cfg.resolve_credential().expect("env resolves");
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
+        unsafe {
+            std::env::remove_var("WYRD_API_KEY");
+            std::env::remove_var("WYRD_CONFIG_HOME");
+        }
+
+        assert!(matches!(floor, ResolvedCredential::ApiKey(_)), "{floor:?}");
+        match saved {
+            ResolvedCredential::Renewable(source) => {
+                assert!(
+                    source
+                        .identity()
+                        .starts_with("saved-login:https://wyrd.example.com:")
+                );
+            }
+            other => panic!("expected the saved login, got {other:?}"),
+        }
+        let error = mismatch.expect_err("tenant mismatch fails closed");
+        assert!(error.to_string().contains("tenant_mismatch"), "{error}");
+        assert!(
+            matches!(&env, ResolvedCredential::ApiKey(key) if key.expose_secret() == "env_api_key_value"),
+            "{env:?}"
+        );
     }
 }

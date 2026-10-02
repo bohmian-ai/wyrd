@@ -29,16 +29,21 @@ pub struct Verification {
 
 #[pymethods]
 impl Verification {
-    /// Build a handle; omitted arguments fall through the client configuration.
+    /// Build a handle; omitted arguments fall through the client configuration,
+    /// and `tenant` (a tenant route key or id) selects the saved user login.
     ///
     /// No network call happens here.
     ///
     /// # Errors
     /// Raises `WyrdError` when the server URL or credential cannot be resolved.
     #[new]
-    #[pyo3(signature = (server_url=None, credential=None))]
-    fn __new__(server_url: Option<&str>, credential: Option<&str>) -> WyrdPyResult<Self> {
-        let client = client_from_options(server_url, credential, None)
+    #[pyo3(signature = (server_url=None, credential=None, tenant=None))]
+    fn __new__(
+        server_url: Option<&str>,
+        credential: Option<&str>,
+        tenant: Option<&str>,
+    ) -> WyrdPyResult<Self> {
+        let client = client_from_options(server_url, credential, None, tenant)
             .map_err(|error| WyrdPyError::from(WyrdError::from(error)))?;
         Ok(Self {
             inner: NativeVerification::with_client(client),

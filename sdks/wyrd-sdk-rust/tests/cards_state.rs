@@ -186,7 +186,7 @@ async fn machine_key(server: &WyrdTestServer, name: &str, roles: &[&str]) -> Str
 /// Panics when the shared client cannot be assembled.
 fn connect(base_url: &str, credential: &str) -> Cards {
     Cards::with_client(
-        client_from_options(Some(base_url), Some(credential), None).expect("client builds"),
+        client_from_options(Some(base_url), Some(credential), None, None).expect("client builds"),
     )
 }
 

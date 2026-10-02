@@ -58,7 +58,8 @@ async fn manages_redacted_connections_with_permission_and_tenant_separation() {
         .to_owned();
     let handle = |credential: &str| {
         OperatorConnections::with_client(
-            client_from_options(Some(&base_url), Some(credential), None).expect("client builds"),
+            client_from_options(Some(&base_url), Some(credential), None, None)
+                .expect("client builds"),
         )
     };
     let admin = handle(&api_key(

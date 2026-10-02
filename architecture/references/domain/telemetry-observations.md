@@ -60,6 +60,17 @@ telemetry causality. Preserve both; never overload one as the other.
   that the production path is instrumented.
 - Every active gauge has a decrement on success, refusal, failure, retry,
   uncertainty, cancellation, and shutdown.
+- Verifier execution telemetry has one owner per execution
+  (`wyrd-server` `verification::telemetry::ExecutionTelemetry`). It is shared by
+  queued attempts and direct requests and labels series only by the closed
+  `kind`, `mode`, `origin`, `phase`, and `outcome` sets. Phases overlap:
+  `engine` contains `input_read` and `prepare`, so phase samples are never
+  summed and aggregate percentiles are never subtracted. Engine overhead is
+  computed per execution as engine elapsed time minus the union of measured
+  wait intervals, all read from one monotonic clock. A wait scope covers only
+  the IO or provider call itself. Synchronous folding and scoring during a
+  streaming read stay local work. The operator catalog and its queries live in
+  `docs/src/content/docs/self-hosting/running-the-server.svx`.
 
 ## Sampling and payload safety
 

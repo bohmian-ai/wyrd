@@ -813,7 +813,7 @@ pub enum WyrdError {
         code = "WYRD_AUTH_409_CONNECTION_NOT_TESTED",
         status = 409,
         title = "Tenant OIDC candidate is not freshly tested",
-        remediation = "Run POST /v1/identity/oidc/candidate/test against this exact candidate revision and activate within 15 minutes of a successful test."
+        remediation = "Run POST /v1/identity/oidc/candidate/test against this exact candidate revision, complete the provider sign-in at the returned authorization_url, and activate within 15 minutes of that successful test."
     )]
     ConnectionNotTested {
         /// Human-readable error message.

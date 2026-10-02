@@ -3,8 +3,11 @@ import { expect, test, vi } from 'vitest';
 import { LocalSessions, sessions, sessionLifetime } from './session';
 import { handle } from '../../../hooks.server';
 import { env } from '$env/dynamic/private';
+import { ServerSessions } from './server-sessions';
 
-vi.mock('$env/dynamic/private', () => ({ env: { WYRD_UI_LOCAL_AUTH: 'true' } }));
+vi.mock('$env/dynamic/private', () => ({
+  env: { WYRD_UI_LOCAL_AUTH: 'true', WYRD_BFF_SERVICE_KEY: 'bff-key' }
+}));
 
 test('missing, forged, expired and revoked sessions fail closed', () => {
   const sessions = new LocalSessions();
@@ -36,10 +39,14 @@ test('cookie is opaque and page metadata excludes session authority', () => {
 test('request hook rejects expiry and disabled local identity before tenant loads execute', async () => {
   const resolve = vi.fn();
   const expired = sessions.create(Date.now() - sessionLifetime);
-  const cookies = { get: vi.fn(() => expired), delete: vi.fn() };
+  const cookies = {
+    get: vi.fn((name: string) => (name === 'wyrd_session' ? expired : undefined)),
+    delete: vi.fn()
+  };
   const event = {
     locals: {},
     params: { tenantKey: 'acme' },
+    route: { id: '/t/[tenantKey]' },
     cookies,
     setHeaders: vi.fn(),
     request: new Request('http://localhost/t/acme', { method: 'POST' }),
@@ -62,7 +69,7 @@ test('request hook rejects expiry and disabled local identity before tenant load
   });
   expect(resolve).not.toHaveBeenCalled();
   const id = sessions.create();
-  cookies.get.mockReturnValue(id);
+  cookies.get.mockImplementation((name: string) => (name === 'wyrd_session' ? id : undefined));
   env.WYRD_UI_LOCAL_AUTH = 'false';
   try {
     await expect(handle({ event, resolve })).rejects.toMatchObject({ status: 401 });
@@ -71,4 +78,237 @@ test('request hook rejects expiry and disabled local identity before tenant load
     env.WYRD_UI_LOCAL_AUTH = 'true';
     sessions.remove(id);
   }
+});
+
+/** In-memory cookie jar standing in for SvelteKit's request cookies. */
+function jar(initial: Record<string, string> = {}) {
+  const values = new Map(Object.entries(initial));
+  return {
+    values,
+    get: (name: string) => values.get(name),
+    getAll: () => [...values].map(([name, value]) => ({ name, value })),
+    set: (name: string, value: string) => void values.set(name, value),
+    delete: (name: string) => void values.delete(name)
+  } as unknown as import('@sveltejs/kit').Cookies & { values: Map<string, string> };
+}
+
+const sessionId = 'a'.repeat(64);
+const csrf = 'c'.repeat(64);
+const tenantId = '01990000-0000-7000-8000-000000000002';
+const read = (
+  tenantKey: string,
+  expiresAt = new Date(Date.now() + 60_000).toISOString(),
+  tenantName = 'Acme'
+) =>
+  Response.json({
+    tenant_key: tenantKey,
+    tenant_id: tenantId,
+    tenant_name: tenantName,
+    principal_id: '01990000-0000-7000-8000-000000000001',
+    roles: ['admin'],
+    permissions: ['identity_connections:write'],
+    expires_at: expiresAt,
+    csrf_token: csrf
+  });
+const action = (body: { origin?: string } = {}) =>
+  new Request('http://localhost/t/acme/settings?/stage', {
+    method: 'POST',
+    headers: body.origin === undefined ? { origin: 'http://localhost' } : { origin: body.origin }
+  });
+
+test('production session rejects cross-tenant and missing CSRF', async () => {
+  const calls: { url: string; init: RequestInit }[] = [];
+  const fetcher = vi.fn(async (url: URL | RequestInfo, init?: RequestInit) => {
+    calls.push({ url: String(url), init: init! });
+    return read('other');
+  }) as unknown as typeof fetch;
+  const sessions = new ServerSessions(fetcher);
+  const cookies = jar({ wyrd_session_acme: sessionId });
+
+  // The cookie name is only a hint: the server-returned tenant must equal the path tenant.
+  expect(await sessions.read('acme', cookies)).toBeNull();
+  expect(cookies.values.has('wyrd_session_acme')).toBe(false);
+  expect(calls[0].url).toBe('http://127.0.0.1:8080/internal/bff/v1/sessions/read');
+  expect(new Headers(calls[0].init.headers).get('x-wyrd-bff-key')).toBe('bff-key');
+  expect(JSON.parse(String(calls[0].init.body))).toEqual({ session_id: sessionId });
+  // A tenant key that is not a route slug never reaches the server.
+  await expect(sessions.read('../acme', cookies)).rejects.toMatchObject({ status: 404 });
+  await expect(sessions.api('acme', cookies, 'GET', '/x')).rejects.toMatchObject({
+    status: 401
+  });
+  expect(calls).toHaveLength(1);
+
+  const live = new ServerSessions(
+    vi.fn(async () => read('acme')) as unknown as typeof fetch
+  );
+  const session = (await live.read('acme', jar({ wyrd_session_acme: sessionId })))!;
+  expect(session).toMatchObject({ tenantKey: 'acme', csrf });
+  expect(JSON.stringify(session)).not.toContain(sessionId);
+  expect(() => live.checkAction(session, action(), null)).toThrow(
+    expect.objectContaining({ status: 403 })
+  );
+  expect(() => live.checkAction(session, action(), 'd'.repeat(64))).toThrow(
+    expect.objectContaining({ status: 403 })
+  );
+  expect(() => live.checkAction(session, action({ origin: 'http://evil.test' }), csrf)).toThrow(
+    expect.objectContaining({ status: 403 })
+  );
+  expect(() => live.checkAction(session, action(), csrf)).not.toThrow();
+});
+
+test('production session expires and logs out', async () => {
+  const paths: string[] = [];
+  let reads = 0;
+  const fetcher = vi.fn(async (url: URL | RequestInfo) => {
+    const path = new URL(String(url)).pathname;
+    paths.push(path);
+    if (path.endsWith('/sessions/read'))
+      return reads++ === 0 ? read('acme') : new Response(null, { status: 401 });
+    if (path.endsWith('/sessions/logout')) return new Response(null, { status: 204 });
+    return new Response(null, { status: 500 });
+  }) as unknown as typeof fetch;
+  const sessions = new ServerSessions(fetcher);
+  const cookies = jar({ wyrd_session_acme: sessionId });
+
+  const session = (await sessions.read('acme', cookies))!;
+  expect(() => sessions.checkAction({ ...session, expiresAt: Date.now() - 1 }, action(), csrf)).toThrow(
+    expect.objectContaining({ status: 401, body: expect.objectContaining({ code: 'WYRD_AUTH_401_TOKEN_EXPIRED' }) })
+  );
+
+  // The server no longer honours the session: no session, cookie cleared.
+  expect(await sessions.read('acme', cookies)).toBeNull();
+  expect(cookies.values.has('wyrd_session_acme')).toBe(false);
+
+  reads = 0;
+  const live = jar({ wyrd_session_acme: sessionId });
+  await sessions.logout('acme', live, action(), csrf);
+  expect(paths.at(-1)).toBe('/internal/bff/v1/sessions/logout');
+  expect(live.values.has('wyrd_session_acme')).toBe(false);
+  // Logging out again is a no-op that still leaves no cookie.
+  await sessions.logout('acme', live, action(), csrf);
+  expect(paths.filter((path) => path.endsWith('/logout'))).toHaveLength(1);
+});
+
+/** Fetcher answering `sessions/read` per session id; unknown ids are refused like the server does. */
+function readsBySession(byId: Record<string, () => Response>) {
+  const seen: string[] = [];
+  const fetcher = vi.fn(async (_url: URL | RequestInfo, init?: RequestInit) => {
+    const { session_id } = JSON.parse(String(init!.body)) as { session_id: string };
+    seen.push(session_id);
+    return byId[session_id]?.() ?? new Response(null, { status: 401 });
+  }) as unknown as typeof fetch;
+  return { fetcher, seen };
+}
+
+test('production chooser lists only server-verified tenant sessions', async () => {
+  const research = 'b'.repeat(64);
+  const { fetcher } = readsBySession({
+    [sessionId]: () => read('acme'),
+    [research]: () => read('research', undefined, 'Research Lab')
+  });
+  const sessions = new ServerSessions(fetcher);
+  const cookies = jar({ wyrd_session_acme: sessionId, wyrd_session_research: research });
+  const current = (await sessions.read('acme', cookies))!;
+
+  const metadata = await sessions.metadata(current, cookies);
+  // Names come from the server, never from the cookie suffix.
+  expect(metadata.tenants).toEqual([
+    { key: 'acme', name: 'Acme' },
+    { key: 'research', name: 'Research Lab' }
+  ]);
+  expect(cookies.values.has('wyrd_session_research')).toBe(true);
+});
+
+test('production chooser clears forged, expired, duplicate and mismatched hints', async () => {
+  const forged = 'd'.repeat(64);
+  const expired = 'e'.repeat(64);
+  const mismatched = 'f'.repeat(64);
+  const research = 'b'.repeat(64);
+  const { fetcher, seen } = readsBySession({
+    [mismatched]: () => read('acme'),
+    [research]: () => read('research', undefined, 'Research Lab')
+  });
+  const sessions = new ServerSessions(fetcher);
+  const cookies = jar({
+    wyrd_session_acme: sessionId,
+    wyrd_session_victim: forged,
+    wyrd_session_stale: expired,
+    wyrd_session_other: mismatched,
+    wyrd_session_research: research,
+    'wyrd_session_../x': research
+  });
+  // A browser may send one name twice (e.g. different paths); it is one hint.
+  const getAll = cookies.getAll;
+  cookies.getAll = () => [...getAll(), { name: 'wyrd_session_research', value: research }];
+  const current = {
+    tenantKey: 'acme',
+    tenantId,
+    tenantName: 'Acme',
+    principalId: 'p',
+    roles: [],
+    permissions: [],
+    expiresAt: Date.now() + 60_000,
+    csrf
+  };
+
+  const metadata = await sessions.metadata(current, cookies);
+  expect(metadata.tenants).toEqual([
+    { key: 'acme', name: 'Acme' },
+    { key: 'research', name: 'Research Lab' }
+  ]);
+  for (const name of ['wyrd_session_victim', 'wyrd_session_stale', 'wyrd_session_other'])
+    expect(cookies.values.has(name)).toBe(false);
+  // The current tenant is not re-read, the duplicate is read once, and a non-slug never reaches the server.
+  expect(seen.sort()).toEqual([forged, expired, mismatched, research].sort());
+});
+
+test('production chooser bounds server verification', async () => {
+  let inFlight = 0;
+  let peak = 0;
+  const hinted = ['one', 'two', 'three', 'four', 'five'];
+  const ids = Object.fromEntries(hinted.map((key, i) => [String(i).repeat(64), key]));
+  const fetcher = vi.fn(async (_url: URL | RequestInfo, init?: RequestInit) => {
+    const { session_id } = JSON.parse(String(init!.body)) as { session_id: string };
+    inFlight++;
+    peak = Math.max(peak, inFlight);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    inFlight--;
+    const key = ids[session_id];
+    return key ? read(key, undefined, key.toUpperCase()) : new Response(null, { status: 401 });
+  }) as unknown as typeof fetch;
+  const sessions = new ServerSessions(fetcher);
+  const cookies = jar({
+    wyrd_session_acme: sessionId,
+    ...Object.fromEntries(Object.entries(ids).map(([id, key]) => [`wyrd_session_${key}`, id])),
+    wyrd_session_forged: 'd'.repeat(64)
+  });
+  const current = {
+    tenantKey: 'acme',
+    tenantId,
+    tenantName: 'Acme',
+    principalId: 'p',
+    roles: [],
+    permissions: [],
+    expiresAt: Date.now() + 60_000,
+    csrf
+  };
+
+  const metadata = await sessions.metadata(current, cookies);
+  expect(peak).toBe(1);
+  expect(fetcher).toHaveBeenCalledTimes(hinted.length + 1);
+  expect(metadata.tenants).toEqual([
+    { key: 'acme', name: 'Acme' },
+    ...hinted.map((key) => ({ key, name: key.toUpperCase() }))
+  ]);
+  expect(cookies.values.has('wyrd_session_forged')).toBe(false);
+});
+
+test('production tenant context carries the server tenant id outside page metadata', async () => {
+  const sessions = new ServerSessions(vi.fn(async () => read('acme')) as unknown as typeof fetch);
+  const cookies = jar({ wyrd_session_acme: sessionId });
+  const session = (await sessions.read('acme', cookies))!;
+
+  expect(sessions.context(session).tenant.tenantId).toBe(tenantId);
+  const metadata = await sessions.metadata(session, cookies);
+  expect(JSON.stringify(metadata)).not.toContain(tenantId);
 });

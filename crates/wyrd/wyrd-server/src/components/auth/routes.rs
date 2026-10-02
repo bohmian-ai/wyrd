@@ -282,15 +282,26 @@ const CLI_LOGIN_COMPLETE_PAGE: &str = "<!doctype html><html><head><meta charset=
 <title>Wyrd sign-in complete</title></head><body><p>Sign-in complete. You can return to your \
 terminal.</p></body></html>";
 
+/// Static page a candidate connection test's browser tab shows once the
+/// callback has marked the candidate revision tested. The test issued no
+/// session; the page carries no token, code, or state.
+const CONNECTION_TEST_COMPLETE_PAGE: &str = "<!doctype html><html><head><meta charset=\"utf-8\">\
+<title>Wyrd connection test complete</title></head><body><p>Connection test complete. Return to \
+Wyrd settings to activate the connection.</p></body></html>";
+
 /// `GET /auth/callback` — the common provider callback for tenant human login.
 ///
 /// Anonymous by construction: the caller is mid-login and has no Wyrd session
 /// yet. The opaque `state` generated at initiation is the only input that
-/// selects the tenant and connection; no header is consulted. On success the
+/// selects the tenant and connection; no header is consulted. The RFC 9207
+/// `iss` parameter, when sent, is forwarded so the exchange can bind the
+/// response to the login's issuer before any token request. On success the
 /// session is stored sealed for one-use redemption by the login's initiator,
 /// and the response carries neither a token nor the provider code: a browser
 /// login is redirected (`303`) to the fixed `{public_origin}/login/complete`
-/// route with no query string, and a CLI login receives a static page.
+/// route with no query string, and a CLI login receives a static page. A
+/// candidate connection test marks its bound candidate revision tested,
+/// issues no session, and receives a static page.
 ///
 /// # Errors
 /// Returns problem JSON for every refusal of
@@ -300,11 +311,16 @@ terminal.</p></body></html>";
     path = "/auth/callback",
     params(
         ("code" = String, Query, description = "Authorization code from the identity provider"),
-        ("state" = String, Query, description = "Opaque login state Wyrd generated at initiation")
+        ("state" = String, Query, description = "Opaque login state Wyrd generated at initiation"),
+        ("iss" = Option<String>, Query, description = "RFC 9207 authorization-response issuer; \
+          when present it must equal the login's issuer, and it is required when the \
+          provider's discovery advertises `authorization_response_iss_parameter_supported`")
     ),
     responses(
-        (status = 200, description = "A CLI-initiated login completed; the browser shows a static \
-          page and the CLI redeems the session", content_type = "text/html", body = String),
+        (status = 200, description = "A CLI-initiated login completed and the CLI redeems the \
+          session, or a candidate connection test sign-in marked that candidate revision tested \
+          and issued no session; the browser shows a static page", content_type = "text/html",
+          body = String),
         (status = 303, description = "A browser login completed; redirect to the fixed \
           `/login/complete` route, which redeems the session with its flow cookie",
           headers(("Location" = String, description = "`{public_origin}/login/complete`"))),
@@ -312,8 +328,14 @@ terminal.</p></body></html>";
           (WYRD_AUTH_400_INVALID_STATE), the ID token nonce does not match \
           (WYRD_AUTH_400_INVALID_NONCE), or the deployment has no sealing key or public origin \
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
-        (status = 401, description = "The code or ID token is not usable, or the login's \
-          connection changed (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 401, description = "The code or ID token is not usable, the response `iss` \
+          does not match the login's issuer or is missing while the provider advertises it, or \
+          the login's connection changed (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 403, description = "The principal that began a connection test no longer \
+          holds identity_connections:write (WYRD_PERMISSION_403_DENIED_RBAC)",
+         body = WyrdProblem),
+        (status = 409, description = "The tested candidate changed during its test sign-in \
+          (WYRD_AUTH_409_CONNECTION_CONFLICT)", body = WyrdProblem),
         (status = 503, description = "The identity provider, auth backend, or audit path is \
           unavailable (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
           WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
@@ -341,6 +363,7 @@ async fn callback(
         &state,
         query.code.into_secret_string(),
         &query.state,
+        query.iss.as_deref(),
         req_id,
     )
     .await?;
@@ -357,6 +380,9 @@ async fn callback(
             Ok(Redirect::to(location.as_str()).into_response())
         }
         LoginInitiation::Cli(_) => Ok(Html(CLI_LOGIN_COMPLETE_PAGE).into_response()),
+        LoginInitiation::ConnectionTest(_) => {
+            Ok(Html(CONNECTION_TEST_COMPLETE_PAGE).into_response())
+        }
     }
 }
 

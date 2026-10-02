@@ -129,6 +129,7 @@ test('real root load and actions handle tenant counts, challenge, and least priv
   const loadEvent = {
     locals: { session, sessionProblem: null, mockData: false },
     request,
+    url: new URL(request.url),
     fetch: ready
   } as unknown as Parameters<typeof rootLoad>[0];
   try {

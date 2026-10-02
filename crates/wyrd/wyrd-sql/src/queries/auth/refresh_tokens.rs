@@ -170,6 +170,44 @@ pub async fn revoke_refresh(
     Ok(())
 }
 
+/// Revoke every active token in one login's rotation chain: the row `root_id`
+/// and every descendant reached through `rotated_from`.
+///
+/// Other chains of the same principal — its other browser sessions, CLI, or
+/// SDK logins — are untouched. Callers serialize against rotation by holding
+/// [`lock_refresh_family`] for the chain's principal first, so no successor
+/// can be inserted outside the update. Returns the number of rows revoked.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the statement.
+pub async fn revoke_refresh_chain(
+    conn: &mut TenantConn<'_>,
+    root_id: Uuid,
+    reason: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        WITH RECURSIVE chain(id) AS (
+            SELECT id FROM wyrd.auth_refresh_tokens WHERE id = $1
+            UNION
+            SELECT token.id
+              FROM wyrd.auth_refresh_tokens token
+              JOIN chain ON token.rotated_from = chain.id
+        )
+        UPDATE wyrd.auth_refresh_tokens
+           SET revoked_at = now(),
+               revoked_reason = $2
+         WHERE id IN (SELECT id FROM chain)
+           AND revoked_at IS NULL
+        "#,
+    )
+    .bind(root_id)
+    .bind(reason)
+    .execute(&mut **conn.transaction())
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Revoke every active token in the family owned by a principal.
 ///
 /// Bulk-revokes all rows where `(principal_kind, principal_id)` match and

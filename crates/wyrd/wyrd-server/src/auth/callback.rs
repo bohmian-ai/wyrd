@@ -7,7 +7,8 @@ use crate::auth::auth_not_configured;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
-/// Complete a login from the provider callback's `code` and `state`.
+/// Complete a login from the provider callback's `code`, `state`, and
+/// optional RFC 9207 `iss`.
 ///
 /// Builds the authorization-code exchange from the server's auth
 /// configuration and runs it. The tenant is recovered from the state alone;
@@ -21,6 +22,7 @@ pub async fn exchange_authorization_code(
     state: &AppState,
     code: SecretString,
     state_key: &str,
+    response_issuer: Option<&str>,
     request_id: &str,
 ) -> Result<LoginInitiation, WyrdErrorResponse> {
     let service = wyrd_auth::callback::AuthorizationCodeExchange {
@@ -37,7 +39,7 @@ pub async fn exchange_authorization_code(
             .ok_or_else(auth_not_configured)?,
     };
     service
-        .execute(code, state_key, request_id)
+        .execute(code, state_key, response_issuer, request_id)
         .await
         .map_err(WyrdErrorResponse::from)
 }
@@ -71,12 +73,17 @@ mod pg_tests {
     };
     use wyrd_crypt::{SealingKeyring, SecretKey};
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
+    use wyrd_runtime::Permission;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::IssuerTokenPolicy;
-    use wyrd_spec::auth::{IssuerUrl, LoginInitiation, Sha256Hex, TokenType};
+    use wyrd_spec::auth::{
+        ConnectionTester, IssuerUrl, LoginInitiation, PrincipalId, PrincipalKindTag, Sha256Hex,
+        TokenType,
+    };
     use wyrd_sql::queries::auth::{
-        LoginState, consume_login_state, insert_login_state, insert_role, list_user_roles,
-        lock_refresh_family, user_id_by_identity,
+        HumanConnectionWrite, LoginState, consume_login_state, human_connection_in_state,
+        insert_human_candidate, insert_login_state, insert_role, insert_user, list_user_roles,
+        lock_refresh_family, replace_user_roles, user_id_by_identity,
     };
     use wyrd_sql::row_types::auth::HumanConnectionBinding;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
@@ -183,6 +190,7 @@ mod pg_tests {
             &state,
             SecretString::from("code".to_owned()),
             "missing-state",
+            None,
             "req-missing-state",
         )
         .await
@@ -215,6 +223,7 @@ mod pg_tests {
             &state,
             SecretString::from("code".to_owned()),
             raw,
+            None,
             "req-consumed",
         )
         .await
@@ -773,6 +782,256 @@ mod pg_tests {
         assert_eq!(role_rows, 0, "the role assignment rolled back");
     }
 
+    /// A verified test sign-in marks only its bound candidate revision tested,
+    /// with the JWKS URI its token was verified against, records one allowed
+    /// `identity.oidc.candidate.tested` decision for its tester, and issues
+    /// nothing: no User, refresh row, completion, or role sync.
+    ///
+    /// # Panics
+    /// Panics when the test is refused, the stamp or decision differs, or
+    /// anything is issued.
+    #[tokio::test]
+    async fn a_test_sign_in_marks_only_its_candidate_tested_and_issues_nothing() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let server = jwks_server().await;
+        let state = test_state_with_external(&fixture).await;
+        let trusted = sync_trusted(&fixture, &server).await;
+        let tester = seed_tester(&fixture, true).await;
+        let binding = committed_candidate_binding(&fixture).await;
+        let (hash, login) = pending_login_with(
+            &fixture,
+            state_hash(20),
+            binding,
+            "nonce",
+            LoginInitiation::ConnectionTest(tester),
+        )
+        .await;
+
+        let completed = authorization_exchange_service(&state)
+            .finish_id_token_exchange(
+                &hash,
+                &trusted,
+                &login,
+                &advertised(),
+                &encode_external_token(&external_claims(
+                    EXTERNAL_AUDIENCE,
+                    "nonce",
+                    Some("ext@example.com"),
+                    &["admins"],
+                )),
+                "req-test",
+            )
+            .await
+            .expect("the test sign-in completes");
+
+        assert_eq!(completed, LoginInitiation::ConnectionTest(tester));
+        assert_eq!(
+            candidate_stamp(&fixture).await,
+            (
+                Some(binding.connection_revision),
+                Some(jwks_uri(&server).to_string())
+            )
+        );
+        assert_eq!(
+            operation_rows(&fixture, "identity.oidc.candidate.tested").await,
+            vec![(
+                tester.principal_id.as_uuid(),
+                "allowed".to_owned(),
+                "identity:oidc_connection".to_owned()
+            )]
+        );
+        assert_nothing_persisted(&fixture, &state, &hash).await;
+    }
+
+    /// A tester whose stored roles no longer grant
+    /// `identity_connections:write` is refused at the stamp: the denial is
+    /// audited and the candidate stays untested.
+    ///
+    /// # Panics
+    /// Panics when the test is accepted, the denial is missing, or the
+    /// candidate is stamped.
+    #[tokio::test]
+    async fn an_unauthorized_tester_leaves_the_candidate_untested() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let server = jwks_server().await;
+        let state = test_state_with_external(&fixture).await;
+        let trusted = sync_trusted(&fixture, &server).await;
+        let tester = seed_tester(&fixture, false).await;
+        let binding = committed_candidate_binding(&fixture).await;
+        let (hash, login) = pending_login_with(
+            &fixture,
+            state_hash(21),
+            binding,
+            "nonce",
+            LoginInitiation::ConnectionTest(tester),
+        )
+        .await;
+
+        let error = authorization_exchange_service(&state)
+            .finish_id_token_exchange(
+                &hash,
+                &trusted,
+                &login,
+                &advertised(),
+                &encode_external_token(&external_claims(EXTERNAL_AUDIENCE, "nonce", None, &[])),
+                "req-test-denied",
+            )
+            .await
+            .expect_err("an unauthorized tester is refused");
+
+        assert_eq!(error.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+        assert_eq!(
+            operation_rows(&fixture, "identity.oidc.candidate.tested").await,
+            vec![(
+                tester.principal_id.as_uuid(),
+                "denied".to_owned(),
+                "identity:oidc_connection".to_owned()
+            )]
+        );
+        assert_eq!(candidate_stamp(&fixture).await, (None, None));
+        assert_nothing_persisted(&fixture, &state, &hash).await;
+    }
+
+    /// A tested decision that cannot be recorded fails closed: the stamp
+    /// shares its transaction, so the candidate stays untested.
+    ///
+    /// # Panics
+    /// Panics when the trigger cannot be installed, the test succeeds, or the
+    /// candidate is stamped.
+    #[tokio::test]
+    async fn a_failed_tested_audit_leaves_the_candidate_untested() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let server = jwks_server().await;
+        let state = test_state_with_external(&fixture).await;
+        let trusted = sync_trusted(&fixture, &server).await;
+        let tester = seed_tester(&fixture, true).await;
+        let binding = committed_candidate_binding(&fixture).await;
+        let (hash, login) = pending_login_with(
+            &fixture,
+            state_hash(22),
+            binding,
+            "nonce",
+            LoginInitiation::ConnectionTest(tester),
+        )
+        .await;
+        let superuser = fixture
+            .superuser_pool()
+            .await
+            .expect("superuser pool opens");
+        sqlx::query(
+            r#"CREATE OR REPLACE FUNCTION vala.test_fail_candidate_tested_audit()
+               RETURNS trigger LANGUAGE plpgsql AS $$
+               BEGIN
+                 IF NEW.operation = 'identity.oidc.candidate.tested' THEN
+                   RAISE EXCEPTION 'injected candidate tested audit failure';
+                 END IF;
+                 RETURN NEW;
+               END;
+               $$;"#,
+        )
+        .execute(&superuser)
+        .await
+        .expect("failure function installs");
+        sqlx::query(
+            r#"CREATE TRIGGER test_fail_candidate_tested_audit
+               BEFORE INSERT ON vala.audit_staging
+               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_candidate_tested_audit()"#,
+        )
+        .execute(&superuser)
+        .await
+        .expect("failure trigger installs");
+
+        let error = authorization_exchange_service(&state)
+            .finish_id_token_exchange(
+                &hash,
+                &trusted,
+                &login,
+                &advertised(),
+                &encode_external_token(&external_claims(EXTERNAL_AUDIENCE, "nonce", None, &[])),
+                "req-test-audit-fail",
+            )
+            .await
+            .expect_err("an unrecordable tested decision refuses the test");
+
+        assert_eq!(error.code(), "WYRD_AUDIT_503_UNAVAILABLE");
+        assert_eq!(candidate_stamp(&fixture).await, (None, None));
+    }
+
+    /// Seed and commit a password User of the fixture tenant to begin a
+    /// connection test as; when `authorized`, it holds a role granting
+    /// `identity_connections:write`.
+    ///
+    /// # Panics
+    /// Panics when the user, role, or grant cannot be written.
+    async fn seed_tester(fixture: &PgFixture, authorized: bool) -> ConnectionTester {
+        let user = Uuid::now_v7();
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        insert_user(&mut conn, user, Some("admin@example.com"), "password", None)
+            .await
+            .expect("tester inserts");
+        if authorized {
+            insert_role(
+                &mut conn,
+                Uuid::now_v7(),
+                "connection_tester",
+                &serde_json::to_value([Permission::identity_connections_write()])
+                    .expect("permission encodes"),
+                false,
+            )
+            .await
+            .expect("role inserts");
+            replace_user_roles(&mut conn, user, &["connection_tester"])
+                .await
+                .expect("role grants");
+        }
+        conn.commit().await.expect("tester commits");
+        ConnectionTester {
+            principal_id: PrincipalId::new(user),
+            principal_kind: PrincipalKindTag::User,
+        }
+    }
+
+    /// Stage and commit an untested public candidate for the test issuer,
+    /// returning the binding a test sign-in of it records.
+    ///
+    /// # Panics
+    /// Panics when the candidate cannot be written.
+    async fn committed_candidate_binding(fixture: &PgFixture) -> HumanConnectionBinding {
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let row = insert_human_candidate(
+            &mut conn,
+            &HumanConnectionWrite {
+                issuer_url: EXTERNAL_ISSUER.to_owned(),
+                client_id: EXTERNAL_AUDIENCE.to_owned(),
+                client_auth: "Public".to_owned(),
+                client_secret_enc: None,
+                claim_mapping: serde_json::json!({ "subject": "sub" }),
+                group_role_map: serde_json::json!({}),
+                jwks_ttl_secs: 300,
+            },
+        )
+        .await
+        .expect("candidate inserts");
+        conn.commit().await.expect("candidate commits");
+        HumanConnectionBinding {
+            connection_id: row.connection_id,
+            connection_revision: row.revision,
+        }
+    }
+
+    /// The candidate's `(tested_revision, jwks_uri)`.
+    ///
+    /// # Panics
+    /// Panics when the candidate cannot be read or is missing.
+    async fn candidate_stamp(fixture: &PgFixture) -> (Option<i64>, Option<String>) {
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let row = human_connection_in_state(&mut conn, "Candidate")
+            .await
+            .expect("candidate reads")
+            .expect("candidate exists");
+        (row.tested_revision, row.jwks_uri)
+    }
+
     /// The tenant role the role-sync cases map a provider group to.
     const SYNC_ROLE: &str = "login_sync_probe";
 
@@ -990,6 +1249,23 @@ mod pg_tests {
         connection: HumanConnectionBinding,
         nonce: &str,
     ) -> (Sha256Hex, LoginState) {
+        let initiation = LoginInitiation::Browser(flow_for(&state_hash));
+        pending_login_with(fixture, state_hash, connection, nonce, initiation).await
+    }
+
+    /// Record and consume a login bound to `connection` with `initiation`, as
+    /// the callback does before provider IO, and return its state hash and
+    /// consumed row.
+    ///
+    /// # Panics
+    /// Panics when the row cannot be written or consumed.
+    async fn pending_login_with(
+        fixture: &PgFixture,
+        state_hash: Sha256Hex,
+        connection: HumanConnectionBinding,
+        nonce: &str,
+        initiation: LoginInitiation,
+    ) -> (Sha256Hex, LoginState) {
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let inserted = insert_login_state(
             &mut conn,
@@ -1001,7 +1277,7 @@ mod pg_tests {
                 redirect_uri: "https://test-tenant-1.example.com/auth/callback".to_owned(),
                 code_verifier: SecretString::from("verifier"),
                 nonce: nonce.to_owned(),
-                initiation: LoginInitiation::Browser(flow_for(&state_hash)),
+                initiation,
             },
             StdDuration::from_mins(5),
         )

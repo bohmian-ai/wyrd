@@ -5,7 +5,9 @@
 //! [`insert_login_state`] when a login begins, [`consume_login_state`] when the
 //! callback arrives (before any provider IO), and [`complete_login_state`] when
 //! the callback has issued a session. [`redeem_login_completion`] then deletes
-//! the completed row once, by the initiation binding the login recorded.
+//! the completed row once, by the initiation binding the login recorded. A
+//! candidate connection test is bound to the principal that began it instead;
+//! it is consumed like any login but never completed or redeemed.
 //! Forced RLS is the only tenant selection; `data_tenant_id` is written as the
 //! row's owner and never repeated as a predicate. `PostgreSQL` owns every
 //! expiry: callers bind lifetimes, never instants.
@@ -15,7 +17,9 @@ use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
-use wyrd_spec::auth::{LoginInitiation, Sha256Hex};
+use wyrd_spec::auth::{
+    ConnectionTester, LoginInitiation, PrincipalId, PrincipalKindTag, Sha256Hex,
+};
 
 use crate::TenantConn;
 use crate::row_types::auth::HumanConnectionBinding;
@@ -37,9 +41,9 @@ const INSERT_LOGIN_STATE_SQL: &str = r#"
     INSERT INTO wyrd.auth_login_state (
         state_hash, data_tenant_id, connection_id, connection_revision, issuer,
         client_id, redirect_uri, code_verifier, nonce, browser_flow_hash,
-        cli_handoff_id, expires_at
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-              statement_timestamp() + ($12 * interval '1 second'))
+        cli_handoff_id, tester_principal_id, tester_principal_kind, expires_at
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+              statement_timestamp() + ($14 * interval '1 second'))
     ON CONFLICT DO NOTHING
 "#;
 
@@ -56,7 +60,8 @@ const CONSUME_LOGIN_STATE_SQL: &str = r#"
        AND consumed_at IS NULL
        AND expires_at > statement_timestamp()
     RETURNING connection_id, connection_revision, issuer, client_id, redirect_uri,
-              code_verifier, nonce, browser_flow_hash, cli_handoff_id
+              code_verifier, nonce, browser_flow_hash, cli_handoff_id,
+              tester_principal_id, tester_principal_kind
 "#;
 
 /// Attach the sealed session to a consumed login, once.
@@ -76,41 +81,78 @@ const COMPLETE_LOGIN_STATE_SQL: &str = r#"
 /// Redeem a completed login once by its initiation binding.
 ///
 /// Deletes the RLS tenant's completed, unexpired row bound to either the
-/// browser flow hash or the CLI handoff id and returns its sealed session.
-/// Deletion is the one-use guarantee: a second redemption matches nothing.
+/// browser flow hash or the CLI handoff id and returns its sealed session and
+/// the connection the login went through. Deletion is the one-use guarantee:
+/// a second redemption matches nothing.
 const REDEEM_LOGIN_COMPLETION_SQL: &str = r#"
     DELETE FROM wyrd.auth_login_state
      WHERE (browser_flow_hash = $1 OR cli_handoff_id = $2)
        AND completion_sealed IS NOT NULL
        AND expires_at > statement_timestamp()
-    RETURNING completion_sealed
+    RETURNING completion_sealed, connection_id
 "#;
 
-/// The `(browser_flow_hash, cli_handoff_id)` column pair of an initiation;
-/// exactly one is set, which is how the stored row records its kind.
-fn initiation_columns(initiation: &LoginInitiation) -> (Option<&[u8]>, Option<Uuid>) {
+/// The stored binding columns of one initiation; exactly one binding is set,
+/// which is how the stored row records its kind.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct InitiationColumns<'a> {
+    /// Browser flow hash, for a browser login.
+    browser_flow_hash: Option<&'a [u8]>,
+    /// CLI handoff id, for a CLI login.
+    cli_handoff_id: Option<Uuid>,
+    /// Principal that began a candidate connection test.
+    tester_principal_id: Option<Uuid>,
+    /// That principal's kind label.
+    tester_principal_kind: Option<&'static str>,
+}
+
+/// Project an initiation onto its stored binding columns.
+fn initiation_columns(initiation: &LoginInitiation) -> InitiationColumns<'_> {
     match initiation {
-        LoginInitiation::Browser(hash) => (Some(hash.as_bytes().as_slice()), None),
-        LoginInitiation::Cli(handoff_id) => (None, Some(*handoff_id)),
+        LoginInitiation::Browser(hash) => InitiationColumns {
+            browser_flow_hash: Some(hash.as_bytes().as_slice()),
+            ..InitiationColumns::default()
+        },
+        LoginInitiation::Cli(handoff_id) => InitiationColumns {
+            cli_handoff_id: Some(*handoff_id),
+            ..InitiationColumns::default()
+        },
+        LoginInitiation::ConnectionTest(tester) => InitiationColumns {
+            tester_principal_id: Some(tester.principal_id.as_uuid()),
+            tester_principal_kind: Some(tester.principal_kind.as_str()),
+            ..InitiationColumns::default()
+        },
     }
 }
 
-/// Rebuild the initiation from its stored columns.
+/// Rebuild the initiation from its stored binding columns, in
+/// [`ConsumedRow`] order.
 ///
 /// # Errors
 /// Returns [`sqlx::Error::Decode`] when the columns do not describe exactly
-/// one binding or the flow hash is not 32 bytes.
+/// one binding, the flow hash is not 32 bytes, or the tester kind is not a
+/// principal kind label.
 fn initiation_from_columns(
     flow_hash: Option<Vec<u8>>,
     handoff_id: Option<Uuid>,
+    tester_id: Option<Uuid>,
+    tester_kind: Option<String>,
 ) -> Result<LoginInitiation, sqlx::Error> {
     let corrupt = || sqlx::Error::Decode("login state binding is corrupt".into());
-    match (flow_hash, handoff_id) {
-        (Some(hash), None) => {
+    match (flow_hash, handoff_id, tester_id, tester_kind) {
+        (Some(hash), None, None, None) => {
             let bytes: [u8; 32] = hash.try_into().map_err(|_| corrupt())?;
             Ok(LoginInitiation::Browser(Sha256Hex::from(bytes)))
         }
-        (None, Some(handoff_id)) => Ok(LoginInitiation::Cli(handoff_id)),
+        (None, Some(handoff_id), None, None) => Ok(LoginInitiation::Cli(handoff_id)),
+        (None, None, Some(principal_id), Some(kind)) => {
+            let principal_kind =
+                serde_json::from_value::<PrincipalKindTag>(kind.into()).map_err(|_| corrupt())?;
+            Ok(LoginInitiation::ConnectionTest(ConnectionTester {
+                principal_id: PrincipalId::new(principal_id),
+                principal_kind,
+            }))
+        }
         _ => Err(corrupt()),
     }
 }
@@ -138,6 +180,16 @@ pub struct LoginState {
     pub initiation: LoginInitiation,
 }
 
+/// A completed login removed by [`redeem_login_completion`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RedeemedLogin {
+    /// The issued session, sealed under the deployment keyring.
+    #[sqlx(rename = "completion_sealed")]
+    pub sealed: Vec<u8>,
+    /// The human connection the login went through.
+    pub connection_id: Uuid,
+}
+
 /// Raw consumed row as returned by [`CONSUME_LOGIN_STATE_SQL`].
 #[derive(sqlx::FromRow)]
 struct ConsumedRow {
@@ -158,6 +210,10 @@ struct ConsumedRow {
     browser_flow_hash: Option<Vec<u8>>,
     /// CLI handoff id, for a CLI login.
     cli_handoff_id: Option<Uuid>,
+    /// Test principal id, for a candidate connection test.
+    tester_principal_id: Option<Uuid>,
+    /// Test principal kind label, for a candidate connection test.
+    tester_principal_kind: Option<String>,
 }
 
 /// Insert a login-state row keyed by `state_hash` whose expiry `PostgreSQL`
@@ -181,7 +237,7 @@ pub async fn insert_login_state(
     sqlx::query(PURGE_EXPIRED_LOGIN_STATE_SQL)
         .execute(&mut **conn.transaction())
         .await?;
-    let (flow_hash, handoff_id) = initiation_columns(&row.initiation);
+    let columns = initiation_columns(&row.initiation);
     let inserted = sqlx::query(INSERT_LOGIN_STATE_SQL)
         .bind(state_hash.as_bytes().as_slice())
         .bind(tenant)
@@ -192,8 +248,10 @@ pub async fn insert_login_state(
         .bind(&row.redirect_uri)
         .bind(row.code_verifier.expose_secret())
         .bind(&row.nonce)
-        .bind(flow_hash)
-        .bind(handoff_id)
+        .bind(columns.browser_flow_hash)
+        .bind(columns.cli_handoff_id)
+        .bind(columns.tester_principal_id)
+        .bind(columns.tester_principal_kind)
         .bind(ttl.as_secs_f64())
         .execute(&mut **conn.transaction())
         .await?;
@@ -219,7 +277,12 @@ pub async fn consume_login_state(
         .await?;
     row.map(|row| {
         Ok(LoginState {
-            initiation: initiation_from_columns(row.browser_flow_hash, row.cli_handoff_id)?,
+            initiation: initiation_from_columns(
+                row.browser_flow_hash,
+                row.cli_handoff_id,
+                row.tester_principal_id,
+                row.tester_principal_kind,
+            )?,
             connection: row.connection,
             issuer: row.issuer,
             client_id: row.client_id,
@@ -255,20 +318,23 @@ pub async fn complete_login_state(
 }
 
 /// Delete this tenant's completed, unexpired row recorded for `initiation`
-/// and return its sealed completion; `None` when there is none.
+/// and return its sealed completion and login connection; `None` when there
+/// is none.
 ///
-/// The delete is the single use: a second redemption finds nothing.
+/// The delete is the single use: a second redemption finds nothing. A
+/// connection test has neither redeemable binding and is never completed, so
+/// redeeming one matches nothing.
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the delete.
 pub async fn redeem_login_completion(
     conn: &mut TenantConn<'_>,
     initiation: &LoginInitiation,
-) -> Result<Option<Vec<u8>>, sqlx::Error> {
-    let (flow_hash, handoff_id) = initiation_columns(initiation);
-    sqlx::query_scalar::<_, Vec<u8>>(REDEEM_LOGIN_COMPLETION_SQL)
-        .bind(flow_hash)
-        .bind(handoff_id)
+) -> Result<Option<RedeemedLogin>, sqlx::Error> {
+    let columns = initiation_columns(initiation);
+    sqlx::query_as::<_, RedeemedLogin>(REDEEM_LOGIN_COMPLETION_SQL)
+        .bind(columns.browser_flow_hash)
+        .bind(columns.cli_handoff_id)
         .fetch_optional(&mut **conn.transaction())
         .await
 }
@@ -277,30 +343,57 @@ pub async fn redeem_login_completion(
 mod tests {
     use secrecy::SecretString;
     use uuid::Uuid;
-    use wyrd_spec::auth::{LoginInitiation, Sha256Hex};
+    use wyrd_spec::auth::{
+        ConnectionTester, LoginInitiation, PrincipalId, PrincipalKindTag, Sha256Hex,
+    };
 
-    use super::{LoginState, initiation_columns, initiation_from_columns};
+    use super::{InitiationColumns, LoginState, initiation_columns, initiation_from_columns};
     use crate::row_types::auth::HumanConnectionBinding;
 
-    /// An initiation round-trips through its stored columns, and a stored row
-    /// naming both or neither binding, or a short hash, is refused as corrupt.
+    /// Rebuild an initiation from the columns it projects to.
+    fn round_trip(initiation: &LoginInitiation) -> Result<LoginInitiation, sqlx::Error> {
+        let InitiationColumns {
+            browser_flow_hash,
+            cli_handoff_id,
+            tester_principal_id,
+            tester_principal_kind,
+        } = initiation_columns(initiation);
+        initiation_from_columns(
+            browser_flow_hash.map(<[u8]>::to_vec),
+            cli_handoff_id,
+            tester_principal_id,
+            tester_principal_kind.map(str::to_owned),
+        )
+    }
+
+    /// Every initiation round-trips through its stored columns, and a stored
+    /// row naming several or no bindings, a short hash, or an unknown tester
+    /// kind is refused as corrupt.
     #[test]
     fn initiation_columns_round_trip_and_refuse_ambiguity() {
-        let browser = LoginInitiation::Browser(Sha256Hex::digest(b"flow"));
-        let (hash, handoff) = initiation_columns(&browser);
-        let rebuilt = initiation_from_columns(hash.map(<[u8]>::to_vec), handoff)
-            .expect("browser binding rebuilds");
-        assert_eq!(rebuilt, browser);
+        let tester = LoginInitiation::ConnectionTest(ConnectionTester {
+            principal_id: PrincipalId::new(Uuid::now_v7()),
+            principal_kind: PrincipalKindTag::TenantAdmin,
+        });
+        for initiation in [
+            LoginInitiation::Browser(Sha256Hex::digest(b"flow")),
+            LoginInitiation::Cli(Uuid::now_v7()),
+            tester,
+        ] {
+            assert_eq!(
+                round_trip(&initiation).expect("binding rebuilds"),
+                initiation
+            );
+        }
 
-        let cli = LoginInitiation::Cli(Uuid::now_v7());
-        let (hash, handoff) = initiation_columns(&cli);
-        let rebuilt = initiation_from_columns(hash.map(<[u8]>::to_vec), handoff)
-            .expect("cli binding rebuilds");
-        assert_eq!(rebuilt, cli);
-
-        assert!(initiation_from_columns(Some(vec![1; 32]), Some(Uuid::now_v7())).is_err());
-        assert!(initiation_from_columns(None, None).is_err());
-        assert!(initiation_from_columns(Some(vec![1; 3]), None).is_err());
+        let id = Some(Uuid::now_v7());
+        let kind = || Some("user".to_owned());
+        assert!(initiation_from_columns(Some(vec![1; 32]), id, None, None).is_err());
+        assert!(initiation_from_columns(None, id, id, kind()).is_err());
+        assert!(initiation_from_columns(None, None, None, None).is_err());
+        assert!(initiation_from_columns(Some(vec![1; 3]), None, None, None).is_err());
+        assert!(initiation_from_columns(None, None, id, None).is_err());
+        assert!(initiation_from_columns(None, None, id, Some("root".to_owned())).is_err());
     }
 
     /// Formatting a login state never prints its PKCE verifier.

@@ -9,11 +9,12 @@ import {
 } from '$lib/server/development';
 import { fail, isHttpError, redirect } from '@sveltejs/kit';
 import { reject, sessionCookie, sessionLifetime, sessions } from '$lib/server/auth/session';
+import { serverSessions } from '$lib/server/auth/server-sessions';
 import { problem, safeProblem } from '$lib/server/problem';
 import { serverReady } from '$lib/server/upstream';
 import type { Actions, PageServerLoad } from './$types';
 
-export const load: PageServerLoad = async ({ locals, request, fetch }) => {
+export const load: PageServerLoad = async ({ locals, request, fetch, url }) => {
   // Failed actions render their problem on the chooser instead of redirecting it away.
   const destination = locals.session && sessions.destination(locals.session);
   const reauthentication =
@@ -28,16 +29,26 @@ export const load: PageServerLoad = async ({ locals, request, fetch }) => {
   const upstream = locals.mockData || (await serverReady(fetch)) ? null : problem('upstream');
   return {
     session: locals.session ? sessions.metadata(locals.session) : null,
-    problem:
+    problem: url.searchParams.get('login') === 'failed' ? problem('unauthenticated') :
       locals.sessionProblem?.code === 'WYRD_AUTH_401_UNAUTHENTICATED'
         ? upstream
         : (locals.sessionProblem ?? upstream),
     reauthentication,
-    localAuth: localAuthEnabled() && locals.mockData
+    localAuth: localAuthEnabled() && locals.mockData,
+    // Production sign-in is per tenant at /t/{tenantKey}/login; this page only routes there.
+    tenantEntry: !localAuthEnabled()
   };
 };
 
+const tenantKeyPattern = /^[a-z0-9][a-z0-9_-]{0,62}$/;
+
 export const actions: Actions = {
+  tenant: async ({ request }) => {
+    const key = (await request.formData()).get('tenantKey');
+    if (typeof key !== 'string' || !tenantKeyPattern.test(key.trim()))
+      return fail(400, { problem: problem('validation'), reauthentication: null });
+    redirect(303, `/t/${encodeURIComponent(key.trim())}/login`);
+  },
   mockData: async ({ locals, request, cookies }) => {
     if (!dev || request.headers.get('origin') !== new URL(request.url).origin)
       return fail(403, { problem: problem('denied'), reauthentication: null });
@@ -125,12 +136,17 @@ export const actions: Actions = {
     const session = sessions.read(id).session!;
     redirect(303, sessions.destination(session) ?? '/');
   },
-  switch: async ({ locals, request }) => {
+  switch: async ({ locals, request, cookies }) => {
     try {
-      if (!locals.session) reject('unauthenticated');
       const data = await request.formData();
       const key = data.get('tenantKey');
       if (typeof key !== 'string') reject('denied');
+      if (!localAuthEnabled()) {
+        const from = data.get('from');
+        if (typeof from !== 'string') reject('denied');
+        redirect(303, await serverSessions.switch(from, key, cookies, request, data.get('csrf')));
+      }
+      if (!locals.session) reject('unauthenticated');
       sessions.checkAction(locals.session, request, data.get('csrf'));
       const reauthentication = sessions.reauthenticationTenant(locals.session, key);
       if (reauthentication)
@@ -160,8 +176,14 @@ export const actions: Actions = {
   },
   logout: async ({ locals, request, cookies }) => {
     try {
-      if (!locals.session) reject('unauthenticated');
       const data = await request.formData();
+      if (!localAuthEnabled()) {
+        const key = data.get('tenantKey');
+        if (typeof key !== 'string') reject('denied');
+        await serverSessions.logout(key, cookies, request, data.get('csrf'));
+        redirect(303, `/t/${encodeURIComponent(key)}/login`);
+      }
+      if (!locals.session) reject('unauthenticated');
       sessions.checkAction(locals.session, request, data.get('csrf'));
       sessions.remove(cookies.get(sessionCookie)!);
       cookies.delete(sessionCookie, { path: '/' });

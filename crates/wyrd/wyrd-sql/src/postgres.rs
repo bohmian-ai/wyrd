@@ -223,14 +223,103 @@ impl WyrdPostgres {
         &self,
         state_hash: &Sha256Hex,
     ) -> Result<Option<DataTenantId>, SqlError> {
-        // Dynamic query is intentional: the definer function post-dates the
+        self.definer_tenant("SELECT wyrd.auth_login_state_tenant($1)", state_hash)
+            .await
+    }
+
+    /// Resolve the tenant owning a completed, unexpired browser login.
+    ///
+    /// BFF login completion presents only the SHA-256 of its `HttpOnly` flow
+    /// id. The SECURITY DEFINER function `wyrd.auth_login_completion_tenant`
+    /// answers which tenant holds a completed login bound to exactly that
+    /// flow hash, or `None`; redemption then runs under that tenant's RLS.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Query`] when Postgres rejects the lookup and
+    /// [`SqlError::InvalidDataTenantId`] when the stored tenant id violates the
+    /// Wyrd tenant-id contract.
+    pub async fn login_completion_tenant(
+        &self,
+        browser_flow_hash: &Sha256Hex,
+    ) -> Result<Option<DataTenantId>, SqlError> {
+        self.definer_tenant(
+            "SELECT wyrd.auth_login_completion_tenant($1)",
+            browser_flow_hash,
+        )
+        .await
+    }
+
+    /// Resolve the tenant owning a live browser session.
+    ///
+    /// The BFF presents only the raw session id; its SHA-256 is all the
+    /// SECURITY DEFINER function `wyrd.auth_browser_session_tenant` accepts.
+    /// It answers which tenant holds an unrevoked, unexpired session with that
+    /// hash, or `None`, and exposes no other column.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Query`] when Postgres rejects the lookup and
+    /// [`SqlError::InvalidDataTenantId`] when the stored tenant id violates the
+    /// Wyrd tenant-id contract.
+    pub async fn browser_session_tenant(
+        &self,
+        id_hash: &Sha256Hex,
+    ) -> Result<Option<DataTenantId>, SqlError> {
+        self.definer_tenant("SELECT wyrd.auth_browser_session_tenant($1)", id_hash)
+            .await
+    }
+
+    /// Read a tenant's route key and display name from the tenant directory.
+    ///
+    /// The directory is not tenant data, so the read runs on the audited
+    /// operator pool through
+    /// [`crate::queries::platform::tenants::tenant_by_id`]; the RLS app pool is
+    /// never a fallback. Returns `None` for a deleted or unknown tenant.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::InsufficientPrivilege`] when no platform-admin
+    /// operator pool is configured, and the errors of
+    /// [`crate::queries::platform::tenants::tenant_by_id`].
+    pub async fn tenant_directory_entry(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<Option<(TenantSlug, String)>, SqlError> {
+        let operator = self
+            .operator_pool()
+            .ok_or_else(|| SqlError::InsufficientPrivilege {
+                detail: "tenant directory reads require the wyrd_platform_admin operator pool"
+                    .to_owned(),
+            })?;
+        let Some(row) = crate::queries::platform::tenants::tenant_by_id(&operator, tenant).await?
+        else {
+            return Ok(None);
+        };
+        let slug = TenantSlug::new(row.slug).map_err(|error| SqlError::SchemaNotReady {
+            detail: format!("tenant {tenant} has an invalid stored slug: {error}"),
+        })?;
+        Ok(Some((slug, row.display_name)))
+    }
+
+    /// Run one SECURITY DEFINER hash-to-tenant lookup on the app pool.
+    ///
+    /// Each lookup function is granted only to `wyrd_app` and returns one
+    /// nullable tenant id for a SHA-256 key.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Query`] when Postgres rejects the lookup and
+    /// [`SqlError::InvalidDataTenantId`] when the stored tenant id violates the
+    /// Wyrd tenant-id contract.
+    async fn definer_tenant(
+        &self,
+        sql: &'static str,
+        hash: &Sha256Hex,
+    ) -> Result<Option<DataTenantId>, SqlError> {
+        // Dynamic query is intentional: the definer functions post-date the
         // SQLx offline bundle.
-        let tenant_uuid =
-            sqlx::query_scalar::<_, Option<Uuid>>("SELECT wyrd.auth_login_state_tenant($1)")
-                .bind(state_hash.as_bytes().as_slice())
-                .fetch_one(&self.app)
-                .await
-                .map_err(SqlError::from)?;
+        let tenant_uuid = sqlx::query_scalar::<_, Option<Uuid>>(sql)
+            .bind(hash.as_bytes().as_slice())
+            .fetch_one(&self.app)
+            .await
+            .map_err(SqlError::from)?;
 
         tenant_uuid
             .map(DataTenantId::new)

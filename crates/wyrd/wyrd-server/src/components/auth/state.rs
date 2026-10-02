@@ -34,6 +34,9 @@ pub struct ServerAuth {
     /// login, the callback, and connection administration all resolve human
     /// trust — and the callback URL, never request headers — through it.
     pub human_connections: Option<HumanConnections>,
+    /// The production UI browser-session channel; `None` leaves
+    /// `/internal/bff/v1/*` unmounted.
+    pub bff: Option<crate::components::auth::bff::BffChannel>,
     /// TTL and delegation settings for token exchange responses.
     pub token_exchange_settings: TokenExchangeSettings,
 }

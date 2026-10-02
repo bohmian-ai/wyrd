@@ -25,6 +25,13 @@ struct RawProviderMetadata {
     token_endpoint: Option<String>,
     jwks_uri: String,
     id_token_signing_alg_values_supported: Vec<String>,
+    /// RFC 9207 `authorization_response_iss_parameter_supported` exactly as
+    /// the document states it. A document that omits the member decodes as
+    /// `false` (`serde(default)`), the RFC's meaning of absence, so only a
+    /// provider that explicitly advertises support makes the human-login
+    /// callback require `iss`. A non-boolean value fails decoding.
+    #[serde(default)]
+    authorization_response_iss_parameter_supported: bool,
 }
 
 /// Parsed OpenID Connect discovery document.
@@ -40,8 +47,25 @@ pub struct ProviderMetadata {
     pub jwks_uri: Url,
     /// Advertised signing algorithms for ID tokens.
     pub id_token_signing_alg_values_supported: Vec<String>,
+    /// RFC 9207 `authorization_response_iss_parameter_supported`: whether the
+    /// provider promises an `iss` parameter on every authorization response.
+    /// Absent means `false`. The human-login callback refuses a response
+    /// without `iss` only when this is `true`; it never gates connection
+    /// testing or activation.
+    pub authorization_response_iss_parameter_supported: bool,
 }
 
+/// Convert the decoded discovery document into [`ProviderMetadata`].
+///
+/// [`OidcProvider::discover`] calls this after the issuer anti-spoofing check:
+/// the three endpoint strings are parsed as absolute URLs and every other
+/// member, including the RFC 9207 support flag, is carried over unchanged.
+/// `issuer_str` only labels a failure; it is not compared here.
+///
+/// # Errors
+/// Returns [`OidcError::Discovery`] naming the field when
+/// `authorization_endpoint`, a present `token_endpoint`, or `jwks_uri` is not
+/// a valid URL.
 fn parse_raw_metadata(
     raw: RawProviderMetadata,
     issuer_str: &str,
@@ -76,6 +100,8 @@ fn parse_raw_metadata(
         token_endpoint,
         jwks_uri,
         id_token_signing_alg_values_supported: raw.id_token_signing_alg_values_supported,
+        authorization_response_iss_parameter_supported: raw
+            .authorization_response_iss_parameter_supported,
     })
 }
 
@@ -227,6 +253,38 @@ mod tests {
                 .id_token_signing_alg_values_supported
                 .contains(&"RS256".to_owned())
         );
+    }
+
+    /// RFC 9207 support is projected from discovery: absent means `false`,
+    /// and an explicit `true` is retained for the callback's decision.
+    #[tokio::test]
+    async fn discover_projects_authorization_response_issuer_support() {
+        for (advertised, expected) in [(None, false), (Some(false), false), (Some(true), true)] {
+            let server = MockServer::start().await;
+            let issuer = server.uri();
+            let mut body = asymmetric_discovery_body(&issuer);
+            if let Some(flag) = advertised {
+                body["authorization_response_iss_parameter_supported"] = Value::Bool(flag);
+            }
+            Mock::given(method("GET"))
+                .and(path("/.well-known/openid-configuration"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+
+            let issuer_url: Url = issuer.parse().expect("server uri is valid url");
+            let provider = OidcProvider::discover(issuer_url, http_client())
+                .await
+                .expect("discover should succeed");
+
+            assert_eq!(
+                provider
+                    .metadata
+                    .authorization_response_iss_parameter_supported,
+                expected,
+                "{advertised:?}"
+            );
+        }
     }
 
     #[tokio::test]

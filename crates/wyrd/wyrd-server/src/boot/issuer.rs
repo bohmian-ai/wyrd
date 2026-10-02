@@ -340,6 +340,11 @@ mod pg_tests {
         })
     }
 
+    /// Discovery metadata for `issuer` with conventional endpoint paths, an
+    /// `RS256`-only signing set, and no RFC 9207 issuer-parameter support.
+    ///
+    /// # Panics
+    /// Panics when `issuer` does not form valid endpoint URLs.
     fn fake_metadata(issuer: &str) -> ProviderMetadata {
         ProviderMetadata {
             issuer: issuer.to_owned(),
@@ -353,6 +358,7 @@ mod pg_tests {
             ),
             jwks_uri: format!("{issuer}/jwks").parse().expect("jwks url is valid"),
             id_token_signing_alg_values_supported: vec!["RS256".to_owned()],
+            authorization_response_iss_parameter_supported: false,
         }
     }
 

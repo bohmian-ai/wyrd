@@ -9,6 +9,9 @@
 //! the session, and stores it sealed against the login's initiation binding;
 //! [`HumanConnections::redeem_completion`] hands it once to the BFF or CLI
 //! holding that binding. No request header ever selects a tenant, connection, or redirect.
+//! A candidate connection test
+//! ([`HumanConnections::begin_test`]) writes the same login state, bound to its
+//! tester instead of a browser flow or CLI handoff, and has no completion.
 
 use std::time::Duration;
 
@@ -40,8 +43,8 @@ pub const LOGIN_COMPLETE_PATH: &str = "/login/complete";
 
 /// Lifetime of a persisted login-state row: the browser must complete the `IdP`
 /// round-trip and reach `/auth/callback` within this window or the state is
-/// gone.
-const LOGIN_STATE_TTL: Duration = Duration::from_mins(5);
+/// gone. A candidate test sign-in's state shares it.
+pub(crate) const LOGIN_STATE_TTL: Duration = Duration::from_mins(5);
 
 /// Redemption window of a completed login: the BFF or CLI must redeem the
 /// sealed session within this window after the callback issues it.
@@ -176,7 +179,8 @@ impl HumanConnections {
             .map_err(store_error)?;
         let sealed = redeem_login_completion(&mut conn, &initiation)
             .await
-            .map_err(store_error)?;
+            .map_err(store_error)?
+            .map(|redeemed| redeemed.sealed);
         conn.commit().await.map_err(store_error)?;
         let sealed = sealed.ok_or_else(|| WyrdError::InvalidState {
             message: "no completed login is waiting for this binding".to_owned(),
@@ -213,10 +217,15 @@ pub(crate) fn seal_completion(
 ///
 /// # Errors
 /// Returns [`WyrdError::InvalidState`] with reason `unknown_cli_handoff` for
-/// every CLI handoff id.
+/// every CLI handoff id, and with reason `connection_test` for a connection
+/// test binding, which only [`HumanConnections::begin_test`] writes.
 pub(crate) fn known_initiation(initiation: LoginInitiation) -> Result<LoginInitiation, WyrdError> {
     match initiation {
         LoginInitiation::Browser(_) => Ok(initiation),
+        LoginInitiation::ConnectionTest(_) => Err(WyrdError::InvalidState {
+            message: "a connection test is begun through the candidate test route".to_owned(),
+            details: json!({ "reason": "connection_test" }),
+        }),
         LoginInitiation::Cli(_) => Err(WyrdError::InvalidState {
             message: "the CLI login handoff is unknown or expired; start a new login".to_owned(),
             details: json!({ "reason": "unknown_cli_handoff" }),

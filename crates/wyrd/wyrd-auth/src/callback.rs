@@ -1,9 +1,15 @@
 //! Domain logic for the common human OIDC callback.
 //!
-//! The callback carries only the provider's `code` and `state`. The state's
-//! SHA-256 names one login-state row across tenants; that row alone decides
-//! the tenant, connection revision, issuer, client, redirect, PKCE verifier,
-//! nonce, and initiation binding. No request header takes part.
+//! The callback carries the provider's `code`, `state`, and optional RFC 9207
+//! `iss`. The state's SHA-256 names one login-state row across tenants; that
+//! row alone decides the tenant, connection revision, issuer, client,
+//! redirect, PKCE verifier, nonce, and initiation binding. No request header
+//! takes part. A present `iss` must name that recorded issuer.
+//!
+//! A candidate connection test's state takes the same path against its bound
+//! candidate instead of the Active connection: the code is redeemed and the ID
+//! token verified exactly as a login, and then only that candidate revision is
+//! marked tested. A test issues no session, credential, or User.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -68,7 +74,8 @@ impl std::fmt::Debug for AuthorizationCodeExchange {
 }
 
 impl AuthorizationCodeExchange {
-    /// Complete a login from the provider callback's `code` and `state`.
+    /// Complete a login from the provider callback's `code`, `state`, and
+    /// optional RFC 9207 `iss`.
     ///
     /// The SHA-256 of `state_key` resolves the login's tenant through the
     /// narrow definer lookup; an unknown, expired, or already consumed state
@@ -76,17 +83,28 @@ impl AuthorizationCodeExchange {
     /// tenant the state row is consumed and committed before any provider IO,
     /// so a replayed state never reaches the provider. The bound connection
     /// revision must still be the tenant's Active connection with the recorded
-    /// issuer and client; the code is exchanged with the recorded redirect URI
+    /// issuer and client; the provider's fresh discovery decides whether the
+    /// response must carry `iss`, and [`verify_response_issuer`] binds it to
+    /// the recorded issuer before any token-endpoint request; the code is
+    /// exchanged with the recorded redirect URI
     /// and PKCE verifier; and [`Self::finish_id_token_exchange`] verifies the
     /// token and issues and seals the session. Returns how the login was
     /// initiated, which decides the callback's response: a browser login is
-    /// redirected to the BFF completion route, a CLI login gets a static page.
+    /// redirected to the BFF completion route, a CLI login and a candidate
+    /// connection test get a static page.
+    ///
+    /// A connection test's state is bound to a candidate revision, not the
+    /// Active connection: the provider is discovered from the recorded issuer
+    /// first, and that exact candidate — with the freshly discovered JWKS URI
+    /// it has not stored yet — is the trust the code and ID token are checked
+    /// against ([`HumanConnections::tested_candidate`]).
     ///
     /// # Errors
     /// Returns [`WyrdError::InvalidState`] when the state is unknown, expired,
     /// or replayed; [`WyrdError::Validation`] when no sealing keyring is
     /// configured; [`WyrdError::InvalidToken`] when the bound connection is no
-    /// longer Active or the provider refuses the code;
+    /// longer Active (or, for a test, the bound candidate changed), the response issuer is mismatched or required and
+    /// missing, or the provider refuses the code;
     /// [`WyrdError::DiscoveryUnavailable`] or
     /// [`WyrdError::AuthVerifyUnavailable`] when the provider or store is
     /// unavailable; and the errors of [`Self::finish_id_token_exchange`].
@@ -97,6 +115,7 @@ impl AuthorizationCodeExchange {
         &self,
         code: SecretString,
         state_key: &str,
+        response_issuer: Option<&str>,
         request_id: &str,
     ) -> Result<LoginInitiation, WyrdError> {
         let postgres = self.connections.postgres();
@@ -112,7 +131,7 @@ impl AuthorizationCodeExchange {
             ));
         };
         let result = self
-            .complete(tenant_id, &state_hash, code, request_id)
+            .complete(tenant_id, &state_hash, code, response_issuer, request_id)
             .await;
         if let Err(error) = &result {
             // A refusal rolls back any user it resolved, so the denied event
@@ -132,6 +151,7 @@ impl AuthorizationCodeExchange {
         tenant_id: DataTenantId,
         state_hash: &Sha256Hex,
         code: SecretString,
+        response_issuer: Option<&str>,
         request_id: &str,
     ) -> Result<LoginInitiation, WyrdError> {
         self.connections.require_keyring()?;
@@ -143,9 +163,36 @@ impl AuthorizationCodeExchange {
         conn.commit().await.map_err(store_error)?;
         let login_state = login_state
             .ok_or_else(|| invalid_state("login state is missing, expired, or already consumed"))?;
-        let trusted = self.bound_connection(tenant_id, &login_state).await?;
         let http = self.connections.http();
-        let provider = discover_provider(&trusted.issuer, http).await?;
+        let (trusted, provider) = if let LoginInitiation::ConnectionTest(_) = login_state.initiation
+        {
+            let issuer = IssuerUrl::new(login_state.issuer.as_str()).map_err(|error| {
+                WyrdError::Internal {
+                    message: format!("recorded login issuer does not decode: {error}"),
+                    details: serde_json::json!({}),
+                }
+            })?;
+            let provider = discover_provider(&issuer, http).await?;
+            let trusted = self
+                .connections
+                .tested_candidate(tenant_id, &login_state, &provider.metadata.jwks_uri)
+                .await?
+                .ok_or_else(|| {
+                    invalid_token("the login connection changed while the login was in progress")
+                })?;
+            (trusted, provider)
+        } else {
+            let trusted = self.bound_connection(tenant_id, &login_state).await?;
+            let provider = discover_provider(&trusted.issuer, http).await?;
+            (trusted, provider)
+        };
+        verify_response_issuer(
+            response_issuer,
+            &login_state.issuer,
+            provider
+                .metadata
+                .authorization_response_iss_parameter_supported,
+        )?;
         let id_token = exchange_code_for_id_token(
             &provider,
             &trusted.client_id,
@@ -191,6 +238,13 @@ impl AuthorizationCodeExchange {
     /// consumed state row with a fresh redemption expiry. The session never
     /// leaves this method except sealed. Returns how the login was initiated.
     ///
+    /// A connection test stops after the token checks: instead of the Active
+    /// connection re-check and any user or session work,
+    /// [`HumanConnections::stamp_test_sign_in`] re-checks the tester's
+    /// authority and marks only the bound candidate revision tested with
+    /// `trusted`'s JWKS URI. The consumed test state is left for expiry
+    /// purge; it never carries a completion.
+    ///
     /// # Errors
     /// Returns [`WyrdError::InvalidToken`] when the token's algorithm was not
     /// advertised, the token fails verification or authorized-party checks,
@@ -198,8 +252,9 @@ impl AuthorizationCodeExchange {
     /// [`WyrdError::InvalidNonce`] on a missing or mismatched nonce,
     /// [`WyrdError::InvalidState`] when the state row is no longer consumed
     /// and awaiting completion, [`WyrdError::Validation`] when no sealing
-    /// keyring is configured, and the store, issuance, audit, and sealing
-    /// errors; nothing commits unless every step succeeds, so a failed audit
+    /// keyring is configured, the errors of
+    /// [`HumanConnections::stamp_test_sign_in`] for a connection test, and the
+    /// store, issuance, audit, and sealing errors; nothing commits unless every step succeeds, so a failed audit
     /// append — role sync or token exchange — leaves no role change, session,
     /// refresh row, or completion.
     pub async fn finish_id_token_exchange(
@@ -221,6 +276,18 @@ impl AuthorizationCodeExchange {
             .map_err(auth_error_to_wyrd)?;
         verify_nonce(&login_state.nonce, &verified.raw_claims)?;
         verify_authorized_party(&trusted.client_id, &verified.raw_claims)?;
+        if let LoginInitiation::ConnectionTest(tester) = login_state.initiation {
+            self.connections
+                .stamp_test_sign_in(
+                    tenant_id,
+                    login_state.connection,
+                    tester,
+                    &trusted.jwks_uri,
+                    request_id,
+                )
+                .await?;
+            return Ok(login_state.initiation);
+        }
         self.bound_connection(tenant_id, login_state).await?;
 
         let mut conn = self
@@ -450,10 +517,9 @@ pub(crate) async fn exchange_code_for_id_token(
 /// Build one authorization-code token request with the client's configured
 /// authentication.
 ///
-/// Shared by the login callback's real exchange and candidate testing's
-/// invalid-code probe, so the probe proves exactly the request a login sends:
-/// the same grant form, PKCE verifier, redirect URI, and `client_secret_basic`
-/// or `client_secret_post` placement. Nothing is sent here.
+/// Sends the same grant form, PKCE verifier, redirect URI, and
+/// `client_secret_basic` or `client_secret_post` placement for every login
+/// and candidate test sign-in. Nothing is sent here.
 ///
 /// # Errors
 /// Returns [`WyrdError::Internal`] for `private_key_jwt`, which human
@@ -542,6 +608,36 @@ pub async fn audit_authorization_code_failure(
         },
     );
     record_auth_audit_best_effort(postgres, tenant_id, &event).await;
+}
+
+/// Bind an authorization response to the issuer its login state recorded
+/// (RFC 9207), before the code is sent to any token endpoint.
+///
+/// A present `response_issuer` must equal `expected` by exact string
+/// comparison. An absent one is refused only when the provider's discovery
+/// advertised `authorization_response_iss_parameter_supported`; otherwise the
+/// login proceeds on server-bound state, PKCE, and ID-token issuer
+/// validation, which leaves the residual mix-up exposure documented in the
+/// security posture.
+///
+/// # Errors
+/// Returns [`WyrdError::InvalidToken`] when the response issuer differs from
+/// `expected`, or is missing while `advertised` is `true`.
+pub fn verify_response_issuer(
+    response_issuer: Option<&str>,
+    expected: &str,
+    advertised: bool,
+) -> Result<(), WyrdError> {
+    match response_issuer {
+        Some(issuer) if issuer == expected => Ok(()),
+        Some(_) => Err(invalid_token(
+            "authorization response issuer does not match the login's issuer",
+        )),
+        None if advertised => Err(invalid_token(
+            "authorization response is missing the issuer the provider advertises",
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Require the verified ID token's `nonce` claim to equal the nonce the login
@@ -679,6 +775,37 @@ fn invalid_token(message: &str) -> WyrdError {
     WyrdError::InvalidToken {
         message: message.to_owned(),
         details: serde_json::json!({}),
+    }
+}
+
+/// The RFC 9207 response-issuer decision in isolation.
+#[cfg(test)]
+mod response_issuer_tests {
+    use super::verify_response_issuer;
+
+    /// The issuer a login recorded.
+    const ISSUER: &str = "https://idp.example.com/realms/acme";
+
+    /// A matching `iss` passes whether or not support is advertised; a
+    /// mismatched one (including a trailing-slash variant) is refused either
+    /// way; a missing one is refused only when the provider advertises support.
+    #[test]
+    fn response_issuer_is_bound_exactly_and_required_only_when_advertised() {
+        for advertised in [false, true] {
+            verify_response_issuer(Some(ISSUER), ISSUER, advertised).expect("matching iss passes");
+            for wrong in [
+                "https://evil.example.com",
+                "https://idp.example.com/realms/acme/",
+            ] {
+                let error = verify_response_issuer(Some(wrong), ISSUER, advertised)
+                    .expect_err("mismatched iss is refused");
+                assert_eq!(error.code(), "WYRD_AUTH_401_INVALID_TOKEN");
+            }
+        }
+        let error =
+            verify_response_issuer(None, ISSUER, true).expect_err("required iss is refused");
+        assert_eq!(error.code(), "WYRD_AUTH_401_INVALID_TOKEN");
+        verify_response_issuer(None, ISSUER, false).expect("unadvertised iss may be absent");
     }
 }
 

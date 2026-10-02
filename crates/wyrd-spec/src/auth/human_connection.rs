@@ -2,9 +2,9 @@
 //!
 //! A tenant has at most one `Active` connection that human login trusts and at
 //! most one `Candidate` staged to replace it. The lifecycle is headless:
-//! `PUT /v1/identity/oidc/candidate` stages or rotates, `POST .../test` proves
-//! the exact candidate revision against the provider, and `POST .../activate`
-//! swaps it in. The bearer credential, never a request field, selects the
+//! `PUT /v1/identity/oidc/candidate` stages or rotates, `POST .../test` starts
+//! a real test sign-in that proves the exact candidate revision against the
+//! provider, and `POST .../activate` swaps it in. The bearer credential, never a request field, selects the
 //! tenant.
 //!
 //! Secrets travel inbound only. [`HumanConnectionView`] carries no secret or
@@ -21,7 +21,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::DataTenantId;
-use crate::auth::{ClaimMappingPayload, IssuerTokenPolicy, IssuerUrl, SecretBearer};
+use crate::auth::{AbsoluteUrl, ClaimMappingPayload, IssuerTokenPolicy, IssuerUrl, SecretBearer};
 use crate::error::WyrdError;
 
 /// Wire spelling of the client-authentication method Wyrd does not implement.
@@ -274,13 +274,20 @@ pub struct ConnectionTestRequest {
     pub expected_revision: u64,
 }
 
-/// `POST /v1/identity/oidc/candidate/test` response.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+/// `POST /v1/identity/oidc/candidate/test` response: the test sign-in to
+/// complete.
+///
+/// The candidate is marked tested only when a person completes this real
+/// authorization-code sign-in and the common callback verifies its ID token
+/// exactly as a login; the test issues no session, credential, or user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ConnectionTestResponse {
-    /// The candidate with its fresh test stamp.
-    pub candidate: HumanConnectionView,
+    /// Provider authorization URL that starts the test sign-in. It carries
+    /// one-use state bound to the candidate revision and the caller, and
+    /// expires with that state.
+    pub authorization_url: AbsoluteUrl,
 }
 
 /// `POST /v1/identity/oidc/candidate/activate` body.

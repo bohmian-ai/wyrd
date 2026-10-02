@@ -282,6 +282,23 @@ pub enum IssuanceError {
     SystemScopeInvalid,
 }
 
+impl IssuanceError {
+    /// Whether this is the ordinary lifecycle refusal of a credential that no
+    /// longer issues — an inactive tenant, principal, or exact login
+    /// connection — rather than an internal failure.
+    ///
+    /// A renewing caller ends the credential's session on a refusal; every
+    /// other variant (store, audit, signing, corrupt role, system-principal
+    /// state) is an internal failure that must roll back and stay retryable.
+    #[must_use]
+    pub(crate) fn is_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::TenantNotAdmitting | Self::PrincipalInactive | Self::ConnectionInactive
+        )
+    }
+}
+
 impl From<IssuanceError> for WyrdError {
     fn from(error: IssuanceError) -> Self {
         match error {

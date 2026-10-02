@@ -11331,6 +11331,7 @@ dependencies = [
  "indicatif",
  "opentelemetry",
  "reqwest 0.13.4",
+ "rustix",
  "schemars 0.8.22",
  "secrecy",
  "serde",

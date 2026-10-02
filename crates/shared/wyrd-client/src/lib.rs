@@ -22,6 +22,7 @@ pub mod observe;
 pub mod operator_connections;
 pub mod platform;
 pub mod principals;
+pub mod saved_login;
 pub mod state;
 pub mod storage;
 pub mod transport;

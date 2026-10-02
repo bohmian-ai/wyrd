@@ -68,6 +68,22 @@ pub enum WyrdClientError {
          ~/.config/wyrd/credentials.toml"
     )]
     NoCredentials,
+
+    /// The saved user login for this server and tenant cannot be used:
+    /// selection is ambiguous or names another tenant, the local store is
+    /// unsafe, corrupt, or locked, the login was logged out, or its renewal
+    /// cannot complete safely. Never falls through to another credential.
+    /// Maps to `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` at the public boundary.
+    #[error("saved user login cannot be used ({reason}): {message}")]
+    SavedLogin {
+        /// Stable machine reason, e.g. `"ambiguous"`, `"tenant_mismatch"`,
+        /// `"unsafe_store"`, `"corrupt"`, `"lock_timeout"`,
+        /// `"refresh_pending"`, `"logged_out"`, or `"refresh_refused"`.
+        /// Echoed into the catalog payload's `reason`.
+        reason: &'static str,
+        /// Human-readable description; never carries a secret.
+        message: String,
+    },
 }
 
 impl WyrdClientError {
@@ -82,6 +98,7 @@ impl WyrdClientError {
             Self::Config { .. } => "WYRD_CLIENT_400_CONFIG_INVALID",
             Self::NoCredentials => "WYRD_CLIENT_401_NO_CREDENTIALS",
             Self::TransportDown { .. } => "WYRD_CLIENT_503_TRANSPORT_DOWN",
+            Self::SavedLogin { .. } => "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE",
         }
     }
 }
@@ -111,6 +128,10 @@ impl From<&WyrdClientError> for WyrdError {
             WyrdClientError::TransportDown { transport, .. } => Self::ClientTransportDown {
                 message,
                 details: serde_json::json!({ "transport": transport }),
+            },
+            WyrdClientError::SavedLogin { reason, .. } => Self::ClientSavedLoginUnusable {
+                message,
+                details: serde_json::json!({ "reason": reason }),
             },
         }
     }

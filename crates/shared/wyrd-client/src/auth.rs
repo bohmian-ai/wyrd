@@ -31,7 +31,8 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use wyrd_spec::auth::{
-    ExchangeTokenType, PlatformTokenRequest, PlatformTokenResponse, SecretBearer, TokenAudience,
+    CliHandoff, CliHandoffClaim, CliHandoffProof, CreateCliHandoff, ExchangeTokenType,
+    PlatformTokenRequest, PlatformTokenResponse, RevokeRefreshToken, SecretBearer, TokenAudience,
     TokenRequest, TokenResponse,
 };
 use wyrd_spec::error::WyrdError;
@@ -202,6 +203,96 @@ impl TokenExchange {
         request: &PlatformTokenRequest,
     ) -> Result<PlatformTokenResponse, AuthError> {
         self.post("/auth/platform/token", request).await
+    }
+
+    /// Begin a CLI login handoff at `tenant_route_key`.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Server`] when the tenant offers no SSO login or
+    /// the server refuses, and [`AuthError::Client`] for a transport or decode
+    /// failure.
+    pub async fn begin_cli_handoff(
+        &self,
+        tenant_route_key: &TenantSlug,
+    ) -> Result<CliHandoff, AuthError> {
+        self.post(
+            "/auth/cli-handoffs",
+            &CreateCliHandoff {
+                tenant_route_key: tenant_route_key.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Poll handoff `handoff_id` once with its verifier.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Server`] when the handoff is unknown, expired,
+    /// cancelled, already claimed, or the verifier is wrong, and
+    /// [`AuthError::Client`] for a transport or decode failure.
+    pub async fn claim_cli_handoff(
+        &self,
+        handoff_id: Uuid,
+        proof: &CliHandoffProof,
+    ) -> Result<CliHandoffClaim, AuthError> {
+        self.post(&format!("/auth/cli-handoffs/{handoff_id}/claim"), proof)
+            .await
+    }
+
+    /// Cancel handoff `handoff_id`; idempotent on the server.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Server`] when the server fails and
+    /// [`AuthError::Client`] for a transport failure.
+    pub async fn cancel_cli_handoff(
+        &self,
+        handoff_id: Uuid,
+        proof: &CliHandoffProof,
+    ) -> Result<(), AuthError> {
+        self.post_no_content(&format!("/auth/cli-handoffs/{handoff_id}/cancel"), proof)
+            .await
+    }
+
+    /// Ask the server to end the login `refresh_token` belongs to, so neither
+    /// it nor any successor renews again; idempotent on the server.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Server`] when the server fails and
+    /// [`AuthError::Client`] for a transport failure.
+    pub async fn revoke_refresh_token(
+        &self,
+        refresh_token: &SecretBearer,
+    ) -> Result<(), AuthError> {
+        self.post_no_content(
+            "/auth/revoke",
+            &RevokeRefreshToken {
+                refresh_token: refresh_token.clone(),
+            },
+        )
+        .await
+    }
+
+    /// POST a JSON body to one unauthenticated `/auth` path whose success
+    /// carries no body.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Server`] for a non-success status and
+    /// [`AuthError::Client`] for a transport or decode failure.
+    async fn post_no_content<S: Serialize>(&self, path: &str, body: &S) -> Result<(), AuthError> {
+        let url = format!("{}{path}", self.base_url);
+        let response = self
+            .http
+            .post(&url)
+            .json(body)
+            .send()
+            .await
+            .map_err(transport_down)?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        Self::decode::<serde_json::Value>(response)
+            .await
+            .map(|_| ())
     }
 
     /// POST a JSON body to one unauthenticated `/auth` path and decode the reply.

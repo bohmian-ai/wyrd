@@ -3559,6 +3559,22 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// The saved user login selected for this server and tenant cannot be
+    /// used: selection is ambiguous or names another tenant, the local store
+    /// is unsafe, corrupt, or locked, or its renewal cannot complete safely.
+    #[error("[WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE",
+        status = 401,
+        title = "Saved user login cannot be used",
+        remediation = "Run `wyrd auth login --server <url> --tenant <tenant>` again, select the intended tenant with the client tenant option or WYRD_TENANT, or pass an explicit credential. The details reason names the failure."
+    )]
+    ClientSavedLoginUnusable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload (`{ reason }`).
+        details: serde_json::Value,
+    },
     /// A sealed batch, or a single row, cannot fit under the client's max_message_bytes.
     #[error("[WYRD_CLIENT_413_PAYLOAD_TOO_LARGE] {message}")]
     #[wyrd_error(
@@ -3890,6 +3906,7 @@ impl WyrdError {
             | Self::WorkflowUnsupportedHandoff { message, details }
             | Self::ClientConfigInvalid { message, details }
             | Self::ClientNoCredentials { message, details }
+            | Self::ClientSavedLoginUnusable { message, details }
             | Self::ClientPayloadTooLarge { message, details }
             | Self::ClientRowDeserialization { message, details }
             | Self::ClientQueueFull { message, details }
@@ -4264,6 +4281,7 @@ mod tests {
         ("WYRD_WORKFLOW_501_UNSUPPORTED_HANDOFF", 501),
         ("WYRD_CLIENT_400_CONFIG_INVALID", 400),
         ("WYRD_CLIENT_401_NO_CREDENTIALS", 401),
+        ("WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE", 401),
         ("WYRD_CLIENT_413_PAYLOAD_TOO_LARGE", 413),
         ("WYRD_CLIENT_422_ROW_DESERIALIZATION", 422),
         ("WYRD_CLIENT_429_QUEUE_FULL", 429),

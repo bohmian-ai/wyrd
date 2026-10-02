@@ -20,6 +20,8 @@ A person logs in through the tenant's IdP with the OIDC authorization-code flow,
 
 Set `WYRD_PUBLIC_ORIGIN` to the origin browsers and IdPs reach Wyrd on, for example `https://wyrd.example.com`. The one callback URL every tenant registers at its IdP is `{WYRD_PUBLIC_ORIGIN}/auth/callback`; it is derived from this setting, never from request headers, and is returned read-only as `callback_url`. Without it, connections cannot be staged or tested. A connection client secret needs a [sealing key](/self-hosting/authentication/#sealing-key), which seals it at rest. The web app signs people in as the confidential OAuth client `wyrd-ui`: set `WYRD_UI_CLIENT_SECRET_SHA256` to the lowercase-hex SHA-256 of its client secret (two comma-separated digests during a rotation). Without it, the server accepts no authorization-code grant.
 
+Wyrd does not rate-limit CLI device login. Rate-limit `POST /auth/device`, where a person enters the CLI's user code (RFC 8628 §5.1), per client address at your public ingress.
+
 ### Connection lifecycle
 
 Every route below takes its tenant from the bearer token and requires `identity_connections:write`, which only the tenant `admin` role holds. `service_accounts:write` alone does not grant it. Each allow or refusal is audited before any provider network call.

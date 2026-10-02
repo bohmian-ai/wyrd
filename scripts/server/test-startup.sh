@@ -9,8 +9,7 @@
 #                                exits nonzero, serve stays unready, and the
 #                                retry succeeds without losing tenant data.
 #   startup_image_journey        migrate, serve, idempotent setup, nginx routes
-#                                (API, BFF, health, MCP stream, no authz check,
-#                                per-client device user-code limit),
+#                                (API, BFF, health, MCP stream, no authz check),
 #                                public Rust SDK over HTTP and derived gRPC,
 #                                restart into APP_ENV=production, persistence.
 #
@@ -187,20 +186,6 @@ mcp="$(curl -sS -N --max-time 30 -D - -H "x-wyrd-access-token: Bearer $token" \
   "$http/mcp")"
 grep -qi '^content-type: text/event-stream' <<<"$mcp" || fail "MCP did not stream: $mcp"
 grep -q '"supportedVersions":\["2026-07-28"\]' <<<"$mcp" || fail "MCP discovery returned no supported version: $mcp"
-# RFC 8628 user-code attempts: the gateway limits one client address's
-# `POST /auth/device` burst; another address and other auth routes still pass.
-device_attempt() { curl -s -o /dev/null -w '%{http_code}' -d user_code=WRONGCODE "$http/auth/device"; }
-for attempt in 1 2 3 4 5 6; do
-  [[ "$(device_attempt)" != 429 ]] || fail "device attempt $attempt was limited inside the burst"
-done
-[[ "$(device_attempt)" == 429 ]] || fail "the gateway did not limit excess device user-code attempts"
-[[ "$(curl -s -o /dev/null -w '%{http_code}' -d grant_type=refresh_token "$http/auth/token")" != 429 ]] \
-  || fail "the device limit throttled the token endpoint"
-[[ "$(curl -s -o /dev/null -w '%{http_code}' "$http/auth/device")" != 429 ]] \
-  || fail "the device limit throttled the verification page"
-other_client="$(docker exec "$app" node -e \
-  'fetch("http://127.0.0.1:8080/auth/device",{method:"POST",body:new URLSearchParams({user_code:"WRONGCODE"})}).then(r=>console.log(r.status))')"
-[[ $other_client != 429 ]] || fail "one client's device attempts limited another client address"
 sdk_phase startup_image_write
 passed+=(startup_image_journey:write)
 

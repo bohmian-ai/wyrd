@@ -26,3 +26,12 @@ Correction:
    redemption remain the in-server protections.
 
 `TASK-010-R2-public-edge-device-admission.md` is superseded by this direction.
+
+## Implementation evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Image NGINX device limit deleted | `docker/official/extras/nginx/nginx.conf.template` no longer has the `map`, `limit_req_zone`, `limit_req_status` or `limit_req` lines | `mise run test:server:startup` | PASS |
+| Startup device-limit assertions deleted; owner-only key and single-tenant fixes kept | `scripts/server/test-startup.sh` | `mise run test:server:startup` (write, migration refusal/retry, production verify) | PASS |
+| One operator note | `docs/src/content/docs/self-hosting/sso-and-oidc.svx`, Deployment setup: rate-limit `POST /auth/device` (RFC 8628 §5.1) per client address at the public ingress | `mise run docs:check` | PASS |
+| Nothing else added | Diff limited to the three files above and this record | `mise run fmt`, `mise run lints` | PASS |

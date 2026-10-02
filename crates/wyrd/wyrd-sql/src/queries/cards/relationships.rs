@@ -14,42 +14,53 @@ use crate::tenant_conn::TenantConn;
 
 const RELATION_OUTBOUND: &str = "outbound";
 
-/// Recheck exact external references while holding row locks until registration commits.
+/// Recheck the exact external references preflight validated, holding row
+/// locks until registration commits.
 ///
-/// The preflight resolver runs in a separate transaction. This second check is the
-/// write-time authority: `FOR SHARE` prevents a concurrent lifecycle update or delete
-/// from invalidating the dependency between validation and the relationship insert.
+/// The preflight resolver runs in a separate transaction and validates the
+/// body at each `(CardRef, CardUid)` pair. This second check is the write-time
+/// authority: it locks only the row matching both the exact identity and the
+/// expected UID and requires it to still be Active, so a replacement Card that
+/// took the same identity after preflight is refused rather than bound
+/// unvalidated. `FOR SHARE` then prevents a concurrent lifecycle update or
+/// delete from invalidating the dependency before the relationship insert.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for a reference without a
+/// space, `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` when the expected UID is
+/// no longer the Active row at that identity, and the mapped database error
+/// when the lookup fails. The caller's transaction rolls back on any error.
 pub async fn recheck_active_card_refs(
     conn: &mut TenantConn<'_>,
-    refs: &[CardRef],
+    refs: &[(CardRef, CardUid)],
 ) -> Result<Vec<(CardRef, CardUid)>, WyrdError> {
     let mut resolved = Vec::with_capacity(refs.len());
-    for card_ref in refs {
+    for (card_ref, expected_uid) in refs {
         let space = card_ref.space.as_ref().ok_or_else(|| {
             WyrdError::registry_invalid_card_spec(
                 "CardRef.space is required at the registry boundary",
             )
         })?;
-        let uid = sqlx::query_scalar::<_, Uuid>(
+        let locked = sqlx::query_scalar::<_, Uuid>(
             "SELECT card_uid FROM wyrd.cards \
              WHERE kind = $1 AND space = $2 AND name = $3 AND version = $4 \
-               AND status = 'active' \
+               AND card_uid = $5 AND status = 'active' \
              FOR SHARE",
         )
         .bind(card_ref.kind.wire_name())
         .bind(space.as_str())
         .bind(card_ref.name.as_str())
         .bind(card_ref.version.as_str())
+        .bind(expected_uid.as_uuid())
         .fetch_optional(&mut **conn.transaction())
         .await
         .map_err(registry_db_error)?;
-        let Some(uid) = uid else {
+        if locked.is_none() {
             return Err(unresolved_dependency(card_ref));
-        };
-        let uid = CardUid::from_uuid(uid).map_err(WyrdError::from_card_uid_error)?;
+        }
         let mut resolved_ref = card_ref.clone();
-        resolved_ref.uid = Some(uid.clone());
-        resolved.push((resolved_ref, uid));
+        resolved_ref.uid = Some(expected_uid.clone());
+        resolved.push((resolved_ref, expected_uid.clone()));
     }
     Ok(resolved)
 }

@@ -671,7 +671,7 @@ async fn relationship_recheck_blocks_target_lifecycle_race() {
         .tenant_conn()
         .await
         .expect("registration connection opens");
-    let resolved = recheck_active_card_refs(&mut registration_conn, &[target_ref])
+    let resolved = recheck_active_card_refs(&mut registration_conn, &[(target_ref, target_uid.clone())])
         .await
         .expect("active target rechecks");
     assert_eq!(resolved[0].1, target_uid);

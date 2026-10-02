@@ -18,6 +18,7 @@ use skald_workflow::{
     WorkflowExecutionDependencies, WorkflowRunOptions, WorkflowRunStatus, WyrdGatewayCall,
     WyrdGatewayCaller,
 };
+use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::cards::Cards;
@@ -27,6 +28,7 @@ use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_client::{WorkflowLoader, WyrdClient};
 use wyrd_loader::{build_registration_input, load};
+use wyrd_spec::card::workflow::WorkflowAction;
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardUid, DataTenantId};
@@ -46,6 +48,13 @@ struct ReviewGateway {
 #[async_trait]
 impl WyrdGatewayCaller for ReviewGateway {
     /// Record the request and answer with the fixed review for its reviewer.
+    ///
+    /// # Errors
+    /// Never returns an error; every request receives its fixed review.
+    ///
+    /// # Panics
+    /// Panics if the request cannot serialize or the static completion
+    /// fixture stops decoding, both test-fixture invariants.
     async fn call(
         &self,
         call: WyrdGatewayCall,
@@ -94,21 +103,23 @@ fn bundle() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../examples/workflows/code-review")
 }
 
-/// Copy the bundle into a temp directory, applying `agent_edit` to each Agent
-/// file and `workflow_edit` to the Workflow file.
+/// Copy the bundle into a temp directory, applying `card_edit` to each Agent
+/// and Prompt file and `workflow_edit` to the Workflow file.
 ///
 /// # Panics
 /// Panics when a bundle file cannot be read or written.
 fn edited_bundle(
-    agent_edit: impl Fn(String) -> String,
+    card_edit: impl Fn(String) -> String,
     workflow_edit: impl Fn(String) -> String,
-) -> tempfile::TempDir {
-    let temp = tempfile::TempDir::new().expect("temp directory creates");
-    std::fs::create_dir(temp.path().join("agents")).expect("agents directory creates");
-    for agent in ["security", "correctness", "final-reviewer"] {
-        let file = format!("agents/{agent}.yaml");
-        let body = std::fs::read_to_string(bundle().join(&file)).expect("agent reads");
-        std::fs::write(temp.path().join(&file), agent_edit(body)).expect("agent writes");
+) -> TempDir {
+    let temp = TempDir::new().expect("temp directory creates");
+    for dir in ["agents", "prompts"] {
+        std::fs::create_dir(temp.path().join(dir)).expect("bundle directory creates");
+        for card in ["security", "correctness", "final-reviewer"] {
+            let file = format!("{dir}/{card}.yaml");
+            let body = std::fs::read_to_string(bundle().join(&file)).expect("card reads");
+            std::fs::write(temp.path().join(&file), card_edit(body)).expect("card writes");
+        }
     }
     let workflow = std::fs::read_to_string(bundle().join("workflow.yaml")).expect("workflow reads");
     std::fs::write(temp.path().join("workflow.yaml"), workflow_edit(workflow))
@@ -135,12 +146,29 @@ fn external_targets(workflow: String) -> String {
     })
 }
 
+/// Insert a step before `correctness` that runs the Agent `name@1.0.0`
+/// through an external `ref:` with the same `code` binding.
+fn add_registered_step(workflow: &str, id: &str, name: &str) -> String {
+    workflow.replacen(
+        "    - id: correctness",
+        &format!(
+            "    - id: {id}\n      action:\n        type: agent\n        target:\n          ref:\n            kind: Agent\n            name: {name}\n            version: \"1.0.0\"\n      inputs:\n        code: input.code\n\n    - id: correctness"
+        ),
+        1,
+    )
+}
+
 /// Rename the Workflow so each registration attempt has a distinct identity.
 fn rename_workflow(workflow: &str, name: &str) -> String {
     workflow.replacen("name: code-review", &format!("name: {name}"), 1)
 }
 
-/// Build an exact Card reference from its wire fields.
+/// Build an exact Card reference in the bundle's `engineering` space from its
+/// wire fields.
+///
+/// # Panics
+/// Panics when the fields do not decode as a Card reference, which is a
+/// fixture invariant of every caller.
 fn card_ref(kind: &str, name: &str, version: &str, uid: Option<&CardUid>) -> CardRef {
     serde_json::from_value(json!({
         "kind": kind,
@@ -237,6 +265,9 @@ async fn count(server: &WyrdTestServer, sql: &'static str, binds: &[&str]) -> i6
 }
 
 /// Count every registration operation this tenant has recorded.
+///
+/// # Panics
+/// Panics when the tenant count query fails.
 async fn operation_count(server: &WyrdTestServer) -> i64 {
     count(
         server,
@@ -246,7 +277,10 @@ async fn operation_count(server: &WyrdTestServer) -> i64 {
     .await
 }
 
-/// Count Card rows named `name`.
+/// Count Card rows named `name`, in any lifecycle state.
+///
+/// # Panics
+/// Panics when the tenant count query fails.
 async fn card_count(server: &WyrdTestServer, name: &str) -> i64 {
     count(
         server,
@@ -306,10 +340,17 @@ async fn refused_registration(
 }
 
 #[tokio::test(flavor = "current_thread")]
-/// Composite registration stores exact Workflow relationships and locked
-/// Agent/Prompt refs, accepts Native and built-in tool declarations, and
-/// refuses invalid bindings, outputs, and routes identically for sibling and
-/// external dependencies without any durable write.
+/// Composite registration stores the checked-in bundle's exact Workflow,
+/// Agent, and Prompt versions with UID-bearing Workflow-to-Agent and
+/// Agent-to-Prompt refs and relationships, accepts Native and built-in tool
+/// declarations, and refuses invalid bindings, outputs, and routes
+/// identically for sibling and external dependencies without any durable
+/// write. An external ref sharing a sibling's identity is validated against
+/// its own registered body.
+///
+/// # Panics
+/// Panics when any registration outcome, stored ref, relationship row, or
+/// refusal diverges from the asserted contract.
 async fn registers_only_valid_explicit_workflow_graphs() {
     let storage_root = tempfile::tempdir().expect("storage root creates");
     let (server, jwt) = start_server(storage_root.path()).await;
@@ -319,12 +360,13 @@ async fn registers_only_valid_explicit_workflow_graphs() {
         .register_from_path(&bundle().join("workflow.yaml"))
         .await
         .expect("code-review bundle registers");
-    assert_eq!(receipt.outcomes.len(), 4);
+    assert_eq!(receipt.outcomes.len(), 7);
     assert!(
         receipt
             .outcomes
             .iter()
-            .all(|outcome| outcome.status == CardLifecycleStatus::Active)
+            .all(|outcome| outcome.status == CardLifecycleStatus::Active
+                && outcome.card_ref.version.to_string() == "1.0.0")
     );
     let workflow_uid = outcome_uid(&receipt, "code-review");
     let agent_uids: Vec<CardUid> = [
@@ -350,7 +392,7 @@ async fn registers_only_valid_explicit_workflow_graphs() {
         .steps
         .iter()
         .map(|step| {
-            let wyrd_spec::card::workflow::WorkflowAction::Agent(target) = &step.action;
+            let WorkflowAction::Agent(target) = &step.action;
             let InlineableRef::Ref(target) = target else {
                 panic!("registration must lock every step target to a UID-bearing ref");
             };
@@ -369,22 +411,58 @@ async fn registers_only_valid_explicit_workflow_graphs() {
             .iter()
             .all(|target| target.version.to_string() == "1.0.0")
     );
-    let relationships: Vec<(String, String, String, uuid::Uuid)> = sqlx::query_as(
-        "SELECT target_kind, target_name, target_version, target_uid \
-         FROM wyrd.card_relationships WHERE card_uid = $1 ORDER BY target_name",
-    )
-    .bind(workflow_uid.as_uuid())
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("Workflow relationships read");
-    conn.commit().await.expect("assertion transaction commits");
-    assert_eq!(relationships.len(), 3);
-    for (kind, name, version, uid) in &relationships {
+    let relationships = |uid: &CardUid| {
+        sqlx::query_as::<_, (String, String, String, uuid::Uuid)>(
+            "SELECT target_kind, target_name, target_version, target_uid \
+             FROM wyrd.card_relationships WHERE card_uid = $1 ORDER BY target_name",
+        )
+        .bind(uid.as_uuid())
+    };
+    let workflow_relationships = relationships(&workflow_uid)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("Workflow relationships read");
+    assert_eq!(workflow_relationships.len(), 3);
+    for (kind, name, version, uid) in &workflow_relationships {
         assert_eq!(kind, "Agent");
         assert_eq!(version, "1.0.0");
-        let expected = outcome_uid(&receipt, name);
-        assert_eq!(uid, &expected.as_uuid());
+        assert_eq!(uid, &outcome_uid(&receipt, name).as_uuid());
     }
+    for (agent, prompt) in [
+        ("security-reviewer", "security-review-prompt"),
+        ("correctness-reviewer", "correctness-review-prompt"),
+        ("final-reviewer", "final-review-prompt"),
+    ] {
+        let agent_uid = outcome_uid(&receipt, agent);
+        let prompt_uid = outcome_uid(&receipt, prompt);
+        let stored = get_card_by_uid(&mut conn, &agent_uid)
+            .await
+            .expect("registered Agent loads");
+        let Spec::Agent(spec) = stored.spec else {
+            panic!("{agent} is not an Agent");
+        };
+        let InlineableRef::Ref(locked) = spec.prompt else {
+            panic!("{agent} must lock its Prompt to a UID-bearing ref");
+        };
+        assert_eq!(locked.name.as_str(), prompt);
+        assert_eq!(locked.version.to_string(), "1.0.0");
+        assert_eq!(locked.uid, Some(prompt_uid.clone()));
+        let rows = relationships(&agent_uid)
+            .fetch_all(&mut **conn.transaction())
+            .await
+            .expect("Agent relationships read");
+        assert_eq!(
+            rows,
+            vec![(
+                "Prompt".to_owned(),
+                prompt.to_owned(),
+                "1.0.0".to_owned(),
+                prompt_uid.as_uuid()
+            )],
+            "{agent}"
+        );
+    }
+    conn.commit().await.expect("assertion transaction commits");
 
     let tooling = tempfile::tempdir().expect("tooling bundle creates");
     std::fs::write(
@@ -519,13 +597,49 @@ async fn registers_only_valid_explicit_workflow_graphs() {
             assert_eq!(card_count(&server, &name).await, 0, "{label}: {name}");
         }
     }
+
+    let registered = tempfile::tempdir().expect("registered Agent workspace creates");
+    std::fs::write(
+        registered.path().join("agent.yaml"),
+        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  space: engineering\n  name: collision-reviewer\n  version: \"1.0.0\"\nspec:\n  prompt:\n    inline:\n      model: gpt-5-5\n      request:\n        model: gpt-5-5\n        messages:\n          - role: user\n            content: \"Inspect {{diff}}\"\n      variables: [diff]\n      response_type: text\n",
+    )
+    .expect("registered Agent writes");
+    cards
+        .register_from_path(&registered.path().join("agent.yaml"))
+        .await
+        .expect("incompatible registered Agent registers");
+    let operations = operation_count(&server).await;
+    let collision = edited_bundle(
+        |card| card.replace("name: security-reviewer", "name: collision-reviewer"),
+        |yaml| {
+            rename_workflow(
+                &add_registered_step(&yaml, "registered_collision", "collision-reviewer"),
+                "collision-review",
+            )
+        },
+    );
+    let error = cards
+        .register_from_path(&collision.path().join("workflow.yaml"))
+        .await
+        .expect_err("the external slot validates its own registered body");
+    assert_eq!(error.code(), "WYRD_WORKFLOW_422_VALIDATION", "{error}");
+    assert!(error.to_string().contains("steps[1]"), "{error}");
+    assert_eq!(operation_count(&server).await, operations);
+    assert_eq!(card_count(&server, "collision-review").await, 0);
+    assert_eq!(card_count(&server, "collision-reviewer").await, 1);
     server.shutdown().await.expect("test server shuts down");
 }
 
 #[tokio::test(flavor = "current_thread")]
 /// A registered Workflow is fetched over HTTP at its exact locked versions and
-/// executed locally; newer Agent versions never float in, and missing,
-/// foreign, mismatched, non-exact, and inactive references are refused.
+/// executed locally; newer Agent versions never float in, a local sibling and
+/// an external ref with the same identity each run their own body, and
+/// missing, foreign, mismatched, non-exact, and inactive references are
+/// refused.
+///
+/// # Panics
+/// Panics when registration, loading, execution, or any refusal diverges
+/// from the asserted contract.
 async fn fetches_and_executes_locked_workflow_graph() {
     let storage_root = tempfile::tempdir().expect("storage root creates");
     let (server, jwt) = start_server(storage_root.path()).await;
@@ -537,16 +651,25 @@ async fn fetches_and_executes_locked_workflow_graph() {
     let workflow_uid = outcome_uid(&receipt, "code-review");
     let security_uid = outcome_uid(&receipt, "security-reviewer");
 
+    // The newer Agent sits at the workspace root so its Prompt path stays
+    // inside the loader's workspace.
     let newer = tempfile::tempdir().expect("newer Agent workspace creates");
-    let security = std::fs::read_to_string(bundle().join("agents/security.yaml"))
-        .expect("security Agent reads")
-        .replacen("version: \"1.0.0\"", "version: \"2.0.0\"", 1)
-        .replacen("You are a security reviewer.", "You are a v2 auditor.", 1);
-    std::fs::write(newer.path().join("security.yaml"), security).expect("newer Agent writes");
+    std::fs::create_dir(newer.path().join("prompts")).expect("newer directory creates");
+    for (source, target) in [
+        ("agents/security.yaml", "security.yaml"),
+        ("prompts/security.yaml", "prompts/security.yaml"),
+    ] {
+        let body = std::fs::read_to_string(bundle().join(source))
+            .expect("security Card reads")
+            .replacen("version: \"1.0.0\"", "version: \"2.0.0\"", 1)
+            .replacen("You are a security reviewer.", "You are a v2 auditor.", 1)
+            .replacen("../prompts/", "prompts/", 1);
+        std::fs::write(newer.path().join(target), body).expect("newer Card writes");
+    }
     cards
         .register_from_path(&newer.path().join("security.yaml"))
         .await
-        .expect("newer security Agent registers");
+        .expect("newer security Agent and Prompt register");
 
     let loader = WorkflowLoader::new(Arc::new(ToolRegistry::new()))
         .with_client(registry_client(&server, &jwt));
@@ -608,6 +731,38 @@ async fn fetches_and_executes_locked_workflow_graph() {
     );
     assert!(local_run.workflow.is_none());
     assert_eq!(gateway.requests().len(), 6);
+
+    let shadowed = edited_bundle(
+        |card| card.replacen("You are a security reviewer.", "You are a local auditor.", 1),
+        |yaml| add_registered_step(&yaml, "registered_security", "security-reviewer"),
+    );
+    let shadowed = loader
+        .load_file(&shadowed.path().join("workflow.yaml"))
+        .await
+        .expect("a sibling and a same-identity external ref load side by side");
+    let shadow_gateway = Arc::new(ReviewGateway::default());
+    let shadow_dependencies =
+        WorkflowExecutionDependencies::new(skald_runtime::ProviderRegistry::new())
+            .with_wyrd_gateway(Arc::clone(&shadow_gateway) as Arc<dyn WyrdGatewayCaller>);
+    let shadow_run = shadowed
+        .run_with_options(&shadow_dependencies, input(), WorkflowRunOptions::default())
+        .await
+        .expect("shadowed run starts");
+    assert_eq!(shadow_run.status, WorkflowRunStatus::Succeeded);
+    let shadow_requests = shadow_gateway.requests();
+    assert_eq!(shadow_requests.len(), 4);
+    assert!(
+        shadow_requests
+            .iter()
+            .any(|request| request.contains("You are a local auditor.")),
+        "the sibling step runs its local body"
+    );
+    assert!(
+        shadow_requests
+            .iter()
+            .any(|request| request.contains("You are a security reviewer.")),
+        "the external step runs the registered body"
+    );
 
     let refusals = [
         (
@@ -693,5 +848,128 @@ async fn fetches_and_executes_locked_workflow_graph() {
         "refused loads dispatch nothing"
     );
 
+    server.shutdown().await.expect("test server shuts down");
+}
+
+#[tokio::test(flavor = "current_thread")]
+/// A registration whose preflight validated Agent UID A is refused when UID B
+/// replaces A at the same identity before the write transaction rechecks it:
+/// nothing commits, and a fresh request validates B on its own.
+///
+/// The test holds the tenant's audit chain-head row lock, which the write
+/// transaction takes before its dependency recheck, so the replacement lands
+/// strictly after preflight committed and before the write-time recheck.
+///
+/// # Panics
+/// Panics when the interleaving cannot be established, the stale plan is not
+/// refused with `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY`, anything durable
+/// commits, or the fresh request is not refused by Workflow validation.
+async fn refuses_stale_preflight_after_dependency_replacement() {
+    let storage_root = tempfile::tempdir().expect("storage root creates");
+    let (server, jwt) = start_server(storage_root.path()).await;
+    let cards = Cards::with_client(registry_client(&server, &jwt));
+    let receipt = cards
+        .register_from_path(&bundle().join("workflow.yaml"))
+        .await
+        .expect("code-review bundle registers");
+    let validated_uid = outcome_uid(&receipt, "security-reviewer");
+    let stale = edited_bundle(
+        |card| card,
+        |yaml| rename_workflow(&external_targets(yaml), "stale-plan"),
+    );
+    let operations = operation_count(&server).await;
+
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    let mut replacement = pool.begin().await.expect("replacement transaction begins");
+    sqlx::query("SELECT 1 FROM vala.audit_chain_head WHERE data_tenant_id = $1 FOR UPDATE")
+        .bind(server.data_tenant_id().as_uuid())
+        .fetch_one(&mut *replacement)
+        .await
+        .expect("audit chain head locks");
+
+    let stale_path = stale.path().join("workflow.yaml");
+    let stale_cards = cards.clone();
+    let registration =
+        tokio::spawn(async move { stale_cards.register_from_path(&stale_path).await });
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE wait_event_type = 'Lock' AND query LIKE '%FROM vala.audit_chain_head%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("lock waiters read");
+            if waiting > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the registration write waits behind the audit chain head");
+
+    let replacement_uid = uuid::Uuid::now_v7();
+    sqlx::query("UPDATE wyrd.cards SET status = 'deleted' WHERE card_uid = $1")
+        .bind(validated_uid.as_uuid())
+        .execute(&mut *replacement)
+        .await
+        .expect("validated Agent deletes");
+    sqlx::query(
+        "INSERT INTO wyrd.cards \
+            (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status) \
+         SELECT $1, data_tenant_id, kind, space, name, version, \
+                jsonb_set(spec, '{prompt}', $2::jsonb), 'replacement-spec-hash', 'active' \
+         FROM wyrd.cards WHERE card_uid = $3",
+    )
+    .bind(replacement_uid)
+    .bind(json!({
+        "model": "gpt-5-5",
+        "request": {
+            "model": "gpt-5-5",
+            "messages": [{ "role": "user", "content": "Inspect {{diff}}" }]
+        },
+        "variables": ["diff"],
+        "response_type": "text"
+    }))
+    .bind(validated_uid.as_uuid())
+    .execute(&mut *replacement)
+    .await
+    .expect("replacement Agent activates at the same identity");
+    replacement
+        .commit()
+        .await
+        .expect("replacement commits and releases the lock");
+
+    let error = registration
+        .await
+        .expect("registration task joins")
+        .expect_err("the stale preflight plan is refused");
+    assert_eq!(
+        error.code(),
+        "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY",
+        "{error}"
+    );
+    assert_eq!(operation_count(&server).await, operations);
+    assert_eq!(card_count(&server, "stale-plan").await, 0);
+    let inbound: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.card_relationships WHERE target_uid = $1",
+    )
+    .bind(replacement_uid)
+    .fetch_one(&pool)
+    .await
+    .expect("replacement relationships read");
+    assert_eq!(inbound, 0);
+
+    let error = cards
+        .register_from_path(&stale.path().join("workflow.yaml"))
+        .await
+        .expect_err("a fresh request validates the replacement body");
+    assert_eq!(error.code(), "WYRD_WORKFLOW_422_VALIDATION", "{error}");
+    assert_eq!(operation_count(&server).await, operations);
     server.shutdown().await.expect("test server shuts down");
 }

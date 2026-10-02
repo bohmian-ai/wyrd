@@ -1,6 +1,6 @@
 ---
 id: SPEC-skald-workflow-runtime
-revision: 9
+revision: 10
 status: approved
 ---
 
@@ -1003,15 +1003,17 @@ never reused by another step, so the existing Agent loop needs no Workflow
 awareness and concurrent steps cannot exchange call metadata.
 
 To preserve canonical remote errors through the existing Agent `Provider`
-interface, `ProviderError` adds one generic redacted variant:
+interface, `ProviderError` adds one generic redacted variant carrying a boxed
+public payload, `RemoteProblem(Box<RemoteProblem>)`, so `ProviderError` stays
+within the repository's large-error lint:
 
 ```rust
-RemoteProblem {
-    code: String,
-    status: u16,
-    message: String,
-    field: Option<String>,
-    remediation: String,
+pub struct RemoteProblem {
+    pub code: String,
+    pub status: u16,
+    pub message: String,
+    pub field: Option<String>,
+    pub remediation: String,
 }
 ```
 
@@ -1249,7 +1251,7 @@ pub struct ExternalGatewayBinding {
     pub name: CredentialBindingName,
     pub protocol: ExternalGatewayProtocol,
     pub origin: Url,
-    pub secret_headers: BTreeMap<HeaderName, SecretString>,
+    pub secret_headers: HashMap<HeaderName, SecretString>,
 }
 
 pub struct ExternalGatewayBindings {
@@ -2442,7 +2444,7 @@ retried after restart.
 
 ## Open material decisions
 
-None in approved Revision 9. The user approved all seven readiness-review
+None in approved Revision 10; Revision 10 only fixes two unimplementable public seams (see Revision history), approved by the user on 2026-10-02. The user approved all seven readiness-review
 recommendations on 2026-10-01, including replacement of unshipped implicit
 local behavior without migration documentation, and requested their explicit
 incorporation, then explicitly instructed approval of the revised spec before
@@ -2473,6 +2475,13 @@ before implementation planning.
 
 ## Revision history
 
+- **Revision 10 — approved (2026-10-02):** Fixes two public seams that
+  Revision 9 could not implement as written (TASK-001 review r1,
+  FIND-TASK-001-3/4). `ExternalGatewayBinding.secret_headers` is
+  `HashMap<HeaderName, SecretString>` because `HeaderName` has no `Ord` and
+  header order is not observable. `ProviderError::RemoteProblem` is the tuple
+  variant `RemoteProblem(Box<RemoteProblem>)` over a public struct with the same
+  five fields, keeping `ProviderError` within clippy `result_large_err`.
 - **Revision 9 — approved (2026-10-01):** Rebases against the current parent and
   incorporates all seven user-approved readiness recommendations. Uses native
   Prompt `request` examples and explains original-input, predecessor-text, and

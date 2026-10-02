@@ -3,7 +3,7 @@ id: TASK-003
 kind: implementation
 status: ready
 spec: SPEC-skald-workflow-runtime
-spec_revision: 9
+spec_revision: 10
 requirements: [REQ-024, REQ-031, REQ-036A, REQ-038, REQ-039, REQ-043, REQ-045, REQ-046, INV-004, INV-007, INV-011, INV-012, INV-020, AC-011A, AC-012, AC-013, AC-019]
 depends_on: [TASK-001]
 ---
@@ -205,7 +205,7 @@ error normalization, Python-enabled Rust/TS dependency cone or polling knobs.
 
 ## Authority Links
 
-- [Approved Revision 9](../spec.md); [TASK-001](TASK-001-explicit-local-runtime.md)
+- [Approved Revision 10](../spec.md); [TASK-001](TASK-001-explicit-local-runtime.md)
 - `AGENTS.md`; `architecture/agent-rules.md`
 - `architecture/wyrd-design.md`; `architecture/wyrd-security-posture.md`
 - `architecture/references/languages/{agent-harness,errors,spec-driven-development,implementation-execution,testing-workflows}.md`

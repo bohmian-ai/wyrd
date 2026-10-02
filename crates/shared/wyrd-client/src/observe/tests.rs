@@ -791,6 +791,31 @@ fn drift_refuses_unsupported_inputs() {
     }
 }
 
+/// Foreign JSON integer literals beyond 64-bit range are refused from the text,
+/// while in-range integers, large float literals, and non-object roots are left
+/// to the feature-map checks.
+///
+/// # Panics
+/// Panics when an out-of-range literal is admitted or a valid one is refused.
+#[test]
+fn drift_json_refuses_integer_literals_beyond_64_bits() {
+    for text in [
+        "{\"count\": 18446744073709551616}",
+        "{\"count\": -18446744073709551616}",
+        "{\"count\": 1180591620717411303424}",
+    ] {
+        let error = drift::check_integer_literals(text)
+            .expect_err(&format!("{text} must be refused before parsing"));
+        assert_eq!(error.code(), "WYRD_SDK_400_INVALID_OBSERVATION", "{text}");
+    }
+    for text in [
+        "{\"count\": 3, \"latency\": 1.5e20, \"big\": 9223372036854775808}",
+        "[1, 2]",
+    ] {
+        drift::check_integer_literals(text).expect("left to the feature-map checks");
+    }
+}
+
 /// A non-finite float cannot even reach JSON, so it is refused at the door.
 #[test]
 fn drift_refuses_non_finite_floats() {

@@ -139,3 +139,73 @@ At minimum, add or extend focused proof for:
 - all previously named TASK-009 tests with exact selectors.
 
 Then run the original TASK-009 broader verification set applicable to the touched final surfaces, including the unfiltered identity journey, shared and Wyrd server suites, principal integration, codegen, docs, formatting, lints, language format/lint/unit/typecheck/integration lanes, SDK/CLI journeys, N-API check, client/PyO3/unwrap boundaries, and `check:workspace-hack`. If the remediation changes only Rust and generated contracts, omit unrelated language runtime lanes only when TASK-009's existing evidence remains valid and record the source-based reason; do not rerun a lane solely because of the already-resolved generated-only `9ef532660` delta.
+
+## Remediation Evidence
+
+Candidate: `0b516e235` (code), on base `35a53faa2`. `FIND-TASK-009-5` is withdrawn by
+`lead-direction-FIND-TASK-009-5.md`; the `oauth2` error display stays as shipped.
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-009-1` | One `PlatformLogin` built in `boot::install_auth` (and `wyrd-testing` server), held in `ServerAuth::platform_login`, read by `components::platform::identity::login_service` for begin and callback | `platform_admin_e2e::federated_platform_sign_in_runs_through_the_served_callback` step 5: discovery and JWKS answer 503 after begin, callback returns 200 with 0 discovery/JWKS requests | PASS |
+| `FIND-TASK-009-2` | `PlatformCallbackRequest.iss` (optional, RFC 9207); `PlatformLogin::complete` calls `callback::verify_response_issuer` with the cached `authorization_response_iss_parameter_supported` before redemption | same journey steps 2 and 4: missing iss and another issuer's iss → 401 with 0 `/token` requests; exact iss → 200 session that creates a tenant, `GET /v1/cards` → 401 | PASS |
+| `FIND-TASK-009-3` | `ScreenedHttp::provider_metadata` (typed `openidconnect::ProviderMetadata`, one screened GET, no JWKS); used by `boot::issuer::discover_with_retry` and `admin::routes::discover_jwks_uri` | `boot::issuer::pg_tests::issuer_boot_discovery_happy_path_fills_jwks_uri` and `..._recovers_after_transient_blip` (JWKS 503, 0 JWKS requests); `components::admin::routes::pg_tests::create_persists_sealed_secret_and_get_redacts` (JWKS 503, 0 requests); workload verification unchanged on `ExternalVerifier` (`test:wyrd`, `test:identity:journey`) | PASS |
+| `FIND-TASK-009-4` | `RelyingParty::cached` uses Moka `try_get_with`; unknown `kid` invalidates and re-enters `cached` once | RED (old get+discover): `overlapping_cache_misses_share_one_discovery` saw 8 discoveries vs 1; `concurrent_rotated_key_redemptions_share_one_refresh` failed. GREEN: both pass; `a_still_unknown_key_fails_after_one_rediscovery` passes | PASS |
+| `FIND-TASK-009-6` | `CodeRedemption.audience` removed; verifier audience = `client_id`; `platform.oidc_connection.expected_audience` dropped (migration `20261002000001`); request/view fields removed | journey step 1 (configure with `expected_audience` → 4xx; view has none) and step 3 (token for another client → 401); `id_token_refusals_fail_closed`; `pg_platform_identity::pg_tests::configuring_the_connection_again_replaces_it`; `codegen:check` 0 | PASS |
+| `FIND-TASK-009-7` | `RelyingParty::http` deleted | workspace compiles (`lints` 0) | PASS |
+| `FIND-TASK-009-8` | `RANDOM_VALUE_BYTES` deleted; `CsrfToken::new_random`, `Nonce::new_random`; PKCE `new_random_sha256` | `the_authorization_request_carries_state_nonce_and_pkce` | PASS |
+| `FIND-TASK-009-9` | `connections.rs` `require_usable_jwks` and `not_tested_reason` carry their own rustdoc | `lints` 0 (review by reading) | PASS |
+| `FIND-TASK-009-10` | exact selectors below | all exit 0, each selects exactly 1 test | PASS |
+
+RED was run for `FIND-TASK-009-4` only. For 1, 2, 3 and 6 the new assertions
+(0 requests during an outage, `iss` in the callback body, 0 JWKS requests,
+no audience input) cannot hold on the reviewed candidate by construction: it
+built a fresh `PlatformLogin` per request, its callback request denied unknown
+fields, and its setup called the JWKS-fetching `discover`.
+
+Exact named tests (candidate `0b516e235`, inside `scripts/postgres/with-test-postgres.sh`
+after `mise run db:migrate:all:inner` where Postgres is needed). Every line exited 0
+and reported `1 test run: 1 passed`:
+
+```
+mise exec -- cargo nextest run --locked -p wyrd-auth-oidc --lib -E 'test(=relying_party::tests::a_mismatched_issuer_is_refused)' => exit=0, 1 test run: 1 passed, 46 skipped
+mise exec -- cargo nextest run --locked -p wyrd-auth-oidc --lib -E 'test(=relying_party::tests::a_provider_outage_fails_closed)' => exit=0, 1 test run: 1 passed, 46 skipped
+mise exec -- cargo nextest run --locked -p wyrd-auth-oidc --lib -E 'test(=relying_party::tests::a_redirecting_token_endpoint_is_refused_without_following)' => exit=0, 1 test run: 1 passed, 46 skipped
+mise exec -- cargo nextest run --locked -p wyrd-auth-oidc --lib -E 'test(=relying_party::tests::a_still_unknown_key_fails_after_one_rediscovery)' => exit=0, 1 test run: 1 passed, 46 skipped
+mise exec -- cargo nextest run --locked -p wyrd-auth-oidc --lib -E 'test(=relying_party::tests::a_valid_id_token_maps_its_identity)' => exit=0, 1 test run: 1 passed, 46 skipped
+mise exec -- cargo nextest run --locked -p wyrd-auth-oidc --lib -E 'test(=relying_party::tests::an_unadvertised_signing_algorithm_is_refused)' => exit=0, 1 test run: 1 passed, 46 skipped
+mise exec -- cargo nextest run --locked -p wyrd-auth-oidc --lib -E 'test(=relying_party::tests::an_unknown_key_rediscovers_exactly_once)' => exit=0, 1 test run: 1 passed, 46 skipped
+mise exec -- cargo nextest run --locked -p wyrd-auth-oidc --lib -E 'test(=relying_party::tests::an_unsafe_issuer_is_refused_before_any_request)' => exit=0, 1 test run: 1 passed, 46 skipped
+mise exec -- cargo nextest run --locked -p wyrd-auth-oidc --lib -E 'test(=relying_party::tests::an_unsafe_key_set_url_is_refused_before_any_request)' => exit=0, 1 test run: 1 passed, 46 skipped
+mise exec -- cargo nextest run --locked -p wyrd-auth-oidc --lib -E 'test(=relying_party::tests::concurrent_rotated_key_redemptions_share_one_refresh)' => exit=0, 1 test run: 1 passed, 46 skipped
+mise exec -- cargo nextest run --locked -p wyrd-auth-oidc --lib -E 'test(=relying_party::tests::id_token_refusals_fail_closed)' => exit=0, 1 test run: 1 passed, 46 skipped
+mise exec -- cargo nextest run --locked -p wyrd-auth-oidc --lib -E 'test(=relying_party::tests::overlapping_cache_misses_share_one_discovery)' => exit=0, 1 test run: 1 passed, 46 skipped
+mise exec -- cargo nextest run --locked -p wyrd-auth-oidc --lib -E 'test(=relying_party::tests::the_authorization_request_carries_state_nonce_and_pkce)' => exit=0, 1 test run: 1 passed, 46 skipped
+mise exec -- cargo nextest run --locked -p wyrd-auth-oidc --lib -E 'test(=relying_party::tests::the_cache_serves_a_discovered_provider)' => exit=0, 1 test run: 1 passed, 46 skipped
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=boot::issuer::pg_tests::issuer_boot_discovery_happy_path_fills_jwks_uri)' => exit=0, 1 test run: 1 passed, 496 skipped
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=boot::issuer::pg_tests::issuer_boot_discovery_recovers_after_transient_blip)' => exit=0, 1 test run: 1 passed, 496 skipped
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=boot::issuer::pg_tests::issuer_boot_discovery_fails_closed_after_retries)' => exit=0, 1 test run: 1 passed, 496 skipped
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=components::admin::routes::pg_tests::create_persists_sealed_secret_and_get_redacts)' => exit=0, 1 test run: 1 passed, 496 skipped
+mise exec -- cargo nextest run --locked -p wyrd-auth --lib -E 'test(=platform_login::pg_tests::production_platform_login_accepts_an_https_authorization_endpoint)' => exit=0, 1 test run: 1 passed, 137 skipped
+mise exec -- cargo nextest run --locked -p wyrd-auth --lib -E 'test(=platform_login::pg_tests::production_platform_login_refuses_a_cleartext_authorization_endpoint)' => exit=0, 1 test run: 1 passed, 137 skipped
+mise exec -- cargo nextest run --locked -p wyrd-sql --test pg_platform_identity -E 'test(=pg_tests::configuring_the_connection_again_replaces_it)' => exit=0, 1 test run: 1 passed, 10 skipped
+mise exec -- cargo nextest run --locked -p wyrd-server --test platform_admin_e2e -E 'test(=federated_platform_sign_in_runs_through_the_served_callback)' => exit=0, 1 test run: 1 passed, 38 skipped
+mise exec -- cargo nextest run --locked -p wyrd-server --test platform_admin_e2e -E 'test(=a_failed_platform_mutation_leaves_no_allowance)' => exit=0, 1 test run: 1 passed, 38 skipped
+mise exec -- cargo nextest run --locked -p wyrd-server --test platform_admin_e2e -E 'test(=an_operator_configures_and_removes_federated_platform_sign_in)' => exit=0, 1 test run: 1 passed, 38 skipped
+mise exec -- cargo nextest list --locked -p wyrd-server --test identity_e2e --run-ignored=all   # lists both journeys below
+mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=tenant_callback_refusal_journey mise run test:identity:journey => exit=0, 1 test run: 1 passed, 30 skipped
+mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=tenant_callback_issuer_binding_journey mise run test:identity:journey => exit=0, 1 test run: 1 passed, 30 skipped
+```
+
+Lanes on `0b516e235`, one at a time, `CARGO_TARGET_DIR` set. All exited 0:
+`fmt`, `lints`, `codegen:check`, `docs:check`, `check:client-tier`,
+`check:pyo3-scope`, `check:unwrap-audit`, `check:workspace-hack`, `py:format`,
+`py:lints`, `py:typecheck`, `py:test:unit`, `ts:typecheck`, `ts:test:unit`,
+`ts:napi:check`, `test:shared`, `test:wyrd-sdk`, `test:cli:journey`,
+`test:principals:integration`, `py:test:integration`, `ts:test:integration`,
+`test:identity:journey` (unfiltered), and `test:wyrd`. No lane failed, so no
+diagnosis was needed.
+
+Non-goals: none of the excluded items was added (no new setting, cache, lock,
+retry, health probe, harness, dependency, or `oauth2` `reqwest` feature).
+Workload `expected_audience` (RFC 7523) is unchanged.

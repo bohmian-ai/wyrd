@@ -281,17 +281,7 @@ fn server_error(error: wyrd_client::auth::AuthError) -> WyrdCliError {
 /// Ask the platform to open `url` in the person's browser; the printed URL
 /// remains the fallback, so a failure is only reported.
 fn open_in_browser(url: &str) {
-    let mut command = if cfg!(target_os = "macos") {
-        std::process::Command::new("open")
-    } else if cfg!(windows) {
-        let mut command = std::process::Command::new("cmd");
-        command.args(["/C", "start", ""]);
-        command
-    } else {
-        std::process::Command::new("xdg-open")
-    };
-    let spawned = command
-        .arg(url)
+    let spawned = browser_command(std::env::consts::OS, url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -301,11 +291,50 @@ fn open_in_browser(url: &str) {
     }
 }
 
+/// The command that opens `url` on the operating system `os`
+/// ([`std::env::consts::OS`]), with `url` passed as one argument and no
+/// command interpreter, so URL characters such as `&` or `|` are never
+/// parsed as syntax.
+///
+/// Windows uses `rundll32 url.dll,FileProtocolHandler`, the shell's own URL
+/// handler, as `gh` does; macOS uses `open` and other systems `xdg-open`.
+fn browser_command(os: &str, url: &str) -> std::process::Command {
+    let mut command = match os {
+        "macos" => std::process::Command::new("open"),
+        "windows" => {
+            let mut command = std::process::Command::new("rundll32");
+            command.arg("url.dll,FileProtocolHandler");
+            command
+        }
+        _ => std::process::Command::new("xdg-open"),
+    };
+    command.arg(url);
+    command
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
 
-    use super::{LoginArgs, LogoutArgs};
+    use super::{LoginArgs, LogoutArgs, browser_command};
+
+    /// Every platform's browser command passes a URL carrying shell
+    /// metacharacters as one argument, and none runs a command interpreter.
+    #[test]
+    fn browser_command_passes_the_url_as_one_argument() {
+        let url = "https://wyrd.example.com/auth/device?tenant=a&user_code=B|C^D%22";
+        for (os, program, leading) in [
+            ("windows", "rundll32", &["url.dll,FileProtocolHandler"][..]),
+            ("macos", "open", &[][..]),
+            ("linux", "xdg-open", &[][..]),
+        ] {
+            let command = browser_command(os, url);
+            assert_eq!(command.get_program(), program, "{os}");
+            let mut expected: Vec<&str> = leading.to_vec();
+            expected.push(url);
+            assert_eq!(command.get_args().collect::<Vec<_>>(), expected, "{os}");
+        }
+    }
 
     /// Bare wrapper so login arguments parse without the binary's tree.
     #[derive(Parser)]

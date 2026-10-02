@@ -16,7 +16,6 @@ sys.path.insert(0, str(EXAMPLES_DIR))
         "from_yaml",
         "from_builder",
         "structured_pipeline",
-        "with_observer",
         "transport_grpc",
         "transport_http",
         "transport_mock",

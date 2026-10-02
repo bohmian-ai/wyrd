@@ -45,7 +45,6 @@ vala-sql = { path = "crates/vala/vala-sql", version = "0.0.1" }
 vala-ingest = { path = "crates/vala/vala-ingest", version = "0.0.1" }
 vala-drift = { path = "crates/vala/vala-drift", version = "0.0.1" }
 vala-eval = { path = "crates/vala/vala-eval", version = "0.0.1" }
-skald-observer = { path = "crates/skald/skald-observer", version = "0.0.1" }
 wyrd-utils = { path = "crates/shared/wyrd-utils", version = "0.0.1" }
 wyrd-version = { path = "crates/shared/wyrd-version", version = "0.0.1" }
 wyrd-test-contract-macros = { path = "crates/shared/wyrd-test-contract-macros", version = "0.0.1" }

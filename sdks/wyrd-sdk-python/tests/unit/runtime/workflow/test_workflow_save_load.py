@@ -15,7 +15,9 @@ def test_workflow_save_load_round_trips_yaml(tmp_path: Path) -> None:
     path = tmp_path / "research.yaml"
     planner = _build_agent("planner")
     writer = _build_agent("writer")
-    workflow = Workflow.sequential("research", planner, writer)
+    workflow = Workflow.sequential("research", planner, writer).with_outputs(
+        {"brief": "steps.writer.output.text"}
+    )
     workflow.set_version("0.1.0")
 
     workflow.save(path)
@@ -27,3 +29,4 @@ def test_workflow_save_load_round_trips_yaml(tmp_path: Path) -> None:
     assert "planner" in yaml_body
     assert "writer" in yaml_body
     assert list(loaded.steps) == ["planner", "writer"]
+    assert "brief: steps.writer.output.text" in yaml_body

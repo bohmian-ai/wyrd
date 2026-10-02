@@ -3,8 +3,10 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use wyrd::agent::WorkflowBinding;
 use wyrd::agent::{OpenAiChatOptions, ToolDef, ToolError, openai_chat};
 use wyrd::{Agent, Workflow};
+use wyrd_spec::card::common::ParameterValue;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SearchInput {
@@ -71,18 +73,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_tool(Arc::new(search_tool));
     let writer = Agent::new(writer_prompt).name("writer").version("0.1.0");
 
-    let workflow =
-        Workflow::sequential("research-and-write", [researcher, writer])?.with_version("0.1.0");
+    let binding = |source: &str| WorkflowBinding::new(source);
+    let workflow = Workflow::sequential("research-and-write", [researcher, writer])?
+        .with_version("0.1.0")
+        .with_inputs([("input".to_owned(), ParameterValue::Str(String::new()))].into())?
+        .with_step_inputs(
+            "researcher",
+            [("topic".to_owned(), binding("input.input")?)].into(),
+        )?
+        .with_step_inputs(
+            "writer",
+            [(
+                "research".to_owned(),
+                binding("steps.researcher.output.text")?,
+            )]
+            .into(),
+        )?
+        .with_outputs([("summary".to_owned(), binding("steps.writer.output.text")?)].into())?;
     let run = workflow.run("renewable energy storage").await?;
 
-    println!("steps completed: {}", run.tasks.len());
-    if let Some(text) = run
-        .result()
-        .and_then(|outcome| outcome.result.as_ref())
-        .and_then(|result| result.adapter().text())
-    {
-        println!("final output: {text}");
-    }
+    println!("status: {:?}", run.status);
+    println!("outputs: {:#?}", run.outputs);
 
     Ok(())
 }

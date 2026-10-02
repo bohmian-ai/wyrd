@@ -862,10 +862,13 @@ mod tests {
         let spec = Spec::Workflow(WorkflowSpec {
             steps: vec![WorkflowStep {
                 id: "nested".to_owned(),
-                action: WorkflowAction::Mcp(Ref::Path(PathBuf::from("nested/mcp.yaml"))),
+                action: WorkflowAction::Agent(InlineableRef::Path(PathBuf::from(
+                    "nested/agent.yaml",
+                ))),
                 depends_on: Vec::new(),
                 inputs: BTreeMap::new(),
-                condition: None,
+                llm_route: None,
+                fallback: None,
                 timeout_seconds: None,
                 retry: None,
                 display: BTreeMap::new(),
@@ -875,7 +878,7 @@ mod tests {
 
         assert_eq!(
             unresolved_card_ref_paths(&spec),
-            vec![PathBuf::from("nested/mcp.yaml")]
+            vec![PathBuf::from("nested/agent.yaml")]
         );
     }
 
@@ -931,7 +934,8 @@ mod tests {
                 )))),
                 depends_on: Vec::new(),
                 inputs: BTreeMap::new(),
-                condition: None,
+                llm_route: None,
+                fallback: None,
                 timeout_seconds: None,
                 retry: None,
                 display: BTreeMap::new(),

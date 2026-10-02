@@ -1,61 +1,60 @@
-//! Skald workflow engine: DAG scheduling, per-task retry and validation, and
-//! cross-provider message handoff.
+//! Skald Workflow engine: explicit-binding DAG execution over Skald Agents.
+//!
+//! ## Model
+//!
+//! A [`Workflow`] declares typed inputs, Agent steps whose unresolved Prompt
+//! variables are bound to exact sources (`input.<name>` or a dependency's
+//! `steps.<id>.output.text|structured[.<field>...]`), and named outputs.
+//! Dependency edges order execution and inject no data.
+//!
+//! ## Execution
+//!
+//! [`Workflow::run_with_options`] validates the resolved graph, input, and
+//! routes before dispatch, then executes steps through the existing Agent loop
+//! in one owned, bounded task set with Workflow retries, per-attempt timeouts,
+//! a total deadline, and cancellation. The result is always the portable
+//! [`WorkflowRun`] snapshot; step failures are recorded in it rather than
+//! returned as errors.
+//!
+//! ## Routes
+//!
+//! Each step's model calls use its resolved [`wyrd_spec::card::workflow::LlmRoute`]:
+//! the native provider registry, a governed Wyrd gateway through
+//! [`WyrdGatewayCaller`], or a bound external gateway. The execution
+//! environment supplies these through [`WorkflowExecutionDependencies`].
 //!
 //! ## Independence
 //!
-//! `skald-workflow` depends on `skald-agent` and neutral infrastructure only.
-//! It does not depend on Wyrd or Vala crates.
-//!
-//! ## Dual entrypoints
-//!
-//! [`DagExecutor::run`] owns the level-parallel DAG schedule and returns a
-//! [`WorkflowRun`] envelope when every task has completed.
-//! [`DagExecutor::execute_task`] is the single-task entrypoint used by external
-//! orchestrators that own their own loop and step one task at a time.
-//!
-//! ## User surface
-//!
-//! [`Workflow`] is the user-facing authoring + run surface. It mirrors the
-//! [`skald_agent::Agent`] pyclass-is-the-class pattern: meta + spec + cascade
-//! state on one struct, with the same struct serving Rust and Python. The
-//! `Workflow::run` method delegates to the internal [`DagExecutor`].
-//!
-//! ## Handoff
-//!
-//! When a downstream task's agent uses a different provider than the upstream
-//! task whose output it consumes, the carried messages are translated through
-//! [`skald_spec::convert::convert_message_dyn`], the same converter the LLM
-//! gateway uses. Workflow-local conversion logic does not exist.
-//!
-//! ## Errors
-//!
-//! All public failures surface as [`WorkflowError`] with stable
-//! stable Wyrd workflow error codes.
+//! `skald-workflow` depends on Skald crates, `wyrd-spec`, and neutral
+//! infrastructure only. It does not depend on Wyrd server or Vala crates.
 
 #![deny(missing_docs)]
 
-pub mod context;
-pub mod def;
+mod attempt;
 pub mod error;
-pub mod handoff;
+mod output;
+mod plan;
 #[cfg(feature = "python")]
 pub mod python;
-pub mod run;
-pub mod schedule;
-pub mod task;
-pub mod tasklist;
+pub mod route;
+mod run;
+#[cfg(test)]
+mod test_support;
 pub mod workflow;
 pub mod workflow_surface;
 
-pub use context::{Context, ContextSnapshot};
-pub use def::{TaskDef, WorkflowAgent, WorkflowDef, default_max_retries};
 pub use error::{WorkflowError, WorkflowResult};
-pub use handoff::{extract_messages_for_handoff, handoff_messages};
-pub use run::{StepEvent, StepOutcome, TaskEvent, TaskOutcome, WorkflowRun};
-pub use task::{Task, TaskStatus};
-pub use tasklist::TaskList;
-pub use workflow::DagExecutor;
-pub use workflow_surface::{AgentResolver, Workflow, WorkflowInput};
-
-#[cfg(feature = "python")]
-pub use python::python_register;
+pub use plan::DEFAULT_MAX_RETRIES;
+pub use route::{
+    DEFAULT_GATEWAY_CALL_TIMEOUT, ExternalEndpointProfile, ExternalGatewayBinding,
+    ExternalGatewayBindings, WorkflowExecutionDependencies, WorkflowGatewayCorrelation,
+    WyrdGatewayCall, WyrdGatewayCaller,
+};
+pub use workflow::{DEFAULT_MAX_CONCURRENCY, WorkflowExecutionLimits, WorkflowRunOptions};
+pub use workflow_surface::{
+    AgentResolver, Workflow, WorkflowBuilder, WorkflowInput, step_id_for_name,
+};
+pub use wyrd_spec::card::workflow::{
+    WorkflowBinding, WorkflowRun, WorkflowRunError, WorkflowRunStatus, WorkflowStepResult,
+    WorkflowStepStatus,
+};

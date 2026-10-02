@@ -3,11 +3,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, TypedDict, runtime_checkable
 
 from .error import WyrdError
 from .header import JsonDict, PathLike
-from .observer import Observer
 from .prompt import Prompt, ProviderResponse
 
 #### end of imports ####
@@ -397,86 +396,72 @@ def local_registry() -> AbstractContextManager[None]:
     """
     ...
 
-class StepStatus:
-    """Lifecycle status of one workflow step."""
+class WorkflowRunError(TypedDict):
+    """Bounded primary error of a failed Workflow run or step."""
 
-    Pending: StepStatus
-    Running: StepStatus
-    Completed: StepStatus
-    Failed: StepStatus
+    code: str
+    message: str
+    details: Any
+    remediation: str
 
-class StepOutcome:
-    """Per-step final outcome captured after a workflow run."""
+class WorkflowStepResult(TypedDict):
+    """One step's result in `WorkflowRun.steps`, keyed by step id."""
 
-    @property
-    def status(self) -> StepStatus:
-        """Return the final step status."""
-        ...
+    status: Literal["pending", "running", "succeeded", "failed", "cancelled", "unstarted"]
+    text: str | None
+    structured_output: Any
+    attempts: int
+    started_at: str | None
+    ended_at: str | None
+    error: WorkflowRunError | None
 
-    @property
-    def retries(self) -> int:
-        """Return the number of retries consumed before reaching the final status."""
-        ...
+class WorkflowRunDict(TypedDict):
+    """Complete wire-shaped snapshot returned by `WorkflowRun.to_dict`."""
 
-class StepEvent:
-    """One observable step transition during a workflow run."""
-
-    @property
-    def step_id(self) -> str:
-        """Return the step id this event refers to."""
-        ...
-
-    @property
-    def status(self) -> StepStatus:
-        """Return the step status recorded for this transition."""
-        ...
-
-    @property
-    def started_at(self) -> int:
-        """Return the Unix epoch milliseconds when the attempt started."""
-        ...
-
-    @property
-    def ended_at(self) -> int:
-        """Return the Unix epoch milliseconds when the attempt ended."""
-        ...
-
-    @property
-    def attempt(self) -> int:
-        """Return the attempt index, starting at 1."""
-        ...
-
-    @property
-    def error(self) -> str | None:
-        """Return the stable error code for failed attempts, or None for completed ones."""
-        ...
+    run_id: str
+    workflow: dict[str, Any] | None
+    status: Literal["succeeded", "failed", "cancelled", "timed_out"]
+    outputs: dict[str, Any]
+    steps: dict[str, WorkflowStepResult]
+    created_at: str
+    started_at: str | None
+    ended_at: str | None
+    error: WorkflowRunError | None
 
 class WorkflowRun:
-    """Final envelope returned by a successful `Workflow.run` call."""
+    """Terminal Workflow run snapshot returned by `Workflow.run`.
+
+    Values are the portable wire projection: named `outputs`, step results
+    keyed by step id, and the bounded primary `error`.
+    """
 
     @property
-    def final_step_id(self) -> str | None:
-        """Return the terminal step's id when the workflow produced one."""
+    def run_id(self) -> str:
+        """Return the run identifier."""
         ...
 
     @property
-    def outcomes(self) -> Mapping[str, StepOutcome]:
-        """Return per-step outcomes keyed by step id."""
+    def status(self) -> Literal["succeeded", "failed", "cancelled", "timed_out"]:
+        """Return the terminal run status."""
         ...
 
     @property
-    def events(self) -> Sequence[StepEvent]:
-        """Return the ordered per-step events captured during the run."""
+    def outputs(self) -> dict[str, Any]:
+        """Return the named Workflow outputs; empty unless the run succeeded."""
         ...
 
     @property
-    def parameters(self) -> dict[str, Any]:
-        """Return the accumulated parameter map from structured outputs."""
+    def steps(self) -> dict[str, WorkflowStepResult]:
+        """Return step results keyed by step id."""
         ...
 
     @property
-    def final_output(self) -> str | None:
-        """Return the terminal step's assistant text, when present."""
+    def error(self) -> WorkflowRunError | None:
+        """Return the primary run error, or None."""
+        ...
+
+    def to_dict(self) -> WorkflowRunDict:
+        """Return the complete snapshot as its wire-shaped dictionary."""
         ...
 
 class Workflow:
@@ -490,7 +475,6 @@ class Workflow:
         space: str | None = ...,
         labels: Mapping[str, str] | None = ...,
         annotations: Mapping[str, str] | None = ...,
-        observers: Sequence[Observer] | None = ...,
     ) -> None:
         """Build an empty Workflow with the given name and optional metadata.
 
@@ -500,7 +484,6 @@ class Workflow:
             space (str | None): Optional logical space.
             labels (Mapping[str, str] | None): Optional queryable labels.
             annotations (Mapping[str, str] | None): Optional free-form annotations.
-            observers (Sequence[Observer] | None): Runtime observers for workflow runs.
         """
         ...
 
@@ -508,14 +491,12 @@ class Workflow:
     def sequential(
         name: str,
         *agents: Agent,
-        observers: Sequence[Observer] | None = ...,
     ) -> Workflow:
         """Build a workflow whose steps run sequentially.
 
         Args:
             name (str): Workflow name.
             *agents (Agent): One or more Agent values to chain.
-            observers (Sequence[Observer] | None): Runtime observers for workflow runs.
 
         Returns:
             Workflow: Workflow with each agent depending on the previous one.
@@ -529,14 +510,12 @@ class Workflow:
     def parallel(
         name: str,
         *agents: Agent,
-        observers: Sequence[Observer] | None = ...,
     ) -> Workflow:
         """Build a workflow whose steps run in parallel with no dependencies.
 
         Args:
             name (str): Workflow name.
             *agents (Agent): One or more Agent values to run in parallel.
-            observers (Sequence[Observer] | None): Runtime observers for workflow runs.
 
         Returns:
             Workflow: Workflow with each agent as an independent root step.
@@ -573,6 +552,62 @@ class Workflow:
 
         Raises:
             WyrdError: When the resulting DAG is invalid.
+        """
+        ...
+
+    def with_inputs(self, inputs: Mapping[str, Any]) -> Workflow:
+        """Declare the Workflow inputs and their defaults, replacing any previous declaration.
+
+        Args:
+            inputs (Mapping[str, Any]): Input name to default value. `bool`,
+                `int`, `float`, and `str` declare scalar inputs; any other JSON
+                value declares a JSON input.
+
+        Returns:
+            Workflow: This workflow (for chaining).
+
+        Raises:
+            WyrdError: When a name is not an identifier or a value is not JSON.
+        """
+        ...
+
+    def with_step_inputs(self, step_id: str, inputs: Mapping[str, str]) -> Workflow:
+        """Bind one step's unresolved Prompt variables, replacing its previous bindings.
+
+        Args:
+            step_id (str): Step to bind.
+            inputs (Mapping[str, str]): Variable name to source: `input.<name>`
+                or a dependency's `steps.<id>.output.text` /
+                `steps.<id>.output.structured[.<field>...]`.
+
+        Returns:
+            Workflow: This workflow (for chaining).
+
+        Raises:
+            WyrdError: For an unknown step, a non-identifier name, or an invalid source.
+        """
+        ...
+
+    def with_outputs(self, outputs: Mapping[str, str]) -> Workflow:
+        """Declare the named Workflow outputs, replacing any previous declaration.
+
+        Args:
+            outputs (Mapping[str, str]): Output name to source, in the step-input grammar.
+
+        Returns:
+            Workflow: This workflow (for chaining).
+
+        Raises:
+            WyrdError: For a non-identifier name or an invalid source.
+        """
+        ...
+
+    def validate(self) -> None:
+        """Validate the complete Workflow against its resolved Agents.
+
+        Raises:
+            WyrdError: For any contract, binding, Prompt-variable, output, or
+                route error that would fail a run before dispatch.
         """
         ...
 
@@ -656,21 +691,24 @@ class Workflow:
         """
         ...
 
-    def run(self, input: str | Mapping[str, Any]) -> WorkflowRun:
+    def run(self, input: str | Mapping[str, Any] | None = None) -> WorkflowRun:
         """Run this workflow against the process-local provider registry.
 
+        Dependencies order steps only; data reaches a step solely through its
+        declared bindings.
+
         Args:
-            input (str | Mapping[str, Any]): Workflow input. A string lands as
-                the `input` template variable; a mapping exposes every key as a
-                discrete template variable.
+            input (str | Mapping[str, Any] | None): Workflow input. A string is
+                shorthand for the declared string input named `input`; a
+                mapping supplies declared inputs by name; `None` uses defaults.
 
         Returns:
-            WorkflowRun: Final run envelope with per-step outcomes, events, and
-            cross-step parameter map.
+            WorkflowRun: Terminal run snapshot. Step failures are recorded in
+            it rather than raised.
 
         Raises:
-            WyrdError: When a provider call fails, retries exhaust, or any
-                step references an undefined variable.
+            WyrdError: When validation, input, or route checks fail before any
+                step is dispatched.
         """
         ...
 
@@ -683,11 +721,11 @@ __all__ = [
     "RunConfig",
     "SessionMemory",
     "SessionTurn",
-    "StepEvent",
-    "StepOutcome",
-    "StepStatus",
     "Workflow",
     "WorkflowRun",
+    "WorkflowRunDict",
+    "WorkflowRunError",
+    "WorkflowStepResult",
     "local_registry",
     "tool",
 ]

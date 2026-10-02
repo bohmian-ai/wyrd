@@ -1,5 +1,5 @@
 //! Agentic runtime for bounded Skald loops, tool execution, callbacks, session
-//! memory, journals, and observers.
+//! memory, journals, and `tracing` spans.
 //!
 //! Users enter through [`Agent`]: `Agent::new(prompt).with_tool(tool).run("draft
 //! the doc").await?`. `Agent::new` takes an already-resolved
@@ -8,8 +8,8 @@
 //!
 //! Adjacent crates own adjacent surfaces: [`wyrd_spec::AgentCard`] is the
 //! durable on-disk envelope, [`skald_tool::AgentTool`] and [`AgentDelegateTool`]
-//! provide callable tools and delegation, and `skald-observer` auto-attaches
-//! observers when configured by the Wyrd runtime.
+//! provide callable tools and delegation. Runs emit OpenTelemetry GenAI-named
+//! `invoke_agent`, `chat`, and `execute_tool` spans through `tracing`.
 
 #![deny(missing_docs)]
 
@@ -49,4 +49,3 @@ pub use python::python_register;
 pub use registry::system_messages;
 pub use run::{AgentRun, FinishReason, RunConfig, RunError};
 pub use session::{NoSession, Role, SessionError, SessionId, SessionMemory, SessionTurn};
-pub use skald_observer::{NoopObserver, Observer};

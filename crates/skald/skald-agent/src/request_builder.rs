@@ -5,6 +5,7 @@ use skald_spec::wire::anthropic_messages::{
 };
 use skald_spec::wire::google_generate::{GoogleContent, GoogleFunctionResponse, GooglePart};
 use skald_spec::wire::openai_chat::{OpenAiChatMessage, OpenAiMessageContent};
+use skald_spec::wire::openai_responses::{OpenAiResponseContentPart, OpenAiResponseItem};
 use skald_spec::{MessageNum, ProviderName, ProviderRequest, ProviderResponse};
 
 use crate::conversation::{Conversation, ConversationTurn};
@@ -15,6 +16,8 @@ use crate::error::{AgentError, AgentResult};
 pub enum PromptLoopSupport {
     /// `ProviderRequest::OpenAiChatCompletion`.
     OpenAiChat,
+    /// `ProviderRequest::OpenAiResponses`, held as native `input` items.
+    OpenAiResponses,
     /// `ProviderRequest::AnthropicMessage`.
     Anthropic,
     /// `ProviderRequest::GeminiGenerateContent`.
@@ -24,6 +27,16 @@ pub enum PromptLoopSupport {
 }
 
 /// Decide whether a rendered provider request can drive the agent tool loop.
+///
+/// Classifies the request into the closed [`PromptLoopSupport`] set that the
+/// loop knows how to seed, extend with conversation history, and replay. The
+/// check is pure; `agent` only names the Agent in the error.
+///
+/// # Errors
+///
+/// Returns [`AgentError::Prompt`] for embedding, Vertex prediction, raw
+/// passthrough, and any other request shape that has no conversation to
+/// drive.
 pub fn validate_prompt_loop_request(
     agent: &str,
     request: &ProviderRequest,
@@ -35,11 +48,7 @@ pub fn validate_prompt_loop_request(
         ProviderRequest::AnthropicMessage(_) => Ok(PromptLoopSupport::Anthropic),
         ProviderRequest::GeminiGenerateContent(_) => Ok(PromptLoopSupport::Gemini),
         ProviderRequest::Vertex(_) => Ok(PromptLoopSupport::Vertex),
-        ProviderRequest::OpenAiResponses(_) => Err(AgentError::Prompt {
-            agent: agent.to_owned(),
-            detail: "OpenAI Responses requests are not yet supported by the agent tool loop"
-                .to_owned(),
-        }),
+        ProviderRequest::OpenAiResponses(_) => Ok(PromptLoopSupport::OpenAiResponses),
         ProviderRequest::OpenAiEmbeddings(_) | ProviderRequest::GoogleBatchEmbed(_) => {
             Err(AgentError::Prompt {
                 agent: agent.to_owned(),
@@ -63,10 +72,22 @@ pub fn validate_prompt_loop_request(
     }
 }
 
-/// Extract the messages embedded in a rendered provider request.
+/// Extract the messages embedded in a rendered provider request; each
+/// OpenAI Responses `input` item becomes one native Responses message.
+///
+/// # Errors
+///
+/// Returns [`AgentError::Prompt`] when the request shape cannot drive the loop.
 pub fn extract_messages(agent: &str, request: &ProviderRequest) -> AgentResult<Vec<MessageNum>> {
     let kind = validate_prompt_loop_request(agent, request)?;
     match (kind, request) {
+        (PromptLoopSupport::OpenAiResponses, ProviderRequest::OpenAiResponses(req)) => Ok(req
+            .input
+            .items()
+            .iter()
+            .cloned()
+            .map(|item| MessageNum::OpenAiResponses(vec![item]))
+            .collect()),
         (PromptLoopSupport::OpenAiChat, ProviderRequest::OpenAiChatCompletion(req))
         | (
             PromptLoopSupport::OpenAiChat,
@@ -101,6 +122,18 @@ pub fn extract_messages(agent: &str, request: &ProviderRequest) -> AgentResult<V
 }
 
 /// Build a provider-native request from rendered prompt seed messages and conversation turns.
+///
+/// Starts from `seed_messages`, appends each conversation turn in the
+/// request's own dialect (OpenAI Responses turns as native `input` items,
+/// including replayed reasoning and function-call items), and replaces the
+/// `template` messages with the result. The template's model, settings, and
+/// tools are kept unchanged.
+///
+/// # Errors
+///
+/// Returns [`AgentError::Prompt`] when the template cannot drive the loop,
+/// and [`AgentError::LoopMessageType`] when a turn or seed message does not
+/// match the template's dialect.
 pub fn request_from_conversation(
     agent: &str,
     template: ProviderRequest,
@@ -116,6 +149,18 @@ pub fn request_from_conversation(
 }
 
 /// Extract the provider-native assistant message from one model response.
+///
+/// OpenAI Chat keeps the first choice's message, Anthropic its role and
+/// content blocks, Gemini and Vertex the first candidate's content, and
+/// OpenAI Responses every output item in provider order, so reasoning
+/// identity, summaries, encrypted state, and function calls are replayed on
+/// the next stateless request.
+///
+/// # Errors
+///
+/// Returns [`AgentError::LoopMessageType`] when an OpenAI Chat response has
+/// no choices, a Google response has no candidates, or the response shape
+/// has no conversation message.
 pub fn assistant_message(agent: &str, response: &ProviderResponse) -> AgentResult<MessageNum> {
     match response {
         ProviderResponse::OpenAiChatCompletion(response) => {
@@ -148,8 +193,12 @@ pub fn assistant_message(agent: &str, response: &ProviderResponse) -> AgentResul
                     })?;
             Ok(MessageNum::Gemini(candidate.content.clone().into()))
         }
-        ProviderResponse::OpenAiResponses(_)
-        | ProviderResponse::OpenAiEmbeddings(_)
+        // Every output item, reasoning included, is replayed in provider order
+        // so a stateless next request carries native continuation state.
+        ProviderResponse::OpenAiResponses(response) => {
+            Ok(MessageNum::OpenAiResponses(response.output.clone()))
+        }
+        ProviderResponse::OpenAiEmbeddings(_)
         | ProviderResponse::GoogleBatchEmbed(_)
         | ProviderResponse::VertexPredict(_)
         | ProviderResponse::RawV1(_)
@@ -161,6 +210,15 @@ pub fn assistant_message(agent: &str, response: &ProviderResponse) -> AgentResul
 }
 
 /// Replace the messages of a provider-native request with accumulated history.
+///
+/// An OpenAI Responses request's `input` becomes the concatenated items of
+/// its native Responses messages.
+///
+/// # Errors
+///
+/// Returns [`AgentError::LoopMessageType`] when a history message does not
+/// match the request dialect, and [`AgentError::Prompt`] when the request
+/// shape cannot drive the loop.
 pub fn rebuild_request_messages(
     mut template: ProviderRequest,
     new_messages: &[MessageNum],
@@ -217,8 +275,17 @@ pub fn rebuild_request_messages(
                 }
             }
         }
-        ProviderRequest::OpenAiResponses(_)
-        | ProviderRequest::OpenAiEmbeddings(_)
+        ProviderRequest::OpenAiResponses(req) => {
+            let mut items = Vec::new();
+            for msg in new_messages {
+                match msg {
+                    MessageNum::OpenAiResponses(message) => items.extend(message.iter().cloned()),
+                    _ => return Err(mismatch(ProviderName::OpenAi)),
+                }
+            }
+            req.input = items.into();
+        }
+        ProviderRequest::OpenAiEmbeddings(_)
         | ProviderRequest::GoogleBatchEmbed(_)
         | ProviderRequest::VertexPredict(_)
         | ProviderRequest::RawV1 { .. } => {
@@ -276,6 +343,10 @@ fn validate_message_provider(
     let valid = matches!(
         (provider, message),
         (PromptLoopSupport::OpenAiChat, MessageNum::OpenAi(_))
+            | (
+                PromptLoopSupport::OpenAiResponses,
+                MessageNum::OpenAiResponses(_)
+            )
             | (PromptLoopSupport::Anthropic, MessageNum::Anthropic(_))
             | (PromptLoopSupport::Gemini, MessageNum::Gemini(_))
             | (PromptLoopSupport::Vertex, MessageNum::Gemini(_))
@@ -285,7 +356,9 @@ fn validate_message_provider(
     }
     Err(AgentError::LoopMessageType {
         provider: match provider {
-            PromptLoopSupport::OpenAiChat => skald_spec::ProviderName::OpenAi,
+            PromptLoopSupport::OpenAiChat | PromptLoopSupport::OpenAiResponses => {
+                skald_spec::ProviderName::OpenAi
+            }
             PromptLoopSupport::Anthropic => skald_spec::ProviderName::Anthropic,
             PromptLoopSupport::Gemini => skald_spec::ProviderName::Google,
             PromptLoopSupport::Vertex => skald_spec::ProviderName::Vertex,
@@ -299,6 +372,7 @@ fn system_message(provider: PromptLoopSupport, content: &str) -> MessageNum {
         PromptLoopSupport::OpenAiChat => {
             MessageNum::OpenAi(Box::new(openai_message("system", content)))
         }
+        PromptLoopSupport::OpenAiResponses => responses_message("system", content),
         PromptLoopSupport::Anthropic => MessageNum::Anthropic(AnthropicMessage {
             role: "system".to_owned(),
             content: vec![AnthropicContentBlock::Text {
@@ -323,6 +397,7 @@ fn user_message(provider: PromptLoopSupport, content: &str) -> MessageNum {
         PromptLoopSupport::OpenAiChat => {
             MessageNum::OpenAi(Box::new(openai_message("user", content)))
         }
+        PromptLoopSupport::OpenAiResponses => responses_message("user", content),
         PromptLoopSupport::Anthropic => MessageNum::Anthropic(AnthropicMessage {
             role: "user".to_owned(),
             content: vec![AnthropicContentBlock::Text {
@@ -350,6 +425,12 @@ fn tool_result_message(
 ) -> MessageNum {
     let content_text = content.to_string();
     match provider {
+        PromptLoopSupport::OpenAiResponses => {
+            MessageNum::OpenAiResponses(vec![OpenAiResponseItem::FunctionCallOutput {
+                call_id: call_id.to_owned(),
+                output: content_text,
+            }])
+        }
         PromptLoopSupport::OpenAiChat => {
             let mut message = openai_message("tool", &content_text);
             message.tool_call_id = Some(call_id.to_owned());
@@ -376,6 +457,16 @@ fn tool_result_message(
             })
         }
     }
+}
+
+/// Native Responses message item with one `input_text` part.
+fn responses_message(role: &str, content: &str) -> MessageNum {
+    MessageNum::OpenAiResponses(vec![OpenAiResponseItem::Message {
+        role: role.to_owned(),
+        content: vec![OpenAiResponseContentPart::InputText {
+            text: content.to_owned(),
+        }],
+    }])
 }
 
 fn openai_message(role: &str, content: &str) -> OpenAiChatMessage {

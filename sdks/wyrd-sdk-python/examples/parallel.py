@@ -33,10 +33,15 @@ def main() -> None:
 
     wf = Workflow.parallel("parallel_research", researcher_a, researcher_b)
     wf.add_after(synthesizer, after=[researcher_a, researcher_b])
+    wf.with_step_inputs(
+        "synthesizer", {"summary": "steps.researcher_a.output.structured.summary"}
+    ).with_outputs(
+        {"brief": "steps.synthesizer.output.text", "b_plan": "steps.researcher_b.output.structured"}
+    )
 
-    run = wf.run({"topic": "the Rust borrow checker"})
-    print(f"steps: {len(run.outcomes)}")
-    print(f"final: {run.final_output}")
+    run = wf.run()
+    print(f"steps: {len(run.steps)}")
+    print(f"outputs: {run.outputs}")
 
 
 if __name__ == "__main__":

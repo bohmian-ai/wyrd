@@ -637,6 +637,13 @@ mod untagged_dispatch {
             .unwrap(),
             MessageNum::Gemini(_)
         ));
+        assert!(matches!(
+            serde_json::from_value::<MessageNum>(
+                serde_json::to_value(common::openai_responses_response().output).unwrap()
+            )
+            .unwrap(),
+            MessageNum::OpenAiResponses(_)
+        ));
     }
 
     #[test]

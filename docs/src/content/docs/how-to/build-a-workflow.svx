@@ -10,6 +10,14 @@ order: 21
 
 A Workflow is a directed acyclic graph of Agent invocations. Use `Workflow.sequential` for linear pipelines, `Workflow.parallel` when steps can run at the same time, or `add` and `add_after` for custom shapes.
 
+Dependencies only order steps. Data moves through explicit declarations:
+
+- `with_inputs` declares the Workflow inputs and their defaults.
+- `with_step_inputs(step_id, ...)` binds each unresolved Prompt variable of a step to `input.<name>`, a dependency's `steps.<id>.output.text`, or `steps.<id>.output.structured[.<field>...]`.
+- `with_outputs` names the values the run returns.
+
+Step ids are derived deterministically from Agent names: characters outside `[A-Za-z0-9_]` become `_`, a name that does not start with a letter or `_` gains a leading `_`, an unnamed Agent becomes `step_<n>` for its position, and a repeated id gains a `_2`, `_3`, ... suffix. When an Agent name is not already a unique valid identifier, read the assigned ids from `Workflow.steps` before binding step inputs. A step whose Prompt variable has no binding, or a binding that names a step the step does not depend on, fails validation before any model call.
+
 ## Author
 
 <LangTabs>
@@ -38,11 +46,12 @@ wf = Workflow.load("research.yaml")
 
 ```python
 run = wf.run({"topic": "the Rust borrow checker"})
-print(run.parameters)
-print(run.final_output)
+print(run.status)    # "succeeded", "failed", "cancelled", or "timed_out"
+print(run.outputs)   # named outputs declared with with_outputs
+print(run.steps["planner"]["structured_output"])
 ```
 
-String input is available as `${input}`. Mapping input exposes each key as a template variable. Structured output from upstream steps accumulates in `WorkflowRun.parameters` and can feed downstream prompts.
+Mapping input supplies declared inputs by name; undeclared keys and values of the wrong declared type are rejected. A string is shorthand for the declared string input named `input`. Validation, input, and route errors raise `WyrdError` before any step runs. Once the run starts, step failures are recorded in `run.steps` and `run.error` instead of being raised.
 
 ## Save And Load
 
@@ -52,8 +61,6 @@ loaded = Workflow.load("research.yaml")
 assert Workflow.from_yaml(wf.to_yaml()).to_yaml() == wf.to_yaml()
 ```
 
-Observers are not serialized. Reattach them after `load`.
-
 ## Custom DAG
 
 ```python
@@ -62,6 +69,11 @@ wf.add(research_agent)
 wf.add_after(analysis_agent, after=research_agent)
 wf.add_after(summary_agent, after=research_agent)
 wf.add_after(final_agent, after=[analysis_agent, summary_agent])
+wf.with_step_inputs("final", {
+    "analysis": "steps.analysis.output.text",
+    "summary": "steps.summary.output.text",
+})
+wf.with_outputs({"report": "steps.final.output.text"})
 ```
 
 ## Parallel
@@ -83,31 +95,24 @@ Use `parallel` when steps do not depend on each other. Use `add_after` to fan ba
 
 ## Observe
 
-Observers attach to workflows. Attach one to capture lifecycle events, spans, and
-structured output across every step of the run.
+Workflow and Agent runs emit plain `tracing` spans and carry no prompt, response, or tool payloads. Install any `tracing` subscriber (for example through `wyrd_telemetry`) to collect them.
 
-<LangTabs>
-<LangTab lang="python">
+- `workflow.run` records `wyrd.workflow.id`, `wyrd.workflow.run_id`, `wyrd.workflow.step_count`, and the terminal `wyrd.workflow.status`.
+- `workflow.step` is a child span per attempt with `wyrd.workflow.step.id`, `wyrd.workflow.step.attempt`, `wyrd.workflow.step.outcome`, and `error.type` on failure.
+- A `workflow.step.backoff` event records `wyrd.workflow.step.next_attempt` and `wyrd.workflow.step.delay_ms` before a retry.
+- Each step's Agent emits `invoke_agent`, `chat`, and `execute_tool` spans with OpenTelemetry GenAI attribute names.
 
-<CodeFromFile file="sdks/wyrd-sdk-python/examples/with_observer.py" lang="python" />
-
-</LangTab>
-<LangTab lang="rust">
-
-<CodeFromFile file="examples/rust/workflow_with_observer.rs" lang="rust" />
-
-</LangTab>
-</LangTabs>
+Telemetry never changes a run's outcome.
 
 ## Typed Callback Wire
 
 ```python
 from wyrd import Agent, Prompt, ProviderRequest, ProviderResponse
 
-def log_prompt(request: ProviderRequest) -> None:
+def log_prompt(ctx: object, request: ProviderRequest) -> None:
     print(request.openai().model)
 
-def log_response(response: ProviderResponse) -> None:
+def log_response(ctx: object, response: ProviderResponse) -> None:
     usage = response.openai().usage
     if usage:
         print(usage.total_tokens)

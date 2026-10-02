@@ -1,6 +1,6 @@
 ---
 id: SPEC-skald-workflow-runtime
-revision: 9
+revision: 11
 status: approved
 ---
 
@@ -33,7 +33,7 @@ workflow engine:
   synchronous engine.
 - `DagExecutor` already validates and executes dependency-ready steps in
   concurrent topological stages, invokes Skald Agents through a supplied
-  `ProviderRegistry`, retries calls, emits observer events, and captures task
+  `ProviderRegistry`, retries calls, emits observer callbacks, and captures task
   responses.
 - Skald Prompt binding already owns `${name}` and `{{name}}` discovery,
   JSON-safe substitution through provider-request string leaves, missing-value
@@ -138,7 +138,7 @@ The workflow runtime does not recreate gateway behavior:
 - **Workflow output:** a named JSON value selected by one validated binding
   after all required steps complete.
 - **Execution environment:** the local process or `wyrd-server`; it supplies
-  route-appropriate clients, tools, observers, deadlines, and resource bounds
+  route-appropriate clients, tools, deadlines, and resource bounds
   but does not change workflow semantics. Gateway provider credentials remain
   owned by the gateway and are never supplied to Skald.
 - **LLM route:** the registered declaration that selects how an Agent step's
@@ -989,9 +989,8 @@ or a provider wire body. The client adapter is the only new client-to-Skald
 dependency and Skald never depends back on `wyrd-client`.
 ExtGateway
 dispatch remains a concrete Skald runtime path using the named bindings and
-the shared endpoint policy. Existing resolved Agent tools and Workflow
-observers remain on their current Agent/Workflow owners and are not duplicated
-in this dependency bundle.
+the shared endpoint policy. Existing resolved Agent tools remain on their
+current Agent owner and are not duplicated in this dependency bundle.
 
 For each WyrdGateway step attempt, the Workflow executor creates a private
 immutable `Provider` adapter containing the shared caller plus that step's
@@ -1003,15 +1002,17 @@ never reused by another step, so the existing Agent loop needs no Workflow
 awareness and concurrent steps cannot exchange call metadata.
 
 To preserve canonical remote errors through the existing Agent `Provider`
-interface, `ProviderError` adds one generic redacted variant:
+interface, `ProviderError` adds one generic redacted variant carrying a boxed
+public payload, `RemoteProblem(Box<RemoteProblem>)`, so `ProviderError` stays
+within the repository's large-error lint:
 
 ```rust
-RemoteProblem {
-    code: String,
-    status: u16,
-    message: String,
-    field: Option<String>,
-    remediation: String,
+pub struct RemoteProblem {
+    pub code: String,
+    pub status: u16,
+    pub message: String,
+    pub field: Option<String>,
+    pub remediation: String,
 }
 ```
 
@@ -1181,10 +1182,10 @@ attempt. This is an explicit consequence of authoring `max_retries > 0`; the
 runtime provides no compensation or exactly-once tool guarantee. The two
 server built-ins are read-only, and each repeated call makes its own
 authorization and audit decision. Local caller-supplied tools may have
-effects and are subject to repetition. Observer events record every Workflow
-attempt start and terminal outcome plus the scheduled backoff duration;
-provider and gateway internal
-attempts remain visible only through their existing observation boundaries.
+effects and are subject to repetition. `tracing` spans and events record every
+Workflow attempt start and terminal outcome plus the scheduled backoff
+duration (REQ-053); provider and gateway internal attempts remain visible only
+through their existing observation boundaries.
 
 One parent Workflow future owns a bounded task set for active Skald steps. The
 task set MUST abort those step futures when the parent is dropped and MUST be
@@ -1249,7 +1250,7 @@ pub struct ExternalGatewayBinding {
     pub name: CredentialBindingName,
     pub protocol: ExternalGatewayProtocol,
     pub origin: Url,
-    pub secret_headers: BTreeMap<HeaderName, SecretString>,
+    pub secret_headers: HashMap<HeaderName, SecretString>,
 }
 
 pub struct ExternalGatewayBindings {
@@ -1628,7 +1629,7 @@ retried after restart.
   any step starts.
 - **REQ-016:** Per-step timeout and retry declarations MUST be honored in both
   environments according to the exact Workflow retry and deadline contract
-  above. A retry MUST be visible in the step result and observer stream. A
+  above. A retry MUST be visible in the step result and the REQ-053 spans. A
   timed-out attempt MUST not continue running in the background. Exhausting
   retries after a step timeout produces a failed step with the exact Workflow
   step-timeout error; the distinct Workflow `timed_out` status is reserved for
@@ -1985,6 +1986,24 @@ retried after restart.
   MUST move as one cohesive buildable change boundary. No implementation task
   may intentionally leave the workspace unable to compile while a later task
   repairs the consumer.
+- **REQ-053:** This change MUST delete the Skald Observer plugin system — the
+  `skald-observer` crate, every Agent and Workflow observer hook, the Workflow
+  and Agent `observers`/`with_observers` surfaces, and the Python `Observer`,
+  `OtelObserver`, and `observers=` exports with their stubs, tests, examples,
+  docs, and boundary-check references — with no compatibility alias. Workflow
+  and Agent telemetry MUST instead be plain synchronous `tracing` spans and
+  events, exported only through the existing `wyrd-telemetry` bridge, carrying
+  identifiers, counts, statuses, and stable Wyrd error codes but no prompt,
+  input, request, response, tool-argument, or credential payload. At minimum:
+  a `workflow.run` span (Workflow id, run id, step count, terminal status); one
+  child `workflow.step` span per step attempt (step id, attempt number, outcome,
+  Wyrd error code on failure) so retries appear as sibling spans; a
+  `workflow.step.backoff` event (next attempt, delay); and Agent `invoke_agent`,
+  model-call `chat`, and `execute_tool` spans using OpenTelemetry GenAI
+  semantic-convention attribute names where one exists. Telemetry emission MUST
+  NOT run user code, block, or affect run outcomes. Agent timeout behavior
+  previously proven through observer tests MUST retain equivalent coverage. No
+  local telemetry-initialization API is added in this change.
 
 ## Invariants and boundaries
 
@@ -2442,7 +2461,7 @@ retried after restart.
 
 ## Open material decisions
 
-None in approved Revision 9. The user approved all seven readiness-review
+None in approved Revision 11; Revisions 10 and 11 (see Revision history) were approved by the user on 2026-10-02. The user approved all seven readiness-review
 recommendations on 2026-10-01, including replacement of unshipped implicit
 local behavior without migration documentation, and requested their explicit
 incorporation, then explicitly instructed approval of the revised spec before
@@ -2473,6 +2492,20 @@ before implementation planning.
 
 ## Revision history
 
+- **Revision 11 — approved (2026-10-02):** Deletes the Skald Observer plugin
+  system in favor of plain `tracing` spans exported through `wyrd-telemetry`
+  (REQ-053). Nothing consumed observer-produced spans, `OtelObserver` emitted no
+  step, retry, or backoff telemetry for YAML workflows, and the user-callback
+  surface was the sole cause of TASK-001 review findings FIND-TASK-001-5, -6,
+  and -12. Local Python/TypeScript runs emit no OTEL until a telemetry
+  initialization API is separately justified.
+- **Revision 10 — approved (2026-10-02):** Fixes two public seams that
+  Revision 9 could not implement as written (TASK-001 review r1,
+  FIND-TASK-001-3/4). `ExternalGatewayBinding.secret_headers` is
+  `HashMap<HeaderName, SecretString>` because `HeaderName` has no `Ord` and
+  header order is not observable. `ProviderError::RemoteProblem` is the tuple
+  variant `RemoteProblem(Box<RemoteProblem>)` over a public struct with the same
+  five fields, keeping `ProviderError` within clippy `result_large_err`.
 - **Revision 9 — approved (2026-10-01):** Rebases against the current parent and
   incorporates all seven user-approved readiness recommendations. Uses native
   Prompt `request` examples and explains original-input, predecessor-text, and

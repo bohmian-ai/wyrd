@@ -147,7 +147,7 @@ pub(crate) mod common {
                 {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hi {{name}}"}]},
                 {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{\"q\":\"x\"}"},
                 {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
-                {"type": "reasoning", "summary": "short", "encrypted_content": "abc"},
+                {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "short"}], "encrypted_content": "abc"},
                 {"type": "input_file", "file_id": "file_1"},
                 {"type": "input_image", "image_url": "https://example.com/image.png", "detail": "low"}
             ],
@@ -368,6 +368,7 @@ pub(crate) mod common {
             MessageNum::OpenAi(Box::new(openai_message())),
             MessageNum::Anthropic(anthropic_message()),
             MessageNum::Gemini(google_message()),
+            MessageNum::OpenAiResponses(openai_responses_response().output),
         ]
     }
 

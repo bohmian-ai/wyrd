@@ -309,9 +309,6 @@ pub trait Observer: Send + Sync + 'static {
 }
 ```
 
-Real example: `crates/skald/skald-observer/src/observer.rs` (`Observer` with
-`NoopObserver`, `CompositeObserver`, and `OtelObserver` implementations).
-
 Avoid platform traits invented for a single caller. If there is only one impl
 and no concrete second implementation, use a concrete type.
 

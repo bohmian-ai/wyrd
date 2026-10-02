@@ -93,6 +93,18 @@ pub struct GatewayFallbackOverride {
 }
 
 impl GatewayFallbackOverride {
+    /// Rejects an empty or duplicated candidate list.
+    ///
+    /// Workflow Card validation uses this model-independent check; the
+    /// gateway applies [`Self::validate_for`] once the requested model is known.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GatewayContractError`] for field `fallback.candidates`.
+    pub fn validate(&self) -> Result<(), GatewayContractError> {
+        validate_candidates("fallback.candidates", &self.candidates)
+    }
+
     /// Rejects an empty or duplicated list, or one containing `requested`.
     ///
     /// # Errors

@@ -154,7 +154,7 @@ impl ServerSimulatedUser {
         for attempt in 1..=self.max_attempts {
             match self
                 .agent
-                .run_prompt(self.providers.as_ref(), &rendered.prompt, &[], None)
+                .run_prompt(self.providers.as_ref(), &rendered.prompt, &[])
                 .await
             {
                 Ok(run) => {

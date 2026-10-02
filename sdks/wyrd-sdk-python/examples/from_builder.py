@@ -28,11 +28,17 @@ def main() -> None:
             messages=["Draft a brief on: ${summary}"],
         ),
     )
-    wf = Workflow.sequential("research", planner, writer)
+    wf = (
+        Workflow.sequential("research", planner, writer)
+        .with_inputs({"topic": ""})
+        .with_step_inputs("writer", {"summary": "steps.planner.output.structured.summary"})
+        .with_outputs(
+            {"plan": "steps.planner.output.structured", "brief": "steps.writer.output.text"}
+        )
+    )
     run = wf.run({"topic": "climate change"})
-    print(f"completed {len(run.outcomes)} steps")
-    print(f"cross-step params: {run.parameters}")
-    print(f"final output: {run.final_output}")
+    print(f"status: {run.status}")
+    print(f"outputs: {run.outputs}")
 
 
 if __name__ == "__main__":

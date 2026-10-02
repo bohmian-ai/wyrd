@@ -3,8 +3,8 @@ id: TASK-001
 kind: implementation
 status: ready
 spec: SPEC-skald-workflow-runtime
-spec_revision: 9
-requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-013A, REQ-015, REQ-016, REQ-017, REQ-018, REQ-019, REQ-020, REQ-021, REQ-022, REQ-023, REQ-024, REQ-035, REQ-036, REQ-036A, REQ-037, REQ-038, REQ-039, REQ-040, REQ-042, REQ-043, REQ-045, REQ-047, REQ-048, REQ-049, REQ-051, REQ-052, INV-001, INV-002, INV-003, INV-004, INV-007, INV-008, INV-009, INV-010, INV-010A, INV-011, INV-012, INV-014, INV-016, INV-017, INV-020, INV-021, INV-023, AC-005, AC-006, AC-007, AC-008, AC-011, AC-011A, AC-016, AC-019, AC-020, AC-023, AC-024, AC-026]
+spec_revision: 11
+requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-013A, REQ-015, REQ-016, REQ-017, REQ-018, REQ-019, REQ-020, REQ-021, REQ-022, REQ-023, REQ-024, REQ-035, REQ-036, REQ-036A, REQ-037, REQ-038, REQ-039, REQ-040, REQ-042, REQ-043, REQ-045, REQ-047, REQ-048, REQ-049, REQ-051, REQ-052, REQ-053, INV-001, INV-002, INV-003, INV-004, INV-007, INV-008, INV-009, INV-010, INV-010A, INV-011, INV-012, INV-014, INV-016, INV-017, INV-020, INV-021, INV-023, AC-005, AC-006, AC-007, AC-008, AC-011, AC-011A, AC-016, AC-019, AC-020, AC-023, AC-024, AC-026]
 depends_on: []
 ---
 
@@ -110,7 +110,7 @@ impl WorkflowExecutionDependencies {
 }
 struct ExternalGatewayBinding {
     name: CredentialBindingName, protocol: ExternalGatewayProtocol, origin: Url,
-    secret_headers: BTreeMap<HeaderName, SecretString>,
+    secret_headers: HashMap<HeaderName, SecretString>,
 }
 struct ExternalGatewayBindings { /* keyed by CredentialBindingName */ }
 impl ExternalGatewayBindings {
@@ -130,7 +130,8 @@ impl Workflow {
         input: impl Into<WorkflowInput>, options: WorkflowRunOptions) -> WorkflowResult<WorkflowRun>;
 }
 // Added to existing ProviderError, propagated through all direct consumers.
-RemoteProblem { code: String, status: u16, message: String, field: Option<String>, remediation: String }
+RemoteProblem(Box<RemoteProblem>)
+pub struct RemoteProblem { code: String, status: u16, message: String, field: Option<String>, remediation: String }
 ```
 
 Run/step enums and route/protocol variants serialize snake_case; run ID is
@@ -370,7 +371,7 @@ near the output ceiling. Server graph admission proof belongs to TASK-004.
 
 **GREEN.** Apply the specified canonical accounting and reserved terminal
 space at candidate transitions/output projection without copying raw payloads
-into diagnostics or observers.
+into diagnostics or telemetry spans.
 
 **REFACTOR.** Share synchronous size/error projection on its natural owner;
 no allocator-size heuristic or second error catalog.
@@ -437,8 +438,59 @@ policy, remote language surface or inability to close direct consumer compilatio
 
 ## Authority Links
 
-- [Approved Revision 9](../spec.md)
+- [Approved Revision 11](../spec.md)
 - `AGENTS.md` §§2–12, 14–16; `architecture/agent-rules.md`
 - `architecture/wyrd-design.md`; `architecture/wyrd-doctrine.mdx`
 - `architecture/references/{doctrine/architecture-constraints,architecture/patterns}.md`
 - `architecture/references/languages/{rust-core,errors,spec-driven-development,implementation-execution,testing-workflows}.md`
+
+## Implementation Evidence
+
+Commits `dbf640c26..286218a68` on `wyrd/skald-workflow-runtime/TASK-001`.
+RED: each scenario selector was written against the old implicit engine
+(flat context, edge message handoff, `parameters`/`final_output`, Prompt/Mcp
+actions, condition) and failed to compile or assert before GREEN.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| S1 declared graph is the contract | `wyrd-spec/src/card/workflow.rs` (bindings, routes, run DTOs, derive codes); `skald-workflow/src/{plan,workflow_surface}.rs` | `card::workflow::tests::explicit_workflow_contract` (1/1); `workflow_surface::tests::resolved_bindings_reject_before_dispatch` | PASS |
+| S2 explicit injection, deterministic results | `skald-workflow/src/workflow.rs` executor, namespaced context, output projection | `workflow::tests::explicit_namespaced_results` | PASS |
+| S3 retries, one deadline, owned lifetime | `workflow.rs`/`attempt.rs` JoinSet, backoff, precedence, classification | `workflow::tests::bounded_attempt_lifecycle` | PASS |
+| S4 isolated route calls, RemoteProblem | `skald-workflow/src/route.rs`; `skald-providers/src/error.rs` `RemoteProblem` | `workflow::tests::isolated_route_calls` | PASS |
+| S5 ExtGateway secure transport | `skald-providers` endpoint policy (moved from `wyrd-gateway`), binding validation, pinning | `workflow::tests::bound_external_gateway_security`; gateway endpoint tests in `test:wyrd` | PASS |
+| S6 terminal budget reserve | `workflow.rs` canonical accounting and terminal reserve | `workflow::tests::terminal_budget_reserve` | PASS |
+| S7 Rust/Python explicit authoring | `workflow_surface.rs` `with_*`; `skald-workflow/src/python.rs` `PyWorkflowRun`; stubs and exports | `workflow_surface::tests::explicit_builder_contract`; `test_workflow_parameter_injection.py::test_explicit_workflow_bindings` | PASS |
+| OpenAI Responses Agents run their tool loop (REQ-039) | `skald-spec` `MessageNum::OpenAiResponses`; `skald-agent/src/request_builder.rs` (`PromptLoopSupport::OpenAiResponses`, native extract/assistant/rebuild/tool-result); `session.rs` dialect-aware seeding | RED: the loop refused with "not yet supported". `-p skald-agent --test loop_responses` (`agent_run_executes_openai_responses_tool_loop`, `responses_session_turns_seed_native_items`); `-p skald-spec --lib` `request::round_trip::messages_roundtrip`, `request::untagged_dispatch::message_num_untagged_dispatch_per_provider`; the `isolated_route_calls` `responses` step over WyrdGateway | PASS |
+| Local tools reach outputs; undeclared tools never run | `workflow_surface.rs` tests | `explicit_builder_contract` (tool result reaches `outputs["found"]`; undeclared gives `WYRD_AGENT_404_TOOL_NOT_IN_AGENT`, zero calls) | PASS |
+| Workspace builds with retained Python features | all consumers in commit range | `cargo check --locked -p skald-workflow --features python`; `mise run lints` (all features) | PASS |
+| Scoped lanes | — | `test:skald`, `test:shared` (702 passed), `test:wyrd` (2285 passed), `py:test:unit`, `py:typecheck`, `codegen:check`, `check:client-tier`, `check:pyo3-scope`, `check:unwrap-audit`, `fmt`, `lints`, `py:format`, `py:lints`, `git diff --check`: all exit 0 | PASS |
+
+Deviations and limits:
+- `ExternalGatewayBinding.secret_headers` is a `HashMap<HeaderName, SecretString>`,
+  because `HeaderName` is not `Ord`. Its iteration order is never observable.
+- `DEFAULT_MAX_RETRIES = 3` for the local executor.
+- The OpenAI Responses Agent loop was added at the lead's direction. The
+  write set now includes `skald-spec/src/message.rs` (new native
+  `MessageNum::OpenAiResponses(Vec<OpenAiResponseItem>)`, the only
+  array-shaped variant) and `skald-agent/src/{request_builder,session,loop_runtime}.rs`.
+  Loop history uses native Responses `input` items (message, function_call,
+  function_call_output) with no cross-dialect translation. Session-seeded
+  assistant turns use Responses output messages. History is replayed
+  statelessly, the same as every other dialect. Reasoning items are not
+  replayed, because the wire type drops their item id. `previous_response_id`
+  is left as authored.
+- `ProviderError::RemoteProblem` boxes its payload as `Box<RemoteProblem>`
+  because of clippy `result_large_err`. The fields match the spec.
+- Six catalog codes that no remaining path emits were removed: `404_TASK`,
+  `500_AGENT_RESPONSE_MISSING`, `500_LOCK`, `500_MAX_RETRIES`, `500_STALLED`,
+  and `501_UNSUPPORTED_HANDOFF`, all prefixed `WYRD_WORKFLOW_`.
+  `MISSING_PARAMETER` was retitled.
+- `tests/parameter_injection.rs` was superseded by the inline scenario tests.
+- Added the `workflow_run` and `create_workflow_run_request` schemas.
+- Real registered route journeys remain TASK-004/005 closure.
+
+Non-goals stayed excluded:
+- No remote Python, TypeScript, or MCP Workflow surface.
+- No compatibility aliases or migration docs.
+- No new crates or third-party dependencies.
+- Native transport and Vault/Operator policies are unchanged.

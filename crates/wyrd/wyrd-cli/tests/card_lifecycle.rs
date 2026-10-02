@@ -2305,4 +2305,415 @@ mod pg_tests {
         );
         stop_cli_server(server, shutdown, serve_handle).await;
     }
+
+    /// Write `contents` to `name` under `dir` and return the path as UTF-8.
+    ///
+    /// # Panics
+    /// Panics when the file cannot be written or its path is not UTF-8.
+    fn write_fixture(dir: &Path, name: &str, contents: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, contents).expect("CLI fixture writes");
+        path.to_str().expect("CLI fixture path is UTF-8").to_owned()
+    }
+
+    /// The CLI enforces the shared Verifier contract against a real server.
+    ///
+    /// `plan` and `apply` refuse the retired `kind: Drift` and `kind: Eval`
+    /// Cards with the loader's stable envelope diagnostic and leave no Card on
+    /// the server; `kind: Verifier` Cards with `implementation.kind: drift`
+    /// and `eval` apply. A standalone Workflow Operator Card applies, while a
+    /// Service binding it in `on_failure` is refused by the server with
+    /// `WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION` and is not registered.
+    ///
+    /// # Panics
+    /// Panics when the server fails to start or stop, a bootstrap fails, a
+    /// CLI invocation's exit status or stable code differs, or a refused Card
+    /// is readable afterwards.
+    #[tokio::test]
+    async fn cli_enforces_the_verifier_card_contract() {
+        let temp = tempfile::tempdir().expect("tempdir creates");
+        let server = WyrdTestServer::start_bound()
+            .await
+            .expect("bound WyrdTestServer starts");
+        let base_url = server
+            .base_url()
+            .expect("bound server exposes base URL")
+            .to_owned();
+        let Bootstrap::User { jwt, .. } = server
+            .bootstrap_user("cli-verifier-contract-admin", &["admin"])
+            .await
+            .expect("journey admin bootstraps")
+        else {
+            panic!("journey bootstrap returned a non-user principal");
+        };
+        let apply = |path: &str| {
+            vec![
+                "apply".to_owned(),
+                path.to_owned(),
+                "--server".to_owned(),
+                base_url.clone(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ]
+        };
+
+        for kind in ["Drift", "Eval"] {
+            let name = format!("cli-retired-{}", kind.to_lowercase());
+            let path = write_fixture(
+                temp.path(),
+                &format!("{name}.yaml"),
+                &format!(
+                    "apiVersion: wyrd/v1\nkind: {kind}\nmetadata:\n  name: {name}\n  version: 1.0.0\n  space: default\nspec: {{}}\n"
+                ),
+            );
+            let plan = run_cli_owned(vec![
+                "plan".to_owned(),
+                path.clone(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ])
+            .await;
+            assert_eq!(plan.status.code(), Some(64), "{kind}");
+            let report: Value = serde_json::from_slice(&plan.stdout).expect("plan error is JSON");
+            assert_eq!(
+                report["diagnostics"][0]["code"], "WYRD_LOADER_400_INVALID_ENVELOPE",
+                "{kind}: {report}"
+            );
+            let refused = run_cli_owned_with_token(apply(&path), Some(jwt.clone())).await;
+            assert_eq!(refused.status.code(), Some(64), "{kind}");
+            assert_eq!(
+                first_stderr_json(&refused)["code"],
+                "WYRD_CLI_400_CARD_LOAD",
+                "{kind}"
+            );
+            let mut conn = server
+                .tenant_conn_for(server.data_tenant_id())
+                .await
+                .expect("tenant connection opens");
+            let cards: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.cards WHERE name = $1")
+                .bind(&name)
+                .fetch_one(&mut **conn.transaction())
+                .await
+                .expect("card count reads");
+            conn.commit().await.expect("assertion transaction commits");
+            assert_eq!(
+                cards, 0,
+                "the retired {kind} Card never reaches the registry"
+            );
+        }
+
+        for (name, contents) in [
+            (
+                "cli-custom-verifier",
+                "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: cli-custom-verifier\n  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: drift\n    spec:\n      method: Custom\n      signal:\n        kind: Metric\n        name: score\n      condition:\n        kind: Statistical\n      profile:\n        kind: Custom\n        metric_name: score\n        baseline_value: 1.0\n        alert_threshold: 0.5\n",
+            ),
+            (
+                "cli-eval-verifier",
+                "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: cli-eval-verifier\n  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: eval\n    spec:\n      tasks: {}\n",
+            ),
+            (
+                "cli-rollback",
+                "apiVersion: wyrd/v1\nkind: Workflow\nmetadata:\n  name: cli-rollback\n  version: 1.0.0\n  space: default\nspec:\n  steps: []\n",
+            ),
+            (
+                "cli-rollback-operator",
+                "apiVersion: wyrd/v1\nkind: Operator\nmetadata:\n  name: cli-rollback-operator\n  version: 1.0.0\n  space: default\nspec:\n  kind: workflow\n  workflow_ref:\n    kind: Workflow\n    name: cli-rollback\n    version: 1.0.0\n    space: default\n",
+            ),
+        ] {
+            let path = write_fixture(temp.path(), &format!("{name}.yaml"), contents);
+            let receipt = run_cli_json(apply(&path), &jwt)
+                .await
+                .unwrap_or_else(|error| panic!("{name} applies: {error}"));
+            assert_eq!(receipt["root"]["name"], name, "{receipt}");
+        }
+
+        let service = write_fixture(
+            temp.path(),
+            "cli-workflow-bound.yaml",
+            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: cli-workflow-bound\n  version: 1.0.0\n  space: default\nspec:\n  verified_by:\n    - verifier:\n        kind: Verifier\n        name: cli-custom-verifier\n        version: 1.0.0\n        space: default\n      runs_on:\n        kind: schedule\n        cron: \"0 2 * * *\"\n      on_failure:\n        - kind: Operator\n          name: cli-rollback-operator\n          version: 1.0.0\n          space: default\n",
+        );
+        let refused = run_cli_owned_with_token(apply(&service), Some(jwt.clone())).await;
+        assert!(!refused.status.success());
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains("WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION"),
+            "binding a Workflow Operator is refused by the server: {stderr}"
+        );
+        let mut conn = server
+            .tenant_conn_for(server.data_tenant_id())
+            .await
+            .expect("tenant connection opens");
+        let bound: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM wyrd.cards WHERE name = 'cli-workflow-bound'")
+                .fetch_one(&mut **conn.transaction())
+                .await
+                .expect("card count reads");
+        conn.commit().await.expect("assertion transaction commits");
+        assert_eq!(bound, 0, "the refused Service is not registered");
+        server.shutdown().await.expect("test server shuts down");
+    }
+
+    /// Secrets the connection journey sends; none may reach argv or output.
+    const CONNECTION_SECRETS: [&str; 6] = [
+        "xoxb-cli-conn-secret",
+        "xoxb-cli-conn-rotated",
+        "pd-cli-conn-secret",
+        "pd-cli-conn-rotated",
+        "http-cli-conn-secret",
+        "http-cli-conn-rotated",
+    ];
+
+    /// Run one `operator-connection` verb with `token` and prove neither its
+    /// argv nor its output carries a journey secret.
+    ///
+    /// # Panics
+    /// Panics when a secret appears in argv, stdout, or stderr.
+    async fn connection_cli(arguments: Vec<String>, token: &str) -> Output {
+        for argument in &arguments {
+            for secret in CONNECTION_SECRETS {
+                assert!(!argument.contains(secret), "secret in argv: {arguments:?}");
+            }
+        }
+        let output = run_cli_owned_with_token(arguments, Some(token.to_owned())).await;
+        let rendered = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for secret in CONNECTION_SECRETS {
+            assert!(
+                !rendered.contains(secret),
+                "secret in CLI output: {rendered}"
+            );
+        }
+        output
+    }
+
+    /// Decode a successful `operator-connection` verb's JSON stdout.
+    ///
+    /// # Panics
+    /// Panics when the verb failed or printed something other than JSON.
+    fn connection_json(what: &str, output: &Output) -> Value {
+        assert!(
+            output.status.success(),
+            "{what} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("connection output is JSON")
+    }
+
+    /// A tenant administrator manages Slack, PagerDuty, and HTTP Operator
+    /// connections through the CLI against a real server.
+    ///
+    /// Each provider is created from a body file, rotated from a body file
+    /// without changing its identity, and read back redacted; `list` returns
+    /// exactly the three; the HTTP connection is disabled and re-enabled with
+    /// a status patch. A writer is refused creation, and another tenant's
+    /// administrator gets the stable not-found refusal on read, rotate, and
+    /// disable. No secret ever appears in argv, stdout, or stderr.
+    ///
+    /// # Panics
+    /// Panics when the server fails to start or stop, a bootstrap fails, a
+    /// verb's status or redacted view differs, or a secret leaks.
+    #[tokio::test]
+    async fn cli_manages_redacted_operator_connections() {
+        let bodies = tempfile::tempdir().expect("connection bodies directory creates");
+        let server = WyrdTestServer::start_bound()
+            .await
+            .expect("bound WyrdTestServer starts");
+        let base_url = server
+            .base_url()
+            .expect("bound server exposes base URL")
+            .to_owned();
+        let Bootstrap::User { jwt: admin, .. } = server
+            .bootstrap_user("cli-connection-admin", &["admin"])
+            .await
+            .expect("journey admin bootstraps")
+        else {
+            panic!("journey bootstrap returned a non-user principal");
+        };
+        let verb = |verb: &str, extra: &[&str]| {
+            let mut arguments = vec!["operator-connection".to_owned(), verb.to_owned()];
+            arguments.extend(extra.iter().map(|argument| (*argument).to_owned()));
+            arguments.extend(["--server".to_owned(), base_url.clone()]);
+            arguments
+        };
+
+        let mut ids = Vec::new();
+        for (provider, create, rotate) in [
+            (
+                "slack",
+                format!(
+                    "provider: slack\nname: cli-slack\nworkspace_id: T0001\nbot_token: {}\n",
+                    CONNECTION_SECRETS[0]
+                ),
+                format!("provider: slack\nbot_token: {}\n", CONNECTION_SECRETS[1]),
+            ),
+            (
+                "pager_duty",
+                format!(
+                    "provider: pager_duty\nname: cli-pagerduty\nintegration_key: {}\n",
+                    CONNECTION_SECRETS[2]
+                ),
+                format!(
+                    "provider: pager_duty\nintegration_key: {}\n",
+                    CONNECTION_SECRETS[3]
+                ),
+            ),
+            (
+                "http",
+                format!(
+                    "provider: http\nname: cli-http\norigin: https://hooks.example.com\nauth:\n  scheme: bearer\n  token: {}\n",
+                    CONNECTION_SECRETS[4]
+                ),
+                format!(
+                    "provider: http\nauth:\n  scheme: header\n  name: X-Api-Key\n  value: {}\n",
+                    CONNECTION_SECRETS[5]
+                ),
+            ),
+        ] {
+            let create_path = write_fixture(bodies.path(), &format!("{provider}.yaml"), &create);
+            let created = connection_json(
+                provider,
+                &connection_cli(verb("create", &["--body-file", &create_path]), &admin).await,
+            );
+            assert_eq!(created["provider"], provider, "{created}");
+            assert_eq!(created["status"], "active", "{created}");
+            let id = created["connection_id"]
+                .as_str()
+                .expect("connection_id is a string")
+                .to_owned();
+            let rotate_path =
+                write_fixture(bodies.path(), &format!("{provider}-rotate.yaml"), &rotate);
+            let rotated = connection_json(
+                provider,
+                &connection_cli(
+                    verb(
+                        "update",
+                        &["--connection-id", &id, "--body-file", &rotate_path],
+                    ),
+                    &admin,
+                )
+                .await,
+            );
+            assert_eq!(rotated["connection_id"], id.as_str(), "{rotated}");
+            let read = connection_json(
+                provider,
+                &connection_cli(verb("get", &["--connection-id", &id]), &admin).await,
+            );
+            assert_eq!(read, rotated, "a read returns the rotated redacted view");
+            ids.push(id);
+        }
+        let http = ids.last().expect("HTTP connection was created").clone();
+        let read = connection_json(
+            "http",
+            &connection_cli(verb("get", &["--connection-id", &http]), &admin).await,
+        );
+        assert_eq!(
+            read["auth"],
+            json!({ "scheme": "header", "name": "X-Api-Key" }),
+            "only the nonsecret HTTP authority is read back: {read}"
+        );
+
+        let listed = connection_json("list", &connection_cli(verb("list", &[]), &admin).await);
+        let mut listed_ids: Vec<&str> = listed
+            .as_array()
+            .expect("list prints an array")
+            .iter()
+            .filter_map(|connection| connection["connection_id"].as_str())
+            .collect();
+        listed_ids.sort_unstable();
+        let mut expected: Vec<&str> = ids.iter().map(String::as_str).collect();
+        expected.sort_unstable();
+        assert_eq!(listed_ids, expected, "{listed}");
+
+        let disabled = connection_json(
+            "disable",
+            &connection_cli(verb("disable", &["--connection-id", &http]), &admin).await,
+        );
+        assert_eq!(disabled["status"], "disabled", "{disabled}");
+        let enable_path = write_fixture(
+            bodies.path(),
+            "http-enable.yaml",
+            "provider: http\nstatus: active\n",
+        );
+        let enabled = connection_json(
+            "re-enable",
+            &connection_cli(
+                verb(
+                    "update",
+                    &["--connection-id", &http, "--body-file", &enable_path],
+                ),
+                &admin,
+            )
+            .await,
+        );
+        assert_eq!(enabled["status"], "active", "{enabled}");
+        assert_eq!(enabled["connection_id"], http.as_str());
+
+        let Bootstrap::User { jwt: writer, .. } = server
+            .bootstrap_user("cli-connection-writer", &["writer"])
+            .await
+            .expect("journey writer bootstraps")
+        else {
+            panic!("journey bootstrap returned a non-user principal");
+        };
+        let writer_create = write_fixture(
+            bodies.path(),
+            "writer.yaml",
+            &format!(
+                "provider: pager_duty\nname: cli-writer-pd\nintegration_key: {}\n",
+                CONNECTION_SECRETS[2]
+            ),
+        );
+        let denied =
+            connection_cli(verb("create", &["--body-file", &writer_create]), &writer).await;
+        assert!(!denied.status.success());
+        assert!(
+            String::from_utf8_lossy(&denied.stderr).contains("WYRD_PERMISSION_403_DENIED_RBAC"),
+            "an under-privileged mutation is refused: {}",
+            String::from_utf8_lossy(&denied.stderr)
+        );
+
+        let other_tenant = server
+            .seed_tenant("cli-connection-other")
+            .await
+            .expect("second tenant seeds");
+        let foreign = server
+            .bootstrap_service_in_tenant(other_tenant, "cli-connection-foreign", &["admin"])
+            .await
+            .expect("foreign admin bootstraps");
+        let foreign = server
+            .exchange_api_key(foreign.api_key().expect("a service carries a key"))
+            .await
+            .expect("foreign key exchanges");
+        let slack_rotate = bodies.path().join("slack-rotate.yaml");
+        let slack_rotate = slack_rotate.to_str().expect("body path is UTF-8");
+        for arguments in [
+            verb("get", &["--connection-id", &http]),
+            verb(
+                "update",
+                &["--connection-id", &ids[0], "--body-file", slack_rotate],
+            ),
+            verb("disable", &["--connection-id", &http]),
+        ] {
+            let refused = connection_cli(arguments.clone(), &foreign).await;
+            assert!(!refused.status.success(), "{arguments:?}");
+            assert!(
+                String::from_utf8_lossy(&refused.stderr)
+                    .contains("WYRD_OPERATOR_404_CONNECTION_NOT_FOUND"),
+                "{arguments:?}: {}",
+                String::from_utf8_lossy(&refused.stderr)
+            );
+        }
+        let still = connection_json(
+            "get",
+            &connection_cli(verb("get", &["--connection-id", &http]), &admin).await,
+        );
+        assert_eq!(
+            still["status"], "active",
+            "a foreign disable leaves the connection untouched"
+        );
+        server.shutdown().await.expect("test server shuts down");
+    }
 }

@@ -317,3 +317,79 @@ If any selected lane is red, diagnose and fix the failure rather than recording
 it as pre-existing or weakening the gate. A later `$wyrd-task-review` must audit
 the complete cumulative candidate against the original TASK-001 and this
 remediation task.
+
+## Implementation evidence
+
+This evidence was recorded under spec Revision 11 (REQ-053) and
+`TASK-001-R1-addendum-revision-11.md`.
+
+- Observer deletion and tracing: `47a231ab3`
+- Docs generator: `757bf6cbc`
+- Python `_init` removal: `0935c4d63`
+
+Every exact command below was prefixed with
+`CARGO_TARGET_DIR=/home/thorrester/Documents/GitHub/wyrd/target` and exited 0.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-TASK-001-1 | `4f61a70fa`: exact JCS growth charged for retained step payloads | `workflow::tests::terminal_budget_reserve` | PASS |
+| FIND-TASK-001-2 | `30519fa38`, `1f9905085`: native Responses reasoning items replayed in order | `loop_responses` `agent_run_executes_openai_responses_tool_loop`, `responses_session_turns_seed_native_items`; `request::round_trip::messages_roundtrip`; `request::untagged_dispatch::message_num_untagged_dispatch_per_provider` | PASS |
+| FIND-TASK-001-5 | Closed by deletion: no payload-bearing observation exists. The engine enforces the ceiling at admission in `skald-workflow/src/attempt.rs` (`AttemptOutcome::from_agent` with `max_step_result_bytes` returns `WYRD_WORKFLOW_413_STEP_RESULT_TOO_LARGE`). Spans carry no payloads. | `workflow::tests::terminal_budget_reserve` (exact 413, one attempt, no text); `workflow::tests::run_tracing_spans` (no payload in any span attribute) | PASS |
+| FIND-TASK-001-6 | Closed by deletion: there is no callback boundary, and spans are synchronous `tracing` that cannot change outcomes. The `AttemptSpan` drop guard records `cancelled` without affecting control flow. | `workflow::tests::run_tracing_spans` (cancelled run: status `cancelled`, attempts `[1 cancelled]`); `workflow::tests::bounded_attempt_lifecycle` | PASS |
+| FIND-TASK-001-7 | `4f61a70fa`: test imports moved into module import blocks | `mise run fmt`, `mise run lints` | PASS |
+| FIND-TASK-001-8 | `757bf6cbc`: `generate_api_docs.py` aligned with the `error.rs` catalog and regenerated. `check:examples` now builds `wyrd-rust-examples` (the removed `otel` feature is gone). | `mise run docs:check`, `mise run check:examples` | PASS |
+| FIND-TASK-001-9 | Exact selectors are listed under "Exact named tests". | 15 exact nextest commands, each running 1 test that passed | PASS |
+| FIND-TASK-001-10 | `b2f0a7b70`: Workflow PyO3 lives in `sdks/wyrd-sdk-python/src/workflow.rs`. The surviving part after deletion: `extract_observers` and the observer parameters are removed, and `skald_observer::python` registration is gone. | `mise run check:pyo3-scope`, `mise run py:test:unit`, `mise run py:typecheck` | PASS |
+| FIND-TASK-001-11 | `b2f0a7b70`: precise step, run-error and run TypedDict declarations | `mise run codegen:check`, `mise run py:typecheck` | PASS |
+| FIND-TASK-001-12 | Closed by deletion: no observer hooks remain to document. The REQ-053 spans are documented in `docs/src/content/docs/how-to/build-a-workflow.svx` (Observe). | `mise run docs:check` | PASS |
+| FIND-TASK-001-13 | `5c474e747`: the step-ID paragraph in `build-a-workflow.svx` is kept. Its observer-hook part was removed with the system. | `workflow_surface::tests::explicit_builder_contract` | PASS |
+| FIND-TASK-001-14 | Pre-poll abort reports `unstarted` (kept from `51c8189f7`/`2f909d860`) | `workflow::tests::bounded_attempt_lifecycle` | PASS |
+| FIND-TASK-001-15 | Checked deadline construction (kept from `51c8189f7`) | `workflow::tests::bounded_attempt_lifecycle`; `workflow_surface::tests::resolved_bindings_reject_before_dispatch` | PASS |
+| FIND-TASK-001-16 | Retry bound (kept from `51c8189f7`) | `workflow::tests::bounded_attempt_lifecycle` | PASS |
+| FIND-TASK-001-17 | `128c0a93f`: reserved binding header names are refused | `workflow::tests::bound_external_gateway_security` | PASS |
+| FIND-TASK-001-18 | `1affd4be0`: reflected refusal bodies are withheld | `workflow::tests::bound_external_gateway_security` | PASS |
+| FIND-TASK-001-19 | `415a28175`: extra blank line removed | `git diff --check a51af030b6039eea4b2914f3ebf2c31925d08721..HEAD` exit 0 | PASS |
+| REQ-053 deletion (addendum 1) | Removed: the `skald-observer` crate and workspace member, the Agent and Workflow hooks, `observe.rs`/`StepResultCeiling`, `observers`/`with_observers`, the `wyrd` re-exports and tests, Python `Observer`/`OtelObserver`/`observers=` and `_init`, stubs, tests, examples, docs, architecture references, and the `client-tier`/`pyo3-scope`/`error-coverage`/`test-families` references. No alias was added, and `wyrd.observe` is untouched. | `mise run check:client-tier`, `check:pyo3-scope`, `codegen:check`, `py:test:unit`, `scripts/checks/error-coverage.sh` | PASS |
+| REQ-053 tracing (addendum 2) | `workflow.rs`: `workflow.run` (id, run id, step count, status), a child `workflow.step` per attempt (step id, attempt, outcome, `error.type`), and the `workflow.step.backoff` event (next attempt, delay). `loop_runtime.rs`: `invoke_agent`, `chat` and `execute_tool` with GenAI attribute names. All are payload-free and use the existing `wyrd_telemetry::init_test_capture`. | `workflow::tests::run_tracing_spans`; `agent_timeout` `agent_run_emits_genai_spans_without_payloads` | PASS |
+| Engine-enforced ceiling (addendum 3) | `attempt.rs` `AttemptOutcome::from_agent` | `workflow::tests::terminal_budget_reserve` | PASS |
+| Agent timeout coverage (addendum 4) | `observer_timeout.rs` rewritten as `agent_timeout.rs`, asserting results, journal and spans | `agent_timeout` `agent_run_timeout_terminates_cleanly`, `agent_run_no_timeout_runs_to_completion` | PASS |
+
+### Diagnosis
+
+- **Symptom:** `py:test:unit` failed at collection with `ImportError: cannot import name '_init' from 'wyrd._wyrd'`.
+- **Cause:** `_init` was registered by the deleted `skald_observer::python` and only installed the observer bridge.
+- **Fix site:** removed `_init` from `python/wyrd/__init__.py` and `scripts/assemble_stubs.py`, then regenerated the stubs. There are no other callers.
+
+### Exact named tests
+
+```bash
+mise exec -- cargo nextest run --locked -p skald-workflow --lib -E 'test(=workflow::tests::terminal_budget_reserve)'
+mise exec -- cargo nextest run --locked -p skald-workflow --lib -E 'test(=workflow::tests::bounded_attempt_lifecycle)'
+mise exec -- cargo nextest run --locked -p skald-workflow --lib -E 'test(=workflow::tests::bound_external_gateway_security)'
+mise exec -- cargo nextest run --locked -p skald-workflow --lib -E 'test(=workflow::tests::run_tracing_spans)'
+mise exec -- cargo nextest run --locked -p skald-workflow --lib -E 'test(=workflow::tests::explicit_namespaced_results)'
+mise exec -- cargo nextest run --locked -p skald-workflow --lib -E 'test(=workflow::tests::isolated_route_calls)'
+mise exec -- cargo nextest run --locked -p skald-workflow --lib -E 'test(=workflow_surface::tests::resolved_bindings_reject_before_dispatch)'
+mise exec -- cargo nextest run --locked -p skald-workflow --lib -E 'test(=workflow_surface::tests::explicit_builder_contract)'
+mise exec -- cargo nextest run --locked -p skald-agent --test loop_responses -E 'test(=agent_run_executes_openai_responses_tool_loop)'
+mise exec -- cargo nextest run --locked -p skald-agent --test loop_responses -E 'test(=responses_session_turns_seed_native_items)'
+mise exec -- cargo nextest run --locked -p skald-agent --test agent_timeout -E 'test(=agent_run_timeout_terminates_cleanly)'
+mise exec -- cargo nextest run --locked -p skald-agent --test agent_timeout -E 'test(=agent_run_no_timeout_runs_to_completion)'
+mise exec -- cargo nextest run --locked -p skald-agent --test agent_timeout -E 'test(=agent_run_emits_genai_spans_without_payloads)'
+mise exec -- cargo nextest run --locked -p skald-spec --lib -E 'test(=request::round_trip::messages_roundtrip)'
+mise exec -- cargo nextest run --locked -p skald-spec --lib -E 'test(=request::untagged_dispatch::message_num_untagged_dispatch_per_provider)'
+```
+
+### Lanes (all exit 0)
+
+`mise run fmt`, `lints`, `py:format`, `py:lints`, `codegen:check`,
+`check:client-tier`, `check:pyo3-scope`, `check:unwrap-audit`, `test:skald`,
+`py:test:unit` (490 passed), `py:typecheck`, `docs:check` and `check:examples`.
+Also: `scripts/checks/error-coverage.sh`, `cargo nextest run --locked -p wyrd`
+(3 passed), `-p vala-eval` (126 passed), and
+`git diff --check a51af030b6039eea4b2914f3ebf2c31925d08721..HEAD`.
+
+The non-goals stayed excluded: no new crate, dependency, route, scheduler,
+queue, serializer, runtime DTO class, repository check or telemetry-init API.
+`wyrd-telemetry` is a dev-dependency only, using its existing `test-support`
+feature.

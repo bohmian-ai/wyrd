@@ -376,4 +376,10 @@ Lane exit codes (each lane run alone):
 | fmt, lints, py:format, py:lints | 0 |
 | codegen:check, check:client-tier, check:pyo3-scope, check:py-wheel-no-testing, check:workspace-hack, docs:check | 0 |
 | py:test:unit, py:typecheck, ts:test:unit, ts:typecheck, ts:napi:check, test:wyrd-sdk | 0 |
-| test:identity:journey (all targets and unfiltered), test:shared, test:cli:journey, test:principals:integration, py:test:integration, ts:test:integration, test:wyrd | not run: Docker daemon absent on host |
+| identity targets `cli`, `rust`, `client`, `python`, `typescript`, then `test:identity:journey` unfiltered | 0 |
+| test:shared (723 passed), test:cli:journey (33 passed), test:principals:integration | 0 |
+| py:test:integration (72 passed), ts:test:integration (25 passed), test:wyrd (2350 passed) | 0 |
+
+The first identity run exited 1 because the host had no Docker daemon, so
+Postgres never started and no test ran. Every lane above ran after Docker was
+restored.

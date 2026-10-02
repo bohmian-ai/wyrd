@@ -49,8 +49,8 @@ impl NativeWyrdClientResult {
 /// Builds one client without performing IO.
 ///
 /// Omitted arguments resolve through `client_from_options`: the environment,
-/// then the saved user login for this server and `tenant` (a tenant route key
-/// or id), then `~/.config/wyrd/credentials.toml`. Failures are returned as catalog
+/// then the saved user login for this server and `tenant` (a tenant route
+/// key), then `~/.config/wyrd/credentials.toml`. Failures are returned as catalog
 /// metadata.
 #[napi]
 pub fn connect_wyrd_client(

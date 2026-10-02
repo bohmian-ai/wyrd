@@ -697,7 +697,7 @@ export class Bifrost {
    * `WYRD_SERVER_URL`, `grpcUrl` from `WYRD_GRPC_URL`, and `credential`
    * through `WYRD_ACCESS_TOKEN` → `WYRD_WORKLOAD_TOKEN` + tenant →
    * `WYRD_API_KEY` → the saved `wyrd auth login` for this server and
-   * `tenant` (a tenant route key or id) → `~/.config/wyrd/credentials.toml`.
+   * `tenant` (a tenant route key) → `~/.config/wyrd/credentials.toml`.
    *
    * `client` reuses an existing, possibly delegated, {@link WyrdClient} for
    * authentication and transport. It cannot be combined with `serverUrl`,
@@ -1077,7 +1077,7 @@ export class WyrdClient {
    * Build a client without performing IO.
    *
    * Omitted options resolve from the environment, then the saved
-   * `wyrd auth login` for this server and `tenant` (a tenant route key or id),
+   * `wyrd auth login` for this server and `tenant` (a tenant route key),
    * then `~/.config/wyrd/credentials.toml`. A saved login that is ambiguous or
    * names another tenant raises `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE`.
    */

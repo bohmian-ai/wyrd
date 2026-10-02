@@ -37,7 +37,7 @@ impl PyWyrdClient {
     ///
     /// Omitted values resolve through `client_from_options`: the environment,
     /// then the saved user login for this server and `tenant` (a tenant route
-    /// key or id), then `~/.config/wyrd/credentials.toml`.
+    /// key), then `~/.config/wyrd/credentials.toml`.
     ///
     /// # Errors
     /// Raises `WyrdError` carrying `WYRD_CLIENT_401_NO_CREDENTIALS` when no

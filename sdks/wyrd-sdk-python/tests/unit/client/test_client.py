@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 
 
@@ -68,8 +70,10 @@ def test_wyrd_server_url_alone_sets_both_endpoints(monkeypatch: pytest.MonkeyPat
 def test_every_public_constructor_accepts_and_forwards_tenant():
     """``tenant`` reaches the shared Rust client from every public entry point.
 
-    ``py:typecheck`` checks this module, so each call is also a static proof
-    that the declarations accept ``tenant``. No call here reaches a server.
+    An explicit credential names its own tenant, so the forwarded selector is
+    refused by the shared resolver; that refusal proves it arrived. ``py:typecheck``
+    checks this module, so each call is also a static proof that the
+    declarations accept ``tenant``. No call here reaches a server.
     """
     from wyrd import WyrdClient, WyrdError
     from wyrd.bifrost import AsyncBifrost, Bifrost, TableConfig
@@ -80,21 +84,30 @@ def test_every_public_constructor_accepts_and_forwards_tenant():
     from wyrd.verification import Verification
 
     options = {"server_url": "http://127.0.0.1:9", "credential": "wyrd_test_actor"}
-    client = WyrdClient(**options, tenant="acme")
-    Cards(**options, tenant="acme")
-    Verification(**options, tenant="acme")
-    OperatorConnections(**options, tenant="acme")
-    Gateway(**options, tenant="acme")
 
+    def refused(build: Callable[[], object]) -> None:
+        with pytest.raises(WyrdError) as captured:
+            build()
+        assert captured.value.code == "WYRD_CLIENT_400_CONFIG_INVALID"
+        assert "already names its tenant" in str(captured.value)
+
+    refused(lambda: WyrdClient(**options, tenant="acme"))
+    refused(lambda: Cards(**options, tenant="acme"))
+    refused(lambda: Verification(**options, tenant="acme"))
+    refused(lambda: OperatorConnections(**options, tenant="acme"))
+    refused(lambda: Gateway(**options, tenant="acme"))
+    refused(
+        lambda: TableConfig.describe(
+            "ns.table", grpc_url="http://127.0.0.1:9", tenant="acme", **options
+        )
+    )
+
+    client = WyrdClient(**options)
     for facade in (Bifrost, AsyncBifrost):
         with pytest.raises(WyrdError) as captured:
             facade(client=client, tenant="acme")
         assert captured.value.code == "WYRD_SPEC_400_VALIDATION"
         assert "tenant" in str(captured.value)
-
-    with pytest.raises(WyrdError) as captured:
-        TableConfig.describe("ns.table", grpc_url="http://127.0.0.1:9", tenant="acme", **options)
-    assert captured.value.code != "WYRD_SPEC_400_VALIDATION"
 
     def start(state: WyrdState) -> None:
         state.start_bifrost(tenant="acme")

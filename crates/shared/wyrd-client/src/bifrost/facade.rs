@@ -944,7 +944,7 @@ pub(crate) fn client_from_env() -> Result<WyrdClient, BifrostClientError> {
 /// `server_url`), `ClientConfig::resolve_credential` for the credential, whose
 /// floor is `~/.config/wyrd/credentials.toml` `[default].api_key`. An explicit
 /// value is written into the config's tier-0 slot, so it wins over the
-/// environment rather than racing it. `tenant` (a tenant route key or id)
+/// environment rather than racing it. `tenant` (a tenant route key)
 /// replaces `WYRD_TENANT` as the selector of the saved user login and of the
 /// workload-token tenant.
 ///

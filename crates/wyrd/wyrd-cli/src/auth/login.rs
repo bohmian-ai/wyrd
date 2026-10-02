@@ -46,9 +46,9 @@ pub struct LogoutArgs {
     /// Wyrd server base URL of the login to end.
     #[arg(long, value_name = "URL", env = "WYRD_SERVER_URL")]
     pub server: Url,
-    /// Tenant route key or id of the login to end; required when the server
+    /// Tenant route key of the login to end; required when the server
     /// has saved logins for several tenants.
-    #[arg(long, value_name = "KEY_OR_ID", env = "WYRD_TENANT")]
+    #[arg(long, value_name = "KEY", env = "WYRD_TENANT")]
     pub tenant: Option<String>,
 }
 

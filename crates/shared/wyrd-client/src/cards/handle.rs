@@ -152,7 +152,7 @@ impl Cards {
     /// optional explicit server URL, credential, and tenant selector
     /// overrides.
     ///
-    /// `tenant` (a tenant route key or id) replaces the configured
+    /// `tenant` (a tenant route key) replaces the configured
     /// `WYRD_TENANT` selector of the saved user login. No network or token
     /// exchange occurs during construction.
     ///

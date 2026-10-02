@@ -121,7 +121,7 @@ impl PyGateway {
 #[pymethods]
 impl PyGateway {
     /// Connects to a Wyrd server; omitted options resolve from the environment,
-    /// and `tenant` (a tenant route key or id) selects the saved user login.
+    /// and `tenant` (a tenant route key) selects the saved user login.
     ///
     /// # Errors
     ///

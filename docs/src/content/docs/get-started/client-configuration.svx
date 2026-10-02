@@ -111,11 +111,17 @@ order, stopping at the first available source:
 
 1. An API key supplied explicitly on `ClientConfig::api_key`.
 2. `WYRD_ACCESS_TOKEN`.
-3. `WYRD_WORKLOAD_TOKEN` with `WYRD_TENANT`, or with `client.tenant` from the
-   global profile when `WYRD_TENANT` is unset.
+3. `WYRD_WORKLOAD_TOKEN` with the selected tenant key (the client `tenant`
+   option or `client.tenant`, else `WYRD_TENANT`).
 4. `WYRD_API_KEY`.
 5. `[default].api_key` in `credentials.toml` under the selected config
    directory.
+
+The tenant selector is a tenant route key, the one `wyrd auth login --tenant`
+takes. It selects a saved user login and names the tenant a workload token is
+exchanged for. An access token or API key already names its tenant, so
+selecting a tenant beside one fails with `WYRD_CLIENT_400_CONFIG_INVALID`
+instead of being ignored.
 
 For local development, the credentials file can look like this:
 

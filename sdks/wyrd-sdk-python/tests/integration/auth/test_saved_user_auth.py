@@ -57,15 +57,20 @@ def test_saved_user_auth_journey(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         with pytest.raises(WyrdError) as denied:
             reader.register(_prompt())
         assert denied.value.status == 403
-        Cards(server_url=url, tenant=second).prompt.list(space="saved-login")
+        Cards(server_url=url, tenant=SECOND_TENANT).prompt.list(space="saved-login")
 
         # A stale login renews through Wyrd exactly once.
         before = server.expire_saved_login(tmp_path, FIXTURE_TENANT)
         Cards(server_url=url, tenant=FIXTURE_TENANT).prompt.list(space="saved-login")
         assert server.saved_login_generation(tmp_path, FIXTURE_TENANT) == before + 1
 
-        # An explicit machine credential overrides the saved reader.
-        Cards(server_url=url, credential=server.api_key, tenant=FIXTURE_TENANT).register(_prompt())
+        # An explicit machine credential overrides the saved reader; it names
+        # its own tenant, so a selector beside it is refused.
+        with pytest.raises(WyrdError) as selected:
+            Cards(server_url=url, credential=server.api_key, tenant=FIXTURE_TENANT)
+        assert selected.value.code == "WYRD_CLIENT_400_CONFIG_INVALID"
+        assert "already names its tenant" in str(selected.value)
+        Cards(server_url=url, credential=server.api_key).register(_prompt())
 
         # Once the chain is revoked the login fails closed and is never retried.
         server.revoke_saved_login(tmp_path, FIXTURE_TENANT)

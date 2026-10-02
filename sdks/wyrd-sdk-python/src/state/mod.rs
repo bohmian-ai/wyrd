@@ -1586,7 +1586,7 @@ impl PyCards {
     /// # Arguments
     /// * `server_url` - Optional Wyrd server URL override.
     /// * `credential` - Optional explicit credential override.
-    /// * `tenant` - Optional tenant route key or id selecting the saved user
+    /// * `tenant` - Optional tenant route key selecting the saved user
     ///   login.
     ///
     /// # Errors

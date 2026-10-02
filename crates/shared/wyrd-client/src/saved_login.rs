@@ -161,13 +161,6 @@ impl SavedLogin {
     fn is_for(&self, origin: &str, tenant_id: DataTenantId) -> bool {
         self.origin == origin && self.tenant_id == tenant_id
     }
-
-    /// Whether `selector` (a tenant route key or tenant id) names this
-    /// record's tenant.
-    #[must_use]
-    pub fn matches_tenant(&self, selector: &str) -> bool {
-        selector == self.tenant_key.as_str() || selector == self.tenant_id.to_string()
-    }
 }
 
 /// Canonical form of a server URL, the key saved logins are stored and
@@ -276,8 +269,8 @@ impl SavedLogins {
 
     /// Select the saved login for `origin` and the optional tenant selector.
     ///
-    /// With a selector, the one record for this origin whose tenant key or id
-    /// equals it is selected; when other tenants' records exist for this
+    /// With a selector (a tenant route key, the one `wyrd auth login` takes),
+    /// the one record for this origin whose tenant key equals it is selected; when other tenants' records exist for this
     /// origin but none matches, selection fails rather than falling through.
     /// Without a selector, exactly one record for this origin is selected and
     /// several fail as ambiguous. No record for this origin selects nothing.
@@ -299,7 +292,7 @@ impl SavedLogins {
             return Ok(None);
         }
         if let Some(selector) = tenant {
-            candidates.retain(|login| login.matches_tenant(selector));
+            candidates.retain(|login| login.tenant_key.as_str() == selector);
             if candidates.is_empty() {
                 return Err(saved_login(
                     "tenant_mismatch",
@@ -910,8 +903,8 @@ mod tests {
         assert!(canonical_origin("not a url").is_err());
     }
 
-    /// Selection by origin and tenant: one record selects, a selector picks
-    /// its tenant, several without a selector are ambiguous, a selector naming
+    /// Selection by origin and tenant: one record selects, a tenant route key
+    /// picks its tenant while a tenant id selects nothing, several without a selector are ambiguous, a selector naming
     /// no record fails, and another origin selects nothing. A saved login is
     /// continued at the next generation, and the status projection carries no
     /// token.
@@ -945,9 +938,8 @@ mod tests {
         assert_eq!(by_key.tenant_id, globex.tenant_id);
         let by_id = store
             .select(origin, Some(&acme.tenant_id.to_string()))
-            .expect("selects")
-            .expect("one");
-        assert_eq!(by_id.tenant_key, acme.tenant_key);
+            .expect_err("a tenant id is not a selector");
+        assert!(by_id.to_string().contains("tenant_mismatch"), "{by_id}");
         let mismatch = store.select(origin, Some("initech")).expect_err("mismatch");
         assert!(mismatch.to_string().contains("tenant_mismatch"));
 

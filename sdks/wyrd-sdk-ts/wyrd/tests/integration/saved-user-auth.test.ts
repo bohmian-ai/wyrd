@@ -68,7 +68,7 @@ describe("saved user login", () => {
     try {
       const serverUrl = server.baseUrl;
       server.activateHumanSso();
-      const second = server.activateHumanSso(SECOND_TENANT);
+      server.activateHumanSso(SECOND_TENANT);
       server.saveHumanLogin(config, FIXTURE_TENANT, "bob", "wyrd-test");
       server.saveHumanLogin(config, SECOND_TENANT, "alice", "alice-password");
 
@@ -82,19 +82,21 @@ describe("saved user login", () => {
       const reader = Cards.connect({ serverUrl, tenant: FIXTURE_TENANT });
       await reader.list({ kind: "Prompt" });
       expect((await rejection(reader.registerFromPath(prompt))).status).toBe(403);
-      await Cards.connect({ serverUrl, tenant: second }).list({ kind: "Prompt" });
+      await Cards.connect({ serverUrl, tenant: SECOND_TENANT }).list({ kind: "Prompt" });
 
       // A stale login renews through Wyrd exactly once.
       const before = server.expireSavedLogin(config, FIXTURE_TENANT);
       await Cards.connect({ serverUrl, tenant: FIXTURE_TENANT }).list({ kind: "Prompt" });
       expect(server.savedLoginGeneration(config, FIXTURE_TENANT)).toBe(before + 1);
 
-      // An explicit machine credential overrides the saved reader.
-      await Cards.connect({
-        serverUrl,
-        credential: server.apiKey,
-        tenant: FIXTURE_TENANT,
-      }).registerFromPath(prompt);
+      // An explicit machine credential overrides the saved reader; it names
+      // its own tenant, so a selector beside it is refused.
+      const selected = thrown(() =>
+        Cards.connect({ serverUrl, credential: server.apiKey, tenant: FIXTURE_TENANT }),
+      );
+      expect(selected.code).toBe("WYRD_CLIENT_400_CONFIG_INVALID");
+      expect(selected.message).toContain("already names its tenant");
+      await Cards.connect({ serverUrl, credential: server.apiKey }).registerFromPath(prompt);
 
       // Once the chain is revoked the login fails closed and is never retried.
       server.revokeSavedLogin(config, FIXTURE_TENANT);

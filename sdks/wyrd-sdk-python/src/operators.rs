@@ -58,7 +58,7 @@ pub struct OperatorConnections {
 #[pymethods]
 impl OperatorConnections {
     /// Build a handle; omitted arguments fall through the client configuration,
-    /// and `tenant` (a tenant route key or id) selects the saved user login.
+    /// and `tenant` (a tenant route key) selects the saved user login.
     ///
     /// No network call happens here.
     ///

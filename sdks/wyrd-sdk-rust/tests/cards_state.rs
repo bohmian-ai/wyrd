@@ -342,8 +342,10 @@ async fn run_script(phase: &str, config: &Path, base_url: &str, second: &str, ma
 /// `select`: two same-server tenants without a selector are ambiguous, a
 /// selector naming no saved login fails, the reader's saved login lists Cards
 /// and is denied a registration, and the second tenant's login resolves by
-/// tenant id. `renew`: a stale login renews through Wyrd. `override`: an
-/// explicit machine credential wins over the saved reader. `revoked`: a
+/// its tenant route key. `renew`: a stale login renews through Wyrd.
+/// `override`: an explicit machine credential wins over the saved reader, and
+/// a tenant selector beside it is refused because the key names its own
+/// tenant. `revoked`: a
 /// revoked login fails renewal, and the uncertain record is never retried.
 ///
 /// # Panics
@@ -381,9 +383,9 @@ async fn saved_user_auth_script() {
                 .await
                 .expect_err("the reader cannot register");
             assert_eq!(denied.status(), 403);
-            let second = std::env::var("WYRD_SAVED_LOGIN_SECOND_TENANT").expect("tenant id");
+            let second = std::env::var("WYRD_SAVED_LOGIN_SECOND_TENANT").expect("tenant key");
             connect(None, Some(&second))
-                .expect("the second tenant's login resolves by tenant id")
+                .expect("the second tenant's login resolves by its route key")
                 .list(card_listing())
                 .await
                 .expect("alice lists in her tenant");
@@ -397,7 +399,15 @@ async fn saved_user_auth_script() {
         }
         "override" => {
             let machine = std::env::var("WYRD_SAVED_LOGIN_MACHINE_KEY").expect("machine key");
-            let cards = connect(Some(machine), Some(FIXTURE_TENANT_SLUG)).expect("resolves");
+            let selected = connect(Some(machine.clone()), Some(FIXTURE_TENANT_SLUG))
+                .err()
+                .expect("a selector beside a machine key is refused");
+            assert_eq!(selected.code(), "WYRD_CLIENT_400_CONFIG_INVALID");
+            assert!(
+                selected.to_string().contains("already names its tenant"),
+                "{selected}"
+            );
+            let cards = connect(Some(machine), None).expect("resolves");
             Box::pin(cards.register_from_path(&prompt_card()))
                 .await
                 .expect("the explicit machine credential overrides the saved reader");
@@ -488,7 +498,7 @@ async fn saved_user_auth_journey() {
     assert_eq!(bob.tenant_id, server.data_tenant_id());
     sso.save_login(config.path(), "saved-login-two", "alice", "alice-password")
         .await;
-    let second = second.to_string();
+    let second = "saved-login-two".to_owned();
     let script =
         |phase: &'static str| run_script(phase, config.path(), &base_url, &second, &admin_key);
 

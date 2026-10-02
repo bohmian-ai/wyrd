@@ -238,8 +238,9 @@ class Cards:
             client configuration supplies it.
         credential: Optional credential override for this handle. When omitted, the
             shared Wyrd client configuration supplies credentials.
-        tenant: Optional tenant route key or id the credential must belong to;
-            it selects among one server's saved logins.
+        tenant: Optional tenant route key that selects one server\'s
+            saved login or the workload-token tenant; an explicit credential, access token, or API key
+            already names its tenant and refuses it.
 
     Raises:
         WyrdError: If local configuration or the API-key override cannot be

@@ -432,8 +432,9 @@ class _BifrostBase:
                 ``on_behalf_of``. Bifrost then uses its authentication and
                 transport; it cannot be combined with ``server_url``,
                 ``credential``, ``grpc_url``, or ``tenant``.
-            tenant: the tenant route key or id the credential must belong to;
-                it selects among one server's saved logins.
+            tenant: the tenant route key that selects one server\'s
+                saved login or the workload-token tenant; an explicit credential, access token, or API key
+                already names its tenant and refuses it.
 
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` when ``client`` is combined

@@ -21,8 +21,8 @@ class WyrdClient:
     ) -> None:
         """Build a client from optional transport overrides.
 
-        ``tenant`` is the optional tenant route key or id the credential must
-        belong to; it selects among one server's saved logins.
+        ``tenant`` is the optional tenant route key that selects one
+        server\'s saved login or the workload-token tenant; an explicit credential, access token, or API key already names its tenant and refuses it.
 
         Raises:
             WyrdError: ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no credential

@@ -298,6 +298,14 @@ pub(crate) async fn cli_oidc_handoff_journey() {
             .expect("lists")
             .is_empty()
     );
+    let renewed = exchange
+        .exchange(&TokenRequest::RefreshToken {
+            refresh_token: second.refresh_token.clone(),
+        })
+        .await
+        .expect("the other login still renews");
+    // Presenting the revoked token is a replay, so it is checked last: the
+    // server's containment then ends every chain of this person.
     assert!(
         exchange
             .exchange(&TokenRequest::RefreshToken {
@@ -307,12 +315,6 @@ pub(crate) async fn cli_oidc_handoff_journey() {
             .is_err(),
         "the logged-out chain no longer renews"
     );
-    let renewed = exchange
-        .exchange(&TokenRequest::RefreshToken {
-            refresh_token: second.refresh_token.clone(),
-        })
-        .await
-        .expect("the other login still renews");
 
     // With the server gone, logout still removes the saved login and says the
     // revocation was not confirmed.

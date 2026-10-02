@@ -50,7 +50,9 @@ pub struct ClientConfig {
     /// always wins over `WYRD_API_KEY`, `WYRD_ACCESS_TOKEN`, and the
     /// `credentials.toml` floor.
     pub credential: Option<SecretString>,
-    /// Optional tenant slug used with workload identity credentials.
+    /// Optional tenant selector: the slug paired with workload identity
+    /// credentials, and the tenant slug or id that picks one saved user login
+    /// for this server.
     pub tenant: Option<String>,
     /// Token cache mode.
     pub token_cache: TokenCacheMode,

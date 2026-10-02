@@ -19,7 +19,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use url::Url;
 use wyrd_client::auth::TokenExchange;
-use wyrd_client::saved_login::{SavedLogin, SavedLogins, canonical_origin};
+use wyrd_client::saved_login::{SavedLogin, SavedLoginState, SavedLogins, canonical_origin};
 use wyrd_spec::auth::{CliHandoffClaim, CliHandoffProof, CliLogin, SecretBearer};
 use wyrd_spec::ids::TenantSlug;
 
@@ -265,4 +265,37 @@ impl HumanSso {
 #[must_use]
 pub fn saved_logins(config_home: &Path) -> SavedLogins {
     SavedLogins::at(config_home.join("logins"))
+}
+
+/// The saved login for `tenant` at `origin` under `config_home`.
+///
+/// # Panics
+/// Panics when the store refuses the selection or holds no such login.
+#[must_use]
+pub fn saved_login(config_home: &Path, origin: &str, tenant: &str) -> SavedLogin {
+    saved_logins(config_home)
+        .select(origin, Some(tenant))
+        .expect("store selects")
+        .expect("saved login exists")
+}
+
+/// Make the saved login for `tenant` at `origin` stale, so the next client
+/// renews it; returns the generation the renewal starts from.
+///
+/// # Panics
+/// Panics when the record is missing or not ready, or cannot be saved.
+#[must_use]
+pub fn expire_saved_access(config_home: &Path, origin: &str, tenant: &str) -> u64 {
+    let mut record = saved_login(config_home, origin, tenant);
+    let SavedLoginState::Ready {
+        access_expires_at, ..
+    } = &mut record.state
+    else {
+        panic!("saved login is ready: {:?}", record.summary());
+    };
+    *access_expires_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+    saved_logins(config_home)
+        .save(record)
+        .expect("stale login saves");
+    saved_login(config_home, origin, tenant).generation
 }

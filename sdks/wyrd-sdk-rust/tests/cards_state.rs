@@ -18,7 +18,9 @@ use wyrd_sdk::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode, Lis
 use wyrd_sdk::saved_login::{SavedLoginState, canonical_origin};
 use wyrd_sdk::state::WyrdState;
 use wyrd_testing::Bootstrap;
-use wyrd_testing::human_login::{FIXTURE_TENANT_SLUG, HUMAN_PUBLIC_ORIGIN, HumanSso, saved_logins};
+use wyrd_testing::human_login::{
+    FIXTURE_TENANT_SLUG, HUMAN_PUBLIC_ORIGIN, HumanSso, expire_saved_access, saved_login,
+};
 use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 
 /// Payload of the single Prompt artifact every bundle must carry verbatim.
@@ -294,32 +296,6 @@ fn card_listing() -> ListCardsRequest {
     }
 }
 
-/// Make the saved login for `tenant` stale, so the next client renews it;
-/// returns the generation the renewal starts from.
-///
-/// # Panics
-/// Panics when the record is missing or not ready, or cannot be saved.
-fn expire_saved_access(config: &Path, origin: &str, tenant: &str) -> u64 {
-    let store = saved_logins(config);
-    let mut record = store
-        .select(origin, Some(tenant))
-        .expect("store selects")
-        .expect("saved login exists");
-    let SavedLoginState::Ready {
-        access_expires_at, ..
-    } = &mut record.state
-    else {
-        panic!("saved login is ready: {:?}", record.summary());
-    };
-    *access_expires_at = chrono::Utc::now() - chrono::Duration::minutes(1);
-    store.save(record).expect("stale login saves");
-    store
-        .select(origin, Some(tenant))
-        .expect("store selects")
-        .expect("saved login exists")
-        .generation
-}
-
 /// Environment naming the phase a [`saved_user_auth_script`] child runs.
 const SCRIPT_PHASE: &str = "WYRD_SAVED_LOGIN_PHASE";
 
@@ -520,10 +496,7 @@ async fn saved_user_auth_journey() {
 
     let before = expire_saved_access(config.path(), &origin, FIXTURE_TENANT_SLUG);
     script("renew").await;
-    let renewed = saved_logins(config.path())
-        .select(&origin, Some(FIXTURE_TENANT_SLUG))
-        .expect("selects")
-        .expect("saved");
+    let renewed = saved_login(config.path(), &origin, FIXTURE_TENANT_SLUG);
     assert_eq!(renewed.generation, before + 1, "exactly one rotation");
 
     script("override").await;
@@ -532,7 +505,7 @@ async fn saved_user_auth_journey() {
         panic!("renewed login is ready");
     };
     sso.revoke(refresh_token).await;
-    expire_saved_access(config.path(), &origin, FIXTURE_TENANT_SLUG);
+    let _ = expire_saved_access(config.path(), &origin, FIXTURE_TENANT_SLUG);
     script("revoked").await;
 
     server.shutdown().await.expect("test server shuts down");

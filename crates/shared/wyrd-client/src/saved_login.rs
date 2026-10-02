@@ -621,7 +621,8 @@ impl AccessTokenSource for SavedLoginSource {
     }
 }
 
-/// The `tenant_id` claim of a Wyrd access token, read without verifying it.
+/// The `principal.tenant_id` claim of a Wyrd access token, read without
+/// verifying it.
 ///
 /// Only a consistency check on a token the server just issued over TLS: the
 /// server still verifies every token it receives. `None` when the token is
@@ -629,16 +630,22 @@ impl AccessTokenSource for SavedLoginSource {
 fn access_token_tenant(token: &SecretBearer) -> Option<DataTenantId> {
     /// The one claim this check reads.
     #[derive(Deserialize)]
-    struct TenantClaim {
+    struct Claims {
+        /// Subject the token acts as.
+        principal: Principal,
+    }
+    /// The token subject, reduced to its tenant.
+    #[derive(Deserialize)]
+    struct Principal {
         /// Tenant the token acts in.
         tenant_id: DataTenantId,
     }
     let payload = token.expose().split('.').nth(1)?;
     let bytes =
         base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload).ok()?;
-    serde_json::from_slice::<TenantClaim>(&bytes)
+    serde_json::from_slice::<Claims>(&bytes)
         .ok()
-        .map(|claim| claim.tenant_id)
+        .map(|claims| claims.principal.tenant_id)
 }
 
 /// File stem of the record for `origin` and `tenant_id`: a hash, so neither
@@ -734,8 +741,38 @@ mod tests {
     use wyrd_spec::ids::TenantSlug;
 
     use super::{
-        SAVED_LOGIN_FORMAT_VERSION, SavedLogin, SavedLoginState, SavedLogins, canonical_origin,
+        SAVED_LOGIN_FORMAT_VERSION, SavedLogin, SavedLoginState, SavedLogins, access_token_tenant,
+        canonical_origin,
     };
+
+    /// The renewal tenant check reads the access token's `principal.tenant_id`
+    /// claim, and a token without it never passes as some tenant.
+    #[test]
+    fn access_token_tenant_reads_the_principal_claim() {
+        let tenant = DataTenantId::new_v7();
+        let token = |claims: serde_json::Value| {
+            let payload = base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                claims.to_string(),
+            );
+            SecretBearer::new(format!("e30.{payload}.sig"))
+        };
+        assert_eq!(
+            access_token_tenant(&token(serde_json::json!({
+                "sub": "user",
+                "principal": { "id": "user", "tenant_id": tenant },
+            }))),
+            Some(tenant)
+        );
+        assert_eq!(
+            access_token_tenant(&token(serde_json::json!({ "tenant_id": tenant }))),
+            None
+        );
+        assert_eq!(
+            access_token_tenant(&SecretBearer::new("opaque".to_owned())),
+            None
+        );
+    }
 
     /// A ready record for `origin` and the tenant `key`.
     fn login(origin: &str, key: &str) -> SavedLogin {

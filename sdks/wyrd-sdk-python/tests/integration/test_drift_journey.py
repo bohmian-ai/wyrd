@@ -15,16 +15,35 @@ retired ``weco_rule`` field, and a caller without ``evals:run``. A second journe
 semantics on isolated subjects: an empty tenant, a baseline-like window, SPC
 subgroups until a partial one, a sparse window, unrelated and incomplete
 records, per-row Custom averaging with window bounds, and a text-valued metric.
+
+A third journey registers one Service whose Model carries PSI, SPC, and Custom
+Drift bindings and whose Agent carries a deterministic and a local LLM-judge
+Eval binding. As its own Card-bound principal the Service emits typed and
+mapping Drift and Eval observations through one ``state.run()`` that switches
+between the Model and Agent views; Scribe acknowledges them, each Eval
+observation runs both Eval bindings, and manual binding runs score each Drift
+method. The failed PSI binding run delivers its HTTP Operator to a local
+receiver, read back as ``delivered`` through Run GET, and a direct PSI run
+persists null owner and binding identity. Mapping, dataclass, and Pydantic
+payloads persist identical tall Drift rows, and registering a retired
+``kind: Drift`` or ``kind: Eval`` Card is refused.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pandas as pd
@@ -32,10 +51,14 @@ import polars as pl
 import pyarrow as pa
 import pytest
 import yaml
+from pydantic import BaseModel
 from wyrd import WyrdError
 from wyrd.bifrost import Bifrost
 from wyrd.cards import CardRef, Cards
 from wyrd.data import ArrowInterface, DataCard, PandasInterface, PolarsInterface
+from wyrd.model import ModelInterface
+from wyrd.observe import Run
+from wyrd.prompt import Prompt
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 from wyrd.verification import Verification
@@ -628,3 +651,526 @@ def test_drift_method_edges_score_through_oracle(tmp_path: Path) -> None:
         text = subject(cards, tmp_path, "py-edge-text")
         emit_rows(server, admin, text, bundles / "text", [{"score": "high"}] * 3)
         assert_unscored(run(custom, text))
+
+
+MODEL_ARTIFACT = b"py-bound-model-artifact"
+
+JUDGE_REPLY = {
+    "id": "chatcmpl_py_eval",
+    "object": "chat.completion",
+    "created": 1_700_000_000,
+    "model": "gpt-test",
+    "choices": [
+        {
+            "index": 0,
+            "finish_reason": "stop",
+            "message": {"role": "assistant", "content": '{"passed":true}'},
+        }
+    ],
+    "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+}
+
+
+@contextmanager
+def local_upstream() -> Iterator[tuple[str, list[tuple[str, dict]]]]:
+    """Serve the judge provider and the Operator hook from one loopback server.
+
+    ``POST /v1/chat/completions`` answers every judge call with a passing
+    verdict; ``POST /hook`` accepts an Operator delivery. Yields the root URL
+    and the ``(path, JSON body)`` of every request received, in arrival order.
+    """
+    received: list[tuple[str, dict]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        """Record one JSON POST and answer the judge or the hook."""
+
+        def do_POST(self) -> None:
+            body = json.loads(self.rfile.read(int(self.headers["content-length"] or 0)) or b"{}")
+            received.append((self.path, body))
+            reply = json.dumps(JUDGE_REPLY if self.path.endswith("/chat/completions") else {})
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(reply.encode())
+
+        def log_message(self, *args: object) -> None:
+            """Keep the test output free of per-request access lines."""
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", received
+    finally:
+        server.shutdown()
+        thread.join()
+
+
+class NoopModelInterface(ModelInterface):
+    """Stand-in loader for the fixture Model, which is observed and never run."""
+
+    def __init__(self) -> None:
+        """Start with the empty holder slot the Model holder expects after load."""
+        super().__init__()
+        self.model: object = None
+
+    def save(self, path: Path, save_kwargs: dict[str, object] | None = None) -> None:
+        """Never called: the journey registers YAML, it does not save a Model."""
+        raise NotImplementedError
+
+    def load(self, path: Path, load_kwargs: dict[str, object] | None = None) -> None:
+        """Read nothing and publish a deterministic stand-in model."""
+        self.model = lambda value: value
+
+
+@dataclass
+class Features:
+    """The typed Drift payload: PSI/SPC ``latency`` and the Custom ``score``."""
+
+    latency: float
+    score: float
+
+
+@dataclass
+class Exchange:
+    """The typed Eval context both Eval Verifiers read."""
+
+    answer: str
+
+
+@dataclass
+class Shape:
+    """One payload of every scalar kind, authored as a dataclass."""
+
+    latency: float
+    tier: str
+    count: int
+    cached: bool
+
+
+class ShapeModel(BaseModel):
+    """The same payload as ``Shape``, authored as a Pydantic model."""
+
+    latency: float
+    tier: str
+    count: int
+    cached: bool
+
+
+def eval_verifier(name: str, tasks: str) -> str:
+    """Build an Eval Verifier whose ``all_pass`` gate covers ``tasks``."""
+    return (
+        f"apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: {name}\n"
+        "  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: eval\n"
+        f"    spec:\n      pass_gate: {{kind: all_pass}}\n      tasks:\n{tasks}"
+    )
+
+
+def write_bound_graph(root: Path, baseline: CardRef, hook: str) -> Path:
+    """Write a Service whose Model and Agent carry all five verification bindings.
+
+    The Model is the subject of the PSI, SPC, and Custom Drift bindings; only
+    PSI names an Operator, an HTTP POST to ``hook``. The Agent is the subject
+    of a deterministic and an LLM-judge Eval binding, both activated by
+    ``observations_ready``. The judge Prompt is native OpenAI Chat with a
+    JSON-schema response built through the public ``Prompt`` builder. The
+    artifact-bearing Model registers alone from ``model.yaml`` first, so the
+    Service names it by exact identity.
+    """
+    (root / "model.bin").write_bytes(MODEL_ARTIFACT)
+    judge = Prompt.openai_chat(
+        "gpt-test",
+        messages=["Grade the answer ${answer}."],
+        variables=["answer"],
+        output={"passed": bool},
+    )
+    card = {
+        "apiVersion": "wyrd/v1",
+        "kind": "Prompt",
+        "metadata": {"name": "py-bound-judge", "version": "1.0.0", "space": "default"},
+        "spec": json.loads(judge.model_dump_json()),
+    }
+    files = {
+        "judge-prompt.json": json.dumps(card),
+        "agent-prompt.yaml": (
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: py-bound-agent-prompt\n"
+            "  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n"
+            "  model: gpt-test\n  messages: [answer the question]\n"
+        ),
+        "agent.yaml": (
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: py-bound-agent\n"
+            "  version: 1.0.0\n  space: default\nspec:\n  prompt: ./agent-prompt.yaml\n"
+            "  run_config:\n    max_iterations: 1\n"
+        ),
+        "model.yaml": (
+            "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: py-bound-model\n"
+            "  version: 1.0.0\n  space: default\nspec:\n  interface:\n    kind: Custom\n"
+            "    meta:\n      framework_version: 0.1.0\n      loader_module: fixture\n"
+            "      loader_class: TinyModel\n      extra: {}\n  task_type: Other\n"
+            "  signature:\n    inputs:\n      - name: latency\n        dtype: float64\n"
+            "    outputs:\n      - name: score\n        dtype: float64\n  card_refs: []\n"
+            "artifacts:\n  - relative_path: model.bin\n"
+            f"    sha256: {base64.standard_b64encode(hashlib.sha256(MODEL_ARTIFACT).digest()).decode()}\n"
+            f"    size_bytes: {len(MODEL_ARTIFACT)}\n"
+            "    content_type: application/octet-stream\n"
+        ),
+        "psi.yaml": verifier_yaml("py-bound-psi", baseline, "Psi"),
+        "spc.yaml": verifier_yaml("py-bound-spc", baseline, "Spc"),
+        "custom.yaml": (
+            "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: py-bound-custom\n"
+            "  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: drift\n"
+            f"    spec:\n{EDGE_VERIFIERS['py-edge-custom']}"
+        ),
+        "eval-assert.yaml": eval_verifier(
+            "py-bound-assert",
+            "        answer: {kind: assertion, id: answer, context_path: $.answer, "
+            'operator: equals, expected: "yes"}\n',
+        ),
+        "eval-judge.yaml": eval_verifier(
+            "py-bound-judge-eval",
+            "        judge:\n          kind: llm_judge\n          id: judge\n"
+            "          judge_ref: {prompt: ./judge-prompt.json, tool_names: [], "
+            "run_config: {max_iterations: 1}}\n"
+            "          context_path: $.answer\n          operator: equals\n"
+            "          expected: {passed: true}\n          max_retries: 0\n",
+        ),
+        "service.yaml": (
+            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: py-bound-service\n"
+            "  version: 1.0.0\n  space: default\nspec:\n  service_type: agent\n"
+            "  components:\n"
+            "    - alias: model\n      ref:\n        kind: Model\n        name: py-bound-model\n"
+            "        version: 1.0.0\n        space: default\n      verified_by:\n"
+            "        - verifier: ./psi.yaml\n"
+            '          runs_on: {kind: schedule, cron: "0 0 * * *"}\n'
+            f"          on_failure:\n            - {{kind: http, method: post, url: '{hook}'}}\n"
+            "        - verifier: ./spc.yaml\n"
+            '          runs_on: {kind: schedule, cron: "0 0 * * *"}\n'
+            "        - verifier: ./custom.yaml\n"
+            '          runs_on: {kind: schedule, cron: "0 0 * * *"}\n'
+            "    - alias: agent\n      ref: ./agent.yaml\n      verified_by:\n"
+            "        - verifier: ./eval-assert.yaml\n          runs_on: {kind: observations_ready}\n"
+            "        - verifier: ./eval-judge.yaml\n          runs_on: {kind: observations_ready}\n"
+        ),
+    }
+    for name, body in files.items():
+        (root / name).write_text(body, encoding="utf-8")
+    return root / "service.yaml"
+
+
+def await_binding_ready(verification: Verification, binding_id: str) -> dict:
+    """Poll one binding until its Verifier is ready to run, and return it."""
+    deadline = time.monotonic() + WAIT_SECONDS
+    while (binding := verification.get_binding(binding_id))["readiness"] != "ready":
+        assert time.monotonic() < deadline, f"binding never became ready: {binding}"
+        time.sleep(0.2)
+    return binding
+
+
+def await_new_runs(server: WyrdTestServer, earlier: set[str], count: int) -> list[str]:
+    """Poll until ``count`` verification runs exist beyond ``earlier``, and return them."""
+    deadline = time.monotonic() + WAIT_SECONDS
+    while len(runs := [run for run in server.verification_runs() if run not in earlier]) < count:
+        assert time.monotonic() < deadline, f"only {len(runs)} of {count} runs were created"
+        time.sleep(0.1)
+    assert len(runs) == count, runs
+    return runs
+
+
+def await_dispatches(verification: Verification, run_id: str) -> dict:
+    """Poll a settled run until every Operator dispatch leaves the queue."""
+    deadline = time.monotonic() + WAIT_SECONDS
+    while True:
+        run = verification.get_run(run_id)
+        statuses = {dispatch["status"] for dispatch in run["dispatches"]}
+        if not statuses & {"pending", "running", "retrying"}:
+            return run
+        assert time.monotonic() < deadline, f"a dispatch never settled: {run}"
+        time.sleep(0.1)
+
+
+def manual_window() -> dict[str, str]:
+    """A Drift window spanning an hour either side of now."""
+    now = datetime.now(UTC)
+    return {
+        "kind": "drift_window",
+        "start": (now - timedelta(hours=1)).isoformat(),
+        "end": (now + timedelta(hours=1)).isoformat(),
+    }
+
+
+def rows_of(query: Bifrost, sql: str) -> list[dict]:
+    """Run one Bifrost query and return its rows as dictionaries."""
+    return query.sql(sql).to_arrow().to_pylist()
+
+
+def assert_psi_bins(details: str, sample: int) -> None:
+    """Assert the persisted PSI bin evidence of ``latency`` in a result's ``details``.
+
+    The baseline's integers 0..99 fill ten equal-width bins with a tenth each;
+    every target value lies above 99, so the whole sample lands in the last bin.
+    """
+    psi = json.loads(details)["features"]["latency"]["evidence"]["Psi"]
+    assert psi["sample"] == sample, psi
+    bins = psi["bins"]
+    assert len(bins) == 10, bins
+    assert all(abs(item["bin"]["proportion"] - 0.1) < 1e-9 for item in bins), bins
+    assert [item["target_count"] for item in bins] == [0] * 9 + [sample], bins
+    assert bins[-1]["target_proportion"] == 1.0, bins
+
+
+def emit_invocation(state: WyrdState) -> tuple[Run, Run, Run]:
+    """Emit one invocation that switches from the Model view to the Agent view.
+
+    The Model view alternates typed and mapping Drift payloads far above the
+    baseline, with a Custom ``score`` above its threshold; the Agent view emits
+    one mapping and one typed Eval context that pass both Eval Verifiers.
+    Returns the root run and its two views.
+    """
+    with state.run() as run:
+        with run.for_card("model") as model:
+            for row in range(DRIFT_ROWS):
+                if row % 2 == 0:
+                    model.observe.drift(Features(latency=150.0 + row, score=5.0))
+                else:
+                    model.observe.drift({"latency": 150.0 + row, "score": 5.0})
+        with run.for_card("agent") as agent:
+            agent.observe.eval({"answer": "yes"})
+            agent.observe.eval(Exchange(answer="yes"))
+    return run, model, agent
+
+
+def emit_payload_forms(state: WyrdState) -> list[str]:
+    """Emit one equal payload as a mapping, a dataclass, and a Pydantic model.
+
+    Each form is its own root-Service run, so its rows are addressable by run
+    and never enter the Model's Drift windows. Returns the three run ids.
+    """
+    forms: list[object] = [
+        {"latency": 1.5, "tier": "gold", "count": 3, "cached": True},
+        Shape(latency=1.5, tier="gold", count=3, cached=True),
+        ShapeModel(latency=1.5, tier="gold", count=3, cached=True),
+    ]
+    run_ids = []
+    for form in forms:
+        run = state.run()
+        run.observe.drift(form)
+        run_ids.append(run.run_id)
+    return run_ids
+
+
+def assert_payload_forms_agree(query: Bifrost, run_ids: list[str]) -> None:
+    """Assert all three payload forms persisted the same canonical tall rows."""
+    persisted = [
+        rows_of(
+            query,
+            "SELECT series, num_value, str_value FROM vala.drift.observations "
+            f"WHERE run_id = '{run_id}' ORDER BY series",
+        )
+        for run_id in run_ids
+    ]
+    canonical = [
+        {"series": "cached", "num_value": None, "str_value": "true"},
+        {"series": "count", "num_value": 3.0, "str_value": "3"},
+        {"series": "latency", "num_value": 1.5, "str_value": "1.5"},
+        {"series": "tier", "num_value": None, "str_value": "gold"},
+    ]
+    assert persisted == [canonical] * 3, persisted
+
+
+def assert_eval_runs(
+    server: WyrdTestServer,
+    verification: Verification,
+    query: Bifrost,
+    earlier: set[str],
+    tasks: dict[str, str],
+    agent_uid: str,
+) -> None:
+    """Settle the four observation-created Eval runs and read their joined results.
+
+    Each acknowledged record activates both Eval bindings; every run passes
+    its gate, dispatches nothing, and persists one item row per task joined to
+    its summary on ``result_id`` (Oracle scopes both sides to the caller's
+    data tenant, which is not a queryable column). ``tasks`` maps each Eval
+    binding id to its one task id.
+    """
+    runs = await_new_runs(server, earlier, 4)
+    observed = []
+    for run_id in runs:
+        settled = settle(verification, run_id)
+        assert settled["status"] == "completed", settled
+        assert settled["dispatches"] == [], "a passing gate dispatches nothing"
+        assert settled["requested_by_principal_id"] is None, settled
+        server.flush_bifrost()
+        (joined,) = rows_of(
+            query,
+            "SELECT r.verdict, r.binding_id, r.subject_card_uid, i.task_id, i.outcome_kind "
+            "FROM vala.verification.results r JOIN vala.eval.result_items i "
+            "ON r.result_id = i.result_id "
+            f"WHERE r.result_id = '{settled['result_id']}'",
+        )
+        assert (joined["verdict"], joined["subject_card_uid"]) == ("passed", agent_uid), joined
+        assert joined["task_id"] == tasks[joined["binding_id"]], joined
+        observed.append(joined["binding_id"])
+    assert sorted(observed) == sorted(list(tasks) * 2), "each record runs both Eval bindings"
+
+
+def assert_direct_run_unbound(
+    verification: Verification, query: Bifrost, server: WyrdTestServer, psi: str, model: str
+) -> None:
+    """A direct PSI run persists null owner and binding on its summary and features."""
+    result_id = complete(
+        verification,
+        CardRef(kind="Verifier", name="py-bound-psi", version="1.0.0", space="default", uid=psi),
+        CardRef(kind="Model", name="py-bound-model", version="1.0.0", space="default", uid=model),
+    )
+    server.flush_bifrost()
+    (unbound,) = rows_of(
+        query,
+        "SELECT r.owner_card_uid, r.binding_id, f.owner_card_uid AS feature_owner, "
+        "f.binding_id AS feature_binding, f.verdict FROM vala.verification.results r "
+        "JOIN vala.drift.result_features f "
+        "ON r.result_id = f.result_id "
+        f"WHERE r.result_id = '{result_id}'",
+    )
+    assert unbound == {
+        "owner_card_uid": None,
+        "binding_id": None,
+        "feature_owner": None,
+        "feature_binding": None,
+        "verdict": "drift",
+    }, unbound
+
+
+def assert_retired_kinds_refused(cards: Cards, root: Path) -> None:
+    """Registering a ``kind: Drift`` or ``kind: Eval`` Card is refused visibly."""
+    for kind in ("Drift", "Eval"):
+        retired = root / f"retired-{kind.lower()}.yaml"
+        retired.write_text(
+            f"apiVersion: wyrd/v1\nkind: {kind}\nmetadata:\n  name: py-retired-{kind.lower()}\n"
+            "  version: 1.0.0\n  space: default\nspec: {}\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(WyrdError) as refused:
+            cards.register_from_path(str(retired))
+        details = refused.value.details or {}
+        assert [d["code"] for d in details.get("diagnostics", [])] == [
+            "WYRD_LOADER_400_INVALID_ENVELOPE"
+        ], refused.value
+        assert details["diagnostics"][0]["path"] == str(retired), details
+
+
+DRIFT_ROWS = ROWS + 20
+
+
+@pytest.mark.integration
+def test_service_bindings_verify_drift_and_eval_through_an_http_operator(tmp_path: Path) -> None:
+    """One Service's five bindings verify typed and mapping observations end to end."""
+    with (
+        local_upstream() as (upstream, received),
+        WyrdTestServer(verification_runtime=True, provider_base_url=upstream) as server,
+    ):
+        admin = server.bootstrap_service(["admin"], name="py-bound-admin")
+        cards = Cards(server_url=server.base_url, credential=admin)
+        baseline = cards.data.register(
+            DataCard(
+                PolarsInterface(data=pl.DataFrame({"latency": LATENCY})),
+                space="default",
+                name="py-bound-data",
+                version="1.0.0",
+            )
+        ).root
+        graph = write_bound_graph(tmp_path, baseline, f"{upstream}/hook")
+        model_ref = cards.register_from_path(str(tmp_path / "model.yaml")).root
+        receipt = cards.register_from_path(str(graph))
+        service = receipt.root
+        uids = {outcome.card_ref.name: str(outcome.card_ref.uid) for outcome in receipt.outcomes}
+        uids["py-bound-model"] = str(model_ref.uid)
+        credential = server.credential_registered_service(
+            f"{service.space}/Service/{service.name}@{service.version}", ["admin"]
+        )
+        verification = Verification(server_url=server.base_url, credential=credential)
+        bundle = tmp_path / "bundle"
+        binding_ids = download(server, admin, "Service", str(service.uid), bundle)["verification"][
+            "binding_ids"
+        ]
+        by_verifier = {uid: name for name, uid in uids.items()}
+        bindings = {
+            by_verifier[binding["verifier_uid"]]: binding
+            for binding in (await_binding_ready(verification, b) for b in binding_ids)
+        }
+        assert sorted(bindings) == [
+            "py-bound-assert",
+            "py-bound-custom",
+            "py-bound-judge-eval",
+            "py-bound-psi",
+            "py-bound-spc",
+        ], bindings
+        model_uid, agent_uid = uids["py-bound-model"], uids["py-bound-agent"]
+        assert {
+            binding["subject_card_uid"]
+            for name, binding in bindings.items()
+            if name in {"py-bound-psi", "py-bound-spc", "py-bound-custom"}
+        } == {model_uid}
+
+        state = WyrdState.from_path(bundle, interfaces={"model": NoopModelInterface()})
+        state.start_bifrost(server_url=server.base_url, credential=credential)
+        run, model, agent = emit_invocation(state)
+        assert model.run_id == agent.run_id == run.run_id
+        assert (model.card_ref.split("#", 1)[1], agent.card_ref.split("#", 1)[1]) == (
+            model_uid,
+            agent_uid,
+        )
+        form_runs = emit_payload_forms(state)
+        earlier = set(server.verification_runs())
+        state.shutdown()
+        server.flush_bifrost()
+
+        query = Bifrost(server_url=server.base_url, credential=admin)
+        assert_payload_forms_agree(query, form_runs)
+        drift = rows_of(
+            query,
+            "SELECT COUNT(*) AS n, MIN(card_uid) AS low, MAX(card_uid) AS high "
+            f"FROM vala.drift.observations WHERE run_id = '{run.run_id}'",
+        )
+        assert drift == [{"n": 2 * DRIFT_ROWS, "low": model_uid, "high": model_uid}], drift
+
+        tasks = {
+            bindings["py-bound-assert"]["binding_id"]: "answer",
+            bindings["py-bound-judge-eval"]["binding_id"]: "judge",
+        }
+        assert_eval_runs(server, verification, query, earlier, tasks, agent_uid)
+        judged = [path for path, _ in received if path == "/v1/chat/completions"]
+        assert len(judged) == 2, "the judge binding called the local provider once per record"
+
+        for name in ("py-bound-psi", "py-bound-spc", "py-bound-custom"):
+            binding_id = bindings[name]["binding_id"]
+            run_id = verification.start_run(
+                {"target": {"kind": "binding", "binding_id": binding_id}, "input": manual_window()}
+            )
+            settled = settle(verification, run_id)
+            assert settled["status"] == "completed", settled
+            assert settled["requested_by_principal_id"] is not None, settled
+            server.flush_bifrost()
+            (result,) = rows_of(
+                query,
+                "SELECT verdict, owner_card_uid, binding_id, subject_card_uid, details "
+                f"FROM vala.verification.results WHERE result_id = '{settled['result_id']}'",
+            )
+            assert result["verdict"] == "failed", (name, result)
+            assert (result["owner_card_uid"], result["binding_id"]) == (
+                str(service.uid),
+                binding_id,
+            ), result
+            assert result["subject_card_uid"] == model_uid, result
+            if name == "py-bound-psi":
+                delivered = await_dispatches(verification, run_id)
+                assert [d["status"] for d in delivered["dispatches"]] == ["delivered"], delivered
+                assert [path for path, _ in received].count("/hook") == 1, received
+                assert_psi_bins(result["details"], DRIFT_ROWS)
+            else:
+                assert settled["dispatches"] == [], "a binding without an Operator dispatches none"
+            if name == "py-bound-spc":
+                assert_spc_evidence(result["details"], DRIFT_ROWS // 5, DRIFT_ROWS // 5)
+
+        assert_direct_run_unbound(verification, query, server, uids["py-bound-psi"], model_uid)
+        assert_retired_kinds_refused(cards, tmp_path)

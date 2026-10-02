@@ -10,11 +10,18 @@ server's staged describe decisions prove repeated writes reuse cached schemas.
 A second, single-Card run is entered with ``with state.run(card="agent")``:
 framework-style spans created inside it export through the stock OTLP/HTTP
 exporter to the authenticated ``/v1/traces`` endpoint, and the persisted span,
-custom, and Eval rows join on their Run and trace identity.
+custom, and Eval rows join on their Run and trace identity. A third run proves
+the scope stamps a span already active at entry, nested root and component
+scopes share its run id and restore the outer Card, and spans created after an
+``await``, in concurrent tasks sharing one immutable view, and in a task
+created inside a scope persist with their exact correlation. A writer holding
+a stale declaration of the generic table the run wrote is fenced by the
+server's schema fingerprint, and malformed trace identity fails visibly.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -71,6 +78,12 @@ class DatasetRow(BaseModel):
     """The one caller-owned column the generic table carries."""
 
     value: int
+
+
+class StaleDatasetRow(DatasetRow):
+    """A writer's outdated declaration of the generic table, with a column it never had."""
+
+    note: str
 
 
 class CorrelatedDatasetRow(DatasetRow):
@@ -348,6 +361,34 @@ def assert_eval_refusals(agent: Run) -> None:
     with pytest.raises(wyrd.WyrdError) as bad_media:
         agent.observe.eval({"answer": "bad-media"}, media=[malformed])
     assert bad_media.value.code == "WYRD_SPEC_400_VALIDATION"
+    # Malformed trace identity fails visibly rather than dropping correlation.
+    for trace_id, span_id in (
+        ("zz" * 16, EXPLICIT_SPAN),
+        (EXPLICIT_TRACE[:30], EXPLICIT_SPAN),
+        (EXPLICIT_TRACE, "zz" * 8),
+        (EXPLICIT_TRACE, EXPLICIT_SPAN + "00"),
+    ):
+        with pytest.raises(wyrd.WyrdError) as bad_trace:
+            agent.observe.eval({"answer": "bad-trace"}, trace_id=trace_id, span_id=span_id)
+        assert bad_trace.value.code == "WYRD_SPEC_400_VALIDATION", (trace_id, span_id)
+
+
+def assert_stale_writer_fenced(server: WyrdTestServer, credential: str, dataset: str) -> None:
+    """Refuse a batch built from a stale declaration of a table the run wrote.
+
+    The writer admits the row locally; the server's schema fingerprint fence
+    refuses it at flush with the stable public code, and nothing lands.
+    """
+    stale = Bifrost(
+        TableConfig(StaleDatasetRow, dataset),
+        server_url=server.base_url,
+        credential=credential,
+    )
+    stale.insert({"value": 99, "note": "stale"})
+    with pytest.raises(wyrd.WyrdError) as fenced:
+        stale.flush()
+    assert fenced.value.code == "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH"
+    stale.shutdown()
 
 
 def access_token(server: WyrdTestServer, credential: str) -> str:
@@ -400,6 +441,77 @@ def emit_framework_scope(
             agent_run.observe.record(dataset, {"value": 44})
             agent_run.observe.eval({"answer": "scoped"})
     return agent_run, (f"{ids.trace_id:032x}", f"{ids.span_id:016x}")
+
+
+def emit_nested_scopes(state: WyrdState, provider: TracerProvider) -> tuple[Run, dict[str, Run]]:
+    """Create framework spans across nested, async, and concurrent Run scopes.
+
+    ``pre.active`` is current before the root scope is entered, so entry stamps
+    it. The Model scope nests inside the root and restores it on exit. Inside
+    ``asyncio.run``, one span follows an ``await``, two concurrent tasks share
+    one immutable Agent view, and a task created inside the Model scope runs
+    after that scope exits. ``nested.outside`` starts after every scope.
+    Returns the root run and the view each named span must carry.
+    """
+    tracer = provider.get_tracer("framework")
+    run = state.run()
+    model = run.for_card("model")
+    agent = run.for_card("agent")
+
+    async def concurrent(name: str) -> None:
+        with agent:
+            await asyncio.sleep(0)
+            tracer.start_span(name).end()
+
+    async def spawned() -> None:
+        await asyncio.sleep(0)
+        tracer.start_span("async.spawned").end()
+
+    async def main() -> None:
+        await asyncio.sleep(0)
+        tracer.start_span("async.await").end()
+        await asyncio.gather(concurrent("async.concurrent.a"), concurrent("async.concurrent.b"))
+        with model:
+            task = asyncio.create_task(spawned())
+        await task
+
+    with tracer.start_as_current_span("pre.active"), run:
+        tracer.start_span("root.before").end()
+        with model:
+            tracer.start_span("model.inner").end()
+        tracer.start_span("root.restored").end()
+        asyncio.run(main())
+    tracer.start_span("nested.outside").end()
+    views = {"pre.active": run, "root.before": run, "root.restored": run, "async.await": run}
+    views |= {"model.inner": model, "async.spawned": model}
+    views |= {"async.concurrent.a": agent, "async.concurrent.b": agent}
+    return run, views
+
+
+def assert_nested_scopes(
+    server: WyrdTestServer, credential: str, run: Run, views: dict[str, Run]
+) -> None:
+    """Prove every nested and async span persisted with its view's exact correlation."""
+    query = Bifrost(server_url=server.base_url, credential=credential)
+    spans = (
+        query.sql(
+            "SELECT name, attributes, run_id, card_uid "
+            f"FROM vala.traces.spans WHERE run_id = '{run.run_id}' ORDER BY name"
+        )
+        .to_arrow()
+        .to_pylist()
+    )
+    assert {
+        row["name"]: (asserted_card_ref(row["attributes"]), row["card_uid"]) for row in spans
+    } == {name: (view.card_ref, view.card_ref.split("#", 1)[1]) for name, view in views.items()}, (
+        "one run id across every scope, each span under its own view's Card"
+    )
+    outside = (
+        query.sql("SELECT run_id, card_uid FROM vala.traces.spans WHERE name = 'nested.outside'")
+        .to_arrow()
+        .to_pylist()
+    )
+    assert outside == [{"run_id": None, "card_uid": None}], "no scope outlives its block"
 
 
 def asserted_card_ref(attributes: bytes) -> str:
@@ -550,6 +662,7 @@ def run_journey(tmp_path: Path, server: WyrdTestServer) -> None:
     provider = otlp_provider(server, credential)
     agent_run, tool = emit_framework_scope(state, provider, dataset)
     assert agent_run.run_id != run.run_id
+    nested_run, views = emit_nested_scopes(state, provider)
     # Leaving the scope is not a durability barrier: flush spans, drain the
     # writer, then wait for publication before reading anything back.
     assert provider.force_flush()
@@ -560,4 +673,15 @@ def run_journey(tmp_path: Path, server: WyrdTestServer) -> None:
 
     assert_read_back(server, admin, run.run_id, model_uid, agent_uid, (dataset, dataset_b), active)
     assert_scope_joins(server, admin, agent_run, agent_uid, dataset, tool)
+    assert_nested_scopes(server, admin, nested_run, views)
+    assert_stale_writer_fenced(server, admin, dataset)
+    server.flush_bifrost()
+    stale_rows = query_values(server, admin, dataset)
+    assert 99 not in stale_rows, "a fenced stale batch never lands"
     provider.shutdown()
+
+
+def query_values(server: WyrdTestServer, credential: str, table: str) -> list[int]:
+    """Read every caller-owned ``value`` in ``table``."""
+    query = Bifrost(server_url=server.base_url, credential=credential)
+    return [row["value"] for row in query.sql(f"SELECT value FROM {table}").to_arrow().to_pylist()]

@@ -23,6 +23,7 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from pydantic import BaseModel
 from wyrd.eval import MediaRef
 from wyrd.observe import Observe, Run
 from wyrd.otel import install_run_correlation
@@ -123,6 +124,65 @@ def test_drift_refuses_a_nested_feature_value(tmp_path: Path) -> None:
     with pytest.raises(wyrd.WyrdError) as raised:
         _state(tmp_path).run().observe.drift({"nested": {"inner": 1}})
     assert _code(raised.value) == "WYRD_SDK_400_INVALID_OBSERVATION"
+
+
+class _PydanticFeatures(BaseModel):
+    """Test-only Pydantic payload whose ``model_dump_json()`` reaches Rust as-is."""
+
+    latency: float
+    tier: str
+
+
+def test_drift_accepts_a_pydantic_model(tmp_path: Path) -> None:
+    """A Pydantic model converts through its own JSON dump before admission."""
+    with pytest.raises(wyrd.WyrdError) as raised:
+        _state(tmp_path).run().observe.drift(_PydanticFeatures(latency=3.0, tier="gold"))
+    assert _code(raised.value) == "WYRD_SDK_400_BIFROST_NOT_STARTED"
+
+
+@pytest.mark.parametrize(
+    ("payload", "code"),
+    [
+        ({"Latency": 1.0}, "WYRD_SDK_400_INVALID_OBSERVATION"),
+        ({"has space": 1.0}, "WYRD_SDK_400_INVALID_OBSERVATION"),
+        ({"latency": None}, "WYRD_SDK_400_INVALID_OBSERVATION"),
+        ({"latency": [1.0]}, "WYRD_SDK_400_INVALID_OBSERVATION"),
+        ({"latency": float("nan")}, "WYRD_SPEC_400_VALIDATION"),
+        ({"latency": float("inf")}, "WYRD_SPEC_400_VALIDATION"),
+        (_PydanticFeatures(latency=float("nan"), tier="gold"), "WYRD_SDK_400_INVALID_OBSERVATION"),
+        ({"count": 2**53 + 1}, "WYRD_SDK_400_INVALID_OBSERVATION"),
+        ({"count": -(2**53) - 1}, "WYRD_SDK_400_INVALID_OBSERVATION"),
+        ({"count": 2**63}, "WYRD_SDK_400_INVALID_OBSERVATION"),
+        ({"count": 2**64}, "WYRD_SDK_400_INVALID_OBSERVATION"),
+        ({"count": -(2**64)}, "WYRD_SDK_400_INVALID_OBSERVATION"),
+    ],
+    ids=[
+        "uppercase-name",
+        "spaced-name",
+        "null",
+        "nested-array",
+        "nan",
+        "infinity",
+        "pydantic-nan",
+        "above-exact-float",
+        "below-exact-float",
+        "beyond-i64",
+        "beyond-u64",
+        "below-i64",
+    ],
+)
+def test_drift_refuses_unrepresentable_payloads_before_admission(
+    tmp_path: Path, payload: object, code: str
+) -> None:
+    """Invalid names, null or nested values, and unrepresentable numbers fail first.
+
+    The state never started Bifrost, so reaching the queue would raise
+    ``WYRD_SDK_400_BIFROST_NOT_STARTED``; a validation code proves refusal
+    happened before admission.
+    """
+    with pytest.raises(wyrd.WyrdError) as raised:
+        _state(tmp_path).run().observe.drift(payload)
+    assert _code(raised.value) == code
 
 
 def test_drift_refuses_a_malformed_session_id(tmp_path: Path) -> None:

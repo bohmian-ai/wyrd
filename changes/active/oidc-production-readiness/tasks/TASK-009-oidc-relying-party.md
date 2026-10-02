@@ -197,3 +197,69 @@ need a provider-specific branch.
 [OIDC Discovery](https://openid.net/specs/openid-connect-discovery-1_0.html);
 [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636);
 [RFC 9207](https://www.rfc-editor.org/rfc/rfc9207).
+
+## Implementation Evidence
+
+Commits: 849e0cae3 (relying party), b97fa1c46 (per-issuer cache at callback
+and platform complete; journeys that changed discovery mid-test use a second
+mock issuer, assertions unchanged — lead decision (1)/(a)), 9ef532660
+(workspace-hack regenerated).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Keycloak/Dex tenant login, connection test sign-in, and platform login run through `openidconnect` | `wyrd-auth-oidc/src/relying_party.rs` (`RelyingParty::{cached,discover,authorize,redeem}`); `wyrd-auth/src/{login,callback,connections,platform_login}.rs` | `test:identity:journey` (server 31 + 5 single-run journeys, ui, cli, rust, client, python, typescript) | PASS |
+| AC-007 negatives: nonce, `iss`, `aud`, `alg`, `exp` | `RelyingParty::redeem` via `openidconnect` ID-token verifier | `id_token_refusals_fail_closed`, `an_unadvertised_signing_algorithm_is_refused`; `tenant_callback_refusal_journey` | PASS |
+| Unknown `kid` causes exactly one re-discovery | `RelyingParty::redeem` | `an_unknown_key_rediscovers_exactly_once`, `a_still_unknown_key_fails_after_one_rediscovery` | PASS |
+| Unsafe discovery or JWKS URL refused | `ScreenedHttp` adapter | `an_unsafe_issuer_is_refused_before_any_request`, `an_unsafe_key_set_url_is_refused_before_any_request` | PASS |
+| Token-endpoint redirect refused, target unreached (FIND-TASK-004-13) | `ScreenedHttp` (redirects disabled) | `a_redirecting_token_endpoint_is_refused_without_following` | PASS |
+| IdP outage fails closed | `relying_party_error` → 503 `retry_after_seconds` | `a_provider_outage_fails_closed`; refusal journey "outage" case | PASS |
+| RFC 9207 cases | `verify_response_issuer` (cached metadata) | `tenant_callback_issuer_binding_journey` | PASS |
+| No hand-written discovery, PKCE/state/nonce, token POST, or human `ExternalVerifier` path; `oauth2` `reqwest` feature off | hand helpers deleted from `login.rs`, `callback.rs`, `platform_login.rs`; `ExternalVerifier` remains only for workload JWT bearer (`jwt_bearer.rs`) | `cargo tree -e features -i oauth2` shows no enabled `oauth2` features; `openidconnect` `default-features = false` | PASS |
+
+Lanes (one at a time, `CARGO_TARGET_DIR` set):
+
+| Lane | Exit |
+|---|---|
+| `mise run test:identity:journey` (unfiltered, b97fa1c46) | 0 |
+| `mise run fmt` | 0 |
+| `mise run lints` | 0 (rerun after 9ef532660: 0) |
+| `mise run codegen:check` | 0 |
+| `mise run docs:check` | 0 |
+| `mise run check:client-tier` | 0 |
+| `mise run check:pyo3-scope` | 0 |
+| `mise run check:unwrap-audit` | 0 |
+| `mise run check:workspace-hack` | 1, then 0 after 9ef532660 |
+| `mise run py:format` | 0 |
+| `mise run py:lints` | 0 |
+| `mise run py:typecheck` | 0 |
+| `mise run py:test:unit` | 0 |
+| `mise run ts:typecheck` | 0 |
+| `mise run ts:test:unit` | 0 |
+| `mise run ts:napi:check` | 0 |
+| `mise run test:shared` | 0 |
+| `mise run test:wyrd-sdk` | 0 |
+| `mise run test:cli:journey` | 0 |
+| `mise run test:principals:integration` | 0 |
+| `mise run py:test:integration` | 0 |
+| `mise run ts:test:integration` | 0 |
+| `mise run test:wyrd` | 0 |
+
+Diagnoses:
+
+- `tenant_callback_issuer_binding_journey` (with the cache, before the
+  journey fix): "advertised, no iss" returned 200 instead of 401. The WYRD_LOG
+  run showed the callback served from the cached silent discovery document,
+  because the journey remounted different metadata on the same issuer between
+  begin and callback. Fix site: the journey. The advertising cases use a
+  second mock issuer that the Active connection is pointed at, as decided by
+  the lead. `tenant_callback_refusal_journey`'s advertised-algorithm cases
+  had the same cause and got the same fix.
+- `check:workspace-hack` exit 1: `openidconnect`/`oauth2` changed the
+  third-party feature union (`ed25519-dalek` pem, `elliptic-curve`, `rsa`,
+  `crypto-bigint`; `signature` dropped). Fix: `cargo hakari generate`, which
+  made no manage-deps changes. The new features are additive crypto-crate
+  features, and the test lanes above ran before this regeneration.
+
+Non-goals: no SCIM/SAML and no `oauth2` `reqwest` feature. The CLI device
+secret helper in `cli_logins.rs` was the only change needed outside this
+task's write set, and only to compile.

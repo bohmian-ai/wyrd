@@ -1,8 +1,9 @@
 # Skald Architecture
 
 Skald is Wyrd's LLM runtime crate family. It stays provider-native and depends
-on neutral infrastructure plus Skald crates only. Wyrd and Vala depend on Skald;
-Skald does not depend on `wyrd-*` or `vala-*`.
+on neutral infrastructure, Skald crates, shared `wyrd-*` foundation crates, and
+the foundational `wyrd-spec` contract crate. Wyrd and Vala depend on Skald;
+Skald never depends on `wyrd-server` or other Wyrd server code, or on `vala-*`.
 
 ## Crate Map
 
@@ -42,19 +43,27 @@ Skald does not depend on `wyrd-*` or `vala-*`.
 ## Dependency Direction
 
 `skald-spec` is the bottom crate. It has zero Wyrd dependencies. Wyrd contracts
-that need prompt/provider shapes depend upward on `skald-spec`; Skald engine
-crates do not depend on `wyrd-spec`.
+that need prompt/provider shapes depend upward on `skald-spec`. Skald crates
+consume the foundational `wyrd-spec` contract crate only where they project a
+shared Wyrd contract: `skald-workflow` uses its Workflow Card and run contracts,
+and `skald-agent`, `skald-tool`, and `skald-prompt` use its error catalog,
+references, and metadata types. `skald-providers` uses the shared `wyrd-tls`
+foundation crate. No Skald crate depends on `wyrd-server`, other Wyrd server
+code, or any `vala-*` crate.
 
 The dependency layers are:
 
 ```text
 skald-workflow -> skald-agent -> skald-runtime
-                                  |
-                                  v
-                {skald-providers, skald-cache, skald-tool} -> skald-spec
-                                                           ^
-                                                           |
-                                                skald-prompt
+      |                               |
+      |                               v
+      |            {skald-providers, skald-cache, skald-tool} -> skald-spec
+      |                                                       ^
+      |                                                       |
+      |                                            skald-prompt
+      v
+  wyrd-spec   (Workflow Card and run contracts; skald-agent, skald-tool,
+               and skald-prompt also depend on it)
 ```
 
 `skald-prompt` is the Python authoring boundary and uses Wyrd Python

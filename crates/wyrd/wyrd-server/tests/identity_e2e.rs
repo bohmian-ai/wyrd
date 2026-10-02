@@ -3847,8 +3847,8 @@ async fn begin_mock_login(srv: &WyrdTestServer, slug: &str) -> (Sha256Hex, Strin
 /// The common callback refuses every unusable login and stores nothing:
 ///   1. a wrong (tampered), unknown, replayed, or expired state is
 ///      `400 INVALID_STATE`;
-///   2. both or neither initiation binding is `400 VALIDATION`, and an
-///      unknown CLI handoff is `400 INVALID_STATE`;
+///   2. a begin request without the browser flow binding, or with an extra
+///      binding field, is refused as malformed (`422`);
 ///   3. the retired `authorization_code` token grant is refused and consumes
 ///      nothing — the same code and state still complete through the callback;
 ///   4. a login begun for tenant B under the same issuer completes into B
@@ -3961,38 +3961,18 @@ async fn tenant_callback_refusal_journey() {
         "WYRD_AUTH_400_INVALID_STATE",
     );
 
-    // 2. Binding shape and unknown handoff.
+    // 2. Binding shape.
     for body in [
         serde_json::json!({
             "tenant_route_key": FIXTURE_TENANT_SLUG,
             "browser_flow_hash": new_flow().to_string(),
-            "cli_handoff_id": uuid::Uuid::new_v4(),
+            "device_id": uuid::Uuid::new_v4(),
         }),
         serde_json::json!({ "tenant_route_key": FIXTURE_TENANT_SLUG }),
     ] {
-        let (status, refusal) = begin_login(&srv, "test-tenant-1.wyrd.test", body).await;
-        assert_refused(
-            status,
-            &refusal,
-            StatusCode::BAD_REQUEST,
-            "WYRD_SPEC_400_VALIDATION",
-        );
+        let (status, _) = begin_login(&srv, "test-tenant-1.wyrd.test", body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
-    let (status, refusal) = begin_login(
-        &srv,
-        "test-tenant-1.wyrd.test",
-        serde_json::json!({
-            "tenant_route_key": FIXTURE_TENANT_SLUG,
-            "cli_handoff_id": uuid::Uuid::new_v4(),
-        }),
-    )
-    .await;
-    assert_refused(
-        status,
-        &refusal,
-        StatusCode::BAD_REQUEST,
-        "WYRD_AUTH_400_INVALID_STATE",
-    );
 
     // 3. The retired token grant is refused and consumes nothing.
     let retired = sign_in().await;

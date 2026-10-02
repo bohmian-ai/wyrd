@@ -700,7 +700,7 @@ esac
 # and a filter, when given, must name that journey.
 saved_login_journey() {
   case "$1" in
-    cli) name=cli_oidc_handoff_journey ;;
+    cli) name=cli_device_login_journey ;;
     rust) name=saved_user_auth_journey ;;
     client) name=concurrent_saved_renewal ;;
     python) name=test_saved_user_auth_journey ;;

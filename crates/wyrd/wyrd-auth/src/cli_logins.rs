@@ -1,22 +1,24 @@
-//! CLI human login: the one-use browser-to-CLI handoff and refresh-chain
-//! revocation.
+//! CLI human login: the RFC 8628 device authorization grant with Wyrd as the
+//! authorization server, and refresh-chain revocation at logout.
 //!
-//! `wyrd auth login` cannot receive the provider redirect itself, so the
-//! server mediates. [`CliLogins::begin`] records a handoff that binds a
-//! random handoff id to the tenant, its Active connection, and the SHA-256 of
-//! a 256-bit verifier only the CLI holds, then begins an ordinary tenant
-//! login bound to that handoff id
-//! ([`HumanConnections::begin_login`]). The common callback issues the
-//! session and stores it sealed against the handoff id, exactly as for a
-//! browser login; the browser receives only a static page. The CLI polls
-//! [`CliLogins::claim`] with its verifier: the claim that finds the sealed
-//! completion redeems it and deletes the handoff in one tenant transaction,
-//! so the credential is handed out once and only to the verifier holder.
-//! [`CliLogins::end`] revokes a saved login's refresh chain at logout.
+//! `wyrd auth login` cannot receive the provider redirect itself.
+//! [`CliLogins::authorize`] records a device authorization: a random device
+//! code the CLI keeps and polls with, stored only as its SHA-256, and a short
+//! user code the person confirms. On the verification page the person
+//! approves that code ([`CliLogins::approve`]), which begins an ordinary
+//! tenant login bound to the device id, or denies it ([`CliLogins::deny`]).
+//! The common callback issues the session and stores it sealed against the
+//! device id, exactly as for a browser login; the browser receives only a
+//! static page. The CLI's token poll ([`CliLogins::redeem`]) redeems that
+//! completion and deletes the device authorization in one tenant
+//! transaction, so the credential is handed out once and only to the device
+//! code holder. [`CliLogins::end`] revokes a saved login's refresh chain at
+//! logout.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use rand::Rng as _;
 use secrecy::SecretString;
 use serde_json::json;
 use uuid::Uuid;
@@ -24,14 +26,15 @@ use wyrd_auth_verify::TokenVerifier;
 use wyrd_crypt::SealingKeyring;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
-    AbsoluteUrl, BeginLogin, CliHandoff, CliHandoffClaim, CliLogin, LoginInitiation, PrincipalId,
-    PrincipalKindTag, SecretBearer, Sha256Hex, TokenResponse,
+    AbsoluteUrl, DeviceAuthorization, LoginInitiation, PrincipalId, PrincipalKindTag, SecretBearer,
+    Sha256Hex, TokenResponse,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::queries::auth::{
-    delete_cli_handoff, insert_cli_handoff, lock_cli_handoff, lock_refresh_family,
+    delete_device_authorization, deny_device_authorization, insert_device_authorization,
+    lock_refresh_family, pending_device_authorization, poll_device_authorization,
     redeem_login_completion, refresh_by_hash, revoke_refresh_chain,
 };
 
@@ -45,27 +48,37 @@ use crate::exchange_api_key::token_hash;
 use crate::login::{login_unavailable, random_b64url};
 use crate::refresh::tenant_from_refresh_jwt;
 
-/// Operation for a CLI handoff claim that handed out, or was refused, a
+/// Operation for a device-code token request that issued, or was refused, a
 /// login's credential.
-pub const CLI_HANDOFF_CLAIM_OPERATION: &str = "auth.cli_handoff.claim";
+pub const DEVICE_CODE_GRANT_OPERATION: &str = "auth.device_code.grant";
 
 /// Operation for a CLI logout that revoked one login's refresh chain.
 pub const CLI_LOGOUT_OPERATION: &str = "auth.cli_login.logout";
 
-/// Lifetime of a CLI handoff: the person must finish the browser sign-in and
-/// the CLI must claim it within this window. The table refuses longer.
-const CLI_HANDOFF_TTL: Duration = Duration::from_mins(5);
+/// Path of the verification page the person approves a user code on.
+pub const DEVICE_VERIFICATION_PATH: &str = "/auth/device";
 
-/// Seconds a pending claim tells the CLI to wait before polling again.
-const CLAIM_RETRY_SECONDS: u32 = 2;
+/// Lifetime of a device code: the person must approve it and sign in, and the
+/// CLI must redeem the login, within this window. The table refuses longer.
+const DEVICE_CODE_TTL: Duration = Duration::from_mins(10);
 
-/// Owner of CLI logins: handoff begin, claim, cancel, and refresh-chain
-/// revocation.
+/// Minimum time between two token polls of one device code (RFC 8628 §3.5).
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// User-code alphabet: 20 consonants without look-alikes, so a code never
+/// spells a word or confuses `0`/`O` (RFC 8628 §6.1).
+const USER_CODE_ALPHABET: &[u8] = b"BCDFGHJKLMNPQRSTVWXZ";
+
+/// Letters in a user code, shown as two groups of four.
+const USER_CODE_LEN: usize = 8;
+
+/// Owner of CLI logins: device authorization, approval, denial, redemption,
+/// and refresh-chain revocation.
 ///
 /// Composed per request from the server's human-connection owner, which
 /// carries the runtime store, sealing keyring, and public origin, and the
 /// verifier of the server's own access tokens, which names the principal a
-/// claimed credential acts as.
+/// redeemed credential acts as.
 #[derive(Clone)]
 pub struct CliLogins {
     /// Tenant human-connection owner logins begin and redeem through.
@@ -94,107 +107,193 @@ impl CliLogins {
         }
     }
 
-    /// Begin a CLI login at `tenant_route_key` and return its handoff.
+    /// Begin a device login at `tenant_route_key` (RFC 8628 §3.1).
     ///
-    /// Resolves the tenant and its Active connection (an unknown tenant and
-    /// one without a connection get the same generic refusal as
-    /// `POST /auth/login`), commits a handoff row bound to that connection and
-    /// to the SHA-256 of a fresh 256-bit verifier with a five-minute
-    /// `PostgreSQL`-derived expiry, then begins the tenant login bound to the
-    /// handoff id. The raw verifier is returned once and never stored.
+    /// Resolves the tenant and requires its Active connection (an unknown
+    /// tenant and one without a connection get the same generic refusal as
+    /// `POST /auth/login`), then commits a device authorization holding the
+    /// SHA-256 of a fresh device code and a random user code, with a
+    /// ten-minute `PostgreSQL`-derived expiry. The device code is
+    /// `{tenant_id}.{256-bit secret}`, so a token poll routes itself to its
+    /// tenant the way a refresh token does; it is returned once and never
+    /// stored.
     ///
     /// # Errors
-    /// Returns [`WyrdError::InvalidToken`] when the route key names no active
-    /// tenant or the tenant has no Active connection, the refusals of
-    /// [`HumanConnections::begin_login`], and
-    /// [`WyrdError::AuthVerifyUnavailable`] when the store fails. A handoff
-    /// whose login could not begin is left to expire unclaimable.
-    pub async fn begin(&self, tenant_route_key: &TenantSlug) -> Result<CliHandoff, WyrdError> {
-        self.connections.require_callback()?;
+    /// Returns [`WyrdError::Validation`] without a public origin or sealing
+    /// keyring, [`WyrdError::InvalidToken`] when the route key names no active
+    /// tenant or the tenant has no Active connection, and
+    /// [`WyrdError::AuthVerifyUnavailable`] when the store fails, including
+    /// the negligible chance of a user code already live in the tenant.
+    pub async fn authorize(
+        &self,
+        tenant_route_key: &TenantSlug,
+    ) -> Result<DeviceAuthorization, WyrdError> {
+        let origin = self
+            .connections
+            .require_callback()?
+            .origin()
+            .ascii_serialization();
         self.connections.require_keyring()?;
         let tenant = self
             .tenant(tenant_route_key)
             .await?
             .ok_or_else(login_unavailable)?;
-        let active = self
-            .connections
+        self.connections
             .active_connection(tenant)
             .await?
             .ok_or_else(login_unavailable)?;
-        let handoff_id = Uuid::now_v7();
-        let verifier = random_b64url(32);
+        let device_code = format!("{tenant}.{}", random_b64url(32));
+        let user_code = new_user_code();
         let mut conn = self
             .connections
             .postgres()
             .tenant_conn(tenant)
             .await
             .map_err(store_error)?;
-        let expires_at = insert_cli_handoff(
+        insert_device_authorization(
             &mut conn,
-            handoff_id,
-            active.binding.connection_id,
-            &Sha256Hex::digest(verifier.as_bytes()),
-            CLI_HANDOFF_TTL,
+            Uuid::now_v7(),
+            &Sha256Hex::digest(device_code.as_bytes()),
+            &user_code,
+            DEVICE_CODE_TTL,
         )
         .await
         .map_err(store_error)?;
         conn.commit().await.map_err(store_error)?;
-        let begun = self
-            .connections
-            .begin_login(&BeginLogin {
-                tenant_route_key: tenant_route_key.clone(),
-                browser_flow_hash: None,
-                cli_handoff_id: Some(handoff_id),
-            })
-            .await?;
-        Ok(CliHandoff {
-            handoff_id,
-            login_url: begun.authorization_url,
-            poll_verifier: SecretBearer::new(verifier),
-            expires_at,
+        let verification_uri = format!(
+            "{origin}{DEVICE_VERIFICATION_PATH}?tenant={}",
+            tenant_route_key.as_str()
+        );
+        let verification_uri_complete = format!("{verification_uri}&user_code={user_code}");
+        Ok(DeviceAuthorization {
+            device_code: SecretBearer::new(device_code),
+            user_code,
+            verification_uri: absolute(verification_uri)?,
+            verification_uri_complete: absolute(verification_uri_complete)?,
+            expires_in: DEVICE_CODE_TTL.as_secs(),
+            interval: POLL_INTERVAL.as_secs(),
         })
     }
 
-    /// Claim the credential of handoff `handoff_id` with its verifier.
+    /// Approve `user_code` at `tenant_route_key` and return the provider URL
+    /// the person signs in at.
     ///
-    /// One tenant transaction locks the unexpired handoff the id and verifier
-    /// hash name. While the callback has not completed the login, the claim
-    /// commits nothing and answers [`CliHandoffClaim::Pending`]. Once it has,
-    /// the claim redeems the sealed completion, deletes the handoff, requires
-    /// the login to have gone through the connection the handoff was begun
-    /// at, appends one allowed `auth.cli_handoff.claim` audit event for the
-    /// User, and commits, so a second claim finds nothing. A completion that
-    /// cannot be used is still consumed.
+    /// Finds the tenant's unexpired, undenied device authorization with that
+    /// user code, then begins the tenant login bound to its device id
+    /// ([`HumanConnections::begin_bound`]). The sign-in completes the
+    /// approval: until the callback has stored the session, a token poll
+    /// stays pending. The unique binding index lets one device authorization
+    /// begin at most one login.
     ///
     /// # Errors
-    /// Returns [`WyrdError::InvalidState`] with reason `cli_handoff_unavailable`
-    /// for an unknown tenant, a missing, expired, cancelled, or already
-    /// claimed handoff, or a wrong verifier, all indistinguishable;
-    /// [`WyrdError::InvalidToken`] when the login went through another
-    /// connection; [`WyrdError::Validation`] without a sealing keyring;
-    /// [`WyrdError::Internal`] when the completion cannot be opened or carries
-    /// no refresh token; [`WyrdError::AuthVerifyUnavailable`] when the store
-    /// fails; and [`WyrdError::AuditUnavailable`] when the audit append fails.
-    /// Every refusal once the tenant is known is audited best-effort.
-    pub async fn claim(
+    /// Returns [`WyrdError::InvalidState`] with reason `user_code_unavailable`
+    /// for an unknown tenant or a malformed, unknown, expired, or denied user
+    /// code, all indistinguishable; the refusals of
+    /// [`HumanConnections::begin_bound`]; and
+    /// [`WyrdError::AuthVerifyUnavailable`] when the store fails.
+    pub async fn approve(
         &self,
         tenant_route_key: &TenantSlug,
-        handoff_id: Uuid,
-        verifier: &SecretBearer,
-        request_id: &str,
-    ) -> Result<CliHandoffClaim, WyrdError> {
-        let keyring = self.connections.require_keyring()?;
+        user_code: &str,
+    ) -> Result<AbsoluteUrl, WyrdError> {
+        let user_code = normalize_user_code(user_code).ok_or_else(user_code_unavailable)?;
         let tenant = self
             .tenant(tenant_route_key)
             .await?
-            .ok_or_else(handoff_unavailable)?;
+            .ok_or_else(user_code_unavailable)?;
+        let mut conn = self
+            .connections
+            .postgres()
+            .tenant_conn(tenant)
+            .await
+            .map_err(store_error)?;
+        let device_id = pending_device_authorization(&mut conn, &user_code)
+            .await
+            .map_err(store_error)?
+            .ok_or_else(user_code_unavailable)?;
+        conn.commit().await.map_err(store_error)?;
+        self.connections
+            .begin_bound(tenant_route_key, LoginInitiation::Device(device_id))
+            .await
+            .map(|begun| begun.authorization_url)
+    }
+
+    /// Deny `user_code` at `tenant_route_key`, so the CLI's next poll ends
+    /// the login with `access_denied`.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::InvalidState`] with reason `user_code_unavailable`
+    /// for an unknown tenant or a malformed, unknown, or expired user code,
+    /// and [`WyrdError::AuthVerifyUnavailable`] when the store fails.
+    pub async fn deny(
+        &self,
+        tenant_route_key: &TenantSlug,
+        user_code: &str,
+    ) -> Result<(), WyrdError> {
+        let user_code = normalize_user_code(user_code).ok_or_else(user_code_unavailable)?;
+        let tenant = self
+            .tenant(tenant_route_key)
+            .await?
+            .ok_or_else(user_code_unavailable)?;
+        let mut conn = self
+            .connections
+            .postgres()
+            .tenant_conn(tenant)
+            .await
+            .map_err(store_error)?;
+        if !deny_device_authorization(&mut conn, &user_code)
+            .await
+            .map_err(store_error)?
+        {
+            return Err(user_code_unavailable());
+        }
+        conn.commit().await.map_err(store_error)
+    }
+
+    /// Redeem `device_code` for the Wyrd user credential (RFC 8628 §3.4).
+    ///
+    /// The device code's tenant prefix only routes the request; the code hash
+    /// under tenant RLS is the authority. One tenant transaction locks the
+    /// device authorization and records the poll. An expired or denied one is
+    /// deleted and refused; a poll within the interval of the previous one is
+    /// told to slow down; while the callback has not completed the login the
+    /// poll is pending. Once it has, the poll redeems the sealed completion,
+    /// deletes the device authorization, appends one allowed
+    /// `auth.device_code.grant` audit event for the User, and commits, so a
+    /// second poll finds nothing. A completion that cannot be used is still
+    /// consumed.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::DeviceAuthorization`] with `details.error`
+    /// `invalid_grant` for a malformed, unknown, or already redeemed code,
+    /// `expired_token`, `access_denied`, `slow_down`, or
+    /// `authorization_pending`; [`WyrdError::Validation`] without a sealing
+    /// keyring; [`WyrdError::Internal`] when the completion cannot be opened
+    /// or carries no refresh token; [`WyrdError::InvalidToken`] when its
+    /// access token does not verify; [`WyrdError::AuthVerifyUnavailable`] when
+    /// the store fails; and [`WyrdError::AuditUnavailable`] when the audit
+    /// append fails. Every refusal that ends a known device code is audited
+    /// best-effort.
+    pub async fn redeem(
+        &self,
+        device_code: &SecretBearer,
+        request_id: &str,
+    ) -> Result<TokenResponse, WyrdError> {
+        let keyring = self.connections.require_keyring()?;
+        let tenant = device_code
+            .expose()
+            .split_once('.')
+            .and_then(|(tenant, _)| tenant.parse::<DataTenantId>().ok())
+            .ok_or_else(|| device_error("invalid_grant", "the device code is not valid"))?;
         let result = self
-            .claim_in(tenant, handoff_id, verifier, keyring, request_id)
+            .redeem_in(tenant, device_code, keyring, request_id)
             .await;
-        if let Err(error) = &result {
+        if let Err(error) = &result
+            && audits_refusal(error)
+        {
             let event = auth_event(
                 request_id,
-                CLI_HANDOFF_CLAIM_OPERATION,
+                DEVICE_CODE_GRANT_OPERATION,
                 PrincipalId::new(Uuid::nil()),
                 PrincipalKindTag::User,
                 None,
@@ -208,51 +307,68 @@ impl CliLogins {
         result
     }
 
-    /// The tenant transaction of [`Self::claim`] once the tenant is known.
+    /// The tenant transaction of [`Self::redeem`] once the tenant is routed.
     ///
     /// # Errors
-    /// Returns the errors [`Self::claim`] documents after tenant resolution.
-    async fn claim_in(
+    /// Returns the errors [`Self::redeem`] documents after routing.
+    async fn redeem_in(
         &self,
         tenant: DataTenantId,
-        handoff_id: Uuid,
-        verifier: &SecretBearer,
+        device_code: &SecretBearer,
         keyring: &SealingKeyring,
         request_id: &str,
-    ) -> Result<CliHandoffClaim, WyrdError> {
-        let verifier_hash = Sha256Hex::digest(verifier.expose().as_bytes());
+    ) -> Result<TokenResponse, WyrdError> {
         let mut conn = self
             .connections
             .postgres()
             .tenant_conn(tenant)
             .await
             .map_err(store_error)?;
-        let connection_id = lock_cli_handoff(&mut conn, handoff_id, &verifier_hash)
-            .await
-            .map_err(store_error)?
-            .ok_or_else(handoff_unavailable)?;
-        let Some(redeemed) = redeem_login_completion(&mut conn, &LoginInitiation::Cli(handoff_id))
-            .await
-            .map_err(store_error)?
+        let poll = poll_device_authorization(
+            &mut conn,
+            &Sha256Hex::digest(device_code.expose().as_bytes()),
+            POLL_INTERVAL,
+        )
+        .await
+        .map_err(store_error)?
+        .ok_or_else(|| device_error("invalid_grant", "the device code is not valid"))?;
+        let refusal = if poll.expired {
+            Some(device_error(
+                "expired_token",
+                "the device code expired; start a new login",
+            ))
+        } else if poll.denied {
+            Some(device_error("access_denied", "the login was denied"))
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            delete_device_authorization(&mut conn, poll.device_id)
+                .await
+                .map_err(store_error)?;
+            conn.commit().await.map_err(store_error)?;
+            return Err(refusal);
+        }
+        if poll.too_fast {
+            conn.commit().await.map_err(store_error)?;
+            return Err(device_error("slow_down", "poll less often"));
+        }
+        let Some(redeemed) =
+            redeem_login_completion(&mut conn, &LoginInitiation::Device(poll.device_id))
+                .await
+                .map_err(store_error)?
         else {
             conn.commit().await.map_err(store_error)?;
-            return Ok(CliHandoffClaim::Pending {
-                retry_after_seconds: CLAIM_RETRY_SECONDS,
-            });
+            return Err(device_error(
+                "authorization_pending",
+                "the person has not approved this device code yet",
+            ));
         };
-        delete_cli_handoff(&mut conn, handoff_id, &verifier_hash)
+        delete_device_authorization(&mut conn, poll.device_id)
             .await
             .map_err(store_error)?;
-        let opened = if redeemed.connection_id == connection_id {
-            open_login(keyring, &redeemed.sealed)
-        } else {
-            Err(WyrdError::InvalidToken {
-                message: "the login connection changed while the login was in progress".to_owned(),
-                details: json!({}),
-            })
-        };
-        let (token, refresh_token) = match opened {
-            Ok(opened) => opened,
+        let token = match open_login(keyring, &redeemed.sealed) {
+            Ok(token) => token,
             Err(error) => {
                 // The completion is single-use even when it is refused.
                 conn.commit().await.map_err(store_error)?;
@@ -270,7 +386,7 @@ impl CliLogins {
             .id;
         let event = principal_event(
             request_id,
-            CLI_HANDOFF_CLAIM_OPERATION,
+            DEVICE_CODE_GRANT_OPERATION,
             principal_id,
             PrincipalKindTag::User,
             None,
@@ -278,47 +394,7 @@ impl CliLogins {
         );
         append_auth_audit(&mut conn, &event).await?;
         conn.commit().await.map_err(store_error)?;
-        Ok(CliHandoffClaim::Complete(CliLogin {
-            server_origin: self.server_origin()?,
-            tenant_id: tenant,
-            principal_id,
-            access_token: token.access_token,
-            refresh_token,
-            access_expires_at: token.expires_at,
-        }))
-    }
-
-    /// Cancel handoff `handoff_id` with its verifier. Idempotent.
-    ///
-    /// Deletes the handoff and any login state still bound to it in one tenant
-    /// transaction, so a later callback and every later claim find nothing.
-    /// An unknown tenant, handoff, or wrong verifier deletes nothing.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the store fails.
-    pub async fn cancel(
-        &self,
-        tenant_route_key: &TenantSlug,
-        handoff_id: Uuid,
-        verifier: &SecretBearer,
-    ) -> Result<(), WyrdError> {
-        let Some(tenant) = self.tenant(tenant_route_key).await? else {
-            return Ok(());
-        };
-        let mut conn = self
-            .connections
-            .postgres()
-            .tenant_conn(tenant)
-            .await
-            .map_err(store_error)?;
-        delete_cli_handoff(
-            &mut conn,
-            handoff_id,
-            &Sha256Hex::digest(verifier.expose().as_bytes()),
-        )
-        .await
-        .map_err(store_error)?;
-        conn.commit().await.map_err(store_error)
+        Ok(token)
     }
 
     /// End the login `refresh_token` belongs to. Idempotent.
@@ -387,41 +463,84 @@ impl CliLogins {
             .await
             .map_err(store_error)
     }
+}
 
-    /// The deployment's public origin, from its configured callback.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] without a public origin.
-    fn server_origin(&self) -> Result<AbsoluteUrl, WyrdError> {
-        let origin = self.connections.require_callback()?.origin();
-        AbsoluteUrl::new(origin.ascii_serialization()).map_err(|_| completion_unusable())
+/// A fresh random user code, `XXXX-XXXX` over [`USER_CODE_ALPHABET`].
+fn new_user_code() -> String {
+    let mut rng = rand::rng();
+    let letters: String = (0..USER_CODE_LEN)
+        .map(|_| char::from(USER_CODE_ALPHABET[rng.random_range(0..USER_CODE_ALPHABET.len())]))
+        .collect();
+    format!("{}-{}", &letters[..4], &letters[4..])
+}
+
+/// The stored form of a user code a person typed: case and separators are
+/// ignored. `None` when it cannot be a user code.
+fn normalize_user_code(input: &str) -> Option<String> {
+    let letters: String = input
+        .chars()
+        .filter(|c| !matches!(c, '-' | ' '))
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    (letters.len() == USER_CODE_LEN && letters.bytes().all(|b| USER_CODE_ALPHABET.contains(&b)))
+        .then(|| format!("{}-{}", &letters[..4], &letters[4..]))
+}
+
+/// Whether a refused token poll is recorded: everything except an unknown
+/// code and the two keep-polling answers, which decide nothing.
+fn audits_refusal(error: &WyrdError) -> bool {
+    let WyrdError::DeviceAuthorization { details, .. } = error else {
+        return true;
+    };
+    !matches!(
+        details.get("error").and_then(serde_json::Value::as_str),
+        Some("invalid_grant" | "authorization_pending" | "slow_down")
+    )
+}
+
+/// A device-code token refusal carrying the RFC 8628 `error`.
+fn device_error(error: &'static str, message: &str) -> WyrdError {
+    WyrdError::DeviceAuthorization {
+        message: message.to_owned(),
+        details: json!({ "error": error }),
     }
 }
 
-/// The one refusal for every claim that cannot name a live handoff.
-fn handoff_unavailable() -> WyrdError {
+/// The one refusal for a verification-page request that names no live user
+/// code.
+fn user_code_unavailable() -> WyrdError {
     WyrdError::InvalidState {
-        message: "the CLI login handoff is unknown, expired, or already claimed; start a new \
-                  login"
+        message: "the code is unknown or expired; check the code your terminal shows, or start a \
+                  new login"
             .to_owned(),
-        details: json!({ "reason": "cli_handoff_unavailable" }),
+        details: json!({ "reason": "user_code_unavailable" }),
     }
 }
 
-/// Open a sealed CLI login completion into its session and refresh token.
+/// A verification URL built from the configured public origin.
+///
+/// # Errors
+/// Returns [`WyrdError::Internal`] when it is not an absolute URL.
+fn absolute(url: String) -> Result<AbsoluteUrl, WyrdError> {
+    AbsoluteUrl::new(url).map_err(|_| WyrdError::Internal {
+        message: "the verification URL is invalid".to_owned(),
+        details: json!({}),
+    })
+}
+
+/// Open a sealed device login completion into its session.
 ///
 /// # Errors
 /// Returns [`WyrdError::Internal`] when the completion cannot be opened with
 /// `keyring`, does not decode, or carries no refresh token.
-fn open_login(
-    keyring: &SealingKeyring,
-    sealed: &[u8],
-) -> Result<(TokenResponse, SecretBearer), WyrdError> {
+fn open_login(keyring: &SealingKeyring, sealed: &[u8]) -> Result<TokenResponse, WyrdError> {
     let opened = keyring.open(sealed).map_err(|_| completion_unusable())?;
-    let mut token: TokenResponse =
+    let token: TokenResponse =
         serde_json::from_slice(&opened).map_err(|_| completion_unusable())?;
-    let refresh_token = token.refresh_token.take().ok_or_else(completion_unusable)?;
-    Ok((token, refresh_token))
+    if token.refresh_token.is_none() {
+        return Err(completion_unusable());
+    }
+    Ok(token)
 }
 
 /// A sealed completion this process cannot open, decode, or use.
@@ -432,7 +551,8 @@ fn completion_unusable() -> WyrdError {
     }
 }
 
-/// CLI handoff begin, claim, cancel, and logout revocation against a real
+/// Device authorization, approval, denial, polling, and logout revocation
+/// against a real
 /// tenant store and a mock provider.
 #[cfg(test)]
 mod pg_tests {
@@ -450,9 +570,7 @@ mod pg_tests {
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
     use wyrd_crypt::{SealingKeyring, SecretKey};
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
-    use wyrd_spec::auth::{
-        BeginLogin, CliHandoffClaim, PrincipalId, PrincipalKindTag, SecretBearer,
-    };
+    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag, SecretBearer};
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::TenantSlug;
     use wyrd_sql::queries::auth::{insert_human_refresh_token, refresh_by_hash};
@@ -540,70 +658,128 @@ mod pg_tests {
         details.get("reason").and_then(serde_json::Value::as_str)
     }
 
-    /// A begun handoff carries a provider URL without its verifier; before
-    /// the callback completes, only the verifier holder at the handoff's
-    /// tenant is told to keep polling. A wrong verifier, an unknown tenant,
-    /// a cancelled handoff, and a handoff id `POST /auth/login` never issued
-    /// all get the one refusal, and cancellation removes the bound login.
+    /// The RFC 8628 `error` of a device-code refusal.
+    fn device_error(result: Result<impl std::fmt::Debug, WyrdError>) -> String {
+        match result {
+            Err(WyrdError::DeviceAuthorization { details, .. }) => details["error"]
+                .as_str()
+                .expect("error is a string")
+                .to_owned(),
+            other => panic!("expected a device-code refusal, got {other:?}"),
+        }
+    }
+
+    /// Number of login-state rows in the fixture tenant.
+    ///
+    /// # Panics
+    /// Panics when the count query fails.
+    async fn state_rows(fixture: &PgFixture) -> i64 {
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        sqlx::query_scalar("SELECT COUNT(*) FROM wyrd.auth_login_state")
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("count runs")
+    }
+
+    /// A device authorization keeps its device code out of the verification
+    /// URLs. Its token poll is pending until the login completes and told to
+    /// slow down when it polls within the interval; a wrong code is an
+    /// invalid grant. The user code is approved case- and separator-
+    /// insensitively and begins exactly one login, while an unknown user code
+    /// or tenant gets the one refusal. A denied code ends the login and its
+    /// bound login state at the next poll, and an expired code is refused
+    /// once; afterwards both are invalid grants.
     ///
     /// # Panics
     /// Panics when any step is accepted or refused differently.
     #[tokio::test]
-    async fn only_the_verifier_holder_polls_and_cancel_ends_the_login() {
+    async fn device_codes_poll_approve_deny_and_expire() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let provider = MockServer::start().await;
         let logins = owner(&fixture, &provider).await;
         let slug = TenantSlug::new(fixture.tenant_slug()).expect("slug");
 
-        let handoff = logins.begin(&slug).await.expect("handoff begins");
+        let device = logins.authorize(&slug).await.expect("authorizes");
+        let code = device.device_code.expose();
+        assert!(!device.verification_uri_complete.as_str().contains(code));
         assert!(
-            !handoff
-                .login_url
+            device
+                .verification_uri_complete
                 .as_str()
-                .contains(handoff.poll_verifier.expose())
+                .ends_with(&format!("user_code={}", device.user_code))
         );
-        let wrong = SecretBearer::new("wrong".to_owned());
-        let other = TenantSlug::new("no-such-tenant").expect("slug");
-        let pending = logins
-            .claim(&slug, handoff.handoff_id, &handoff.poll_verifier, "req")
-            .await
-            .expect("the holder polls");
-        assert!(matches!(pending, CliHandoffClaim::Pending { .. }));
-        for (tenant, verifier) in [(&slug, &wrong), (&other, &handoff.poll_verifier)] {
-            let error = logins
-                .claim(tenant, handoff.handoff_id, verifier, "req")
-                .await
-                .expect_err("refused");
-            assert_eq!(reason(&error), Some("cli_handoff_unavailable"));
+        assert_eq!((device.expires_in, device.interval), (600, 5));
+        assert_eq!(
+            device_error(logins.redeem(&device.device_code, "req").await),
+            "authorization_pending"
+        );
+        assert_eq!(
+            device_error(logins.redeem(&device.device_code, "req").await),
+            "slow_down"
+        );
+        let wrong = SecretBearer::new(format!("{}.wrong", fixture.data_tenant_id()));
+        for code in [wrong, SecretBearer::new("not-a-code".to_owned())] {
+            assert_eq!(
+                device_error(logins.redeem(&code, "req").await),
+                "invalid_grant"
+            );
         }
 
-        logins
-            .cancel(&slug, handoff.handoff_id, &handoff.poll_verifier)
-            .await
-            .expect("cancel succeeds");
+        let other = TenantSlug::new("no-such-tenant").expect("slug");
+        for (tenant, user_code) in [
+            (&slug, "BCDF-GHJK"),
+            (&slug, "nope"),
+            (&other, &*device.user_code),
+        ] {
+            let error = logins
+                .approve(tenant, user_code)
+                .await
+                .expect_err("refused");
+            assert_eq!(reason(&error), Some("user_code_unavailable"));
+        }
+        let typed = device.user_code.replace('-', " ").to_lowercase();
+        let url = logins.approve(&slug, &typed).await.expect("approves");
+        assert!(url.as_str().starts_with(&provider.uri()));
         let error = logins
-            .claim(&slug, handoff.handoff_id, &handoff.poll_verifier, "req")
+            .approve(&slug, &device.user_code)
             .await
-            .expect_err("a cancelled handoff is gone");
-        assert_eq!(reason(&error), Some("cli_handoff_unavailable"));
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let states: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wyrd.auth_login_state")
-            .fetch_one(&mut **conn.transaction())
-            .await
-            .expect("count runs");
-        assert_eq!(states, 0, "cancel removes the bound login state");
-        drop(conn);
+            .expect_err("one login per device code");
+        assert_eq!(reason(&error), Some("login_binding_reused"));
+        assert_eq!(state_rows(&fixture).await, 1);
 
+        logins.deny(&slug, &device.user_code).await.expect("denies");
+        assert_eq!(
+            device_error(logins.redeem(&device.device_code, "req").await),
+            "access_denied"
+        );
+        assert_eq!(state_rows(&fixture).await, 0, "denial ends the bound login");
+        assert_eq!(
+            device_error(logins.redeem(&device.device_code, "req").await),
+            "invalid_grant"
+        );
+
+        let expiring = logins.authorize(&slug).await.expect("authorizes");
+        sqlx::query(
+            "UPDATE wyrd.auth_device_authorizations
+                SET created_at = statement_timestamp() - interval '11 minutes',
+                    expires_at = statement_timestamp() - interval '1 minute'",
+        )
+        .execute(&fixture.superuser_pool().await.expect("superuser pool"))
+        .await
+        .expect("expires the code");
+        assert_eq!(
+            device_error(logins.redeem(&expiring.device_code, "req").await),
+            "expired_token"
+        );
+        assert_eq!(
+            device_error(logins.redeem(&expiring.device_code, "req").await),
+            "invalid_grant"
+        );
         let error = logins
-            .connections
-            .begin_login(&BeginLogin {
-                tenant_route_key: slug,
-                browser_flow_hash: None,
-                cli_handoff_id: Some(Uuid::now_v7()),
-            })
+            .deny(&slug, &expiring.user_code)
             .await
-            .expect_err("an unissued handoff id is refused");
-        assert_eq!(reason(&error), Some("unknown_cli_handoff"));
+            .expect_err("a removed code cannot be denied");
+        assert_eq!(reason(&error), Some("user_code_unavailable"));
     }
 
     /// Seed one User with two CLI logins: a stale refresh token and its live

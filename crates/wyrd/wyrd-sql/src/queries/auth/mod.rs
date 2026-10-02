@@ -9,7 +9,7 @@
 
 pub mod api_keys;
 pub mod browser_sessions;
-pub mod cli_handoffs;
+pub mod device_authorizations;
 pub mod human_connections;
 pub mod login_state;
 pub mod refresh_tokens;
@@ -29,8 +29,9 @@ pub use browser_sessions::{
     BrowserSessionMode, BrowserSessionWrite, LockedBrowserSession, insert_browser_session,
     lock_browser_session, revoke_browser_session, rotate_browser_session,
 };
-pub use cli_handoffs::{
-    cli_handoff_is_open, delete_cli_handoff, insert_cli_handoff, lock_cli_handoff,
+pub use device_authorizations::{
+    DevicePoll, delete_device_authorization, deny_device_authorization,
+    insert_device_authorization, pending_device_authorization, poll_device_authorization,
 };
 pub use human_connections::{
     HumanConnectionWrite, SealedSecretRow, SealedSecretTable, deactivate_active_human_connection,

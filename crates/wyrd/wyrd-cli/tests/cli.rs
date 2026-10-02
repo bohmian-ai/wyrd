@@ -23,14 +23,14 @@ mod query_server_journey;
 mod secret_sources;
 
 /// Root of the provider-backed CLI login journey, so its exact name
-/// `cli_oidc_handoff_journey` selects it; only the Keycloak identity lane
+/// `cli_device_login_journey` selects it; only the Keycloak identity lane
 /// runs it.
 ///
 /// # Panics
-/// Panics when any step of [`cli_login_journey::cli_oidc_handoff_journey`]
+/// Panics when any step of [`cli_login_journey::cli_device_login_journey`]
 /// differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the Keycloak identity lane; run via `mise run test:identity:journey`"]
-async fn cli_oidc_handoff_journey() {
-    cli_login_journey::cli_oidc_handoff_journey().await;
+async fn cli_device_login_journey() {
+    cli_login_journey::cli_device_login_journey().await;
 }

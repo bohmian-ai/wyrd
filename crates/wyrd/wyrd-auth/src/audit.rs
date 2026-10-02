@@ -172,6 +172,7 @@ pub fn auth_failure_code(error: &WyrdError) -> AuditErrorCode {
         | WyrdError::BadTokenFormat { .. }
         | WyrdError::InvalidNonce { .. }
         | WyrdError::InvalidState { .. }
+        | WyrdError::DeviceAuthorization { .. }
         | WyrdError::CredentialRevoked { .. } => AuditErrorCode::InvalidToken,
         WyrdError::PrincipalNotFound { .. } | WyrdError::RegistryCardNotFound { .. } => {
             AuditErrorCode::NotFound

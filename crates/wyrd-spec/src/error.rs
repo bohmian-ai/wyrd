@@ -569,6 +569,25 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A device-code token request (RFC 8628) issued no credential.
+    ///
+    /// `details.error` carries the RFC 8628 error: `authorization_pending`
+    /// and `slow_down` ask the client to keep polling (`slow_down` at an
+    /// interval five seconds longer); `access_denied`, `expired_token`, and
+    /// `invalid_grant` end the login.
+    #[error("[WYRD_AUTH_400_DEVICE_AUTHORIZATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_400_DEVICE_AUTHORIZATION",
+        status = 400,
+        title = "Device authorization did not issue a credential",
+        remediation = "Keep polling on `authorization_pending`, poll five seconds slower on `slow_down`, and start a new login on any other `details.error`."
+    )]
+    DeviceAuthorization {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload; `error` is the RFC 8628 error name.
+        details: serde_json::Value,
+    },
     /// OIDC callback state is missing, invalid, or replayed.
     #[error("[WYRD_AUTH_400_INVALID_STATE] {message}")]
     #[wyrd_error(
@@ -3560,8 +3579,8 @@ pub enum WyrdError {
         details: serde_json::Value,
     },
     /// The saved user login selected for this server and tenant cannot be
-    /// used: selection is ambiguous or names another tenant, the local store
-    /// is unsafe, corrupt, or locked, or its renewal cannot complete safely.
+    /// used: the selector names no saved login, the credential file is unsafe
+    /// or corrupt, the login was removed, or the server refused its renewal.
     #[error("[WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE] {message}")]
     #[wyrd_error(
         code = "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE",
@@ -3698,6 +3717,7 @@ impl WyrdError {
             | Self::BadTokenFormat { message, details }
             | Self::UnsupportedGrantType { message, details }
             | Self::InvalidState { message, details }
+            | Self::DeviceAuthorization { message, details }
             | Self::InvalidNonce { message, details }
             | Self::RefreshReused { message, details }
             | Self::RefreshRevoked { message, details }
@@ -4575,6 +4595,10 @@ mod tests {
             WyrdError::InvalidState {
                 message: "state was missing or replayed".to_owned(),
                 details: serde_json::json!({}),
+            },
+            WyrdError::DeviceAuthorization {
+                message: "the person has not approved this device code yet".to_owned(),
+                details: serde_json::json!({ "error": "authorization_pending" }),
             },
             WyrdError::InvalidNonce {
                 message: "id token nonce mismatch".to_owned(),

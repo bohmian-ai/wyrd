@@ -128,12 +128,12 @@ class WyrdTestServer:
         """Save ``username``'s login to ``tenant`` under ``config_home`` as ``wyrd auth login`` does."""
         ...
 
-    def expire_saved_login(self, config_home: str | os.PathLike[str], tenant: str) -> int:
-        """Make the saved login stale; return the generation its renewal starts from."""
+    def expire_saved_login(self, config_home: str | os.PathLike[str], tenant: str) -> None:
+        """Make the saved login stale, so the next client renews it."""
         ...
 
-    def saved_login_generation(self, config_home: str | os.PathLike[str], tenant: str) -> int:
-        """Return the saved login's generation."""
+    def saved_login_is_stale(self, config_home: str | os.PathLike[str], tenant: str) -> bool:
+        """Return whether the saved login's access token has expired."""
         ...
 
     def revoke_saved_login(self, config_home: str | os.PathLike[str], tenant: str) -> None:

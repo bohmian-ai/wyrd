@@ -1,19 +1,21 @@
-//! CLI human login HTTP adapters: handoff begin, claim, and cancel, and
-//! refresh-chain revocation at logout.
+//! CLI human login HTTP adapters: the RFC 8628 device authorization endpoint,
+//! its verification page, and refresh-chain revocation at logout. The
+//! device-code token poll is a `POST /auth/token` grant.
 //!
 //! Every route is anonymous: the CLI holds no Wyrd session yet, or is ending
-//! one. Each handler composes [`CliLogins`] from the server's auth
-//! configuration and maps its refusals to problem JSON.
+//! one, and the person approving a code signs in only after approving it.
+//! Each handler composes [`CliLogins`] from the server's auth configuration
+//! and maps its refusals to problem JSON, or to a plain page for the browser.
 
 use axum::Json;
-use axum::extract::{Extension, Path, State};
-use axum::http::StatusCode;
-use uuid::Uuid;
-use wyrd_auth::cli_logins::CliLogins;
-use wyrd_spec::auth::{
-    CliHandoff, CliHandoffClaim, CliHandoffProof, CreateCliHandoff, RevokeRefreshToken,
-};
-use wyrd_spec::error::WyrdProblem;
+use axum::extract::{Extension, Form, Query, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use serde::Deserialize;
+use wyrd_auth::cli_logins::{CliLogins, DEVICE_VERIFICATION_PATH};
+use wyrd_spec::auth::{DeviceAuthorization, DeviceAuthorizationRequest, RevokeRefreshToken};
+use wyrd_spec::error::{WyrdError, WyrdProblem};
+use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::request_id::RequestId;
 
 use crate::auth::auth_not_configured;
@@ -25,7 +27,7 @@ use crate::state::AppState;
 ///
 /// # Errors
 /// Returns a `500` when either is not configured.
-fn cli_logins(state: &AppState) -> Result<CliLogins, WyrdErrorResponse> {
+pub(crate) fn cli_logins(state: &AppState) -> Result<CliLogins, WyrdErrorResponse> {
     Ok(CliLogins::new(
         state
             .auth
@@ -40,29 +42,29 @@ fn cli_logins(state: &AppState) -> Result<CliLogins, WyrdErrorResponse> {
     ))
 }
 
-/// `POST /auth/cli-handoffs` — begin a CLI login.
+/// `POST /auth/device_authorization` — begin a CLI device login (RFC 8628
+/// §3.1).
 ///
-/// Returns the handoff id, the provider URL to open in the system browser,
-/// the one-time poll verifier, and the handoff expiry. Like `POST /auth/login`
-/// it appends no audit event: it evaluates no principal permission.
+/// Like `POST /auth/login` it appends no audit event: it evaluates no
+/// principal permission.
 ///
 /// # Errors
-/// Returns the refusals of [`CliLogins::begin`] and a `500` when auth is not
-/// configured.
+/// Returns the refusals of [`CliLogins::authorize`] and a `500` when auth is
+/// not configured.
 #[utoipa::path(
     post,
-    path = "/auth/cli-handoffs",
-    request_body = CreateCliHandoff,
+    path = "/auth/device_authorization",
+    request_body = DeviceAuthorizationRequest,
     responses(
-        (status = 200, description = "Handoff begun; open `login_url` in the system browser and \
-          poll the claim route with `poll_verifier`", body = CliHandoff),
+        (status = 200, description = "Device code issued; show `user_code`, open \
+          `verification_uri_complete`, and poll `POST /auth/token` with the device_code grant \
+          every `interval` seconds", body = DeviceAuthorization),
         (status = 400, description = "The deployment has no public origin or sealing key \
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "SSO login is not available for this tenant route key \
           (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
-        (status = 503, description = "The identity provider or auth backend is unavailable \
-          (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)",
-          body = WyrdProblem)
+        (status = 503, description = "The auth backend is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     // No session exists yet at this operation, so it clears the document-wide
     // requirement instead of inheriting it.
@@ -74,100 +76,187 @@ fn cli_logins(state: &AppState) -> Result<CliLogins, WyrdErrorResponse> {
     skip(state, request),
     fields(tenant_route_key = %request.tenant_route_key)
 )]
-pub async fn begin_cli_handoff(
+pub async fn device_authorization(
     State(state): State<AppState>,
-    Json(request): Json<CreateCliHandoff>,
-) -> Result<Json<CliHandoff>, WyrdErrorResponse> {
+    Json(request): Json<DeviceAuthorizationRequest>,
+) -> Result<Json<DeviceAuthorization>, WyrdErrorResponse> {
     cli_logins(&state)?
-        .begin(&request.tenant_route_key)
+        .authorize(&request.tenant_route_key)
         .await
         .map(Json)
         .map_err(WyrdErrorResponse::from)
 }
 
-/// `POST /auth/cli-handoffs/{handoff_id}/claim` — poll a CLI login.
-///
-/// Answers `pending` with a retry interval until the browser sign-in
-/// completes, then hands the Wyrd user credential to the verifier holder
-/// exactly once.
-///
-/// # Errors
-/// Returns the refusals of [`CliLogins::claim`] and a `500` when auth is not
-/// configured.
-#[utoipa::path(
-    post,
-    path = "/auth/cli-handoffs/{handoff_id}/claim",
-    params(("handoff_id" = Uuid, Path, description = "Handoff id from the begin response")),
-    request_body = CliHandoffProof,
-    responses(
-        (status = 200, description = "`pending` with a retry interval, or `complete` with the \
-          Wyrd user credential, returned once", body = CliHandoffClaim),
-        (status = 400, description = "The handoff is unknown, expired, cancelled, or already \
-          claimed, the verifier is wrong, or the route key names another tenant \
-          (WYRD_AUTH_400_INVALID_STATE); or the deployment has no sealing key \
-          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
-        (status = 401, description = "The login went through a connection that is no longer the \
-          handoff's (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
-        (status = 500, description = "The stored completion could not be opened \
-          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
-        (status = 503, description = "The auth backend or audit path is unavailable \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
-    ),
-    security(()),
-    tag = "Auth"
-)]
-#[tracing::instrument(level = "debug", skip(state, request_id, proof))]
-pub async fn claim_cli_handoff(
-    State(state): State<AppState>,
-    request_id: Option<Extension<RequestId>>,
-    Path(handoff_id): Path<Uuid>,
-    Json(proof): Json<CliHandoffProof>,
-) -> Result<Json<CliHandoffClaim>, WyrdErrorResponse> {
-    let request_id = request_id.map_or_else(RequestId::now_v7, |Extension(id)| id);
-    cli_logins(&state)?
-        .claim(
-            &proof.tenant_route_key,
-            handoff_id,
-            &proof.poll_verifier,
-            request_id.as_str(),
-        )
-        .await
-        .map(Json)
-        .map_err(WyrdErrorResponse::from)
+/// Query of the verification page: the tenant, and the user code when the
+/// CLI opened `verification_uri_complete`.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct DeviceQuery {
+    /// The tenant's route key.
+    tenant: TenantSlug,
+    /// The user code to prefill.
+    user_code: Option<String>,
 }
 
-/// `POST /auth/cli-handoffs/{handoff_id}/cancel` — abandon a CLI login.
+/// The person's decision on the verification page.
+#[derive(Debug, Clone, Copy, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceDecision {
+    /// Approve the code and sign in.
+    Approve,
+    /// Deny the code; the CLI's login ends.
+    Deny,
+}
+
+/// Form the verification page posts.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct DeviceForm {
+    /// The tenant's route key.
+    #[schema(value_type = String)]
+    tenant: TenantSlug,
+    /// The user code the person confirmed.
+    user_code: String,
+    /// Approve or deny.
+    decision: DeviceDecision,
+}
+
+/// `GET /auth/device` — the device verification page (RFC 8628 §3.3).
 ///
-/// Idempotent: an unknown handoff or wrong verifier also answers `204` and
-/// changes nothing.
-///
-/// # Errors
-/// Returns a `503` when the store fails and a `500` when auth is not
-/// configured.
+/// A static form: the user code (prefilled from the query when it is
+/// well-formed), and Approve and Deny buttons that post to the same path.
+/// The page may not be framed, so it cannot be clicked through invisibly.
 #[utoipa::path(
-    post,
-    path = "/auth/cli-handoffs/{handoff_id}/cancel",
-    params(("handoff_id" = Uuid, Path, description = "Handoff id from the begin response")),
-    request_body = CliHandoffProof,
+    get,
+    path = "/auth/device",
+    params(DeviceQuery),
     responses(
-        (status = 204, description = "The handoff, if the verifier named one, no longer exists"),
-        (status = 503, description = "The auth backend is unavailable \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+        (status = 200, description = "The verification form", content_type = "text/html",
+          body = String)
     ),
     security(()),
     tag = "Auth"
 )]
-#[tracing::instrument(level = "debug", skip(state, proof))]
-pub async fn cancel_cli_handoff(
+#[tracing::instrument(level = "debug", skip_all, fields(tenant_route_key = %query.tenant))]
+pub async fn device_page(Query(query): Query<DeviceQuery>) -> Response {
+    // Only a code of user-code characters is echoed, so it needs no escaping;
+    // the tenant is a validated slug.
+    let user_code = query
+        .user_code
+        .filter(|code| {
+            code.len() <= 16 && code.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+        .unwrap_or_default();
+    page(
+        StatusCode::OK,
+        &format!(
+            "<h1>Approve a Wyrd CLI login</h1><p>Approve only if this code is shown in your own \
+             terminal.</p><form method=\"post\" action=\"{DEVICE_VERIFICATION_PATH}\">\
+             <input type=\"hidden\" name=\"tenant\" value=\"{tenant}\"><label>Code \
+             <input name=\"user_code\" value=\"{user_code}\" autocomplete=\"off\" required>\
+             </label> <button name=\"decision\" value=\"approve\">Approve and sign in</button> \
+             <button name=\"decision\" value=\"deny\">Deny</button></form>",
+            tenant = query.tenant.as_str(),
+        ),
+    )
+}
+
+/// `POST /auth/device` — approve or deny a user code (RFC 8628 §3.3).
+///
+/// Only a form posted from the deployment's own origin is accepted, so
+/// another site cannot approve its own code in the person's browser. Approve
+/// redirects (`303`) to the tenant's provider sign-in, bound to the code's
+/// device authorization; Deny ends the CLI's login.
+///
+/// # Errors
+/// Answers a plain `400` page for an unknown, expired, or denied code, a
+/// `403` page for a cross-origin post, and problem JSON for every other
+/// refusal of [`CliLogins::approve`] and [`CliLogins::deny`].
+#[utoipa::path(
+    post,
+    path = "/auth/device",
+    request_body(content = DeviceForm, content_type = "application/x-www-form-urlencoded"),
+    responses(
+        (status = 200, description = "The code was denied", content_type = "text/html",
+          body = String),
+        (status = 303, description = "Approved; sign in at the tenant's provider",
+          headers(("Location" = String, description = "Provider authorization URL"))),
+        (status = 400, description = "The code is unknown, expired, or denied",
+          content_type = "text/html", body = String),
+        (status = 403, description = "The form was not posted from this deployment's origin",
+          content_type = "text/html", body = String),
+        (status = 401, description = "SSO login is not available for this tenant \
+          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 503, description = "The identity provider or auth backend is unavailable \
+          (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)",
+          body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all, fields(tenant_route_key = %form.tenant))]
+pub async fn device_decision(
     State(state): State<AppState>,
-    Path(handoff_id): Path<Uuid>,
-    Json(proof): Json<CliHandoffProof>,
-) -> Result<StatusCode, WyrdErrorResponse> {
-    cli_logins(&state)?
-        .cancel(&proof.tenant_route_key, handoff_id, &proof.poll_verifier)
-        .await
-        .map(|()| StatusCode::NO_CONTENT)
-        .map_err(WyrdErrorResponse::from)
+    headers: HeaderMap,
+    Form(form): Form<DeviceForm>,
+) -> Result<Response, WyrdErrorResponse> {
+    let logins = cli_logins(&state)?;
+    let origin = state
+        .auth
+        .human_connections
+        .as_ref()
+        .ok_or_else(auth_not_configured)?
+        .completion_url()?
+        .origin()
+        .ascii_serialization();
+    if headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        != Some(&*origin)
+    {
+        return Ok(page(
+            StatusCode::FORBIDDEN,
+            "<h1>Request refused</h1><p>Open the link your terminal shows and try again.</p>",
+        ));
+    }
+    let result = match form.decision {
+        DeviceDecision::Approve => logins
+            .approve(&form.tenant, &form.user_code)
+            .await
+            .map(|url| Redirect::to(url.as_str()).into_response()),
+        DeviceDecision::Deny => logins.deny(&form.tenant, &form.user_code).await.map(|()| {
+            page(
+                StatusCode::OK,
+                "<h1>Login denied</h1><p>The terminal's login was refused. You can close this \
+                 page.</p>",
+            )
+        }),
+    };
+    match result {
+        Err(WyrdError::InvalidState { .. }) => Ok(page(
+            StatusCode::BAD_REQUEST,
+            "<h1>Code not accepted</h1><p>The code is unknown or expired. Check the code your \
+             terminal shows, or start a new login.</p>",
+        )),
+        other => other.map_err(WyrdErrorResponse::from),
+    }
+}
+
+/// A plain HTML page with `body`, which may not be framed.
+fn page(status: StatusCode, body: &str) -> Response {
+    let mut response = (
+        status,
+        Html(format!(
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>Wyrd CLI login</title>\
+             </head><body>{body}</body></html>"
+        )),
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    response
 }
 
 /// `POST /auth/revoke` — end the login a refresh token belongs to.

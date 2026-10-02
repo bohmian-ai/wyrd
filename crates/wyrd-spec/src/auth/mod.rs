@@ -2,7 +2,7 @@
 
 mod admin;
 mod card_scope;
-mod cli_handoff;
+mod device;
 mod human_connection;
 mod issue_key;
 mod oidc;
@@ -21,9 +21,7 @@ pub use admin::{
     IssuerTokenPolicy, TrustedIssuerView, WorkloadBindingView,
 };
 pub use card_scope::CardScope;
-pub use cli_handoff::{
-    CliHandoff, CliHandoffClaim, CliHandoffProof, CliLogin, CreateCliHandoff, RevokeRefreshToken,
-};
+pub use device::{DeviceAuthorization, DeviceAuthorizationRequest, RevokeRefreshToken};
 pub use human_connection::{
     ConnectionActivate, ConnectionInput, ConnectionTestRequest, ConnectionTestResponse,
     HUMAN_SUBJECT_CLAIM, HumanClientAuth, HumanConnectionState, HumanConnectionView,

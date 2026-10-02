@@ -1,23 +1,26 @@
 //! `wyrd auth login`, `wyrd auth logout`, and `wyrd auth status`: the saved
 //! human user login every local SDK resolves.
 //!
-//! Login begins a server-owned one-use handoff, sends the system browser to the
-//! tenant's provider, and polls the handoff with the in-memory verifier until
-//! the browser sign-in completes. The claimed Wyrd user credential goes
-//! straight into the private saved-login store owned by `wyrd-client`; no token
-//! is printed, logged, or placed in argv. Logout tombstones the record, revokes
-//! that login's refresh chain on the server, and deletes the record even when
-//! the server cannot be reached.
+//! Login uses the RFC 8628 device authorization grant, as `gh` and
+//! `aws sso login` do: it prints a one-time user code, opens the server's
+//! verification page, where the person approves the code and signs in to the
+//! tenant's provider, and polls the token endpoint with the in-memory device
+//! code until the sign-in completes. The Wyrd user credential goes straight
+//! into the private saved-login store owned by `wyrd-client`; no token is
+//! printed, logged, or placed in argv. Logout deletes the record, then revokes
+//! that login's refresh chain on the server best-effort and warns when it
+//! cannot.
 
 use std::process::{ExitCode, Stdio};
 use std::time::Duration;
 
 use clap::Args;
 use url::Url;
-use wyrd_client::auth::TokenExchange;
+use wyrd_client::auth::{AuthError, TokenExchange};
 use wyrd_client::saved_login::{SavedLogin, SavedLogins, canonical_origin};
 use wyrd_client::transport::HttpConfig;
-use wyrd_spec::auth::{CliHandoff, CliHandoffClaim, CliHandoffProof, CliLogin};
+use wyrd_spec::auth::{DeviceAuthorization, TokenRequest, TokenResponse};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
 
 use crate::client::map_client_error;
@@ -35,7 +38,7 @@ pub struct LoginArgs {
     /// Route key (slug) of the tenant to sign in to.
     #[arg(long, value_name = "KEY", env = "WYRD_TENANT")]
     pub tenant: TenantSlug,
-    /// Print the sign-in URL without opening a browser.
+    /// Print the verification URL without opening a browser.
     #[arg(long)]
     pub no_browser: bool,
 }
@@ -46,8 +49,8 @@ pub struct LogoutArgs {
     /// Wyrd server base URL of the login to end.
     #[arg(long, value_name = "URL", env = "WYRD_SERVER_URL")]
     pub server: Url,
-    /// Tenant route key of the login to end; required when the server
-    /// has saved logins for several tenants.
+    /// Tenant route key of the login to end; defaults to the most recent
+    /// login for the server.
     #[arg(long, value_name = "KEY", env = "WYRD_TENANT")]
     pub tenant: Option<String>,
 }
@@ -60,7 +63,7 @@ struct LoginFlow {
     origin: String,
     /// Tenant the login is for.
     tenant: TenantSlug,
-    /// Where the claimed credential is saved.
+    /// Where the credential is saved.
     store: SavedLogins,
 }
 
@@ -80,90 +83,85 @@ impl LoginFlow {
         })
     }
 
-    /// Begin the handoff, send the person to the provider, wait for the
-    /// browser sign-in, and save the claimed credential.
+    /// Authorize a device code, send the person to the verification page,
+    /// wait for the sign-in, and save the credential.
     ///
-    /// Ctrl-C cancels the handoff on the server and exits `130` without
-    /// saving anything.
+    /// Ctrl-C exits `130` without saving anything; the unredeemed device code
+    /// expires on the server.
     ///
     /// # Errors
     /// Returns the server's stable error when the tenant has no usable SSO
-    /// login or the handoff is refused or expires, and a saved-login error
+    /// login or the device code is denied or expires, and a saved-login error
     /// when the credential cannot be stored.
     async fn run(self, open_browser: bool) -> Result<ExitCode, WyrdCliError> {
-        let handoff = self
+        let device = self
             .exchange
-            .begin_cli_handoff(&self.tenant)
+            .device_authorization(&self.tenant)
             .await
             .map_err(server_error)?;
         eprintln!(
-            "Sign in to tenant {} in your browser:\n  {}",
+            "First copy your one-time code: {}\nThen approve it and sign in to tenant {} at:\n  {}",
+            device.user_code,
             self.tenant,
-            handoff.login_url.as_str()
+            device.verification_uri_complete.as_str()
         );
         if open_browser {
-            open_in_browser(handoff.login_url.as_str());
+            open_in_browser(device.verification_uri_complete.as_str());
         }
-        let proof = CliHandoffProof {
-            tenant_route_key: self.tenant.clone(),
-            poll_verifier: handoff.poll_verifier.clone(),
-        };
-        let login = tokio::select! {
-            login = self.poll(&handoff, &proof) => login?,
+        let token = tokio::select! {
+            token = self.poll(device) => token?,
             _ = tokio::signal::ctrl_c() => {
-                if let Err(error) = self.exchange.cancel_cli_handoff(handoff.handoff_id, &proof).await {
-                    eprintln!("warning: could not cancel the login on the server: {}", error.into_wyrd());
-                }
                 eprintln!("Login cancelled.");
                 return Ok(ExitCode::from(INTERRUPTED));
             }
         };
-        self.save(login).await
+        self.save(token).await
     }
 
-    /// Claim the handoff until the browser sign-in completes, waiting the
-    /// server's retry interval between claims.
+    /// Poll the token endpoint with the device code until the sign-in
+    /// completes (RFC 8628 §3.5): wait the interval after
+    /// `authorization_pending` and five seconds longer from each
+    /// `slow_down` on.
     ///
     /// # Errors
-    /// Returns the server's stable refusal, including the one an expired
-    /// handoff answers with.
-    async fn poll(
-        &self,
-        handoff: &CliHandoff,
-        proof: &CliHandoffProof,
-    ) -> Result<CliLogin, WyrdCliError> {
+    /// Returns the server's stable refusal for every other answer, including
+    /// `access_denied` and `expired_token`.
+    async fn poll(&self, device: DeviceAuthorization) -> Result<TokenResponse, WyrdCliError> {
+        let mut interval = device.interval.max(1);
+        let request = TokenRequest::DeviceCode {
+            device_code: device.device_code,
+        };
         loop {
-            match self
-                .exchange
-                .claim_cli_handoff(handoff.handoff_id, proof)
-                .await
-                .map_err(server_error)?
-            {
-                CliHandoffClaim::Complete(login) => return Ok(login),
-                CliHandoffClaim::Pending {
-                    retry_after_seconds,
-                } => {
-                    tokio::time::sleep(Duration::from_secs(u64::from(retry_after_seconds.max(1))))
-                        .await;
+            tokio::time::sleep(Duration::from_secs(interval)).await;
+            match self.exchange.exchange(&request).await {
+                Ok(token) => return Ok(token),
+                Err(AuthError::Server(WyrdError::DeviceAuthorization { details, .. }))
+                    if details["error"] == "authorization_pending" => {}
+                Err(AuthError::Server(WyrdError::DeviceAuthorization { details, .. }))
+                    if details["error"] == "slow_down" =>
+                {
+                    interval += 5;
                 }
+                Err(error) => return Err(server_error(error)),
             }
         }
     }
 
-    /// Save `login` under this flow's origin and tenant and print its
+    /// Save `token` under this flow's origin and tenant and print its
     /// token-free summary.
     ///
     /// # Errors
-    /// Returns a saved-login error when the store is unsafe or the write
-    /// fails.
-    async fn save(self, login: CliLogin) -> Result<ExitCode, WyrdCliError> {
-        let record = SavedLogin::from_cli_login(self.origin, self.tenant, login);
+    /// Returns a saved-login error when the server issued no refresh token,
+    /// the store is unsafe, or the write fails.
+    async fn save(self, token: TokenResponse) -> Result<ExitCode, WyrdCliError> {
+        let record =
+            SavedLogin::from_token(self.origin, self.tenant, token).map_err(map_client_error)?;
         let summary = record.summary();
         let store = self.store;
         blocking(move || store.save(record)).await?;
         println!(
-            "Logged in to {} as {}.",
-            summary.origin, summary.principal_id
+            "Logged in to {} tenant {}.",
+            summary.origin, summary.tenant_key
         );
         print_summary(&summary);
         Ok(ExitCode::SUCCESS)
@@ -179,50 +177,44 @@ pub async fn login(args: LoginArgs) -> Result<ExitCode, WyrdCliError> {
     LoginFlow::new(&args)?.run(open_browser).await
 }
 
-/// End the saved login for `args.server` and the selected tenant.
+/// End the saved login for `args.server` and the selected tenant, or the
+/// most recent one for the server.
 ///
-/// The record is tombstoned first, so no concurrent SDK renewal can use it,
-/// then its refresh chain is revoked and the record deleted. A failed
-/// revocation is reported as a warning: the local record is still deleted.
+/// The record is deleted first, then its refresh chain is revoked on the
+/// server; a failed revocation is reported as a warning.
 ///
 /// # Errors
-/// Returns a saved-login error when the selection is ambiguous or names no
-/// saved tenant, the store is unsafe, or the record cannot be changed.
+/// Returns a saved-login error when the selector names no saved tenant, the
+/// store is unsafe, or the record cannot be deleted.
 pub async fn logout(args: LogoutArgs) -> Result<ExitCode, WyrdCliError> {
     let origin = canonical_origin(args.server.as_str()).map_err(map_client_error)?;
     let store = saved_logins()?;
-    let selected = {
-        let (store, origin) = (store.clone(), origin.clone());
-        blocking(move || store.select(&origin, args.tenant.as_deref())).await?
+    let removed = {
+        let origin = origin.clone();
+        blocking(move || {
+            let Some(selected) = store.select(&origin, args.tenant.as_deref())? else {
+                return Ok(None);
+            };
+            store.remove(&origin, &selected.tenant_key)
+        })
+        .await?
     };
-    let Some(record) = selected else {
+    let Some(record) = removed else {
         println!("No saved login for {origin}.");
         return Ok(ExitCode::SUCCESS);
     };
-    let tenant_id = record.tenant_id;
-    let refresh_token = {
-        let (store, origin) = (store.clone(), origin.clone());
-        blocking(move || store.begin_logout(&origin, tenant_id)).await?
+    let revoked = match TokenExchange::new(args.server.as_str(), HttpConfig::default().timeout_ms) {
+        Ok(exchange) => exchange
+            .revoke_refresh_token(&record.refresh_token)
+            .await
+            .map_err(AuthError::into_wyrd),
+        Err(error) => Err(error.into()),
     };
-    if let Some(refresh_token) = refresh_token {
-        let revoked =
-            match TokenExchange::new(args.server.as_str(), HttpConfig::default().timeout_ms) {
-                Ok(exchange) => exchange
-                    .revoke_refresh_token(&refresh_token)
-                    .await
-                    .map_err(wyrd_client::auth::AuthError::into_wyrd),
-                Err(error) => Err(error.into()),
-            };
-        if let Err(error) = revoked {
-            eprintln!(
-                "warning: the server did not confirm revocation ({error}); the saved login was \
-                 removed locally, but its refresh token stays valid on the server until it expires"
-            );
-        }
-    }
-    {
-        let origin = origin.clone();
-        blocking(move || store.finish_logout(&origin, tenant_id)).await?;
+    if let Err(error) = revoked {
+        eprintln!(
+            "warning: the server did not confirm revocation ({error}); the saved login was \
+             removed locally, but its refresh token stays valid on the server until it expires"
+        );
     }
     println!("Logged out of {origin} tenant {}.", record.tenant_key);
     Ok(ExitCode::SUCCESS)
@@ -275,12 +267,8 @@ async fn blocking<T: Send + 'static>(
 /// Print one saved login's token-free summary.
 fn print_summary(summary: &wyrd_client::saved_login::SavedLoginSummary) {
     println!("server:     {}", summary.origin);
-    println!("tenant:     {} ({})", summary.tenant_key, summary.tenant_id);
-    println!("principal:  {}", summary.principal_id);
-    println!("status:     {}", summary.status);
-    if let Some(expires_at) = summary.access_expires_at {
-        println!("expires_at: {expires_at}");
-    }
+    println!("tenant:     {}", summary.tenant_key);
+    println!("expires_at: {}", summary.access_expires_at);
 }
 
 /// Map a `/auth` exchange failure to the CLI's server error.

@@ -126,6 +126,31 @@
       "additionalProperties": false
     },
     {
+      "description": "RFC 8628 device-code poll: the device code from `POST /auth/device_authorization`, redeemed once the person approved it.",
+      "type": "object",
+      "required": [
+        "device_code",
+        "grant_type"
+      ],
+      "properties": {
+        "device_code": {
+          "description": "The device code.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SecretBearer"
+            }
+          ]
+        },
+        "grant_type": {
+          "type": "string",
+          "enum": [
+            "urn:ietf:params:oauth:grant-type:device_code"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
       "description": "Wyrd refresh-token rotation.",
       "type": "object",
       "required": [

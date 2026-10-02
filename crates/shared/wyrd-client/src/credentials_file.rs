@@ -13,7 +13,6 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret, SecretString};
@@ -30,12 +29,6 @@ const CREDENTIALS_FILE: &str = "credentials.toml";
 /// The `credentials.toml` table holding the user's API key and its cached
 /// access token.
 const DEFAULT_KEY: &str = "default";
-
-/// Longest a process waits for another process's hold on the file lock.
-const LOCK_DEADLINE: Duration = Duration::from_secs(30);
-
-/// Pause between attempts to take a held file lock.
-const LOCK_RETRY: Duration = Duration::from_millis(25);
 
 /// The `[default]` profile as the token cache reads it.
 #[derive(Deserialize)]
@@ -112,7 +105,7 @@ impl CredentialsFile {
     ///
     /// # Errors
     /// Returns [`WyrdClientError::SavedLogin`] with reason `unsafe_store`,
-    /// `lock_timeout`, `corrupt`, or `io` from [`Self::lock`],
+    /// `corrupt`, or `io` from [`Self::lock`],
     /// [`Self::document`], and [`Self::replace`]; the file is then unchanged.
     pub(crate) fn cache_api_key_token(
         &self,
@@ -218,17 +211,17 @@ impl CredentialsFile {
         }
     }
 
-    /// Take the exclusive OS lock on the configuration directory, waiting at
-    /// most [`LOCK_DEADLINE`] for another holder.
+    /// Take the exclusive OS lock on the configuration directory, blocking
+    /// while another process holds it.
     ///
     /// The directory, not `credentials.toml`, carries the lock: every write
     /// atomically replaces the file with a new inode, while the directory is
     /// stable and adds no file of its own.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::SavedLogin`] with reason `lock_timeout`
-    /// when the deadline passes, `unsafe_store` for an unsafe directory or a
-    /// platform without POSIX file permissions, and an IO failure otherwise.
+    /// Returns [`WyrdClientError::SavedLogin`] with reason `unsafe_store` for
+    /// an unsafe directory or a platform without POSIX file permissions, and
+    /// an IO failure otherwise.
     pub(crate) fn lock(&self) -> Result<CredentialsLock, WyrdClientError> {
         self.check_dir(true)?;
         // ponytail: Windows cannot prove a user-only file or lock a directory;
@@ -241,22 +234,8 @@ impl CredentialsFile {
         #[cfg(unix)]
         {
             let dir = File::open(&self.dir).map_err(|error| io_failure(&error))?;
-            let deadline = Instant::now() + LOCK_DEADLINE;
-            loop {
-                match dir.try_lock() {
-                    Ok(()) => return Ok(CredentialsLock { _dir: dir }),
-                    Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                        std::thread::sleep(LOCK_RETRY);
-                    }
-                    Err(std::fs::TryLockError::WouldBlock) => {
-                        return Err(saved_login(
-                            "lock_timeout",
-                            "another Wyrd process held the credential file too long",
-                        ));
-                    }
-                    Err(std::fs::TryLockError::Error(error)) => return Err(io_failure(&error)),
-                }
-            }
+            dir.lock().map_err(|error| io_failure(&error))?;
+            Ok(CredentialsLock { _dir: dir })
         }
     }
 

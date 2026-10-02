@@ -29,14 +29,10 @@
 // `--skip pg_tests` (it needs the real `WyrdTestServer` + Postgres); the
 // infra e2e lane selects it by `--test` and runs it.
 use std::os::unix::fs::PermissionsExt;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-use tokio::io::AsyncReadExt;
-use tokio::net::{TcpListener, TcpStream};
 
 use secrecy::ExposeSecret;
-use wyrd_client::saved_login::{SavedLoginState, canonical_origin};
+use wyrd_client::saved_login::canonical_origin;
+use wyrd_spec::ids::TenantSlug;
 use wyrd_testing::human_login::{
     FIXTURE_TENANT_SLUG, HUMAN_PUBLIC_ORIGIN, HumanSso, expire_saved_access, saved_login,
     saved_logins,
@@ -202,95 +198,9 @@ async fn mint_in_children(count: usize, config: &std::path::Path, server: &str) 
     .expect("children join")
 }
 
-/// A TCP relay in front of the server that forwards each connection's
-/// request and then closes the connection unanswered as soon as the server's
-/// response begins.
-///
-/// The server has executed the request — for a refresh, rotated the token —
-/// but the client never learns the outcome: the uncertain network result a
-/// saved-login renewal must survive without retrying.
-struct LossyProxy {
-    /// `http://127.0.0.1:{port}` of the relay.
-    url: String,
-    /// The status line of every response the relay swallowed, in order.
-    swallowed: Arc<Mutex<Vec<String>>>,
-    /// The accept loop; aborted on drop.
-    accept: tokio::task::JoinHandle<()>,
-}
-
-impl LossyProxy {
-    /// Start a relay to the server at `server`.
-    ///
-    /// # Panics
-    /// Panics when the relay cannot bind or `server` is not `http://host:port`.
-    async fn start(server: &str) -> Self {
-        let upstream = server
-            .strip_prefix("http://")
-            .expect("plain loopback server")
-            .trim_end_matches('/')
-            .to_owned();
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("relay binds");
-        let url = format!("http://{}", listener.local_addr().expect("relay address"));
-        let swallowed = Arc::new(Mutex::new(Vec::new()));
-        let accept = tokio::spawn({
-            let swallowed = Arc::clone(&swallowed);
-            async move {
-                while let Ok((client, _)) = listener.accept().await {
-                    let server = TcpStream::connect(&upstream).await.expect("server accepts");
-                    tokio::spawn(Self::relay(client, server, Arc::clone(&swallowed)));
-                }
-            }
-        });
-        Self {
-            url,
-            swallowed,
-            accept,
-        }
-    }
-
-    /// Forward `client`'s bytes to `server` until the response's first bytes
-    /// arrive, record its status line, and drop both connections without
-    /// answering the client.
-    async fn relay(client: TcpStream, server: TcpStream, swallowed: Arc<Mutex<Vec<String>>>) {
-        let (mut from_client, to_client) = client.into_split();
-        let (mut from_server, mut to_server) = server.into_split();
-        let forward = tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut from_client, &mut to_server).await;
-        });
-        let mut head = [0_u8; 64];
-        let read = from_server.read(&mut head).await.unwrap_or(0);
-        let status = String::from_utf8_lossy(&head[..read])
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_owned();
-        swallowed.lock().expect("swallowed lock").push(status);
-        forward.abort();
-        drop(to_client);
-    }
-
-    /// The status lines swallowed so far.
-    ///
-    /// # Panics
-    /// Panics when the record lock is poisoned.
-    fn swallowed(&self) -> Vec<String> {
-        self.swallowed.lock().expect("swallowed lock").clone()
-    }
-}
-
-impl Drop for LossyProxy {
-    /// Stop accepting connections.
-    fn drop(&mut self) {
-        self.accept.abort();
-    }
-}
-
-/// Separate local processes sharing one saved login renew it exactly once
-/// and never replay a rotated refresh token; an unsafe record fails closed; a
-/// logout racing renewals never leaves a usable record; a renewal whose
-/// response is lost after the server rotated stays pending and is never sent
-/// again; and a lock held past its deadline fails `lock_timeout` without a
-/// request.
+/// Separate local processes sharing one saved login renew it once under the
+/// file lock and never replay a rotated refresh token; an unsafe file fails
+/// closed; and a logout racing renewals leaves no record behind.
 ///
 /// # Panics
 /// Panics when any step differs.
@@ -317,25 +227,32 @@ async fn concurrent_saved_renewal() {
     let store = saved_logins(config.path());
     let current = || saved_login(config.path(), &origin, FIXTURE_TENANT_SLUG);
 
-    // Four processes race one stale login: one rotates, the rest reuse it.
-    let before = expire_saved_access(config.path(), &origin, FIXTURE_TENANT_SLUG);
+    // Four processes race one stale login: the first rotates it under the
+    // lock, the rest reread the file and use the rotated token.
+    let stale = current();
+    expire_saved_access(config.path(), &origin, FIXTURE_TENANT_SLUG);
     let outcomes = mint_in_children(4, config.path(), &server).await;
     assert!(
         outcomes.iter().all(|outcome| outcome == "ok"),
         "{outcomes:?}"
     );
     let winner = current();
-    assert_eq!(winner.generation, before + 1, "exactly one rotation");
-    assert!(matches!(winner.state, SavedLoginState::Ready { .. }));
+    assert_ne!(
+        winner.refresh_token.expose(),
+        stale.refresh_token.expose(),
+        "the refresh token rotated"
+    );
+    assert!(winner.access_expires_at > chrono::Utc::now());
 
     // The winner's chain was never replayed, so it still renews.
-    let before = expire_saved_access(config.path(), &origin, FIXTURE_TENANT_SLUG);
+    expire_saved_access(config.path(), &origin, FIXTURE_TENANT_SLUG);
     assert_eq!(mint_in_children(1, config.path(), &server).await, ["ok"]);
-    assert_eq!(current().generation, before + 1);
+    assert_ne!(
+        current().refresh_token.expose(),
+        winner.refresh_token.expose()
+    );
 
-    // An unsafe store is refused, not read.
-    sso.save_login(config.path(), FIXTURE_TENANT_SLUG, "bob", "wyrd-test")
-        .await;
+    // An unsafe file is refused, not read.
     {
         let record = config.path().join("credentials.toml");
         std::fs::set_permissions(
@@ -355,27 +272,21 @@ async fn concurrent_saved_renewal() {
         .expect("chmod");
     }
 
-    // A logout racing renewals leaves no usable record behind.
-    let _ = expire_saved_access(config.path(), &origin, FIXTURE_TENANT_SLUG);
-    let tenant_id = current().tenant_id;
+    // A logout racing renewals leaves no record behind: it deletes under the
+    // same lock the renewals hold, and a later renewal finds no login.
+    expire_saved_access(config.path(), &origin, FIXTURE_TENANT_SLUG);
+    let tenant_key = TenantSlug::new(FIXTURE_TENANT_SLUG).expect("tenant key");
     let racers = mint_in_children(3, config.path(), &server);
     let logout = {
         let (store, origin, server) = (store.clone(), origin.clone(), server.clone());
         async move {
-            let refresh = tokio::task::spawn_blocking({
-                let (store, origin) = (store.clone(), origin.clone());
-                move || store.begin_logout(&origin, tenant_id)
-            })
-            .await
-            .expect("joins")
-            .expect("tombstones");
-            if let Some(refresh) = refresh {
-                HumanSso::new(&server).revoke(&refresh).await;
-            }
-            tokio::task::spawn_blocking(move || store.finish_logout(&origin, tenant_id))
+            let removed = tokio::task::spawn_blocking(move || store.remove(&origin, &tenant_key))
                 .await
                 .expect("joins")
-                .expect("deletes");
+                .expect("removes");
+            if let Some(login) = removed {
+                HumanSso::new(&server).revoke(&login.refresh_token).await;
+            }
         }
     };
     let (outcomes, ()) = tokio::join!(racers, logout);
@@ -383,56 +294,11 @@ async fn concurrent_saved_renewal() {
         store.list().expect("lists").is_empty(),
         "no renewal restored a logged-out login: {outcomes:?}"
     );
-
-    // A renewal the server executed but whose response was lost stays
-    // pending; a later process sends nothing and leaves it pending.
-    sso.save_login(config.path(), FIXTURE_TENANT_SLUG, "bob", "wyrd-test")
-        .await;
-    let lossy = LossyProxy::start(&server).await;
-    let proxied = canonical_origin(&lossy.url).expect("relay origin");
-    store
-        .save(wyrd_client::saved_login::SavedLogin {
-            origin: proxied.clone(),
-            ..current()
-        })
-        .expect("saves the relayed login");
-    let before = expire_saved_access(config.path(), &proxied, FIXTURE_TENANT_SLUG);
-    let lost = mint_in_children(1, config.path(), &lossy.url).await;
-    assert!(lost[0].contains("(refresh_pending)"), "{lost:?}");
-    assert_eq!(
-        lossy.swallowed(),
-        ["HTTP/1.1 200 OK"],
-        "the server rotated the refresh token"
-    );
-    let pending = saved_login(config.path(), &proxied, FIXTURE_TENANT_SLUG);
-    assert_eq!(pending.generation, before);
     assert!(
-        matches!(pending.state, SavedLoginState::RefreshPending { .. }),
-        "{:?}",
-        pending.summary()
-    );
-    let later = mint_in_children(1, config.path(), &lossy.url).await;
-    assert!(later[0].contains("(refresh_pending)"), "{later:?}");
-    assert_eq!(lossy.swallowed().len(), 1, "no second refresh is sent");
-    assert_eq!(
-        saved_login(config.path(), &proxied, FIXTURE_TENANT_SLUG),
-        pending,
-        "the pending record is not overwritten"
-    );
-
-    // A store lock held past the deadline fails closed without a request.
-    let held = std::fs::File::open(config.path()).expect("config directory opens");
-    held.lock().expect("store lock held");
-    let waited = Instant::now();
-    let timed_out = mint_in_children(1, config.path(), &lossy.url).await;
-    let waited = waited.elapsed();
-    drop(held);
-    assert!(timed_out[0].contains("(lock_timeout)"), "{timed_out:?}");
-    assert!(waited >= Duration::from_secs(30), "waited {waited:?}");
-    assert_eq!(lossy.swallowed().len(), 1, "no request under a held lock");
-    assert_eq!(
-        saved_login(config.path(), &proxied, FIXTURE_TENANT_SLUG),
-        pending
+        outcomes
+            .iter()
+            .all(|outcome| outcome == "ok" || outcome.contains("(logged_out)")),
+        "{outcomes:?}"
     );
 
     srv.shutdown().await.expect("server stops");

@@ -43,10 +43,9 @@ def test_saved_user_auth_journey(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         server.save_human_login(tmp_path, FIXTURE_TENANT, "bob", "wyrd-test")
         server.save_human_login(tmp_path, SECOND_TENANT, "alice", "alice-password")
 
-        # Two same-server tenants need a selector, and it must name one of them.
-        with pytest.raises(WyrdError) as ambiguous:
-            Cards(server_url=url)
-        assert _reason(ambiguous) == "ambiguous"
+        # Without a selector the newest login, alice's admin login, is used; a
+        # selector must name a saved login.
+        Cards(server_url=url).register(_prompt())
         with pytest.raises(WyrdError) as unmatched:
             Cards(server_url=url, tenant="no-such-tenant")
         assert _reason(unmatched) == "tenant_mismatch"
@@ -59,10 +58,11 @@ def test_saved_user_auth_journey(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         assert denied.value.status == 403
         Cards(server_url=url, tenant=SECOND_TENANT).prompt.list(space="saved-login")
 
-        # A stale login renews through Wyrd exactly once.
-        before = server.expire_saved_login(tmp_path, FIXTURE_TENANT)
+        # A stale login renews through Wyrd and the renewal is saved.
+        server.expire_saved_login(tmp_path, FIXTURE_TENANT)
+        assert server.saved_login_is_stale(tmp_path, FIXTURE_TENANT)
         Cards(server_url=url, tenant=FIXTURE_TENANT).prompt.list(space="saved-login")
-        assert server.saved_login_generation(tmp_path, FIXTURE_TENANT) == before + 1
+        assert not server.saved_login_is_stale(tmp_path, FIXTURE_TENANT)
 
         # An explicit machine credential overrides the saved reader; it names
         # its own tenant, so a selector beside it is refused.
@@ -72,12 +72,9 @@ def test_saved_user_auth_journey(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         assert "already names its tenant" in str(selected.value)
         Cards(server_url=url, credential=server.api_key).register(_prompt())
 
-        # Once the chain is revoked the login fails closed and is never retried.
+        # Once the chain is revoked the login fails closed and asks for a new login.
         server.revoke_saved_login(tmp_path, FIXTURE_TENANT)
         server.expire_saved_login(tmp_path, FIXTURE_TENANT)
         with pytest.raises(WyrdError) as refused:
             Cards(server_url=url, tenant=FIXTURE_TENANT).prompt.list(space="saved-login")
         assert _reason(refused) == "refresh_refused"
-        with pytest.raises(WyrdError) as pending:
-            Cards(server_url=url, tenant=FIXTURE_TENANT).prompt.list(space="saved-login")
-        assert _reason(pending) == "refresh_pending"

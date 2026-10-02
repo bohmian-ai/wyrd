@@ -246,14 +246,11 @@ mod tests {
 
     use std::str::FromStr;
 
-    use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::auth::SecretBearer;
     use wyrd_spec::ids::TenantSlug;
 
     use crate::global_config::{ClientSection, GlobalConfig};
-    use crate::saved_login::{
-        SAVED_LOGIN_FORMAT_VERSION, SavedLogin, SavedLoginState, SavedLogins,
-    };
+    use crate::saved_login::{SavedLogin, SavedLogins};
 
     use super::{ClientConfig, TokenCacheMode};
     use crate::transport::{
@@ -669,13 +666,11 @@ mod tests {
         let tenant_key = TenantSlug::from_str("acme").expect("slug");
         store
             .save(SavedLogin {
-                format_version: SAVED_LOGIN_FORMAT_VERSION,
                 origin: "https://wyrd.example.com".to_owned(),
-                tenant_id: DataTenantId::new_v7(),
                 tenant_key,
-                principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
-                generation: 1,
-                state: SavedLoginState::LoggedOut,
+                access_token: SecretBearer::new("access".to_owned()),
+                access_expires_at: chrono::Utc::now(),
+                refresh_token: SecretBearer::new("refresh".to_owned()),
             })
             .expect("saves");
         let saved = cfg.resolve_credential().expect("saved login resolves");

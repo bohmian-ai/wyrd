@@ -118,8 +118,8 @@ order, stopping at the first available source:
    directory.
 
 The tenant selector is a tenant route key, the one `wyrd auth login --tenant`
-takes. It selects a saved user login and names the tenant a workload token is
-exchanged for. An access token or API key already names its tenant, so
+takes. It selects a saved user login (without it, the most recent login for
+the server is used) and names the tenant a workload token is exchanged for. An access token or API key already names its tenant, so
 selecting a tenant beside one fails with `WYRD_CLIENT_400_CONFIG_INVALID`
 instead of being ignored.
 

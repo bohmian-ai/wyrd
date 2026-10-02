@@ -707,7 +707,7 @@ mod pg_tests {
         assert_regclass_exists(pool, "wyrd.auth_workload_bindings", true).await;
         assert_regclass_exists(pool, "wyrd.auth_human_connections", true).await;
         assert_regclass_exists(pool, "wyrd.auth_browser_sessions", true).await;
-        assert_regclass_exists(pool, "wyrd.auth_cli_handoffs", true).await;
+        assert_regclass_exists(pool, "wyrd.auth_device_authorizations", true).await;
 
         assert_platform_resolver_shape(pool).await;
         assert_current_tenant_parallel_restricted(pool).await;
@@ -717,7 +717,7 @@ mod pg_tests {
             &[
                 "auth_api_keys",
                 "auth_browser_sessions",
-                "auth_cli_handoffs",
+                "auth_device_authorizations",
                 "auth_human_connections",
                 "auth_login_state",
                 "auth_refresh_tokens",

@@ -2,13 +2,14 @@
 //!
 //! Every journey that needs a saved Wyrd user login drives the same served
 //! path a person does: a tenant administrator stages, tests, and activates the
-//! public Keycloak `wyrd-human` connection; the CLI handoff begins at
-//! `POST /auth/cli-handoffs`; the fixture user signs in at the returned
-//! provider URL; the provider's return reaches the server's common callback;
-//! and the handoff is claimed with its verifier. [`HumanSso::save_login`]
-//! then stores the claimed credential exactly as `wyrd auth login` does, so
-//! the Rust, Python, and TypeScript journeys exercise the CLI-established
-//! record without each re-implementing the handoff.
+//! public Keycloak `wyrd-human` connection; the CLI's device login begins at
+//! `POST /auth/device_authorization`; the fixture user approves the user code
+//! on the verification page and signs in at the provider it redirects to;
+//! the provider's return reaches the server's common callback; and the device
+//! code is redeemed at `POST /auth/token`. [`HumanSso::save_login`] then
+//! stores the credential exactly as `wyrd auth login` does, so the Rust,
+//! Python, and TypeScript journeys exercise the CLI-established record
+//! without each re-implementing the device flow.
 //!
 //! These helpers need the identity lane's Keycloak; every caller is an
 //! ignored journey that lane selects.
@@ -18,9 +19,9 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use url::Url;
-use wyrd_client::auth::TokenExchange;
-use wyrd_client::saved_login::{SavedLogin, SavedLoginState, SavedLogins, canonical_origin};
-use wyrd_spec::auth::{CliHandoffClaim, CliHandoffProof, CliLogin, SecretBearer};
+use wyrd_client::auth::{AuthError, TokenExchange};
+use wyrd_client::saved_login::{SavedLogin, SavedLogins, canonical_origin};
+use wyrd_spec::auth::{SecretBearer, TokenRequest, TokenResponse};
 use wyrd_spec::ids::TenantSlug;
 
 /// Public origin every human journey server is configured with; the Keycloak
@@ -147,44 +148,76 @@ impl HumanSso {
         page
     }
 
-    /// Complete one CLI handoff for `tenant` as `username`: begin it, sign in
-    /// at its provider URL, and claim it with its verifier.
+    /// Complete one CLI device login for `tenant` as `username`: authorize a
+    /// device code, approve its user code on the verification page, sign in
+    /// at the provider it redirects to, and redeem the device code.
     ///
     /// # Panics
-    /// Panics when any step fails or the claim never completes.
-    pub async fn cli_login(&self, tenant: &str, username: &str, password: &str) -> CliLogin {
+    /// Panics when any step fails or the device code is never redeemed.
+    pub async fn cli_login(&self, tenant: &str, username: &str, password: &str) -> TokenResponse {
         let tenant: TenantSlug = tenant.parse().expect("tenant route key parses");
-        let handoff = self
+        let device = self
             .exchange
-            .begin_cli_handoff(&tenant)
+            .device_authorization(&tenant)
             .await
-            .expect("the CLI handoff begins");
-        let login_url: Url = handoff
-            .login_url
-            .as_str()
-            .parse()
-            .expect("login URL parses");
+            .expect("the device login begins");
+        let login_url = self.approve(&tenant, &device.user_code).await;
         self.sign_in(&login_url, username, password).await;
-        let proof = CliHandoffProof {
-            tenant_route_key: tenant,
-            poll_verifier: handoff.poll_verifier,
+        let poll = TokenRequest::DeviceCode {
+            device_code: device.device_code,
         };
-        for _ in 0..30 {
-            match self
-                .exchange
-                .claim_cli_handoff(handoff.handoff_id, &proof)
-                .await
-                .expect("the handoff claims")
-            {
-                CliHandoffClaim::Complete(login) => return login,
-                CliHandoffClaim::Pending { .. } => tokio::time::sleep(Duration::from_secs(1)).await,
+        for _ in 0..10 {
+            match self.exchange.exchange(&poll).await {
+                Ok(token) => return token,
+                Err(AuthError::Server(error))
+                    if error.problem().details["error"] == "authorization_pending" =>
+                {
+                    tokio::time::sleep(Duration::from_secs(device.interval)).await;
+                }
+                Err(error) => panic!("the device code redeems: {error}"),
             }
         }
-        panic!("the CLI handoff never completed");
+        panic!("the device login never completed");
     }
 
-    /// Log `username` in to `tenant` through the CLI handoff and save the
-    /// credential under `config_home`, exactly as `wyrd auth login` does.
+    /// Approve `user_code` for `tenant` on the verification page, posting
+    /// from the deployment's origin as the page's own form does, and return
+    /// the provider sign-in URL it redirects to.
+    ///
+    /// # Panics
+    /// Panics when the page refuses the approval.
+    pub async fn approve(&self, tenant: &TenantSlug, user_code: &str) -> Url {
+        let page = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("client builds");
+        let reply = page
+            .post(format!("{}/auth/device", self.server))
+            .header(reqwest::header::ORIGIN, HUMAN_PUBLIC_ORIGIN)
+            .form(&[
+                ("tenant", tenant.as_str()),
+                ("user_code", user_code),
+                ("decision", "approve"),
+            ])
+            .send()
+            .await
+            .expect("verification page answers");
+        assert_eq!(
+            reply.status(),
+            reqwest::StatusCode::SEE_OTHER,
+            "approval redirects to sign-in"
+        );
+        reply
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|location| location.to_str().ok())
+            .expect("approval names the sign-in URL")
+            .parse()
+            .expect("sign-in URL parses")
+    }
+
+    /// Log `username` in to `tenant` through the CLI device login and save
+    /// the credential under `config_home`, exactly as `wyrd auth login` does.
     ///
     /// # Panics
     /// Panics when the login or the save fails.
@@ -195,12 +228,13 @@ impl HumanSso {
         username: &str,
         password: &str,
     ) -> SavedLogin {
-        let login = self.cli_login(tenant, username, password).await;
-        let record = SavedLogin::from_cli_login(
+        let token = self.cli_login(tenant, username, password).await;
+        let record = SavedLogin::from_token(
             self.origin(),
             tenant.parse().expect("tenant route key parses"),
-            login,
-        );
+            token,
+        )
+        .expect("the login carries a refresh token");
         saved_logins(config_home)
             .save(record.clone())
             .expect("the login saves");
@@ -219,24 +253,33 @@ impl HumanSso {
             .expect("the refresh chain revokes");
     }
 
-    /// Make this server's saved login for `tenant` under `config_home` stale;
-    /// returns the generation the renewal starts from.
+    /// Make this server's saved login for `tenant` under `config_home` stale,
+    /// so the next client renews it.
     ///
     /// # Panics
-    /// Panics when the login is missing or not ready, or cannot be saved.
-    #[must_use]
-    pub fn expire_saved(&self, config_home: &Path, tenant: &str) -> u64 {
-        expire_saved_access(config_home, &self.origin(), tenant)
+    /// Panics when the login is missing or cannot be saved.
+    pub fn expire_saved(&self, config_home: &Path, tenant: &str) {
+        expire_saved_access(config_home, &self.origin(), tenant);
     }
 
-    /// Generation of this server's saved login for `tenant` under
-    /// `config_home`.
+    /// This server's saved login for `tenant` under `config_home`.
     ///
     /// # Panics
     /// Panics when the login is missing.
     #[must_use]
-    pub fn saved_generation(&self, config_home: &Path, tenant: &str) -> u64 {
-        saved_login(config_home, &self.origin(), tenant).generation
+    pub fn saved(&self, config_home: &Path, tenant: &str) -> SavedLogin {
+        saved_login(config_home, &self.origin(), tenant)
+    }
+
+    /// Whether this server's saved login for `tenant` under `config_home`
+    /// holds an expired access token; a journey checks it before and after a
+    /// client call to prove the renewal was saved.
+    ///
+    /// # Panics
+    /// Panics when the login is missing.
+    #[must_use]
+    pub fn saved_is_stale(&self, config_home: &Path, tenant: &str) -> bool {
+        self.saved(config_home, tenant).access_expires_at <= chrono::Utc::now()
     }
 
     /// Revoke the server-side refresh chain of this server's saved login for
@@ -244,13 +287,10 @@ impl HumanSso {
     /// logout would.
     ///
     /// # Panics
-    /// Panics when the login is not ready or the server refuses.
+    /// Panics when the login is missing or the server refuses.
     pub async fn revoke_saved(&self, config_home: &Path, tenant: &str) {
         let login = saved_login(config_home, &self.origin(), tenant);
-        let SavedLoginState::Ready { refresh_token, .. } = login.state else {
-            panic!("the saved login is ready: {:?}", login.summary());
-        };
-        self.revoke(&refresh_token).await;
+        self.revoke(&login.refresh_token).await;
     }
 
     /// The canonical origin this server's saved logins are keyed by.
@@ -322,22 +362,14 @@ pub fn saved_login(config_home: &Path, origin: &str, tenant: &str) -> SavedLogin
 }
 
 /// Make the saved login for `tenant` at `origin` stale, so the next client
-/// renews it; returns the generation the renewal starts from.
+/// renews it. Saving it again makes it the newest login for `origin`.
 ///
 /// # Panics
-/// Panics when the record is missing or not ready, or cannot be saved.
-#[must_use]
-pub fn expire_saved_access(config_home: &Path, origin: &str, tenant: &str) -> u64 {
+/// Panics when the record is missing or cannot be saved.
+pub fn expire_saved_access(config_home: &Path, origin: &str, tenant: &str) {
     let mut record = saved_login(config_home, origin, tenant);
-    let SavedLoginState::Ready {
-        access_expires_at, ..
-    } = &mut record.state
-    else {
-        panic!("saved login is ready: {:?}", record.summary());
-    };
-    *access_expires_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+    record.access_expires_at = chrono::Utc::now() - chrono::Duration::minutes(1);
     saved_logins(config_home)
         .save(record)
         .expect("stale login saves");
-    saved_login(config_home, origin, tenant).generation
 }

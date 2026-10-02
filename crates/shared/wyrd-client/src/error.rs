@@ -70,15 +70,14 @@ pub enum WyrdClientError {
     NoCredentials,
 
     /// The saved user login for this server and tenant cannot be used:
-    /// selection is ambiguous or names another tenant, the local store is
-    /// unsafe, corrupt, or locked, the login was logged out, or its renewal
-    /// cannot complete safely. Never falls through to another credential.
+    /// the selector names another tenant, the local store is unsafe or
+    /// corrupt, the login was logged out, or the server refused its renewal.
+    /// Never falls through to another credential.
     /// Maps to `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` at the public boundary.
     #[error("saved user login cannot be used ({reason}): {message}")]
     SavedLogin {
-        /// Stable machine reason, e.g. `"ambiguous"`, `"tenant_mismatch"`,
-        /// `"unsafe_store"`, `"corrupt"`, `"lock_timeout"`,
-        /// `"refresh_pending"`, `"logged_out"`, or `"refresh_refused"`.
+        /// Stable machine reason: `"tenant_mismatch"`, `"unsafe_store"`,
+        /// `"corrupt"`, `"io"`, `"logged_out"`, or `"refresh_refused"`.
         /// Echoed into the catalog payload's `reason`.
         reason: &'static str,
         /// Human-readable description; never carries a secret.

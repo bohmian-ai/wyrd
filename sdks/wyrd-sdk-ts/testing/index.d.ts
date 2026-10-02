@@ -223,23 +223,22 @@ export declare class NativeWyrdTestServer {
   saveHumanLogin(configHome: string, tenant: string, username: string, password: string): void
   /**
    * Make the saved login for `tenant` under `configHome` stale, so the
-   * next client renews it; returns the generation the renewal starts from.
+   * next client renews it.
    *
    * # Errors
    *
-   * Returns a napi error when the login is missing or not ready, or the
-   * generation does not fit a JavaScript number.
+   * Returns a napi error when the login is missing or cannot be saved.
    */
-  expireSavedLogin(configHome: string, tenant: string): number
+  expireSavedLogin(configHome: string, tenant: string): void
   /**
-   * Generation of the saved login for `tenant` under `configHome`.
+   * Whether the saved login for `tenant` under `configHome` holds an
+   * expired access token, so a journey can prove a renewal was saved.
    *
    * # Errors
    *
-   * Returns a napi error when the login is missing or the generation does
-   * not fit a JavaScript number.
+   * Returns a napi error when the login is missing.
    */
-  savedLoginGeneration(configHome: string, tenant: string): number
+  savedLoginIsStale(configHome: string, tenant: string): boolean
   /**
    * Revoke the server-side refresh chain of the saved login for `tenant`
    * under `configHome` without touching the record, as another device's

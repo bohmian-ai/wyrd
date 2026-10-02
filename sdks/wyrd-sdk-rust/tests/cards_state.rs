@@ -15,7 +15,7 @@ use secrecy::{ExposeSecret, SecretString};
 use sha2::Digest;
 use wyrd_sdk::bifrost::client_from_options;
 use wyrd_sdk::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode, ListCardsRequest};
-use wyrd_sdk::saved_login::{SavedLoginState, canonical_origin};
+use wyrd_sdk::saved_login::canonical_origin;
 use wyrd_sdk::state::WyrdState;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::human_login::{
@@ -339,14 +339,13 @@ async fn run_script(phase: &str, config: &Path, base_url: &str, second: &str, ma
 /// One phase of a local script using the saved logins, run only as the child
 /// [`run_script`] starts; without [`SCRIPT_PHASE`] it does nothing.
 ///
-/// `select`: two same-server tenants without a selector are ambiguous, a
-/// selector naming no saved login fails, the reader's saved login lists Cards
+/// `select`: without a selector the newest login (alice's admin login to the
+/// second tenant) registers a Card, a selector naming no saved login fails, the reader's saved login lists Cards
 /// and is denied a registration, and the second tenant's login resolves by
 /// its tenant route key. `renew`: a stale login renews through Wyrd.
 /// `override`: an explicit machine credential wins over the saved reader, and
 /// a tenant selector beside it is refused because the key names its own
-/// tenant. `revoked`: a
-/// revoked login fails renewal, and the uncertain record is never retried.
+/// tenant. `revoked`: a revoked login fails renewal and asks for a new login.
 ///
 /// # Panics
 /// Panics when the phase's expectation differs.
@@ -362,11 +361,10 @@ async fn saved_user_auth_script() {
     };
     match phase.as_str() {
         "select" => {
-            let ambiguous = connect(None, None)
-                .err()
-                .expect("two tenants without a selector are ambiguous");
-            assert_eq!(ambiguous.code(), "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE");
-            assert!(ambiguous.to_string().contains("(ambiguous)"), "{ambiguous}");
+            let newest = connect(None, None).expect("the newest login resolves");
+            Box::pin(newest.register_from_path(&prompt_card()))
+                .await
+                .expect("the newest login, alice's admin login, registers");
             let unmatched = connect(None, Some("no-such-tenant"))
                 .err()
                 .expect("a selector naming no saved login fails");
@@ -423,15 +421,6 @@ async fn saved_user_auth_script() {
                 revoked.to_string().contains("(refresh_refused)"),
                 "{revoked}"
             );
-            let pending = connect(None, Some(FIXTURE_TENANT_SLUG))
-                .expect("resolves")
-                .list(card_listing())
-                .await
-                .expect_err("the refused renewal is never retried");
-            assert!(
-                pending.to_string().contains("(refresh_pending)"),
-                "{pending}"
-            );
         }
         other => panic!("unknown script phase {other}"),
     }
@@ -452,9 +441,10 @@ fn prompt_card() -> PathBuf {
 }
 
 /// The Rust SDK uses CLI-established user logins from separate local
-/// processes: it selects the right one of two same-server tenants, refuses an
-/// ambiguous or unmatched selection, makes the reader's allowed read and is
-/// denied its write, renews exactly once without the provider, lets an
+/// processes: it uses the newest of two same-server tenants' logins without a
+/// selector and the named one with it, refuses an unmatched selection, makes
+/// the reader's allowed read and is denied its write, renews without the
+/// provider, lets an
 /// explicit machine credential override, and fails closed once the login's
 /// refresh chain is revoked.
 ///
@@ -492,10 +482,8 @@ async fn saved_user_auth_journey() {
         Bootstrap::User { .. } => panic!("service bootstrap returned a user principal"),
     };
     sso.activate_keycloak(&second_admin).await;
-    let bob = sso
-        .save_login(config.path(), FIXTURE_TENANT_SLUG, "bob", "wyrd-test")
+    sso.save_login(config.path(), FIXTURE_TENANT_SLUG, "bob", "wyrd-test")
         .await;
-    assert_eq!(bob.tenant_id, server.data_tenant_id());
     sso.save_login(config.path(), "saved-login-two", "alice", "alice-password")
         .await;
     let second = "saved-login-two".to_owned();
@@ -504,18 +492,23 @@ async fn saved_user_auth_journey() {
 
     script("select").await;
 
-    let before = expire_saved_access(config.path(), &origin, FIXTURE_TENANT_SLUG);
+    let stale = saved_login(config.path(), &origin, FIXTURE_TENANT_SLUG);
+    expire_saved_access(config.path(), &origin, FIXTURE_TENANT_SLUG);
     script("renew").await;
     let renewed = saved_login(config.path(), &origin, FIXTURE_TENANT_SLUG);
-    assert_eq!(renewed.generation, before + 1, "exactly one rotation");
+    assert!(
+        renewed.refresh_token.expose() != stale.refresh_token.expose(),
+        "the renewal rotated the refresh token"
+    );
+    assert!(
+        renewed.access_expires_at > chrono::Utc::now(),
+        "the renewed token is fresh"
+    );
 
     script("override").await;
 
-    let SavedLoginState::Ready { refresh_token, .. } = &renewed.state else {
-        panic!("renewed login is ready");
-    };
-    sso.revoke(refresh_token).await;
-    let _ = expire_saved_access(config.path(), &origin, FIXTURE_TENANT_SLUG);
+    sso.revoke(&renewed.refresh_token).await;
+    expire_saved_access(config.path(), &origin, FIXTURE_TENANT_SLUG);
     script("revoked").await;
 
     server.shutdown().await.expect("test server shuts down");

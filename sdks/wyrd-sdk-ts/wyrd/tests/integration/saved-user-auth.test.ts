@@ -72,8 +72,9 @@ describe("saved user login", () => {
       server.saveHumanLogin(config, FIXTURE_TENANT, "bob", "wyrd-test");
       server.saveHumanLogin(config, SECOND_TENANT, "alice", "alice-password");
 
-      // Two same-server tenants need a selector, and it must name one of them.
-      expect(reason(thrown(() => Cards.connect({ serverUrl })))).toBe("ambiguous");
+      // Without a selector the newest login, alice's admin login, is used; a
+      // selector must name a saved login.
+      await Cards.connect({ serverUrl }).registerFromPath(prompt);
       expect(reason(thrown(() => Cards.connect({ serverUrl, tenant: "no-such-tenant" })))).toBe(
         "tenant_mismatch",
       );
@@ -84,10 +85,11 @@ describe("saved user login", () => {
       expect((await rejection(reader.registerFromPath(prompt))).status).toBe(403);
       await Cards.connect({ serverUrl, tenant: SECOND_TENANT }).list({ kind: "Prompt" });
 
-      // A stale login renews through Wyrd exactly once.
-      const before = server.expireSavedLogin(config, FIXTURE_TENANT);
+      // A stale login renews through Wyrd and the renewal is saved.
+      server.expireSavedLogin(config, FIXTURE_TENANT);
+      expect(server.savedLoginIsStale(config, FIXTURE_TENANT)).toBe(true);
       await Cards.connect({ serverUrl, tenant: FIXTURE_TENANT }).list({ kind: "Prompt" });
-      expect(server.savedLoginGeneration(config, FIXTURE_TENANT)).toBe(before + 1);
+      expect(server.savedLoginIsStale(config, FIXTURE_TENANT)).toBe(false);
 
       // An explicit machine credential overrides the saved reader; it names
       // its own tenant, so a selector beside it is refused.
@@ -98,13 +100,11 @@ describe("saved user login", () => {
       expect(selected.message).toContain("already names its tenant");
       await Cards.connect({ serverUrl, credential: server.apiKey }).registerFromPath(prompt);
 
-      // Once the chain is revoked the login fails closed and is never retried.
+      // Once the chain is revoked the login fails closed and asks for a new login.
       server.revokeSavedLogin(config, FIXTURE_TENANT);
       server.expireSavedLogin(config, FIXTURE_TENANT);
       const revoked = Cards.connect({ serverUrl, tenant: FIXTURE_TENANT });
       expect(reason(await rejection(revoked.list({ kind: "Prompt" })))).toBe("refresh_refused");
-      const pending = Cards.connect({ serverUrl, tenant: FIXTURE_TENANT });
-      expect(reason(await rejection(pending.list({ kind: "Prompt" })))).toBe("refresh_pending");
     } finally {
       server.shutdown();
     }

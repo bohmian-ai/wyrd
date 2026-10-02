@@ -610,32 +610,29 @@ impl NativeWyrdTestServer {
     }
 
     /// Make the saved login for `tenant` under `configHome` stale, so the
-    /// next client renews it; returns the generation the renewal starts from.
+    /// next client renews it.
     ///
     /// # Errors
     ///
-    /// Returns a napi error when the login is missing or not ready, or the
-    /// generation does not fit a JavaScript number.
+    /// Returns a napi error when the login is missing or cannot be saved.
     #[napi(catch_unwind)]
-    pub fn expire_saved_login(&self, config_home: String, tenant: String) -> Result<i64> {
-        let generation =
-            HumanSso::new(&self.base_url).expire_saved(Path::new(&config_home), &tenant);
+    pub fn expire_saved_login(&self, config_home: String, tenant: String) -> Result<()> {
+        HumanSso::new(&self.base_url).expire_saved(Path::new(&config_home), &tenant);
         drop((config_home, tenant));
-        i64::try_from(generation).map_err(reason)
+        Ok(())
     }
 
-    /// Generation of the saved login for `tenant` under `configHome`.
+    /// Whether the saved login for `tenant` under `configHome` holds an
+    /// expired access token, so a journey can prove a renewal was saved.
     ///
     /// # Errors
     ///
-    /// Returns a napi error when the login is missing or the generation does
-    /// not fit a JavaScript number.
+    /// Returns a napi error when the login is missing.
     #[napi(catch_unwind)]
-    pub fn saved_login_generation(&self, config_home: String, tenant: String) -> Result<i64> {
-        let generation =
-            HumanSso::new(&self.base_url).saved_generation(Path::new(&config_home), &tenant);
+    pub fn saved_login_is_stale(&self, config_home: String, tenant: String) -> Result<bool> {
+        let stale = HumanSso::new(&self.base_url).saved_is_stale(Path::new(&config_home), &tenant);
         drop((config_home, tenant));
-        i64::try_from(generation).map_err(reason)
+        Ok(stale)
     }
 
     /// Revoke the server-side refresh chain of the saved login for `tenant`

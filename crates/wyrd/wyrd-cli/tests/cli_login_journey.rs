@@ -1,25 +1,29 @@
 //! Provider-backed journey for `wyrd auth login`, `status`, and `logout`.
 //!
-//! The shipped binary signs in through a real Keycloak connection: it begins a
-//! one-use handoff, the fixture user signs in at the printed provider URL, the
-//! provider's return reaches the server callback, and the CLI's poll claims
-//! the Wyrd user credential into the private saved-login store. The handoff's
-//! refusals — wrong verifier, wrong tenant, replay, expiry — are driven over
+//! The shipped binary signs in through a real Keycloak connection with the
+//! RFC 8628 device-code grant: it prints a user code and the verification
+//! URL, the fixture user approves the code there and signs in at the provider
+//! it redirects to, the provider's return reaches the server callback, and
+//! the CLI's token poll saves the Wyrd user credential into the private
+//! saved-login store. The device code's refusals — pending, wrong code,
+//! cross-origin or unknown approval, replay, denial, expiry — are driven over
 //! the same served routes, and logout revokes only its own login's refresh
-//! chain, also when the server is unreachable. No command output carries a
-//! token. The ignored root test `cli_oidc_handoff_journey` in `cli.rs` runs
-//! it, so the identity lane selects it by its exact name.
+//! chain, and still deletes the record when the server is unreachable. No
+//! command output carries a token. The ignored root test
+//! `cli_device_login_journey` in `cli.rs` runs it, so the identity lane
+//! selects it by its exact name.
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 use assert_cmd::prelude::*;
 use secrecy::ExposeSecret;
 use url::Url;
-use wyrd_client::auth::TokenExchange;
-use wyrd_client::saved_login::SavedLoginState;
-use wyrd_spec::auth::{CliHandoffClaim, CliHandoffProof, SecretBearer, TokenRequest};
+use wyrd_client::auth::{AuthError, TokenExchange};
+use wyrd_client::saved_login::{SavedLogin, canonical_origin};
+use wyrd_spec::auth::{SecretBearer, TokenRequest, TokenResponse};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_testing::WyrdTestServerBuilder;
 use wyrd_testing::human_login::{FIXTURE_TENANT_SLUG, HUMAN_PUBLIC_ORIGIN, HumanSso, saved_logins};
@@ -63,26 +67,89 @@ fn transcript(output: &Output) -> String {
     )
 }
 
-/// The stable code of a refused `/auth` call.
+/// The RFC 8628 `error` of a refused device-code poll.
 ///
 /// # Panics
-/// Panics when the call succeeded.
-fn refusal<T: std::fmt::Debug>(result: Result<T, wyrd_client::auth::AuthError>) -> String {
-    result
-        .expect_err("the call is refused")
+/// Panics when the poll succeeded or was refused otherwise.
+fn device_error<T: std::fmt::Debug>(result: Result<T, AuthError>) -> String {
+    let problem = result
+        .expect_err("the poll is refused")
         .into_wyrd()
-        .code()
+        .problem();
+    assert_eq!(problem.code, "WYRD_AUTH_400_DEVICE_AUTHORIZATION");
+    problem.details["error"]
+        .as_str()
+        .expect("the refusal names its error")
         .to_owned()
 }
 
-/// `wyrd auth login` refuses a remote cleartext server, completes a browser
-/// sign-in into a saved login without printing a token; the handoff refuses every wrong initiator, replay, and
-/// expiry; and logout ends only its own login, locally even when the server
-/// is down.
+/// Poll `device_code` until it redeems, waiting `interval` seconds after a
+/// pending or slow-down answer.
+///
+/// # Panics
+/// Panics when the poll is refused otherwise or never redeems.
+async fn redeem(
+    exchange: &TokenExchange,
+    device_code: SecretBearer,
+    interval: u64,
+) -> TokenResponse {
+    let request = TokenRequest::DeviceCode { device_code };
+    for _ in 0..5 {
+        match exchange.exchange(&request).await {
+            Ok(token) => return token,
+            refused => {
+                let error = device_error(refused);
+                assert!(
+                    matches!(error.as_str(), "authorization_pending" | "slow_down"),
+                    "{error}"
+                );
+                tokio::time::sleep(Duration::from_secs(interval + 5)).await;
+            }
+        }
+    }
+    panic!("the device code never redeemed");
+}
+
+/// Post a decision on `user_code` to the verification page, from `origin`
+/// when given, and return the response status.
+///
+/// # Panics
+/// Panics when the page does not answer.
+async fn decide(
+    server: &str,
+    origin: Option<&str>,
+    tenant: &str,
+    user_code: &str,
+    decision: &str,
+) -> reqwest::StatusCode {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client builds");
+    let mut request = client.post(format!("{server}/auth/device")).form(&[
+        ("tenant", tenant),
+        ("user_code", user_code),
+        ("decision", decision),
+    ]);
+    if let Some(origin) = origin {
+        request = request.header(reqwest::header::ORIGIN, origin);
+    }
+    request
+        .send()
+        .await
+        .expect("verification page answers")
+        .status()
+}
+
+/// `wyrd auth login` refuses a remote cleartext server and completes a
+/// device-code sign-in into a saved login without printing a token; a device
+/// code issues nothing while pending, to a wrong code, on a cross-origin or
+/// unknown approval, on replay, after denial, or after expiry; and logout
+/// ends only its own login, locally even when the server is down.
 ///
 /// # Panics
 /// Panics when any step of the journey differs.
-pub(crate) async fn cli_oidc_handoff_journey() {
+pub(crate) async fn cli_device_login_journey() {
     let srv = WyrdTestServerBuilder::default()
         .with_public_origin(HUMAN_PUBLIC_ORIGIN.parse().expect("origin parses"))
         .start_bound()
@@ -134,8 +201,9 @@ pub(crate) async fn cli_oidc_handoff_journey() {
             .is_empty()
     );
 
-    // The shipped CLI prints the provider URL, the person signs in there, and
-    // the CLI's own poll saves the credential.
+    // The shipped CLI prints the user code and verification URL; the person
+    // approves the code there and signs in, and the CLI's own poll saves the
+    // credential.
     let mut command = cli(config.path());
     command
         .args([
@@ -170,11 +238,16 @@ pub(crate) async fn cli_oidc_handoff_journey() {
         }
         text
     });
-    let login_url: Url = url_rx
+    let verification_url: Url = url_rx
         .await
-        .expect("the CLI prints the sign-in URL")
+        .expect("the CLI prints the verification URL")
         .parse()
-        .expect("sign-in URL parses");
+        .expect("verification URL parses");
+    let (_, user_code) = verification_url
+        .query_pairs()
+        .find(|(name, _)| name == "user_code")
+        .expect("the URL carries the user code");
+    let login_url = sso.approve(&tenant, &user_code).await;
     let page = sso.sign_in(&login_url, "bob", "wyrd-test").await;
     let output = tokio::task::spawn_blocking(move || child.wait_with_output())
         .await
@@ -188,26 +261,14 @@ pub(crate) async fn cli_oidc_handoff_journey() {
     assert_eq!(saved.len(), 1, "one saved login");
     let record = &saved[0];
     assert_eq!(record.tenant_key, tenant);
-    assert_eq!(record.tenant_id, srv.data_tenant_id());
-    let SavedLoginState::Ready {
-        access_token,
-        refresh_token,
-        ..
-    } = &record.state
-    else {
-        panic!("the saved login is ready: {:?}", record.summary());
-    };
-    assert!(
-        printed.contains(&record.principal_id.to_string()),
-        "{printed}"
-    );
+    assert!(printed.contains(user_code.as_ref()), "{printed}");
+    let (access_token, refresh_token) = (&record.access_token, &record.refresh_token);
     for secret in [access_token.expose(), refresh_token.expose()] {
         assert!(!printed.contains(secret), "login output carries no token");
         assert!(!page.contains(secret), "the browser page carries no token");
-        assert!(
-            !login_url.as_str().contains(secret),
-            "the URL carries no token"
-        );
+        for url in [&verification_url, &login_url] {
+            assert!(!url.as_str().contains(secret), "the URL carries no token");
+        }
     }
 
     let status = run(config.path(), &["auth", "status"]).await;
@@ -223,72 +284,94 @@ pub(crate) async fn cli_oidc_handoff_journey() {
         "status prints no token"
     );
 
-    // Refusals: no credential reaches a wrong verifier, a wrong tenant, a
-    // replayed claim, or an expired handoff.
+    // Refusals: no credential reaches a pending or wrong device code, a
+    // cross-origin or unknown approval, a replay, a denied code, or an
+    // expired one.
     let exchange = TokenExchange::new(&server, 30_000).expect("exchange builds");
-    let handoff = exchange
-        .begin_cli_handoff(&tenant)
+    let device = exchange
+        .device_authorization(&tenant)
         .await
-        .expect("handoff begins");
-    let proof = CliHandoffProof {
-        tenant_route_key: tenant.clone(),
-        poll_verifier: handoff.poll_verifier.clone(),
-    };
-    let wrong_verifier = CliHandoffProof {
-        tenant_route_key: tenant.clone(),
-        poll_verifier: SecretBearer::new("not-the-verifier".to_owned()),
-    };
-    let wrong_tenant = CliHandoffProof {
-        tenant_route_key: "some-other-tenant".parse().expect("slug"),
-        poll_verifier: handoff.poll_verifier.clone(),
+        .expect("device login begins");
+    let poll = |device_code: &SecretBearer| TokenRequest::DeviceCode {
+        device_code: device_code.clone(),
     };
     assert_eq!(
-        exchange
-            .claim_cli_handoff(handoff.handoff_id, &proof)
-            .await
-            .expect("pending"),
-        CliHandoffClaim::Pending {
-            retry_after_seconds: 2
-        }
+        device_error(exchange.exchange(&poll(&device.device_code)).await),
+        "authorization_pending"
     );
-    let handoff_url: Url = handoff.login_url.as_str().parse().expect("URL parses");
-    sso.sign_in(&handoff_url, "bob", "wyrd-test").await;
+    let wrong = SecretBearer::new(format!("{}.not-the-code", srv.data_tenant_id()));
     assert_eq!(
-        refusal(
-            exchange
-                .claim_cli_handoff(handoff.handoff_id, &wrong_verifier)
-                .await
-        ),
-        "WYRD_AUTH_400_INVALID_STATE"
+        device_error(exchange.exchange(&poll(&wrong)).await),
+        "invalid_grant"
     );
-    assert!(
-        exchange
-            .claim_cli_handoff(handoff.handoff_id, &wrong_tenant)
-            .await
-            .is_err(),
-        "another tenant's route key claims nothing"
+    assert_eq!(
+        decide(
+            &server,
+            None,
+            FIXTURE_TENANT_SLUG,
+            &device.user_code,
+            "approve"
+        )
+        .await,
+        reqwest::StatusCode::FORBIDDEN,
+        "a post from another origin approves nothing"
     );
-    let CliHandoffClaim::Complete(second) = exchange
-        .claim_cli_handoff(handoff.handoff_id, &proof)
+    for (tenant, user_code) in [
+        ("some-other-tenant", device.user_code.as_str()),
+        (FIXTURE_TENANT_SLUG, "BCDF-GHJK"),
+    ] {
+        assert_eq!(
+            decide(
+                &server,
+                Some(HUMAN_PUBLIC_ORIGIN),
+                tenant,
+                user_code,
+                "approve"
+            )
+            .await,
+            reqwest::StatusCode::BAD_REQUEST,
+            "an unknown code or tenant approves nothing"
+        );
+    }
+    let approved = sso.approve(&tenant, &device.user_code).await;
+    sso.sign_in(&approved, "bob", "wyrd-test").await;
+    let second = redeem(&exchange, device.device_code.clone(), device.interval).await;
+    assert_eq!(
+        device_error(exchange.exchange(&poll(&device.device_code)).await),
+        "invalid_grant",
+        "a redeemed device code returns nothing"
+    );
+
+    let denied = exchange
+        .device_authorization(&tenant)
         .await
-        .expect("the verifier holder claims")
-    else {
-        panic!("the signed-in handoff completes");
-    };
+        .expect("device login begins");
     assert_eq!(
-        refusal(exchange.claim_cli_handoff(handoff.handoff_id, &proof).await),
-        "WYRD_AUTH_400_INVALID_STATE",
-        "a replayed claim returns nothing"
+        decide(
+            &server,
+            Some(HUMAN_PUBLIC_ORIGIN),
+            FIXTURE_TENANT_SLUG,
+            &denied.user_code,
+            "deny"
+        )
+        .await,
+        reqwest::StatusCode::OK
     );
+    assert_eq!(
+        device_error(exchange.exchange(&poll(&denied.device_code)).await),
+        "access_denied"
+    );
+
     let expiring = exchange
-        .begin_cli_handoff(&tenant)
+        .device_authorization(&tenant)
         .await
-        .expect("handoff begins");
+        .expect("device login begins");
     sqlx::query(
-        "UPDATE wyrd.auth_cli_handoffs SET created_at = statement_timestamp() - interval '6 \
-         minutes', expires_at = statement_timestamp() - interval '1 minute' WHERE handoff_id = $1",
+        "UPDATE wyrd.auth_device_authorizations SET created_at = statement_timestamp() - \
+         interval '11 minutes', expires_at = statement_timestamp() - interval '1 minute' \
+         WHERE user_code = $1",
     )
-    .bind(expiring.handoff_id)
+    .bind(&expiring.user_code)
     .execute(
         &srv.pg_fixture()
             .superuser_pool()
@@ -296,24 +379,20 @@ pub(crate) async fn cli_oidc_handoff_journey() {
             .expect("superuser pool opens"),
     )
     .await
-    .expect("handoff expires");
-    let expired_proof = CliHandoffProof {
-        tenant_route_key: tenant.clone(),
-        poll_verifier: expiring.poll_verifier,
-    };
+    .expect("device code expires");
     assert_eq!(
-        refusal(
-            exchange
-                .claim_cli_handoff(expiring.handoff_id, &expired_proof)
-                .await
-        ),
-        "WYRD_AUTH_400_INVALID_STATE",
-        "an expired handoff returns nothing"
+        device_error(exchange.exchange(&poll(&expiring.device_code)).await),
+        "expired_token",
+        "an expired device code returns nothing"
     );
 
     // Logout revokes the saved login's chain and only it: the second login of
     // the same person still renews.
     let saved_refresh = refresh_token.clone();
+    let second_refresh = second
+        .refresh_token
+        .clone()
+        .expect("a device login returns a refresh token");
     let logout = run(
         config.path(),
         &[
@@ -335,7 +414,7 @@ pub(crate) async fn cli_oidc_handoff_journey() {
     );
     let renewed = exchange
         .exchange(&TokenRequest::RefreshToken {
-            refresh_token: second.refresh_token.clone(),
+            refresh_token: second_refresh,
         })
         .await
         .expect("the other login still renews");
@@ -353,16 +432,15 @@ pub(crate) async fn cli_oidc_handoff_journey() {
 
     // With the server gone, logout still removes the saved login and says the
     // revocation was not confirmed.
-    let mut offline = second;
-    offline.refresh_token = renewed
-        .refresh_token
-        .expect("rotation returns a refresh token");
     saved_logins(config.path())
-        .save(wyrd_client::saved_login::SavedLogin::from_cli_login(
-            wyrd_client::saved_login::canonical_origin(&server).expect("origin"),
-            tenant.clone(),
-            offline,
-        ))
+        .save(
+            SavedLogin::from_token(
+                canonical_origin(&server).expect("origin"),
+                tenant.clone(),
+                renewed,
+            )
+            .expect("rotation returns a refresh token"),
+        )
         .expect("saves");
     srv.shutdown().await.expect("server stops");
     let offline_logout = run(config.path(), &["auth", "logout", "--server", &server]).await;

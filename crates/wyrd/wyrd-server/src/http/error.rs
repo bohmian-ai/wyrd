@@ -626,6 +626,7 @@ mod error_mapper_tests {
             InvalidToken,
             BadTokenFormat,
             UnsupportedGrantType,
+            DeviceAuthorization,
             DelegationDepthExceededIssue,
             PrincipalKindCardKindMismatch,
             InvalidCardRefVersion,

@@ -48,19 +48,6 @@ pub trait AccessTokenSource: Send + Sync {
     ///
     /// Returns a [`WyrdClientError`] when the token cannot be minted.
     fn mint(&self) -> Result<MintedAccessToken, WyrdClientError>;
-
-    /// Whether a token this source returned can be superseded or withdrawn
-    /// outside this process.
-    ///
-    /// `false` (the default) for an in-process minter: the middleware reuses
-    /// its cached token until the refresh skew. A source whose token lives in
-    /// durable state that other processes rotate, mark pending, or log out —
-    /// a saved user login — returns `true`, and the middleware then calls
-    /// [`Self::mint`] for every use instead of trusting its cache, so a newer
-    /// token is picked up and a withdrawn one fails closed.
-    fn revalidates_cache(&self) -> bool {
-        false
-    }
 }
 
 /// A resolved credential ready to attach to an outbound request.

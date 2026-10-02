@@ -827,39 +827,41 @@ impl WyrdTestServer {
     }
 
     /// Make the saved login for `tenant` under `config_home` stale, so the
-    /// next client renews it; returns the generation the renewal starts from.
+    /// next client renews it.
     ///
     /// # Errors
     /// Raises the harness error outside the context manager.
     ///
     /// # Panics
-    /// Panics (a Python `PanicException`) when the login is missing or not
-    /// ready.
+    /// Panics (a Python `PanicException`) when the login is missing or cannot
+    /// be saved.
     fn expire_saved_login(
         &self,
         py: Python<'_>,
         config_home: PathBuf,
         tenant: &str,
-    ) -> WyrdPyResult<u64> {
+    ) -> WyrdPyResult<()> {
         let sso = HumanSso::new(&self.base_url()?);
-        Ok(py.detach(move || sso.expire_saved(&config_home, tenant)))
+        py.detach(move || sso.expire_saved(&config_home, tenant));
+        Ok(())
     }
 
-    /// Generation of the saved login for `tenant` under `config_home`.
+    /// Whether the saved login for `tenant` under `config_home` holds an
+    /// expired access token, so a journey can prove a renewal was saved.
     ///
     /// # Errors
     /// Raises the harness error outside the context manager.
     ///
     /// # Panics
     /// Panics (a Python `PanicException`) when the login is missing.
-    fn saved_login_generation(
+    fn saved_login_is_stale(
         &self,
         py: Python<'_>,
         config_home: PathBuf,
         tenant: &str,
-    ) -> WyrdPyResult<u64> {
+    ) -> WyrdPyResult<bool> {
         let sso = HumanSso::new(&self.base_url()?);
-        Ok(py.detach(move || sso.saved_generation(&config_home, tenant)))
+        Ok(py.detach(move || sso.saved_is_stale(&config_home, tenant)))
     }
 
     /// Revoke the server-side refresh chain of the saved login for `tenant`

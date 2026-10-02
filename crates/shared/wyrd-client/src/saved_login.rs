@@ -7,35 +7,27 @@
 //! such as `[default].api_key`. That file's protection, atomic replacement,
 //! and content preservation belong to [`crate::credentials_file`].
 //!
-//! Every read-modify-write — renewal, login, logout — holds the credential
-//! file's exclusive OS lock on the configuration directory.
-//! Renewal rereads the record under the lock, so a process that lost
-//! a race uses the winner's newer generation instead of replaying its rotated
-//! refresh token. Before a refresh token is sent, the record is durably moved
-//! to [`SavedLoginState::RefreshPending`]; only a successful rotation moves it
-//! back to [`SavedLoginState::Ready`] with the next generation. A crash or an
-//! uncertain outcome leaves it pending, and every later process fails closed
-//! and asks the person to log in again, because nobody can know whether the
-//! server already consumed that token. Logout first persists a
-//! [`SavedLoginState::LoggedOut`] tombstone under the lock, so no concurrent
-//! renewal can resurrect the login, then revokes it remotely and deletes it.
+//! Renewal works the way `gh`, `gcloud`, and `aws` do. A client uses the saved
+//! access token until it nears expiry; then, holding the credential file's
+//! exclusive lock, it rereads the record, uses a token another client already
+//! renewed, or else sends the refresh token once and saves the rotated pair.
+//! A refused refresh asks the person to log in again. Logout deletes the
+//! record and then revokes it on the server best-effort. The newest login for
+//! a server is the last record for it in the file, and it is the one used
+//! when no tenant is selected.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{CliLogin, PrincipalId, SecretBearer, TokenRequest};
+use wyrd_spec::auth::{SecretBearer, TokenRequest, TokenResponse};
 use wyrd_spec::ids::TenantSlug;
 
 use crate::auth::{AuthError, TokenExchange};
 use crate::credentials_file::CredentialsFile;
 use crate::error::WyrdClientError;
 use crate::transport::credential::{AccessTokenSource, MintedAccessToken};
-
-/// Format version of a [`SavedLogin`] record; any other version is refused.
-pub const SAVED_LOGIN_FORMAT_VERSION: u32 = 1;
 
 /// A saved access token this close to expiry is renewed instead of returned,
 /// comfortably outside the middleware's own 30-second refresh skew.
@@ -47,46 +39,16 @@ const RENEW_MARGIN: chrono::Duration = chrono::Duration::seconds(60);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SavedLogin {
-    /// Always [`SAVED_LOGIN_FORMAT_VERSION`].
-    pub format_version: u32,
     /// Canonical server URL the login was made against ([`canonical_origin`]).
     pub origin: String,
-    /// The tenant the credential belongs to.
-    pub tenant_id: DataTenantId,
     /// The tenant's route key the person logged in at.
     pub tenant_key: TenantSlug,
-    /// The tenant `User` the credential acts as.
-    pub principal_id: PrincipalId,
-    /// Incremented by every successful rotation and every new login.
-    pub generation: u64,
-    /// Where the record is in its renewal lifecycle.
-    pub state: SavedLoginState,
-}
-
-/// Renewal lifecycle of a [`SavedLogin`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
-pub enum SavedLoginState {
-    /// Usable: the current access token and the refresh token that renews it.
-    Ready {
-        /// Current Wyrd access token.
-        access_token: SecretBearer,
-        /// Its expiry.
-        access_expires_at: DateTime<Utc>,
-        /// The refresh token not yet sent to the server.
-        refresh_token: SecretBearer,
-    },
-    /// A process began sending this refresh token and has not recorded the
-    /// outcome. It is never sent again; the login must be repeated.
-    RefreshPending {
-        /// When the renewal began.
-        started_at: DateTime<Utc>,
-        /// The refresh token in flight, kept only so logout can revoke its
-        /// chain.
-        refresh_token: SecretBearer,
-    },
-    /// Logout began; the record must not be used or renewed.
-    LoggedOut,
+    /// Current Wyrd access token.
+    pub access_token: SecretBearer,
+    /// Its expiry.
+    pub access_expires_at: DateTime<Utc>,
+    /// The refresh token that renews it.
+    pub refresh_token: SecretBearer,
 }
 
 /// The safe projection `wyrd auth status` prints: no token.
@@ -94,60 +56,51 @@ pub enum SavedLoginState {
 pub struct SavedLoginSummary {
     /// Canonical server URL.
     pub origin: String,
-    /// Tenant id.
-    pub tenant_id: DataTenantId,
     /// Tenant route key.
     pub tenant_key: TenantSlug,
-    /// The `User` principal.
-    pub principal_id: PrincipalId,
-    /// Access-token expiry while the record is usable, else `None`.
-    pub access_expires_at: Option<DateTime<Utc>>,
-    /// `ready`, `refresh_pending`, or `logged_out`.
-    pub status: &'static str,
+    /// Access-token expiry.
+    pub access_expires_at: DateTime<Utc>,
 }
 
 impl SavedLogin {
-    /// Build the first record of a login the CLI handoff just completed.
-    #[must_use]
-    pub fn from_cli_login(origin: String, tenant_key: TenantSlug, login: CliLogin) -> Self {
-        Self {
-            format_version: SAVED_LOGIN_FORMAT_VERSION,
+    /// Build the record of a login the device-code grant just issued.
+    ///
+    /// # Errors
+    /// Returns [`WyrdClientError::SavedLogin`] with reason `refresh_refused`
+    /// when the server issued no refresh token, so the login could not renew.
+    pub fn from_token(
+        origin: String,
+        tenant_key: TenantSlug,
+        token: TokenResponse,
+    ) -> Result<Self, WyrdClientError> {
+        let refresh_token = token.refresh_token.ok_or_else(|| {
+            saved_login(
+                "refresh_refused",
+                "the server issued the login without a refresh token",
+            )
+        })?;
+        Ok(Self {
             origin,
-            tenant_id: login.tenant_id,
             tenant_key,
-            principal_id: login.principal_id,
-            generation: 1,
-            state: SavedLoginState::Ready {
-                access_token: login.access_token,
-                access_expires_at: login.access_expires_at,
-                refresh_token: login.refresh_token,
-            },
-        }
+            access_token: token.access_token,
+            access_expires_at: token.expires_at,
+            refresh_token,
+        })
     }
 
     /// The token-free projection of this record.
     #[must_use]
     pub fn summary(&self) -> SavedLoginSummary {
-        let (access_expires_at, status) = match &self.state {
-            SavedLoginState::Ready {
-                access_expires_at, ..
-            } => (Some(*access_expires_at), "ready"),
-            SavedLoginState::RefreshPending { .. } => (None, "refresh_pending"),
-            SavedLoginState::LoggedOut => (None, "logged_out"),
-        };
         SavedLoginSummary {
             origin: self.origin.clone(),
-            tenant_id: self.tenant_id,
             tenant_key: self.tenant_key.clone(),
-            principal_id: self.principal_id,
-            access_expires_at,
-            status,
+            access_expires_at: self.access_expires_at,
         }
     }
 
-    /// Whether this is the login for `origin` and `tenant_id`.
-    fn is_for(&self, origin: &str, tenant_id: DataTenantId) -> bool {
-        self.origin == origin && self.tenant_id == tenant_id
+    /// Whether this is the login for `origin` and `tenant_key`.
+    fn is_for(&self, origin: &str, tenant_key: &TenantSlug) -> bool {
+        self.origin == origin && self.tenant_key == *tenant_key
     }
 }
 
@@ -211,32 +164,24 @@ impl SavedLogins {
         }
     }
 
-    /// Save a login the CLI just completed, replacing any earlier login for
-    /// the same origin and tenant under the store lock.
+    /// Save a login the CLI just completed under the file lock, replacing
+    /// any earlier login for the same origin and tenant.
     ///
-    /// The new record continues the old record's generation, so a process
-    /// holding the old generation rereads instead of reusing it.
+    /// The record is written last, so it becomes the newest login for its
+    /// server.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::SavedLogin`] when the file is unsafe or
-    /// corrupt, the lock cannot be taken in time, or the write fails.
-    pub fn save(&self, mut login: SavedLogin) -> Result<(), WyrdClientError> {
+    /// corrupt or the write fails.
+    pub fn save(&self, login: SavedLogin) -> Result<(), WyrdClientError> {
         let _lock = self.file.lock()?;
         let mut logins = self.read()?;
-        match logins
-            .iter_mut()
-            .find(|saved| saved.is_for(&login.origin, login.tenant_id))
-        {
-            Some(previous) => {
-                login.generation = previous.generation.saturating_add(1);
-                *previous = login;
-            }
-            None => logins.push(login),
-        }
+        logins.retain(|saved| !saved.is_for(&login.origin, &login.tenant_key));
+        logins.push(login);
         self.write(&logins)
     }
 
-    /// Every saved login, in file order. An absent file or configuration
+    /// Every saved login, oldest first. An absent file or configuration
     /// directory holds none.
     ///
     /// # Errors
@@ -249,14 +194,15 @@ impl SavedLogins {
     /// Select the saved login for `origin` and the optional tenant selector.
     ///
     /// With a selector (a tenant route key, the one `wyrd auth login` takes),
-    /// the one record for this origin whose tenant key equals it is selected; when other tenants' records exist for this
-    /// origin but none matches, selection fails rather than falling through.
-    /// Without a selector, exactly one record for this origin is selected and
-    /// several fail as ambiguous. No record for this origin selects nothing.
+    /// the record for this origin with that tenant key is selected; when
+    /// other tenants' records exist for this origin but none matches,
+    /// selection fails rather than falling through. Without a selector, the
+    /// newest login for this origin is selected. No record for this origin
+    /// selects nothing.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::SavedLogin`] with reason `tenant_mismatch`
-    /// or `ambiguous`, and the errors of [`Self::list`].
+    /// Returns [`WyrdClientError::SavedLogin`] with reason `tenant_mismatch`,
+    /// and the errors of [`Self::list`].
     pub fn select(
         &self,
         origin: &str,
@@ -279,15 +225,6 @@ impl SavedLogins {
                 ));
             }
         }
-        if candidates.len() > 1 {
-            return Err(saved_login(
-                "ambiguous",
-                format!(
-                    "several tenants have saved logins for {origin}; select one with the client \
-                     tenant option or WYRD_TENANT"
-                ),
-            ));
-        }
         Ok(candidates.pop())
     }
 
@@ -298,126 +235,74 @@ impl SavedLogins {
         Arc::new(SavedLoginSource {
             store: self.clone(),
             origin: login.origin.clone(),
-            tenant_id: login.tenant_id,
-            identity: format!("saved-login:{}:{}", login.origin, login.tenant_id),
+            tenant_key: login.tenant_key.clone(),
+            identity: format!("saved-login:{}:{}", login.origin, login.tenant_key),
             exchange,
         })
     }
 
-    /// Mark the login for `origin` and `tenant_id` logged out and return the
-    /// refresh token to revoke, if the login carried one.
-    ///
-    /// The tombstone is durable before this returns, so no renewal that
-    /// starts afterwards can use or resurrect the login.
+    /// Delete the login for `origin` and `tenant_key` under the file lock and
+    /// return it, so the caller can revoke its refresh token.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::SavedLogin`] when the file is unsafe or
-    /// corrupt, the lock cannot be taken in time, or the write fails.
-    pub fn begin_logout(
+    /// corrupt or the write fails.
+    pub fn remove(
         &self,
         origin: &str,
-        tenant_id: DataTenantId,
-    ) -> Result<Option<SecretBearer>, WyrdClientError> {
+        tenant_key: &TenantSlug,
+    ) -> Result<Option<SavedLogin>, WyrdClientError> {
         let _lock = self.file.lock()?;
         let mut logins = self.read()?;
-        let Some(login) = logins
-            .iter_mut()
-            .find(|login| login.is_for(origin, tenant_id))
+        let Some(index) = logins
+            .iter()
+            .position(|login| login.is_for(origin, tenant_key))
         else {
             return Ok(None);
         };
-        let refresh = match std::mem::replace(&mut login.state, SavedLoginState::LoggedOut) {
-            SavedLoginState::Ready { refresh_token, .. }
-            | SavedLoginState::RefreshPending { refresh_token, .. } => Some(refresh_token),
-            SavedLoginState::LoggedOut => None,
-        };
+        let removed = logins.remove(index);
         self.write(&logins)?;
-        Ok(refresh)
+        Ok(Some(removed))
     }
 
-    /// Remove the logged-out login for `origin` and `tenant_id`.
-    ///
-    /// A login a new `wyrd auth login` saved in the meantime is kept.
-    ///
-    /// # Errors
-    /// Returns [`WyrdClientError::SavedLogin`] when the file is unsafe or
-    /// corrupt, the lock cannot be taken in time, or the write fails.
-    pub fn finish_logout(
-        &self,
-        origin: &str,
-        tenant_id: DataTenantId,
-    ) -> Result<(), WyrdClientError> {
-        let _lock = self.file.lock()?;
-        let mut logins = self.read()?;
-        let before = logins.len();
-        logins.retain(|login| {
-            !(login.is_for(origin, tenant_id) && login.state == SavedLoginState::LoggedOut)
-        });
-        if logins.len() == before {
-            return Ok(());
-        }
-        self.write(&logins)
-    }
-
-    /// Renew under the store lock and return a usable access token.
+    /// Return a usable access token for the login, renewing it under the file
+    /// lock when it nears expiry.
     ///
     /// # Errors
     /// See [`SavedLoginSource::mint`].
     fn renew(
         &self,
         origin: &str,
-        tenant_id: DataTenantId,
+        tenant_key: &TenantSlug,
         exchange: &TokenExchange,
     ) -> Result<MintedAccessToken, WyrdClientError> {
         let _lock = self.file.lock()?;
         let mut logins = self.read()?;
-        let index = logins
-            .iter()
-            .position(|login| login.is_for(origin, tenant_id))
+        let login = logins
+            .iter_mut()
+            .find(|login| login.is_for(origin, tenant_key))
             .ok_or_else(|| {
                 saved_login(
                     "logged_out",
                     "the saved login was removed; run `wyrd auth login`",
                 )
             })?;
-        let refresh_token = match &logins[index].state {
-            SavedLoginState::Ready {
-                access_token,
-                access_expires_at,
-                ..
-            } if *access_expires_at - RENEW_MARGIN > Utc::now() => {
-                return Ok(MintedAccessToken {
-                    access_token: access_token.clone(),
-                    expires_at: *access_expires_at,
-                });
-            }
-            SavedLoginState::Ready { refresh_token, .. } => refresh_token.clone(),
-            SavedLoginState::RefreshPending { .. } => {
-                return Err(saved_login(
-                    "refresh_pending",
-                    "an earlier renewal of the saved login did not finish; run `wyrd auth login`",
-                ));
-            }
-            SavedLoginState::LoggedOut => {
-                return Err(saved_login(
-                    "logged_out",
-                    "the saved login was logged out; run `wyrd auth login`",
-                ));
-            }
-        };
-        logins[index].state = SavedLoginState::RefreshPending {
-            started_at: Utc::now(),
-            refresh_token: refresh_token.clone(),
-        };
-        self.write(&logins)?;
+        if login.access_expires_at - RENEW_MARGIN > Utc::now() {
+            return Ok(MintedAccessToken {
+                access_token: login.access_token.clone(),
+                expires_at: login.access_expires_at,
+            });
+        }
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             saved_login(
-                "refresh_pending",
+                "refresh_refused",
                 "saved login renewal needs the client's async runtime",
             )
         })?;
         let rotated = handle
-            .block_on(exchange.exchange(&TokenRequest::RefreshToken { refresh_token }))
+            .block_on(exchange.exchange(&TokenRequest::RefreshToken {
+                refresh_token: login.refresh_token.clone(),
+            }))
             .map_err(|error| match error {
                 AuthError::Server(wyrd) => saved_login(
                     "refresh_refused",
@@ -426,27 +311,16 @@ impl SavedLogins {
                         wyrd.code()
                     ),
                 ),
-                AuthError::Client(client) => saved_login(
-                    "refresh_pending",
-                    format!(
-                        "renewing the saved login did not complete ({client}); run `wyrd auth \
-                         login`"
-                    ),
-                ),
+                AuthError::Client(client) => client,
             })?;
-        let refresh_token = rotated.refresh_token.ok_or_else(|| {
+        login.refresh_token = rotated.refresh_token.ok_or_else(|| {
             saved_login(
                 "refresh_refused",
                 "the server renewed the saved login without a refresh token",
             )
         })?;
-        let login = &mut logins[index];
-        login.generation = login.generation.saturating_add(1);
-        login.state = SavedLoginState::Ready {
-            access_token: rotated.access_token.clone(),
-            access_expires_at: rotated.expires_at,
-            refresh_token,
-        };
+        login.access_token = rotated.access_token.clone();
+        login.access_expires_at = rotated.expires_at;
         self.write(&logins)?;
         Ok(MintedAccessToken {
             access_token: rotated.access_token,
@@ -457,33 +331,21 @@ impl SavedLogins {
     /// Every saved login in `credentials.toml`.
     ///
     /// # Errors
-    /// The errors of [`Self::read_text`], and `corrupt` when the file is not
-    /// TOML, a login does not decode, or a login has an unknown format
-    /// version.
+    /// The errors of [`CredentialsFile::read_text`], and `corrupt` when the
+    /// file is not TOML or a login does not decode.
     fn read(&self) -> Result<Vec<SavedLogin>, WyrdClientError> {
         let Some(text) = self.file.read_text()? else {
             return Ok(Vec::new());
         };
-        let path = self.file.path();
         let stored: StoredLogins = toml::from_str(&text).map_err(|_| {
             saved_login(
                 "corrupt",
-                format!("{} has saved logins that do not decode", path.display()),
+                format!(
+                    "{} has saved logins that do not decode",
+                    self.file.path().display()
+                ),
             )
         })?;
-        if stored
-            .logins
-            .iter()
-            .any(|login| login.format_version != SAVED_LOGIN_FORMAT_VERSION)
-        {
-            return Err(saved_login(
-                "corrupt",
-                format!(
-                    "{} has a saved login of an unknown format version",
-                    path.display()
-                ),
-            ));
-        }
         Ok(stored.logins)
     }
 
@@ -492,15 +354,13 @@ impl SavedLogins {
     ///
     /// The current file is reread and edited in place, so every other key,
     /// comment, and layout the user wrote survives; an empty `logins`
-    /// removes the `[[logins]]` tables. The new text goes to a `0600`
-    /// temporary file in the same directory, is `fsync`ed, renamed over the
-    /// file, and the directory is `fsync`ed. Callers hold the store lock.
+    /// removes the `[[logins]]` tables. Callers hold the file lock.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::SavedLogin`] with the errors of
-    /// [`Self::read_text`], `corrupt` when the current file is not TOML or a
-    /// login does not encode, and `io` when any write, `fsync`, or rename
-    /// fails; the previous file is then unchanged.
+    /// [`CredentialsFile::document`] and [`CredentialsFile::replace`], and
+    /// `corrupt` when a login does not encode; the previous file is then
+    /// unchanged.
     fn write(&self, logins: &[SavedLogin]) -> Result<(), WyrdClientError> {
         let mut document = self.file.document()?;
         if logins.is_empty() {
@@ -520,15 +380,16 @@ impl SavedLogins {
 
 /// The renewing [`AccessTokenSource`] for one saved login.
 ///
-/// Holds only where the record lives; every mint rereads it under its lock.
+/// Holds only where the record lives; every mint rereads it under the file
+/// lock.
 pub struct SavedLoginSource {
     /// The store holding the record.
     store: SavedLogins,
     /// Canonical origin the record is saved under.
     origin: String,
-    /// Tenant the record belongs to.
-    tenant_id: DataTenantId,
-    /// Non-secret identity: origin and tenant id.
+    /// Tenant route key the record is saved under.
+    tenant_key: TenantSlug,
+    /// Non-secret identity: origin and tenant key.
     identity: String,
     /// The unauthenticated `/auth` surface renewal exchanges through.
     exchange: TokenExchange,
@@ -544,38 +405,28 @@ impl std::fmt::Debug for SavedLoginSource {
 }
 
 impl AccessTokenSource for SavedLoginSource {
-    /// `saved-login:{origin}:{tenant_id}`.
+    /// `saved-login:{origin}:{tenant_key}`.
     fn identity(&self) -> &str {
         &self.identity
     }
 
-    /// Return the saved access token, renewing it first when it is near
-    /// expiry.
+    /// Return the saved access token, renewing it first when it nears expiry.
     ///
-    /// Runs on the middleware's blocking pool: it takes the store's OS lock,
-    /// rereads the record, and returns a fresh access token as stored, which
-    /// may be another process's newer generation. A stale `Ready` record is
-    /// durably moved to `RefreshPending`, its refresh token is exchanged once
-    /// on the client's runtime, and the rotated pair is stored as `Ready` with
-    /// the next generation before the lock is released.
+    /// Runs on the middleware's blocking pool: it takes the file lock,
+    /// rereads the record, and returns its access token when it is still
+    /// fresh, which may be one another client just saved. Otherwise the
+    /// refresh token is exchanged once on the client's runtime and the
+    /// rotated pair is saved before the lock is released.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::SavedLogin`] with reason `logged_out` for a
-    /// removed or logged-out record, `refresh_pending` for a record an earlier
-    /// renewal left uncertain or a renewal whose outcome is unknown,
-    /// `refresh_refused` when the server refuses the refresh token,
-    /// `lock_timeout`, `unsafe_store`, or `corrupt`. A failed renewal leaves the record
-    /// `RefreshPending`, so it never retries the token.
+    /// removed record, `refresh_refused` when the server refuses the refresh
+    /// token, or `unsafe_store`, `corrupt`, or `io` from the file; and the
+    /// transport error when the server cannot be reached, in which case the
+    /// record is unchanged and a later call retries.
     fn mint(&self) -> Result<MintedAccessToken, WyrdClientError> {
         self.store
-            .renew(&self.origin, self.tenant_id, &self.exchange)
-    }
-
-    /// Always: another process can rotate, mark pending, or log out the
-    /// record, so every use rereads it under the store lock through
-    /// [`Self::mint`] instead of reusing the middleware's cached token.
-    fn revalidates_cache(&self) -> bool {
-        true
+            .renew(&self.origin, &self.tenant_key, &self.exchange)
     }
 }
 
@@ -592,29 +443,19 @@ mod tests {
     use std::str::FromStr;
 
     use chrono::Utc;
-    use uuid::Uuid;
-    use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{PrincipalId, SecretBearer};
+    use wyrd_spec::auth::SecretBearer;
     use wyrd_spec::ids::TenantSlug;
 
-    use super::{
-        SAVED_LOGIN_FORMAT_VERSION, SavedLogin, SavedLoginState, SavedLogins, canonical_origin,
-    };
+    use super::{SavedLogin, SavedLogins, canonical_origin};
 
-    /// A ready record for `origin` and the tenant `key`.
+    /// A login record for `origin` and the tenant `key`.
     fn login(origin: &str, key: &str) -> SavedLogin {
         SavedLogin {
-            format_version: SAVED_LOGIN_FORMAT_VERSION,
             origin: origin.to_owned(),
-            tenant_id: DataTenantId::new_v7(),
             tenant_key: TenantSlug::from_str(key).expect("slug"),
-            principal_id: PrincipalId::new(Uuid::now_v7()),
-            generation: 7,
-            state: SavedLoginState::Ready {
-                access_token: SecretBearer::new("access-sentinel".to_owned()),
-                access_expires_at: Utc::now(),
-                refresh_token: SecretBearer::new("refresh-sentinel".to_owned()),
-            },
+            access_token: SecretBearer::new("access-sentinel".to_owned()),
+            access_expires_at: Utc::now(),
+            refresh_token: SecretBearer::new("refresh-sentinel".to_owned()),
         }
     }
 
@@ -628,81 +469,50 @@ mod tests {
         assert!(canonical_origin("not a url").is_err());
     }
 
-    /// Selection by origin and tenant: one record selects, a tenant route key
-    /// picks its tenant while a tenant id selects nothing, several without a selector are ambiguous, a selector naming
-    /// no record fails, and another origin selects nothing. A saved login is
-    /// continued at the next generation, and the status projection carries no
-    /// token.
+    /// Selection by origin and tenant: a tenant route key picks its tenant
+    /// while a selector naming no record fails, no selector picks the newest
+    /// login for the origin, and another origin selects nothing. A repeated
+    /// login replaces its record and becomes the newest, and the status
+    /// projection carries no token.
     #[test]
-    fn selection_is_exact_and_never_guesses_a_tenant() {
+    fn selection_picks_the_named_or_newest_login() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SavedLogins::at(dir.path().to_path_buf());
         let origin = "https://wyrd.example.com";
         let acme = login(origin, "acme");
+        let globex = login(origin, "globex");
         store.save(acme.clone()).expect("saves");
-        store.save(acme.clone()).expect("saves again");
-
-        let only = store.select(origin, None).expect("selects").expect("one");
-        assert_eq!(only.generation, acme.generation + 1);
+        store.save(globex.clone()).expect("saves");
         assert!(
             store
                 .select("https://other.example.com", None)
                 .expect("selects")
                 .is_none()
         );
-
-        let globex = login(origin, "globex");
-        store.save(globex.clone()).expect("saves");
-        let ambiguous = store.select(origin, None).expect_err("ambiguous");
-        assert_eq!(ambiguous.code(), "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE");
-        assert!(ambiguous.to_string().contains("ambiguous"));
-        let by_key = store
-            .select(origin, Some("globex"))
+        let newest = store.select(origin, None).expect("selects").expect("one");
+        assert_eq!(newest.tenant_key, globex.tenant_key);
+        let named = store
+            .select(origin, Some("acme"))
             .expect("selects")
             .expect("one");
-        assert_eq!(by_key.tenant_id, globex.tenant_id);
-        let by_id = store
-            .select(origin, Some(&acme.tenant_id.to_string()))
-            .expect_err("a tenant id is not a selector");
-        assert!(by_id.to_string().contains("tenant_mismatch"), "{by_id}");
+        assert_eq!(named.tenant_key, acme.tenant_key);
         let mismatch = store.select(origin, Some("initech")).expect_err("mismatch");
+        assert_eq!(mismatch.code(), "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE");
         assert!(mismatch.to_string().contains("tenant_mismatch"));
+
+        store.save(acme.clone()).expect("logs in again");
+        assert_eq!(store.list().expect("lists").len(), 2);
+        let newest = store.select(origin, None).expect("selects").expect("one");
+        assert_eq!(newest.tenant_key, acme.tenant_key);
 
         let printed = format!("{:?} {:?}", acme.summary(), acme);
         assert!(!printed.contains("sentinel"), "{printed}");
     }
 
-    /// Logout tombstones the record and hands back the refresh token, then
-    /// deletes the tombstone; a record a new login wrote in between is kept.
-    #[test]
-    fn logout_tombstones_before_deleting() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = SavedLogins::at(dir.path().to_path_buf());
-        let record = login("https://wyrd.example.com", "acme");
-        store.save(record.clone()).expect("saves");
-
-        let refresh = store
-            .begin_logout(&record.origin, record.tenant_id)
-            .expect("tombstones")
-            .expect("refresh token");
-        assert_eq!(refresh.expose(), "refresh-sentinel");
-        let tombstone = store.list().expect("lists").pop().expect("record kept");
-        assert_eq!(tombstone.state, SavedLoginState::LoggedOut);
-        store
-            .finish_logout(&record.origin, record.tenant_id)
-            .expect("deletes");
-        assert!(store.list().expect("lists").is_empty());
-
-        store.save(record.clone()).expect("saves");
-        store
-            .finish_logout(&record.origin, record.tenant_id)
-            .expect("keeps a live login");
-        assert_eq!(store.list().expect("lists").len(), 1);
-    }
-
     /// The saved logins share `credentials.toml` with the user's own
-    /// content: a save and a logout carry every other key and comment
-    /// through, and no other file or directory is left behind.
+    /// content: a save and a removal carry every other key and comment
+    /// through, removal hands back the record, and no other file or
+    /// directory is left behind.
     #[test]
     fn logins_live_in_credentials_toml_beside_user_content() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -726,13 +536,7 @@ mod tests {
         assert!(text.starts_with(user), "{text}");
         assert_eq!(
             store.list().expect("lists"),
-            vec![
-                SavedLogin {
-                    generation: acme.generation,
-                    ..acme.clone()
-                },
-                globex.clone()
-            ]
+            vec![acme.clone(), globex.clone()]
         );
         let names: Vec<_> = std::fs::read_dir(dir.path())
             .expect("lists dir")
@@ -741,13 +545,17 @@ mod tests {
         assert_eq!(names, ["credentials.toml"]);
 
         for record in [&acme, &globex] {
-            store
-                .begin_logout(&record.origin, record.tenant_id)
-                .expect("tombstones");
-            store
-                .finish_logout(&record.origin, record.tenant_id)
+            let removed = store
+                .remove(&record.origin, &record.tenant_key)
                 .expect("removes");
+            assert_eq!(removed.as_ref(), Some(record));
         }
+        assert!(
+            store
+                .remove(origin, &acme.tenant_key)
+                .expect("removes nothing")
+                .is_none()
+        );
         assert_eq!(std::fs::read_to_string(&file).expect("reads"), user);
     }
 
@@ -777,7 +585,7 @@ mod tests {
         assert!(error.to_string().contains("unsafe_store"), "{error}");
 
         chmod(&file, 0o600);
-        std::fs::write(&file, b"[[logins]]\nformat_version = 1\n").expect("corrupts");
+        std::fs::write(&file, b"[[logins]]\norigin = 1\n").expect("corrupts");
         let error = store.select(&record.origin, None).expect_err("corrupt");
         assert!(error.to_string().contains("corrupt"), "{error}");
 

@@ -45,8 +45,15 @@ anything the RFCs do not have (no discovery document, no new grant).
    problem+json rule (AGENTS.md §9); record that exception in the
    architecture authority. Every other endpoint keeps problem+json, and
    server-side logging and audit keep the Wyrd error codes.
-4. Move `wyrd-client`, the CLI, BFF, and all three SDK paths to the form
-   format through the shared client, then update journeys, schemas, and docs.
+4. Replace the hand-written OAuth client calls in `wyrd-client` with the
+   `oauth2` crate (already in the dependency graph) for the grants it
+   implements: device code, refresh, and revocation. It owns form encoding,
+   RFC error parsing, and device polling; configure its HTTP client with
+   redirects disabled, as its documentation requires. Grants the crate does
+   not implement (RFC 8693 token exchange, RFC 7523 jwt-bearer) keep one
+   small form POST through the same redirect-disabled client. Delete the
+   hand-written code this replaces. The CLI, BFF, and all three SDKs reach it
+   through the shared client; then update journeys, schemas, and docs.
 
 ## Acceptance Criteria
 

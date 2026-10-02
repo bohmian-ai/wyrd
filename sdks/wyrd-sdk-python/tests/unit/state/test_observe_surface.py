@@ -392,7 +392,11 @@ def test_unsupported_providers_are_refused_without_raising() -> None:
 def test_run_exit_accepts_conventional_keywords_and_omitted_arguments(tmp_path: Path) -> None:
     """``Run.__exit__`` names and defaults match the public stub; it never suppresses."""
     run = _state(tmp_path).run()
-    assert list(inspect.signature(run.__exit__).parameters) == ["exc_type", "exc_value", "traceback"]
+    assert list(inspect.signature(run.__exit__).parameters) == [
+        "exc_type",
+        "exc_value",
+        "traceback",
+    ]
     run.__enter__()
     assert run.__exit__(exc_type=None, exc_value=None, traceback=None) is False
     run.__enter__()

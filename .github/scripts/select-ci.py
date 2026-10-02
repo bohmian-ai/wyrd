@@ -73,7 +73,7 @@ IDENTITY_PACKAGES = {
     "wyrd-auth", "wyrd-auth-check", "wyrd-auth-issue", "wyrd-auth-oidc",
     "wyrd-auth-verify", "wyrd-client", "wyrd-server", "wyrd-testing",
 }
-CODEGEN_PACKAGES = {"wyrd-spec", "wyrd-client", "vala-core", "wyrd-sdk-python"}
+CODEGEN_PACKAGES = {"wyrd-spec", "wyrd-client", "wyrd-sdk-python"}
 RUST_CLIENT_PACKAGES = {"wyrd-client", "wyrd-sdk-rust"}
 EXAMPLE_PACKAGES = {"wyrd-rust-examples", "wyrd-cli"}
 # release-plz publishes these crates.

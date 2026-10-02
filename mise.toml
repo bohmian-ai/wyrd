@@ -167,6 +167,7 @@ run = [
   "cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=card_lifecycle::pg_tests::cli_bundle_loads_typed_wyrdstate_after_server_shutdown)'",
   "cargo nextest run --locked -p wyrd-sdk-rust --test cards_state -E 'test(=registers_reads_hydrates_and_loads_offline_state)'",
   "cargo nextest run --locked -p wyrd-sdk-rust --test gateway_admin --run-ignored all -E 'test(=administers_redacted_gateway_configuration)'",
+  "cargo nextest run --locked -p wyrd-sdk-rust --test operator_connections --run-ignored all -E 'test(=manages_redacted_connections_with_permission_and_tenant_separation)'",
 ]
 
 [tasks."test:gateway:native"]
@@ -363,6 +364,22 @@ hide = true
 description = "Run explicit wyrd-server integration targets that exercise Bifrost serving seams."
 run = "cargo nextest run --locked -p wyrd-server --features test-support --test pg_grpc_ingest_smoke --test pg_grpc_smoke --test pg_merge_http_protected --test pg_router_smoke --test pg_verification_runtime --test-threads=1"
 
+[tasks."test:operators:integration"]
+description = "Run the Operator connection and delivery Postgres suites: redacted encrypted connections, fanout, retries, deadlines, and pool fairness against local provider fixtures."
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:operators:integration:inner'"
+
+[tasks."test:operators:integration:inner"]
+hide = true
+description = "Run the Operator Postgres suites with their lifecycle already provisioned."
+run = "cargo nextest run --locked -p wyrd-server --features test-support --test pg_operator_connection_routes --test pg_operator_delivery --test-threads=1"
+
+[tasks."test:operators:smoke:live"]
+description = """Release-gated live Operator smoke: delivers through the production Operator runner to a dedicated
+Slack test channel and PagerDuty test service. Reads WYRD_LIVE_SLACK_BOT_TOKEN, WYRD_LIVE_SLACK_WORKSPACE_ID,
+WYRD_LIVE_SLACK_CHANNEL_ID, and WYRD_LIVE_PAGERDUTY_KEY from the environment, normally an untracked
+mise.local.toml. Deliberately outside every credential-free lane and the CI gate."""
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --test pg_operator_delivery --run-ignored only --test-threads=1 -E \"test(=live_smoke_delivers_to_slack) | test(=live_smoke_delivers_to_pagerduty)\"'"
+
 [tasks."test:bifrost:integration:server"]
 description = "Run wyrd-server integration targets that exercise Bifrost serving seams."
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:integration:server:inner'"
@@ -524,7 +541,7 @@ hide = true
 description = "Run Python Bifrost journeys against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_bifrost_query.py tests/integration/state/test_observe_journey.py tests/integration/test_drift_journey.py"
+run = "uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_bifrost_query.py tests/integration/state/test_observe_journey.py tests/integration/test_drift_journey.py tests/integration/test_verification_journey.py"
 
 [tasks."test:bifrost:journey:typescript"]
 description = "Tier-1 journeys: TypeScript Bifrost client, query and write surfaces"
@@ -535,7 +552,7 @@ hide = true
 description = "Run the TypeScript Bifrost journey against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-ts/wyrd"
 depends = ["ts:build", "ts:build:testing"]
-run = "pnpm exec vitest run tests/integration/oracle-query.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/observe-run.test.ts tests/integration/verification-run.test.ts tests/integration/drift-verification.test.ts"
+run = "pnpm exec vitest run tests/integration/oracle-query.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/observe-run.test.ts tests/integration/verification-run.test.ts tests/integration/drift-verification.test.ts tests/integration/operator-connections.test.ts"
 
 [tasks."check:bifrost-resource-governance"]
 description = "Reject obsolete Bifrost resource ownership"

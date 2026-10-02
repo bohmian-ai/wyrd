@@ -2330,7 +2330,6 @@ mod key_array_sync_tests {
             TRACING_OUTPUT,
             TRACING_LABEL,
             EVAL_RECORD_UID,
-            EVAL_PROFILE_UID,
             SERVICE_CARD_UID,
             DATA_TENANT_ID,
         ];

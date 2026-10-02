@@ -89,7 +89,23 @@ pub const BUILTIN_ROLES: &[BuiltinRole] = &[
         name: "runtime_admin",
         permissions: &[Permission::service_accounts_write()],
     },
+    BuiltinRole {
+        name: WORKLOAD_ROLE,
+        permissions: &[
+            Permission::bifrost_record_write(),
+            Permission::bifrost_query_read(),
+        ],
+    },
 ];
+
+/// Built-in Role a Card-bound Service or Agent principal receives at its first
+/// projection.
+///
+/// It lets the workload emit and read back its own evidence: Bifrost record
+/// write and Bifrost query read, nothing else. The principal's Card scope
+/// still bounds which Cards it may emit for, and an administrator who revokes
+/// the Role is not overridden by a later re-registration.
+pub const WORKLOAD_ROLE: &str = "workload";
 
 /// Deterministic UUID for a tenant-scoped builtin role row.
 #[must_use]

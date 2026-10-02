@@ -3,6 +3,7 @@
 
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
+use wyrd_runtime::builtin_roles::WORKLOAD_ROLE;
 use wyrd_runtime::principal::{Principal, PrincipalId};
 use wyrd_semver::{VersionBlock, VersionSpec};
 use wyrd_spec::envelope::{Card, Spec};
@@ -10,6 +11,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::CardRef;
 
+use crate::queries::auth::{grant_role_to_service_account, role_by_name};
 use crate::tenant_conn::TenantConn;
 
 const UPSERT_SQL: &str = r#"
@@ -22,10 +24,23 @@ ON CONFLICT (data_tenant_id, principal_kind, card_kind, card_uid)
 DO UPDATE SET card_ref = EXCLUDED.card_ref, space = EXCLUDED.space,
     name = EXCLUDED.name, version = EXCLUDED.version,
     description = EXCLUDED.description, updated_at = now()
-RETURNING id
+RETURNING id, (xmax = 0) AS inserted
 "#;
 
 /// Upsert the principal row backing a newly registered Service or Agent card.
+///
+/// The first projection of a Card also grants the built-in
+/// [`WORKLOAD_ROLE`] in the caller's transaction, so a key issued for the
+/// principal can emit and query its own evidence. A re-registration only
+/// refreshes the row's Card projection: it never grants the Role again, so an
+/// administrator's revocation stands. `xmax = 0` identifies the freshly
+/// inserted row of an `INSERT ... ON CONFLICT DO UPDATE`.
+///
+/// # Errors
+///
+/// Returns `registry_invalid_card_spec` for a Card without `metadata.space`,
+/// `internal` for a non-Service/Agent Card or an unresolved version, and
+/// `registry_unavailable` when Postgres rejects the upsert or grant.
 #[tracing::instrument(skip(conn), fields(operation = "card.service_account.upsert"))]
 pub async fn upsert_service_account_from_card(
     conn: &mut TenantConn<'_>,
@@ -64,7 +79,7 @@ pub async fn upsert_service_account_from_card(
     };
     let card_ref_json: JsonValue =
         serde_json::to_value(card_ref).map_err(WyrdError::from_spec_serialization)?;
-    let id = sqlx::query_scalar::<_, Uuid>(UPSERT_SQL)
+    let (id, inserted) = sqlx::query_as::<_, (Uuid, bool)>(UPSERT_SQL)
         .bind(principal_kind)
         .bind(card.kind.wire_name())
         .bind(card_uid.as_uuid())
@@ -80,5 +95,32 @@ pub async fn upsert_service_account_from_card(
             tracing::error!(%error, "service-account projection failed");
             WyrdError::registry_unavailable("card registry unavailable")
         })?;
+    if inserted {
+        grant_workload_role(conn, id).await?;
+    }
     Ok(PrincipalId::new(id))
+}
+
+/// Grants the tenant's built-in [`WORKLOAD_ROLE`] to a newly projected principal.
+///
+/// Every provisioned tenant carries the built-in roles (seeded at
+/// provisioning, backfilled by migration); a bare tenant without them, such as
+/// a persistence-level fixture, projects the principal with no Role.
+///
+/// # Errors
+///
+/// Returns `registry_unavailable` when Postgres rejects the lookup or grant.
+async fn grant_workload_role(conn: &mut TenantConn<'_>, principal: Uuid) -> Result<(), WyrdError> {
+    let unavailable = |error: sqlx::Error| {
+        tracing::error!(%error, "workload role grant failed");
+        WyrdError::registry_unavailable("card registry unavailable")
+    };
+    let Some(role) = role_by_name(conn, WORKLOAD_ROLE).await.map_err(unavailable)? else {
+        tracing::warn!("tenant has no built-in workload role; principal projected without it");
+        return Ok(());
+    };
+    grant_role_to_service_account(conn, principal, role.id)
+        .await
+        .map_err(unavailable)?;
+    Ok(())
 }

@@ -77,11 +77,16 @@ The resolution path:
     ['writer', 'cards:read, cards:write, artifacts:read, artifacts:write, operators:invoke, evals:run, triggers:write'],
     ['reader', 'cards:read, artifacts:read, audit:read'],
     ['agent', 'cards:read, cards:write, artifacts:read, artifacts:write, operators:invoke, evals:run'],
-    ['runtime_admin', 'service_accounts:write']
+    ['runtime_admin', 'service_accounts:write'],
+    ['workload', 'bifrost_record:write, bifrost_query:read']
   ]}
 />
 
-Built-in roles are seeded per tenant at tenant creation.
+Built-in roles are seeded per tenant at tenant creation. A Service or Agent
+Card's principal receives `workload` when its Card is first registered, so a
+key issued for it can emit and query its own evidence without a manual grant.
+Its Card scope still bounds which Cards it may emit for. Re-registering the
+Card never re-grants a revoked `workload` role.
 
 The `operators` resource has three actions. `operators:invoke` lets a
 principal register a verification binding that names an `on_failure` Operator

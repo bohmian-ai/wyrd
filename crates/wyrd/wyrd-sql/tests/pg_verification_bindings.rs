@@ -13,7 +13,11 @@ use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::{BindingId, CardUid};
 use wyrd_spec::registry::RegistrationOperationId;
+use wyrd_runtime::builtin_roles::{BUILTIN_ROLES, WORKLOAD_ROLE, builtin_role_uuid};
 use wyrd_sql::TenantConn;
+use wyrd_sql::queries::auth::{
+    insert_role, list_service_account_roles, revoke_role_from_service_account,
+};
 use wyrd_sql::queries::cards::{
     NewCardRow, NewRegistrationOperation, insert_card_row, insert_registration_operation,
     upsert_service_account_from_card,
@@ -148,6 +152,69 @@ async fn cursor(conn: &mut TenantConn<'_>, binding: Uuid) -> Option<DateTime<Utc
 ///
 /// # Panics
 /// Panics when any identity, ordering, or persisted-key expectation fails.
+/// A Card's first principal projection grants the built-in `workload` role
+/// once; re-applying the Card neither duplicates the grant nor restores it
+/// after an administrator revoked it.
+///
+/// # Panics
+///
+/// Panics when a write fails or the principal's roles differ.
+#[tokio::test]
+async fn first_projection_grants_workload_once_and_revocation_stands() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(&fixture);
+    let tenant = fixture.data_tenant_id();
+    let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+    let workload = BUILTIN_ROLES
+        .iter()
+        .find(|role| role.name == WORKLOAD_ROLE)
+        .expect("workload is a built-in role");
+    let role_id = builtin_role_uuid(tenant, WORKLOAD_ROLE);
+    insert_role(
+        &mut conn,
+        role_id,
+        WORKLOAD_ROLE,
+        &serde_json::to_value(workload.permissions).expect("permissions serialize"),
+        true,
+    )
+    .await
+    .expect("workload role seeds");
+    let card = service_card("workload-svc", "1.0.0");
+    let (card_uid, principal) = register_service(&mut conn, &actor, &card).await;
+    assert_eq!(
+        list_service_account_roles(&mut conn, principal.as_uuid())
+            .await
+            .expect("roles list"),
+        [WORKLOAD_ROLE]
+    );
+
+    let reapplied = upsert_service_account_from_card(&mut conn, &card_uid, &card, &actor)
+        .await
+        .expect("principal re-projects");
+    assert_eq!(reapplied, principal);
+    assert_eq!(
+        list_service_account_roles(&mut conn, principal.as_uuid())
+            .await
+            .expect("roles list"),
+        [WORKLOAD_ROLE]
+    );
+
+    assert!(
+        revoke_role_from_service_account(&mut conn, principal.as_uuid(), role_id)
+            .await
+            .expect("role revokes")
+    );
+    upsert_service_account_from_card(&mut conn, &card_uid, &card, &actor)
+        .await
+        .expect("principal re-projects");
+    assert!(
+        list_service_account_roles(&mut conn, principal.as_uuid())
+            .await
+            .expect("roles list")
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn projection_identity_is_stable_under_reapply_and_reorder() {
     let fixture = PgFixture::start().await.expect("fixture starts");

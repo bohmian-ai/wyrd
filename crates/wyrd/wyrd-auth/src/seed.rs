@@ -53,7 +53,7 @@ mod pg_tests {
     use sqlx::Row;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::Permission;
-    use wyrd_runtime::builtin_roles::{BUILTIN_ROLES, builtin_role_uuid};
+    use wyrd_runtime::builtin_roles::{BUILTIN_ROLES, WORKLOAD_ROLE, builtin_role_uuid};
     use wyrd_spec::DataTenantId;
 
     use super::seed_builtin_roles_for_tenant;
@@ -86,6 +86,51 @@ mod pg_tests {
             assert!(builtin);
             assert_eq!(decoded, role.permissions);
         }
+    }
+
+    /// The existing-tenant backfill migration writes the `workload` row with
+    /// exactly the permissions the built-in seed serializes.
+    ///
+    /// The migration runs inside one tenant connection, so row-level security
+    /// confines its set-based insert to that tenant.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture, seed, migration, or decoded permissions differ.
+    #[tokio::test]
+    async fn workload_backfill_matches_seed() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        seed_builtin_roles_for_tenant(&mut conn, tenant)
+            .await
+            .expect("builtin roles seed");
+        sqlx::query("DELETE FROM wyrd.auth_roles WHERE name = $1")
+            .bind(WORKLOAD_ROLE)
+            .execute(&mut **conn.transaction())
+            .await
+            .expect("workload row deletes");
+
+        sqlx::raw_sql(include_str!(
+            "../../wyrd-sql/migrations/20261002000000_workload_role.sql"
+        ))
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("backfill runs");
+
+        let permissions: serde_json::Value =
+            sqlx::query_scalar("SELECT permissions FROM wyrd.auth_roles WHERE name = $1")
+                .bind(WORKLOAD_ROLE)
+                .fetch_one(&mut **conn.transaction())
+                .await
+                .expect("backfilled workload row exists");
+        let decoded: Vec<Permission> =
+            serde_json::from_value(permissions).expect("permissions deserialize");
+        let seeded = BUILTIN_ROLES
+            .iter()
+            .find(|role| role.name == WORKLOAD_ROLE)
+            .expect("workload is a built-in role");
+        assert_eq!(decoded, seeded.permissions);
     }
 
     #[tokio::test]

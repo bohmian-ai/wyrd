@@ -63,3 +63,40 @@ def test_wyrd_server_url_alone_sets_both_endpoints(monkeypatch: pytest.MonkeyPat
     client = WyrdClient(credential="wyrd_test_actor")
     assert client.server_url == "http://wyrd.internal:8080"
     assert client.grpc_url == "http://wyrd.internal:50051"
+
+
+def test_every_public_constructor_accepts_and_forwards_tenant():
+    """``tenant`` reaches the shared Rust client from every public entry point.
+
+    ``py:typecheck`` checks this module, so each call is also a static proof
+    that the declarations accept ``tenant``. No call here reaches a server.
+    """
+    from wyrd import WyrdClient, WyrdError
+    from wyrd.bifrost import AsyncBifrost, Bifrost, TableConfig
+    from wyrd.cards import Cards
+    from wyrd.gateway import Gateway
+    from wyrd.operators import OperatorConnections
+    from wyrd.state import WyrdState
+    from wyrd.verification import Verification
+
+    options = {"server_url": "http://127.0.0.1:9", "credential": "wyrd_test_actor"}
+    client = WyrdClient(**options, tenant="acme")
+    Cards(**options, tenant="acme")
+    Verification(**options, tenant="acme")
+    OperatorConnections(**options, tenant="acme")
+    Gateway(**options, tenant="acme")
+
+    for facade in (Bifrost, AsyncBifrost):
+        with pytest.raises(WyrdError) as captured:
+            facade(client=client, tenant="acme")
+        assert captured.value.code == "WYRD_SPEC_400_VALIDATION"
+        assert "tenant" in str(captured.value)
+
+    with pytest.raises(WyrdError) as captured:
+        TableConfig.describe("ns.table", grpc_url="http://127.0.0.1:9", tenant="acme", **options)
+    assert captured.value.code != "WYRD_SPEC_400_VALIDATION"
+
+    def start(state: WyrdState) -> None:
+        state.start_bifrost(tenant="acme")
+
+    assert callable(start)

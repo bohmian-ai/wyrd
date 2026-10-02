@@ -249,15 +249,16 @@ class TableConfig:
         server_url: str | None = None,
         credential: str | None = None,
         grpc_url: str | None = None,
+        tenant: str | None = None,
     ) -> TableConfig:
         """Fetch an already-registered table's config by name.
 
         Every transport argument is optional; an omitted one resolves through
-        the same chain the client constructor uses.
+        the same chain the client constructor uses, including ``tenant``.
         """
 
         return TableConfig._from_native(
-            _native.bifrost.TableConfig.describe(table, server_url, credential, grpc_url)
+            _native.bifrost.TableConfig.describe(table, server_url, credential, grpc_url, tenant)
         )
 
     @property
@@ -412,6 +413,7 @@ class _BifrostBase:
         credential: str | None = None,
         grpc_url: str | None = None,
         client: WyrdClient | None = None,
+        tenant: str | None = None,
     ) -> None:
         """Connect one client, optionally already bound to a write target.
 
@@ -429,7 +431,9 @@ class _BifrostBase:
             client: an existing ``WyrdClient``, such as one returned by
                 ``on_behalf_of``. Bifrost then uses its authentication and
                 transport; it cannot be combined with ``server_url``,
-                ``credential``, or ``grpc_url``.
+                ``credential``, ``grpc_url``, or ``tenant``.
+            tenant: the tenant route key or id the credential must belong to;
+                it selects among one server's saved logins.
 
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` when ``client`` is combined
@@ -444,6 +448,7 @@ class _BifrostBase:
             credential,
             grpc_url,
             client,
+            tenant,
         )
 
     def use_table(self, table: TableConfig) -> TableConfig | None:

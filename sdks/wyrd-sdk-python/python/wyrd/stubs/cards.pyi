@@ -236,13 +236,20 @@ class Cards:
             client configuration supplies it.
         credential: Optional credential override for this handle. When omitted, the
             shared Wyrd client configuration supplies credentials.
+        tenant: Optional tenant route key or id the credential must belong to;
+            it selects among one server's saved logins.
 
     Raises:
         WyrdError: If local configuration or the API-key override cannot be
             loaded.
     """
 
-    def __init__(self, server_url: str | None = ..., credential: str | None = ...) -> None: ...
+    def __init__(
+        self,
+        server_url: str | None = ...,
+        credential: str | None = ...,
+        tenant: str | None = ...,
+    ) -> None: ...
     @property
     def data(self) -> DataCardRegistry:
         """Return the typed registry view for `DataCard` operations."""

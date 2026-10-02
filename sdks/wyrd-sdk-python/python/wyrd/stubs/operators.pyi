@@ -149,10 +149,17 @@ class OperatorConnections:
     ``updated_at``. No call ever returns a secret.
     """
 
-    def __init__(self, server_url: str | None = None, credential: str | None = None) -> None:
+    def __init__(
+        self,
+        server_url: str | None = None,
+        credential: str | None = None,
+        tenant: str | None = None,
+    ) -> None:
         """Build a handle; omitted arguments fall through the client configuration.
 
-        No network call happens here.
+        ``tenant`` is the optional tenant route key or id the credential must
+        belong to; it selects among one server's saved logins. No network call
+        happens here.
 
         Raises:
             WyrdError: When the server URL or credential cannot be resolved.

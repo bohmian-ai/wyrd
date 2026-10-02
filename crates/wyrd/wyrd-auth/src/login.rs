@@ -17,13 +17,7 @@
 
 use std::time::Duration;
 
-use base64::Engine;
-use rand::RngCore;
-use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
-use sha2::{Digest, Sha256};
-use url::Url;
-use wyrd_auth_oidc::{OidcProvider, ScreenedHttp};
 use wyrd_crypt::SealingKeyring;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
@@ -33,9 +27,8 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_sql::queries::auth::{LoginState, insert_login_state, redeem_login_completion};
 
-use crate::callback::discover_provider;
 use crate::connections::HumanConnections;
-use crate::error::{screen_error, store_error};
+use crate::error::{relying_party_error, store_error};
 
 /// Path of the fixed same-origin BFF route a completed browser login is
 /// redirected to: `{public_origin}/login/complete`, with no query string.
@@ -78,12 +71,14 @@ impl HumanConnections {
     /// tenant and a tenant without one fail with the same generic refusal, so
     /// the endpoint cannot enumerate tenants or their login configuration.
     ///
-    /// Discovery runs through this owner's screened HTTP capability and the
-    /// discovered authorization endpoint is screened by scheme. The redirect
-    /// URI is always the deployment's configured callback. The state row binds
-    /// the exact connection revision, issuer, and client id, the PKCE verifier,
-    /// the nonce, and the initiation binding; only the SHA-256 of the random
-    /// state is stored, and the raw state is returned only inside the URL. The
+    /// The provider comes from the relying party's per-issuer cache, which
+    /// discovers through the screened HTTP capability on a miss, and the
+    /// relying party screens the authorization endpoint by scheme and
+    /// generates the state, nonce, and PKCE verifier. The redirect URI is
+    /// always the deployment's configured callback. The state row binds the
+    /// exact connection revision, issuer, and client id, the PKCE verifier,
+    /// the nonce, and the initiation binding; only the SHA-256 of the state is
+    /// stored, and the raw state is returned only inside the URL. The
     /// unique binding index lets a browser flow or device authorization name
     /// at most one login.
     ///
@@ -115,28 +110,24 @@ impl HumanConnections {
             .await?
             .ok_or_else(login_unavailable)?;
         let trusted = &active.trusted;
-        let provider = discover_provider(&trusted.issuer, self.http()).await?;
-        let authorization_endpoint = browser_authorization_endpoint(provider, self.http())?;
-        let state_key = auth_state_key();
-        let code_verifier = pkce_verifier();
-        let nonce = auth_nonce();
-        let authorization_url = build_authorization_url(
-            &authorization_endpoint,
-            &trusted.client_id,
-            redirect_uri.as_str(),
-            &state_key,
-            code_verifier.expose_secret(),
-            &nonce,
-        );
-        let authorization_url = AbsoluteUrl::new(authorization_url.as_str().to_owned())
+        let provider = self
+            .relying_party()
+            .cached(&trusted.issuer)
+            .await
+            .map_err(relying_party_error)?;
+        let authorization = self
+            .relying_party()
+            .authorize(&provider, &trusted.client_id, redirect_uri.as_str())
+            .map_err(relying_party_error)?;
+        let authorization_url = AbsoluteUrl::new(authorization.url.as_str().to_owned())
             .map_err(|_| invalid_token("authorization URL is invalid"))?;
         let row = LoginState {
             connection: active.binding,
             issuer: trusted.issuer.to_string(),
             client_id: trusted.client_id.clone(),
             redirect_uri: redirect_uri.to_string(),
-            code_verifier,
-            nonce,
+            code_verifier: authorization.code_verifier,
+            nonce: authorization.nonce,
             initiation,
         };
         let mut conn = self
@@ -144,7 +135,7 @@ impl HumanConnections {
             .tenant_conn(tenant)
             .await
             .map_err(store_error)?;
-        let state_hash = Sha256Hex::digest(state_key.as_bytes());
+        let state_hash = Sha256Hex::digest(authorization.state.as_bytes());
         if !insert_login_state(&mut conn, &state_hash, &row, LOGIN_STATE_TTL)
             .await
             .map_err(store_error)?
@@ -238,82 +229,6 @@ fn completion_unusable() -> WyrdError {
         message: "the login completion could not be processed; start a new login".to_owned(),
         details: json!({}),
     }
-}
-
-/// Take the discovered authorization endpoint only if `http`'s policy permits
-/// sending a browser there.
-///
-/// Discovery is fresh on every login, so a provider can change this endpoint
-/// after its connection was tested. The deployment's scheme rule is reapplied
-/// before any login state exists: production refuses cleartext, so state,
-/// nonce, and PKCE challenge never travel over `http`, while a permissive
-/// deployment keeps its local `http` providers.
-///
-/// # Errors
-/// Returns [`WyrdError::DiscoveryUnavailable`] — the redacted screening
-/// refusal — when the policy refuses the endpoint's scheme.
-pub(crate) fn browser_authorization_endpoint(
-    provider: OidcProvider,
-    http: ScreenedHttp,
-) -> Result<Url, WyrdError> {
-    let endpoint = provider.metadata.authorization_endpoint;
-    http.screen_scheme(&endpoint)
-        .map_err(|error| screen_error(&error))?;
-    Ok(endpoint)
-}
-
-/// Generate an unguessable login-state key.
-pub(crate) fn auth_state_key() -> String {
-    random_b64url(32)
-}
-
-/// Generate the nonce the returned ID token must echo.
-pub(crate) fn auth_nonce() -> String {
-    random_b64url(32)
-}
-
-/// Generate a PKCE code verifier.
-pub(crate) fn pkce_verifier() -> SecretString {
-    SecretString::from(random_b64url(48))
-}
-
-fn pkce_challenge(verifier: &str) -> String {
-    let digest = Sha256::digest(verifier.as_bytes());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-}
-
-pub(crate) fn random_b64url(bytes: usize) -> String {
-    let mut buf = vec![0_u8; bytes];
-    rand::rng().fill_bytes(&mut buf);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
-}
-
-/// Build the provider authorization URL for one login attempt.
-///
-/// Takes the client identifier rather than a whole trusted issuer because the
-/// platform control plane's connection is not a tenant's issuer, and the URL
-/// depends on nothing else about the issuer's trust configuration.
-pub(crate) fn build_authorization_url(
-    authorization_endpoint: &Url,
-    client_id: &str,
-    redirect_uri: &str,
-    state: &str,
-    code_verifier: &str,
-    nonce: &str,
-) -> Url {
-    let mut url = authorization_endpoint.clone();
-    let challenge = pkce_challenge(code_verifier);
-    let mut query = url.query_pairs_mut();
-    query.append_pair("response_type", "code");
-    query.append_pair("client_id", client_id);
-    query.append_pair("redirect_uri", redirect_uri);
-    query.append_pair("scope", "openid profile email");
-    query.append_pair("code_challenge", &challenge);
-    query.append_pair("code_challenge_method", "S256");
-    query.append_pair("state", state);
-    query.append_pair("nonce", nonce);
-    drop(query);
-    url
 }
 
 fn invalid_token(message: &str) -> WyrdError {
@@ -635,84 +550,5 @@ mod pg_tests {
             .await
             .expect_err("an unusable completion was still consumed");
         assert!(matches!(error, WyrdError::InvalidState { .. }), "{error:?}");
-    }
-}
-
-/// The browser destination a login returns is screened by scheme after fresh
-/// discovery, independent of the address rules server fetches use.
-#[cfg(test)]
-mod destination_tests {
-    use serde_json::json;
-    use url::Url;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-    use wyrd_auth_oidc::{AddressPolicy, OidcProvider, ScreenedHttp};
-    use wyrd_spec::error::WyrdError;
-
-    use super::browser_authorization_endpoint;
-
-    /// Discover a loopback provider whose authorization endpoint is cleartext
-    /// `http`, as a provider could republish after its connection was tested.
-    ///
-    /// # Panics
-    /// Panics when the mock provider cannot be discovered.
-    async fn cleartext_provider() -> (MockServer, OidcProvider) {
-        let server = MockServer::start().await;
-        let issuer = server.uri();
-        Mock::given(method("GET"))
-            .and(path("/.well-known/openid-configuration"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "issuer": issuer,
-                "authorization_endpoint": format!("{issuer}/authorize"),
-                "token_endpoint": format!("{issuer}/token"),
-                "jwks_uri": format!("{issuer}/jwks"),
-                "id_token_signing_alg_values_supported": ["RS256"],
-            })))
-            .mount(&server)
-            .await;
-        let issuer_url = Url::parse(&issuer).expect("mock issuer parses");
-        let client = ScreenedHttp::allowing_internal()
-            .client_for(&issuer_url)
-            .await
-            .expect("screened client");
-        let provider = OidcProvider::discover(issuer_url, client)
-            .await
-            .expect("mock provider is discovered");
-        (server, provider)
-    }
-
-    /// Production refuses a discovered cleartext authorization endpoint with
-    /// the redacted discovery refusal, so no login state is written for it.
-    ///
-    /// # Panics
-    /// Panics when the endpoint is accepted or refused with another error.
-    #[tokio::test]
-    async fn production_refuses_a_discovered_cleartext_authorization_endpoint() {
-        let (_server, provider) = cleartext_provider().await;
-
-        let error = browser_authorization_endpoint(
-            provider,
-            ScreenedHttp::new(AddressPolicy::BlockInternal),
-        )
-        .expect_err("a cleartext browser destination is refused");
-
-        assert!(
-            matches!(error, WyrdError::DiscoveryUnavailable { .. }),
-            "{error:?}"
-        );
-    }
-
-    /// A permissive deployment keeps its local `http` provider's endpoint.
-    ///
-    /// # Panics
-    /// Panics when the local endpoint is refused.
-    #[tokio::test]
-    async fn a_permissive_deployment_keeps_a_local_http_authorization_endpoint() {
-        let (server, provider) = cleartext_provider().await;
-
-        let endpoint = browser_authorization_endpoint(provider, ScreenedHttp::allowing_internal())
-            .expect("a local provider endpoint is kept");
-
-        assert_eq!(endpoint.as_str(), format!("{}/authorize", server.uri()));
     }
 }

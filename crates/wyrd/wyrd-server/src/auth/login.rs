@@ -113,8 +113,17 @@ mod pg_tests {
                 "authorization_endpoint": format!("{issuer}/authorize"),
                 "token_endpoint": format!("{issuer}/token"),
                 "jwks_uri": format!("{issuer}/jwks"),
+                "response_types_supported": ["code"],
+                "subject_types_supported": ["public"],
                 "id_token_signing_alg_values_supported": ["EdDSA"],
             })))
+            .mount(provider)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "keys": [] })),
+            )
             .mount(provider)
             .await;
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");

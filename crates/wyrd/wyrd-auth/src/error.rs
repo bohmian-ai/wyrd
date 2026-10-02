@@ -3,7 +3,7 @@
 use std::fmt::Display;
 
 use serde_json::json;
-use wyrd_auth_oidc::ScreenError;
+use wyrd_auth_oidc::{RelyingPartyError, ScreenError};
 use wyrd_auth_verify::{AuthError, MAX_DELEGATION_DEPTH};
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::SqlError;
@@ -28,6 +28,50 @@ pub(crate) fn provider_unreachable(cause: impl Display) -> WyrdError {
     WyrdError::DiscoveryUnavailable {
         message: "identity provider could not be reached".to_owned(),
         details: json!({}),
+    }
+}
+
+/// Convert a relying-party refusal to the public catalog.
+///
+/// Screening refusals and provider outages are the one provider-unreachable
+/// refusal; an issuer mismatch keeps its stable
+/// `details.reason = "issuer_mismatch"`; a token-endpoint outage is a
+/// retryable `503`; every refused code or ID token is
+/// [`WyrdError::InvalidToken`] with its cause logged server-side only.
+pub(crate) fn relying_party_error(error: RelyingPartyError) -> WyrdError {
+    match error {
+        RelyingPartyError::Screened(error) => screen_error(&error),
+        RelyingPartyError::IssuerMismatch => {
+            tracing::warn!("OIDC discovery names a different issuer");
+            WyrdError::DiscoveryUnavailable {
+                message: "the provider discovery document names a different issuer".to_owned(),
+                details: json!({ "reason": "issuer_mismatch" }),
+            }
+        }
+        RelyingPartyError::DiscoveryUnavailable(cause) => {
+            provider_unreachable(format_args!("OIDC discovery failed: {cause}"))
+        }
+        RelyingPartyError::TokenEndpointUnavailable(cause) => {
+            tracing::warn!(error = %cause, "OIDC token endpoint unavailable");
+            WyrdError::AuthVerifyUnavailable {
+                message: "OIDC token endpoint unavailable".to_owned(),
+                details: json!({ "retry_after_seconds": 1 }),
+            }
+        }
+        RelyingPartyError::InvalidNonce => WyrdError::InvalidNonce {
+            message: "id token nonce is missing or mismatched".to_owned(),
+            details: json!({}),
+        },
+        RelyingPartyError::Configuration(cause) => WyrdError::Internal {
+            message: format!("relying-party configuration is unusable: {cause}"),
+            details: json!({}),
+        },
+        error @ (RelyingPartyError::TokenRejected(_)
+        | RelyingPartyError::UnknownKey
+        | RelyingPartyError::InvalidIdToken(_)) => {
+            tracing::warn!(error = %error, "OIDC sign-in refused");
+            invalid_token("sign-in was refused")
+        }
     }
 }
 

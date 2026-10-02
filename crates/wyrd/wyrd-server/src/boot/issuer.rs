@@ -26,8 +26,7 @@ use std::time::Duration;
 
 use url::Url;
 use wyrd_auth_oidc::{
-    ClaimMapping, ClaimPath, ClientAuth, OidcProvider, ProviderMetadata, TrustedIssuer,
-    WorkloadBinding,
+    ClaimMapping, ClaimPath, ClientAuth, RelyingParty, ScreenedHttp, TrustedIssuer, WorkloadBinding,
 };
 use wyrd_crypt::SealingKeyring;
 use wyrd_spec::auth::IssuerUrl;
@@ -127,14 +126,12 @@ pub async fn seed_trusted_issuers(
             message: error.to_string(),
         }
     })?;
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("discovery client config is valid");
+    // Boot issuers are operator configuration, so internal addresses stay
+    // reachable; requests still go through the redirect-disabled transport.
+    let discovery = RelyingParty::new(ScreenedHttp::allowing_internal());
     let mut conn = postgres.tenant_conn(tenant_id).await?;
     for entry in entries {
-        seed_one_trusted_issuer(&mut conn, tenant_id, entry, sealing_key, &http).await?;
+        seed_one_trusted_issuer(&mut conn, tenant_id, entry, sealing_key, &discovery).await?;
     }
     conn.commit().await?;
     Ok(())
@@ -146,11 +143,11 @@ async fn seed_one_trusted_issuer(
     tenant_id: DataTenantId,
     entry: &IssuerEntry,
     sealing_key: Option<&SealingKeyring>,
-    http: &reqwest::Client,
+    discovery: &RelyingParty,
 ) -> Result<(), ServerBootError> {
-    match discover_with_retry(&entry.issuer, http).await {
-        Ok(metadata) => {
-            let trusted = build_trusted_issuer(entry, tenant_id, &metadata)?;
+    match discover_with_retry(&entry.issuer, discovery).await {
+        Ok(jwks_uri) => {
+            let trusted = build_trusted_issuer(entry, tenant_id, jwks_uri)?;
             let write = issuer_write_from_trusted(&trusted, sealing_key).map_err(|error| {
                 ServerBootError::IssuerSeal {
                     issuer: entry.issuer.clone(),
@@ -220,22 +217,27 @@ pub async fn seed_workload_bindings(
     Ok(())
 }
 
-/// Run OIDC discovery for `issuer`, retrying transient failures on the bounded
-/// backoff schedule. Returns the discovered metadata or a fail-closed error.
+/// Run OIDC discovery for `issuer` through `discovery`, retrying transient
+/// failures on the bounded backoff schedule, and return the key-set URI the
+/// provider published.
+///
+/// # Errors
+/// Returns [`ServerBootError::IssuerDiscoveryUnavailable`] when `issuer` is
+/// not a valid issuer URL (without retrying) or every attempt fails.
 async fn discover_with_retry(
     issuer: &str,
-    http: &reqwest::Client,
-) -> Result<ProviderMetadata, ServerBootError> {
+    discovery: &RelyingParty,
+) -> Result<Url, ServerBootError> {
     let issuer_url =
-        Url::parse(issuer).map_err(|e| ServerBootError::IssuerDiscoveryUnavailable {
+        IssuerUrl::new(issuer).map_err(|e| ServerBootError::IssuerDiscoveryUnavailable {
             issuer: issuer.to_owned(),
             message: format!("issuer URL could not be parsed: {e}"),
         })?;
 
     let mut last_message = String::from("discovery did not complete");
     for attempt in 0..DISCOVERY_MAX_ATTEMPTS {
-        match OidcProvider::discover(issuer_url.clone(), http.clone()).await {
-            Ok(provider) => return Ok(provider.metadata),
+        match discovery.discover(&issuer_url).await {
+            Ok(provider) => return Ok(provider.jwks_uri().url().clone()),
             Err(error) => {
                 tracing::warn!(
                     issuer,
@@ -257,14 +259,14 @@ async fn discover_with_retry(
     })
 }
 
-/// Map one config DTO plus its discovered metadata to a [`TrustedIssuer`].
+/// Map one config DTO plus its discovered key-set URI to a [`TrustedIssuer`].
 ///
 /// `jwks_uri` comes solely from discovery (F04: never hand-authored from
 /// config, no `card_ref` on this path).
 fn build_trusted_issuer(
     entry: &IssuerEntry,
     tenant_id: DataTenantId,
-    metadata: &ProviderMetadata,
+    jwks_uri: Url,
 ) -> Result<TrustedIssuer, ServerBootError> {
     let issuer = IssuerUrl::new(entry.issuer.clone()).map_err(|e| {
         ServerBootError::IssuerDiscoveryUnavailable {
@@ -276,7 +278,7 @@ fn build_trusted_issuer(
     Ok(TrustedIssuer {
         tenant_id,
         issuer,
-        jwks_uri: metadata.jwks_uri.clone(),
+        jwks_uri,
         expected_audience: entry.expected_audience.clone(),
         client_id: entry.client_id.clone(),
         client_auth: map_client_auth(&entry.client_auth),
@@ -336,30 +338,34 @@ mod pg_tests {
             "authorization_endpoint": format!("{issuer}/authorize"),
             "token_endpoint": format!("{issuer}/token"),
             "jwks_uri": format!("{issuer}/jwks"),
+            "response_types_supported": ["id_token"],
+            "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["RS256", "EdDSA"]
         })
     }
 
-    /// Discovery metadata for `issuer` with conventional endpoint paths, an
-    /// `RS256`-only signing set, and no RFC 9207 issuer-parameter support.
+    /// Serve an empty key set at `server`'s `/jwks`, which discovery fetches.
+    async fn mount_key_set(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "keys": [] })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// The discovery transport the boot tests use.
+    fn discovery() -> RelyingParty {
+        RelyingParty::new(ScreenedHttp::allowing_internal())
+    }
+
+    /// The conventional key-set URI of `issuer`.
     ///
     /// # Panics
-    /// Panics when `issuer` does not form valid endpoint URLs.
-    fn fake_metadata(issuer: &str) -> ProviderMetadata {
-        ProviderMetadata {
-            issuer: issuer.to_owned(),
-            authorization_endpoint: format!("{issuer}/authorize")
-                .parse()
-                .expect("authorize url is valid"),
-            token_endpoint: Some(
-                format!("{issuer}/token")
-                    .parse()
-                    .expect("token url is valid"),
-            ),
-            jwks_uri: format!("{issuer}/jwks").parse().expect("jwks url is valid"),
-            id_token_signing_alg_values_supported: vec!["RS256".to_owned()],
-            authorization_response_iss_parameter_supported: false,
-        }
+    /// Panics when `issuer` does not form a valid URL.
+    fn fake_jwks_uri(issuer: &str) -> Url {
+        format!("{issuer}/jwks").parse().expect("jwks url is valid")
     }
 
     fn issuer_entry(issuer: &str) -> IssuerEntry {
@@ -390,11 +396,13 @@ mod pg_tests {
             .mount(&server)
             .await;
 
-        let metadata = discover_with_retry(&issuer, &reqwest::Client::new())
+        mount_key_set(&server).await;
+
+        let jwks_uri = discover_with_retry(&issuer, &discovery())
             .await
             .expect("discovery should succeed");
 
-        assert!(metadata.jwks_uri.as_str().ends_with("/jwks"));
+        assert!(jwks_uri.as_str().ends_with("/jwks"));
     }
 
     #[tokio::test]
@@ -407,7 +415,7 @@ mod pg_tests {
             .mount(&server)
             .await;
 
-        let error = discover_with_retry(&issuer, &reqwest::Client::new())
+        let error = discover_with_retry(&issuer, &discovery())
             .await
             .expect_err("unreachable issuer must fail closed");
 
@@ -443,21 +451,21 @@ mod pg_tests {
             .mount(&server)
             .await;
 
-        let metadata = discover_with_retry(&issuer, &reqwest::Client::new())
+        mount_key_set(&server).await;
+
+        let jwks_uri = discover_with_retry(&issuer, &discovery())
             .await
             .expect("discovery should recover after a transient failure");
 
-        assert!(metadata.jwks_uri.as_str().ends_with("/jwks"));
+        assert!(jwks_uri.as_str().ends_with("/jwks"));
     }
 
     #[test]
     fn issuer_boot_build_trusted_issuer_maps_dto_fields() {
         let issuer = "https://idp.example.com/realms/acme";
         let entry = issuer_entry(issuer);
-        let metadata = fake_metadata(issuer);
-
-        let trusted =
-            build_trusted_issuer(&entry, tenant(), &metadata).expect("mapping should succeed");
+        let trusted = build_trusted_issuer(&entry, tenant(), fake_jwks_uri(issuer))
+            .expect("mapping should succeed");
 
         assert_eq!(trusted.tenant_id, tenant());
         assert_eq!(trusted.issuer.as_str(), issuer);
@@ -485,9 +493,7 @@ mod pg_tests {
     fn issuer_boot_build_trusted_issuer_rejects_non_https_issuer() {
         let issuer = "http://insecure.example.com";
         let entry = issuer_entry(issuer);
-        let metadata = fake_metadata(issuer);
-
-        let error = build_trusted_issuer(&entry, tenant(), &metadata)
+        let error = build_trusted_issuer(&entry, tenant(), fake_jwks_uri(issuer))
             .expect_err("non-https issuer must fail closed");
 
         assert!(
@@ -508,7 +514,7 @@ mod pg_tests {
 
         // Pre-seed the row as a prior successful boot would have.
         let entry = issuer_entry(UNREACHABLE_ISSUER);
-        let trusted = build_trusted_issuer(&entry, tenant_id, &fake_metadata(UNREACHABLE_ISSUER))
+        let trusted = build_trusted_issuer(&entry, tenant_id, fake_jwks_uri(UNREACHABLE_ISSUER))
             .expect("issuer maps");
         let write = crate::auth::pg_resolvers::issuer_write_from_trusted(&trusted, Some(&key))
             .expect("issuer encodes");

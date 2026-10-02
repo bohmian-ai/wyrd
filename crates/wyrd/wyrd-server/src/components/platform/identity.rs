@@ -647,19 +647,13 @@ async fn set_admin_status(
 /// Build the platform login service from server state.
 ///
 /// # Errors
-/// Returns an internal error when the platform plane, the token verifier, or
-/// the signing key is not configured.
+/// Returns an internal error when the platform plane or the signing key is not
+/// configured.
 fn login_service(state: &AppState) -> Result<PlatformLogin, WyrdErrorResponse> {
     let pool = operator(state)?;
     let issuing_key = state.auth.issuing_key.clone().ok_or_else(|| {
         WyrdErrorResponse::from(WyrdError::Internal {
             message: "platform session issuance is not configured".to_owned(),
-            details: serde_json::json!({ "plane": "platform" }),
-        })
-    })?;
-    let verifier = state.auth.external_verifier.clone().ok_or_else(|| {
-        WyrdErrorResponse::from(WyrdError::Internal {
-            message: "external token verification is not configured".to_owned(),
             details: serde_json::json!({ "plane": "platform" }),
         })
     })?;
@@ -670,7 +664,6 @@ fn login_service(state: &AppState) -> Result<PlatformLogin, WyrdErrorResponse> {
     Ok(PlatformLogin::new(
         pool,
         state.auth.sealing_key.clone(),
-        verifier,
         sessions,
         state.deployment_profile.screened_http(),
     ))

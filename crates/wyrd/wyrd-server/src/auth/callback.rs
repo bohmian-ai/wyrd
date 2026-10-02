@@ -27,11 +27,6 @@ pub async fn exchange_authorization_code(
 ) -> Result<LoginInitiation, WyrdErrorResponse> {
     let service = wyrd_auth::callback::AuthorizationCodeExchange {
         issuer: state.auth.tenant_issuer().ok_or_else(auth_not_configured)?,
-        verifier: state
-            .auth
-            .external_verifier
-            .clone()
-            .ok_or_else(auth_not_configured)?,
         connections: state
             .auth
             .human_connections
@@ -53,20 +48,18 @@ mod pg_tests {
     use crate::auth::pg_resolvers::PgIssuerResolver;
     use crate::http::error::WyrdErrorResponse;
     use crate::state::AppState;
-    use chrono::{Duration as ChronoDuration, Utc};
-    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use secrecy::SecretString;
     use uuid::Uuid;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wyrd_auth::callback::{
         AuthorizationCodeExchange, audit_authorization_code_failure, ensure_user_identity,
-        role_names_to_refs, verify_authorized_party, verify_nonce,
+        role_names_to_refs,
     };
     use wyrd_auth::connections::HumanConnections;
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_oidc::{
-        ClaimMapping, ClaimPath, ClientAuth, JwksCache, ScreenedHttp, TrustedIssuer,
+        ClaimMapping, ClaimPath, ClientAuth, JwksCache, MappedClaims, ScreenedHttp, TrustedIssuer,
     };
     use wyrd_auth_verify::{
         ExternalVerifier, Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
@@ -167,15 +160,6 @@ mod pg_tests {
         assert_eq!(roles, BTreeSet::from(["viewer".to_owned()]));
     }
 
-    /// A token echoing another login's nonce is refused.
-    #[test]
-    fn verify_nonce_rejects_mismatched_id_token_nonce() {
-        let error = verify_nonce("nonce-a", &serde_json::json!({ "nonce": "nonce-b" }))
-            .expect_err("nonce mismatch rejects");
-
-        assert_eq!(error.code(), "WYRD_AUTH_400_INVALID_NONCE");
-    }
-
     /// A state naming no pending login is refused before any tenant is known,
     /// so no tenant audit event is written for it.
     ///
@@ -248,20 +232,13 @@ mod pg_tests {
             trusted_issuer_with_jwks(tenant, jwks_uri(&server), HashMap::new(), Vec::new());
         let binding = committed_active_binding(&fixture).await;
         let (hash, login) = pending_login(&fixture, state_hash(1), binding, "nonce-ok").await;
-        let id_token = encode_external_token(&external_claims(
-            EXTERNAL_AUDIENCE,
-            "nonce-ok",
-            Some("ext@example.com"),
-            &[],
-        ));
 
         let completed = authorization_exchange_service(&state)
             .finish_id_token_exchange(
                 &hash,
                 &trusted,
                 &login,
-                &advertised(),
-                &id_token,
+                &identity(EXTERNAL_SUBJECT, Some("ext@example.com"), &[]),
                 "req-success",
             )
             .await
@@ -291,31 +268,33 @@ mod pg_tests {
             .expect_err("a completion redeems once");
     }
 
-    /// A token for another audience is refused, audited with no principal,
-    /// and leaves no completion or session behind.
+    /// A login whose bound connection is no longer the tenant's Active one is
+    /// refused after verification, audited with no principal, and leaves no
+    /// completion or session behind.
     ///
     /// # Panics
-    /// Panics when the token is accepted or a completion is stored.
+    /// Panics when the login is accepted or a completion is stored.
     #[tokio::test]
-    async fn a_wrong_audience_is_refused_and_leaves_no_completion() {
+    async fn a_changed_connection_is_refused_and_leaves_no_completion() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let server = jwks_server().await;
         let state = test_state_with_external(&fixture).await;
         let trusted =
             trusted_issuer_with_jwks(tenant, jwks_uri(&server), HashMap::new(), Vec::new());
-        let binding = committed_active_binding(&fixture).await;
+        let mut binding = committed_active_binding(&fixture).await;
+        binding.connection_revision += 1;
         let (hash, login) = pending_login(&fixture, state_hash(2), binding, "nonce-ok").await;
-        let id_token = encode_external_token(&external_claims(
-            "wrong-audience",
-            "nonce-ok",
-            Some("ext@example.com"),
-            &[],
-        ));
 
-        let error = finish_with_failure_audit(&state, &hash, &trusted, &login, &id_token)
-            .await
-            .expect_err("wrong audience rejects");
+        let error = finish_with_failure_audit(
+            &state,
+            &hash,
+            &trusted,
+            &login,
+            &identity(EXTERNAL_SUBJECT, Some("ext@example.com"), &[]),
+        )
+        .await
+        .expect_err("a changed connection rejects");
 
         assert_eq!(error.0.code(), "WYRD_AUTH_401_INVALID_TOKEN");
         let audit = audit_rows(&fixture).await;
@@ -383,119 +362,6 @@ mod pg_tests {
         );
     }
 
-    /// OIDC authorized-party rules: several audiences need `azp` naming the
-    /// client, a present `azp` must name the client, and a lone audience may
-    /// omit it.
-    #[test]
-    fn verify_authorized_party_enforces_azp_for_the_client() {
-        let client = EXTERNAL_AUDIENCE;
-        let refused = [
-            serde_json::json!({ "aud": [client, "other"] }),
-            serde_json::json!({ "aud": [client, "other"], "azp": "other" }),
-            serde_json::json!({ "aud": [client, "other"], "azp": 7 }),
-            serde_json::json!({ "aud": client, "azp": "other" }),
-            serde_json::json!({ "aud": [client], "azp": "other" }),
-        ];
-        for claims in refused {
-            let error = verify_authorized_party(client, &claims).expect_err("azp is refused");
-            assert_eq!(error.code(), "WYRD_AUTH_401_INVALID_TOKEN", "{claims}");
-        }
-        for claims in [
-            serde_json::json!({ "aud": client }),
-            serde_json::json!({ "aud": [client] }),
-            serde_json::json!({ "aud": client, "azp": client }),
-            serde_json::json!({ "aud": [client, "other"], "azp": client }),
-        ] {
-            verify_authorized_party(client, &claims).expect("azp is accepted");
-        }
-    }
-
-    /// A signed multi-audience token without `azp` is refused before any
-    /// User, session, or completion exists; the same token naming the client
-    /// in `azp` completes.
-    ///
-    /// # Panics
-    /// Panics when the refusal persists anything or the matching token fails.
-    #[tokio::test]
-    async fn a_multi_audience_token_needs_azp_naming_the_client() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let server = jwks_server().await;
-        let state = test_state_with_external(&fixture).await;
-        let trusted =
-            trusted_issuer_with_jwks(tenant, jwks_uri(&server), HashMap::new(), Vec::new());
-        let binding = committed_active_binding(&fixture).await;
-        let (refused_hash, refused_login) =
-            pending_login(&fixture, state_hash(3), binding, "nonce-ok").await;
-        let mut claims = external_claims(EXTERNAL_AUDIENCE, "nonce-ok", None, &[]);
-        claims["aud"] = serde_json::json!([EXTERNAL_AUDIENCE, "another-client"]);
-
-        let error = finish_with_failure_audit(
-            &state,
-            &refused_hash,
-            &trusted,
-            &refused_login,
-            &encode_external_token(&claims),
-        )
-        .await
-        .expect_err("a multi-audience token without azp is refused");
-
-        assert_eq!(error.0.code(), "WYRD_AUTH_401_INVALID_TOKEN");
-        assert_nothing_persisted(&fixture, &state, &refused_hash).await;
-
-        let (hash, login) = pending_login(&fixture, state_hash(4), binding, "nonce-ok").await;
-        claims["azp"] = serde_json::json!(EXTERNAL_AUDIENCE);
-        authorization_exchange_service(&state)
-            .finish_id_token_exchange(
-                &hash,
-                &trusted,
-                &login,
-                &advertised(),
-                &encode_external_token(&claims),
-                "req-azp",
-            )
-            .await
-            .expect("azp naming the client completes");
-        redeem(&state, tenant, &hash)
-            .await
-            .expect("the completion redeems");
-    }
-
-    /// A validly signed token whose asymmetric algorithm the provider did not
-    /// advertise for ID tokens is refused before any User, session, or
-    /// completion exists.
-    ///
-    /// # Panics
-    /// Panics when the token is accepted or anything persists.
-    #[tokio::test]
-    async fn an_unadvertised_id_token_algorithm_is_refused() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let server = jwks_server().await;
-        let state = test_state_with_external(&fixture).await;
-        let trusted =
-            trusted_issuer_with_jwks(tenant, jwks_uri(&server), HashMap::new(), Vec::new());
-        let binding = committed_active_binding(&fixture).await;
-        let (hash, login) = pending_login(&fixture, state_hash(5), binding, "nonce-ok").await;
-        let id_token =
-            encode_external_token(&external_claims(EXTERNAL_AUDIENCE, "nonce-ok", None, &[]));
-
-        let error = authorization_exchange_service(&state)
-            .finish_id_token_exchange(
-                &hash,
-                &trusted,
-                &login,
-                &["RS256".to_owned(), "HS256".to_owned()],
-                &id_token,
-                "req-alg",
-            )
-            .await
-            .expect_err("an unadvertised algorithm is refused");
-
-        assert_eq!(error.code(), "WYRD_AUTH_401_INVALID_TOKEN");
-        assert_nothing_persisted(&fixture, &state, &hash).await;
-    }
-
     /// Two signed subjects at one issuer sharing an email are two Users, and
     /// the second gains none of the first's authority.
     ///
@@ -511,20 +377,12 @@ mod pg_tests {
         let service = authorization_exchange_service(&state);
         for (n, subject, groups) in [(6, "subject-a", &["admins"][..]), (7, "subject-b", &[])] {
             let (hash, login) = pending_login(&fixture, state_hash(n), binding, "nonce").await;
-            let mut claims = external_claims(
-                EXTERNAL_AUDIENCE,
-                "nonce",
-                Some("shared@example.com"),
-                groups,
-            );
-            claims["sub"] = serde_json::json!(subject);
             service
                 .finish_id_token_exchange(
                     &hash,
                     &trusted,
                     &login,
-                    &advertised(),
-                    &encode_external_token(&claims),
+                    &identity(subject, Some("shared@example.com"), groups),
                     "req-subject",
                 )
                 .await
@@ -557,14 +415,12 @@ mod pg_tests {
         let service = authorization_exchange_service(&state);
         for n in [8, 9] {
             let (hash, login) = pending_login(&fixture, state_hash(n), binding, "nonce").await;
-            let claims = external_claims(EXTERNAL_AUDIENCE, "nonce", None, &["admins"]);
             service
                 .finish_id_token_exchange(
                     &hash,
                     &trusted,
                     &login,
-                    &advertised(),
-                    &encode_external_token(&claims),
+                    &identity(EXTERNAL_SUBJECT, None, &["admins"]),
                     "req-sync",
                 )
                 .await
@@ -622,19 +478,12 @@ mod pg_tests {
             let service = &service;
             let trusted = &trusted;
             async move {
-                let token = encode_external_token(&external_claims(
-                    EXTERNAL_AUDIENCE,
-                    "nonce",
-                    None,
-                    &[group],
-                ));
                 service
                     .finish_id_token_exchange(
                         &hash,
                         trusted,
                         &login,
-                        &advertised(),
-                        &token,
+                        &identity(EXTERNAL_SUBJECT, None, &[group]),
                         "req-race",
                     )
                     .await
@@ -758,13 +607,7 @@ mod pg_tests {
                 &hash,
                 &trusted,
                 &login,
-                &advertised(),
-                &encode_external_token(&external_claims(
-                    EXTERNAL_AUDIENCE,
-                    "nonce",
-                    None,
-                    &["admins"],
-                )),
+                &identity(EXTERNAL_SUBJECT, None, &["admins"]),
                 "req-sync-fail",
             )
             .await
@@ -812,13 +655,7 @@ mod pg_tests {
                 &hash,
                 &trusted,
                 &login,
-                &advertised(),
-                &encode_external_token(&external_claims(
-                    EXTERNAL_AUDIENCE,
-                    "nonce",
-                    Some("ext@example.com"),
-                    &["admins"],
-                )),
+                &identity(EXTERNAL_SUBJECT, Some("ext@example.com"), &["admins"]),
                 "req-test",
             )
             .await
@@ -872,8 +709,7 @@ mod pg_tests {
                 &hash,
                 &trusted,
                 &login,
-                &advertised(),
-                &encode_external_token(&external_claims(EXTERNAL_AUDIENCE, "nonce", None, &[])),
+                &identity(EXTERNAL_SUBJECT, None, &[]),
                 "req-test-denied",
             )
             .await
@@ -946,8 +782,7 @@ mod pg_tests {
                 &hash,
                 &trusted,
                 &login,
-                &advertised(),
-                &encode_external_token(&external_claims(EXTERNAL_AUDIENCE, "nonce", None, &[])),
+                &identity(EXTERNAL_SUBJECT, None, &[]),
                 "req-test-audit-fail",
             )
             .await
@@ -1198,10 +1033,13 @@ mod pg_tests {
         Sha256Hex::digest(state_hash.as_bytes())
     }
 
-    /// The ID-token algorithms the test provider advertises: the one its
-    /// Ed25519 key signs with.
-    fn advertised() -> Vec<String> {
-        vec!["EdDSA".to_owned()]
+    /// The identity a verified ID token for `subject` maps to.
+    fn identity(subject: &str, email: Option<&str>, groups: &[&str]) -> MappedClaims {
+        MappedClaims {
+            subject: subject.to_owned(),
+            email: email.map(ToOwned::to_owned),
+            groups: groups.iter().map(|group| (*group).to_owned()).collect(),
+        }
     }
 
     /// Redeem the completion of the login under `state_hash` through the
@@ -1313,10 +1151,10 @@ mod pg_tests {
         state_hash: &Sha256Hex,
         trusted: &TrustedIssuer,
         login: &LoginState,
-        id_token: &str,
+        identity: &MappedClaims,
     ) -> Result<LoginInitiation, WyrdErrorResponse> {
         let result = authorization_exchange_service(state)
-            .finish_id_token_exchange(state_hash, trusted, login, &advertised(), id_token, "req")
+            .finish_id_token_exchange(state_hash, trusted, login, identity, "req")
             .await
             .map_err(WyrdErrorResponse::from);
         if let Err(error) = &result {
@@ -1334,18 +1172,13 @@ mod pg_tests {
     /// The exchange service over the test state's auth configuration.
     ///
     /// # Panics
-    /// Panics when the test state lacks issuing, verification, or connections.
+    /// Panics when the test state lacks issuing or connections.
     fn authorization_exchange_service(state: &AppState) -> AuthorizationCodeExchange {
         AuthorizationCodeExchange {
             issuer: state
                 .auth
                 .tenant_issuer()
                 .expect("test state has issuing key"),
-            verifier: state
-                .auth
-                .external_verifier
-                .clone()
-                .expect("test state has external verifier"),
             connections: state
                 .auth
                 .human_connections
@@ -1369,36 +1202,6 @@ mod pg_tests {
                 "x": ED_X
             }]
         })
-    }
-
-    fn external_claims(
-        audience: &str,
-        nonce: &str,
-        email: Option<&str>,
-        groups: &[&str],
-    ) -> serde_json::Value {
-        let now = Utc::now();
-        let mut claims = serde_json::json!({
-            "sub": EXTERNAL_SUBJECT,
-            "iss": EXTERNAL_ISSUER,
-            "aud": audience,
-            "exp": (now + ChronoDuration::hours(1)).timestamp(),
-            "iat": now.timestamp(),
-            "nonce": nonce,
-            "groups": groups,
-        });
-        if let Some(email) = email {
-            claims["email"] = serde_json::json!(email);
-        }
-        claims
-    }
-
-    fn encode_external_token(claims: &serde_json::Value) -> String {
-        let mut header = Header::new(Algorithm::EdDSA);
-        header.kid = Some(EXTERNAL_KID.to_owned());
-        let key = EncodingKey::from_ed_pem(PRIVATE_KEY_PEM.as_bytes())
-            .expect("external private key parses");
-        encode(&header, claims, &key).expect("external token signs")
     }
 
     fn role_set(roles: Vec<wyrd_runtime::RoleRef>) -> BTreeSet<String> {

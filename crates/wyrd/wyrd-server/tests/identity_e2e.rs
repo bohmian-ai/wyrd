@@ -248,23 +248,21 @@ async fn discovery_resolves_keycloak() {
     let fixture = OidcIssuerFixture::connect(&keycloak_issuer()).await;
     let meta = fixture.metadata();
     assert!(
-        meta.authorization_endpoint
+        meta.authorization_endpoint()
             .as_str()
             .contains("openid-connect/auth"),
         "Keycloak authorization_endpoint: {}",
-        meta.authorization_endpoint
+        meta.authorization_endpoint().as_str()
     );
     assert!(
-        meta.token_endpoint
-            .as_ref()
-            .map(|u| u.as_str().contains("openid-connect/token"))
-            .unwrap_or(false),
+        meta.token_endpoint()
+            .is_some_and(|u| u.as_str().contains("openid-connect/token")),
         "Keycloak token_endpoint missing or unexpected"
     );
     assert!(
-        meta.jwks_uri.as_str().contains("openid-connect/certs"),
+        meta.jwks_uri().as_str().contains("openid-connect/certs"),
         "Keycloak jwks_uri: {}",
-        meta.jwks_uri
+        meta.jwks_uri().as_str()
     );
 }
 
@@ -274,9 +272,9 @@ async fn discovery_resolves_dex() {
     let fixture = OidcIssuerFixture::connect(&dex_issuer()).await;
     let meta = fixture.metadata();
     assert!(
-        meta.jwks_uri.as_str().contains("/keys"),
+        meta.jwks_uri().as_str().contains("/keys"),
         "Dex jwks_uri: {}",
-        meta.jwks_uri
+        meta.jwks_uri().as_str()
     );
 }
 
@@ -294,7 +292,7 @@ async fn discovery_resolves_dex() {
 /// `client_credentials` tokens, so it never drives the workload issuance journey.
 async fn assert_config_driven_trust_layer(issuer: &str, audience: &str) {
     let fixture = OidcIssuerFixture::connect(issuer).await;
-    let jwks = reqwest::get(fixture.metadata().jwks_uri.clone())
+    let jwks = reqwest::get(fixture.metadata().jwks_uri().url().clone())
         .await
         .expect("JWKS fetch succeeds");
     assert!(jwks.status().is_success(), "{issuer}: JWKS reachable");
@@ -3740,6 +3738,8 @@ fn mock_discovery(issuer: &str, algorithms: &[&str]) -> Value {
         "authorization_endpoint": format!("{issuer}/authorize"),
         "token_endpoint": format!("{issuer}/token"),
         "jwks_uri": format!("{issuer}/jwks"),
+        "response_types_supported": ["code"],
+        "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": algorithms,
     })
 }

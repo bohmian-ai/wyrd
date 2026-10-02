@@ -18,7 +18,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rand::Rng as _;
+use base64::Engine as _;
+use rand::{Rng as _, RngCore as _};
 use secrecy::SecretString;
 use serde_json::json;
 use uuid::Uuid;
@@ -45,7 +46,7 @@ use crate::audit::{
 use crate::connections::HumanConnections;
 use crate::error::{auth_error_to_wyrd, store_error};
 use crate::exchange_api_key::token_hash;
-use crate::login::{login_unavailable, random_b64url};
+use crate::login::login_unavailable;
 use crate::refresh::tenant_from_refresh_jwt;
 
 /// Operation for a device-code token request that issued, or was refused, a
@@ -142,7 +143,7 @@ impl CliLogins {
             .active_connection(tenant)
             .await?
             .ok_or_else(login_unavailable)?;
-        let device_code = format!("{tenant}.{}", random_b64url(32));
+        let device_code = format!("{tenant}.{}", new_device_secret());
         let user_code = new_user_code();
         let mut conn = self
             .connections
@@ -465,6 +466,14 @@ impl CliLogins {
     }
 }
 
+/// A fresh unguessable device-code secret: 32 random bytes, base64url
+/// without padding (RFC 8628 §5.2).
+fn new_device_secret() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
 /// A fresh random user code, `XXXX-XXXX` over [`USER_CODE_ALPHABET`].
 fn new_user_code() -> String {
     let mut rng = rand::rng();
@@ -593,8 +602,17 @@ mod pg_tests {
                 "authorization_endpoint": format!("{issuer}/authorize"),
                 "token_endpoint": format!("{issuer}/token"),
                 "jwks_uri": format!("{issuer}/jwks"),
+                "response_types_supported": ["code"],
+                "subject_types_supported": ["public"],
                 "id_token_signing_alg_values_supported": ["EdDSA"],
             })))
+            .mount(provider)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "keys": [] })),
+            )
             .mount(provider)
             .await;
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");

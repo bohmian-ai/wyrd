@@ -30,11 +30,13 @@ use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
 use std::time::Duration;
 
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use serde_json::json;
 use url::Url;
 use uuid::Uuid;
-use wyrd_auth_oidc::{OidcProvider, ScreenedHttp, TrustedIssuer, usable_jwks_keys};
+use wyrd_auth_oidc::{
+    ProviderMetadata, RelyingParty, RelyingPartyError, ScreenedHttp, TrustedIssuer,
+};
 use wyrd_crypt::SealingKeyring;
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
@@ -56,14 +58,10 @@ use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanConnectionRow};
 use wyrd_sql::{TenantConn, WyrdPostgres};
 
 use crate::audit::{append_auth_audit, principal_event, principal_kind_tag};
-use crate::callback::{DiscoveryFailure, discover_provider};
-use crate::error::store_error;
+use crate::error::{relying_party_error, store_error};
 use crate::exchange_api_key::{ExchangeError, role_refs, verify_api_key};
 use crate::issuance::resolve_permissions;
-use crate::login::{
-    LOGIN_COMPLETE_PATH, LOGIN_STATE_TTL, auth_nonce, auth_state_key,
-    browser_authorization_endpoint, build_authorization_url, pkce_verifier,
-};
+use crate::login::{LOGIN_COMPLETE_PATH, LOGIN_STATE_TTL};
 use crate::pg_resolvers::{human_connection_trusted_issuer, seal_secret};
 
 /// How long a successful candidate test authorizes activation.
@@ -87,9 +85,9 @@ const CONNECTION_RESOURCE: &str = "identity:oidc_connection";
 ///
 /// Holds the role-separated runtime store (every statement runs on an RLS
 /// [`TenantConn`] acquired through [`WyrdPostgres`]), the deployment sealing
-/// keyring, the screened provider HTTP capability, and the callback URL
-/// derived from the configured public origin. Built once per server and
-/// cheap to clone.
+/// keyring, the human-login relying party, and the callback URL derived from
+/// the configured public origin. Built once per server and cheap to clone;
+/// clones share the relying party's provider cache.
 #[derive(Clone)]
 pub struct HumanConnections {
     /// Runtime Postgres handle every tenant transaction is acquired from.
@@ -97,9 +95,9 @@ pub struct HumanConnections {
     /// Sealing keyring for provider client secrets; `None` on a keyless
     /// deployment, which can then stage only public clients.
     keyring: Option<Arc<SealingKeyring>>,
-    /// Screened, redirect-disabled, proxy-free HTTP capability every provider
-    /// request goes through.
-    http: ScreenedHttp,
+    /// The human-login relying party; every provider request it makes goes
+    /// through the screened, redirect-disabled, proxy-free HTTP capability.
+    relying_party: RelyingParty,
     /// `{public_origin}/auth/callback`, or `None` without a public origin.
     callback_url: Option<Url>,
     /// `{public_origin}/login/complete`, or `None` without a public origin.
@@ -165,18 +163,18 @@ impl HumanConnections {
         Self {
             postgres,
             keyring,
-            http,
+            relying_party: RelyingParty::new(http),
             callback_url: public_origin.and_then(|origin| origin.join(CALLBACK_PATH).ok()),
             completion_url: public_origin.and_then(|origin| origin.join(LOGIN_COMPLETE_PATH).ok()),
         }
     }
 
-    /// The screened HTTP capability every provider request is made through;
-    /// login and the callback exchange reuse it so their provider requests
-    /// are screened exactly as candidate testing's are.
+    /// The human-login relying party; login and the callback exchange reuse
+    /// it so their provider requests are screened exactly as candidate
+    /// testing's are and share one provider cache.
     #[must_use]
-    pub(crate) fn http(&self) -> ScreenedHttp {
-        self.http
+    pub(crate) fn relying_party(&self) -> &RelyingParty {
+        &self.relying_party
     }
 
     /// The runtime Postgres handle this owner acquires tenant transactions
@@ -350,41 +348,35 @@ impl HumanConnections {
         let redirect_uri = self.require_callback()?.clone();
         self.require_keyring()?;
         let target = self.test_target(tenant, expected_revision).await?;
-        let provider = discover_provider(&target.issuer, self.http)
+        let provider = self
+            .relying_party
+            .discover(&target.issuer)
             .await
-            .map_err(|failure| match failure {
-                DiscoveryFailure::IssuerMismatch => not_tested_reason(
+            .map_err(|error| match error {
+                RelyingPartyError::IssuerMismatch => not_tested_reason(
                     "issuer_mismatch",
                     "the provider discovery document names a different issuer",
                 ),
-                DiscoveryFailure::Unavailable(error) => error,
+                error => relying_party_error(error),
             })?;
-        self.require_usable_jwks(&target, &provider).await?;
-        let authorization_endpoint = browser_authorization_endpoint(provider, self.http)?;
-        let state_key = auth_state_key();
-        let code_verifier = pkce_verifier();
-        let nonce = auth_nonce();
-        let authorization_url = build_authorization_url(
-            &authorization_endpoint,
-            &target.client_id,
-            redirect_uri.as_str(),
-            &state_key,
-            code_verifier.expose_secret(),
-            &nonce,
-        );
+        require_usable_jwks(&provider)?;
+        let authorization = self
+            .relying_party
+            .authorize(&provider, &target.client_id, redirect_uri.as_str())
+            .map_err(relying_party_error)?;
         let authorization_url =
-            AbsoluteUrl::new(authorization_url.as_str().to_owned()).map_err(internal)?;
+            AbsoluteUrl::new(authorization.url.as_str().to_owned()).map_err(internal)?;
         let row = LoginState {
             connection: target.binding,
             issuer: target.issuer.to_string(),
             client_id: target.client_id,
             redirect_uri: redirect_uri.to_string(),
-            code_verifier,
-            nonce,
+            code_verifier: authorization.code_verifier,
+            nonce: authorization.nonce,
             initiation: LoginInitiation::ConnectionTest(tester),
         };
         let mut conn = self.begin(tenant).await?;
-        let state_hash = Sha256Hex::digest(state_key.as_bytes());
+        let state_hash = Sha256Hex::digest(authorization.state.as_bytes());
         if !insert_login_state(&mut conn, &state_hash, &row, LOGIN_STATE_TTL)
             .await
             .map_err(store_error)?
@@ -791,35 +783,6 @@ impl HumanConnections {
         })
     }
 
-    /// Require the discovered JWKS to decode to at least one usable key,
-    /// through the same screened fetch and decoder the verifier uses.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::ConnectionNotTested`] with reason `jwks_unusable`
-    /// when the key set is unreachable, malformed, or holds no usable key.
-    async fn require_usable_jwks(
-        &self,
-        target: &TestTarget,
-        provider: &OidcProvider,
-    ) -> Result<(), WyrdError> {
-        match usable_jwks_keys(
-            target.issuer.as_str(),
-            &provider.metadata.jwks_uri,
-            self.http,
-        )
-        .await
-        {
-            Ok(count) if count > 0 => Ok(()),
-            outcome => {
-                tracing::warn!(?outcome, "candidate provider JWKS is unusable");
-                Err(not_tested_reason(
-                    "jwks_unusable",
-                    "the provider JWKS has no usable keys",
-                ))
-            }
-        }
-    }
-
     /// Project a stored row to its redacted view.
     ///
     /// # Errors
@@ -971,6 +934,23 @@ async fn commit_refusal<T>(conn: TenantConn<'_>, refusal: WyrdError) -> Result<T
 }
 
 /// A failed test check with a stable machine-readable reason.
+/// Require the key set discovery fetched to hold at least one key the
+/// verifier can decode.
+///
+/// # Errors
+/// Returns [`WyrdError::ConnectionNotTested`] with reason `jwks_unusable`
+/// when the key set holds no usable key.
+fn require_usable_jwks(provider: &ProviderMetadata) -> Result<(), WyrdError> {
+    if provider.jwks().keys().is_empty() {
+        tracing::warn!("candidate provider JWKS has no usable keys");
+        return Err(not_tested_reason(
+            "jwks_unusable",
+            "the provider JWKS has no usable keys",
+        ));
+    }
+    Ok(())
+}
+
 fn not_tested_reason(reason: &str, message: &str) -> WyrdError {
     WyrdError::ConnectionNotTested {
         message: message.to_owned(),

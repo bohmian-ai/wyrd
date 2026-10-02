@@ -94,6 +94,10 @@ rmcp = { version = "3.2.0", default-features = false }
 # signatures. Wyrd never parses SSE itself; it only has to name the type.
 sse-stream = "0.2.4"
 http = "1"
+# Vetted OpenID Connect relying party (discovery, PKCE, code exchange, ID-token
+# validation). Its `reqwest` feature stays off: provider HTTP runs through the
+# screened transport in `wyrd-auth-oidc`.
+openidconnect = { version = "=4.0.1", default-features = false }
 http-body = "1"
 serde = { version = "1", features = ["derive"] }
 serde_jcs = "0.1"

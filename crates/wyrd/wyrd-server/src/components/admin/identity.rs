@@ -471,6 +471,8 @@ mod pg_tests {
                 "authorization_endpoint": format!("{issuer}/authorize"),
                 "token_endpoint": format!("{issuer}/token"),
                 "jwks_uri": format!("{issuer}/jwks"),
+                "response_types_supported": ["code"],
+                "subject_types_supported": ["public"],
                 "id_token_signing_alg_values_supported": ["EdDSA"],
             })))
             .mount(&server)

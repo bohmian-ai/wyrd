@@ -11,20 +11,9 @@
 //! token verified exactly as a login, and then only that candidate revision is
 //! marked tested. A test issues no session, credential, or User.
 
-use std::str::FromStr;
-use std::sync::Arc;
-
-use jsonwebtoken::Algorithm;
-use reqwest::RequestBuilder;
-use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
-use serde_json::Value;
-use url::Url;
+use secrecy::SecretString;
 use uuid::Uuid;
-use wyrd_auth_oidc::{
-    ClientAuth, OidcError, OidcProvider, ScreenedHttp, TrustedIssuer, read_bounded_body,
-};
-use wyrd_auth_verify::ExternalVerifier;
+use wyrd_auth_oidc::{CodeRedemption, MappedClaims, TrustedIssuer};
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
@@ -42,27 +31,19 @@ use crate::audit::{
     auth_failure_code, principal_event, record_auth_audit_best_effort,
 };
 use crate::connections::HumanConnections;
-use crate::error::{auth_error_to_wyrd, provider_unreachable, screen_error, store_error};
+use crate::error::{relying_party_error, store_error};
 use crate::exchange_api_key::role_refs;
 use crate::issuance::TenantTokenIssuer;
 use crate::login::{LOGIN_COMPLETION_TTL, seal_completion};
-use crate::pg_resolvers::PgIssuerResolver;
-
-#[derive(Debug, Deserialize)]
-struct TokenEndpointResponse {
-    id_token: String,
-}
 
 /// Human OIDC authorization-code exchange service behind the common callback.
 #[derive(Clone)]
 pub struct AuthorizationCodeExchange {
     /// The shared tenant issuance workflow.
     pub issuer: TenantTokenIssuer,
-    /// External OIDC id-token verifier.
-    pub verifier: Arc<ExternalVerifier<PgIssuerResolver>>,
     /// The tenant human-connection owner; the only source of human trust, of
-    /// the completion keyring, and of the screened HTTP capability every
-    /// provider request is made through.
+    /// the completion keyring, and of the relying party every provider
+    /// request is made through.
     pub connections: HumanConnections,
 }
 
@@ -85,10 +66,11 @@ impl AuthorizationCodeExchange {
     /// revision must still be the tenant's Active connection with the recorded
     /// issuer and client; the provider's fresh discovery decides whether the
     /// response must carry `iss`, and [`verify_response_issuer`] binds it to
-    /// the recorded issuer before any token-endpoint request; the code is
-    /// exchanged with the recorded redirect URI
-    /// and PKCE verifier; and [`Self::finish_id_token_exchange`] verifies the
-    /// token and issues and seals the session. Returns how the login was
+    /// the recorded issuer before any token-endpoint request; the relying
+    /// party exchanges the code with the recorded redirect URI and PKCE
+    /// verifier and verifies the ID token, its nonce, and its authorized
+    /// party; and [`Self::finish_id_token_exchange`] issues and seals the
+    /// session. Returns how the login was
     /// initiated, which decides the callback's response: a browser login is
     /// redirected to the BFF completion route, a CLI login and a candidate
     /// connection test get a static page.
@@ -103,8 +85,10 @@ impl AuthorizationCodeExchange {
     /// Returns [`WyrdError::InvalidState`] when the state is unknown, expired,
     /// or replayed; [`WyrdError::Validation`] when no sealing keyring is
     /// configured; [`WyrdError::InvalidToken`] when the bound connection is no
-    /// longer Active (or, for a test, the bound candidate changed), the response issuer is mismatched or required and
-    /// missing, or the provider refuses the code;
+    /// longer Active (or, for a test, the bound candidate changed), the
+    /// response issuer is mismatched or required and missing, the provider
+    /// refuses the code, or the ID token fails verification;
+    /// [`WyrdError::InvalidNonce`] on a missing or mismatched nonce;
     /// [`WyrdError::DiscoveryUnavailable`] or
     /// [`WyrdError::AuthVerifyUnavailable`] when the provider or store is
     /// unavailable; and the errors of [`Self::finish_id_token_exchange`].
@@ -163,7 +147,7 @@ impl AuthorizationCodeExchange {
         conn.commit().await.map_err(store_error)?;
         let login_state = login_state
             .ok_or_else(|| invalid_state("login state is missing, expired, or already consumed"))?;
-        let http = self.connections.http();
+        let relying_party = self.connections.relying_party();
         let (trusted, provider) = if let LoginInitiation::ConnectionTest(_) = login_state.initiation
         {
             let issuer = IssuerUrl::new(login_state.issuer.as_str()).map_err(|error| {
@@ -172,10 +156,13 @@ impl AuthorizationCodeExchange {
                     details: serde_json::json!({}),
                 }
             })?;
-            let provider = discover_provider(&issuer, http).await?;
+            let provider = relying_party
+                .discover(&issuer)
+                .await
+                .map_err(relying_party_error)?;
             let trusted = self
                 .connections
-                .tested_candidate(tenant_id, &login_state, &provider.metadata.jwks_uri)
+                .tested_candidate(tenant_id, &login_state, provider.jwks_uri().url())
                 .await?
                 .ok_or_else(|| {
                     invalid_token("the login connection changed while the login was in progress")
@@ -183,47 +170,46 @@ impl AuthorizationCodeExchange {
             (trusted, provider)
         } else {
             let trusted = self.bound_connection(tenant_id, &login_state).await?;
-            let provider = discover_provider(&trusted.issuer, http).await?;
+            let provider = relying_party
+                .discover(&trusted.issuer)
+                .await
+                .map_err(relying_party_error)?;
             (trusted, provider)
         };
         verify_response_issuer(
             response_issuer,
             &login_state.issuer,
             provider
-                .metadata
+                .additional_metadata()
                 .authorization_response_iss_parameter_supported,
         )?;
-        let id_token = exchange_code_for_id_token(
-            &provider,
-            &trusted.client_id,
-            &trusted.client_auth,
-            &login_state.redirect_uri,
-            &login_state.code_verifier,
-            code,
-            http,
-        )
-        .await?;
+        let redemption = CodeRedemption {
+            client_id: &trusted.client_id,
+            client_auth: &trusted.client_auth,
+            audience: &trusted.expected_audience,
+            claim_mapping: &trusted.claim_mapping,
+            redirect_uri: &login_state.redirect_uri,
+            code_verifier: &login_state.code_verifier,
+            nonce: &login_state.nonce,
+        };
+        let verified = relying_party
+            .redeem(&trusted.issuer, provider, code, &redemption)
+            .await
+            .map_err(relying_party_error)?;
         self.finish_id_token_exchange(
             state_hash,
             &trusted,
             &login_state,
-            &provider.metadata.id_token_signing_alg_values_supported,
-            &id_token,
+            &verified.identity,
             request_id,
         )
         .await
     }
 
-    /// Finish a consumed login in `trusted.tenant_id` once the provider has
-    /// returned an ID token.
+    /// Finish a consumed login in `trusted.tenant_id` once the relying party
+    /// has verified the provider's ID token and mapped it to `identity`.
     ///
-    /// The token's header algorithm must be one the provider's fresh
-    /// discovery advertised in `supported_algorithms`; only then is it
-    /// verified against `trusted` by the shared external verifier, which
-    /// refuses symmetric algorithms even when the provider advertises them. The verified claims must carry
-    /// the nonce recorded in `login_state` and satisfy OIDC authorized-party
-    /// rules for the bound client ([`verify_authorized_party`]). The tenant's
-    /// Active connection is then re-read and must still be the exact revision,
+    /// The tenant's Active connection is re-read and must still be the exact revision,
     /// issuer, and client the login bound. One tenant transaction then
     /// resolves the user by (issuer, `sub`) only and takes the User's
     /// tenant-qualified refresh-family lock, held through commit and taken
@@ -238,7 +224,7 @@ impl AuthorizationCodeExchange {
     /// consumed state row with a fresh redemption expiry. The session never
     /// leaves this method except sealed. Returns how the login was initiated.
     ///
-    /// A connection test stops after the token checks: instead of the Active
+    /// A connection test stops here: instead of the Active
     /// connection re-check and any user or session work,
     /// [`HumanConnections::stamp_test_sign_in`] re-checks the tester's
     /// authority and marks only the bound candidate revision tested with
@@ -246,11 +232,8 @@ impl AuthorizationCodeExchange {
     /// purge; it never carries a completion.
     ///
     /// # Errors
-    /// Returns [`WyrdError::InvalidToken`] when the token's algorithm was not
-    /// advertised, the token fails verification or authorized-party checks,
-    /// or the bound connection is no longer Active,
-    /// [`WyrdError::InvalidNonce`] on a missing or mismatched nonce,
-    /// [`WyrdError::InvalidState`] when the state row is no longer consumed
+    /// Returns [`WyrdError::InvalidToken`] when the bound connection is no
+    /// longer Active, [`WyrdError::InvalidState`] when the state row is no longer consumed
     /// and awaiting completion, [`WyrdError::Validation`] when no sealing
     /// keyring is configured, the errors of
     /// [`HumanConnections::stamp_test_sign_in`] for a connection test, and the
@@ -262,20 +245,11 @@ impl AuthorizationCodeExchange {
         state_hash: &Sha256Hex,
         trusted: &TrustedIssuer,
         login_state: &LoginState,
-        supported_algorithms: &[String],
-        id_token: &str,
+        identity: &MappedClaims,
         request_id: &str,
     ) -> Result<LoginInitiation, WyrdError> {
         let tenant_id = trusted.tenant_id;
         let keyring = self.connections.require_keyring()?;
-        verify_id_token_algorithm(supported_algorithms, id_token)?;
-        let verified = self
-            .verifier
-            .verify_id_token_against(&trusted.verification(), id_token)
-            .await
-            .map_err(auth_error_to_wyrd)?;
-        verify_nonce(&login_state.nonce, &verified.raw_claims)?;
-        verify_authorized_party(&trusted.client_id, &verified.raw_claims)?;
         if let LoginInitiation::ConnectionTest(tester) = login_state.initiation {
             self.connections
                 .stamp_test_sign_in(
@@ -299,8 +273,8 @@ impl AuthorizationCodeExchange {
         let principal_id = ensure_user_identity(
             &mut conn,
             trusted,
-            &verified.subject,
-            verified.email.as_deref(),
+            &identity.subject,
+            identity.email.as_deref(),
         )
         .await
         .map_err(store_error)?;
@@ -310,7 +284,7 @@ impl AuthorizationCodeExchange {
         lock_refresh_family(&mut conn, "user", principal_id)
             .await
             .map_err(store_error)?;
-        let roles = role_names_to_refs(trusted, &verified.groups)?;
+        let roles = role_names_to_refs(trusted, &identity.groups)?;
         // The provider just asserted this human's authority, and nothing else
         // in Wyrd grants a user a role. Recording it here is what makes the
         // grant table the truth a later refresh rotation can re-read.
@@ -371,190 +345,6 @@ impl AuthorizationCodeExchange {
             )),
         }
     }
-}
-
-/// Why screened discovery produced no provider.
-///
-/// Keeps an issuer mismatch typed so candidate testing can report it as a
-/// failed check while login and the callback convert it into the public
-/// [`WyrdError::DiscoveryUnavailable`] through [`From`].
-#[derive(Debug)]
-pub(crate) enum DiscoveryFailure {
-    /// The discovery document names a different issuer than requested.
-    IssuerMismatch,
-    /// Any other failure, already mapped to its public error.
-    Unavailable(WyrdError),
-}
-
-impl From<DiscoveryFailure> for WyrdError {
-    /// Project a discovery failure onto the public catalog; a mismatch keeps
-    /// its stable `details.reason = "issuer_mismatch"`.
-    fn from(failure: DiscoveryFailure) -> Self {
-        match failure {
-            DiscoveryFailure::IssuerMismatch => WyrdError::DiscoveryUnavailable {
-                message: "the provider discovery document names a different issuer".to_owned(),
-                details: serde_json::json!({ "reason": "issuer_mismatch" }),
-            },
-            DiscoveryFailure::Unavailable(error) => error,
-        }
-    }
-}
-
-/// Discover an issuer using Wyrd's process-owned TLS implementation.
-///
-/// Shared by login, the callback, platform login, and candidate testing, so
-/// every provider discovery is screened and pinned to its issuer the same way.
-///
-/// # Errors
-///
-/// Returns [`DiscoveryFailure::IssuerMismatch`] when the discovery document
-/// names a different issuer, and [`DiscoveryFailure::Unavailable`] carrying
-/// [`WyrdError::DiscoveryUnavailable`] when the issuer URL is invalid, `http`
-/// refuses the address behind it, or discovery otherwise fails. Cancellation
-/// interrupts the request without persisting callback state.
-pub(crate) async fn discover_provider(
-    issuer: &IssuerUrl,
-    http: ScreenedHttp,
-) -> Result<OidcProvider, DiscoveryFailure> {
-    let issuer_url = Url::parse(issuer.as_str()).map_err(|error| {
-        DiscoveryFailure::Unavailable(provider_unreachable(format_args!(
-            "trusted issuer URL could not be parsed: {error}"
-        )))
-    })?;
-    let client = http
-        .client_for(&issuer_url)
-        .await
-        .map_err(|error| DiscoveryFailure::Unavailable(screen_error(&error)))?;
-    OidcProvider::discover(issuer_url, client)
-        .await
-        .map_err(|error| match error {
-            OidcError::IssuerMismatch { .. } => {
-                tracing::warn!(error = %error, "OIDC discovery failed");
-                DiscoveryFailure::IssuerMismatch
-            }
-            error => DiscoveryFailure::Unavailable(provider_unreachable(format_args!(
-                "OIDC discovery failed: {error}"
-            ))),
-        })
-}
-
-/// Exchange one validated authorization code for an issuer ID token.
-///
-/// The request includes the configured client authentication material and the
-/// callback's PKCE verifier; no token is persisted by this helper.
-///
-/// # Errors
-///
-/// Returns [`WyrdError::DiscoveryUnavailable`] when another Rustls provider
-/// already owns the process or discovery omitted the token endpoint. Returns
-/// the callback's structured authentication errors when request construction,
-/// transport, response parsing (including a body over
-/// [`wyrd_auth_oidc::MAX_RESPONSE_BYTES`]), or token validation fails. Cancellation can
-/// leave the remote exchange outcome unknown, but this helper makes no local
-/// durable progress.
-pub(crate) async fn exchange_code_for_id_token(
-    provider: &OidcProvider,
-    client_id: &str,
-    client_auth: &ClientAuth,
-    redirect_uri: &str,
-    code_verifier: &SecretString,
-    code: SecretString,
-    http: ScreenedHttp,
-) -> Result<String, WyrdError> {
-    let Some(token_endpoint) = provider.metadata.token_endpoint.clone() else {
-        return Err(WyrdError::DiscoveryUnavailable {
-            message: "OIDC discovery document did not advertise a token endpoint".to_owned(),
-            details: serde_json::json!({}),
-        });
-    };
-
-    let client = http
-        .client_for(&token_endpoint)
-        .await
-        .map_err(|error| screen_error(&error))?;
-    let request = authorization_code_request(
-        &client,
-        token_endpoint,
-        client_id,
-        client_auth,
-        redirect_uri,
-        code.expose_secret(),
-        code_verifier.expose_secret(),
-    )?;
-    let response = request.send().await.map_err(|error| {
-        tracing::warn!(error = %error, "OIDC token endpoint unavailable");
-        WyrdError::AuthVerifyUnavailable {
-            message: "OIDC token endpoint unavailable".to_owned(),
-            details: serde_json::json!({ "retry_after_seconds": 1 }),
-        }
-    })?;
-    if !response.status().is_success() {
-        return if response.status().is_server_error() {
-            Err(WyrdError::AuthVerifyUnavailable {
-                message: "OIDC token endpoint unavailable".to_owned(),
-                details: serde_json::json!({ "retry_after_seconds": 1 }),
-            })
-        } else {
-            Err(invalid_token("authorization code exchange was rejected"))
-        };
-    }
-
-    let decode_failed = |error: &dyn std::fmt::Display| {
-        tracing::warn!(error = %error, "OIDC token response decode failed");
-        WyrdError::AuthVerifyUnavailable {
-            message: "OIDC token response decode failed".to_owned(),
-            details: serde_json::json!({ "retry_after_seconds": 1 }),
-        }
-    };
-    let body = read_bounded_body(response)
-        .await
-        .map_err(|error| decode_failed(&error))?;
-    serde_json::from_slice::<TokenEndpointResponse>(&body)
-        .map(|body| body.id_token)
-        .map_err(|error| decode_failed(&error))
-}
-
-/// Build one authorization-code token request with the client's configured
-/// authentication.
-///
-/// Sends the same grant form, PKCE verifier, redirect URI, and
-/// `client_secret_basic` or `client_secret_post` placement for every login
-/// and candidate test sign-in. Nothing is sent here.
-///
-/// # Errors
-/// Returns [`WyrdError::Internal`] for `private_key_jwt`, which human
-/// connections cannot store and this request cannot sign.
-pub(crate) fn authorization_code_request(
-    client: &reqwest::Client,
-    token_endpoint: Url,
-    client_id: &str,
-    client_auth: &ClientAuth,
-    redirect_uri: &str,
-    code: &str,
-    code_verifier: &str,
-) -> Result<RequestBuilder, WyrdError> {
-    let mut request = client.post(token_endpoint);
-    let mut form = vec![
-        ("grant_type", "authorization_code"),
-        ("code", code),
-        ("client_id", client_id),
-        ("redirect_uri", redirect_uri),
-        ("code_verifier", code_verifier),
-    ];
-    match client_auth {
-        ClientAuth::SecretBasic(secret) => {
-            request = request.basic_auth(client_id, Some(secret.expose_secret()));
-        }
-        ClientAuth::SecretPost(secret) => form.push(("client_secret", secret.expose_secret())),
-        ClientAuth::PrivateKeyJwt => {
-            return Err(WyrdError::Internal {
-                message: "private_key_jwt client authentication is not implemented".to_owned(),
-                details: serde_json::json!({ "client_auth": "private_key_jwt" }),
-            });
-        }
-        ClientAuth::Public => {}
-    }
-    Ok(request.form(&form))
 }
 
 /// Resolve the local user for a trusted external identity or create it once.
@@ -640,21 +430,6 @@ pub fn verify_response_issuer(
     }
 }
 
-/// Require the verified ID token's `nonce` claim to equal the nonce the login
-/// state recorded.
-///
-/// # Errors
-/// Returns [`WyrdError::InvalidNonce`] when the claim is missing or differs.
-pub fn verify_nonce(expected: &str, claims: &Value) -> Result<(), WyrdError> {
-    let Some(nonce) = claims.get("nonce").and_then(Value::as_str) else {
-        return Err(invalid_nonce("id token nonce is missing"));
-    };
-    if nonce != expected {
-        return Err(invalid_nonce("id token nonce mismatch"));
-    }
-    Ok(())
-}
-
 /// The allowed `auth.user.roles.sync` event recording that a login's
 /// provider-asserted groups changed a User's durable roles.
 ///
@@ -670,63 +445,6 @@ fn roles_sync_event(request_id: &str, principal_id: Uuid) -> AuditEvent {
         None,
         AuditOutcome::Allowed,
     )
-}
-
-/// Require the ID token's header algorithm to be one the provider advertised
-/// for ID tokens in its fresh discovery document.
-///
-/// This checks advertised-set membership only; it does not itself refuse
-/// symmetric algorithms. Its sole caller,
-/// [`AuthorizationCodeExchange::finish_id_token_exchange`], immediately hands
-/// the token to [`ExternalVerifier::verify_id_token_against`], which owns
-/// symmetric-algorithm (`HS256`/`HS384`/`HS512`) rejection and the signature
-/// and JWKS verification. This check narrows a tenant login to the
-/// provider's own policy before that key lookup. Advertised names that do not
-/// parse as a known algorithm are ignored rather than rejected, so they can
-/// never admit a token.
-///
-/// # Errors
-/// Returns [`WyrdError::InvalidToken`] when the token header is malformed or
-/// does not decode, or when its algorithm is absent from the advertised set.
-/// An unparseable advertised value is not itself an error: it is skipped, so
-/// it can only contribute to the absent-from-advertised-set failure.
-pub fn verify_id_token_algorithm(supported: &[String], id_token: &str) -> Result<(), WyrdError> {
-    let header = jsonwebtoken::decode_header(id_token)
-        .map_err(|_| invalid_token("id token header is malformed"))?;
-    let advertised = supported
-        .iter()
-        .filter_map(|name| Algorithm::from_str(name).ok())
-        .any(|alg| alg == header.alg);
-    if advertised {
-        Ok(())
-    } else {
-        Err(invalid_token(
-            "id token algorithm is not advertised by the provider",
-        ))
-    }
-}
-
-/// Require OIDC authorized-party semantics for the connection's client.
-///
-/// A token for several audiences must name this client in a string `azp`;
-/// a present `azp` must equal this client for any audience. The generic
-/// verifier has already proven `client_id` is among the audiences.
-///
-/// # Errors
-/// Returns [`WyrdError::InvalidToken`] when `azp` is required and missing, or
-/// is present and not exactly `client_id`.
-pub fn verify_authorized_party(client_id: &str, claims: &Value) -> Result<(), WyrdError> {
-    let multiple_audiences = claims
-        .get("aud")
-        .and_then(Value::as_array)
-        .is_some_and(|audiences| audiences.len() > 1);
-    match claims.get("azp") {
-        None if !multiple_audiences => Ok(()),
-        Some(Value::String(azp)) if azp == client_id => Ok(()),
-        _ => Err(invalid_token(
-            "id token authorized party does not match the client",
-        )),
-    }
 }
 
 /// Map the verified groups of a human login to local Wyrd role refs.
@@ -755,13 +473,6 @@ pub fn role_names_to_refs(
         message: "trusted issuer role mapping is invalid".to_owned(),
         details: serde_json::json!({}),
     })
-}
-
-fn invalid_nonce(message: &str) -> WyrdError {
-    WyrdError::InvalidNonce {
-        message: message.to_owned(),
-        details: serde_json::json!({}),
-    }
 }
 
 fn invalid_state(message: &str) -> WyrdError {
@@ -806,119 +517,5 @@ mod response_issuer_tests {
             verify_response_issuer(None, ISSUER, true).expect_err("required iss is refused");
         assert_eq!(error.code(), "WYRD_AUTH_401_INVALID_TOKEN");
         verify_response_issuer(None, ISSUER, false).expect("unadvertised iss may be absent");
-    }
-}
-
-/// Outbound address screening on the federated callback's own HTTP calls.
-///
-/// A trusted issuer URL is screened when it is registered, but DNS can answer
-/// differently later; these cases drive the callback against a provider that
-/// really does resolve to a blocked range.
-#[cfg(test)]
-mod screening_tests {
-    use secrecy::SecretString;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-    use wyrd_auth_oidc::{AddressPolicy, ClientAuth, OidcProvider, ScreenedHttp};
-    use wyrd_spec::auth::IssuerUrl;
-    use wyrd_spec::error::WyrdError;
-
-    /// Stand up a provider that advertises itself on loopback.
-    ///
-    /// Loopback is exactly the address a rebinding answer aims at, so a
-    /// deployment that blocks internal ranges must refuse this provider at the
-    /// moment of every request — even though the URL was accepted when the
-    /// issuer was configured under a different answer.
-    async fn loopback_provider() -> (MockServer, IssuerUrl) {
-        let server = MockServer::start().await;
-        let issuer = server.uri();
-        Mock::given(method("GET"))
-            .and(path("/.well-known/openid-configuration"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "issuer": issuer,
-                "authorization_endpoint": format!("{issuer}/authorize"),
-                "token_endpoint": format!("{issuer}/token"),
-                "jwks_uri": format!("{issuer}/jwks"),
-                "id_token_signing_alg_values_supported": ["RS256"],
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id_token": "never.reached.here"
-            })))
-            .mount(&server)
-            .await;
-        let url = IssuerUrl::new(issuer).expect("mock issuer is a valid URL");
-        (server, url)
-    }
-
-    /// Beginning a login screens the issuer again and makes no request.
-    #[tokio::test]
-    async fn begin_login_refuses_an_internal_issuer_without_reaching_it() {
-        let (server, issuer) = loopback_provider().await;
-
-        let error =
-            super::discover_provider(&issuer, ScreenedHttp::new(AddressPolicy::BlockInternal))
-                .await
-                .expect_err("an internal issuer is refused");
-
-        assert!(matches!(
-            WyrdError::from(error),
-            WyrdError::DiscoveryUnavailable { .. }
-        ));
-        assert!(
-            server
-                .received_requests()
-                .await
-                .is_some_and(|r| r.is_empty()),
-            "the refusal must happen before any request leaves the process"
-        );
-    }
-
-    /// The token exchange screens the endpoint discovery handed it, not the
-    /// address that was acceptable when discovery ran.
-    #[tokio::test]
-    async fn the_token_exchange_refuses_an_internal_endpoint_without_reaching_it() {
-        let (server, issuer) = loopback_provider().await;
-
-        let provider = OidcProvider::discover(
-            url::Url::parse(issuer.as_str()).expect("issuer parses"),
-            ScreenedHttp::allowing_internal()
-                .client_for(&url::Url::parse(issuer.as_str()).expect("issuer parses"))
-                .await
-                .expect("a permissive deployment reaches its loopback provider"),
-        )
-        .await
-        .expect("discovery succeeds under the permissive policy");
-        let discovery_requests = server
-            .received_requests()
-            .await
-            .expect("the mock records requests")
-            .len();
-
-        let error = super::exchange_code_for_id_token(
-            &provider,
-            "wyrd",
-            &ClientAuth::Public,
-            "https://tenant.example/auth/callback",
-            &SecretString::from("verifier"),
-            SecretString::from("code"),
-            ScreenedHttp::new(AddressPolicy::BlockInternal),
-        )
-        .await
-        .expect_err("an internal token endpoint is refused");
-
-        assert!(matches!(error, WyrdError::DiscoveryUnavailable { .. }));
-        assert_eq!(
-            server
-                .received_requests()
-                .await
-                .expect("the mock records requests")
-                .len(),
-            discovery_requests,
-            "no token request may leave the process after the screen refuses"
-        );
     }
 }

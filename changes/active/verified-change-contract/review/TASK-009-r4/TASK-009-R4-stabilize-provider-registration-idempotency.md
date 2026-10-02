@@ -10,6 +10,8 @@ parent_task: TASK-009
 remediates: [FIND-TASK-009-8]
 ---
 
+Superseded by TASK-009-R4E-token-free-run-correlation.md (human-approved design revision, spec rev 46)
+
 # Stabilize provider registration idempotency
 
 ## Authority and immutable inputs

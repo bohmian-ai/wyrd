@@ -3855,13 +3855,14 @@ async fn begin_mock_login(srv: &WyrdTestServer, slug: &str) -> (Sha256Hex, Strin
 ///      only, whatever `Host` the callback carried: A cannot redeem it;
 ///   5. against a mock provider: a nonce, issuer, audience, signature, or
 ///      algorithm mismatch, a validly signed token without `iat`, a
-///      multi-audience token without `azp`, an `azp`
+///      multi-audience token without `azp`, an untrusted additional audience
+///      even when `azp` names the client, an `azp`
 ///      naming another client, a validly signed token whose algorithm
 ///      discovery did not advertise, an `HS256` token even when discovery
 ///      advertises `HS256` beside an asymmetric algorithm, and a provider
 ///      outage are refused, leaving no completion, User, identity, role
 ///      grant, or refresh row, while a valid
-///      multi-audience token whose `azp` names the client completes;
+///      single-audience token whose `azp` names the client completes;
 ///   6. an injected audit-staging failure issues nothing: no completion and
 ///      no refresh row.
 ///
@@ -4136,6 +4137,17 @@ async fn tenant_callback_refusal_journey() {
             "WYRD_AUTH_401_INVALID_TOKEN",
         ),
         (
+            "untrusted additional audience with azp naming the client",
+            Box::new(|nonce| {
+                let mut wrong = claims(nonce);
+                wrong["aud"] = serde_json::json!([MOCK_CLIENT_ID, "another-client"]);
+                wrong["azp"] = Value::from(MOCK_CLIENT_ID);
+                id_token_reply(&sign_id_token(&eddsa, &wrong, MOCK_SIGNING_KEY))
+            }),
+            StatusCode::UNAUTHORIZED,
+            "WYRD_AUTH_401_INVALID_TOKEN",
+        ),
+        (
             "azp naming another client",
             Box::new(|nonce| {
                 let mut wrong = claims(nonce);
@@ -4235,7 +4247,6 @@ async fn tenant_callback_refusal_journey() {
     mount_mock_provider(&mock, id_token_reply("unused")).await;
     let (flow, state, nonce) = begin_mock_login(&srv, "test-tenant-3").await;
     let mut with_azp = claims(&nonce);
-    with_azp["aud"] = serde_json::json!([MOCK_CLIENT_ID, "another-client"]);
     with_azp["azp"] = Value::from(MOCK_CLIENT_ID);
     mount_mock_provider(
         &mock,

@@ -162,3 +162,71 @@ Use Red-Green-Refactor and record exact zero-selection-safe commands.
   evidence and state why it remains applicable.
 
 Route this task directly to `$wyrd-implement`.
+
+## Remediation Evidence
+
+Commits: `769024a02` (FIND-11/12/13), `7327f2030` (nextest group, lead-approved),
+and this commit (refusal journey corrected for FIND-11, evidence). Base `35a53faa2`.
+`FIND-TASK-009-14` is withdrawn by `lead-direction-FIND-TASK-009-14.md`: migration
+`20261002000001` is unchanged, with no preflight, overlap column or dual-write.
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-009-11` | `set_other_audience_verifier_fn(|_| true)` deleted from `relying_party::id_token_verifier`; `verify_authorized_party` still checks a present `azp` | RED: `id_token_refusals_fail_closed` with the new "untrusted additional audience" case accepted `aud=[client, other], azp=client`. GREEN after deletion. `tenant_callback_refusal_journey` refuses the same token served, and a single-audience `azp=client` token completes | PASS |
+| `FIND-TASK-009-12` | `wyrd-auth-verify` `ExternalClaims`/`VerifiedExternalIdentity`/`ExternalVerifier`/`verify_external_against`, `ServerAuth::{external_verifier,trusted_issuer_resolver}` and `AuthHandles`/`build_auth_handles` rustdoc now describe workload `jwt-bearer` only, with the commit-history prose removed. The callback fixture is renamed `test_state_with_human_connections` and no longer builds `PgIssuerResolver`/`JwksCache`/`ExternalVerifier` (imports removed). The production `jwt-bearer` wiring is unchanged | `auth::callback` target: 18/18 pass; `test:wyrd` 0 (includes `jwt_bearer`) | PASS |
+| `FIND-TASK-009-13` | `PUT /platform/oidc/connection` discovers through `PlatformLogin::relying_party().discover` (full `openidconnect` discovery, replaces the process cache entry before the row commits); errors map through the shared `admin::routes::discovery_error`; workload admin/boot stay on `ScreenedHttp::provider_metadata` | RED (route reverted): "unavailable key set" configure returned 200. GREEN: `federated_platform_sign_in_runs_through_the_served_callback` refuses an unavailable and an undecodable key set with the stored `client_id` unchanged; a same-issuer reconfiguration makes a newly published `mock-2` key verify at callback with 0 discovery requests during an outage. Workload zero-JWKS tests pass | PASS |
+
+Diagnoses:
+
+- `platform_admin_e2e` (full binary, default profile): `recovery_is_refused_for_every_state_but_active`
+  failed at server start with "sorry, too many clients already". Cause: under the
+  default nextest profile, up to 32 per-test WyrdTestServers boot concurrently
+  against Postgres `max_connections=400`, and the binary was outside the existing
+  `postgres-fixtures` ceiling that `pg_router_smoke` uses for the same reason. Fix
+  site: `.config/nextest.toml`, one override (lead-approved, `7327f2030`).
+- `test:identity:journey` exit 100: `tenant_callback_refusal_journey` asserted that
+  `aud=[client, another-client], azp=client` completes, which is the nonstandard
+  acceptance FIND-11 removes. The callback returned 401 "`another-client` is not a
+  trusted audience" (WYRD_LOG trace). Fix site: the journey. That token is now a
+  refusal case, and the success case is a single-audience token with `azp=client`.
+
+Exact named tests (candidate code `769024a02` plus the journey fix; Postgres
+wrapper where needed). All exited 0:
+
+```
+mise exec -- cargo nextest run --locked -p wyrd-auth-oidc --lib -E 'test(=relying_party::tests::id_token_refusals_fail_closed)' => exit=0, 1 test run: 1 passed, 46 skipped
+mise exec -- cargo nextest run --locked -p wyrd-auth-oidc --lib -E 'test(=relying_party::tests::a_valid_id_token_maps_its_identity)' => exit=0, 1 test run: 1 passed, 46 skipped
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(/^auth::callback::/)' => exit=0, 18 tests run: 18 passed, 479 skipped
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=boot::issuer::pg_tests::issuer_boot_discovery_happy_path_fills_jwks_uri)' => exit=0, 1 test run: 1 passed, 496 skipped
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=boot::issuer::pg_tests::issuer_boot_discovery_recovers_after_transient_blip)' => exit=0, 1 test run: 1 passed, 496 skipped
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=components::admin::routes::pg_tests::create_persists_sealed_secret_and_get_redacts)' => exit=0, 1 test run: 1 passed, 496 skipped
+mise exec -- cargo nextest run --locked -p wyrd-server --test platform_admin_e2e -E 'test(=federated_platform_sign_in_runs_through_the_served_callback)' => exit=0, 1 test run: 1 passed, 38 skipped
+mise exec -- cargo nextest run --locked -p wyrd-server --test platform_admin_e2e -E 'test(=an_operator_configures_and_removes_federated_platform_sign_in)' => exit=0, 1 test run: 1 passed, 38 skipped
+mise exec -- cargo nextest run --locked -p wyrd-server --test platform_admin_e2e -E 'test(=a_connection_cannot_name_an_unresolvable_issuer)' => exit=0, 1 test run: 1 passed, 38 skipped
+mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=tenant_callback_refusal_journey mise run test:identity:journey => exit=0, 1 test run: 1 passed, 30 skipped
+```
+
+Lanes (one at a time, `CARGO_TARGET_DIR` set):
+
+| Lane | Exit |
+|---|---|
+| `mise run fmt` | 0 (rerun after journey fix: 0) |
+| `mise run lints` | 0 (rerun after journey fix: 0) |
+| `mise run codegen:check` | 0 |
+| `mise run docs:check` | 0 |
+| `mise run check:client-tier` | 0 |
+| `mise run check:pyo3-scope` | 0 |
+| `mise run check:unwrap-audit` | 0 |
+| `mise run check:workspace-hack` | 0 |
+| `mise run test:shared` | 0 |
+| `mise run test:principals:integration` | 0 |
+| `mise run test:identity:journey` | 100, then 0 after the journey fix (unfiltered) |
+| `mise run test:wyrd` | 0 (2344 passed) |
+
+The language lanes were not rerun. r2 changes no Python, TypeScript or SDK
+source, and no generated contract (`codegen:check` 0 with no diff). The r1
+language-lane evidence on `0b516e235` therefore still applies.
+
+Non-goals: no audience allowlist, setting, second verifier, key-health probe,
+empty-key policy, second cache, invalidation service, retry, provider branch, or
+`FIND-TASK-009-5`/`-14` change.

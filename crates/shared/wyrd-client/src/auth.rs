@@ -378,9 +378,9 @@ fn oauth_error(error: OAuthErrorResponse) -> WyrdError {
         OAuthErrorCode::UnsupportedGrantType => {
             WyrdError::UnsupportedGrantType { message, details }
         }
-        OAuthErrorCode::InvalidRequest | OAuthErrorCode::UnsupportedResponseType => {
-            WyrdError::Validation { message, details }
-        }
+        OAuthErrorCode::InvalidRequest
+        | OAuthErrorCode::UnsupportedResponseType
+        | OAuthErrorCode::InvalidTarget => WyrdError::Validation { message, details },
         OAuthErrorCode::TemporarilyUnavailable => {
             WyrdError::AuthVerifyUnavailable { message, details }
         }

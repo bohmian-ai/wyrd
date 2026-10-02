@@ -15,21 +15,30 @@ use axum::response::{IntoResponse, Json, Response};
 use base64::Engine;
 use serde::de::DeserializeOwned;
 use url::form_urlencoded;
-use wyrd_spec::auth::{OAuthClientId, OAuthErrorCode, OAuthErrorResponse, Sha256Hex};
+use wyrd_spec::auth::{
+    OAuthClientId, OAuthErrorCode, OAuthErrorResponse, Sha256Hex, TokenAudience, TokenRequest,
+};
 use wyrd_spec::error::WyrdError;
+
+/// The RFC 8693 token-exchange `grant_type`.
+pub const TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 
 /// Every `grant_type` `POST /auth/token` accepts.
 pub const GRANT_TYPES: [&str; 5] = [
     "authorization_code",
     "refresh_token",
     "urn:ietf:params:oauth:grant-type:device_code",
-    "urn:ietf:params:oauth:grant-type:token-exchange",
+    TOKEN_EXCHANGE,
     "urn:ietf:params:oauth:grant-type:jwt-bearer",
 ];
 
 /// The RFC 6749 §5.2 refusal of one OAuth endpoint request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OAuthError(pub OAuthErrorCode);
+pub struct OAuthError(
+    /// The registered OAuth error code the response body carries; it also
+    /// selects the HTTP status ([`Self::status`]).
+    pub OAuthErrorCode,
+);
 
 impl OAuthError {
     /// The HTTP status RFC 6749 §5.2 gives `self`: `401` for
@@ -181,12 +190,38 @@ impl OAuthForm {
         serde_json::from_value(serde_json::Value::Object(self.params.clone()))
             .map_err(|_| OAuthError(OAuthErrorCode::InvalidRequest))
     }
+
+    /// Decode the parameters as a token-endpoint [`TokenRequest`].
+    ///
+    /// A token exchange whose `audience` is not a [`TokenAudience`] names a
+    /// target this server does not issue for, so it is classified before the
+    /// generic decode turns it into a malformed request.
+    ///
+    /// # Errors
+    /// Returns RFC 8693 §2.2.2 `invalid_target` for a token exchange naming
+    /// an unsupported `audience`, and the errors of [`Self::decode`].
+    pub fn token_request(&self) -> Result<TokenRequest, OAuthError> {
+        let exchange = self.get("grant_type") == Some(TOKEN_EXCHANGE);
+        let unsupported_audience = self.params.get("audience").is_some_and(|audience| {
+            serde_json::from_value::<TokenAudience>(audience.clone()).is_err()
+        });
+        if exchange && unsupported_audience {
+            return Err(OAuthError(OAuthErrorCode::InvalidTarget));
+        }
+        self.decode()
+    }
 }
 
 impl<S: Send + Sync> FromRequest<S> for OAuthForm {
+    /// A refused body answers the RFC 6749 §5.2 `invalid_request`.
     type Rejection = OAuthError;
 
-    /// Read the body of an `application/x-www-form-urlencoded` request.
+    /// Read the body of an `application/x-www-form-urlencoded` request and
+    /// parse it with [`OAuthForm::parse`].
+    ///
+    /// # Errors
+    /// Returns `invalid_request` when the `Content-Type` is missing or names
+    /// another media type, the body cannot be read, or a parameter repeats.
     async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
         let form = request
             .headers()
@@ -255,7 +290,10 @@ impl OAuthClients {
         let (client_id, secret) = authorization
             .to_str()
             .ok()
-            .and_then(|value| value.strip_prefix("Basic "))
+            .and_then(|value| value.split_once(' '))
+            .and_then(|(scheme, credentials)| {
+                scheme.eq_ignore_ascii_case("basic").then_some(credentials)
+            })
             .and_then(|encoded| {
                 base64::engine::general_purpose::STANDARD
                     .decode(encoded.trim())
@@ -311,20 +349,62 @@ fn form_decoded(component: &str) -> String {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
     use base64::Engine;
-    use wyrd_spec::auth::{OAuthClientId, OAuthErrorCode, Sha256Hex};
+    use wyrd_spec::auth::{OAuthClientId, OAuthErrorCode, Sha256Hex, TokenAudience, TokenRequest};
     use wyrd_spec::error::WyrdError;
 
     use super::{OAuthClients, OAuthError, OAuthForm};
 
     /// Headers carrying `Authorization: Basic` for `id` and `secret`.
     fn basic(id: &str, secret: &str) -> HeaderMap {
+        basic_with_scheme("Basic", id, secret)
+    }
+
+    /// Headers carrying `Authorization: <scheme>` with the Base64 of
+    /// `id:secret`.
+    ///
+    /// # Panics
+    /// Panics when the header value is not valid.
+    fn basic_with_scheme(scheme: &str, id: &str, secret: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{id}:{secret}"));
         headers.insert(
             header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("Basic {encoded}")).expect("header value"),
+            HeaderValue::from_str(&format!("{scheme} {encoded}")).expect("header value"),
         );
         headers
+    }
+
+    /// The `Basic` scheme token matches in any case (RFC 9110 §11.1); another
+    /// scheme, a missing separator, or a wrong secret stays `invalid_client`.
+    ///
+    /// # Panics
+    /// Panics when a header authenticates differently.
+    #[test]
+    fn basic_scheme_matches_case_insensitively() {
+        let clients = OAuthClients::new(vec![Sha256Hex::digest(b"s3cret")]);
+        let empty = OAuthForm::parse(b"").expect("form parses");
+        for scheme in ["Basic", "basic", "BASIC", "bAsIc"] {
+            assert_eq!(
+                clients.identify(&basic_with_scheme(scheme, "wyrd-ui", "s3cret"), &empty),
+                Ok(Some(OAuthClientId::WyrdUi)),
+                "{scheme}"
+            );
+        }
+        let invalid = Err(OAuthError(OAuthErrorCode::InvalidClient));
+        assert_eq!(
+            clients.identify(&basic_with_scheme("basic", "wyrd-ui", "wrong"), &empty),
+            invalid
+        );
+        assert_eq!(
+            clients.identify(&basic_with_scheme("Bearer", "wyrd-ui", "s3cret"), &empty),
+            invalid
+        );
+        let mut joined = HeaderMap::new();
+        joined.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Basicd3lyZC11aTpzM2NyZXQ="),
+        );
+        assert_eq!(clients.identify(&joined, &empty), invalid);
     }
 
     /// A repeated parameter is refused, an empty one is omitted.
@@ -340,6 +420,48 @@ mod tests {
         let form = OAuthForm::parse(b"grant_type=refresh_token&scope=").expect("form parses");
         assert_eq!(form.get("grant_type"), Some("refresh_token"));
         assert_eq!(form.get("scope"), None);
+    }
+
+    /// A token exchange naming an unsupported `audience` is `invalid_target`
+    /// (RFC 8693 §2.2.2); a malformed exchange stays `invalid_request`, and
+    /// both supported audiences decode unchanged.
+    ///
+    /// # Panics
+    /// Panics when a request is classified differently.
+    #[test]
+    fn token_exchange_audience_is_classified_before_decoding() {
+        let exchange = "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange\
+            &subject_token=s&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token\
+            &actor_token=a&actor_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token";
+        let with = |audience: &str| {
+            OAuthForm::parse(format!("{exchange}&audience={audience}").as_bytes())
+                .expect("form parses")
+                .token_request()
+        };
+        assert_eq!(
+            with("https%3A%2F%2Fother.example.com"),
+            Err(OAuthError(OAuthErrorCode::InvalidTarget))
+        );
+        for audience in [TokenAudience::Wyrd, TokenAudience::Bifrost] {
+            assert!(matches!(
+                with(audience.as_str()),
+                Ok(TokenRequest::TokenExchange { audience: Some(decoded), .. }) if decoded == audience
+            ));
+        }
+        let malformed = OAuthForm::parse(
+            b"grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&audience=wyrd",
+        )
+        .expect("form parses");
+        assert_eq!(
+            malformed.token_request(),
+            Err(OAuthError(OAuthErrorCode::InvalidRequest))
+        );
+        let refresh = OAuthForm::parse(b"grant_type=refresh_token&refresh_token=r&audience=x")
+            .expect("form parses");
+        assert!(matches!(
+            refresh.token_request(),
+            Ok(TokenRequest::RefreshToken { .. })
+        ));
     }
 
     /// `wyrd-ui` authenticates only with an accepted, form-urlencoded Basic

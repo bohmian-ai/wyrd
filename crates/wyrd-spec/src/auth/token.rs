@@ -176,7 +176,8 @@ impl OAuthClientId {
     }
 }
 
-/// An OAuth error code: RFC 6749 §4.1.2.1 and §5.2, and RFC 8628 §3.5.
+/// An OAuth error code: RFC 6749 §4.1.2.1 and §5.2, RFC 8628 §3.5, and
+/// RFC 8693 §2.2.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
@@ -194,6 +195,9 @@ pub enum OAuthErrorCode {
     UnsupportedGrantType,
     /// The response type is not supported.
     UnsupportedResponseType,
+    /// RFC 8693 §2.2.2: the server cannot issue a token for the requested
+    /// `audience`.
+    InvalidTarget,
     /// The resource owner or the server denied the request.
     AccessDenied,
     /// The device authorization is still pending.
@@ -255,6 +259,10 @@ mod tests {
     use crate::auth::SecretBearer;
 
     /// Decode form-shaped parameters, as the token endpoint does.
+    ///
+    /// # Errors
+    /// Returns the decode error when the parameters name no supported grant
+    /// or omit one of its required parameters.
     fn parse(pairs: &[(&str, &str)]) -> Result<TokenRequest, serde_json::Error> {
         let map = pairs
             .iter()
@@ -348,6 +356,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&error).expect("serializes"),
             serde_json::json!({ "error": "authorization_pending" })
+        );
+        assert_eq!(
+            serde_json::to_value(OAuthErrorCode::InvalidTarget).expect("serializes"),
+            "invalid_target"
         );
         assert_eq!(
             OAuthClientId::parse("wyrd-cli"),

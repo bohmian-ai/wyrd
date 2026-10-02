@@ -30,7 +30,7 @@ use wyrd_spec::auth::{SecretBearer, TokenRequest, TokenResponse, TokenType};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
 
-use crate::auth::oauth::{OAuthError, OAuthForm, no_store};
+use crate::auth::oauth::{OAuthError, OAuthForm, TOKEN_EXCHANGE, no_store};
 use crate::components::auth::PlatformCaller;
 use crate::components::platform::provisioning::{ProvisionError, TenantProvisioning};
 use crate::components::platform::recovery::TenantRecovery;
@@ -71,7 +71,8 @@ pub fn platform_auth_router() -> OpenApiRouter<AppState> {
 /// # Errors
 /// Answers the RFC 6749 §5.2 body: `invalid_request` for a malformed
 /// request and, per RFC 8693 §2.2.2, for every credential rejection,
-/// indistinguishably; `unsupported_grant_type` for another grant; and
+/// indistinguishably; `invalid_target` for an unsupported `audience`;
+/// `unsupported_grant_type` for another grant; and
 /// `server_error` when the platform store or its audit fails.
 #[utoipa::path(
     post,
@@ -80,7 +81,7 @@ pub fn platform_auth_router() -> OpenApiRouter<AppState> {
     responses(
         (status = 200, description = "Short-lived platform session", body = TokenResponse),
         (status = 400, description = "`invalid_request`, including every credential \
-          rejection, or `unsupported_grant_type`", body = OAuthErrorResponse),
+          rejection, `invalid_target`, or `unsupported_grant_type`", body = OAuthErrorResponse),
         (status = 500, description = "`server_error`: a platform store read or write \
           failed, or the platform decision could not be audited", body = OAuthErrorResponse)
     ),
@@ -96,7 +97,7 @@ async fn platform_token(
     form: OAuthForm,
 ) -> Result<Response, OAuthError> {
     match form.get("grant_type") {
-        Some("urn:ietf:params:oauth:grant-type:token-exchange") => {}
+        Some(TOKEN_EXCHANGE) => {}
         Some(_) => return Err(OAuthError(OAuthErrorCode::UnsupportedGrantType)),
         None => return Err(OAuthError(OAuthErrorCode::InvalidRequest)),
     }
@@ -106,7 +107,7 @@ async fn platform_token(
         actor_token: None,
         actor_token_type: None,
         audience: None,
-    } = form.decode()?
+    } = form.token_request()?
     else {
         return Err(OAuthError(OAuthErrorCode::InvalidRequest));
     };

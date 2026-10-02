@@ -220,6 +220,7 @@ pub(crate) fn error_name(code: OAuthErrorCode) -> &'static str {
         OAuthErrorCode::UnauthorizedClient => "unauthorized_client",
         OAuthErrorCode::UnsupportedGrantType => "unsupported_grant_type",
         OAuthErrorCode::UnsupportedResponseType => "unsupported_response_type",
+        OAuthErrorCode::InvalidTarget => "invalid_target",
         OAuthErrorCode::AccessDenied => "access_denied",
         OAuthErrorCode::AuthorizationPending => "authorization_pending",
         OAuthErrorCode::SlowDown => "slow_down",

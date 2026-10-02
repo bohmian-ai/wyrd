@@ -97,6 +97,7 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
 /// # Errors
 /// Answers the RFC 6749 §5.2 body: `invalid_request` for a malformed
 /// request — and, per RFC 8693 §2.2.2, an unusable subject or actor token —
+/// `invalid_target` for a token exchange naming an unsupported `audience`,
 /// `invalid_client` (`401`) for a missing or refused client,
 /// `unauthorized_client` for a grant another client must use,
 /// `unsupported_grant_type`, `invalid_grant` for every unusable code,
@@ -112,7 +113,7 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
         (status = 200, description = "Access token issued", body = TokenResponse),
         (status = 400, description = "RFC 6749 §5.2 or RFC 8628 §3.5 refusal: \
           `invalid_request`, `invalid_grant`, `unauthorized_client`, \
-          `unsupported_grant_type`, `authorization_pending`, `slow_down`, `access_denied`, \
+          `unsupported_grant_type`, `invalid_target`, `authorization_pending`, `slow_down`, `access_denied`, \
           or `expired_token`", body = OAuthErrorResponse),
         (status = 401, description = "`invalid_client`", body = OAuthErrorResponse),
         (status = 500, description = "`server_error`", body = OAuthErrorResponse),
@@ -144,7 +145,7 @@ async fn token(
         request_id: request_id.as_str(),
     };
     let required = client.ok_or(OAuthError(OAuthErrorCode::InvalidClient));
-    let response = match form.decode()? {
+    let response = match form.token_request()? {
         TokenRequest::AuthorizationCode {
             code,
             redirect_uri,

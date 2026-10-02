@@ -230,3 +230,11 @@ language-lane evidence on `0b516e235` therefore still applies.
 Non-goals: no audience allowlist, setting, second verifier, key-health probe,
 empty-key policy, second cache, invalidation service, retry, provider branch, or
 `FIND-TASK-009-5`/`-14` change.
+
+Verification scope: this follows the lead-relayed human rule "run only the
+narrowest verification per task; full user-journey suites and broad aggregates
+run once, at the final change review". Every lane in the table above had
+already run before that rule arrived and is kept. `test:wyrd` ran because the
+r2 diff touches `wyrd-server`. The Python, TypeScript, SDK and CLI lanes
+(`py:*`, `ts:*`, `test:wyrd-sdk`, `test:cli:journey`) were not run for r2, and
+are left to the final change review under that rule.

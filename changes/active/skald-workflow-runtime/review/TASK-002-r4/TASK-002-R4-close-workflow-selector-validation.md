@@ -176,3 +176,24 @@ Do not add a new gate or rerun an unrelated whole-repository release aggregate.
 Route directly to `$wyrd-implement`. The next `$wyrd-task-review` must inspect
 the complete original-base-to-new-candidate range, including this remediation
 and every prior finding closure; it must not review only the latest fix diff.
+
+## Implementation evidence
+
+Owner and gap: `VersionBlock` (`crates/shared/wyrd-semver/src/block.rs`) owned
+the exact-version invariant in `parse` but derived `Deserialize`. It now uses a
+manual `Deserialize` that reads a `String` and calls `parse`, which is the same
+pattern as the `wyrd-spec` id newtypes. The TypeScript native selector
+(`sdks/wyrd-sdk-ts/native/src/workflow.rs`) now reads raw strings and builds the
+selector with `CardUid::new`, `SpaceName::new`, `CardName::new`, and
+`VersionBlock::parse`, in the same way as the Python `WorkflowCards.load`. The
+schema output is unchanged, as `codegen:check` confirms.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| 1. `VersionBlock` Serde preserves the parse invariant | `block.rs` `impl Deserialize for VersionBlock` | `block::tests::serde_preserves_the_exact_version_invariant`; `test:shared` | PASS |
+| 2. Rust/TS cannot send a ranged `VersionBlock`; Registry-error row replaced | `pg_workflow_registration.rs` asserts a ranged `CardRef` does not decode; server query parsing unchanged | `fetches_and_executes_locked_workflow_graph`; `rust_journey` | PASS |
+| 3. TS names `uid`/`space`/`name`/`version`; combinations report `selector` | `workflow.rs` `parse_workflow_selector`; `workflow-loading.test.ts` step 7 (outsider client, so a registry read would return 403) | TS journey; `ts:test:integration`; `ts:test:unit` | PASS |
+| 4. Python/Rust behavior and the three journeys are unchanged | No change to Python or `WorkflowCards::load` | Python, Rust, and TS journeys; `test:wyrd-sdk` | PASS |
+| 5. No new mechanism, check, setting, or compatibility path | Only change outside the edited files: the TS native crate now depends on workspace crate `wyrd-semver`, which the Python SDK already uses | `check:client-tier`, `check:sdk-client-tier`, `codegen:check`, `ts:napi:check`, `ts:typecheck`, `fmt`, `lints` | PASS |
+
+Commands (all with `CARGO_TARGET_DIR=/home/thorrester/Documents/GitHub/wyrd/target`) exited 0: the five focused commands in this task, `mise run test:shared`, `test:wyrd-sdk`, `ts:test:unit`, `ts:test:integration`, `ts:typecheck`, `ts:napi:check`, `codegen:check`, `check:client-tier`, `check:sdk-client-tier`, `fmt`, `lints`, and `git diff --check 0569b79702218600c4f9790f45cc03100d5c6f1c <candidate>`. The first `codegen:check` run failed because the new struct rustdoc changed the generated schema description. I moved that prose onto the `Deserialize` impl, and the rerun passed. All non-goals stay excluded.

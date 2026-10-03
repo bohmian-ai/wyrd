@@ -38,6 +38,7 @@ use std::sync::Arc;
 use clap::Parser;
 use secrecy::ExposeSecret as _;
 use wyrd_testing::bifrost::peer_ca::BifrostPeerCa;
+use wyrd_testing::capacity::{install_tracing, release_binary};
 use wyrd_testing::release_server::{CPUS, LocalServer, MEMORY_BYTES};
 
 use collector::Collector;
@@ -361,34 +362,6 @@ fn identity(binary: &Path, profiled: bool) -> Result<serde_json::Value> {
         "modified": modified,
         "profiling_build": profiled,
     }))
-}
-
-/// The release `wyrd-server` built beside this binary.
-///
-/// # Errors
-///
-/// Returns an error when it has not been built.
-fn release_binary() -> Result<PathBuf> {
-    let binary = std::env::current_exe()?.with_file_name("wyrd-server");
-    if binary.is_file() {
-        Ok(binary)
-    } else {
-        Err(format!("{} is not built; run through mise", binary.display()).into())
-    }
-}
-
-/// Installs a stderr log subscriber when `WYRD_LOG`, else `RUST_LOG`, is set,
-/// so client-side failures read alongside the server logs.
-fn install_tracing() {
-    let Ok(filter) = std::env::var("WYRD_LOG").or_else(|_| std::env::var("RUST_LOG")) else {
-        return;
-    };
-    let _ = tracing::subscriber::set_global_default(
-        tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-            .with_writer(std::io::stderr)
-            .finish(),
-    );
 }
 
 /// Runs the benchmark and exits nonzero on any failed check or error.

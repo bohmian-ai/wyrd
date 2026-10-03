@@ -19,6 +19,7 @@ use std::time::Duration;
 use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
+use wyrd_testing::capacity::{ResourceWindow, Resources, driver_cpu_seconds};
 use wyrd_testing::release_server::LocalServer;
 
 use crate::Result;
@@ -151,19 +152,6 @@ impl From<&Tally> for TallyRecord {
     }
 }
 
-/// One replica's resource use over the arrival window.
-#[derive(Debug, Clone, Serialize)]
-pub struct Resources {
-    /// Replica ordinal.
-    pub replica: u16,
-    /// Cgroup CPU seconds consumed.
-    pub cpu_seconds: f64,
-    /// Mean cores: CPU seconds over window seconds.
-    pub cores: f64,
-    /// Peak cgroup memory, bytes.
-    pub peak_memory: u64,
-}
-
 /// Everything one step produced.
 #[derive(Debug, Clone, Serialize)]
 pub struct Record {
@@ -203,15 +191,7 @@ impl Deployment {
         for replica in &self.replicas {
             before.push(replica.metrics().await?);
         }
-        let cpu_before: Vec<u64> = self
-            .replicas
-            .iter()
-            .map(|replica| replica.cgroup_stat("cpu.stat", "usage_usec"))
-            .collect();
-        let mut peaks = Vec::new();
-        for replica in &self.replicas {
-            peaks.push(replica.memory_peak()?);
-        }
+        let mut resources = ResourceWindow::open(&self.replicas)?;
         let driver_before = driver_cpu_seconds();
         let judge_before = self.judge.calls();
         let captures = self.start_captures(&plan)?;
@@ -236,11 +216,7 @@ impl Deployment {
             .as_secs_f64()
             .min(plan.seconds)
             .max(f64::EPSILON);
-        let cpu_after: Vec<u64> = self
-            .replicas
-            .iter()
-            .map(|replica| replica.cgroup_stat("cpu.stat", "usage_usec"))
-            .collect();
+        resources.freeze(&self.replicas);
         let driver_cores = (driver_cpu_seconds() - driver_before) / window_seconds;
         let mut profiles = Vec::new();
         let metadata = serde_json::json!({ "step": plan, "binary": self.binary });
@@ -284,16 +260,7 @@ impl Deployment {
         }
         let scrapes = Scrapes { before, after };
         let runs = self.queue.runs(since).await?;
-        let mut resources = Vec::new();
-        for (index, (replica, peak)) in self.replicas.iter().zip(peaks).enumerate() {
-            let cpu_seconds = cpu_after[index].saturating_sub(cpu_before[index]) as f64 / 1e6;
-            resources.push(Resources {
-                replica: replica.ordinal(),
-                cpu_seconds,
-                cores: cpu_seconds / window_seconds,
-                peak_memory: peak.read()?,
-            });
-        }
+        let resources = resources.finish(&self.replicas, window_seconds)?;
         let lanes = plan
             .lanes
             .iter()
@@ -407,24 +374,6 @@ pub fn lanes(tenant: usize, kinds: &[Kind], mode: Mode, per_kind: f64) -> Vec<La
             rate: per_kind,
         })
         .collect()
-}
-
-/// The driver process's user plus system CPU seconds.
-fn driver_cpu_seconds() -> f64 {
-    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
-    // Fields after the parenthesized command; utime and stime are the 14th
-    // and 15th fields overall, in clock ticks of 1/100 s on Linux.
-    let fields: Vec<&str> = stat
-        .rsplit_once(')')
-        .map(|(_, rest)| rest.split_whitespace().collect())
-        .unwrap_or_default();
-    let ticks = |index: usize| {
-        fields
-            .get(index)
-            .and_then(|f| f.parse::<f64>().ok())
-            .unwrap_or(0.0)
-    };
-    (ticks(11) + ticks(12)) / 100.0
 }
 
 /// Nanoseconds since the Unix epoch.

@@ -13,6 +13,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::PgPool;
+pub use wyrd_testing::capacity::Percentiles;
+use wyrd_testing::capacity::{deltas, merged};
 use wyrd_testing::release_server::Metrics;
 
 use crate::Result;
@@ -32,47 +34,6 @@ pub const PHASES: [&str; 6] = [
 /// Engine-overhead bucket bound under which a sample is below the AC-040
 /// 10 ms objective: the shared bucket set's `0.009`.
 pub const OVERHEAD_BOUND: f64 = 0.009;
-
-/// p50, p95, and p99 of something.
-#[derive(Debug, Default, Clone, Copy, Serialize)]
-pub struct Percentiles {
-    /// Median.
-    pub p50: Option<f64>,
-    /// 95th percentile.
-    pub p95: Option<f64>,
-    /// 99th percentile.
-    pub p99: Option<f64>,
-}
-
-impl Percentiles {
-    /// Nearest-rank percentiles of raw `samples`, scaled by `scale`.
-    pub fn raw(samples: &[u64], scale: f64) -> Self {
-        let mut sorted = samples.to_vec();
-        sorted.sort_unstable();
-        let rank = |q: f64| -> Option<f64> {
-            if sorted.is_empty() {
-                return None;
-            }
-            let index = ((q * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len()) - 1;
-            Some(sorted[index] as f64 * scale)
-        };
-        Self {
-            p50: rank(0.5),
-            p95: rank(0.95),
-            p99: rank(0.99),
-        }
-    }
-
-    /// Bucket-estimated percentiles of the observations between two bucket
-    /// readings.
-    fn buckets(before: &[(f64, f64)], after: &[(f64, f64)]) -> Self {
-        Self {
-            p50: quantile(before, after, 0.5),
-            p95: quantile(before, after, 0.95),
-            p99: quantile(before, after, 0.99),
-        }
-    }
-}
 
 /// Every replica's `/metrics` scrapes at both step boundaries, in ordinal
 /// order.
@@ -171,49 +132,6 @@ impl Scrapes {
             },
         }
     }
-}
-
-/// The cumulative buckets of `family` matching `labels`, summed across
-/// every replica's scrape.
-fn merged(scrapes: &[Metrics], family: &str, labels: &[&str]) -> Vec<(f64, f64)> {
-    let mut buckets: BTreeMap<u64, (f64, f64)> = BTreeMap::new();
-    for scrape in scrapes {
-        for (bound, count) in scrape.buckets(family, labels) {
-            buckets.entry(bound.to_bits()).or_insert((bound, 0.0)).1 += count;
-        }
-    }
-    let mut sorted: Vec<(f64, f64)> = buckets.into_values().collect();
-    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
-    sorted
-}
-
-/// Per-bound increase between two cumulative bucket readings.
-fn deltas(before: &[(f64, f64)], after: &[(f64, f64)]) -> Vec<(f64, f64)> {
-    let prior = |bound: f64| {
-        before
-            .iter()
-            .find(|(b, _)| b.to_bits() == bound.to_bits())
-            .map_or(0.0, |(_, count)| *count)
-    };
-    after
-        .iter()
-        .map(|(bound, count)| (*bound, count - prior(*bound)))
-        .collect()
-}
-
-/// The bound of the cumulative bucket holding quantile `q` of the
-/// observations between two readings of one histogram, or `None` when none
-/// were recorded.
-pub fn quantile(before: &[(f64, f64)], after: &[(f64, f64)], q: f64) -> Option<f64> {
-    let deltas = deltas(before, after);
-    let total = deltas.last().map_or(0.0, |(_, count)| *count);
-    if total <= 0.0 {
-        return None;
-    }
-    deltas
-        .iter()
-        .find(|(_, count)| *count >= q * total)
-        .map(|(bound, _)| *bound)
 }
 
 /// Observations at or below `bound`, and all observations, between two
@@ -330,23 +248,7 @@ impl Queue {
 
 #[cfg(test)]
 mod tests {
-    use super::{Percentiles, quantile, share_within};
-
-    /// A quantile is the first cumulative bucket bound covering it among the
-    /// observations between two readings, and an empty interval has none.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a bound is wrong.
-    #[test]
-    fn quantile_reads_bucket_deltas() {
-        let before = [(0.1, 10.0), (1.0, 10.0), (f64::INFINITY, 10.0)];
-        let after = [(0.1, 15.0), (1.0, 105.0), (f64::INFINITY, 110.0)];
-        assert_eq!(quantile(&before, &after, 0.05), Some(0.1));
-        assert_eq!(quantile(&before, &after, 0.5), Some(1.0));
-        assert_eq!(quantile(&before, &after, 0.99), Some(f64::INFINITY));
-        assert_eq!(quantile(&after, &after, 0.5), None);
-    }
+    use super::share_within;
 
     /// The share under a bound counts only the interval's observations.
     ///
@@ -358,21 +260,5 @@ mod tests {
         let before = [(0.009, 90.0), (0.01, 95.0), (f64::INFINITY, 100.0)];
         let after = [(0.009, 185.0), (0.01, 195.0), (f64::INFINITY, 200.0)];
         assert_eq!(share_within(&before, &after, 0.009), (95.0, 100.0));
-    }
-
-    /// Raw percentiles use the nearest rank and an empty sample has none.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a percentile is wrong.
-    #[test]
-    fn raw_percentiles_use_nearest_rank() {
-        let samples: Vec<u64> = (1..=100).collect();
-        let percentiles = Percentiles::raw(&samples, 1.0);
-        assert_eq!(
-            (percentiles.p50, percentiles.p95, percentiles.p99),
-            (Some(50.0), Some(95.0), Some(99.0))
-        );
-        assert_eq!(Percentiles::raw(&[], 1.0).p50, None);
     }
 }

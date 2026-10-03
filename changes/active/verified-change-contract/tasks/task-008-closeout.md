@@ -6,7 +6,7 @@ caller_approval: approved
 planning_result: SPEC_REVISION_REQUIRED
 spec: SPEC-verified-change-contract
 spec_revision: 49
-requirements: [REQ-089, REQ-101, REQ-114, REQ-115, REQ-135, REQ-136, REQ-137, REQ-145, REQ-146, REQ-151, REQ-152, INV-015, AC-017, AC-020, AC-021, AC-022, AC-023, AC-024, AC-030, AC-032, AC-033, REQ-172, REQ-173, REQ-174, REQ-175, REQ-176, REQ-177, INV-019, AC-041, AC-042]
+requirements: [REQ-089, REQ-101, REQ-114, REQ-115, REQ-135, REQ-136, REQ-137, REQ-145, REQ-146, REQ-151, REQ-152, INV-015, AC-017, AC-020, AC-021, AC-022, AC-023, AC-024, AC-030, AC-032, AC-033, REQ-172, REQ-173, REQ-174, REQ-175, REQ-176, REQ-177, INV-019, AC-041, AC-042, REQ-178, REQ-179, REQ-180, INV-020, AC-043]
 depends_on: [TASK-005, TASK-006, TASK-009, TASK-010, TASK-012]
 continues: TASK-008
 intended_to_replace: task-008-recovery.md
@@ -977,6 +977,162 @@ benchmark-only fast path.
 - Meeting AC-041 would require ordering, blocking admission, or a
   persisted-format change.
 
+## Amendment B — Gateway capture writer (spec revision 54)
+
+### Outcome and value
+
+Gateway capture stops minting tenant tokens and writing through one embedded
+client per tenant over the server's own public gRPC listener. Each server
+process owns one capture writer: in-process to a local Scribe, otherwise a
+capture-only peer ingest RPC over the mTLS peer plane (REQ-178). Capture is a
+server-internal write with no token, permission, or audit decision (REQ-179),
+delivered before the call's deadline or dropped with a counted reason
+(REQ-180). Proves INV-020 and AC-043. The peer-mode journey runs on the same
+topology as this task's 1- and 2-replica smoke.
+
+### Owners, scope, and prohibited changes
+
+**Owners:**
+- `crates/wyrd/wyrd-server/src/components/gateway/capture.rs`: the writer;
+  `invocation.rs` settle path and `app/server.rs` shutdown consume it;
+- `crates/wyrd/wyrd-tonic/proto/wyrd.v1.proto` and `wyrd-server` `grpc`: the
+  capture peer service, mounted only when Scribe runs in the pod;
+- `crates/vala/vala-bifrost-redux` Gate: the reserved-table refusal. Scribe
+  keeps readiness, schema, dedup, and backpressure;
+- auth issue, verify, and builtin-role crates: removal of the capture token
+  and role.
+
+**Reuse:** `AuditPublisher`'s in-process `Scribe::ingest_frame` with a
+constructed `Principal`; `BifrostPeerTls`, `ClusterRegistry::live_scribes`,
+and the `RegistryTailStreamDiscovery` channel pattern for the peer path.
+
+**Remove:**
+- `CaptureTokenSource`, the per-tenant producer map and construction lock,
+  `MAX_CAPTURE_TENANTS`, `CAPTURE_CLIENT_BYTE_LIMIT`, and the capture
+  producer, backlog, and retry gauges;
+- the capture shutdown drain;
+- `issue_gateway_capture_access_token`, capture token verification,
+  `GATEWAY_CAPTURE_TOKEN_MAX_TTL_SECONDS`, `GATEWAY_CAPTURE_ROLE`, and
+  `gateway_capture_permissions`;
+- the renewable-credential client plumbing if capture is its only production
+  consumer.
+
+`GATEWAY_CAPTURE_PRINCIPAL` stays as the identity stamped on captured rows.
+
+**Prohibited:**
+- a general-purpose internal ingest RPC;
+- any capture token, permission check, or audit decision;
+- per-tenant capture state or an in-memory capture backlog;
+- moving verification `ResultPublisher` onto this path.
+
+### Approach
+
+1. Replace the per-tenant registry with one writer selected at boot from pod
+   topology; retain peer TLS for the peer variant.
+2. Add the capture-only peer service, its allowlist checks, and its mount.
+3. Retry retryable refusals with the queue's backoff inside the existing call
+   deadline; map every other outcome to a counted `CaptureDrop`.
+4. Make Gate refuse every public write to `vala.gateway.calls`; delete the
+   capture token, role, and verification surfaces.
+5. Rewrite `architecture/wyrd-design.md` (token planes, principal model),
+   `architecture/bifrost-design.md` (reserved table, peer plane), and
+   `architecture/wyrd-security-posture.md` (capture identity).
+
+### Scenario B1 — In-process capture with a local Scribe
+
+**Behavior.** With Scribe in the pod, a gateway call's capture lands in its
+tenant's `vala.gateway.calls` and `vala.traces.spans` without a token, stamped
+with the capture principal. A resubmitted batch is absorbed by dedup.
+(REQ-178, REQ-179, REQ-180, AC-043)
+
+**RED.** Rework `gateway_capture_follows_policy_and_never_affects_the_call` to
+read capture rows back through Bifrost instead of a mock sink. It fails while
+capture still dials the public listener with a minted token:
+
+```bash
+scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --lib --run-ignored=all -E "test(=components::gateway::pg_invocation_tests::gateway_capture_follows_policy_and_never_affects_the_call)"'
+```
+
+**GREEN.** One writer submitting canonical batches to the local Scribe with a
+deterministic tenant/call/table batch id.
+
+**REFACTOR.** Delete the per-tenant map, token source, gauges, and drain.
+
+### Scenario B2 — Deadline-bounded delivery
+
+**Behavior.** Backpressure retries until the call deadline, then drops as
+`Saturated`. Other failures drop with their reason. The call result never
+changes. (REQ-180, AC-043)
+
+**RED.** A unit test where Scribe refuses with backpressure past the deadline
+expects a counted `Saturated` drop and fails without the retry mapping. These
+stay green:
+
+```bash
+scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --lib --run-ignored=all -E "test(=components::gateway::pg_invocation_tests::gateway_capture_work_ends_at_the_call_deadline)"'
+scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test gateway -P journey --run-ignored=all -E "test(=compatible::openai_compatible_streams_terminate_and_survive_a_capture_outage)"'
+```
+
+**GREEN.** Bounded backoff inside the existing `timeout_at(call.deadline)`.
+
+**REFACTOR.** Delete `CaptureDrop::from_client` and the queue-error mapping.
+
+### Scenario B3 — Gate refuses every public write to the calls table
+
+**Behavior.** No principal, including one carrying the capture identity, can
+write `vala.gateway.calls` through Gate. (REQ-179, INV-020, AC-043)
+
+**RED.** Change `gate_reserves_the_gateway_call_table_to_the_capture_principal`
+to expect refusal for the capture principal; it fails on the exemption:
+
+```bash
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=gate::tests::gate_reserves_the_gateway_call_table_to_the_capture_principal)'
+```
+
+**GREEN.** Unconditional refusal; remove the capture confinement rule.
+
+**REFACTOR.** Delete capture issuance, verification, role, and their tests.
+Move `gateway_capture_decisions_publish_ahead_of_later_history` onto a
+non-capture principal.
+
+### Scenario B4 — Peer RPC capture in peer mode
+
+**Behavior.** A gateway served by a pod without Scribe lands capture through
+the peer RPC on a live Scribe. The RPC refuses non-capture tables, reserved
+tenants, and callers without a peer certificate. (REQ-178, INV-020, AC-043)
+
+**RED.** A new Rust gateway journey in `wyrd-testing --test gateway` running an
+`oracle`-target gateway pod beside a `scribe`-target pod in peer mode over
+RustFS, plus peer-handler negative tests. Both fail without the service.
+Record their exact `mise exec -- cargo nextest run` commands once named.
+
+**GREEN.** The peer service, its mount, and the writer's peer variant dialing
+live Scribes.
+
+**REFACTOR.** Share channel handling with the existing peer dialers where it
+removes code.
+
+### Acceptance criteria
+
+- REQ-178 to REQ-180, INV-020, and AC-043 each have passing evidence in the
+  table below.
+- Existing gateway journeys, including the Python capture-evidence journeys,
+  stay green.
+
+### Verification
+
+- The focused commands above, plus the new journey and peer-handler commands.
+- `mise run test:gateway:journey`, `mise run test:bifrost`,
+  `mise run test:principals:integration`, `mise run codegen:check`,
+  `mise run check:client-tier`, `mise run docs:check`, `mise run fmt`,
+  `mise run lints`.
+
+### Stop conditions
+
+- Any need to widen the peer RPC beyond the two capture tables.
+- Scribe or Gate behavior that requires a token or audit row for capture.
+- A gateway-serving pod with neither a local Scribe nor peer TLS configured.
+
 ## Implementation Evidence (in progress)
 
 | Item | Implementation | Verification | Result |
@@ -1001,107 +1157,334 @@ assertion. Its output was not captured, and four later runs with tracing passed.
 If it recurs, capture the trace before changing the test. The real Drift run's
 evidence read retrying under load is a candidate cause, not a diagnosis.
 
-## Proposed Specification Revision 51 (awaiting human approval)
+Diagnosis, wyrd-client `blocking_mint_spends_one_transport_budget_then_retains`
+(Amendment A):
+- **Symptom:** the test hung until its timeout once retained ambiguous batches
+  entered `Task::drain`.
+- **Evidence:** `RecordQueue::start` restarted every retained entry whose
+  backoff was due *now*; `drain` called it in a loop, so each retry that came
+  due during the pass was restarted inside the same pass and the pass never
+  ended.
+- **Cause:** drain re-armed batches that became due after the pass began.
+- **Fix site:** `RecordQueue::start(cutoff)` (`wyrd-queue/src/queue.rs`) starts
+  only entries due at or before `cutoff`; `Task::drain` holds the pass-start
+  instant, while `pump` and `send_outbox` pass `Instant::now()`. Those are the
+  only callers. Pinned by `queue::tests::a_held_cutoff_starts_each_retained_batch_once`.
+  An independent read-only diagnostician reached the same cause and fix site.
+  The hung test itself exercised `ResolvedCredential::Renewable`, whose only
+  production consumer was gateway capture; Amendment B removed that plumbing and
+  the test with it.
 
-Not authoritative until approved. It closes Material Stop Conditions 1, 3 and
-4. Condition 2 is closed by revision 50.
+### Amendment A evidence (revisions 53 and 55)
 
-**REQ-135 amendment.** Add a fourth Verification operation:
-`POST /v1/verification/execute`. Ordinary observations and `POST
-/v1/verification/runs` stay asynchronous (REQ-136 unchanged).
+| Criterion | Implementation | Verification | Result |
+|---|---|---|---|
+| REQ-172, REQ-173, INV-019: one shared budget, no per-producer caps, no preallocation | `9e6464d2d`, `de3dfaca6`; `wyrd-queue` `ClientByteBudget`, `QueueConfig` | `mise exec -- cargo nextest run --locked -p wyrd-queue` (50/50), including `producer::tests::{a_thousand_tables_share_one_budget_and_idle_producers_hold_nothing, bounded_client_bytes_refuse_before_allocation}`; `wyrd-client` lib 219/219 including `bifrost::tests::a_thousand_tables_share_one_handle_budget` | PASS |
+| REQ-174 (rev 55): byte or linger-with-free-slot sealing | `cac83f17d`; `Task::pump` and its linger arm in `wyrd-queue/src/producer.rs` | RED then GREEN: `mise exec -- cargo nextest run --locked -p wyrd-queue --lib -E 'test(=producer::tests::stalled_sends_bound_concurrency_and_grow_the_next_batch)'` (RED: 1,000 rows behind two stalled sends never stayed staged; GREEN: they leave as one third batch); `producer::tests::byte_and_linger_triggers_seal_without_a_flush` | PASS |
+| REQ-175: bounded concurrent sends, default is the smallest passing value | `cac83f17d`; `QueueConfig::default().max_in_flight = 1` | AC-041 benchmark below: 1, 2, 4 and 8 all pass; smallest passing is 1 | PASS |
+| REQ-176: immediate all-or-none admission | `wyrd-queue` producer | `producer::tests::multi_row_admission_is_all_or_none`, `admitted_rows_cannot_take_the_sealing_headroom` | PASS |
+| REQ-177: ambiguous sends retained under one identity | `9e6464d2d`; `RecordQueue::start(cutoff)` | `producer::tests::ambiguous_sends_retry_one_identity_until_acked`, `queue::tests::a_held_cutoff_starts_each_retained_batch_once`; `wyrd-client` `bifrost::grpc::tests::held_calls_exhaust_one_transport_budget_then_retain` | PASS |
+| AC-042: SDK byte-budget override and 1,000×9 bursts | `de3dfaca6`; Rust/Python/TypeScript wrappers and stubs | `mise exec -- cargo nextest run --locked -p wyrd-sdk-rust --test observe_run -P journey --run-ignored=all -E 'test(=drift_burst_survives_a_byte_budget_override)'`; Py `tests/integration/state/test_observe_journey.py::test_drift_burst_survives_a_byte_budget_override`; TS `observe-run.test.ts` "lands every row of a 1,000 x 9 burst exactly once"; `mise run codegen:check` | PASS |
+| AC-041: 50,000 rows/s sustained | `cac83f17d`; `wyrd-testing` bin `bifrost_ingest_capacity`, `mise run bench:bifrost:ingest-capacity` | Table below; report at `target/bifrost-ingest-capacity/report.{json,txt}` | PASS |
+| Capacity seed resubmits on `QUEUE_FULL` and counts `SAMPLES × 9` | `de3dfaca6`; `verification_capacity/fixture.rs` | clippy clean; exercised by `mise run bench:verification:capacity` | PASS |
 
-**Request.** The target is exact and untagged: `{ verifier_uid,
-subject_card_uid, input }`. `input` is tagged by `kind`:
-- `eval_record { context: object, media?: [MediaRef] }` for assertion-only and
-  LLM-judge Evals. The judge receives the supplied `context`.
-- `drift_samples { columns: { <feature>: [number | string | null] } }`. PSI and
-  SPC score against the Verifier's `ready` fitted baseline. Custom scores the
-  mean of `profile.metric_name`.
+AC-041 run (release `wyrd-server --features cloud`, one process, Postgres,
+RustFS; one `WyrdState` emitting Drift observations of 100 features; 60 s per
+step):
 
-**Response `200`.** `{ execution_id, verifier: CardRef, subject: CardRef, kind,
-verdict: passed | failed | inconclusive, summary, counts, detail: { drift:
-DriftReport } | { eval: EvalReport } }`.
-- `execution_id` is a UUIDv7 that appears only in the response, the audit row
-  and the trace. It is never persisted or queryable.
-- A `failed` verdict is a `200`, not an error.
+| Step | obs/s | max_in_flight | Refused | Peak client bytes | Byte slope (B/s) | Drain (s) | Durable / expected rows | Uneven ids | Gate frames | Rows per frame | Gate write p50 / p99 (ms bucket) | Client / server µs per row |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| sustained | 500 | 4 | 0 | 5,592,976 | -34,191 | 0.047 | 3,000,000 / 3,000,000 | 0 | 6,069 | 494 | 25 / 100 | 4.5 / 4.5 |
+| headroom | 1,000 | 4 | 0 | 6,845,464 | -16,420 | 0.053 | 6,000,000 / 6,000,000 | 0 | 4,656 | 1,289 | 25 / 50 | 3.8 / 2.5 |
+| ack delay +50 ms | 500 | 4 | 0 | 7,030,936 | 78,892 | 0.117 | 3,000,000 / 3,000,000 | 0 | 1,835 | 1,635 | 25 / 50 | 4.1 / 2.5 |
+| max_in_flight 1 | 500 | 1 | 0 | 5,231,104 | -47,591 | 0.045 | 3,000,000 / 3,000,000 | 0 | 1,387 | 2,163 | 25 / 25 | 3.7 / 2.2 |
+| max_in_flight 2 | 500 | 2 | 0 | 5,335,048 | -20,887 | 0.045 | 3,000,000 / 3,000,000 | 0 | 3,619 | 829 | 25 / 50 | 4.2 / 3.6 |
+| max_in_flight 4 | 500 | 4 | 0 | 5,462,872 | -92,523 | 0.048 | 3,000,000 / 3,000,000 | 0 | 6,316 | 475 | 25 / 50 | 4.4 / 4.5 |
+| max_in_flight 8 | 500 | 8 | 0 | 4,536,856 | 4,118 | 0.043 | 3,000,000 / 3,000,000 | 0 | 8,676 | 346 | 25 / 50 | 4.6 / 5.5 |
 
-**Not performed.** No durable run, published result, Operator dispatch,
-Bifrost read or write, or Eval sampling policy. Registry, baseline and judge
-Agent/Prompt resolution and canonical audit still use PostgreSQL.
+The run used the then-default `max_in_flight = 4` for the sustained step; the
+`max_in_flight 1` step is the same configuration as the new default and passes
+every AC-041 check. Batch figures are the Gate's accepted-frame counter, so
+they are means, not a distribution; latency is the Gate write histogram's
+bucket bound.
 
-**Authorization.**
-- Requires `evals:run` with exact Verifier and subject scope, as for the
-  direct-target `POST /runs`.
-- The permission check blocks; the audit does not (revision 52). One allowed
-  or denied decision per request is staged on the audit outbox shared with
-  Oracle; an audit-append failure is logged and counted and never refuses the
-  request.
-- Cross-tenant or unknown targets return `404`.
+Before the revision 55 fix, a 5 s smoke at `max_in_flight = 4` sealed ~350-row
+frames at ~142/s against a sink capacity of ~95 frames/s, so client bytes grew
+~3 MB/s and drain took 2.4 s (16 s with the 50 ms ack delay).
 
-**Bounds.**
-- Request body at most 1 MiB.
-- `drift_samples` at most 64 columns × 100,000 values.
-- `eval_record.context` at most 256 KiB.
-- One 60 s execution deadline per request. No concurrency cap or admission
-  layer.
+Diagnosis, AC-041 sustained step (Amendment A):
+- **Symptom:** the sustained step failed "bytes grew" and "drain 2.4 s" with
+  exact rows and no refusals.
+- **Evidence:** `Task::pump` sealed whenever the linger had elapsed regardless
+  of free slots; the linger `select!` arm ignored `can_send`; the outbox is a
+  FIFO of sealed frames that never merge (`queue.rs`); `staging_full` was never
+  reached because the linger emptied staging every ~7 ms; server cost is per
+  frame (~42 ms ack, mostly WAL sync and the dedup fence), not per row.
+- **Cause:** the linger, not load or sink capacity, set the frame rate, so
+  capacity was fixed at `max_in_flight / ack latency` frames of ~350 rows.
+- **Fix site:** `Task::pump` and its linger arm, the single producer owner
+  reached by every SDK through `wyrd-client` `bifrost/handle.rs`; `Task::drain`,
+  `RecordQueue::seal`, and the gRPC sink were checked and need no change. An
+  independent read-only diagnostician reached the same cause and fix. The fix
+  needed spec revision 55, which the user approved.
+- A second defect in the benchmark itself counted rows by overlapping
+  ±500 ms time windows, so each later step also counted its predecessor's
+  tail; counts are now scoped by the step's `run_id`.
 
-**Stable errors.**
+### Amendment B evidence (revision 54)
 
-| Status | Code | Condition |
-|---|---|---|
-| 400 | `verification_input_invalid` | Malformed input |
-| 413 | `verification_input_too_large` | A bound is exceeded |
-| 403 | existing RBAC code | Permission denied |
-| 404 | `verification_target_not_found` | Unknown or cross-tenant target |
-| 409 | `verification_baseline_not_ready` | No `ready` fitted baseline |
-| 409 | `verification_baseline_legacy` | Baseline fitted under an earlier format |
-| 422 | `verification_input_incompatible` | Missing feature or type mismatch |
-| 422 | `verification_input_unsupported` | Eval with trace or agent assertions, refused before any task runs |
-| 502 | `verification_dependency_failed` | Judge provider failure after the task's own `max_retries` |
-| 504 | `verification_execution_timed_out` | The 60 s deadline elapsed |
+| Criterion | Implementation | Verification | Result |
+|---|---|---|---|
+| REQ-178, B1: one writer per process, in-process to a local Scribe | `de3dfaca6`; `components/gateway/capture.rs` (`GatewayCapture`, `CaptureRoute`) | `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(/^components::gateway::capture::tests::/)'` including `local_writer_submits_under_the_capture_principal`, `batches_carry_deterministic_ids_under_the_admitting_request`; `pg_invocation_tests::gateway_capture_follows_policy_and_never_affects_the_call` | PASS |
+| REQ-180, B2: deadline-bounded delivery, counted drops | `capture.rs` `until_deadline`, `CaptureDrop` | `capture::tests::{saturation_retries_until_acknowledged_or_the_deadline, terminal_parked_and_absent_scribes_drop_without_retry, scribe_refusals_and_peer_codes_classify_alike}`; `pg_invocation_tests::gateway_capture_work_ends_at_the_call_deadline` (21/21 `pg_invocation_tests` with `scripts/postgres/with-test-postgres.sh`) | PASS |
+| REQ-179, INV-020, B3: no token, permission, or audit; Gate refuses every public write to `vala.gateway.calls` | Gate, auth issue/verify, builtin roles, `wyrd-client` renewable credential removed | `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=gate::tests::gate_reserves_the_gateway_call_table_to_the_capture_principal)'`; `audit_publication::service_decisions_publish_ahead_of_later_history` (`-p wyrd-testing --test server -P journey`) | PASS |
+| REQ-178, B4: peer RPC capture from a pod without Scribe | `grpc/capture_peer.rs` (`ScribeCapturePeerGrpc`), mounted on the `wyrd-peer` mTLS listener; `WyrdTestCluster` gateway provider root | `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test gateway -P journey --run-ignored=all -E "test(=peer::oracle_only_gateway_captures_through_the_peer_scribe)"'`; peer handler `grpc::capture_peer::tests::{requests_are_confined_to_tenant_capture_destinations, scribe_saturation_answers_resource_exhausted}`; misnamed-leaf refusal is covered for every peer service by `peer_network::listener` | PASS |
+| Architecture docs | `de3dfaca6`; `wyrd-design.md`, `bifrost-design.md`, `wyrd-security-posture.md` | `mise run docs:check` | PASS |
 
-**Retries and cancellation.**
-- The operation is not idempotent and takes no `Idempotency-Key`.
-- SDKs never retry it automatically.
-- A client disconnect drops the handler and cancels in-flight work. Provider
-  calls already issued may have incurred cost.
+The B4 journey runs the Oracle and Scribe pods over local shared storage, not
+RustFS: the cluster harness has no RustFS option. Peer mode over RustFS is
+exercised by the capacity benchmark topology.
 
-**Projections.**
-- `client.verification.execute(...)` in `wyrd-client` and in the Rust, Python
-  and TypeScript SDKs.
-- An MCP write tool `verification_execute` gated on `evals:run`.
-- The served OpenAPI document.
-- Telemetry uses `mode="direct"` with only `load`, `prepare` and `engine` phases.
+### Direct execution documentation
 
-**CLOSE-05 reference workloads.** One release `wyrd-server` replica plus a
-two-replica repeat.
+`8ae5dfdd8` adds "Judging input directly" to
+`docs/src/content/docs/how-to/evaluate/index.svx`: the HTTP route, request and
+response, bounds, stable errors, `evals:run`, no idempotency or retries, the
+three SDK calls, and the MCP tool. `mise run docs:check` passes. The MCP tool's
+wire name is `verification.execute`, matching every other MCP tool's dotted
+name; REQ-169's text spells it `verification_execute`.
 
-| Case | Workload |
-|---|---|
-| Assertion Eval | 4 assertion tasks over a 2 KiB context |
-| Custom | 1 metric, 1,000 samples |
-| PSI | 8 numeric features × 1,000 samples, 10 quantile bins, baseline fitted from 10,000 rows |
-| SPC | 4 features × 1,000 samples, subgroup size 5, baseline from 10,000 rows |
-| LLM judge | 1 judge task plus 1 assertion against the local TLS mock with a 200 ms delay |
+### CLOSE-01 inherited obligation matrix
 
-**Sustainable load** is the highest offered step whose achieved rate is at
-least 95% of offered and whose outstanding work drains within one step.
+"gate" means the row's tests run inside `mise run gate` (traced through
+`test:rust`, `test:bifrost:gate`, `py:test:integration`,
+`ts:test:integration`, `codegen:check`, `docs:check` and the static checks).
+Rust SDK journeys and the principals lane are outside gate and were run
+separately; their results are recorded here.
 
-**Strict proof** is direct-mode paired per-request engine overhead below 10 ms
-at p95. It requires at least 1,000 samples per case per step, solo and mixed,
-at sustainable load, for the four non-judge cases. Judge cases report overhead
-and provider waits separately with no threshold.
+| Inherited obligation | Strongest current proof | Lane | Result |
+|---|---|---|---|
+| PSI/SPC/Custom/assertion/judge → failed-verdict Operator, principal, SDK parity | Py `test_drift_journey.py::test_service_bindings_verify_drift_and_eval_through_an_http_operator`; TS `drift-verification.test.ts` "verifies one Service through Drift, Eval, and an Operator end to end"; RS `drift_verification.rs::service_verifies_drift_and_eval_through_the_sdk`; `pg_operator_delivery.rs::failed_verdict_fans_out_to_every_provider_independently` | gate; `mise run test:bifrost:journey:drift` (4/4) | GATE_PENDING |
+| Locked Run identity, typed/mapping input, native projection, bounded IPC, custom-table reuse, shutdown | `wyrd-client` `observe::tests::{each_run_is_its_own_invocation, drift_projects_one_tall_row_per_feature, ambiguous_shutdown_retries_the_same_batch_on_the_same_state}`; Py/TS/RS observe journeys including the 1,000×9 bursts | gate; `mise run test:bifrost:journey:observe` (3/3) | GATE_PENDING |
+| Python span enrichment, joins, nested scopes, asyncio isolation, private provider, OTEL fail-open | Py `test_observe_journey.py::test_scoped_run_emits_drift_eval_and_generic_rows`; `unit/state/test_observe_surface.py::{test_scope_survives_await_and_isolates_concurrent_tasks, test_nested_card_scopes_share_the_run_and_restore_the_outer_card, test_missing_opentelemetry_is_a_no_op, test_enrichment_failure_never_blocks_observations}` | gate | GATE_PENDING; the "no log/metric enrichment inferred" clause is a non-goal with no executable assertion |
+| HTTP/MCP binding and direct Drift runs, requester, ownership, idempotency, authz, result queries, MCP catalog | `pg_verification_routes.rs::{manual_runs_enqueue_replay_and_read_back, manual_run_refusals_fail_before_enqueue, verification_state_is_tenant_isolated}`; `pg_verifier_runs.rs::manual_idempotency_keys_replay_conflict_and_scope_to_requester`; MCP `pg_tests::an_agent_runs_a_verifier_directly_and_reads_its_result`; Py/TS run journeys; RS `verification_run.rs::starts_a_keyed_manual_run_and_reads_its_status` | gate; `mise run test:cards:integration` | GATE_PENDING |
+| Worker without local Scribe, SYSTEM table matrix, SYSTEM refusals, shared fanout | `verification_runtime.rs::{runner_without_local_scribe_publishes_through_the_ingest_endpoint, drift_runner_without_local_oracle_reads_through_a_peer, two_bindings_share_one_client_observation}`; `pg_grpc_ingest_smoke.rs::system_writer_matrix_spans_every_builtin_table`; `pg_verification_routes.rs::system_writer_token_is_refused_by_every_public_token_grant` | gate | GATE_PENDING |
+| Daily partitions, Bloom/row-group pruning, Eval record-day lookup, midnight ACKs | `verification_runtime.rs::result_layout_partitions_blooms_and_prunes_by_result`; `eval_verification.rs::sealed_replay_on_a_later_day_activates_once`; `pg_verifier_runs.rs::observation_runs_are_unique_per_input_record` | gate | GATE_PENDING |
+| Duplicates, sealed replay, expired leases, retries, fail-open Eval enqueue, partial ACKs, summary-only | `pg_verification_runtime.rs::{lost_result_ack_replays_the_identical_sealed_batch_and_scribe_deduplicates, unacknowledged_summary_retries_with_a_fresh_result, crashed_runner_restarts_and_reclaims_without_duplicates}`; `pg_verifier_runs.rs::concurrent_schedulers_create_one_run_per_occurrence`; `eval_verification.rs::integrated_enqueue_failure_preserves_ack` | gate | GATE_PENDING |
+| PostgreSQL-owned times and restart fencing | `pg_verifier_runs.rs::{database_clock_owns_verifier_queue_deadlines, reclaimed_lease_fences_the_stale_token, dispatch_delivery_obeys_budget_deadline_and_fencing}`; `pg_verification_bindings.rs::database_clock_owns_machine_activity_and_schedule_arming` | gate | GATE_PENDING |
+| Execution beyond former ceilings, Operator limits/timeout, shutdown/reclaim, health | `pg_verification_runtime.rs::{verifier_runs_execute_beyond_the_former_permit_ceilings, shutdown_stops_claims_drains_bounded_and_restart_recovers_identity}`; `pg_operator_delivery.rs::{verifiers_progress_while_operator_deliveries_are_capped, slow_endpoint_exhausts_the_budget_and_shutdown_releases}` | gate | GATE_PENDING |
+| Allowed/denied authorization audit at public/Gate boundaries only | `pg_verification_runtime.rs::completed_run_publishes_details_then_summary_and_records_metrics`; `pg_verification_routes.rs::status_reads_audit_cards_read_decisions`; `pg_bifrost_e2e.rs::denied_describe_is_audited_before_admission` | gate | GATE_PENDING |
+| Operator CRUD, rotation, redaction, protocol fixtures, SDK/CLI/MCP parity | `pg_operator_connection_routes.rs::admin_manages_redacted_encrypted_connections`; `pg_operator_delivery.rs::{next_attempt_on_another_replica_uses_the_rotated_credential, ambiguous_pagerduty_retry_reuses_the_dedup_key}`; RS/Py/TS/CLI/MCP connection journeys | gate | GATE_PENDING; live Slack/PagerDuty (`test:operators:smoke:live`) is credentialed release evidence, not run |
+| Qualifying exchanges activate owners; others do not; suspension and snapshots | `wyrd-auth` `issuance::pg_tests::{qualifying_machine_grants_activate_the_bound_owner, non_qualifying_grants_never_touch_activity, a_suspended_principal_is_refused_by_every_grant}`; `pg_verification_bindings.rs::{excluded_principals_record_nothing, out_of_order_exchanges_never_move_activity_backward}` | gate; `mise run test:principals:integration` (15/15, 19/19) | GATE_PENDING; human refresh, SYSTEM and cached-bearer non-activation rest on the single `records_owner_activity` match without a dedicated test (open gap) |
+| Verifier vocabulary, no retired surfaces, codegen, registration, docs, served OpenAPI | `pg_openapi_contract.rs::verification_contract_publishes_exactly_four_typed_operations`; `wyrd-loader` `parse_rejects_retired_drift_and_eval_card_kinds`; `codegen:check`, `docs:check` | gate; `mise run test:principals:integration` | GATE_PENDING; no gated scan names retired Verifier routes/tables; absence is proven by the four-operation OpenAPI and loader refusal |
 
-**Capacity benchmark defaults.**
-- 30 s steps.
-- Offered totals of 10, 25, 50, 100 and 200 executions/s, split evenly across
-  the five kinds.
-- 1 noisy tenant, 1 quiet tenant and 70 background tenants. This exceeds one
-  64-tenant discovery round.
+Credentialed cloud/provider smokes and official-image qualification
+(`test:server:startup`, `test:operators:smoke:live`, `test:gateway:smoke:live`,
+`test:storage:*:cloud`) remain separately identified release evidence and were
+not run.
 
-**Recovery-task alignment.** The capacity benchmark replaces the recovery
-task's fixed observation-traffic profile and its prohibition on synchronous
-execution. Scheduled Drift and observation-triggered Eval stay in queued
-capacity traffic. Manual activations are labelled and never counted as
-scheduler throughput. Existing correctness journeys keep the removed
-custom-table and OTLP coverage.
+### Capacity benchmark startup diagnosis
+
+- **Symptom:** `mise run bench:verification:capacity` failed while
+  provisioning. The client error alternated between
+  `WYRD_CLIENT_503_TRANSPORT_DOWN` "error decoding response body for url
+  (http://127.0.0.1:8080/auth/token)" and an empty
+  `WYRD_SPEC_502_UPSTREAM_FAILURE`. The server log had no errors.
+- **Evidence:** `wyrd-server/src/components/auth/routes.rs` puts a per-peer-IP
+  `GovernorLayer` on the `/auth/*` routes: a burst of 20, then one request per
+  100 ms. The benchmark provisioned 72 tenants (m0, m1 and 70 background
+  tenants) from 127.0.0.1 back to back. Each tenant makes a token exchange and
+  an `issue-key` call, then one more exchange per replica for each client.
+  With `--background 0` (2 tenants), provisioning and the run completed.
+- **Cause:** the benchmark exceeded the server's intentional auth rate limit.
+  The governor's 429 response is plain text. `AuthClient::decode`
+  (`wyrd-client/src/auth.rs`) parses every error body as JSON and turns this
+  one into a transport error. `transport/http.rs` maps a non-JSON error body to
+  an empty code, which drops the HTTP status.
+- **Fix site:** the benchmark owner (`verification_capacity/main.rs`,
+  `load.rs`). Tenant provisioning and client connects are now spaced by
+  `AUTH_SPACING` (400 ms). Each administrator client exchanges its token at
+  connect, so no load step opens with every tenant authenticating at once.
+  The production limit is unchanged.
+- **Open product defect (recorded, not fixed):** the auth governor's 429 is not
+  problem+json, and the client loses the status for non-JSON error bodies.
+  AGENTS §9 requires structured Wyrd errors. A fix needs a stable
+  auth-rate-limit code; the catalog has none today. That is a contract decision
+  outside this task.
+
+### Capacity benchmark replica join diagnosis
+
+- **Symptom:** the first revision 56 run failed after the one-replica
+  sustained step. The joining replica 1 exited with status 70.
+- **Evidence:** its kept log shows `Bifrost peer listener failed to bind
+  127.0.0.1:50062: Address already in use`. `ip_local_port_range` is
+  `32768 60999`. Replica 0's log shows it bound 50051 and 50052 at startup,
+  before any load.
+- **Cause:** `release_server.rs` gave joined replicas fixed gRPC and peer
+  ports of 50061 and 50062, which lie inside the kernel's ephemeral port
+  range. After 11 minutes of load from 72 tenants, an outbound connection
+  already held local port 50062 when replica 1 tried to bind it. The previous
+  run's logs were lost because `LocalServer`'s temporary directory was
+  deleted on the error path.
+- **Fix site:** `wyrd-testing/src/release_server.rs`, whose only
+  `start_replica` caller is this benchmark.
+  - Joined replicas now bind gRPC and peer ports below the ephemeral range,
+    from bases 30051 and 30052. Replica 0 keeps the server defaults.
+  - A `LocalServer` dropped without `stop` keeps its working directory and
+    prints the path of its `server.log`.
+
+### Capacity benchmark second-replica readiness diagnosis
+
+- **Symptom:** after the port fix, replica 1 (`all`) never reported ready. A
+  10-second smoke run (`-- --steps 50 --step-seconds 10 --sustained-seconds
+  10 --background 0`) reproduced it in about 3 minutes.
+- **Evidence:** `await_ready` now carries the last `/readyz` body. It showed
+  `"forge_coordinator":{"reason":"forge_coordinator_unavailable"}`, with every
+  other check ok. `forge/scheduler.rs` published coordinator readiness as
+  `!outcome.standby && !outcome.incomplete`.
+- **Cause:** Forge planning is a singleton held by the
+  `vala.forge_scheduler_state` lease. A second replica finds the live peer's
+  lease, skips planning (standby), and keeps running its Forge worker, Scribe,
+  Oracle, and API. Readiness treated that healthy standby as unready, so
+  `/readyz` failed and Kubernetes would drop every `all` replica after the
+  first from its Service. `pg_router_smoke::coordinator_standby_pass_is_not_ready`
+  pinned the defect, and both Kubernetes guides, `deploy/kubernetes/kind/wyrd.yaml`,
+  and `peer_network/join.rs` documented it as the reason to scale with
+  `oracle` pods instead of more `all` pods.
+- **Fix site:** `forge/scheduler.rs` publishes
+  `outcome.standby || !outcome.incomplete`, so only a lease holder whose pass
+  left demand unplanned is unready. The only consumers are `/readyz`
+  (`components/health/mod.rs::probe_forge_coordinator`) and the
+  `bifrost_role_ready{role="forge_coordinator"}` gauge. The test is now
+  `coordinator_standby_pass_is_ready`. The guides recommend scaling with `all`
+  replicas first and role-specific pods second. The benchmark's second replica
+  is `all`, every replica shares one `WYRD_SIGNING_KEY_FILE`, and observations
+  rotate across both replicas.
+- **Verification:** `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test pg_router_smoke -E "test(=coordinator_standby_pass_is_ready) | test(/coordinator/)"'`
+  passed 6/6 (standby, partial pass, completed pass, insert failure, object
+  store failure, roster discovery). `mise run docs:check` passed.
+- **Finding, not fixed:** neither `deploy/kubernetes/kind/wyrd.yaml` nor the
+  production guide sets `WYRD_VERIFICATION_INGEST_ENDPOINT` on `wyrd-oracle`.
+  Per `configuration.svx`, those Oracle pods therefore run no Verifier runner.
+
+### Capacity benchmark run 1 on two `all` replicas
+
+`mise run bench:verification:capacity`: exit 1, wall 1351 s, setup 43 s. That
+exceeds REQ-171's 30-minute budget only because the two-replica drain ran its
+full 300 s. Another session's clippy build shared the host during the run.
+
+| Step | Replicas | Offered/s | Achieved/s | Backlog at deadline/final | Drain s | Sustainable |
+|---|---|---|---|---|---|---|
+| warmup-50 | 1 | 87.0 | 86.8 | 0/0 | 0.3 | yes |
+| ramp-50 | 1 | 87.0 | 86.9 | 0/0 | 0.5 | yes |
+| ramp-100 | 1 | 137.0 | 136.8 | 0/0 | 0.3 | yes |
+| ramp-200 | 1 | 237.0 | 231.9 | 0/0 | 1.8 | yes |
+| ramp-400 | 1 | 437.0 | 292.8 | 4768/0 | 100.0 | no |
+| sustained-200 | 1 | 237.0 | 232.6 | 0/0 | 6.0 | yes |
+| sustained-200 | 2 | 237.0 | 200.6 | 6166/6166 | 300.0 | no |
+
+AC-040 passed in the one-replica sustained step: 3,600 samples per objective
+kind, 100% at or below 9 ms. The only failing check was the two-replica
+overlap: the noisy tenant's queued `eval_assertion` and `eval_llm_judge` runs
+stopped completing, with 517 of 3,600 made. Its Drift runs, the quiet tenant,
+and all 70 background tenants completed everything.
+
+- **Symptom:** in the two-replica step, replica 0 logged 908 occurrences of
+  `acknowledged Eval observation did not enqueue verification runs ...
+  error="error returned from database: deadlock detected at line 1130"`, all
+  for the noisy tenant. The first came at 03:27:50Z, 42 s after replica 1
+  started; none came in the one-replica steps. Each was preceded by a 1 s wait
+  on `SELECT 1 FROM wyrd.verification_bindings WHERE binding_id = $1 FOR NO KEY
+  UPDATE`.
+- **Evidence:** both sides of each cycle are in replica 0's log. The victim
+  waited 1.0 s (`deadlock_timeout`) on the binding of subject `…68f4…`; the
+  survivor, on `…68f1…`, got its lock the moment the victim aborted. "Line
+  1130" is the Postgres C source line that sqlx 0.9 appends, not a SQL line.
+  Replica 1 logged no binding-lock waits.
+- **Cause (independent diagnostician, confirmed in source):**
+  `ObservationEnqueue::enqueue` (`verification/observations.rs`) enqueues one
+  acknowledged frame in one tenant transaction, row by row in emission order.
+  `VerifierRunQueue::insert` (`wyrd-sql/src/queries/verifier_runs.rs`) row-locks
+  each row's binding with `FOR NO KEY UPDATE` until commit. The noisy tenant's
+  frames mix rows for two subjects (assertion and judge, one binding each) in
+  arbitrary order, so two concurrent frames locked the two bindings in opposite
+  orders. Eval enqueue is fail-open with no retry, and Gate calls the hook only
+  on a batch's first commit, so every row of the aborted frame permanently lost
+  its runs. Background tenants have one binding and cannot form a cycle. The
+  second replica only raised concurrency; it is not required for the cycle.
+  None of the uncommitted closeout diff touches this path.
+- **Fix site:** `VerifierRunQueue::enqueue_observations`, the lock owner. It
+  locks every `observations_ready` binding of the frame's distinct subjects in
+  one statement ordered by `binding_id`, then enqueues rows in frame order
+  through `enqueue_observation`, whose per-binding lock is then already held.
+  `ObservationEnqueue::enqueue` is the only production caller and now calls it.
+  Manual and scheduled enqueue never take the binding lock and are unchanged.
+- **Verification:** RED, then GREEN:
+  `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-sql --test pg_verifier_runs -E "test(=frames_naming_subjects_in_opposite_orders_serialize)"'`.
+  The whole `pg_verifier_runs` target passed 23/23. `-p wyrd-testing --test
+  server -P journey --run-ignored=all -E "test(/eval_verification::/)"` passed
+  7/7. Clippy for `wyrd-sql`, `wyrd-server` and `vala-bifrost-redux` with
+  `--all-targets --all-features` is clean.
+- **Separate finding, undiagnosed:** replica 0, the planning-lease holder,
+  logged `gRPC health marking NotServing because cached readiness snapshot
+  failed` every 2 minutes in both one- and two-replica steps. Replica 1 never
+  did. No Postgres or storage probe warning accompanied it, so a role readiness
+  bit flipped. The info-level logs do not name which one.
+
+### Capacity benchmark run 3: two tenants (draft revision 57)
+
+Run: `WYRD_LOG=info,vala_bifrost_redux::scribe=debug,vala_bifrost_redux::gate=debug,wyrd_server::verification=debug,sqlx=warn mise run bench:verification:capacity`. The run exited 0 in 777 s, with 10 s of setup.
+
+| step | replicas | offered/s | achieved/s | client p95 ms | drain s | sustainable |
+|---|---|---|---|---|---|---|
+| ramp-200 | 1 | 202.0 | 201.3 | 207.3 | 0.3 | yes |
+| ramp-400 | 1 | 402.0 | 266.1 | 233.6 | 77.0 | no |
+| sustained-200 | 1 | 202.0 | 201.7 | 207.5 | 0.3 | yes |
+| sustained-200 | 2 | 202.0 | 179.7 | 530.6 | 42.4 | no |
+
+What passed:
+
+- Every step reconciled, with no wrong verdicts. Every kind overlapped in every 5 s slice.
+- On two replicas, queued work was claimed across replicas exactly once.
+- The quiet tenant progressed in both sustained steps.
+- AC-040 passed for every non-judge kind: 3,600 samples each, 100% at or below 9 ms.
+- Trace scrubbing passed, and both replicas shut down cleanly.
+- There were zero deadlocks and zero NotServing transitions. The 15 s Scribe acknowledgement stall did not recur.
+
+Open finding: two replicas sustain less throughput than one.
+
+#### Diagnosis: two-replica throughput loss
+
+A fresh read-only diagnostician worked from the run 3 logs and source.
+
+- **Symptom:** At 202/s, two replicas achieved 179.7/s. The noisy tenant's queued kinds completed 15.6/s against 20/s offered. Client p95 rose from 207 ms to 530 ms on both the queued and the direct paths. Total replica CPU was about 5.0 cores on one replica and about 5.5 cores on two.
+- **Evidence:**
+  - The only statements slower than 1 s in the run were `SELECT last_seq, head_hash FROM vala.audit_chain_head ... FOR UPDATE`.
+    - There were zero in the one-replica window.
+    - In the two-replica window there were about 200 per minute per replica, with a mean of 1.3 s and a maximum of 3.92 s, nearly all for tenant m0.
+  - The callers were Gate `dispatch_native_frame` writes to `vala.verification.results`, `vala.drift.result_features` and `vala.eval.result_items`, plus `start_run`.
+  - Publication phase p95 rose from 0.5 s to 30 s.
+  - The quiet tenant m1 has its own chain-head row. On two replicas its terminal p95 was 486 ms, against about 52 s for m0.
+- **Cause:** Gate write audit (`wyrd-server/src/bifrost/gate_audit.rs::PostgresGateAudit::append_write_decision`) and `start_run` audit (`components/verification/service.rs`) append synchronously, one transaction per decision. Each append locks the tenant's single `audit_chain_head` row (`vala-sql/src/queries/audit_staging.rs::append_audit_batch`). A second replica doubles the number of concurrent appenders queued on that row. Waiting connections also take pool slots away from the direct path. This contradicts AGENTS.md: permissions block, audits do not.
+- **Secondary cause:** `freeze_publication_range` locks the same row `FOR UPDATE NOWAIT` and failed nearly every sweep, even on one replica. As a result, staged audit was not published during load.
+- **Ruled out:** binding enqueue locks, run-claim SQL, peer tail RPC, and pool exhaustion as a root cause. The 48 HTTP 503s were `/readyz` polls during replica 1 startup.
+- **Fix site:** one shared batched audit outbox for every surface, and publication state separated from the chain-head lock. This is drafted as `changes/active/audit-outbox/spec.md` revision 1, which awaits approval.
+
+#### Forge planning review
+
+An independent reviewer compared Forge planning with the local RisingWave copy and found:
+
+- Planning is a fleet singleton behind a 15-minute lease that is never released.
+- Planning is paced by a timer at 256 demands per 60 s tick.
+- Every cycle re-seeds the full roster.
+- Hot tables starve.
+- Worker claims serialize on one cursor row.
+
+The target design, concurrent per-table demand claims, is drafted as `changes/active/forge-concurrent-planning/spec.md` revision 1, which awaits approval.
+
+## Specification Revision 51
+
+Approved and folded into the spec under "Direct execution, telemetry, and
+verification capacity (revision 51)", with revision 52 making its audit
+non-blocking. The spec is the authority for the direct-execution contract,
+bounds, stable errors, CLOSE-05 reference workloads, and capacity defaults.

@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 56
+revision: 57
 status: approved
 ---
 
@@ -1703,39 +1703,59 @@ table on `(data_tenant_id, result_id)`.
   - the operator catalog and its PromQL.
 
   No Grafana deliverable is part of this change.
-- **REQ-171**: `mise run bench:verification:capacity` MUST replace the
-  verification journey benchmark. It follows standard capacity-testing
-  practice: one realistic production workload, a short ramp to find
-  saturation, then a sustained run at load on one and then two release
-  replicas. A default run MUST complete within 30 minutes, including setup.
-  - **Workload.** Every scored step drives the same production mix at once:
-    queued and direct execution of PSI, SPC, Custom, assertion Eval, and
-    LLM-judge Eval. The offered total is split evenly across the two paths
-    and the five kinds and carried by one noisy tenant. One quiet tenant
-    sends low-volume assertion work, and 70 background tenants send queued
-    work throughout. There are no separate solo-kind, queued-only, or
-    direct-only ladders.
-  - **Steps.** The default run has seven steps:
-    1. a 30-second warmup, which is not scored;
-    2. a ramp of 60-second steps at offered totals of 50, 100, 200, and
-       400 executions per second on one replica. The ramp stops at the
-       first step that is not sustainable;
-    3. a 180-second sustained step on one replica at the highest
-       sustainable ramp rate;
-    4. the same 180-second sustained step on two replicas.
-  - **Report.** One summary row per step: offered and achieved rate,
-    reconciled work, errors, raw client p50/p95/p99, backlog, drain, the
-    resource envelope, and a verdict. Each step also has a per-kind,
-    per-path breakdown of the same fields, bucket-estimated server phases,
-    paired engine overhead, and task-start delay. The two-replica step also
-    reports per-replica results, cross-replica claim exclusivity, and
-    reconciliation. Both sustained steps report quiet- and background-tenant
-    progress during noisy traffic.
+- **REQ-171**: `mise run bench:capacity` is Wyrd's one capacity benchmark. It
+  replaces `bench:verification:capacity` and `bench:bifrost:ingest-capacity`;
+  no other server capacity benchmark exists. It follows the Google SRE
+  load-test shape: one production-shaped workload, a ramp to find
+  saturation, sustained steps at load, and the four golden signals judged
+  against stated SLOs. A default run MUST complete within 30 minutes,
+  including setup, against release `wyrd-server` replicas in peer mode over
+  Postgres and the RustFS emulator, each in an 8-CPU/16-GiB scope.
+  - **Workload.** One mix of everything the server does, driven open-loop
+    through the public Rust client and spread evenly over four tenants with
+    identical traffic. The load level `L` is verification executions per
+    second. At level `L` the mix is:
+
+    | Operation | Rate | Shape |
+    |---|---|---|
+    | Verification, direct | `L/2` per second | PSI, SPC, Custom, assertion Eval, LLM-judge Eval in equal shares (AC-040 reference workloads) |
+    | Verification, queued | `L/2` per second | same five kinds and shares |
+    | Scribe ingest | `2.5·L` Drift observations per second | 100 features each, through `WyrdState` with default queue configuration |
+    | Oracle query | `L/2` per second | equal shares of a selective lookup and a small aggregate over the last 5 minutes of the tenant's ingested data |
+
+    Audit, run settlement, Scribe publication, and Forge maintenance run as
+    the server's own side effects of this mix. Nothing else is driven.
+  - **Steps.**
+    1. warmup: 30 seconds at `L = 50` on one replica, not judged;
+    2. ramp: 60-second steps at `L` = 50, 100, 200, 400 on one replica,
+       stopping at the first step that misses an SLO; the highest passing
+       step is the knee `K`;
+    3. sustained: 180 seconds at `K` on one replica;
+    4. sustained: 180 seconds at `K` on two replicas;
+    5. scale-out: 180 seconds at `2K` on two replicas.
+  - **SLOs.** A step passes only when every SLO holds:
+
+    | Golden signal | SLI | SLO |
+    |---|---|---|
+    | Traffic | achieved ÷ offered, per operation | ≥ 95% |
+    | Errors | requests that failed, were refused, were lost, or produced a wrong judgment | 0 (intentionally failing verifier inputs are judgments, not errors) |
+    | Latency | direct verification paired engine overhead, non-judge kinds | p95 < 10 ms (AC-040) |
+    | Latency | Scribe ingest: client queue drain after load stops | ≤ 1 s |
+    | Latency | client p50/p95/p99 per operation | reported |
+    | Saturation | every backlog (run queue, Scribe, audit outbox, Forge demand) after load stops | drained within 60 s |
+    | Saturation | replica CPU cores and peak memory | reported |
+
+  - **Verdict.** The run passes when the sustained one-replica step and both
+    two-replica steps pass. The scale-out step passing is the proof that two
+    replicas carry more than one.
+  - **Report.** One table, one row per step, one column per SLI, each cell
+    marked PASS or FAIL, then one per-operation row per step with the same
+    columns for diagnosis. Nothing else is judged.
+  - Correctness and isolation are proven by tests, not by this benchmark:
+    tenant fairness, exactly-once queued claims across replicas, judgment
+    correctness, and the AC-041 queue properties.
   - `--profile` captures symbolized per-step, per-replica `perf` profiles of
     a diagnostic build and fails explicitly on missing evidence.
-  - Manual activations used for capacity are labelled and never counted as
-    scheduler throughput. Scheduled Drift and observation-triggered Eval
-    correctness stays proven by the existing journeys.
 
 ### Client ingestion throughput and memory (revision 53)
 
@@ -1791,7 +1811,7 @@ call site when the budget is exhausted.
     one batch keep admission order. Consumers order by row timestamps, never
     by arrival.
   - The default `max_in_flight` is the smallest value that meets AC-041,
-    recorded with the benchmark evidence.
+    recorded with the `bench:capacity` evidence.
 - **REQ-176**: Admission MUST be immediate and all-or-none per logical record.
   For example, every tall row of one Drift observation is admitted, or none is.
   - A record that cannot fit in the remaining budget returns
@@ -2336,30 +2356,18 @@ published image pinned by an immutable registry digest before release.
   | SPC | 4 features × 1,000 samples, subgroup size 5, baseline from 10,000 rows |
   | LLM judge | 1 judge plus 1 assertion against a local TLS mock with a 200 ms delay |
 
-  A step is sustainable when its achieved rate is at least 95% of offered
-  and its outstanding work drains within one ramp step (60 seconds). In the
-  one-replica sustained step of REQ-171, the four non-judge kinds MUST show
-  direct-mode paired per-request engine overhead below 10 ms at p95, from at
-  least 1,000 samples per kind. A sustained rate too low to yield 1,000
-  samples per kind fails this criterion. Judge cases report overhead and
-  provider waits separately, with no threshold. The two-replica sustained
-  step reports scaling and overhead with no threshold.
-- **AC-041**: A release-build Rust benchmark against a real server, Postgres,
-  and the RustFS emulator MUST drive one `WyrdState` emitting 500 Drift
-  observations per second × 100 features (50,000 rows/s) for 60 s with
-  default queue configuration.
-
-  It MUST prove:
-  - zero `QUEUE_FULL` refusals;
-  - client-owned bytes that do not grow from step to step;
-  - backlog that drains within one second after load stops;
-  - exactly 3,000,000 durable rows, with 100 per `record_id`.
-
-  It MUST report, without a threshold:
-  - a 1,000 observations/s headroom step;
-  - a step under a 50 ms injected server acknowledgement delay;
-  - the batch-size distribution, send latency, client CPU per row, and the
-    chosen `max_in_flight`.
+  In `bench:capacity` (REQ-171), the four non-judge kinds MUST show
+  direct-mode paired per-request engine overhead below 10 ms at p95 in every
+  judged step, from at least 1,000 samples per kind in the one-replica
+  sustained step. Judge cases report overhead and provider waits separately,
+  with no threshold.
+- **AC-041**: `bench:capacity` (REQ-171) carries 50,000 ingest rows per
+  second (500 Drift observations × 100 features) at `L = 200` with default
+  queue configuration. Every step at or below the knee MUST show zero
+  `QUEUE_FULL` refusals and client queue drain within one second of load
+  stopping. Tests MUST prove, against a real server, that every emitted
+  observation is durable exactly once with 100 rows per `record_id`, and that
+  client-owned bytes stay flat under sustained emission.
 - **AC-042**: Queue and journey tests MUST prove:
   - all-or-none admission with resubmission and no duplicates;
   - a record larger than the budget refused as too large;
@@ -2391,7 +2399,7 @@ published image pinned by an immutable registry digest before release.
 
 ## Open material decisions
 
-None for revision 56.
+None for revision 57.
 
 Revision 39 records the user's narrow deletion: remove the always-allow
 hook and its fake `invoke` policy attribution without redesigning delegation.
@@ -2426,6 +2434,25 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 - [PagerDuty Global Integrations and Service Routes](https://support.pagerduty.com/main/docs/event-orchestration)
 
 ## Revision history
+
+- **Revision 57 one capacity benchmark (2026-10-03, approved):** Wyrd had three
+  capacity benchmarks (verification, Bifrost ingest, Bifrost query) and the
+  verification one judged correctness, fairness, and tenant roles alongside
+  capacity. Its tenant shape changed twice with no production basis, and
+  two-replica results were hard to read.
+  - **Direction:** the user chose one benchmark for the whole server that is
+    easy to follow under Google SRE practice.
+  - **Changes:** REQ-171 becomes `bench:capacity`: one mix of verification,
+    Scribe ingest, and Oracle query over four identical tenants; ramp,
+    sustained, and two-replica scale-out steps; golden-signal SLIs with
+    stated SLOs and PASS/FAIL per cell. It replaces
+    `bench:verification:capacity` and `bench:bifrost:ingest-capacity`.
+    AC-040 and AC-041 become SLOs of that run; fairness, exactly-once claims,
+    judgment correctness, and queue durability move to tests.
+    `bench:bifrost:query-capacity` is already deleted by
+    `opitimization-and-benchmarks` REQ-010; its ClickBench and observability
+    benchmarks compare the storage engine externally and are not capacity
+    benchmarks.
 
 - **Revision 56 production-shaped capacity benchmark (2026-10-02, approved):**
   The REQ-171 defaults expanded to 134 steps of 30 seconds: 2 paths × 6

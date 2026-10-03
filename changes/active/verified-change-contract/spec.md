@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 58
+revision: 59
 status: approved
 ---
 
@@ -77,10 +77,9 @@ contracts, in-memory demos, or disconnected engine tests. Their supported user
 workflows MUST run through real SDK, server, durable work, Bifrost persistence,
 status, result, Notify/HTTP Operator delivery, restart, authorization, and
 tenant-isolation boundaries. Accepted reliability ceilings are explicit:
-Eval run enqueue is best-effort after its observation commits, so a committed
-observation may not receive a run if that post-commit step fails or the process
-crashes; separate result-table acknowledgements can leave partial rows; and
-an ambiguous external Operator send may be delivered more than once.
+separate result-table acknowledgements can leave a run's detail rows visible
+before its summary; and an ambiguous external Operator send may be delivered
+more than once.
 
 Only Drift and Eval MAY appear as registrable `VerifierImplementation`
 variants or in generated public schemas in this change. Eval's existing internal
@@ -122,10 +121,9 @@ make the standalone LLM-judge Verifier implementation part of this delivery.
 - **Internal SYSTEM result writer**: one server-only tenant principal, persisted
   in the existing tenant machine-principal store with `kind: system`, a
   server-minted UUIDv7, and the fixed name `verification-results-writer`. It
-  has exactly three separately scoped uses: publishing Verification Result
-  batches under its exact-Verifier `bifrost_record:write` token, the fixed
-  Drift observation read under its own server-minted token, and reading
-  continuous Eval inputs under a separate server-minted, table-scoped
+  is an attribution identity only and never appears in a token. It has two
+  uses: stamping Verification Result rows written by the server-internal
+  result writer, and Verifier input reads under a tokenless, table-scoped
   `bifrost_query:read` authority (REQ-086). It has no public credential, Card,
   role grant, refresh, workload, delegation, or principal-management path.
 - **Operator connection**: one tenant-owned, provider-specific Postgres record
@@ -588,7 +586,7 @@ flows are listed in its "Input and queue boundary" section.
   inactive without changing Card lifecycle or credential status. Suspending
   or deleting the principal makes it inactive immediately.
 - **REQ-108**: Before creating a binding-driven Verifier run, the scheduler
-  or Eval post-commit enqueue MUST restrict new work to runtime-active exact
+  or the Eval run insert in Scribe's batch fence MUST restrict new work to runtime-active exact
   owners. An inactive occurrence MUST create no activation or run and MUST NOT
   be backfilled after later authentication. Reauthentication starts eligibility
   with the next schedule occurrence after that authentication. A later
@@ -771,17 +769,20 @@ multi-table transaction design survives as an alternative.
   surface. This change MUST NOT retain it as a hidden second Eval execution
   path or repurpose it as continuous Eval. Future offline dataset evaluation
   may define its own Verifier-backed route when that journey ships.
-- **REQ-077**: Once Scribe acknowledges an Eval observation, the server MUST
-  attempt an asynchronous, idempotent insert of one verifier_runs row per
-  matching active binding, keyed by tenant, binding, and record identity. The
-  row MUST freeze `input_record_id` and `input_event_time`, where
-  `input_event_time` is the exact server-managed `wyrd_event_time` assigned to
-  the committed observation, not the client-authored `created_at`. The
-  insert MUST NOT be part of Scribe's batch-fence transaction, delay or roll
-  back the Bifrost acknowledgement, or add an outbox in this change. If enqueue
-  fails or the process stops before it completes, Bifrost retains the record,
-  no Eval run is guaranteed, and the server emits a structured tracing error.
-  This best-effort loss is accepted for the initial delivery.
+- **REQ-077**: An acknowledged Eval observation MUST never lose its runs.
+  Scribe's batch-fence transaction for a `vala.eval.observations` batch MUST
+  also insert, through one `wyrd-sql` statement, one verifier_runs row per
+  matching active `observations_ready` binding for every record in the batch,
+  keyed by tenant, binding, and record identity so a replayed batch inserts
+  nothing new. The row MUST freeze `input_record_id` and `input_event_time`,
+  where `input_event_time` is the exact server-managed `wyrd_event_time`
+  assigned to the committed observation, not the client-authored
+  `created_at`. Scribe acknowledges the batch only after that transaction
+  commits, so an acknowledged observation always has its runs and a failed
+  insert fails the batch like any other fence failure. There is no
+  process-local activation backlog, post-acknowledgement handoff, or separate
+  activation outbox table. Scribe stays ignorant of Verifiers: the statement
+  is owned by `wyrd-sql` and reached through the `vala-sql` re-export.
 - **REQ-078**: Postgres owns `verification_bindings`, `drift_baselines`,
   `verifier_runs`, `operator_dispatches`, and tenant Operator connections:
   exact identities,
@@ -999,129 +1000,89 @@ table on `(data_tenant_id, result_id)`.
   performance aids, never identity or authorization boundaries. Bifrost's
   existing default `wyrd_event_time DESC` sort applies; this change adds no
   new partition transform, index service, or custom join mechanism.
-- **REQ-086**: The server MUST send the result tables as Arrow batches through
-  `wyrd_client::Bifrost` over its existing authenticated Arrow/gRPC path back
-  through the Wyrd server's Gate to whichever Scribe owns the batch. A runner
-  MUST NOT assume a Scribe is active in its own server process or write
-  directly to local Scribe state. Tenant provisioning and upgrade migration
-  MUST idempotently create exactly one internal `system` principal row named
-  `verification-results-writer` for each tenant in the existing tenant machine
-  principal store. Its server-minted `PrincipalId` MUST be UUIDv7 and remain
-  stable after provisioning. `system` is the sixth `PrincipalKindTag` wire
-  value and a tenant-plane `PrincipalKind`, not a second identity hierarchy.
-  The row has no bound Card or user-managed lifecycle. It is not a Card, API
-  key, refresh token, role grant, workload binding, or user-manageable
-  principal. Public create, list, get, update, suspend/delete, credential,
-  refresh, workload, delegation, and token-exchange operations MUST reject or
-  omit it as appropriate; it remains representable in token and audit wire
-  contracts so internal writes are attributable.
+- **REQ-086**: Verifier results MUST be written as a server-internal write,
+  the same way gateway capture is (REQ-178). The process's one capture writer
+  submits the result batches to Scribe in-process when Scribe runs in the same
+  pod and otherwise over the mutually authenticated peer plane to a live,
+  ready Scribe; the choice follows pod topology (`WYRD_TARGET`). Result writes
+  MUST NOT go through `wyrd_client::Bifrost`, the public ingest listener, or
+  Gate, and no token is minted for them. The peer ingest RPC is widened to
+  carry exactly the three result tables in addition to the two capture tables,
+  each submission naming the tenant, table, run, and frozen Verifier Card UID
+  explicitly; it refuses every other table and every reserved system tenant.
+  Result writes share the capture writer's transport but not its delivery
+  policy: a result batch is never dropped. Retryable refusals are retried for
+  as long as the run's lease remains, and an unwritten result stays stored
+  for the next claimant (REQ-183).
+  Gate MUST refuse every public write to `vala.verification.results`,
+  `vala.drift.result_features`, and `vala.eval.result_items`, from any
+  principal including wildcard administrators.
 
-  Immediately before each result-publication attempt, the runner MUST mint a
-  normal five-minute-or-shorter Wyrd access token through the existing tenant
-  token issuer using that tenant's persisted SYSTEM
-  principal. The token MUST contain the run tenant, `kind=system`, no roles or
-  credential attribution, delegation chain, or bound root Card, and signed Card
-  scope containing exactly one UID-bearing `Verifier` CardRef: the run's exact
-  Verifier version. Verification MUST reject
-  a missing or non-UUIDv7 persisted principal, a mismatched tenant, a bound root
-  Card, any role, an empty or multi-Card scope, a non-Verifier scope member, or
-  a scope member without managed Card UID. Public API-key, refresh, JWT-bearer,
-  delegation, workload-binding, principal-management, and token-exchange paths
-  MUST reject creation, credentialing, impersonation, delegation, or refresh
-  of `system`. Expiry or retry mints a new short-lived token; no credential is
-  persisted.
+  Tenant provisioning and upgrade migration MUST idempotently create exactly
+  one internal `system` principal row named `verification-results-writer` for
+  each tenant in the existing tenant machine principal store. Its
+  server-minted `PrincipalId` MUST be UUIDv7 and remain stable after
+  provisioning. `system` is the sixth `PrincipalKindTag` wire value and a
+  tenant-plane `PrincipalKind`, not a second identity hierarchy. It is an
+  attribution identity only: result rows carry it as `principal_id`, and
+  in-process reads (below) run as it, but it never appears in a token. It is
+  not a Card, API key, refresh token, role grant, workload binding, or
+  user-manageable principal. Public create, list, get, update,
+  suspend/delete, credential, refresh, workload, delegation, and
+  token-exchange operations MUST reject or omit it as appropriate. The token
+  issuer MUST refuse to mint any token for it, and token verification MUST
+  refuse any `kind=system` claim set. The SYSTEM result-write token, the
+  SYSTEM Drift read token, and their issuance and verification paths are
+  removed.
 
-  SYSTEM minting evaluates no end-user permission and emits no authorization
-  audit row. Gate's result-table admission is the one
-  `bifrost_record:write` authorization decision and uses the canonical audit
-  path. No second issuer, token format, credential table, or identity store is
-  introduced.
+  Scribe stamps the submitted tenant as `data_tenant_id`, the tenant's SYSTEM
+  principal as `principal_id`, and the submitted Verifier Card UID as managed
+  `card_uid`; it MUST refuse a row whose `card_ref` names a different Card. The
+  submitted values come from the run's frozen Postgres row, never from a Verifier
+  or an Arrow payload. A result write evaluates no permission and writes no
+  audit decision, like every other worker mechanic under REQ-145.
 
-  A valid SYSTEM result token receives only the existing
-  `bifrost_record:write` permission. Gate MUST reserve exactly
-  `vala.verification.results`, `vala.drift.result_features`, and
-  `vala.eval.result_items` for this principal kind. A write to one of those
-  tables requires `kind=system`, that permission, and the exact signed Verifier
-  scope; every other principal, including wildcard administrators, is denied.
-  SYSTEM is denied every other table. Gate MUST enforce and audit this as its
-  one canonical `bifrost_record:write` decision. Scribe MUST continue to derive
-  tenant and `principal_id` from authenticated authority, authorize every row's
-  Verifier CardRef against signed scope, and stamp the managed Verifier Card
-  UID; neither tenant nor Card UID may be trusted from Arrow payloads.
-  `Verifier` is therefore an eligible scoped Bifrost target only for this
-  internal path. The global `SYSTEM_OWNER` tenant, platform audit principal,
-  and audit-publisher identity MUST NOT be reused.
-
-  Drift observation reads use a second, mutually exclusive SYSTEM token
-  purpose. Immediately before each Drift aggregate query the runner mints,
-  through the same tenant issuer and persisted SYSTEM principal, a
-  five-minute-or-shorter token with no roles, credential attribution,
-  delegation chain, or bound root Card, whose only permission is
-  `bifrost_query:read` scoped to the table object
-  `{ catalog: vala, schema: drift, table_uid }` of the tenant's registered
-  `vala.drift.observations` table. The issuer resolves that existing table UID
-  in the caller's tenant transaction and MUST NOT create or register a table;
-  when the tenant has no such table no token is minted and the run scores an
-  empty window (Custom completes `inconclusive` with no report). The token's
-  Card scope is the run's exact UID-bearing Verifier CardRef and serves
-  attribution only; it does not limit what Oracle reads. No SYSTEM token
-  carries both the result-write and read permission. Verification MUST accept
-  a `kind=system` claim set only when its permissions are exactly
-  `bifrost_record:write` or exactly one table-scoped `bifrost_query:read` on
-  catalog `vala`, schema `drift`, and MUST refuse every other set, scope, or
-  combination as forged.
-
-  The runner verifies the minted read token with the server's ordinary token
-  verifier, derives the query caller from the verified principal, and
-  dispatches through the ordinary server query service: coarse capability
-  admission, Gate, and a local or peer-forwarded Oracle. It MUST NOT assume an
-  Oracle is active in its own process, construct a principal or query context
-  by hand, or add an Oracle endpoint, client query route, or plan
-  serialization. Oracle's table authorization is the enforcement point; each
-  read records the canonical Oracle read decision and each denial the
-  canonical audited denial. Minting records no audit. The token does not
-  enforce subject, series, or window limits: the server-built fixed SQL
-  supplies those filters from the frozen run and fitted baseline, rendering
-  the subject UID, feature name, fitted edges and labels, and window bounds as
-  escaped typed literals. A Verifier contributes no SQL text. Registration
-  authorization is not standing query authorization. A read token is refused
-  by every record-write admission, and a result-write token is refused by
-  query admission.
-
-  Continuous Eval's own Bifrost reads of its inputs—the run's committed
-  `vala.eval.observations` record and its `vala.traces.spans` trace—run
-  in-process through Oracle as this same persisted tenant SYSTEM principal and
-  never as a fabricated user or other identity. Before each run's reads the
-  server resolves the principal's stable ID from tenant-owned state and mints,
-  without a token, a read authority separate from the result-write token:
-  `bifrost_query:read` scoped to exactly those two tables by their registered
-  UIDs, with no roles, credential, delegation, Card, or Verifier write scope.
-  It is not a general Bifrost query grant; every other table is refused.
-  Oracle authorizes and audits each read through its existing object decision
-  and canonical audit path, attributing allowed read decisions and object
-  denials to that principal. A missing or non-UUIDv7 SYSTEM principal, a
+  Every Verifier input read runs in-process as that same tenant SYSTEM
+  principal under a tokenless read authority. The server resolves the
+  principal's stable ID from tenant-owned state and builds an authority whose
+  only permission is `bifrost_query:read` scoped by registered table UID to
+  exactly the tables the run reads: `vala.drift.observations` for Drift, and
+  `vala.eval.observations` plus `vala.traces.spans` for Eval. It carries no
+  roles, credential, delegation, Card, or write scope, and every other table
+  is refused. Drift resolves the existing table UID in the run's tenant and
+  MUST NOT create or register a table; when the tenant has no such table the
+  run scores an empty window (Custom completes `inconclusive` with no report).
+  The read goes through the ordinary server query service to a local or
+  peer-forwarded Oracle, carrying the authority over the peer plane rather
+  than as a token. The server MUST NOT assume an Oracle is active in its own
+  process or add an Oracle endpoint, client query route, or plan
+  serialization. Oracle's table authorization is the enforcement point; it
+  records the canonical read decision for each read and the canonical audited
+  denial for each refusal. A missing or non-UUIDv7 SYSTEM principal, a
   mismatched tenant, or insufficient table scope MUST fail closed before any
-  row is returned. This read use adds no identity store, principal kind, user,
-  public permission, token format, or public surface.
+  row is returned. The server-built fixed Drift SQL supplies subject, feature,
+  fitted-edge, label, and window filters from the frozen run and fitted
+  baseline as escaped typed literals; a Verifier contributes no SQL text.
+  Registration authorization is not standing query authorization. This adds
+  no identity store, principal kind, user, public permission, token format, or
+  public surface.
 
   Every non-empty required detail batch is written before the canonical
   summary batch, and each is separately acknowledged. A result with zero
   details—such as sampled-out Eval or pre-scoring inconclusive Drift—writes no
-  empty detail batch and requires only the summary acknowledgement. Their writes
-  are not atomic across tables. Only after every required batch is
+  empty detail batch and requires only the summary acknowledgement. Only
+  after every required batch of the run's staged result (REQ-183) is
   acknowledged may the runner settle verifier_runs as completed and create
-  Operator dispatches. Partial result rows may be visible after a failed
-  write or crash; this initial change accepts that limitation and does not
-  add a per-table crash-recovery protocol or claim atomic result visibility.
+  Operator dispatches. Detail rows may be visible before their summary, but a
+  run never has more than one result: every write of its result reuses the
+  same staged bytes and batch IDs.
 - **REQ-087**: Scribe acknowledgement means its existing WAL, batch fence,
   and active rows accepted that sealed batch; it does not mean Iceberg
-  publication. A retry of an unacknowledged result batch MUST preserve the
-  same sealed Arrow payload, table, and batch ID so Scribe can deduplicate it.
-  A fresh write_batch call creates a new batch ID and MUST NOT be described
-  as deduplicated replay. If a process crash loses an unacknowledged payload,
-  the run may remain partial and end errored; it MUST NOT dispatch an Operator
-  as though all result tables were acknowledged. No stronger cross-table
-  crash guarantee is claimed.
+  publication. Every write of a run's result, by any replica and after any
+  crash, MUST submit the staged Arrow bytes under the staged batch IDs
+  (REQ-183), so Scribe's batch fence absorbs every repeat and each result
+  table holds exactly one copy of the run's rows. A result is never rebuilt
+  for a new write.
 - **REQ-097**: For a completed binding-created run with failed verdict, the
   generic runner MUST settle the run and insert one operator_dispatches row
   for each distinct configured Operator UID or inline-spec digest in the
@@ -1380,10 +1341,10 @@ table on `(data_tenant_id, result_id)`.
 - **REQ-101**: The initial change MUST prove the entire registered
   Service/Agent-to-Operator journey for PSI, SPC, Custom Drift, deterministic
   Eval, and LLM-judge Eval through real SDK, server, Postgres control state,
-  canonical client queue/IPC observation ingest, Bifrost query and Arrow/gRPC
-  result writes, scheduling or post-commit enqueue,
+  canonical client queue/IPC observation ingest, Bifrost query, server-internal
+  result writes, scheduling or transactional Eval enqueue,
   result persistence, and status. Cron, manual activation, worker lease,
-  retry, fail-open Eval enqueue, partial result write, Operator fanout,
+  retry, Eval enqueue in the batch fence, single-copy result writes, Operator fanout,
   notification delivery, restart, authorization, and tenant isolation are
   required evidence. Offline dataset/scenario evaluation is excluded from
   this initial journey.
@@ -1397,7 +1358,7 @@ table on `(data_tenant_id, result_id)`.
   Oracle reads, `vala-drift` fitting/scoring, and `vala-eval` planning/executor
   and result types. Only the missing binding projection, generic scheduling,
   run/dispatch control state, Drift baseline fitting orchestration, Eval
-  post-commit enqueue, media binding through the existing judge path,
+  run insert in the batch fence, media binding through the existing judge path,
   result-table writers, and public status/manual surfaces are added. No new
   downstream projector, observation envelope, Eval engine, generic
   broker, or Alert persistence path is permitted.
@@ -1449,16 +1410,53 @@ table on `(data_tenant_id, result_id)`.
   absent. Existing tracing and metrics MUST expose queue depth, active work,
   attempts, failures, and latency; this change adds no new telemetry service or
   process-local work registry.
-- **REQ-178**: The Verifier runner MUST NOT let a burst of runs exhaust the
-  server's Postgres pool. Its Postgres phases (loading the Verifier, minting
-  the result-write token, and settlement) share one in-process bound derived
-  from the configured pool size, so runner Postgres work never holds more than
-  half of the pool. The bound has no separate configuration. Engine execution,
-  claims, and leases stay unbounded and durable as REQ-146 states; this bound
-  limits connection use, not runs. Settlement that fails to acquire a
-  connection retries with backoff within the run's lease instead of leaving the
-  run until lease expiry. A run never consumes an attempt because a connection
-  was unavailable.
+- **REQ-181**: Every claim round MUST consider every tenant with a claimable
+  run, with no limit on the number of tenants, and claim at most one run per
+  tenant. A round claims each tenant in order of its oldest claimable run.
+  Execution has no count limit and nothing is reserved in advance (revision
+  50). The pod's real limits come from the shared resources that already
+  admit work: the Postgres pool, Oracle query admission and memory, and the
+  Bifrost memory budget. When one of them refuses a run for lack of capacity,
+  the run returns to the queue without consuming an attempt, and the process
+  claims nothing new until one of its running runs finishes.
+- **REQ-182**: Each process MUST cache parsed Verifier Cards by tenant and
+  Verifier Card UID. A Card's spec never changes under its UID, so a cached
+  entry needs no content invalidation. The claim transaction returns the
+  claimed run's Verifier Card status from `wyrd.cards`; a deleted Verifier
+  terminates the run `errored` exactly as an unloadable Card does today. On a
+  miss the claim transaction also returns the Card spec, so loading a Verifier
+  never opens its own connection. The cache is bounded by total bytes with
+  least-recently-used eviction, fixed at 64 MiB per process, because every
+  Wyrd-owned buffer is bounded (`architecture/bifrost-design.md`, Resource and
+  failure invariants). It has no configuration and is never shared across
+  tenants.
+- **REQ-183**: A run's result MUST be decided once. When execution finishes,
+  the runner stores the complete result in one lease-fenced Postgres
+  transaction before any of it is written to Bifrost: the `result_id`, the
+  result event time, one batch ID per result table, and each table's Arrow IPC
+  bytes. A transaction whose lease token no longer matches stores nothing, and
+  its work is discarded. A run with a stored result is never executed again:
+  any later claimant, whether a retry, a reclaim after lease expiry, or a
+  restart, writes that stored result instead. The settle transaction that
+  completes the run deletes the stored result. The staging table is owned by
+  `wyrd-sql`, carries `data_tenant_id`, enables and forces RLS, and is
+  reachable only through `TenantConn`. A failed write of a stored result
+  retries the write, not the execution.
+- **REQ-184**: While a run executes or writes its result, the runner MUST
+  renew its lease on the PostgreSQL clock once a third of the lease duration
+  has passed. It renews all of one tenant's in-flight leases in one statement.
+  A renewal that finds a run's token gone cancels that run's work at once. A
+  run that has not stored its result stores nothing; one that has stored it
+  leaves it for the new claimant. Renewal evaluates no permission and writes
+  no audit.
+- **REQ-185**: A run MUST hold a Postgres connection only inside these short
+  transactions, never across engine execution, Oracle reads, LLM or media
+  calls, or Bifrost writes: the claim (which also returns the Verifier), the
+  result store, the settle, and the shared per-tenant lease renewal. No phase
+  mints a token. A connection that cannot be acquired never consumes an
+  attempt. The result store and the settle retry with backoff for as long as
+  the run's lease remains, and a settle that still cannot run leaves the
+  stored result for the next claimant.
 - **REQ-152**: Verification coordination MUST use PostgreSQL as its clock.
   PostgreSQL MUST write and evaluate runtime activity, schedule eligibility,
   run and dispatch availability, claim and lease expiry, retry/backoff
@@ -1497,8 +1495,8 @@ table on `(data_tenant_id, result_id)`.
   process-local-only run state, registration-only relationship, or provisional
   storage path standing in for the documented server workflow. A successfully
   enqueued run MUST reach completed or a visible bounded retry/terminal state.
-  This does not promise an Eval run when its best-effort post-commit enqueue
-  fails, nor atomic visibility across the separate Bifrost result tables.
+  It does not promise atomic visibility across the separate Bifrost result
+  tables.
 
 - **REQ-061**: Drift and Eval MUST produce the same common Verification Result
   shape. Future implementations can project that core result without changing
@@ -1853,8 +1851,9 @@ listener. This revision supersedes the capture-authority mechanism in
   - The choice follows pod topology (`WYRD_TARGET`), never table ownership.
   - The peer RPC is served only by pods running Scribe and admits only
     `wyrd-peer` client certificates. It refuses any table other than the two
-    capture destinations and any reserved system tenant. Widening it to other
-    server-internal writers requires a spec revision.
+    capture destinations and the three Verifier result tables (REQ-086), and
+    any reserved system tenant. Widening it to other server-internal writers
+    requires a spec revision.
 - **REQ-179**: Capture MUST be a server-internal write. It holds no token,
   evaluates no permission, and writes no audit decision. Captured rows carry
   the reserved `GATEWAY_CAPTURE_PRINCIPAL` identity, which, like
@@ -1928,6 +1927,9 @@ listener. This revision supersedes the capture-authority mechanism in
 - **INV-020**: Gateway capture cannot write outside its tenant and the two
   capture destinations. No public principal, including one claiming the
   capture identity, can write `vala.gateway.calls` through Gate.
+- **INV-021**: A Verifier run has at most one result. Every write of it, by
+  any replica and after any crash, carries the same stored bytes and batch
+  IDs, and no public principal can write a Verifier result table.
 
 ## Acceptance obligations
 
@@ -1986,8 +1988,8 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   Verifier with deterministic and LLM-judge tasks, authored pass_gate, and
   observations_ready binding; emits existing EvalRecordObservation through
   observe:eval over wyrd-client/wyrd-queue's canonical IPC path; and proves
-  the new vala.eval.observations row receives a Scribe acknowledgement
-  independent of the later best-effort Postgres verifier_runs insert.
+  the new vala.eval.observations row and its verifier_runs rows commit in
+  the same Scribe batch-fence transaction.
   The created run MUST retain the committed row's exact `record_id` and
   server-managed `wyrd_event_time`, and its input read MUST demonstrate UTC-day
   partition pruning with those frozen values even when client `created_at`
@@ -1997,9 +1999,9 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   tenant-scoped query. A workflow that skips a task MUST persist
   its `TaskRunOutcome::Skipped` beside every `Ran` task outcome, while the
   common result's `details` serializes `EvalWorkflowSummary`. A forced
-  post-commit enqueue failure MUST preserve the Bifrost observation, return
-  successful ingest, emit a structured
-  tracing error, and create no Eval run or Operator dispatch. A failing
+  run-insert failure MUST fail the batch without an acknowledgement, and the
+  client's resend MUST land the observation once with exactly one run per
+  matching binding. A failing
   pass_gate creates one dispatch per configured Operator; a passing gate
   creates none; an absent gate persists `completed/inconclusive` and creates
   none. A sampled-out record persists one zero-count summary, zero item rows,
@@ -2166,7 +2168,7 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   re-exchange renews activity without resetting an active schedule cursor, and
   an idle client does not
   re-exchange solely on token expiry. Delegation, human refresh, Card-free
-  automation, SYSTEM minting, cached-token requests, and ordinary observations
+  automation, server-internal SYSTEM work, cached-token requests, and ordinary observations
   do not activate or renew an owner. Inactivity, suspension, and deletion
   prevent scheduled work; later reauthentication starts at the next future
   occurrence without backfill. Two A/B versions remain independently
@@ -2176,7 +2178,7 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
 - **AC-020**: Supporting integration tests MUST exercise the real Postgres
   registration/auth/binding/run/dispatch seams, Oracle/Scribe result and
   observation seams, scheduler claim and lease expiry, baseline fitting,
-  Eval post-commit enqueue, and Operator retry/fanout. Unit tests cover
+  the Eval run insert in the batch fence, and Operator retry/fanout. Unit tests cover
   pure Drift/Eval validation, cron-window calculation, verdict mapping,
   sampling and pass-gate branches, and stable public errors. These lower
   tiers support, but do not replace, AC-012–AC-019 user journeys. The
@@ -2227,23 +2229,21 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   MUST observe a Postgres rotation on the next attempt without a Card revision
   or replica rollout.
 - **AC-023**: A multi-server journey MUST run the Verifier worker on a server
-  without local Scribe ownership and prove its Arrow result batches return
-  through `wyrd_client::Bifrost` to Gate/Scribe, are acknowledged, and are
-  queryable. It MUST assert input rows carry the client Service/Agent
-  `principal_id` and subject `card_uid`, while result/detail rows carry the
-  tenant-scoped SYSTEM writer `principal_id`, exact Verifier `card_uid`, and
-  explicit subject/owner/binding IDs. A forged tenant or out-of-scope Verifier
-  `card_ref` MUST be rejected; no global `SYSTEM_OWNER` token may write a
-  customer-tenant result. Provisioning MUST create one stable UUIDv7 SYSTEM
-  principal per tenant without a public credential. Tests MUST reject public
-  create, list, get, update, suspend/delete, credential, refresh, workload,
-  delegation, impersonation, and token-exchange operations for SYSTEM,
-  non-SYSTEM writes to any result table, and SYSTEM writes to every other
-  table. They MUST prove that a SYSTEM read token is refused against another
-  table and another tenant and cannot write results, and that a verification
-  process without a local Oracle completes a Drift run through peer-forwarded
-  Oracle with an audited read decision. They MUST also prove the existing tenant issuer/JWT format and the
-  single canonical Gate authorization audit. Two bindings for one subject MUST
+  without local Scribe or Oracle and prove that its result batches reach a live
+  Scribe through the peer ingest RPC, are acknowledged, and are queryable, and
+  that a Drift run completes through a peer-forwarded Oracle with an audited
+  SYSTEM read decision. It MUST assert input rows carry the client
+  Service/Agent `principal_id` and subject `card_uid`, while result/detail
+  rows carry the tenant-scoped SYSTEM `principal_id`, exact Verifier
+  `card_uid`, and explicit subject/owner/binding IDs. Provisioning MUST create
+  one stable UUIDv7 SYSTEM principal per tenant without a public credential.
+  Tests MUST reject public create, list, get, update, suspend/delete,
+  credential, refresh, workload, delegation, impersonation, and token-exchange
+  operations for SYSTEM; the issuer's refusal to mint a SYSTEM token;
+  verification's refusal of any `kind=system` claim set; every public write to
+  a result table through Gate, including from a wildcard administrator; a
+  result row whose `card_ref` differs from the submitted Verifier; and a SYSTEM
+  read of another table or another tenant. Two bindings for one subject MUST
   remain independently filterable through runs/results while sharing the one
   raw subject observation without Verifier/binding columns or per-binding
   copies.
@@ -2268,7 +2268,7 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   scope refusal, reserved-table refusal, and no audit rows for internal claims,
   retries, Scribe commits, or worker mechanics. They MUST also prove
   `operators:read` versus `operators:write` separation for connection
-  management and Gate's closed SYSTEM/result-table matrix. A multi-tenant runtime journey
+  management and Gate's refusal of every public result-table write. A multi-tenant runtime journey
   MUST execute more than sixteen held Verifier runs, including more than four
   for one tenant, while another tenant also progresses. Baseline fitting MUST
   proceed while those runs are held. Operator delivery MUST still enforce four
@@ -2404,12 +2404,31 @@ published image pinned by an immutable registry digest before release.
   - a resubmitted capture batch is not written twice.
 
   Negative tests MUST prove that Gate refuses every public write to
-  `vala.gateway.calls`, and that the peer RPC refuses non-capture tables,
-  reserved tenants, and callers without a peer certificate.
+  `vala.gateway.calls`, and that the peer RPC refuses tables other than the
+  capture and Verifier result tables, reserved tenants, and callers without a
+  peer certificate.
+
+- **AC-044**: Verifier runtime journeys under load MUST prove:
+  - 200 held queued runs released at once on the 8-connection test pool all
+    complete on their first attempt, with no `settlement_failed` outcome and
+    no connection-acquire timeout;
+  - with more than 64 tenants each holding a claimable run, every tenant
+    receives a claim in the first round;
+  - a run whose lease is reclaimed after its result was stored is written
+    from the stored result without re-executing, and each result table holds
+    exactly one copy of that run's rows;
+  - a stale claimant whose lease was taken cannot store a result, and its
+    work never reaches Bifrost;
+  - a run that executes longer than its lease keeps its lease through
+    renewal, and a renewal that finds its token gone cancels the run's work;
+  - a second run of the same Verifier on one process opens no connection to
+    load its Card, and a run whose Verifier was deleted settles `errored`;
+  - a run refused by a full shared resource returns to the queue without
+    consuming an attempt, and claiming resumes when a running run finishes.
 
 ## Open material decisions
 
-None for revision 58.
+None for revision 59.
 
 Revision 39 records the user's narrow deletion: remove the always-allow
 hook and its fake `invoke` policy attribution without redesigning delegation.
@@ -2444,6 +2463,36 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 - [PagerDuty Global Integrations and Service Routes](https://support.pagerduty.com/main/docs/event-orchestration)
 
 ## Revision history
+
+- **Revision 59 Verifier runtime under load (2026-10-03, approved):** An
+  independent architecture review (Codex gpt-5.6-sol, medium) found that one
+  run could write more than one result, because each retry built a new result
+  and new batch IDs. It also found that Eval runs were lost when the
+  post-acknowledgement handoff failed, that leases were never renewed, and
+  that claim rounds stopped at 64 tenants. The user also objected to three
+  more things. Internal jobs minted tokens, results looped back through the
+  server's own Gate as if from an outside client, and every run reloaded its
+  Verifier from Postgres. Each run took five to seven connections.
+  - **Changes:**
+    - Results are written by the server-internal capture writer with no
+      token and no Gate (REQ-086). They are stored once before writing, and
+      every write reuses those stored bytes and batch IDs (REQ-183).
+    - Leases are renewed (REQ-184).
+    - The claim round has no tenant limit (REQ-181).
+    - Verifiers are cached per process (REQ-182).
+    - A run holds a connection only for its claim, result store, settle, and
+      shared lease renewal (REQ-185).
+    - Eval runs are inserted in Scribe's batch-fence transaction (REQ-077).
+    - The SYSTEM tokens are removed.
+    - Revision 58's half-pool bound (the first REQ-178, which also duplicated
+      the capture writer's ID) is withdrawn.
+  - **Decided by the user:**
+    - Verifier execution has no count cap. Shared resources that are full
+      push back instead: the run returns to the queue without using an
+      attempt, and claiming pauses until a run finishes.
+    - Drift only runs its SQL on Bifrost and scores what returns. It makes
+      no completeness or freshness check.
+  - **Proof:** AC-044 and the revised AC-014 and AC-023.
 
 - **Revision 58 runner connection bound (2026-10-03, approved):** A fairness
   test that released 200 held queued runs at once exhausted the server's

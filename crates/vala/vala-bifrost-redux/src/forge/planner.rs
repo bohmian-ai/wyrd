@@ -164,10 +164,14 @@ mod tests {
             parameters: serde_json::from_str(parameters).expect("test parameters parse"),
         };
         assert_eq!(
-            plan_hash(&plan(r#"{"kind":"k","compaction_type":"full","dispatch":"d"}"#))
-                .expect("hash"),
-            plan_hash(&plan(r#"{"kind":"k","dispatch":"d","compaction_type":"full"}"#))
-                .expect("hash"),
+            plan_hash(&plan(
+                r#"{"kind":"k","compaction_type":"full","dispatch":"d"}"#
+            ))
+            .expect("hash"),
+            plan_hash(&plan(
+                r#"{"kind":"k","dispatch":"d","compaction_type":"full"}"#
+            ))
+            .expect("hash"),
         );
     }
 }

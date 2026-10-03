@@ -473,8 +473,9 @@ async fn assert_spent_retry_closes_every_operation(phase: SpentRetryPhase<'_>) {
         published_plans,
         telemetry,
     } = phase;
-    // Every plan refused twice: each spends its one retry, so no plan commits
-    // and the attempt has no partial progress to report as success.
+    // Every submission refused: each plan spends its whole retry schedule, so
+    // no plan commits and the attempt has no partial progress to report as
+    // success.
     catalog.reject_next_commits(usize::MAX);
     supervisor.restart_worker();
     let error = supervisor.run_one_failure().await;

@@ -9,9 +9,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use vala_bifrost_redux::forge::{
-    ForgeClock, ForgeLifecycleEvent, ForgeObjectStore, ForgeTableKey,
-};
+use vala_bifrost_redux::forge::{ForgeClock, ForgeLifecycleEvent, ForgeObjectStore, ForgeTableKey};
 use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
 
 use super::rewrite_support::PromotedRewriteFixture;
@@ -267,7 +265,12 @@ async fn admitted_batch_reports_partial_progress_semantics() {
         "exactly one attempt was spent: {refused:?}"
     );
     assert!(
-        owes_compaction(&promoted, &supervisor, promoted.fixture.tenant, &promoted.fixture.binding.table_ref.name),
+        owes_compaction(
+            &promoted,
+            &supervisor,
+            promoted.fixture.tenant,
+            &promoted.fixture.binding.table_ref.name
+        ),
         "the leader keeps the refused attempt's commits owed for its own retry"
     );
 
@@ -1491,8 +1494,7 @@ async fn released_authority_gates_readiness_and_new_claims() {
         released_task,
     )
     .await;
-    assert_lapsed_claim_restores_readiness(&promoted, &supervisor, own_tenant, &unresolved)
-        .await;
+    assert_lapsed_claim_restores_readiness(&promoted, &supervisor, own_tenant, &unresolved).await;
     supervisor.stop_worker().await;
     supervisor.shutdown().await;
 }
@@ -1642,7 +1644,14 @@ async fn assert_unready_takes_no_new_authority(
             &promoted.fixture,
             own_tenant,
             GATED_TABLE,
-            &["claimed", "running", "prepared", "succeeded", "retryable", "failed"],
+            &[
+                "claimed",
+                "running",
+                "prepared",
+                "succeeded",
+                "retryable",
+                "failed"
+            ],
         )
         .await,
         0,
@@ -2079,8 +2088,13 @@ async fn pull_turn_stops_at_the_tenant_allowance(
             saturated = true;
             let pulled = small_files_named(&promoted.fixture, own, "pull_bound", OWNED_TASK_STATES)
                 .await
-                + small_files_named(&promoted.fixture, other_tenant, "pull_bound", OWNED_TASK_STATES)
-                    .await;
+                + small_files_named(
+                    &promoted.fixture,
+                    other_tenant,
+                    "pull_bound",
+                    OWNED_TASK_STATES,
+                )
+                .await;
             still_owed = PULL_BOUND_TABLES.len().saturating_sub(pulled);
         }
         if ended > window_ended {

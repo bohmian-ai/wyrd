@@ -1243,17 +1243,7 @@ impl PromotionIntegrationFixture {
     ///
     /// Panics when the read-only diagnostic query fails.
     pub(crate) async fn forge_tasks(&self) -> Vec<ForgeTaskRow> {
-        sqlx::query_as::<
-            _,
-            (
-                uuid::Uuid,
-                String,
-                String,
-                i64,
-                i32,
-                Option<String>,
-            ),
-        >(
+        sqlx::query_as::<_, (uuid::Uuid, String, String, i64, i32, Option<String>)>(
             "SELECT task_id, strategy, state, base_snapshot_id, \
                     attempt_count, failure_class \
              FROM vala.forge_tasks \
@@ -1268,20 +1258,15 @@ impl PromotionIntegrationFixture {
         .expect("fixture Forge task inspection")
         .into_iter()
         .map(
-            |(
-                task_id,
-                strategy,
-                state,
-                base_snapshot_id,
-                attempt_count,
-                failure_class,
-            )| ForgeTaskRow {
-                task_id,
-                strategy,
-                state,
-                base_snapshot_id,
-                attempt_count,
-                failure_class,
+            |(task_id, strategy, state, base_snapshot_id, attempt_count, failure_class)| {
+                ForgeTaskRow {
+                    task_id,
+                    strategy,
+                    state,
+                    base_snapshot_id,
+                    attempt_count,
+                    failure_class,
+                }
             },
         )
         .collect()
@@ -1718,9 +1703,9 @@ impl SupervisedPromotion {
         let scheduler_trigger = ForgeSchedulerTrigger::with_owner_for_test(uuid::Uuid::now_v7());
         let worker_observer = ForgeWorkerCompletionObserver::new();
         let forge = fixture.build_forge_for_test(
-            Arc::clone(&catalog),
-            Arc::clone(&object_store),
-            clock.clone(),
+            catalog,
+            object_store,
+            clock,
             worker_observer.clone(),
             scheduler_trigger.clone(),
         );

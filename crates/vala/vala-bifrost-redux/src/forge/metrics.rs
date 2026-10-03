@@ -1,8 +1,8 @@
 //! Public Forge production telemetry.
 //!
-//! Forge exposes exactly the seventeen Prometheus families operators need to
+//! Forge exposes exactly the fifteen Prometheus families operators need to
 //! read demand, queue depth and age, active ownership, durable results,
-//! latency, failure class, physical data flow, and compaction debt. Lease,
+//! latency, failure class, and physical data flow. Lease,
 //! fence, catalog, reconciliation, cursor, scheduler, and resource protocol
 //! detail belongs to structured traces and durable audit/task evidence, and
 //! unresolved authority belongs to role readiness — none of it is duplicated
@@ -30,7 +30,7 @@ pub(super) const TASK_TYPES: [ForgeTaskStrategy; 5] = [
 
 /// The exact public Forge family inventory, used by documentation coverage.
 #[cfg(test)]
-pub(super) const FORGE_METRIC_FAMILIES: [&str; 17] = [
+pub(super) const FORGE_METRIC_FAMILIES: [&str; 15] = [
     "bifrost_forge_planning_demands",
     "bifrost_forge_oldest_planning_demand_timestamp_seconds",
     "bifrost_forge_tasks_created_total",
@@ -46,8 +46,6 @@ pub(super) const FORGE_METRIC_FAMILIES: [&str; 17] = [
     "bifrost_forge_output_bytes_total",
     "bifrost_forge_deleted_objects_total",
     "bifrost_forge_snapshots_expired_total",
-    "bifrost_forge_compaction_debt_files",
-    "bifrost_forge_compaction_debt_bytes",
 ];
 
 /// Closed durable result of one completed Forge ownership episode.
@@ -118,10 +116,6 @@ pub struct ForgeTelemetry {
     oldest_pending_task: BTreeMap<ForgeTaskStrategy, Gauge>,
     /// Attempts this process currently holds unsettled, by work type.
     active_tasks: BTreeMap<ForgeTaskStrategy, Gauge>,
-    /// Files the latest complete compaction inventory left outstanding.
-    compaction_debt_files: Gauge,
-    /// Bytes the latest complete compaction inventory left outstanding.
-    compaction_debt_bytes: Gauge,
 }
 
 impl ForgeTelemetry {
@@ -138,8 +132,6 @@ impl ForgeTelemetry {
                 "bifrost_forge_oldest_pending_task_timestamp_seconds",
             ),
             active_tasks: zeroed_task_type_gauges("bifrost_forge_active_tasks"),
-            compaction_debt_files: zeroed_gauge("bifrost_forge_compaction_debt_files"),
-            compaction_debt_bytes: zeroed_gauge("bifrost_forge_compaction_debt_bytes"),
         }
     }
 
@@ -258,12 +250,6 @@ impl ForgeTelemetry {
             self.oldest_pending_task[&task_type]
                 .set(observed.map_or(0.0, |o| o.oldest_ready_at_unix.to_f64().unwrap_or(0.0)));
         }
-    }
-
-    /// Publishes the latest complete compaction-debt inventory.
-    pub(super) fn record_compaction_debt(&self, files: u64, bytes: u64) {
-        self.compaction_debt_files.set(exact(files));
-        self.compaction_debt_bytes.set(exact(bytes));
     }
 
     /// Opens one balanced active-task guard for the duration of an attempt.
@@ -470,7 +456,6 @@ mod tests {
                 count: 2,
                 oldest_ready_at_unix: 1_767_311_000,
             }]);
-            telemetry.record_compaction_debt(9, 900);
 
             drop(telemetry.active_task(ForgeTaskStrategy::SmallFiles));
             let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -490,7 +475,7 @@ mod tests {
         );
         assert_eq!(
             registered.gauges.len(),
-            4 + 3 * TASK_TYPES.len(),
+            2 + 3 * TASK_TYPES.len(),
             "construction registers exactly the scalar and per-task-type gauges"
         );
         for (series, value) in &registered.gauges {

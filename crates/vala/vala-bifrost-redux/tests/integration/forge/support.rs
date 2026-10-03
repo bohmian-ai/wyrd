@@ -20,6 +20,7 @@ use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use async_trait::async_trait;
 use iceberg::table::Table;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{
     Catalog, Error as IcebergError, ErrorKind as IcebergErrorKind, Namespace, NamespaceIdent,
     TableCommit, TableCreation, TableIdent,
@@ -1016,35 +1017,6 @@ impl PromotionIntegrationFixture {
         )
     }
 
-    /// Build one production Forge owner whose worker cadence a scenario can wait on.
-    ///
-    /// A worker's own delayed cadence is the maintenance interval, which is
-    /// also the scheduler's periodic planning period. A supervised worker is
-    /// therefore built over its own Forge: the scheduler keeps the inert hour
-    /// that makes planning explicit, and the worker gets a cadence short enough
-    /// that a scenario can wait for one exact-operation reconciliation pass.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the fixture cannot produce a validated Forge graph.
-    pub(crate) fn build_worker_forge_for_test(
-        &self,
-        catalog: Arc<dyn Catalog>,
-        object_store: Arc<dyn ForgeObjectStore>,
-        clock: ForgeClock,
-        completion_observer: ForgeWorkerCompletionObserver,
-        scheduler_trigger: ForgeSchedulerTrigger,
-    ) -> Arc<Forge> {
-        self.build_forge_with_interval(
-            catalog,
-            object_store,
-            clock,
-            completion_observer,
-            scheduler_trigger,
-            Duration::from_secs(1),
-        )
-    }
-
     /// Build one production Forge owner over an explicit maintenance interval.
     ///
     /// # Panics
@@ -1081,37 +1053,6 @@ impl PromotionIntegrationFixture {
             })
             .expect("fixture Forge"),
         )
-    }
-
-    /// Promotes every table that owes hot objects through the coordinator route.
-    ///
-    /// Reads the same `file_list` debt the leader sweeps and promotes each
-    /// table with a production executor over `forge`.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the debt read, the executor or any promotion fails.
-    pub(crate) async fn promote_owed(&self, forge: &Arc<Forge>) {
-        let executor = ForgeWorker::new(
-            Arc::clone(forge),
-            ForgeWorkerConfig::default(),
-            Uuid::now_v7(),
-        )
-        .expect("fixture promotion executor");
-        let owed = vala_sql::queries::forge_tasks::ForgeTasks::new(self.operator_pool.clone())
-            .tables_owing_promotion()
-            .await
-            .expect("promotion debt");
-        for (tenant, table) in owed {
-            assert!(
-                executor
-                    .promote_for_test(tenant, &table, &CancellationToken::new())
-                    .await
-                    .expect("coordinator promotion"),
-                "{} promotes",
-                table.table
-            );
-        }
     }
 
     /// Reads the promotion settlement columns of the fixture table, in durable order.
@@ -1741,12 +1682,6 @@ pub(crate) struct SupervisedPromotion {
     /// is never released on shutdown, so a second supervisor in one test would
     /// stand by and plan nothing.
     forge: Arc<Forge>,
-    /// Graph every generation of this supervisor's worker is built over.
-    ///
-    /// Identical to [`Self::forge`] except for its maintenance interval, which
-    /// is the worker's own delayed reconciliation cadence rather than the
-    /// scheduler's deliberately inert planning period.
-    worker_forge: Arc<Forge>,
     /// Worker bounds every generation of this supervisor's worker is built with.
     worker_config: ForgeWorkerConfig,
     /// Readiness bit every generation of this supervisor's worker publishes.
@@ -1828,21 +1763,11 @@ impl SupervisedPromotion {
             worker_observer.clone(),
             scheduler_trigger.clone(),
         );
-        // Every supervised worker generation is built over this one, so the
-        // cadence a scenario waits on is the worker's, not the scheduler's.
-        let worker_forge = fixture.build_worker_forge_for_test(
-            catalog,
-            object_store,
-            clock,
-            worker_observer.clone(),
-            scheduler_trigger.clone(),
-        );
-        let worker = ForgeWorker::new(
-            Arc::clone(&worker_forge),
-            worker_config,
-            uuid::Uuid::now_v7(),
-        )
-        .expect("fixture Forge worker");
+        // Every worker generation shares the scheduler's Forge, as one server
+        // process does, so its compaction pulls reach the leader term that
+        // Forge holds in-process.
+        let worker = ForgeWorker::new(Arc::clone(&forge), worker_config, uuid::Uuid::now_v7())
+            .expect("fixture Forge worker");
         let scheduler_stop = CancellationToken::new();
         let worker_stop = CancellationToken::new();
         let readiness = ForgeRoleReadiness::detached();
@@ -1865,7 +1790,6 @@ impl SupervisedPromotion {
             worker_task: Some(worker_task),
             worker_armed: false,
             forge,
-            worker_forge,
             worker_config,
             readiness,
         }
@@ -1907,7 +1831,7 @@ impl SupervisedPromotion {
     /// Panics when the worker cannot be built or the reclaim fails.
     pub(crate) async fn reclaim_expired_claims(&self) {
         let worker = ForgeWorker::new(
-            Arc::clone(&self.worker_forge),
+            Arc::clone(&self.forge),
             self.worker_config,
             uuid::Uuid::now_v7(),
         )
@@ -1955,7 +1879,7 @@ impl SupervisedPromotion {
             return;
         }
         let worker = ForgeWorker::new(
-            Arc::clone(&self.worker_forge),
+            Arc::clone(&self.forge),
             self.worker_config,
             uuid::Uuid::now_v7(),
         )
@@ -2597,7 +2521,7 @@ async fn register_scribe_fence(
     .expect("register the Scribe publication fence");
 }
 
-/// The partition day every fixture row lands in: yesterday, UTC.
+/// The newest partition day a fixture row lands in: yesterday, UTC.
 ///
 /// Scribe sets the floor with its event-time acceptance window, and Forge sets
 /// the ceiling by refusing to act on a partition that is still open. Yesterday
@@ -2625,21 +2549,23 @@ fn ingress_schema() -> Arc<ArrowSchema> {
     ]))
 }
 
-/// Builds one two-row ingress batch whose event times land inside the fixture day.
+/// Builds one two-row ingress batch whose event times land in its own closed day.
 ///
 /// `file_number` separates the batches so each sealed object carries a distinct
-/// value and event-time range, which makes the pair a genuine promotion group.
+/// value and lands `file_number` days before the fixture day. One file per
+/// partition gives Forge's per-partition planner one plan per sealed file, so
+/// multi-plan scenarios stay multi-plan; Scribe's 30-day acceptance window
+/// bounds a fixture table to 29 files.
 ///
 /// # Panics
 ///
 /// Panics when the fixture timestamp or batch cannot be constructed.
 fn ingress_batch(schema: &Arc<ArrowSchema>, file_number: i64) -> RecordBatch {
-    let base = fixture_day()
+    let base = (fixture_day() - chrono::Duration::days(file_number))
         .and_hms_opt(12, 0, 0)
         .expect("fixture timestamp")
         .and_utc()
-        .timestamp_micros()
-        + file_number * 1_000_000;
+        .timestamp_micros();
     RecordBatch::try_new(
         Arc::clone(schema),
         vec![
@@ -2696,7 +2622,37 @@ async fn create_table(
         })
         .await
         .expect("fixture table");
+    enable_compaction(catalog, &binding).await;
     binding
+}
+
+/// Declares the fixture table compaction-enabled and due on every commit.
+///
+/// Rewrites are dispatched by the leader from table properties, as in
+/// `RisingWave`; a snapshot-count trigger of one makes each promotion commit
+/// due on the next worker pull, so a scenario never waits out the interval.
+///
+/// # Panics
+/// Panics when the table cannot be loaded or the property commit fails.
+async fn enable_compaction(catalog: &BifrostCatalog, binding: &TenantTableBinding) {
+    let iceberg = catalog.iceberg_catalog();
+    let table = iceberg
+        .load_table(&binding.table_ident())
+        .await
+        .expect("fixture table load");
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_table_properties()
+        .set("wyrd.forge.enable-compaction".to_owned(), "true".to_owned())
+        .set(
+            "wyrd.forge.compaction.trigger-snapshot-count".to_owned(),
+            "1".to_owned(),
+        )
+        .apply(tx)
+        .expect("fixture Forge settings");
+    tx.commit_once(iceberg.as_ref())
+        .await
+        .expect("fixture Forge settings commit");
 }
 
 /// Drives one real Scribe append and seal for the fixture table.

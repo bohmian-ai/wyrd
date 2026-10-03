@@ -228,11 +228,10 @@ transition after a replacement worker has taken over.
 ## Telemetry
 
 `forge/metrics.rs` is the only Forge metric owner, and it publishes exactly the
-seventeen Prometheus families below. They answer the operational questions
+fifteen Prometheus families below. They answer the operational questions
 Forge is accountable for: how much work is demanded, how much is queued and how
 old it is, how much this process is doing right now, how attempts ended, how
-long they took, why they failed, how much physical data moved, and how much
-compaction debt remains.
+long they took, why they failed, and how much physical data moved.
 
 Everything else stays where it is already authoritative. Lease, fence, catalog,
 reconciliation, cursor, scheduler, and resource mechanics are structured traces
@@ -276,7 +275,7 @@ failure:
 | `capacity_refused` | The compaction queue refused every plan for waiting-parallelism capacity or per-plan size. |
 | `internal_invariant` | An internal invariant failed; this is a defect, not a condition. |
 
-### The seventeen families
+### The fifteen families
 
 Process-local families are produced by whichever replica did the work and sum
 across replicas. Coordinator-owned gauges describe one durable, cluster-wide
@@ -300,8 +299,6 @@ must be read with `max`, never summed.
 | `bifrost_forge_output_bytes_total` | counter | `task_type` | After a committed or recovered effect | Absent until an effect publishes bytes | Process-local |
 | `bifrost_forge_deleted_objects_total` | counter | `task_type` | At the delete boundary itself, once per accepted delete of a freshly proven-present, eligible object | Pre-delete-missing, refused, and already-absent recovery paths count nothing | Process-local |
 | `bifrost_forge_snapshots_expired_total` | counter | — | After committed or recovered expiration settlement | Counts individual snapshots, not tasks | Process-local |
-| `bifrost_forge_compaction_debt_files` | gauge | — | After a complete compaction inventory | Always exported; zero means no outstanding debt | Coordinator-owned |
-| `bifrost_forge_compaction_debt_bytes` | gauge | — | After a complete compaction inventory | Always exported; zero means no outstanding debt | Coordinator-owned |
 
 The two timestamp gauges publish the stored Unix second, never an age computed
 at publication time. Query the age with `time() - <gauge>` so it keeps growing
@@ -333,9 +330,7 @@ sum by (task_type) (rate(bifrost_forge_input_bytes_total[5m]))
 sum by (task_type) (rate(bifrost_forge_output_bytes_total[5m]))
 sum by (task_type) (rate(bifrost_forge_deleted_objects_total[5m]))
 
-# Compaction debt, and orphan-cleanup progress.
-max(bifrost_forge_compaction_debt_files)
-max(bifrost_forge_compaction_debt_bytes)
+# Orphan-cleanup progress.
 sum(rate(bifrost_forge_deleted_objects_total{task_type="orphan_cleanup"}[30m]))
 time() - max(bifrost_forge_oldest_pending_task_timestamp_seconds{task_type="orphan_cleanup"} > 0)
 

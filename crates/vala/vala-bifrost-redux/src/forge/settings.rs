@@ -24,6 +24,20 @@ pub const COMPACTION_TYPE_PROPERTY: &str = "wyrd.forge.compaction.type";
 pub const ENABLE_SNAPSHOT_EXPIRATION_PROPERTY: &str = "wyrd.forge.enable-snapshot-expiration";
 /// Enables leader-timer data-manifest rewriting for one table.
 pub const ENABLE_MANIFEST_REWRITE_PROPERTY: &str = "wyrd.forge.enable-manifest-rewrite";
+/// Iceberg's row-delete mode; `copy-on-write` makes every compaction `Full`.
+pub const DELETE_MODE_PROPERTY: &str = "write.delete.mode";
+
+/// Reports whether a table declares Iceberg copy-on-write deletes.
+///
+/// `RisingWave` forces `Full` compaction over the whole table for a
+/// copy-on-write sink (`should_enable_iceberg_cow`, `config.rs:881` at
+/// e23ddf95); Forge reads the same intent from the standard Iceberg property.
+#[must_use]
+pub fn is_copy_on_write(properties: &HashMap<String, String>) -> bool {
+    properties
+        .get(DELETE_MODE_PROPERTY)
+        .is_some_and(|mode| mode == "copy-on-write")
+}
 
 /// Physical selection a worker applies to one dispatched compaction task.
 ///
@@ -105,6 +119,8 @@ impl Default for ForgeTableSettings {
 impl ForgeTableSettings {
     /// Reads one table's settings, defaulting every absent property.
     ///
+    /// A copy-on-write table always compacts `Full`, whatever type it names.
+    ///
     /// # Errors
     ///
     /// Returns [`ForgeError::InvalidConfig`] when a present property does not
@@ -133,11 +149,15 @@ impl ForgeTableSettings {
                 TRIGGER_SNAPSHOT_COUNT_PROPERTY,
                 defaults.trigger_snapshot_count,
             )?,
-            compaction_type: properties
-                .get(COMPACTION_TYPE_PROPERTY)
-                .map_or(Ok(defaults.compaction_type), |raw| {
-                    ForgeCompactionType::parse(raw)
-                })?,
+            compaction_type: if is_copy_on_write(properties) {
+                ForgeCompactionType::Full
+            } else {
+                properties
+                    .get(COMPACTION_TYPE_PROPERTY)
+                    .map_or(Ok(defaults.compaction_type), |raw| {
+                        ForgeCompactionType::parse(raw)
+                    })?
+            },
             snapshot_expiration_enabled: parse_or(
                 properties,
                 ENABLE_SNAPSHOT_EXPIRATION_PROPERTY,
@@ -244,6 +264,15 @@ mod tests {
         assert_eq!(
             ForgeTableSettings::from_properties(&settings.to_properties()).expect("round trip"),
             settings
+        );
+        let mut copy_on_write = declared.clone();
+        copy_on_write.insert(DELETE_MODE_PROPERTY.to_owned(), "copy-on-write".to_owned());
+        assert_eq!(
+            ForgeTableSettings::from_properties(&copy_on_write)
+                .expect("copy-on-write")
+                .compaction_type,
+            ForgeCompactionType::Full,
+            "copy-on-write forces Full"
         );
 
         for (key, raw) in [

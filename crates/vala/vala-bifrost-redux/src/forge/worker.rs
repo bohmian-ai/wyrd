@@ -2622,6 +2622,20 @@ impl ForgeWorker {
         Ok(Some(()))
     }
 
+    /// Returns the physical compaction type a rewrite claim plans with.
+    ///
+    /// A leader dispatch carries its table's type in the attempt parameters;
+    /// a claim without one plans small files, the strategy it names.
+    fn claim_compaction_type(claim: &ForgeTaskClaim) -> ForgeCompactionType {
+        claim
+            .plan
+            .parameters
+            .get("compaction_type")
+            .and_then(Value::as_str)
+            .and_then(|raw| ForgeCompactionType::parse(raw).ok())
+            .unwrap_or(ForgeCompactionType::SmallFiles)
+    }
+
     /// Turns one leader dispatch into this worker's own claimed attempt.
     ///
     /// The worker loads the current table and binds the attempt to its head:
@@ -5602,7 +5616,7 @@ impl ForgeWorker {
             evidence,
             plans,
             policy,
-        } = rewrite.plan().await?;
+        } = rewrite.plan(Self::claim_compaction_type(claim)).await?;
         if plans.is_empty() {
             self.acknowledge_compact_table(claim, attempt, &table, lease)
                 .await?;

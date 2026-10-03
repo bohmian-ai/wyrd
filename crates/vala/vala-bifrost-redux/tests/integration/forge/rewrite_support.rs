@@ -263,7 +263,10 @@ impl PromotedRewriteFixture {
                 &cancel,
             )
             .expect("the attempt context builds");
-        let planned = match rewrite.plan().await {
+        let planned = match rewrite
+            .plan(vala_bifrost_redux::forge::ForgeCompactionType::SmallFiles)
+            .await
+        {
             Ok(planned) => planned,
             Err(failure) => {
                 return AttemptRun {

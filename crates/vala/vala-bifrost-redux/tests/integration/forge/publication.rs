@@ -203,8 +203,8 @@ struct SharedDeleteState {
 
 /// Publishes one position delete and one equality delete over the promoted cut.
 ///
-/// Both deletes are committed through the real catalog so the rewrite meets
-/// them as ordinary table state. The position delete removes a row of the
+/// Both deletes are committed through the real catalog, each in its own
+/// commit, so the rewrite meets them as ordinary table state. The position delete removes a row of the
 /// chosen target object; the equality delete removes a row value that lives in
 /// the other object, which is what makes the two disposition rules separable.
 async fn seed_shared_deletes(promoted: &PromotedRewriteFixture) -> SharedDeleteState {
@@ -227,8 +227,11 @@ async fn seed_shared_deletes(promoted: &PromotedRewriteFixture) -> SharedDeleteS
         .first()
         .copied()
         .expect("the second object has rows");
+    // Equality deletes are partition-scoped, so each delete is written into
+    // the partition of the object whose row it removes.
+    promoted.publish_deletes(&target, Some(0), None).await;
     promoted
-        .publish_deletes(&target, Some(0), Some(deleted_by_equality))
+        .publish_deletes(&other, None, Some(deleted_by_equality))
         .await;
     let mut expected = promoted
         .object_values(&inputs.iter().cloned().collect::<Vec<_>>())

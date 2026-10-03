@@ -24,7 +24,6 @@ use super::Forge;
 use super::compact::ForgeGroupKey;
 use super::error::ForgeError;
 use super::identity::task_table_binding;
-use super::managed::policy::ForgeTablePolicy;
 use super::metrics::{ForgePendingTasks, ForgeTelemetry};
 use super::path::catalog_path_to_object_key;
 use super::planner::{ForgePlanCandidate, ForgeTableSnapshot, plan_hash, plan_table};
@@ -47,10 +46,6 @@ pub struct ForgeScheduleOutcome {
     pub tasks_not_inserted: usize,
     /// Maximum-minus-minimum admitted task count across this complete pass's tenants.
     pub fairness_lag_tasks: usize,
-    /// Candidate input files observed in this cycle; only complete cycles publish gauges.
-    pub compaction_debt_files: u64,
-    /// Candidate input bytes observed in this cycle; only complete cycles publish gauges.
-    pub compaction_debt_bytes: u64,
     /// Whether the bounded page or any demand remained incomplete.
     pub incomplete: bool,
 }
@@ -64,10 +59,6 @@ struct DemandPlanningResult {
     tasks_not_inserted: usize,
     /// Whether the exact observed demand generation was acknowledged.
     acknowledged: bool,
-    /// Candidate input files represented by this exact demand generation.
-    compaction_debt_files: u64,
-    /// Candidate input bytes represented by this exact demand generation.
-    compaction_debt_bytes: u64,
 }
 
 /// Disposable coverage of one traversal under an exact scheduler generation.
@@ -79,8 +70,6 @@ struct PlanningCycle {
     seeded: BTreeSet<(DataTenantId, ForgeTaskTableIdentity)>,
     /// Demand identities already attempted, including failed or disappeared tables.
     attempted: BTreeSet<(DataTenantId, ForgeTaskTableIdentity)>,
-    /// Latest successful file/byte debt observation for each table.
-    debt: BTreeMap<(DataTenantId, ForgeTaskTableIdentity), (u64, u64)>,
     /// Sticky failure or generation race; page exhaustion never clears it.
     failed: bool,
 }
@@ -378,15 +367,6 @@ impl<'forge> ForgeScheduler<'forge> {
             .map_err(ForgeError::Sql)?;
         let remaining = !eligible.is_empty();
         outcome.incomplete = cycle.failed || remaining;
-        (outcome.compaction_debt_files, outcome.compaction_debt_bytes) = cycle.debt.values().fold(
-            (0_u64, 0_u64),
-            |(files, bytes), (next_files, next_bytes)| {
-                (
-                    files.saturating_add(*next_files),
-                    bytes.saturating_add(*next_bytes),
-                )
-            },
-        );
         self.renew_fence(fence).await?;
         Ok((outcome, remaining))
     }
@@ -432,12 +412,6 @@ impl<'forge> ForgeScheduler<'forge> {
                         outcome.tasks_not_inserted = outcome
                             .tasks_not_inserted
                             .saturating_add(planned.tasks_not_inserted);
-                        if cycle.seeded.contains(&identity) {
-                            cycle.debt.insert(
-                                identity,
-                                (planned.compaction_debt_files, planned.compaction_debt_bytes),
-                            );
-                        }
                         outcome.demands_acknowledged = outcome
                             .demands_acknowledged
                             .saturating_add(usize::from(planned.acknowledged));
@@ -562,9 +536,6 @@ impl<'forge> ForgeScheduler<'forge> {
             .map_err(ForgeError::Sql)?;
             roster.insert((key.tenant, identity));
         }
-        if failures == 0 {
-            cycle.debt.retain(|identity, _| roster.contains(identity));
-        }
         for identity in roster {
             if stop.is_cancelled() {
                 return Ok(true);
@@ -593,8 +564,7 @@ impl<'forge> ForgeScheduler<'forge> {
         demand: &ForgePlanningDemand,
         fence: i64,
     ) -> Result<DemandPlanningResult, ForgeError> {
-        let (snapshot, compaction_debt_files, compaction_debt_bytes, orphan_scan_prefix) =
-            self.discover_snapshot(demand).await?;
+        let (snapshot, orphan_scan_prefix) = self.discover_snapshot(demand).await?;
         let ForgeDemandArbitration { executable } = self
             .arbitrate_demand(demand, &snapshot, orphan_scan_prefix)
             .await?;
@@ -617,8 +587,6 @@ impl<'forge> ForgeScheduler<'forge> {
             tasks_enqueued: inserted.len(),
             tasks_not_inserted: executable.len().saturating_sub(inserted.len()),
             acknowledged: true,
-            compaction_debt_files,
-            compaction_debt_bytes,
         };
         for task_type in &inserted {
             ForgeTelemetry::record_task_created(*task_type);
@@ -674,11 +642,8 @@ impl<'forge> ForgeScheduler<'forge> {
         }
     }
 
-    /// Reconstructs the deterministic task candidates for one current table snapshot.
-    ///
-    /// Promotion and rewrite candidates both contribute debt from the same
-    /// discovery reads, even when promotion takes admission priority. Expiration
-    /// and cleanup never contribute file or byte compaction debt.
+    /// Reconstructs the deterministic maintenance candidates for one current
+    /// table snapshot, plus the table's orphan-scan prefix.
     ///
     /// # Errors
     ///
@@ -686,7 +651,7 @@ impl<'forge> ForgeScheduler<'forge> {
     async fn discover_snapshot(
         &self,
         demand: &ForgePlanningDemand,
-    ) -> Result<(ForgeTableSnapshot, u64, u64, String), ForgeError> {
+    ) -> Result<(ForgeTableSnapshot, String), ForgeError> {
         let binding = task_table_binding(
             demand.data_tenant_id,
             demand.data_tenant_id,
@@ -721,24 +686,9 @@ impl<'forge> ForgeScheduler<'forge> {
         let maintenance_candidate = maintenance_candidate
             .filter(|candidate| super::phase::admits_new_effect(candidate.strategy));
         // Promotion is executed by the coordinator that observed the hot
-        // object and by the leader's debt sweep, never planned here.
-        let rewrite_candidate = self
-            .rewrite_candidate(&table)
-            .await?
-            .filter(|candidate| super::phase::admits_new_effect(candidate.strategy));
-        let (compaction_debt_files, compaction_debt_bytes) =
-            rewrite_candidate
-                .iter()
-                .fold((0_u64, 0_u64), |(files, bytes), candidate| {
-                    (
-                        files.saturating_add(candidate.inputs.len() as u64),
-                        bytes.saturating_add(candidate.bytes),
-                    )
-                });
-        let candidates = rewrite_candidate
-            .into_iter()
-            .chain(maintenance_candidate)
-            .collect::<Vec<_>>();
+        // object, and rewrites are dispatched by the leader to a worker that
+        // plans them from current files; neither is planned here.
+        let candidates = maintenance_candidate.into_iter().collect::<Vec<_>>();
         Ok((
             ForgeTableSnapshot {
                 snapshot_id: table
@@ -747,89 +697,8 @@ impl<'forge> ForgeScheduler<'forge> {
                     .map_or(0, |snapshot| snapshot.snapshot_id()),
                 candidates,
             },
-            compaction_debt_files,
-            compaction_debt_bytes,
             orphan_scan_prefix,
         ))
-    }
-
-    /// Builds the small-file rewrite candidate one table currently owes, if any.
-    ///
-    /// Candidacy is decided from the base snapshot's own live data files and
-    /// the configured small-file threshold, so the same snapshot always yields
-    /// the same inputs, the same parameters, and therefore the same plan hash —
-    /// which is what lets the idempotent enqueue collapse repeated passes over
-    /// an unchanged table into one durable task rather than a queue of them.
-    ///
-    /// A single small file is not debt: rewriting one file into one file
-    /// changes nothing a reader can observe and would spend a commit to do it.
-    /// The candidate therefore requires at least two, which is also the
-    /// smallest input set the managed core can produce a smaller live set from.
-    ///
-    /// Selection here is a *bound*, not the execution plan. The managed core
-    /// performs its own selection and reports what it actually consumed; this
-    /// candidate exists to bind the durable task to one immutable base and to
-    /// name the inputs recovery will look for.
-    ///
-    /// The threshold comes from the same [`ForgeTablePolicy`] the worker
-    /// extracts, so a table whose declared geometry cannot hold the operator
-    /// threshold (for example an undeclared 512 MiB table under a 768 MiB
-    /// threshold) is refused here, with a warning, instead of being enqueued as
-    /// a task every worker attempt must refuse. Only the rewrite is withheld;
-    /// promotion and maintenance for the same table still plan.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ForgeError::Catalog`] when the base snapshot's manifest list
-    /// or one of its manifests cannot be read.
-    async fn rewrite_candidate(
-        &self,
-        table: &iceberg::table::Table,
-    ) -> Result<Option<ForgePlanCandidate>, ForgeError> {
-        let Some(snapshot) = table.metadata().current_snapshot() else {
-            return Ok(None);
-        };
-        let threshold = match ForgeTablePolicy::extract(table.metadata(), &self.forge.core.config) {
-            Ok(policy) => policy.small_file_threshold_bytes,
-            Err(error) => {
-                tracing::warn!(table = %table.identifier(), error = %error, "Forge rewrite policy is impossible for this table; no rewrite is planned");
-                return Ok(None);
-            }
-        };
-        let manifests = table
-            .manifest_list_reader(snapshot)
-            .load()
-            .await
-            .map_err(ForgeError::Catalog)?;
-        let mut selected = BTreeMap::new();
-        for manifest_file in manifests.entries() {
-            let manifest = manifest_file
-                .load_manifest(table.file_io())
-                .await
-                .map_err(ForgeError::Catalog)?;
-            for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
-                let file = entry.data_file();
-                if file.content_type() != iceberg::spec::DataContentType::Data
-                    || file.file_size_in_bytes() >= threshold
-                {
-                    continue;
-                }
-                selected.insert(file.file_path().to_owned(), file.file_size_in_bytes());
-            }
-        }
-        if selected.len() < 2 {
-            return Ok(None);
-        }
-        let inputs = selected.keys().cloned().collect::<Vec<_>>();
-        let input_bytes = selected.values().copied().collect::<Vec<_>>();
-        let bytes = input_bytes.iter().copied().fold(0_u64, u64::saturating_add);
-        Ok(Some(ForgePlanCandidate {
-            strategy: ForgeTaskStrategy::SmallFiles,
-            input_bytes,
-            inputs,
-            bytes: bytes.max(1),
-            parameters: serde_json::json!({ "kind": super::worker::LIVE_REWRITE_PARAMETER_KIND }),
-        }))
     }
 
     /// Evaluates the independent snapshot-expiry trigger for one table.
@@ -1087,7 +956,7 @@ impl<'forge> ForgeScheduler<'forge> {
         &self,
         demand: &ForgePlanningDemand,
     ) -> Result<Vec<NewForgeTask>, ForgeError> {
-        let (snapshot, _, _, prefix) = self.discover_snapshot(demand).await?;
+        let (snapshot, prefix) = self.discover_snapshot(demand).await?;
         let arbitration = self.arbitrate_demand(demand, &snapshot, prefix).await?;
         Ok(arbitration.executable)
     }
@@ -1260,10 +1129,6 @@ impl<'forge> ForgeScheduler<'forge> {
             .core
             .telemetry
             .publish_pending_tasks(&observations);
-        self.forge
-            .core
-            .telemetry
-            .record_compaction_debt(outcome.compaction_debt_files, outcome.compaction_debt_bytes);
         Ok(())
     }
 }

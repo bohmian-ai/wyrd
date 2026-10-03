@@ -1868,7 +1868,7 @@ impl WyrdTestServer {
     /// decision committed so far. Oracle's read-decision commits are tracked
     /// tasks that land in staging slightly after the query returns, so those
     /// are drained first; the chain head then reports the publisher's own
-    /// progress as `published_seq` catching up to `last_seq`. A tenant with no
+    /// progress as its `published_seq` catching up to the chain head's `last_seq`. A tenant with no
     /// chain-head row has appended nothing and owes nothing.
     ///
     /// # Errors
@@ -1891,8 +1891,10 @@ impl WyrdTestServer {
         let deadline = std::time::Instant::now() + RETAINED_AUDIT_BUDGET;
         loop {
             let head = sqlx::query_as::<_, (i64, i64)>(
-                "SELECT last_seq, published_seq FROM vala.audit_chain_head \
-                 WHERE data_tenant_id = $1",
+                "SELECT head.last_seq, COALESCE(progress.published_seq, 0) \
+                   FROM vala.audit_chain_head head \
+                   LEFT JOIN vala.audit_publication progress USING (data_tenant_id) \
+                  WHERE head.data_tenant_id = $1",
             )
             .bind(tenant.as_uuid())
             .fetch_optional(&pool)

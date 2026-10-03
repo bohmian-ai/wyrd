@@ -271,7 +271,7 @@ async fn await_blocked_backends(
 
 /// Reads the tenant's in-flight publication bound without taking its lock.
 ///
-/// A plain read of `audit_chain_head` is not blocked by a settlement holding
+/// A plain read of `audit_publication` is not blocked by a settlement holding
 /// the row, so it observes the committed bound mid-interleaving.
 ///
 /// # Errors
@@ -282,7 +282,7 @@ async fn frozen_bound(
 ) -> Result<Option<i64>, ServerJourneyError> {
     let mut conn = server.tenant_conn_for(tenant).await?;
     let bound: Option<i64> =
-        sqlx::query_scalar("SELECT publishing_seq_hi FROM vala.audit_chain_head")
+        sqlx::query_scalar("SELECT publishing_seq_hi FROM vala.audit_publication")
             .fetch_one(&mut **conn.transaction())
             .await?;
     conn.commit().await?;
@@ -351,7 +351,7 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
     let mut fence = fence_staged_rows(&server, tenant, appended).await?;
 
     // The bound is committed before any competitor starts, so every later
-    // freeze reads it rather than contending for the chain head.
+    // freeze reads it rather than contending for the progress row.
     let mut freezer = server.tenant_conn_for(tenant).await?;
     let range = freeze_publication_range(&mut freezer, 512)
         .await?
@@ -378,7 +378,7 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
     // `survivor` freezes and reads the committed range, then pauses before its
     // append, so its own append can only follow the crash. `crashing` starts
     // only once `survivor` has read the range, so neither freeze can meet a
-    // settlement already holding the chain head.
+    // settlement already holding the progress row.
     let mut survivor_publisher = AuditPublisher::from_state(server.state())
         .ok_or("a Scribe-bearing server composes the audit publisher")?;
     let mut survivor_appended = survivor_publisher.observe_appends();
@@ -575,10 +575,10 @@ fn commit_failures(metrics: &metrics_exporter_prometheus::PrometheusHandle) -> u
 /// One stalled tenant does not hold retained history back for another tenant.
 ///
 /// A sweep that published tenants one after another would make every tenant
-/// wait on the slowest: a tenant whose chain head is held by an unrelated
+/// wait on the slowest: a tenant whose progress row is held by an unrelated
 /// transaction would stall the whole directory behind it. The journey seeds a
 /// second tenant, appends a decision in each, then holds the boot tenant's
-/// chain-head row. A cycle that reaches that tenant afterwards cannot freeze;
+/// publication progress row, as a stalled competing publisher would. A cycle that reaches that tenant afterwards cannot freeze;
 /// one that froze and appended before the fence landed blocks in settlement
 /// until the fence is released. The second tenant must still reach retained
 /// history and drain inside the bounded wait — including the read decisions the
@@ -609,7 +609,13 @@ async fn a_stalled_tenant_does_not_block_another_tenants_history() -> Result<(),
     // The boot tenant sorts before a freshly minted UUIDv7 tenant, so a serial
     // sweep would reach the healthy tenant only after this fence is released.
     let mut fence = server.tenant_conn_for(stalled).await?;
-    sqlx::query("SELECT last_seq FROM vala.audit_chain_head FOR UPDATE")
+    sqlx::query(
+        "INSERT INTO vala.audit_publication (data_tenant_id) \
+         VALUES (wyrd.current_tenant()) ON CONFLICT DO NOTHING",
+    )
+    .execute(&mut **fence.transaction())
+    .await?;
+    sqlx::query("SELECT published_seq FROM vala.audit_publication FOR UPDATE")
         .fetch_all(&mut **fence.transaction())
         .await?;
 

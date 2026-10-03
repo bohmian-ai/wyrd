@@ -341,7 +341,7 @@ mod pg_tests {
             assert_eq!(stale, 0, "a stale settlement removes nothing");
 
             let (published, in_flight): (i64, Option<i64>) = sqlx::query_as(
-                "SELECT published_seq, publishing_seq_hi FROM vala.audit_chain_head
+                "SELECT published_seq, publishing_seq_hi FROM vala.audit_publication
                   WHERE data_tenant_id = $1",
             )
             .bind(tenant.as_uuid())
@@ -359,8 +359,57 @@ mod pg_tests {
             );
         }
 
-        /// A held chain head fails the freeze immediately, never as an idle
-        /// tenant.
+        /// An append holding the chain head never blocks publication.
+        ///
+        /// Appenders lock only the chain head and publishers lock only their
+        /// own progress row, so a publisher freezes and settles the committed
+        /// prefix while an append for the same tenant is still in flight.
+        #[tokio::test]
+        async fn publication_proceeds_while_an_append_holds_the_chain_head() {
+            let (fixture, _superuser, tenant) = setup().await;
+            append(fixture.app_pool(), tenant, "op.a").await;
+
+            let mut appender = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .unwrap();
+            vala_sql::queries::audit_staging::append_audit(&mut appender, &event("op.b"))
+                .await
+                .unwrap();
+
+            let mut publisher = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .unwrap();
+            let range =
+                vala_sql::queries::audit_staging::freeze_publication_range(&mut publisher, 512)
+                    .await
+                    .unwrap()
+                    .expect("the committed row is owed while the append is open");
+            assert_eq!(
+                (range.seq_lo, range.seq_hi),
+                (1, 1),
+                "only the committed prefix is frozen"
+            );
+            let retired =
+                vala_sql::queries::audit_staging::settle_publication(&mut publisher, range.seq_hi)
+                    .await
+                    .unwrap();
+            publisher.commit().await.unwrap();
+            assert_eq!(retired, 1);
+
+            appender.commit().await.unwrap();
+            let mut next = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .unwrap();
+            let range = vala_sql::queries::audit_staging::freeze_publication_range(&mut next, 512)
+                .await
+                .unwrap()
+                .expect("the appended row is owed once committed");
+            next.commit().await.unwrap();
+            assert_eq!((range.seq_lo, range.seq_hi), (2, 2));
+        }
+
+        /// A competing publisher holding the progress row fails the freeze
+        /// immediately, never as an idle tenant.
         ///
         /// Postgres aborts the waiter's transaction on `55P03`, so reporting
         /// `None` would hand the publisher a transaction that can only fail at
@@ -368,14 +417,19 @@ mod pg_tests {
         /// range unfrozen, and a fresh freeze after the holder releases must
         /// establish the owed range.
         #[tokio::test]
-        async fn held_chain_head_fails_immediately_and_retries_unchanged() {
+        async fn held_progress_row_fails_immediately_and_retries_unchanged() {
             let (fixture, superuser, tenant) = setup().await;
             append(fixture.app_pool(), tenant, "op.a").await;
+            sqlx::query("INSERT INTO vala.audit_publication (data_tenant_id) VALUES ($1)")
+                .bind(tenant.as_uuid())
+                .execute(&superuser)
+                .await
+                .unwrap();
 
             let mut holder = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
                 .await
                 .unwrap();
-            sqlx::query("SELECT 1 FROM vala.audit_chain_head FOR UPDATE")
+            sqlx::query("SELECT 1 FROM vala.audit_publication FOR UPDATE")
                 .execute(&mut **holder.transaction())
                 .await
                 .unwrap();
@@ -386,7 +440,7 @@ mod pg_tests {
             let lock_error =
                 vala_sql::queries::audit_staging::freeze_publication_range(&mut waiter, 512)
                     .await
-                    .expect_err("a held chain head is an immediate, explicit error");
+                    .expect_err("a held progress row is an immediate, explicit error");
             let vala_sql::SqlError::Query(sqlx::Error::Database(database_error)) = &lock_error
             else {
                 panic!("the freeze returns the database lock error: {lock_error}");
@@ -399,7 +453,7 @@ mod pg_tests {
             drop(waiter);
 
             let in_flight: Option<i64> = sqlx::query_scalar(
-                "SELECT publishing_seq_hi FROM vala.audit_chain_head WHERE data_tenant_id = $1",
+                "SELECT publishing_seq_hi FROM vala.audit_publication WHERE data_tenant_id = $1",
             )
             .bind(tenant.as_uuid())
             .fetch_one(&superuser)

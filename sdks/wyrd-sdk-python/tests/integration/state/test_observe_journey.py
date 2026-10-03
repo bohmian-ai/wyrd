@@ -745,7 +745,10 @@ def test_drift_burst_survives_a_byte_budget_override(tmp_path: Path) -> None:
             emit_with_resubmit(
                 state,
                 model,
-                {f"feature_{feature}": observation + feature / 10 for feature in range(BURST_FEATURES)},
+                {
+                    f"feature_{feature}": observation + feature / 10
+                    for feature in range(BURST_FEATURES)
+                },
             )
         state.shutdown()
         server.flush_bifrost()

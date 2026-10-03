@@ -17,6 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CALL_RE = re.compile(r"\.(unwrap|expect)\(")
+TEST_MOD_RE = re.compile(r"#\[cfg\(test\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;")
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,27 @@ def is_ignored_path(path: Path) -> bool:
     """Return whether `path` is a Rust test/example path."""
     parts = path.relative_to(ROOT).parts
     return "tests" in parts or "examples" in parts
+
+
+def out_of_line_test_modules(paths: list[Path]) -> set[Path]:
+    """Return files that hold a `#[cfg(test)] mod name;` declared elsewhere.
+
+    The module file sits beside a `lib.rs`, `main.rs`, or `mod.rs` parent and
+    under a directory named for any other parent file, as `rustc` resolves it.
+    """
+    modules: set[Path] = set()
+    for path in paths:
+        names = TEST_MOD_RE.findall(path.read_text(encoding="utf-8"))
+        if not names:
+            continue
+        base = (
+            path.parent
+            if path.name in {"lib.rs", "main.rs", "mod.rs"}
+            else path.parent / path.stem
+        )
+        for name in names:
+            modules.update({base / f"{name}.rs", base / name / "mod.rs"})
+    return modules
 
 
 def read_string_literal(text: str, i: int) -> tuple[int, str] | None:
@@ -223,8 +245,10 @@ def scan_file(path: Path) -> list[Finding]:
 def main() -> int:
     """Run the unwrap audit."""
     findings: list[Finding] = []
-    for path in sorted((ROOT / "crates").rglob("*.rs")):
-        if is_ignored_path(path):
+    paths = sorted((ROOT / "crates").rglob("*.rs"))
+    test_modules = out_of_line_test_modules(paths)
+    for path in paths:
+        if is_ignored_path(path) or path in test_modules:
             continue
         findings.extend(scan_file(path))
 

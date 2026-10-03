@@ -912,10 +912,10 @@ async fn issued_card_key_writes_and_queries_within_its_scope_only() {
 }
 
 /// The number of Drift observations one burst emits.
-const BURST_OBSERVATIONS: usize = 1_000;
+const BURST_OBSERVATIONS: u32 = 1_000;
 
 /// The features every burst observation carries, one tall row each.
-const BURST_FEATURES: usize = 9;
+const BURST_FEATURES: u32 = 9;
 
 /// A byte budget smaller than one maximum message plus its sealing headroom.
 const UNSEALABLE_BUDGET: usize = 1024;
@@ -999,7 +999,7 @@ async fn drift_burst_survives_a_byte_budget_override() {
             .map(|feature| {
                 (
                     format!("feature_{feature}"),
-                    serde_json::json!(observation as f64 + feature as f64 / 10.0),
+                    serde_json::json!(f64::from(observation) + f64::from(feature) / 10.0),
                 )
             })
             .collect();
@@ -1017,16 +1017,18 @@ async fn drift_burst_survives_a_byte_budget_override() {
         .expect("burst rows read back");
     assert_eq!(
         groups.len(),
-        BURST_OBSERVATIONS,
+        usize::try_from(BURST_OBSERVATIONS).expect("the burst size fits usize"),
         "one record_id per observation"
     );
     assert!(
-        groups.iter().all(|group| group.n == BURST_FEATURES as i64),
+        groups
+            .iter()
+            .all(|group| group.n == i64::from(BURST_FEATURES)),
         "every observation landed all of its features exactly once"
     );
     assert_eq!(
         groups.iter().map(|group| group.n).sum::<i64>(),
-        (BURST_OBSERVATIONS * BURST_FEATURES) as i64
+        i64::from(BURST_OBSERVATIONS * BURST_FEATURES)
     );
     server.shutdown().await.expect("test server shuts down");
 }

@@ -71,7 +71,7 @@ The peer listener accepts only mutual TLS from that CA. A valid certificate iden
 
 ## Authentication
 
-Every request carries a token the server signs itself, so a deployment supplies the material that makes those tokens work. There are three pieces here, and only the first is always required.
+Every protected request carries a token the server signs itself, so a deployment supplies the material that makes those tokens work. There are three pieces here, and only the first is always required.
 
 The **signing key** is Wyrd's own Ed25519 private key. It signs every token the server issues and verifies every token that comes back, so it is the one secret a production server cannot boot without. Lose it and nothing validates. Generating, mounting, and rotating it is covered in [Authentication](/self-hosting/authentication/#signing-key).
 
@@ -95,7 +95,7 @@ Signing and sealing keys are read from the environment only, never from the TOML
 
 ### The implicit tenant
 
-Wyrd is multi-tenant by design. In the hosted product, each request names its tenant through the `Host` it arrives on, so one process serves many tenants. A self-hosted deployment has no such routing: it serves one tenant, and boot has no request to derive it from. `WYRD_SERVER_TENANT_SLUG` is how the operator names that tenant.
+Wyrd is multi-tenant by design, and a self-hosted deployment can serve one or more tenants. A protected request's tenant comes from its verified Wyrd access token, never from `Host` or another header. The only request-time tenant hint is for workload `jwt-bearer` issuance: the leftmost `Host` label, or else the form's `tenant` parameter, names a candidate tenant, which the external assertion and the server-owned workload binding must then verify. Boot has no request at all, so configured workload issuers and bindings need an explicit owner: `WYRD_SERVER_TENANT_SLUG` names that tenant. It does not limit the deployment to one tenant.
 
 You only need it when you federate identity. Trusted issuers and workload bindings are owned by a tenant, so the moment you declare either one (see [SSO and OIDC](/self-hosting/sso-and-oidc/)), the server has to know which tenant they attach to. Leave it unset if you configure no federation. If you do set it, the slug must resolve to an active tenant at boot; the server resolves it through the same lookup the request handlers use, so a bound issuer matches request-time identity. A slug that resolves to nothing fails boot rather than binding issuers to a tenant that does not exist.
 

@@ -1,6 +1,6 @@
 ---
 title: Identity and auth
-description: End-to-end map of how Wyrd scopes identity across its platform and tenant planes and five principal kinds, and how the server verifies every request.
+description: End-to-end map of how Wyrd scopes identity across its platform and tenant planes and five principal kinds, and how the server verifies every protected request.
 pillar: wyrd
 group: Concepts
 order: 6
@@ -35,15 +35,15 @@ This page is the map. The three pages it links to hold the detail:
     { header: 'Meaning' }
   ]}
   rows={[
-    ['Tenant', 'Isolation boundary. Every principal, token, role, issuer, and binding belongs to exactly one tenant. Postgres row-level security enforces it.'],
+    ['Tenant', 'Isolation boundary. Every tenant-plane principal, token, role, issuer, and binding belongs to exactly one tenant. Postgres row-level security enforces it. Platform principals and sessions hold no tenant.'],
     ['Principal', 'The identity a token acts as. One of five kinds: GlobalAdmin, TenantAdmin, User, Service, or Agent.'],
     ['GlobalAdmin', 'Platform-plane administrator. Holds no tenant and operates tenant lifecycle and tenant-administration recovery; never implicitly authorized over a tenant\'s resources.'],
     ['TenantAdmin', 'The tenant\'s headless root of trust, created during provisioning. Carries no card.'],
-    ['User', 'A human, authenticated through the tenant\'s OIDC provider. Identified by the provider\'s issuer and subject, never by email; no card.'],
+    ['User', 'A human. A tenant User authenticates through the tenant\'s OIDC connection and is identified by the provider\'s issuer and subject, never by email; no card. A platform User is a pre-registered, tenantless platform administrator who signs in through the deployment-wide platform connection.'],
     ['Service', 'A non-human principal that may be bound to a ServiceCard. Authenticates with an API key or a workload assertion.'],
     ['Agent', 'A non-human principal, always bound to an AgentCard. Same auth paths as a Service.'],
-    ['Access token', 'Short-lived EdDSA JWT sent on every request. Carries the principal, tenant, and role claims.'],
-    ['Refresh token', 'Token that mints a new access token. Issued only for human login: the CLI\'s rotates on every use, the web app\'s does not and ends after 12 hours. A machine re-exchanges its durable credential instead.'],
+    ['Access token', 'Short-lived EdDSA JWT sent on every protected request. A tenant token carries the principal, tenant, role, and permission claims. A platform session token carries platform scope and principal and session identifiers but no tenant or roles; the server re-reads the principal\'s current platform grants on each request.'],
+    ['Refresh token', 'Token that mints a new access token. Issued only for tenant human login: the CLI\'s rotates on every use, the web app\'s does not and ends after 12 hours. A machine re-exchanges its durable credential instead.'],
     ['Delegated token', 'Access token minted on behalf of another Service/Agent, carrying an act chain. No refresh token.'],
     ['act chain', 'RFC 8693 delegation record embedded in a token: the ordered list of principals that delegated down to the callee.'],
     ['Trusted issuer', 'An external OIDC issuer whose JWTs Wyrd will verify, scoped to one tenant.'],
@@ -54,7 +54,9 @@ This page is the map. The three pages it links to hold the detail:
 
 ## The authenticated request path
 
-Once a caller has an access token, every request follows the same path. The
+Once a caller has a tenant access token, every protected tenant request
+follows the same path. (A platform session is verified by the platform plane,
+which re-reads current grants.) The
 server never trusts the token's contents until `TokenVerifier::verify` has
 checked them; the tenant is read from the unverified token only to route to the
 correct tenant verifier, not to grant anything.

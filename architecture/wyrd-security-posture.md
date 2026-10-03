@@ -318,7 +318,7 @@ approved scoped decision is bound into the distributed permission digest so a
 worker cannot widen it.
 
 There is no runtime cross-service invoke policy decision point. Wyrd
-authorizes every API request with its own RBAC permission check on the
+authorizes every protected API request with its own RBAC permission check on the
 verified principal, recorded to canonical audit; there is no separate
 policy engine, policy cache, or stale-allow mode to reason about.
 

@@ -3,15 +3,20 @@
 //! `POST /auth/token`, `POST /auth/platform/token`,
 //! `POST /auth/device_authorization`, and `POST /auth/revoke` take
 //! `application/x-www-form-urlencoded` parameters ([`OAuthForm`]) and answer
-//! with `Cache-Control: no-store`. The tenant token, device-authorization,
-//! and revocation endpoints identify a registered OAuth client through
-//! [`OAuthClients`]; the platform token endpoint has no registered client and
-//! authenticates only its presented platform API-key subject. Each success keeps its own standard shape: the
-//! token endpoints return the RFC 6749 §5.1 token response, device
-//! authorization the RFC 8628 §3.2 response, and revocation an empty `200`
-//! (RFC 7009 §2.2). Every refusal is the RFC 6749 §5.2 error ([`OAuthError`])
-//! with `400`, `401` for `invalid_client`, `500` for `server_error`, or `503`
-//! for `temporarily_unavailable`. They are the one exception to the `WyrdError` problem-json surface. Only a
+//! with `Cache-Control: no-store`. Device authorization and revocation
+//! require a registered OAuth client ([`OAuthClients::require`]). The tenant
+//! token endpoint identifies a client when one is supplied
+//! ([`OAuthClients::identify`]) and requires one only for the
+//! authorization-code, refresh, and device-code grants; RFC 8693 token
+//! exchange and RFC 7523 JWT bearer are clientless. The platform token
+//! endpoint is clientless and authenticates only its presented platform
+//! API-key subject. Each success keeps its own standard shape: the token
+//! endpoints return the RFC 6749 §5.1 token response, device authorization
+//! the RFC 8628 §3.2 response, and revocation an empty `200` (RFC 7009 §2.2).
+//! Every refusal is the RFC 6749 §5.2 error ([`OAuthError`]) with `400`,
+//! `401` for `invalid_client`, `500` for `server_error`, or `503` for
+//! `temporarily_unavailable`. They are the one exception to the `WyrdError`
+//! problem-json surface. Only a
 //! refusal converted from a `WyrdError` is logged under its Wyrd code; the
 //! extractors' own malformed-form and client-identification refusals carry
 //! none.

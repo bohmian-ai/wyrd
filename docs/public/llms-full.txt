@@ -31,7 +31,7 @@ Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architect
 - [Card kinds](https://mitari-ai.github.io/wyrd/concepts/card-kinds/): The 15 native card kinds plus External, grouped by domain, with what each declares and its shipping status.
 - [Cloud identity](https://mitari-ai.github.io/wyrd/concepts/cloud-identity/): Trusted OIDC issuers and workload bindings, with setup, admin CRUD, TOML seeding, and the sealing key.
 - [Doctrine](https://mitari-ai.github.io/wyrd/concepts/doctrine/): The design doctrine behind Wyrd's nouns, layers, services, and public surfaces.
-- [Identity and auth](https://mitari-ai.github.io/wyrd/concepts/identity-and-auth/): End-to-end map of how Wyrd scopes identity across its platform and tenant planes and five principal kinds, and how the server verifies every request.
+- [Identity and auth](https://mitari-ai.github.io/wyrd/concepts/identity-and-auth/): End-to-end map of how Wyrd scopes identity across its platform and tenant planes and five principal kinds, and how the server verifies every protected request.
 
 ## How-to guides
 

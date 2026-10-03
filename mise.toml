@@ -508,19 +508,44 @@ run = "cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run
 description = "Opt-in benchmark (REQ-171, AC-040, AC-041): Wyrd's one server capacity benchmark. Release cloud wyrd-server replicas in peer mode over Postgres and the storage emulators' RustFS service, as the kind deployment runs them, each in an 8-CPU/16-GiB systemd user scope, started through the local-development journey. One production mix over four identical tenants, open-loop through the public Rust client: at level L, direct and queued verification at L/2 each across PSI, SPC, Custom, assertion Eval and LLM-judge Eval, Scribe ingest of 2.5*L Drift observations of 100 features through WyrdState, and Oracle queries at L/2. Warmup 30 s at 50, 1-replica ramp of 60 s steps at 50/100/200/400 stopping at the first SLO miss (knee K), 180 s sustained at K on 1 and on 2 replicas, then 180 s at 2K on 2 replicas; within 30 minutes. Golden-signal SLOs judged per step (traffic >=95%, zero errors, direct overhead p95 < 10 ms, client queue drain <= 1 s, every backlog drained within 60 s); passes when the 1-replica sustained step and both 2-replica steps pass. Writes target/capacity/. `-- --profile` builds a frame-pointer profiling binary into target/profiling and captures every step with perf as diagnostic evidence. Linux with a delegating systemd user manager; part of no gate or verify lane."
 env = { WYRD_STORAGE_URL = "s3://wyrd-storage-test", WYRD_STORAGE_ENDPOINT_URL = "http://localhost:9000", AWS_REGION = "us-east-1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret" }
 run = '''
-docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml up -d --wait rustfs
-docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml run --rm rustfs-setup
-scripts/postgres/with-test-postgres.sh -- bash -lc '
+# One absolute 30-minute deadline over the whole command (REQ-171), fixed
+# before the first setup action and exported to every step. Each step gets
+# only what remains: the capacity binary finishes its report 60 s before the
+# deadline, the build and the binary are stopped 30 s before it, and the
+# Postgres wrapper, which tears its database down on TERM, 10 s before it.
+# `--foreground` keeps every step in the task's process group, so Ctrl-C
+# still reaches it.
+WYRD_CAPACITY_STARTED=$(date +%s)
+WYRD_CAPACITY_DEADLINE=$((WYRD_CAPACITY_STARTED + 30 * 60))
+export WYRD_CAPACITY_STARTED WYRD_CAPACITY_DEADLINE
+budget() {
+  left=$((WYRD_CAPACITY_DEADLINE - $1 - $(date +%s)))
+  [ "$left" -gt 0 ] || { echo "bench:capacity passed its 30-minute limit" >&2; return 124; }
+  echo "$left"
+}
+seconds=$(budget 0)
+timeout --foreground "$seconds" docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml up -d --wait rustfs
+seconds=$(budget 0)
+timeout --foreground "$seconds" docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml run --rm rustfs-setup
+seconds=$(budget 10)
+timeout --foreground --kill-after=5 "$seconds" scripts/postgres/with-test-postgres.sh -- bash -lc '
 set -euo pipefail
+budget() {
+  local left=$((WYRD_CAPACITY_DEADLINE - $1 - $(date +%s)))
+  ((left > 0)) || { echo "bench:capacity passed its 30-minute limit" >&2; return 124; }
+  echo "$left"
+}
 binary=()
+seconds=$(budget 30)
 if [[ " $* " == *" --profile "* ]]; then
   CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes" \
-    cargo build --locked --release -p wyrd-server --features cloud --target-dir target/profiling
+    timeout --foreground "$seconds" cargo build --locked --release -p wyrd-server --features cloud --target-dir target/profiling
   binary=(--server-binary target/profiling/release/wyrd-server)
 else
-  cargo build --locked --release -p wyrd-server --features cloud
+  timeout --foreground "$seconds" cargo build --locked --release -p wyrd-server --features cloud
 fi
-cargo run --locked --release -p wyrd-testing --bin capacity -- "${binary[@]}" "$@"' _
+seconds=$(budget 30)
+timeout --foreground --kill-after=20 "$seconds" cargo run --locked --release -p wyrd-testing --bin capacity -- "${binary[@]}" "$@"' _
 '''
 
 [tasks."test:bifrost:journey:otlp"]

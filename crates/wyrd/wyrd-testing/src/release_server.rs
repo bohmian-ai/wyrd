@@ -144,6 +144,16 @@ impl LocalServer {
     /// `setup` fails or prints no credential, the server exits or never
     /// becomes ready, or its cgroup does not enforce the
     /// [`CPUS`]/[`MEMORY_BYTES`] envelope.
+    ///
+    /// # Cancellation
+    ///
+    /// Every child is owned while this future is pending, so a caller's
+    /// deadline drops it at its next yield without waiting for a child: a
+    /// `migrate` or `setup` still running is killed and reaped with its
+    /// stderr printed, and the serving replica is killed
+    /// and reaped with its working directory, `server.log`, and each
+    /// `setup`'s stderr file kept. Rows `migrate` and the finished `setup`s
+    /// wrote stay in the database; a retry starts from a fresh database.
     pub async fn start(binary: &Path, tenants: &[&str], env: &[(&str, &str)]) -> Result<Self> {
         let owner_url = std::env::var("WYRD_TEST_DATABASE_ADMIN_URL")
             .map_err(|_| "WYRD_TEST_DATABASE_ADMIN_URL is unset; run through mise")?;
@@ -152,9 +162,14 @@ impl LocalServer {
         std::fs::create_dir_all(&storage)?;
         let storage_url = format!("file://{}", storage.display());
         let workdir = root.path().to_path_buf();
-        run(operator(binary, &workdir, &storage_url, 0, env)
-            .arg("migrate")
-            .env("WYRD_DATABASE_URL", owner_url))?;
+        OperatorRun::spawn(
+            operator(binary, &workdir, &storage_url, 0, env)
+                .arg("migrate")
+                .env("WYRD_DATABASE_URL", owner_url),
+            &workdir.join("migrate.stderr"),
+        )?
+        .finish()
+        .await?;
         let mut server = Self::serve(binary, root, &storage_url, 0, env).await?;
 
         let operator = |program: &Path| operator(program, &workdir, &storage_url, 0, env);
@@ -166,7 +181,10 @@ impl LocalServer {
             if let Some(credential) = &platform {
                 setup.env("WYRD_PLATFORM_CREDENTIAL", credential);
             }
-            let printed = run(&mut setup)?;
+            let printed =
+                OperatorRun::spawn(&mut setup, &workdir.join(format!("setup-{slug}.stderr")))?
+                    .finish()
+                    .await?;
             let field = |name: &str| {
                 printed
                     .lines()
@@ -615,23 +633,102 @@ fn operator(
     command
 }
 
-/// Runs an operator subcommand to completion and returns its stdout.
+/// One operator subcommand (`migrate`, `setup`) the harness owns until it
+/// exits, so a caller's deadline can stop it instead of waiting on it.
 ///
-/// # Errors
-///
-/// Returns an error with its stderr when it cannot run or exits
-/// unsuccessfully.
-fn run(command: &mut Command) -> Result<String> {
-    let output = command.output()?;
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+/// Stdout goes to an unlinked file, since `setup` prints credentials, and
+/// stderr to a file the caller names, kept for diagnosis; neither can fill a
+/// pipe and stall the child.
+struct OperatorRun {
+    /// The running child until it is reaped.
+    child: Option<Child>,
+    /// The program and arguments, for failure messages; never the
+    /// environment, which carries credentials.
+    command: String,
+    /// The child's stdout.
+    stdout: File,
+    /// Where the child's stderr lands.
+    stderr: PathBuf,
+}
+
+impl OperatorRun {
+    /// Spawns `command` with stdout to an unlinked file and stderr to
+    /// `stderr`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either file cannot be created or the command
+    /// cannot spawn.
+    fn spawn(command: &mut Command, stderr: &Path) -> Result<Self> {
+        let stdout = tempfile::tempfile()?;
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(stdout.try_clone()?)
+            .stderr(File::create(stderr)?)
+            .spawn()?;
+        Ok(Self {
+            child: Some(child),
+            command: std::iter::once(command.get_program())
+                .chain(command.get_args())
+                .map(|part| part.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" "),
+            stdout,
+            stderr: stderr.to_path_buf(),
+        })
     }
-    Err(format!(
-        "{command:?} exited with {}: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    )
-    .into())
+
+    /// Waits for the child to exit, polling so the future yields, and
+    /// returns its stdout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error carrying its stderr when it exits unsuccessfully, or
+    /// an IO error waiting on it or reading its output.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future at a yield drops `self`, whose `Drop` kills and
+    /// reaps the child; whatever it already wrote stays written.
+    async fn finish(mut self) -> Result<String> {
+        loop {
+            let child = self.child.as_mut().ok_or("operator command was reaped")?;
+            if let Some(status) = child.try_wait()? {
+                self.child = None;
+                if !status.success() {
+                    return Err(format!(
+                        "{} exited with {status}: {}",
+                        self.command,
+                        std::fs::read_to_string(&self.stderr).unwrap_or_default()
+                    )
+                    .into());
+                }
+                let mut printed = String::new();
+                self.stdout.rewind()?;
+                self.stdout.read_to_string(&mut printed)?;
+                return Ok(printed);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+impl Drop for OperatorRun {
+    /// Kills and reaps a child that [`OperatorRun::finish`] did not see exit,
+    /// which only happens when its caller stopped waiting, and prints its
+    /// stderr so the stop is diagnosable.
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!(
+                "{} stopped before it exited; its stderr ({}):\n{}",
+                self.command,
+                self.stderr.display(),
+                std::fs::read_to_string(&self.stderr).unwrap_or_default()
+            );
+        }
+    }
 }
 
 #[cfg(test)]

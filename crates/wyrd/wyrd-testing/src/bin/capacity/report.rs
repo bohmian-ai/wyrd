@@ -373,10 +373,11 @@ fn op_row(record: &Record, op: Op, evidence: &OpRecord) -> Row {
 pub struct Report {
     /// Whether this run was profiled, and so is diagnostic only.
     pub profiled: bool,
-    /// Seconds spent starting, provisioning, fitting, and seeding; `None`
-    /// when setup did not finish.
+    /// Seconds from the command's start through starting, provisioning,
+    /// fitting, and seeding; `None` when setup did not finish.
     pub setup_seconds: Option<f64>,
-    /// Seconds the whole run took.
+    /// Seconds from the command's start, before its first setup action,
+    /// to this report.
     pub total_seconds: f64,
     /// Why the run stopped before finishing its sequence or cleanup: a
     /// failure or the lifetime limit. Any failure fails the verdict.

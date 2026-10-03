@@ -22,9 +22,11 @@
 //! steps pass. The report in `target/capacity/` has one row per step with
 //! PASS/FAIL cells, then one row per operation per step.
 //!
-//! The whole command, setup through cleanup, lives inside one [`LIMIT`]
-//! (REQ-171): a run that has not finished by then stops, cleans up within
-//! the time it reserved, and reports what it measured as a failure.
+//! The whole command, setup through exit, lives inside one absolute 30-minute
+//! deadline (REQ-171) that `mise run bench:capacity` fixes before its first
+//! setup action and hands this binary in [`STARTED_ENV`] and
+//! [`DEADLINE_ENV`]: a run that has not finished by then stops, cleans up
+//! within the time it reserved, and reports what it measured as a failure.
 //!
 //! Run through `mise run bench:capacity`; `-- --profile` adds per-step,
 //! per-replica `perf` captures of a frame-pointer build, as diagnostic
@@ -42,7 +44,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use clap::Parser;
 use secrecy::ExposeSecret as _;
@@ -76,8 +78,16 @@ const PEER_NAME: &str = "wyrd-peer";
 /// rate instead of tripping the limiter.
 const AUTH_SPACING: Duration = Duration::from_millis(400);
 
-/// The whole command's lifetime, setup through cleanup (REQ-171).
-const LIMIT: Duration = Duration::from_secs(30 * 60);
+/// Unix second at which `mise run bench:capacity` began, before its first
+/// setup action; the report's durations count from it.
+const STARTED_ENV: &str = "WYRD_CAPACITY_STARTED";
+
+/// Unix second by which the whole command must have exited (REQ-171).
+const DEADLINE_ENV: &str = "WYRD_CAPACITY_DEADLINE";
+
+/// What the lifetime keeps after the replicas stop: writing the report, the
+/// Postgres wrapper's teardown, and the command's exit.
+const EXIT_RESERVE: Duration = Duration::from_secs(60);
 
 /// How long cleanup lets the tenants' clients flush and stop before
 /// dropping them.
@@ -121,32 +131,76 @@ struct Cli {
     storage_endpoint_url: String,
 }
 
-/// One absolute benchmark lifetime split into a measuring part and the
+/// One absolute command lifetime split into a measuring part and the
 /// cleanup it reserves, so the command ends by its deadline however its
 /// work behaves.
 #[derive(Debug, Clone, Copy)]
 struct Lifetime {
-    /// When the benchmark began.
+    /// When the command began.
     started: Instant,
-    /// When measuring must stop: client shutdown and replica stops remain.
+    /// When the command must have exited.
+    deadline: Instant,
+    /// When measuring must stop: client shutdown, replica stops, and exit
+    /// remain.
     measure_until: Instant,
-    /// When client shutdown must stop: replica stops remain.
+    /// When client shutdown must stop: replica stops and exit remain.
     clients_until: Instant,
 }
 
 impl Lifetime {
-    /// A lifetime of `limit` from now, reserving `client_shutdown` and then
-    /// `replica_stops` at its end.
-    fn new(limit: Duration, client_shutdown: Duration, replica_stops: Duration) -> Self {
-        let started = Instant::now();
-        let clients_until = started + limit.saturating_sub(replica_stops);
+    /// The lifetime `mise run bench:capacity` fixed in [`STARTED_ENV`] and
+    /// [`DEADLINE_ENV`], reserving [`CLIENT_SHUTDOWN`], each replica's
+    /// [`REPLICA_STOP`], and [`EXIT_RESERVE`] at its end.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either variable is unset or not a Unix second,
+    /// which means the binary is not running through mise.
+    fn from_command() -> Result<Self> {
+        let at = |name: &str| -> Result<Instant> {
+            let seconds: u64 = std::env::var(name)
+                .map_err(|_| format!("{name} is unset; run through mise run bench:capacity"))?
+                .parse()?;
+            Ok(instant_at(
+                SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+            ))
+        };
+        Ok(Self::new(
+            at(STARTED_ENV)?,
+            at(DEADLINE_ENV)?,
+            CLIENT_SHUTDOWN,
+            REPLICA_STOP
+                .saturating_mul(u32::from(REPLICAS))
+                .saturating_add(EXIT_RESERVE),
+        ))
+    }
+
+    /// A lifetime from `started` to `deadline`, reserving `client_shutdown`
+    /// and then `finish` at its end. A reserve longer than the lifetime
+    /// leaves no time before it, never time before `started`.
+    fn new(
+        started: Instant,
+        deadline: Instant,
+        client_shutdown: Duration,
+        finish: Duration,
+    ) -> Self {
+        let clients_until = deadline.checked_sub(finish).unwrap_or(started).max(started);
         Self {
             started,
+            deadline,
             measure_until: clients_until
                 .checked_sub(client_shutdown)
-                .unwrap_or(started),
+                .unwrap_or(started)
+                .max(started),
             clients_until,
         }
+    }
+
+    /// Whole seconds from start to deadline.
+    fn limit_seconds(&self) -> u64 {
+        self.deadline
+            .saturating_duration_since(self.started)
+            .as_secs()
     }
 
     /// Runs `work` until [`Lifetime::measure_until`]; returns why it did not
@@ -154,10 +208,12 @@ impl Lifetime {
     ///
     /// # Cancellation
     ///
-    /// At the deadline `work` is dropped at its next await; whatever it
-    /// recorded in its owner before then stays there.
+    /// See [`Lifetime::bounded`]; whatever `work` recorded in its owner
+    /// before the deadline stays there.
     async fn measure(&self, work: impl Future<Output = Result<()>>) -> Option<String> {
-        Self::bounded(self.measure_until, work, "measuring").await
+        self.bounded(self.measure_until, work, "measuring")
+            .await
+            .err()
     }
 
     /// Runs cleanup `work` until [`Lifetime::clients_until`]; returns why it
@@ -165,26 +221,56 @@ impl Lifetime {
     ///
     /// # Cancellation
     ///
-    /// At the deadline `work` is dropped, leaving its remaining cleanup to
-    /// the owners' `Drop`.
+    /// See [`Lifetime::bounded`]; cleanup `work` left unfinished at the
+    /// deadline falls to the owners' `Drop`.
     async fn shut_down(&self, work: impl Future<Output = Result<()>>) -> Option<String> {
-        Self::bounded(self.clients_until, work, "client shutdown").await
+        self.bounded(self.clients_until, work, "client shutdown")
+            .await
+            .err()
     }
 
-    /// Runs `work` until `deadline`, naming `phase` in the failure.
-    async fn bounded(
+    /// Runs `work` until `deadline` and returns its output, or why it did
+    /// not finish, naming `phase`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `work`'s own failure, or a message that `phase` passed its
+    /// share of the limit.
+    ///
+    /// # Cancellation
+    ///
+    /// The one place the benchmark cancels work. Cancellation is
+    /// cooperative: at `deadline` `work` is dropped at its next yield, and
+    /// work that blocks without yielding is not interrupted, so every child
+    /// process it waits on must be polled, as [`LocalServer`] does. Nothing
+    /// is rolled back: effects `work` already produced (database rows, store
+    /// objects, records in its owner) stay as their owners left them, and
+    /// processes or clients it started are stopped by their owners' `Drop`
+    /// as the future drops. Whether a retry is safe depends on the
+    /// interrupted workflow, whose own documentation says so.
+    async fn bounded<T>(
+        &self,
         deadline: Instant,
-        work: impl Future<Output = Result<()>>,
+        work: impl Future<Output = Result<T>>,
         phase: &str,
-    ) -> Option<String> {
+    ) -> std::result::Result<T, String> {
         match tokio::time::timeout_at(deadline, work).await {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(format!("{phase} failed: {error}")),
-            Err(_) => Some(format!(
-                "{phase} passed its share of the {} minute limit",
-                LIMIT.as_secs() / 60
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(error)) => Err(format!("{phase} failed: {error}")),
+            Err(_) => Err(format!(
+                "{phase} passed its share of the command's {} s limit",
+                self.limit_seconds()
             )),
         }
+    }
+}
+
+/// The monotonic instant of wall-clock time `at`, which may be past.
+fn instant_at(at: SystemTime) -> Instant {
+    let now = Instant::now();
+    match at.duration_since(SystemTime::now()) {
+        Ok(ahead) => now + ahead,
+        Err(behind) => now.checked_sub(behind.duration()).unwrap_or(now),
     }
 }
 
@@ -225,9 +311,9 @@ struct Benchmark {
 }
 
 impl Benchmark {
-    /// Prepares the local fixtures: output directory, scratch directory,
-    /// server binary, judge provider, peer certificates, and signing key.
-    /// The lifetime starts here, before any server starts.
+    /// Prepares the local fixtures under `lifetime`: output directory,
+    /// scratch directory, server binary, judge provider, peer certificates,
+    /// and signing key.
     ///
     /// # Errors
     ///
@@ -237,12 +323,7 @@ impl Benchmark {
     ///
     /// Only local files and the judge listener exist yet; dropping the
     /// future removes the scratch directory and stops the judge.
-    async fn prepare(cli: Cli) -> Result<Self> {
-        let lifetime = Lifetime::new(
-            LIMIT,
-            CLIENT_SHUTDOWN,
-            REPLICA_STOP.saturating_mul(u32::from(REPLICAS)),
-        );
+    async fn prepare(cli: Cli, lifetime: Lifetime) -> Result<Self> {
         let output = PathBuf::from("target/capacity");
         std::fs::create_dir_all(&output)?;
         let profiles = output.join("profiles");
@@ -330,7 +411,7 @@ impl Benchmark {
                 "sustained_seconds": self.cli.sustained_seconds,
                 "replicas": REPLICAS,
                 "driver_permits": MAX_IN_FLIGHT,
-                "limit_seconds": LIMIT.as_secs(),
+                "limit_seconds": lifetime.limit_seconds(),
                 "binary": identity(&self.binary, self.cli.profile)?,
             }),
             records: std::mem::take(&mut self.records),
@@ -622,8 +703,19 @@ fn install_tracing() {
 #[tokio::main]
 async fn main() -> ExitCode {
     install_tracing();
-    let result = match Benchmark::prepare(Cli::parse()).await {
-        Ok(benchmark) => benchmark.run().await,
+    let cli = Cli::parse();
+    let result = match Lifetime::from_command() {
+        Ok(lifetime) => match lifetime
+            .bounded(
+                lifetime.measure_until,
+                Benchmark::prepare(cli, lifetime),
+                "preparation",
+            )
+            .await
+        {
+            Ok(benchmark) => benchmark.run().await,
+            Err(error) => Err(error.into()),
+        },
         Err(error) => Err(error),
     };
     match result {
@@ -638,11 +730,14 @@ async fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::Path;
     use std::time::Duration;
 
+    use clap::Parser as _;
     use tokio::time::Instant;
 
-    use super::Lifetime;
+    use super::{Benchmark, Cli, Lifetime};
 
     /// A benchmark that cannot finish fails when its measuring share ends,
     /// and a cleanup that cannot finish stops at its own reserve, so both
@@ -654,16 +749,17 @@ mod tests {
     /// Panics when a phase outlives its bound or reports wrongly.
     #[tokio::test(start_paused = true)]
     async fn an_unfinished_benchmark_fails_and_cleans_up_by_its_deadline() {
+        let started = Instant::now();
         let lifetime = Lifetime::new(
-            Duration::from_secs(60),
+            started,
+            started + Duration::from_secs(60),
             Duration::from_secs(5),
             Duration::from_secs(10),
         );
-        let started = Instant::now();
         let stopped = lifetime
             .measure(std::future::pending::<super::Result<()>>())
             .await;
-        assert!(stopped.is_some_and(|failure| failure.contains("30 minute limit")));
+        assert!(stopped.is_some_and(|failure| failure.contains("60 s limit")));
         assert_eq!(started.elapsed(), Duration::from_secs(45));
         let cleanup = lifetime
             .shut_down(std::future::pending::<super::Result<()>>())
@@ -677,5 +773,127 @@ mod tests {
                 .await
                 .is_some_and(|failure| failure.contains("setup broke"))
         );
+    }
+
+    /// A stand-in `wyrd-server` for the stalled-setup proof: `migrate`
+    /// succeeds, serving answers `/readyz` from a static file server, and
+    /// `setup` logs to stderr and never exits. Each invocation records its
+    /// pid, the serve its working directory, and each `setup` its tenant in
+    /// `scratch`.
+    const STALLING_SERVER: &str = r#"#!/bin/sh
+case "$1" in
+  migrate) exit 0 ;;
+  setup)
+    echo "$3" >> "SCRATCH/setups"
+    echo $$ > "SCRATCH/setup.pid"
+    echo "setup stalled" >&2
+    exec sleep 600 ;;
+  *)
+    echo $$ > "SCRATCH/serve.pid"
+    pwd > "SCRATCH/serve.cwd"
+    touch readyz
+    exec python3 -m http.server --bind 127.0.0.1 8080 ;;
+esac
+"#;
+
+    /// Whether process `pid` is gone, reaped rather than left a zombie.
+    fn reaped(scratch: &Path, file: &str) -> bool {
+        let pid =
+            std::fs::read_to_string(scratch.join(file)).expect("the stand-in recorded its pid");
+        !Path::new(&format!("/proc/{}", pid.trim())).exists()
+    }
+
+    /// A tenant `setup` that never exits, with the first replica already
+    /// serving, cannot hold the benchmark past its deadline: the run stops at
+    /// its measuring share, kills and reaps the `setup` and the replica, keeps
+    /// the replica's log and the `setup`'s stderr, starts no later `setup` or
+    /// step, and writes a failed report, all before the deadline.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the run outlives its deadline, a child survives, a later
+    /// phase starts, a diagnostic is lost, or the report does not fail.
+    #[tokio::test]
+    #[ignore = "starts a stand-in server in a systemd user scope on port 8080; needs a delegating systemd user manager and python3"]
+    async fn a_stalled_tenant_setup_stops_the_run_by_its_deadline() {
+        // SAFETY: nextest runs this test alone in its process, and no other
+        // thread reads the environment yet. `LocalServer::start` only checks
+        // that the Postgres wrapper set it; the stand-in never connects.
+        unsafe { std::env::set_var("WYRD_TEST_DATABASE_ADMIN_URL", "postgres://unused") };
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let server = scratch.path().join("wyrd-server");
+        std::fs::write(
+            &server,
+            STALLING_SERVER.replace("SCRATCH", &scratch.path().display().to_string()),
+        )
+        .expect("write the stand-in");
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in executable");
+        let cli = Cli::parse_from([
+            "capacity",
+            "--server-binary",
+            &server.display().to_string(),
+            "--storage-url",
+            "file:///unused",
+            "--storage-endpoint-url",
+            "http://127.0.0.1:1",
+        ]);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(12);
+        let lifetime = Lifetime::new(
+            started,
+            deadline,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let mut benchmark = Benchmark::prepare(cli, lifetime).await.expect("prepare");
+        benchmark.output = scratch.path().join("capacity");
+        std::fs::create_dir_all(&benchmark.output).expect("output directory");
+
+        let passed = benchmark.run().await.expect("the failed report is written");
+
+        assert!(!passed, "a stopped run fails its verdict");
+        assert!(Instant::now() < deadline, "the run ended by its deadline");
+        assert!(
+            reaped(scratch.path(), "setup.pid"),
+            "the stalled setup was reaped"
+        );
+        assert!(
+            reaped(scratch.path(), "serve.pid"),
+            "the replica was reaped"
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.path().join("setups")).expect("setup ran"),
+            "t0\n",
+            "no later setup started"
+        );
+        let root = std::fs::read_to_string(scratch.path().join("serve.cwd")).expect("served");
+        let root = Path::new(root.trim());
+        assert!(
+            root.join("server.log").is_file(),
+            "the replica's log is kept"
+        );
+        assert!(
+            std::fs::read_to_string(root.join("setup-t0.stderr"))
+                .expect("the setup's stderr is kept")
+                .contains("setup stalled")
+        );
+        let report: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(scratch.path().join("capacity/report.json")).expect("report written"),
+        )
+        .expect("report is JSON");
+        assert_eq!(report["passed"], false);
+        assert!(
+            report["report"]["failure"]
+                .as_str()
+                .is_some_and(|failure| failure.starts_with("measuring passed its share"))
+        );
+        assert_eq!(
+            report["report"]["records"],
+            serde_json::json!([]),
+            "no step started"
+        );
+        assert!(report["report"]["setup_seconds"].is_null());
+        std::fs::remove_dir_all(root).expect("remove the kept replica directory");
     }
 }

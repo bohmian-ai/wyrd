@@ -20,10 +20,10 @@ Rules for every worktree:
 | # | Work | Spec | Worktree / branch | Latest commit | Status | Next step |
 |---|---|---|---|---|---|---|
 | 1 | Gateway capture refactor | verified-change-contract rev 54 | merged | `de3dfaca6` | **Done** | — |
-| 2 | Benchmark fixes (review R1, findings 1–12) | verified-change-contract rev 57 | `agent-a82d72f51901e1dc5` / `worktree-agent-a82d72f51901e1dc5` | `5c3bb79b3` | Codex review R2 running | Validate findings, then fix or merge |
-| 3 | Forge concurrent planning (TASK-001, TASK-002) | forge-concurrent-planning rev 1 | `agent-ac58f45cb5b747685` / `worktree-agent-ac58f45cb5b747685` | `36d8634a6` | Codex review r1 running | Validate findings, then fix or merge |
+| 2 | Benchmark fixes (review R1, findings 1–12) | verified-change-contract rev 57 | `agent-a82d72f51901e1dc5` / `worktree-agent-a82d72f51901e1dc5` | `5c3bb79b3` | R3: FIX_REQUIRED, 2 valid findings (complete-command 30-min deadline; cancellation docs); fix agent running | R4 Codex review after fix |
+| 3 | Forge concurrent planning (TASK-001, TASK-002) | forge-concurrent-planning rev 1 | `agent-ac58f45cb5b747685` / `worktree-agent-ac58f45cb5b747685` | `36d8634a6` | r1: SPEC_REVISION_REQUIRED (two decisions); FIND-12 rejected because I gave the wrong base | User decision on forge spec rev 2, then remediation and r2 review |
 | 4 | Audit outbox (3 tasks) | audit-outbox rev 1 | `agent-aad682fbca5074900` / `worktree-agent-aad682fbca5074900` | `0fa3d0d6b` (in progress) | Implementing | Codex review when the agent finishes |
-| 5 | Verifier runtime under load (tasks TASK-013+) | verified-change-contract rev 59 (`5e5623a2e`) | new agent worktree (rev59-impl) | — | Planning and implementing | Codex review when the agent finishes |
+| 5 | Verifier runtime under load (tasks TASK-013+) | verified-change-contract rev 59 (`5e5623a2e`) + rev 60 (`82f142580`) | new agent worktree (rev59-impl) | — | Planning and implementing | Codex review when the agent finishes |
 
 ### 2. Benchmark fixes
 
@@ -61,7 +61,7 @@ Rules for every worktree:
 
 ### 5. Verifier runtime under load (revision 59)
 
-- REQ-077: Eval runs are inserted in Scribe's batch-fence transaction.
+- REQ-077 (rev 60): Eval runs come from a batched run-request outbox like audit's. The ack covers receipt only, flushes are batched per tenant, a failed flush retries and never drops, graceful shutdown flushes, and losing unflushed requests on a hard kill is accepted.
 - REQ-086 and REQ-087: results go through the server-internal capture writer.
   No tokens and no Gate are involved, and Gate refuses public writes to the
   result tables. Reads use a tokenless SYSTEM authority.

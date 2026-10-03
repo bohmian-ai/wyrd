@@ -665,9 +665,31 @@ Drift schedule window does not determine partition size.
 
 ### Scheduling, admission, and fences
 
-Forge schedules durable Postgres tasks with tenant-fair admission. At most one
-durable task attempt owns the lease and fence for a tenant-qualified table.
-Within that attempt, admitted ordinary compaction plans are independent child
+Forge follows `RisingWave`'s Iceberg maintenance model. One replica holds the
+Forge leader term through a single Postgres election row with a heartbeat and
+expiry; every replica can execute Forge work, but only the leader decides it.
+The leader's schedule is process memory and starts empty on every new term:
+no compaction count, in-flight dispatch, or maintenance membership survives a
+leader change. A successful Iceberg commit notifies the leader in-process on
+its own replica or over the private peer route from another pod. Compactors on
+any replica pull due table identities up to their free capacity; the worker
+loads current Iceberg metadata and plans the rewrite itself, so no leader
+decision performs catalog or object-store IO. Reports settle only the commits
+the dispatch captured, and a report for an unknown or timed-out dispatch
+changes nothing.
+
+Scribe hot-promotion debt is the one durable scheduling input: a new leader
+and every heartbeat read outstanding `file_list` promotion debt, so a
+promotion lost with a dead leader is recovered by its successor. An hourly
+leader timer runs maintenance for tables that joined its sets through a commit
+since the term began: manifest rewrite for opted-in tables, then snapshot
+expiry, then expired-object and never-published orphan cleanup. A failure on
+one table is logged and the pass continues. Durable task rows record attempt
+evidence and recovery; retryable rows are reclaimed with tenant-fair
+admission, but no durable queue decides what runs next.
+
+At most one durable task attempt owns the lease and fence for a
+tenant-qualified table. Within that attempt, admitted ordinary compaction plans are independent child
 operations: fitting siblings may rewrite and publish concurrently, while
 bounded per-tenant and per-worker admission also permits independent tables to
 progress concurrently. Each plan binds the owning tenant, table, task, plan
@@ -693,8 +715,9 @@ revalidates the exact `file_list` rows, object/footer evidence, absence of an
 equivalent promoted entry, branch, lease, and fence. When all assumptions hold,
 the same attempt and operation ID may make at most one additional `commit_once`
 within the original deadline. Another conflict, changed assumption, or expired
-deadline settles the attempt as definitely uncommitted and returns the rows to
-durable promotion demand under a new attempt. No retry rewrites or reuploads
+deadline settles the attempt as definitely uncommitted and leaves the rows as
+`file_list` promotion debt that a later leader sweep retries under a new
+attempt. No retry rewrites or reuploads
 the Scribe object.
 
 An ambiguous catalog result keeps the same attempt and operation ID. Forge
@@ -819,8 +842,11 @@ Path churn alone never authorizes another rewrite. Missing, expired, partial,
 or contradictory lineage evidence fails closed.
 
 Data-file compaction, manifest rewriting, snapshot expiration, expired-object
-cleanup, and never-published orphan cleanup are separate protocols. Snapshot
-expiration preserves active refs, unresolved attempts, reconciliation evidence,
+cleanup, and never-published orphan cleanup are separate protocols. The leader
+timer orders them per pass as manifest rewrite, snapshot expiry, then cleanup.
+Expiry's age cutoff (24 hours by default) never passes the snapshot an
+in-flight compaction observed, and a table whose in-flight task observed none
+is skipped; snapshot expiration preserves active refs, unresolved attempts, reconciliation evidence,
 and the lineage snapshot referenced by the branch head. Orphan GC deletes only
 objects proven unreferenced and outside every active or uncertain attempt.
 Committed Scribe hot objects in `file_list` that lack exact promotion evidence,

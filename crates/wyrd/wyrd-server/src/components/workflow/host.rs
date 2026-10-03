@@ -303,6 +303,8 @@ impl Preparation {
         timeout: Duration,
         cancel: &CancellationToken,
     ) -> Result<(PreparedWorkflowRun, RunTools), WyrdError> {
+        #[cfg(feature = "test-support")]
+        state.workflows.pass_preparation_gate_for_test().await;
         let config = state.workflows.config();
         let graph = {
             let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;

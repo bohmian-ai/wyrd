@@ -214,6 +214,9 @@ pub struct WorkflowRuns {
     tasks: TaskTracker,
     /// The run table.
     table: Mutex<RunTable>,
+    /// Holds an armed preparation before it reads its graph.
+    #[cfg(feature = "test-support")]
+    preparation_gate: PreparationGate,
 }
 
 impl WorkflowRuns {
@@ -225,6 +228,8 @@ impl WorkflowRuns {
             admission: shutdown.child_token(),
             tasks: TaskTracker::new(),
             table: Mutex::default(),
+            #[cfg(feature = "test-support")]
+            preparation_gate: PreparationGate::default(),
         }
     }
 
@@ -398,6 +403,56 @@ impl WorkflowRuns {
     pub fn advance_clock_for_test(&self, offset: Duration) {
         self.table().clock_offset += offset;
     }
+
+    /// Stop the next preparation before it reads its graph, until
+    /// [`Self::release_preparation_for_test`].
+    #[cfg(feature = "test-support")]
+    pub fn stall_next_preparation_for_test(&self) {
+        self.preparation_gate
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Wait until the preparation armed by
+    /// [`Self::stall_next_preparation_for_test`] has stopped.
+    #[cfg(feature = "test-support")]
+    pub async fn wait_preparation_stall_for_test(&self) {
+        self.preparation_gate.reached.notified().await;
+    }
+
+    /// Let the stopped preparation continue.
+    #[cfg(feature = "test-support")]
+    pub fn release_preparation_for_test(&self) {
+        self.preparation_gate.released.notify_one();
+    }
+
+    /// Stop here when a stall is armed, consuming it, until released.
+    ///
+    /// The preparation awaits this under its run token, so shutdown still
+    /// cancels a stopped preparation.
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn pass_preparation_gate_for_test(&self) {
+        let gate = &self.preparation_gate;
+        if gate.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            gate.reached.notify_one();
+            gate.released.notified().await;
+        }
+    }
+}
+
+/// A one-shot stop for the next preparation.
+///
+/// Both notifications store a permit when nobody waits yet, so neither side
+/// can miss the other.
+#[cfg(feature = "test-support")]
+#[derive(Default)]
+struct PreparationGate {
+    /// Whether the next preparation stops.
+    armed: std::sync::atomic::AtomicBool,
+    /// Notified once a preparation has stopped.
+    reached: tokio::sync::Notify,
+    /// Notified to let the stopped preparation continue.
+    released: tokio::sync::Notify,
 }
 
 /// One in-flight preparation's ownership of its key and active slot.

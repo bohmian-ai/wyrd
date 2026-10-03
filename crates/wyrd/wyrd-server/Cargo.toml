@@ -157,3 +157,7 @@ name = "pg_card_registration_route"
 
 [[test]]
 name = "pg_workflow_registration"
+
+[[test]]
+name = "pg_workflow_runs"
+required-features = ["test-support"]

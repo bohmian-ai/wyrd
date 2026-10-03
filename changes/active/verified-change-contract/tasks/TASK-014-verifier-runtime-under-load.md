@@ -1,7 +1,7 @@
 ---
 id: TASK-014
 kind: implementation
-status: ready
+status: review
 spec: SPEC-verified-change-contract
 spec_revision: 59
 requirements: [REQ-087, REQ-181, REQ-182, REQ-183, REQ-184, REQ-185, REQ-114, INV-021, AC-044]
@@ -159,3 +159,58 @@ present.
 - [Approved spec revision 59](../spec.md): REQ-087, REQ-181..185, INV-021,
   AC-044.
 - `AGENTS.md`, `architecture/bifrost-design.md` (bounded buffers).
+
+## Implementation Evidence
+
+### Acceptance matrix (AC-044)
+
+| AC-044 bullet | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| 200 released runs complete on their first attempt on the 8-connection pool, no `settlement_failed`, no acquire timeout | Connections only for claim, store, settle, renew (`runner.rs`); `persist` retries store/settle with backoff while the lease holds | `pg_verification_runtime::two_hundred_released_runs_complete_on_their_first_attempt` | PASS |
+| More than 64 tenants all claimed in the first round | `TENANTS_PER_ROUND` and the due-tenant `LIMIT` removed; a failing tenant claim is logged and skipped (`claims.rs::claim_round`) | `pg_verification_runtime::every_tenant_is_claimed_in_the_first_round` (70 tenants) | PASS |
+| Reclaim after a stored result replays it without re-executing; one copy per result table | `wyrd.verifier_run_results` (migration `20261003000000`), `store_result`, claim returns `staged`, deleted at settle | `pg_verification_runtime::crash_after_detail_ack_reclaims_the_same_run_before_dispatch`; `pg_verifier_runs::stored_results_are_lease_fenced_and_deleted_at_settle` | PASS |
+| A stale claimant cannot store and never reaches Bifrost | Store is lease-fenced; `LeaseLost` settles nothing and writes nothing | `pg_verification_runtime::expired_lease_is_reclaimed_and_the_stale_holder_is_fenced`; `renewal_keeps_a_long_run_and_a_taken_token_cancels_it` | PASS |
+| Long run keeps its lease via renewal; a missing token cancels the work | `verification/leases.rs` `LeaseRenewal` (per-tenant statement after a third of the lease); `RENEW_LEASES_SQL` never revives an expired lease | `pg_verification_runtime::renewal_keeps_a_long_run_and_a_taken_token_cancels_it`; `pg_verifier_runs::leases_renew_once_a_third_has_passed_and_never_revive` | PASS |
+| A second run of one Verifier opens no Card connection; a deleted Verifier settles `errored` | Claim returns Card status (spec only on cache miss); `verification/cache.rs` 64 MiB per-process LRU keyed by (tenant, uid) | `pg_verification_runtime::verifier_cards_are_cached_and_a_deleted_verifier_errors`; `verification::cache::tests::entries_are_tenant_scoped_and_evicted_least_recently_used_by_bytes` | PASS |
+| A shared-resource refusal returns the run without an attempt; claiming resumes when a running run finishes | `Transition::Defer` releases without an attempt; the claim loop pauses until a spawned run finishes | `pg_verification_runtime::a_refused_run_pauses_claiming_until_a_running_run_finishes` | PASS |
+
+### Test changes with reasons
+
+- `pg_verification_runtime::unacknowledged_summary_retries_with_a_fresh_result`
+  was deleted. REQ-183 and INV-021 require every attempt to replay the stored
+  result, so a fresh result can no longer happen.
+- `expired_lease_...` and `crash_after_detail_ack_...` now assert that the
+  stored result is replayed: one engine entry and identical feature rows.
+- `eval_verification::continuous_eval_failures_publish_only_stable_errors`:
+  the claim now reads the Verifier Card, so a Card read that raises rolls the
+  claim back. The test now asserts that no run is claimed and no attempt is
+  used while the policy stands. After the policy is dropped, the runs settle
+  `eval_execution_failed` against the failing provider. The no-leak
+  assertions are unchanged.
+- `RuntimeLimits::publication_timeout` was removed, along with its use in
+  `wyrd-testing`.
+
+### Commands
+
+```
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=verification::cache::tests::entries_are_tenant_scoped_and_evicted_least_recently_used_by_bytes)'
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test pg_verification_runtime --test-threads=1 -E 'test(=every_tenant_is_claimed_in_the_first_round) | test(=verifier_cards_are_cached_and_a_deleted_verifier_errors) | test(=renewal_keeps_a_long_run_and_a_taken_token_cancels_it) | test(=two_hundred_released_runs_complete_on_their_first_attempt) | test(=a_refused_run_pauses_claiming_until_a_running_run_finishes) | test(=crash_after_detail_ack_reclaims_the_same_run_before_dispatch) | test(=expired_lease_is_reclaimed_and_the_stale_holder_is_fenced)' && mise exec -- cargo nextest run --locked -p wyrd-sql --test pg_verifier_runs -E 'test(=leases_renew_once_a_third_has_passed_and_never_revive) | test(=stored_results_are_lease_fenced_and_deleted_at_settle)'"
+mise run fmt; mise run lints; mise run check:tenant-isolation
+mise run test:sql; mise run test:bifrost:integration:server; mise run test:operators:integration
+mise run test:bifrost:journey:server
+```
+
+The last command ran 29 tests: 27 passed and 2 failed. The failures are
+`continuous_eval_runs_the_terminal_matrix` and
+`sealed_replay_on_a_later_day_activates_once`. Both come from the parked
+TASK-015 WIP outbox (commit 16ba1d2c8), not from this task. That outbox has a
+single writer and retries the whole batch, and it is being replaced by the
+shared generic outbox. There is no `test:bifrost:integration` aggregate task,
+so the `server` variant was run instead.
+
+### Residual risks
+
+- Eval judge Card reads still open a short connection while the run executes.
+- The fitted baseline comes back on every claim, not only on a cache miss.
+- A Card read that keeps failing in SQL now blocks claims for that tenant
+  indefinitely, without using attempts. It is logged once per round.

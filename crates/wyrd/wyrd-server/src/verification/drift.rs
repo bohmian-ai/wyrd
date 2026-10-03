@@ -644,12 +644,10 @@ pub fn fold_custom(batch: &RecordBatch, row: &mut Option<Option<f64>>) -> Result
     Ok(())
 }
 
-/// Owner of Drift execution: baseline loading, SYSTEM reads, scoring.
+/// Owner of Drift execution: baseline decoding, SYSTEM reads, scoring.
 pub struct DriftEngine {
-    /// Server state owning Postgres, the Bifrost catalog, and the query service.
+    /// Server state owning the Bifrost catalog and the query service.
     state: AppState,
-    /// Fitted baseline reads.
-    baselines: FittedBaselines,
     /// Deadline of one aggregate query.
     query_timeout: Duration,
 }
@@ -659,7 +657,6 @@ impl DriftEngine {
     #[must_use]
     pub fn new(state: AppState, query_timeout: Duration) -> Self {
         Self {
-            baselines: FittedBaselines::new(state.clone()),
             state,
             query_timeout,
         }
@@ -667,13 +664,13 @@ impl DriftEngine {
 
     /// Execute one claimed Drift run for `tenant`.
     ///
-    /// Loads the fitted baseline (PSI/SPC), runs one fixed aggregate
+    /// Decodes the fitted baseline the claim returned (PSI/SPC) without a
+    /// registry connection, runs one fixed aggregate
     /// statement under the tenant's tokenless SYSTEM read authority, and
     /// scores the folded
     /// aggregates. Baseline retrieval and statement construction are the
-    /// `prepare` phase, the streaming read is `input_read`, and the baseline
-    /// read, read authority, and gaps between streamed batches are waits on
-    /// `telemetry`. Never fails: every failure is the [`EngineOutcome`] it
+    /// `prepare` phase, the streaming read is `input_read`, and the read
+    /// authority and gaps between streamed batches are waits on `telemetry`. Never fails: every failure is the [`EngineOutcome`] it
     /// maps to.
     pub async fn verify(
         &self,
@@ -734,10 +731,8 @@ impl DriftEngine {
             Some(DriftProfile::Psi(profile)) => {
                 let (baseline, sql) = telemetry
                     .prepare(async {
-                        let FittedBaseline::Psi(baseline) = self
-                            .baselines
-                            .load(tenant, &run.verifier_uid, telemetry)
-                            .await?
+                        let FittedBaseline::Psi(baseline) =
+                            FittedBaselines::decode(run.fitted_baseline.clone())?
                         else {
                             return Err(invalid(
                                 "the fitted baseline is not a PSI baseline".to_owned(),
@@ -755,10 +750,8 @@ impl DriftEngine {
             Some(DriftProfile::Spc(_)) => {
                 let (baseline, sql) = telemetry
                     .prepare(async {
-                        let FittedBaseline::Spc(baseline) = self
-                            .baselines
-                            .load(tenant, &run.verifier_uid, telemetry)
-                            .await?
+                        let FittedBaseline::Spc(baseline) =
+                            FittedBaselines::decode(run.fitted_baseline.clone())?
                         else {
                             return Err(invalid(
                                 "the fitted baseline is not an SPC baseline".to_owned(),
@@ -780,7 +773,7 @@ impl DriftEngine {
 
 /// Loader of ready fitted Drift baselines.
 ///
-/// Queued Drift runs and direct executions share it, so both refuse a missing
+/// Queued Drift runs and direct executions share its decoding, so both refuse a missing
 /// or legacy baseline identically.
 #[derive(Clone)]
 pub struct FittedBaselines {
@@ -800,17 +793,15 @@ impl FittedBaselines {
         }
     }
 
-    /// Load the ready fitted baseline of `verifier_uid`.
+    /// Load the ready fitted baseline of `verifier_uid` for direct execution.
     ///
-    /// The registry read is one wait on `telemetry`; decoding is local work.
-    /// A PSI or SPC profile whose `format` is not [`FITTED_FORMAT`] was fitted
-    /// under earlier semantics and is refused before decoding; it is never
-    /// rescored or migrated.
+    /// The registry read is one wait on `telemetry`; decoding is
+    /// [`Self::decode`]. Queued runs never call this: their claim returns the
+    /// fitted baseline.
     ///
     /// # Errors
-    /// Retries a registry failure; terminates with [`BASELINE_NOT_READY`] when
-    /// no baseline is ready, [`BASELINE_LEGACY`] for an earlier format, and
-    /// [`DRIFT_INVALID`] when the stored profile does not decode.
+    /// Retries a registry failure, and otherwise returns [`Self::decode`]'s
+    /// refusals.
     pub async fn load(
         &self,
         tenant: DataTenantId,
@@ -834,7 +825,22 @@ impl FittedBaselines {
                     .map_err(|error| unavailable(&error))
             })
             .instrument(tracing::info_span!("verification.baseline"))
-            .await?
+            .await?;
+        Self::decode(fitted)
+    }
+
+    /// Decode a stored fitted baseline, `None` when none is ready.
+    ///
+    /// A PSI or SPC profile whose `format` is not [`FITTED_FORMAT`] was fitted
+    /// under earlier semantics and is refused before decoding; it is never
+    /// rescored or migrated.
+    ///
+    /// # Errors
+    /// Terminates with [`BASELINE_NOT_READY`] when no baseline is ready,
+    /// [`BASELINE_LEGACY`] for an earlier format, and [`DRIFT_INVALID`] when
+    /// the stored profile does not decode.
+    pub fn decode(fitted: Option<serde_json::Value>) -> Result<FittedBaseline, EngineOutcome> {
+        let fitted = fitted
             .ok_or_else(|| terminal(BASELINE_NOT_READY, "the Drift baseline is not fitted"))?;
         let format = fitted
             .as_object()

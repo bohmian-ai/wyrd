@@ -34,7 +34,8 @@ use wyrd_sql::queries::verification::{
 use wyrd_sql::queries::verifier_runs::{
     ClaimedRun, EnqueueOutcome, EnqueueRefusal, ManualEnqueueOutcome, ObservationRecord,
     QueueCounts, RequestKey, RetryOutcome, RunInput, RunOrigin, RunRequest, ScheduleOutcome,
-    ScheduleSkip, Settlement, TerminalStatus, TraceWaitOutcome, VerifierRunQueue,
+    ScheduleSkip, Settlement, StagedBatch, StagedResult, TerminalStatus, TraceWaitOutcome,
+    VerifierRunQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -1086,6 +1087,221 @@ async fn scheduler_skips_inactive_unready_and_missed_occurrences() {
     assert_eq!(run_count(&mut conn).await, 0);
 }
 
+/// A two-batch staged result of `verifier`: a detail batch, then the summary.
+///
+/// # Panics
+/// Never in practice: the static Card name and version are valid.
+fn staged_result(verifier: &CardUid) -> StagedResult {
+    StagedResult {
+        result_id: VerificationResultId::new_v7(),
+        event_time: Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 0).unwrap(),
+        verdict: VerificationVerdict::Failed,
+        summary: "1 of 3 features drifted".to_owned(),
+        counts: DRIFT_COUNTS,
+        verifier: wyrd_spec::reference::CardRef {
+            kind: CardKind::Verifier,
+            name: wyrd_spec::ids::CardName::new("drift").expect("static Card name"),
+            version: "1.0.0".parse().expect("static version"),
+            space: Some(wyrd_spec::ids::SpaceName::new("default").expect("static space")),
+            uid: Some(verifier.clone()),
+        },
+        batches: vec![
+            StagedBatch {
+                table: "vala.drift.result_features".to_owned(),
+                batch_id: Uuid::now_v7(),
+                ipc: vec![1, 2, 3],
+            },
+            StagedBatch {
+                table: "vala.verification.results".to_owned(),
+                batch_id: Uuid::now_v7(),
+                ipc: vec![4, 5],
+            },
+        ],
+    }
+}
+
+/// Stored results visible to the tenant.
+///
+/// # Panics
+/// Panics when the count cannot be read.
+async fn staged_count(conn: &mut TenantConn<'_>) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM wyrd.verifier_run_results")
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("staged results count")
+}
+
+/// Only the current lease holder stores a run's result; a stale token stores
+/// nothing. Every later claim of the run returns the stored result byte for
+/// byte, an expired final attempt with a stored result is reclaimed rather
+/// than exhausted, and the settlement that completes the run deletes it.
+///
+/// # Panics
+/// Panics when a stale token stores, a reclaim misses or alters the stored
+/// result, the run is exhausted, or completion leaves the result stored.
+#[tokio::test]
+async fn stored_results_are_lease_fenced_and_deleted_at_settle() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierRunQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    let binding = bind(&mut conn, &owner, &verifier, daily(), Vec::new()).await;
+    let run = enqueued(
+        queue
+            .enqueue(&mut conn, &manual_binding(&actor, binding))
+            .await
+            .expect("run enqueues"),
+    );
+    let staged = staged_result(&verifier);
+
+    let first = claim(&queue, &mut conn).await;
+    assert_eq!(first.staged, None, "a fresh run has no stored result");
+    assert!(
+        first.verifier_present,
+        "the claim reports the live Verifier"
+    );
+    expire_deadlines(&mut conn, run).await;
+    let holder = claim(&queue, &mut conn).await;
+    assert_eq!(
+        queue
+            .store_result(&mut conn, first.lease, &staged_result(&verifier))
+            .await
+            .expect("stale store answers"),
+        Settlement::StaleLease,
+        "a reclaimed token stores nothing"
+    );
+    assert_eq!(staged_count(&mut conn).await, 0);
+    for _ in 0..2 {
+        assert_eq!(
+            queue
+                .store_result(&mut conn, holder.lease, &staged)
+                .await
+                .expect("store answers"),
+            Settlement::Applied,
+            "the holder stores, and a repeated store keeps the same result"
+        );
+    }
+    assert_eq!(staged_count(&mut conn).await, 1);
+
+    sqlx::query("UPDATE wyrd.verifier_runs SET attempts = max_attempts WHERE run_id = $1")
+        .bind(run.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("attempts spent");
+    expire_deadlines(&mut conn, run).await;
+    let replay = claim(&queue, &mut conn).await;
+    assert_eq!(replay.lease.run_id, run, "a decided run is not exhausted");
+    assert_eq!(replay.staged.as_ref(), Some(&staged));
+
+    assert_eq!(
+        queue
+            .complete(
+                &mut conn,
+                replay.lease,
+                staged.result_id,
+                staged.verdict,
+                &staged.summary,
+                staged.counts,
+            )
+            .await
+            .expect("completion answers"),
+        Settlement::Applied
+    );
+    assert_eq!(staged_count(&mut conn).await, 0, "completion deletes it");
+}
+
+/// The stored lease expiry of `run`.
+///
+/// # Panics
+/// Panics when the run cannot be read or holds no lease.
+async fn lease_expiry(conn: &mut TenantConn<'_>, run: VerificationRunId) -> DateTime<Utc> {
+    sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+        "SELECT lease_expires_at FROM wyrd.verifier_runs WHERE run_id = $1",
+    )
+    .bind(run.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("lease reads")
+    .expect("the run holds a lease")
+}
+
+/// One renewal statement leaves a lease younger than a third of its length
+/// as it is, extends an older one from the database clock, and returns only
+/// tokens that still hold an unexpired lease: a reclaimed token and an
+/// expired lease are absent, so their work stops.
+///
+/// # Panics
+/// Panics when a young lease moves, an old lease is not extended, or a
+/// reclaimed or expired token is returned.
+#[tokio::test]
+async fn leases_renew_once_a_third_has_passed_and_never_revive() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierRunQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    let binding = bind(&mut conn, &owner, &verifier, daily(), Vec::new()).await;
+    let run = enqueued(
+        queue
+            .enqueue(&mut conn, &manual_binding(&actor, binding))
+            .await
+            .expect("run enqueues"),
+    );
+    let lease = Duration::minutes(5);
+    let stale = claim(&queue, &mut conn).await;
+    expire_deadlines(&mut conn, run).await;
+    let held = claim(&queue, &mut conn).await;
+    let young = lease_expiry(&mut conn, run).await;
+    let renewed = queue
+        .renew(&mut conn, &[stale.lease.token, held.lease.token], lease)
+        .await
+        .expect("renewal runs");
+    assert_eq!(renewed, vec![held.lease.token], "a reclaimed token is gone");
+    assert_eq!(
+        lease_expiry(&mut conn, run).await,
+        young,
+        "a young lease stays"
+    );
+
+    sqlx::query(
+        "UPDATE wyrd.verifier_runs \
+         SET lease_expires_at = statement_timestamp() + INTERVAL '1 minute' WHERE run_id = $1",
+    )
+    .bind(run.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("lease ages");
+    let now = database_now(&mut conn).await;
+    let renewed = queue
+        .renew(&mut conn, &[held.lease.token], lease)
+        .await
+        .expect("renewal runs");
+    assert_eq!(renewed, vec![held.lease.token]);
+    assert!(
+        lease_expiry(&mut conn, run).await >= now + lease,
+        "a lease past a third of its length is extended from the database clock"
+    );
+
+    expire_deadlines(&mut conn, run).await;
+    assert!(
+        queue
+            .renew(&mut conn, &[held.lease.token], lease)
+            .await
+            .expect("renewal runs")
+            .is_empty(),
+        "an expired lease is never revived"
+    );
+}
+
 /// An expired lease is reclaimed under a new token with the attempt counted;
 /// the old holder's completion affects nothing, while the new holder's
 /// completion applies and re-applies idempotently.
@@ -2044,7 +2260,7 @@ async fn queue_state_is_tenant_isolated() {
     let operator = fixture.operator_pool();
     assert_eq!(
         queue
-            .tenants_with_runnable_runs(operator, 10)
+            .tenants_with_runnable_runs(operator)
             .await
             .expect("runnable tenants read"),
         vec![tenant]
@@ -2434,7 +2650,7 @@ async fn dispatch_delivery_obeys_budget_deadline_and_fencing() {
     conn.commit().await.expect("settlement commits");
     assert_eq!(
         dispatches
-            .due_tenants(fixture.operator_pool(), 10)
+            .due_tenants(fixture.operator_pool())
             .await
             .expect("due tenants read"),
         vec![fixture.data_tenant_id()]

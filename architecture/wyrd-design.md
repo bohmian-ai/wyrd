@@ -993,6 +993,31 @@ not the Drift or Eval implementation, creates dispatches; each Operator owns
 its own delivery. A Verifier run never creates another Trigger. Direct
 Verifier invocation is analysis-only and dispatches nothing.
 
+The runner drains `wyrd.verifier_runs` in claim rounds. Each round considers
+every tenant with a claimable run, oldest first, with no tenant limit, and
+claims at most one run per tenant. Execution has no count limit. The shared
+resources that already admit work bound it: the Postgres pool, Oracle
+admission and memory, and the Bifrost memory budget. A run refused by one of
+them returns to the queue without consuming an attempt, and the process
+claims nothing new until one of its running runs finishes. The claim
+transaction also returns the Verifier Card's status, its spec on a cache miss,
+and any fitted Drift baseline. Parsed Verifiers are cached per process by
+tenant and Card UID in a fixed 64 MiB least-recently-used cache that is never
+shared across tenants. A deleted Verifier terminates the run `errored`.
+
+A run's result is decided once. When execution completes, the runner encodes
+the result and stores it, with its result ID, event time, batch IDs, and
+Arrow IPC bytes, in `wyrd.verifier_run_results` in one lease-fenced
+transaction before writing any of it. A stale lease stores nothing. Any later
+claimant of a run with a stored result writes those stored batches instead of
+executing again, so Scribe's batch fence absorbs every repeat. The settlement
+that completes or terminates the run deletes the stored result. While a run is
+in flight, one statement per tenant renews its leases on the PostgreSQL clock
+once a third of the lease has passed. An expired lease is never revived, and a
+renewal that no longer finds a run's token cancels that run's work. A run
+holds a connection only to claim, store, settle, and renew. The store and the
+settlement retry with backoff while the lease holds.
+
 #### Drift implementation
 Subject-less observation definition. The implementation is orthogonal: signal +
 condition + math. Subject identity is supplied by the publisher at

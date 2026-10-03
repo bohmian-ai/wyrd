@@ -34,7 +34,7 @@ use wyrd_server::verification::fault::{PublicationFault, SentBatch};
 use wyrd_server::verification::fitter::{BaselineFitter, FitGate};
 use wyrd_server::verification::health::RuntimeCapability;
 use wyrd_server::verification::observations::ObservationRunOutbox;
-use wyrd_server::verification::runner::{EngineScript, RESULT_PUBLICATION_FAILED};
+use wyrd_server::verification::runner::{EngineScript, VERIFIER_UNAVAILABLE};
 use wyrd_server::verification::{CapabilityCrash, RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::drift::DriftMethod;
@@ -113,7 +113,6 @@ impl Harness {
         RuntimeLimits {
             lease: Duration::from_secs(60),
             execution_timeout: Duration::from_secs(20),
-            publication_timeout: Duration::from_secs(20),
             drain_grace: Duration::from_secs(10),
             poll_interval: Duration::from_millis(50),
             restart_backoff: Duration::from_millis(300),
@@ -223,25 +222,6 @@ impl Harness {
         .fetch_all(&self.assertion)
         .await
         .expect("staged audit operations")
-    }
-
-    /// Wait until at least `count` result batches were submitted.
-    ///
-    /// # Panics
-    /// Panics when the count is not reached within [`WAIT`].
-    async fn wait_writes(&self, count: usize) -> Vec<String> {
-        let deadline = tokio::time::Instant::now() + WAIT;
-        loop {
-            let writes = self.writes();
-            if writes.len() >= count {
-                return writes;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "expected {count} submitted batches, saw {writes:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
     }
 
     /// Flush the server's Scribe and count the tenant's durable rows per
@@ -967,63 +947,6 @@ async fn unscorable_verifier_errors_without_publishing() {
     runtime.stop().await;
 }
 
-/// A summary that is not acknowledged within the publication budget leaves
-/// the acknowledged details written, retries the run instead of completing
-/// it, and the next attempt publishes a fresh detail batch and summary before
-/// completing. The fresh detail batch
-/// carries a new batch ID and Scribe keeps both attempts' detail rows, so a
-/// fresh `write_batch` is never treated as a deduplicated replay.
-///
-/// # Panics
-/// Panics when the failed attempt completes, the retry is not scheduled with
-/// the publication code, the writes differ from the expected sequence, the
-/// fresh batch reuses a batch ID, or the durable row counts differ.
-#[tokio::test]
-async fn unacknowledged_summary_retries_with_a_fresh_result() {
-    let harness = Harness::start().await;
-    let script = EngineScript::default();
-    script.push(EngineOutcome::Completed(drifting_report()));
-    script.push(EngineOutcome::Completed(drifting_report()));
-    let fault = &harness.fault;
-    fault.hang_next(RESULTS);
-    let runtime = RunningRuntime::spawn(harness.runtime(
-        RuntimeLimits {
-            publication_timeout: Duration::from_secs(1),
-            ..Harness::limits()
-        },
-        &script,
-        &CapabilityCrash::default(),
-    ));
-    let run = harness.enqueue().await;
-
-    let row = harness.wait_run(run, status("retrying")).await;
-    assert_eq!(row.error_code.as_deref(), Some(RESULT_PUBLICATION_FAILED));
-    assert_eq!(row.result_id, None);
-    assert_eq!(harness.writes(), vec![FEATURES.to_owned()]);
-
-    harness.expire(run).await;
-    let row = harness.wait_run(run, status("completed")).await;
-    assert_eq!(row.attempts, 2);
-    assert_eq!(
-        harness.writes(),
-        vec![FEATURES.to_owned(), FEATURES.to_owned(), RESULTS.to_owned()]
-    );
-    let features = sent_to(fault, FEATURES);
-    assert_eq!(features.len(), 2, "one detail batch per attempt");
-    assert_ne!(
-        features[0].batch_id, features[1].batch_id,
-        "the retried attempt's write_batch sealed a fresh batch, not a replay"
-    );
-    runtime.stop().await;
-    let rows = harness.durable_rows().await;
-    assert_eq!(
-        rows.get(FEATURES),
-        Some(&4),
-        "both attempts' two feature rows stay durable; a fresh batch is never deduplicated: {rows:?}"
-    );
-    assert_eq!(rows.get(RESULTS), Some(&1), "{rows:?}");
-}
-
 /// A result batch Scribe durably accepted but whose acknowledgement was lost
 /// is resent inside the same publication attempt as the identical sealed
 /// batch — same table, batch ID, and Arrow bytes — and Scribe acknowledges the
@@ -1352,11 +1275,12 @@ async fn baseline_fits_do_not_wait_for_verifier_executions() {
 }
 
 /// An expired lease is reclaimed by another runner that completes the run;
-/// the original holder's late settlement is fenced and changes nothing.
+/// the original holder, released afterwards, cannot store a result, so its
+/// work never reaches Bifrost and the run is unchanged.
 ///
 /// # Panics
-/// Panics when the run is not reclaimed, the stale holder overwrites the
-/// result, or the attempts differ.
+/// Panics when the run is not reclaimed, the stale holder writes a batch or
+/// changes the run, or the attempts differ.
 #[tokio::test]
 async fn expired_lease_is_reclaimed_and_the_stale_holder_is_fenced() {
     let harness = Harness::start().await;
@@ -1378,14 +1302,17 @@ async fn expired_lease_is_reclaimed_and_the_stale_holder_is_fenced() {
     assert_eq!(row.attempts, 2, "the reclaim is the second attempt");
 
     stale_script.release();
-    harness.wait_writes(2).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    stale.stop().await;
+    assert_eq!(
+        harness.writes(),
+        vec![RESULTS.to_owned()],
+        "only the fresh claimant's result reaches Bifrost"
+    );
     assert_eq!(
         harness.seed.run(run).await.expect("run reads"),
         row,
-        "the stale holder's settlement is fenced"
+        "the stale holder changes nothing"
     );
-    stale.stop().await;
     fresh.stop().await;
 }
 
@@ -2010,15 +1937,18 @@ async fn claim_committed_after_cancellation_is_released_unexecuted() {
         .expect("hold function drops");
 }
 
-/// A runner that crashes after its detail batch is durably acknowledged but
-/// while its summary is blocked leaves a partial result that neither completes
-/// the run nor dispatches an Operator; once the lease expires the same run is
-/// reclaimed within its attempt budget, and completion and dispatch happen
-/// only after that later attempt receives every required acknowledgement.
+/// A runner that crashes after its result is stored and its detail batch is
+/// durably acknowledged, but while its summary is blocked, leaves a partial
+/// result that neither completes the run nor dispatches an Operator. Once the
+/// lease expires the same run is reclaimed and writes its stored result
+/// without executing again: the replayed detail batch is byte-identical, so
+/// each result table holds exactly one copy, and completion and dispatch
+/// happen only after every stored batch is acknowledged.
 ///
 /// # Panics
-/// Panics when the partial detail completes or dispatches, a different run is
-/// executed, the attempt count differs, or the final rows differ.
+/// Panics when the partial detail completes or dispatches, the run executes
+/// twice, the replay differs from the stored batch, the attempt count differs,
+/// or the final rows differ.
 #[tokio::test]
 async fn crash_after_detail_ack_reclaims_the_same_run_before_dispatch() {
     let harness = Harness::start().await;
@@ -2045,7 +1975,6 @@ async fn crash_after_detail_ack_reclaims_the_same_run_before_dispatch() {
         .expect("owner activates");
     harness.make_due(binding).await;
     let script = EngineScript::default();
-    script.push(EngineOutcome::Completed(drifting_report()));
     script.push(EngineOutcome::Completed(drifting_report()));
     let fault = &harness.fault;
     fault.hang_next(RESULTS);
@@ -2104,12 +2033,26 @@ async fn crash_after_detail_ack_reclaims_the_same_run_before_dispatch() {
         "the failed binding result dispatches its Operator once completed"
     );
     assert_eq!(
+        script.entered(),
+        1,
+        "the stored result is never re-executed"
+    );
+    assert_eq!(
         harness.writes(),
         vec![FEATURES.to_owned(), FEATURES.to_owned(), RESULTS.to_owned()]
     );
+    let features = sent_to(fault, FEATURES);
+    assert_eq!(
+        features[0], features[1],
+        "the replay writes the stored table, batch ID, and bytes"
+    );
     runtime.stop().await;
     let rows = harness.durable_rows().await;
-    assert_eq!(rows.get(FEATURES), Some(&4), "{rows:?}");
+    assert_eq!(
+        rows.get(FEATURES),
+        Some(&2),
+        "Scribe absorbs the replayed detail batch: {rows:?}"
+    );
     assert_eq!(rows.get(RESULTS), Some(&1), "{rows:?}");
 }
 
@@ -2530,4 +2473,253 @@ async fn observation_outbox_retains_through_an_outage_and_flushes_at_shutdown() 
         "a request unwritten at the deadline is reported"
     );
     refuse_run_writes(&harness.assertion, false).await;
+}
+
+/// The hour before now, the window every manual run in these tests covers.
+fn last_hour() -> DriftWindow {
+    let now = Utc::now();
+    DriftWindow {
+        start: now - chrono::Duration::hours(1),
+        end: now,
+    }
+}
+
+/// The runner's first logged claim round.
+///
+/// # Panics
+/// Panics when the runner logged no claim round.
+fn first_runner_round(logs: &LogCapture) -> String {
+    logs.text()
+        .lines()
+        .find(|line| line.contains("claim round") && line.contains(r#"capability="runner""#))
+        .map(str::to_owned)
+        .expect("the runner logs its claim rounds")
+}
+
+/// With more than 64 tenants each holding a claimable run, the runner's
+/// first claim round considers and claims every one of them.
+///
+/// # Panics
+/// Panics when seeding fails, the first round misses a tenant, or a run does
+/// not complete.
+#[tokio::test]
+async fn every_tenant_is_claimed_in_the_first_round() {
+    let logs = LogCapture::install();
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    script.hold();
+    let mut runs = vec![(harness.seed.clone(), harness.enqueue().await)];
+    for index in 1..70 {
+        let tenant = DataTenantId::new_v7();
+        harness
+            .server
+            .pg_fixture()
+            .seed_additional_tenant_with_uuid(tenant, &format!("claim-round-{index}"))
+            .await
+            .expect("tenant seeds");
+        let (seed, subject, verifier) = seed_tenant(&harness.server, tenant).await;
+        let run = seed
+            .enqueue_direct(&verifier, &subject, last_hour())
+            .await
+            .expect("run enqueues");
+        runs.push((seed, run));
+    }
+    for _ in 0..70 {
+        script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+    }
+    let runtime = harness.spawn(Harness::limits(), &script);
+    wait_until("all 70 executions", || script.entered() == 70).await;
+    let round = first_runner_round(&logs);
+    assert!(
+        round.contains("due=70") && round.contains("claimed=70"),
+        "the first round claims every tenant: {round}"
+    );
+    script.release();
+    for (seed, run) in &runs {
+        wait_run_in(seed, *run, status("completed")).await;
+    }
+    runtime.stop().await;
+}
+
+/// A second run of the same Verifier on one process resolves it from the
+/// process cache without reading its Card, and a run whose Verifier was
+/// deleted settles `errored` without executing or writing.
+///
+/// # Panics
+/// Panics when the second run reads the Card, the deleted Verifier's run
+/// executes or settles otherwise, or anything more is written.
+#[tokio::test]
+async fn verifier_cards_are_cached_and_a_deleted_verifier_errors() {
+    let logs = LogCapture::install();
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    for _ in 0..2 {
+        script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+    }
+    let runtime = harness.spawn(Harness::limits(), &script);
+    for _ in 0..2 {
+        let run = harness.enqueue().await;
+        harness.wait_run(run, status("completed")).await;
+    }
+    runtime.stop().await;
+    let misses = logs
+        .text()
+        .lines()
+        .filter(|line| line.contains("Verifier Card cache miss"))
+        .count();
+    assert_eq!(misses, 1, "only the first run reads the Verifier Card");
+
+    let orphan = harness.enqueue().await;
+    sqlx::query("UPDATE wyrd.cards SET status = 'deleted' WHERE card_uid = $1")
+        .bind(harness.verifier.as_uuid())
+        .execute(&harness.assertion)
+        .await
+        .expect("the Verifier is deleted");
+    let runtime = harness.spawn(Harness::limits(), &script);
+    let row = harness.wait_run(orphan, status("errored")).await;
+    assert_eq!(row.error_code.as_deref(), Some(VERIFIER_UNAVAILABLE));
+    assert_eq!(script.entered(), 2, "a deleted Verifier never executes");
+    assert_eq!(
+        harness.writes(),
+        vec![RESULTS.to_owned(), RESULTS.to_owned()]
+    );
+    runtime.stop().await;
+}
+
+/// A run executing longer than its lease keeps it through renewal on the
+/// database clock, and a renewal that finds its token gone cancels the work,
+/// which then stores and writes nothing.
+///
+/// # Panics
+/// Panics when the lease is not extended, the run is reclaimed while live,
+/// the taken token does not cancel the work, or anything is stored or
+/// written.
+#[tokio::test]
+async fn renewal_keeps_a_long_run_and_a_taken_token_cancels_it() {
+    let logs = LogCapture::install();
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    script.hold();
+    script.push(EngineOutcome::Completed(drifting_report()));
+    let lease = Duration::from_secs(3);
+    let runtime = harness.spawn(
+        RuntimeLimits {
+            lease,
+            ..Harness::limits()
+        },
+        &script,
+    );
+    let run = harness.enqueue().await;
+    wait_until("the claim", || script.entered() == 1).await;
+    let (token, claimed_expiry) = harness.lease(run).await;
+
+    tokio::time::sleep(lease * 2).await;
+    let row = harness.seed.run(run).await.expect("run reads");
+    assert_eq!(
+        (row.status.as_str(), row.attempts),
+        ("running", 1),
+        "renewal keeps the lease past its length"
+    );
+    let (renewed_token, renewed_expiry) = harness.lease(run).await;
+    assert_eq!(renewed_token, token, "renewal keeps the claim's token");
+    assert!(renewed_expiry > claimed_expiry, "renewal extends the lease");
+
+    sqlx::query("UPDATE wyrd.verifier_runs SET lease_token = gen_random_uuid() WHERE run_id = $1")
+        .bind(run.as_uuid())
+        .execute(&harness.assertion)
+        .await
+        .expect("the token is taken");
+    wait_until("the taken lease cancels the work", || {
+        logs.text().contains("a held Verifier run lease was taken")
+    })
+    .await;
+    script.release();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(harness.writes().is_empty(), "cancelled work writes nothing");
+    let stored: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM wyrd.verifier_run_results WHERE run_id = $1")
+            .bind(run.as_uuid())
+            .fetch_one(&harness.assertion)
+            .await
+            .expect("stored results read");
+    assert_eq!(stored, 0, "cancelled work stores nothing");
+    runtime.stop().await;
+}
+
+/// Two hundred held runs released at once on the eight-connection test pool
+/// all complete on their first attempt: no settlement fails and no
+/// connection acquire times out, because a run holds a connection only to
+/// claim, store, settle, and renew.
+///
+/// # Panics
+/// Panics when a run does not complete on its first attempt, or a settlement
+/// failure or pool timeout is logged.
+#[tokio::test]
+async fn two_hundred_released_runs_complete_on_their_first_attempt() {
+    let logs = LogCapture::install();
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    script.hold();
+    let mut runs = Vec::new();
+    for _ in 0..200 {
+        script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+        runs.push(harness.enqueue().await);
+    }
+    let runtime = harness.spawn(Harness::limits(), &script);
+    wait_until("all 200 executions", || script.entered() == 200).await;
+    script.release();
+    for run in runs {
+        let row = harness.wait_run(run, status("completed")).await;
+        assert_eq!(row.attempts, 1, "{row:?}");
+    }
+    runtime.stop().await;
+    let text = logs.text();
+    assert!(
+        !text.contains("verification settlement failed"),
+        "no settlement fails"
+    );
+    assert!(
+        !text.contains("pool timed out"),
+        "no connection acquire times out"
+    );
+}
+
+/// A run refused by a full shared resource returns to the queue without
+/// consuming an attempt, and the process claims nothing new until one of its
+/// running runs finishes.
+///
+/// # Panics
+/// Panics when the refused run is charged an attempt, is claimed again while
+/// the other run still runs, or does not complete afterwards.
+#[tokio::test]
+async fn a_refused_run_pauses_claiming_until_a_running_run_finishes() {
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    script.hold();
+    script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+    script.push_unheld(EngineOutcome::Deferred(VerificationError {
+        code: "input_admission_refused".to_owned(),
+        message: "the input read was refused at admission".to_owned(),
+    }));
+    script.push_unheld(EngineOutcome::Completed(VerifierReport::Drift(None)));
+    let runtime = harness.spawn(Harness::limits(), &script);
+    let running = harness.enqueue().await;
+    wait_until("the running run executes", || script.entered() == 1).await;
+    let refused = harness.enqueue().await;
+    let row = harness
+        .wait_run(refused, |row| row.attempts == 0 && row.status == "pending")
+        .await;
+    assert_eq!(row.error_code, None, "a refusal is not a failure");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        script.entered(),
+        2,
+        "nothing is claimed while the refusal pauses claiming"
+    );
+    script.release();
+    harness.wait_run(running, status("completed")).await;
+    let row = harness.wait_run(refused, status("completed")).await;
+    assert_eq!(row.attempts, 1, "the refusal consumed no attempt");
+    runtime.stop().await;
 }

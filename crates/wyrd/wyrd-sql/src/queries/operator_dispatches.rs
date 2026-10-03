@@ -126,7 +126,8 @@ const RELEASE_SQL: &str = r#"
      WHERE dispatch_id = $1 AND lease_token = $2 AND status = 'running'
 "#;
 
-/// List tenants with claimable or exhaustible dispatches, longest-waiting first.
+/// List every tenant with claimable or exhaustible dispatches,
+/// longest-waiting first.
 const DUE_TENANTS_SQL: &str = r#"
     SELECT data_tenant_id
       FROM wyrd.operator_dispatches
@@ -134,7 +135,6 @@ const DUE_TENANTS_SQL: &str = r#"
         OR (status = 'running' AND lease_expires_at <= statement_timestamp())
      GROUP BY data_tenant_id
      ORDER BY min(COALESCE(next_attempt_at, lease_expires_at)), data_tenant_id
-     LIMIT $1
 "#;
 
 /// Server delivery ceilings every dispatch transition applies.
@@ -318,7 +318,8 @@ impl OperatorDispatchQueue {
         Ok(settlement(done.rows_affected()))
     }
 
-    /// Tenants with due, lease-expired, or exhaustible dispatches.
+    /// Every tenant with due, lease-expired, or exhaustible dispatches; there
+    /// is no tenant limit.
     ///
     /// # Errors
     /// Returns the database error when the read fails.
@@ -326,10 +327,8 @@ impl OperatorDispatchQueue {
     pub async fn due_tenants(
         &self,
         operator: &OperatorPool,
-        limit: i64,
     ) -> Result<Vec<DataTenantId>, SqlxError> {
         let rows: Vec<(Uuid,)> = sqlx::query_as(DUE_TENANTS_SQL)
-            .bind(limit)
             .fetch_all(operator.pool())
             .await?;
         rows.into_iter()

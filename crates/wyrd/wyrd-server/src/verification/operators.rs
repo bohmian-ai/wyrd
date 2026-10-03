@@ -431,12 +431,12 @@ impl LeasedWork for OperatorWorker {
     const ACTIVE_GAUGE: Option<&'static str> =
         Some(crate::app::metrics::OPERATOR_ACTIVE_DISPATCHES);
 
-    /// Tenants with due dispatches, most overdue first.
+    /// Every tenant with due dispatches, most overdue first.
     ///
     /// # Errors
     /// Returns [`SqlError`] when the cross-tenant read fails.
-    async fn due_tenants(&self, limit: i64) -> Result<Vec<DataTenantId>, SqlError> {
-        Ok(self.queue.due_tenants(&self.operator, limit).await?)
+    async fn due_tenants(&self) -> Result<Vec<DataTenantId>, SqlError> {
+        Ok(self.queue.due_tenants(&self.operator).await?)
     }
 
     /// Claim the tenant's next due dispatch under a fresh lease.
@@ -454,6 +454,8 @@ impl LeasedWork for OperatorWorker {
     /// released, since the process, not the dispatch, failed. The attempt
     /// runs in one `operator.dispatch` span naming the scrubbed dispatch and
     /// failed run identities, which relates it to that run's attempt trace.
+    /// Delivery is bounded by its own permits, so it never reports a
+    /// shared-resource refusal and always resolves to `false`.
     #[tracing::instrument(
         name = "operator.dispatch",
         skip_all,
@@ -466,7 +468,7 @@ impl LeasedWork for OperatorWorker {
         stop: CancellationToken,
         abandon: CancellationToken,
         _spawned_at: Instant,
-    ) {
+    ) -> bool {
         let started = Instant::now();
         let timeout = self.limits.operator_attempt_timeout.min(dispatch.remaining);
         let attempt = tokio::select! {
@@ -497,6 +499,7 @@ impl LeasedWork for OperatorWorker {
             "outcome" => outcome
         )
         .record(started.elapsed().as_secs_f64());
+        false
     }
 
     /// Release a dispatch claimed after shutdown began, attempt refunded.

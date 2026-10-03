@@ -60,6 +60,7 @@ base64 = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
 jsonwebtoken = { workspace = true }
+lru = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 rand = { workspace = true }

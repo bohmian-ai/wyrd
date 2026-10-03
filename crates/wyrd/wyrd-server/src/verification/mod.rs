@@ -10,6 +10,7 @@
 //! another reclaims its leases.
 
 pub mod authority;
+mod cache;
 mod claims;
 pub mod direct;
 pub mod drift;
@@ -19,6 +20,7 @@ pub mod eval;
 pub mod fault;
 pub mod fitter;
 pub mod health;
+mod leases;
 pub mod observations;
 pub mod operators;
 pub mod permits;
@@ -56,15 +58,13 @@ pub struct RuntimeLimits {
     pub operator_global_permits: usize,
     /// Ceiling of concurrent Operator deliveries for one tenant.
     pub operator_tenant_permits: usize,
-    /// How long one claim holds a run before another process may reclaim it.
-    ///
-    /// Must exceed `execution_timeout + publication_timeout`, so a live
-    /// attempt always settles before its lease can be reclaimed.
+    /// How long one claim or renewal holds a run before another process may
+    /// reclaim it. The runner renews a live run's lease once a third of it
+    /// has passed, so a run outlives its lease only when its process stops
+    /// renewing.
     pub lease: Duration,
     /// Deadline of one engine execution; exceeding it settles `timed_out`.
     pub execution_timeout: Duration,
-    /// Deadline of one result publication attempt; exceeding it retries.
-    pub publication_timeout: Duration,
     /// How long shutdown waits for in-flight runs and baseline fits before
     /// releasing them.
     pub drain_grace: Duration,
@@ -100,7 +100,7 @@ pub struct RuntimeLimits {
 
 impl Default for RuntimeLimits {
     /// Production bounds: 16 process-wide and 4 per-tenant Operator deliveries, a ten-minute
-    /// lease over a five-minute execution and one-minute publication, a
+    /// renewed lease over a five-minute execution, a
     /// thirty-second drain, Eval traces polled every five seconds for up to
     /// five minutes, and a five-minute rewrap interval whose passes stop after
     /// two minutes and thirty seconds per tenant.
@@ -110,7 +110,6 @@ impl Default for RuntimeLimits {
             operator_tenant_permits: 4,
             lease: Duration::from_secs(600),
             execution_timeout: Duration::from_secs(300),
-            publication_timeout: Duration::from_secs(60),
             drain_grace: Duration::from_secs(30),
             poll_interval: Duration::from_secs(1),
             restart_backoff: Duration::from_secs(1),

@@ -272,7 +272,6 @@ fn spawn_runtime(server: &WyrdTestServer, provider: &str) -> (CancellationToken,
         .limits(RuntimeLimits {
             lease: Duration::from_secs(60),
             execution_timeout: Duration::from_secs(20),
-            publication_timeout: Duration::from_secs(20),
             drain_grace: Duration::from_secs(10),
             poll_interval: Duration::from_millis(50),
             restart_backoff: Duration::from_millis(300),
@@ -323,38 +322,34 @@ async fn settle(
     }
 }
 
-/// Poll as the superuser until every observation run is terminal, bringing
-/// each retry's deadline due, without reading the Cards table.
+/// Watch the run queue as the superuser for one second, twenty runtime poll
+/// intervals, while a test policy makes tenant Card reads fail, and confirm
+/// no open observation run was claimed or charged an attempt.
 ///
-/// [`settle`] names each run's Verifier from its Card, so it cannot poll while
-/// a test policy makes tenant Card reads fail; the superuser bypasses row
-/// security and reads only the run queue.
+/// A claim reads the claimed run's Verifier Card status in its own
+/// transaction, so a failing Card read rolls the claim back and consumes no
+/// attempt. [`settle`] names each run's Verifier from its Card, so it cannot
+/// poll while the policy stands; the superuser bypasses row security and
+/// reads only the run queue.
 ///
 /// # Errors
-/// Returns a query error or a timeout naming the open run count.
-async fn settle_without_cards(superuser: &sqlx::PgPool) -> Result<(), ServerJourneyError> {
-    let deadline = tokio::time::Instant::now() + WAIT;
-    loop {
-        sqlx::query(
-            "UPDATE wyrd.verifier_runs SET next_attempt_at = statement_timestamp() \
-              WHERE status = 'retrying'",
-        )
-        .execute(superuser)
-        .await?;
-        let open: i64 = sqlx::query_scalar(
+/// Returns a query error, or the number of open runs that were claimed.
+async fn unclaimed_while_cards_fail(superuser: &sqlx::PgPool) -> Result<(), ServerJourneyError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < deadline {
+        let claimed: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM wyrd.verifier_runs WHERE origin = 'observation' \
-                AND status NOT IN ('completed', 'errored', 'timed_out')",
+                AND status NOT IN ('completed', 'errored', 'timed_out') \
+                AND (status <> 'pending' OR attempts <> 0)",
         )
         .fetch_one(superuser)
         .await?;
-        if open == 0 {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("{open} observation runs never settled").into());
+        if claimed != 0 {
+            return Err(format!("{claimed} runs were claimed while Card reads fail").into());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    Ok(())
 }
 
 /// Poll until at least `count` observation runs exist while no runtime runs,
@@ -2189,10 +2184,11 @@ const SQL_SENTINEL: &str = "SQL-SENTINEL-c93e";
 /// Continuous Eval failures persist and expose only stable codes and fixed
 /// operation text, never the dependency detail that caused them.
 ///
-/// A provider that fails with a sentinel body, a media URI whose private
-/// object key is a sentinel, and a Postgres read that raises a sentinel while
-/// the claimed run loads its Verifier Card each settle their gated run
-/// `errored` with the stable code. The public run status and every persisted
+/// A provider that fails with a sentinel body and a media URI whose private
+/// object key is a sentinel each settle their gated run `errored` with the
+/// stable code. A Postgres read of the Verifier Card that raises a sentinel
+/// fails the claim itself, so the run is neither started nor charged an
+/// attempt until the read succeeds. The public run status and every persisted
 /// `VerificationError` of the tenant carry none of the sentinels.
 ///
 /// # Errors
@@ -2262,9 +2258,10 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
     tokio::time::timeout(WAIT, task).await??;
 
     // A Postgres failure: while this policy stands, every tenant read of the
-    // Cards table raises the sentinel, so a claimed run cannot load its
-    // Verifier. The claim and its settlement read no Card, and the record's
-    // runs are enqueued before the policy is created.
+    // Cards table raises the sentinel. The claim reads the run's Verifier
+    // Card, so it rolls back and no run starts or spends an attempt; the
+    // record's runs are enqueued before the policy is created, and they run
+    // once the policy is dropped.
     let state = start_state(&bundle, &client).await;
     emit(
         &state.run().for_card("agent")?,
@@ -2300,21 +2297,22 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
     .execute(&superuser)
     .await?;
     let (stop, task) = spawn_runtime(&server, &provider.uri());
-    let settled = settle_without_cards(&superuser).await;
-    stop.cancel();
-    tokio::time::timeout(WAIT, task).await??;
+    let unclaimed = unclaimed_while_cards_fail(&superuser).await;
     sqlx::query("DROP POLICY eval_errors_refuse ON wyrd.cards")
         .execute(&superuser)
         .await?;
-    settled?;
-    let runs = settle(&seed, queued + AGENT_BINDINGS).await?;
+    unclaimed?;
+    let runs = settle(&seed, queued + AGENT_BINDINGS).await;
+    stop.cancel();
+    tokio::time::timeout(WAIT, task).await??;
+    let runs = runs?;
 
     let verification =
         wyrd_client::verification::Verification::with_client(connect(&server, &admin));
     for (record, code) in [
         (&provider_id, "eval_execution_failed"),
         (&locator_id, "eval_execution_failed"),
-        (&sql_id, "verifier_unavailable"),
+        (&sql_id, "eval_execution_failed"),
     ] {
         let run = run_of(&runs, "eval-gated", record)?;
         assert_unresulted(&server, tenant, run, "errored").await?;

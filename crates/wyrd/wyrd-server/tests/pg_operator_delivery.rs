@@ -315,7 +315,6 @@ impl Delivery {
         RuntimeLimits {
             lease: Duration::from_secs(60),
             execution_timeout: Duration::from_secs(20),
-            publication_timeout: Duration::from_secs(20),
             drain_grace: Duration::from_secs(10),
             poll_interval: Duration::from_millis(50),
             restart_backoff: Duration::from_millis(300),

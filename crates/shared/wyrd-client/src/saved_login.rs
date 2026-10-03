@@ -19,11 +19,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::transport::HttpConfig;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use wyrd_spec::auth::{SecretBearer, TokenResponse};
 use wyrd_spec::ids::TenantSlug;
-use wyrd_spec::operator_connection::HttpsOrigin;
 
 use crate::auth::{AuthError, TokenExchange};
 use crate::credentials_file::CredentialsFile;
@@ -106,27 +106,25 @@ impl SavedLogin {
 }
 
 /// Canonical form of a server URL, the key saved logins are stored and
-/// selected under: its origin, `scheme://host[:port]`, with the scheme and
-/// host lowercased and the default port elided by the URL parser, so every
-/// spelling and path of one deployment selects the same login.
+/// selected under: the origin [`HttpConfig::validate`] derives,
+/// `scheme://host[:port]` with the scheme and host lowercased and the default
+/// port elided, so every spelling and path of one deployment selects the same
+/// login, and the same origin the token exchange and transport address.
 ///
-/// This is [`HttpsOrigin::of_url`], so URL userinfo is refused before a
-/// login can be saved, selected, or printed, and only HTTPS or loopback HTTP
-/// is accepted, as for every secret-bearing request.
+/// URL userinfo is refused before a login can be saved, selected, or printed,
+/// and only HTTPS or loopback HTTP is accepted, as for every secret-bearing
+/// request.
 ///
 /// # Errors
 /// Returns [`WyrdClientError::Config`] when `server_url` is not an absolute
 /// URL, carries userinfo, or is not HTTPS or loopback HTTP.
 pub fn canonical_origin(server_url: &str) -> Result<String, WyrdClientError> {
-    let invalid = |reason: String| WyrdClientError::Config {
-        field: "http_config.base_url".to_owned(),
-        reason,
-    };
-    let url = reqwest::Url::parse(server_url)
-        .map_err(|error| invalid(format!("not an absolute URL: {error}")))?;
-    HttpsOrigin::of_url(&url)
-        .map(|origin| origin.as_str().to_owned())
-        .map_err(|error| invalid(error.to_string()))
+    HttpConfig {
+        base_url: server_url.to_owned(),
+        ..HttpConfig::default()
+    }
+    .validate()
+    .map(|origin| origin.as_str().to_owned())
 }
 
 /// The `credentials.toml` array of tables holding saved logins.

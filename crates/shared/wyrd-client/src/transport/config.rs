@@ -1,6 +1,7 @@
 //! Wyrd client transport configuration types.
 
 use serde::{Deserialize, Serialize};
+use wyrd_spec::operator_connection::HttpsOrigin;
 
 use crate::error::WyrdClientError;
 
@@ -199,26 +200,30 @@ impl Default for HttpConfig {
 }
 
 impl HttpConfig {
-    /// Validate the config. Returns `Err` if `base_url` is empty or
-    /// `timeout_ms` is zero.
+    /// Validate the config and return the one deployment origin every HTTP
+    /// and `/auth` client of it addresses.
     ///
-    /// `base_url` must parse as an absolute `https://` URL, or an `http://`
-    /// URL whose host is loopback (`localhost` or a loopback IP), because
-    /// credentials may be sent to `{base_url}/auth/token` or in request
-    /// headers. The URL parser decides scheme and host, so spellings such as
-    /// `HTTP://` are judged the same way the HTTP client will send them.
+    /// `base_url` is parsed once by the URL parser and reduced by
+    /// [`HttpsOrigin::of_url`] to `scheme://host[:port]`: scheme and host
+    /// lowercased, the default port elided, and any path, query, or fragment
+    /// dropped, so every spelling of one deployment reaches the same root
+    /// routes. Credentials may be sent to `{origin}/auth/token` or in request
+    /// headers, so only `https`, or `http` with a loopback host (`localhost`
+    /// or a loopback IP), is accepted, and URL userinfo is refused. Refusal
+    /// reasons never repeat the URL, so userinfo cannot reach an error or a
+    /// log line.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::Config`] for an empty or unparsable
     /// `base_url`, a scheme other than `http` or `https`, remote cleartext
-    /// `http`, or a zero `timeout_ms`.
-    pub fn validate(&self) -> Result<(), WyrdClientError> {
-        let invalid = |reason: &str| WyrdClientError::Config {
+    /// `http`, userinfo, no host, or a zero `timeout_ms`.
+    pub fn validate(&self) -> Result<HttpsOrigin, WyrdClientError> {
+        let invalid = |reason: String| WyrdClientError::Config {
             field: "http_config.base_url".to_string(),
-            reason: reason.to_string(),
+            reason,
         };
         if self.base_url.is_empty() {
-            return Err(invalid("must not be empty"));
+            return Err(invalid("must not be empty".to_owned()));
         }
         if self.timeout_ms == 0 {
             return Err(WyrdClientError::Config {
@@ -227,32 +232,16 @@ impl HttpConfig {
             });
         }
         let url = reqwest::Url::parse(&self.base_url)
-            .map_err(|error| invalid(&format!("not an absolute URL: {error}")))?;
-        match url.scheme() {
-            "https" => Ok(()),
-            "http" if is_loopback(&url) => Ok(()),
-            "http" => Err(invalid(
-                "remote cleartext HTTP is not allowed; use https:// or a loopback host",
-            )),
-            _ => Err(invalid(
-                "the scheme must be https, or http for a loopback host",
-            )),
-        }
+            .map_err(|error| invalid(format!("not an absolute URL: {error}")))?;
+        // Plain `http` without userinfo fails only for a remote host; name
+        // the fix rather than the origin rule.
+        HttpsOrigin::of_url(&url).map_err(|error| match url.scheme() {
+            "http" if url.username().is_empty() && url.password().is_none() => invalid(
+                "remote cleartext HTTP is not allowed; use https:// or a loopback host".to_owned(),
+            ),
+            _ => invalid(error.to_string()),
+        })
     }
-}
-
-/// Whether the parsed `url` names a loopback host: `localhost` or a loopback
-/// IP address. The parser has already lowercased the host.
-fn is_loopback(url: &reqwest::Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    host == "localhost"
-        || host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Default buffer label used by [`MockConfig::default`].
@@ -339,12 +328,16 @@ impl TransportConfig {
 
     /// Validate the wrapped transport config.
     ///
-    /// Delegates to the inner config's `validate()`. `Mock` always returns
-    /// `Ok(())` — the mock transport has no invalid field combinations.
+    /// Delegates to the inner config's `validate()`, discarding the HTTP
+    /// origin it returns. `Mock` always returns `Ok(())` — the mock transport
+    /// has no invalid field combinations.
+    ///
+    /// # Errors
+    /// Returns the inner config's [`WyrdClientError::Config`] refusal.
     pub fn validate(&self) -> Result<(), WyrdClientError> {
         match self {
             Self::Grpc(c) => c.validate(),
-            Self::Http(c) => c.validate(),
+            Self::Http(c) => c.validate().map(drop),
             Self::Mock(_) => Ok(()),
         }
     }
@@ -353,19 +346,21 @@ impl TransportConfig {
 #[cfg(test)]
 mod tests {
     use super::HttpConfig;
+    use crate::error::WyrdClientError;
+    use wyrd_spec::operator_connection::HttpsOrigin;
 
     /// The base-URL decision for `base_url`, through [`HttpConfig::validate`].
-    fn accepts(base_url: &str) -> bool {
+    fn origin(base_url: &str) -> Result<HttpsOrigin, WyrdClientError> {
         HttpConfig {
             base_url: base_url.to_owned(),
             ..HttpConfig::default()
         }
         .validate()
-        .is_ok()
     }
 
-    /// Remote cleartext in any scheme spelling, malformed targets, and
-    /// unsupported schemes are refused.
+    /// Remote cleartext in any scheme spelling, malformed targets,
+    /// unsupported schemes, and URL userinfo are refused, and no refusal
+    /// repeats the userinfo.
     #[test]
     fn remote_cleartext_malformed_and_unsupported_targets_are_refused() {
         for url in [
@@ -381,23 +376,36 @@ mod tests {
             "http//wyrd.example.com",
             "ftp://wyrd.example.com",
             "file:///etc/passwd",
+            "https://alice:s3cret@wyrd.example.com",
+            "https://alice@wyrd.example.com",
+            "http://alice:s3cret@localhost:8080",
         ] {
-            assert!(!accepts(url), "{url} must be refused");
+            let error = origin(url).expect_err(url).to_string();
+            assert!(
+                !error.contains("alice") && !error.contains("s3cret"),
+                "{url} refusal discloses userinfo: {error}"
+            );
         }
     }
 
-    /// HTTPS in any spelling and loopback HTTP are accepted.
+    /// HTTPS in any spelling and loopback HTTP are accepted, and every
+    /// case, default-port, path, query, and fragment spelling of one
+    /// deployment yields the same root origin.
     #[test]
     fn https_and_loopback_http_are_accepted() {
-        for url in [
-            "https://wyrd.example.com",
-            "HTTPS://Wyrd.Example.com/api",
-            "http://localhost:8080",
-            "HTTP://LOCALHOST:8080",
-            "http://127.0.0.1:8080",
-            "http://[::1]:8080",
+        for (url, expected) in [
+            ("https://wyrd.example.com", "https://wyrd.example.com"),
+            ("HTTPS://Wyrd.Example.com/api", "https://wyrd.example.com"),
+            (
+                "https://wyrd.example.com:443/api/?q=1#f",
+                "https://wyrd.example.com",
+            ),
+            ("http://localhost:8080", "http://localhost:8080"),
+            ("HTTP://LOCALHOST:8080/", "http://localhost:8080"),
+            ("http://127.0.0.1:8080", "http://127.0.0.1:8080"),
+            ("http://[::1]:8080", "http://[::1]:8080"),
         ] {
-            assert!(accepts(url), "{url} must be accepted");
+            assert_eq!(origin(url).expect(url).as_str(), expected, "{url}");
         }
     }
 }

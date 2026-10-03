@@ -5,9 +5,9 @@
 //! URL, the fixture user approves the code there and signs in at the provider
 //! it redirects to, the provider's return reaches the server callback, and
 //! the CLI's token poll saves the Wyrd user credential into the private
-//! saved-login store. The device code's refusals — pending, wrong code,
-//! cross-origin or unknown approval, replay, denial, expiry — are driven over
-//! the same served routes, and logout revokes only its own login's refresh
+//! saved-login store. The device code's refusals — cross-origin or unknown
+//! approval, replay, denial, expiry — are driven through the same `oauth2`
+//! client over the served routes, and logout revokes only its own login's refresh
 //! chain, and still deletes the record when the server is unreachable. No
 //! command output carries a token. The ignored root test
 //! `cli_device_login_journey` in `cli.rs` runs it, so the identity lane
@@ -22,7 +22,6 @@ use secrecy::ExposeSecret;
 use url::Url;
 use wyrd_client::auth::{AuthError, TokenExchange};
 use wyrd_client::saved_login::{SavedLogin, canonical_origin};
-use wyrd_spec::auth::{SecretBearer, TokenRequest};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_testing::WyrdTestServerBuilder;
 use wyrd_testing::human_login::{FIXTURE_TENANT_SLUG, HUMAN_PUBLIC_ORIGIN, HumanSso, saved_logins};
@@ -277,32 +276,14 @@ pub(crate) async fn cli_device_login_journey() {
         "status prints no token"
     );
 
-    // Refusals: no credential reaches a pending or wrong device code, a
-    // cross-origin or unknown approval, a replay, a denied code, or an
-    // expired one.
+    // Refusals: no credential reaches a cross-origin or unknown approval, a
+    // replay, a denied code, or an expired one. The server's single-poll
+    // answers (pending, unknown code) are its own device-grant journey's.
     let exchange = TokenExchange::new(&server, 30_000).expect("exchange builds");
     let device = exchange
         .device_authorization(&tenant)
         .await
         .expect("device login begins");
-    // Single polls show the server's answer to each one; the CLI's own
-    // `oauth2` poll keeps polling through `authorization_pending`.
-    let poll = |device_code: &str| TokenRequest::DeviceCode {
-        device_code: SecretBearer::new(device_code.to_owned()),
-    };
-    assert_eq!(
-        device_error(
-            exchange
-                .exchange(&poll(device.device_code().secret()))
-                .await
-        ),
-        "authorization_pending"
-    );
-    let wrong = format!("{}.not-the-code", srv.data_tenant_id());
-    assert_eq!(
-        device_error(exchange.exchange(&poll(&wrong)).await),
-        "invalid_grant"
-    );
     assert_eq!(
         decide(
             &server,
@@ -339,11 +320,7 @@ pub(crate) async fn cli_device_login_journey() {
         .await
         .expect("the approved device code redeems");
     assert_eq!(
-        device_error(
-            exchange
-                .exchange(&poll(device.device_code().secret()))
-                .await
-        ),
+        device_error(exchange.device_access_token(&device).await),
         "invalid_grant",
         "a redeemed device code returns nothing"
     );

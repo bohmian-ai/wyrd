@@ -204,3 +204,20 @@ Record the corrected source locations, the static owner comparison for each
 finding, and the exit result of every focused command above. Route the
 completed remediation directly to `$wyrd-implement`, then reassess the full
 original base-to-new-candidate range with `$wyrd-task-review`.
+
+## Implementation Evidence
+
+Commit `5030285e3`. Documentation and rustdoc only; no runtime change.
+
+| Finding | Corrected locations | Static owner comparison | Result |
+|---|---|---|---|
+| FIND-TASK-005-1 | `docs/scripts/generate_api_docs.py` (OpenAPI and error-catalog intros) and regenerated `api/openapi.md`, `api/errors.md`; `for-agents/error-remediation.svx` (Problem Details scoped, new "OAuth endpoint errors" with `error` actions, SDK mapping note); `wyrd-security-posture.md`; `sso-and-oidc.svx` OAuth endpoints; `auth/oauth.rs` module rustdoc | `OAuthForm`/`OAuthClients` build `OAuthError` directly with no log; only `From<WyrdError>` logs `wyrd_code` (`oauth.rs`). Body is `error` + optional `error_description`. `wyrd-client/src/auth.rs::oauth_error` maps refusals onto catalog codes for SDK callers | PASS |
+| FIND-TASK-005-2 | `concepts/cloud-identity.svx` field table (`principal_kind` must be `workload`; default/explicit human refused; human mapping fields not used); `self-hosting/configuration.svx` sealing paragraph | `seed_trusted_issuers` returns `HumanIssuerSeed` before IO; admin create calls `refuse_human_trusted_issuer`; `issuer_write_from_trusted` seals `secret_basic`/`secret_post` | PASS |
+| FIND-TASK-005-3 | `self-hosting/authentication.svx` Grants | Tenant grants on `/auth/token` (`components/auth/routes.rs`); platform RFC 8693 exchange only on `/auth/platform/token` (`components/platform/routes.rs`) | PASS |
+| FIND-TASK-005-4 | `wyrd-security-posture.md`, `sso-and-oidc.svx`, `auth/oauth.rs` | Token handlers return `TokenResponse`; device authorization returns the RFC 8628 §3.2 object; revocation returns `no_store(StatusCode::OK, ())` | PASS |
+| FIND-TASK-005-5 | `self-hosting/authentication.svx` intro | `BrowserSessions` keeps the refresh token or recovery key in an encrypted Secure, HttpOnly, SameSite=Lax cookie keyed from the client secret and sends a bearer token; the server has no session store | PASS |
+| FIND-TASK-005-6 | `sso-and-oidc.svx` Activating a candidate | `HumanConnections::activate` checks the exact-revision 15-minute stamp and recovery key under the slot lock, with no provider IO | PASS |
+| Constraint 7: no behavior change | Diff limited to docs, the generator, architecture prose, and one module rustdoc | `git diff 134f60536..HEAD --stat` | PASS |
+
+Verification (all exit 0): `mise run docs:check`, `mise run codegen:check`,
+`mise run fmt`, `mise run lints`, `git diff --check`.

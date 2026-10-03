@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 57
+revision: 58
 status: approved
 ---
 
@@ -1449,6 +1449,16 @@ table on `(data_tenant_id, result_id)`.
   absent. Existing tracing and metrics MUST expose queue depth, active work,
   attempts, failures, and latency; this change adds no new telemetry service or
   process-local work registry.
+- **REQ-178**: The Verifier runner MUST NOT let a burst of runs exhaust the
+  server's Postgres pool. Its Postgres phases (loading the Verifier, minting
+  the result-write token, and settlement) share one in-process bound derived
+  from the configured pool size, so runner Postgres work never holds more than
+  half of the pool. The bound has no separate configuration. Engine execution,
+  claims, and leases stay unbounded and durable as REQ-146 states; this bound
+  limits connection use, not runs. Settlement that fails to acquire a
+  connection retries with backoff within the run's lease instead of leaving the
+  run until lease expiry. A run never consumes an attempt because a connection
+  was unavailable.
 - **REQ-152**: Verification coordination MUST use PostgreSQL as its clock.
   PostgreSQL MUST write and evaluate runtime activity, schedule eligibility,
   run and dispatch availability, claim and lease expiry, retry/backoff
@@ -2399,7 +2409,7 @@ published image pinned by an immutable registry digest before release.
 
 ## Open material decisions
 
-None for revision 57.
+None for revision 58.
 
 Revision 39 records the user's narrow deletion: remove the always-allow
 hook and its fake `invoke` policy attribution without redesigning delegation.
@@ -2434,6 +2444,22 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 - [PagerDuty Global Integrations and Service Routes](https://support.pagerduty.com/main/docs/event-orchestration)
 
 ## Revision history
+
+- **Revision 58 runner connection bound (2026-10-03, approved):** A fairness
+  test that released 200 held queued runs at once exhausted the server's
+  Postgres pool. Revision 50 removed the Verifier execution permits, which
+  were the only thing bounding concurrent runner Postgres work. Each run makes
+  three separate connection acquisitions (Verifier load at `runner.rs:314`,
+  token mint at `publisher.rs:197`, and settlement at `runner.rs:456`). The
+  pool defaults to 32 connections with a 5 s acquire timeout. A timed-out mint
+  consumes an attempt; a timed-out settlement strands the run until its
+  10-minute lease expires; and HTTP, MCP, and audit work share the same pool.
+  - **Changes:** REQ-178 bounds runner Postgres phases to half the pool and
+    makes settlement retry connection timeouts. Execution remains
+    permit-free.
+  - **Proof:** the fairness test returns to 200 runs on the 8-connection test
+    pool and fails on any `settlement_failed` outcome or any attempt beyond the
+    first.
 
 - **Revision 57 one capacity benchmark (2026-10-03, approved):** Wyrd had three
   capacity benchmarks (verification, Bifrost ingest, Bifrost query) and the

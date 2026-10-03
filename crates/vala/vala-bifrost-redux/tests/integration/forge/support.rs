@@ -782,10 +782,6 @@ pub(crate) struct ForgeTaskRow {
     pub(crate) state: String,
     /// Snapshot the task was bound to at enqueue.
     pub(crate) base_snapshot_id: i64,
-    /// Immutable plan payload bound at enqueue.
-    pub(crate) plan: serde_json::Value,
-    /// Canonical hash of that plan payload.
-    pub(crate) plan_hash: Vec<u8>,
     /// Number of settled attempts the failure taxonomy has counted.
     pub(crate) attempt_count: i32,
     /// Persisted failure class, or `None` while the task carries no failure.
@@ -1256,14 +1252,12 @@ impl PromotionIntegrationFixture {
                 String,
                 String,
                 i64,
-                serde_json::Value,
-                Vec<u8>,
                 i32,
                 Option<String>,
                 chrono::DateTime<chrono::Utc>,
             ),
         >(
-            "SELECT task_id, strategy, state, base_snapshot_id, plan, plan_hash, \
+            "SELECT task_id, strategy, state, base_snapshot_id, \
                     attempt_count, failure_class, next_eligible_at \
              FROM vala.forge_tasks \
              WHERE data_tenant_id = $1 AND namespace_name = $2 AND table_name = $3 \
@@ -1282,8 +1276,6 @@ impl PromotionIntegrationFixture {
                 strategy,
                 state,
                 base_snapshot_id,
-                plan,
-                plan_hash,
                 attempt_count,
                 failure_class,
                 next_eligible_at,
@@ -1292,8 +1284,6 @@ impl PromotionIntegrationFixture {
                 strategy,
                 state,
                 base_snapshot_id,
-                plan,
-                plan_hash,
                 attempt_count,
                 failure_class,
                 next_eligible_at,
@@ -1445,30 +1435,6 @@ impl PromotionIntegrationFixture {
         .execute(self.operator_pool.pool())
         .await
         .expect("fixture backoff aging");
-    }
-
-    /// Moves another tenant's Forge tasks to `offset_secs` from now.
-    ///
-    /// A scenario that must decide *when* a second tenant's work becomes
-    /// claimable cannot rely on planning order: the scheduler plans every
-    /// eligible table in one pass. Holding that tenant's tasks past the window
-    /// and releasing them afterwards makes the moment exact, with no race
-    /// against a running worker.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the update fails.
-    pub(crate) async fn offer_tasks_of(&self, tenant: DataTenantId, offset_secs: i64) {
-        sqlx::query(
-            "UPDATE vala.forge_tasks \
-             SET next_eligible_at = statement_timestamp() + ($2::text || ' seconds')::interval \
-             WHERE data_tenant_id = $1",
-        )
-        .bind(tenant.as_uuid())
-        .bind(offset_secs.to_string())
-        .execute(self.operator_pool.pool())
-        .await
-        .expect("fixture task offer window");
     }
 
     /// Moves one exact task to `offset_secs` from now.

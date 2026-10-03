@@ -330,27 +330,34 @@ async fn four_strategies_schedule_dispatch_and_settle_independently() {
     let mut table = expirable_table("four_routes", true).await;
     // Promotion already settled twice while the fixture started, so the routes
     // still owed are compaction, expiration, expired cleanup, and orphan work.
+    // Stopping the worker after each held attempt releases any sibling claim
+    // it took meanwhile back to `retryable`, so a route is done only once every
+    // row it owns has settled, not merely once it exists.
     let mut deletes_before_expiry = None;
-    for _ in 0..8 {
+    for _ in 0..12 {
         let settled = settled_tasks(&table.fixture).await;
         let seen = settled
             .iter()
             .map(|(_, strategy, _)| strategy.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        if [
+        let routes = [
             "small_files",
             "snapshot_expiry",
             "expired_cleanup",
             "orphan_cleanup",
-        ]
-        .iter()
-        .all(|strategy| seen.contains(strategy))
+        ];
+        if routes.iter().all(|strategy| seen.contains(strategy))
+            && settled
+                .iter()
+                .filter(|(_, strategy, _)| routes.contains(&strategy.as_str()))
+                .all(|(_, _, state)| state == "succeeded")
         {
             break;
         }
         if deletes_before_expiry.is_none() && seen.contains("small_files") {
             deletes_before_expiry = Some(table.store.deletes());
         }
+        table.fixture.clear_task_backoff().await;
         table.supervised.restart_worker();
         table.supervised.run_one_success().await;
     }
@@ -387,35 +394,30 @@ async fn four_strategies_schedule_dispatch_and_settle_independently() {
 
     // Snapshot expiration leaves durable cleanup demand rather than performing
     // the deletion itself, so the exact objects it retired are only removed
-    // once the separate cleanup task claims them.
-    let expiry = settled
+    // once the separate cleanup task claims them. A compaction the leader
+    // dispatches after an expiry retires the head that expiry kept, which is
+    // new retention debt, so every expiry — not exactly one — hands off its own.
+    for (task_id, _, _) in settled
         .iter()
-        .find(|(_, strategy, _)| strategy == "snapshot_expiry")
-        .expect("the expiration route settled");
-    assert_eq!(
-        settled
-            .iter()
-            .filter(|(_, strategy, _)| strategy == "snapshot_expiry")
-            .count(),
-        1,
-        "one expiration settled the retention debt: {settled:?}"
-    );
-    let evidence: Option<serde_json::Value> =
-        sqlx::query_scalar("SELECT evidence FROM vala.forge_tasks WHERE task_id = $1")
-            .bind(expiry.0)
-            .fetch_one(table.fixture.operator_pool.pool())
-            .await
-            .expect("expiry evidence is readable");
-    let candidates = evidence
-        .as_ref()
-        .and_then(|value| value.get("cleanup_candidates"))
-        .and_then(serde_json::Value::as_array)
-        .map(Vec::len)
-        .unwrap_or_default();
-    assert!(
-        candidates > 0,
-        "the expiration handed off its candidates instead of deleting them"
-    );
+        .filter(|(_, strategy, _)| strategy == "snapshot_expiry")
+    {
+        let evidence: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT evidence FROM vala.forge_tasks WHERE task_id = $1")
+                .bind(task_id)
+                .fetch_one(table.fixture.operator_pool.pool())
+                .await
+                .expect("expiry evidence is readable");
+        let candidates = evidence
+            .as_ref()
+            .and_then(|value| value.get("cleanup_candidates"))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
+        assert!(
+            candidates > 0,
+            "every expiration handed off its candidates instead of deleting them"
+        );
+    }
 }
 
 /// Sums every recorded counter series of one family carrying all given labels.

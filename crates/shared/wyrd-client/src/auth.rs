@@ -39,7 +39,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 use wyrd_spec::auth::{
     ExchangeTokenType, OAuthClientId, OAuthErrorCode, OAuthErrorResponse, SecretBearer,
-    TokenAudience, TokenRequest, TokenResponse, TokenRevocationRequest, TokenType,
+    TokenAudience, TokenRequest, TokenResponse, TokenType,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
@@ -364,13 +364,17 @@ impl TokenExchange {
     /// Revoke the login `refresh_token` belongs to (RFC 7009 §2.1), so neither
     /// it nor any successor renews again; idempotent on the server.
     ///
-    /// Sent as one form POST through the redirect-free client, like the RFC
-    /// 8693 and RFC 7523 grants: the `oauth2` crate refuses every non-HTTPS
-    /// revocation endpoint, including the loopback HTTP target
-    /// [`HttpConfig::validate`] accepts for local deployments.
+    /// Sent as one form POST of `token` and `token_type_hint=refresh_token`
+    /// through the redirect-free client, as the public `wyrd-cli` client like
+    /// the RFC 8693 and RFC 7523 grants, and only the status is checked: any
+    /// `2xx` is success. `oauth2` 5.0's `revoke_token` refuses every
+    /// non-HTTPS revocation URL, so a logout from a loopback HTTP deployment,
+    /// which [`HttpConfig::validate`] accepts, could not use it; the
+    /// configured server URL decides the scheme here, as it does for the
+    /// device and refresh grants.
     ///
     /// # Errors
-    /// Returns [`AuthError::Server`] when the server refuses and
+    /// Returns [`AuthError::Server`] for a non-success status and
     /// [`AuthError::Client`] for an encoding or transport failure.
     pub async fn revoke_refresh_token(
         &self,
@@ -378,8 +382,9 @@ impl TokenExchange {
     ) -> Result<(), AuthError> {
         self.post_form(
             "/auth/revoke",
-            &TokenRevocationRequest {
-                token: refresh_token.clone(),
+            &RevocationForm {
+                token: refresh_token.expose(),
+                token_type_hint: "refresh_token",
             },
         )
         .await
@@ -431,6 +436,15 @@ impl TokenExchange {
         }
         Ok(response)
     }
+}
+
+/// RFC 7009 §2.1 revocation parameters, besides the client's `client_id`.
+#[derive(Serialize)]
+struct RevocationForm<'a> {
+    /// The refresh token to revoke.
+    token: &'a str,
+    /// Always `refresh_token`.
+    token_type_hint: &'static str,
 }
 
 /// Form parameters of one `wyrd-cli` request: its `client_id` beside the

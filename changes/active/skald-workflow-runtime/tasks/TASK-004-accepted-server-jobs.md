@@ -437,3 +437,173 @@ size/count defaults/accounting or gateway credential/settlement ownership.
 - `architecture/wyrd-design.md`; `architecture/wyrd-security-posture.md`
 - `architecture/bifrost-design.md` §§Query contract, Read audit and terminal
 - `architecture/references/languages/{agent-harness,errors,spec-driven-development,implementation-execution,testing-workflows}.md`
+
+
+## Implementation Evidence
+
+### Reuse-map revalidation
+
+| Capability | Existing owner reused | Gap found | Extension chosen |
+|---|---|---|---|
+| Graph preparation | `components/cards/resolve.rs` effective-body resolution and `PinnedWorkflowGraph`; Skald `WorkflowSurface` validation | Admission needs the exact locked graph under step/edge/byte bounds | Bounded pinning on the existing server Cards owner (`resolve.rs`); registration consumers unchanged |
+| Prepare/execute seam (approved) | `skald-workflow` `Workflow::run_with_options` | Server must mint the id and publish acceptance before dispatch | `run_with_options` = `prepare(...)?.execute(\|_\| {})`; `execute` stays async with a synchronous non-blocking `FnMut(&WorkflowRun) + Send` observer; `prepare` mints the id and dispatches nothing; cancellation only via the `WorkflowRunOptions` token (`workflow.rs`, `run.rs`) |
+| Per-Agent tools (approved) | `bodies.rs::from_card_bodies`, `AgentTool`, `ToolResolver` | One resolver for every Agent cannot default `cards.get` space per Agent | `from_card_bodies` changed in place to take an Agent-ref resolver; its only client caller (`wyrd-client` `cards/hydrate/workflow.rs`) passes `\|_\| registry`; an inline Agent gets the Workflow's ref; `AgentTool`/`ToolResolver` unchanged |
+| Client binding reuse | `wyrd-client` `resolve_binding` | none | reused for server external bindings; no second resolver |
+| Run lifecycle | AppState/boot/`BoundServer::run` shared shutdown deadline, `TaskTracker` precedent | Process-local accepted-run state | One cohesive owner `components/workflow/runs.rs::WorkflowRuns` + `host.rs::WorkflowRunHost`; no durable queue, actor, or second executor |
+| Authority and audit | `Caller::from_authenticated`, `audit::authorize`, builtin role definitions | `workflows:run` and accepted capture | `Permission::workflow_run()`, writer/agent grants at the builtin-role definition; captured `Caller` without bearer |
+| Gateway | `GatewayInvocation::run` | In-process run-bound caller | `components/gateway/workflow.rs` calls the existing owner with `authorized = false` and separate cancellation |
+| Query tool | MCP `QueryArguments`/`ResultCollector`, `query::service::stream_query`, `RunningQueryControls::cancel_and_settle` | Shared terminal-safe collection | Collector lifted once to `query/collect.rs::BoundedQuery`, consumed by MCP (`mcp/bifrost.rs`) and the run tool (`components/workflow/tools.rs`); query owners run on the run's `TaskTracker` |
+| Cards tool | `get_card_for` authorized UID read | Exact-ref authorized/audited read | `get_card_by_ref_for` beside it on the same authorize/audit path |
+| Test probes | `stall_next_query_after_schema` test-support precedent | Deterministic hold inside tracked preparation | `WorkflowRuns::stall_next_preparation_for_test` gate compiled only under `test-support`; one `BifrostClusterSpec::with_gateway_provider_root_for_test` node option following `with_oracle_runtime_for_test` |
+
+### Acceptance
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| S1 admission authenticated, audited, bounded, side-effect free on refusal | `routes.rs`, `host.rs::create`, `config.rs::ServerWorkflowConfig`, `wyrd-runtime` permission/roles | `admission_is_audited_and_side_effect_free_on_refusal`; config unit `workflow_config_rejects_zero_and_contradictory_bounds` | PASS |
+| S2 one preparation and one job per scoped key | `runs.rs` admission/promotion, `host.rs::Preparation` | `tracked_preparation_replay_and_disconnect` | PASS |
+| S3 accepted authority outlives submission only | captured `Caller` in `host.rs`; `tools.rs`; `gateway/workflow.rs` | `accepted_authority_outlives_submission_only` | PASS |
+| S4 built-in read tools keep object authorization | `tools.rs`, `query/collect.rs`, `cards/routes.rs::get_card_by_ref_for` | `declared_tools_use_captured_scopes_and_owned_services`; forwarded: `workflow::workflow_forwarded_query_settles_before_the_run_ends` | PASS |
+| S5 gateway and external routes keep owners | `gateway/workflow.rs`, external binding resolution in `host.rs` | `server_routes_keep_gateway_and_external_ownership` | PASS |
+| S6 races, retention, shutdown | `runs.rs` terminal CAS, eviction, drain; `app/server.rs` shutdown order | `lifecycle_races_retention_and_shutdown`; forwarded cancel/deadline/pod-loss journey above | PASS |
+| S7 graph/snapshot bounds and sibling services | bounded pinning in `cards/resolve.rs`; terminal reserve in `runs.rs` | `graph_and_snapshot_limits_preserve_sibling_services` | PASS |
+| MCP and moved collector unchanged | `mcp/bifrost.rs` over `BoundedQuery` | collector unit tests + 4 MCP query journeys | PASS |
+
+### Forwarded-Oracle journey
+
+`crates/wyrd/wyrd-testing/tests/bifrost/oracle/workflow.rs` lives in the `oracle`
+target, not `pg_workflow_runs.rs`, because the only forwarding fixture
+(`PeerCluster`, with `arm_execute_pause` and the Analytical cleanup pause) is
+local to that target. One journey loops over cancel, run deadline, and
+held-follower pod kill on a fresh 3-Oracle + Scribe topology. The Workflow is
+submitted to the Scribe-only pod. No case uses a synchronization sleep; each uses
+the pause controls and polls only observable state:
+
+- **While the follower is held:** a sibling query succeeds.
+- **While the leader's cleanup is paused:** the run is non-terminal, any cancel
+  response is still pending, and the model has seen no tool result.
+- **When the run ends:** it is `cancelled`, `timed_out`, or `succeeded`. On pod
+  loss the model receives a redacted `WYRD_VALA_` tool failure without rows.
+- **Metrics:** Analytical success is unchanged and each case's exact outcome
+  increments.
+
+Status: Cancel and PodKill pass. Deadline is pending the Bifrost decision below
+(B1, B2).
+
+### Diagnoses
+
+**D1. wyrd-spec fixture round trips** (`phase_1_addendum_fixtures_round_trip`,
+`service_runtime_fixture_round_trips`)
+- Symptom: "data did not match any variant of untagged enum Ref".
+- Evidence: `crates/wyrd-spec/tests/fixtures/service-with-runtime-policy.yaml` gives
+  both component refs `version: "^1"`.
+- Cause: strict `VersionBlock` deserialization accepts only exact versions, so a
+  range in a `CardRef` is refused.
+- Fix site: the fixture, now exact `1.0.0`. No other fixture used a range.
+
+**D2. `pg_openapi_contract` "too many clients"** (diagnostician confirmed)
+- Symptom: three server tests failed to connect.
+- Evidence: Postgres reported `max_connections` 400 exceeded.
+- Cause: the default nextest profile is uncapped, so 32 server-booting binaries
+  run concurrently at about 14 connections each (app pool 8, migrator 2,
+  platform-admin 2, fixtures).
+- Fix site: `.config/nextest.toml` `pg-servers` group, `max-threads = 16`
+  (16 × 14 ≈ 224 < 400), filtered to wyrd-server `pg_*` and the wyrd-cli pg
+  journeys. `max_connections` is unchanged.
+
+**D3. `cli_bundle_loads_typed_wyrdstate_after_server_shutdown`**
+- Symptom: `WYRD_CLI_400_CARD_LOAD`.
+- Evidence: `wyrd plan` on the fixture returned
+  `WYRD_WORKFLOW_422_VALIDATION: a workflow must declare at least one step`, and
+  then the same for outputs.
+- Cause: `typed_state/runtime.yaml` was a zero-step Workflow, which validation now
+  refuses.
+- Fix site: the fixture now declares one Agent step and one output. The
+  committed alias projection gained the Workflow's real
+  `default-Agent-triage-1.0.0` dependency.
+
+**D4. Cancelled Workflow run never reached its forwarded query** (diagnostician
+confirmed)
+- Symptom: the cancel route returned 504 after 30 s, and the query stayed
+  `Admitted` with `cancellation_requested=false` until its deadline.
+- Evidence: there was no "Oracle leader opened one query stream" line for the
+  Workflow query. The sibling query did log it.
+- Cause: an Analytical leader opens its stream only with its first batch. The
+  bounded and scheduled callers watched their cancellation token only after the
+  open, so a cancellation during the open was ignored.
+- Fix site: `RunningQueryControls::open_cancellable`
+  (`oracle/lifecycle_controls.rs`). It routes the cancellation to the owner and
+  still awaits the same open. Callers that now use it:
+  - `BoundedQuery::run` (MCP and Workflow `bifrost.query`);
+  - `ScheduledQuery::run_with`.
+
+  The HTTP and gRPC routes are unaffected, because client disconnect is their
+  cancellation. Unit test:
+  `oracle::lifecycle_controls::tests::cancel_while_opening_requests_cancellation_and_keeps_the_open`.
+
+**D5. PodKill: the leader never observed the lost follower** (diagnostician
+confirmed)
+- Symptom: "no graph cleanup reached the cleanup pause" after 240 s.
+- Evidence: the killed pod's attempts settled `cancelled`, but its other
+  follower's s2t1 settled only at the 240 s statement deadline.
+- Cause: the test-support `AnalyticalExecutePause::hold` ignores cancellation,
+  and aborting the pod's serving task leaves its held peer request alive. The
+  leader therefore waited for a first batch that never came. This is a harness
+  artifact, not a peer-loss defect.
+- Fix site: `PeerCluster::kill` releases the killed pod's armed pause after
+  termination. Other kill-while-held callers that still pass:
+  - `analytical_activation::selected_peer_failure_is_terminal`;
+  - `peer_network::analytical::one_attempt_peer_loss_and_cancellation_join_every_pod`.
+
+**B1. Bifrost: a registry cancel before the stream exists is recorded as
+`failed`** (decision pending)
+- Symptom: the forwarded Cancel case recorded
+  `oracle_query_duration_seconds{class=analytical,outcome=failed}`. Root stage 0
+  attempt `failed`; follower stages `cancelled`.
+- Evidence: `QueryTelemetryGuard::drop` (`vala-bifrost-redux/src/oracle/mod.rs:781`)
+  prefers `explicit_cancelled`. That marker is shared only with a constructed
+  stream.
+- Cause: a registry cancel that arrives before stream construction never sets the
+  marker, so Drop falls through to `failed`.
+- Fix site: the running-query registry cancel in vala-bifrost-redux should set
+  the query's existing `explicit_cancelled` marker. Until then, the Cancel case
+  asserts `bifrost_oracle_analytical_attempts_total{outcome="cancelled"}`.
+
+**B2. Bifrost: a deadline cleanup failure leaves the leader holding its graph**
+(decision pending)
+- Symptom: after a run deadline the leader logs "graph cleanup did not complete".
+  It stays at `leader_graphs=1`, `root_query_active=true`, and is not ready
+  ("Oracle role unavailable"), even after the follower is released.
+- Evidence: `release_graph` (`oracle/analytical.rs:2838`) checks the graph
+  deadline before child idleness, and the deadline cap makes the graph deadline
+  equal to the run deadline. Cleanup that starts at expiry therefore fails without
+  entering the cleanup pause and without releasing the graph.
+- Cause: the held follower request outlives the deadline (it is the same pause as
+  in D5), and Bifrost retains a graph whose drain it could not confirm.
+- Fix site: undecided, either Bifrost's deadline cleanup or the harness pause.
+
+### Commands
+
+- `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test pg_workflow_runs'` (all 7 scenario selectors) — exit 0
+- Each scenario's exact `-E "test(=<name>)"` command from the task — exit 0
+- `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=mcp::bifrost::tests::query_schema_is_closed_bounded_and_has_no_path_selector) | test(=query::collect::tests::query_rejects_untrustworthy_terminal_and_settles_stream) | test(=query::collect::tests::query_result_is_positional_and_counts_exact_structured_json_bytes)'` — exit 0
+- MCP query journeys `-p wyrd-mcp --test mcp -P journey --run-ignored=all` under the PG wrapper (4 tests) — exit 0
+- `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E "test(=workflow::workflow_forwarded_query_settles_before_the_run_ends)"'` — Cancel and PodKill pass; Deadline pending B1/B2
+- `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=oracle::lifecycle_controls::tests::cancel_while_opening_requests_cancellation_and_keeps_the_open)'` — exit 0
+- `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E "test(=analytical_activation::selected_peer_failure_is_terminal) | test(=peer_network::analytical::one_attempt_peer_loss_and_cancellation_join_every_pod)"'` — exit 0
+- `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-cli --test cli -E "test(/^card_lifecycle::/)"'` (18 tests) — exit 0
+- Lanes: pending the Bifrost decision.
+
+### Material limits
+
+- Live gateway deployment removal mid-run is not journeyed; per-call gateway admission stays live through `authorized = false`.
+- Production-profile egress negatives and fallback/Vertex dialect combinations rely on the gateway owner's existing journeys; this task journeys the governed and external routes it composes.
+- Duplicate-edge counting is unreachable: Workflow validation rejects duplicate `depends_on` entries before counting.
+- Audit-append failure uses a tenant- and operation-scoped `audit_staging` trigger, the existing precedent.
+- Runs are process-local: restart or a non-owning replica returns `WYRD_WORKFLOW_404_RUN_NOT_FOUND` (journeyed in S6).
+
+### Non-goals
+
+No Workflow principal, durable run table/queue/lease, client HTTP graph loading,
+new MCP/remote language surface, bearer retention, tool registration platform,
+second audit writer, or Workflow persistence migration was added.

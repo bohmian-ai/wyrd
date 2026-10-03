@@ -82,7 +82,21 @@ impl PeerCluster {
     /// pod and its failing probes.
     pub(crate) async fn start(targets: &[BifrostTarget]) -> Result<Self, JourneyError> {
         let pods: Vec<_> = targets.iter().map(|target| (*target, None)).collect();
-        Self::launch(&pods, false).await
+        Self::launch(&pods, false, None).await
+    }
+
+    /// Starts one pod per target with every pod's built-in gateway adapters
+    /// rooted at the local mock upstream `root`, and waits for readiness.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::start`].
+    pub(crate) async fn start_with_gateway_provider_root(
+        targets: &[BifrostTarget],
+        root: url::Url,
+    ) -> Result<Self, JourneyError> {
+        let pods: Vec<_> = targets.iter().map(|target| (*target, None)).collect();
+        Self::launch(&pods, false, Some(root)).await
     }
 
     /// Starts one pod per `(target, slot units)` pair and waits for readiness.
@@ -97,7 +111,7 @@ impl PeerCluster {
     pub(crate) async fn start_with_slots(
         pods: &[(BifrostTarget, Option<usize>)],
     ) -> Result<Self, JourneyError> {
-        Self::launch(pods, false).await
+        Self::launch(pods, false, None).await
     }
 
     /// Starts every pod but the last, which stays configured and unbooted.
@@ -110,10 +124,13 @@ impl PeerCluster {
     /// Returns the same errors as [`Self::start`].
     pub(crate) async fn start_with_joiner(targets: &[BifrostTarget]) -> Result<Self, JourneyError> {
         let pods: Vec<_> = targets.iter().map(|target| (*target, None)).collect();
-        Self::launch(&pods, true).await
+        Self::launch(&pods, true, None).await
     }
 
     /// Builds the spec, boots the pods, and waits for each booted pod.
+    ///
+    /// `gateway_provider_root`, when present, roots every pod's built-in
+    /// gateway adapters at that local mock upstream.
     ///
     /// # Errors
     ///
@@ -122,9 +139,13 @@ impl PeerCluster {
     async fn launch(
         pods: &[(BifrostTarget, Option<usize>)],
         delay_last: bool,
+        gateway_provider_root: Option<url::Url>,
     ) -> Result<Self, JourneyError> {
         let targets: Vec<BifrostTarget> = pods.iter().map(|(target, _)| *target).collect();
         let mut spec = BifrostClusterSpec::for_targets(&targets);
+        if let Some(root) = gateway_provider_root {
+            spec = spec.with_gateway_provider_root_for_test(root);
+        }
         for (node, (_, slots)) in spec.nodes.iter_mut().zip(pods) {
             if let Some(oracle) = node.oracle.as_mut() {
                 oracle.oracle_query_slot_limit = *slots;

@@ -3028,7 +3028,7 @@ fn selector_for_kind(
     version: Option<&str>,
 ) -> CardPyResult<CardSelector> {
     if let Some(uid) = uid {
-        let uid = CardUid::new(uid).map_err(|error| WyrdPyError::validation(error.to_string()))?;
+        let uid = CardUid::new(uid).map_err(|error| invalid_selector("uid", error.to_string()))?;
         let selector = CardSelector::uid(kind, uid).with_identity_assertions(
             space.map(parse_space).transpose()?,
             name.map(parse_name).transpose()?,
@@ -3042,10 +3042,10 @@ fn selector_for_kind(
     }
 
     let space = space
-        .ok_or_else(|| WyrdPyError::validation("space is required when uid is not provided"))
+        .ok_or_else(|| invalid_selector("space", "space is required when uid is not provided"))
         .and_then(parse_space)?;
     let name = name
-        .ok_or_else(|| WyrdPyError::validation("name is required when uid is not provided"))
+        .ok_or_else(|| invalid_selector("name", "name is required when uid is not provided"))
         .and_then(parse_name)?;
     let selector = CardSelector::named(kind, space, name);
     version
@@ -3056,13 +3056,27 @@ fn selector_for_kind(
         })
 }
 
+/// Builds the request validation error for one malformed registry selector
+/// field.
+///
+/// Selector identity is generic across Card kinds, so these failures are
+/// request validation rather than any kind's body validation; `field` names
+/// the selector argument that failed.
+fn invalid_selector(field: &str, reason: impl Into<String>) -> WyrdPyError {
+    WyrdError::Validation {
+        message: reason.into(),
+        details: serde_json::json!({ "field": field }),
+    }
+    .into()
+}
+
 /// Validates a Card space name.
 ///
 /// # Errors
 ///
 /// Returns a validation error carrying the space-name rule that failed.
 fn parse_space(value: &str) -> CardPyResult<SpaceName> {
-    SpaceName::new(value).map_err(|error| WyrdPyError::validation(error.to_string()))
+    SpaceName::new(value).map_err(|error| invalid_selector("space", error.to_string()))
 }
 
 /// Validates a Card name.
@@ -3071,7 +3085,7 @@ fn parse_space(value: &str) -> CardPyResult<SpaceName> {
 ///
 /// Returns a validation error carrying the name rule that failed.
 fn parse_name(value: &str) -> CardPyResult<CardName> {
-    CardName::new(value).map_err(|error| WyrdPyError::validation(error.to_string()))
+    CardName::new(value).map_err(|error| invalid_selector("name", error.to_string()))
 }
 
 /// Parses a version or version block used to narrow a selector.
@@ -3080,7 +3094,7 @@ fn parse_name(value: &str) -> CardPyResult<CardName> {
 ///
 /// Returns a validation error for an unparseable version.
 fn parse_version(value: &str) -> CardPyResult<VersionBlock> {
-    VersionBlock::parse(value).map_err(|error| WyrdPyError::validation(error.to_string()))
+    VersionBlock::parse(value).map_err(|error| invalid_selector("version", error.to_string()))
 }
 
 /// Parses a case-insensitive lifecycle status filter.

@@ -157,6 +157,8 @@ for that transaction's outcome (`pg_xact_status`) and acts on the answer:
 - aborted: the batch is retried;
 - in progress, or Postgres unreachable: the writer waits and asks again, and
   re-sends nothing until the outcome is known.
+- unknown (Postgres no longer holds the status): the events are counted in
+  `outbox_events_lost_total{outbox="audit"}` and are not re-sent.
 
 Each decision is therefore staged, and retained, exactly once. Audit staging
 and the retained audit log carry no event ID, and readers do no deduplication.

@@ -259,7 +259,9 @@ impl Principal {
     /// # Panics
     /// Panics when the principal is not a machine principal.
     fn api_key(&self) -> &SecretString {
-        self.bootstrap.api_key().expect("service principals carry a key")
+        self.bootstrap
+            .api_key()
+            .expect("service principals carry a key")
     }
 }
 
@@ -731,7 +733,11 @@ async fn send(request: RequestBuilder) -> (StatusCode, Value) {
 #[track_caller]
 fn problem(answer: (StatusCode, Value), status: StatusCode, code: &str) -> Value {
     let (actual, body) = answer;
-    assert_eq!((actual, body["code"].as_str()), (status, Some(code)), "{body}");
+    assert_eq!(
+        (actual, body["code"].as_str()),
+        (status, Some(code)),
+        "{body}"
+    );
     body
 }
 
@@ -750,7 +756,8 @@ fn run_request(name: &str, code: &str) -> Value {
 
 /// The checked-in code-review bundle's Workflow file.
 fn code_review() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../examples/workflows/code-review/workflow.yaml")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../examples/workflows/code-review/workflow.yaml")
 }
 
 /// Copy the code-review bundle renamed to `name`, applying `edit` to its
@@ -991,7 +998,11 @@ async fn admission_is_audited_and_side_effect_free_on_refusal() {
     ];
     let mut runner_allowed = authorized_refusals.len();
     for (body, status, code) in authorized_refusals {
-        problem(fixture.create(runner, &new_key(), &body).await, status, code);
+        problem(
+            fixture.create(runner, &new_key(), &body).await,
+            status,
+            code,
+        );
     }
 
     fixture.fail_create_audit().await;
@@ -1007,7 +1018,11 @@ async fn admission_is_audited_and_side_effect_free_on_refusal() {
         StatusCode::NOT_FOUND,
         "WYRD_WORKFLOW_404_RUN_NOT_FOUND",
     );
-    assert_eq!(fixture.upstream.arrivals(), 0, "no refusal reached a provider");
+    assert_eq!(
+        fixture.upstream.arrivals(),
+        0,
+        "no refusal reached a provider"
+    );
 
     fixture.upstream.hold();
     let held = fixture.accept(runner, &request).await;
@@ -1085,18 +1100,23 @@ async fn tracked_preparation_replay_and_disconnect() {
 
     fixture.upstream.hold();
     let key = new_key();
-    let answers = futures_util::future::join_all(
-        (0..4).map(|_| fixture.create(runner, &key, &request)),
-    )
-    .await;
+    let answers =
+        futures_util::future::join_all((0..4).map(|_| fixture.create(runner, &key, &request)))
+            .await;
     let statuses: Vec<StatusCode> = answers.iter().map(|(status, _)| *status).collect();
     assert_eq!(
-        statuses.iter().filter(|status| **status == StatusCode::ACCEPTED).count(),
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::ACCEPTED)
+            .count(),
         1,
         "{statuses:?}"
     );
     assert_eq!(
-        statuses.iter().filter(|status| **status == StatusCode::OK).count(),
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::OK)
+            .count(),
         3,
         "{statuses:?}"
     );
@@ -1149,7 +1169,11 @@ async fn tracked_preparation_replay_and_disconnect() {
     let bundle = single_step("late-review", "[]", WYRD_GATEWAY, 0);
     fixture.register(&bundle.path().join("workflow.yaml")).await;
     let (status, late_run) = fixture.create(runner, &late_key, &late).await;
-    assert_eq!(status, StatusCode::ACCEPTED, "a failed preparation is not cached");
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "a failed preparation is not cached"
+    );
     assert_eq!(
         fixture.terminal(runner, &run_of(late_run)).await.status,
         WorkflowRunStatus::Succeeded
@@ -1159,13 +1183,21 @@ async fn tracked_preparation_replay_and_disconnect() {
     let workflows = &fixture.server.state().workflows;
     workflows.stall_next_preparation_for_test();
     let detached_key = new_key();
-    let creator = tokio::spawn(send(fixture.create_request(runner, &detached_key, &request)));
+    let creator = tokio::spawn(send(fixture.create_request(
+        runner,
+        &detached_key,
+        &request,
+    )));
     tokio::time::timeout(PATIENCE, workflows.wait_preparation_stall_for_test())
         .await
         .expect("the creator's preparation stops at the gate");
     creator.abort();
     assert!(creator.await.is_err(), "the creator disconnected");
-    let waiter = tokio::spawn(send(fixture.create_request(runner, &detached_key, &request)));
+    let waiter = tokio::spawn(send(fixture.create_request(
+        runner,
+        &detached_key,
+        &request,
+    )));
     workflows.release_preparation_for_test();
     let (status, recovered) = waiter.await.expect("waiter finishes");
     assert_eq!(status, StatusCode::OK, "{recovered}");
@@ -1305,17 +1337,46 @@ async fn declared_tools_use_captured_scopes_and_owned_services() {
     let calls = fixture.upstream.calls();
     assert_eq!(calls.len(), 2);
     let offered = calls[0].body["tools"].to_string();
-    assert!(offered.contains("bifrost.query") && offered.contains("cards.get"), "{offered}");
+    assert!(
+        offered.contains("bifrost.query") && offered.contains("cards.get"),
+        "{offered}"
+    );
     let results = calls[1].body["messages"].to_string();
-    assert!(results.contains("first") && results.contains("second"), "{results}");
-    assert!(results.contains("wyrd/v1"), "the Card envelope reaches the model: {results}");
+    assert!(
+        results.contains("first") && results.contains("second"),
+        "{results}"
+    );
+    assert!(
+        results.contains("wyrd/v1"),
+        "the Card envelope reaches the model: {results}"
+    );
 
     fixture.upstream.reply(tool_calls(&[
-        ("unknown-key", "bifrost.query", json!({ "sql": select, "path": "analytical" })),
-        ("delete", "bifrost.query", json!({ "sql": format!("DELETE FROM {}", seeded.table) })),
-        ("ceiling", "bifrost.query", json!({ "sql": select, "max_bytes": 1 })),
-        ("absent", "cards.get", json!({ "kind": "Prompt", "name": "absent-prompt", "version": "1.0.0" })),
-        ("tenant", "cards.get", json!({ "kind": "Prompt", "name": "x", "version": "1.0.0", "tenant": "other" })),
+        (
+            "unknown-key",
+            "bifrost.query",
+            json!({ "sql": select, "path": "analytical" }),
+        ),
+        (
+            "delete",
+            "bifrost.query",
+            json!({ "sql": format!("DELETE FROM {}", seeded.table) }),
+        ),
+        (
+            "ceiling",
+            "bifrost.query",
+            json!({ "sql": select, "max_bytes": 1 }),
+        ),
+        (
+            "absent",
+            "cards.get",
+            json!({ "kind": "Prompt", "name": "absent-prompt", "version": "1.0.0" }),
+        ),
+        (
+            "tenant",
+            "cards.get",
+            json!({ "kind": "Prompt", "name": "x", "version": "1.0.0", "tenant": "other" }),
+        ),
     ]));
     fixture.upstream.reply(text("HANDLED"));
     let run = fixture.accept(runner, &request).await;
@@ -1330,9 +1391,14 @@ async fn declared_tools_use_captured_scopes_and_owned_services() {
     ] {
         assert!(results.contains(code), "{code}: {results}");
     }
-    assert!(!results.contains("first"), "no refused call leaks rows: {results}");
+    assert!(
+        !results.contains("first"),
+        "no refused call leaks rows: {results}"
+    );
 
-    fixture.upstream.reply(tool_calls(&[("shell", "shell.exec", json!({}))]));
+    fixture
+        .upstream
+        .reply(tool_calls(&[("shell", "shell.exec", json!({}))]));
     let run = fixture.accept(runner, &request).await;
     let run = fixture.terminal(runner, &run).await;
     assert_eq!(run.status, WorkflowRunStatus::Failed, "{run:?}");
@@ -1370,12 +1436,17 @@ async fn declared_tools_use_captured_scopes_and_owned_services() {
         results.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
         "the run keeps its accepted grants: {results}"
     );
-    assert!(!results.contains("first") && !results.contains("wyrd/v1"), "{results}");
+    assert!(
+        !results.contains("first") && !results.contains("wyrd/v1"),
+        "{results}"
+    );
 
     fixture.server.stall_next_query_after_schema();
-    fixture
-        .upstream
-        .reply(tool_calls(&[("held", "bifrost.query", json!({ "sql": select }))]));
+    fixture.upstream.reply(tool_calls(&[(
+        "held",
+        "bifrost.query",
+        json!({ "sql": select }),
+    )]));
     let run = fixture.accept(runner, &request).await;
     let query_id = fixture
         .server
@@ -1395,9 +1466,11 @@ async fn declared_tools_use_captured_scopes_and_owned_services() {
         "the cancelled run's query returned every resource"
     );
     let before = fixture.upstream.arrivals();
-    fixture
-        .upstream
-        .reply(tool_calls(&[("again", "bifrost.query", json!({ "sql": select }))]));
+    fixture.upstream.reply(tool_calls(&[(
+        "again",
+        "bifrost.query",
+        json!({ "sql": select }),
+    )]));
     fixture.upstream.reply(text("AGAIN"));
     let run = fixture.accept(runner, &request).await;
     let run = fixture.terminal(runner, &run).await;
@@ -1437,7 +1510,12 @@ async fn server_routes_keep_gateway_and_external_ownership() {
         std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600))
             .expect("secret restricts");
     }
-    let origin = fixture.upstream.url.as_str().trim_end_matches('/').to_owned();
+    let origin = fixture
+        .upstream
+        .url
+        .as_str()
+        .trim_end_matches('/')
+        .to_owned();
     let binding = |tenant: String| {
         json!({
             "tenant": tenant,
@@ -1454,8 +1532,14 @@ async fn server_routes_keep_gateway_and_external_ownership() {
     }));
     let fixture = fixture.restart(bound).await;
     for (name, route) in [
-        ("external-review", external_route(&fixture.upstream, "review-gateway")),
-        ("foreign-review", external_route(&fixture.upstream, "foreign-gateway")),
+        (
+            "external-review",
+            external_route(&fixture.upstream, "review-gateway"),
+        ),
+        (
+            "foreign-review",
+            external_route(&fixture.upstream, "foreign-gateway"),
+        ),
         ("gateway-review", WYRD_GATEWAY.to_owned()),
     ] {
         let bundle = single_step(name, "[]", &route, 0);
@@ -1464,10 +1548,16 @@ async fn server_routes_keep_gateway_and_external_ownership() {
     let runner = &fixture.runner.token;
     let accounted = fixture.accounted_calls().await;
 
-    let run = fixture.accept(runner, &run_request("external-review", "x")).await;
+    let run = fixture
+        .accept(runner, &run_request("external-review", "x"))
+        .await;
     let run = fixture.terminal(runner, &run).await;
     assert_eq!(run.status, WorkflowRunStatus::Succeeded, "{run:?}");
-    assert!(!serde_json::to_string(&run).expect("run serializes").contains(EXTERNAL_SECRET));
+    assert!(
+        !serde_json::to_string(&run)
+            .expect("run serializes")
+            .contains(EXTERNAL_SECRET)
+    );
     let calls = fixture.upstream.calls();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].secret.as_deref(), Some(EXTERNAL_SECRET));
@@ -1478,9 +1568,15 @@ async fn server_routes_keep_gateway_and_external_ownership() {
             .unwrap_or_default()
             .contains(PROVIDER_KEY)
     );
-    assert_eq!(fixture.accounted_calls().await, accounted, "no gateway ledger entry");
+    assert_eq!(
+        fixture.accounted_calls().await,
+        accounted,
+        "no gateway ledger entry"
+    );
 
-    let run = fixture.accept(runner, &run_request("gateway-review", "x")).await;
+    let run = fixture
+        .accept(runner, &run_request("gateway-review", "x"))
+        .await;
     let run = fixture.terminal(runner, &run).await;
     assert_eq!(run.status, WorkflowRunStatus::Succeeded, "{run:?}");
     let calls = fixture.upstream.calls();
@@ -1539,12 +1635,25 @@ async fn lifecycle_races_retention_and_shutdown() {
     assert_eq!(status, StatusCode::OK, "{cancelled}");
     let cancelled = run_of(cancelled);
     assert_eq!(cancelled.status, WorkflowRunStatus::Cancelled);
-    assert_eq!(step_status(&cancelled, "security"), WorkflowStepStatus::Cancelled);
-    assert_eq!(step_status(&cancelled, "correctness"), WorkflowStepStatus::Cancelled);
-    assert_eq!(step_status(&cancelled, "final_review"), WorkflowStepStatus::Unstarted);
+    assert_eq!(
+        step_status(&cancelled, "security"),
+        WorkflowStepStatus::Cancelled
+    );
+    assert_eq!(
+        step_status(&cancelled, "correctness"),
+        WorkflowStepStatus::Cancelled
+    );
+    assert_eq!(
+        step_status(&cancelled, "final_review"),
+        WorkflowStepStatus::Unstarted
+    );
     fixture.upstream.release();
     let (_, again) = fixture.cancel(&runner, &first_id).await;
-    assert_eq!(run_of(again), cancelled, "a terminal run is returned unchanged");
+    assert_eq!(
+        run_of(again),
+        cancelled,
+        "a terminal run is returned unchanged"
+    );
 
     fixture.upstream.hold();
     let mut short = request.clone();
@@ -1562,7 +1671,11 @@ async fn lifecycle_races_retention_and_shutdown() {
         WorkflowStepStatus::Pending | WorkflowStepStatus::Running
     )));
     let (_, read) = fixture.get(&runner, &first_id).await;
-    assert_eq!(run_of(read), cancelled, "late upstream answers change nothing");
+    assert_eq!(
+        run_of(read),
+        cancelled,
+        "late upstream answers change nothing"
+    );
 
     let raced = fixture.accept(&runner, &request).await;
     let (status, won) = fixture.cancel(&runner, &raced.run_id.to_string()).await;
@@ -1573,10 +1686,18 @@ async fn lifecycle_races_retention_and_shutdown() {
         WorkflowRunStatus::Succeeded | WorkflowRunStatus::Cancelled
     ));
     let (_, read) = fixture.get(&runner, &raced.run_id.to_string()).await;
-    assert_eq!(run_of(read), won, "the cancel answers the snapshot that won");
+    assert_eq!(
+        run_of(read),
+        won,
+        "the cancel answers the snapshot that won"
+    );
 
     let not_found = |answer: (StatusCode, Value)| {
-        let body = problem(answer, StatusCode::NOT_FOUND, "WYRD_WORKFLOW_404_RUN_NOT_FOUND");
+        let body = problem(
+            answer,
+            StatusCode::NOT_FOUND,
+            "WYRD_WORKFLOW_404_RUN_NOT_FOUND",
+        );
         (body["title"].clone(), body["detail"].clone())
     };
     let evicted = not_found(fixture.get(&runner, &first_id).await);
@@ -1584,16 +1705,28 @@ async fn lifecycle_races_retention_and_shutdown() {
         .principal("workflow-runner-two", &[RUNNER_ROLE])
         .await;
     for answer in [
-        fixture.get(&runner, &uuid::Uuid::now_v7().to_string()).await,
+        fixture
+            .get(&runner, &uuid::Uuid::now_v7().to_string())
+            .await,
         fixture.get(&runner, "not-a-run").await,
         fixture.cancel(&runner, "not-a-run").await,
         fixture.get(&other.token, &timed.run_id.to_string()).await,
-        fixture.cancel(&other.token, &timed.run_id.to_string()).await,
+        fixture
+            .cancel(&other.token, &timed.run_id.to_string())
+            .await,
     ] {
-        assert_eq!(not_found(answer), evicted, "every hidden run looks the same");
+        assert_eq!(
+            not_found(answer),
+            evicted,
+            "every hidden run looks the same"
+        );
     }
     let (status, reused) = fixture.create(&runner, &first_key, &request).await;
-    assert_eq!(status, StatusCode::ACCEPTED, "eviction removed the key: {reused}");
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "eviction removed the key: {reused}"
+    );
     let reused = run_of(reused);
     assert_ne!(reused.run_id, first.run_id);
     fixture.terminal(&runner, &reused).await;
@@ -1610,7 +1743,10 @@ async fn lifecycle_races_retention_and_shutdown() {
 
     fixture.upstream.hold();
     let lost = fixture.accept(&runner, &request).await;
-    fixture.upstream.wait_arrivals(fixture.upstream.arrivals() + 2).await;
+    fixture
+        .upstream
+        .wait_arrivals(fixture.upstream.arrivals() + 2)
+        .await;
     let fixture = fixture.restart(config(bounds)).await;
     let runner = fixture.runner.token.clone();
     let after_restart = fixture.upstream.arrivals();
@@ -1713,7 +1849,9 @@ async fn graph_and_snapshot_limits_preserve_sibling_services() {
         ("heavy-review", "max_resolved_graph_bytes"),
     ] {
         let refusal = problem(
-            fixture.create(runner, &new_key(), &run_request(name, "x")).await,
+            fixture
+                .create(runner, &new_key(), &run_request(name, "x"))
+                .await,
             StatusCode::PAYLOAD_TOO_LARGE,
             too_large,
         );
@@ -1721,7 +1859,11 @@ async fn graph_and_snapshot_limits_preserve_sibling_services() {
     }
     problem(
         fixture
-            .create(runner, &new_key(), &run_request("code-review", &"x".repeat(2048)))
+            .create(
+                runner,
+                &new_key(),
+                &run_request("code-review", &"x".repeat(2048)),
+            )
             .await,
         StatusCode::PAYLOAD_TOO_LARGE,
         "WYRD_WORKFLOW_413_INPUT_TOO_LARGE",
@@ -1730,7 +1872,9 @@ async fn graph_and_snapshot_limits_preserve_sibling_services() {
 
     let oversized = "y".repeat(4096);
     fixture.upstream.reply(text(&oversized));
-    let run = fixture.accept(runner, &run_request("bulky-review", "x")).await;
+    let run = fixture
+        .accept(runner, &run_request("bulky-review", "x"))
+        .await;
     let run = fixture.terminal(runner, &run).await;
     assert_eq!(run.status, WorkflowRunStatus::Failed, "{run:?}");
     let step = &run.steps["answer"];
@@ -1778,7 +1922,11 @@ async fn graph_and_snapshot_limits_preserve_sibling_services() {
     assert_eq!(status, StatusCode::OK, "{completion}");
     workflows.release_preparation_for_test();
     let (status, run) = creator.await.expect("creator answers");
-    assert_eq!(status, StatusCode::ACCEPTED, "the only slot was never leaked: {run}");
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "the only slot was never leaked: {run}"
+    );
     assert_eq!(
         fixture.terminal(runner, &run_of(run)).await.status,
         WorkflowRunStatus::Succeeded

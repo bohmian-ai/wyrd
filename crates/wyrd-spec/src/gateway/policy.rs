@@ -569,6 +569,9 @@ pub struct GatewayCapturePolicy {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+
     use super::{
         GatewayCapturePolicyWrite, GatewayFallbackOverride, GatewayFallbackPolicy,
         GatewayGovernancePolicy,
@@ -619,9 +622,6 @@ mod tests {
     /// refuses every malformed, oversized, or invalid value as `fallback`.
     #[test]
     fn fallback_header_round_trips_and_refuses() {
-        use base64::Engine as _;
-        use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
-
         let requested = ModelRef::from_projection("openai/gpt-4o").expect("model");
         let fallback: GatewayFallbackOverride =
             serde_json::from_value(json!({"candidates": [model("anthropic", "claude")]}))

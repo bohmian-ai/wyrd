@@ -10,6 +10,8 @@
 
 use std::fs::{File, Metadata};
 use std::io::Read as _;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
 use secrecy::SecretString;
@@ -22,8 +24,9 @@ pub const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
 ///
 /// # Errors
 ///
-/// Returns a short static reason — an unset variable, the errors of
-/// [`read_secret_file`], or a reference kind other than `env` or `file` —
+/// Returns a short static reason — an unset variable, an unopenable,
+/// non-regular, permissive, or oversized file, or a reference kind other than
+/// `env` or `file` —
 /// naming no variable, path, or content, so a caller can render it verbatim
 /// in a redacted error.
 pub fn read_secret_ref(secret: &SecretRef) -> Result<SecretString, &'static str> {
@@ -42,7 +45,7 @@ pub fn read_secret_ref(secret: &SecretRef) -> Result<SecretString, &'static str>
 ///
 /// Returns a short static reason — unopenable, non-regular or permissive, or
 /// oversized — naming no path and no content.
-pub fn read_secret_file(path: &Path) -> Result<String, &'static str> {
+fn read_secret_file(path: &Path) -> Result<String, &'static str> {
     let file = File::open(path).map_err(|_| "names an unreadable file")?;
     let metadata = file.metadata().map_err(|_| "names an unreadable file")?;
     if !restrictive(&metadata) {
@@ -63,7 +66,6 @@ pub fn read_secret_file(path: &Path) -> Result<String, &'static str> {
 /// owner only: the six low group and other mode bits are all clear.
 #[cfg(unix)]
 fn restrictive(metadata: &Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
     metadata.is_file() && metadata.permissions().mode().trailing_zeros() >= 6
 }
 

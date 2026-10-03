@@ -2,7 +2,7 @@
 //!
 //! One coordinator at a time holds the singleton election row
 //! ([`ForgeLeaderElection`]). While it does, it owns a [`ForgeSchedule`] that
-//! starts empty on every acquisition, as RisingWave's Iceberg compaction
+//! starts empty on every acquisition, as `RisingWave`'s Iceberg compaction
 //! manager does when its meta node becomes leader. Losing or resigning the
 //! term drops that schedule at once, so a replaced leader can never dispatch.
 //!
@@ -26,7 +26,7 @@ use super::error::ForgeError;
 use super::leader::{DEFAULT_REPORT_TIMEOUT, ForgeCommitNotice, ForgeSchedule};
 use crate::oracle::dispatcher::BifrostPeerTls;
 
-/// Lifetime of one leader term without renewal, matching RisingWave's
+/// Lifetime of one leader term without renewal, matching `RisingWave`'s
 /// default meta leader lease.
 pub(super) const LEADER_TERM: Duration = Duration::from_secs(30);
 /// Interval at which a coordinator renews or contends for the term.
@@ -245,7 +245,7 @@ impl ForgeLeadership {
     /// The in-process path is taken when this replica holds the term.
     /// Otherwise the live election row names the leader's peer URI and token.
     /// No live term, or a leader without a peer route, drops the notice: like
-    /// RisingWave, ordinary compaction counters are volatile, and the next
+    /// `RisingWave`, ordinary compaction counters are volatile, and the next
     /// commit refreshes the table.
     ///
     /// # Errors

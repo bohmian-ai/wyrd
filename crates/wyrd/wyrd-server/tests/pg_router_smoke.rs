@@ -2581,9 +2581,7 @@ fn forge_table_ident(server: &WyrdTestServer, table: &str) -> iceberg::TableIden
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn coordinator_object_store_failure_clears_readiness() {
-    let observer = vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new();
     let server = WyrdTestServer::builder()
-        .with_forge_completion_observer_for_test(observer.clone())
         .start_bound()
         .await
         .expect("test server starts");
@@ -2594,10 +2592,8 @@ async fn coordinator_object_store_failure_clears_readiness() {
         .coordinator_readiness();
     // The coordinator's first tick is immediate, so the boot pass must be
     // observed before this test arranges anything. Otherwise the pass this
-    // test drives below can be that boot pass still in flight — one that
-    // planned the table before it held any rows — and the worker barrier
-    // armed for the promoting attempt closes on that empty attempt instead.
-    // The worker then never attempts again and no snapshot ever appears.
+    // test drives below can be that boot pass still in flight — one that ran
+    // before the table held any rows — and the promotion loop would count it.
     await_boot_scheduler_pass(&server, "boot pass before object-store fault").await;
     let pool = server
         .pg_fixture()
@@ -2618,12 +2614,9 @@ async fn coordinator_object_store_failure_clears_readiness() {
         .flush_bifrost()
         .await
         .expect("the seeded rows publish as hot files");
-    // Snapshot visibility precedes terminal settlement. Park the worker after
-    // its full attempt so the coordinator's fault proof has a stable demand generation.
-    // The hold targets this table: the server's audit publisher also drives
-    // Forge work for the system and tenant audit logs, and an audit-log attempt
-    // must not consume the barrier and park the worker before this table promotes.
-    observer.hold_after_next_table_attempt_for_test(server.data_tenant_id(), table);
+    // The coordinator promotes inline, so a driven pass returns only after the
+    // promoting attempt settled: a visible snapshot already proves ownership
+    // finished and the demand generation is stable.
     let catalog = server.bifrost_catalog();
     let ident = forge_table_ident(&server, table);
     let mut completed = server.completed_forge_scheduler_passes_for_test();
@@ -2643,27 +2636,11 @@ async fn coordinator_object_store_failure_clears_readiness() {
     .await
     .unwrap_or_else(|_| {
         server.state().shutdown_token.cancel();
-        observer.release_held_attempt_for_test();
         panic!(
             "promotion timed out without a snapshot; ready={}, completed passes={completed}",
             readiness.is_ready()
         );
     });
-    if tokio::time::timeout(
-        FORGE_READINESS_CEILING,
-        observer.wait_for_held_attempt_for_test(),
-    )
-    .await
-    .is_err()
-    {
-        server.state().shutdown_token.cancel();
-        observer.release_held_attempt_for_test();
-        panic!(
-            "promotion did not finish ownership; ready={}, passes={completed}, attempts={}",
-            readiness.is_ready(),
-            observer.attempts()
-        );
-    }
     drive_scheduler_pass(&server, "healthy pass after promotion ownership completes").await;
     assert!(readiness.is_ready(), "the healthy pass did not complete");
     assert_eq!(
@@ -2721,7 +2698,6 @@ async fn coordinator_object_store_failure_clears_readiness() {
     );
 
     server.state().shutdown_token.cancel();
-    observer.release_held_attempt_for_test();
     server.shutdown().await.expect("test server shuts down");
 }
 

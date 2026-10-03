@@ -1,8 +1,8 @@
 //! The elected leader's in-memory Forge compaction schedule.
 //!
-//! This is a port of RisingWave's Iceberg compaction track
+//! This is a port of `RisingWave`'s Iceberg compaction track
 //! (`meta/src/manager/iceberg_compaction/schedule.rs` at e23ddf95). Each
-//! tenant-qualified table moves among Idle, PendingDispatch and InFlight.
+//! tenant-qualified table moves among `Idle`, `PendingDispatch` and `InFlight`.
 //! Successful Iceberg promotions add pending commits; a pull selects the
 //! oldest due Idle tables and captures each one's pending count and observed
 //! snapshot; a matching report subtracts only that captured count. Nothing
@@ -22,7 +22,7 @@ use wyrd_spec::DataTenantId;
 use super::settings::{ForgeCompactionType, ForgeTableSettings};
 
 /// Default time a dispatched task may run before it becomes eligible again.
-pub const DEFAULT_REPORT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+pub const DEFAULT_REPORT_TIMEOUT: Duration = Duration::from_mins(30);
 
 /// Tenant-qualified physical table identity the schedule is keyed by.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -131,7 +131,7 @@ impl CompactionTrack {
         }
     }
 
-    /// RisingWave's due rule: count threshold, or elapsed interval with a commit.
+    /// `RisingWave`'s due rule: count threshold, or elapsed interval with a commit.
     fn should_trigger(&self, now: DateTime<Utc>) -> bool {
         let TrackState::Idle { next_compaction_at } = self.state else {
             return false;
@@ -260,7 +260,7 @@ pub struct ForgeTrackView {
 pub struct ForgeSchedule {
     /// Time a dispatched task may run before it is eligible again.
     report_timeout: Duration,
-    /// Every track and maintenance set, behind one lock as in RisingWave.
+    /// Every track and maintenance set, behind one lock as in `RisingWave`.
     inner: Mutex<ScheduleInner>,
 }
 
@@ -360,7 +360,7 @@ impl ForgeSchedule {
     /// Selects up to `limit` oldest due tables and dispatches them.
     ///
     /// Timed-out tasks first return to Idle, due immediately, exactly as
-    /// RisingWave reconsiders them on the next pull. Every Idle track is then
+    /// `RisingWave` reconsiders them on the next pull. Every `Idle` track is then
     /// scanned and the due ones sorted by their next compaction time.
     #[must_use]
     pub fn pull(&self, limit: usize, now: DateTime<Utc>) -> Vec<ForgeCompactionDispatch> {
@@ -387,7 +387,7 @@ impl ForgeSchedule {
                 _ => None,
             })
             .collect();
-        due.sort_by(|left, right| left.0.cmp(&right.0));
+        due.sort_by_key(|entry| entry.0);
         due.into_iter()
             .take(limit)
             .filter_map(|(_, key)| {
@@ -545,7 +545,7 @@ mod tests {
         );
     }
 
-    /// The RisingWave due rule's exact interval, count and zero-commit boundaries.
+    /// The `RisingWave` due rule's exact interval, count and zero-commit boundaries.
     ///
     /// # Panics
     /// Panics when a boundary dispatches early, late or without a commit.
@@ -599,14 +599,14 @@ mod tests {
         );
     }
 
-    /// Reports subtract only captured commits; stale reports and timeouts behave as RisingWave.
+    /// Reports subtract only captured commits; stale reports and timeouts behave as `RisingWave`.
     ///
     /// # Panics
     /// Panics when a later commit is lost, a stale report applies or a timeout is not retried.
     #[test]
     fn reports_preserve_later_commits_and_ignore_stale_tasks() {
         let start = DateTime::<Utc>::UNIX_EPOCH;
-        let schedule = ForgeSchedule::new(Duration::from_secs(60));
+        let schedule = ForgeSchedule::new(Duration::from_mins(1));
         let settings = enabled(10, 1);
         commit(&schedule, "t", 1, &settings, start);
         let first = schedule.pull(4, start).remove(0);

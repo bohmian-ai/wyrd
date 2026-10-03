@@ -1,6 +1,6 @@
 //! Per-table Forge maintenance settings read from Iceberg table properties.
 //!
-//! The settings mirror RisingWave's Iceberg sink options and defaults
+//! The settings mirror `RisingWave`'s Iceberg sink options and defaults
 //! (`connector/src/sink/iceberg/config.rs` at e23ddf95): compaction is off
 //! until a table enables it, the interval is one hour, the snapshot-count
 //! trigger is disabled, the physical type is `full`, snapshot expiration is on
@@ -27,7 +27,7 @@ pub const ENABLE_MANIFEST_REWRITE_PROPERTY: &str = "wyrd.forge.enable-manifest-r
 
 /// Physical selection a worker applies to one dispatched compaction task.
 ///
-/// The four values are RisingWave's `CompactionType`; `Full` is its default.
+/// The four values are `RisingWave`'s `CompactionType`; `Full` is its default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ForgeCompactionType {
     /// Choose a delete-heavy or small-file plan from table-wide thresholds.
@@ -89,11 +89,11 @@ pub struct ForgeTableSettings {
 }
 
 impl Default for ForgeTableSettings {
-    /// Returns RisingWave's Iceberg sink defaults.
+    /// Returns `RisingWave`'s Iceberg sink defaults.
     fn default() -> Self {
         Self {
             compaction_enabled: false,
-            compaction_interval: Duration::from_secs(3600),
+            compaction_interval: Duration::from_hours(1),
             trigger_snapshot_count: usize::MAX,
             compaction_type: ForgeCompactionType::Full,
             snapshot_expiration_enabled: true,
@@ -207,7 +207,7 @@ where
 mod tests {
     use super::*;
 
-    /// Absent properties are RisingWave's defaults; present ones override them.
+    /// Absent properties are `RisingWave`'s defaults; present ones override them.
     ///
     /// # Panics
     /// Panics when parsing or a default disagrees with the pinned reference.
@@ -238,7 +238,7 @@ mod tests {
         let settings = ForgeTableSettings::from_properties(&declared).expect("declared");
         assert!(settings.compaction_enabled && settings.manifest_rewrite_enabled);
         assert!(!settings.snapshot_expiration_enabled);
-        assert_eq!(settings.compaction_interval, Duration::from_secs(60));
+        assert_eq!(settings.compaction_interval, Duration::from_mins(1));
         assert_eq!(settings.trigger_snapshot_count, 3);
         assert_eq!(settings.compaction_type, ForgeCompactionType::SmallFiles);
         assert_eq!(

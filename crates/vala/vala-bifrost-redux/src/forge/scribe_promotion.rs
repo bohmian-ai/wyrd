@@ -703,7 +703,7 @@ impl Forge {
     /// Runs only after the Iceberg fast append returned, so a hot publication
     /// alone never counts. The table's settings are read from the metadata
     /// this commit returned, so the leader does no catalog IO. Delivery is
-    /// best-effort, as RisingWave's post-commit notification is: a lost notice
+    /// best-effort, as `RisingWave`'s post-commit notification is: a lost notice
     /// costs one pending count, never data.
     pub(super) async fn notify_promotion_commit(
         &self,

@@ -20,7 +20,7 @@ Rules for every worktree:
 | # | Work | Spec | Worktree / branch | Latest commit | Status | Next step |
 |---|---|---|---|---|---|---|
 | 1 | Gateway capture refactor | verified-change-contract rev 54 | merged | `de3dfaca6` | **Done** | — |
-| 2 | Benchmark fixes (review R1, findings 1–12) | verified-change-contract rev 57 | `agent-a82d72f51901e1dc5` / `worktree-agent-a82d72f51901e1dc5` | `802243638` | R4: FIX_REQUIRED. Accepted: descendant processes killed at the deadline; blocking replica stop moved off async workers; exact test commands. Rejected: report total including post-report teardown. Fix agent running | R5 Codex review after fix |
+| 2 | Benchmark fixes (reviews R1–R4) | verified-change-contract rev 57 | `agent-a82d72f51901e1dc5` / `worktree-agent-a82d72f51901e1dc5` | `0973a03e5` | R4 findings fixed in `0a8ad01b7` (process-group deadline, blocking stop off async workers, exact test commands); R5 Codex review running | Validate R5 findings, then fix or merge |
 | 3 | Forge concurrent planning (TASK-001, TASK-002) | forge-concurrent-planning rev 2 | `agent-ac58f45cb5b747685` / `worktree-agent-ac58f45cb5b747685` | `f67b59b2c` | r1 findings fixed (all lanes green); r2 Codex review running against base `ce5c09ef3` | Validate r2 findings, then fix or merge |
 | 4 | Audit outbox (3 tasks) | audit-outbox rev 1 | `agent-aad682fbca5074900` / `worktree-agent-aad682fbca5074900` | `0fa3d0d6b` (in progress) | Implementing | Codex review when the agent finishes |
 | 5 | Verifier runtime under load (tasks TASK-013+) | verified-change-contract rev 59 (`5e5623a2e`) + rev 60 (`82f142580`) | new agent worktree (rev59-impl) | — | Planning and implementing | Codex review when the agent finishes |

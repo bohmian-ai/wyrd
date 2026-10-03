@@ -675,7 +675,12 @@ impl Forge {
         };
         // Boxed: the full attempt future is deep, and inlining it into every
         // supervisor future that promotes overflows the compiler's layout depth.
-        Box::pin(executor.execute_accepted(Uuid::now_v7(), &task, stop)).await?;
+        if !Box::pin(executor.execute_accepted(Uuid::now_v7(), &task, stop)).await? {
+            // ponytail: retried only by the next planning pass's sweep, so a
+            // busy table waits up to one maintenance interval; re-sweep on the
+            // active attempt's settlement if that delay ever matters.
+            tracing::debug!(table = %table_ref.table, "Forge promotion deferred behind the table's active attempt");
+        }
         Ok(true)
     }
 

@@ -1157,7 +1157,7 @@ async fn assert_refused_publication_left_no_trace(aftermath: HeldAuthorityAfterm
 ///
 /// # Panics
 ///
-/// Panics when the held rewrite is not left retryable, its lease is not
+/// Panics when the held rewrite's row is not closed failed, its lease is not
 /// released, it did not report exactly one task span, or a catalog commit span
 /// was reported for an attempt that never committed.
 async fn assert_refused_attempt_settled_and_reported(
@@ -1175,9 +1175,11 @@ async fn assert_refused_attempt_settled_and_reported(
         .filter(|task| task.strategy == "small_files")
         .collect::<Vec<_>>();
     assert_eq!(tasks.len(), 1, "one rewrite task was held: {tasks:?}");
+    // The leader owns a dispatched rewrite's retry, so the refused attempt's
+    // row closes rather than becoming claimable by a second owner.
     assert_eq!(
-        tasks[0].state, "retryable",
-        "a coordination refusal leaves the held rewrite retryable ({mutation:?}): {tasks:?}"
+        tasks[0].state, "failed",
+        "a coordination refusal closes the held rewrite for the leader to retry ({mutation:?}): {tasks:?}"
     );
     assert_eq!(
         promoted.fixture.live_leases().await,

@@ -159,6 +159,7 @@ async fn independent_plan_publications_compose_on_current_head() {
 /// nothing consumes the task's attempt budget or writes an operation.
 #[tokio::test]
 async fn admitted_batch_reports_partial_progress_semantics() {
+    let _telemetry = super::support::ForgeTelemetryCheckpoint::install();
     let promoted = PromotedRewriteFixture::start_unpromoted("compaction_reduction").await;
     let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
     let catalog = PromotionCatalogSeam::new(
@@ -171,8 +172,15 @@ async fn admitted_batch_reports_partial_progress_semantics() {
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
         ForgeClock::system(),
     );
-    promoted.fixture.seal_more(2).await;
-    supervisor.run_one_success().await;
+    // Published with the worker stopped, over the seeded objects alone: each
+    // fixture object is its own partition and so its own plan, and every
+    // wholly refused plan walks the whole retry schedule, so the scenario
+    // keeps the plan count each phase needs and no more.
+    // The fixture's first worker never armed the returned-attempt hold, so it
+    // is joined rather than released: a release would store a permit that the
+    // next armed hold falls straight through.
+    supervisor.join_worker().await;
+    promote_more_inputs(&promoted, &mut supervisor, 0).await;
 
     // Phase one: the head plan exhausts its whole retry schedule against a
     // definite refusal while its siblings commit. One durable commit is
@@ -216,6 +224,9 @@ async fn admitted_batch_reports_partial_progress_semantics() {
 
     // Phase two: nothing publishes, so the reduction reports one plan's typed
     // failure, and that failure — not a sibling's — is what the task carries.
+    // Phase one's success settled the table's debt at the leader, so a newly
+    // promoted commit is what makes it owe another rewrite.
+    promote_more_inputs(&promoted, &mut supervisor, 1).await;
     let snapshots_before = promoted.load_table().await.metadata().snapshots().count();
     let operations_before = promoted.fixture.rewrite_operations().await.len();
     catalog.reject_remaining_commits();
@@ -239,9 +250,11 @@ async fn admitted_batch_reports_partial_progress_semantics() {
         "every refused plan closed its operation as never-published: {operations:?}"
     );
     let refused = latest_small_files_task(&promoted.fixture).await;
+    // The leader owns a dispatched table's retry, so the attempt row closes
+    // terminally rather than becoming claimable by a second owner.
     assert_eq!(
-        refused.state, "retryable",
-        "a wholly refused attempt leaves the task retryable: {refused:?}"
+        refused.state, "failed",
+        "a wholly refused dispatched attempt closes its row for the leader to retry: {refused:?}"
     );
     assert_eq!(
         refused.failure_class.as_deref(),
@@ -254,8 +267,8 @@ async fn admitted_batch_reports_partial_progress_semantics() {
         "exactly one attempt was spent: {refused:?}"
     );
     assert!(
-        refused.next_eligible_at > chrono::Utc::now(),
-        "a retryable task backs off before it is claimable again: {refused:?}"
+        owes_compaction(&promoted, &supervisor, promoted.fixture.tenant, &promoted.fixture.binding.table_ref.name),
+        "the leader keeps the refused attempt's commits owed for its own retry"
     );
 
     assert_compact_table_is_acknowledged(&promoted, supervisor, &catalog).await;
@@ -506,9 +519,9 @@ fn small_files_volume(telemetry: &super::support::ForgeTelemetryCheckpoint, fami
 async fn consumed_by_settled_compaction(
     promoted: &PromotedRewriteFixture,
     supervisor: &mut SupervisedPromotion,
-    settled_tasks: usize,
 ) -> usize {
     let before = promoted.fixture.live_data_paths().await;
+    let settled_tasks = small_files_in_state(&promoted.fixture, &["succeeded"]).await + 1;
     promoted.fixture.clear_task_backoff().await;
     supervisor.restart_worker();
     supervisor.schedule_only().await;
@@ -570,11 +583,29 @@ async fn consumed_by_recovered_compaction(
     supervisor.reclaim_expired_claims().await;
     // No new planning pass: recovery is driven by the reclaimed task and the
     // table-wide reconciliation it carries, and a fresh rewrite planned into
-    // the same window would consume files this window itself created.
+    // the same window would consume files this window itself created. The
+    // released dispatch reported failure, so the leader still owes the table a
+    // rewrite; the successor is therefore held once its reconciliation settled
+    // and stopped there, before it can pull that rewrite.
     promoted.fixture.clear_task_backoff().await;
+    supervisor
+        .observer()
+        .hold_after_next_rewrite_settlement_for_test();
     supervisor.restart_worker();
     supervisor.start_worker();
+    tokio::time::timeout(
+        ADMISSION_BOUND,
+        supervisor
+            .observer()
+            .wait_for_held_rewrite_settlement_for_test(),
+    )
+    .await
+    .expect("the successor settles the recovered operations");
     await_operation_phase(&promoted.fixture, &open, &["recovered", "reset"]).await;
+    supervisor.worker_stop().cancel();
+    supervisor
+        .observer()
+        .release_held_rewrite_settlement_for_test();
     // The task itself is recovered too, not just its operations: a table whose
     // rewrite task is still owned admits no further maintenance of any kind.
     let returned = tokio::time::timeout(ADMISSION_BOUND, async {
@@ -593,29 +624,34 @@ async fn consumed_by_recovered_compaction(
     before.difference(&after).count()
 }
 
-/// Seals and promotes one more generation so the next window has work.
+/// Seals `count` more hot objects and promotes every sealed one, so the next
+/// window has work.
+///
+/// The leader promotes inline on its own pass and its promotion commit is what
+/// makes the table owe a rewrite, so the caller has stopped the worker: a
+/// running one would pull that rewrite before the window under test arms its
+/// fault.
 ///
 /// # Panics
 ///
-/// Panics when the promotion attempt does not settle successfully.
+/// Panics when the promotion does not settle successfully.
 async fn promote_more_inputs(
     promoted: &PromotedRewriteFixture,
     supervisor: &mut SupervisedPromotion,
+    count: usize,
 ) {
     let promoted_before = promotions_succeeded(&promoted.fixture).await;
-    promoted.fixture.seal_more(4).await;
-    promoted.fixture.clear_task_backoff().await;
-    supervisor.restart_worker();
-    supervisor.start_worker();
-    supervisor.schedule_only().await;
-    tokio::time::timeout(ADMISSION_BOUND, async {
-        while promotions_succeeded(&promoted.fixture).await <= promoted_before {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    promoted.fixture.seal_more(count).await;
+    for _ in 0..12 {
+        if promotions_succeeded(&promoted.fixture).await > promoted_before {
+            return;
         }
-    })
-    .await
-    .expect("the new hot objects are published before compaction plans them");
-    supervisor.stop_worker().await;
+        supervisor.schedule_only().await;
+    }
+    panic!(
+        "the new hot objects are published before compaction plans them: {:?}",
+        tenant_tasks(&promoted.fixture).await
+    );
 }
 
 /// A multi-plan attempt counts every committed plan's volume exactly once.
@@ -653,12 +689,15 @@ async fn multi_plan_success_counts_all_committed_volume_once() {
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
         clock,
     );
-    promoted.fixture.seal_more(4).await;
-    supervisor.run_one_success().await;
+    // The fixture's first worker never armed the returned-attempt hold, so it
+    // is joined rather than released: a release would store a permit that the
+    // next armed hold falls straight through.
+    supervisor.join_worker().await;
+    promote_more_inputs(&promoted, &mut supervisor, 4).await;
 
     // Several ordinary successes in one attempt: the counter is their sum, so
     // a reduction that kept only one plan's measurement is short here.
-    let mut consumed = consumed_by_settled_compaction(&promoted, &mut supervisor, 1).await;
+    let mut consumed = consumed_by_settled_compaction(&promoted, &mut supervisor).await;
     assert_eq!(
         small_files_volume(&telemetry, "bifrost_forge_input_files_total"),
         consumed as u64,
@@ -673,8 +712,8 @@ async fn multi_plan_success_counts_all_committed_volume_once() {
     // No plan learns its acceptance, so the attempt settles nothing at all:
     // it is released, and the durable recovery that follows reports the volume
     // of whichever operation it proves live.
-    promote_more_inputs(&promoted, &mut supervisor).await;
-    catalog.stall_next_commit_responses(8);
+    promote_more_inputs(&promoted, &mut supervisor, 4).await;
+    catalog.stall_next_commit_responses(usize::MAX);
     consumed += consumed_by_recovered_compaction(&promoted, &mut supervisor, &catalog).await;
     let after_recovery = small_files_volume(&telemetry, "bifrost_forge_input_files_total");
     assert!(
@@ -686,15 +725,18 @@ async fn multi_plan_success_counts_all_committed_volume_once() {
     // One ordinary success beside one unresolved sibling: the task settles at
     // once on what it knows, and the sibling stays uncounted until the
     // table-wide owner proves it.
-    promote_more_inputs(&promoted, &mut supervisor).await;
+    promote_more_inputs(&promoted, &mut supervisor, 4).await;
     catalog.stall_next_commit_responses(1);
-    consumed += consumed_by_settled_compaction(&promoted, &mut supervisor, 3).await;
+    consumed += consumed_by_settled_compaction(&promoted, &mut supervisor).await;
     catalog.stall_next_commit_responses(0);
     assert!(
         small_files_volume(&telemetry, "bifrost_forge_input_files_total") < consumed as u64,
         "the still-Prepared sibling is not counted before it is proved"
     );
 
+    // The table-wide owner is the table's next rewrite, and the leader owes
+    // one only after a newer promotion commit, so one is published first.
+    promote_more_inputs(&promoted, &mut supervisor, 1).await;
     // The takeover only starts once the uncertainty bound and the reclaim
     // backoff lapse, measured from wall clock because the operations carry
     // database timestamps taken while their attempts ran.
@@ -2249,6 +2291,7 @@ async fn await_operation_phase(
 /// or when a proven operation does not reach its exact terminal phase.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn acceptance_unknown_recovers_from_durable_state() {
+    let _telemetry = super::support::ForgeTelemetryCheckpoint::install();
     let mut promoted = PromotedRewriteFixture::start_unpromoted("unknown_acceptance").await;
     // A parked commit has to run out of publication budget while the scenario
     // is still watching, so the budget is the seconds a test can wait rather
@@ -2268,7 +2311,13 @@ async fn acceptance_unknown_recovers_from_durable_state() {
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
         clock,
     );
-    supervisor.run_one_success().await;
+    // Published with the worker stopped, so the table's first rewrite is the
+    // one the first shape below arms its fault for.
+    // The fixture's first worker never armed the returned-attempt hold, so it
+    // is joined rather than released: a release would store a permit that the
+    // next armed hold falls straight through.
+    supervisor.join_worker().await;
+    promote_more_inputs(&promoted, &mut supervisor, 0).await;
 
     unresolved_commit_resets_once_absence_is_provable(
         &promoted,
@@ -2459,7 +2508,7 @@ async fn landed_replacement_recovers_into_success(
     promoted.fixture.reoffer_settled_small_files_task().await;
     promoted.fixture.clear_task_backoff().await;
     let landed_before = promoted.fixture.rewrite_operations().await.len();
-    catalog.stall_next_commit_responses(8);
+    catalog.stall_next_commit_responses(usize::MAX);
     let released_before = supervisor.observer().released_attempts_for_test().len();
     supervisor.restart_worker();
     supervisor.start_worker();
@@ -2484,6 +2533,9 @@ async fn landed_replacement_recovers_into_success(
         .fixture
         .expire_claims_of(promoted.fixture.tenant)
         .await;
+    // The released dispatch reported failure, so the leader still owes the
+    // table a rewrite; its next dispatch is the table-wide owner that settles
+    // the landed operation before it publishes anything of its own.
     supervisor.reclaim_expired_claims().await;
     promoted.fixture.clear_task_backoff().await;
     let recovered_to_success = tokio::time::timeout(ADMISSION_BOUND, async {
@@ -2511,12 +2563,12 @@ async fn landed_replacement_recovers_into_success(
         recovered.iter().any(|(_, phase)| phase == "recovered"),
         "an exact recovery closes the operation it proved: {recovered:?}"
     );
+    // The owner that recovered the landed operation goes on to publish its own
+    // rewrite, so `committed` rows may follow; no inherited operation is reset.
     assert!(
-        recovered
-            .iter()
-            .all(|(_, phase)| phase == "recovered" || phase == "prepared"),
-        "the first proven operation settles the task and the rest stay open for \
-         the table-wide owner, which never fails or resets them: {recovered:?}"
+        recovered.iter().all(|(_, phase)| phase != "reset"),
+        "the table-wide owner recovers the inherited operations and never \
+         resets them: {recovered:?}"
     );
 }
 
@@ -2537,19 +2589,7 @@ async fn known_success_leaves_its_ambiguous_sibling_open(
     supervisor: &mut SupervisedPromotion,
 ) {
     // 3. One known success beside one ambiguous sibling.
-    promoted.fixture.seal_more(4).await;
-    promoted.fixture.clear_task_backoff().await;
-    supervisor.restart_worker();
-    supervisor.start_worker();
-    supervisor.schedule_only().await;
-    tokio::time::timeout(ADMISSION_BOUND, async {
-        while promotions_succeeded(&promoted.fixture).await < 2 {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("the new hot objects are published before compaction plans them");
-    supervisor.stop_worker().await;
+    promote_more_inputs(promoted, supervisor, 4).await;
 
     let succeeded_before = small_files_in_state(&promoted.fixture, &["succeeded"]).await;
     let open_before = operation_phases(&promoted.fixture).await.len();
@@ -2606,20 +2646,7 @@ async fn release_one_unresolved_attempt(
     supervisor.stop_worker().await;
     // The new hot objects are published first, so the seam armed below meets
     // the rewrite's own commit rather than the promotion's.
-    let promoted_before = promotions_succeeded(&promoted.fixture).await;
-    promoted.fixture.seal_more(4).await;
-    promoted.fixture.clear_task_backoff().await;
-    supervisor.restart_worker();
-    supervisor.start_worker();
-    supervisor.schedule_only().await;
-    tokio::time::timeout(ADMISSION_BOUND, async {
-        while promotions_succeeded(&promoted.fixture).await <= promoted_before {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("the new hot objects are published before compaction plans them");
-    supervisor.stop_worker().await;
+    promote_more_inputs(promoted, supervisor, 4).await;
 
     let open_before = operation_phases(&promoted.fixture).await.len();
     let errors_before = supervisor.returned_errors().len();
@@ -2814,16 +2841,19 @@ async fn successor_reconciles_before_publishing(
     // successor can take the table at all.
     promoted.fixture.expire_table_lease().await;
     promoted.fixture.seal_more(4).await;
-    promoted.fixture.clear_task_backoff().await;
     supervisor.restart_worker();
     supervisor.start_worker();
     supervisor.reclaim_expired_claims().await;
-    supervisor.schedule_only().await;
+    // Cleared after the reclaim, whose own retry backoff would otherwise hold
+    // the inherited task — and with it the table's promotion — for a minute.
+    promoted.fixture.clear_task_backoff().await;
     // The new hot objects publish first, so a later snapshot is the rewrite the
-    // ordering assertion below is about rather than a promotion.
+    // ordering assertion below is about rather than a promotion. A promotion
+    // the pass offers while the reclaimed attempt still holds the table is
+    // deferred to the next pass's sweep, so passes are driven until it lands.
     tokio::time::timeout(ADMISSION_BOUND, async {
         while promotions_succeeded(&promoted.fixture).await <= promoted_before {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            supervisor.schedule_only().await;
         }
     })
     .await

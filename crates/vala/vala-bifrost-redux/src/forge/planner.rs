@@ -33,19 +33,22 @@ pub struct ForgePlanCandidate {
 /// makes replanning the same work recognize its own already-enqueued task
 /// instead of creating a second one. Publication recomputes it from the claimed
 /// plan to bind a committed snapshot back to the durable row that authorized
-/// it, which only works while both sides derive it here.
+/// it, which only works while both sides derive it here. Object keys are
+/// sorted before hashing: the stored plan is JSONB, which reorders keys, and
+/// `serde_json` preserves insertion order in this build.
 ///
 /// # Errors
 ///
 /// Returns [`ForgeError::Invariant`] when the plan's parameters do not
 /// serialize, which no validated plan can do.
 pub(super) fn plan_hash(plan: &ForgeTaskPlan) -> Result<[u8; 32], ForgeError> {
-    let canonical = serde_json::to_vec(&serde_json::json!({
+    let mut canonical = serde_json::json!({
         "inputs": plan.inputs,
         "parameters": plan.parameters,
         "version": plan.version,
-    }))
-    .map_err(|error| ForgeError::Invariant {
+    });
+    canonical.sort_all_objects();
+    let canonical = serde_json::to_vec(&canonical).map_err(|error| ForgeError::Invariant {
         detail: error.to_string(),
     })?;
     Ok(Sha256::digest(canonical).into())
@@ -141,4 +144,30 @@ fn plan_candidate(
             bytes: candidate.bytes,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure checks of the plan identity digest.
+
+    use vala_sql::row_types::forge_tasks::ForgeTaskPlan;
+
+    use super::plan_hash;
+
+    /// A plan read back from JSONB, whose object keys come back reordered,
+    /// hashes to the digest it was stored under.
+    #[test]
+    fn plan_hash_ignores_parameter_key_order() {
+        let plan = |parameters: &str| ForgeTaskPlan {
+            version: 1,
+            inputs: vec!["a.parquet".to_owned()],
+            parameters: serde_json::from_str(parameters).expect("test parameters parse"),
+        };
+        assert_eq!(
+            plan_hash(&plan(r#"{"kind":"k","compaction_type":"full","dispatch":"d"}"#))
+                .expect("hash"),
+            plan_hash(&plan(r#"{"kind":"k","dispatch":"d","compaction_type":"full"}"#))
+                .expect("hash"),
+        );
+    }
 }

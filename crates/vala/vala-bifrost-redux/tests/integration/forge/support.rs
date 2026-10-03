@@ -786,8 +786,6 @@ pub(crate) struct ForgeTaskRow {
     pub(crate) attempt_count: i32,
     /// Persisted failure class, or `None` while the task carries no failure.
     pub(crate) failure_class: Option<String>,
-    /// Earliest instant a claim may take this task again.
-    pub(crate) next_eligible_at: chrono::DateTime<chrono::Utc>,
 }
 
 pub(crate) struct PromotionIntegrationFixture {
@@ -1254,11 +1252,10 @@ impl PromotionIntegrationFixture {
                 i64,
                 i32,
                 Option<String>,
-                chrono::DateTime<chrono::Utc>,
             ),
         >(
             "SELECT task_id, strategy, state, base_snapshot_id, \
-                    attempt_count, failure_class, next_eligible_at \
+                    attempt_count, failure_class \
              FROM vala.forge_tasks \
              WHERE data_tenant_id = $1 AND namespace_name = $2 AND table_name = $3 \
              ORDER BY created_at, task_id",
@@ -1278,7 +1275,6 @@ impl PromotionIntegrationFixture {
                 base_snapshot_id,
                 attempt_count,
                 failure_class,
-                next_eligible_at,
             )| ForgeTaskRow {
                 task_id,
                 strategy,
@@ -1286,7 +1282,6 @@ impl PromotionIntegrationFixture {
                 base_snapshot_id,
                 attempt_count,
                 failure_class,
-                next_eligible_at,
             },
         )
         .collect()
@@ -2294,7 +2289,7 @@ impl SupervisedPromotion {
     ///
     /// Panics when the worker misses its bounded shutdown or exits
     /// unexpectedly.
-    async fn join_worker(&mut self) {
+    pub(crate) async fn join_worker(&mut self) {
         self.worker_stop.cancel();
         let task = self.worker_task.take().expect("worker is stopped once");
         tokio::time::timeout(FIXTURE_BOUND, task)

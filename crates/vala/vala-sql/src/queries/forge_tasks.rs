@@ -978,6 +978,32 @@ impl ForgeTasks {
         exact_one(changed, "retry")
     }
 
+    /// Closes one leader-dispatched compaction attempt without making it
+    /// claimable again.
+    ///
+    /// The leader owns a dispatched table's retry, so a dispatched row must
+    /// never become `retryable`, where another worker's fair claim would give
+    /// the same work a second owner. `failure_class` `None` closes a pre-effect
+    /// release as `cancelled`; a class closes an execution failure as `failed`
+    /// under that class, consuming one attempt as [`Self::retry_failure`]
+    /// does. The update is guarded to this exact pre-effect attempt and owner.
+    ///
+    /// Returns whether this call closed the row; `false` means the attempt
+    /// already advanced (for example to `prepared`) and stays retained.
+    ///
+    /// # Errors
+    /// Returns SQL errors, including a rejected unknown failure class.
+    pub async fn close_dispatched(
+        &self,
+        task_id: Uuid,
+        attempt: Uuid,
+        owner: Uuid,
+        failure_class: Option<&str>,
+    ) -> Result<bool, SqlError> {
+        let changed=sqlx::query("UPDATE vala.forge_tasks SET state=CASE WHEN $4::text IS NULL THEN 'cancelled' ELSE 'failed' END,attempt_count=attempt_count+CASE WHEN $4::text IS NULL THEN 0 ELSE 1 END,failure_class=COALESCE($4,failure_class),attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,updated_at=statement_timestamp() WHERE task_id=$1 AND state IN ('claimed','running') AND attempt_id=$2 AND claimed_by=$3").bind(task_id).bind(attempt).bind(owner).bind(failure_class).execute(self.operator_pool.pool()).await.map_err(SqlError::from)?.rows_affected();
+        Ok(changed == 1)
+    }
+
     /// Persists one attempt-consuming failure with bounded exponential backoff.
     ///
     /// The owned attempt is released only by this statement. The returned count
@@ -1211,6 +1237,8 @@ impl ForgeTasks {
 
     /// Reclaims expired Claimed or Running attempts into Retryable with no audit.
     /// Prepared is intentionally excluded because it may represent an uncertain external effect.
+    /// A leader-dispatched attempt (its plan names a `dispatch`) closes as
+    /// `cancelled` instead, because the leader alone owns its retry.
     ///
     /// # Errors
     /// Returns SQL errors from the bounded operator update.
@@ -1218,23 +1246,61 @@ impl ForgeTasks {
     /// # Cancellation
     /// Reclaim is one bounded statement and cannot commit partial progress.
     pub async fn reclaim_expired(&self, cap: u32) -> Result<u64, SqlError> {
-        let changed=sqlx::query("WITH victims AS (SELECT task_id FROM vala.forge_tasks WHERE state IN ('claimed','running') AND claim_expires_at<statement_timestamp() ORDER BY claim_expires_at,task_id FOR UPDATE SKIP LOCKED LIMIT $1) UPDATE vala.forge_tasks t SET state='retryable',attempt_count=attempt_count+1,next_eligible_at=statement_timestamp()+LEAST(power(2,attempt_count+1)*interval '30 seconds',interval '15 minutes'),attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,ready_at=statement_timestamp()+LEAST(power(2,attempt_count+1)*interval '30 seconds',interval '15 minutes'),updated_at=statement_timestamp() FROM victims v WHERE t.task_id=v.task_id").bind(i64::from(cap)).execute(self.operator_pool.pool()).await.map_err(SqlError::from)?.rows_affected();
+        let changed=sqlx::query("WITH victims AS (SELECT task_id FROM vala.forge_tasks WHERE state IN ('claimed','running') AND claim_expires_at<statement_timestamp() ORDER BY claim_expires_at,task_id FOR UPDATE SKIP LOCKED LIMIT $1) UPDATE vala.forge_tasks t SET state=CASE WHEN t.plan->'parameters'->>'dispatch' IS NULL THEN 'retryable' ELSE 'cancelled' END,attempt_count=attempt_count+1,next_eligible_at=statement_timestamp()+LEAST(power(2,attempt_count+1)*interval '30 seconds',interval '15 minutes'),attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,ready_at=statement_timestamp()+LEAST(power(2,attempt_count+1)*interval '30 seconds',interval '15 minutes'),updated_at=statement_timestamp() FROM victims v WHERE t.task_id=v.task_id").bind(i64::from(cap)).execute(self.operator_pool.pool()).await.map_err(SqlError::from)?.rows_affected();
         Ok(changed)
     }
 
     /// Reclaims expired attempts and returns their exact scratch ownership identities.
     ///
-    /// Prepared attempts remain excluded. The returned identities were captured
+    /// A leader-dispatched attempt closes as `cancelled` rather than
+    /// `retryable`, as in [`Self::reclaim_expired`]; read its dispatch with
+    /// [`Self::cancelled_dispatches`] to tell the leader. Prepared attempts
+    /// remain excluded. The returned identities were captured
     /// under the same row locks that cleared durable ownership.
     ///
     /// # Errors
     /// Returns SQL errors from the bounded reclaim transaction.
     pub async fn reclaim_expired_attempts(&self, cap: u32) -> Result<Vec<(Uuid, Uuid)>, SqlError> {
-        sqlx::query_as("WITH victims AS (SELECT task_id,attempt_id FROM vala.forge_tasks WHERE state IN ('claimed','running') AND claim_expires_at<statement_timestamp() AND attempt_id IS NOT NULL ORDER BY claim_expires_at,task_id FOR UPDATE SKIP LOCKED LIMIT $1), updated AS (UPDATE vala.forge_tasks t SET state='retryable',attempt_count=attempt_count+1,next_eligible_at=statement_timestamp()+LEAST(power(2,attempt_count+1)*interval '30 seconds',interval '15 minutes'),attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,ready_at=statement_timestamp()+LEAST(power(2,attempt_count+1)*interval '30 seconds',interval '15 minutes'),updated_at=statement_timestamp() FROM victims v WHERE t.task_id=v.task_id RETURNING v.task_id,v.attempt_id) SELECT task_id,attempt_id FROM updated ORDER BY task_id")
+        sqlx::query_as("WITH victims AS (SELECT task_id,attempt_id FROM vala.forge_tasks WHERE state IN ('claimed','running') AND claim_expires_at<statement_timestamp() AND attempt_id IS NOT NULL ORDER BY claim_expires_at,task_id FOR UPDATE SKIP LOCKED LIMIT $1), updated AS (UPDATE vala.forge_tasks t SET state=CASE WHEN t.plan->'parameters'->>'dispatch' IS NULL THEN 'retryable' ELSE 'cancelled' END,attempt_count=attempt_count+1,next_eligible_at=statement_timestamp()+LEAST(power(2,attempt_count+1)*interval '30 seconds',interval '15 minutes'),attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,ready_at=statement_timestamp()+LEAST(power(2,attempt_count+1)*interval '30 seconds',interval '15 minutes'),updated_at=statement_timestamp() FROM victims v WHERE t.task_id=v.task_id RETURNING v.task_id,v.attempt_id) SELECT task_id,attempt_id FROM updated ORDER BY task_id")
             .bind(i64::from(cap))
             .fetch_all(self.operator_pool.pool())
             .await
             .map_err(SqlError::from)
+    }
+
+    /// Returns the leader dispatches of the cancelled rows among `task_ids`.
+    ///
+    /// Each item is the row's tenant, table, and the leader's dispatch task id
+    /// from its plan. Cancelled is terminal, so the read cannot race a later
+    /// transition of the same row.
+    ///
+    /// # Errors
+    /// Returns SQL errors, and an invariant violation for a malformed persisted
+    /// table identity or dispatch id.
+    pub async fn cancelled_dispatches(
+        &self,
+        task_ids: &[Uuid],
+    ) -> Result<Vec<(DataTenantId, ForgeTaskTableIdentity, Uuid)>, SqlError> {
+        let rows = sqlx::query_as::<_, (Uuid, String, String, String, String)>("SELECT data_tenant_id,catalog_name,namespace_name,table_name,plan->'parameters'->>'dispatch' FROM vala.forge_tasks WHERE task_id=ANY($1) AND state='cancelled' AND plan->'parameters'->>'dispatch' IS NOT NULL ORDER BY task_id")
+            .bind(task_ids)
+            .fetch_all(self.operator_pool.pool())
+            .await
+            .map_err(SqlError::from)?;
+        rows.into_iter()
+            .map(|(tenant, catalog, namespace, table, dispatch)| {
+                let invalid = |detail: &str| SqlError::InvariantViolation {
+                    detail: detail.to_owned(),
+                };
+                Ok((
+                    DataTenantId::new(tenant)
+                        .map_err(|_| invalid("invalid persisted Forge tenant id"))?,
+                    ForgeTaskTableIdentity::new(catalog, namespace, table)
+                        .map_err(|_| invalid("invalid persisted Forge table identity"))?,
+                    Uuid::parse_str(&dispatch)
+                        .map_err(|_| invalid("invalid persisted Forge dispatch id"))?,
+                ))
+            })
+            .collect()
     }
 
     /// Reads active watermarks for one table with explicit overflow detection.

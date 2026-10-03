@@ -2313,13 +2313,41 @@ impl ForgeWorker {
 
     /// Reclaims expired durable attempts.
     ///
+    /// A reclaimed leader-dispatched attempt closes as cancelled, and is
+    /// reported Failed so the leader reschedules its table at once, as
+    /// `RisingWave` cancels an expired compactor's tasks; a lost report is
+    /// covered by the leader's report deadline.
+    ///
     /// # Errors
-    /// Returns SQL errors from the bounded operator reclaim.
+    /// Returns SQL errors from the bounded operator reclaim or the dispatch
+    /// read.
     async fn reclaim_expired_attempts(&self, cap: u32) -> Result<Vec<(Uuid, Uuid)>, ForgeError> {
-        self.tasks
+        let reclaimed = self
+            .tasks
             .reclaim_expired_attempts(cap)
             .await
-            .map_err(ForgeError::Sql)
+            .map_err(ForgeError::Sql)?;
+        if reclaimed.is_empty() {
+            return Ok(reclaimed);
+        }
+        let task_ids: Vec<Uuid> = reclaimed.iter().map(|(task_id, _)| *task_id).collect();
+        for (tenant, table, task_id) in self
+            .tasks
+            .cancelled_dispatches(&task_ids)
+            .await
+            .map_err(ForgeError::Sql)?
+        {
+            let dispatch = ForgeCompactionDispatch {
+                task_id,
+                key: super::ForgeTableKey { tenant, table },
+                branch: super::scribe_promotion::PROMOTION_BRANCH.to_owned(),
+                // A report carries only the key and task id.
+                compaction_type: ForgeCompactionType::default(),
+            };
+            self.report_dispatch(&dispatch, ForgeCompactionOutcome::Failed)
+                .await;
+        }
+        Ok(reclaimed)
     }
 
     /// Reclaims expired attempts through the production worker owner in tests.
@@ -2760,6 +2788,10 @@ impl ForgeWorker {
             parameters: serde_json::json!({
                 "kind": LIVE_REWRITE_PARAMETER_KIND,
                 "compaction_type": dispatch.compaction_type.as_str(),
+                // The leader's task id makes each dispatch its own plan
+                // identity, so the leader's retry of an unchanged head is a new
+                // attempt rather than a duplicate of the closed one.
+                "dispatch": dispatch.task_id.to_string(),
             }),
         };
         Ok(Some(NewForgeTask {
@@ -4592,16 +4624,19 @@ impl ForgeWorker {
                 ForgeSnapshotExpiryIntent::parse(&task.strategy, parameters).is_some()
             }
             ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles) => {
+                let compaction_type = parameters.get("compaction_type").map(|raw| {
+                    raw.as_str()
+                        .is_some_and(|raw| ForgeCompactionType::parse(raw).is_ok())
+                });
+                let dispatch = parameters
+                    .get("dispatch")
+                    .map(|raw| raw.as_str().is_some_and(|raw| Uuid::parse_str(raw).is_ok()));
                 parameters.get("kind").and_then(Value::as_str) == Some(expected_kind)
-                    && match parameters.get("compaction_type") {
-                        None => parameters.len() == 1,
-                        Some(raw) => {
-                            parameters.len() == 2
-                                && raw
-                                    .as_str()
-                                    .is_some_and(|raw| ForgeCompactionType::parse(raw).is_ok())
-                        }
-                    }
+                    && compaction_type.unwrap_or(true)
+                    && dispatch.unwrap_or(true)
+                    && parameters.len()
+                        == 1 + usize::from(compaction_type.is_some())
+                            + usize::from(dispatch.is_some())
             }
             _ => {
                 parameters.get("kind").and_then(Value::as_str) == Some(expected_kind)
@@ -8464,6 +8499,9 @@ impl ForgeWorker {
         attempt: Uuid,
         error: &ForgeError,
     ) -> Result<Option<ForgeTaskResult>, ForgeError> {
+        if self.is_dispatched(claim.task_id) && !matches!(error, ForgeError::ShutdownRetained) {
+            return self.close_dispatched(claim, attempt, error).await;
+        }
         match error {
             ForgeError::Shutdown => Ok(self
                 .release_cancelled_claim(claim.task_id, attempt)
@@ -8503,6 +8541,57 @@ impl ForgeWorker {
                 Ok(durable_task_result((state, Some(class))))
             }
         }
+    }
+
+    /// Whether `task_id` is a leader-dispatched attempt this worker still runs.
+    fn is_dispatched(&self, task_id: Uuid) -> bool {
+        self.dispatched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&task_id)
+    }
+
+    /// Settles a failed leader-dispatched attempt terminally.
+    ///
+    /// The leader retries a dispatched table after its Failed report, so the
+    /// row must not also become `retryable`: a fair claim would then run the
+    /// same work under a second owner whose result the leader never hears.
+    /// Pre-effect shutdown and capacity refusal close as `cancelled`; every
+    /// other failure closes as `failed` under its class. A row that already
+    /// advanced past the pre-effect guard stays retained and commits nothing.
+    ///
+    /// # Errors
+    /// Returns SQL errors from the guarded close.
+    async fn close_dispatched(
+        &self,
+        claim: &ForgeTaskClaim,
+        attempt: Uuid,
+        error: &ForgeError,
+    ) -> Result<Option<ForgeTaskResult>, ForgeError> {
+        let class = match error {
+            ForgeError::Shutdown | ForgeError::Capacity { .. } => None,
+            _ => Some(error.failure_class()),
+        };
+        let closed = self
+            .tasks
+            .close_dispatched(
+                claim.task_id,
+                attempt,
+                self.owner,
+                class.map(ForgeFailureClass::as_str),
+            )
+            .await
+            .map_err(ForgeError::Sql)?;
+        if !closed {
+            return Ok(None);
+        }
+        Ok(match class {
+            Some(class) => {
+                Self::record_settled_failure(claim, class);
+                durable_task_result((ForgeTaskState::Failed, Some(class)))
+            }
+            None => Some(ForgeTaskResult::Cancelled),
+        })
     }
 
     /// Counts one settled durable failure under its exact class.

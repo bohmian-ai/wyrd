@@ -1425,7 +1425,10 @@ impl AnalyticalExecutePause {
     }
 
     /// Holds only the first `ExecuteTask` and lets every later one proceed.
-    async fn hold(&self) {
+    ///
+    /// The held task also continues once `graph_cancel` fires, so a graph
+    /// cancelled or expired while held settles exactly as it would unpaused.
+    async fn hold(&self, graph_cancel: &CancellationToken) {
         if self
             .claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1435,7 +1438,10 @@ impl AnalyticalExecutePause {
         }
         self.paused.notify_waiters();
         while !self.released.load(Ordering::Acquire) {
-            self.release.notified().await;
+            tokio::select! {
+                () = self.release.notified() => {}
+                () = graph_cancel.cancelled() => return,
+            }
         }
     }
 }
@@ -1738,7 +1744,7 @@ impl AnalyticalStageIngress {
                     .ok()
                     .and_then(|pause| pause.as_ref().map(Arc::clone))
                 {
-                    pause.hold().await;
+                    pause.hold(&lease.cancel).await;
                 }
             }
         }

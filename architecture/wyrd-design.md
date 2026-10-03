@@ -534,8 +534,8 @@ Secrets Manager CSI driver, etc.) puts the API key into the pod as
 JWT (five minutes) and re-exchanges the same durable key when that token nears expiry
 or is refused — a machine grant issues no refresh token, so the key in the
 secret store is the only renewable authority and revoking it ends renewal.
-Rotating renewal authority is a human concern: only an OIDC login returns a
-refresh token, and only that token rotates. `/auth/token`
+Renewal authority is a human concern: only a human login returns a refresh
+token, and only the public CLI client's refresh token rotates. `/auth/token`
 derives `tenant_id` and `principal_id` from the verified API-key record;
 no client-supplied tenant header is accepted. The JWT carries the principal
 as the top-level `principal` claim, the `permissions` resolved from its current
@@ -551,6 +551,27 @@ Env vars in deployed services:
 | `WYRD_API_KEY` | REQUIRED | Deploy environment's secret store (key minted by `wyrd auth issue-key <card_ref>`) | Exchanged at `POST /auth/token` for a short-lived JWT and re-exchanged by the SDK when that token expires or is refused; no refresh token is issued. JWT carries the card-bound `principal` claim (kind, id, tenant, `card_ref`). |
 | `WYRD_SERVER_URL` | REQUIRED | Static config | Wyrd server HTTP base URL (default `http://localhost:8080`). Read by `ClientConfig::from_env`. |
 | `WYRD_GRPC_URL` | OPTIONAL | Static config | Wyrd server gRPC endpoint (default `http://localhost:50051`). Read by `ClientConfig::from_env`. |
+
+#### Human sign-in
+
+Human federation is optional per tenant. A tenant has at most one active OIDC
+connection, administered through `/v1/identity/oidc/*`; Wyrd is an OpenID
+Connect relying party of that provider (`openidconnect`) and the OAuth 2.0
+authorization server for its own clients. The provider authenticates the
+person; Wyrd resolves the tenant `User` by verified `(issuer, subject)`, maps
+provider groups only to that tenant's roles, and issues Wyrd tokens. Provider
+tokens are never Wyrd authority.
+
+| Client | OAuth client | Grant | Session holder |
+|---|---|---|---|
+| Web app | `wyrd-ui`, confidential (`client_secret_basic`) | Authorization code + PKCE (`GET /auth/authorize`) | The BFF's encrypted HttpOnly cookie; refresh token does not rotate, 12-hour absolute lifetime |
+| CLI and SDKs | `wyrd-cli`, public | Device authorization (RFC 8628) | `credentials.toml`, owned by `wyrd-client`; refresh token rotates on every use |
+
+The BFF uses `openid-client`; the shared Rust client uses `oauth2`, so Rust,
+Python, and TypeScript share one implementation. The OAuth endpoints use the
+RFC 6749 form and JSON wire format and are the one exception to `WyrdError`
+problem+json. Deployed Services and Agents keep their own API keys or
+workload assertions; human SSO never replaces or disables them.
 
 #### Cross-service delegation
 

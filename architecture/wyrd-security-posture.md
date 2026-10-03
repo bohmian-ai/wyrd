@@ -146,9 +146,14 @@ credential.
 - Tenant access tokens expire five minutes after issuance. Privileged
   operations may require a shorter configured lifetime, but never a longer
   one.
-- Refresh tokens are stored by one-way digest, rotated on every successful
-  use, and invalidated when replay is detected. Reuse of a rotated refresh
-  token revokes its token family and emits a security audit event.
+- Only a human login receives a refresh token. Refresh tokens are stored by
+  one-way digest and rotated on every use for public clients (`wyrd-cli`):
+  reuse of a rotated refresh token revokes its rotation chain and emits a
+  security audit event (RFC 9700 §4.14.2). The confidential web-app client
+  (`wyrd-ui`) authenticates every refresh, so its refresh token does not
+  rotate and ends at a fixed 12-hour absolute lifetime. Revoking a refresh
+  token (RFC 7009) ends that one login's renewal; it does not withdraw access
+  tokens already issued.
 - Every tenant access token carries issuer, audience `wyrd`, subject,
   issued-at, expiry, unique token identity, principal, tenant, Card scope,
   credential attribution, delegation chain, informational roles, and one
@@ -182,6 +187,42 @@ credential.
   token-family replay detection, least privilege, and audit are the required
   replay controls. Logs and traces never record bearer material.
 
+### OAuth authorization server
+
+- Wyrd is the OAuth 2.0 authorization server for its own clients. It
+  implements only the authorization code grant with PKCE S256 at
+  `GET /auth/authorize` (RFC 6749 §4.1, RFC 7636), the device authorization
+  grant (RFC 8628), the refresh grant (RFC 6749 §6), revocation (RFC 7009),
+  token exchange (RFC 8693), JWT bearer assertions (RFC 7523), and RFC 8414
+  metadata at `/.well-known/oauth-authorization-server`.
+- Two clients are registered. `wyrd-ui`, the web app's backend-for-frontend,
+  is confidential and authenticates with `client_secret_basic`; the server
+  holds only SHA-256 digests of its secret. `wyrd-cli` is public. The
+  `wyrd-ui` redirect URI is fixed to `{public origin}/login/callback` and is
+  matched exactly.
+- An authorization code is stored by digest, expires within 60 seconds, is
+  single-use, and is bound to the client, redirect URI, PKCE challenge,
+  tenant, and principal. A device approval records only the approving
+  principal, tenant, and connection; tokens are minted when the code or
+  device code is redeemed, never stored awaiting pickup.
+- The token, platform token, revocation, and device authorization endpoints
+  take form-encoded bodies and answer RFC 6749 §5.1 and §5.2 JSON with
+  `Cache-Control: no-store`. They are the one exception to `WyrdError`
+  problem+json; the server still logs each refusal under its Wyrd error
+  code.
+- The web app keeps a person's session in one Secure, HttpOnly,
+  SameSite=Lax cookie that it encrypts and that holds the refresh token (or,
+  for operator recovery sign-in, the API key). No token reaches page data,
+  URLs, or browser JavaScript. Logout clears the cookie and revokes the
+  refresh token best-effort; it does not end the IdP session, and an access
+  token the web app already cached stays valid until it expires.
+- Interactive CLI login rate limiting is an ingress concern: deployments
+  rate-limit `POST /auth/device`, the user-code entry form, per client address
+  (RFC 8628 §5.1).
+- The deployment sealing keyring protects only stored provider and
+  workload-issuer client secrets. Wyrd stores no recoverable access token,
+  refresh token, authorization code, device code, or API key.
+
 ### Delegation and federation
 
 - Cross-service delegation uses RFC 8693 token exchange: the actor presents
@@ -214,7 +255,7 @@ credential.
   login state recorded, byte for byte, and an absent `iss` is refused when the
   provider's discovery advertises
   `authorization_response_iss_parameter_supported`. Either refusal is audited
-  as a denied exchange and stores no completion or session. Support is not
+  as a denied exchange and issues no authorization code or token. Support is not
   required to test or activate a connection, so providers that neither send
   nor advertise `iss` (Microsoft Entra ID, Okta, Auth0) still work; for them
   server-bound state, PKCE, and ID-token issuer validation are the controls.

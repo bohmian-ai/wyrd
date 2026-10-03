@@ -5,12 +5,12 @@ import { browserSessions } from '$lib/server/auth/browser-sessions';
 import { WyrdClient } from '$lib/server/wyrd';
 import { problem } from '$lib/server/problem';
 
-const loginRoute = '/t/[tenantKey]/login';
+const loginRoutes = ['/t/[tenantKey]/login', '/t/[tenantKey]/login/api-key'];
 
 export const handle: Handle = async ({ event, resolve }) => {
   event.setHeaders({ 'cache-control': 'private, no-store' });
   event.locals.mockData = mockDataEnabled(event.cookies);
-  const tenantKey = event.route.id === loginRoute ? undefined : event.params.tenantKey;
+  const tenantKey = loginRoutes.includes(event.route.id ?? '') ? undefined : event.params.tenantKey;
   if (!localAuthEnabled()) {
     event.locals.session = null;
     event.locals.sessionProblem = null;

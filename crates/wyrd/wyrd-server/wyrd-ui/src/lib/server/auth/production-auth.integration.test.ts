@@ -1,17 +1,23 @@
 // @vitest-environment node
 /**
- * Production BFF journeys over real HTTP. `identity_ui_e2e.rs` starts the Wyrd
- * server, two `node build` BFF replicas sharing one public origin, Postgres,
- * Keycloak (two realms), and Dex, then runs this file with the `WYRD_UI_JOURNEY` fixture. Every
- * request goes over the wire; nothing here mocks the BFF or the server.
+ * Production BFF journeys over real HTTP. `identity_ui_e2e.rs` starts two Wyrd
+ * server replicas over one Postgres, two `node build` BFF replicas sharing one
+ * public origin (one per server replica), Keycloak (two realms), and Dex, then
+ * runs this file with the `WYRD_UI_JOURNEY` fixture. Every request goes over
+ * the wire; nothing here mocks the BFF or the server.
+ *
+ * The BFF is the confidential OAuth client `wyrd-ui`: sign-in is the
+ * authorization code grant with PKCE, a replica that has not cached a
+ * session's access token renews it with the refresh token, and logout revokes
+ * that refresh token (RFC 7009).
  */
 import { expect, test } from 'vitest';
 
 type Journey = {
   origin: string;
-  server: string;
+  /** The Wyrd replicas, in BFF order: the server routes the gateway sends `/auth/*` to. */
+  servers: [string, string];
   bffs: [string, string];
-  serviceKey: string;
   ssoTenant: string;
   apiKeyTenant: string;
   ssoAdminKey: string;
@@ -31,10 +37,18 @@ const keycloakIssuer =
 const secondIssuer = `${keycloakIssuer.replace(/\/$/, '')}-2`;
 /** Dex: the different provider the multi-provider switch tenant signs in through. */
 const dexIssuer = process.env.WYRD_DEX_ISSUER ?? 'http://localhost:5556';
+/** A clear-text JWT (access, refresh, or ID token). A `dir` JWE has an empty second part. */
 const jwt = /eyJ[\w-]+\.[\w-]+\./;
 const sessionCookie = (tenant: string) => `wyrd_session_${tenant}`;
 /** Each journey drives many real logins, key verifications, and renewals. */
 const journeyTimeout = 60_000;
+
+/** The gateway's routing of a public-origin `/auth/*` URL to Wyrd replica `replica`. */
+function gateway(url: string, replica: 0 | 1 = 0): string {
+  const target = new URL(url);
+  expect(target.origin).toBe(journey.origin);
+  return journey.servers[replica] + target.pathname + target.search;
+}
 
 /**
  * One browser behind a load balancer: a host-only cookie jar for the public
@@ -92,12 +106,12 @@ function expectSafeCookie(raw: string): void {
   expect(raw).not.toMatch(/;\s*Domain=/i);
 }
 
-/** The session CSRF token rendered into the page's forms. */
-async function csrfOf(response: Response): Promise<string> {
-  expect(response.status).toBe(200);
-  const csrf = /name="csrf" value="([a-f0-9]{64})"/.exec(await response.text())?.[1];
-  expect(csrf, 'page renders the session CSRF token').toBeDefined();
-  return csrf!;
+/** A session cookie value is a compact `dir`/`A256GCM` JWE: no clear-text token inside. */
+function expectEncrypted(value: string): void {
+  expect(value).toMatch(/^eyJ[\w-]+\.\.[\w-]+\.[\w-]+\.[\w-]+$/);
+  const header = JSON.parse(Buffer.from(value.split('.')[0], 'base64url').toString());
+  expect(header).toEqual({ alg: 'dir', enc: 'A256GCM' });
+  expect(value).not.toMatch(jwt);
 }
 
 /**
@@ -139,7 +153,11 @@ async function providerLogin(authorization: string, user: Record<string, string>
   }
 }
 
-/** Begin SSO at one replica: sets the flow cookie and returns the provider URL. */
+/**
+ * Begin SSO at one replica: the BFF sets the login cookie and sends the
+ * browser to Wyrd's authorization endpoint (code + S256 PKCE + state), which
+ * sends it on to the tenant's provider. Returns the provider URL.
+ */
 async function beginSso(
   browser: Browser,
   replica: 0 | 1,
@@ -150,27 +168,47 @@ async function beginSso(
   expect(await page.text()).toContain('Sign in with SSO');
   const begun = await browser.go(replica, `/t/${tenant}/login?/sso`, { form: {} });
   expect(begun.status).toBe(303);
-  expectSafeCookie(browser.setCookie('wyrd_flow'));
-  const authorization = begun.headers.get('location')!;
+  expectSafeCookie(browser.setCookie('wyrd_login'));
+  expectEncrypted(browser.cookies.get('wyrd_login')!);
+  const request = new URL(begun.headers.get('location')!);
+  expect(request.origin + request.pathname).toBe(`${journey.origin}/auth/authorize`);
+  const query = request.searchParams;
+  expect(query.get('response_type')).toBe('code');
+  expect(query.get('client_id')).toBe('wyrd-ui');
+  expect(query.get('redirect_uri')).toBe(`${journey.origin}/login/callback`);
+  expect(query.get('code_challenge_method')).toBe('S256');
+  expect(query.get('code_challenge')).toMatch(/^[\w-]{43}$/);
+  expect(query.get('state')).toBeTruthy();
+  expect(query.get('tenant')).toBe(tenant);
+  const authorized = await fetch(gateway(request.toString(), replica), { redirect: 'manual' });
+  expect(authorized.status, await authorized.clone().text()).toBe(303);
+  const authorization = authorized.headers.get('location')!;
   expect(authorization.startsWith(issuer)).toBe(true);
   return authorization;
 }
 
 /**
- * Finish the provider leg the way the gateway routes it: Keycloak's callback
- * location is on the public origin, and `/auth/callback` belongs to the server.
+ * Finish the provider leg the way the gateway routes it: the provider's
+ * callback location is on the public origin, and `/auth/callback` belongs to
+ * the server, which answers with the BFF's authorization response. Returns
+ * that response's path and query on the public origin.
  */
-async function providerCallback(authorization: string, user: Record<string, string>) {
+async function providerCallback(
+  authorization: string,
+  user: Record<string, string>,
+  replica: 0 | 1 = 0
+): Promise<string> {
   const callback = new URL(await providerLogin(authorization, user));
   expect(callback.origin + callback.pathname).toBe(`${journey.origin}/auth/callback`);
-  const response = await fetch(`${journey.server}/auth/callback${callback.search}`, {
-    redirect: 'manual'
-  });
+  const response = await fetch(gateway(callback.toString(), replica), { redirect: 'manual' });
   expect(response.status, await response.clone().text()).toBe(303);
-  expect(response.headers.get('location')).toBe(`${journey.origin}/login/complete`);
+  const returned = new URL(response.headers.get('location')!);
+  expect(returned.origin + returned.pathname).toBe(`${journey.origin}/login/callback`);
+  expect(returned.searchParams.get('code')).toBeTruthy();
+  return returned.pathname + returned.search;
 }
 
-/** Full SSO sign-in: begin at `start`, complete at `finish`. */
+/** Full SSO sign-in: begin at `start`, redeem the code at `finish`; returns the session cookie. */
 async function ssoLogin(
   browser: Browser,
   user: Record<string, string>,
@@ -179,20 +217,24 @@ async function ssoLogin(
   tenant = journey.ssoTenant,
   issuer = keycloakIssuer
 ): Promise<string> {
-  await providerCallback(await beginSso(browser, start, tenant, issuer), user);
-  const done = await browser.go(finish, '/login/complete');
+  const returned = await providerCallback(await beginSso(browser, start, tenant, issuer), user, finish);
+  const done = await browser.go(finish, returned);
   expect(done.status).toBe(303);
   expect(done.headers.get('location')).toBe(`/t/${tenant}`);
-  expect(browser.cookies.has('wyrd_flow')).toBe(false);
-  return browser.cookies.get(sessionCookie(tenant))!;
+  expect(browser.cookies.has('wyrd_login')).toBe(false);
+  const session = browser.cookies.get(sessionCookie(tenant))!;
+  expectSafeCookie(browser.setCookie(sessionCookie(tenant)));
+  expectEncrypted(session);
+  return session;
 }
 
 /**
  * Replay one provider's genuine return to the common callback under another
  * login's state, as a mix-up or injection attacker would: every parameter the
  * provider sent (`code`, any RFC 9207 `iss`, and the rest) is kept and only
- * `state` is replaced. The server must refuse it, and the browser holding that
- * other login's flow gets no completion and no session.
+ * `state` is replaced. The server issues no code: it refuses that other
+ * login back to the BFF with an OAuth `error` (or rejects the request
+ * outright), and the browser holding that login gets no session.
  */
 async function expectMixedCallbackRefused(
   browser: Browser,
@@ -202,43 +244,62 @@ async function expectMixedCallbackRefused(
 ) {
   const query = new URL(providerReturn).searchParams;
   query.set('state', state);
-  const mixed = await fetch(`${journey.server}/auth/callback?${query}`, { redirect: 'manual' });
-  expect(mixed.status, await mixed.clone().text()).toBeGreaterThanOrEqual(400);
-  expect(mixed.status).toBeLessThan(500);
-  const done = await browser.go(1, '/login/complete');
-  expect(done.headers.get('location')).toBe('/?login=failed');
+  const mixed = await fetch(`${journey.servers[0]}/auth/callback?${query}`, {
+    redirect: 'manual'
+  });
+  let completion = '/login/callback';
+  if (mixed.status === 303) {
+    const returned = new URL(mixed.headers.get('location')!);
+    expect(returned.origin + returned.pathname).toBe(`${journey.origin}/login/callback`);
+    expect(returned.searchParams.get('error')).toBeTruthy();
+    expect(returned.searchParams.has('code')).toBe(false);
+    completion = returned.pathname + returned.search;
+  } else {
+    expect(mixed.status, await mixed.clone().text()).toBeGreaterThanOrEqual(400);
+    expect(mixed.status).toBeLessThan(500);
+  }
+  const done = await browser.go(1, completion);
+  expect(done.headers.get('location')).toBe(`/t/${tenant}/login?login=failed`);
   expect(browser.cookies.has(sessionCookie(tenant))).toBe(false);
 }
 
-/** The server's view of one session over the private channel, as a BFF reads it. */
-async function serverRead(sessionId: string): Promise<Response> {
-  return fetch(`${journey.server}/internal/bff/v1/sessions/read`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-wyrd-bff-key': journey.serviceKey },
-    body: JSON.stringify({ session_id: sessionId })
-  });
+/**
+ * Begin SSO for a tenant with no Active connection: Wyrd's authorization
+ * endpoint answers the BFF's callback with `access_denied`, and the BFF
+ * renders the sign-in problem page. Returns that page.
+ */
+async function providerAuthorizationDenied(browser: Browser, tenant: string): Promise<string> {
+  const begun = await browser.go(0, `/t/${tenant}/login?/sso`, { form: {} });
+  expect(begun.status).toBe(303);
+  const denied = await fetch(gateway(begun.headers.get('location')!), { redirect: 'manual' });
+  expect(denied.status).toBe(303);
+  const returned = new URL(denied.headers.get('location')!);
+  expect(returned.origin + returned.pathname).toBe(`${journey.origin}/login/callback`);
+  expect(returned.searchParams.get('error')).toBe('access_denied');
+  const done = await browser.go(1, returned.pathname + returned.search);
+  expect(done.headers.get('location')).toBe(`/t/${tenant}/login?login=failed`);
+  expect(browser.cookies.has(sessionCookie(tenant))).toBe(false);
+  const page = await browser.go(0, done.headers.get('location')!);
+  expect(page.status).toBe(200);
+  const html = await page.text();
+  expect(html).toContain('role="alert"');
+  return html;
 }
 
-/** The fields of a private-channel session read these journeys compare. */
-type SessionRead = { tenant_key: string; principal_id: string; roles: string[] };
-
-/** A session the server still honours, read over the private channel. */
-async function liveSession(sessionId: string): Promise<SessionRead> {
-  const response = await serverRead(sessionId);
-  expect(response.status).toBe(200);
-  return (await response.json()) as SessionRead;
-}
-
-/** Call a tenant `/v1` API on the server as the holder of `apiKey`. */
+/** Call a tenant `/v1` API on the server as the holder of `apiKey` (RFC 8693 exchange). */
 async function asKey(apiKey: string, method: string, path: string): Promise<Response> {
-  const token = await fetch(`${journey.server}/auth/token`, {
+  const token = await fetch(`${journey.servers[1]}/auth/token`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ grant_type: 'wyrd_api_key', api_key: apiKey })
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+      subject_token: apiKey,
+      subject_token_type: 'urn:wyrd:oauth:token-type:api_key'
+    })
   });
   expect(token.status).toBe(200);
   const { access_token } = (await token.json()) as { access_token: string };
-  return fetch(`${journey.server}/v1${path}`, {
+  return fetch(`${journey.servers[1]}/v1${path}`, {
     method,
     headers: { 'x-wyrd-access-token': `Bearer ${access_token}` }
   });
@@ -251,20 +312,34 @@ function chooserTenants(html: string): string[] {
     .sort();
 }
 
-/** The page and its data channel carry neither the session id nor any token. */
-async function expectNoSecrets(browser: Browser, tenant: string, sessionId: string) {
+/** Follow `tenant`'s home page on `replica` until it sends the browser to sign-in. */
+async function expectSessionEnds(browser: Browser, replica: 0 | 1, tenant: string) {
+  // Each BFF keeps an issued access token until its 30-second journey lifetime runs out.
+  const deadline = Date.now() + 45_000;
+  let location: string | null = null;
+  while (location === null && Date.now() < deadline) {
+    const page = await browser.go(replica, `/t/${tenant}`);
+    location = page.headers.get('location');
+    if (location === null) await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+  expect(location).toBe(`/t/${tenant}/login`);
+  expect(browser.cookies.has(sessionCookie(tenant))).toBe(false);
+}
+
+/** The page and its data channel carry neither the session cookie nor any token. */
+async function expectNoSecrets(browser: Browser, tenant: string, session: string) {
   for (const path of [`/t/${tenant}`, `/t/${tenant}/__data.json`, `/t/${tenant}/settings`]) {
     for (const replica of [0, 1] as const) {
       const response = await browser.go(replica, path);
       // Served to the session (a reader may be denied a page), never sent to sign-in.
       expect([200, 403], path).toContain(response.status);
       const body = await response.text();
-      expect(body).not.toContain(sessionId);
+      expect(body).not.toContain(session);
       expect(body).not.toMatch(jwt);
     }
   }
   for (const value of browser.seen.filter((seen) => !seen.startsWith('wyrd_'))) {
-    expect(value).not.toContain(sessionId);
+    expect(value).not.toContain(session);
     expect(value).not.toMatch(jwt);
   }
 }
@@ -273,59 +348,55 @@ test('production SSO crosses replicas', async () => {
   const sso = journey.ssoTenant;
   const settings = `/t/${sso}/settings`;
 
-  // Only the deployment BFF key opens the private channel.
-  for (const key of [undefined, 'not-the-key']) {
-    const refused = await fetch(`${journey.server}/internal/bff/v1/sessions/read`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', ...(key ? { 'x-wyrd-bff-key': key } : {}) },
-      body: JSON.stringify({ session_id: 'a'.repeat(64) })
-    });
-    expect(refused.status).toBe(401);
-  }
-
-  // Missing, forged, mismatched, and replayed flows set no session.
+  // A missing or forged login cookie redeems nothing and sets no session.
   const alice = new Browser();
   expect((await alice.go(0, `/t/${sso}`)).headers.get('location')).toBe(`/t/${sso}/login`);
-  for (const flow of [undefined, 'f'.repeat(64)]) {
-    if (flow) alice.cookies.set('wyrd_flow', flow);
-    const failed = await alice.go(1, '/login/complete');
+  for (const login of [undefined, 'f'.repeat(64)]) {
+    if (login) alice.cookies.set('wyrd_login', login);
+    const failed = await alice.go(1, '/login/callback?code=c&state=s');
     expect(failed.headers.get('location')).toBe('/?login=failed');
+    expect(alice.cookies.has('wyrd_login')).toBe(false);
     expect(alice.cookies.has(sessionCookie(sso))).toBe(false);
   }
+  // Two logins in one browser: the first login's state and verifier cannot redeem the second's code.
   await beginSso(alice, 0);
-  const firstFlow = alice.cookies.get('wyrd_flow')!;
-  await providerCallback(await beginSso(alice, 1), journey.users.admin);
-  // The provider completed the second flow; the first flow's cookie cannot redeem it.
-  const secondFlow = alice.cookies.get('wyrd_flow')!;
-  alice.cookies.set('wyrd_flow', firstFlow);
-  expect((await alice.go(0, '/login/complete')).headers.get('location')).toBe('/?login=failed');
+  const firstLogin = alice.cookies.get('wyrd_login')!;
+  const returned = await providerCallback(await beginSso(alice, 1), journey.users.admin, 1);
+  const secondLogin = alice.cookies.get('wyrd_login')!;
+  alice.cookies.set('wyrd_login', firstLogin);
+  expect((await alice.go(0, returned)).headers.get('location')).toBe(
+    `/t/${sso}/login?login=failed`
+  );
   expect(alice.cookies.has(sessionCookie(sso))).toBe(false);
 
-  // Begun at replica 0 (above), completed at replica 1.
-  alice.cookies.set('wyrd_flow', secondFlow);
-  const done = await alice.go(1, '/login/complete');
+  // Begun at replica 1 (above), redeemed at replica 0.
+  alice.cookies.set('wyrd_login', secondLogin);
+  const done = await alice.go(0, returned);
   expect(done.headers.get('location')).toBe(`/t/${sso}`);
-  const sessionId = alice.cookies.get(sessionCookie(sso))!;
-  expect(sessionId).toMatch(/^[a-f0-9]{64}$/);
+  const session = alice.cookies.get(sessionCookie(sso))!;
   expectSafeCookie(alice.setCookie(sessionCookie(sso)));
-  // The completion is one-use.
+  expectEncrypted(session);
+  // The code is one-use: its replay with the same login sets no session.
   const replay = new Browser();
-  replay.cookies.set('wyrd_flow', secondFlow);
-  expect((await replay.go(0, '/login/complete')).headers.get('location')).toBe('/?login=failed');
-  expect(replay.cookies.size).toBe(0);
+  replay.cookies.set('wyrd_login', secondLogin);
+  expect((await replay.go(1, returned)).headers.get('location')).toBe(
+    `/t/${sso}/login?login=failed`
+  );
+  expect(replay.cookies.has(sessionCookie(sso))).toBe(false);
 
-  // Both replicas serve the session, concurrently renewing the same row.
+  // Both replicas serve the session from the cookie alone: replica 1 never saw this
+  // login, so it renews the access token with the refresh token through Wyrd replica 1.
   const both = await Promise.all([alice.go(0, `/t/${sso}`), alice.go(1, `/t/${sso}`)]);
   expect(both.map((response) => response.status)).toEqual([200, 200]);
-  await expectNoSecrets(alice, sso, sessionId);
+  await expectNoSecrets(alice, sso, session);
 
-  // Forged and cross-tenant cookies are refused; the cookie name is only a hint.
+  // Forged and cross-tenant cookies are refused and cleared; the cookie name is only a hint.
   const forged = new Browser();
   forged.cookies.set(sessionCookie(sso), 'b'.repeat(64));
   expect((await forged.go(1, `/t/${sso}`)).headers.get('location')).toBe(`/t/${sso}/login`);
   expect(forged.cookies.has(sessionCookie(sso))).toBe(false);
   const crossed = new Browser();
-  crossed.cookies.set(sessionCookie(journey.apiKeyTenant), sessionId);
+  crossed.cookies.set(sessionCookie(journey.apiKeyTenant), session);
   expect((await crossed.go(0, `/t/${journey.apiKeyTenant}/settings`)).headers.get('location')).toBe(
     `/t/${journey.apiKeyTenant}/login`
   );
@@ -334,84 +405,60 @@ test('production SSO crosses replicas', async () => {
     (await alice.go(0, `/t/${journey.apiKeyTenant}/settings?/deactivate`, { form: {} })).status
   ).toBe(401);
 
-  // Actions need the session CSRF token and the public origin.
-  const csrf = await csrfOf(await alice.go(0, settings));
-  expect((await alice.go(1, `${settings}?/deactivate`, { form: {} })).status).toBe(403);
+  // A cross-site form post is refused (SvelteKit `csrf.checkOrigin`).
   expect(
-    (await alice.go(1, `${settings}?/deactivate`, { form: { csrf: 'c'.repeat(64) } })).status
-  ).toBe(403);
-  expect(
-    (
-      await alice.go(1, `${settings}?/deactivate`, {
-        form: { csrf },
-        origin: 'http://evil.test'
-      })
-    ).status
+    (await alice.go(1, `${settings}?/deactivate`, { form: {}, origin: 'http://evil.test' })).status
   ).toBe(403);
 
   // A reader signs in on the same connection and is denied the admin action.
   const bob = new Browser();
   await ssoLogin(bob, journey.users.reader, 1, 0);
-  const bobCsrf = await csrfOf(await bob.go(1, settings));
-  expect((await bob.go(0, `${settings}?/deactivate`, { form: { csrf: bobCsrf } })).status).toBe(
-    403
-  );
+  expect((await bob.go(1, settings)).status).toBe(200);
+  expect((await bob.go(0, `${settings}?/deactivate`, { form: {} })).status).toBe(403);
 
-  // Switch: a tenant without a session in this browser goes to its login; one with a session opens.
-  const toLogin = await alice.go(0, '/?/switch', {
-    form: { csrf, from: sso, tenantKey: journey.apiKeyTenant }
-  });
-  expect(toLogin.headers.get('location')).toBe(`/t/${journey.apiKeyTenant}/login`);
-  expect((await alice.go(0, '/?/switch', { form: { from: sso, tenantKey: sso } })).status).toBe(
-    403
-  );
-
-  // Logout at one replica ends the session at both; the stale cookie is cleared.
-  const second = new Browser();
-  const secondId = await ssoLogin(second, journey.users.admin, 0, 1);
-  const secondCsrf = await csrfOf(await second.go(0, settings));
-  const loggedOut = await second.go(1, '/?/logout', {
-    form: { csrf: secondCsrf, tenantKey: sso }
-  });
-  expect(loggedOut.headers.get('location')).toBe(`/t/${sso}/login`);
-  expect(second.cookies.has(sessionCookie(sso))).toBe(false);
-  second.cookies.set(sessionCookie(sso), secondId);
-  expect((await second.go(0, `/t/${sso}`)).headers.get('location')).toBe(`/t/${sso}/login`);
-  expect(second.cookies.has(sessionCookie(sso))).toBe(false);
-
-  // A tenant with SSO never accepts an API key at its sign-in page.
-  const apiKeyAtSso = new Browser();
-  const refusedKey = await apiKeyAtSso.go(0, `/t/${sso}/login?/apiKey`, {
+  // With SSO active, the recovery page still signs in with an operator key.
+  const operator = new Browser();
+  const recovered = await operator.go(0, `/t/${sso}/login/api-key`, {
     form: { apiKey: journey.ssoAdminKey }
   });
-  expect(refusedKey.status).toBe(401);
-  expect(apiKeyAtSso.cookies.has(sessionCookie(sso))).toBe(false);
+  expect(recovered.headers.get('location')).toBe(`/t/${sso}`);
+  expect((await operator.go(1, settings)).status).toBe(200);
+
+  // Switch: a tenant without a session in this browser goes to its login; one with a session opens.
+  const toLogin = await alice.go(0, '/?/switch', { form: { tenantKey: journey.apiKeyTenant } });
+  expect(toLogin.headers.get('location')).toBe(`/t/${journey.apiKeyTenant}/login`);
+  const toSso = await alice.go(1, '/?/switch', { form: { tenantKey: sso } });
+  expect(toSso.headers.get('location')).toBe(`/t/${sso}`);
+
+  // Logout revokes only this login. Two logins of the same user: the first signs out at
+  // replica 1, which revokes its refresh token and clears its cookie.
+  const first = new Browser();
+  const firstSession = await ssoLogin(first, journey.users.admin, 0, 1);
+  const second = new Browser();
+  await ssoLogin(second, journey.users.admin, 1, 0);
+  const loggedOut = await first.go(1, '/?/logout', { form: { tenantKey: sso } });
+  expect(loggedOut.headers.get('location')).toBe(`/t/${sso}/login`);
+  expect(first.cookies.has(sessionCookie(sso))).toBe(false);
+  expect((await first.go(0, `/t/${sso}`)).headers.get('location')).toBe(`/t/${sso}/login`);
+  // The revoked refresh token cannot renew: replaying the old cookie at replica 1 ends it.
+  first.cookies.set(sessionCookie(sso), firstSession);
+  expect((await first.go(1, `/t/${sso}`)).headers.get('location')).toBe(`/t/${sso}/login`);
+  expect(first.cookies.has(sessionCookie(sso))).toBe(false);
+  // The other login of the same user still renews: replica 1 has not seen it yet.
+  expect((await second.go(1, `/t/${sso}`)).status).toBe(200);
+  expect((await second.go(0, `/t/${sso}`)).status).toBe(200);
 
   // The admin may deactivate; every session on that connection then stops renewing but keeps
-  // its already-issued access token until that token's own expiry. Alice's token was just
-  // renewed by the deactivating request, so her next page still renders.
-  const deactivated = await alice.go(1, `${settings}?/deactivate`, { form: { csrf } });
+  // its already-issued access token until that token's own expiry, so the next page still renders.
+  const deactivated = await alice.go(1, `${settings}?/deactivate`, { form: {} });
   expect(deactivated.status).not.toBe(403);
   expect(deactivated.status).toBeLessThan(500);
-  const stillIssued = await alice.go(0, `/t/${sso}`);
+  const stillIssued = await alice.go(1, `/t/${sso}`);
   expect(stillIssued.status).toBe(200);
   expect(alice.cookies.has(sessionCookie(sso))).toBe(true);
   // Once each issued token expires (30-second journey lifetime), the first use ends the session.
-  for (const browser of [alice, bob]) {
-    const deadline = Date.now() + 45_000;
-    let location: string | null = null;
-    while (location === null && Date.now() < deadline) {
-      const page = await browser.go(0, `/t/${sso}`);
-      location = page.headers.get('location');
-      if (location === null) {
-        expect(page.status).toBe(200);
-        await new Promise((resolve) => setTimeout(resolve, 1_000));
-      }
-    }
-    expect(location).toBe(`/t/${sso}/login`);
-    expect(browser.cookies.has(sessionCookie(sso))).toBe(false);
-  }
-}, journeyTimeout + 60_000);
+  for (const browser of [alice, bob, second]) await expectSessionEnds(browser, 0, sso);
+}, journeyTimeout + 90_000);
 
 test('OIDC-off credential UI', async () => {
   const tenant = journey.apiKeyTenant;
@@ -419,20 +466,26 @@ test('OIDC-off credential UI', async () => {
   const settings = `/t/${tenant}/settings`;
   const browser = new Browser();
 
+  const recovery = `${login}/api-key`;
+  // Routine sign-in is SSO; the operator key form is a separate recovery page the login page links to.
   const page = await (await browser.go(0, login)).text();
-  expect(page).toContain('name="apiKey"');
-  expect(page).not.toContain('Sign in with SSO');
+  expect(page).toContain('Sign in with SSO');
+  expect(page).not.toContain('name="apiKey"');
+  expect(page).toContain(`href="${recovery}"`);
+  expect(await (await browser.go(1, recovery)).text()).toContain('name="apiKey"');
+  // Without an Active connection, SSO comes back `access_denied` to the sign-in problem page,
+  // which links to the recovery page.
+  const sso = await providerAuthorizationDenied(browser, tenant);
+  expect(sso).toContain(`href="${recovery}"`);
 
-  // Unusable keys and another tenant's key get one indistinguishable refusal.
-  for (const apiKey of ['wyrd_not_a_key', journey.ssoAdminKey]) {
-    const refused = await browser.go(1, `${login}?/apiKey`, { form: { apiKey } });
-    expect(refused.status).toBe(401);
-    expect(browser.cookies.has(sessionCookie(tenant))).toBe(false);
-  }
+  // An unusable key is refused and sets no session.
+  const refused = await browser.go(1, recovery, { form: { apiKey: 'wyrd_not_a_key' } });
+  expect(refused.status).toBe(401);
+  expect(browser.cookies.has(sessionCookie(tenant))).toBe(false);
   // A cross-site sign-in post is refused.
   expect(
     (
-      await browser.go(0, `${login}?/apiKey`, {
+      await browser.go(0, recovery, {
         form: { apiKey: journey.offReaderKey },
         origin: 'http://evil.test'
       })
@@ -440,28 +493,26 @@ test('OIDC-off credential UI', async () => {
   ).toBe(403);
 
   // A reader signs in with its key and is denied connection administration.
-  const reader = await browser.go(1, `${login}?/apiKey`, { form: { apiKey: journey.offReaderKey } });
+  const reader = await browser.go(1, recovery, { form: { apiKey: journey.offReaderKey } });
   expect(reader.headers.get('location')).toBe(`/t/${tenant}`);
   expectSafeCookie(browser.setCookie(sessionCookie(tenant)));
-  const readerId = browser.cookies.get(sessionCookie(tenant))!;
-  await expectNoSecrets(browser, tenant, readerId);
+  const readerSession = browser.cookies.get(sessionCookie(tenant))!;
+  expectEncrypted(readerSession);
+  await expectNoSecrets(browser, tenant, readerSession);
   for (const seen of browser.seen) expect(seen).not.toContain(journey.offReaderKey);
-  const readerCsrf = await csrfOf(await browser.go(0, settings));
-  expect((await browser.go(1, `${settings}?/deactivate`, { form: { csrf: readerCsrf } })).status).toBe(
-    403
-  );
   expect((await browser.go(1, `${settings}?/deactivate`, { form: {} })).status).toBe(403);
-  const out = await browser.go(0, '/?/logout', { form: { csrf: readerCsrf, tenantKey: tenant } });
+  const out = await browser.go(0, '/?/logout', { form: { tenantKey: tenant } });
   expect(out.headers.get('location')).toBe(login);
   expect(browser.cookies.has(sessionCookie(tenant))).toBe(false);
+  // Signing out of the UI never revokes the operator's API key: it still exchanges.
+  await asKey(journey.offReaderKey, 'GET', '/identity/oidc/connections');
 
   // An admin key opens the session; staging an SSO candidate is allowed.
-  const admin = await browser.go(0, `${login}?/apiKey`, { form: { apiKey: journey.offAdminKey } });
+  const admin = await browser.go(0, recovery, { form: { apiKey: journey.offAdminKey } });
   expect(admin.headers.get('location')).toBe(`/t/${tenant}`);
-  const adminCsrf = await csrfOf(await browser.go(1, settings));
+  expect((await browser.go(1, settings)).status).toBe(200);
   const staged = await browser.go(0, `${settings}?/stage`, {
     form: {
-      csrf: adminCsrf,
       revision: '',
       issuer: keycloakIssuer,
       clientId: 'wyrd-human',
@@ -476,6 +527,22 @@ test('OIDC-off credential UI', async () => {
   const stagedPage = await (await browser.go(1, settings)).text();
   expect(stagedPage).toContain('wyrd-human');
   expect(stagedPage).not.toContain(journey.offAdminKey);
+  const [stagedId] = [...stagedPage.matchAll(/name="id" value="([0-9a-f-]{36})"/g)].map(
+    ([, id]) => id
+  );
+  expect(stagedId).toBeDefined();
+
+  // Another tenant's key at this tenant's recovery page signs in as the key's own tenant:
+  // every call reaches only that tenant, so the server refuses this tenant's connection.
+  const crossed = new Browser();
+  const other = await crossed.go(1, recovery, { form: { apiKey: journey.ssoAdminKey } });
+  expect(other.headers.get('location')).toBe(`/t/${tenant}`);
+  const crossedPage = await (await crossed.go(0, settings)).text();
+  expect(crossedPage).not.toContain(stagedId);
+  const removal = await crossed.go(1, `${settings}?/remove`, { form: { id: stagedId } });
+  expect(removal.status).toBeGreaterThanOrEqual(400);
+  expect(removal.status).toBeLessThan(500);
+  expect(await (await browser.go(0, settings)).text()).toContain(stagedId);
 }, journeyTimeout);
 
 test('production multi-provider tenant switch', async () => {
@@ -483,20 +550,14 @@ test('production multi-provider tenant switch', async () => {
   const browser = new Browser();
 
   // Independent sessions for two tenants on two different real providers, in one browser.
-  const keycloakId = await ssoLogin(browser, journey.users.admin, 0, 1, keycloak);
-  const secondId = await ssoLogin(browser, journey.users.dex, 1, 0, second, dexIssuer);
-  expect(secondId).not.toBe(keycloakId);
-  expect(browser.cookies.get(sessionCookie(keycloak))).toBe(keycloakId);
-  const [keycloakSession, secondSession] = await Promise.all([
-    liveSession(keycloakId),
-    liveSession(secondId)
-  ]);
-  expect([keycloakSession.tenant_key, secondSession.tenant_key]).toEqual([keycloak, second]);
-  expect(secondSession.principal_id).not.toBe(keycloakSession.principal_id);
+  const keycloakSession = await ssoLogin(browser, journey.users.admin, 0, 1, keycloak);
+  const secondSession = await ssoLogin(browser, journey.users.dex, 1, 0, second, dexIssuer);
+  expect(secondSession).not.toBe(keycloakSession);
+  expect(browser.cookies.get(sessionCookie(keycloak))).toBe(keycloakSession);
 
-  // Both replicas render a chooser of exactly the server-verified tenants; a
-  // forged session-cookie hint never renders and is cleared. (Settings render
-  // for every member; the Dex tenant's role-less user is denied the home page.)
+  // Both replicas render a chooser of exactly this browser's sessions; a forged
+  // session-cookie hint never renders and is cleared. (Settings render for every
+  // member; the Dex tenant's role-less user is denied the home page.)
   browser.cookies.set(sessionCookie('ui-ghost'), 'd'.repeat(64));
   for (const [replica, tenant] of [
     [0, keycloak],
@@ -509,24 +570,12 @@ test('production multi-provider tenant switch', async () => {
   expect(browser.cookies.has(sessionCookie('ui-ghost'))).toBe(false);
 
   // Switching takes the target's own session on either replica.
-  const keycloakCsrf = await csrfOf(await browser.go(0, `/t/${keycloak}/settings`));
-  const secondCsrf = await csrfOf(await browser.go(1, `/t/${second}/settings`));
-  expect(secondCsrf).not.toBe(keycloakCsrf);
-  const toSecond = await browser.go(1, '/?/switch', {
-    form: { csrf: keycloakCsrf, from: keycloak, tenantKey: second }
-  });
+  const toSecond = await browser.go(1, '/?/switch', { form: { tenantKey: second } });
   expect(toSecond.status).toBe(303);
   expect(toSecond.headers.get('location')).toBe(`/t/${second}`);
   expect((await browser.go(1, `/t/${second}/settings`)).status).toBe(200);
-  const toKeycloak = await browser.go(0, '/?/switch', {
-    form: { csrf: secondCsrf, from: second, tenantKey: keycloak }
-  });
+  const toKeycloak = await browser.go(0, '/?/switch', { form: { tenantKey: keycloak } });
   expect(toKeycloak.headers.get('location')).toBe(`/t/${keycloak}`);
-  // One tenant's CSRF token does not authorize leaving another tenant.
-  const crossCsrf = await browser.go(0, '/?/switch', {
-    form: { csrf: keycloakCsrf, from: second, tenantKey: keycloak }
-  });
-  expect(crossCsrf.status).toBe(403);
 
   // Wrong provider and tenant: Dex's genuine return for the Dex tenant's login
   // cannot complete the Keycloak tenant's login, though the state is genuine.
@@ -549,30 +598,26 @@ test('production multi-provider tenant switch', async () => {
 
   // The same provider user signed in to the peer is a different tenant's
   // session: it joins this browser's chooser, but never opens the other tenant.
-  const peerId = await ssoLogin(browser, journey.users.admin, 1, 0, peer);
-  const peerSession = await liveSession(peerId);
-  expect(peerSession.tenant_key).toBe(peer);
-  expect(peerSession.principal_id).not.toBe(keycloakSession.principal_id);
+  const peerSession = await ssoLogin(browser, journey.users.admin, 1, 0, peer);
   expect(chooserTenants(await (await browser.go(1, `/t/${keycloak}/settings`)).text())).toEqual(
     [second, keycloak, peer].sort()
   );
   const crossed = new Browser();
-  crossed.cookies.set(sessionCookie(keycloak), peerId);
+  crossed.cookies.set(sessionCookie(keycloak), peerSession);
   expect((await crossed.go(0, `/t/${keycloak}`)).headers.get('location')).toBe(
     `/t/${keycloak}/login`
   );
   expect(crossed.cookies.has(sessionCookie(keycloak))).toBe(false);
-  await liveSession(peerId);
+  expect((await browser.go(0, `/t/${peer}/settings`)).status).toBe(200);
 }, journeyTimeout);
 
 test('production provider replacement settings', async () => {
   const tenant = journey.replacementTenant;
   const settings = `/t/${tenant}/settings`;
   const alice = new Browser();
-  const stage = (csrf: string) =>
+  const stage = () =>
     alice.go(0, `${settings}?/stage`, {
       form: {
-        csrf,
         revision: '',
         issuer: secondIssuer,
         clientId: 'wyrd-human',
@@ -593,20 +638,15 @@ test('production provider replacement settings', async () => {
   };
 
   // Keycloak alice administers the tenant through its Active connection.
-  const oldId = await ssoLogin(alice, journey.users.admin, 0, 1, tenant);
-  const old = await liveSession(oldId);
-  expect(old.roles).toContain('admin');
-  const csrf = await csrfOf(await alice.go(0, settings));
+  const oldSession = await ssoLogin(alice, journey.users.admin, 0, 1, tenant);
   const [oldConnection] = (await connections()).ids;
   expect(oldConnection).toBeDefined();
 
   // Stage a second-realm replacement, then remove that candidate through settings.
-  expect((await stage(csrf)).status).toBe(200);
+  expect((await stage()).status).toBe(200);
   const discarded = await connections();
   expect(discarded.ids).toHaveLength(2);
-  const removed = await alice.go(1, `${settings}?/remove`, {
-    form: { csrf, id: discarded.ids[1] }
-  });
+  const removed = await alice.go(1, `${settings}?/remove`, { form: { id: discarded.ids[1] } });
   expect(removed.status).toBe(200);
   expect((await connections()).ids).toEqual([oldConnection]);
 
@@ -614,66 +654,49 @@ test('production provider replacement settings', async () => {
   // realm for one real sign-in; its return to the server's callback marks the
   // revision tested and issues nothing. Activation demands a live recovery key
   // of this tenant: an unusable one is refused and the old connection stays Active.
-  expect((await stage(csrf)).status).toBe(200);
+  expect((await stage()).status).toBe(200);
   const { ids, revision } = await connections();
   expect(ids).toHaveLength(2);
   expect(revision).toBeDefined();
   expect(await (await alice.go(1, settings)).text()).toContain('Not tested');
-  const tested = await alice.go(0, `${settings}?/test`, { form: { csrf, revision: revision! } });
+  const tested = await alice.go(0, `${settings}?/test`, { form: { revision: revision! } });
   expect(tested.status).toBe(303);
   const testSignIn = tested.headers.get('location')!;
   expect(testSignIn.startsWith(secondIssuer)).toBe(true);
-  const testReturn = new URL(await providerLogin(testSignIn, journey.users.admin));
-  expect(testReturn.origin + testReturn.pathname).toBe(`${journey.origin}/auth/callback`);
-  const testCallback = await fetch(`${journey.server}/auth/callback${testReturn.search}`, {
-    redirect: 'manual'
-  });
+  const testReturn = await providerLogin(testSignIn, journey.users.admin);
+  expect(testReturn.startsWith(`${journey.origin}/auth/callback?`)).toBe(true);
+  const testCallback = await fetch(gateway(testReturn, 1), { redirect: 'manual' });
   expect(testCallback.status, await testCallback.clone().text()).toBe(200);
   expect(await testCallback.text()).toContain('Connection test complete');
   expect(testCallback.headers.getSetCookie()).toEqual([]);
   expect(await (await alice.go(1, settings)).text()).toContain('Passed');
   for (const recoveryApiKey of ['wyrd_not_a_key', journey.ssoAdminKey]) {
     const refused = await alice.go(1, `${settings}?/activate`, {
-      form: { csrf, revision: revision!, recoveryApiKey }
+      form: { revision: revision!, recoveryApiKey }
     });
     expect(refused.status).toBeGreaterThanOrEqual(400);
     expect(refused.status).toBeLessThan(500);
     expect((await connections()).ids).toEqual(ids);
   }
   const activated = await alice.go(0, `${settings}?/activate`, {
-    form: { csrf, revision: revision!, recoveryApiKey: journey.replacementOwnerKey }
+    form: { revision: revision!, recoveryApiKey: journey.replacementOwnerKey }
   });
   expect(activated.status).toBe(200);
   for (const seen of alice.seen) expect(seen).not.toContain(journey.replacementOwnerKey);
 
-  // The retired connection's session cannot renew: it keeps its already-issued
-  // access token until that token's expiry (30-second journey lifetime), and its
-  // first use afterwards ends it on either replica.
-  const deadline = Date.now() + 45_000;
-  let location: string | null = null;
-  while (location === null && Date.now() < deadline) {
-    const page = await alice.go(1, `/t/${tenant}`);
-    location = page.headers.get('location');
-    if (location === null) await new Promise((resolve) => setTimeout(resolve, 1_000));
-  }
-  expect(location).toBe(`/t/${tenant}/login`);
-  expect(alice.cookies.has(sessionCookie(tenant))).toBe(false);
-  alice.cookies.set(sessionCookie(tenant), oldId);
+  // The retired connection's session cannot refresh: it keeps its already-issued
+  // access token until that token's expiry, and its first use afterwards ends it
+  // on either replica.
+  await expectSessionEnds(alice, 1, tenant);
+  alice.cookies.set(sessionCookie(tenant), oldSession);
   expect((await alice.go(0, `/t/${tenant}`)).headers.get('location')).toBe(`/t/${tenant}/login`);
   expect(alice.cookies.has(sessionCookie(tenant))).toBe(false);
-  expect((await serverRead(oldId)).status).toBe(401);
 
   // The second realm's alice — same email — is a new User with none of the old authority.
   const replaced = new Browser();
-  const newId = await ssoLogin(replaced, journey.users.admin, 1, 0, tenant, secondIssuer);
-  const fresh = await liveSession(newId);
-  expect(fresh.principal_id).not.toBe(old.principal_id);
-  expect(fresh.roles).toEqual([]);
-  const freshCsrf = await csrfOf(await replaced.go(0, settings));
+  await ssoLogin(replaced, journey.users.admin, 1, 0, tenant, secondIssuer);
   for (const action of ['deactivate', 'remove']) {
-    const denied = await replaced.go(1, `${settings}?/${action}`, {
-      form: { csrf: freshCsrf, id: oldConnection }
-    });
+    const denied = await replaced.go(1, `${settings}?/${action}`, { form: { id: oldConnection } });
     expect(denied.status, action).toBe(403);
   }
 
@@ -687,9 +710,9 @@ test('production provider replacement settings', async () => {
   const retired = `/identity/oidc/connections/${oldConnection}`;
   expect((await asKey(journey.replacementOwnerKey, 'DELETE', retired)).status).toBeLessThan(300);
   expect((await asKey(journey.replacementOwnerKey, 'DELETE', retired)).status).toBe(404);
-  alice.cookies.set(sessionCookie(tenant), oldId);
+  alice.cookies.set(sessionCookie(tenant), oldSession);
   expect((await alice.go(1, `/t/${tenant}`)).headers.get('location')).toBe(`/t/${tenant}/login`);
   // Removing the retired connection leaves the replacement's session live.
   expect((await replaced.go(0, settings)).status).toBe(200);
-  await liveSession(newId);
-}, journeyTimeout);
+  expect((await replaced.go(1, settings)).status).toBe(200);
+}, journeyTimeout + 60_000);

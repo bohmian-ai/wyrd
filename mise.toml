@@ -768,7 +768,8 @@ run_ui() {
       exit 1
     fi
   done
-  if [ -n "${WYRD_IDENTITY_FILTER:-}" ]; then
+  # The host test's own name selects every UI journey it runs.
+  if [ -n "${WYRD_IDENTITY_FILTER:-}" ] && [ "$WYRD_IDENTITY_FILTER" != production_ui_bff_journey ]; then
     count="$(ui_selected_count "$WYRD_IDENTITY_FILTER")"
     if [ "$count" != 1 ]; then
       echo "WYRD_IDENTITY_FILTER=$WYRD_IDENTITY_FILTER selects $count UI tests; expected exactly 1" >&2

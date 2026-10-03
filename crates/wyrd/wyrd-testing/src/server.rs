@@ -847,6 +847,22 @@ impl WyrdTestServer {
             .await
     }
 
+    /// Start `builder` as a second replica like
+    /// [`start_replica`](Self::start_replica), then bind it to loopback
+    /// sockets so out-of-process clients reach it over HTTP.
+    ///
+    /// # Errors
+    /// Returns an error when the replica fails to start or bind.
+    pub async fn start_bound_replica(
+        &self,
+        mut builder: WyrdTestServerBuilder,
+    ) -> Result<WyrdTestServer, WyrdTestServerError> {
+        if builder.bind_addrs.is_none() {
+            builder.bind_addrs = Some((reserve_loopback_addr()?, reserve_loopback_addr()?));
+        }
+        self.start_replica(builder).await?.bind().await
+    }
+
     /// Cancel the serve task, join it in place, and return its drain outcome.
     ///
     /// Unlike [`shutdown`](Self::shutdown) and

@@ -1,12 +1,12 @@
 <script lang="ts">
   import type { PageProps } from './$types';
   import StateBlock from '$lib/components/StateBlock.svelte';
-  import logo from '../../../../../brand/logo.svg?inline';
+  import logo from '../../../../../../brand/logo.svg?inline';
   let { data, form }: PageProps = $props();
   let issue = $derived(form?.problem ?? data.problem);
 </script>
 
-<svelte:head><title>Sign in · {data.tenant.key} · Wyrd</title></svelte:head>
+<svelte:head><title>API key sign-in · {data.tenant.key} · Wyrd</title></svelte:head>
 <main class="entry">
   <div class="card">
     <header>
@@ -20,9 +20,14 @@
       </div>
     {/if}
     {#if !issue || issue.status < 500}
-      <form method="POST" action="?/sso"><button class="app-control primary wide" type="submit">Sign in with SSO</button></form>
+      <form class="api-key" method="POST">
+        <label for="api-key">API key</label>
+        <input id="api-key" class="app-input" type="password" name="apiKey" required autocomplete="off" />
+        <p>Recovery sign-in with an operator API key, for a tenant without SSO or when SSO is unavailable. This browser keeps the key only inside an encrypted, HttpOnly cookie.</p>
+        <button class="app-control primary wide" type="submit">Sign in with API key</button>
+      </form>
     {/if}
-    <a class="recovery" href="/t/{encodeURIComponent(data.tenant.key)}/login/api-key">Sign in with an API key</a>
+    <a class="back" href="/t/{encodeURIComponent(data.tenant.key)}/login">Back to SSO sign-in</a>
   </div>
 </main>
 
@@ -68,10 +73,22 @@
     text-align: center;
     overflow-wrap: anywhere;
   }
-  .recovery {
+  .api-key {
+    display: grid;
+    gap: 10px;
+  }
+  .back {
     justify-self: center;
     font: 12px var(--font-sans);
     color: var(--muted);
+  }
+  label {
+    font: 700 11px var(--font-mono);
+  }
+  p {
+    font: 12px/18px var(--font-sans);
+    color: var(--muted);
+    margin: 0;
   }
   .wide {
     width: 100%;

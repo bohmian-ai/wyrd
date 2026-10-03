@@ -33,18 +33,5 @@ export const actions: Actions = {
       return fail(cause.status, { problem: safeProblem(cause) });
     }
     redirect(303, target);
-  },
-  apiKey: async ({ params, request, cookies, url }) => {
-    let destination: string;
-    try {
-      if (localAuthEnabled()) reject('denied');
-      const apiKey = (await request.formData()).get('apiKey');
-      if (typeof apiKey !== 'string' || !apiKey || apiKey.length > 4096) reject('validation');
-      destination = await browserSessions.signInWithApiKey(params.tenantKey, apiKey, url, cookies);
-    } catch (cause) {
-      if (!isHttpError(cause)) throw cause;
-      return fail(cause.status, { problem: safeProblem(cause) });
-    }
-    redirect(303, destination);
   }
 };

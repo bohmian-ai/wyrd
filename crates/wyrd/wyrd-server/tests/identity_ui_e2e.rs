@@ -1,18 +1,20 @@
 //! Production UI identity journey host.
 //!
-//! Starts one real Wyrd server on a bound socket with the deployment BFF
-//! service key and public origin, seeds an SSO tenant (Active Keycloak
+//! Starts two real Wyrd server replicas over one Postgres on bound sockets,
+//! both registering the `wyrd-ui` confidential client secret and the shared
+//! public origin, seeds an SSO tenant (Active Keycloak
 //! connection), an OIDC-off tenant (API keys only), three switch tenants (two
 //! on the same Keycloak issuer, one on Dex, a different provider), and a
 //! provider-replacement tenant (Active first realm, replaced by the second
 //! Keycloak realm through the settings page), starts two production
-//! BFF processes (`node build`) against that same server and Postgres with the
-//! same public origin — the first over loopback HTTP, the second only through
-//! a Node TLS terminator whose certificate the repository's test CA issues and
-//! the replica trusts — and runs the Vitest HTTP journey
+//! BFF processes (`node build`) with the same public origin and client secret
+//! — the first in front of replica A over loopback HTTP, the second in front of
+//! replica B only through a Node TLS terminator whose certificate the
+//! repository's test CA issues and the BFF trusts — and runs the Vitest HTTP journey
 //! `src/lib/server/auth/production-auth.integration.test.ts` against them. The
-//! journey drives both replicas over HTTP like a browser behind a load
-//! balancer; no Vitest mock stands in for the BFF or the server.
+//! journey drives both BFFs over HTTP like a browser behind a load balancer,
+//! sending the public origin's `/auth/*` routes to either server replica as
+//! the gateway would; no Vitest mock stands in for the BFF or the server.
 //!
 //! Ignored so the family lanes, which start no identity provider or BFF, skip
 //! it visibly; `mise run test:identity:journey` builds the UI and runs it.
@@ -101,8 +103,8 @@ fn ui_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("wyrd-ui")
 }
 
-/// Start one production BFF replica against `server_url` and wait until it
-/// answers. `extra_ca` is the PEM file Node adds to its trust store, so a
+/// Start one production BFF replica against `server_url`, as the `wyrd-ui`
+/// OAuth client holding `client_secret`, and wait until it answers. `extra_ca` is the PEM file Node adds to its trust store, so a
 /// replica given the TLS terminator's `https:` origin verifies it through the
 /// ordinary native `fetch` path.
 ///
@@ -111,7 +113,7 @@ fn ui_dir() -> PathBuf {
 async fn start_bff(
     origin: &str,
     server_url: &str,
-    service_key: &str,
+    client_secret: &str,
     extra_ca: Option<&std::path::Path>,
 ) -> Bff {
     let ui = ui_dir();
@@ -131,7 +133,7 @@ async fn start_bff(
         .env("PORT", port.to_string())
         .env("ORIGIN", origin)
         .env("WYRD_SERVER_URL", server_url)
-        .env("WYRD_BFF_SERVICE_KEY", service_key)
+        .env("WYRD_UI_CLIENT_SECRET", client_secret)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -167,8 +169,8 @@ tls.createServer({ key: fs.readFileSync(env.TLS_KEY), cert: fs.readFileSync(env.
 /// issued by the repository's test certificate authority, and return it with
 /// the CA file a BFF must trust.
 ///
-/// The private BFF channel must be `https:` off loopback; this gives one
-/// replica a real trusted TLS hop to the same server.
+/// A BFF reaches Wyrd over `https:` off loopback; this gives one BFF a real
+/// trusted TLS hop to its server replica.
 ///
 /// # Panics
 /// Panics when the material cannot be minted or written, or the terminator
@@ -372,13 +374,14 @@ async fn sso_tenant(
     key
 }
 
-/// The production UI journey over two BFF replicas and one real server.
+/// The production UI journey over two BFF replicas in front of two Wyrd
+/// replicas.
 ///
-/// Access tokens live 30 seconds, inside the one-minute renewal margin, so
-/// every session read renews through the ordinary issuance path: both
-/// replicas contend for the same row lock. A deactivated connection stops
-/// renewal at once, but each session keeps its issued token until that
-/// token's stored expiry and ends at its first use afterwards.
+/// Access tokens live 30 seconds, so a BFF renews each session's cached
+/// access token with its refresh token (or API key) through the ordinary
+/// token endpoint every half minute. A deactivated or replaced connection
+/// stops renewal at once, but each BFF keeps a session's issued token until
+/// its expiry, and the first use afterwards ends the session.
 ///
 /// # Panics
 /// Panics when any setup step fails or the Vitest journey does not pass.
@@ -386,15 +389,23 @@ async fn sso_tenant(
 #[ignore = "requires Keycloak and a built UI; run via `mise run test:identity:journey`"]
 async fn production_ui_bff_journey() {
     let origin = format!("http://localhost:{}", free_port());
-    let service_key = uuid::Uuid::new_v4().simple().to_string();
-    let srv = WyrdTestServerBuilder::default()
-        .with_public_origin(origin.parse().expect("origin parses"))
-        .with_ui_client_secret(&service_key)
-        .with_access_ttl(chrono::Duration::seconds(30))
-        .start_bound()
-        .await
-        .expect("server starts");
+    let client_secret = uuid::Uuid::new_v4().simple().to_string();
+    let builder = || {
+        WyrdTestServerBuilder::default()
+            .with_public_origin(origin.parse().expect("origin parses"))
+            .with_ui_client_secret(&client_secret)
+            .with_access_ttl(chrono::Duration::seconds(30))
+    };
+    let srv = builder().start_bound().await.expect("server starts");
     let server = srv.base_url().expect("bound server has a URL").to_owned();
+    let replica = srv
+        .start_bound_replica(builder())
+        .await
+        .expect("server replica starts");
+    let replica_url = replica
+        .base_url()
+        .expect("bound replica has a URL")
+        .to_owned();
 
     let sso_admin = srv
         .bootstrap_service_in_tenant(srv.data_tenant_id(), "ui-sso-admin", &["admin"])
@@ -456,18 +467,17 @@ async fn production_ui_bff_journey() {
     )
     .await;
 
-    // Replica 0 keeps the loopback HTTP topology; replica 1 reaches the same
-    // server only through a trusted TLS origin, so every journey step it
-    // serves crosses a real TLS hop.
+    // BFF 0 reaches server replica A over loopback HTTP; BFF 1 reaches
+    // replica B only through a trusted TLS origin, so every journey step it
+    // serves crosses a real TLS hop to the other server replica.
     let material = std::env::temp_dir().join(format!("wyrd-ui-tls-{}", uuid::Uuid::new_v4()));
-    let (terminator, ca) = start_tls_terminator(&server, &material).await;
-    let first = start_bff(&origin, &server, &service_key, None).await;
-    let second = start_bff(&origin, &terminator.url, &service_key, Some(&ca)).await;
+    let (terminator, ca) = start_tls_terminator(&replica_url, &material).await;
+    let first = start_bff(&origin, &server, &client_secret, None).await;
+    let second = start_bff(&origin, &terminator.url, &client_secret, Some(&ca)).await;
     let fixture = json!({
         "origin": origin,
-        "server": server,
+        "servers": [server, replica_url],
         "bffs": [first.url, second.url],
-        "serviceKey": service_key,
         "ssoTenant": SSO_TENANT,
         "apiKeyTenant": API_KEY_TENANT,
         "ssoAdminKey": sso_admin_key,
@@ -507,6 +517,7 @@ async fn production_ui_bff_journey() {
         .expect("vitest runs");
     drop((first, second, terminator));
     let _ = std::fs::remove_dir_all(&material);
+    replica.shutdown().await.expect("server replica shuts down");
     srv.shutdown().await.expect("server shuts down");
     assert!(
         status.success(),

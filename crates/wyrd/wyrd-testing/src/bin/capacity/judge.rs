@@ -51,7 +51,7 @@ impl Judge {
     /// Returns a certificate, file, TLS configuration, or bind failure.
     pub async fn start(directory: &Path) -> Result<Self> {
         let authority = BifrostPeerCa::generate(HOST)?;
-        let leaf = authority.issue_leaf("verification-capacity-judge")?;
+        let leaf = authority.issue_leaf("capacity-judge")?;
         std::fs::create_dir_all(directory)?;
         let ca_file = directory.join("judge-ca.pem");
         std::fs::write(&ca_file, authority.ca_certificate_pem())?;

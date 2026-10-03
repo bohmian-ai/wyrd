@@ -180,8 +180,6 @@ fn value(row: u32, feature: usize) -> f64 {
 pub struct Tenant {
     /// Tenant slug.
     pub slug: String,
-    /// Data tenant id `setup` printed; never sent anywhere.
-    pub tenant_id: String,
     /// Tenant administrator credential: runs, executes, and reads back.
     pub admin_key: SecretString,
     /// The Service's Card-bound API key its application clients present.
@@ -246,7 +244,7 @@ impl Tenant {
                 "/auth/issue-key",
                 Some(&IssueKeyRequest {
                     card_ref: service.root.clone(),
-                    label: Some("verification-capacity".to_owned()),
+                    label: Some("capacity".to_owned()),
                     expires_in_seconds: None,
                 }),
             )
@@ -275,7 +273,6 @@ impl Tenant {
         }
         let mut tenant = Self {
             slug: setup.slug.clone(),
-            tenant_id: setup.tenant_id.clone(),
             admin_key: SecretString::from(setup.api_key.expose_secret().to_owned()),
             service_key: SecretString::from(issued.key.expose().to_owned()),
             bundle,

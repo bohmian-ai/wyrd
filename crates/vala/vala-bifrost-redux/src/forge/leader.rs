@@ -568,7 +568,7 @@ mod tests {
         assert!(schedule.report(
             &key("interval"),
             due[0].task_id,
-            true,
+            ForgeCompactionOutcome::Succeeded,
             start + chrono::Duration::seconds(3600)
         ));
         assert!(

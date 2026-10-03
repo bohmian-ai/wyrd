@@ -373,6 +373,39 @@ impl Forge {
         )
     }
 
+    /// Pulls at most `limit` table-level compaction tasks from the live leader.
+    ///
+    /// This is a compactor's pull: in-process when this replica holds the
+    /// term, otherwise over the peer route to the elected leader. No live or
+    /// reachable leader yields no work.
+    ///
+    /// # Errors
+    ///
+    /// Returns clock and SQL errors, and [`ForgeError::LeaderPeer`] for a
+    /// transport failure, a refusal, or a malformed task.
+    pub async fn pull_compaction(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ForgeCompactionDispatch>, ForgeError> {
+        self.leadership.pull(limit, self.core.clock.now()?).await
+    }
+
+    /// Reports one pulled task's outcome to the live leader, by the same route.
+    ///
+    /// # Errors
+    ///
+    /// Returns clock and SQL errors, and [`ForgeError::LeaderPeer`] for a
+    /// transport failure.
+    pub async fn report_compaction(
+        &self,
+        dispatch: &ForgeCompactionDispatch,
+        outcome: ForgeCompactionOutcome,
+    ) -> Result<(), ForgeError> {
+        self.leadership
+            .report(dispatch, outcome, self.core.clock.now()?)
+            .await
+    }
+
     /// Returns this Forge clock for test-only fixture reconstruction.
     #[cfg(feature = "test-support")]
     #[must_use]

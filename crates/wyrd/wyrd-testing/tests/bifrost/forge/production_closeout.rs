@@ -16,7 +16,8 @@ use rand::{RngCore, SeedableRng, rngs::StdRng};
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
 use vala_bifrost_redux::forge::{
-    ForgeConfig, ForgeHeldTerm, ForgeTableKey, ForgeWorkerCompletionObserver,
+    ForgeCompactionDispatch, ForgeCompactionOutcome, ForgeCompactionType, ForgeConfig,
+    ForgeHeldTerm, ForgeLifecycleEvent, ForgeTableKey, ForgeWorkerCompletionObserver,
 };
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::resources::{ResourceSource, SystemResourceSnapshot};
@@ -2193,6 +2194,19 @@ impl LeaderJourney {
     /// # Panics
     /// Panics if registration or the catalog property commit fails.
     async fn register_scheduled_table(&self, via: NodeId, prefix: &str) -> JourneyTable {
+        self.register_table_with(via, prefix, &[]).await
+    }
+
+    /// Registers a scheduled table with additional Forge table properties.
+    ///
+    /// # Panics
+    /// Panics if registration or the catalog property commit fails.
+    async fn register_table_with(
+        &self,
+        via: NodeId,
+        prefix: &str,
+        properties: &[(&str, &str)],
+    ) -> JourneyTable {
         let table = register_table(self.node(via), self.tenant, &unique_table(prefix)).await;
         let catalog = self.node(via).bifrost_catalog().iceberg_catalog();
         let loaded = catalog
@@ -2200,12 +2214,16 @@ impl LeaderJourney {
             .await
             .expect("scheduled table");
         let tx = Transaction::new(&loaded);
-        let tx = tx
-            .update_table_properties()
-            .set("wyrd.forge.enable-compaction".to_owned(), "true".to_owned())
-            .set(
-                "wyrd.forge.enable-manifest-rewrite".to_owned(),
-                "true".to_owned(),
+        let tx = properties
+            .iter()
+            .fold(
+                tx.update_table_properties()
+                    .set("wyrd.forge.enable-compaction".to_owned(), "true".to_owned())
+                    .set(
+                        "wyrd.forge.enable-manifest-rewrite".to_owned(),
+                        "true".to_owned(),
+                    ),
+                |update, (key, value)| update.set((*key).to_owned(), (*value).to_owned()),
             )
             .apply(tx)
             .expect("Forge table settings");
@@ -2442,6 +2460,206 @@ async fn restart_recovers_hot_promotion_with_empty_schedule() {
         term.schedule().sizes_for_test(),
         (1, 1, 1),
         "membership holds only the recovered table"
+    );
+    journey.cluster.shutdown().await.expect("cluster drains");
+}
+
+/// Compactors pull the oldest due tables on either route and both replicas work.
+///
+/// Mirrors RisingWave's compactor pull (`compactor/mod.rs:1606-1640`) and
+/// oldest-due dispatch (`schedule.rs:428-490,915-993`) at e23ddf95: a pull
+/// names only table identities, a failed delivery returns the table to Idle
+/// with its commits, and success consumes only the commits counted at
+/// dispatch. The first cluster runs coordinators without workers so every
+/// pull is the test's own; the second lets both replicas' workers pull.
+///
+/// # Panics
+/// Panics when a pull returns tables out of due order or beyond its limit,
+/// a route disagrees with the other, a report loses a commit, or the workers
+/// of only one replica execute the dispatched backlog.
+#[tokio::test]
+#[ignore = "requires Postgres and two replicas"]
+async fn compactors_pull_oldest_due_with_capacity() {
+    let due_now = [("wyrd.forge.compaction.trigger-snapshot-count", "1")];
+    let mut spec = BifrostClusterSpec::two_mixed();
+    for node in &mut spec.nodes {
+        node.roles.remove(&BifrostRuntimeRole::ForgeWorker);
+    }
+    let (first, second) = (spec.nodes[0].node_id, spec.nodes[1].node_id);
+    let journey = LeaderJourney::start(spec).await;
+    journey.pass(first).await;
+    journey.pass(second).await;
+    let (leader, _) = journey.leaders()[0];
+    let standby = if leader == first { second } else { first };
+    let forge = |node: NodeId| {
+        Arc::clone(
+            journey
+                .node(node)
+                .state()
+                .forge_coordinator()
+                .expect("coordinator"),
+        )
+    };
+    let mut keys = Vec::new();
+    let mut tables = Vec::new();
+    for index in 0..5_i64 {
+        let table = journey
+            .register_table_with(leader, "pull_due", &due_now)
+            .await;
+        journey.write_hot(leader, &table, &[index]).await;
+        journey.await_promoted(&table).await;
+        keys.push(journey.key(&table));
+        tables.push(table);
+    }
+    let pulled_keys = |dispatches: &[ForgeCompactionDispatch]| {
+        dispatches
+            .iter()
+            .map(|dispatch| dispatch.key.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // The peer route and the in-process route share one oldest-due order.
+    let peer = forge(standby).pull_compaction(2).await.expect("peer pull");
+    assert_eq!(pulled_keys(&peer), keys[..2], "the two oldest due tables");
+    assert!(
+        peer.iter()
+            .all(|dispatch| dispatch.compaction_type == ForgeCompactionType::Full),
+        "a dispatch names the table and its task type, never files: {peer:?}"
+    );
+    let local = forge(leader).pull_compaction(2).await.expect("local pull");
+    assert_eq!(pulled_keys(&local), keys[2..4], "the next two due tables");
+
+    // A failed delivery returns the table to Idle, due now, with its commit.
+    forge(standby)
+        .report_compaction(&peer[0], ForgeCompactionOutcome::NotStarted)
+        .await
+        .expect("peer report");
+    let term = journey.held(leader).expect("leader term");
+    let reverted = term.schedule().track_for_test(&keys[0]).expect("track");
+    assert_eq!((reverted.pending_commits, reverted.in_flight), (1, None));
+    let again = forge(leader).pull_compaction(4).await.expect("local pull");
+    assert_eq!(
+        pulled_keys(&again),
+        vec![keys[0].clone(), keys[4].clone()],
+        "only due Idle tables are offered, oldest due first, within the limit"
+    );
+
+    // A commit during execution survives success; a stale report is ignored.
+    journey.write_hot(leader, &tables[1], &[10]).await;
+    journey.await_promoted(&tables[1]).await;
+    forge(standby)
+        .report_compaction(&peer[1], ForgeCompactionOutcome::Succeeded)
+        .await
+        .expect("peer report");
+    let finished = term.schedule().track_for_test(&keys[1]).expect("track");
+    assert_eq!(
+        (finished.pending_commits, finished.in_flight),
+        (1, None),
+        "success consumes only the commit counted at dispatch"
+    );
+    forge(leader)
+        .report_compaction(&peer[0], ForgeCompactionOutcome::Failed)
+        .await
+        .expect("local report");
+    assert_eq!(
+        term.schedule()
+            .track_for_test(&keys[0])
+            .expect("track")
+            .in_flight,
+        Some(again[0].task_id),
+        "a report for an earlier task changes nothing"
+    );
+    journey.cluster.shutdown().await.expect("cluster drains");
+
+    // Both replicas' workers pull from the one leader and execute the backlog.
+    let journey = LeaderJourney::start(BifrostClusterSpec::two_mixed()).await;
+    let nodes = journey
+        .cluster
+        .servers()
+        .map(|server| server.node_id())
+        .collect::<Vec<_>>();
+    for node in &nodes {
+        journey.pass(*node).await;
+    }
+    let (leader, _) = journey.leaders()[0];
+    journey.observer.hold_after_claims_for_test(2);
+    let mut tables = Vec::new();
+    for index in 0..9_i64 {
+        let table = journey
+            .register_table_with(leader, "pull_work", &due_now)
+            .await;
+        journey.write_hot(leader, &table, &[index]).await;
+        tables.push(table);
+    }
+    tokio::time::timeout(PASS_BOUND, journey.observer.wait_for_claims_for_test())
+        .await
+        .expect("each replica's worker claims pulled work");
+    journey.observer.release_claims_for_test();
+    let names = tables
+        .iter()
+        .map(|table| table.name.clone())
+        .collect::<Vec<_>>();
+    let term = journey.held(leader).expect("leader term");
+    tokio::time::timeout(REWRITE_BOUND, async {
+        loop {
+            let next = journey.observer.attempts() + 1;
+            let idle = tables.iter().all(|table| {
+                term.schedule()
+                    .track_for_test(&journey.key(table))
+                    .is_some_and(|track| track.pending_commits == 0 && track.in_flight.is_none())
+            });
+            if idle {
+                break;
+            }
+            journey.observer.wait_for_attempts_at_least(next).await;
+        }
+    })
+    .await
+    .expect("the pulled backlog drains");
+    let dispatched: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT task_id, state FROM vala.forge_tasks WHERE data_tenant_id = $1 \
+         AND table_name = ANY($2) AND plan->'parameters' ? 'compaction_type'",
+    )
+    .bind(journey.tenant.as_uuid())
+    .bind(&names)
+    .fetch_all(journey.cluster.pg_fixture().operator_pool().pool())
+    .await
+    .expect("dispatched task inspection");
+    assert_eq!(
+        dispatched.len(),
+        tables.len(),
+        "one dispatched attempt per table"
+    );
+    assert!(
+        dispatched.iter().all(|(_, state)| state == "succeeded"),
+        "{dispatched:?}"
+    );
+    let dispatched = dispatched
+        .into_iter()
+        .map(|(task_id, _)| task_id)
+        .collect::<BTreeSet<_>>();
+    let workers = journey
+        .observer
+        .lifecycle_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            ForgeLifecycleEvent::Claimed { task_id, worker_id }
+                if dispatched.contains(&task_id) =>
+            {
+                Some(worker_id)
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        workers.len(),
+        2,
+        "both replicas' workers executed pulled work"
+    );
+    assert!(
+        journey.observer.returned_errors().is_empty(),
+        "{:?}",
+        journey.observer.returned_errors()
     );
     journey.cluster.shutdown().await.expect("cluster drains");
 }

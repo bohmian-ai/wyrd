@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-#[cfg(feature = "test-support")]
 use std::sync::Mutex;
 #[cfg(feature = "test-support")]
 use std::sync::atomic::AtomicBool;
@@ -41,6 +40,7 @@ use super::compact::ForgeGroupKey;
 use super::error::{ForgeError, ForgeFailureClass};
 use super::expire::ExpiryTaskAuthority;
 use super::identity::task_table_binding;
+use super::leader::{ForgeCompactionDispatch, ForgeCompactionOutcome};
 use super::lease::{ForgeLease, forge_lease_key};
 use super::metrics::{ForgeTaskResult, ForgeTelemetry};
 use super::orphan_gc::{ExpiredCleanupExemption, GcEligibility, ObjectEvidence};
@@ -48,6 +48,7 @@ use super::path::catalog_path_to_object_key;
 use super::scribe_promotion::{
     ForgePromotionCommit, ForgePromotionSettlement, PromotionPlanStatus, ScribePromotionPlan,
 };
+use super::settings::ForgeCompactionType;
 use super::{Forge, ForgeRoleReadiness};
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::forge_data_location;
@@ -58,6 +59,9 @@ use crate::catalog::layout::forge_data_location;
 /// row whose parameters describe a different workflow cannot be executed as a
 /// rewrite even if its strategy column says otherwise.
 pub(super) const LIVE_REWRITE_PARAMETER_KIND: &str = "live_rewrite";
+
+/// `RisingWave`'s compactor pull period.
+pub const DEFAULT_PULL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Everything one rewrite publication holds constant across its attempts.
 ///
@@ -727,6 +731,11 @@ pub struct ForgeWorkerConfig {
     /// Must be at least [`Self::max_task_parallelism`], otherwise the queue
     /// could not hold one maximally parallel plan.
     pub pending_task_parallelism: u32,
+    /// Minimum time between two compaction pulls from the leader.
+    ///
+    /// `RisingWave`'s compactor polls every five seconds; each pull completes
+    /// (is acknowledged) before the next is sent.
+    pub pull_interval: Duration,
 }
 
 /// One admitted rewrite attempt's publication evidence, keyed by its identities.
@@ -1874,6 +1883,7 @@ impl Default for ForgeWorkerConfig {
             per_tenant_active_cap: 1,
             max_task_parallelism: 3,
             pending_task_parallelism: 12,
+            pull_interval: DEFAULT_PULL_INTERVAL,
         }
     }
 }
@@ -1895,6 +1905,11 @@ impl ForgeWorkerConfig {
         if self.max_task_parallelism == 0 {
             return Err(ForgeError::InvalidConfig {
                 detail: "Forge compaction running parallelism must be positive".to_owned(),
+            });
+        }
+        if self.pull_interval.is_zero() {
+            return Err(ForgeError::InvalidConfig {
+                detail: "Forge compaction pull interval must be positive".to_owned(),
             });
         }
         if self.pending_task_parallelism < self.max_task_parallelism {
@@ -1971,6 +1986,8 @@ pub struct ForgeWorker {
     /// a [`tokio::runtime::Handle`] ever reaches this worker; the `Runtime`
     /// itself is owned by the server composition that outlives supervision.
     compaction_runtime: Option<tokio::runtime::Handle>,
+    /// Leader dispatches this worker accepted, by task, awaiting their report.
+    dispatched: Arc<Mutex<HashMap<Uuid, ForgeCompactionDispatch>>>,
 }
 
 impl ForgeWorker {
@@ -1995,6 +2012,7 @@ impl ForgeWorker {
             config,
             loop_handles: None,
             compaction_runtime: None,
+            dispatched: Arc::default(),
         })
     }
 
@@ -2354,6 +2372,7 @@ impl ForgeWorker {
         // two tasks claimed a moment apart compete for the same room, in the
         // order their plans were offered.
         let mut pool = ForgeAttemptPool::new(&self.config);
+        let mut next_pull = Instant::now();
         loop {
             let stranded = self.start_fitting_plans(&mut pool, &shutdown);
             for state in stranded {
@@ -2423,16 +2442,21 @@ impl ForgeWorker {
                 continue;
             }
             self.publish_readiness(true);
-            if (self.config.max_task_parallelism - pool.queue.running_parallelism_sum()).min(4) == 0
-            {
+            if self.free_pull_room(&pool) == 0 {
                 // No running parallelism remains, so this turn acquires no
                 // authority at all. Waiting plans keep their pending
                 // reservation; it does not authorize a pull.
-                Box::pin(self.await_loop_event(&mut pool, &shutdown)).await?;
+                Box::pin(self.await_loop_event(&mut pool, None, &shutdown)).await?;
                 continue;
             }
             let Some(claimed) = self
-                .pull_claimed_tasks(&mut pool, claim_limits, reserved_maintenance, &shutdown)
+                .pull_claimed_tasks(
+                    &mut pool,
+                    claim_limits,
+                    reserved_maintenance,
+                    &mut next_pull,
+                    &shutdown,
+                )
                 .await?
             else {
                 return Ok(());
@@ -2449,20 +2473,23 @@ impl ForgeWorker {
             }
             // Nothing to claim while this worker still holds work: waiting on a
             // running plan is the idle wait, because polling for new work on a
-            // timer would delay the settlement that frees its budget.
-            Box::pin(self.await_loop_event(&mut pool, &shutdown)).await?;
+            // timer would delay the settlement that frees its budget. The one
+            // timer is the leader pull, which this worker has room for.
+            Box::pin(self.await_loop_event(&mut pool, Some(next_pull), &shutdown)).await?;
         }
     }
 
     /// Claims and admits tasks for one pull turn, up to this worker's free room.
     ///
-    /// The pull budget is recomputed after every claim's plans are offered, so
-    /// a task that filled the queue ends the turn instead of letting the next
-    /// claim overcommit the same parallelism. Claims are taken one at a time
-    /// through the fair SQL selection, which is what keeps two workers from
-    /// splitting a tenant's backlog unevenly.
+    /// Durable work already queued in SQL (maintenance and retries) is taken
+    /// first through the fair claim. What room remains is offered to the
+    /// leader as one capacity pull, at most once per
+    /// [`ForgeWorkerConfig::pull_interval`]: `min(max_task_parallelism -
+    /// running parallelism, 4)` table-level tasks, as `RisingWave`'s compactor
+    /// requests. The pull budget is recomputed after every admitted task, so a
+    /// task that filled the queue ends the turn.
     ///
-    /// Returns the number of tasks claimed, or `None` when a stop signal or a
+    /// Returns the number of tasks started, or `None` when a stop signal or a
     /// test-support abandonment ended this worker's loop.
     ///
     /// # Errors
@@ -2474,13 +2501,10 @@ impl ForgeWorker {
         pool: &mut ForgeAttemptPool,
         claim_limits: ForgeClaimLimits,
         reserved_maintenance: bool,
+        next_pull: &mut Instant,
         shutdown: &CancellationToken,
     ) -> Result<Option<u32>, ForgeError> {
-        // One pull turn asks for at most
-        // the parallelism this worker still has free, and never more than four
-        // tasks.
-        let mut pending_pull_task_count =
-            (self.config.max_task_parallelism - pool.queue.running_parallelism_sum()).min(4);
+        let mut pending_pull_task_count = self.free_pull_room(pool);
         let mut claimed = 0_u32;
         while pending_pull_task_count > 0 {
             let claim = self
@@ -2491,58 +2515,274 @@ impl ForgeWorker {
                 break;
             };
             claimed += 1;
-            let started = Instant::now();
-            let active = Self::metric_strategy(&claim.strategy)
-                .map(|strategy| self.forge.core.telemetry.active_task(strategy));
-            #[cfg(feature = "test-support")]
-            let task_id = claim.task_id;
-            #[cfg(feature = "test-support")]
-            if let Some(observer) = &self.completion_observer {
-                observer.record_lifecycle(ForgeLifecycleEvent::Claimed {
-                    task_id,
-                    worker_id: self.owner,
-                });
-            }
-            #[cfg(feature = "test-support")]
-            if let Some(observer) = &self.completion_observer {
-                observer.pause_after_claim_for_test().await;
-                if observer.abandon_claim_for_test(&claim, self.owner) {
-                    return Ok(None);
-                }
-            }
-            if shutdown.is_cancelled() {
-                self.release_claim_at_shutdown(&claim, started).await?;
+            if self.start_claim(claim, pool, shutdown).await?.is_none() {
                 return Ok(None);
-            }
-            #[cfg(feature = "test-support")]
-            let strategy = claim.strategy.clone();
-            let open = Self::open_claim_episode(claim, started, active);
-            match self.begin_claim_episode(open, shutdown, pool).await {
-                // The attempt's plans are on the queue; it settles when they drain.
-                ClaimStep::Admitted => {}
-                ClaimStep::Closed(result) => {
-                    #[cfg(feature = "test-support")]
-                    self.observe_settled_claim(task_id, &strategy, &result)
-                        .await;
-                    result?;
-                }
             }
             // This claim consumed one unit of the turn's allowance, and the
             // remainder is clamped to the room recomputed after its plans were
             // offered. Consuming the unit is what bounds one turn to four
             // tasks even when no plan has started yet.
-            pending_pull_task_count = pending_pull_task_count.saturating_sub(1).min(
-                (self.config.max_task_parallelism - pool.queue.running_parallelism_sum()).min(4),
-            );
+            pending_pull_task_count = pending_pull_task_count
+                .saturating_sub(1)
+                .min(self.free_pull_room(pool));
+        }
+        if pending_pull_task_count == 0 || Instant::now() < *next_pull || shutdown.is_cancelled() {
+            return Ok(Some(claimed));
+        }
+        *next_pull = Instant::now() + self.config.pull_interval;
+        let dispatches = match self
+            .forge
+            .pull_compaction(usize::try_from(pending_pull_task_count).unwrap_or(usize::MAX))
+            .await
+        {
+            Ok(dispatches) => dispatches,
+            Err(error) => {
+                tracing::warn!(worker = %self.owner, error = %error, "Forge compaction pull failed; retrying at the next pull");
+                Vec::new()
+            }
+        };
+        let mut dispatches = dispatches.into_iter();
+        while let Some(dispatch) = dispatches.next() {
+            match self
+                .admit_dispatch(dispatch, pool, claim_limits, shutdown)
+                .await?
+            {
+                Some(true) => claimed += 1,
+                Some(false) => {}
+                None => {
+                    for undelivered in dispatches {
+                        self.report_dispatch(&undelivered, ForgeCompactionOutcome::NotStarted)
+                            .await;
+                    }
+                    return Ok(None);
+                }
+            }
         }
         Ok(Some(claimed))
     }
 
-    /// Waits for the next plan completion or stop signal.
+    /// Returns how many tasks one pull may request now.
+    ///
+    /// `RisingWave`'s formula: running parallelism still free, capped at four.
+    /// Waiting plans have their own pending budget and do not reduce it.
+    fn free_pull_room(&self, pool: &ForgeAttemptPool) -> u32 {
+        (self.config.max_task_parallelism - pool.queue.running_parallelism_sum()).min(4)
+    }
+
+    /// Opens and starts one durable claim, from the fair claim or a dispatch.
+    ///
+    /// Returns `None` when a stop signal or a test-support abandonment ended
+    /// this worker's loop before the claim started.
+    ///
+    /// # Errors
+    ///
+    /// Returns the slot-fatal failures of the claim's episode.
+    async fn start_claim(
+        &self,
+        claim: ForgeTaskClaim,
+        pool: &mut ForgeAttemptPool,
+        shutdown: &CancellationToken,
+    ) -> Result<Option<()>, ForgeError> {
+        let started = Instant::now();
+        let active = Self::metric_strategy(&claim.strategy)
+            .map(|strategy| self.forge.core.telemetry.active_task(strategy));
+        #[cfg(feature = "test-support")]
+        let task_id = claim.task_id;
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = &self.completion_observer {
+            observer.record_lifecycle(ForgeLifecycleEvent::Claimed {
+                task_id,
+                worker_id: self.owner,
+            });
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = &self.completion_observer {
+            observer.pause_after_claim_for_test().await;
+            if observer.abandon_claim_for_test(&claim, self.owner) {
+                return Ok(None);
+            }
+        }
+        if shutdown.is_cancelled() {
+            self.release_claim_at_shutdown(&claim, started).await?;
+            return Ok(None);
+        }
+        #[cfg(feature = "test-support")]
+        let strategy = claim.strategy.clone();
+        let open = Self::open_claim_episode(claim, started, active);
+        match self.begin_claim_episode(open, shutdown, pool).await {
+            // The attempt's plans are on the queue; it settles when they drain.
+            ClaimStep::Admitted => {}
+            ClaimStep::Closed(result) => {
+                #[cfg(feature = "test-support")]
+                self.observe_settled_claim(task_id, &strategy, &result)
+                    .await;
+                result?;
+            }
+        }
+        Ok(Some(()))
+    }
+
+    /// Turns one leader dispatch into this worker's own claimed attempt.
+    ///
+    /// The worker loads the current table and binds the attempt to its head:
+    /// every live data file is the attempt's input bound, and the managed
+    /// planner chooses the files to rewrite from that same head when the
+    /// attempt runs. A table with no live data reports success without a
+    /// rewrite. A table that already has an active or queued attempt reports
+    /// the dispatch not started, so the leader keeps its commits and offers
+    /// it again on a later pull.
+    ///
+    /// Returns `Some(true)` when an attempt started, `Some(false)` when the
+    /// dispatch was answered without one, and `None` when the worker stopped.
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQL failure recording the attempt and the slot-fatal
+    /// failures of its episode.
+    async fn admit_dispatch(
+        &self,
+        dispatch: ForgeCompactionDispatch,
+        pool: &mut ForgeAttemptPool,
+        claim_limits: ForgeClaimLimits,
+        shutdown: &CancellationToken,
+    ) -> Result<Option<bool>, ForgeError> {
+        if shutdown.is_cancelled() {
+            self.report_dispatch(&dispatch, ForgeCompactionOutcome::NotStarted)
+                .await;
+            return Ok(None);
+        }
+        let task = match self.dispatch_envelope(&dispatch).await {
+            Ok(Some(task)) => task,
+            Ok(None) => {
+                self.report_dispatch(&dispatch, ForgeCompactionOutcome::Succeeded)
+                    .await;
+                return Ok(Some(false));
+            }
+            Err(error) => {
+                tracing::warn!(task_id = %dispatch.task_id, table = %dispatch.key.table.table, error = %error, "Forge could not load a dispatched table");
+                self.report_dispatch(&dispatch, ForgeCompactionOutcome::Failed)
+                    .await;
+                return Ok(Some(false));
+            }
+        };
+        let claimed = self
+            .tasks
+            .insert_claimed(
+                dispatch.task_id,
+                &task,
+                self.owner,
+                claim_limits.lease_seconds,
+            )
+            .await;
+        let claim = match claimed {
+            Ok(Some(claim)) => claim,
+            Ok(None) => {
+                self.report_dispatch(&dispatch, ForgeCompactionOutcome::NotStarted)
+                    .await;
+                return Ok(Some(false));
+            }
+            Err(error) => {
+                self.report_dispatch(&dispatch, ForgeCompactionOutcome::NotStarted)
+                    .await;
+                return Err(ForgeError::Sql(error));
+            }
+        };
+        ForgeTelemetry::record_task_created(task.strategy);
+        self.dispatched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(dispatch.task_id, dispatch);
+        Ok(self
+            .start_claim(claim, pool, shutdown)
+            .await?
+            .map(|()| true))
+    }
+
+    /// Builds the attempt envelope for one dispatched table from its head.
+    ///
+    /// Returns `None` when the table has no snapshot or no live data file.
+    ///
+    /// # Errors
+    ///
+    /// Returns the binding, catalog and manifest-read failures.
+    async fn dispatch_envelope(
+        &self,
+        dispatch: &ForgeCompactionDispatch,
+    ) -> Result<Option<NewForgeTask>, ForgeError> {
+        let binding = task_table_binding(
+            dispatch.key.tenant,
+            dispatch.key.tenant,
+            &dispatch.key.table,
+        )?;
+        let table = self.forge.load_table(&binding.table_ident()).await?;
+        let Some(snapshot) = table.metadata().current_snapshot() else {
+            return Ok(None);
+        };
+        let manifests = table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .map_err(ForgeError::Catalog)?;
+        let mut live = std::collections::BTreeMap::new();
+        for manifest_file in manifests.entries() {
+            let manifest = manifest_file
+                .load_manifest(table.file_io())
+                .await
+                .map_err(ForgeError::Catalog)?;
+            for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                let file = entry.data_file();
+                if file.content_type() == iceberg::spec::DataContentType::Data {
+                    live.insert(file.file_path().to_owned(), file.file_size_in_bytes());
+                }
+            }
+        }
+        if live.is_empty() {
+            return Ok(None);
+        }
+        let bytes = live.values().copied().fold(0_u64, u64::saturating_add);
+        let plan = vala_sql::row_types::forge_tasks::ForgeTaskPlan {
+            version: vala_sql::row_types::forge_tasks::FORGE_TASK_PAYLOAD_VERSION,
+            inputs: live.into_keys().collect(),
+            parameters: serde_json::json!({
+                "kind": LIVE_REWRITE_PARAMETER_KIND,
+                "compaction_type": dispatch.compaction_type.as_str(),
+            }),
+        };
+        Ok(Some(NewForgeTask {
+            data_tenant_id: dispatch.key.tenant,
+            table_ref: dispatch.key.table.clone(),
+            strategy: ForgeTaskStrategy::SmallFiles,
+            base_snapshot_id: snapshot.snapshot_id(),
+            plan_hash: super::planner::plan_hash(&plan)?,
+            estimates: vala_sql::row_types::forge_tasks::ForgeTaskEstimates {
+                files: u32::try_from(plan.inputs.len()).unwrap_or(u32::MAX),
+                bytes: bytes.max(1),
+            },
+            plan,
+            ready_at: None,
+        }))
+    }
+
+    /// Reports one dispatch's outcome to the leader; failures are logged.
+    ///
+    /// A lost report costs nothing durable: the leader's report deadline
+    /// makes the table eligible again.
+    async fn report_dispatch(
+        &self,
+        dispatch: &ForgeCompactionDispatch,
+        outcome: ForgeCompactionOutcome,
+    ) {
+        if let Err(error) = self.forge.report_compaction(dispatch, outcome).await {
+            tracing::warn!(task_id = %dispatch.task_id, ?outcome, error = %error, "Forge compaction report was not delivered");
+        }
+    }
+
+    /// Waits for the next plan completion, stop signal, or due pull.
     ///
     /// This is the loop's only wait once it holds work. A completion is
     /// recorded and, when it drained its attempt, settled or released; a stop
-    /// signal returns so the caller re-reads it.
+    /// signal or the `pull_at` instant (when this worker has room to pull)
+    /// returns so the caller re-reads its state.
     ///
     /// # Errors
     ///
@@ -2551,10 +2791,18 @@ impl ForgeWorker {
     async fn await_loop_event(
         &self,
         pool: &mut ForgeAttemptPool,
+        pull_at: Option<Instant>,
         shutdown: &CancellationToken,
     ) -> Result<(), ForgeError> {
+        let pull_due = async {
+            match pull_at {
+                Some(at) => tokio::time::sleep_until(at.into()).await,
+                None => std::future::pending().await,
+            }
+        };
         let completion = tokio::select! {
             () = shutdown.cancelled() => None,
+            () = pull_due => None,
             completion = pool.completion_rx.recv() => completion,
         };
         if let Some(completion) = completion
@@ -2681,7 +2929,7 @@ impl ForgeWorker {
             }
             return Ok(());
         }
-        Box::pin(self.await_loop_event(pool, shutdown)).await
+        Box::pin(self.await_loop_event(pool, None, shutdown)).await
     }
 
     /// Publishes this loop's readiness, when it is running under a role handle.
@@ -3564,6 +3812,20 @@ impl ForgeWorker {
         if outcome.is_err() {
             self.close_after_fatal();
         }
+        let dispatch = self
+            .dispatched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&claim.task_id);
+        if let Some(dispatch) = dispatch {
+            let reported = match &outcome {
+                Ok(settled) if settled.result == Some(ForgeTaskResult::Succeeded) => {
+                    ForgeCompactionOutcome::Succeeded
+                }
+                _ => ForgeCompactionOutcome::Failed,
+            };
+            self.report_dispatch(&dispatch, reported).await;
+        }
         #[cfg(feature = "test-support")]
         if outcome.is_err()
             && let Some(observer) = &self.completion_observer
@@ -4300,6 +4562,18 @@ impl ForgeWorker {
             }
             ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry) => {
                 ForgeSnapshotExpiryIntent::parse(&task.strategy, parameters).is_some()
+            }
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles) => {
+                parameters.get("kind").and_then(Value::as_str) == Some(expected_kind)
+                    && match parameters.get("compaction_type") {
+                        None => parameters.len() == 1,
+                        Some(raw) => {
+                            parameters.len() == 2
+                                && raw
+                                    .as_str()
+                                    .is_some_and(|raw| ForgeCompactionType::parse(raw).is_ok())
+                        }
+                    }
             }
             _ => {
                 parameters.get("kind").and_then(Value::as_str) == Some(expected_kind)
@@ -8798,6 +9072,7 @@ mod tests {
             per_tenant_active_cap: 8,
             max_task_parallelism: 2,
             pending_task_parallelism: 8,
+            ..ForgeWorkerConfig::default()
         }
         .validate()
         .expect("a per-tenant cap above running parallelism is legal");
@@ -8808,6 +9083,7 @@ mod tests {
             per_tenant_active_cap: 1,
             max_task_parallelism: 8,
             pending_task_parallelism: 32,
+            ..ForgeWorkerConfig::default()
         }
         .validate()
         .expect("a per-tenant cap below running parallelism is legal");

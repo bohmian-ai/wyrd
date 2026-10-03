@@ -1149,8 +1149,9 @@ pub async fn compose_bifrost(
 /// Every bound comes from values the immutable [`ResourcePlan`] already
 /// resolved, so a node cannot admit compaction work its own resource plan did
 /// not reserve. Memory is not bounded here: each rewrite charges the shared
-/// governor through its own pool. Running parallelism is three units per effective CPU, matching upstream's
-/// task multiplier over its detected worker threads, and waiting parallelism is
+/// governor through its own pool. Running parallelism is twelve units per
+/// effective CPU, `RisingWave`'s Iceberg-mode compactor multiplier over its
+/// worker threads (`ceil(effective_cpu × 12)`), and waiting parallelism is
 /// four times that, so a burst of planned work queues rather than being refused
 /// while earlier plans still run. Tenant fairness is unrelated to either and
 /// stays with the SQL fair claim.
@@ -1160,13 +1161,14 @@ fn forge_compaction_worker_config(
     plan: &vala_bifrost_redux::resources::ResourcePlan,
     forge_runtime: &crate::config::ForgeRuntimeConfig,
 ) -> ForgeWorkerConfig {
-    let max_task_parallelism = u32::try_from(plan.effective_cpu.saturating_mul(3))
+    let max_task_parallelism = u32::try_from(plan.effective_cpu.saturating_mul(12))
         .unwrap_or(u32::MAX)
         .max(1);
     ForgeWorkerConfig {
         per_tenant_active_cap: forge_runtime.resolved_per_tenant_active_cap(),
         max_task_parallelism,
         pending_task_parallelism: max_task_parallelism.saturating_mul(4),
+        ..ForgeWorkerConfig::default()
     }
 }
 

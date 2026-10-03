@@ -14,7 +14,10 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use iceberg::Catalog;
-use vala_bifrost_redux::forge::{ForgeClock, ForgeObjectStore};
+use vala_bifrost_redux::forge::{
+    ForgeClock, ForgeCompactionOutcome, ForgeCompactionType, ForgeObjectStore, ForgeTableKey,
+};
+use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
 
 use super::rewrite_support::PromotedRewriteFixture;
 use super::support::{
@@ -22,86 +25,35 @@ use super::support::{
     PromotionIntegrationFixture, SupervisedPromotion, manual_clock,
 };
 
-/// Asserts the settled table carries exactly one fully bound rewrite task.
-///
-/// The binding is the whole point of the enqueue: a worker may only claim a
-/// task whose base snapshot, input identities, and canonical plan hash were
-/// durable before the claim, so all of that is checked here against the table's
-/// live cut. Returns the bound task's identity so the caller can prove a second
-/// scheduling pass reuses it.
-async fn assert_one_bound_rewrite(fixture: &PromotionIntegrationFixture) -> uuid::Uuid {
-    let live = fixture.live_data_paths().await;
-    let current = fixture
-        .catalog
-        .iceberg_catalog()
-        .load_table(&fixture.binding.table_ident())
-        .await
-        .expect("the promoted fixture table")
-        .metadata()
-        .current_snapshot_id()
-        .expect("the promoted table has a current snapshot");
-    let rewrites = fixture
-        .forge_tasks()
-        .await
-        .into_iter()
-        .filter(|task| task.strategy == "small_files")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        rewrites.len(),
-        1,
-        "a settled table plans exactly one rewrite: {rewrites:?}"
-    );
-    let rewrite = &rewrites[0];
-    assert_eq!(
-        rewrite.state, "ready",
-        "the bound rewrite is schedulable and unclaimed"
-    );
-    assert_eq!(
-        rewrite.base_snapshot_id, current,
-        "the rewrite is bound to the snapshot it was planned against"
-    );
-    assert_eq!(
-        rewrite.plan_hash.len(),
-        32,
-        "the durable plan carries its canonical hash"
-    );
-    let inputs = rewrite
-        .plan
-        .get("inputs")
-        .and_then(serde_json::Value::as_array)
-        .expect("the durable plan binds its inputs")
-        .iter()
-        .map(|input| {
-            input
-                .as_str()
-                .expect("a plan input is an object path")
-                .to_owned()
-        })
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        inputs, live,
-        "the rewrite binds exactly the live data files it was planned over"
-    );
-    rewrite.task_id
+/// Builds the leader-schedule key of the fixture's one table.
+fn table_key(fixture: &PromotionIntegrationFixture) -> ForgeTableKey {
+    ForgeTableKey {
+        tenant: fixture.tenant,
+        table: ForgeTaskTableIdentity::new(
+            "wyrd-redux",
+            fixture.binding.table_ref.namespace.as_str(),
+            &fixture.binding.table_ref.name,
+        )
+        .expect("fixture table identity"),
+    }
 }
 
-/// Dispatch is authorized twice: at planning, and again before any effect.
+/// Dispatch is authorized twice: at the leader, and again before any effect.
 ///
 /// The scheduling half and the publication half are one rule — a rewrite acts
-/// only while it still holds the authority it was planned under — so they share
-/// one scenario.
+/// only while it still holds the authority it was dispatched under — so they
+/// share one scenario.
 ///
-/// Planning first. A table that still owes Scribe a publication must not start
+/// Dispatch first. A table that still owes Scribe a publication must not start
 /// a rewrite, or the rewrite would reason about a live set that is about to
-/// change underneath it, so the pass that sees both promotes and binds
-/// nothing else. Once nothing is owed, the pass binds exactly one rewrite task,
-/// and it binds it completely: the base snapshot, the exact input identities,
-/// and the canonical plan hash are all durable before any worker can claim it.
-/// A second pass over the same unchanged table must add nothing, because the
-/// table may carry only one active publication attempt at a time.
+/// change underneath it, so the pass that promotes binds nothing else. Once
+/// the promotion commits, the leader offers exactly one table-level dispatch
+/// naming the table and its compaction type — never files — and offers no
+/// second one while that dispatch is in flight, because the table may carry
+/// only one active publication attempt at a time.
 ///
-/// Then publication. A bound task's plan is evidence, not standing permission:
-/// the table stays open to every other writer while managed execution runs. So
+/// Then publication. A dispatch is evidence, not standing permission: the
+/// table stays open to every other writer while managed execution runs. So
 /// each held-authority phase mutates the real owner of one authority dimension
 /// at the only point where the distinction is observable — outputs exist,
 /// nothing has been derived, audited, or submitted — and requires the attempt
@@ -126,8 +78,7 @@ async fn rewrite_scheduler_dispatches_only_after_promotion_and_authority() {
         "the rewrite route starts from a promoted live set: {promoted:?}"
     );
 
-    // Promotion outranks the rewrite debt that live set already owes: the
-    // leader's pass that promotes the new hot objects binds no rewrite.
+    // The leader's pass that promotes the new hot objects binds no rewrite.
     fixture.seal_more(2).await;
     supervisor.schedule_only().await;
     let planned = fixture.forge_tasks().await;
@@ -142,33 +93,36 @@ async fn rewrite_scheduler_dispatches_only_after_promotion_and_authority() {
         "the pass promoted every outstanding hot object"
     );
 
-    // With nothing owed, one pass binds exactly one fully bound rewrite task.
-    supervisor.schedule_only().await;
-    let bound = assert_one_bound_rewrite(&fixture).await;
-
-    // The same table cannot acquire a second active publication attempt.
-    supervisor.schedule_only().await;
-    let after = fixture
-        .forge_tasks()
+    // The promotion commit made the table due: one dispatch names the table
+    // and its type, and a second pull offers nothing while it is in flight.
+    let forge = supervisor.forge();
+    let dispatches = forge.pull_compaction(4).await.expect("leader pull");
+    assert_eq!(
+        dispatches
+            .iter()
+            .map(|dispatch| (dispatch.key.clone(), dispatch.compaction_type))
+            .collect::<Vec<_>>(),
+        vec![(table_key(&fixture), ForgeCompactionType::Full)],
+        "one table-level dispatch of the default type: {dispatches:?}"
+    );
+    assert!(
+        forge
+            .pull_compaction(4)
+            .await
+            .expect("leader pull")
+            .is_empty(),
+        "an in-flight table is not dispatched twice"
+    );
+    forge
+        .report_compaction(&dispatches[0], ForgeCompactionOutcome::NotStarted)
         .await
-        .into_iter()
-        .filter(|task| task.strategy == "small_files")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        after.len(),
-        1,
-        "a second pass over an unchanged table binds no second rewrite: {after:?}"
-    );
-    assert_eq!(
-        after[0].task_id, bound,
-        "the idempotent enqueue keeps the identity the first pass bound"
-    );
+        .expect("leader report");
     supervisor.shutdown().await;
 
     assert_eq!(
         object_store.output_writers(),
         0,
-        "planning a rewrite writes no object"
+        "dispatching a rewrite writes no object"
     );
     assert!(
         !telemetry

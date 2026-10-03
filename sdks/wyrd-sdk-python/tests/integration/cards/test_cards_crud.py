@@ -9,8 +9,10 @@ from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
 
+import httpx
 import pandas as pd
 import pytest
+import yaml
 from sklearn.linear_model import LogisticRegression
 from wyrd import WyrdError
 from wyrd.cards import (
@@ -477,8 +479,44 @@ _REPO = Path(__file__).parents[5]
 _FIXTURES = _REPO / "tests" / "fixtures" / "workflow-loading"
 
 
-def _uids(receipt) -> dict[str, str]:
-    return {outcome.card_ref.name: outcome.card_ref.uid for outcome in receipt.outcomes}
+def _refs(receipt) -> dict[str, dict[str, str]]:
+    """Exact reference of every Card a receipt registered, keyed by name, as wire JSON."""
+    return {
+        outcome.card_ref.name: {
+            "kind": outcome.card_ref.kind.name,
+            "name": outcome.card_ref.name,
+            "version": outcome.card_ref.version,
+            "space": outcome.card_ref.space,
+            "uid": outcome.card_ref.uid,
+        }
+        for outcome in receipt.outcomes
+    }
+
+
+def _access_token(wyrd_server, api_key: str) -> str:
+    """Exchange an API key for a Wyrd access token through the public auth route."""
+    response = httpx.post(
+        f"{wyrd_server.base_url}/auth/token",
+        json={"grant_type": "wyrd_api_key", "api_key": api_key},
+    )
+    response.raise_for_status()
+    return response.json()["access_token"]
+
+
+def _envelope(wyrd_server, token: str, ref: dict[str, str]) -> dict:
+    """Read one registered Card envelope through the public HTTP route."""
+    response = httpx.get(
+        f"{wyrd_server.base_url}/v1/cards/by-uid/{ref['kind']}/{ref['uid']}",
+        headers={"x-wyrd-access-token": f"Bearer {token}"},
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["card"]
+
+
+def _outbound(card: dict) -> list[dict[str, str]]:
+    """Server-derived outbound relationship targets of a Card envelope, by name."""
+    targets = [relationship["ref"] for relationship in card["relationships"]["outbound_refs"]]
+    return sorted(targets, key=lambda target: target["name"])
 
 
 # The fixture Prompts send their Native Chat request to the built-in `mock`
@@ -527,8 +565,8 @@ def test_workflow_loading_journey(wyrd_server, tmp_path: Path, monkeypatch) -> N
     assert unavailable.value.code == "WYRD_WORKFLOW_503_BINDING_UNAVAILABLE"
 
     # 2. The team registers its reviewer Agents.
-    team = _uids(writer.register_from_path(_FIXTURES / "team" / "security.yaml"))
-    team.update(_uids(writer.register_from_path(_FIXTURES / "team" / "correctness.yaml")))
+    team = _refs(writer.register_from_path(_FIXTURES / "team" / "security.yaml"))
+    team.update(_refs(writer.register_from_path(_FIXTURES / "team" / "correctness.yaml")))
 
     # 3. A file referencing registered Agents needs a credential that can read them.
     mixed = _FIXTURES / "mixed" / "workflow.yaml"
@@ -557,8 +595,8 @@ def test_workflow_loading_journey(wyrd_server, tmp_path: Path, monkeypatch) -> N
     }
 
     # 5. A reference to a deleted Card is refused.
-    retired = _uids(writer.register_from_path(_FIXTURES / "retired" / "retired-prompt.yaml"))
-    writer.prompt.delete(uid=retired["retired-prompt"])
+    retired = _refs(writer.register_from_path(_FIXTURES / "retired" / "retired-prompt.yaml"))
+    writer.prompt.delete(uid=retired["retired-prompt"]["uid"])
     with pytest.raises(WyrdError) as inactive:
         Workflow.from_path(_FIXTURES / "retired" / "workflow.yaml")
     assert inactive.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"
@@ -566,18 +604,34 @@ def test_workflow_loading_journey(wyrd_server, tmp_path: Path, monkeypatch) -> N
     # 6. Apply the mixed Workflow, register a newer security Agent, then load
     #    the applied Workflow by identity and by UID: both stay pinned to 1.0.0
     #    and never run the newer Prompt ("v2 security review of diff").
-    workflow_uid = _uids(writer.register_from_path(mixed))["code-review"]
-    newer = _uids(writer.register_from_path(_FIXTURES / "team-v2" / "security.yaml"))
+    refs = {**team, **_refs(writer.register_from_path(mixed))}
+    workflow_uid = refs["code-review"]["uid"]
+    writer.register_from_path(_FIXTURES / "team-v2" / "security.yaml")
+    agents = [refs["security-reviewer"], refs["correctness-reviewer"], refs["final-reviewer"]]
+
+    # The Python SDK has no generic Card envelope read, so the public HTTP
+    # route shows the stored spec references and server-derived relationships.
+    token = _access_token(wyrd_server, reader_key)
+    stored = _envelope(wyrd_server, token, refs["code-review"])
+    assert [step["action"]["target"] for step in stored["spec"]["steps"]] == agents
+    assert _outbound(stored) == sorted(agents, key=lambda agent: agent["name"])
+    for agent, prompt in [
+        ("security-reviewer", "security-review-prompt"),
+        ("correctness-reviewer", "correctness-review-prompt"),
+        ("final-reviewer", "final-review-prompt"),
+    ]:
+        stored_agent = _envelope(wyrd_server, token, refs[agent])
+        assert stored_agent["spec"]["prompt"] == refs[prompt], agent
+        assert _outbound(stored_agent) == [refs[prompt]], agent
+
     by_identity = reader.workflow.load(
         space="workflow-loading", name="code-review", version="1.0.0"
     )
     by_uid = reader.workflow.load(uid=workflow_uid)
     for workflow in [by_identity, by_uid]:
         assert workflow.version == "1.0.0"
-        stored = workflow.to_yaml()
-        assert team["security-reviewer"] in stored
-        assert team["correctness-reviewer"] in stored
-        assert newer["security-reviewer"] not in stored
+        loaded = yaml.safe_load(workflow.to_yaml())
+        assert [step["action"]["target"] for step in loaded["spec"]["steps"]] == agents
         run = workflow.run({"code": "diff"})
         assert run.status == "succeeded"
         assert run.outputs == {"review": _REGISTERED_REVIEW}
@@ -592,7 +646,7 @@ def test_workflow_loading_journey(wyrd_server, tmp_path: Path, monkeypatch) -> N
     assert mixed_selector.value.code == "WYRD_WORKFLOW_400_INVALID_CARD_REF"
     # An Agent's UID names no Workflow.
     with pytest.raises(WyrdError) as wrong_kind:
-        reader.workflow.load(uid=team["security-reviewer"])
+        reader.workflow.load(uid=team["security-reviewer"]["uid"])
     assert wrong_kind.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"
     with pytest.raises(WyrdError) as unauthorized:
         no_roles.workflow.load(uid=workflow_uid)

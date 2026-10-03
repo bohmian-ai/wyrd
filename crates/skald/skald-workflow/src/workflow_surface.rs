@@ -532,10 +532,34 @@ impl Workflow {
 
     /// Run with explicit execution dependencies, limits, and cancellation.
     ///
+    /// Equivalent to [`prepare`](Self::prepare) followed by
+    /// [`PreparedWorkflowRun::execute`] with no transition observer. Once
+    /// execution starts, step failures, cancellation, deadline expiry, and
+    /// size limits are reported in the returned [`WorkflowRun`], never as an
+    /// error.
+    ///
+    /// # Errors
+    /// Returns the errors of [`prepare`](Self::prepare).
+    pub async fn run_with_options(
+        &self,
+        dependencies: &WorkflowExecutionDependencies,
+        input: impl Into<WorkflowInput>,
+        options: WorkflowRunOptions,
+    ) -> WorkflowResult<WorkflowRun> {
+        Ok(self
+            .prepare(dependencies, input, options)?
+            .execute(|_| {})
+            .await)
+    }
+
+    /// Prepare one run without dispatching any step.
+    ///
     /// Every validation, input, route, binding-availability, and size check
-    /// runs before any step is dispatched. Once execution starts, step
-    /// failures, cancellation, deadline expiry, and size limits are reported
-    /// in the returned [`WorkflowRun`], never as an error.
+    /// runs here; the run ID is minted and the absolute total deadline is
+    /// fixed from now. The returned run holds the queued snapshot and starts
+    /// only when [`PreparedWorkflowRun::execute`] is awaited; dropping it
+    /// dispatches nothing. Cancellation flows only through
+    /// `options.cancellation`.
     ///
     /// # Errors
     /// Returns the errors of [`validate`](Self::validate), and
@@ -544,12 +568,12 @@ impl Workflow {
     /// `WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED`, or
     /// `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` for invalid input or an
     /// environment that cannot serve the declared routes.
-    pub async fn run_with_options(
+    pub fn prepare(
         &self,
         dependencies: &WorkflowExecutionDependencies,
         input: impl Into<WorkflowInput>,
         options: WorkflowRunOptions,
-    ) -> WorkflowResult<WorkflowRun> {
+    ) -> WorkflowResult<PreparedWorkflowRun> {
         let plan = ExecutionPlan::build(
             &self.spec,
             &self.resolved_agents,
@@ -568,7 +592,7 @@ impl Workflow {
             .unwrap_or_else(|| "workflow".to_owned());
         let executor =
             WorkflowExecutor::new(workflow_id, workflow, plan, dependencies.native(), options)?;
-        Ok(executor.execute().await)
+        Ok(PreparedWorkflowRun { executor })
     }
 
     fn append_agent_step(&mut self, agent: Agent, deps: Vec<String>) -> WorkflowResult<String> {
@@ -641,6 +665,39 @@ impl Workflow {
             a_key.cmp(&b_key)
         });
         self.cascade_children.dedup();
+    }
+}
+
+/// One prepared Workflow run that has passed every pre-dispatch check.
+///
+/// Created by [`Workflow::prepare`]. It owns the run's plan, minted run ID,
+/// and queued snapshot; nothing is dispatched until
+/// [`execute`](Self::execute) is awaited.
+pub struct PreparedWorkflowRun {
+    /// Executor holding the plan, ledger, limits, and cancellation.
+    executor: WorkflowExecutor,
+}
+
+impl PreparedWorkflowRun {
+    /// The queued snapshot, carrying the run ID the terminal snapshot keeps.
+    #[must_use]
+    pub fn snapshot(&self) -> &WorkflowRun {
+        self.executor.snapshot()
+    }
+
+    /// Execute the run to its terminal snapshot.
+    ///
+    /// `on_transition` is called synchronously on the scheduling task with
+    /// the complete snapshot after the run starts and after every step starts
+    /// or settles; it must not block or await. The terminal snapshot is
+    /// returned, not observed. Never fails: step, cancellation, deadline, and
+    /// size outcomes are recorded in the returned snapshot. Dropping the
+    /// future aborts the in-flight step tasks.
+    pub async fn execute<F>(self, on_transition: F) -> WorkflowRun
+    where
+        F: FnMut(&WorkflowRun) + Send,
+    {
+        self.executor.execute(on_transition).await
     }
 }
 

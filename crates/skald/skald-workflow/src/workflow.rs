@@ -197,13 +197,23 @@ impl WorkflowExecutor {
         })
     }
 
+    /// The queued snapshot this executor will run.
+    pub(crate) fn snapshot(&self) -> &WorkflowRun {
+        self.ledger.snapshot()
+    }
+
     /// Execute the run to a terminal snapshot inside its `workflow.run` span.
     ///
     /// Never fails after preparation: step, cancellation, deadline, and size
     /// outcomes are all recorded in the returned snapshot. The span records
     /// the terminal status and, for an unsuccessful run, the primary error
-    /// code.
-    pub(crate) async fn execute(self) -> WorkflowRun {
+    /// code. `on_transition` receives the complete non-terminal snapshot
+    /// after every ledger transition, on the scheduling task, so it must not
+    /// block; the terminal snapshot is only returned.
+    pub(crate) async fn execute<F>(self, mut on_transition: F) -> WorkflowRun
+    where
+        F: FnMut(&WorkflowRun) + Send,
+    {
         let span = info_span!(
             "workflow.run",
             wyrd.workflow.id = %self.workflow_id,
@@ -213,7 +223,10 @@ impl WorkflowExecutor {
             error.r#type = field::Empty,
             otel.status_code = field::Empty,
         );
-        let run = self.drive().instrument(span.clone()).await;
+        let run = self
+            .drive(&mut on_transition)
+            .instrument(span.clone())
+            .await;
         span.record("wyrd.workflow.status", status_name(run.status));
         if let Some(error) = &run.error {
             span.record("error.type", error.code.as_str());
@@ -227,11 +240,16 @@ impl WorkflowExecutor {
     /// Schedule, settle, and terminalize the run.
     ///
     /// Step tasks inherit the current `workflow.run` span so their attempt
-    /// spans are its children.
-    async fn drive(mut self) -> WorkflowRun {
+    /// spans are its children. `on_transition` observes the snapshot after
+    /// the run starts and after each step starts or settles.
+    async fn drive<F>(mut self, on_transition: &mut F) -> WorkflowRun
+    where
+        F: FnMut(&WorkflowRun) + Send,
+    {
         let deadline = self.deadline;
         let cancellation = self.options.cancellation.clone();
         self.ledger.start();
+        on_transition(self.ledger.snapshot());
         let mut tasks: JoinSet<StepReport> = JoinSet::new();
         let mut running: HashMap<Id, usize> = HashMap::new();
         let mut stopping = false;
@@ -255,6 +273,7 @@ impl WorkflowExecutor {
                 match self.bind(index) {
                     Ok(pairs) => {
                         self.ledger.step_started(index);
+                        on_transition(self.ledger.snapshot());
                         let task = StepTask {
                             plan: Arc::clone(&self.plan),
                             index,
@@ -277,6 +296,7 @@ impl WorkflowExecutor {
                             wyrd_spec::card::workflow::WorkflowRunError::from_wyrd(&error),
                             1,
                         );
+                        on_transition(self.ledger.snapshot());
                         stopping = true;
                     }
                 }
@@ -307,6 +327,7 @@ impl WorkflowExecutor {
                 continue;
             };
             stopping |= self.settle(index, report);
+            on_transition(self.ledger.snapshot());
         }
         self.ledger.finish(ending, &self.plan)
     }
@@ -733,6 +754,70 @@ mod tests {
             )
             .await
             .expect("workflow passes pre-dispatch validation")
+    }
+
+    /// Preparing a run checks it and mints its ID without dispatching any
+    /// step; execution reports complete snapshots under that ID after every
+    /// transition and ends with the same ID.
+    #[tokio::test(start_paused = true)]
+    async fn prepared_run_keeps_its_id() {
+        let workflow = Workflow::builder("prepared")
+            .add(agent("first", "first static", None))
+            .and_then(|b| b.add_after(agent("second", "second static", None), ["first"]))
+            .and_then(|b| b.with_outputs(bindings(&[("text", "steps.second.output.text")])))
+            .and_then(|b| b.build())
+            .expect("prepared workflow builds");
+        let provider = ScriptedProvider::new();
+        provider.on("first static", vec![Reply::Text("one".to_owned())]);
+        provider.on("second static", vec![Reply::Text("two".to_owned())]);
+        let dependencies = WorkflowExecutionDependencies::new(provider.registry());
+
+        let prepared = workflow
+            .prepare(
+                &dependencies,
+                serde_json::Map::new(),
+                WorkflowRunOptions::default(),
+            )
+            .expect("workflow passes pre-dispatch validation");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(provider.requests().is_empty(), "prepare dispatches nothing");
+        let queued = prepared.snapshot().clone();
+        assert_eq!(queued.status, WorkflowRunStatus::Queued);
+        assert_eq!(queued.steps.len(), 2, "the queued snapshot is complete");
+
+        let mut observed = Vec::new();
+        let run = prepared
+            .execute(|snapshot| observed.push(snapshot.clone()))
+            .await;
+
+        assert_eq!(run.status, WorkflowRunStatus::Succeeded);
+        assert_eq!(
+            run.run_id, queued.run_id,
+            "the terminal run keeps the queued ID"
+        );
+        assert_eq!(provider.requests().len(), 2);
+        let transitions: Vec<_> = observed
+            .iter()
+            .map(|snapshot| {
+                assert_eq!(snapshot.run_id, queued.run_id);
+                assert_eq!(snapshot.status, WorkflowRunStatus::Running);
+                (
+                    snapshot.steps["first"].status,
+                    snapshot.steps["second"].status,
+                )
+            })
+            .collect();
+        assert_eq!(
+            transitions,
+            [
+                (WorkflowStepStatus::Pending, WorkflowStepStatus::Pending),
+                (WorkflowStepStatus::Running, WorkflowStepStatus::Pending),
+                (WorkflowStepStatus::Succeeded, WorkflowStepStatus::Pending),
+                (WorkflowStepStatus::Succeeded, WorkflowStepStatus::Running),
+                (WorkflowStepStatus::Succeeded, WorkflowStepStatus::Succeeded),
+            ],
+            "every transition is observed as a complete snapshot"
+        );
     }
 
     /// Scenario 2: parallel steps with the same output key stay namespaced;

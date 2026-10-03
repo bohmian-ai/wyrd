@@ -111,6 +111,11 @@ impl RunLedger {
         &self.run.run_id
     }
 
+    /// The complete current snapshot, consistent between transitions.
+    pub(crate) fn snapshot(&self) -> &WorkflowRun {
+        &self.run
+    }
+
     /// Mark the run started.
     pub(crate) fn start(&mut self) {
         self.run.status = WorkflowRunStatus::Running;

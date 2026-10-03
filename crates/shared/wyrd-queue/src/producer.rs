@@ -679,7 +679,8 @@ impl Producer {
 /// attempts. Intake never awaits the network: while attempts are in flight
 /// the task keeps taking admitted records into staging and sealing batches
 /// into the outbox. Staging seals when its JSON bytes reach the message
-/// ceiling or when the linger since its first row elapses. Batches carry no
+/// ceiling, or when the linger since its first row has elapsed and a send
+/// slot is free, so batches grow while every slot is busy. Batches carry no
 /// order relative to one another. After a shutdown that could not settle
 /// everything, the task keeps retrying retained batches and serving controls
 /// until a later shutdown succeeds or the handle drops.
@@ -772,7 +773,7 @@ impl Task {
                         return None;
                     }
                 },
-                () = sleep_until(self.linger_deadline), if self.linger_deadline.is_some() => {
+                () = sleep_until(self.linger_deadline), if can_send && self.linger_deadline.is_some() => {
                     self.pump();
                 },
                 () = sleep_until(retry_due), if can_send && retry_due.is_some() => {
@@ -793,17 +794,19 @@ impl Task {
 
     /// Seals staging that is due and starts every send a slot allows.
     ///
-    /// Staging is due once its bytes reach the message ceiling, its linger
-    /// elapses, or the linger is zero; otherwise the linger starts with its
-    /// first row. A seal refused for frame space restores its rows and is
+    /// Staging seals once its bytes reach the message ceiling, or once its
+    /// linger has elapsed (or is zero) and a send slot is free. While every
+    /// slot is busy an elapsed linger stays armed and staging keeps growing,
+    /// so the next settle seals the accumulated rows as one larger batch;
+    /// otherwise the linger starts with the first staged row. A seal refused for frame space restores its rows and is
     /// retried on the next pass. Sends start, retained batches whose backoff
     /// elapsed first, until `max_in_flight` attempts are running.
     fn pump(&mut self) {
         if self.queue.staging_len() > 0 {
             let now = Instant::now();
-            if self.queue.staging_full()
-                || self.linger.is_zero()
-                || self.linger_deadline.is_some_and(|deadline| deadline <= now)
+            let lingered = self.linger.is_zero()
+                || self.linger_deadline.is_some_and(|deadline| deadline <= now);
+            if self.queue.staging_full() || (lingered && self.in_flight.len() < self.max_in_flight)
             {
                 self.linger_deadline = None;
                 match self.queue.seal() {
@@ -1419,7 +1422,9 @@ mod tests {
         producer
             .enqueue(br#"{"id":1}"#.to_vec(), Some(card()), None)
             .expect("row admitted");
-        attempted.recv().expect("the immediate seal reaches the sink");
+        attempted
+            .recv()
+            .expect("the immediate seal reaches the sink");
 
         let first = producer.flush();
         assert!(
@@ -1490,7 +1495,9 @@ mod tests {
         )
         .expect("producer starts");
         let settle = |expected: u64| {
-            wait_until("lost rows settle", || lost.load(Ordering::Acquire) >= expected);
+            wait_until("lost rows settle", || {
+                lost.load(Ordering::Acquire) >= expected
+            });
         };
 
         sink.terminal_next(1);
@@ -1622,11 +1629,12 @@ mod tests {
         assert_eq!(budget.used_bytes(), 0, "shutdown settles every reservation");
     }
 
-    /// While sends stall, at most `max_in_flight` run at once, sealed
-    /// batches queue behind them, and intake keeps admitting far more rows
-    /// than any fixed slot count; every row then drains on release.
+    /// While sends stall, at most `max_in_flight` run at once and intake
+    /// keeps admitting far more rows than any fixed slot count. A due linger
+    /// does not seal while every slot is busy, so the rows admitted behind
+    /// the stalled sends accumulate and leave as one batch on release.
     #[test]
-    fn stalled_sends_bound_concurrency_but_never_admission() {
+    fn stalled_sends_bound_concurrency_and_grow_the_next_batch() {
         let sink = Arc::new(TimeoutSink::default());
         let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
         let producer = Producer::with_budget(
@@ -1642,25 +1650,39 @@ mod tests {
             budget.clone(),
         )
         .expect("producer starts");
-        for record in 0..3 {
+        for record in 0..2 {
             producer
                 .enqueue_rows(rows(1), Some(card()), None)
                 .unwrap_or_else(|error| panic!("record {record} admitted: {error}"));
-            wait_until("each record seals at once", || {
-                budget.metrics().live_batches == record + 1
+            wait_until("each record seals while a slot is free", || {
+                sink.attempted() == record + 1
             });
         }
-        assert_eq!(sink.attempted(), 2, "two sends in flight, one waiting");
         for _ in 0..1_000 {
             producer
                 .enqueue_rows(rows(1), Some(card()), None)
                 .expect("admission never waits on stalled sends");
         }
+        wait_until("rows behind busy slots stay staged", || {
+            producer.counters.staged.load(Ordering::Acquire) == 1_000
+        });
+        assert_eq!(
+            budget.metrics().live_batches,
+            2,
+            "nothing sealed while slots are busy"
+        );
         sink.release();
-        producer.shutdown().expect("released sink drains every batch");
-        assert_eq!(producer.metrics().accepted, 1_003);
+        producer
+            .shutdown()
+            .expect("released sink drains every batch");
+        assert_eq!(sink.attempted(), 3, "the staged rows leave as one batch");
+        assert_eq!(producer.metrics().accepted, 1_002);
         assert_eq!(producer.metrics().dropped, 0);
-        assert_eq!(sink.peak.load(Ordering::Acquire), 2, "never above max_in_flight");
+        assert_eq!(
+            sink.peak.load(Ordering::Acquire),
+            2,
+            "never above max_in_flight"
+        );
         assert_eq!(budget.used_bytes(), 0, "shutdown settles every reservation");
     }
 
@@ -1703,7 +1725,11 @@ mod tests {
         ));
         assert_eq!(budget.used_bytes(), blocked, "no row kept its bytes");
         drop(blocker);
-        assert_eq!(producer.metrics().accepted, 0, "refused records admit no prefix");
+        assert_eq!(
+            producer.metrics().accepted,
+            0,
+            "refused records admit no prefix"
+        );
         assert_eq!(producer.metrics().dropped, oversized_count + 9);
         producer
             .enqueue_rows(rows(9), Some(card()), None)

@@ -8,7 +8,6 @@
 
 use std::time::Duration;
 
-use chrono::Utc;
 use serde::Serialize;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -17,7 +16,7 @@ use wyrd_client::state::WyrdState;
 use wyrd_testing::release_server::{LocalServer, Metrics};
 
 use crate::Result;
-use crate::fixture::{Tenant, window};
+use crate::fixture::Tenant;
 use crate::proxy::DelayProxy;
 
 /// Numeric features, and so durable rows, of one observation (AC-041).
@@ -87,9 +86,9 @@ pub struct Record {
     pub drain_seconds: f64,
     /// Rows the admitted observations land.
     pub expected_rows: u64,
-    /// Rows durable in the step's window.
+    /// Rows durable under the step's own `run_id`.
     pub durable_rows: u64,
-    /// `record_id`s in the window whose row count is not [`FEATURES`].
+    /// The step's `record_id`s whose row count is not [`FEATURES`].
     pub uneven_records: u64,
     /// Frames the server's Gate accepted during the step.
     pub batches: f64,
@@ -199,7 +198,6 @@ impl Bench<'_> {
             .await?;
         let model = state.run_for_card("model")?;
 
-        let start = Utc::now() - chrono::TimeDelta::milliseconds(500);
         let server_before = ServerSnapshot::take(self.server).await?;
         let client_cpu_before = client_cpu_seconds()?;
         let stop = CancellationToken::new();
@@ -236,15 +234,15 @@ impl Bench<'_> {
         state.shutdown().await?;
         drop(proxy);
 
-        let end = Utc::now() + chrono::TimeDelta::milliseconds(500);
+        let own_rows = format!("run_id = '{}'", model.run_id().as_str());
         let expected_rows = admitted * FEATURES as u64;
-        let durable_rows = self.durable(&window(start, end), expected_rows).await?;
+        let durable_rows = self.durable(&own_rows, expected_rows).await?;
         let uneven_records = self
             .tenant
             .count(&format!(
                 "SELECT COUNT(*) AS n FROM (SELECT record_id FROM vala.drift.observations \
                  WHERE {} GROUP BY record_id HAVING COUNT(*) <> {FEATURES}) AS uneven",
-                window(start, end)
+                own_rows
             ))
             .await?;
         let server_after = ServerSnapshot::take(self.server).await?;

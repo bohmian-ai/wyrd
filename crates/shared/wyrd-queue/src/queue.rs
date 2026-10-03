@@ -902,7 +902,9 @@ mod tests {
         assert!(queue.seal_and_send().await.is_err());
         let after = Instant::now();
         let backoff = retry_backoff(sink.attempted()[0], 0);
-        let due = queue.next_retry_due().expect("the ambiguous batch is retained");
+        let due = queue
+            .next_retry_due()
+            .expect("the ambiguous batch is retained");
         assert!(due >= before + backoff && due <= after + backoff);
         assert_eq!(budget.metrics().retry_entries, 1);
     }

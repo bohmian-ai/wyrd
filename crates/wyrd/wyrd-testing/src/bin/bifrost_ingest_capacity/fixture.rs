@@ -9,7 +9,6 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
 use reqwest::Method;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
@@ -110,18 +109,6 @@ impl Tenant {
             _ => Err(format!("`{sql}` returned {} rows", rows.len()).into()),
         }
     }
-}
-
-/// The `WHERE` clause selecting the Drift rows created in `[start, end)`.
-///
-/// Steps never overlap, so each step's window holds exactly its own rows.
-pub fn window(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
-    let format = "%Y-%m-%d %H:%M:%S%.6f";
-    format!(
-        "created_at >= TIMESTAMP '{}' AND created_at < TIMESTAMP '{}'",
-        start.format(format),
-        end.format(format)
-    )
 }
 
 /// A public client of [`SERVER_URL`] presenting `credential`, with its gRPC

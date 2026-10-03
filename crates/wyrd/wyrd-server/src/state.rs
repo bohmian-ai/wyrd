@@ -2164,6 +2164,8 @@ pub struct AppState {
     /// inside the shutdown deadline, so accepted calls keep their accounting
     /// evidence.
     pub gateway_tasks: tokio_util::task::TaskTracker,
+    /// Accepted Workflow runs of this process and their admission.
+    pub workflows: Arc<crate::components::workflow::WorkflowRuns>,
     /// Register the test-support MCP context probe in the `/mcp` tool catalog.
     ///
     /// Default `false`: only a test server that explicitly opted in through
@@ -2234,9 +2236,13 @@ impl AppState {
             auth: ServerAuth::default(),
             authz: ServerAuthz::default(),
             deployment_profile: DeploymentProfile::Development,
-            shutdown_token,
+            shutdown_token: shutdown_token.clone(),
             mcp_tasks: tokio_util::task::TaskTracker::new(),
             gateway_tasks: tokio_util::task::TaskTracker::new(),
+            workflows: Arc::new(crate::components::workflow::WorkflowRuns::new(
+                crate::config::ServerWorkflowConfig::default(),
+                &shutdown_token,
+            )),
             #[cfg(feature = "test-support")]
             mcp_context_probe: false,
             #[cfg(feature = "test-support")]
@@ -2370,6 +2376,19 @@ impl AppState {
     #[must_use]
     pub fn with_gateway_engine(mut self, engine: GatewayEngine) -> Self {
         self.gateway_engine = Arc::new(engine);
+        self
+    }
+
+    /// Replace the Workflow run owner with one built from `config`.
+    ///
+    /// Call during composition, before any run is admitted; the new owner's
+    /// admission closes with this state's shutdown token.
+    #[must_use]
+    pub fn with_workflow_config(mut self, config: crate::config::ServerWorkflowConfig) -> Self {
+        self.workflows = Arc::new(crate::components::workflow::WorkflowRuns::new(
+            config,
+            &self.shutdown_token,
+        ));
         self
     }
 

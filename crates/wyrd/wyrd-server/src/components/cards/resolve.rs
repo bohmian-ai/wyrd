@@ -5,6 +5,7 @@ use std::collections::{BTreeSet, HashMap};
 use serde_json::json;
 use skald_workflow::{Workflow, card_body_dependencies};
 use wyrd_semver::VersionSpec;
+use wyrd_spec::AgentSpec;
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::data::{ArrowFormat, DataInterface};
 use wyrd_spec::card::drift::DriftSignal;
@@ -556,8 +557,7 @@ impl PinnedWorkflowGraph {
     /// after completed reads.
     ///
     /// # Errors
-    /// Returns `WYRD_WORKFLOW_422_RUN_REQUEST` when `workflow_ref` names no
-    /// space; `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no Workflow exists at
+    /// Returns the reference errors of [`Self::check_ref`]; `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no Workflow exists at
     /// that identity or UID; `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` when
     /// the root or a dependency is not active, names a path or sibling, or
     /// its bound UID names another identity; `WYRD_WORKFLOW_413_GRAPH_TOO_LARGE`
@@ -568,12 +568,7 @@ impl PinnedWorkflowGraph {
         workflow_ref: &CardRef,
         bounds: GraphBounds,
     ) -> Result<Self, WyrdError> {
-        if workflow_ref.kind != CardKind::Workflow || workflow_ref.space.is_none() {
-            return Err(WyrdError::WorkflowRunRequest {
-                message: "workflow must be a Workflow CardRef with an explicit space".to_owned(),
-                details: json!({ "field": "workflow" }),
-            });
-        }
+        Self::check_ref(workflow_ref)?;
         let root = active_row(conn, workflow_ref).await?;
         let workflow = WorkflowCard::from_envelope(row_card(root))?;
         let steps = workflow.spec.steps.len();
@@ -590,6 +585,12 @@ impl PinnedWorkflowGraph {
             ));
         }
         let mut charged = jcs_len(&workflow.spec);
+        if charged > bounds.max_bytes {
+            return Err(graph_too_large(
+                "max_resolved_graph_bytes",
+                bounds.max_bytes,
+            ));
+        }
         let mut bodies = HashMap::new();
         let mut pending = card_body_dependencies(&Spec::Workflow(workflow.spec.clone()));
         while let Some(dependency) = pending.pop() {
@@ -618,9 +619,37 @@ impl PinnedWorkflowGraph {
         Ok(Self { workflow, bodies })
     }
 
+    /// Check that `workflow_ref` can name a pinnable Workflow: a Workflow
+    /// reference with an explicit space.
+    ///
+    /// Request parsing calls this before any authorization decision so a
+    /// malformed reference is refused as request shape; [`Self::pin`] calls it
+    /// again because it reads by that space.
+    ///
+    /// # Errors
+    /// Returns `WYRD_WORKFLOW_422_RUN_REQUEST` naming `workflow` for another
+    /// kind or a reference without a space.
+    pub(crate) fn check_ref(workflow_ref: &CardRef) -> Result<(), WyrdError> {
+        if workflow_ref.kind != CardKind::Workflow || workflow_ref.space.is_none() {
+            return Err(WyrdError::WorkflowRunRequest {
+                message: "workflow must be a Workflow CardRef with an explicit space".to_owned(),
+                details: json!({ "field": "workflow" }),
+            });
+        }
+        Ok(())
+    }
+
     /// The pinned root Workflow Card.
     pub(crate) fn workflow(&self) -> &WorkflowCard {
         &self.workflow
+    }
+
+    /// Every pinned Agent spec the Workflow's steps reference.
+    pub(crate) fn agents(&self) -> impl Iterator<Item = &AgentSpec> {
+        self.bodies.values().filter_map(|spec| match spec {
+            Spec::Agent(agent) => Some(agent),
+            _ => None,
+        })
     }
 
     /// Return the pinned spec an external reference names by its exact

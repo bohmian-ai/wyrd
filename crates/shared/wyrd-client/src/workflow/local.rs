@@ -112,7 +112,9 @@ impl SelectedRoutes {
 
 /// Resolve one configured binding's secret headers.
 ///
-/// Each secret is read by the shared [`read_secret_ref`] on the blocking
+/// Local runs resolve the bindings their routes select from shared
+/// configuration; the server resolves the tenant-assigned bindings an
+/// accepted run selects. Each secret is read by the shared [`read_secret_ref`] on the blocking
 /// pool, under its owner-only, bounded file rule, one header at a time.
 ///
 /// On error or when the future is dropped, earlier headers' secrets may
@@ -123,7 +125,7 @@ impl SelectedRoutes {
 /// # Errors
 /// Returns `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` for an invalid header name
 /// or an unreadable secret.
-async fn resolve_binding(
+pub async fn resolve_binding(
     name: &CredentialBindingName,
     config: &ExternalGatewayBindingConfig,
 ) -> Result<ExternalGatewayBinding, WyrdError> {

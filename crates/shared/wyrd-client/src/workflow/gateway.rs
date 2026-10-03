@@ -154,26 +154,22 @@ impl Ingress {
 
     /// Normalize a refusal in this protocol's error envelope.
     ///
-    /// Only the status, the envelope's stable Wyrd code, its message when that
-    /// code is present, and `OpenAI`'s `param` are kept. An answer without a
-    /// Wyrd code, such as a relayed provider refusal, gets the provider status
-    /// code and a fixed message, so no upstream text is retained.
+    /// Only the status, the envelope's stable Wyrd code, and `OpenAI`'s
+    /// `param` are kept. A recognized code takes its message and remediation
+    /// from the Wyrd error catalog, never from the body, because a relayed
+    /// provider envelope can carry a Wyrd-looking code beside upstream text.
+    /// An answer without a Wyrd code gets the provider status code and a
+    /// fixed message, so no upstream text is retained.
     fn problem(self, status: StatusCode, body: &[u8]) -> RemoteProblem {
-        let (message, code, field) = match self {
+        let (code, field) = match self {
             Self::OpenAiChat | Self::OpenAiResponses => {
                 serde_json::from_slice::<OpenAiErrorEnvelope>(body)
                     .ok()
-                    .map(|envelope| {
-                        (
-                            envelope.error.message,
-                            envelope.error.code,
-                            envelope.error.param,
-                        )
-                    })
+                    .map(|envelope| (envelope.error.code, envelope.error.param))
             }
             Self::AnthropicMessages => serde_json::from_slice::<AnthropicErrorEnvelope>(body)
                 .ok()
-                .map(|envelope| (envelope.error.message, envelope.error.code, None)),
+                .map(|envelope| (envelope.error.code, None)),
             Self::GeminiGenerateContent => serde_json::from_slice::<GoogleErrorEnvelope>(body)
                 .ok()
                 .map(|envelope| {
@@ -183,25 +179,32 @@ impl Ingress {
                         .into_iter()
                         .next()
                         .map(|info| info.reason);
-                    (envelope.error.message, code, None)
+                    (code, None)
                 }),
         }
         .unwrap_or_default();
+        let fixed_message = format!("Wyrd gateway answered HTTP {}", status.as_u16());
         match code.filter(|code| WyrdError::codes().contains(&code.as_str())) {
-            Some(code) => RemoteProblem {
-                remediation: WyrdError::from_code(&code, String::new(), serde_json::json!({}))
-                    .map_or_else(provider_remediation, |error| error.remediation().to_owned()),
-                code,
-                status: status.as_u16(),
-                message,
-                field,
-            },
+            Some(code) => {
+                let catalog = WyrdError::from_code(&code, String::new(), serde_json::json!({}));
+                RemoteProblem {
+                    message: catalog
+                        .as_ref()
+                        .map_or(fixed_message, |error| error.title().to_owned()),
+                    remediation: catalog
+                        .as_ref()
+                        .map_or_else(provider_remediation, |error| error.remediation().to_owned()),
+                    code,
+                    status: status.as_u16(),
+                    field,
+                }
+            }
             None => RemoteProblem {
                 code: ProviderError::from_status(PROVIDER, status, "", None)
                     .code()
                     .to_owned(),
                 status: status.as_u16(),
-                message: format!("Wyrd gateway answered HTTP {}", status.as_u16()),
+                message: fixed_message,
                 field,
                 remediation: provider_remediation(),
             },

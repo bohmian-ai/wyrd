@@ -352,16 +352,18 @@ impl HttpTransport {
     /// Native gateway ingresses answer refusals in their protocol's own error
     /// envelope rather than `application/problem+json`, so the status and
     /// body are returned undecoded for the caller's protocol codec. The
-    /// request carries the Wyrd bearer, a minted request id, and `headers`;
-    /// it is never retried, because a model call is not replay-safe, except
-    /// that one `401` buys exactly one [`AuthMiddleware::force_refresh`] and
-    /// one replay, which is safe because the edge refuses an unusable
-    /// credential before any service acts. No total deadline is applied; the
-    /// caller bounds the call.
+    /// request carries the Wyrd bearer, a minted request id, and `headers`.
+    /// It is sent exactly once, because a model call is not replay-safe: a
+    /// `401` may come from the upstream provider after the gateway already
+    /// dispatched the call. A `401` instead renews the credential through
+    /// [`AuthMiddleware::force_refresh`] so the next call carries a fresh
+    /// bearer, and the original refusal is returned. No total deadline is
+    /// applied; the caller bounds the call.
     ///
     /// # Errors
-    /// Returns the authentication error when no bearer can be produced, or
-    /// [`WyrdError::Internal`] for a transport or body-read failure.
+    /// Returns the authentication error when no bearer can be produced or
+    /// renewal after a `401` fails, or [`WyrdError::Internal`] for a transport
+    /// or body-read failure.
     pub(crate) async fn post_native(
         &self,
         path: &str,
@@ -370,35 +372,33 @@ impl HttpTransport {
     ) -> Result<(StatusCode, bytes::Bytes), WyrdError> {
         let url = self.authenticated_url(path)?;
         let request_id = self.auth.request_id(None);
-        let mut refreshed = false;
-        loop {
-            let bearer = self.auth.bearer().await.map_err(AuthError::into_wyrd)?;
-            let mut request = self
-                .client
-                .post(&url)
-                .header(
-                    HEADER_WYRD_ACCESS_TOKEN,
-                    format!("Bearer {}", bearer.expose()),
-                )
-                .header(HEADER_REQUEST_ID, &request_id)
-                .header("content-type", "application/json")
-                .body(body.clone());
-            for (name, value) in headers {
-                request = request.header(*name, *value);
-            }
-            let response = request.send().await.map_err(|err| WyrdError::Internal {
-                message: format!("transport error: {err}"),
-                details: serde_json::json!({"transport": "http"}),
-            })?;
-            let status = response.status();
-            if status == StatusCode::UNAUTHORIZED && !refreshed {
-                refreshed = true;
-                let _ = self.auth.force_refresh().await;
-                continue;
-            }
-            let bytes = response.bytes().await.map_err(body_read_err)?;
-            return Ok((status, bytes));
+        let bearer = self.auth.bearer().await.map_err(AuthError::into_wyrd)?;
+        let mut request = self
+            .client
+            .post(&url)
+            .header(
+                HEADER_WYRD_ACCESS_TOKEN,
+                format!("Bearer {}", bearer.expose()),
+            )
+            .header(HEADER_REQUEST_ID, &request_id)
+            .header("content-type", "application/json")
+            .body(body);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
         }
+        let response = request.send().await.map_err(|err| WyrdError::Internal {
+            message: format!("transport error: {err}"),
+            details: serde_json::json!({"transport": "http"}),
+        })?;
+        let status = response.status();
+        let bytes = response.bytes().await.map_err(body_read_err)?;
+        if status == StatusCode::UNAUTHORIZED {
+            self.auth
+                .force_refresh()
+                .await
+                .map_err(AuthError::into_wyrd)?;
+        }
+        Ok((status, bytes))
     }
 
     /// Send a request and return raw Arrow IPC bytes plus metadata headers.

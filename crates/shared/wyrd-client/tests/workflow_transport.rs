@@ -20,6 +20,7 @@ use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_client::{PublicWyrdGatewayCaller, Workflows, WyrdClient};
 use wyrd_spec::card::workflow::{CreateWorkflowRunRequest, WorkflowRunStatus};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{GatewayFallbackOverride, ModelRef};
 use wyrd_spec::ids::WorkflowRunId;
 
@@ -335,6 +336,62 @@ fn fallback(candidate: &str) -> GatewayFallbackOverride {
     }
 }
 
+/// The problem a recognized Wyrd `code` normalizes to: its catalog title
+/// and remediation, never text from the answer body.
+///
+/// # Panics
+/// Panics when `code` has no reconstructable catalog variant.
+fn catalog_problem(code: &str, status: u16, field: Option<&str>) -> RemoteProblem {
+    let catalog = WyrdError::from_code(code, String::new(), json!({})).expect("catalog code");
+    RemoteProblem {
+        code: code.to_owned(),
+        status,
+        message: catalog.title().to_owned(),
+        field: field.map(str::to_owned),
+        remediation: catalog.remediation().to_owned(),
+    }
+}
+
+/// Build an API-key [`WyrdClient`] pointed at `base_url`, so an
+/// authentication refusal renews through a real `/auth/token` exchange.
+fn api_key_client(base_url: &str) -> WyrdClient {
+    let mut config = ClientConfig::default();
+    config.http.base_url = base_url.to_owned();
+    let auth = AuthMiddleware::new(
+        &config,
+        ResolvedCredential::ApiKey(SecretString::from("api-key")),
+    )
+    .expect("auth builds");
+    let transport = HttpTransport::new(
+        &HttpConfig {
+            base_url: base_url.to_owned(),
+            ..HttpConfig::default()
+        },
+        Arc::clone(&auth),
+    )
+    .expect("transport builds");
+    WyrdClient::from_parts(auth, transport, config.grpc)
+}
+
+/// A successful `/auth/token` answer issuing `access`.
+fn token_answer(access: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "access_token": access,
+        "refresh_token": "unused",
+        "token_type": "Bearer",
+        "expires_at": "2099-01-01T00:00:00Z"
+    }))
+}
+
+/// Every model POST the server received, skipping credential exchanges.
+async fn model_posts(server: &MockServer) -> Vec<wiremock::Request> {
+    received(server)
+        .await
+        .into_iter()
+        .filter(|request| request.url.path() == "/v1/chat/completions")
+        .collect()
+}
+
 /// The remote problem a call returned.
 ///
 /// # Panics
@@ -349,8 +406,9 @@ fn problem(outcome: Result<ProviderResponse, ProviderError>) -> RemoteProblem {
 /// Concurrent public gateway calls keep their own fallback, deadline, and
 /// model; each dialect reaches its ingress with the call's model; Vertex,
 /// cancellation, and timeouts stop locally; native error envelopes become
-/// redacted problems keeping only status, Wyrd code, message, OpenAI `param`,
-/// and catalog remediation.
+/// redacted problems keeping only status, Wyrd code, OpenAI `param`, and the
+/// code's catalog title and remediation; a `401` is sent once and renews the
+/// credential instead of replaying the model call.
 #[tokio::test]
 async fn public_gateway_call_context_and_errors() {
     // Concurrent calls on one caller carry only their own fallback header.
@@ -573,7 +631,7 @@ async fn public_gateway_call_context_and_errors() {
         400,
         "/v1/chat/completions",
         json!({"error": {
-            "message": "fallback must be unpadded base64url", "type": "invalid_request_error",
+            "message": "echoed prompt sk-canary", "type": "invalid_request_error",
             "param": "fallback", "code": "WYRD_GATEWAY_400_INVALID_REQUEST"
         }}),
     )
@@ -586,25 +644,15 @@ async fn public_gateway_call_context_and_errors() {
             )
             .await,
     );
-    let catalog = wyrd_spec::error::WyrdError::GatewayInvalidRequest {
-        message: String::new(),
-        details: json!({}),
-    };
     assert_eq!(
         refused,
-        RemoteProblem {
-            code: "WYRD_GATEWAY_400_INVALID_REQUEST".to_owned(),
-            status: 400,
-            message: "fallback must be unpadded base64url".to_owned(),
-            field: Some("fallback".to_owned()),
-            remediation: catalog.remediation().to_owned(),
-        }
+        catalog_problem("WYRD_GATEWAY_400_INVALID_REQUEST", 400, Some("fallback"))
     );
     let anthropic = refusal(
         429,
         "/v1/messages",
         json!({"type": "error", "error": {
-            "type": "rate_limit_error", "message": "limit exceeded",
+            "type": "rate_limit_error", "message": "echoed prompt sk-canary",
             "code": "WYRD_GATEWAY_429_LIMIT_EXCEEDED"
         }}),
     )
@@ -625,16 +673,14 @@ async fn public_gateway_call_context_and_errors() {
             .await,
     );
     assert_eq!(
-        (refused.code.as_str(), refused.status),
-        ("WYRD_GATEWAY_429_LIMIT_EXCEEDED", 429)
+        refused,
+        catalog_problem("WYRD_GATEWAY_429_LIMIT_EXCEEDED", 429, None)
     );
-    assert_eq!(refused.message, "limit exceeded");
-    assert_eq!(refused.field, None);
     let google = refusal(
         504,
         "/v1beta/models/gemini-a:generateContent",
         json!({"error": {
-            "code": 504, "message": "deadline exceeded", "status": "DEADLINE_EXCEEDED",
+            "code": 504, "message": "echoed prompt sk-canary", "status": "DEADLINE_EXCEEDED",
             "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
                 "reason": "WYRD_GATEWAY_504_DEADLINE_EXCEEDED", "domain": "wyrd"}]
         }}),
@@ -649,16 +695,8 @@ async fn public_gateway_call_context_and_errors() {
             .await,
     );
     assert_eq!(
-        (
-            refused.code.as_str(),
-            refused.status,
-            refused.message.as_str()
-        ),
-        (
-            "WYRD_GATEWAY_504_DEADLINE_EXCEEDED",
-            504,
-            "deadline exceeded"
-        )
+        refused,
+        catalog_problem("WYRD_GATEWAY_504_DEADLINE_EXCEEDED", 504, None)
     );
 
     // A relayed provider refusal without a Wyrd code keeps no upstream text.
@@ -689,4 +727,140 @@ async fn public_gateway_call_context_and_errors() {
         assert!(!format!("{refused:?}").contains("sk-canary"));
         assert_eq!(refused.field, None);
     }
+
+    // An uncoded 401 is sent once and surfaces as a provider auth refusal.
+    let unauthorized = refusal(
+        401,
+        "/v1/chat/completions",
+        json!({"error": {"message": "echoed prompt sk-canary", "type": "provider_error"}}),
+    )
+    .await;
+    let refused = problem(
+        PublicWyrdGatewayCaller::new(client(&unauthorized.uri()))
+            .call(
+                gateway_call(chat_request(), "openai/gpt-a", None, deadline),
+                &token,
+            )
+            .await,
+    );
+    assert_eq!(
+        (refused.code.as_str(), refused.status),
+        ("SKALD_PROVIDERS_401_AUTH", 401)
+    );
+    assert!(!format!("{refused:?}").contains("sk-canary"));
+    assert_eq!(model_posts(&unauthorized).await.len(), 1);
+
+    // A 401 carrying a Wyrd auth code renews the credential without
+    // resending the model call and returns the original refusal; the next
+    // call carries the renewed bearer.
+    let spoofed = MockServer::start().await;
+    mount(&spoofed, "POST", "/auth/token", token_answer("tok-a"), 1).await;
+    mount(&spoofed, "POST", "/auth/token", token_answer("tok-b"), 1).await;
+    mount(
+        &spoofed,
+        "POST",
+        "/v1/chat/completions",
+        ResponseTemplate::new(401).set_body_json(json!({"error": {
+            "message": "echoed prompt sk-canary", "type": "invalid_request_error",
+            "code": "WYRD_AUTH_401_INVALID_TOKEN"
+        }})),
+        1,
+    )
+    .await;
+    mount(
+        &spoofed,
+        "POST",
+        "/v1/chat/completions",
+        ResponseTemplate::new(200).set_body_json(chat_answer()),
+        1,
+    )
+    .await;
+    let caller = PublicWyrdGatewayCaller::new(api_key_client(&spoofed.uri()));
+    let refused = problem(
+        caller
+            .call(
+                gateway_call(chat_request(), "openai/gpt-a", None, deadline),
+                &token,
+            )
+            .await,
+    );
+    assert_eq!(
+        refused,
+        catalog_problem("WYRD_AUTH_401_INVALID_TOKEN", 401, None)
+    );
+    assert_eq!(
+        model_posts(&spoofed).await.len(),
+        1,
+        "the model call is not resent"
+    );
+    assert!(
+        caller
+            .call(
+                gateway_call(chat_request(), "openai/gpt-a", None, deadline),
+                &token,
+            )
+            .await
+            .is_ok()
+    );
+    let bearers: Vec<_> = model_posts(&spoofed)
+        .await
+        .iter()
+        .map(|request| {
+            request.headers["x-wyrd-access-token"]
+                .to_str()
+                .expect("ASCII")
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(bearers, ["Bearer tok-a", "Bearer tok-b"]);
+
+    // A failed renewal returns its authentication error, still without
+    // resending the model call.
+    let unrenewable = MockServer::start().await;
+    mount(
+        &unrenewable,
+        "POST",
+        "/auth/token",
+        token_answer("tok-a"),
+        1,
+    )
+    .await;
+    mount(
+        &unrenewable,
+        "POST",
+        "/auth/token",
+        ResponseTemplate::new(401).set_body_json(json!({
+            "type": "about:blank",
+            "title": "API key invalid",
+            "status": 401,
+            "code": "WYRD_AUTH_401_API_KEY_INVALID",
+            "detail": "api key revoked",
+            "details": {}
+        })),
+        1,
+    )
+    .await;
+    mount(
+        &unrenewable,
+        "POST",
+        "/v1/chat/completions",
+        ResponseTemplate::new(401).set_body_json(json!({"error": {
+            "message": "echoed prompt sk-canary", "type": "provider_error"
+        }})),
+        1,
+    )
+    .await;
+    let refused = problem(
+        PublicWyrdGatewayCaller::new(api_key_client(&unrenewable.uri()))
+            .call(
+                gateway_call(chat_request(), "openai/gpt-a", None, deadline),
+                &token,
+            )
+            .await,
+    );
+    assert_eq!(
+        (refused.code.as_str(), refused.status),
+        ("WYRD_AUTH_401_API_KEY_INVALID", 401)
+    );
+    assert_eq!(model_posts(&unrenewable).await.len(), 1);
 }

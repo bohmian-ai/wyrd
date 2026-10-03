@@ -188,3 +188,18 @@ Record the corrected source locations, the static owner comparison for every
 finding, generated-page parity, and the exit result of each focused command.
 Route the completed remediation directly to `$wyrd-implement`, then reassess
 the complete original base-to-new-candidate range with `$wyrd-task-review`.
+
+## Implementation Evidence
+
+Commit `7ceaf8ece`. Documentation, the API-doc generator with its regenerated pages, and one module rustdoc. No runtime change.
+
+| Finding | Corrected locations | Static owner comparison | Result |
+|---|---|---|---|
+| FIND-TASK-005-3 | `concepts/identity-and-auth.svx` (dispatch scoped to the tenant plane; platform `/auth/platform/token`, `/auth/platform/login` → `/auth/platform/callback`, access-only); `concepts/authentication.svx` (grant table platform rows, tenant-only refresh); `auth/oauth.rs` module rustdoc (only tenant token, device authorization and revoke use `OAuthClients`) | `platform_auth_router`/`platform_token` exchange the API-key subject via `PlatformSessions`; `platform_session_response` sets `refresh_token: None`; `complete_login` returns `TokenResponse` via Problem Details errors; `oauth_clients` is called only in `components/auth/routes.rs` and `auth/cli_login.rs` | PASS |
+| FIND-TASK-005-4 | `wyrd-design.md` (four form endpoints vs browser interactions); `generate_api_docs.py` and regenerated `api/openapi.md` and `api/errors.md`; `for-agents/error-remediation.svx` (JSON API vs browser endpoints; 400/401/500/503); `sso-and-oidc.svx` status paragraph plus browser-endpoint paragraph; `wyrd-security-posture.md` statuses; `concepts/authentication.svx` form vs browser | `OAuthError::status` (401/500/503/400); `authorize` utoipa responses (303 redirect, 400 HTML or Problem Details, 500); device page and `/auth/callback` declarations (HTML, 303, Problem Details); revoke 200 has no body | PASS |
+| FIND-TASK-005-7 | `sso-and-oidc.svx` Registering Wyrd steps 1 and 5 | `HumanClientAuth` is `SecretBasic`/`SecretPost`/`Public`; secret methods require `client_secret` and sealing, and `Public` takes none and uses PKCE | PASS |
+| FIND-TASK-005-8 | `get-started/client-configuration.svx` Rust example | `wyrd_client::config::ClientConfig::credential: Option<SecretString>`; the SDK re-exports it | PASS |
+| Same-class sweep | Same-class claims qualified across the touched files: "only a human login gets a refresh token" (security posture, design, self-hosting authentication), "every request carries a token" (identity-and-auth, self-hosting authentication), "every token endpoint is form/§5.2" (concepts/authentication) | Every file changed since base was grepped for blanket refusal, refresh, route and envelope claims | PASS |
+
+Generated-page parity: `mise run docs:generate`, then `docs:check` passes against the committed pages.
+Verification (all exit 0): `mise run docs:check`, `mise run codegen:check`, `mise run fmt`, `mise run lints`, `git diff --check`.

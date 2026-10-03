@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 53
+revision: 54
 status: approved
 ---
 
@@ -1786,6 +1786,44 @@ call site when the budget is exhausted.
   identity until it is reconciled. Only a definite refusal settles a batch as
   a counted loss.
 
+### Gateway capture writer (revision 54)
+
+Gateway call capture is server-internal evidence, written the way Bifrost's
+own engines reach Scribe. It does not impersonate a client: no token, no
+per-tenant embedded client, and no loopback through the public ingest
+listener. This revision supersedes the capture-authority mechanism in
+`changes/active/wyrd-gateway-port/spec.md` REQ-006 and its capture boundary.
+
+- **REQ-178**: Each `wyrd-server` process MUST own exactly one capture writer.
+  - When Scribe is active in the same pod, the writer submits the projected
+    `vala.gateway.calls` and `vala.traces.spans` batches to it in-process.
+  - Otherwise it submits them over the existing mutually authenticated peer
+    plane to a live, ready Scribe, through a capture-only peer ingest RPC
+    that carries the tenant and destination table explicitly.
+  - The choice follows pod topology (`WYRD_TARGET`), never table ownership.
+  - The peer RPC is served only by pods running Scribe and admits only
+    `wyrd-peer` client certificates. It refuses any table other than the two
+    capture destinations and any reserved system tenant. Widening it to other
+    server-internal writers requires a spec revision.
+- **REQ-179**: Capture MUST be a server-internal write. It holds no token,
+  evaluates no permission, and writes no audit decision. Captured rows carry
+  the reserved `GATEWAY_CAPTURE_PRINCIPAL` identity, which, like
+  `PLATFORM_AUDIT_PRINCIPAL`, never appears in a token. The capture token,
+  its issuance and verification paths, the capture role, and Gate's
+  principal exception are removed. Gate MUST refuse every public write to
+  `vala.gateway.calls`.
+- **REQ-180**: A capture is delivered when Scribe acknowledges it before the
+  call's deadline.
+  - Retryable refusals (backpressure or an unavailable peer) are retried with
+    bounded backoff until that deadline.
+  - Any other failure, or the deadline elapsing, drops the capture with a
+    counted, logged reason and never changes the call's result.
+  - Capture holds no per-tenant queue, client, or in-memory backlog beyond
+    the in-flight attempt.
+  - Each capture batch has a deterministic identity derived from the tenant,
+    call, and table, so a retried or redirected submission is absorbed by
+    Scribe's batch-id dedup.
+
 ## Invariants
 
 - **INV-001**: The shipped continuous user model is an existing Service/Agent
@@ -1837,6 +1875,9 @@ call site when the budget is exhausted.
   `client_byte_limit_bytes`. A refused record admits no row. A batch is
   released only by a durable ACK or a definite refusal, and never by
   ambiguity.
+- **INV-020**: Gateway capture cannot write outside its tenant and the two
+  capture destinations. No public principal, including one claiming the
+  capture identity, can write `vala.gateway.calls` through Gate.
 
 ## Acceptance obligations
 
@@ -2314,10 +2355,22 @@ published image pinned by an immutable registry digest before release.
   `record_id`s, and 9 rows per id. Each SDK MUST also prove that a
   byte-budget override is honoured and that an override too small to seal a
   message is refused at connect time.
+- **AC-043**: Gateway capture journeys MUST prove:
+  - in a single-pod topology, capture rows land in-process in both capture
+    tables, stamped with the capture principal;
+  - in a peer-mode topology, a gateway served by a pod without Scribe lands
+    capture through the peer RPC on a live Scribe;
+  - a Scribe outage longer than the call's deadline drops that call's
+    capture with a counted reason and never fails the call;
+  - a resubmitted capture batch is not written twice.
+
+  Negative tests MUST prove that Gate refuses every public write to
+  `vala.gateway.calls`, and that the peer RPC refuses non-capture tables,
+  reserved tenants, and callers without a peer certificate.
 
 ## Open material decisions
 
-None for revision 53.
+None for revision 54.
 
 Revision 39 records the user's narrow deletion: remove the always-allow
 hook and its fake `invoke` policy attribution without redesigning delegation.
@@ -2352,6 +2405,22 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 - [PagerDuty Global Integrations and Service Routes](https://support.pagerduty.com/main/docs/event-orchestration)
 
 ## Revision history
+
+- **Revision 54 gateway capture writer (2026-10-02, approved):** Gateway
+  capture minted a tenant token per tenant and wrote through one embedded
+  client per tenant over the server's own public gRPC listener, with a
+  64-tenant ceiling and a preallocated per-tenant budget.
+  - **Direction:** the user directed that capture behave like Bifrost's own
+    engines: in-process when Scribe is in the pod, otherwise over the gRPC
+    peer plane, through one writer.
+  - **Changes:** REQ-178 to REQ-180 and INV-020 define the topology-routed
+    writer, the capture-only peer RPC, server-internal identity, and
+    deadline-bounded delivery. AC-043 makes both paths and the refusals
+    acceptance evidence.
+  - **Decided:** the peer RPC is a new capture-only service, not a general
+    internal-write RPC. Delivery is acknowledged before the call's deadline or
+    a counted drop; no backlog survives the deadline. The user approved these
+    decisions and the requirement text in conversation.
 
 - **Revision 53 client ingestion throughput and memory (2026-10-02,
   approved):** The capacity benchmark's 1,000-observation Drift seed failed with

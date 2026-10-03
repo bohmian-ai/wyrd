@@ -1089,7 +1089,9 @@ impl BifrostRuntimeConfig {
 /// Oracle, and Forge in-process and opens no private socket. Peer mode is
 /// enabled by supplying both `address` and `tls_dir`, even for the first of
 /// several replicas; each replica publishes its own address through the
-/// existing fenced `vala.cluster_nodes` membership.
+/// existing fenced `vala.cluster_nodes` membership. A dedicated `forge-worker`
+/// opens no listener, so it takes `tls_dir` alone: its credentials only dial
+/// the elected Forge leader's peer route.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BifrostPeerConfig {
@@ -1159,13 +1161,35 @@ impl BifrostPeerConfig {
         }))
     }
 
-    /// Validates the explicit peer-mode inputs.
+    /// Validates the explicit peer-mode inputs for a process that does, or
+    /// does not, serve a peer listener.
+    ///
+    /// A listening target needs both `address` and `tls_dir` or neither. A
+    /// dial-only target (`listens == false`, the dedicated Forge worker) may
+    /// name `tls_dir` alone and never an `address`, because it publishes no
+    /// endpoint for anyone to dial.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::Invalid`] when only one of `address` and
-    /// `tls_dir` is supplied, or when `address` is not a bare `host:port`.
-    fn validate(&self) -> Result<(), ConfigError> {
+    /// Returns [`ConfigError::Invalid`] when a listening target supplies only
+    /// one of `address` and `tls_dir`, a dial-only target supplies an
+    /// `address`, `tls_dir` is empty, or `address` is not a bare `host:port`.
+    fn validate(&self, listens: bool) -> Result<(), ConfigError> {
+        if !listens {
+            if self.address.is_some() {
+                return Err(ConfigError::Invalid {
+                    message: "the forge-worker target serves no peer listener; \
+                              unset WYRD_PEER_ADDRESS and keep only WYRD_PEER_TLS_DIR"
+                        .to_owned(),
+                });
+            }
+            return match &self.tls_dir {
+                Some(tls_dir) if tls_dir.as_os_str().is_empty() => Err(ConfigError::Invalid {
+                    message: "WYRD_PEER_TLS_DIR must name a directory".to_owned(),
+                }),
+                _ => Ok(()),
+            };
+        }
         let (address, tls_dir) = match (&self.address, &self.tls_dir) {
             (None, None) => return Ok(()),
             (Some(address), Some(tls_dir)) => (address, tls_dir),
@@ -3110,21 +3134,15 @@ impl WyrdServerConfig {
             self.validate_oracle_calibration()?;
         }
 
-        // Peer mode is explicit and all-or-nothing. A split Scribe or Oracle
-        // target cannot reach its counterpart in-process and needs it; a Forge
-        // worker keeps its durable assignment path and never opens the socket.
-        self.bifrost.peer.validate()?;
+        // Peer mode is explicit and all-or-nothing for a listening target. A
+        // split Scribe or Oracle target cannot reach its counterpart
+        // in-process and needs it; a Forge worker never opens the socket and
+        // takes only the credentials it dials the Forge leader with.
+        self.bifrost.peer.validate(serves_api)?;
         if self.role.requires_peer() && !self.bifrost.peer.is_enabled() {
             return Err(ConfigError::Invalid {
                 message: "split oracle and scribe targets require peer mode \
                           (WYRD_PEER_ADDRESS and WYRD_PEER_TLS_DIR)"
-                    .to_owned(),
-            });
-        }
-        if !serves_api && self.bifrost.peer.is_enabled() {
-            return Err(ConfigError::Invalid {
-                message: "the forge-worker target serves no peer listener; \
-                          unset WYRD_PEER_ADDRESS and WYRD_PEER_TLS_DIR"
                     .to_owned(),
             });
         }
@@ -4404,6 +4422,54 @@ minimum_slots = 2
         assert!(
             config.validate().is_err(),
             "a Forge worker opens no peer socket"
+        );
+    }
+
+    /// A dedicated Forge worker takes peer credentials without an address and
+    /// reads them to dial the leader; a listening target may not.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a dial-only worker is refused or reads no bundle, or when a
+    /// listening target accepts credentials without an address.
+    #[test]
+    fn forge_worker_takes_dial_only_peer_credentials() {
+        let dir = tempfile::tempdir().expect("peer TLS directory");
+        for (name, contents) in [("ca.crt", "ca"), ("tls.crt", "leaf"), ("tls.key", "key")] {
+            std::fs::write(dir.path().join(name), contents).expect("peer TLS file");
+        }
+        let dial_only = BifrostPeerConfig {
+            tls_dir: Some(dir.path().to_path_buf()),
+            ..BifrostPeerConfig::default()
+        };
+        let mut config = WyrdServerConfig {
+            role: BifrostTarget::ForgeWorker,
+            ..WyrdServerConfig::default()
+        };
+        config.bifrost.peer = dial_only.clone();
+        config
+            .validate()
+            .expect("a Forge worker dials the leader with credentials alone");
+        assert_eq!(config.bifrost.peer.advertised_uri(), None);
+        let bundle = config
+            .bifrost
+            .peer
+            .read_bundle()
+            .expect("the dial-only bundle reads")
+            .expect("dial-only credentials are peer mode");
+        assert_eq!(bundle.certificate_chain, b"leaf");
+
+        config.bifrost.peer.tls_dir = Some(PathBuf::new());
+        assert!(
+            config.validate().is_err(),
+            "an empty dial-only directory is refused"
+        );
+
+        config.role = BifrostTarget::Server;
+        config.bifrost.peer = dial_only;
+        assert!(
+            config.validate().is_err(),
+            "a listening target needs an address with its credentials"
         );
     }
 

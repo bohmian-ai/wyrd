@@ -319,6 +319,11 @@ impl PeerCluster {
     ///
     /// Its public request lifetime is cancelled and its serving task aborted,
     /// which is the closest a single process comes to a pod disappearing.
+    /// Aborting the serving task does not end a peer request held at the pod's
+    /// execute pause, which ignores cancellation, so a pause armed there is
+    /// released once the pod is gone. A dead pod's held request must not keep
+    /// its leader waiting, and it cannot produce rows from attempts the
+    /// termination already cancelled.
     ///
     /// # Errors
     ///
@@ -327,6 +332,9 @@ impl PeerCluster {
         self.cluster
             .terminate_node_abruptly_for_test(self.node_id(index))
             .await?;
+        if let Some(pause) = self.execute_pauses.remove(&index) {
+            pause.release();
+        }
         Ok(())
     }
 

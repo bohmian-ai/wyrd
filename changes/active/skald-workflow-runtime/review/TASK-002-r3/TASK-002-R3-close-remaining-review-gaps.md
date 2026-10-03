@@ -106,3 +106,12 @@ The supplemental registry test name is planned, not claimed to exist at candidat
 Run the cleanup task's applicable final lanes: `test:shared`, `test:skald`, `test:cards:integration`, `test:wyrd-sdk`, `py:test:unit`, `py:test:cards:integration`, `py:typecheck`, `ts:test:unit`, `ts:test:integration`, `ts:typecheck`, `ts:napi:check`, `codegen:check`, `check:client-tier`, `check:sdk-client-tier`, `check:pyo3-scope`, `check:registry-tx-coupling`, and format/lints for touched languages, plus repaired workspace-hack and explicit cumulative hygiene. Regenerate contract artifacts from source; do not hand-edit them. Preserve shared Service/loader regression coverage. Add docs:check or check:skills-sync only if those surfaces are touched; no unsolicited release aggregate.
 
 Record each finding's actual source/proof, including what the newer existing fix supplies, and any diagnosed blockers. Route implementation directly to `$wyrd-implement`; subsequent `$wyrd-task-review` must audit the original-base-to-new-immutable-candidate range against all prior obligations and this remediation. The present review does not implement these changes or approve the excluded later commit.
+
+## Implementation evidence
+
+### Diagnosis: TypeScript journey timeout
+
+- **Symptom:** after adding the envelope reads, `workflow-loading.test.ts` "workflow loading journey" failed with `Test timed out in 5000ms` at the `it` on line 72.
+- **Evidence:** the trace shows server start at 23:56:51, the last registration (team-v2) at 23:56:56.306 and shutdown at 23:56:56.78, with no error; the same command with `--testTimeout=60000` passed in 6303ms.
+- **Cause:** no vitest config exists under `sdks/wyrd-sdk-ts`, so this single-`it` journey (which starts its own server) ran under vitest's 5000ms default; the four added `Cards.get` round-trips pushed it past that budget.
+- **Fix site:** the journey's own `it` call, given `60_000` like every other `startTestServer` integration test in the directory (`gateway-admin`, `cards-state`, `verification-run`, `operator-connections`). A read-only diagnostician independently confirmed the cause and fix site; no other file is affected.

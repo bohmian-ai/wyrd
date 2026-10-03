@@ -6,6 +6,8 @@ import { startTestServer } from "@wyrd/testing";
 import { describe, expect, it } from "vitest";
 
 import {
+  type Card,
+  type CardRef,
   Cards,
   type RegistrationReceipt,
   Workflow,
@@ -29,11 +31,31 @@ async function rejection(promise: Promise<unknown>): Promise<WyrdError> {
   return error as WyrdError;
 }
 
-/** The UID of every Card a registration registered, keyed by Card name. */
-function uids(receipt: RegistrationReceipt): Record<string, string> {
+/** The exact reference of every Card a registration registered, keyed by Card name. */
+function refs(receipt: RegistrationReceipt): Record<string, CardRef> {
   return Object.fromEntries(
-    receipt.outcomes.map((outcome) => [outcome.card_ref.name, outcome.card_ref.uid ?? ""]),
+    receipt.outcomes.map((outcome) => [outcome.card_ref.name, outcome.card_ref]),
   );
+}
+
+/** The registered reference named `name`, which must be present. */
+function ref(registered: Record<string, CardRef>, name: string): CardRef {
+  const found = registered[name];
+  expect(found, name).toBeDefined();
+  return found as CardRef;
+}
+
+/** Server-derived outbound relationship targets of a Card envelope, by name. */
+function outbound(card: Card): CardRef[] {
+  const relationships = card.relationships as { outbound_refs: { ref: CardRef }[] };
+  return relationships.outbound_refs
+    .map((relationship) => relationship.ref)
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
+/** `targets` ordered by name, as {@link outbound} orders relationships. */
+function byName(targets: CardRef[]): CardRef[] {
+  return [...targets].sort((left, right) => left.name.localeCompare(right.name));
 }
 
 // The fixture Prompts send their Native Chat request to the built-in `mock`
@@ -83,8 +105,8 @@ describe("Workflow loading", () => {
 
       // 2. The team registers its reviewer Agents.
       const team = {
-        ...uids(await writer.registerFromPath(join(FIXTURES, "team/security.yaml"))),
-        ...uids(await writer.registerFromPath(join(FIXTURES, "team/correctness.yaml"))),
+        ...refs(await writer.registerFromPath(join(FIXTURES, "team/security.yaml"))),
+        ...refs(await writer.registerFromPath(join(FIXTURES, "team/correctness.yaml"))),
       };
 
       // 3. A file referencing registered Agents needs a credential that can read them.
@@ -124,8 +146,29 @@ describe("Workflow loading", () => {
       // 6. Apply the mixed Workflow, register a newer security Agent, then
       //    load the applied Workflow by identity and by UID: both stay pinned
       //    to 1.0.0 and never run the newer Prompt ("v2 security review of diff").
-      const workflowUid = uids(await writer.registerFromPath(mixed))["code-review"] ?? "";
+      const applied = { ...team, ...refs(await writer.registerFromPath(mixed)) };
+      const workflowUid = ref(applied, "code-review").uid ?? "";
       await writer.registerFromPath(join(FIXTURES, "team-v2/security.yaml"));
+
+      // The applied Workflow and each Agent stay locked to the exact registered
+      // Agents and Prompts, in spec references and server-derived relationships.
+      const agents = ["security-reviewer", "correctness-reviewer", "final-reviewer"].map((name) =>
+        ref(applied, name),
+      );
+      const stored = await reader.get(ref(applied, "code-review"));
+      const steps = stored.spec["steps"] as { action: { target: unknown } }[];
+      expect(steps.map((step) => step.action.target)).toEqual(agents);
+      expect(outbound(stored)).toEqual(byName(agents));
+      for (const [agent, prompt] of [
+        ["security-reviewer", "security-review-prompt"],
+        ["correctness-reviewer", "correctness-review-prompt"],
+        ["final-reviewer", "final-review-prompt"],
+      ] as const) {
+        const storedAgent = await reader.get(ref(applied, agent));
+        expect(storedAgent.spec["prompt"], agent).toEqual(ref(applied, prompt));
+        expect(outbound(storedAgent), agent).toEqual([ref(applied, prompt)]);
+      }
+
       const byIdentity = await reader.workflow.load({
         space: "workflow-loading",
         name: "code-review",
@@ -151,9 +194,10 @@ describe("Workflow loading", () => {
         "WYRD_WORKFLOW_400_INVALID_CARD_REF",
       );
       // An Agent's UID names no Workflow.
-      expect(
-        (await rejection(reader.workflow.load({ uid: team["security-reviewer"] ?? "" }))).code,
-      ).toBe("WYRD_REGISTRY_404_CARD_NOT_FOUND");
+      const agentUid = ref(team, "security-reviewer").uid ?? "";
+      expect((await rejection(reader.workflow.load({ uid: agentUid }))).code).toBe(
+        "WYRD_REGISTRY_404_CARD_NOT_FOUND",
+      );
       expect((await rejection(outsider.workflow.load({ uid: workflowUid }))).code).toBe(
         "WYRD_PERMISSION_403_DENIED_RBAC",
       );
@@ -163,5 +207,5 @@ describe("Workflow loading", () => {
       delete process.env.WYRD_API_KEY;
       server.shutdown();
     }
-  });
+  }, 60_000);
 });

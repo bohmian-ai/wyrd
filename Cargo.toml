@@ -98,9 +98,12 @@ http = "1"
 # validation). Its `reqwest` feature stays off: provider HTTP runs through the
 # screened transport in `wyrd-auth-oidc`.
 openidconnect = { version = "=4.0.1", default-features = false }
-# Off-the-shelf OAuth client the identity journeys drive the device and
-# refresh grants with (test-only).
+# Vetted OAuth 2.0 client for the CLI and SDK device, refresh, and
+# revocation grants. Its `reqwest` feature stays off: requests run through the
+# redirect-free adapter in `wyrd-client`.
 oauth2 = { version = "=5.0.0", default-features = false }
+# Opens the device-login verification URL in the platform browser.
+webbrowser = "=1.2.4"
 http-body = "1"
 serde = { version = "1", features = ["derive"] }
 serde_jcs = "0.1"

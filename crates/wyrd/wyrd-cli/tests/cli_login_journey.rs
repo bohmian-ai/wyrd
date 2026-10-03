@@ -16,14 +16,13 @@
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::time::Duration;
 
 use assert_cmd::prelude::*;
 use secrecy::ExposeSecret;
 use url::Url;
 use wyrd_client::auth::{AuthError, TokenExchange};
 use wyrd_client::saved_login::{SavedLogin, canonical_origin};
-use wyrd_spec::auth::{SecretBearer, TokenRequest, TokenResponse};
+use wyrd_spec::auth::{SecretBearer, TokenRequest};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_testing::WyrdTestServerBuilder;
 use wyrd_testing::human_login::{FIXTURE_TENANT_SLUG, HUMAN_PUBLIC_ORIGIN, HumanSso, saved_logins};
@@ -81,33 +80,6 @@ fn device_error<T: std::fmt::Debug>(result: Result<T, AuthError>) -> String {
         .as_str()
         .expect("the refusal names its error")
         .to_owned()
-}
-
-/// Poll `device_code` until it redeems, waiting `interval` seconds after a
-/// pending or slow-down answer.
-///
-/// # Panics
-/// Panics when the poll is refused otherwise or never redeems.
-async fn redeem(
-    exchange: &TokenExchange,
-    device_code: SecretBearer,
-    interval: u64,
-) -> TokenResponse {
-    let request = TokenRequest::DeviceCode { device_code };
-    for _ in 0..5 {
-        match exchange.exchange(&request).await {
-            Ok(token) => return token,
-            refused => {
-                let error = device_error(refused);
-                assert!(
-                    matches!(error.as_str(), "authorization_pending" | "slow_down"),
-                    "{error}"
-                );
-                tokio::time::sleep(Duration::from_secs(interval + 5)).await;
-            }
-        }
-    }
-    panic!("the device code never redeemed");
 }
 
 /// Post a decision on `user_code` to the verification page, from `origin`
@@ -313,14 +285,20 @@ pub(crate) async fn cli_device_login_journey() {
         .device_authorization(&tenant)
         .await
         .expect("device login begins");
-    let poll = |device_code: &SecretBearer| TokenRequest::DeviceCode {
-        device_code: device_code.clone(),
+    // Single polls show the server's answer to each one; the CLI's own
+    // `oauth2` poll keeps polling through `authorization_pending`.
+    let poll = |device_code: &str| TokenRequest::DeviceCode {
+        device_code: SecretBearer::new(device_code.to_owned()),
     };
     assert_eq!(
-        device_error(exchange.exchange(&poll(&device.device_code)).await),
+        device_error(
+            exchange
+                .exchange(&poll(device.device_code().secret()))
+                .await
+        ),
         "authorization_pending"
     );
-    let wrong = SecretBearer::new(format!("{}.not-the-code", srv.data_tenant_id()));
+    let wrong = format!("{}.not-the-code", srv.data_tenant_id());
     assert_eq!(
         device_error(exchange.exchange(&poll(&wrong)).await),
         "invalid_grant"
@@ -330,7 +308,7 @@ pub(crate) async fn cli_device_login_journey() {
             &server,
             None,
             FIXTURE_TENANT_SLUG,
-            &device.user_code,
+            device.user_code().secret(),
             "approve"
         )
         .await,
@@ -338,7 +316,7 @@ pub(crate) async fn cli_device_login_journey() {
         "a post from another origin approves nothing"
     );
     for (tenant, user_code) in [
-        ("some-other-tenant", device.user_code.as_str()),
+        ("some-other-tenant", device.user_code().secret().as_str()),
         (FIXTURE_TENANT_SLUG, "BCDF-GHJK"),
     ] {
         assert_eq!(
@@ -354,11 +332,18 @@ pub(crate) async fn cli_device_login_journey() {
             "an unknown code or tenant approves nothing"
         );
     }
-    let approved = sso.approve(&tenant, &device.user_code).await;
+    let approved = sso.approve(&tenant, device.user_code().secret()).await;
     sso.sign_in(&approved, "bob", "wyrd-test").await;
-    let second = redeem(&exchange, device.device_code.clone(), device.interval).await;
+    let second = exchange
+        .device_access_token(&device)
+        .await
+        .expect("the approved device code redeems");
     assert_eq!(
-        device_error(exchange.exchange(&poll(&device.device_code)).await),
+        device_error(
+            exchange
+                .exchange(&poll(device.device_code().secret()))
+                .await
+        ),
         "invalid_grant",
         "a redeemed device code returns nothing"
     );
@@ -372,14 +357,14 @@ pub(crate) async fn cli_device_login_journey() {
             &server,
             Some(HUMAN_PUBLIC_ORIGIN),
             FIXTURE_TENANT_SLUG,
-            &denied.user_code,
+            denied.user_code().secret(),
             "deny"
         )
         .await,
         reqwest::StatusCode::OK
     );
     assert_eq!(
-        device_error(exchange.exchange(&poll(&denied.device_code)).await),
+        device_error(exchange.device_access_token(&denied).await),
         "access_denied"
     );
 
@@ -392,7 +377,7 @@ pub(crate) async fn cli_device_login_journey() {
          interval '11 minutes', expires_at = statement_timestamp() - interval '1 minute' \
          WHERE user_code = $1",
     )
-    .bind(&expiring.user_code)
+    .bind(expiring.user_code().secret())
     .execute(
         &srv.pg_fixture()
             .superuser_pool()
@@ -402,7 +387,7 @@ pub(crate) async fn cli_device_login_journey() {
     .await
     .expect("device code expires");
     assert_eq!(
-        device_error(exchange.exchange(&poll(&expiring.device_code)).await),
+        device_error(exchange.device_access_token(&expiring).await),
         "expired_token",
         "an expired device code returns nothing"
     );
@@ -434,20 +419,13 @@ pub(crate) async fn cli_device_login_journey() {
             .is_empty()
     );
     let renewed = exchange
-        .exchange(&TokenRequest::RefreshToken {
-            refresh_token: second_refresh,
-        })
+        .refresh(&second_refresh)
         .await
         .expect("the other login still renews");
     // Presenting the revoked token is a replay, so it is checked last: the
     // server's containment then ends every chain of this person.
     assert!(
-        exchange
-            .exchange(&TokenRequest::RefreshToken {
-                refresh_token: saved_refresh,
-            })
-            .await
-            .is_err(),
+        exchange.refresh(&saved_refresh).await.is_err(),
         "the logged-out chain no longer renews"
     );
 

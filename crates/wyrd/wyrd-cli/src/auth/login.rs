@@ -11,16 +11,14 @@
 //! that login's refresh chain on the server best-effort and warns when it
 //! cannot.
 
-use std::process::{ExitCode, Stdio};
-use std::time::Duration;
+use std::process::ExitCode;
 
 use clap::Args;
 use url::Url;
 use wyrd_client::auth::{AuthError, TokenExchange};
 use wyrd_client::saved_login::{SavedLogin, SavedLogins, canonical_origin};
 use wyrd_client::transport::HttpConfig;
-use wyrd_spec::auth::{DeviceAuthorization, TokenRequest, TokenResponse};
-use wyrd_spec::error::WyrdError;
+use wyrd_spec::auth::TokenResponse;
 use wyrd_spec::ids::TenantSlug;
 
 use crate::client::map_client_error;
@@ -86,6 +84,12 @@ impl LoginFlow {
     /// Authorize a device code, send the person to the verification page,
     /// wait for the sign-in, and save the credential.
     ///
+    /// The verification URL is always printed. Unless `--no-browser` is
+    /// given, `webbrowser` also opens it as one URL item through the
+    /// platform's own URL handler, never a command interpreter; a launch
+    /// failure only points the person at the printed URL. The `oauth2` poll
+    /// in [`TokenExchange::device_access_token`] then waits for the sign-in.
+    ///
     /// Ctrl-C exits `130` without saving anything; the unredeemed device code
     /// expires on the server.
     ///
@@ -99,52 +103,26 @@ impl LoginFlow {
             .device_authorization(&self.tenant)
             .await
             .map_err(server_error)?;
+        let verification_url = device
+            .verification_uri_complete()
+            .map_or_else(|| device.verification_uri().as_str(), |url| url.secret());
         eprintln!(
             "First copy your one-time code: {}\nThen approve it and sign in to tenant {} at:\n  {}",
-            device.user_code,
+            device.user_code().secret(),
             self.tenant,
-            device.verification_uri_complete.as_str()
+            verification_url
         );
-        if open_browser {
-            open_in_browser(device.verification_uri_complete.as_str());
+        if open_browser && webbrowser::open(verification_url).is_err() {
+            eprintln!("Could not open a browser; open the URL above yourself.");
         }
         let token = tokio::select! {
-            token = self.poll(device) => token?,
+            token = self.exchange.device_access_token(&device) => token.map_err(server_error)?,
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("Login cancelled.");
                 return Ok(ExitCode::from(INTERRUPTED));
             }
         };
         self.save(token).await
-    }
-
-    /// Poll the token endpoint with the device code until the sign-in
-    /// completes (RFC 8628 §3.5): wait the interval after
-    /// `authorization_pending` and five seconds longer from each
-    /// `slow_down` on.
-    ///
-    /// # Errors
-    /// Returns the server's stable refusal for every other answer, including
-    /// `access_denied` and `expired_token`.
-    async fn poll(&self, device: DeviceAuthorization) -> Result<TokenResponse, WyrdCliError> {
-        let mut interval = device.interval.max(1);
-        let request = TokenRequest::DeviceCode {
-            device_code: device.device_code,
-        };
-        loop {
-            tokio::time::sleep(Duration::from_secs(interval)).await;
-            match self.exchange.exchange(&request).await {
-                Ok(token) => return Ok(token),
-                Err(AuthError::Server(WyrdError::DeviceAuthorization { details, .. }))
-                    if details["error"] == "authorization_pending" => {}
-                Err(AuthError::Server(WyrdError::DeviceAuthorization { details, .. }))
-                    if details["error"] == "slow_down" =>
-                {
-                    interval += 5;
-                }
-                Err(error) => return Err(server_error(error)),
-            }
-        }
     }
 
     /// Save `token` under this flow's origin and tenant and print its
@@ -278,63 +256,11 @@ fn server_error(error: wyrd_client::auth::AuthError) -> WyrdCliError {
     }
 }
 
-/// Ask the platform to open `url` in the person's browser; the printed URL
-/// remains the fallback, so a failure is only reported.
-fn open_in_browser(url: &str) {
-    let spawned = browser_command(std::env::consts::OS, url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    if spawned.is_err() {
-        eprintln!("Could not open a browser; open the URL above yourself.");
-    }
-}
-
-/// The command that opens `url` on the operating system `os`
-/// ([`std::env::consts::OS`]), with `url` passed as one argument and no
-/// command interpreter, so URL characters such as `&` or `|` are never
-/// parsed as syntax.
-///
-/// Windows uses `rundll32 url.dll,FileProtocolHandler`, the shell's own URL
-/// handler, as `gh` does; macOS uses `open` and other systems `xdg-open`.
-fn browser_command(os: &str, url: &str) -> std::process::Command {
-    let mut command = match os {
-        "macos" => std::process::Command::new("open"),
-        "windows" => {
-            let mut command = std::process::Command::new("rundll32");
-            command.arg("url.dll,FileProtocolHandler");
-            command
-        }
-        _ => std::process::Command::new("xdg-open"),
-    };
-    command.arg(url);
-    command
-}
-
 #[cfg(test)]
 mod tests {
     use clap::Parser;
 
-    use super::{LoginArgs, LogoutArgs, browser_command};
-
-    /// Every platform's browser command passes a URL carrying shell
-    /// metacharacters as one argument, and none runs a command interpreter.
-    #[test]
-    fn browser_command_passes_the_url_as_one_argument() {
-        let url = "https://wyrd.example.com/auth/device?tenant=a&user_code=B|C^D%22";
-        for (os, program, leading) in [
-            ("windows", "rundll32", &["url.dll,FileProtocolHandler"][..]),
-            ("macos", "open", &[][..]),
-            ("linux", "xdg-open", &[][..]),
-        ] {
-            let command = browser_command(os, url);
-            assert_eq!(command.get_program(), program, "{os}");
-            let mut expected: Vec<&str> = leading.to_vec();
-            expected.push(url);
-            assert_eq!(command.get_args().collect::<Vec<_>>(), expected, "{os}");
-        }
-    }
+    use super::{LoginArgs, LogoutArgs};
 
     /// Bare wrapper so login arguments parse without the binary's tree.
     #[derive(Parser)]

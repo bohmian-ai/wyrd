@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use wyrd_spec::auth::{SecretBearer, TokenRequest, TokenResponse};
+use wyrd_spec::auth::{SecretBearer, TokenResponse};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::operator_connection::HttpsOrigin;
 
@@ -308,9 +308,7 @@ impl SavedLogins {
             )
         })?;
         let rotated = handle
-            .block_on(exchange.exchange(&TokenRequest::RefreshToken {
-                refresh_token: login.refresh_token.clone(),
-            }))
+            .block_on(exchange.refresh(&login.refresh_token))
             .map_err(|error| match error {
                 AuthError::Server(wyrd) => saved_login(
                     "refresh_refused",

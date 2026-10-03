@@ -17,22 +17,29 @@
 //! [`AuthMiddleware::on_behalf_of`], re-runs its RFC 8693 exchange through the
 //! same cache and gate, drawing the actor token from the acting middleware.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use oauth2::basic::{BasicClient, BasicTokenResponse};
+use oauth2::http::header::{ACCEPT, CONTENT_TYPE};
+use oauth2::{
+    AsyncHttpClient, AuthType, ClientId, DeviceAuthorizationUrl, EndpointNotSet, EndpointSet,
+    ErrorResponse, HttpRequest, HttpResponse, RefreshToken, RequestTokenError, TokenResponse as _,
+    TokenUrl,
+};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
-use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use wyrd_spec::auth::{
-    DeviceAuthorization, DeviceAuthorizationRequest, ExchangeTokenType, OAuthClientId,
-    OAuthErrorCode, OAuthErrorResponse, SecretBearer, TokenAudience, TokenRequest, TokenResponse,
-    TokenRevocationRequest,
+    ExchangeTokenType, OAuthClientId, OAuthErrorCode, OAuthErrorResponse, SecretBearer,
+    TokenAudience, TokenRequest, TokenResponse, TokenRevocationRequest, TokenType,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
@@ -42,8 +49,13 @@ use crate::credentials_file::CredentialsFile;
 use crate::error::{WyrdClientError, from_problem_json};
 use crate::transport::HttpConfig;
 use crate::transport::credential::{AccessTokenSource, MintedAccessToken, ResolvedCredential};
-use reqwest::{Client, Response};
+use reqwest::Client;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
+
+/// The RFC 8628 §3.2 device authorization response
+/// [`TokenExchange::device_authorization`] returns and
+/// [`TokenExchange::device_access_token`] redeems.
+pub use oauth2::StandardDeviceAuthorizationResponse;
 
 /// Fixed proactive-refresh skew. A cached access token is considered stale once
 /// `now >= expires_at - SKEW`, so the client refreshes before the server would
@@ -103,15 +115,62 @@ impl CachedToken {
 /// A renewable mint running on Tokio's blocking pool.
 type PendingMint = JoinHandle<Result<MintedAccessToken, WyrdClientError>>;
 
+/// The `wyrd-cli` OAuth client: the device authorization and token
+/// endpoints of one deployment set, the rest unset.
+type CliClient =
+    BasicClient<EndpointNotSet, EndpointSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
+
+/// The redirect-free HTTP client every `/auth` call goes through.
+///
+/// The `oauth2` crate's own `reqwest` integration targets another `reqwest`
+/// major version, so this adapter hands its requests to the workspace
+/// client. That client follows no redirect, as OAuth clients do: a
+/// `307`/`308` would replay the secret body at the redirect target, so a
+/// redirect reaches the caller as an ordinary non-success response.
+#[derive(Clone)]
+struct AuthHttp(Client);
+
+impl AuthHttp {
+    /// Send one request and buffer its response.
+    ///
+    /// # Errors
+    /// Returns the `reqwest` error when the request cannot be converted or
+    /// sent, or its body cannot be read.
+    async fn send(&self, request: HttpRequest) -> Result<HttpResponse, reqwest::Error> {
+        let mut response = self.0.execute(request.try_into()?).await?;
+        let status = response.status();
+        let headers = std::mem::take(response.headers_mut());
+        let mut buffered = HttpResponse::new(response.bytes().await?.to_vec());
+        *buffered.status_mut() = status;
+        *buffered.headers_mut() = headers;
+        Ok(buffered)
+    }
+}
+
+impl<'c> AsyncHttpClient<'c> for AuthHttp {
+    type Error = reqwest::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<HttpResponse, reqwest::Error>> + Send + 'c>>;
+
+    /// Hand `request` to [`AuthHttp::send`].
+    fn call(&'c self, request: HttpRequest) -> Self::Future {
+        Box::pin(self.send(request))
+    }
+}
+
 /// The unauthenticated `/auth` surface of one Wyrd deployment.
 ///
 /// Every grant that *mints* a Wyrd credential is presented without one: the API
-/// key and workload exchanges behind [`AuthMiddleware`], an interactive OIDC
-/// login, a refresh-token rotation, and the platform credential exchange all
-/// POST to a route that no access token could reach. This type owns that one
-/// wire path — the URL join, the POST, the `application/problem+json` mapping,
-/// and the typed decode — so those callers do not each grow their own HTTP
-/// client and their own idea of what a rejection looks like.
+/// key and workload exchanges behind [`AuthMiddleware`], an interactive device
+/// login, a refresh-token rotation, a revocation, and the platform credential
+/// exchange all reach a route that no access token could reach. This type owns
+/// that one wire path so those callers do not each grow their own HTTP client
+/// and their own idea of what a rejection looks like.
+///
+/// The device (RFC 8628) and refresh (RFC 6749 §6) grants run on the `oauth2`
+/// crate as the public `wyrd-cli` client. The RFC 8693 token exchange and RFC
+/// 7523 jwt-bearer grants, which that crate does not model, and RFC 7009
+/// revocation, which it allows only over HTTPS, are one form POST through
+/// the same redirect-free client.
 ///
 /// It is separate from [`crate::transport::HttpTransport`] because that layer
 /// injects a bearer on every request, and none of these calls has one yet.
@@ -119,8 +178,10 @@ type PendingMint = JoinHandle<Result<MintedAccessToken, WyrdClientError>>;
 pub struct TokenExchange {
     /// Deployment base URL, without a trailing slash.
     base_url: String,
-    /// Shared connection pool for the exchange routes.
-    http: Client,
+    /// Shared redirect-free connection pool for the exchange routes.
+    http: AuthHttp,
+    /// The `wyrd-cli` OAuth client bound to this deployment's endpoints.
+    oauth: CliClient,
 }
 
 impl Debug for TokenExchange {
@@ -142,10 +203,6 @@ impl TokenExchange {
     /// transport before anything is built: remote cleartext `http://` is
     /// refused, HTTPS and loopback HTTP are accepted. This one check covers
     /// every caller, including the CLI login, logout, and refresh commands.
-    ///
-    /// The client follows no redirect, as OAuth clients do: a `307`/`308`
-    /// would replay the secret body at the redirect target, so a redirect is
-    /// returned to the caller as an ordinary non-success response.
     ///
     /// Installs Wyrd's process TLS provider next, for the same reason the
     /// authenticated transport does: the provider is process-global and the
@@ -175,9 +232,23 @@ impl TokenExchange {
                 transport: "http".to_owned(),
                 message: format!("failed to build HTTP client: {err}"),
             })?;
+        let base_url = base_url.trim_end_matches('/').to_owned();
+        let endpoint = |path: &str| format!("{base_url}{path}");
+        let invalid = |error: oauth2::url::ParseError| WyrdClientError::Config {
+            field: "http_config.base_url".to_owned(),
+            reason: error.to_string(),
+        };
+        let oauth = BasicClient::new(ClientId::new(OAuthClientId::WyrdCli.as_str().to_owned()))
+            .set_auth_type(AuthType::RequestBody)
+            .set_device_authorization_url(
+                DeviceAuthorizationUrl::new(endpoint("/auth/device_authorization"))
+                    .map_err(invalid)?,
+            )
+            .set_token_uri(TokenUrl::new(endpoint("/auth/token")).map_err(invalid)?);
         Ok(Self {
-            base_url: base_url.trim_end_matches('/').to_owned(),
-            http,
+            base_url,
+            http: AuthHttp(http),
+            oauth,
         })
     }
 
@@ -187,19 +258,21 @@ impl TokenExchange {
         &self.base_url
     }
 
-    /// Exchange one tenant grant at `/auth/token`.
+    /// POST one tenant grant form-encoded to `/auth/token`.
+    ///
+    /// The RFC 8693 token exchange and RFC 7523 jwt-bearer grants are sent
+    /// this way; the device and refresh grants have their `oauth2` methods,
+    /// [`Self::device_access_token`] and [`Self::refresh`].
     ///
     /// Returns the server's response whole, refresh token included. The
-    /// middleware drops the refresh token because it caches nothing durable; an
-    /// interactive caller that must show the operator their new refresh token
-    /// needs it, which is why the discarding happens in the caller and not here.
+    /// middleware drops the refresh token because it caches nothing durable.
     ///
     /// # Errors
     /// Returns [`AuthError::Server`] with the stable Wyrd error for a rejected
     /// grant, and [`AuthError::Client`] when the server cannot be reached or its
     /// body cannot be decoded.
     pub async fn exchange(&self, request: &TokenRequest) -> Result<TokenResponse, AuthError> {
-        self.post("/auth/token", request).await
+        self.grant("/auth/token", request).await
     }
 
     /// Exchange a platform credential for a short-lived platform session
@@ -216,7 +289,7 @@ impl TokenExchange {
         &self,
         credential: &SecretBearer,
     ) -> Result<TokenResponse, AuthError> {
-        self.post(
+        self.grant(
             "/auth/platform/token",
             &TokenRequest::TokenExchange {
                 subject_token: credential.clone(),
@@ -229,8 +302,9 @@ impl TokenExchange {
         .await
     }
 
-    /// Begin a device login at `tenant` (RFC 8628 §3.1); poll it with
-    /// [`TokenRequest::DeviceCode`] through [`Self::exchange`].
+    /// Begin a device login at `tenant` (RFC 8628 §3.1), passing the tenant
+    /// as the request's one extension parameter; redeem it with
+    /// [`Self::device_access_token`].
     ///
     /// # Errors
     /// Returns [`AuthError::Server`] when the tenant offers no SSO login or
@@ -239,109 +313,123 @@ impl TokenExchange {
     pub async fn device_authorization(
         &self,
         tenant: &TenantSlug,
-    ) -> Result<DeviceAuthorization, AuthError> {
-        self.post(
-            "/auth/device_authorization",
-            &DeviceAuthorizationRequest {
-                tenant: tenant.clone(),
-            },
-        )
-        .await
+    ) -> Result<StandardDeviceAuthorizationResponse, AuthError> {
+        self.oauth
+            .exchange_device_code()
+            .add_extra_param("tenant", tenant.as_str())
+            .request_async(&self.http)
+            .await
+            .map_err(refused)
+    }
+
+    /// Poll the token endpoint with `device`'s code until the person
+    /// completes the sign-in (RFC 8628 §3.4–3.5).
+    ///
+    /// The `oauth2` crate runs the poll: it waits the advertised interval
+    /// after `authorization_pending`, five seconds longer from each
+    /// `slow_down` on, and stops once the code expires. Dropping the future
+    /// stops polling; the unredeemed code then expires on the server.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Server`] carrying the RFC error in
+    /// `details.error` for every terminal refusal, including `access_denied`
+    /// and `expired_token`, and [`AuthError::Client`] for a transport or
+    /// decode failure.
+    pub async fn device_access_token(
+        &self,
+        device: &StandardDeviceAuthorizationResponse,
+    ) -> Result<TokenResponse, AuthError> {
+        self.oauth
+            .exchange_device_access_token(device)
+            .request_async(&self.http, tokio::time::sleep, None)
+            .await
+            .map(token_response)
+            .map_err(refused)
+    }
+
+    /// Rotate `refresh_token` (RFC 6749 §6) and return the new pair.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Server`] when the server refuses the refresh
+    /// token, and [`AuthError::Client`] for a transport or decode failure.
+    pub async fn refresh(&self, refresh_token: &SecretBearer) -> Result<TokenResponse, AuthError> {
+        self.oauth
+            .exchange_refresh_token(&RefreshToken::new(refresh_token.expose().to_owned()))
+            .request_async(&self.http)
+            .await
+            .map(token_response)
+            .map_err(refused)
     }
 
     /// Revoke the login `refresh_token` belongs to (RFC 7009 §2.1), so neither
     /// it nor any successor renews again; idempotent on the server.
     ///
+    /// Sent as one form POST through the redirect-free client, like the RFC
+    /// 8693 and RFC 7523 grants: the `oauth2` crate refuses every non-HTTPS
+    /// revocation endpoint, including the loopback HTTP target
+    /// [`HttpConfig::validate`] accepts for local deployments.
+    ///
     /// # Errors
     /// Returns [`AuthError::Server`] when the server refuses and
-    /// [`AuthError::Client`] for a transport failure.
+    /// [`AuthError::Client`] for an encoding or transport failure.
     pub async fn revoke_refresh_token(
         &self,
         refresh_token: &SecretBearer,
     ) -> Result<(), AuthError> {
-        let response = self
-            .send(
-                "/auth/revoke",
-                &TokenRevocationRequest {
-                    token: refresh_token.clone(),
-                },
-            )
-            .await?;
-        if response.status().is_success() {
-            return Ok(());
-        }
-        Self::decode::<serde_json::Value>(response)
-            .await
-            .map(|_| ())
+        self.post_form(
+            "/auth/revoke",
+            &TokenRevocationRequest {
+                token: refresh_token.clone(),
+            },
+        )
+        .await
+        .map(drop)
     }
 
-    /// POST `body` as `wyrd-cli`'s form parameters to one unauthenticated
-    /// `/auth` path and decode the reply.
+    /// POST `request` to one unauthenticated `/auth` token path and decode
+    /// the RFC 6749 §5.1 reply.
+    ///
+    /// # Errors
+    /// The errors of [`Self::post_form`], and [`AuthError::Client`] when the
+    /// reply does not decode.
+    async fn grant(&self, path: &str, request: &TokenRequest) -> Result<TokenResponse, AuthError> {
+        let response = self.post_form(path, request).await?;
+        serde_json::from_slice(response.body()).map_err(|error| decode_failure(&error))
+    }
+
+    /// POST `params` form-encoded to one unauthenticated `/auth` path as the
+    /// public `wyrd-cli` client, identified by its `client_id` parameter
+    /// (RFC 6749 §2.3), and return the successful response.
     ///
     /// # Errors
     /// Returns [`AuthError::Server`] for a non-success status and
-    /// [`AuthError::Client`] for a transport or decode failure.
-    async fn post<S, D>(&self, path: &str, body: &S) -> Result<D, AuthError>
-    where
-        S: Serialize,
-        D: DeserializeOwned,
-    {
-        Self::decode(self.send(path, body).await?).await
-    }
-
-    /// POST `body` form-encoded, identified as the public `wyrd-cli` client
-    /// by its `client_id` parameter (RFC 6749 §2.3).
-    ///
-    /// # Errors
-    /// Returns [`AuthError::Client`] when the body cannot be encoded or the
-    /// server cannot be reached.
-    async fn send<S: Serialize>(&self, path: &str, body: &S) -> Result<Response, AuthError> {
-        let form = serde_urlencoded::to_string(PublicClientForm {
-            client_id: OAuthClientId::WyrdCli,
-            params: body,
-        })
-        .map_err(|error| {
+    /// [`AuthError::Client`] for an encoding or transport failure.
+    async fn post_form<S: Serialize>(
+        &self,
+        path: &str,
+        params: &S,
+    ) -> Result<HttpResponse, AuthError> {
+        let client_error = |reason: String| {
             AuthError::Client(WyrdClientError::Config {
                 field: "token_request".to_owned(),
-                reason: error.to_string(),
+                reason,
             })
-        })?;
-        self.http
-            .post(format!("{}{path}", self.base_url))
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                "application/x-www-form-urlencoded",
-            )
-            .body(form)
-            .send()
-            .await
-            .map_err(transport_down)
-    }
-
-    /// Map one response onto the catalog or the typed success body.
-    ///
-    /// A non-success status carrying an RFC 6749 §5.2 body is mapped through
-    /// [`oauth_error`]; any other is read as `application/problem+json`, so
-    /// every caller reports the server's own refusal rather than inventing a
-    /// status-shaped error of its own.
-    ///
-    /// # Errors
-    /// Returns [`AuthError::Server`] for a non-success status and
-    /// [`AuthError::Client`] when the body cannot be read or decoded.
-    async fn decode<D: DeserializeOwned>(response: Response) -> Result<D, AuthError> {
+        };
+        let form = serde_urlencoded::to_string(PublicClientForm {
+            client_id: OAuthClientId::WyrdCli,
+            params,
+        })
+        .map_err(|error| client_error(error.to_string()))?;
+        let request = oauth2::http::Request::post(format!("{}{path}", self.base_url))
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(ACCEPT, "application/json")
+            .body(form.into_bytes())
+            .map_err(|error| client_error(error.to_string()))?;
+        let response = self.http.send(request).await.map_err(transport_down)?;
         if !response.status().is_success() {
-            let body = response
-                .json::<serde_json::Value>()
-                .await
-                .map_err(transport_down)?;
-            return Err(AuthError::Server(
-                match serde_json::from_value::<OAuthErrorResponse>(body.clone()) {
-                    Ok(error) => oauth_error(error),
-                    Err(_) => from_problem_json(&body),
-                },
-            ));
+            return Err(refusal(response.body()));
         }
-        response.json::<D>().await.map_err(transport_down)
+        Ok(response)
     }
 }
 
@@ -354,6 +442,69 @@ struct PublicClientForm<'a, S> {
     /// The endpoint's parameters.
     #[serde(flatten)]
     params: &'a S,
+}
+
+/// The Wyrd form of an `oauth2` token response.
+///
+/// A response without `expires_in` is treated as already expired, so the
+/// next use renews it rather than trusting it indefinitely.
+fn token_response(token: BasicTokenResponse) -> TokenResponse {
+    TokenResponse {
+        access_token: SecretBearer::new(token.access_token().secret().to_owned()),
+        token_type: TokenType::Bearer,
+        expires_in: token.expires_in().map_or(0, |lifetime| lifetime.as_secs()),
+        refresh_token: token
+            .refresh_token()
+            .map(|refresh| SecretBearer::new(refresh.secret().to_owned())),
+        issued_token_type: None,
+    }
+}
+
+/// Map an `oauth2` request failure onto the auth error channels.
+///
+/// A parsed RFC 6749 §5.2 refusal, and an unparsed error body such as a
+/// `application/problem+json` one, both go through [`refusal`]; a transport
+/// failure is [`WyrdClientError::TransportDown`].
+fn refused<T: ErrorResponse>(error: RequestTokenError<reqwest::Error, T>) -> AuthError {
+    match error {
+        RequestTokenError::ServerResponse(response) => match serde_json::to_vec(&response) {
+            Ok(body) => refusal(&body),
+            Err(error) => decode_failure(&error),
+        },
+        RequestTokenError::Request(error) => transport_down(error),
+        RequestTokenError::Parse(_, body) => refusal(&body),
+        RequestTokenError::Other(message) => AuthError::Client(WyrdClientError::TransportDown {
+            transport: "http".to_owned(),
+            message,
+        }),
+    }
+}
+
+/// The catalog error of one non-success `/auth` response body.
+///
+/// An RFC 6749 §5.2 body is mapped through [`oauth_error`]; any other JSON
+/// body is read as `application/problem+json`, so every caller reports the
+/// server's own refusal rather than inventing a status-shaped error of its
+/// own. A body that is not JSON, such as a redirect's, is a client-local
+/// decode failure.
+fn refusal(body: &[u8]) -> AuthError {
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(body) => AuthError::Server(
+            match serde_json::from_value::<OAuthErrorResponse>(body.clone()) {
+                Ok(error) => oauth_error(error),
+                Err(_) => from_problem_json(&body),
+            },
+        ),
+        Err(error) => decode_failure(&error),
+    }
+}
+
+/// A `/auth` response body that does not decode.
+fn decode_failure(error: &serde_json::Error) -> AuthError {
+    AuthError::Client(WyrdClientError::TransportDown {
+        transport: "http".to_owned(),
+        message: format!("the auth response does not decode: {error}"),
+    })
 }
 
 /// The catalog error for an RFC 6749 §5.2 / RFC 8628 §3.5 refusal.
@@ -976,12 +1127,11 @@ mod tests {
     }
 
     fn token_body(access: &str, expires_in_secs: i64) -> String {
-        let expires_at = Utc::now() + chrono::Duration::seconds(expires_in_secs);
         serde_json::json!({
             "access_token": access,
             "refresh_token": "refresh-should-drop",
             "token_type": "Bearer",
-            "expires_at": expires_at,
+            "expires_in": expires_in_secs,
         })
         .to_string()
     }
@@ -1592,8 +1742,9 @@ mod tests {
         }
     }
 
-    /// A `307` or `308` from the token or revocation route fails the call and
-    /// never replays its secret body at the redirect target.
+    /// A `307` or `308` from the token or revocation route fails the
+    /// `oauth2` refresh and revocation and the form-POST exchange alike, and
+    /// never replays a secret body at the redirect target.
     #[tokio::test]
     async fn token_exchange_never_follows_a_redirect() {
         let target = spawn_mock("HTTP/1.1 200 OK", token_body("stolen", 3600)).await;
@@ -1608,8 +1759,13 @@ mod tests {
             .await;
             let exchange = TokenExchange::new(&redirect.base_url, 30_000).expect("builds");
             exchange
-                .exchange(&TokenRequest::RefreshToken {
-                    refresh_token: SecretBearer::new("refresh-secret".to_owned()),
+                .refresh(&SecretBearer::new("refresh-secret".to_owned()))
+                .await
+                .expect_err("a redirected refresh fails");
+            exchange
+                .exchange(&TokenRequest::JwtBearer {
+                    assertion: SecretBearer::new("workload-secret".to_owned()),
+                    tenant: None,
                 })
                 .await
                 .expect_err("a redirected exchange fails");
@@ -1617,7 +1773,7 @@ mod tests {
                 .revoke_refresh_token(&SecretBearer::new("refresh-secret".to_owned()))
                 .await
                 .expect_err("a redirected revocation fails");
-            assert_eq!(redirect.hits.load(Ordering::SeqCst), 2);
+            assert_eq!(redirect.hits.load(Ordering::SeqCst), 3);
         }
         assert_eq!(
             target.hits.load(Ordering::SeqCst),

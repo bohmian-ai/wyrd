@@ -15,13 +15,12 @@
 //! ignored journey that lane selects.
 
 use std::path::Path;
-use std::time::Duration;
 
 use serde_json::{Value, json};
 use url::Url;
-use wyrd_client::auth::{AuthError, TokenExchange};
+use wyrd_client::auth::TokenExchange;
 use wyrd_client::saved_login::{SavedLogin, SavedLogins, canonical_origin};
-use wyrd_spec::auth::{SecretBearer, TokenRequest, TokenResponse};
+use wyrd_spec::auth::{SecretBearer, TokenResponse};
 use wyrd_spec::ids::TenantSlug;
 
 /// Public origin every human journey server is configured with; the Keycloak
@@ -150,7 +149,8 @@ impl HumanSso {
 
     /// Complete one CLI device login for `tenant` as `username`: authorize a
     /// device code, approve its user code on the verification page, sign in
-    /// at the provider it redirects to, and redeem the device code.
+    /// at the provider it redirects to, and redeem the device code with the
+    /// `oauth2` poll `wyrd auth login` runs.
     ///
     /// # Panics
     /// Panics when any step fails or the device code is never redeemed.
@@ -161,23 +161,12 @@ impl HumanSso {
             .device_authorization(&tenant)
             .await
             .expect("the device login begins");
-        let login_url = self.approve(&tenant, &device.user_code).await;
+        let login_url = self.approve(&tenant, device.user_code().secret()).await;
         self.sign_in(&login_url, username, password).await;
-        let poll = TokenRequest::DeviceCode {
-            device_code: device.device_code,
-        };
-        for _ in 0..10 {
-            match self.exchange.exchange(&poll).await {
-                Ok(token) => return token,
-                Err(AuthError::Server(error))
-                    if error.problem().details["error"] == "authorization_pending" =>
-                {
-                    tokio::time::sleep(Duration::from_secs(device.interval)).await;
-                }
-                Err(error) => panic!("the device code redeems: {error}"),
-            }
-        }
-        panic!("the device login never completed");
+        self.exchange
+            .device_access_token(&device)
+            .await
+            .expect("the device code redeems")
     }
 
     /// Approve `user_code` for `tenant` on the verification page, posting

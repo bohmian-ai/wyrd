@@ -29,6 +29,7 @@ chrono = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }
 indicatif = { workspace = true }
+oauth2 = { workspace = true }
 opentelemetry = { workspace = true }
 reqwest = { workspace = true }
 schemars = { workspace = true }

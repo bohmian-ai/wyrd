@@ -5,7 +5,7 @@ use secrecy::{ExposeSecret, SecretString};
 use url::Url;
 use wyrd_client::auth::TokenExchange;
 use wyrd_client::transport::HttpConfig;
-use wyrd_spec::auth::{SecretBearer, TokenRequest, TokenResponse};
+use wyrd_spec::auth::{SecretBearer, TokenResponse};
 
 use crate::error::WyrdCliError;
 
@@ -39,9 +39,7 @@ pub async fn dispatch(args: RefreshArgs) -> Result<ExitCode, WyrdCliError> {
         .ok_or(WyrdCliError::NoRefreshToken)?;
     let token = TokenExchange::new(args.server.as_str(), HttpConfig::default().timeout_ms)
         .map_err(crate::client::map_client_error)?
-        .exchange(&TokenRequest::RefreshToken {
-            refresh_token: SecretBearer::new(refresh_token.expose_secret().to_owned()),
-        })
+        .refresh(&SecretBearer::new(refresh_token.expose_secret().to_owned()))
         .await
         .map_err(|error| WyrdCliError::Server {
             source: error.into_wyrd(),

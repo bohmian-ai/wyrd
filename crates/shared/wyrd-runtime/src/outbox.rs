@@ -305,9 +305,9 @@ impl<S: OutboxSink> OutboxWriter<S> {
     /// in flight, and is not backing off, while fewer than `concurrency` writes
     /// run. A write takes the tenant's whole backlog.
     ///
-    /// The write task keeps its items through a panicking sink and returns
-    /// them with the panic as the error, so they are retried like any failed
-    /// write.
+    /// The write task keeps its items through a panicking sink, including a
+    /// panic while rendering the sink's error, and returns them with the panic
+    /// as the error, so they are retried like any failed write.
     fn dispatch(&mut self) {
         let now = Instant::now();
         let ready: Vec<DataTenantId> = self
@@ -335,10 +335,18 @@ impl<S: OutboxSink> OutboxWriter<S> {
                         Err(panic) => Err(panic),
                     }
                 };
-                let result = match outcome {
+                // Rendering a sink error runs sink code too, so it is
+                // contained as well and `items` is still returned.
+                let result = catch_unwind(AssertUnwindSafe(|| match outcome {
                     Ok(written) => written.map_err(|error| error.to_string()),
                     Err(panic) => Err(format!("sink write panicked: {}", panic_message(&*panic))),
-                };
+                }))
+                .unwrap_or_else(|panic| {
+                    Err(format!(
+                        "sink error rendering panicked: {}",
+                        panic_message(&*panic)
+                    ))
+                });
                 (tenant, items, result)
             });
             self.in_flight.insert(task.id(), (tenant, count));
@@ -473,6 +481,7 @@ mod tests {
     //! to fail on demand.
 
     use std::collections::{HashMap, HashSet};
+    use std::fmt::{self, Display, Formatter};
     use std::future::{Future, poll_fn};
     use std::pin::pin;
     use std::sync::atomic::Ordering;
@@ -512,16 +521,65 @@ mod tests {
         hanging: HashSet<DataTenantId>,
         /// Tenants whose next write panics once.
         panicking: HashSet<DataTenantId>,
+        /// Tenants whose next write fails once with an error whose `Display`
+        /// panics.
+        display_panicking: HashSet<DataTenantId>,
         /// Failed write attempts.
         failures: usize,
     }
 
+    /// Failure the memory sink reports for an injected write failure.
+    #[derive(Debug)]
+    struct MemoryError {
+        /// Whether rendering this error panics, simulating a sink error type
+        /// whose `Display` implementation is faulty.
+        panics_on_display: bool,
+    }
+
+    impl Display for MemoryError {
+        /// Renders the injected failure message.
+        ///
+        /// # Panics
+        ///
+        /// Panics when `panics_on_display` is set, so a test can prove the
+        /// writer contains a panic raised while rendering a sink error.
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+            assert!(!self.panics_on_display, "injected error display panic");
+            formatter.write_str("injected failure")
+        }
+    }
+
     impl OutboxSink for MemorySink {
         type Item = u32;
-        type Error = String;
+        type Error = MemoryError;
         const NAME: &'static str = "test";
 
-        async fn write(&self, tenant: DataTenantId, items: &[u32]) -> Result<(), String> {
+        /// Writes `items` for `tenant`, applying the injections configured in
+        /// [`MemoryState`] in a fixed order the tests depend on.
+        ///
+        /// The order is: notify `started` that a write was dispatched; if the
+        /// tenant is hanging, wait for `hang`; if the tenant has a one-shot
+        /// panic injected, consume it and panic; if the tenant has a one-shot
+        /// panicking-display failure injected, consume it, count a failure,
+        /// and fail; if the tenant is failing, count a failure and fail;
+        /// otherwise append `items` to the tenant's written record.
+        ///
+        /// # Errors
+        ///
+        /// Returns a [`MemoryError`] when the tenant is failing or has a
+        /// panicking-display failure injected; that error's `Display` panics
+        /// only in the latter case.
+        ///
+        /// # Panics
+        ///
+        /// Panics once, after the hang stage, when a panic is injected for the
+        /// tenant.
+        ///
+        /// # Cancellation
+        ///
+        /// Dropping the future while it waits for `hang` leaves the state
+        /// unchanged, so the batch is neither written nor counted as failed.
+        async fn write(&self, tenant: DataTenantId, items: &[u32]) -> Result<(), MemoryError> {
             self.started.notify_one();
             let hangs = self.lock().hanging.contains(&tenant);
             if hangs {
@@ -530,9 +588,17 @@ mod tests {
             let panics = self.lock().panicking.remove(&tenant);
             assert!(!panics, "injected sink panic");
             let mut state = self.lock();
+            if state.display_panicking.remove(&tenant) {
+                state.failures += 1;
+                return Err(MemoryError {
+                    panics_on_display: true,
+                });
+            }
             if state.failing.contains(&tenant) {
                 state.failures += 1;
-                return Err("injected failure".to_owned());
+                return Err(MemoryError {
+                    panics_on_display: false,
+                });
             }
             state
                 .written
@@ -612,18 +678,31 @@ mod tests {
     }
 
     impl Recorder for TestMetrics {
+        /// Intentionally ignores counter descriptions; tests assert values
+        /// only.
         fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+
+        /// Intentionally ignores gauge descriptions; tests assert values only.
         fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+
+        /// Intentionally ignores histogram descriptions; histograms are not
+        /// recorded.
         fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
 
+        /// Records the counter by metric name, ignoring labels, so every
+        /// registration of one name shares a single value cell.
         fn register_counter(&self, key: &Key, _: &Metadata<'_>) -> Counter {
             Counter::from_arc(self.cell(key))
         }
 
+        /// Records the gauge by metric name, ignoring labels, storing its
+        /// `f64` value as bits in a shared cell.
         fn register_gauge(&self, key: &Key, _: &Metadata<'_>) -> Gauge {
             Gauge::from_arc(self.cell(key))
         }
 
+        /// Intentionally records nothing: the outbox emits no histogram the
+        /// tests assert on.
         fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
             Histogram::noop()
         }
@@ -781,6 +860,37 @@ mod tests {
             state.lock().expect("unpoisoned").written.get(&tenant),
             Some(&vec![1, 2]),
             "the panicked batch commits once, ahead of the later item"
+        );
+        assert_eq!(metrics.counter("outbox_write_failures_total"), 1);
+        assert_eq!(metrics.counter("outbox_events_lost_total"), 0);
+        assert!(metrics.gauge("outbox_pending").abs() < f64::EPSILON);
+    }
+
+    /// A sink error whose `Display` panics is retried like a failed write: the
+    /// batch stays pending, commits once ahead of a later item, the writer
+    /// keeps running, the failure is counted once, nothing is counted lost,
+    /// and `pending` and its gauge return to zero.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_panicking_error_display_is_retried_once_in_order_without_loss() {
+        let metrics = TestMetrics::default();
+        let _metrics = metrics::set_default_local_recorder(&metrics);
+        let (outbox, state, started) = outbox_over(MemorySink::default());
+        let tenant = DataTenantId::new_v7();
+        state
+            .lock()
+            .expect("unpoisoned")
+            .display_panicking
+            .insert(tenant);
+        outbox.stage(tenant, 1_u32);
+        started.notified().await;
+        outbox.stage(tenant, 2_u32);
+        assert_eq!(outbox.pending(), 2, "the failed batch stays pending");
+
+        assert_eq!(outbox.settle(within(10)).await, 0, "the retry drains");
+        assert_eq!(
+            state.lock().expect("unpoisoned").written.get(&tenant),
+            Some(&vec![1, 2]),
+            "the failed batch commits once, ahead of the later item"
         );
         assert_eq!(metrics.counter("outbox_write_failures_total"), 1);
         assert_eq!(metrics.counter("outbox_events_lost_total"), 0);

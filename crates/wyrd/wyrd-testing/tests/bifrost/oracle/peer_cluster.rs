@@ -27,6 +27,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::NodeId;
 use wyrd_testing::bifrost::peer_ca::{BifrostPeerCa, BifrostPeerLeaf};
+use wyrd_testing::bifrost::telemetry::BifrostMetricKind;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -320,8 +321,8 @@ impl PeerCluster {
     /// Its public request lifetime is cancelled and its serving task aborted,
     /// which is the closest a single process comes to a pod disappearing.
     /// Aborting the serving task does not end a peer request held at the pod's
-    /// execute pause, which ignores cancellation, so a pause armed there is
-    /// released once the pod is gone. A dead pod's held request must not keep
+    /// execute pause, which observes graph cancellation but not termination,
+    /// so a pause armed there is released once the pod is gone. A dead pod's held request must not keep
     /// its leader waiting, and it cannot produce rows from attempts the
     /// termination already cancelled.
     ///
@@ -763,6 +764,9 @@ impl PeerCluster {
 
     /// Totals each named family over the process samples carrying every label.
     ///
+    /// A histogram family totals its observation count; its bucket and sum
+    /// samples are not observations.
+    ///
     /// # Errors
     ///
     /// Returns the recorder parse failure.
@@ -776,7 +780,10 @@ impl PeerCluster {
             .map(|family| ((*family).to_owned(), 0.0))
             .collect();
         for sample in self.cluster.telemetry().snapshot()? {
-            let matches = labels
+            let matches = !matches!(
+                sample.kind,
+                BifrostMetricKind::HistogramBucket | BifrostMetricKind::HistogramSum
+            ) && labels
                 .iter()
                 .all(|(name, value)| sample.labels.get(name) == Some(value));
             if let Some(total) = totals.get_mut(&sample.family)

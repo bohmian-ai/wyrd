@@ -6,10 +6,8 @@
 //! authenticated forwarding, and the leader runs a distributed graph whose
 //! follower is held at a real execute boundary. Each terminal cause — an
 //! explicit cancel, the run deadline, and the loss of the held follower pod —
-//! must leave the leader's graph cleanup in charge of the result. For a cancel
-//! or a pod loss, the run stays non-terminal and the model sees nothing while
-//! that cleanup is paused. A deadline ends cleanup without pausing, so there
-//! the leader's settled attempt is already recorded when the run ends.
+//! must leave the leader's graph cleanup in charge of the result: the run
+//! stays non-terminal and the model sees nothing while that cleanup is paused.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -64,10 +62,8 @@ enum TerminalCause {
 /// A forwarded Workflow query settles on its remote Oracle before the run
 /// ends, for cancel, deadline, and pod loss alike.
 ///
-/// Pod loss records a `failed` Analytical query. Cancel and deadline read
-/// the attempt family instead, because both reach the leader before its
-/// stream opens, and the query family records every end before a stream
-/// exists as `failed`.
+/// Cancel and deadline record a `cancelled` Analytical query, and pod loss
+/// records a `failed` one.
 ///
 /// # Panics
 ///
@@ -158,17 +154,11 @@ async fn prove_forwarded_query_settles(cause: TerminalCause) -> Result<(), Journ
     }
 
     let success = duration_outcome("success");
-    let (family, expected_outcome) = cause.recorded_outcome();
+    let expected_outcome = duration_outcome(cause.recorded_outcome());
     let successes_before = cluster.metric_totals_labeled(&[DURATION], &success)?[DURATION];
-    let outcomes_before = cluster.metric_totals_labeled(&[family], &expected_outcome)?[family];
+    let outcomes_before = cluster.metric_totals_labeled(&[DURATION], &expected_outcome)?[DURATION];
 
-    // A deadline ends the leader's cleanup without entering the cleanup
-    // pause, so that case proves settlement by the attempt metric already
-    // recorded when the run is terminal.
-    let holds_cleanup = cause != TerminalCause::Deadline;
-    if holds_cleanup {
-        cluster.arm_cleanup_pause();
-    }
+    cluster.arm_cleanup_pause();
     let cancel = match cause {
         TerminalCause::Cancel => {
             let ingress = ingress.clone();
@@ -181,36 +171,32 @@ async fn prove_forwarded_query_settles(cause: TerminalCause) -> Result<(), Journ
             None
         }
     };
-    // The held follower task does not observe cancellation, so the leader's
-    // cleanup can begin only once that task is released. Releasing it after
-    // the leader recorded the cancellation lets the graph end but never
-    // succeed.
+    // A registry cancel does not reach the held follower task, so the
+    // leader's cleanup can begin only once that task is released. Releasing
+    // it after the leader recorded the cancellation lets the graph end but
+    // never succeed.
     if cause == TerminalCause::Cancel {
         let leader =
             wyrd_client::Bifrost::query_only(&public_client(cluster.server(LEADER)?, &api_key)?);
         await_cancellation_requested(&leader).await?;
         cluster.release_execute_pause(HELD_FOLLOWER)?;
     }
-    if holds_cleanup {
-        cluster.await_cleanup_paused().await?;
+    cluster.await_cleanup_paused().await?;
 
-        // The leader's cleanup still owns the query, so its terminal has not
-        // reached the forwarding ingress: the run cannot have ended and the
-        // model cannot have seen a tool result.
-        let held = ingress.get(&run).await?;
-        let cancel_finished = cancel
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished);
-        let arrivals = upstream.arrivals();
-        cluster.release_cleanup_pause();
-        if held.status.is_terminal() || cancel_finished {
-            return Err(format!("the run ended before its query settled: {held:?}").into());
-        }
-        if arrivals != 1 {
-            return Err(
-                format!("the model saw a tool result before settlement: {arrivals}").into(),
-            );
-        }
+    // The leader's cleanup still owns the query, so its terminal has not
+    // reached the forwarding ingress: the run cannot have ended and the model
+    // cannot have seen a tool result.
+    let held = ingress.get(&run).await?;
+    let cancel_finished = cancel
+        .as_ref()
+        .is_some_and(tokio::task::JoinHandle::is_finished);
+    let arrivals = upstream.arrivals();
+    cluster.release_cleanup_pause();
+    if held.status.is_terminal() || cancel_finished {
+        return Err(format!("the run ended before its query settled: {held:?}").into());
+    }
+    if arrivals != 1 {
+        return Err(format!("the model saw a tool result before settlement: {arrivals}").into());
     }
 
     let terminal = match cancel {
@@ -233,19 +219,18 @@ async fn prove_forwarded_query_settles(cause: TerminalCause) -> Result<(), Journ
     }
 
     let successes = cluster.metric_totals_labeled(&[DURATION], &success)?[DURATION];
-    let outcomes = cluster.metric_totals_labeled(&[family], &expected_outcome)?[family];
+    let outcomes = cluster.metric_totals_labeled(&[DURATION], &expected_outcome)?[DURATION];
     if successes != successes_before {
         return Err("the held query must not record a successful Analytical query".into());
     }
-    if outcomes <= outcomes_before {
-        return Err(format!("the held query must record {family} {expected_outcome:?}").into());
+    if (outcomes - outcomes_before - 1.0).abs() > f64::EPSILON {
+        return Err(format!("the held query must record exactly one {expected_outcome:?}").into());
     }
 
-    // Once the held follower task is released, every Oracle drains back to
-    // its baseline ownership and the topology answers again; the killed pod
-    // no longer serves the graph's follower stages.
+    // Once the query has settled, every Oracle drains back to its baseline
+    // ownership and the topology answers again; the killed pod no longer
+    // serves the graph's follower stages.
     if cause != TerminalCause::PodKill {
-        cluster.release_execute_pause(HELD_FOLLOWER)?;
         for (index, before) in baseline {
             await_baseline(&cluster, index, before).await?;
         }
@@ -282,9 +267,6 @@ async fn await_cancellation_requested(leader: &wyrd_client::Bifrost) -> Result<(
 /// Production Oracle query duration family, labelled by class and outcome.
 const DURATION: &str = "oracle_query_duration_seconds";
 
-/// Production Analytical attempt family, labelled by its closed outcome.
-const ATTEMPTS: &str = "bifrost_oracle_analytical_attempts_total";
-
 /// Analytical-class [`DURATION`] labels for one `outcome`.
 fn duration_outcome(outcome: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
@@ -294,22 +276,15 @@ fn duration_outcome(outcome: &str) -> BTreeMap<String, String> {
 }
 
 impl TerminalCause {
-    /// The metric family and labels the held query's end must increment.
+    /// The [`DURATION`] outcome the held query's end must record.
     ///
-    /// Cancel and deadline read [`ATTEMPTS`]. Both end the query while the
-    /// leader still waits for its first batch, before any stream exists, and
-    /// [`DURATION`] records every such end as `failed`. The attempt family's
-    /// `cancelled` outcome covers an owner cancel and a deadline alike. The
-    /// tool query's deadline is capped at the run's remaining time, so in the
-    /// deadline case the run's cancel and the query's own expiry arrive
-    /// together.
-    fn recorded_outcome(self) -> (&'static str, BTreeMap<String, String>) {
+    /// The tool query's deadline is capped at the run's remaining time, so in
+    /// the deadline case the run's cancel and the query's own expiry arrive
+    /// together, and both are a cancellation.
+    const fn recorded_outcome(self) -> &'static str {
         match self {
-            Self::Cancel | Self::Deadline => (
-                ATTEMPTS,
-                BTreeMap::from([("outcome".to_owned(), "cancelled".to_owned())]),
-            ),
-            Self::PodKill => (DURATION, duration_outcome("failed")),
+            Self::Cancel | Self::Deadline => "cancelled",
+            Self::PodKill => "failed",
         }
     }
 }

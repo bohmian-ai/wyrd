@@ -12,7 +12,7 @@
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, RawQuery, Request, State};
-use axum::http::{HeaderName, Method};
+use axum::http::{HeaderMap, HeaderName, Method};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
@@ -24,7 +24,9 @@ use wyrd_spec::gateway::native::{
     AnthropicErrorEnvelope, GatewayAnthropicMessage, GatewayAnthropicMessagesRequest,
     GatewayGeminiGenerateContentRequest, GatewayGeminiGenerateContentResponse, GoogleErrorEnvelope,
 };
-use wyrd_spec::gateway::{GatewayContractError, GatewayOperation, ModelRef};
+use wyrd_spec::gateway::{
+    FALLBACK_HEADER, GatewayContractError, GatewayFallbackOverride, GatewayOperation, ModelRef,
+};
 use wyrd_spec::ids::{ModelId, ProviderId};
 
 use super::invocation::{GatewayCallRequest, GatewayInvocation, invalid_request};
@@ -184,9 +186,47 @@ fn native_model(provider: &str, model: &str) -> Result<ModelRef, WyrdError> {
     })
 }
 
+/// OpenAPI description of the optional `wyrd-gateway-fallback` request header
+/// on every governed inference route that accepts it.
+pub(super) const FALLBACK_HEADER_DOC: &str = "Optional per-call fallback override: unpadded \
+    base64url over the JCS UTF-8 serialization of a GatewayFallbackOverride, at most 8 KiB \
+    encoded and 4 KiB decoded, whose candidates are non-empty, duplicate-free, and exclude the \
+    requested model. Absent means tenant fallback policy applies. A repeated, malformed, \
+    oversized, or invalid value is refused before dispatch with \
+    WYRD_GATEWAY_400_INVALID_REQUEST naming `fallback`. The header never reaches a provider.";
+
+/// Reads the optional `wyrd-gateway-fallback` override of a call to `model`.
+///
+/// The header is consumed here and never reaches a provider; its absence
+/// leaves tenant fallback policy in effect.
+///
+/// # Errors
+/// Returns `GatewayInvalidRequest` naming `fallback` when the header repeats
+/// or its value is not a valid override for `model`, as decided by
+/// [`GatewayFallbackOverride::from_header_value`].
+pub(super) fn requested_fallback(
+    headers: &HeaderMap,
+    model: &ModelRef,
+) -> Result<Option<GatewayFallbackOverride>, WyrdError> {
+    let mut values = headers.get_all(FALLBACK_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(invalid_request(GatewayContractError::new(
+            "fallback",
+            "must appear at most once",
+        )));
+    }
+    GatewayFallbackOverride::from_header_value(value.as_bytes(), model)
+        .map(Some)
+        .map_err(invalid_request)
+}
+
 #[utoipa::path(
     post,
     path = "/v1/messages",
+    params(("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC)),
     request_body(content = GatewayAnthropicMessagesRequest, description = "Anthropic Messages request whose `model` is an exact Anthropic model id; the Wyrd access token travels in `x-api-key` or an `Authorization` bearer"),
     responses(
         (status = 200, description = "Anthropic message as JSON, or Anthropic server-sent events when `stream` is true", content(
@@ -221,6 +261,7 @@ fn native_model(provider: &str, model: &str) -> Result<ModelRef, WyrdError> {
 pub(crate) async fn anthropic_messages(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    headers: HeaderMap,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let answer = match caller {
@@ -238,8 +279,8 @@ pub(crate) async fn anthropic_messages(
                 Ok(GatewayCallRequest {
                     operation: GatewayOperation::ChatCompletions,
                     ingress: IngressDialect::AnthropicMessages,
+                    fallback: requested_fallback(&headers, &model)?,
                     model,
-                    fallback: None,
                     stream: body.get("stream") == Some(&Value::Bool(true)),
                     usage_bound: output.and_then(|output| token_bound(&body, Some(output))),
                     body,
@@ -266,7 +307,8 @@ pub(crate) async fn anthropic_messages(
     path = "/v1beta/models/{target}",
     params(
         ("target" = String, Path, description = "`<model>:generateContent`, or `<model>:streamGenerateContent` with `alt=sse`, where `<model>` is an exact Gemini model id"),
-        ("alt" = Option<String>, Query, description = "`sse` for streamGenerateContent; `json` or absent for generateContent")
+        ("alt" = Option<String>, Query, description = "`sse` for streamGenerateContent; `json` or absent for generateContent"),
+        ("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC)
     ),
     request_body(content = GatewayGeminiGenerateContentRequest, description = "Gemini GenerateContent request; the Wyrd access token travels in `x-goog-api-key` or an `Authorization` bearer"),
     responses(
@@ -303,11 +345,12 @@ pub(crate) async fn gemini_generate_content(
     caller: Result<Caller, WyrdErrorResponse>,
     Path(target): Path<String>,
     RawQuery(query): RawQuery,
+    headers: HeaderMap,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let answer = match caller {
         Err(WyrdErrorResponse(error)) => Err(error),
-        Ok(caller) => match gemini_call(&target, query.as_deref(), request) {
+        Ok(caller) => match gemini_call(&target, query.as_deref(), &headers, request) {
             Ok(call) => GatewayInvocation::new(&state).invoke(&caller, call).await,
             Err(error) => Err(error),
         },
@@ -319,17 +362,18 @@ pub(crate) async fn gemini_generate_content(
 }
 
 /// Builds the governed call of a Gemini `target` (`<model>:<method>`) with
-/// its raw `query` and body.
+/// its raw `query`, request `headers`, and body.
 ///
 /// # Errors
 /// Returns `GatewayInvalidRequest` naming `method` for a method other than
 /// `generateContent` or `streamGenerateContent`, `alt` when it repeats or the
 /// response format does not match the method, `model` for an invalid model id,
-/// and `body` or the missing member for a body that is not a `GenerateContent`
-/// request.
+/// `body` or the missing member for a body that is not a `GenerateContent`
+/// request, and every error of [`requested_fallback`].
 fn gemini_call(
     target: &str,
     query: Option<&str>,
+    headers: &HeaderMap,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Result<GatewayCallRequest, WyrdError> {
     let (model, method) = target.split_once(':').unwrap_or((target, ""));
@@ -379,8 +423,8 @@ fn gemini_call(
     Ok(GatewayCallRequest {
         operation: GatewayOperation::ChatCompletions,
         ingress: IngressDialect::GeminiGenerateContent,
+        fallback: requested_fallback(headers, &model)?,
         model,
-        fallback: None,
         stream,
         usage_bound: output.and_then(|output| token_bound(&body, Some(output))),
         body,

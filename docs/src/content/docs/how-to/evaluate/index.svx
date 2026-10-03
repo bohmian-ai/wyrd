@@ -35,3 +35,61 @@ verdicts and task outcomes are queryable through Bifrost
 
 `wyrd eval run` scores pre-collected records against an Eval Verifier card file
 without a server. See the [CLI reference](/reference/cli/).
+
+## Judging input directly
+
+`POST /v1/verification/execute` runs one exact registered Verifier against one
+exact subject Card over input supplied in the request, and returns the judgment
+in the response. Use it to gate a deploy or check a candidate before its
+observations exist. Nothing durable is created: there is no run, no published
+result, no Operator dispatch, no Bifrost read or write, and no Eval sampling.
+
+```json
+{
+  "verifier_uid": "<Verifier card uid>",
+  "subject_card_uid": "<subject card uid>",
+  "input": { "kind": "drift_samples", "columns": { "latency": [12, 14, null] } }
+}
+```
+
+`input` is one of:
+
+- `{"kind": "drift_samples", "columns": {<feature>: [number | string | null]}}`
+  for Drift Verifiers. PSI and SPC score against the Verifier's `ready` fitted
+  baseline; Custom scores the mean of `profile.metric_name`.
+- `{"kind": "eval_record", "context": {...}, "media": [...]}` for
+  assertion-only and LLM-judge Evals. Judges receive the supplied context.
+
+A `200` response carries `execution_id`, the exact `verifier` and `subject`
+references, `kind`, `verdict` (`passed`, `failed`, or `inconclusive`),
+`summary`, `counts`, and `detail` (`{"drift": ...}` or `{"eval": ...}`). A
+`failed` verdict is a successful response. `execution_id` appears only in the
+response, the audit record, and the trace; it is not queryable.
+
+The caller needs `evals:run` scoped to both the Verifier and the subject. Each
+request records one allowed or denied audit decision. Bounds are a 1 MiB body,
+at most 64 columns × 100,000 values of `drift_samples`, a 256 KiB
+`eval_record.context`, and a 60-second execution deadline.
+
+| Status | Code | Condition |
+|---|---|---|
+| 400 | `WYRD_VERIFICATION_400_INPUT_INVALID` | Malformed request |
+| 403 | `WYRD_PERMISSION_403_DENIED_RBAC` | No `evals:run` for the Verifier or subject |
+| 404 | `WYRD_VERIFICATION_404_TARGET_NOT_FOUND` | Unknown or cross-tenant Verifier or subject |
+| 409 | `WYRD_VERIFICATION_409_BASELINE_NOT_READY` | No `ready` fitted baseline |
+| 409 | `WYRD_VERIFICATION_409_BASELINE_LEGACY` | Baseline fitted under an earlier format |
+| 413 | `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` | A bound is exceeded |
+| 422 | `WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE` | Missing feature or type mismatch |
+| 422 | `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` | An Eval with trace or agent assertions |
+| 502 | `WYRD_VERIFICATION_502_DEPENDENCY_FAILED` | Judge provider failure after the task's own retries |
+| 504 | `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` | The deadline elapsed |
+
+The operation is not idempotent, takes no `Idempotency-Key`, and no SDK retries
+it. Disconnecting cancels in-flight work, but judge provider calls already
+issued may have incurred cost.
+
+The SDKs expose the same operation as `client.verification.execute(&request)`
+in Rust, `Verification().execute(request)` in Python, and
+`verification.execute(request)` in TypeScript. The MCP tool
+`verification.execute` takes the same request and appears only to a caller
+holding `evals:run`.

@@ -1,170 +1,165 @@
-# Invariant review — audit-outbox r3 closure
-
-## Review findings
-
-### Important
-
-#### INV-R3-001 — repeated unknown commit outcomes can retain more than one extra copy
-
-- **Classification:** `INCORRECT`
-- **Prior finding / violated obligation:** `FIND-AUDIT-OUTBOX-11`; approved
-  revision 3 `REQ-009` and `AC-009`.
-- **Exact locations:**
-  `crates/vala/vala-sql/src/audit_outbox.rs:102-109`,
-  `crates/shared/wyrd-runtime/src/outbox.rs:391-422`,
-  `crates/vala/vala-sql/src/queries/audit_staging.rs:113-132`, and
-  `crates/wyrd/wyrd-testing/tests/bifrost/server/audit_publication.rs:821-870,909-1054`.
-- **Evidence:** `AuditSink::write` reports the result of `commit()` directly.
-  Any error is returned to the generic outbox, which retains the same
-  `StagedAuditEvent` and retries it indefinitely. The append-time event-ID
-  lookup sees only live staging. If the first ambiguously successful commit is
-  published and retired before retry, the retry allocates a second sequence for
-  the same event ID. If that second commit also succeeds but reports an unknown
-  outcome and its row is again retired during backoff, the next retry allocates
-  a third sequence, and the same interleaving can repeat. Nothing in the writer,
-  staging table, or retained table bounds the retained multiplicity at two.
-  The added journey cannot falsify this path: `UnknownOutcomeSink` clears
-  `lose_next_ack` on the first attempt and expressly makes every later write
-  commit normally (`lines 854-869`), so it proves only one ambiguous outcome.
-- **Observable consequence:** one authorization decision can occupy three or
-  more valid, gap-free retained chain rows, contradicting AC-009's “at most one
-  extra retained row” and the test's claimed “at most twice” boundary. Logical
-  counts can also grow without bound on any read that does not collapse by
-  event ID.
-- **Required correction:** the current constraints cannot both guarantee
-  unbounded retry/no loss and cap physical retained copies at two after repeated
-  ambiguous outcomes: staging retirement deliberately deletes the only durable
-  fence, while revision 3 prohibits a second durable identity owner or a
-  retirement hold. Authority must either approve the ordinary at-least-once
-  consequence (any number of detectable physical copies, with all logical reads
-  collapsing them) or permit a durable identity lifetime/coordination mechanism.
-  The closure proof must inject at least two successive commit-success/unknown-
-  outcome cycles with publication and retirement between them and prove the
-  newly approved bound.
-
-#### INV-R3-002 — shipped audit read surfaces expose duplicate decisions
-
-- **Classification:** `MISSING`
-- **Prior finding / violated obligation:** `FIND-AUDIT-OUTBOX-11`; approved
-  revision 3 `REQ-009` and `AC-009`; the same invariant is live authority in
-  `architecture/bifrost-design.md:639-644` and
-  `architecture/wyrd-security-posture.md:365-372`.
-- **Exact locations:**
-  `crates/vala/vala-bifrost-redux/src/catalog/bifrost_catalog.rs:1535-1557`,
-  `crates/wyrd/wyrd-server/src/query/routes.rs:241-296`,
-  `crates/wyrd/wyrd-server/src/mcp/bifrost.rs:376-420`,
-  `crates/shared/wyrd-client/src/bifrost/facade.rs:1-8,652-693`,
-  `crates/wyrd/wyrd-cli/src/query/mod.rs:67-87`, and
-  `crates/wyrd/wyrd-testing/src/server.rs:1700-1801,1803-1857`.
-- **Evidence:** the authoritative `vala.system.audit_log` provider is the raw
-  Iceberg provider; it has no event-ID collapse. `POST /v1/query` accepts an
-  arbitrary `BifrostQueryRequest`, the MCP `bifrost.query` tool calls the same
-  stream service, the CLI forwards caller SQL unchanged, and the shared
-  `wyrd_client::Bifrost` facade (projected by the language SDKs) documents that
-  SQL may query any authorized table. The new production-publisher journey
-  demonstrates the result directly: its ordinary scheduled query observes two
-  raw rows for one event ID at
-  `audit_publication.rs:1006-1031`. Only `WyrdTestServer` helpers add
-  `SELECT DISTINCT event_id` or discard duplicate event IDs in a local
-  `HashSet`; those helpers are test harness, not HTTP, MCP, CLI, SDK, or server
-  table behavior. No dedicated shipped audit list/count endpoint or UI audit
-  reader was found, but the shipped generic HTTP/MCP/CLI/SDK query surfaces are
-  already sufficient to reach the violating count/list path.
-- **Observable consequence:** an authorized caller issuing
-  `SELECT COUNT(*) ...` or listing rows from `vala.system.audit_log` sees one
-  authorization decision more than once after the accepted retirement race.
-  Audit results are therefore duplicated on production surfaces even though the
-  harness reports one decision.
-- **Required correction:** make the production-owned logical audit read path
-  collapse `(tenant, event_id)` before count/list semantics reach any shared
-  query surface, while retaining the raw physical evidence needed for chain and
-  publication integrity behind its owning internal boundary. Reuse the one
-  Oracle/query path shared by HTTP, MCP, CLI, and SDK rather than duplicating
-  guards in each client. Focused proof must drive the production publisher to
-  create duplicate physical rows, then query through public HTTP plus at least
-  one independently projected agent/client surface and show both a list and a
-  count return one logical decision; a raw internal integrity proof should still
-  establish that the retained physical copies and chain rows remain available
-  to their owner.
+# Audit outbox r3 invariant review
 
 ## Immutable subject and scope
 
-- Repository root:
-  `/home/thorrester/Documents/GitHub/wyrd/.claude/worktrees/agent-aad682fbca5074900`
 - Base: `cf5ee4128ce0b842e00a0eb20770ab5c285dedd8`
-- Candidate: `e54b1244f32950d1ab251dae6530c4e1694c78d5`
-- Candidate was rechecked at report completion and remained unchanged.
-- Approved authority: `changes/active/audit-outbox/spec.md`, revision 3.
-- Closure scope: `FIND-AUDIT-OUTBOX-11`, `-12`, `-13`, `-14`, `-7`, `-3`,
-  plus regressions introduced by the range. `FIND-5`, `bench:capacity`, and the
-  aggregate gate remain integration-deferred by user direction.
-- CodeGraph was unavailable because this worktree has no `.codegraph/` index;
-  source, callers, tests, and history were inspected directly.
+- Candidate: `52e1144b5c186ccacd85d9c779a4e60c3cce5ac2`
+- Reviewed range: `cf5ee4128..52e1144b5`
+- Approved authority: `changes/active/audit-outbox/spec.md`, revision 4
+- Closure authority: `review/r2/verdict.md`, `review/r2/findings-validation.md`,
+  `review/r2/TASK-AUDIT-OUTBOX-R2-bounded-remediation.md`, and
+  `review/r2/TASK-AUDIT-OUTBOX-R3-commit-outcome.md`
 
-## Navigation and state trace
+This review is restricted to closure of `FIND-AUDIT-OUTBOX-11`, `-12`, `-13`,
+`-14`, `-7`, and `-3`, plus regressions introduced by the reviewed range. It
+does not reassess earlier accepted code except where the range could lose,
+duplicate, misattribute, or cross tenants with an audit decision. The committed
+abandoned `review/r3/` reports were not used as review evidence. `HEAD` remained
+the candidate throughout this review.
 
-| State / value | Producer and owner | Sink / sibling consumers | Failure or lifecycle boundary |
-|---|---|---|---|
-| Generic outbox item and pending count | `Outbox::stage`; handle-owned sender fence and atomics | `OutboxWriter::{dispatch,finish,release}`; sink write | Sink error/panic returns the owned vector to tenant-front retry; shutdown drops the only sender, drains, then abandons and clears terminal pending |
-| Audit `event_id` | `StagedAuditEvent::from` | staging append lookup/unique key, `AuditStagingRow`, retained projection | Identity survives ordinary retry while staged; retirement deletes the append-time fence |
-| Retained audit row | `AuditPublisher` projects `AuditStagingRow` through `AuditLogTable` | raw Oracle provider; public HTTP, MCP, CLI, SDK SQL readers; test-harness helpers | Publisher retirement permits later retry to allocate another sequence for the same event ID |
-| Unwrap audit exclusion | explicit `CFG_TEST_MODULES` paths | repository Rust scan | basename-wide escape removed; each current entry resolves to a real `#[cfg(test)] mod tests;` declaration |
+## Producer-to-sink and lifecycle trace
+
+### Generic outbox state
+
+`Outbox::stage` increments the pending count and gauge before sending under the
+queue read lock (`crates/shared/wyrd-runtime/src/outbox.rs:143-162`). Shutdown
+takes and drops the sender under the write lock before its first await
+(`outbox.rs:189-227`), so a staged item is either inside the pre-fence drain set
+or refused and counted after the fence. The writer groups by tenant, removes one
+tenant backlog into a child task, and records that task's tenant and count
+(`outbox.rs:304-345`). Ordinary errors and ordinary panics while constructing or
+polling `sink.write` return the owned items to the parent; `finish` restores
+them ahead of later same-tenant work (`outbox.rs:391-422`). Success releases the
+pending count; deadline abandonment leaves the count for `shutdown` to exchange
+to zero and count once.
+
+The panic invariant still has one reachable hole. Panic containment ends before
+the child task normalizes the sink error and before caught values are destroyed:
+`contain_panic(write).await` is followed by `error.to_string()` and panic-payload
+destruction in the child task (`outbox.rs:328-342`). `OutboxSink::Error` is only
+bounded by `Display`; a sink error whose `Display` panics therefore escapes the
+child task. Likewise, a caught panic payload or sink future with a panicking
+destructor can escape when dropped outside the inner polling catch. The parent
+then receives `JoinError` without the child-owned items and explicitly counts
+and releases them as lost (`outbox.rs:382-387`). That loss is neither abrupt
+process loss nor deadline abandonment. This is the same ownership source as
+`FIND-AUDIT-OUTBOX-12`, not a new unrelated hardening concern.
+
+### Audit transaction and retained result
+
+`AuditSink::write` acquires a tenant-bound `TenantConn`, obtains the xid8 in the
+same transaction, performs the sole canonical append, and commits
+(`crates/vala/vala-sql/src/audit_outbox.rs:128-158`). A normal commit returns
+success. If commit acknowledgement fails, `resolve_commit` asks
+`pg_xact_status` through a fresh pool checkout without calling the append again
+(`audit_outbox.rs:65-125`):
+
+- `committed` returns success, so the generic writer releases the batch without
+  resending it;
+- `aborted` returns the original error, so the generic writer restores the
+  batch to the front of only that tenant's queue;
+- in-progress, an unexpected status, or an unavailable Postgres repeats only
+  the status query after 50 ms-to-5 s backoff; and
+- `NULL` increments the audit lost counter and returns success, so no resend is
+  possible and the generic pending count is released.
+
+The canonical append derives sequence and hashes after locking the current
+tenant's chain head and inserts under the same `TenantConn`
+(`crates/vala/vala-sql/src/queries/audit_staging.rs:69-175`). The publisher still
+reads the staged sequence range and projects it once under its frozen range and
+stable batch identity. Event-ID staging, projection, harness collapse, and the
+event-ID migration are absent from the final candidate. Thus the revision-4
+source path has neither a producer of duplicate IDs nor a sibling reader that
+silently hides duplicate retained decisions.
+
+The production-writer/publisher journey cuts three commit acknowledgements,
+waits for publication and retirement between them, then cuts a commit before
+Postgres sees it (`crates/wyrd/wyrd-testing/tests/bifrost/server/audit_publication.rs:820-1054`).
+It observes one retained decision for each committed transaction, one retained
+decision after the aborted transaction is retried, and a retained row count
+equal to the chain head. This exercises the producer, writer, publisher, and
+retained sink rather than a substitute sink.
 
 ## Acceptance matrix
 
-| Requirement, acceptance criterion, constraint, or non-goal | Implementation evidence | Verification evidence | Result |
+| Obligation | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
-| `FIND-11` / REQ-009: retained rows carry the staged event ID | `AuditStagingRow.event_id`; publication selects it; `AuditLogTable::EVENT_ID`; `project_record_batch` appends it in canonical order | Reviewed seven focused audit projection tests; independently rerun `tables::audit::` (7/7 passed) | **PASS** |
-| `FIND-11` / REQ-009: a retry while the event remains staged consumes no sequence | append locks the chain head, reads same-tenant staged event IDs under RLS, and filters them before sequence allocation | Prior Postgres evidence and the production-publisher journey cover the still-staged interleaving | **PASS** |
-| `FIND-11` / AC-009: retirement retry creates at most one extra retained row | No durable event-ID fence remains after retirement; every returned commit error is retried | Journey injects exactly one lost acknowledgement and therefore does not exercise consecutive ambiguous commits | **FAIL — INV-R3-001** |
-| `FIND-11` / REQ-009 and AC-009: audit reads that count/list decisions collapse `(tenant,event_id)` | Only `WyrdTestServer::{retained_audit_records,retained_audit_rows}` collapse; raw catalog/provider and shared query surfaces do not | New journey explicitly observes two raw rows and one harness row; no public-surface collapse test exists | **FAIL — INV-R3-002** |
-| `FIND-12`: a normal sink construction/poll panic retains and retries the batch ahead of later same-tenant work | `dispatch` catches construction and polling unwind before returning `(tenant, items, result)`; `finish` requeues items at the front and increments write failures | Independently reran all `outbox::` tests; panic/order/loss proof passed (7/7 suite) | **PASS** |
-| `FIND-13`: shutdown fences admission at invocation, drains pre-fence items, reports exact deadline loss, and clears pending/gauge | `Outbox.queue` is a handle-owned `RwLock<Option<Sender>>`; shutdown takes/drops sender before awaiting; writer exit precedes one `pending.swap(0)` | Admission race and deadline-loss/pending/gauge tests passed in independently rerun outbox suite | **PASS** |
-| `FIND-14`: no blanket `tests.rs` exclusion | `CFG_TEST_MODULES` lists four exact paths and their declaring modules; each declaration was checked and is guarded by `#[cfg(test)]` | Standalone checker fixtures passed; `check:unwrap-audit` passed with a writable temporary cache | **PASS** |
-| `FIND-7`: changed declarations use top-level imports and bare names | `MutexGuard` at `outbox.rs:479,548`; `Uuid` at `audit_staging.rs:17` and bare declaration fields | Source inspection; implementer-recorded format/lints | **PASS** |
-| `FIND-3`: live security authority names the shared owner | `architecture/wyrd-security-posture.md:424-427` says “audit outbox write failure” | Focused live-authority search found no remaining targeted “Oracle audit commit failure” phrase | **PASS** |
-| Retained-schema fingerprint compatibility risk | Revision 3 explicitly approves `event_id` as an expensive-to-reverse retained-schema change. Repository history already removed an audit schema upgrader in `b7185d0ee` under the recorded decision that this schema had not shipped; no release compatibility contract in the reviewed authority requires an upgrade path | Static authority/history review only; no old physical table was upgraded | **PASS within approved pre-ship assumption; deployment state remains an integration limit** |
-| No second audit table, ledger, WAL, relay, retirement delay, or publisher | Range carries the ID through the existing staging row, publisher, and retained table | Complete range/name review | **PASS** |
-| No lost, misattributed, or cross-tenant decisions introduced by the range | Staging lookup remains RLS-bound through `TenantConn`; retained projection revalidates every row tenant; outbox shutdown/panic paths preserve or explicitly account for items | Focused source and outbox/projection tests | **PASS** |
+| `FIND-AUDIT-OUTBOX-11`; rev-4 REQ-009 / AC-009: never resend a committed batch; retry an aborted batch; repeated ambiguous commits remain exactly once after retirement | Xid is read in the append transaction and `resolve_commit` gates every retry on `pg_xact_status` (`audit_outbox.rs:65-158`); event-ID producer, projection, collapse, and migration are removed | Journey `ambiguous_audit_commits_retain_each_decision_exactly_once` covers three committed/lost acknowledgements across retirement plus one aborted commit (`audit_publication.rs:976-1054`) | **PASS** |
+| REQ-009 wait and `NULL` states | The status loop contains no append or resend; `NULL` counts the batch lost and returns success (`audit_outbox.rs:90-124`) | No direct branch-specific test; the `CommitLost` round may transiently observe in-progress but does not assert it | **PASS by source trace; residual proof limit** |
+| `FIND-AUDIT-OUTBOX-12`; REQ-003 / REQ-003a / REQ-008: a sink-task panic preserves and retries the batch; accepted work is lost only at approved boundaries | Poll-time sink panics are caught, but error formatting and destruction remain outside containment; `JoinError` counts/releases the child-owned batch (`outbox.rs:328-342,382-387`) | `a_panicking_write_is_retried_once_in_order_without_loss` proves an ordinary async-body panic only; the seven focused outbox tests passed in this review | **FAIL — `INV-R3-001`** |
+| `FIND-AUDIT-OUTBOX-13`; REQ-007 / AC-008: one-way shutdown admission fence and terminal pending/gauge settlement | Queue sender is taken before the first await; post-fence staging is refused; deadline abandonment swaps pending to zero and settles the gauge (`outbox.rs:143-162,189-227`) | Focused tests cover the stage/shutdown race and exact deadline loss; all seven outbox tests passed | **PASS** |
+| `FIND-AUDIT-OUTBOX-14`: `tests.rs` basename cannot bypass the unwrap gate | Only four explicit cfg-test module paths are exempt (`scripts/check_unwrap_audit.py:31-55`) | Identical allowlisted and production `tests.rs` fixtures pass; direct checker execution passed | **PASS** |
+| `FIND-AUDIT-OUTBOX-7`: changed declarations use imported bare names | `MutexGuard` is imported in the outbox test module and `Uuid` at audit-staging module scope (`outbox.rs:475-490`; `audit_staging.rs:14-20,181-210`) | Source inspection; recorded lint evidence was not independently rerun here | **PASS** |
+| `FIND-AUDIT-OUTBOX-3`: live security authority names the shared owner | Security operations names `audit outbox write failure` (`architecture/wyrd-security-posture.md:420-426`) | Focused source inspection | **PASS** |
+| No range regression in audit identity, ordering, tenancy, or retention | Tenant id selects `TenantConn`; retry stays on the same tenant; append locks and advances one tenant chain; publisher projection retains the same canonical fields without event-ID collapse | Two-replica/chain and tenant-independence Postgres tests remain; exact-once journey covers publisher retirement | **PASS**, subject to `INV-R3-001`'s loss path |
 
-## Schema compatibility risk judgment
+## Requested risk judgments
 
-The changed `AuditLogTable::arrow_fields()` necessarily changes both the
-catalog user-schema fingerprint and the canonical physical schema. Existing
-registered/physical tables with the old 14-column shape would be refused by
-`BifrostCatalog::ensure_builtin` because `create_table_locked` rejects a
-fingerprint mismatch and validates exact physical shape. The reviewed range has
-no migration path.
+- **Untested in-progress/unreachable and `NULL` branches:** not a separate
+  implementation finding. The loop is local and has no path back to
+  `append_audit_events`; `NULL` has a single counted-loss terminal. The absence
+  of direct proof is a real verification limit, especially for recovery after
+  status-query unavailability, but AC-009's required committed, aborted, and
+  repeated-retirement cases are exercised through the production writer and
+  publisher.
+- **One waiting batch occupies one of four writer slots:** accepted by the
+  approved bounded-concurrency shape. It occupies a generic tenant-write slot,
+  not a Postgres connection while sleeping. One unresolved tenant leaves three
+  slots for other tenants. If four transactions are simultaneously unresolved,
+  no fifth dispatches until an outcome resolves; when Postgres is unreachable,
+  a fifth write could not commit either. This does not introduce duplicate,
+  reordered, or cross-tenant audit state.
+- **Deleted migration:** the removed event-ID migration is unreleased and exists
+  only to implement the revision-2/3 design that revision 4 explicitly rejects.
+  Removing it with all event-ID producers and consumers leaves a coherent fresh
+  migration history and avoids retaining a forbidden schema column. No rollback
+  or compatibility migration is required for an unreleased schema.
 
-That is not a new closure finding under the present authority: revision 3
-explicitly approves the retained-schema change, and repository history contains
-the prior deliberate removal of the only audit-specific schema-evolution path
-because this retained schema was treated as unshipped. The acceptance is
-therefore conditional on that repository-owned pre-ship fact. If integration
-targets any deployment that already materialized the 14-column table, this
-becomes a blocking compatibility failure rather than an acceptable limit and
-requires an approved schema-evolution decision before rollout.
+## Proposed findings
+
+### INV-R3-001 — `FIND-AUDIT-OUTBOX-12` remains open after partial panic containment
+
+- **Classification:** `INCORRECT`
+- **Violated obligation:** `FIND-AUDIT-OUTBOX-12`; REQ-003, REQ-003a, and
+  REQ-008 require a panicking sink batch to remain queued and limit accepted
+  loss to abrupt process stop or an expired graceful-shutdown deadline.
+- **Exact location:** `crates/shared/wyrd-runtime/src/outbox.rs:328-342` and
+  `:382-387`.
+- **Evidence:** only construction and polling of `sink.write` occur inside
+  `catch_unwind`. Sink-error `Display` conversion and destruction of the sink
+  future/caught panic payload can still panic after containment. The resulting
+  `JoinError` no longer carries `items`; `finish` counts and releases their
+  count instead of restoring the batch.
+- **Observable consequence:** a reachable sink-task panic outside the narrow
+  poll catch loses every accepted item in that tenant batch while the process
+  continues, increments the loss metric outside an approved loss boundary, and
+  permits later same-tenant decisions to commit without the lost decisions.
+- **Required testable correction:** keep the batch owned inside the child while
+  containing the complete sink-controlled outcome lifecycle, including error
+  normalization and destruction, so every non-deadline sink panic returns the
+  original items as an ordinary failed write for front-of-queue retry. A focused
+  test sink whose returned error panics from `Display` (or whose caught panic
+  payload panics on drop) must prove the writer survives, the original batch
+  commits once ahead of later same-tenant items, the failure counter increments,
+  and the loss counter remains zero. Preserve deadline abandonment and ordinary
+  retry behavior.
 
 ## Verification notes
 
-- Independently run:
-  - `mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E 'test(/^outbox::/)'` — 7/7 passed.
-  - `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(/^tables::audit::/)'` — 7/7 passed.
-  - `mise exec -- python3 scripts/test_check_unwrap_audit.py` — passed.
-  - `mise run check:unwrap-audit` — passed after using a writable temporary cache; the first attempt was infrastructure-blocked by a read-only default cache, not a checker failure.
-  - `git diff --check` — passed.
-- Reviewed but did not independently rerun the Postgres journey. Its source is
-  sufficient to establish both the intended one-ambiguity case and the raw
-  production-query duplicate; the implementer reports its focused lane and
-  `test:bifrost:journey:server` passed.
-- `bench:capacity` and `mise run gate` were not run, per the explicit deferral.
+- `mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E 'test(/^outbox::tests::/)'`:
+  7 passed.
+- `mise exec -- python3 scripts/test_check_unwrap_audit.py`: passed.
+- `python3 scripts/check_unwrap_audit.py`: passed.
+- `git diff --check cf5ee4128..52e1144b5`: passed.
+- The canonical `mise run check:unwrap-audit` wrapper could not acquire its uv
+  cache lock because that cache path is read-only in this review sandbox; the
+  same checker was run directly and passed.
+- The Postgres journey and broader recorded lanes were inspected in source but
+  not independently rerun by this reviewer. `bench:capacity` and `mise run gate`
+  remain deferred by user direction.
 
 ## Overall result
 
-**FAIL**
-
-`FIND-AUDIT-OUTBOX-12`, `-13`, `-14`, `-7`, and `-3` are closed. Revision 3
-does not close `FIND-AUDIT-OUTBOX-11`: repeated ambiguous commits can exceed
-AC-009's physical duplicate bound, and the only logical collapse is in test
-harness helpers while shipped HTTP/MCP/CLI/SDK query surfaces expose duplicate
-audit decisions. No unrelated range regression was found.
+**FAIL** — revision-4 `FIND-AUDIT-OUTBOX-11` and findings `-13`, `-14`, `-7`,
+and `-3` are closed, but `FIND-AUDIT-OUTBOX-12` remains open as
+`INV-R3-001`.

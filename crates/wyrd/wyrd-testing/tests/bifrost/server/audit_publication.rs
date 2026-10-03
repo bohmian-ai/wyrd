@@ -1,7 +1,11 @@
+use std::io::Result as IoResult;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use vala_bifrost_redux::oracle::peer::PeerSecurityAudit;
 use vala_sql::audit_outbox::AuditSink;
 use vala_sql::queries::audit_staging::{
@@ -838,7 +842,7 @@ enum Cut {
 /// writer resolves a failed commit on, behaves as a direct pool would.
 struct CommitCutter {
     /// Address the proxied pool connects to.
-    addr: std::net::SocketAddr,
+    addr: SocketAddr,
     /// The cut the next proxied `COMMIT` takes, when armed.
     armed: Arc<Mutex<Option<Cut>>>,
     /// How many armed cuts were performed.
@@ -862,7 +866,7 @@ impl CommitCutter {
                 let (armed, fired) = (Arc::clone(&accept_armed), Arc::clone(&accept_fired));
                 let target = target.clone();
                 tokio::spawn(async move {
-                    if let Ok(upstream) = tokio::net::TcpStream::connect(target).await {
+                    if let Ok(upstream) = TcpStream::connect(target).await {
                         let _closed = relay(client, upstream, &armed, &fired).await;
                     }
                 });
@@ -913,13 +917,11 @@ impl CommitCutter {
 /// # Errors
 /// Returns the read or write failure of either side.
 async fn relay(
-    client: tokio::net::TcpStream,
-    upstream: tokio::net::TcpStream,
+    client: TcpStream,
+    upstream: TcpStream,
     armed: &Mutex<Option<Cut>>,
     fired: &AtomicUsize,
-) -> std::io::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
+) -> IoResult<()> {
     let (mut client_rx, mut client_tx) = client.into_split();
     let (mut upstream_rx, mut upstream_tx) = upstream.into_split();
     let swallow = Arc::new(AtomicBool::new(false));

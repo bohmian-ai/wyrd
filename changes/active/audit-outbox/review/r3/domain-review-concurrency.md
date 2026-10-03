@@ -1,139 +1,132 @@
-# Concurrency and lifecycle domain review
+# Concurrency and resource-ownership domain review
 
 ## Immutable subject
 
 - Repository: `/home/thorrester/Documents/GitHub/wyrd/.claude/worktrees/agent-aad682fbca5074900`
 - Base: `cf5ee4128ce0b842e00a0eb20770ab5c285dedd8`
-- Candidate: `e54b1244f32950d1ab251dae6530c4e1694c78d5`
-- Approved specification: `changes/active/audit-outbox/spec.md`, revision 3
-- Prior review: `changes/active/audit-outbox/review/r2/`
-- Remediation task: `changes/active/audit-outbox/review/r2/TASK-AUDIT-OUTBOX-R2-bounded-remediation.md`
+- Candidate: `52e1144b5c186ccacd85d9c779a4e60c3cce5ac2`
+- Reviewed range: `cf5ee4128ce0b842e00a0eb20770ab5c285dedd8..52e1144b5c186ccacd85d9c779a4e60c3cce5ac2`
+- Approved authority: `changes/active/audit-outbox/spec.md`, revision 4
+- Prior findings and remediation authority: `review/r2/verdict.md`, `review/r2/findings-validation.md`, `review/r2/TASK-AUDIT-OUTBOX-R2-bounded-remediation.md`, and `review/r2/TASK-AUDIT-OUTBOX-R3-commit-outcome.md`
 
-The repository has no `.codegraph/` directory. `HEAD` matched the candidate at
-the start of this review. This report is limited to closure of
-`FIND-AUDIT-OUTBOX-12` and `FIND-AUDIT-OUTBOX-13`, their concurrency
-interaction with revision 3's `FIND-AUDIT-OUTBOX-11` outcome, and regressions
-introduced by the remediation range. It does not reopen earlier passed code.
+`HEAD` matched the immutable candidate before source review, focused verification,
+and report writing. The repository has no `.codegraph/` directory. The abandoned
+review artifacts from the earlier superseded r3 attempt were not used as
+evidence.
 
 ## Reviewed boundary
 
-The review traced:
+This review traced the concurrency and lifecycle boundary relevant to the
+user-directed closure scope:
 
-- `Outbox::stage`, `settle`, and `shutdown`, including the sender `RwLock`,
-  the admission fence, concurrent stage/shutdown linearization, concurrent
-  shutdown calls, cancellation, the common deadline, pending accounting, the
-  `outbox_pending` gauge, and terminal loss accounting;
-- `OutboxWriter::run`, receive/dispatch order, one in-flight write per tenant,
-  retry-front insertion, backoff, `JoinSet` completion, item ownership, unwind
-  containment, and abandonment;
-- the production `AuditSink`, the only shipped `OutboxSink`, and the
-  production-shaped unknown-commit test sink;
-- the actual server shutdown order, which drains request/Bifrost producers
-  before the process audit outbox; and
-- the focused generic tests plus the unknown-outcome publication journey.
+- the `Outbox` handle's `RwLock<Option<UnboundedSender<_>>>` admission fence,
+  pending atomic, gauge, idle notification, abandonment token, and tracked
+  writer lifecycle in `crates/shared/wyrd-runtime/src/outbox.rs:83-227`;
+- writer dispatch, one-in-flight-write-per-tenant enforcement, the four-slot
+  concurrency bound, retry ordering/backoff, panic containment, `JoinSet`
+  completion, and terminal release accounting in
+  `crates/shared/wyrd-runtime/src/outbox.rs:230-468`;
+- the audit sink's fixed four-writer topology and failed-commit resolution on a
+  fresh pool checkout in `crates/vala/vala-sql/src/audit_outbox.rs:27-158`;
+- tenant-bound transaction acquisition and consuming commit ownership in
+  `crates/wyrd/wyrd-sql/src/tenant_conn.rs:25-73`;
+- server ownership and shutdown ordering: one shared process outbox is composed
+  into `AppState` (`crates/wyrd/wyrd-server/src/state.rs:1571-1641,2176-2222`),
+  request/Bifrost producers drain before the outbox fence, and the same process
+  deadline controls final outbox abandonment
+  (`crates/wyrd/wyrd-server/src/app/server.rs:853-887`);
+- the production-writer/publisher ambiguity journey and its commit-cut proxy in
+  `crates/wyrd/wyrd-testing/tests/bifrost/server/audit_publication.rs:843-1054`;
+- the generic panic, retry, cross-tenant, shutdown-fence, deadline-loss, pending,
+  and gauge tests in `crates/shared/wyrd-runtime/src/outbox.rs:640-823`.
 
-No production Eval outbox consumer exists in this candidate. The approved
-verified-change authority explicitly says the initial Eval change has no Eval
-outbox, so the generic owner and its tests are currently the only evidence for
-that future consumer.
-
-## Authority coverage
-
-| Boundary | Governing authority inspected | Result |
-|---|---|---|
-| Accepted loss, panic retry, order, and backoff | Spec rev. 3 REQ-003, REQ-003a, REQ-008, AC-008; r2 `FIND-AUDIT-OUTBOX-12` and its remediation | Ordinary sink polling panic is retried in order; one remaining escaped-unwind path still loses the batch (`CONC-R3-001`) |
-| Shutdown fence and terminal accounting | Spec rev. 3 REQ-007, REQ-008, AC-007, AC-008; r2 `FIND-AUDIT-OUTBOX-13` and its remediation | PASS |
-| Audit unknown-outcome interaction | Spec rev. 3 REQ-009 and AC-009; AGENTS.md and `architecture/agent-rules.md` one-path/non-blocking audit rules | PASS for concurrency/lifecycle: the same owned event stays ahead of later tenant work, and post-retirement duplication remains identifiable as revision 3 permits |
-| Async ownership and lifecycle | AGENTS.md §§5-6, 11-12; `architecture/references/languages/maintainer-style.md`; `architecture/references/languages/spec-driven-development.md` | One finding below |
-| Server composition | `architecture/wyrd-design.md`, `architecture/bifrost-design.md`, `crates/wyrd/wyrd-server/src/app/server.rs` | PASS: producers drain before the final audit-outbox fence and wait |
-
-## Source coverage
-
-| Area | Source and tests inspected | Assessment |
-|---|---|---|
-| Generic outbox | `crates/shared/wyrd-runtime/src/outbox.rs` in full and its base-to-candidate diff | FIND-13 closes; FIND-12 closes the tested polling-panic path but not every unwind the child task admits |
-| Audit sink | `crates/vala/vala-sql/src/audit_outbox.rs` | The sink uses the generic owner and canonical append; no second queue or lifecycle owner was introduced |
-| Unknown outcome | `crates/wyrd/wyrd-testing/tests/bifrost/server/audit_publication.rs:821-1030` | Failed acknowledgement keeps the original items owned, blocks retry deterministically, preserves same-tenant order, and settles to zero |
-| Server shutdown | `crates/wyrd/wyrd-server/src/app/server.rs:744-878` | Request, MCP, gateway, and Bifrost producers drain before `audit_outbox.shutdown(deadline)` |
-| Eval consumer | `changes/active/verified-change-contract/architecture/verifier/eval.md:90-111`; repository-wide `OutboxSink` implementation search | No production Eval outbox exists in the candidate |
+Governing authority included `AGENTS.md` sections 2, 5, 6, 11, and 12;
+`architecture/agent-rules.md` audit, tenancy, async, and verification rules;
+`architecture/bifrost-design.md` audit durability/publication and lifecycle
+authority; and the approved revision-4 REQ-002, REQ-003, REQ-003a, REQ-007,
+REQ-008, REQ-009, AC-007, AC-008, and AC-009.
 
 ## Closure assessment
 
-| Obligation | Evidence | Result |
+| Closure item | Concurrency/resource evidence | Result |
 |---|---|---|
-| FIND-12: a sink panic retains its batch, retries at the tenant front with backoff/write-failure accounting, and records no live-process loss | `dispatch` catches future construction and polling panics while it still owns `items`; `finish` requeues the returned vector ahead of later items. `a_panicking_write_is_retried_once_in_order_without_loss` passes. However, teardown and error/panic formatting occur outside the unwind boundary, and `finish` still deliberately loses the batch for the resulting `JoinError`. | **FAIL — `CONC-R3-001`** |
-| FIND-13: shutdown fences intake before waiting | `Outbox::shutdown` takes and drops the sole sender under the write lock before its first await; `stage` holds the read lock through send. Thus every send linearizes before the fence or is refused after it. | PASS |
-| FIND-13: post-fence stages are refused and counted without entering pending | `stage` increments pending/gauge only while a sender exists and reverses both on a closed receiver; the no-sender path increments only loss. `shutdown_refuses_items_staged_after_it_begins` proves the late item does not reach the sink. | PASS |
-| FIND-13: deadline abandonment is exact and clears terminal pending/gauge | Shutdown cancels abandonment, waits for writer destruction (including in-flight cancellation), then atomically swaps pending to zero, decrements the gauge by exactly that value, counts it once, and notifies settlers. Concurrent shutdown callers share the writer wait and only one can receive the nonzero swap. | PASS |
-| FIND-11 interaction: retry ownership/order survives unknown commit and publisher retirement | The child task returns the same `StagedAuditEvent` vector on an ordinary reported error; `finish` prepends it to later same-tenant work. The journey proves both the still-staged and retired-row cases and ends with `pending() == 0`. | PASS within this domain; audit-read surface breadth is outside this concurrency report |
-| Range regression boundary | The sender change preserves non-blocking staging, one in-flight batch per tenant, bounded tenant concurrency, healthy-tenant progress, retry timing, and server drain order. No additional lifecycle regression was found. | PASS apart from `CONC-R3-001` |
+| `FIND-AUDIT-OUTBOX-11` under revision 4 | `AuditSink::write` obtains the transaction ID before append and does not return the batch to the generic retry owner after a failed commit until `resolve_commit` reports `aborted` (`audit_outbox.rs:83-124,144-157`). `committed` becomes success, `aborted` becomes the ordinary front-of-queue retry, unresolved status stays inside the same sink future without re-send, and `NULL` records terminal loss and returns success so the batch cannot be reissued. The journey performs three acknowledgement-loss rounds with publication/retirement between them, then one pre-commit loss, and verifies one retained row per decision plus a gap-free retained prefix (`audit_publication.rs:976-1054`). | **CLOSED** |
+| `FIND-AUDIT-OUTBOX-12` | Future construction and every poll occur under `catch_unwind` while the spawned child still owns `items`; a recovered panic is returned with the vector and follows the same retry/backoff/front-of-queue path as a sink error (`outbox.rs:304-345,368-423,435-454`). The focused test proves the original batch stays pending, precedes a later same-tenant item, commits once, increments failure once, loses nothing, and settles both pending and gauge (`outbox.rs:764-788`). The remaining `JoinError` branch covers task failures outside the specifically required sink-future construction/poll containment and is not the former reachable sink-panic loss path. | **CLOSED** |
+| `FIND-AUDIT-OUTBOX-13` | `stage` holds the queue read lock through count, gauge, and send; `shutdown` takes and drops the only sender under the write lock before its first await (`outbox.rs:143-161,189-227`). Therefore a racing stage linearizes wholly before or wholly after the fence. Deadline abandonment first stops and drops the writer/its `JoinSet`, then atomically swaps pending to zero, counts the exact remainder once, decrements the gauge, and wakes settlers. The focused tests cover pre-fence drain/post-fence refusal and exact deadline loss with zero terminal pending/gauge (`outbox.rs:732-762,790-823`). | **CLOSED** |
+| Same-tenant ordering and cross-tenant dispatch | `in_flight` prevents a second write for the same tenant; failure prepends its returned vector ahead of later queued work; elapsed backoff and slot availability control dispatch (`outbox.rs:311-365,391-423`). Existing focused tests exercise order and a failing tenant with concurrency one (`outbox.rs:640-693`). | **PASS — no regression** |
+| Cancellation and shutdown ownership | The outer tracked writer is the only owner of the receiver, waiting maps, retry state, and `JoinSet`. Deadline cancellation selects the biased abandon branch; dropping that owner cancels in-flight children before `shutdown` settles the shared pending count. Production shuts down request and Bifrost producers before invoking this fence (`server.rs:853-878`). | **PASS — no regression** |
+| `FIND-AUDIT-OUTBOX-7` concurrency-adjacent declarations | The changed generic test declaration imports and uses bare `MutexGuard`, and the audit row arrays import and use bare `Uuid`; no concurrency owner/type regression was introduced (`outbox.rs:475-490,546-552`; `audit_staging.rs:14-20,181-210`). | **CLOSED in the reviewed boundary** |
 
-## Material finding
+## Directed risk judgments
 
-### CONC-R3-001 — the panic boundary still permits a child-task unwind to destroy its owned batch
+### Unresolved-status and `NULL` branches lack direct tests
 
-- **Classification:** INCORRECT; `FIND-AUDIT-OUTBOX-12` remains partially open.
-- **Violated obligation:** REQ-003, REQ-003a, REQ-008, AC-008, and the r2
-  correction require a sink-task panic to preserve item ownership and enter the
-  existing retry path. Accepted items may be lost only on abrupt process stop
-  or the graceful-shutdown deadline.
-- **Exact location:** `crates/shared/wyrd-runtime/src/outbox.rs:328-342,
-  368-389,435-453`.
-- **Evidence:** `contain_panic` catches only calls to `Future::poll`. After a
-  caught poll panic, the pinned sink future is dropped when `contain_panic`
-  returns, outside `catch_unwind`. Converting an ordinary sink error with
-  `error.to_string()` and formatting/dropping the caught panic payload also
-  occur outside any unwind boundary. Each is code executed by or over types
-  supplied by the public `OutboxSink` contract and can panic. Such a panic
-  escapes the child task, so `JoinSet` returns `JoinError`; `finish` then uses
-  only the `(tenant, count)` side record, increments
-  `outbox_events_lost_total`, releases pending, and discards the sole item
-  vector. The source documentation itself acknowledges this reachable loss
-  path for an escaped panic.
-- **Observable consequence:** a legal generic sink whose future panics while
-  being dropped, whose error `Display` panics, or whose panic payload panics on
-  drop can lose accepted audit/evaluation work while the process and writer
-  continue. A later same-tenant batch can pass the lost decision and
-  `settle()` can report zero, recreating the exact result FIND-12 prohibited.
-  The current `AuditSink` does not intentionally define any of those panics,
-  but REQ-008 makes the generic owner—not each sink—the owner of this
-  guarantee, and the future Eval sink is not yet present to narrow it.
-- **Testable correction:** keep the existing writer, `JoinSet`, tenant queues,
-  and retry path, but make the child-task unwind boundary cover the complete
-  sink attempt lifecycle, including future teardown and conversion of a sink
-  error or panic into the writer's non-panicking failure value, before the
-  task relinquishes the item vector. Then delete the live-process loss behavior
-  for a sink-originated `JoinError` or make that state unreachable by
-  construction. Add focused generic cases whose sink future panics during
-  teardown and whose error formatting panics; prove the original batch remains
-  pending, increments the write-failure metric rather than the loss metric,
-  retries once ahead of a later same-tenant item, and returns pending/gauge to
-  zero. Preserve deadline cancellation as the terminal loss boundary.
+This is a real verification limit, but not a material closure finding. The
+revision-4 acceptance proof explicitly requires the committed, aborted, and
+repeated ambiguity-with-retirement outcomes; the production journey exercises
+those through the real writer and publisher. The unasserted branches are small
+and source-complete: every nonterminal status/query error takes only the bounded
+50 ms-to-5 s polling backoff without returning the batch, while `NULL` performs
+the required loss increment and returns success so neither the generic retry
+path nor publisher can create a duplicate (`audit_outbox.rs:90-124`). There is
+no downstream state transition between the status result and those actions.
+The absence of deterministic direct injection for `in progress`, connection
+unreachability, and `NULL` should remain recorded as a verification limit; it
+does not invalidate AC-009's existing direct proof.
+
+### An ambiguous batch occupies one of the four writer slots
+
+This is acceptable bounded behavior under the approved topology, not a
+correctness or regression issue. `AUDIT_WRITER_CONNECTIONS` is four
+(`audit_outbox.rs:27-32`), and an unresolved transaction remains the one
+in-flight write for its tenant, occupying one generic dispatch slot while
+`pg_xact_status` is retried. That preserves the more important REQ-009 rule that
+neither the batch nor later same-tenant work is re-sent before its outcome is
+known. One ambiguous tenant leaves three slots available, satisfying the
+specified one-contended-tenant isolation. Four simultaneous unresolved commits
+can consume all four slots, but that is the direct bounded consequence of four
+concurrent uncertain writes; during database unreachability no tenant could
+commit through another slot, and after recovery each resolver uses the shared
+Vala pool (default 16 connections) and releases its slot as soon as the status
+is known (`vala-sql/src/postgres.rs:64-159`). Freeing a slot while its sink call
+remains unresolved would require a second concurrency/state owner and would
+weaken the current one-write-per-tenant ordering unless the specification chose
+new concurrency semantics.
+
+### Deleted unreleased migration
+
+Deletion is the required revision-4 rollback of the superseded event-ID model,
+not a persistent-data or lifecycle regression. The migration was introduced
+only by the still-active, unreleased change and revision 4 explicitly requires
+no event-ID column. Keeping it would make the candidate violate REQ-009's wire
+and retained-state contract. No compatibility migration is warranted for an
+unreleased schema; previously initialized development databases may need their
+normal test/database reset, but no shipped deployment contract is being
+removed.
+
+## Material proposed findings
+
+None. The concurrency/resource-ownership finding ledger is empty.
 
 ## Verification limits
 
-- Independently ran `mise exec -- cargo nextest run --locked -p wyrd-runtime
-  --lib -E 'test(/^outbox::/)'`: all 7 focused tests passed.
-- The passing panic test covers a conventional panic during future polling.
-  It does not enter the teardown or formatting unwind paths described in
-  `CONC-R3-001`.
-- The Postgres-backed audit-publication journey and recorded broader lanes were
-  inspected from source and implementer evidence but not rerun by this domain
-  reviewer.
-- `mise run bench:capacity` and `mise run gate` remain explicitly deferred to
-  integration and are not treated as domain-review failures.
-- Schema fingerprint compatibility and shipped audit-reader deduplication are
-  assigned to the persistent-data and surface reviewers, respectively; this
-  report assessed only their concurrency/lifecycle interactions.
+- Independently run: `mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E 'test(/^outbox::tests::/)'` — **7/7 passed**.
+- Independently run: `git diff --check cf5ee4128ce0b842e00a0eb20770ab5c285dedd8..52e1144b5c186ccacd85d9c779a4e60c3cce5ac2` — **passed**.
+- The remediation record reports the production commit-outcome journey, the
+  SQL integration lane, Bifrost journey lane, `test:wyrd`, format, lints,
+  docs, and unwrap-audit checks green. This domain reviewer did not rerun the
+  Postgres journey or broad lanes.
+- The in-progress/unreachable status loop and `NULL` loss branch have no
+  deterministic direct assertion, as assessed above.
+- `mise run bench:capacity`, `FIND-AUDIT-OUTBOX-5`, and `mise run gate` remain
+  deferred to integration by explicit user direction and were not treated as
+  review failures.
 
 ## Overall result
 
-**FAIL**
-
-`FIND-AUDIT-OUTBOX-13` is closed: shutdown has a one-way admission fence,
-drains only pre-fence work to the deadline, and settles pending/gauge/loss
-accounting coherently. The normal unknown-outcome retry continues to own and
-order the same events, including revision 3's allowed post-retirement retained
-duplicate. `FIND-AUDIT-OUTBOX-12` is not fully closed because sink-controlled
-teardown and formatting can still unwind beyond the containment boundary and
-the remaining `JoinError` branch intentionally records live-process loss.
+**PASS.** Within the user-directed closure scope, the range closes the
+concurrency/lifecycle portions of `FIND-AUDIT-OUTBOX-11`, `-12`, `-13`, and
+`-7`, introduces no concurrency, cancellation, accounting, tenant-dispatch, or
+resource-ownership regression, and the three directed risks are either bounded
+approved behavior or explicit non-blocking verification limits rather than
+material defects.

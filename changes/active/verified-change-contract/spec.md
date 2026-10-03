@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 61
+revision: 62
 status: approved
 ---
 
@@ -1471,6 +1471,12 @@ table on `(data_tenant_id, result_id)`.
   attempt. The result store and the settle retry with backoff for as long as
   the run's lease remains, and a settle that still cannot run leaves the
   stored result for the next claimant.
+- **REQ-186**: A scheduled occurrence whose window ends at `T` MUST NOT be
+  claimed before PostgreSQL's `statement_timestamp()` reaches `T + 30
+  seconds`. The window stays `[start, T)`. The 30-second wait lets
+  observations stamped before `T` finish ingest before the window is read.
+  It is a fixed value, not configuration.
+
 - **REQ-152**: Verification coordination MUST use PostgreSQL as its clock.
   PostgreSQL MUST write and evaluate runtime activity, schedule eligibility,
   run and dispatch availability, claim and lease expiry, retry/backoff
@@ -2443,7 +2449,7 @@ published image pinned by an immutable registry digest before release.
 
 ## Open material decisions
 
-None for revision 61.
+None for revision 62.
 
 Revision 39 records the user's narrow deletion: remove the always-allow
 hook and its fake `invoke` policy attribution without redesigning delegation.
@@ -2479,6 +2485,13 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 
 ## Revision history
 
+- **Revision 62 Late observations reach their window (2026-10-03, approved on
+  user direction):** A scheduled Drift occurrence was claimed the instant
+  PostgreSQL reached its window end. An observation stamped just before the end
+  but still being ingested was left out of that window, and the next window
+  starts at the end, so it was never counted. REQ-186 adds a fixed 30-second
+  wait after the window end before the occurrence is claimed. Event time stays
+  producer-owned.
 - **Revision 61 Eval runs follow the writer (2026-10-03, approved on user
   direction):** The TASK-015 review found that the flusher created runs for
   every binding on the observation's subject and checked each owner's

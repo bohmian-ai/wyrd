@@ -527,6 +527,8 @@ impl PyWorkflow {
 
     /// Run this workflow against the process-local provider registry.
     ///
+    /// Steps routed to an external gateway use the bindings named in the
+    /// shared client configuration; only selected bindings' secrets are read.
     /// The GIL is released while the shared Wyrd runtime drives the native
     /// executor to its terminal snapshot.
     ///
@@ -545,10 +547,8 @@ impl PyWorkflow {
     #[pyo3(signature = (input = None))]
     fn run(&self, py: Python<'_>, input: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<PyWorkflowRun> {
         let input = workflow_input_from_py(input)?;
-        let providers = skald_runtime::default_registry();
-        let run = py.detach(|| {
-            wyrd_runtime::runtime().block_on(self.inner.run_with(providers.as_ref(), input))
-        })?;
+        let workflow = wyrd_client::Workflow::from(self.inner.clone());
+        let run = py.detach(|| wyrd_runtime::runtime().block_on(workflow.run(input)))?;
         Ok(PyWorkflowRun { run })
     }
 }

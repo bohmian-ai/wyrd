@@ -6,16 +6,23 @@
 //! authored bundle, the Cards graph owner reads exact registered bodies, and
 //! Skald hydrates, validates, and runs. Rust cannot attach client IO methods
 //! to the foreign Skald type, so loading lives here. Loading never registers,
-//! executes, or resolves execution secrets.
+//! executes, or resolves execution secrets; running prepares only the local
+//! dependencies the Workflow's routes select.
 
 use std::path::{Path, PathBuf};
 
-use skald_workflow::{Workflow as SkaldWorkflow, WorkflowInput, WorkflowResult, WorkflowRun};
+use skald_runtime::ProviderRegistry;
+use skald_workflow::{
+    Workflow as SkaldWorkflow, WorkflowInput, WorkflowResult, WorkflowRun, WorkflowRunOptions,
+};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 
 use crate::cards::{CardGraphHydrator, CardSelector, Cards, WorkflowBodies};
+use crate::global_config::{GlobalConfig, LocalWorkflowConfig};
+use local::SelectedRoutes;
 
+mod local;
 mod remote;
 
 pub use remote::Workflows;
@@ -80,10 +87,41 @@ impl Workflow {
     /// Run on the process-default native provider registry.
     ///
     /// # Errors
-    /// Returns the pre-dispatch errors of [`SkaldWorkflow::run`]; step
-    /// failures are reported in the returned run.
+    /// Returns the errors of [`Self::run_with`].
     pub async fn run(&self, input: impl Into<WorkflowInput>) -> WorkflowResult<WorkflowRun> {
-        self.inner.run(input).await
+        self.run_with(skald_runtime::default_registry().as_ref(), input)
+            .await
+    }
+
+    /// Run on `native` with the shared local dependencies its routes select.
+    ///
+    /// Only when a step resolves to an `ext_gateway` route is the shared
+    /// client configuration loaded; then each selected binding it configures
+    /// has its secret headers resolved, and no other binding is read. A
+    /// selected binding absent from configuration is refused by Skald before
+    /// any dispatch. Loading a Workflow never performs this preparation.
+    ///
+    /// # Errors
+    /// Returns the client configuration error when the shared configuration
+    /// cannot be read, `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` when a selected
+    /// binding is absent, invalid, or has an unreadable secret, and the other
+    /// pre-dispatch errors of [`SkaldWorkflow::run_with_options`]; step
+    /// failures are reported in the returned run.
+    pub async fn run_with(
+        &self,
+        native: &ProviderRegistry,
+        input: impl Into<WorkflowInput>,
+    ) -> WorkflowResult<WorkflowRun> {
+        let routes = SelectedRoutes::of(self.inner.spec());
+        let config = if routes.needs_config() {
+            GlobalConfig::load().map_err(WyrdError::from)?.workflow
+        } else {
+            LocalWorkflowConfig::default()
+        };
+        let dependencies = routes.dependencies(native.clone(), &config).await?;
+        self.inner
+            .run_with_options(&dependencies, input, WorkflowRunOptions::default())
+            .await
     }
 
     /// Borrow the hydrated Skald Workflow, for runs with explicit execution
@@ -389,5 +427,171 @@ mod tests {
             3,
             "refused loads dispatch nothing"
         );
+    }
+
+    /// Write `contents` to an owner-only secret file inside `dir`.
+    ///
+    /// # Panics
+    /// Panics when the file cannot be written or restricted.
+    fn secret_file(dir: &Path, contents: &str) -> PathBuf {
+        let path = dir.join("review-secret");
+        std::fs::write(&path, contents).expect("secret writes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("secret restricts");
+        }
+        path
+    }
+
+    /// Parse a `[workflow]` client configuration section.
+    ///
+    /// # Panics
+    /// Panics when the TOML is not a valid client configuration.
+    fn workflow_config(toml: &str) -> LocalWorkflowConfig {
+        toml::from_str::<GlobalConfig>(toml)
+            .expect("client configuration parses")
+            .workflow
+    }
+
+    /// Run `workflow` on the dependencies its routes select from `config`.
+    ///
+    /// # Errors
+    /// Returns the dependency preparation and pre-dispatch run errors.
+    async fn run_selected(
+        workflow: &Workflow,
+        config: &LocalWorkflowConfig,
+    ) -> WorkflowResult<WorkflowRun> {
+        let dependencies = SelectedRoutes::of(workflow.as_skald().spec())
+            .dependencies(skald_runtime::ProviderRegistry::new(), config)
+            .await?;
+        let input = serde_json::Map::from_iter([("code".to_owned(), json!("diff"))]);
+        workflow
+            .as_skald()
+            .run_with_options(&dependencies, input, WorkflowRunOptions::default())
+            .await
+    }
+
+    /// An `ext_gateway` bundle runs through the binding named in the shared
+    /// client configuration: loading makes no call, only the selected
+    /// binding's secret is read and sent, and an unused binding naming an
+    /// unreadable secret is never touched. An absent binding, a binding for
+    /// another protocol, and an unreadable selected secret are refused before
+    /// any dispatch. Native-only and `wyrd_gateway` Workflows select no
+    /// configuration.
+    ///
+    /// # Panics
+    /// Panics when a run, refusal, or upstream request differs from the
+    /// asserted behavior.
+    #[tokio::test]
+    async fn selected_local_dependencies_use_shared_config() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "gpt-5-5",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "REVIEWED" },
+                    "finish_reason": "stop"
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let route = format!(
+            "    kind: ext_gateway\n    protocol: openai_chat\n    base_url: {}/v1\n    credential_binding: review-gateway",
+            server.uri()
+        );
+        let external = edited_bundle(|yaml| yaml.replacen("    kind: wyrd_gateway", &route, 1));
+        let workflow = Workflow::from_path(external.path().join("workflow.yaml"))
+            .await
+            .expect("ext_gateway bundle loads");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "loading makes no call"
+        );
+
+        let secret = secret_file(external.path(), "s3cret");
+        let configured = workflow_config(&format!(
+            r#"
+            [workflow.external_gateway_bindings.review-gateway]
+            protocol = "openai_chat"
+            origin = "{origin}"
+            secret_headers = {{ x-review-secret = {{ source = "file", path = "{secret}" }} }}
+
+            [workflow.external_gateway_bindings.unused]
+            protocol = "openai_chat"
+            origin = "{origin}"
+            secret_headers = {{ x-unused = {{ source = "file", path = "{missing}" }} }}
+            "#,
+            origin = server.uri(),
+            secret = secret.display(),
+            missing = external.path().join("missing").display(),
+        ));
+        let run = run_selected(&workflow, &configured)
+            .await
+            .expect("configured binding runs");
+        assert_eq!(run.status, WorkflowRunStatus::Succeeded);
+        assert_eq!(run.outputs["review"], json!("REVIEWED"));
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| {
+            request
+                .headers
+                .get("x-review-secret")
+                .map(|value| value.as_bytes())
+                == Some(b"s3cret".as_slice())
+                && !request.headers.contains_key("x-unused")
+        }));
+        assert!(
+            !serde_json::to_string(&run)
+                .unwrap_or_default()
+                .contains("s3cret")
+        );
+
+        for (config, code) in [
+            (
+                LocalWorkflowConfig::default(),
+                "WYRD_WORKFLOW_503_BINDING_UNAVAILABLE",
+            ),
+            (
+                workflow_config(&format!(
+                    "[workflow.external_gateway_bindings.review-gateway]\nprotocol = \"anthropic_messages\"\norigin = \"{}\"\n",
+                    server.uri()
+                )),
+                "WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED",
+            ),
+            (
+                workflow_config(&format!(
+                    "[workflow.external_gateway_bindings.review-gateway]\nprotocol = \"openai_chat\"\norigin = \"{}\"\nsecret_headers = {{ x-review-secret = {{ source = \"file\", path = \"{}\" }} }}\n",
+                    server.uri(),
+                    external.path().join("missing").display()
+                )),
+                "WYRD_WORKFLOW_503_BINDING_UNAVAILABLE",
+            ),
+        ] {
+            let error = run_selected(&workflow, &config)
+                .await
+                .expect_err("unusable binding is refused");
+            assert_eq!(error.code(), code);
+        }
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            3,
+            "refused runs dispatch nothing"
+        );
+
+        let gateway = Workflow::from_path(bundle().join("workflow.yaml"))
+            .await
+            .expect("local bundle loads");
+        assert!(!SelectedRoutes::of(gateway.as_skald().spec()).needs_config());
     }
 }

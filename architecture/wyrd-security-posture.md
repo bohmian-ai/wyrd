@@ -21,8 +21,7 @@ controls required to operate those boundaries.
 - Security uncertainty fails closed. Verification, authorization, policy,
   tenant binding, and fencing failures deny the operation. Audit is
   non-blocking: a decision that fails to commit is logged and counted and does
-  not deny the operation, except on surfaces not yet converted to the audit
-  outbox.
+  not deny the operation.
 - Secrets are resolved from a deployment secret provider at runtime. They are
   never Card fields, generated artifacts, logs, traces, errors, or audit
   payloads.
@@ -359,34 +358,29 @@ is not an SSRF control.
 ## Audit integrity and privacy
 
 Audit cardinality follows authorization decisions, not HTTP requests and not
-engine mechanics. Permissions are blocking; audits are non-blocking. Oracle
-reads, gateway invocations, and direct verification execution stage their
-decisions on the shared audit outbox without waiting for the commit; surfaces
-not yet converted still append their audit row in the same transaction that
-made the decision. Scribe
-batch commits and Forge maintenance transitions evaluate no permission: they
-are recorded as lineage in `vala.scribe_batch_commits` and
-`vala.forge_operations` and emit no audit event.
+engine mechanics. Permissions are blocking; audits are non-blocking. Every
+audited surface stages its decision on the one process audit outbox once the
+decision is known, outside the operation's transaction, and never waits for
+the commit. The outbox has no count limit: a tenant batch whose commit fails
+stays at the front of that tenant's queue and is retried with backoff while
+other tenants keep committing, each failed attempt logged with its tenant and
+counted in `outbox_write_failures_total{outbox="audit"}`. A commit that returns
+an error is resolved from Postgres transaction status (`pg_xact_status`) before
+any retry: a committed batch is not written again, an aborted one is retried,
+and the writer waits while the outcome is still unknown. Each decision is
+therefore staged and retained once. A decision is lost only at abrupt process
+loss, when graceful shutdown reaches its deadline with it still unwritten, or
+when Postgres no longer holds the status of its failed commit; each is counted
+in `outbox_events_lost_total{outbox="audit"}`. Scribe batch commits and Forge
+maintenance transitions evaluate no permission: they are recorded as lineage
+in `vala.scribe_batch_commits` and `vala.forge_operations` and emit no audit
+event.
 
-Oracle query admission uses a stronger local durability handoff: the serving
-process fsyncs a versioned, CRC-framed local acceptance record before returning
-rows, then a bounded at-least-once relay appends the canonical tenant
-`vala.audit_staging` entry. Relay identity makes replay safe and observable.
-
-Gateway invocation authorization is evaluated synchronously before protected
-work, but its audit event is committed to the same canonical
-`vala.audit_staging` path by tracked non-blocking server work. Slow or failed
-audit persistence does not delay or reverse the authorization verdict; failure
-is metered and logged, and shutdown drains tracked work. Gateway administration
-decisions remain transactional with their mutations. No gateway-specific audit
-WAL, disk spool, durable queue, relay, table, publisher, or sink exists; abrupt
-process loss may therefore lose an invocation event that has not committed.
-
-Direct verification execution evaluates `evals:run` and subject scope
-synchronously, then stages its one allowed or denied decision on the process
-audit outbox shared with Oracle. A full queue or failed commit is counted in
-`oracle_audit_commit_failures_total` and logged; the execution proceeds, and
-server shutdown drains the outbox.
+Oracle query admission, gateway invocation and administration, and direct
+verification execution follow the same rule with no surface-specific
+exception: each evaluates its permission synchronously before protected work
+and stages its decision on the process outbox. No surface-specific audit WAL,
+disk spool, durable queue, relay, table, publisher, or sink exists.
 
 `vala.audit_staging` is transient transactional write-ahead state with no
 external consumer. Retained audit history lives in the
@@ -429,7 +423,7 @@ chain.
 
 Security events include credential issuance and revocation, token replay,
 unknown signing keys, policy unavailability, repeated authorization denial,
-peer context refusal, tenant-tripwire failure, Oracle audit commit failure, audit-chain or
+peer context refusal, tenant-tripwire failure, audit outbox write failure, audit-chain or
 publication failure, SSRF rejection, secret-resolution failure, and privileged
 operator use.
 

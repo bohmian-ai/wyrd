@@ -223,8 +223,8 @@ where
          body = WyrdProblem),
         (status = 429, description = "Ingest is saturated; retry the whole export, none of it \
           was written (WYRD_VALA_429_INGEST_BUSY)", body = WyrdProblem),
-        (status = 500, description = "Ingest failed internally, or the decision could not be \
-          audited (WYRD_VALA_500_BIFROST_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+        (status = 500, description = "Ingest failed internally \
+          (WYRD_VALA_500_BIFROST_INTERNAL)",
          body = WyrdProblem),
         (status = 503, description = "The writer is unavailable, or no verifier is configured \
           for the access token (WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE, \
@@ -335,8 +335,8 @@ async fn export_traces(
          body = WyrdProblem),
         (status = 429, description = "Ingest is saturated; retry the whole export, none of it \
           was written (WYRD_VALA_429_INGEST_BUSY)", body = WyrdProblem),
-        (status = 500, description = "Ingest failed internally, or the decision could not be \
-          audited (WYRD_VALA_500_BIFROST_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+        (status = 500, description = "Ingest failed internally \
+          (WYRD_VALA_500_BIFROST_INTERNAL)",
          body = WyrdProblem),
         (status = 503, description = "The writer is unavailable, or no verifier is configured \
           for the access token (WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE, \
@@ -448,8 +448,8 @@ async fn export_metrics(
          body = WyrdProblem),
         (status = 429, description = "Ingest is saturated; retry the whole export, none of it \
           was written (WYRD_VALA_429_INGEST_BUSY)", body = WyrdProblem),
-        (status = 500, description = "Ingest failed internally, or the decision could not be \
-          audited (WYRD_VALA_500_BIFROST_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+        (status = 500, description = "Ingest failed internally \
+          (WYRD_VALA_500_BIFROST_INTERNAL)",
          body = WyrdProblem),
         (status = 503, description = "The writer is unavailable, or no verifier is configured \
           for the access token (WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE, \

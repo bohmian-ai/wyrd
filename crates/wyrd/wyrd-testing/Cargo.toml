@@ -124,6 +124,9 @@ datafusion-proto = { workspace = true }
 # The analytical-layout journey maps an Eval report through the production
 # result payload builder, whose Eval input is this crate's report type.
 vala-eval = { workspace = true }
+# The audit publication and Oracle journeys seed staged decisions directly
+# through the canonical append the outbox otherwise owns.
+vala-sql = { workspace = true, features = ["test-support"] }
 metrics = { workspace = true }
 # Local provider upstream of the native gateway ingress journey.
 wiremock = { workspace = true }

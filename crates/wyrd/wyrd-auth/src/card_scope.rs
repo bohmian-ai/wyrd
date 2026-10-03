@@ -4,8 +4,8 @@ use std::str::FromStr;
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
 use uuid::Uuid;
+use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_auth_issue::IssueError;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId, PrincipalKindTag};
@@ -17,10 +17,7 @@ use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_spec::vala::audit_detail::CardScopeMintKind;
 use wyrd_sql::TenantConn;
 
-use crate::audit::{
-    CARD_SCOPE_MINT_OPERATION, append_auth_audit, auth_event, auth_failure_code,
-    record_auth_audit_best_effort,
-};
+use crate::audit::{CARD_SCOPE_MINT_OPERATION, auth_event, auth_failure_code};
 use wyrd_sql::queries::cards::get_card_by_ref;
 
 const MAX_SCOPE_DEPTH: usize = 16;
@@ -153,34 +150,32 @@ pub enum IssueErrorOrWyrd {
     Wyrd(WyrdError),
 }
 
-/// Stage the successful card-ref scope mint audit event on the mint transaction.
+/// Stage the successful card-ref scope mint audit event on the process outbox.
 ///
-/// The event commits with the token grant, carrying the scope digest, the full
-/// member count, and at most [`SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT`] members.
-///
-/// # Errors
-/// Returns [`WyrdError::AuditUnavailable`] when the scope digest is not a valid
-/// audit value or the append fails.
+/// The event carries the scope digest, the full member count, and at most
+/// [`SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT`] members. It is staged without waiting
+/// and never refuses the grant; a digest that is not a valid audit value is
+/// logged and the event is staged without it.
 ///
 /// # Panics
 ///
 /// Panics if `scope.len()` exceeds `u32::MAX`. Callers must enforce the
 /// `MAX_SCOPE_CARDS` limit upstream; violating it is a programmer error,
 /// not a runtime condition.
-pub async fn write_scope_mint_success_audit(
-    conn: &mut TenantConn<'_>,
+pub fn stage_scope_mint_success_audit(
+    audit: &AuditOutbox,
+    tenant_id: DataTenantId,
     principal_id: Uuid,
     root: &CardRef,
     scope: &CardRefScope,
     request_id: &str,
     mint_kind: CardScopeMintKind,
-) -> Result<(), WyrdError> {
-    let scope_hash = ScopeHash::new(scope_hash(&scope_member_strings(scope))).map_err(|error| {
-        WyrdError::AuditUnavailable {
-            message: format!("scope digest is not a valid audit value: {error}"),
-            details: json!({}),
-        }
-    })?;
+) {
+    let scope_hash = ScopeHash::new(scope_hash(&scope_member_strings(scope)))
+        .inspect_err(|error| {
+            tracing::error!(error = %error, "scope digest is not a valid audit value");
+        })
+        .ok();
     let event = auth_event(
         request_id,
         CARD_SCOPE_MINT_OPERATION,
@@ -191,7 +186,7 @@ pub async fn write_scope_mint_success_audit(
         AuditDetail::CardScopeMint {
             mint_kind,
             root_card_ref: root.clone(),
-            scope_hash: Some(scope_hash),
+            scope_hash,
             scope_member_count: Some(
                 u32::try_from(scope.len())
                     .expect("MAX_SCOPE_CARDS invariant: scope count fits into u32"),
@@ -200,16 +195,17 @@ pub async fn write_scope_mint_success_audit(
             failure_code: None,
         },
     );
-    append_auth_audit(conn, &event).await
+    audit.stage(tenant_id, event);
 }
 
-/// Best-effort staging of a refused card-ref scope mint in its own transaction.
+/// Stage a refused card-ref scope mint on the process outbox.
 ///
 /// Only errors that name a scope root are recorded; the refused grant has no
 /// authenticated principal yet, so the event is attributed to
-/// [`PLATFORM_AUDIT_PRINCIPAL`]. Staging failures are logged, never returned.
-pub async fn audit_scope_mint_failure_best_effort(
-    pool: &PgPool,
+/// [`PLATFORM_AUDIT_PRINCIPAL`]. Staging never waits and never fails the
+/// caller, whose original refusal still reaches the client.
+pub fn stage_scope_mint_failure_audit(
+    audit: &AuditOutbox,
     tenant_id: DataTenantId,
     request_id: &str,
     mint_kind: CardScopeMintKind,
@@ -234,7 +230,7 @@ pub async fn audit_scope_mint_failure_best_effort(
             failure_code: Some(auth_failure_code(error)),
         },
     );
-    record_auth_audit_best_effort(pool, tenant_id, &event).await;
+    audit.stage(tenant_id, event);
 }
 
 /// Principal kind of the card-bound principal that owns `root`.

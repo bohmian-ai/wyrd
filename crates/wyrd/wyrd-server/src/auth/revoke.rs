@@ -23,14 +23,12 @@ use wyrd_sql::TenantConn;
 /// next token; a token it already holds lapses at its five-minute expiry.
 ///
 /// Revocation is an administrative authorization boundary: the
-/// `service_accounts:write` verdict is audited for both outcomes. A refusal is
-/// durable on its own, because a denied attempt is evidence whether or not
-/// anything followed it. An allowance is appended to the same transaction as
-/// the suspension and commits with it, so the record and the effect cannot
-/// disagree. An authorized revoke that names no principal of that kind is still
-/// an authorization decision: its allowance commits with no effect before the
-/// not-found refusal returns. A store failure rolls back the allowance and any
-/// effect together.
+/// `service_accounts:write` verdict is audited for both outcomes. Either
+/// decision is staged on the process audit outbox as soon as it is reached,
+/// before the suspension runs, and never delays or fails the request. An
+/// authorized revoke that names no principal of that kind, or whose store
+/// write fails, is still an authorization decision: its allowance is staged
+/// regardless of the effect.
 ///
 /// The request body is the contract, not decoration. Its `principal_kind`
 /// selects the table the id is resolved in, and its `reason` is folded into
@@ -44,8 +42,7 @@ use wyrd_sql::TenantConn;
 /// `service_accounts:write`, [`WyrdError::MissingRequiredField`] when the
 /// reason is empty, oversized, or secret-like, [`WyrdError::PrincipalNotFound`]
 /// when no principal of that kind exists in the tenant,
-/// [`WyrdError::AuditUnavailable`] when the decision cannot be recorded, and an
-/// internal error when the revocation transaction cannot be acquired or
+/// and an internal error when the revocation transaction cannot be acquired or
 /// committed.
 #[utoipa::path(
     post,
@@ -65,9 +62,8 @@ use wyrd_sql::TenantConn;
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such principal of that kind in the caller's tenant \
           (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A tenant store read or write failed, or the revocation \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "A tenant store read or write failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "No verifier is configured for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -95,7 +91,6 @@ pub async fn revoke_principal(
         "auth.principal.revoke",
         &format!("principal:{target_id}"),
     )
-    .await
     .map_err(WyrdErrorResponse::from)?;
     decision.detail = Some(AuditDetail::PrincipalRevocation {
         principal_id: target_id,
@@ -103,13 +98,11 @@ pub async fn revoke_principal(
         reason,
         delegation_chain: wyrd_runtime::audit_delegation_chain(&caller.delegation_chain),
     });
+    state.audit_outbox.stage(caller.data_tenant_id, decision);
 
     let mut conn = acquire_conn(&state, tenant).await?;
-    audit::append_on(&mut conn, &decision)
-        .await
-        .map_err(WyrdErrorResponse::from)?;
-    // A miss is an authorized decision with no effect, so its allowance
-    // commits; any other failure drops `conn` and rolls the allowance back.
+    // A miss is an authorized decision with no effect, so the transaction
+    // commits nothing; any other failure drops `conn` and rolls back.
     let outcome =
         revoke_principal_in_conn(&mut conn, target_id, request.principal_kind, tenant).await;
     if let Err(error) = &outcome

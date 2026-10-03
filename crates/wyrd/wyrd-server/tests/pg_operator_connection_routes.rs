@@ -144,6 +144,10 @@ async fn decisions(
     principal: Uuid,
     operation: &str,
 ) -> Vec<(String, String)> {
+    server
+        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await
+        .expect("audit outbox settles");
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
         .await

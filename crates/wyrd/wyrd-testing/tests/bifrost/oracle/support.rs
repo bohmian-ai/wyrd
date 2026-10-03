@@ -119,7 +119,6 @@ pub(crate) async fn register_table(
             ],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await?;
     Ok(())

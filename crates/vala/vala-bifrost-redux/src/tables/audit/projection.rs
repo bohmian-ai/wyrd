@@ -334,6 +334,7 @@ mod tests {
         DataTenantId::new(Uuid::from_bytes(bytes)).expect("UUIDv7 test tenant")
     }
 
+    /// One valid staged row of `tenant` at `seq`.
     fn row(tenant: DataTenantId, seq: i64) -> AuditStagingRow {
         AuditStagingRow {
             data_tenant_id: tenant.as_uuid(),
@@ -358,6 +359,13 @@ mod tests {
         }
     }
 
+    /// A valid range projects every content column in canonical order, the
+    /// credential last before the managed event time, and its batch id
+    /// derives from the tenant and range alone.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the projection is refused or a column is misplaced.
     #[test]
     fn projects_canonical_content_and_derives_missing_batch_id() {
         let authenticated = tenant(1);

@@ -1,4 +1,4 @@
-//! Row types for Vala transactional audit staging.
+//! Row types for Vala audit staging.
 
 use sqlx::types::{Uuid, chrono};
 

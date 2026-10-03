@@ -2,8 +2,8 @@
 //!
 //! [`OperatorConnectionControl`] is the one owner of create, list, get,
 //! update, and disable. Every read authorizes `operators:read`, every write
-//! `operators:write`, and each write appends its allowed decision inside the
-//! transaction that performs it. Secrets are sealed by [`OperatorKeys`] before
+//! `operators:write`, and each decision is staged on the process audit outbox
+//! before the operation runs. Secrets are sealed by [`OperatorKeys`] before
 //! they reach SQL, and no operation returns or logs one.
 
 use wyrd_runtime::Permission;
@@ -13,7 +13,6 @@ use wyrd_spec::operator_connection::{
     ConnectionSecret, CreateOperatorConnectionRequest, OperatorConnectionStatus,
     OperatorConnectionView, UpdateOperatorConnectionRequest,
 };
-use wyrd_spec::vala::api::AuditEvent;
 use wyrd_sql::queries::operator_connections::{
     ConnectionChange, NewConnection, get_connection, insert_connection, list_connections,
     update_connection,
@@ -89,7 +88,7 @@ impl<'a> OperatorConnectionControl<'a> {
     /// [`WyrdError::PermissionDeniedRbac`] without `operators:write`,
     /// [`WyrdError::OperatorKeyUnavailable`] when no active key is readable,
     /// [`WyrdError::OperatorConnectionConflict`] when the provider/name exists,
-    /// [`WyrdError::AuditUnavailable`], or a registry error.
+    /// or a registry error.
     pub(crate) async fn create(
         &self,
         caller: &Caller,
@@ -97,7 +96,7 @@ impl<'a> OperatorConnectionControl<'a> {
     ) -> Result<OperatorConnectionView, WyrdError> {
         let (name, config, secret) = request.split()?;
         let resource = format!("operator_connection:{}/{name}", config.provider());
-        let allowed = self.authorize_write(caller, CREATE, &resource).await?;
+        self.authorize_write(caller, CREATE, &resource)?;
         let connection_id = OperatorConnectionId::new_v7();
         let identity = SecretIdentity {
             tenant: caller.data_tenant_id,
@@ -112,7 +111,6 @@ impl<'a> OperatorConnectionControl<'a> {
                 .state
                 .registry_tenant_conn(caller.data_tenant_id)
                 .await?;
-            audit::append_on(&mut conn, &allowed).await?;
             let stored = insert_connection(
                 &mut conn,
                 &NewConnection {
@@ -130,7 +128,7 @@ impl<'a> OperatorConnectionControl<'a> {
             Ok::<_, WyrdError>(stored)
         }
         .await;
-        match audit::record_unless_committed(self.state, caller, &allowed, committed).await? {
+        match committed? {
             Some(stored) => Ok(stored.view),
             None => Err(WyrdError::OperatorConnectionConflict {
                 message: format!(
@@ -146,7 +144,7 @@ impl<'a> OperatorConnectionControl<'a> {
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] without `operators:read`,
-    /// [`WyrdError::AuditUnavailable`], or a registry error.
+    /// or a registry error.
     pub(crate) async fn list(
         &self,
         caller: &Caller,
@@ -157,8 +155,7 @@ impl<'a> OperatorConnectionControl<'a> {
             &Permission::operators_read(),
             LIST,
             "operator_connections",
-        )
-        .await?;
+        )?;
         let mut conn = self
             .state
             .registry_tenant_conn(caller.data_tenant_id)
@@ -175,7 +172,7 @@ impl<'a> OperatorConnectionControl<'a> {
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] without `operators:read`,
     /// [`WyrdError::OperatorConnectionNotFound`] when the tenant has no such
-    /// connection, [`WyrdError::AuditUnavailable`], or a registry error.
+    /// connection, or a registry error.
     pub(crate) async fn get(
         &self,
         caller: &Caller,
@@ -187,8 +184,7 @@ impl<'a> OperatorConnectionControl<'a> {
             &Permission::operators_read(),
             GET,
             &format!("operator_connection:{connection_id}"),
-        )
-        .await?;
+        )?;
         let mut conn = self
             .state
             .registry_tenant_conn(caller.data_tenant_id)
@@ -209,8 +205,7 @@ impl<'a> OperatorConnectionControl<'a> {
     /// [`WyrdError::OperatorConnectionNotFound`],
     /// [`WyrdError::OperatorConnectionInvalid`] for a wrong provider or
     /// invalid value, [`WyrdError::OperatorKeyUnavailable`] when a secret is
-    /// supplied and no active key is readable, [`WyrdError::AuditUnavailable`],
-    /// or a registry error.
+    /// supplied and no active key is readable, or a registry error.
     pub(crate) async fn update(
         &self,
         caller: &Caller,
@@ -226,8 +221,7 @@ impl<'a> OperatorConnectionControl<'a> {
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] without `operators:write`,
-    /// [`WyrdError::OperatorConnectionNotFound`], [`WyrdError::AuditUnavailable`],
-    /// or a registry error.
+    /// [`WyrdError::OperatorConnectionNotFound`], or a registry error.
     pub(crate) async fn disable(
         &self,
         caller: &Caller,
@@ -237,11 +231,10 @@ impl<'a> OperatorConnectionControl<'a> {
             .await
     }
 
-    /// Lock, change, and store one connection with its audit decision.
+    /// Lock, change, and store one connection after staging its decision.
     ///
-    /// A committed refusal (not found, invalid) is returned in the inner
-    /// result; the allowed decision is recorded standalone only when nothing
-    /// committed.
+    /// A refusal found under the lock (not found, invalid) commits the read
+    /// transaction and is returned as the operation's error.
     ///
     /// # Errors
     /// Returns the refusals named on [`Self::update`].
@@ -252,19 +245,16 @@ impl<'a> OperatorConnectionControl<'a> {
         operation: &str,
         change: Change,
     ) -> Result<OperatorConnectionView, WyrdError> {
-        let allowed = self
-            .authorize_write(
-                caller,
-                operation,
-                &format!("operator_connection:{connection_id}"),
-            )
-            .await?;
+        self.authorize_write(
+            caller,
+            operation,
+            &format!("operator_connection:{connection_id}"),
+        )?;
         let committed = async {
             let mut conn = self
                 .state
                 .registry_tenant_conn(caller.data_tenant_id)
                 .await?;
-            audit::append_on(&mut conn, &allowed).await?;
             let Some(current) = get_connection(&mut conn, connection_id, true)
                 .await
                 .map_err(registry_db_error)?
@@ -320,28 +310,27 @@ impl<'a> OperatorConnectionControl<'a> {
             Ok::<_, WyrdError>(Ok(stored.view))
         }
         .await;
-        audit::record_unless_committed(self.state, caller, &allowed, committed).await?
+        committed?
     }
 
-    /// Evaluate `operators:write`, recording a denial standalone and
-    /// returning the allowed decision for the operation transaction.
+    /// Evaluate `operators:write` and stage the decision on the process audit
+    /// outbox before the operation runs.
     ///
     /// # Errors
-    /// Returns [`WyrdError::PermissionDeniedRbac`] or
-    /// [`WyrdError::AuditUnavailable`].
-    async fn authorize_write(
+    /// Returns [`WyrdError::PermissionDeniedRbac`] when the caller lacks
+    /// `operators:write`.
+    fn authorize_write(
         &self,
         caller: &Caller,
         operation: &str,
         resource: &str,
-    ) -> Result<AuditEvent, WyrdError> {
-        audit::authorize_recording_denial(
+    ) -> Result<(), WyrdError> {
+        audit::authorize(
             self.state,
             caller,
             &Permission::operators_write(),
             operation,
             resource,
         )
-        .await
     }
 }

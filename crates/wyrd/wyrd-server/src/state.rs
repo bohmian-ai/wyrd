@@ -15,6 +15,8 @@ use vala_bifrost_redux::forge::Forge as ForgeCoordinator;
 use vala_bifrost_redux::forge::ForgeWorker;
 use vala_bifrost_redux::gate::Gate;
 use vala_bifrost_redux::oracle::Oracle as OracleEngine;
+#[cfg(feature = "test-support")]
+use vala_bifrost_redux::oracle::OracleRuntimeInspection;
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::oracle::follower::{PhysicalPlanFollower, ScribeTailResolver};
 use vala_bifrost_redux::oracle::peer::{PeerSecurityAudit, PeerTicketVerifier};
@@ -22,13 +24,13 @@ use vala_bifrost_redux::oracle::{AuthorizedQueryContext, OracleQueryStream, Runn
 use vala_bifrost_redux::resources::{BifrostRoleResources, OracleResources, ScribeResources};
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailService;
+use vala_sql::audit_outbox::{AuditOutbox, AuditSink};
 use wyrd_auth_verify::TokenVerifier;
 use wyrd_gateway::{GatewayEngine, ManagedSecretKeys};
 use wyrd_storage::StorageHandle;
 use wyrd_telemetry::TelemetryGuard;
 use wyrd_tonic::tonic_health::server::HealthReporter;
 
-use crate::bifrost::gate_audit::PostgresGateAudit;
 use crate::boot::ServerBootError;
 use crate::boot::data_root::BifrostDataRoot;
 use crate::components::auth::{ServerAuth, ServerAuthz};
@@ -115,8 +117,6 @@ pub struct OracleBuildInputs {
     pub registered_role: RegisteredRole,
     /// Shared current-ready cluster registry.
     pub cluster: Arc<ClusterRegistry>,
-    /// Audit outbox writer for Oracle read decisions and tenant tripwires.
-    pub audit: Arc<crate::oracle::OracleQueryAudit>,
     /// Transport carrying lifecycle control to peer participants.
     pub lifecycle_transport: Arc<crate::oracle::OracleLifecycleTransport>,
     /// Root-derived resource capability for the Oracle role.
@@ -323,7 +323,7 @@ pub struct BifrostTestControls {
 ///
 /// Fixing the audit sink keeps [`Bifrost`] and [`AppState`] non-generic while
 /// the Gate itself stays generic over its sink.
-pub type ServerGate = Gate<PostgresGateAudit>;
+pub type ServerGate = Gate<AuditOutbox>;
 
 /// Ordered local lifecycle states for one independently fenced role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,8 +471,6 @@ pub struct Oracle {
     continuity_monitor_abort: AbortHandle,
     /// Readiness value preserved by heartbeats during transport drain.
     advertise_ready: Arc<AtomicBool>,
-    /// Audit outbox writer retained for the complete Oracle lifecycle.
-    audit: Arc<crate::oracle::OracleQueryAudit>,
     /// Canonical authenticated transport for owner-local lifecycle fanout.
     lifecycle_transport: Arc<crate::oracle::OracleLifecycleTransport>,
 }
@@ -483,15 +481,6 @@ impl Oracle {
     #[must_use]
     pub fn process_shutdown_observed_for_test(&self) -> bool {
         self.role_shutdown.is_cancelled() && self.engine.process_shutdown_observed_for_test()
-    }
-
-    /// Returns the audit outbox writer this role stages its decisions on.
-    ///
-    /// [`AppState::new`] shares it so one writer per process carries every
-    /// non-blocking decision.
-    #[must_use]
-    pub(crate) const fn audit(&self) -> &Arc<crate::oracle::OracleQueryAudit> {
-        &self.audit
     }
 
     /// Returns the exact registered Oracle role identity and fence.
@@ -527,7 +516,6 @@ impl Oracle {
             catalog,
             registered_role,
             cluster,
-            audit,
             lifecycle_transport,
             resources,
             peer,
@@ -580,7 +568,6 @@ impl Oracle {
             continuity_monitor_abort,
             lifecycle,
             advertise_ready,
-            audit,
             running_queries,
             lifecycle_transport,
             query_controls,
@@ -631,13 +618,11 @@ impl Oracle {
         &self.query_controls
     }
 
-    /// Captures Oracle resource reservations and in-flight audit outbox commits.
+    /// Captures Oracle resource reservations.
     #[cfg(feature = "test-support")]
     #[must_use]
-    pub fn oracle_runtime_inspection(
-        &self,
-    ) -> (vala_bifrost_redux::oracle::OracleRuntimeInspection, usize) {
-        (self.engine.runtime_inspection(), self.audit.pending())
+    pub fn oracle_runtime_inspection(&self) -> OracleRuntimeInspection {
+        self.engine.runtime_inspection()
     }
 
     /// Reports startup reconciliation and lifecycle readiness, excluding saturation.
@@ -731,7 +716,6 @@ impl Oracle {
         self.lifecycle.begin_stopping();
         self.role_shutdown.cancel();
         let report = self.engine.shutdown(deadline).await;
-        let audit = self.audit.shutdown(deadline).await;
         await_role_task(
             &self.continuity_monitor,
             deadline,
@@ -744,11 +728,9 @@ impl Oracle {
             || report.queued_queries != 0
             || report.peer_running != 0
             || report.reserved_memory_bytes != 0
-            || audit != 0
         {
             return Err(wyrd_spec::vala::error::BifrostError::Internal {
-                detail: "Oracle shutdown retained admission, resource, peer, or audit state"
-                    .to_owned(),
+                detail: "Oracle shutdown retained admission, resource, or peer state".to_owned(),
             });
         }
         Ok(())
@@ -1381,50 +1363,6 @@ pub struct QueryStreamFaultController {
     capture: Arc<std::sync::Mutex<Option<Arc<QueryStreamProbeCapture>>>>,
 }
 
-/// Atomic control-audit fault owned by a test server instance.
-#[cfg(feature = "test-support")]
-#[derive(Debug, Default, Clone)]
-pub struct QueryControlAuditFaultController {
-    fail_cancel_attempts: Arc<AtomicBool>,
-    /// Forces the authoritative object-denial audit append to fail.
-    fail_object_denials: Arc<AtomicBool>,
-}
-
-#[cfg(feature = "test-support")]
-impl QueryControlAuditFaultController {
-    /// Enables failure of cancellation pre-dispatch audit appends.
-    pub fn fail_cancel_attempts(&self) {
-        self.fail_cancel_attempts.store(true, Ordering::Release);
-    }
-
-    /// Restores cancellation pre-dispatch audit appends.
-    pub fn restore_cancel_attempts(&self) {
-        self.fail_cancel_attempts.store(false, Ordering::Release);
-    }
-
-    /// Reports whether cancellation pre-dispatch audit appends must fail.
-    #[must_use]
-    pub fn cancel_attempts_fail(&self) -> bool {
-        self.fail_cancel_attempts.load(Ordering::Acquire)
-    }
-
-    /// Enables failure of the authoritative object-denial audit append.
-    pub fn fail_object_denials(&self) {
-        self.fail_object_denials.store(true, Ordering::Release);
-    }
-
-    /// Restores the authoritative object-denial audit append.
-    pub fn restore_object_denials(&self) {
-        self.fail_object_denials.store(false, Ordering::Release);
-    }
-
-    /// Reports whether object-denial audit appends must fail.
-    #[must_use]
-    pub fn object_denials_fail(&self) -> bool {
-        self.fail_object_denials.load(Ordering::Acquire)
-    }
-}
-
 #[cfg(feature = "test-support")]
 impl QueryStreamFaultController {
     /// Schedule one truncation and replace any previously scheduled fault.
@@ -1633,6 +1571,11 @@ pub struct Bifrost {
     /// when no role owns one.
     #[cfg(feature = "test-support")]
     test_catalog: Option<Arc<BifrostCatalog>>,
+    /// The process audit outbox the Gate, Oracle, and peer security stage on.
+    ///
+    /// `None` only for the ownerless unit-test shell, whose `AppState` starts
+    /// its own outbox.
+    audit_outbox: Option<Arc<AuditOutbox>>,
 }
 
 /// Complete immutable composition retained by one published [`Bifrost`].
@@ -1661,6 +1604,8 @@ pub(crate) struct BifrostComposition {
     pub(crate) query_controls: Option<crate::oracle::RunningQueryControls>,
     /// Run-request outbox the Gate's observation acknowledgement stages on.
     pub(crate) observation_runs: Arc<crate::verification::observations::ObservationRunOutbox>,
+    /// The process audit outbox every audited surface of this process shares.
+    pub(crate) audit_outbox: Arc<AuditOutbox>,
     /// Already-composed production resources exposed only to the test tier.
     #[cfg(feature = "test-support")]
     pub(crate) resources: Option<BifrostRoleResources>,
@@ -1680,6 +1625,7 @@ impl Bifrost {
             query_forwarder,
             query_controls,
             observation_runs,
+            audit_outbox,
             #[cfg(feature = "test-support")]
             resources,
         } = composition;
@@ -1698,6 +1644,7 @@ impl Bifrost {
             test_resources: resources,
             #[cfg(feature = "test-support")]
             test_catalog: None,
+            audit_outbox: Some(audit_outbox),
         })
     }
 
@@ -1723,6 +1670,7 @@ impl Bifrost {
             observation_runs: None,
             test_resources: None,
             test_catalog: None,
+            audit_outbox: None,
         })
     }
 
@@ -1757,6 +1705,7 @@ impl Bifrost {
             observation_runs: None,
             test_resources: None,
             test_catalog: Some(catalog),
+            audit_outbox: None,
         })
     }
 
@@ -1784,6 +1733,12 @@ impl Bifrost {
     #[must_use]
     pub const fn scribe(&self) -> Option<&Arc<Scribe>> {
         self.scribe.as_ref()
+    }
+
+    /// Borrows the process audit outbox, absent only for the unit-test shell.
+    #[must_use]
+    pub const fn audit_outbox(&self) -> Option<&Arc<AuditOutbox>> {
+        self.audit_outbox.as_ref()
     }
 
     /// Borrows the one public Gate.
@@ -2242,10 +2197,10 @@ pub struct AppState {
     /// Non-blocking audit outbox writer every request-path decision of this
     /// process stages on without waiting for its commit.
     ///
-    /// The Oracle role's writer when this process runs Oracle, otherwise one
-    /// built for the process; drained by `BoundServer::run` after Bifrost
+    /// The one outbox `compose_bifrost` builds and shares with the Gate,
+    /// Oracle, and peer security; drained by `BoundServer::run` after Bifrost
     /// shutdown.
-    pub audit_outbox: Arc<crate::oracle::OracleQueryAudit>,
+    pub audit_outbox: Arc<AuditOutbox>,
     /// Model providers Eval judges call, in queued runs and direct execution.
     ///
     /// The environment-built process default unless a test or embedding
@@ -2254,19 +2209,16 @@ pub struct AppState {
     /// Optional deterministic stream truncation controller for test servers.
     #[cfg(feature = "test-support")]
     pub query_stream_fault: Option<QueryStreamFaultController>,
-    /// Optional deterministic lifecycle-audit fault controller for test servers.
-    #[cfg(feature = "test-support")]
-    pub query_control_audit_fault: Option<QueryControlAuditFaultController>,
 }
 
 impl AppState {
     /// Build runtime state from production-ready Postgres handles.
     ///
-    /// Shares the Oracle role's audit outbox writer when `bifrost` runs
-    /// Oracle, and otherwise starts one for the process.
+    /// Shares the process audit outbox `bifrost` was composed with, and starts
+    /// one only for the ownerless unit-test shell, which has none.
     ///
     /// # Panics
-    /// Panics when called outside a Tokio runtime without an Oracle role,
+    /// Panics when called outside a Tokio runtime with the unit-test shell,
     /// because the outbox writer task is spawned immediately.
     #[must_use]
     pub fn new(
@@ -2276,10 +2228,9 @@ impl AppState {
         shutdown_token: CancellationToken,
     ) -> Self {
         let (reporter, _service) = wyrd_tonic::tonic_health::server::health_reporter();
-        let audit_outbox = bifrost.oracle().map_or_else(
-            || crate::oracle::OracleQueryAudit::new(postgres.vala().clone()),
-            |oracle| Arc::clone(oracle.audit()),
-        );
+        let audit_outbox = bifrost
+            .audit_outbox()
+            .map_or_else(|| AuditSink::outbox(postgres.vala().clone()), Arc::clone);
         let gateway_capture = Arc::new(crate::components::gateway::GatewayCapture::for_bifrost(
             &bifrost,
         ));
@@ -2314,8 +2265,6 @@ impl AppState {
             judge_providers: skald_runtime::default_registry(),
             #[cfg(feature = "test-support")]
             query_stream_fault: None,
-            #[cfg(feature = "test-support")]
-            query_control_audit_fault: None,
         }
     }
 
@@ -2348,17 +2297,6 @@ impl AppState {
     #[must_use]
     pub fn with_query_stream_fault(mut self, controller: QueryStreamFaultController) -> Self {
         self.query_stream_fault = Some(controller);
-        self
-    }
-
-    /// Attach a test-tier lifecycle-audit fault controller.
-    #[cfg(feature = "test-support")]
-    #[must_use]
-    pub fn with_query_control_audit_fault(
-        mut self,
-        controller: QueryControlAuditFaultController,
-    ) -> Self {
-        self.query_control_audit_fault = Some(controller);
         self
     }
 

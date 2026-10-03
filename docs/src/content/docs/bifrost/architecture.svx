@@ -313,19 +313,23 @@ Tenancy is a property of the physical table, of each Parquet file, and of each i
 ## Audit data
 
 Audit records authorization decisions. Every boundary that evaluates a
-principal's permission appends exactly one immutable, hash-chained row to
-`vala.audit_staging` before it returns a result or a refusal. Redux owns the
-canonical `vala.system.audit_log` table definition and deterministic row
-projection.
+principal's permission stages exactly one decision on the server's process
+audit outbox once the decision is known, and returns its result or refusal
+without waiting for the audit commit. The outbox commits each tenant's
+decisions in order as immutable, hash-chained rows in `vala.audit_staging`.
+Redux owns the canonical `vala.system.audit_log` table definition and
+deterministic row projection.
 
 The audit row captures: operation name, principal ID, tenant, timestamp,
-decision (allow/deny), result, and detail field. An allowed decision commits in
-the transaction that performs the authorized operation wherever one exists, so
-the decision is durable exactly when its effect is; a denial commits in its own
-transaction before the error is returned. Both are fail-closed: an append
-failure refuses the operation. Engine-internal transitions — Scribe batch
-commits, Forge maintenance, audit publication — evaluate no permission and
-record lineage in their own operational tables instead.
+decision (allow/deny), result, and detail field. Permissions block; audits do
+not. An audit write that fails never refuses or delays the operation: the
+outbox retries it with backoff until it commits. A commit that returns an error
+is resolved from Postgres transaction status first, so a committed decision is
+never written twice and each decision is retained once. A decision is lost only
+at abrupt process loss, when graceful shutdown reaches its deadline with it
+unwritten, or when Postgres no longer holds the status of its failed commit. Engine-internal transitions —
+Scribe batch commits, Forge maintenance, audit publication — evaluate no
+permission and record lineage in their own operational tables instead.
 
 ## Payload governance
 

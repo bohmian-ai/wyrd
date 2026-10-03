@@ -1,14 +1,18 @@
 //! Tenant-scoped writes and reads for audit staging:
-//! `vala.audit_chain_head` and `vala.audit_staging`.
+//! `vala.audit_chain_head`, `vala.audit_staging`, and the publisher's own
+//! progress row, `vala.audit_publication`.
 //!
-//! `append_audit` runs in the audited operation's own [`TenantConn`]
-//! transaction: it advances the per-tenant chain head under a `FOR UPDATE`
-//! lock, computes the SHA256 entry hash in Rust (this module owns the canonical
-//! encoding), inserts the append-only row, and bumps the head — all so the audit
-//! row commits atomically with the operation it records.
+//! The canonical append advances the per-tenant chain head under a `FOR
+//! UPDATE` lock, computes the SHA256 entry hash in Rust (this module owns the
+//! canonical encoding), inserts the append-only rows, and bumps the head. It is
+//! private to this crate: [`crate::audit_outbox::AuditSink`] is the only
+//! production writer, committing each tenant's batch in its own transaction.
+//! The `test-support` feature exposes [`append_audit`] and
+//! [`append_audit_batch`] for tests that seed staging directly.
 // raw-query grep allowlist: audit staging tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 use wyrd_spec::vala::api::{AuditEvent, AuditOutcome, audit_detail_canonical_json};
 use wyrd_sql::TenantConn;
 
@@ -17,13 +21,30 @@ use crate::row_types::audit_staging::AuditStagingRow;
 
 /// Append one hash-chained audit row for the connection's tenant, returning its `seq`.
 ///
-/// This is [`append_audit_batch`] with one event, so a single row and a batch
-/// share one chaining and hashing path.
+/// Test-only seeding entry point over the canonical append; production audit
+/// stages through [`crate::audit_outbox::AuditOutbox`].
 ///
 /// # Errors
 /// Returns [`SqlError`] when any statement fails or an RLS policy rejects a row.
+#[cfg(feature = "test-support")]
 pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Result<i64, SqlError> {
-    append_audit_batch(conn, std::slice::from_ref(event)).await
+    append_audit_events(conn, std::slice::from_ref(event)).await
+}
+
+/// Append hash-chained audit rows for the connection's tenant, in order,
+/// returning the chain head's `seq` afterwards.
+///
+/// Test-only seeding entry point over the canonical append; production audit
+/// stages through [`crate::audit_outbox::AuditOutbox`].
+///
+/// # Errors
+/// Returns [`SqlError`] when any statement fails or an RLS policy rejects a row.
+#[cfg(feature = "test-support")]
+pub async fn append_audit_batch(
+    conn: &mut TenantConn<'_>,
+    events: &[AuditEvent],
+) -> Result<i64, SqlError> {
+    append_audit_events(conn, events).await
 }
 
 /// Append hash-chained audit rows for the connection's tenant, in order,
@@ -37,18 +58,15 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
 /// transaction so the rows are durable exactly when — and only when — the
 /// caller commits. An empty batch changes nothing and returns the current head.
 ///
-/// Every statement names [`TenantConn::data_tenant_id`] explicitly rather than
-/// leaning on the row-level-security policy to supply it. Under the application
-/// role the two agree and nothing changes; the explicit predicate is what makes
-/// the append correct on the operator boundary too, where row-level security is
-/// bypassed and an unqualified `FOR UPDATE` would lock — and an unqualified
-/// `UPDATE` would rewrite — every tenant's chain head. Platform-plane decisions
-/// stage through that boundary under `DataTenantId::SYSTEM_OWNER`, which is
-/// why this is the one canonical append for both planes.
+/// Row-level security through the [`TenantConn`] is the tenant boundary: the
+/// head lock and the head update see only the
+/// connection's tenant. Its id is bound only where a row is inserted.
+/// Platform-plane decisions stage under `DataTenantId::SYSTEM_OWNER` through
+/// that tenant's ordinary connection.
 ///
 /// # Errors
 /// Returns [`SqlError`] when any statement fails or an RLS policy rejects a row.
-pub async fn append_audit_batch(
+pub(crate) async fn append_audit_events(
     conn: &mut TenantConn<'_>,
     events: &[AuditEvent],
 ) -> Result<i64, SqlError> {
@@ -70,11 +88,9 @@ pub async fn append_audit_batch(
         r#"
         SELECT last_seq, head_hash
           FROM vala.audit_chain_head
-         WHERE data_tenant_id = $1
         FOR UPDATE
         "#,
     )
-    .bind(data_tenant_id)
     .fetch_one(&mut *conn)
     .await
     .map_err(SqlError::from)?;
@@ -147,12 +163,10 @@ pub async fn append_audit_batch(
         r#"
         UPDATE vala.audit_chain_head
            SET last_seq = $1, head_hash = $2, updated_at = now()
-         WHERE data_tenant_id = $3
         "#,
     )
     .bind(seq)
     .bind(prev_hash.as_slice())
-    .bind(data_tenant_id)
     .execute(&mut *conn)
     .await
     .map_err(SqlError::from)?;
@@ -182,11 +196,11 @@ struct AuditRows<'a> {
     /// Canonical writer-identity card, when the principal has one.
     card_ref: Vec<Option<String>>,
     /// Principal that was authorized.
-    principal_id: Vec<uuid::Uuid>,
+    principal_id: Vec<Uuid>,
     /// Durable spelling of the principal's kind.
     principal_kind: Vec<&'a str>,
     /// Credential the principal used, when known.
-    credential_id: Vec<Option<uuid::Uuid>>,
+    credential_id: Vec<Option<Uuid>>,
     /// Permission that was evaluated.
     permission: Vec<&'a str>,
     /// Durable spelling of the decision.
@@ -283,10 +297,10 @@ pub async fn list_publication_batch(
 
 /// One frozen contiguous audit range owed to retained history.
 ///
-/// Both bounds are inclusive. The range is derived under tenant serialization
-/// and persisted as `vala.audit_chain_head.publishing_seq_hi`, so every
-/// concurrent or restarted publisher that observes the same in-flight bound
-/// projects the same rows and therefore the same batch identity.
+/// Both bounds are inclusive. The range is derived under publisher
+/// serialization and persisted as `vala.audit_publication.publishing_seq_hi`,
+/// so every concurrent or restarted publisher that observes the same in-flight
+/// bound projects the same rows and therefore the same batch identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuditPublicationRange {
     /// First sequence number owed, always `published_seq + 1`.
@@ -297,54 +311,70 @@ pub struct AuditPublicationRange {
 
 /// Freeze, or reuse, the one contiguous range this tenant owes retained history.
 ///
-/// The chain head is locked `FOR UPDATE NOWAIT` so two publishers cannot
-/// establish two different bounds. An existing `publishing_seq_hi` is reused verbatim —
-/// that is what makes a competing or restarted publisher derive the identical
-/// batch identity — and is otherwise established from the bounded staging
-/// prefix above the watermark. Returns `None` when the tenant has never
-/// appended an audit row or owes nothing, in which case the caller has no work
-/// this cycle.
+/// Publication progress lives in `vala.audit_publication`, a row appenders
+/// never touch, so freezing never waits on, or blocks, an audit append holding
+/// the tenant's chain head. The progress row is created on first need, then
+/// locked `FOR UPDATE NOWAIT` so two publishers cannot establish two different
+/// bounds. An existing `publishing_seq_hi` is reused verbatim — that is what
+/// makes a competing or restarted publisher derive the identical batch
+/// identity — and is otherwise established from the bounded staging prefix
+/// above the watermark. Committed staged rows always form a gapless prefix,
+/// because appends serialize on the chain head and each allocates its sequence
+/// only after the previous append committed. Returns `None` when the tenant
+/// owes nothing, in which case the caller has no work this cycle.
 ///
 /// The caller commits the short transaction before performing any Scribe IO:
 /// the bound is durable progress state, not a lease, so no owner token,
 /// deadline, or audit-chain lock travels with it.
 ///
-/// Lock acquisition never waits. When another transaction holds this tenant's
-/// chain head, the locked read fails immediately with PostgreSQL `55P03`
-/// (`lock_not_available`) before any publication state changes: no bound is
-/// frozen and no staged row is read. The publisher logs that failure and
-/// retries the unchanged tenant on a later sweep, so a contended tenant never
-/// holds a sweep open and delays only itself.
+/// Lock acquisition never waits. When another publisher holds this tenant's
+/// progress row, the locked read fails immediately with PostgreSQL `55P03`
+/// (`lock_not_available`) before any publication state changes. The publisher
+/// logs that failure and retries the unchanged tenant on a later sweep.
 ///
 /// # Errors
-/// Returns [`SqlError`] when the locked read or the bound update fails, when
-/// another transaction holds the tenant's chain head (lock contention is this
-/// error, never `None`), or when RLS rejects the tenant's own chain head.
+/// Returns [`SqlError`] when the progress insert, the locked read, or the bound
+/// update fails, when another publisher holds the tenant's progress row (lock
+/// contention is this error, never `None`), or when RLS rejects the row.
 pub async fn freeze_publication_range(
     conn: &mut TenantConn<'_>,
     limit: i64,
 ) -> Result<Option<AuditPublicationRange>, SqlError> {
+    let data_tenant_id = conn.data_tenant_id().as_uuid();
+    sqlx::query(
+        r#"
+        INSERT INTO vala.audit_publication (data_tenant_id)
+        SELECT $1
+         WHERE EXISTS (SELECT 1 FROM vala.audit_staging)
+        ON CONFLICT (data_tenant_id) DO NOTHING
+        "#,
+    )
+    .bind(data_tenant_id)
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+
     let frozen: Option<(i64, Option<i64>, bool)> = sqlx::query_as(
         r#"
-        WITH head AS (
+        WITH progress AS (
             SELECT published_seq, publishing_seq_hi
-              FROM vala.audit_chain_head
+              FROM vala.audit_publication
             FOR UPDATE NOWAIT
         )
-        SELECT head.published_seq + 1,
+        SELECT progress.published_seq + 1,
                COALESCE(
-                   head.publishing_seq_hi,
+                   progress.publishing_seq_hi,
                    (SELECT max(prefix.seq)
                       FROM (
                           SELECT seq
                             FROM vala.audit_staging
-                           WHERE seq > head.published_seq
+                           WHERE seq > progress.published_seq
                            ORDER BY seq
                            LIMIT $1
                       ) prefix)
                ),
-               head.publishing_seq_hi IS NOT NULL
-          FROM head
+               progress.publishing_seq_hi IS NOT NULL
+          FROM progress
         "#,
     )
     .bind(limit)
@@ -358,7 +388,7 @@ pub async fn freeze_publication_range(
     if !already_frozen {
         sqlx::query(
             r#"
-            UPDATE vala.audit_chain_head
+            UPDATE vala.audit_publication
                SET publishing_seq_hi = $1, updated_at = now()
             "#,
         )
@@ -405,7 +435,8 @@ pub async fn list_publication_range(
 /// The caller MUST have observed a durable `vala.system.audit_log` publication
 /// for the whole range first. All three effects run in the caller's tenant
 /// transaction, so the watermark never advances without the deletion and the
-/// bound is never released without the watermark.
+/// bound is never released without the watermark. The tenant's progress row is
+/// created here when no freeze created it first.
 ///
 /// Both the advance and the release are guarded so a stale completion is inert:
 /// `GREATEST` refuses to move the watermark backwards, and the bound is cleared
@@ -415,21 +446,24 @@ pub async fn list_publication_range(
 /// losing or duplicating a retained event or clearing a newer batch's bound.
 ///
 /// # Errors
-/// Returns [`SqlError`] when the chain-head update or the delete fails, or RLS
+/// Returns [`SqlError`] when the progress update or the delete fails, or RLS
 /// rejects the range.
 pub async fn settle_publication(conn: &mut TenantConn<'_>, seq_hi: i64) -> Result<u64, SqlError> {
     sqlx::query(
         r#"
-        UPDATE vala.audit_chain_head
-           SET published_seq = GREATEST(published_seq, $1),
+        INSERT INTO vala.audit_publication AS progress (data_tenant_id, published_seq)
+        VALUES ($2, $1)
+        ON CONFLICT (data_tenant_id) DO UPDATE
+           SET published_seq = GREATEST(progress.published_seq, $1),
                publishing_seq_hi = CASE
-                   WHEN publishing_seq_hi = $1 THEN NULL
-                   ELSE publishing_seq_hi
+                   WHEN progress.publishing_seq_hi = $1 THEN NULL
+                   ELSE progress.publishing_seq_hi
                END,
                updated_at = now()
         "#,
     )
     .bind(seq_hi)
+    .bind(conn.data_tenant_id().as_uuid())
     .execute(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;
@@ -438,7 +472,7 @@ pub async fn settle_publication(conn: &mut TenantConn<'_>, seq_hi: i64) -> Resul
         DELETE FROM vala.audit_staging
          WHERE seq <= (
                SELECT published_seq
-                 FROM vala.audit_chain_head
+                 FROM vala.audit_publication
            )
         "#,
     )

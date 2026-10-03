@@ -1,7 +1,9 @@
-//! Durable audit-staging collaborator for rejected Oracle peer tickets.
+//! Non-blocking audit collaborator for rejected Oracle peer tickets.
 
-use async_trait::async_trait;
+use std::sync::Arc;
+
 use vala_bifrost_redux::oracle::peer::{PeerSecurityAudit, PeerSecurityAuditError};
+use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
@@ -11,20 +13,26 @@ use wyrd_spec::vala::api::{
 use crate::audit;
 use crate::postgres::ServerPostgres;
 
-/// Server-owned peer-security writer using canonical tenant audit staging.
+/// Server-owned peer-security auditor staging on the process audit outbox.
 #[derive(Clone)]
 pub struct PostgresPeerSecurityAudit {
-    /// Runtime-ready Postgres owner used to acquire tenant-scoped transactions.
-    postgres: ServerPostgres,
+    /// The process audit outbox every rejection is staged on.
+    audit: Arc<AuditOutbox>,
 }
 
 impl PostgresPeerSecurityAudit {
     /// Verifies the exact durable system sentinel before enabling peer auditing.
     ///
+    /// The sentinel must exist because unverified rejections stage on the
+    /// platform/system chain; `audit` is the process outbox they stage on.
+    ///
     /// # Errors
     /// Returns [`PeerSecurityAuditError`] when the operator capability is absent,
     /// the sentinel cannot be read, or any canonical attribute differs.
-    pub async fn try_new(postgres: &ServerPostgres) -> Result<Self, PeerSecurityAuditError> {
+    pub async fn try_new(
+        postgres: &ServerPostgres,
+        audit: Arc<AuditOutbox>,
+    ) -> Result<Self, PeerSecurityAuditError> {
         let operator = postgres.operator_pool().ok_or(PeerSecurityAuditError)?;
         let sentinel: Option<(
             String,
@@ -50,20 +58,14 @@ impl PostgresPeerSecurityAudit {
         {
             return Err(PeerSecurityAuditError);
         }
-        Ok(Self {
-            postgres: postgres.clone(),
-        })
+        Ok(Self { audit })
     }
 
-    /// Commits one scrubbed rejection under the selected trusted audit tenant.
+    /// Stages one scrubbed rejection under the selected trusted audit tenant.
     ///
-    /// # Errors
-    /// Returns [`PeerSecurityAuditError`] when acquire, append, or commit fails.
-    async fn commit(
-        &self,
-        tenant_id: DataTenantId,
-        violation: BifrostSecurityViolationKind,
-    ) -> Result<(), PeerSecurityAuditError> {
+    /// Returns immediately; the outbox commits the row in the background and
+    /// counts a failed commit instead of reporting it.
+    fn stage(&self, tenant_id: DataTenantId, violation: BifrostSecurityViolationKind) {
         let event = audit::audit_event_unauthenticated(
             RequestId::now_v7(),
             "bifrost.query.security_violation",
@@ -79,50 +81,37 @@ impl PostgresPeerSecurityAudit {
             // Wyrd caller, so there is no verified chain to attribute.
             delegation_chain: Vec::new(),
         });
-        let mut conn = self
-            .postgres
-            .tenant_conn(tenant_id)
-            .await
-            .map_err(|_| PeerSecurityAuditError)?;
-        audit::append_on(&mut conn, &event)
-            .await
-            .map_err(|_| PeerSecurityAuditError)?;
-        conn.commit().await.map_err(|_| PeerSecurityAuditError)
+        self.audit.stage(tenant_id, event);
     }
 }
 
-#[async_trait]
 impl PeerSecurityAudit for PostgresPeerSecurityAudit {
-    /// Commits an untrusted-ticket rejection to the platform/system audit chain.
-    ///
-    /// # Errors
-    /// Returns [`PeerSecurityAuditError`] when the system-chain row cannot commit.
-    async fn append_unverified_ticket_rejection(
-        &self,
-        violation: BifrostSecurityViolationKind,
-    ) -> Result<(), PeerSecurityAuditError> {
-        self.commit(DataTenantId::SYSTEM_OWNER, violation).await
+    /// Stages an untrusted-ticket rejection on the platform/system audit chain.
+    fn stage_unverified_ticket_rejection(&self, violation: BifrostSecurityViolationKind) {
+        self.stage(DataTenantId::SYSTEM_OWNER, violation);
     }
 
-    /// Commits a signed-ticket rejection to the cryptographically verified tenant chain.
-    ///
-    /// # Errors
-    /// Returns [`PeerSecurityAuditError`] when the tenant-chain row cannot commit.
-    async fn append_verified_ticket_violation(
+    /// Stages a signed-ticket rejection on the cryptographically verified tenant chain.
+    fn stage_verified_ticket_violation(
         &self,
         tenant_id: DataTenantId,
         violation: BifrostSecurityViolationKind,
-    ) -> Result<(), PeerSecurityAuditError> {
-        self.commit(tenant_id, violation).await
+    ) {
+        self.stage(tenant_id, violation);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vala_sql::audit_outbox::AuditSink;
     use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
 
-    /// Production peer audit writes exact system and verified-tenant identities.
+    /// Production peer audit stages exact system and verified-tenant identities.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot start, the sentinel is rejected, the
+    /// staged rejections do not commit, or a committed row is misattributed.
     #[tokio::test]
     async fn oracle_peer_postgres_audit_routes_security_identity_and_detail() {
         let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
@@ -132,20 +121,17 @@ mod tests {
             fixture.wyrd_postgres().clone(),
             fixture.vala_postgres().clone(),
         );
-        let writer = PostgresPeerSecurityAudit::try_new(&postgres)
+        let outbox = AuditSink::outbox(fixture.vala_postgres().clone());
+        let writer = PostgresPeerSecurityAudit::try_new(&postgres, Arc::clone(&outbox))
             .await
             .expect("exact sentinel enables peer audit");
-        writer
-            .append_unverified_ticket_rejection(BifrostSecurityViolationKind::PeerUnknownKey)
-            .await
-            .expect("system audit commits");
-        writer
-            .append_verified_ticket_violation(
-                fixture.data_tenant_id(),
-                BifrostSecurityViolationKind::PeerAudience,
-            )
-            .await
-            .expect("tenant audit commits");
+        writer.stage_unverified_ticket_rejection(BifrostSecurityViolationKind::PeerUnknownKey);
+        writer.stage_verified_ticket_violation(
+            fixture.data_tenant_id(),
+            BifrostSecurityViolationKind::PeerAudience,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert_eq!(outbox.shutdown(deadline).await, 0, "both rejections commit");
 
         let pool = fixture.superuser_pool().await.expect("assertion pool");
         let rows: Vec<(uuid::Uuid, uuid::Uuid, String, String, String, String)> = sqlx::query_as(
@@ -179,6 +165,10 @@ mod tests {
     }
 
     /// Missing or incompatible system state prevents peer audit readiness.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot start, the sentinel cannot be changed,
+    /// or construction succeeds without the exact sentinel.
     #[tokio::test]
     async fn oracle_peer_postgres_audit_rejects_missing_or_incompatible_sentinel() {
         let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
@@ -194,7 +184,12 @@ mod tests {
             .await
             .expect("remove sentinel");
         assert!(
-            PostgresPeerSecurityAudit::try_new(&postgres).await.is_err(),
+            PostgresPeerSecurityAudit::try_new(
+                &postgres,
+                AuditSink::outbox(fixture.vala_postgres().clone())
+            )
+            .await
+            .is_err(),
             "missing sentinel must prevent peer runtime construction"
         );
 
@@ -208,7 +203,12 @@ mod tests {
         .await
         .expect("stage incompatible sentinel");
         assert!(
-            PostgresPeerSecurityAudit::try_new(&postgres).await.is_err(),
+            PostgresPeerSecurityAudit::try_new(
+                &postgres,
+                AuditSink::outbox(fixture.vala_postgres().clone())
+            )
+            .await
+            .is_err(),
             "incompatible sentinel must prevent peer runtime construction"
         );
     }

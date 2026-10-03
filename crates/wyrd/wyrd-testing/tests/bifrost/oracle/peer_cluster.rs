@@ -435,7 +435,6 @@ impl PeerCluster {
                 ],
                 tenant: self.tenant(),
                 physical_layout: None,
-                audit: None,
             })
             .await?;
         Ok(())

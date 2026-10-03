@@ -95,8 +95,7 @@ impl ScheduledQueryCaller {
     /// # Errors
     ///
     /// Returns the stable pre-stream query error (an object denial is
-    /// audited first, or replaced by audit-unavailable when that append
-    /// fails), a frame or Arrow decode
+    /// staged for audit first), a frame or Arrow decode
     /// error, [`WyrdError`] for a failed terminal, unconfirmed lifecycle routing,
     /// and a protocol error when
     /// the stream ended without a terminal frame.
@@ -172,8 +171,7 @@ impl ScheduledQueryCaller {
     /// # Errors
     ///
     /// Returns the stable pre-stream admission or query error. A bound-context
-    /// object denial is audited first, or replaced by audit-unavailable when
-    /// that append fails.
+    /// object denial is staged for audit first.
     async fn dispatch(&self, request: BifrostQueryRequest) -> Result<OracleQueryStream, WyrdError> {
         match &self.caller {
             Some(caller) => {
@@ -188,23 +186,22 @@ impl ScheduledQueryCaller {
             {
                 Ok(stream) => Ok(stream),
                 Err(denial @ BifrostError::QueryForbidden) => {
-                    Err(self.record_object_denial(denial.into()).await)
+                    Err(self.record_object_denial(denial.into()))
                 }
                 Err(error) => Err(error.into()),
             },
         }
     }
 
-    /// Durably records Oracle's object denial of this caller's statement.
+    /// Stages Oracle's object denial of this caller's statement.
     ///
     /// Oracle refuses a statement over any resolved table the bound
     /// principal is not granted. That refusal is an authorization decision, so
     /// it is audited exactly as the public query entry audits it: one `denied`
     /// row for the bound principal through [`QueryAuthority`].
     ///
-    /// Returns audit-unavailable when the append fails, and otherwise
-    /// `denial` unchanged.
-    async fn record_object_denial(&self, denial: WyrdError) -> WyrdError {
+    /// Returns `denial` unchanged.
+    fn record_object_denial(&self, denial: WyrdError) -> WyrdError {
         let caller = Caller {
             data_tenant_id: self.context.data_tenant_id,
             principal: self.context.principal.clone(),
@@ -213,7 +210,6 @@ impl ScheduledQueryCaller {
         };
         QueryAuthority::new(&self.state, &caller, "vala.query.sync", "vala.query")
             .record_object_denial(denial)
-            .await
     }
 
     /// Consumes one dispatched stream to a valid terminal followed by clean EOF.

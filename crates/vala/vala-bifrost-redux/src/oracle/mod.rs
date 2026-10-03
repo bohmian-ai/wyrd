@@ -24,12 +24,13 @@ use sha2::{Digest as _, Sha256};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use vala_sql::ValaPostgres;
+use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_runtime::{DelegationStep, Permission, PermissionScope, Principal};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
-    AuditDetail, AuthMethod, BifrostQueryRequest, BifrostSecurityPhase,
+    AuditDetail, AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest, BifrostSecurityPhase,
     BifrostSecurityViolationKind, NodeId, PersistedFileDescriptor, QueryAuditDigest,
     QueryBatchFrame, QueryClass, QueryExecutionMode, QueryId, QuerySchemaFrame, QuerySource,
     QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
@@ -831,23 +832,83 @@ impl Drop for AdmissionWaitTelemetryGuard {
 
 /// Narrow, non-blocking audit collaborator owned by the serving composition root.
 ///
-/// Both methods only stage the event and return: the writer commits it to the
-/// tenant audit outbox from a tracked task, and owns counting and logging a
-/// commit that fails. Rows are never held for that commit.
+/// Both methods only stage the event and return: the outbox writer commits it
+/// to the tenant's audit chain in the background and retries a commit that
+/// fails. Rows are never held for that commit.
 pub trait OracleAudit: Send + Sync {
     /// Stages the immutable read-decision detail after admission.
-    fn append_read_decision(
+    fn stage_read_decision(
         &self,
         context: &AuthorizedQueryContext,
         decision: BifrostQueryReadDecision,
     );
 
     /// Stages a tenant or peer security event.
-    fn append_security_violation(
+    fn stage_security_violation(
         &self,
         context: VerifiedSecurityContext,
         violation: BifrostSecurityViolation,
     );
+}
+
+impl OracleAudit for AuditOutbox {
+    /// Stages the immutable read decision on the query tenant's chain.
+    fn stage_read_decision(
+        &self,
+        context: &AuthorizedQueryContext,
+        decision: BifrostQueryReadDecision,
+    ) {
+        let event = query_audit_event(
+            context,
+            "bifrost.query.read_decision",
+            AuditOutcome::Allowed,
+            decision.into_detail(),
+        );
+        self.stage(context.data_tenant_id, event);
+    }
+
+    /// Stages a verified security violation on the query tenant's chain.
+    fn stage_security_violation(
+        &self,
+        context: VerifiedSecurityContext,
+        violation: BifrostSecurityViolation,
+    ) {
+        let event = query_audit_event(
+            &context.query,
+            "bifrost.query.security_violation",
+            AuditOutcome::Denied,
+            AuditDetail::BifrostSecurityViolation {
+                violation: violation.violation,
+                phase: violation.phase,
+                query_digest: context.query_digest.clone(),
+                delegation_chain: wyrd_runtime::audit_delegation_chain(
+                    &context.query.delegation_chain,
+                ),
+            },
+        );
+        self.stage(context.query.data_tenant_id, event);
+    }
+}
+
+/// Builds the scrubbed event shared by read decisions and security violations.
+fn query_audit_event(
+    context: &AuthorizedQueryContext,
+    operation: &str,
+    outcome: AuditOutcome,
+    detail: AuditDetail,
+) -> AuditEvent {
+    AuditEvent::new(
+        context.request_id.clone(),
+        context.trace_id.clone(),
+        operation.to_owned(),
+        "bifrost.query".to_owned(),
+        context.principal.card_ref().cloned(),
+        context.principal.id,
+        context.principal.kind.tag(),
+        context.permission.to_string(),
+        outcome,
+    )
+    .with_detail(detail)
 }
 
 /// Locked T1 projection of one immutable local Oracle read decision.
@@ -862,15 +923,15 @@ impl BifrostQueryReadDecision {
     ///
     /// # Errors
     ///
-    /// Returns audit unavailable when the projection violates the locked
-    /// binding, topology, retry, slot, or deadline bounds.
+    /// Returns [`BifrostError::QueryExecutionFailed`] when the projection
+    /// violates the locked binding, topology, retry, slot, or deadline bounds.
     pub fn try_new(detail: AuditDetail) -> Result<Self, BifrostError> {
         if !matches!(detail, AuditDetail::BifrostQueryReadDecision { .. }) {
-            return Err(BifrostError::QueryAuditUnavailable);
+            return Err(BifrostError::QueryExecutionFailed);
         }
         detail
             .validate()
-            .map_err(|_| BifrostError::QueryAuditUnavailable)?;
+            .map_err(|_| BifrostError::QueryExecutionFailed)?;
         Ok(Self { detail })
     }
 
@@ -903,7 +964,7 @@ pub struct BifrostSecurityViolation {
 ///
 /// Peer transport and fencing proofs assert on routing, reservation, and frame
 /// behavior, not on the audit chain. Binding this writer keeps the worker's
-/// real fail-closed audit call on the path while removing the Postgres
+/// real non-blocking audit call on the path while removing the Postgres
 /// dependency those proofs do not need. Any test that asserts audit content
 /// must use a writer that actually records.
 #[cfg(any(test, feature = "test-support"))]
@@ -913,7 +974,7 @@ pub struct AcceptingOracleAudit;
 #[cfg(any(test, feature = "test-support"))]
 impl OracleAudit for AcceptingOracleAudit {
     /// Discards the read decision.
-    fn append_read_decision(
+    fn stage_read_decision(
         &self,
         _context: &AuthorizedQueryContext,
         _decision: BifrostQueryReadDecision,
@@ -921,7 +982,7 @@ impl OracleAudit for AcceptingOracleAudit {
     }
 
     /// Discards the security violation.
-    fn append_security_violation(
+    fn stage_security_violation(
         &self,
         _context: VerifiedSecurityContext,
         _violation: BifrostSecurityViolation,
@@ -2087,7 +2148,7 @@ impl Oracle {
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::QueryAuditUnavailable`] when a digest input is
+    /// Returns [`BifrostError::QueryExecutionFailed`] when a digest input is
     /// outside the bounded audit digest contract.
     fn candidate_attempt_context(
         context: &AuthorizedQueryContext,
@@ -2483,7 +2544,7 @@ impl Oracle {
                 "event_class" => "tenant_file"
             )
             .increment(1);
-            audit.append_security_violation(
+            audit.stage_security_violation(
                 VerifiedSecurityContext {
                     query,
                     query_digest: None,
@@ -2509,8 +2570,8 @@ impl Oracle {
     ///
     /// Returns [`BifrostError::QueryExecutionFailed`] when the session carries
     /// no bindings extension, when validation refuses the binding set, or when
-    /// the lock was already bound, and [`BifrostError::QueryAuditUnavailable`]
-    /// when the live permission digest cannot be derived.
+    /// the lock was already bound, or when the live permission digest cannot
+    /// be derived.
     ///
     /// On success the bound lock is returned so the terminal path reads the
     /// degraded sources from the same post-admission registry the leaves
@@ -2615,7 +2676,7 @@ impl Oracle {
     /// # Errors
     ///
     /// Returns [`BifrostError::QueryAdmissionRejected`] when the admitted query
-    /// no longer holds its envelope, and [`BifrostError::QueryAuditUnavailable`]
+    /// no longer holds its envelope, and [`BifrostError::QueryExecutionFailed`]
     /// when the permission digest cannot be derived.
     fn live_dispatch(
         &self,
@@ -2729,7 +2790,7 @@ impl Oracle {
     /// # Errors
     ///
     /// Returns [`BifrostError::QueryTimeout`] when no deadline remains and
-    /// [`BifrostError::QueryAuditUnavailable`] when the detail violates the
+    /// [`BifrostError::QueryExecutionFailed`] when the detail violates the
     /// bounded audit contract.
     fn audit_read_decision(&self, input: CutAuditInput<'_>) -> Result<(), BifrostError> {
         let decision = read_decision(
@@ -2741,7 +2802,7 @@ impl Oracle {
             input.deadline,
         )
         .inspect_err(|error| tracing::error!(error = %error, "Oracle read decision is invalid"))?;
-        self.audit.append_read_decision(input.context, decision);
+        self.audit.stage_read_decision(input.context, decision);
         Ok(())
     }
 
@@ -3773,16 +3834,18 @@ fn query_digest(value: &str) -> String {
 ///
 /// # Errors
 ///
-/// Returns audit unavailable when the locked audit scalar rejects the digest.
+/// Returns [`BifrostError::QueryExecutionFailed`] when the locked audit scalar
+/// rejects the digest.
 fn audit_digest(value: &str) -> Result<QueryAuditDigest, BifrostError> {
-    QueryAuditDigest::new(query_digest(value)).map_err(|_| BifrostError::QueryAuditUnavailable)
+    QueryAuditDigest::new(query_digest(value)).map_err(|_| BifrostError::QueryExecutionFailed)
 }
 
 /// Produces one digest from an ordered list without exposing its source values.
 ///
 /// # Errors
 ///
-/// Returns audit unavailable when the locked audit scalar rejects the digest.
+/// Returns [`BifrostError::QueryExecutionFailed`] when the locked audit scalar
+/// rejects the digest.
 fn aggregate_audit_digest<'a>(
     values: impl IntoIterator<Item = &'a str>,
 ) -> Result<QueryAuditDigest, BifrostError> {
@@ -3794,8 +3857,8 @@ fn aggregate_audit_digest<'a>(
 ///
 /// # Errors
 ///
-/// Returns audit unavailable when a digest or T1 bounded invariant is invalid,
-/// and timeout when no positive settled deadline remains.
+/// Returns [`BifrostError::QueryExecutionFailed`] when a digest or T1 bounded
+/// invariant is invalid, and timeout when no positive settled deadline remains.
 fn read_decision(
     context: &AuthorizedQueryContext,
     sql: &str,
@@ -3819,7 +3882,7 @@ fn read_decision(
             .as_millis()
             .max(1),
     )
-    .map_err(|_| BifrostError::QueryAuditUnavailable)?;
+    .map_err(|_| BifrostError::QueryExecutionFailed)?;
     BifrostQueryReadDecision::try_new(AuditDetail::BifrostQueryReadDecision {
         query_digest: audit_digest(sql)?,
         query_class,
@@ -3856,7 +3919,7 @@ fn read_decision(
 ///
 /// # Errors
 ///
-/// Returns [`BifrostError::QueryAuditUnavailable`] when an Analytical cut is
+/// Returns [`BifrostError::QueryExecutionFailed`] when an Analytical cut is
 /// empty or larger than the audit contract's node field can carry.
 fn execution_topology(
     query_class: QueryClass,
@@ -3868,7 +3931,7 @@ fn execution_topology(
             let nodes = u8::try_from(oracle_count)
                 .ok()
                 .filter(|nodes| *nodes > 0)
-                .ok_or(BifrostError::QueryAuditUnavailable)?;
+                .ok_or(BifrostError::QueryExecutionFailed)?;
             Ok((QueryExecutionMode::Distributed, nodes, nodes - 1))
         }
     }
@@ -4005,7 +4068,7 @@ pub(super) fn authorize_payload_columns(
 ///
 /// # Errors
 ///
-/// Returns [`BifrostError::QueryAuditUnavailable`] when the decision cannot be
+/// Returns [`BifrostError::QueryExecutionFailed`] when the decision cannot be
 /// canonicalized or the digest falls outside the bounded audit contract.
 pub(super) fn scoped_permission_digest(
     permission: &Permission,
@@ -4013,11 +4076,11 @@ pub(super) fn scoped_permission_digest(
 ) -> Result<QueryAuditDigest, BifrostError> {
     let mut rendered = scopes
         .iter()
-        .map(|scope| serde_json::to_string(scope).map_err(|_| BifrostError::QueryAuditUnavailable))
+        .map(|scope| serde_json::to_string(scope).map_err(|_| BifrostError::QueryExecutionFailed))
         .collect::<Result<Vec<_>, _>>()?;
     rendered.sort_unstable();
     let permission =
-        serde_json::to_string(permission).map_err(|_| BifrostError::QueryAuditUnavailable)?;
+        serde_json::to_string(permission).map_err(|_| BifrostError::QueryExecutionFailed)?;
     audit_digest(&format!("{permission}\n{}", rendered.join("\n")))
 }
 
@@ -4036,7 +4099,6 @@ const fn terminal_error_label(code: QueryTerminalErrorCode) -> &'static str {
         QueryTerminalErrorCode::QueryTenantInvariant => "query_tenant_invariant",
         QueryTerminalErrorCode::QueryReconciliationInvariant => "query_reconciliation_invariant",
         QueryTerminalErrorCode::QueryPeerSecurity => "query_peer_security",
-        QueryTerminalErrorCode::QueryAuditUnavailable => "query_audit_unavailable",
         QueryTerminalErrorCode::CatalogUnreachable => "catalog_unreachable",
         QueryTerminalErrorCode::StorageUnreachable => "storage_unreachable",
         QueryTerminalErrorCode::QueryExecutionFailed => "query_execution_failed",
@@ -4272,8 +4334,6 @@ fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostEr
         BifrostError::QueryTenantInvariant
     } else if message.contains("reconciliation invariant") {
         BifrostError::QueryReconciliationInvariant
-    } else if message.contains("audit unavailable") {
-        BifrostError::QueryAuditUnavailable
     } else {
         BifrostError::QueryExecutionFailed
     }
@@ -4846,7 +4906,6 @@ mod tests {
                 "reconciliation invariant",
                 BifrostError::QueryReconciliationInvariant,
             ),
-            ("audit unavailable", BifrostError::QueryAuditUnavailable),
         ] {
             let error = DataFusionError::Context(
                 context.to_owned(),

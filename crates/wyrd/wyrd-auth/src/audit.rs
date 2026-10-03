@@ -1,21 +1,18 @@
 //! Authentication audit events on the canonical audit outbox.
 //!
 //! Token grants, API-key issuance, refresh-family revocation, and card-scope
-//! mints are each recorded as one [`AuditEvent`] appended to
-//! `vala.audit_staging` through [`append_audit`], the single audit write path.
-//! The server's `AuditPublisher` is the only thing that moves those rows into
-//! retained history; this module owns no table and no other sink.
+//! mints are each recorded as one [`AuditEvent`] staged on the process
+//! [`vala_sql::audit_outbox::AuditOutbox`], the single audit write path. A grant
+//! never waits for, or fails on, that commit. The server's `AuditPublisher` is
+//! the only thing that moves staged rows into retained history; this module
+//! owns no table and no other sink.
 
-use sqlx::PgPool;
-use vala_sql::queries::audit_staging::append_audit;
-use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
 use wyrd_spec::vala::audit_detail::AuditErrorCode;
-use wyrd_sql::TenantConn;
 
 /// Operation for every issued access token: authorization code, API key, JWT
 /// bearer, delegation, and refresh rotation.
@@ -89,49 +86,6 @@ pub fn principal_kind_tag(value: &str) -> PrincipalKindTag {
     }
 }
 
-/// Append one auth audit event on the grant's own transaction.
-///
-/// The row commits exactly when the caller commits `conn`, so a token or key is
-/// never returned without its audit row.
-///
-/// # Errors
-/// Returns [`WyrdError::AuditUnavailable`] when the append fails.
-pub async fn append_auth_audit(
-    conn: &mut TenantConn<'_>,
-    event: &AuditEvent,
-) -> Result<(), WyrdError> {
-    append_audit(conn, event)
-        .await
-        .map(|_| ())
-        .map_err(|error| audit_unavailable(&error))
-}
-
-/// Append one auth failure event in its own transaction, logging instead of
-/// failing.
-///
-/// Refused grants already return an error to the caller; a missing refusal row
-/// must not replace that error, so acquire, append, and commit failures are
-/// logged at `error` and swallowed.
-pub async fn record_auth_audit_best_effort(
-    pool: &PgPool,
-    tenant: DataTenantId,
-    event: &AuditEvent,
-) {
-    let result = async {
-        let mut conn = TenantConn::acquire(pool, tenant).await?;
-        append_audit(&mut conn, event).await?;
-        conn.commit().await
-    }
-    .await;
-    if let Err(error) = result {
-        tracing::error!(
-            error = %error,
-            operation = %event.operation,
-            "auth failure audit could not be staged"
-        );
-    }
-}
-
 /// Map a refused grant's error onto the closed audit failure code.
 ///
 /// Credential problems collapse to `InvalidToken`, missing principals or cards
@@ -152,17 +106,7 @@ pub fn auth_failure_code(error: &WyrdError) -> AuditErrorCode {
         WyrdError::PrincipalKindCardKindMismatch { .. } | WyrdError::CardScopeTooLarge { .. } => {
             AuditErrorCode::ValidationFailed
         }
-        WyrdError::AuditUnavailable { .. } => AuditErrorCode::AuditUnavailable,
         _ => AuditErrorCode::PermissionDenied,
-    }
-}
-
-/// Build the fail-closed public error for a failed audit append.
-fn audit_unavailable(error: &dyn std::fmt::Display) -> WyrdError {
-    tracing::error!(error = %error, "auth audit append failed; refusing grant");
-    WyrdError::AuditUnavailable {
-        message: "audit append failed".to_owned(),
-        details: serde_json::json!({}),
     }
 }
 
@@ -198,5 +142,61 @@ mod tests {
         let id = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1bff";
         assert_eq!(audit_request_id(id).as_str(), id);
         assert_ne!(audit_request_id("not-a-uuid").as_str(), "not-a-uuid");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_outbox {
+    //! A real process audit outbox for Postgres-backed auth tests.
+
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use vala_sql::ValaPostgres;
+    use vala_sql::audit_outbox::{AuditOutbox, AuditSink};
+    use wyrd_dev_fixtures::pg::PgFixture;
+
+    /// Upper bound for the outbox to commit everything a test staged.
+    const DRAIN_BUDGET: Duration = Duration::from_secs(30);
+
+    /// An outbox committing through the fixture's application pool, exactly as
+    /// the server's does.
+    pub(crate) fn outbox(fixture: &PgFixture) -> Arc<AuditOutbox> {
+        AuditSink::outbox(ValaPostgres::from_pool(fixture.app_pool().clone()))
+    }
+
+    /// Proves `outbox` cannot commit what a test staged while audit staging
+    /// refuses writes.
+    ///
+    /// The writer retries a failed batch from 50 ms backoff, so one second of
+    /// settling covers several attempts; the staged decisions must all remain
+    /// pending, neither committed nor dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics when fewer than `staged` decisions remain pending.
+    pub(crate) async fn assert_retrying(outbox: &AuditOutbox, staged: usize) {
+        assert_eq!(
+            outbox.settle(Instant::now() + Duration::from_secs(1)).await,
+            staged,
+            "a decision whose commit fails stays queued for retry"
+        );
+    }
+
+    /// Commits everything staged on `outbox` before a test reads staging.
+    ///
+    /// Shutting the outbox down is the drain: it stops intake and waits for the
+    /// writer, so every decision staged before the call is committed when
+    /// this returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when staged events remain uncommitted after the drain budget.
+    pub(crate) async fn drain(outbox: &AuditOutbox) {
+        assert_eq!(
+            outbox.shutdown(Instant::now() + DRAIN_BUDGET).await,
+            0,
+            "every staged auth decision is committed"
+        );
     }
 }

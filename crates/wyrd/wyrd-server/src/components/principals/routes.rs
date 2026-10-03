@@ -73,17 +73,15 @@ fn require_principal_admin(caller: &Caller, action: &str) -> Result<(), WyrdErro
         .map_err(WyrdErrorResponse::from)
 }
 
-/// Authorize one operation on this surface and record the decision.
+/// Authorize one operation on this surface and stage the decision.
 ///
-/// Opens the tenant transaction first so the decision and the work it permits
-/// share it. A denial is committed on its own — a refused attempt is exactly
-/// the thing an operator needs in the log — and the connection is returned only
-/// when the caller may proceed.
+/// The decision is staged on the process audit outbox as soon as it is made,
+/// allowed and denied alike, and the tenant transaction the work runs in is
+/// opened only when the caller may proceed.
 ///
 /// # Errors
 /// Returns [`WyrdError::PermissionDeniedRbac`] when the caller lacks the
-/// permission, and [`WyrdError::AuditUnavailable`] when the decision cannot be
-/// recorded, which refuses the operation either way.
+/// permission, and an internal error when the connection cannot be opened.
 async fn authorize<'a>(
     state: &'a AppState,
     caller: &Caller,
@@ -91,51 +89,18 @@ async fn authorize<'a>(
     operation: &str,
     resource: &str,
 ) -> Result<TenantConn<'a>, WyrdErrorResponse> {
-    let mut conn = tenant_conn(state, caller).await?;
-    match require_principal_admin(caller, action) {
-        Ok(()) => {
-            record_decision(
-                &mut conn,
-                caller,
-                operation,
-                resource,
-                AuditOutcome::Allowed,
-            )
-            .await?;
-            Ok(conn)
-        }
-        Err(denied) => {
-            record_decision(&mut conn, caller, operation, resource, AuditOutcome::Denied).await?;
-            conn.commit().await.map_err(internal)?;
-            Err(denied)
-        }
-    }
-}
-
-/// Record an authorization decision on this surface.
-///
-/// Every operation here decides whether a principal may administer its tenant's
-/// identities, and agent-rules requires such a decision to be audited in the
-/// transaction that made it. Appending on the caller's own connection is what
-/// makes the record and the write it permits commit or fail together — an audit
-/// row for an operation that was rolled back would be worse than none.
-///
-/// # Errors
-/// Returns [`WyrdError::AuditUnavailable`] when the append fails, which fails
-/// the operation closed: a decision that cannot be recorded did not happen.
-async fn record_decision(
-    conn: &mut TenantConn<'_>,
-    caller: &Caller,
-    operation: &str,
-    resource: &str,
-    outcome: AuditOutcome,
-) -> Result<(), WyrdErrorResponse> {
-    audit::append_on(
-        conn,
-        &audit::audit_event(caller, operation, resource, REQUIRED_PERMISSION, outcome),
-    )
-    .await
-    .map_err(WyrdErrorResponse::from)
+    let verdict = require_principal_admin(caller, action);
+    let outcome = if verdict.is_ok() {
+        AuditOutcome::Allowed
+    } else {
+        AuditOutcome::Denied
+    };
+    state.audit_outbox.stage(
+        caller.data_tenant_id,
+        audit::audit_event(caller, operation, resource, REQUIRED_PERMISSION, outcome),
+    );
+    verdict?;
+    tenant_conn(state, caller).await
 }
 
 /// Open a transaction scoped to the caller's tenant.
@@ -267,9 +232,8 @@ async fn mint_credential(
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "Tenant principal administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 500, description = "A tenant store read or write failed, or the authorization \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "A tenant store read or write failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "No verifier is configured for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -366,9 +330,8 @@ async fn create_service_principal(
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such principal in the caller's tenant \
           (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A tenant store read or write failed, or the authorization \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "A tenant store read or write failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "No verifier is configured for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -416,9 +379,8 @@ async fn issue_credential(
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such principal in the caller's tenant \
           (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A tenant store read or write failed, or the authorization \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "A tenant store read or write failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "No verifier is configured for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -444,8 +406,8 @@ async fn list_credentials(
 /// contains.
 ///
 /// # Errors
-/// Returns a stable Wyrd error when the caller is unauthorized, the decision
-/// cannot be audited, or the read fails.
+/// Returns a stable Wyrd error when the caller is unauthorized or the read
+/// fails.
 pub(crate) async fn list_credentials_for(
     state: &AppState,
     caller: &Caller,
@@ -504,9 +466,8 @@ pub(crate) async fn list_credentials_for(
         (status = 404, description = "No such principal in the caller's tenant, or it holds \
           no live credential of that id (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND, \
           WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A tenant store read or write failed, or the authorization \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "A tenant store read or write failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "No verifier is configured for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),

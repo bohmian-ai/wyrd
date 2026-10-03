@@ -529,42 +529,6 @@ async fn describe_counts(server: &WyrdTestServer, tables: &[&str]) -> Vec<i64> {
     counts
 }
 
-/// Refuse startup once per fixed table whose describe the server fails.
-///
-/// For each fixed table in turn the server fails only that table's describe,
-/// so the Drift case fails first and the Eval case fails after Drift already
-/// described. Both must refuse `start_bifrost` with the server's stable error
-/// and leave the state startable, which the caller then proves by starting it.
-///
-/// # Panics
-/// Panics when a start succeeds, carries the wrong code, or the fault cannot
-/// be installed or removed.
-async fn assert_fixed_table_preflight_refusals(
-    server: &WyrdTestServer,
-    state: &WyrdState,
-    client: &WyrdClient,
-) {
-    for table in FIXED_TABLES {
-        server
-            .fail_table_describe(table)
-            .await
-            .expect("describe fault installs");
-        let refused = state
-            .start_bifrost_with_config(client, None, QueueConfig::default())
-            .await
-            .expect_err("startup cannot succeed without describing every fixed table");
-        assert_eq!(
-            refused.code(),
-            "WYRD_VALA_500_AUDIT_UNAVAILABLE",
-            "{table} describe refusal: {refused:?}"
-        );
-        server
-            .restore_table_describe()
-            .await
-            .expect("describe fault is removed");
-    }
-}
-
 /// Emit the journey's Drift, Eval, and generic rows from their subject views.
 ///
 /// The Agent writes `dataset` twice and the staged describe count proves the
@@ -658,7 +622,6 @@ async fn scoped_run_emits_drift_eval_and_generic_rows() {
 
     let state = WyrdState::from_path(&bundle).expect("complete bundle loads offline");
     let client = connect(&server, &credential);
-    assert_fixed_table_preflight_refusals(&server, &state, &client).await;
     state
         .start_bifrost_with_config(&client, None, QueueConfig::default())
         .await
@@ -912,10 +875,10 @@ async fn issued_card_key_writes_and_queries_within_its_scope_only() {
 }
 
 /// The number of Drift observations one burst emits.
-const BURST_OBSERVATIONS: usize = 1_000;
+const BURST_OBSERVATIONS: u16 = 1_000;
 
 /// The features every burst observation carries, one tall row each.
-const BURST_FEATURES: usize = 9;
+const BURST_FEATURES: u16 = 9;
 
 /// A byte budget smaller than one maximum message plus its sealing headroom.
 const UNSEALABLE_BUDGET: usize = 1024;
@@ -1019,7 +982,7 @@ async fn drift_burst_survives_a_byte_budget_override() {
         .expect("burst rows read back");
     assert_eq!(
         groups.len(),
-        BURST_OBSERVATIONS,
+        usize::from(BURST_OBSERVATIONS),
         "one record_id per observation"
     );
     assert!(

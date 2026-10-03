@@ -67,7 +67,6 @@ pub async fn seed_query_fixture(
                 .collect(),
             tenant: server.data_tenant_id(),
             physical_layout: None,
-            audit: None,
         })
         .await
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
@@ -179,7 +178,6 @@ impl WyrdTestServer {
                     .collect(),
                 tenant: self.data_tenant_id(),
                 physical_layout: None,
-                audit: None,
             })
             .await
             .map_err(harness_error)?;

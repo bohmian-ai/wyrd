@@ -93,7 +93,6 @@ mod pg_tests {
                 )],
                 tenant: foreign_tenant,
                 physical_layout: None,
-                audit: None,
             })
             .await?;
 

@@ -1,4 +1,4 @@
-//! Typed, redacted detail carried by the transactional audit event.
+//! Typed, redacted detail carried by the staged audit event.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -434,6 +434,9 @@ pub enum AuditErrorCode {
     /// The caller lacked the required permission.
     PermissionDenied,
     /// Audit staging was unavailable.
+    ///
+    /// No longer recorded: audit never refuses an operation. Retained so
+    /// retained history that carries it still decodes.
     AuditUnavailable,
     /// The supplied token was invalid.
     InvalidToken,

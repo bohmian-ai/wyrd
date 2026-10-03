@@ -3,8 +3,10 @@
 use chrono::Duration;
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
+use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_auth_issue::{self, IssueError};
 use wyrd_runtime::{Permission, Principal, PrincipalId};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{IssueKeyRequest, IssueKeyResponse, SecretBearer};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
@@ -13,7 +15,7 @@ use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{insert_api_key, service_account_by_card_ref};
 
-use crate::audit::{API_KEY_ISSUE_OPERATION, append_auth_audit, auth_event};
+use crate::audit::{API_KEY_ISSUE_OPERATION, auth_event};
 
 /// API-key issue settings.
 #[derive(Debug, Clone)]
@@ -37,7 +39,7 @@ pub struct IssueApiKey {
     pub settings: ApiKeySettings,
 }
 
-/// Internal result carrying non-wire fields needed by transactional audit.
+/// Internal result carrying non-wire fields the staged audit event needs.
 #[derive(Debug, Clone)]
 pub struct IssuedApiKey {
     /// Wire response.
@@ -143,21 +145,20 @@ impl IssueApiKey {
         })
     }
 
-    /// Stage the credential-issuance audit event on the issuing transaction.
+    /// Stage the credential-issuance audit event on the process outbox.
     ///
     /// The event names the target card as its resource and `service_accounts`
     /// write as its permission, and records the key id and expiry — never the
-    /// key. It commits with the key row, so a key is never returned unaudited.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::AuditUnavailable`] when the audit append fails.
-    pub async fn audit(
+    /// key. It is staged on `tenant`'s chain without waiting and never refuses
+    /// the issuance.
+    pub fn audit(
         &self,
-        conn: &mut TenantConn<'_>,
+        audit: &AuditOutbox,
+        tenant: DataTenantId,
         issued: &IssuedApiKey,
         actor: &Principal,
         request_id: &str,
-    ) -> Result<(), WyrdError> {
+    ) {
         let mut event = auth_event(
             request_id,
             API_KEY_ISSUE_OPERATION,
@@ -173,7 +174,7 @@ impl IssueApiKey {
         );
         event.resource = issued.response.card_ref.to_string();
         event.permission = Permission::service_accounts_write().to_string();
-        append_auth_audit(conn, &event).await
+        audit.stage(tenant, event);
     }
 }
 

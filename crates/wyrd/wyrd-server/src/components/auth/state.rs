@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_auth_issue::IssuingKey;
 use wyrd_crypt::SecretKey;
 use wyrd_runtime::{PermissionCheck, RbacCheck};
@@ -34,13 +35,14 @@ impl ServerAuth {
     /// Build the one tenant issuance owner over the configured signing key.
     ///
     /// Every tenant grant route mints through this, so all five paths share
-    /// the same activity checks, grant resolution, lifetimes, and audit.
-    /// Returns `None` when no signing key is configured.
+    /// the same activity checks, grant resolution, lifetimes, and audit, which
+    /// the issuer stages on `audit`, the process audit outbox. Returns `None`
+    /// when no signing key is configured.
     #[must_use]
-    pub fn tenant_issuer(&self) -> Option<TenantTokenIssuer> {
-        self.issuing_key
-            .clone()
-            .map(|key| TenantTokenIssuer::new(key, self.token_exchange_settings.clone()))
+    pub fn tenant_issuer(&self, audit: &Arc<AuditOutbox>) -> Option<TenantTokenIssuer> {
+        self.issuing_key.clone().map(|key| {
+            TenantTokenIssuer::new(key, self.token_exchange_settings.clone(), Arc::clone(audit))
+        })
     }
 }
 

@@ -193,7 +193,6 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
             vec![Field::new("value", DataType::Int64, false)],
             None,
             None,
-            None,
         )
         .await
         .expect("tail fixture dataset registers for the authenticated tenant");
@@ -593,7 +592,6 @@ async fn embedded_ingest_resolves_catalog_and_durably_acknowledges_arrow() {
             vec![Field::new("value", DataType::Int64, false)],
             None,
             None,
-            None,
         )
         .await
         .expect("logical dataset registers for the authenticated tenant");
@@ -927,6 +925,10 @@ impl ResultTableHarness {
             .superuser_pool()
             .await
             .expect("fixture exposes a migrator assertion pool");
+        server
+            .wait_oracle_audit_staged(Duration::from_secs(30))
+            .await
+            .expect("audit outbox settles");
         let seq_before: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_staging WHERE data_tenant_id = $1",
         )
@@ -969,6 +971,10 @@ impl ResultTableHarness {
     /// Panics when audit staging cannot be read or a decision names a
     /// permission other than `bifrost:record:write`.
     async fn write_decisions(&self) -> Vec<(String, String, String)> {
+        self.server
+            .wait_oracle_audit_staged(Duration::from_secs(30))
+            .await
+            .expect("audit outbox settles");
         let decisions: Vec<(String, String, String, String)> = sqlx::query_as(
             "SELECT principal_kind, resource, permission, outcome \
              FROM vala.audit_staging \

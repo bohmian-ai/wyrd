@@ -361,6 +361,9 @@ async fn storage_routes_refuse_and_audit_an_unprivileged_caller() {
         .expect_err("a principal without card:read cannot plan a download");
     assert_eq!(error.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
 
+    srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await
+        .expect("audit outbox settles");
     let mut conn = srv
         .tenant_conn_for(srv.data_tenant_id())
         .await

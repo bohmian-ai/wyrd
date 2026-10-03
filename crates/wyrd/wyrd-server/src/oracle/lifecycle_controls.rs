@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use futures_util::StreamExt as _;
+use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::oracle::{OracleQueryStream, RunningQueryRegistry};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
@@ -112,6 +113,30 @@ impl RunningQueryControls {
         })
         .await
         .map_err(|_| WyrdError::from(BifrostError::QueryStreamIncomplete))?
+    }
+
+    /// Awaits a query's stream `open`, cancelling the query at its owner if
+    /// `cancel` fires first.
+    ///
+    /// An Analytical leader opens its stream only with its first batch, so a
+    /// cancellation that waited for the open would wait for the query itself.
+    /// The cancellation is routed to the request's registered owner through
+    /// [`Self::cancel`] and the same open is still awaited rather than dropped,
+    /// so whatever it returns is settled by the caller instead of being
+    /// abandoned mid-flight. A query its owner has not registered yet is not
+    /// found; the caller cancels it through [`Self::cancel_and_settle`] once its
+    /// stream opens.
+    ///
+    /// # Errors
+    /// Returns the open's own error; a refused cancellation is not an error.
+    pub async fn open_cancellable(
+        &self,
+        open: impl Future<Output = Result<OracleQueryStream, WyrdError>>,
+        tenant_id: DataTenantId,
+        request_id: &RequestId,
+        cancel: &CancellationToken,
+    ) -> Result<OracleQueryStream, WyrdError> {
+        cancel_while_opening(open, self.cancel(tenant_id, request_id.clone()), cancel).await
     }
 
     /// Creates the facade from explicit process-owned dependencies.
@@ -248,5 +273,90 @@ impl RunningQueryControls {
             1 => Ok(owners.remove(0)),
             _ => Err(BifrostError::RunningQueryConflict.into()),
         }
+    }
+}
+
+/// Awaits `open`; if `cancel` fires first, awaits `cancel_owner` once and then
+/// the same `open` to completion.
+///
+/// The open is never dropped, so its result always reaches the caller. The
+/// cancellation request's own refusal is only logged, because the caller
+/// settles whatever the open returns.
+///
+/// # Errors
+/// Returns the open's own error.
+async fn cancel_while_opening<T, C>(
+    open: impl Future<Output = Result<T, WyrdError>>,
+    cancel_owner: impl Future<Output = Result<C, WyrdError>>,
+    cancel: &CancellationToken,
+) -> Result<T, WyrdError> {
+    tokio::pin!(open);
+    tokio::select! {
+        biased;
+        opened = &mut open => return opened,
+        () = cancel.cancelled() => {}
+    }
+    if let Err(error) = cancel_owner.await {
+        tracing::debug!(
+            code = error.code(),
+            "the opening query had no cancellable owner yet"
+        );
+    }
+    open.await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use tokio_util::sync::CancellationToken;
+    use wyrd_spec::error::WyrdError;
+    use wyrd_spec::vala::BifrostError;
+
+    use super::cancel_while_opening;
+
+    /// An open that finishes first is returned without any cancellation; a
+    /// cancellation during the open is requested once and the same open still
+    /// completes and is returned, even when the owner refuses the request.
+    ///
+    /// # Panics
+    /// Panics if an uncancelled open requests cancellation, a cancelled open
+    /// is dropped instead of completed, or a refused request hides the open.
+    #[tokio::test]
+    async fn cancel_while_opening_requests_cancellation_and_keeps_the_open() {
+        let requested = AtomicBool::new(false);
+        let owner = || async {
+            requested.store(true, Ordering::Release);
+            Ok::<(), WyrdError>(())
+        };
+        let opened = cancel_while_opening(async { Ok(7) }, owner(), &CancellationToken::new())
+            .await
+            .expect("an uncancelled open returns its stream");
+        assert_eq!(opened, 7);
+        assert!(!requested.load(Ordering::Acquire));
+
+        // The open completes only after the owner was asked to cancel, so a
+        // dropped open or a skipped request cannot return its result.
+        let cancel = CancellationToken::new();
+        let (opening, open) = tokio::sync::oneshot::channel::<u32>();
+        let (asked, request) = tokio::sync::oneshot::channel::<()>();
+        let open = async { Ok(open.await.expect("the test sends the open result")) };
+        let owner = async {
+            asked.send(()).expect("the test awaits the request");
+            Ok::<(), WyrdError>(())
+        };
+        let signal = async {
+            cancel.cancel();
+            request.await.expect("cancellation reaches the owner");
+            opening.send(9).expect("the open is still awaited");
+        };
+        let (opened, ()) = tokio::join!(cancel_while_opening(open, owner, &cancel), signal);
+        assert_eq!(opened.expect("a cancelled open still returns"), 9);
+
+        let refused = async { Err::<(), WyrdError>(BifrostError::RunningQueryNotFound.into()) };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let opened = cancel_while_opening(async { Ok(3) }, refused, &cancel).await;
+        assert_eq!(opened.expect("a refused cancellation keeps the open"), 3);
     }
 }

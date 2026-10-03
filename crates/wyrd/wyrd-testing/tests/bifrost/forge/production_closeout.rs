@@ -15,7 +15,9 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use rand::{RngCore, SeedableRng, rngs::StdRng};
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
-use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
+use vala_bifrost_redux::forge::{
+    ForgeConfig, ForgeHeldTerm, ForgeTableKey, ForgeWorkerCompletionObserver,
+};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::resources::{ResourceSource, SystemResourceSnapshot};
 use vala_bifrost_redux::storage::{StorageOperation, StorageOperationBarrier};
@@ -2101,4 +2103,310 @@ impl OrphanJourney {
 async fn failed_never_published_output_is_collected_after_terminal_age() {
     let journey = OrphanJourney::start().await;
     journey.finish().await;
+}
+
+/// Two coordinators sharing one election row, composed only from cluster owners.
+///
+/// The fixture adds no replica runner, clock or election harness: every
+/// coordinator is a real server node of the shared-Postgres cluster, passes
+/// are the production loop's own, and leadership is read from each node's
+/// coordinator.
+struct LeaderJourney {
+    /// Real nodes sharing Postgres, storage and the election row.
+    cluster: WyrdTestCluster,
+    /// Notification source for every executed Forge attempt in the cluster.
+    observer: ForgeWorkerCompletionObserver,
+    /// Tenant every table in the journey belongs to.
+    tenant: DataTenantId,
+}
+
+impl LeaderJourney {
+    /// Starts `spec` with the default Forge policy and a completion observer.
+    ///
+    /// # Panics
+    /// Panics if the cluster cannot start or composes no observer.
+    async fn start(spec: BifrostClusterSpec) -> Self {
+        let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
+            spec,
+            ForgeConfig::default(),
+            false,
+            false,
+        )
+        .await
+        .expect("leader journey cluster starts");
+        let observer = cluster
+            .forge_completion_observer()
+            .expect("completion observer");
+        let tenant = cluster.data_tenant_id();
+        Self {
+            cluster,
+            observer,
+            tenant,
+        }
+    }
+
+    /// Borrows one running node.
+    ///
+    /// # Panics
+    /// Panics if the node is unknown or stopped.
+    fn node(&self, node: NodeId) -> &WyrdTestServer {
+        self.cluster.server_by_node(node).expect("running node")
+    }
+
+    /// Runs one production planning pass on `node` and waits for it.
+    ///
+    /// # Panics
+    /// Panics if the pass does not complete within the diagnostic bound.
+    async fn pass(&self, node: NodeId) {
+        let server = self.node(node);
+        let before = server.completed_forge_scheduler_passes_for_test();
+        server.request_forge_scheduler_pass_for_test();
+        tokio::time::timeout(
+            PASS_BOUND,
+            server.wait_for_forge_scheduler_passes_for_test(before + 1),
+        )
+        .await
+        .expect("the production loop completes the requested pass");
+    }
+
+    /// Returns the leader term `node` holds, if any.
+    fn held(&self, node: NodeId) -> Option<Arc<ForgeHeldTerm>> {
+        self.node(node)
+            .state()
+            .forge_coordinator()
+            .and_then(|forge| forge.held_leader_term())
+    }
+
+    /// Returns every running node that holds a leader term.
+    fn leaders(&self) -> Vec<(NodeId, i64)> {
+        self.cluster
+            .servers()
+            .filter_map(|server| {
+                self.held(server.node_id())
+                    .map(|term| (server.node_id(), term.fencing_token()))
+            })
+            .collect()
+    }
+
+    /// Registers a table that enables compaction and manifest rewriting.
+    ///
+    /// # Panics
+    /// Panics if registration or the catalog property commit fails.
+    async fn register_scheduled_table(&self, via: NodeId, prefix: &str) -> JourneyTable {
+        let table = register_table(self.node(via), self.tenant, &unique_table(prefix)).await;
+        let catalog = self.node(via).bifrost_catalog().iceberg_catalog();
+        let loaded = catalog
+            .load_table(&table.binding.table_ident())
+            .await
+            .expect("scheduled table");
+        let tx = Transaction::new(&loaded);
+        let tx = tx
+            .update_table_properties()
+            .set("wyrd.forge.enable-compaction".to_owned(), "true".to_owned())
+            .set(
+                "wyrd.forge.enable-manifest-rewrite".to_owned(),
+                "true".to_owned(),
+            )
+            .apply(tx)
+            .expect("Forge table settings");
+        tx.commit_once(catalog.as_ref())
+            .await
+            .expect("Forge table settings commit");
+        table
+    }
+
+    /// Appends rows through `via`'s public ingest and seals them as hot objects.
+    ///
+    /// # Panics
+    /// Panics if the append is refused or the Scribe flush fails.
+    async fn write_hot(&self, via: NodeId, table: &JourneyTable, values: &[i64]) {
+        let client = tenant_client(self.node(via), self.tenant).await;
+        append_values(&client, &table.qualified, Uuid::now_v7(), values).await;
+        self.node(via)
+            .flush_bifrost()
+            .await
+            .expect("acknowledged rows seal as hot objects");
+    }
+
+    /// Counts the table's hot objects that still owe an Iceberg promotion.
+    ///
+    /// # Panics
+    /// Panics when the read-only inspection fails.
+    async fn unpromoted(&self, table: &JourneyTable) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1 \
+             AND table_name = $2 AND committed_snapshot_id IS NULL",
+        )
+        .bind(self.tenant.as_uuid())
+        .bind(&table.name)
+        .fetch_one(self.cluster.pg_fixture().operator_pool().pool())
+        .await
+        .expect("file_list inspection")
+    }
+
+    /// Waits until every hot object of `table` has been promoted.
+    ///
+    /// Each wait is one completed Forge attempt, never a timer.
+    ///
+    /// # Panics
+    /// Panics if the bound elapses or an attempt returns an error.
+    async fn await_promoted(&self, table: &JourneyTable) {
+        tokio::time::timeout(PASS_BOUND, async {
+            while self.unpromoted(table).await > 0 {
+                let next = self.observer.attempts() + 1;
+                self.observer.wait_for_attempts_at_least(next).await;
+            }
+        })
+        .await
+        .expect("hot objects are promoted by a coordinator");
+        assert!(
+            self.observer.returned_errors().is_empty(),
+            "{:?}",
+            self.observer.returned_errors()
+        );
+    }
+
+    /// Builds the leader's key for one journey table.
+    fn key(&self, table: &JourneyTable) -> ForgeTableKey {
+        ForgeTableKey {
+            tenant: self.tenant,
+            table: vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity::new(
+                vala_bifrost_redux::catalog::BIFROST_CATALOG_NAME,
+                BifrostNamespace::Datasets.as_str(),
+                &table.name,
+            )
+            .expect("table identity"),
+        }
+    }
+}
+
+/// One coordinator leads; its successor starts with an empty volatile schedule.
+///
+/// Mirrors RisingWave's meta election: only the elected node builds the
+/// Iceberg compaction manager, a replacement is elected through the shared
+/// SQL row, and the replacement's tracks and maintenance sets start empty.
+///
+/// # Panics
+/// Panics when two coordinators lead, a commit is not counted by the leader,
+/// or the successor inherits any pending count or maintenance membership.
+#[tokio::test]
+#[ignore = "requires Postgres and two coordinator replicas"]
+async fn one_leader_failover_volatile_state() {
+    let spec = BifrostClusterSpec::two_mixed();
+    let (first, second) = (spec.nodes[0].node_id, spec.nodes[1].node_id);
+    let mut journey = LeaderJourney::start(spec).await;
+    journey.pass(first).await;
+    journey.pass(second).await;
+    let leaders = journey.leaders();
+    assert_eq!(leaders.len(), 1, "exactly one coordinator leads: {leaders:?}");
+    let (leader, first_token) = leaders[0];
+    let standby = if leader == first { second } else { first };
+
+    // A commit promoted on the standby reaches the leader over the peer route.
+    let table = journey.register_scheduled_table(standby, "leader_failover").await;
+    journey.write_hot(standby, &table, &[1, 2, 3]).await;
+    journey.await_promoted(&table).await;
+    let key = journey.key(&table);
+    let counted = journey
+        .held(leader)
+        .expect("leader still holds its term")
+        .schedule()
+        .track_for_test(&key)
+        .expect("the leader tracks the promoted table");
+    assert_eq!(counted.pending_commits, 1, "one promotion is one Iceberg commit");
+    assert_eq!(journey.held(standby).map(|term| term.fencing_token()), None);
+
+    // Graceful stop resigns; the standby takes over on its next pass.
+    let stopped = Instant::now();
+    journey.cluster.stop_node(leader).await.expect("leader stops");
+    journey.pass(standby).await;
+    let successor = journey.held(standby).expect("the standby takes over");
+    eprintln!("Forge leader failover took {:?}", stopped.elapsed());
+    assert!(successor.fencing_token() > first_token, "a new term is minted");
+    assert_eq!(
+        successor.schedule().sizes_for_test(),
+        (0, 0, 0),
+        "the successor starts with no tracks or maintenance membership"
+    );
+
+    // The successor counts only commits it observes, through the local route.
+    journey.write_hot(standby, &table, &[4, 5]).await;
+    journey.await_promoted(&table).await;
+    let recounted = successor
+        .schedule()
+        .track_for_test(&key)
+        .expect("the successor tracks the table after a new commit");
+    assert_eq!(recounted.pending_commits, 1, "no pending count is copied");
+
+    // The restarted former leader is a standby while the successor's term lives.
+    journey.cluster.restart_node(leader).await.expect("restart");
+    journey.pass(leader).await;
+    assert_eq!(journey.leaders(), vec![(standby, successor.fencing_token())]);
+    journey.cluster.shutdown().await.expect("cluster drains");
+}
+
+/// A restarted leader recovers lost-hint promotion debt with an empty schedule.
+///
+/// The second node runs Scribe without a coordinator, so its hot objects have
+/// no hint consumer: only the leader's `file_list` sweep can promote them.
+///
+/// # Panics
+/// Panics if hot objects stay unpromoted after the restart, or the restarted
+/// leader carries any track or membership from its previous term.
+#[tokio::test]
+#[ignore = "requires Postgres and two replicas"]
+async fn restart_recovers_hot_promotion_with_empty_schedule() {
+    let mut spec = BifrostClusterSpec::two_mixed();
+    spec.nodes[1].roles = [BifrostRuntimeRole::Scribe].into_iter().collect();
+    let (leader, scribe) = (spec.nodes[0].node_id, spec.nodes[1].node_id);
+    let mut journey = LeaderJourney::start(spec).await;
+    journey.pass(leader).await;
+    let first_token = journey
+        .held(leader)
+        .expect("the only coordinator leads")
+        .fencing_token();
+
+    let before = journey.register_scheduled_table(leader, "restart_before").await;
+    journey.write_hot(leader, &before, &[1, 2]).await;
+    journey.await_promoted(&before).await;
+    assert!(
+        journey
+            .held(leader)
+            .expect("term")
+            .schedule()
+            .track_for_test(&journey.key(&before))
+            .is_some(),
+        "the first term tracks its table"
+    );
+
+    journey.cluster.stop_node(leader).await.expect("leader stops");
+    let lost = journey.register_scheduled_table(scribe, "restart_lost").await;
+    journey.write_hot(scribe, &lost, &[7, 8, 9]).await;
+    assert!(
+        journey.unpromoted(&lost).await > 0,
+        "no coordinator promoted the Scribe-only objects"
+    );
+
+    journey.cluster.restart_node(leader).await.expect("restart");
+    journey.pass(leader).await;
+    assert_eq!(journey.unpromoted(&lost).await, 0, "the sweep promoted the debt");
+    let term = journey.held(leader).expect("the restarted coordinator leads");
+    assert!(term.fencing_token() > first_token, "a new term is minted");
+    assert!(
+        term.schedule().track_for_test(&journey.key(&before)).is_none(),
+        "no track survives the restart"
+    );
+    assert_eq!(
+        term.schedule()
+            .track_for_test(&journey.key(&lost))
+            .map(|track| track.pending_commits),
+        Some(1),
+        "the recovered promotion is the only counted commit"
+    );
+    assert_eq!(
+        term.schedule().sizes_for_test(),
+        (1, 1, 1),
+        "membership holds only the recovered table"
+    );
+    journey.cluster.shutdown().await.expect("cluster drains");
 }

@@ -27,10 +27,17 @@ use wyrd_spec::vala::api::{
     StoragePath,
 };
 
-use super::Forge;
+use vala_sql::row_types::forge_tasks::{ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask};
+use wyrd_spec::DataTenantId;
+
 use super::compact::ForgeGroupKey;
 use super::error::ForgeError;
+use super::identity::task_table_binding;
 use super::lease::ForgeLease;
+use super::leader::{ForgeCommitNotice, ForgeTableKey};
+use super::planner::{ForgePlanCandidate, ForgeTableSnapshot, plan_table};
+use super::settings::ForgeTableSettings;
+use super::{Forge, ForgeWorker};
 use crate::catalog::TenantTableBinding;
 use crate::scribe::promotion::ScribePublishedHotFileV1;
 
@@ -580,6 +587,135 @@ pub(super) enum PromotionPlanStatus {
 }
 
 impl Forge {
+    /// Builds the attempt request for the promotion one table owes now, if any.
+    ///
+    /// The request is derived entirely from durable Scribe evidence bound to
+    /// the table's current snapshot, so the same eligible rows always produce
+    /// the same inputs, parameters and promoted-file-set digest. Promotion
+    /// never opens the objects it publishes; the byte total is carried only as
+    /// the attempt's estimate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the tenant-scoped demand read fails,
+    /// [`ForgeError::Catalog`] when the table cannot be loaded, and
+    /// [`ForgeError::Invariant`] when promotion evidence is absent or
+    /// contradictory.
+    pub(super) async fn promotion_task(
+        &self,
+        binding: &TenantTableBinding,
+        table_ref: &ForgeTaskTableIdentity,
+    ) -> Result<Option<NewForgeTask>, ForgeError> {
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(binding.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let demand = read_promotion_demand(&mut conn, binding, PROMOTION_BRANCH, None).await?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        let Some(ScribePromotionDemand {
+            plan, total_bytes, ..
+        }) = demand
+        else {
+            return Ok(None);
+        };
+        let table = self.load_table(&binding.table_ident()).await?;
+        let mut inputs = plan
+            .files()
+            .iter()
+            .map(|file| file.path().as_str().to_owned())
+            .collect::<Vec<_>>();
+        inputs.sort_unstable();
+        let candidate = ForgePlanCandidate {
+            strategy: ForgeTaskStrategy::ScribePromotion,
+            input_bytes: vec![1; inputs.len()],
+            inputs,
+            bytes: total_bytes.max(1),
+            parameters: plan.to_parameters(),
+        };
+        let planned = plan_table(&ForgeTableSnapshot {
+            snapshot_id: table.metadata().current_snapshot_id().unwrap_or(0),
+            candidates: vec![candidate],
+        })?;
+        Ok(planned.into_iter().next().map(|task| NewForgeTask {
+            data_tenant_id: binding.tenant,
+            table_ref: table_ref.clone(),
+            strategy: task.strategy,
+            base_snapshot_id: task.base_snapshot_id,
+            plan: task.plan,
+            plan_hash: task.plan_hash,
+            estimates: task.estimates,
+            ready_at: None,
+        }))
+    }
+
+    /// Promotes what one table owes through `executor`, the coordinator's own
+    /// attempt executor.
+    ///
+    /// Returns `false` when nothing is owed or the table already has an active
+    /// attempt; the leader's promotion-debt sweep retries the latter.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::promotion_task`] and
+    /// [`ForgeWorker::execute_accepted`].
+    pub(super) async fn promote_table(
+        &self,
+        executor: &ForgeWorker,
+        tenant: DataTenantId,
+        table_ref: &ForgeTaskTableIdentity,
+        stop: &CancellationToken,
+    ) -> Result<bool, ForgeError> {
+        let binding = task_table_binding(tenant, tenant, table_ref)?;
+        let Some(task) = self.promotion_task(&binding, table_ref).await? else {
+            return Ok(false);
+        };
+        // Boxed: the full attempt future is deep, and inlining it into every
+        // supervisor future that promotes overflows the compiler's layout depth.
+        Box::pin(executor.execute_accepted(Uuid::now_v7(), &task, stop)).await
+    }
+
+    /// Reports one committed promotion to the live leader.
+    ///
+    /// Runs only after the Iceberg fast append returned, so a hot publication
+    /// alone never counts. The table's settings are read from the metadata
+    /// this commit returned, so the leader does no catalog IO. Delivery is
+    /// best-effort, as RisingWave's post-commit notification is: a lost notice
+    /// costs one pending count, never data.
+    pub(super) async fn notify_promotion_commit(
+        &self,
+        tenant: DataTenantId,
+        table_ref: &ForgeTaskTableIdentity,
+        table: &iceberg::table::Table,
+    ) {
+        let Some(snapshot_id) = table.metadata().current_snapshot_id() else {
+            return;
+        };
+        let settings = match ForgeTableSettings::from_properties(table.metadata().properties()) {
+            Ok(settings) => settings,
+            Err(error) => {
+                tracing::warn!(table = %table_ref.table, error = %error, "Forge table settings are invalid; table is not scheduled");
+                return;
+            }
+        };
+        let notice = ForgeCommitNotice {
+            key: ForgeTableKey {
+                tenant,
+                table: table_ref.clone(),
+            },
+            snapshot_id,
+            settings,
+        };
+        let delivered = match self.core.clock.now() {
+            Ok(now) => self.leadership.notify(notice, now).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = delivered {
+            tracing::warn!(table = %table_ref.table, error = %error, "Forge promotion notice was not delivered");
+        }
+    }
+
     /// Classifies one claimed promotion plan against its own durable rows.
     ///
     /// This runs before the Prepared transition, because Prepared is a promise

@@ -72,6 +72,9 @@ pub enum ForgeError {
     /// Prepared or terminal durable state could not be reconciled safely.
     #[error("Forge reconciliation failed: {detail}")]
     Reconciliation { detail: String },
+    /// The live Forge leader could not be reached or refused a peer call.
+    #[error("Forge leader peer call failed: {detail}")]
+    LeaderPeer { detail: String },
     /// Cancellation stopped work at a bounded stage or batch boundary *before*
     /// any durable side effect, so the claim is safe to release.
     ///
@@ -158,6 +161,7 @@ impl ForgeError {
             Self::Lease(_)
             | Self::Sql(_)
             | Self::FenceLost { .. }
+            | Self::LeaderPeer { .. }
             | Self::Reconciliation { .. } => ForgeFailureClass::TransientCoordination,
             Self::Schema { .. }
             | Self::Group { .. }

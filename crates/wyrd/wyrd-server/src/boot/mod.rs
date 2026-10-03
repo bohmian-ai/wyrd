@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::forge::{
-    Forge as ForgeCoordinator, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeObjectPages,
+    Forge as ForgeCoordinator, ForgeBuildConfig, ForgeLeaderPeer, ForgeClock, ForgeConfig, ForgeObjectPages,
     ForgeObjectStore, ForgeTelemetry, ForgeWorker, ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
@@ -917,7 +917,7 @@ pub async fn compose_bifrost(
         #[cfg(not(feature = "test-support"))]
         let object_store: Arc<dyn ForgeObjectStore> =
             Arc::new(OpenDalForgeObjectStore::new(Arc::clone(&staging)));
-        let coordinator = Arc::new(ForgeCoordinator::new(ForgeBuildConfig {
+        let coordinator = ForgeCoordinator::new(ForgeBuildConfig {
             resources: bifrost_resources.forge().ok_or_else(|| {
                 ServerBootError::ForgeSchedulerRequired {
                     detail: "Forge role selected without a composed Forge capability".to_owned(),
@@ -966,7 +966,16 @@ pub async fn compose_bifrost(
                 .as_ref()
                 .map(|controls| controls.forge_scheduler_trigger.clone()),
             telemetry: Arc::new(ForgeTelemetry::new()),
-        })?);
+        })?;
+        // A peer-mode coordinator publishes its private listener with every
+        // leader term, so commit notices from other replicas reach the leader.
+        let coordinator = Arc::new(match &peer_tls {
+            Some(tls) => coordinator.with_leader_peer(ForgeLeaderPeer::new(
+                advertise_addr.clone(),
+                tls.clone(),
+            )),
+            None => coordinator,
+        });
         // Only the Forge worker role runs admitted compaction plans, so only it
         // builds the dedicated executor. Its thread count is the resolved
         // effective CPU the same plan derived the memory budget from, rather

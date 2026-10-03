@@ -79,6 +79,12 @@ service ScribeTailService {
 service ScribeCapturePeerService {
   rpc IngestCapture(IngestCaptureRequest) returns (IngestCaptureResponse);
 }
+// The elected Forge leader's private surface on a coordinator's peer listener.
+// A caller resolves the live term from the election row and names its fencing
+// token, so a replaced or expired leader refuses rather than counting a commit.
+service ForgeLeaderPeerService {
+  rpc NotifyPromotion(NotifyForgePromotionRequest) returns (NotifyForgePromotionResponse);
+}
 service OraclePeerService {
   // Held graph grant. The first message admits or refuses; an admitted grant
   // lives exactly as long as the leader keeps this stream open.
@@ -109,6 +115,13 @@ message IngestCaptureRequest {
   bytes arrow_ipc = 5;
 }
 message IngestCaptureResponse {}
+// One successful Scribe promotion Iceberg commit. properties carries only the
+// table's wyrd.forge.* scheduling settings, read where the table was loaded.
+message NotifyForgePromotionRequest {
+  sint64 fencing_token = 1; string tenant_id = 2; string namespace = 3; string table = 4;
+  sint64 snapshot_id = 5; map<string, string> properties = 6;
+}
+message NotifyForgePromotionResponse {}
 enum QueryClass { QUERY_CLASS_UNSPECIFIED = 0; QUERY_CLASS_INTERACTIVE = 1; QUERY_CLASS_ANALYTICAL = 2; }
 enum ClusterRole { CLUSTER_ROLE_UNSPECIFIED = 0; CLUSTER_ROLE_SCRIBE = 1; CLUSTER_ROLE_ORACLE = 2; }
 message OracleRoleFence { string node_id = 1; ClusterRole role = 2; uint64 fencing_token = 3; }

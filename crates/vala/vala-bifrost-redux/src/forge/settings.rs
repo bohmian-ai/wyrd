@@ -150,6 +150,40 @@ impl ForgeTableSettings {
             )?,
         })
     }
+
+    /// Writes every setting back as its table property.
+    ///
+    /// [`Self::from_properties`] reads the result back unchanged, which is how
+    /// a commit notice carries settings to a remote leader.
+    #[must_use]
+    pub fn to_properties(&self) -> HashMap<String, String> {
+        HashMap::from([
+            (
+                ENABLE_COMPACTION_PROPERTY.to_owned(),
+                self.compaction_enabled.to_string(),
+            ),
+            (
+                COMPACTION_INTERVAL_PROPERTY.to_owned(),
+                self.compaction_interval.as_secs().to_string(),
+            ),
+            (
+                TRIGGER_SNAPSHOT_COUNT_PROPERTY.to_owned(),
+                self.trigger_snapshot_count.to_string(),
+            ),
+            (
+                COMPACTION_TYPE_PROPERTY.to_owned(),
+                self.compaction_type.as_str().to_owned(),
+            ),
+            (
+                ENABLE_SNAPSHOT_EXPIRATION_PROPERTY.to_owned(),
+                self.snapshot_expiration_enabled.to_string(),
+            ),
+            (
+                ENABLE_MANIFEST_REWRITE_PROPERTY.to_owned(),
+                self.manifest_rewrite_enabled.to_string(),
+            ),
+        ])
+    }
 }
 
 /// Parses one present property or returns its default.
@@ -207,6 +241,10 @@ mod tests {
         assert_eq!(settings.compaction_interval, Duration::from_secs(60));
         assert_eq!(settings.trigger_snapshot_count, 3);
         assert_eq!(settings.compaction_type, ForgeCompactionType::SmallFiles);
+        assert_eq!(
+            ForgeTableSettings::from_properties(&settings.to_properties()).expect("round trip"),
+            settings
+        );
 
         for (key, raw) in [
             (COMPACTION_INTERVAL_PROPERTY, "0"),

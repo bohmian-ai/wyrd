@@ -28,7 +28,7 @@ use vala_sql::row_types::forge_operations::ForgeOperationFamily;
 use vala_sql::row_types::forge_tasks::{
     ExpiredCleanupCandidateRequest, ExpiredCleanupOutcome, ExpiredCleanupPayload,
     FORGE_TASK_PAYLOAD_VERSION, ForgeClaimStrategy, ForgeCleanupCandidate, ForgePreparedTaskClaim,
-    ForgeTask, ForgeTaskClaim, ForgeTaskEvidence, ForgeTaskRowEvidence, ForgeTaskState,
+    ForgeTask, ForgeTaskClaim, NewForgeTask, ForgeTaskEvidence, ForgeTaskRowEvidence, ForgeTaskState,
     ForgeTaskStrategy, ForgeTaskTableIdentity, ForgeTaskTransition, MAINTENANCE_STRATEGIES,
     SnapshotWatermark, TaskProgressEffect,
 };
@@ -3302,6 +3302,49 @@ impl ForgeWorker {
         self.execute_claim(claim, shutdown).await.map(|_| ())
     }
 
+    /// Records `task` as an attempt claimed by this worker and executes it.
+    ///
+    /// Forge work is chosen by the leader or by the coordinator that observed
+    /// it, never by a durable queue; the row exists only as the attempt's
+    /// evidence, so start, settlement and recovery stay those of
+    /// [`Self::execute_claim`]. Returns `Ok(false)` without effect when the
+    /// table already has an active attempt or the exact plan was recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation and SQL errors from recording the attempt and the
+    /// errors of [`Self::execute_claim`].
+    pub async fn execute_accepted(
+        &self,
+        task_id: Uuid,
+        task: &NewForgeTask,
+        shutdown: &CancellationToken,
+    ) -> Result<bool, ForgeError> {
+        let Some(claim) = self
+            .tasks
+            .insert_claimed(
+                task_id,
+                task,
+                self.owner,
+                self.claim_limits()?.lease_seconds,
+            )
+            .await
+            .map_err(ForgeError::Sql)?
+        else {
+            return Ok(false);
+        };
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = &self.completion_observer {
+            observer.record_lifecycle(ForgeLifecycleEvent::Planned {
+                task_id,
+                tenant: task.data_tenant_id,
+                table: task.table_ref.table.clone(),
+                inputs: task.plan.inputs.clone(),
+            });
+        }
+        self.execute_claim(claim, shutdown).await
+    }
+
     /// Executes one exact claimed task through validation, table fencing,
     /// bounded rewrite, exact evidence persistence, and terminal audit.
     ///
@@ -4385,8 +4428,16 @@ impl ForgeWorker {
         ForgeError,
     > {
         match result {
-            ForgeDispatchResult::Committed(publication) => self
-                .committed_evidence(binding, &publication.table)
+            ForgeDispatchResult::Committed(publication) => {
+                if matches!(
+                    claim.strategy,
+                    ForgeClaimStrategy::Known(ForgeTaskStrategy::ScribePromotion)
+                ) {
+                    self.forge
+                        .notify_promotion_commit(claim.data_tenant_id, &claim.table_ref, &publication.table)
+                        .await;
+                }
+                self.committed_evidence(binding, &publication.table)
                 .await
                 .map(|evidence| {
                     (
@@ -4394,7 +4445,8 @@ impl ForgeWorker {
                         ForgeExecutionEvidenceState::Fresh,
                         publication.volume,
                     )
-                }),
+                })
+            }
             ForgeDispatchResult::Cleaned(evidence) => {
                 Ok((*evidence, ForgeExecutionEvidenceState::Prepared, None))
             }

@@ -31,7 +31,6 @@ use super::planner::{ForgePlanCandidate, ForgeTableSnapshot, plan_hash, plan_tab
 #[cfg(feature = "test-support")]
 use super::worker::ForgeLifecycleEvent;
 use crate::catalog::layout::forge_data_location;
-use crate::maintenance::StagingFileCommitted;
 
 /// Complete classification from one bounded durable scheduler pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -266,33 +265,6 @@ impl<'forge> ForgeScheduler<'forge> {
     #[must_use]
     pub fn complete_publications_for_test(&self) -> usize {
         self.complete_publications.load(Ordering::Acquire)
-    }
-
-    /// Durably records an advisory Scribe hint without planning or executing it.
-    ///
-    /// # Errors
-    /// Returns identity or SQL errors. A failed transaction leaves no partial demand.
-    pub async fn record_hint(&self, hint: StagingFileCommitted) -> Result<(), ForgeError> {
-        let (binding, _) = hint.into_parts();
-        let table = ForgeTaskTableIdentity::new(
-            crate::catalog::BIFROST_CATALOG_NAME,
-            binding.logical_namespace.clone(),
-            binding.table_ref.name.clone(),
-        )
-        .map_err(ForgeError::Sql)?;
-        let mut conn = self
-            .forge
-            .core
-            .vala
-            .tenant_conn(binding.tenant)
-            .await
-            .map_err(ForgeError::Sql)?;
-        self.tasks
-            .upsert_hint(&mut conn, binding.tenant, &table)
-            .await
-            .map_err(ForgeError::Sql)?;
-        conn.commit().await.map_err(ForgeError::Sql)?;
-        Ok(())
     }
 
     /// Advances one bounded page of a roster-aware planning cycle.
@@ -748,30 +720,22 @@ impl<'forge> ForgeScheduler<'forge> {
         // admission is where the phase boundary applies.
         let maintenance_candidate = maintenance_candidate
             .filter(|candidate| super::phase::admits_new_effect(candidate.strategy));
-        let promotion_candidate = self.promotion_candidate(&binding).await?;
-        // The rewrite candidate is derived unconditionally so its debt is
-        // recorded even on a pass that will not admit it, but it is ordered
-        // behind promotion below: a table that still owes Scribe a publication
-        // must not start a rewrite against a live set that is about to change.
+        // Promotion is executed by the coordinator that observed the hot
+        // object and by the leader's debt sweep, never planned here.
         let rewrite_candidate = self
             .rewrite_candidate(&table)
             .await?
             .filter(|candidate| super::phase::admits_new_effect(candidate.strategy));
-        let (compaction_debt_files, compaction_debt_bytes) = promotion_candidate
+        let (compaction_debt_files, compaction_debt_bytes) = rewrite_candidate
             .iter()
-            .chain(rewrite_candidate.iter())
             .fold((0_u64, 0_u64), |(files, bytes), candidate| {
                 (
                     files.saturating_add(candidate.inputs.len() as u64),
                     bytes.saturating_add(candidate.bytes),
                 )
             });
-        // Promotion precedes every other demand for the same table: an object
-        // Scribe already published must reach the catalog before any pass that
-        // reasons about the catalog's contents runs against it.
-        let candidates = promotion_candidate
+        let candidates = rewrite_candidate
             .into_iter()
-            .chain(rewrite_candidate)
             .chain(maintenance_candidate)
             .collect::<Vec<_>>();
         Ok((
@@ -786,65 +750,6 @@ impl<'forge> ForgeScheduler<'forge> {
             compaction_debt_bytes,
             orphan_scan_prefix,
         ))
-    }
-
-    /// Builds the exact promotion candidate one table currently owes, if any.
-    ///
-    /// The candidate is derived entirely from durable Scribe evidence, so it is
-    /// deterministic across schedulers: the same eligible rows in the same
-    /// production order produce the same inputs, the same parameters, and the
-    /// same promoted-file-set digest, which the idempotent enqueue then
-    /// collapses into one durable task.
-    ///
-    /// Promotion never opens the objects it publishes, so its admission working
-    /// set is the fixed metadata cost of one commit rather than the promoted
-    /// byte total; the byte total is still carried as the candidate's estimate
-    /// so telemetry and durable estimates report the real published volume.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ForgeError::Sql`] when the tenant-scoped demand read fails,
-    /// [`ForgeError::Invariant`] when a row's promotion evidence is absent or
-    /// contradictory, and [`ForgeError::Capacity`] when the fixed promotion
-    /// envelope does not fit this scheduler's ceilings.
-    async fn promotion_candidate(
-        &self,
-        binding: &crate::catalog::TenantTableBinding,
-    ) -> Result<Option<ForgePlanCandidate>, ForgeError> {
-        let mut conn = self
-            .forge
-            .core
-            .vala
-            .tenant_conn(binding.tenant)
-            .await
-            .map_err(ForgeError::Sql)?;
-        let demand = super::scribe_promotion::read_promotion_demand(
-            &mut conn,
-            binding,
-            super::scribe_promotion::PROMOTION_BRANCH,
-            None,
-        )
-        .await?;
-        conn.commit().await.map_err(ForgeError::Sql)?;
-        let Some(super::scribe_promotion::ScribePromotionDemand {
-            plan, total_bytes, ..
-        }) = demand
-        else {
-            return Ok(None);
-        };
-        let mut inputs = plan
-            .files()
-            .iter()
-            .map(|file| file.path().as_str().to_owned())
-            .collect::<Vec<_>>();
-        inputs.sort_unstable();
-        Ok(Some(ForgePlanCandidate {
-            strategy: ForgeTaskStrategy::ScribePromotion,
-            input_bytes: vec![1; inputs.len()],
-            inputs,
-            bytes: total_bytes.max(1),
-            parameters: plan.to_parameters(),
-        }))
     }
 
     /// Builds the small-file rewrite candidate one table currently owes, if any.

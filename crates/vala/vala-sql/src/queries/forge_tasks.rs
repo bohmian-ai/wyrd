@@ -499,6 +499,41 @@ impl ForgeTasks {
         Ok(())
     }
 
+    /// Lists every table that still owes Scribe hot objects an Iceberg promotion.
+    ///
+    /// This is the one durable recovery read a newly elected Forge leader
+    /// performs: Scribe's `file_list` publication is the hot-object authority,
+    /// so a lost wake or a dead leader's memory can never strand a promotion.
+    /// Eligibility matches the per-table promotable projection: not compacted,
+    /// no committed snapshot and no open Forge publication.
+    ///
+    /// # Errors
+    /// Returns SQL errors from the read and identity errors for a row whose
+    /// stored table name is not a valid Forge identity.
+    pub async fn tables_owing_promotion(
+        &self,
+    ) -> Result<Vec<(DataTenantId, ForgeTaskTableIdentity)>, SqlError> {
+        let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
+            "SELECT DISTINCT data_tenant_id,namespace,table_name FROM vala.file_list \
+             WHERE committed_snapshot_id IS NULL AND NOT compacted \
+             AND forge_publication_operation_id IS NULL \
+             ORDER BY data_tenant_id,namespace,table_name",
+        )
+        .fetch_all(self.operator_pool.pool())
+        .await
+        .map_err(SqlError::from)?;
+        rows.into_iter()
+            .map(|(tenant, namespace, table)| {
+                Ok((
+                    DataTenantId::new(tenant).map_err(|error| SqlError::InvariantViolation {
+                        detail: format!("file_list tenant {tenant} is invalid: {error}"),
+                    })?,
+                    ForgeTaskTableIdentity::new("wyrd-redux", namespace, table)?,
+                ))
+            })
+            .collect()
+    }
+
     /// Records one accepted task as an attempt already claimed by `owner`.
     ///
     /// Forge work is chosen by the elected leader or by the executor that

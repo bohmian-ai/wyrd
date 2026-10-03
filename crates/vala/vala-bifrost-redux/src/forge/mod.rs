@@ -19,6 +19,7 @@ mod expiry_gates;
 mod expiry_policy;
 mod identity;
 mod leader;
+mod leadership;
 pub(crate) mod lease;
 mod live_reconcile;
 mod live_replace;
@@ -52,6 +53,7 @@ pub use managed::{
     ForgeManagedRewrite, ForgePlannedAttempt, ForgePlannedRewrite, ForgeRewriteEvidence,
     ForgeRewriteOutcome, ForgeTablePolicy, ForgeUnsettledOutput, RewriteHandoff,
 };
+pub use leadership::{ForgeHeldTerm, ForgeLeaderPeer};
 pub use metrics::ForgeTelemetry;
 pub use planner::{ForgePlanCandidate, PlannedForgeTask};
 pub use planning_scheduler::{ForgeScheduleOutcome, ForgeScheduler};
@@ -198,6 +200,8 @@ pub struct Forge {
     hints: tokio::sync::Mutex<crate::maintenance::StagingFileInbox>,
     /// Rejects a second directly supervised scheduler loop.
     running: AtomicBool,
+    /// This coordinator's leader term, its volatile schedule, and notice routing.
+    leadership: leadership::ForgeLeadership,
 }
 
 /// Immutable dependency graph shared by one Forge owner.
@@ -254,6 +258,18 @@ impl Forge {
             });
         }
         build.config.validate()?;
+        #[cfg(feature = "test-support")]
+        let leader_owner = build
+            .scheduler_trigger
+            .as_ref()
+            .and_then(ForgeSchedulerTrigger::owner_for_test)
+            .unwrap_or(build.scheduler_owner);
+        #[cfg(not(feature = "test-support"))]
+        let leader_owner = build.scheduler_owner;
+        let leadership = leadership::ForgeLeadership::new(
+            vala_sql::queries::forge_leader::ForgeLeaderElection::new(build.operator_pool.clone()),
+            leader_owner,
+        );
         let core = ForgeCore {
             resources: build.resources,
             spill_root: build.spill_root,
@@ -280,7 +296,39 @@ impl Forge {
             core: Arc::new(core),
             hints: tokio::sync::Mutex::new(build.hints),
             running: AtomicBool::new(false),
+            leadership,
         })
+    }
+
+    /// Publishes `peer` with every leader term this coordinator acquires.
+    ///
+    /// Without it the coordinator can lead only in-process: remote replicas
+    /// find no route and drop their commit notices.
+    #[must_use]
+    pub fn with_leader_peer(mut self, peer: ForgeLeaderPeer) -> Self {
+        self.leadership.set_peer(peer);
+        self
+    }
+
+    /// Returns the leader term this coordinator holds, if any.
+    #[must_use]
+    pub fn held_leader_term(&self) -> Option<Arc<ForgeHeldTerm>> {
+        self.leadership.held()
+    }
+
+    /// Applies one remote commit notice addressed to the term `fencing_token`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::FenceLost`] when this coordinator does not hold
+    /// that term, and clock errors.
+    pub fn accept_commit_notice(
+        &self,
+        fencing_token: i64,
+        notice: ForgeCommitNotice,
+    ) -> Result<(), ForgeError> {
+        self.leadership
+            .accept(Some(fencing_token), notice, self.core.clock.now()?)
     }
 
     /// Returns this Forge clock for test-only fixture reconstruction.

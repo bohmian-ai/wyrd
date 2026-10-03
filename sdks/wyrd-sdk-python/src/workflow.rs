@@ -534,13 +534,14 @@ impl PyWorkflow {
         Ok(Self::from(inner))
     }
 
-    /// Run this workflow against the process-local provider registry.
+    /// Run this workflow, preparing only what its step routes select.
     ///
-    /// Steps routed to the Wyrd gateway call the server and credential this
-    /// Workflow was loaded through, or the ambient client configuration when
-    /// it was built locally. Steps routed to an external gateway use the
-    /// bindings named in the shared client configuration; only selected
-    /// bindings' secrets are read. The GIL is released while the shared Wyrd runtime drives the native
+    /// Native steps use the process-local provider registry. Steps routed to
+    /// the Wyrd gateway call the server and credential this Workflow was
+    /// loaded through, or the ambient client configuration when it was built
+    /// locally. Steps routed to an external gateway use the bindings named in
+    /// the shared client configuration; only the selected bindings' secrets
+    /// are read, at run start. The GIL is released while the shared Wyrd runtime drives the native
     /// executor to its terminal snapshot.
     ///
     /// Args:

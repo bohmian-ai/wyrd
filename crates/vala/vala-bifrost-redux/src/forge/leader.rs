@@ -314,6 +314,7 @@ impl ForgeSchedule {
             }
             return;
         }
+        tracing::debug!(table = %key.table.table, snapshot_id, "Forge commit notice recorded");
         let track = inner
             .tracks
             .entry(key)
@@ -408,6 +409,7 @@ impl ForgeSchedule {
                 let task_id = Uuid::now_v7();
                 let compaction_type = track.compaction_type;
                 track.mark_dispatched(task_id, now, self.report_timeout);
+                tracing::debug!(table = %key.table.table, %task_id, pending_commits = track.pending_commits, "Forge compaction dispatched");
                 Some(ForgeCompactionDispatch {
                     task_id,
                     key,
@@ -440,6 +442,7 @@ impl ForgeSchedule {
             tracing::warn!(%task_id, "stale Forge compaction report ignored");
             return false;
         }
+        tracing::debug!(table = %key.table.table, %task_id, ?outcome, "Forge compaction report applied");
         match outcome {
             ForgeCompactionOutcome::Succeeded => track.finish_success(now),
             ForgeCompactionOutcome::Failed => track.finish_failed(now),
@@ -462,6 +465,18 @@ impl ForgeSchedule {
             inner.manifest_rewrite.iter().cloned().collect(),
             inner.snapshot_expiration.iter().cloned().collect(),
         )
+    }
+
+    /// Whether this table has commits awaiting compaction or a task in flight.
+    ///
+    /// Lower-priority maintenance that would occupy the table's single active
+    /// task slot yields while this holds, so it cannot displace the rewrite.
+    #[must_use]
+    pub fn owes_compaction(&self, key: &ForgeTableKey) -> bool {
+        self.lock()
+            .tracks
+            .get(key)
+            .is_some_and(|track| track.pending_commits > 0 || track.is_processing())
     }
 
     /// Returns the snapshot captured by a selected or running task, if any.

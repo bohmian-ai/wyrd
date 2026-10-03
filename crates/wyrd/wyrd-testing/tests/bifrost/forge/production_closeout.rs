@@ -324,28 +324,51 @@ impl CloseoutJourney {
         }
     }
 
-    /// Drives real passes until one compacted file owns this small test table.
+    /// Promotes owed debt, then waits for a pulled rewrite of this table's head.
+    ///
+    /// One scheduler pass promotes owed Scribe debt; its commit makes the table
+    /// due on the leader, and a worker pulls it on its own interval. Progress
+    /// is observed through settled attempts, never sleeps, until a snapshot
+    /// newer than the one on entry names only Forge outputs.
     ///
     /// # Panics
-    /// Panics if promotion/rewrite fails or cannot settle the fixed-hour data.
+    /// Panics if no such rewrite publishes within the rewrite bound, or on any
+    /// worker or SQL failure observed while draining.
+    async fn compact(&self, binding: &TenantTableBinding) -> (i64, BTreeMap<String, DataFile>) {
+        let (entry, _) = self.live_files(binding).await;
+        self.scheduler_pass().await;
+        let current = tokio::time::timeout(REWRITE_BOUND, async {
+            loop {
+                let next = self.observer.attempts() + 1;
+                let current = self.live_files(binding).await;
+                if current.0 != entry && current.1.keys().all(|path| path.contains("/data/forge/"))
+                {
+                    return current;
+                }
+                self.observer.wait_for_attempts_at_least(next).await;
+            }
+        })
+        .await
+        .expect("a pulled rewrite publishes the table's current head");
+        self.drain_tasks().await;
+        current
+    }
+
+    /// Compacts this small fixed-hour test table into exactly one Forge file.
+    ///
+    /// # Panics
+    /// Panics if [`Self::compact`] panics or the rewrite leaves more than one file.
     async fn compact_small_table(
         &self,
         binding: &TenantTableBinding,
     ) -> (i64, BTreeMap<String, DataFile>) {
-        let mut previous = None;
-        for _ in 0..12 {
-            self.scheduler_pass().await;
-            self.drain_tasks().await;
-            let current = self.live_files(binding).await;
-            if current.1.len() == 1
-                && previous == Some(current.0)
-                && current.1.keys().all(|path| path.contains("/data/forge/"))
-            {
-                return current;
-            }
-            previous = Some(current.0);
-        }
-        panic!("small fixed-hour table did not converge through real maintenance");
+        let current = self.compact(binding).await;
+        assert_eq!(
+            current.1.len(),
+            1,
+            "one partition rewrites into one small file"
+        );
+        current
     }
 
     /// Requires a named object to be physically absent, rejecting other IO errors.
@@ -1088,35 +1111,26 @@ impl GeometryWorkload {
     }
 }
 
-/// Proves each output rolled at the declared target on a whole row group.
+/// Proves the rewrite's balanced outputs are well-formed replacements.
 ///
-/// A writer can only close a file on a completed row group, so the exact
-/// property being checked is that the *final* group is the one that carried the
-/// file across the target: every earlier group ended below it, and nothing was
-/// written after the crossing. That distinguishes a correct rolling threshold
-/// from a writer that keeps appending past its target or cuts early, which a
-/// size band cannot. Exactly one file — the last residue — stays below target.
+/// The full-table rewrite plans one task per partition and writes it through
+/// `max_output_parallelism` balanced writers, as RisingWave does, so outputs
+/// are split evenly rather than rolled at the target. Each output must stay at
+/// or under the declared target and report ascending row groups inside its
+/// physical file.
 ///
 /// # Panics
-/// Panics when no output crosses the target, when a crossing file started its
-/// final group at or beyond the target, when more than one residue exists, or
-/// when a row group escapes its physical file.
+/// Panics when no output exists, an output exceeds the declared target, or a
+/// row group escapes its physical file.
 fn assert_output_geometry(outputs: &BTreeMap<String, DataFile>, rows: usize, target: u64) {
     let output_sizes: Vec<_> = outputs.values().map(DataFile::file_size_in_bytes).collect();
-    eprintln!(
-        "Forge physical bytes: {output_sizes:?}; exact rows: {}",
-        rows
-    );
-    let residues = output_sizes.iter().filter(|size| **size < target).count();
-    assert_eq!(
-        residues, 1,
-        "only the final residue stays below the declared target {target}: {output_sizes:?}"
-    );
-    assert!(
-        output_sizes.iter().any(|size| *size >= target),
-        "at least one output rolled at the declared target {target}: {output_sizes:?}"
-    );
+    eprintln!("Forge physical bytes: {output_sizes:?}; exact rows: {rows}");
+    assert!(!outputs.is_empty(), "the rewrite publishes outputs");
     for (path, file) in outputs {
+        assert!(
+            file.file_size_in_bytes() <= target,
+            "{path} stays within the declared target {target}: {output_sizes:?}"
+        );
         let offsets = file.split_offsets().expect("row-group offsets");
         assert!(!offsets.is_empty(), "{path} reports its row groups");
         assert!(
@@ -1129,29 +1143,10 @@ fn assert_output_geometry(outputs: &BTreeMap<String, DataFile>, rows: usize, tar
             }),
             "{path} row groups stay inside the physical file"
         );
-        if file.file_size_in_bytes() < target {
-            continue;
-        }
-        assert!(
-            offsets.len() > 1,
-            "a rolled replacement has multiple row groups: {path}"
-        );
-        let final_group = u64::try_from(
-            *offsets
-                .last()
-                .expect("a non-empty offset list has a last entry"),
-        )
-        .expect("a row-group offset inside the file is representable");
-        assert!(
-            final_group < target,
-            "{path} was still below the declared target {target} when its final row group opened, \
-             so that group is the one that crossed: final group at {final_group}, size {}",
-            file.file_size_in_bytes()
-        );
     }
 }
 
-/// Qualifies real 512 MiB Scribe inputs and approximately 1 GiB Forge outputs.
+/// Qualifies real 512 MiB Scribe inputs and balanced Forge outputs within the 1 GiB target.
 ///
 /// Public exact rows, manifest membership, old-object presence and a second
 /// unchanged pass jointly distinguish publication from destructive cleanup.
@@ -1260,54 +1255,9 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
             .advance(chrono::Duration::days(1))
             .expect("closed partition");
     }
-    // The managed core first normalizes promoted-file identity, then packs
-    // current-recipe files. Continue packing residues until a pass is unchanged.
-    let mut replacement = journey.live_files(&table.binding).await;
-    let mut passes = 0;
-    for pass in 0..8 {
-        passes += 1;
-        journey.scheduler_pass().await;
-        journey.drain_tasks().await;
-        let next = journey.live_files(&table.binding).await;
-        eprintln!(
-            "rewrite pass {pass}: {:?}",
-            next.1
-                .values()
-                .map(DataFile::file_size_in_bytes)
-                .collect::<Vec<_>>()
-        );
-        let unchanged = next.0 == replacement.0;
-        replacement = next;
-        // A pass that publishes nothing is not necessarily the end of the
-        // backlog: a busy worker can return one before the packing it owes has
-        // run. The cut is settled only once it is both unchanged and rolled at
-        // the declared target, which is the property this loop is packing for.
-        if unchanged
-            && replacement
-                .1
-                .values()
-                .any(|file| file.file_size_in_bytes() >= target)
-        {
-            break;
-        }
-    }
-    let (replacement_snapshot, outputs) = replacement;
-    assert!(
-        outputs
-            .values()
-            .any(|file| file.file_size_in_bytes() >= target),
-        "geometry backlog must roll at the declared target: {:?}",
-        outputs
-            .values()
-            .map(DataFile::file_size_in_bytes)
-            .collect::<Vec<_>>()
-    );
+    // One dispatched full rewrite covers the closed partition's whole head.
+    let (replacement_snapshot, outputs) = journey.compact(&table.binding).await;
     assert_ne!(replacement_snapshot, promoted_snapshot);
-    assert!(
-        passes > 1,
-        "the geometry backlog is packed over more than one pass, so its residue \
-         is replanned rather than published in one commit"
-    );
     let (neighbour_snapshot, neighbour_files) = journey.live_files(&neighbour_table.binding).await;
     assert_ne!(
         neighbour_snapshot, neighbour_promoted,

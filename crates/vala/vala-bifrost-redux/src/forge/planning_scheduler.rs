@@ -24,6 +24,7 @@ use super::Forge;
 use super::compact::ForgeGroupKey;
 use super::error::ForgeError;
 use super::identity::task_table_binding;
+use super::leader::ForgeTableKey;
 use super::metrics::{ForgePendingTasks, ForgeTelemetry};
 use super::path::catalog_path_to_object_key;
 use super::planner::{ForgePlanCandidate, ForgeTableSnapshot, plan_hash, plan_table};
@@ -934,8 +935,9 @@ impl<'forge> ForgeScheduler<'forge> {
         // Orphan cleanup is deliberately last. It reclaims objects no metadata
         // references, so it must never displace a compaction, expiration, or
         // cleanup effect that a reader can still observe. It fills the table's
-        // single active-task slot only when nothing else claimed it.
-        if executable.is_empty() {
+        // single active-task slot only when nothing else claimed it, and never
+        // while the leader's schedule still owes this table a compaction.
+        if executable.is_empty() && !self.owes_compaction(demand) {
             executable.push(self.orphan_cleanup_task(
                 demand,
                 snapshot.snapshot_id,
@@ -943,6 +945,18 @@ impl<'forge> ForgeScheduler<'forge> {
             )?);
         }
         Ok(ForgeDemandArbitration { executable })
+    }
+
+    /// Whether the held leader term owes this demand's table a compaction.
+    ///
+    /// A process without the term has no schedule to consult and owes nothing.
+    fn owes_compaction(&self, demand: &ForgePlanningDemand) -> bool {
+        self.forge.leadership.held().is_some_and(|term| {
+            term.schedule().owes_compaction(&ForgeTableKey {
+                tenant: demand.data_tenant_id,
+                table: demand.table_ref.clone(),
+            })
+        })
     }
 
     /// Runs one production arbitration for an integration fixture.

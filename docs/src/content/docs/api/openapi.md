@@ -24,9 +24,11 @@ point Swagger UI, Redoc, or an `openapi-generator` client at it, or load it
 into Postman or Bruno to explore the API interactively.
 
 Every operation declares its authentication, typed request and response
-bodies, `application/problem+json` error media type, and the stable Wyrd
-error codes it can return. The four OAuth 2.0 endpoints (`/auth/token`,
-`/auth/platform/token`, `/auth/device_authorization`, and `/auth/revoke`)
-are the exception: they take form bodies and refuse with the RFC 6749
+bodies, error media types, and the stable Wyrd error codes it can return.
+JSON API operations refuse with `application/problem+json`. The four OAuth
+2.0 form endpoints (`/auth/token`, `/auth/platform/token`,
+`/auth/device_authorization`, and `/auth/revoke`) refuse with the RFC 6749
 section 5.2 JSON (`error`, optional `error_description`), which carries no
-Wyrd error code.
+Wyrd error code. The browser sign-in endpoints (`/auth/authorize`,
+`/auth/callback`, and `/auth/device`) answer with redirects and HTML pages
+as well; each operation declares its own responses.

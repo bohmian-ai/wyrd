@@ -534,8 +534,8 @@ Secrets Manager CSI driver, etc.) puts the API key into the pod as
 JWT (five minutes) and re-exchanges the same durable key when that token nears expiry
 or is refused — a machine grant issues no refresh token, so the key in the
 secret store is the only renewable authority and revoking it ends renewal.
-Renewal authority is a human concern: only a human login returns a refresh
-token, and only the public CLI client's refresh token rotates. `/auth/token`
+Renewal authority is a human concern: only a tenant human login returns a
+refresh token (a platform login is access-only), and only the public CLI client's refresh token rotates. `/auth/token`
 derives `tenant_id` and `principal_id` from the verified API-key record;
 no client-supplied tenant header is accepted. The JWT carries the principal
 as the top-level `principal` claim, the `permissions` resolved from its current
@@ -568,9 +568,16 @@ tokens are never Wyrd authority.
 | CLI and SDKs | `wyrd-cli`, public | Device authorization (RFC 8628) | `credentials.toml`, owned by `wyrd-client`; refresh token rotates on every use |
 
 The BFF uses `openid-client`; the shared Rust client uses `oauth2`, so Rust,
-Python, and TypeScript share one implementation. The OAuth endpoints use the
-RFC 6749 form and JSON wire format and are the one exception to `WyrdError`
-problem+json. Deployed Services and Agents keep their own API keys or
+Python, and TypeScript share one implementation. The four OAuth form
+endpoints (`POST /auth/token`, `/auth/platform/token`,
+`/auth/device_authorization`, and `/auth/revoke`) take form bodies, refuse
+with RFC 6749 §5.2 JSON, and are the one exception to `WyrdError`
+problem+json; their successes keep their own standard shapes (RFC 6749 §5.1
+tokens, the RFC 8628 §3.2 device response, an empty RFC 7009 revocation
+`200`). Browser interactions are not form endpoints: `GET /auth/authorize`
+redirects with an RFC 6749 §4.1.2.1 `error` once the client and redirect URI
+are trusted and shows a local HTML page before that, while `GET /auth/callback`
+and the `/auth/device` page answer with redirects, HTML, or Problem Details. Deployed Services and Agents keep their own API keys or
 workload assertions; human SSO never replaces or disables them.
 
 #### Cross-service delegation

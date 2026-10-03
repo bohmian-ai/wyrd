@@ -12,10 +12,12 @@ Wyrd errors carry structured data. An agent must preserve that structure and act
 
 ## Error shape
 
-Wyrd API errors follow RFC 9457 Problem Details with Wyrd extensions, except
-on the four OAuth 2.0 endpoints described in [OAuth endpoint
-errors](#oauth-endpoint-errors). A registration spec-drift response looks like
-this:
+Wyrd JSON API errors follow RFC 9457 Problem Details with Wyrd extensions.
+Two kinds of endpoint differ: the four OAuth 2.0 form endpoints described in
+[OAuth endpoint errors](#oauth-endpoint-errors), and the browser sign-in
+endpoints (`GET /auth/authorize`, `GET /auth/callback`, and `/auth/device`),
+which may answer with a redirect or an HTML page instead. A registration
+spec-drift response looks like this:
 
 ```json
 {
@@ -52,8 +54,10 @@ this:
 `POST /auth/device_authorization`, and `POST /auth/revoke` follow OAuth 2.0
 instead. A refusal is the [RFC 6749
 §5.2](https://www.rfc-editor.org/rfc/rfc6749#section-5.2) JSON body with
-`error` and an optional `error_description`. It has no `code`, `remediation`,
-or `instance`, so branch on `error`:
+`error` and an optional `error_description`, sent with `400`, `401` for
+`invalid_client`, `500` for `server_error`, or `503` for
+`temporarily_unavailable`. It has no `code`, `remediation`, or `instance`, so
+branch on `error`:
 
 | `error` | Agent action |
 | --- | --- |

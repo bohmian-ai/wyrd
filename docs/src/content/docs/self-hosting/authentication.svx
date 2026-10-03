@@ -8,7 +8,7 @@ order: 7
 
 # Authentication
 
-Wyrd authenticates every request with a signed token. The Wyrd API server keeps no browser session and no ambient identity: a caller presents a bearer token in the `X-Wyrd-Access-Token: Bearer <token>` header, and that token is the only credential the server trusts per request. The web app is a separate backend-for-frontend (BFF): it keeps a person's refresh token, or an operator's recovery API key, in its own encrypted Secure, HttpOnly, SameSite=Lax cookie and sends the server a Wyrd access token on each call. Rotating the web-app client secret invalidates those cookies. Logout revokes the refresh token best-effort, and an access token already issued stays valid until it expires. This page is the operator view. For the deeper model behind it, read [Authentication](/concepts/authentication/) and [Authorization](/concepts/authorization/) in Concepts.
+Wyrd authenticates every API request with a signed token. The Wyrd API server keeps no browser session and no ambient identity: a caller presents a bearer token in the `X-Wyrd-Access-Token: Bearer <token>` header, and that token is the only credential the server trusts per request. The web app is a separate backend-for-frontend (BFF): it keeps a person's refresh token, or an operator's recovery API key, in its own encrypted Secure, HttpOnly, SameSite=Lax cookie and sends the server a Wyrd access token on each call. Rotating the web-app client secret invalidates those cookies. Logout revokes the refresh token best-effort, and an access token already issued stays valid until it expires. This page is the operator view. For the deeper model behind it, read [Authentication](/concepts/authentication/) and [Authorization](/concepts/authorization/) in Concepts.
 
 ## Principals
 
@@ -16,7 +16,7 @@ Every token belongs to a principal, and there are five kinds across two planes. 
 
 ## Tokens
 
-Wyrd mints EdDSA (Ed25519) JWTs signed with its own key, presented on every request. Access tokens are short-lived. Only a human OIDC login receives a refresh token: the CLI's rotates on every use, and the web app's does not rotate and ends after 12 hours; a machine receives access only and renews by re-exchanging the durable credential it already holds, so revoking that credential ends its access. How a token is verified, and what each grant returns, is covered in [Authentication](/concepts/authentication/). What an operator supplies is the key material below.
+Wyrd mints EdDSA (Ed25519) JWTs signed with its own key, presented on every request. Access tokens are short-lived. Only a tenant human OIDC login receives a refresh token (a platform session is access-only): the CLI's rotates on every use, and the web app's does not rotate and ends after 12 hours; a machine receives access only and renews by re-exchanging the durable credential it already holds, so revoking that credential ends its access. How a token is verified, and what each grant returns, is covered in [Authentication](/concepts/authentication/). What an operator supplies is the key material below.
 
 ## Grants
 

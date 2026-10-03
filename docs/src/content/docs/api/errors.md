@@ -8,9 +8,9 @@ order: 21
 
 # Errors
 
-Wyrd returns errors as structured RFC 9457 Problem Details objects (`application/problem+json`). Agents and SDK clients must preserve the full structure and must not collapse errors into prose.
+Wyrd's JSON API returns errors as structured RFC 9457 Problem Details objects (`application/problem+json`). Agents and SDK clients must preserve the full structure and must not collapse errors into prose. The browser sign-in endpoints (`/auth/authorize`, `/auth/callback`, and `/auth/device`) may instead redirect or show an HTML page; see the [OpenAPI reference](/api/openapi/).
 
-The one exception is the OAuth 2.0 endpoints (`/auth/token`, `/auth/platform/token`, `/auth/device_authorization`, and `/auth/revoke`). They refuse with the standard RFC 6749 section 5.2 JSON body (`error`, optional `error_description`), as OAuth clients expect. That body carries no Wyrd `code`, so branch on `error`; the codes below never appear in it. The Rust, Python, and TypeScript SDKs map such a refusal onto the nearest catalog code. See [SSO and OIDC](/self-hosting/sso-and-oidc/#oauth-endpoints).
+The other exception is the four OAuth 2.0 form endpoints (`/auth/token`, `/auth/platform/token`, `/auth/device_authorization`, and `/auth/revoke`). They refuse with the standard RFC 6749 section 5.2 JSON body (`error`, optional `error_description`), as OAuth clients expect. That body carries no Wyrd `code`, so branch on `error`; the codes below never appear in it. The Rust, Python, and TypeScript SDKs map such a refusal onto the nearest catalog code. See [SSO and OIDC](/self-hosting/sso-and-oidc/#oauth-endpoints).
 
 This page is the generated error catalog. For how an agent should act on these errors, see [Error remediation](/for-agents/error-remediation/).
 

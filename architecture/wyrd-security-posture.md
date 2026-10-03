@@ -146,7 +146,8 @@ credential.
 - Tenant access tokens expire five minutes after issuance. Privileged
   operations may require a shorter configured lifetime, but never a longer
   one.
-- Only a human login receives a refresh token. Refresh tokens are stored by
+- Only a tenant human login receives a refresh token; platform sessions are
+  access-only. Refresh tokens are stored by
   one-way digest and rotated on every use for public clients (`wyrd-cli`):
   reuse of a rotated refresh token revokes its rotation chain and emits a
   security audit event (RFC 9700 §4.14.2). The confidential web-app client
@@ -209,7 +210,9 @@ credential.
   take form-encoded bodies and answer with `Cache-Control: no-store`. Token
   success is the RFC 6749 §5.1 token response, device authorization success
   is the RFC 8628 §3.2 response, and revocation success is an empty `200`
-  (RFC 7009 §2.2). Every refusal is the RFC 6749 §5.2 error JSON. They are
+  (RFC 7009 §2.2). Every refusal is the RFC 6749 §5.2 error JSON, with
+  `400`, `401` for `invalid_client`, `500` for `server_error`, or `503` for
+  `temporarily_unavailable`. They are
   the one exception to `WyrdError` problem+json: a refusal converted from a
   `WyrdError` is logged under its Wyrd code, while a malformed form or
   client-identification refusal is answered directly with no Wyrd code.

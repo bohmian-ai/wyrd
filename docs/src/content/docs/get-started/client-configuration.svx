@@ -94,7 +94,7 @@ use wyrd_sdk::{config::ClientConfig, WyrdClient};
 
 let mut config = ClientConfig::from_global()?;
 config.http.base_url = "http://localhost:8080".to_owned();
-config.api_key = Some(SecretString::from("wyrd_sk_example"));
+config.credential = Some(SecretString::from("wyrd_sk_example"));
 let client = WyrdClient::with_config(config)?;
 ```
 

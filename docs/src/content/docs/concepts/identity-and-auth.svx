@@ -8,8 +8,9 @@ order: 6
 
 # Identity and auth
 
-Wyrd owns identity and authorization on the server. Every request carries exactly
-one credential: a Wyrd-signed access token in the `X-Wyrd-Access-Token` header.
+Wyrd owns identity and authorization on the server. Every authenticated request
+carries exactly one credential: a Wyrd-signed access token in the
+`X-Wyrd-Access-Token` header.
 The server verifies it, resolves the caller's permissions, and decides what runs.
 The server keeps no session and no ambient identity. A client can hold a token,
 but only the server decides what it means.
@@ -85,9 +86,9 @@ once after an authentication refusal.
 
 ## Obtaining a token: `/auth/token` grant dispatch
 
-All machine-facing token issuance goes through one route, `POST /auth/token`,
+All tenant-plane token issuance goes through one route, `POST /auth/token`,
 which matches on the `TokenRequest` grant and dispatches to the right exchange.
-Human login also ends there: the web app begins at `GET /auth/authorize` and
+Tenant human login also ends there: the web app begins at `GET /auth/authorize` and
 redeems its authorization code at `/auth/token`, and the CLI redeems its
 device code there.
 
@@ -113,6 +114,14 @@ Who uses which grant:
   revoking that credential ends its renewal.
 - **Delegation** (`token-exchange`) lets a caller mint a scoped token for
   another Service/Agent. It never issues a refresh token. See [Authorization](/concepts/authorization/#delegation).
+
+The platform plane has its own routes and never uses `/auth/token`. A
+platform credential is exchanged at `POST /auth/platform/token` (RFC 8693
+token exchange with the API key as the subject token). A platform
+administrator's federated login begins at `POST /auth/platform/login` and
+completes at `POST /auth/platform/callback`. Both return an access token only:
+the platform plane issues no refresh token, so a platform session ends at
+expiry and the caller signs in or exchanges its credential again.
 
 The per-grant flows, with diagrams, are on the
 [Authentication](/concepts/authentication/) page.

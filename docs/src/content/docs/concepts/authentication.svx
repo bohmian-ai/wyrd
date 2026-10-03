@@ -44,7 +44,8 @@ administrator operates tenant lifecycle and tenant-administration recovery, and
 is never implicitly authorized over a tenant's resources.
 
 Access tokens are short-lived, and how a caller renews one splits along the same
-line as identity. A **human** login receives a refresh token. A
+line as identity. A **tenant human** login receives a refresh token; a
+platform login never does. A
 **machine** — API key or workload assertion — receives access only and renews by
 re-exchanging the durable credential it already holds, so that credential is the
 single thing to revoke to end its access.
@@ -63,7 +64,9 @@ single thing to revoke to end its access.
     ['authorization_code (web app)', 'GET /auth/authorize → POST /auth/token', 'Yes'],
     ['device_code (CLI)', 'POST /auth/device_authorization → POST /auth/token', 'Yes'],
     ['token-exchange (delegation)', 'POST /auth/token', 'No'],
-    ['refresh_token', 'POST /auth/token', 'CLI: rotated · web app: not rotated']
+    ['refresh_token', 'POST /auth/token', 'CLI: rotated · web app: not rotated'],
+    ['token-exchange (platform API key)', 'POST /auth/platform/token', 'No — re-exchange the key'],
+    ['platform OIDC login', 'POST /auth/platform/login → POST /auth/platform/callback', 'No — sign in again']
   ]}
 />
 
@@ -73,9 +76,11 @@ Wyrd is the OAuth 2.0 authorization server for its own clients and an OpenID
 Connect relying party of each tenant's IdP. A person signs in through their
 tenant's **Active** OIDC connection. The tenant comes from the `tenant`
 request parameter, never from `Host` or forwarded headers, and only that
-connection can authenticate the login. Every token endpoint takes an
-`application/x-www-form-urlencoded` body and answers refusals with the RFC 6749
-§5.2 `{"error": …}` body. The server publishes its endpoints at
+connection can authenticate the login. The form endpoints (`/auth/token`,
+`/auth/device_authorization`, and `/auth/revoke`) take an
+`application/x-www-form-urlencoded` body and answer refusals with the RFC 6749
+§5.2 `{"error": …}` body; the browser steps (`/auth/authorize`,
+`/auth/callback`, and the device page) answer with redirects and HTML pages. The server publishes its endpoints at
 `GET /.well-known/oauth-authorization-server` (RFC 8414).
 
 <WyrdSequenceDiagram

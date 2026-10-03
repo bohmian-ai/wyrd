@@ -259,3 +259,27 @@ sentence in `architecture/bifrost-design.md` changed. `Queue::unconnected` is
 database. Integration note: the bench reads pending audit work only through
 the `audit_outbox_pending` scrape, so the audit-outbox branch only has to move
 that gauge's source onto `AuditOutbox`.
+
+### Lane failure diagnosis: `test:bifrost:journey:server`
+
+- **Symptom:** 28/29 passed. `verification_runtime::two_bindings_share_one_client_observation`
+  failed with both Custom Drift bindings `inconclusive`. A rerun of that test
+  alone under `WYRD_LOG` also failed.
+- **Evidence:** a fresh read-only diagnostician reran the same unchanged test
+  binary. It failed twice early, then passed 6 times in a row with no rebuild.
+  On a pass the published results were `failed`/`passed` as expected. On a
+  failure both runs pinned one hot file through Oracle, yet folded an empty
+  aggregate (`drift.rs:731-739`, `fold_custom` at `drift.rs:629-646`). Window,
+  cron boundaries, event-time stamping, attribution, and SQL were each checked
+  and are correct. The failures overlapped another session's concurrent
+  capacity-binary run on the host.
+- **Cause:** not proven. It is intermittent and confined to event-time-ranged
+  Oracle reads right after flush and snapshot refresh. Suspects:
+  `EventTimeQueryInterval::retains` (`oracle/pruning.rs:187`, used at
+  `oracle/exec.rs:1987`) and `LiveScribeRoute::is_selected_by`
+  (`oracle/live.rs:80`). Today nothing logs pruning outcomes or the folded
+  aggregate.
+- **Fix site:** outside this task's write set, in Oracle event-time pruning and
+  live-route selection or the Drift fold. This remediation's diff does not
+  touch verification, Drift, Scribe, or the Oracle scan path. Reported as a
+  blocker for the integrator rather than patched here.

@@ -1,7 +1,7 @@
 ---
 id: SPEC-audit-outbox
 revision: 3
-status: draft
+status: approved
 ---
 
 # One non-blocking audit outbox
@@ -254,7 +254,7 @@ outbox-labelled metrics. Adds REQ-009: an audit event ID with (tenant, event
 ID) uniqueness, so a retry after an unknown commit outcome cannot duplicate
 audit. Source: r1 review FIND-AUDIT-OUTBOX-1. Approved by the user on
 2026-10-03.
-- Revision 3 (2026-10-03, draft): r2 review FIND-AUDIT-OUTBOX-11 showed
+- Revision 3 (2026-10-03, approved by the user): r2 review FIND-AUDIT-OUTBOX-11 showed
   staging-only event-ID uniqueness cannot prevent a duplicate once the
   publisher retires the staged row before an unknown-outcome retry. Audit
   delivery is at least once: the event ID is carried into the retained audit

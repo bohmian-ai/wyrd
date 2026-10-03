@@ -71,4 +71,3 @@ Their callers are all methods of the existing dependency-owning CardGraphHydrato
 Performed `git diff --check 0569b797 e7d16b5b` successfully and checked HEAD against the immutable candidate. No builds, live environments, code generation or source mutations were performed. Task evidence claims focused tests and broader format/lint/typecheck/codegen lanes passed, and explicitly records incomplete Python/TypeScript execution until TASK-003; those claims do not establish the missing public type precision or structural compliance.
 
 No personal-preference findings are retained. The two findings are source-local, bounded corrections under existing authority; neither needs a new product decision.
-

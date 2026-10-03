@@ -22,6 +22,7 @@ use wyrd_spec::error::WyrdError;
 
 use crate::WyrdClient;
 use crate::cards::{CardGraphHydrator, CardSelector, Cards, WorkflowBodies};
+use crate::config::ClientConfig;
 use crate::global_config::{GlobalConfig, LocalWorkflowConfig};
 use local::SelectedRoutes;
 
@@ -178,34 +179,62 @@ impl Workflow {
 /// Read the shared configuration and gateway client a run's routes select.
 ///
 /// This is the synchronous filesystem half of [`Workflow::run_with`], which
-/// runs it on the blocking pool. The shared configuration is read only when
-/// `needs_config`. A gateway client is returned only when `needs_gateway`:
-/// `loaded`, the client that loaded the Workflow's registered Cards, when
-/// present, else one built from the shared configuration and credentials.
+/// runs it on the blocking pool. The shared configuration file is read at
+/// most once per run: only when `needs_config`, or when `needs_gateway` and
+/// no `loaded` client exists. [`local_setup_from`] then derives both the
+/// selected bindings and any built gateway client from that one snapshot, so
+/// a run never mixes two versions of the file.
 ///
 /// # Errors
 /// Returns the client configuration error when the shared configuration
-/// cannot be read, and `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` when a gateway
-/// client is needed and none can be built.
+/// cannot be read, and the errors of [`local_setup_from`].
 fn load_local_setup(
     needs_config: bool,
     needs_gateway: bool,
     loaded: Option<WyrdClient>,
 ) -> Result<(LocalWorkflowConfig, Option<WyrdClient>), WyrdError> {
-    let config = if needs_config {
-        GlobalConfig::load().map_err(WyrdError::from)?.workflow
+    let global = if needs_config || (needs_gateway && loaded.is_none()) {
+        GlobalConfig::load().map_err(WyrdError::from)?
     } else {
-        LocalWorkflowConfig::default()
+        GlobalConfig::default()
     };
-    let gateway = match (loaded, needs_gateway) {
-        (_, false) => None,
-        (Some(client), true) => Some(client),
-        (None, true) => Some(WyrdClient::from_global().map_err(|error| {
-            WyrdError::WorkflowBindingUnavailable {
+    local_setup_from(global, needs_config, needs_gateway, loaded)
+}
+
+/// Derive a run's selected bindings and gateway client from one `global`
+/// configuration snapshot.
+///
+/// The bindings are `global.workflow` when `needs_config`, else empty. A
+/// gateway client is returned only when `needs_gateway`: `loaded`, the client
+/// that loaded the Workflow's registered Cards, when present, else one built
+/// from `global` and the ambient credential.
+///
+/// # Errors
+/// Returns `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` when a gateway client is
+/// needed and none can be built.
+fn local_setup_from(
+    global: GlobalConfig,
+    needs_config: bool,
+    needs_gateway: bool,
+    loaded: Option<WyrdClient>,
+) -> Result<(LocalWorkflowConfig, Option<WyrdClient>), WyrdError> {
+    let gateway = if !needs_gateway {
+        None
+    } else if let Some(client) = loaded {
+        Some(client)
+    } else {
+        let client = WyrdClient::with_config(ClientConfig::from_global_with_env(&global)).map_err(
+            |error| WyrdError::WorkflowBindingUnavailable {
                 message: format!("no Wyrd gateway client is available: {error}"),
                 details: serde_json::json!({ "route": "wyrd_gateway" }),
-            }
-        })?),
+            },
+        )?;
+        Some(client)
+    };
+    let config = if needs_config {
+        global.workflow
+    } else {
+        LocalWorkflowConfig::default()
     };
     Ok((config, gateway))
 }
@@ -346,6 +375,10 @@ mod tests {
     use crate::transport::HttpTransport;
     use crate::transport::config::HttpConfig;
     use crate::transport::credential::ResolvedCredential;
+
+    /// A well-formed Wyrd API key, so building a client finds a credential.
+    const API_KEY_FIXTURE: &str =
+        "wyrd_sk_4d5e1c3a9b7f4e2d8a6c0b1e2f3a4b5c_1a2b3c4d_9f8e7d6c5b4a39281706f5e4d3c2b1a0";
 
     /// Deterministic gateway answering each reviewer by its system role.
     #[derive(Default)]
@@ -745,5 +778,50 @@ mod tests {
         )
         .expect("transport builds");
         WyrdClient::from_parts(auth, transport, config.grpc)
+    }
+
+    /// A client-less run with both `ext_gateway` and `wyrd_gateway` steps
+    /// takes its bindings and its gateway client from the same configuration
+    /// snapshot.
+    ///
+    /// # Panics
+    /// Panics when the snapshot's binding or server URL is not the one used.
+    #[test]
+    fn mixed_routes_use_one_config_snapshot() {
+        let global: GlobalConfig = toml::from_str(
+            r#"
+            [client]
+            http_url = "http://snapshot.example"
+
+            [workflow.external_gateway_bindings.review-gateway]
+            protocol = "openai_chat"
+            origin = "http://binding.example"
+            secret_headers = { x-review-secret = { source = "env", name = "REVIEW_SECRET" } }
+            "#,
+        )
+        .expect("client configuration parses");
+
+        let _env = crate::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: ENV_MUTEX serializes environment mutation in this test binary.
+        unsafe {
+            std::env::set_var("WYRD_API_KEY", API_KEY_FIXTURE);
+        }
+        let setup = local_setup_from(global, true, true, None);
+        // SAFETY: ENV_MUTEX serializes environment mutation in this test binary.
+        unsafe {
+            std::env::remove_var("WYRD_API_KEY");
+        }
+
+        let (config, gateway) = setup.expect("mixed-route setup builds");
+        let names: Vec<_> = config
+            .external_gateway_bindings
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(names, ["review-gateway"]);
+        let gateway = gateway.expect("a wyrd_gateway step gets a client");
+        assert_eq!(gateway.server_url(), "http://snapshot.example");
     }
 }

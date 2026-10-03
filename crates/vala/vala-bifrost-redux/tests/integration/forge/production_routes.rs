@@ -10,7 +10,8 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
 use vala_bifrost_redux::forge::{
-    Forge, ForgeClock, ForgeCompactionType, ForgeObjectStore, ForgeRoleReadiness, ForgeScheduler,
+    DEFAULT_REPORT_TIMEOUT, Forge, ForgeClock, ForgeCompactionDispatch, ForgeCompactionOutcome,
+    ForgeCompactionType, ForgeObjectStore, ForgeRoleReadiness, ForgeScheduler,
     ForgeSchedulerTrigger, ForgeTableKey, ForgeWorker, ForgeWorkerCompletionObserver,
     ForgeWorkerConfig,
 };
@@ -1967,4 +1968,130 @@ async fn snapshot_count(fixture: &PromotionIntegrationFixture) -> usize {
         .metadata()
         .snapshots()
         .count()
+}
+
+/// Reads the leader's view of the fixture table's compaction track.
+///
+/// # Panics
+///
+/// Panics when the supervisor holds no leader term or the table has no track.
+fn track(
+    supervisor: &SupervisedPromotion,
+    fixture: &PromotionIntegrationFixture,
+) -> vala_bifrost_redux::forge::ForgeTrackView {
+    let key = ForgeTableKey {
+        tenant: fixture.tenant,
+        table: identity(fixture),
+    };
+    supervisor
+        .forge()
+        .held_leader_term()
+        .expect("the supervisor's pass holds the leader term")
+        .schedule()
+        .track_for_test(&key)
+        .expect("the promoted table is tracked")
+}
+
+/// Reports settle only the commits a dispatch captured, and stale ones nothing.
+///
+/// Every step goes through the production promotion, pull, and report routes
+/// under a manual clock, so a commit can land while a dispatch is in flight and
+/// a report can arrive after its dispatch timed out. Success subtracts only the
+/// count the dispatch captured, so a commit that arrived during execution stays
+/// pending and the table is due again at once. A report naming any task but
+/// the in-flight one changes nothing — neither a task the leader never issued
+/// nor one whose report deadline elapsed and was redispatched.
+///
+/// # Panics
+///
+/// Panics when a later commit is lost, a stale or late report applies, or a
+/// timed-out dispatch is not reconsidered on the next pull.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn report_preserves_later_commits_and_ignores_stale() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let fixture = PromotionIntegrationFixture::start("report_accounting").await;
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let (clock, control) = manual_clock();
+    let supervisor = SupervisedPromotion::start_serial(
+        &fixture,
+        fixture.catalog.iceberg_catalog(),
+        Arc::clone(&store) as Arc<dyn ForgeObjectStore>,
+        clock,
+    );
+    let forge = supervisor.forge();
+
+    supervisor.schedule_only().await;
+    assert_eq!(track(&supervisor, &fixture).pending_commits, 1);
+    let first = forge.pull_compaction(4).await.expect("leader pull");
+    assert_eq!(first.len(), 1, "the promoted table is due: {first:?}");
+
+    // A commit lands while the dispatch is in flight.
+    fixture.seal_more(2).await;
+    supervisor.schedule_only().await;
+    assert_eq!(track(&supervisor, &fixture).pending_commits, 2);
+
+    let unknown = ForgeCompactionDispatch {
+        task_id: Uuid::now_v7(),
+        ..first[0].clone()
+    };
+    forge
+        .report_compaction(&unknown, ForgeCompactionOutcome::Succeeded)
+        .await
+        .expect("leader report");
+    let after_unknown = track(&supervisor, &fixture);
+    assert_eq!(
+        (after_unknown.pending_commits, after_unknown.in_flight),
+        (2, Some(first[0].task_id)),
+        "a report for a task the leader never issued changes nothing"
+    );
+
+    forge
+        .report_compaction(&first[0], ForgeCompactionOutcome::Succeeded)
+        .await
+        .expect("leader report");
+    assert_eq!(
+        track(&supervisor, &fixture).pending_commits,
+        1,
+        "success consumes only the captured commit"
+    );
+    let second = forge.pull_compaction(4).await.expect("leader pull");
+    assert_eq!(second.len(), 1, "the surviving commit is due at once");
+
+    // The second dispatch's report deadline elapses before it reports.
+    control
+        .advance(ChronoDuration::from_std(DEFAULT_REPORT_TIMEOUT).expect("report timeout fits"))
+        .expect("manual clock advances");
+    let redispatched = forge.pull_compaction(4).await.expect("leader pull");
+    assert_eq!(
+        redispatched.len(),
+        1,
+        "a timed-out dispatch is reconsidered on the next pull"
+    );
+    assert_ne!(redispatched[0].task_id, second[0].task_id);
+    forge
+        .report_compaction(&second[0], ForgeCompactionOutcome::Succeeded)
+        .await
+        .expect("leader report");
+    let after_late = track(&supervisor, &fixture);
+    assert_eq!(
+        (after_late.pending_commits, after_late.in_flight),
+        (1, Some(redispatched[0].task_id)),
+        "the timed-out dispatch's late report is stale"
+    );
+
+    // A late commit during the redispatch also survives its success.
+    fixture.seal_more(1).await;
+    supervisor.schedule_only().await;
+    forge
+        .report_compaction(&redispatched[0], ForgeCompactionOutcome::Succeeded)
+        .await
+        .expect("leader report");
+    let settled = track(&supervisor, &fixture);
+    assert_eq!(
+        (settled.pending_commits, settled.in_flight),
+        (1, None),
+        "the redispatch consumes only what it captured"
+    );
+    supervisor.shutdown().await;
 }

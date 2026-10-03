@@ -4199,4 +4199,54 @@ mod pg_tests {
             "the pending snapshot reports the stored earliest ready_at, not an age"
         );
     }
+
+    /// Accepted work is recorded already claimed, and one table admits one attempt.
+    ///
+    /// The leader or accepting executor chooses Forge work; the row only
+    /// records the attempt. The insert must return the claimed attempt under
+    /// the caller's task id, refuse a second active attempt on the same table
+    /// without error, and admit a different table.
+    ///
+    /// # Panics
+    /// Panics when the claimed row is missing, unclaimed, or a busy table admits
+    /// a second attempt.
+    #[tokio::test]
+    async fn insert_claimed_records_one_active_attempt_per_table() {
+        let (fixture, _admin) = setup().await;
+        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
+        let tenant = fixture.data_tenant_id();
+        let owner = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+
+        let claim = tasks
+            .insert_claimed(task_id, &task(tenant, "events", 1), owner, 30)
+            .await
+            .expect("insert claimed")
+            .expect("idle table accepts the attempt");
+        assert_eq!(claim.task_id, task_id);
+        assert_eq!(claim.state, ForgeTaskState::Claimed);
+        assert_eq!(claim.claimed_by, Some(owner));
+        assert!(claim.attempt_id.is_some() && claim.claim_expires_at.is_some());
+
+        let busy = tasks
+            .insert_claimed(Uuid::now_v7(), &task(tenant, "events", 2), owner, 30)
+            .await
+            .expect("busy insert");
+        assert!(busy.is_none(), "one active attempt per table");
+
+        assert!(
+            tasks
+                .insert_claimed(Uuid::now_v7(), &task(tenant, "spans", 3), owner, 30)
+                .await
+                .expect("other table")
+                .is_some()
+        );
+        assert!(
+            tasks
+                .insert_claimed(Uuid::now_v7(), &task(tenant, "logs", 4), owner, 0)
+                .await
+                .is_err(),
+            "a zero lease is refused"
+        );
+    }
 }

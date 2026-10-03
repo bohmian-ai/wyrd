@@ -499,6 +499,70 @@ impl ForgeTasks {
         Ok(())
     }
 
+    /// Records one accepted task as an attempt already claimed by `owner`.
+    ///
+    /// Forge work is chosen by the elected leader or by the executor that
+    /// accepted it, never by a durable queue. The row is the attempt's
+    /// evidence: it exists from acceptance, under `task_id`, so the ordinary
+    /// start, prepared, terminal and recovery transitions apply unchanged.
+    /// Returns `None` without effect when the table already has an active
+    /// attempt or the exact plan was already recorded.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Conflict`] for an expired-cleanup task, an invalid
+    /// plan or estimates, or a zero lease, and SQL errors from the insert.
+    ///
+    /// # Cancellation
+    /// The single statement either inserts the claimed row or has no effect.
+    pub async fn insert_claimed(
+        &self,
+        task_id: Uuid,
+        task: &NewForgeTask,
+        owner: Uuid,
+        lease_seconds: u32,
+    ) -> Result<Option<ForgeTaskClaim>, SqlError> {
+        if task.strategy == ForgeTaskStrategy::ExpiredCleanup {
+            return Err(SqlError::Conflict {
+                detail: "expired cleanup requires a validated snapshot-expiration handoff"
+                    .to_owned(),
+            });
+        }
+        if lease_seconds == 0 {
+            return Err(SqlError::Conflict {
+                detail: "Forge claim lease must be positive".to_owned(),
+            });
+        }
+        task.plan.validate_for_strategy(task.strategy, false)?;
+        task.estimates.validate()?;
+        let plan = crate::row_types::forge_tasks::plan_to_value(&task.plan);
+        let row = sqlx::query_as::<_, ForgeTaskClaimSqlRow>(
+            r#"INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,attempt_id,claimed_by,claim_expires_at,ready_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'claimed',$12,$13,statement_timestamp()+($14*interval '1 second'),statement_timestamp())
+               ON CONFLICT DO NOTHING
+               RETURNING data_tenant_id AS execution_tenant_id,task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,estimated_files,estimated_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,evidence,attempt_count,failure_class,next_eligible_at,ready_at,created_at,updated_at"#,
+        )
+        .bind(task_id)
+        .bind(task.data_tenant_id.as_uuid())
+        .bind(&task.table_ref.catalog)
+        .bind(&task.table_ref.namespace)
+        .bind(&task.table_ref.table)
+        .bind(task.strategy.as_str())
+        .bind(task.base_snapshot_id)
+        .bind(plan)
+        .bind(task.plan_hash.as_slice())
+        .bind(i64::from(task.estimates.files))
+        .bind(i64::try_from(task.estimates.bytes).map_err(|_| SqlError::Conflict {
+            detail: "estimated bytes overflow".to_owned(),
+        })?)
+        .bind(Uuid::now_v7())
+        .bind(owner)
+        .bind(i64::from(lease_seconds))
+        .fetch_optional(self.operator_pool.pool())
+        .await
+        .map_err(SqlError::from)?;
+        row.map(TryInto::try_into).transpose()
+    }
+
     /// Idempotently enqueues a validated plan and returns its stable task ID.
     ///
     /// # Errors

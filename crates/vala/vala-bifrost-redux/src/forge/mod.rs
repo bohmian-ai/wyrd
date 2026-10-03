@@ -18,6 +18,7 @@ pub(crate) mod expire;
 mod expiry_gates;
 mod expiry_policy;
 mod identity;
+mod leader;
 pub(crate) mod lease;
 mod live_reconcile;
 mod live_replace;
@@ -33,6 +34,7 @@ pub(crate) mod publication;
 mod reader_protection;
 mod scheduler;
 pub(crate) mod scribe_promotion;
+mod settings;
 mod worker;
 
 pub use clock::ForgeClock;
@@ -40,6 +42,12 @@ pub use clock::ForgeClock;
 pub use clock::ForgeClockControl;
 pub use compact::{ForgeConfig, ForgeObjectPages, ForgeObjectStore};
 pub use error::ForgeError;
+#[cfg(feature = "test-support")]
+pub use leader::ForgeTrackView;
+pub use leader::{
+    DEFAULT_REPORT_TIMEOUT, ForgeCommitNotice, ForgeCompactionDispatch, ForgeSchedule,
+    ForgeTableKey,
+};
 pub use managed::{
     ForgeManagedRewrite, ForgePlannedAttempt, ForgePlannedRewrite, ForgeRewriteEvidence,
     ForgeRewriteOutcome, ForgeTablePolicy, ForgeUnsettledOutput, RewriteHandoff,
@@ -49,6 +57,7 @@ pub use planner::{ForgePlanCandidate, PlannedForgeTask};
 pub use planning_scheduler::{ForgeScheduleOutcome, ForgeScheduler};
 #[cfg(feature = "test-support")]
 pub use scheduler::ForgeSchedulerTrigger;
+pub use settings::{ForgeCompactionType, ForgeTableSettings};
 #[cfg(feature = "test-support")]
 pub use worker::{ForgeLifecycleEvent, ForgeWorkerCompletionObserver};
 pub use worker::{ForgeWorker, ForgeWorkerConfig};

@@ -334,24 +334,6 @@ def assert_read_back(
         assert {row.card_uid for row in rows} == {subject}
 
 
-def assert_fixed_table_preflight_refusals(
-    server: WyrdTestServer, state: WyrdState, credential: str
-) -> None:
-    """Refuse startup once per fixed table whose describe the server fails.
-
-    Drift fails first; Eval fails after Drift already described. Each refusal
-    carries the server's stable code and leaves the state startable.
-    """
-    for table in FIXED_TABLES:
-        server.fail_table_describe(table)
-        try:
-            with pytest.raises(wyrd.WyrdError) as refused:
-                state.start_bifrost(server_url=server.base_url, credential=credential)
-        finally:
-            server.restore_table_describe()
-        assert refused.value.code == "WYRD_VALA_500_AUDIT_UNAVAILABLE", table
-
-
 def assert_eval_refusals(agent: Run) -> None:
     """Refuse a span without its trace and malformed media before enqueue."""
     with pytest.raises(wyrd.WyrdError) as unpaired:
@@ -615,7 +597,6 @@ def run_journey(tmp_path: Path, server: WyrdTestServer) -> None:
     )
 
     state = WyrdState.from_path(bundle, interfaces={"model": NoopModelInterface()})
-    assert_fixed_table_preflight_refusals(server, state, credential)
     state.start_bifrost(server_url=server.base_url, credential=credential)
     fixed_describes = [server.table_describe_count(table) for table in FIXED_TABLES]
 
@@ -745,7 +726,10 @@ def test_drift_burst_survives_a_byte_budget_override(tmp_path: Path) -> None:
             emit_with_resubmit(
                 state,
                 model,
-                {f"feature_{feature}": observation + feature / 10 for feature in range(BURST_FEATURES)},
+                {
+                    f"feature_{feature}": observation + feature / 10
+                    for feature in range(BURST_FEATURES)
+                },
             )
         state.shutdown()
         server.flush_bifrost()

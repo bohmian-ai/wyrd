@@ -1,20 +1,22 @@
 //! Platform-control-plane authorization, coupled to its canonical audit record.
 //!
-//! Every decision that evaluates a platform principal's permission is recorded
-//! in the same transaction that makes it, allowed and denied alike. An
-//! allowance hands the open transaction back so the caller performs the
-//! operation in it and commits both together; a denial commits its own record
-//! and refuses. A decision that cannot be recorded rolls back and refuses, so
-//! an unavailable audit log can never quietly permit a privileged operation.
+//! Every decision that evaluates a platform principal's permission is staged
+//! on the process audit outbox as soon as it is known, allowed and denied
+//! alike. The permission blocks; the audit does not. An allowance then opens
+//! the operator transaction the caller performs the operation in; a denial
+//! refuses. Neither waits for, or fails on, the audit commit.
 //!
-//! The record goes to `vala.audit_staging` through the one canonical append,
+//! The record goes to `vala.audit_staging` through the one canonical outbox,
 //! staged under `DataTenantId::SYSTEM_OWNER` because a platform decision has no
 //! owning tenant. The ordinary `AuditPublisher` drains that sentinel tenant like
 //! any other, so these decisions reach retained history through the same
 //! publisher and the same reader as every tenant-plane decision. There is no
 //! platform audit table, publisher, or reader.
 
+use std::sync::Arc;
+
 use uuid::Uuid;
+use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_runtime::{AuthContext, Permission};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
@@ -89,9 +91,6 @@ pub enum PlatformAuthzError {
         /// Action label the decision named.
         action: &'static str,
     },
-    /// The decision could not be recorded, so the operation must not proceed.
-    #[error("platform authorization could not be audited: {0}")]
-    AuditUnavailable(#[source] SqlError),
     /// The transaction could not be opened or committed.
     #[error("platform authorization transaction failed: {0}")]
     Transaction(#[source] SqlError),
@@ -99,13 +98,16 @@ pub enum PlatformAuthzError {
 
 /// Authorizes platform-plane operations and records every decision.
 ///
-/// Owns the operator boundary the decision, its audit row, and the operation's
-/// own `platform.*` writes commit through, because all three must share one
-/// transaction and therefore one connection source.
+/// Owns the operator boundary the operation's own `platform.*` writes commit
+/// through, and the process audit outbox each decision is staged on. The
+/// decision is staged, never appended inside the operation's transaction, so
+/// no platform operation waits for or fails on its audit.
 #[derive(Clone)]
 pub struct PlatformAuthorization {
-    /// Cross-tenant boundary the decision and its audit record commit through.
+    /// Cross-tenant boundary the authorized operation runs on.
     pool: OperatorPool,
+    /// Process audit outbox every decision is staged on.
+    audit: Arc<AuditOutbox>,
 }
 
 impl Debug for PlatformAuthorization {
@@ -118,18 +120,19 @@ impl Debug for PlatformAuthorization {
 }
 
 impl PlatformAuthorization {
-    /// Bind platform authorization to one operator boundary.
+    /// Bind platform authorization to one operator boundary and the process
+    /// audit outbox.
     #[must_use]
-    pub const fn new(pool: OperatorPool) -> Self {
-        Self { pool }
+    pub const fn new(pool: OperatorPool, audit: Arc<AuditOutbox>) -> Self {
+        Self { pool, audit }
     }
 
     /// Decide one platform-plane permission and record the decision.
     ///
-    /// On success the returned transaction already carries the allowance row,
-    /// so the caller's operation and its authorization commit or roll back
-    /// together. The caller owns that transaction and must commit it; this
-    /// function neither commits nor rolls back an allowance.
+    /// The decision — allowed or denied — is staged on the process audit outbox
+    /// under the `wyrd-system` sentinel tenant as soon as it is known, before
+    /// the operation runs and outside its transaction. On success the caller
+    /// owns the returned operator transaction and must commit it.
     ///
     /// The returned [`TenantConn`] is an operator transaction carrying the
     /// sentinel audit scope, so `platform.*` statements run on
@@ -143,11 +146,9 @@ impl PlatformAuthorization {
     ///
     /// # Errors
     /// Returns [`PlatformAuthzError::Denied`] when the grant does not cover
-    /// `required`, after committing the denial record.
-    /// Returns [`PlatformAuthzError::AuditUnavailable`] when the record cannot
-    /// be appended; the transaction is rolled back and the caller must refuse.
-    /// Returns [`PlatformAuthzError::Transaction`] when the transaction cannot
-    /// be opened or the denial record cannot be committed.
+    /// `required`, after staging the denial record.
+    /// Returns [`PlatformAuthzError::Transaction`] when the operation's
+    /// transaction cannot be opened.
     #[tracing::instrument(level = "debug", skip(self, context), err)]
     pub async fn authorize(
         &self,
@@ -165,32 +166,19 @@ impl PlatformAuthorization {
             AuthContext::Tenant(_) => false,
         };
 
-        let mut conn = self
-            .pool
-            .begin_platform_audited()
-            .await
-            .map_err(PlatformAuthzError::Transaction)?;
-
         let event = Self::decision_event(context, required, request_id, resource, allowed);
-        if let Err(error) = vala_sql::queries::audit_staging::append_audit(&mut conn, &event).await
-        {
-            // Fail closed: a decision that cannot be recorded did not happen.
-            drop(conn);
-            return Err(PlatformAuthzError::AuditUnavailable(error));
-        }
-
+        self.audit.stage(DataTenantId::SYSTEM_OWNER, event);
         if !allowed {
-            // The refusal is durable even though the operation never ran.
-            conn.commit()
-                .await
-                .map_err(PlatformAuthzError::Transaction)?;
             return Err(PlatformAuthzError::Denied {
                 resource: denied_resource,
                 action,
             });
         }
 
-        Ok(conn)
+        self.pool
+            .begin_platform_audited()
+            .await
+            .map_err(PlatformAuthzError::Transaction)
     }
 
     /// Build the canonical audit row for one platform decision.
@@ -252,6 +240,8 @@ mod pg_tests {
     use wyrd_sql::queries::platform::principals::insert_platform_principal;
 
     use super::{PLATFORM_AUTHZ_OPERATION, PlatformAuthorization, PlatformAuthzError};
+    use crate::audit::test_outbox::{drain, outbox};
+    use std::sync::Arc;
 
     /// A platform context holding exactly `permissions`, backed by a real row.
     async fn platform_context(fixture: &PgFixture, permissions: PermissionSet) -> AuthContext {
@@ -346,17 +336,24 @@ mod pg_tests {
         .expect("staged decisions are readable")
     }
 
-    /// An allowance is staged in the transaction the caller goes on to use, so
-    /// the decision and the operation commit together.
+    /// An allowance is staged once the decision is known, outside the
+    /// operation's transaction, so it is recorded whether or not the caller
+    /// goes on to commit the operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start, the decision is refused, or the
+    /// allowance is not staged exactly once.
     #[tokio::test]
-    async fn an_allowance_commits_with_the_operation() {
+    async fn an_allowance_is_staged_whether_or_not_the_operation_commits() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let mut permissions = PermissionSet::new();
         permissions.insert(Permission::tenant_create());
         let context = platform_context(&fixture, permissions).await;
         let principal = context.principal_id();
 
-        let authz = PlatformAuthorization::new(fixture.operator_pool().clone());
+        let audit = outbox(&fixture);
+        let authz = PlatformAuthorization::new(fixture.operator_pool().clone(), Arc::clone(&audit));
         let conn = authz
             .authorize(
                 &context,
@@ -366,39 +363,10 @@ mod pg_tests {
             )
             .await
             .expect("authorized");
-
-        assert_eq!(
-            staged_rows(&fixture, principal, "allowed").await,
-            0,
-            "the allowance is not visible until the caller commits"
-        );
-        conn.commit().await.expect("caller commits");
-        assert_eq!(staged_rows(&fixture, principal, "allowed").await, 1);
-    }
-
-    /// Abandoning the operation abandons its authorization record too: an
-    /// operation that never happened leaves no allowance behind.
-    #[tokio::test]
-    async fn a_rolled_back_operation_leaves_no_allowance() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let mut permissions = PermissionSet::new();
-        permissions.insert(Permission::tenant_create());
-        let context = platform_context(&fixture, permissions).await;
-        let principal = context.principal_id();
-
-        let authz = PlatformAuthorization::new(fixture.operator_pool().clone());
-        let conn = authz
-            .authorize(
-                &context,
-                &Permission::tenant_create(),
-                "req-rollback",
-                PLATFORM_TENANTS_RESOURCE,
-            )
-            .await
-            .expect("authorized");
         drop(conn);
+        drain(&audit).await;
 
-        assert_eq!(staged_rows(&fixture, principal, "allowed").await, 0);
+        assert_eq!(staged_rows(&fixture, principal, "allowed").await, 1);
     }
 
     /// The decision records the principal's stored kind, not the plane's.
@@ -414,7 +382,9 @@ mod pg_tests {
     #[tokio::test]
     async fn a_decision_records_the_stored_principal_kind() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let authz = PlatformAuthorization::new(fixture.operator_pool().clone());
+        let audit = outbox(&fixture);
+        let authz = PlatformAuthorization::new(fixture.operator_pool().clone(), Arc::clone(&audit));
+        let mut decided = Vec::new();
 
         for (kind, expected) in [
             (PrincipalKindTag::GlobalAdmin, "global_admin"),
@@ -434,8 +404,12 @@ mod pg_tests {
                 )
                 .await
                 .expect("authorized");
-            conn.commit().await.expect("allowance commits");
+            conn.commit().await.expect("operation commits");
+            decided.push((principal, expected));
+        }
+        drain(&audit).await;
 
+        for (principal, expected) in decided {
             assert_eq!(
                 staged_principal_kind(&fixture, principal).await,
                 expected,
@@ -458,7 +432,8 @@ mod pg_tests {
     #[tokio::test]
     async fn a_decision_records_the_credential_it_was_made_with() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let authz = PlatformAuthorization::new(fixture.operator_pool().clone());
+        let audit = outbox(&fixture);
+        let authz = PlatformAuthorization::new(fixture.operator_pool().clone(), Arc::clone(&audit));
         let mut permissions = PermissionSet::new();
         permissions.insert(Permission::tenant_create());
         let context =
@@ -480,8 +455,9 @@ mod pg_tests {
                 )
                 .await
                 .expect("authorized");
-            conn.commit().await.expect("allowance commits");
+            conn.commit().await.expect("operation commits");
         }
+        drain(&audit).await;
 
         assert_eq!(
             staged_credential_ids(&fixture, principal).await,
@@ -499,7 +475,8 @@ mod pg_tests {
         let principal = context.principal_id();
         let target = DataTenantId::new_v7();
 
-        let authz = PlatformAuthorization::new(fixture.operator_pool().clone());
+        let audit = outbox(&fixture);
+        let authz = PlatformAuthorization::new(fixture.operator_pool().clone(), Arc::clone(&audit));
         let error = authz
             .authorize(
                 &context,
@@ -510,6 +487,7 @@ mod pg_tests {
             .await
             .err()
             .expect("denied");
+        drain(&audit).await;
 
         assert!(matches!(error, PlatformAuthzError::Denied { .. }));
         assert_eq!(staged_rows(&fixture, principal, "denied").await, 1);
@@ -547,7 +525,8 @@ mod pg_tests {
         let principal = tenant.id;
         let context = AuthContext::from(tenant);
 
-        let authz = PlatformAuthorization::new(fixture.operator_pool().clone());
+        let audit = outbox(&fixture);
+        let authz = PlatformAuthorization::new(fixture.operator_pool().clone(), Arc::clone(&audit));
         let error = authz
             .authorize(
                 &context,
@@ -558,6 +537,7 @@ mod pg_tests {
             .await
             .err()
             .expect("refused");
+        drain(&audit).await;
 
         assert!(matches!(error, PlatformAuthzError::Denied { .. }));
         assert_eq!(
@@ -567,26 +547,33 @@ mod pg_tests {
         );
     }
 
-    /// When the canonical audit log cannot accept the decision, the operation is
-    /// refused and nothing is committed.
+    /// When the canonical audit log cannot accept the decision, the operation
+    /// is still authorized: permissions block, audits do not.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start, the decision is refused, or a
+    /// row reaches staging while its insert privilege is revoked.
     #[tokio::test]
-    async fn an_unrecordable_decision_fails_closed() {
+    async fn an_unrecordable_decision_still_authorizes() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let mut permissions = PermissionSet::new();
         permissions.insert(Permission::tenant_create());
         let context = platform_context(&fixture, permissions).await;
         let principal = context.principal_id();
 
-        // Remove the staging table's insert privilege for the operator role so
-        // the append fails exactly as an unavailable audit log would.
+        // Remove the staging table's insert privilege for the role the outbox
+        // commits as, so the commit fails exactly as an unavailable audit log
+        // would.
         let admin = fixture.superuser_pool().await.expect("superuser pool");
-        sqlx::query("REVOKE INSERT ON vala.audit_staging FROM wyrd_platform_admin")
+        sqlx::query("REVOKE INSERT ON vala.audit_staging FROM wyrd_app")
             .execute(&admin)
             .await
             .expect("privilege revoked");
 
-        let authz = PlatformAuthorization::new(fixture.operator_pool().clone());
-        let error = authz
+        let audit = outbox(&fixture);
+        let authz = PlatformAuthorization::new(fixture.operator_pool().clone(), Arc::clone(&audit));
+        let conn = authz
             .authorize(
                 &context,
                 &Permission::tenant_create(),
@@ -594,15 +581,15 @@ mod pg_tests {
                 PLATFORM_TENANTS_RESOURCE,
             )
             .await
-            .err()
-            .expect("refused when the decision cannot be recorded");
+            .expect("an audit failure never refuses an authorized operation");
+        conn.commit().await.expect("operation commits");
+        drain(&audit).await;
 
-        sqlx::query("GRANT INSERT ON vala.audit_staging TO wyrd_platform_admin")
+        sqlx::query("GRANT INSERT ON vala.audit_staging TO wyrd_app")
             .execute(&admin)
             .await
             .expect("privilege restored");
 
-        assert!(matches!(error, PlatformAuthzError::AuditUnavailable(_)));
         assert_eq!(staged_rows(&fixture, principal, "allowed").await, 0);
     }
 }

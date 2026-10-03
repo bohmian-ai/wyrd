@@ -12,7 +12,9 @@
 //! anything inside it.
 
 use secrecy::ExposeSecret;
+use std::sync::Arc;
 use uuid::Uuid;
+use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_auth::platform_authz::{PlatformAuthorization, tenant_resource};
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
@@ -42,6 +44,8 @@ pub struct TenantRecovery {
     /// the replacement credential is written on is lent to it per call, so
     /// recovery cannot reach a tenant its caller did not name.
     operator: OperatorPool,
+    /// Process audit outbox the recovery decision is staged on.
+    audit: Arc<AuditOutbox>,
 }
 
 impl Debug for TenantRecovery {
@@ -52,10 +56,11 @@ impl Debug for TenantRecovery {
 }
 
 impl TenantRecovery {
-    /// Bind recovery to the platform boundary it owns.
+    /// Bind recovery to the platform boundary it owns and the process audit
+    /// outbox its decision is staged on.
     #[must_use]
-    pub const fn new(operator: OperatorPool) -> Self {
-        Self { operator }
+    pub const fn new(operator: OperatorPool, audit: Arc<AuditOutbox>) -> Self {
+        Self { operator, audit }
     }
 
     /// Issue a replacement credential for a tenant's existing administrator.
@@ -71,9 +76,7 @@ impl TenantRecovery {
     ///
     /// # Errors
     /// Returns [`ProvisionError::Denied`] when the caller lacks the recovery
-    /// permission, [`ProvisionError::AuditUnavailable`] when the decision
-    /// cannot be recorded — in which case no credential is issued — and
-    /// [`ProvisionError::TenantUnavailable`] when the platform directory holds
+    /// permission, [`ProvisionError::TenantUnavailable`] when the platform directory holds
     /// no active row for `tenant_id`, and [`ProvisionError::Store`] when the
     /// tenant has no administrative principal or a write fails.
     #[tracing::instrument(level = "info", skip(self, caller, conn), fields(tenant = %tenant_id), err)]
@@ -83,7 +86,7 @@ impl TenantRecovery {
         tenant_id: DataTenantId,
         mut conn: TenantConn<'_>,
     ) -> Result<ProvisionedTenantAdmin, ProvisionError> {
-        let authz = PlatformAuthorization::new(self.operator.clone());
+        let authz = PlatformAuthorization::new(self.operator.clone(), Arc::clone(&self.audit));
         let decision = authz
             .authorize(
                 &caller.context,

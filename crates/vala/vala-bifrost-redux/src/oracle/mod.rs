@@ -24,12 +24,13 @@ use sha2::{Digest as _, Sha256};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use vala_sql::ValaPostgres;
+use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_runtime::{DelegationStep, Permission, PermissionScope, Principal};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
-    AuditDetail, AuthMethod, BifrostQueryRequest, BifrostSecurityPhase,
+    AuditDetail, AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest, BifrostSecurityPhase,
     BifrostSecurityViolationKind, NodeId, PersistedFileDescriptor, QueryAuditDigest,
     QueryBatchFrame, QueryClass, QueryExecutionMode, QueryId, QuerySchemaFrame, QuerySource,
     QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
@@ -848,6 +849,66 @@ pub trait OracleAudit: Send + Sync {
         context: VerifiedSecurityContext,
         violation: BifrostSecurityViolation,
     );
+}
+
+impl OracleAudit for AuditOutbox {
+    /// Stages the immutable read decision on the query tenant's chain.
+    fn append_read_decision(
+        &self,
+        context: &AuthorizedQueryContext,
+        decision: BifrostQueryReadDecision,
+    ) {
+        let event = query_audit_event(
+            context,
+            "bifrost.query.read_decision",
+            AuditOutcome::Allowed,
+            decision.into_detail(),
+        );
+        self.stage(context.data_tenant_id, event);
+    }
+
+    /// Stages a verified security violation on the query tenant's chain.
+    fn append_security_violation(
+        &self,
+        context: VerifiedSecurityContext,
+        violation: BifrostSecurityViolation,
+    ) {
+        let event = query_audit_event(
+            &context.query,
+            "bifrost.query.security_violation",
+            AuditOutcome::Denied,
+            AuditDetail::BifrostSecurityViolation {
+                violation: violation.violation,
+                phase: violation.phase,
+                query_digest: context.query_digest.clone(),
+                delegation_chain: wyrd_runtime::audit_delegation_chain(
+                    &context.query.delegation_chain,
+                ),
+            },
+        );
+        self.stage(context.query.data_tenant_id, event);
+    }
+}
+
+/// Builds the scrubbed event shared by read decisions and security violations.
+fn query_audit_event(
+    context: &AuthorizedQueryContext,
+    operation: &str,
+    outcome: AuditOutcome,
+    detail: AuditDetail,
+) -> AuditEvent {
+    AuditEvent::new(
+        context.request_id.clone(),
+        context.trace_id.clone(),
+        operation.to_owned(),
+        "bifrost.query".to_owned(),
+        context.principal.card_ref().cloned(),
+        context.principal.id,
+        context.principal.kind.tag(),
+        context.permission.to_string(),
+        outcome,
+    )
+    .with_detail(detail)
 }
 
 /// Locked T1 projection of one immutable local Oracle read decision.

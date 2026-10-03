@@ -2623,7 +2623,6 @@ async fn create_table(
                 sort_keys: Vec::new(),
                 bloom_columns: Vec::new(),
             }),
-            audit: None,
         })
         .await
         .expect("fixture table");

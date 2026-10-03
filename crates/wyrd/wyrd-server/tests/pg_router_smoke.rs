@@ -1977,7 +1977,6 @@ async fn register_forge_table(server: &WyrdTestServer, table: &str) {
             )],
             tenant: server.data_tenant_id(),
             physical_layout: None,
-            audit: None,
         })
         .await
         .expect("the production catalog registers the table");

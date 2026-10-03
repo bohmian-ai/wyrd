@@ -175,7 +175,11 @@ impl FromRequestParts<AppState> for PlatformCaller {
         let Ok(claims) = verifier.verify_platform(token.expose_secret()) else {
             return Err(unauthenticated());
         };
-        let sessions = PlatformSessions::new(pool.clone(), issuing_key);
+        let sessions = PlatformSessions::new(
+            pool.clone(),
+            issuing_key,
+            std::sync::Arc::clone(&state.audit_outbox),
+        );
         let session = match sessions.confirm(&claims).await {
             Ok(session) => session,
             Err(PlatformSessionError::Invalid) => return Err(unauthenticated()),

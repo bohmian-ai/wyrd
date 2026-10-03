@@ -1165,7 +1165,6 @@ impl crate::WyrdTestServer {
                         )],
                         tenant,
                         physical_layout: None,
-                        audit: None,
                     },
                 )
                 .await?;

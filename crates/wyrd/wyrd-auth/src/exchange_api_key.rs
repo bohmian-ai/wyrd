@@ -10,6 +10,7 @@ use wyrd_auth_verify::{
     ActClaim, AuthError, TokenAudience, TokenPrincipalRef, TokenVerifier, VerifiedToken,
 };
 use wyrd_runtime::{DelegationStep, PrincipalRef, RoleRef};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
@@ -18,7 +19,7 @@ use wyrd_sql::queries::auth::{
 };
 use wyrd_sql::{SqlError, TenantConn};
 
-use crate::audit::{TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event};
+use crate::audit::{TOKEN_EXCHANGE_OPERATION, auth_event};
 use crate::credential_verify::verify_presented;
 use crate::error::auth_error_to_wyrd;
 use crate::issuance::{ExchangedToken, IssuanceError, TenantGrant, TenantTokenIssuer};
@@ -223,22 +224,24 @@ impl DelegateToken {
     /// Both tokens are verified locally for the connection's tenant, so a
     /// cross-tenant pair fails verification; unverifiable or malformed
     /// identity input is refused before any decision and records nothing.
-    /// Exactly one canonical audit row is then committed: an exchange that
-    /// mints commits the issuer's token-exchange row with the token; an
-    /// issuance refusal commits an allowed row with no effect.
+    /// Exactly one canonical audit event is then staged on the process outbox:
+    /// an exchange that mints stages the issuer's token-exchange event; an
+    /// issuance refusal stages an allowed event with no effect and rolls its
+    /// transaction back.
     /// The issued token names the subject as principal, the actor as its
     /// outermost `act` with the subject token's earlier actors nested inside,
     /// and carries the actor's current permissions narrowed to the subject's.
-    /// A store or audit failure commits nothing and serves no token.
+    /// A store failure commits nothing and serves no token; audit never
+    /// refuses or delays the exchange.
     ///
     /// # Errors
     /// Returns [`DelegateError::InvalidSubjectToken`] or
     /// [`DelegateError::InvalidActorToken`] for an unverifiable token,
     /// [`DelegateError::MalformedIdentity`] for input that cannot name one
     /// actor acting for one subject, [`DelegateError::ActorNotFound`] for a missing or
-    /// inactive actor, [`DelegateError::Issuance`] when issuance or an audit
-    /// append fails, [`DelegateError::Database`] when a read fails, and
-    /// [`DelegateError::Commit`] when the decision cannot be committed.
+    /// inactive actor, [`DelegateError::Issuance`] when issuance fails,
+    /// [`DelegateError::Database`] when a read fails, and
+    /// [`DelegateError::Commit`] when the minted grant cannot be committed.
     #[tracing::instrument(
         level = "debug",
         skip(self, conn, subject_token, actor_token),
@@ -283,11 +286,44 @@ impl DelegateToken {
             }
             Err(error) if error.is_store_failure() => Err(error),
             Err(error) => {
-                record_refusal(&mut conn, &subject, &chain, &actor, audience, request_id).await?;
-                conn.commit().await?;
+                self.record_refusal(tenant, &subject, &chain, &actor, audience, request_id);
                 Err(error)
             }
         }
+    }
+
+    /// Stage the exchange decision for an exchange whose issuance refused.
+    ///
+    /// A minted token's decision is the issuer's token-exchange row, so this is
+    /// only for an issuance refusal. Like every delegated request, the row is
+    /// recorded under the subject with the full actor chain, targets the
+    /// requested audience, and attaches the credential that authenticated the
+    /// actor. It is staged on the process outbox without waiting; the
+    /// refusal's own transaction is rolled back.
+    fn record_refusal(
+        &self,
+        tenant: DataTenantId,
+        subject: &VerifiedToken,
+        chain: &[DelegationStep],
+        actor: &VerifiedToken,
+        audience: TokenAudience,
+        request_id: &str,
+    ) {
+        let subject = &subject.principal;
+        let mut event = auth_event(
+            request_id,
+            TOKEN_EXCHANGE_OPERATION,
+            subject.id,
+            subject.kind.tag(),
+            subject.card_ref().cloned(),
+            AuditOutcome::Allowed,
+            AuditDetail::DelegationAttribution {
+                delegation_chain: wyrd_runtime::audit_delegation_chain(chain),
+            },
+        )
+        .with_credential_id(actor.principal.credential_id);
+        audience.as_str().clone_into(&mut event.resource);
+        self.issuer.audit().stage(tenant, event);
     }
 }
 
@@ -330,43 +366,6 @@ fn delegation_chain(
             principal: PrincipalRef::from_principal(&actor.principal),
         }))
         .collect())
-}
-
-/// Append the exchange decision for an exchange whose issuance refused.
-///
-/// A minted token's decision is the issuer's token-exchange row, so this is
-/// only for an issuance refusal. Like every delegated request, the row is
-/// recorded under the subject with the full actor chain, targets the requested
-/// audience, and attaches the credential that authenticated the actor.
-///
-/// # Errors
-/// Returns [`DelegateError::Issuance`] carrying the audit-unavailable error
-/// when the append fails.
-async fn record_refusal(
-    conn: &mut TenantConn<'_>,
-    subject: &VerifiedToken,
-    chain: &[DelegationStep],
-    actor: &VerifiedToken,
-    audience: TokenAudience,
-    request_id: &str,
-) -> Result<(), DelegateError> {
-    let subject = &subject.principal;
-    let mut event = auth_event(
-        request_id,
-        TOKEN_EXCHANGE_OPERATION,
-        subject.id,
-        subject.kind.tag(),
-        subject.card_ref().cloned(),
-        AuditOutcome::Allowed,
-        AuditDetail::DelegationAttribution {
-            delegation_chain: wyrd_runtime::audit_delegation_chain(chain),
-        },
-    )
-    .with_credential_id(actor.principal.credential_id);
-    audience.as_str().clone_into(&mut event.resource);
-    append_auth_audit(conn, &event)
-        .await
-        .map_err(|error| DelegateError::Issuance(IssuanceError::Wyrd(error)))
 }
 
 /// Convert stored role names into runtime role references.
@@ -562,11 +561,13 @@ mod pg_tests {
     use wyrd_spec::vala::api::AuditDetail;
     use wyrd_sql::TenantConn;
 
+    use crate::audit::test_outbox::{drain, outbox};
     use crate::credential_verify;
+    use vala_sql::audit_outbox::AuditOutbox;
     use wyrd_sql::queries::auth::{ApiKeyStatus, grant_role_to_service_account, insert_role};
 
     use super::{DelegateError, DelegateToken, ExchangeApiKey, ExchangeError};
-    use crate::issuance::{IssuanceError, TenantTokenIssuer, TokenExchangeSettings};
+    use crate::issuance::{TenantTokenIssuer, TokenExchangeSettings};
     use crate::issue_api_key::WyrdApiKey;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
@@ -602,26 +603,36 @@ mod pg_tests {
         )
     }
 
-    fn test_issuer() -> TenantTokenIssuer {
-        TenantTokenIssuer::new(test_issuing_key(), TokenExchangeSettings::default())
+    /// The issuer under test, staging its audit on `audit`.
+    ///
+    /// The test owns `audit` and drains it before its fixture drops, so no audit
+    /// commit is still logging in when the fixture drops its database.
+    fn test_issuer(audit: &Arc<AuditOutbox>) -> TenantTokenIssuer {
+        TenantTokenIssuer::new(
+            test_issuing_key(),
+            TokenExchangeSettings::default(),
+            Arc::clone(audit),
+        )
     }
 
-    fn exchange_service() -> ExchangeApiKey {
+    /// The API-key exchange under test, staging its audit on `audit`.
+    fn exchange_service(audit: &Arc<AuditOutbox>) -> ExchangeApiKey {
         ExchangeApiKey {
-            issuer: test_issuer(),
+            issuer: test_issuer(audit),
         }
     }
 
-    /// Build an exchange service whose verifier trusts the test signing key.
+    /// Build an exchange service whose verifier trusts the test signing key
+    /// and whose issuer stages its audit on `audit`.
     ///
     /// # Panics
     /// Panics when the static test public key or key id fails to load.
-    fn delegate_service() -> DelegateToken {
+    fn delegate_service(audit: &Arc<AuditOutbox>) -> DelegateToken {
         let public_key = public_key_from_pem(PUBLIC_KEY_PEM).expect("test public key loads");
         let mut decoding_keys = HashMap::new();
         decoding_keys.insert(Kid::new("k1").expect("kid is valid"), Arc::new(public_key));
         DelegateToken {
-            issuer: test_issuer(),
+            issuer: test_issuer(audit),
             verifier: Arc::new(TokenVerifier::new(
                 decoding_keys,
                 "wyrd",
@@ -923,6 +934,7 @@ mod pg_tests {
     #[tokio::test]
     async fn a_card_free_exchange_commits_one_attributed_grant_record() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
@@ -942,10 +954,12 @@ mod pg_tests {
         .expect("card-free administrator inserts");
         let (api_key_id, secret) = insert_live_api_key(&mut conn, tenant, admin_id, user_id).await;
 
-        exchange_service()
+        let service = exchange_service(&audit);
+        service
             .execute(&mut conn, secret, "req-cardfree-grant")
             .await
             .expect("a card-free administrator exchanges its credential");
+        drain(service.issuer.audit()).await;
 
         let (count, credential) = staged_exchange(&mut conn, tenant, admin_id).await;
         assert_eq!(count, 1, "exactly one grant record is staged");
@@ -954,6 +968,7 @@ mod pg_tests {
             Some(api_key_id),
             "the grant names the api key that was spent"
         );
+        drain(&audit).await;
     }
 
     /// A Card-bound tenant grant records the exchange and the scope mint.
@@ -968,6 +983,7 @@ mod pg_tests {
     #[tokio::test]
     async fn a_card_bound_exchange_records_the_grant_and_the_scope_mint() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let card_ref = test_service_card_ref();
 
@@ -976,10 +992,12 @@ mod pg_tests {
         let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
         let (api_key_id, secret) = insert_live_api_key(&mut conn, tenant, sa_id, user_id).await;
 
-        exchange_service()
+        let service = exchange_service(&audit);
+        service
             .execute(&mut conn, secret, "req-cardbound-grant")
             .await
             .expect("a card-bound service exchanges its credential");
+        drain(service.issuer.audit()).await;
 
         let (count, credential) = staged_exchange(&mut conn, tenant, sa_id).await;
         assert_eq!(count, 1, "exactly one grant record is staged");
@@ -1003,6 +1021,7 @@ mod pg_tests {
             mints, 1,
             "the distinct scope-mint decision is still recorded on its own"
         );
+        drain(&audit).await;
     }
 
     /// A machine exchange returns access only and writes no refresh row.
@@ -1014,6 +1033,7 @@ mod pg_tests {
     #[tokio::test]
     async fn api_key_exchange_issues_no_refresh_token_or_row() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let card_ref = test_service_card_ref();
 
@@ -1038,7 +1058,7 @@ mod pg_tests {
         .await
         .expect("live api key inserts");
 
-        let exchanged = exchange_service()
+        let exchanged = exchange_service(&audit)
             .execute(&mut conn, key.secret, "req-api-key-no-refresh")
             .await
             .expect("a live api key exchanges");
@@ -1056,6 +1076,7 @@ mod pg_tests {
         .await
         .expect("refresh row count runs");
         assert_eq!(rows, 0, "an api-key exchange stores no refresh row");
+        drain(&audit).await;
     }
 
     /// Every invalid API-key condition renders the same public problem.
@@ -1222,6 +1243,7 @@ mod pg_tests {
     #[tokio::test]
     async fn every_invalid_api_key_costs_exactly_one_verification() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let card_ref = test_service_card_ref();
 
@@ -1258,7 +1280,7 @@ mod pg_tests {
         let disabled = seed_suspended_account_key(&mut conn, tenant, user_id, &card_ref).await;
 
         let expected = rendered(&super::api_key_invalid());
-        let service = exchange_service();
+        let service = exchange_service(&audit);
         let cases = [
             ("malformed", SecretString::from("not-a-wyrd-api-key")),
             ("cross_tenant", foreign.secret),
@@ -1312,6 +1334,7 @@ mod pg_tests {
             expected,
             "the unadmitted-tenant refusal is distinguishable"
         );
+        drain(&audit).await;
     }
 
     #[test]
@@ -1332,6 +1355,7 @@ mod pg_tests {
     #[tokio::test]
     async fn cross_tenant_key_rejected() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant_a = fixture.data_tenant_id();
         let tenant_b = DataTenantId::new_v7();
 
@@ -1345,16 +1369,18 @@ mod pg_tests {
             .tenant_conn_for(tenant_b)
             .await
             .expect("tenant B conn opens");
-        let result = exchange_service()
+        let result = exchange_service(&audit)
             .execute(&mut conn, key.secret, "req-cross-tenant")
             .await;
 
         assert!(matches!(result, Err(ExchangeError::CrossTenant)));
+        drain(&audit).await;
     }
 
     #[tokio::test]
     async fn revoked_key_rejected() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let card_ref = test_service_card_ref();
         let key = WyrdApiKey::generate(tenant);
@@ -1380,16 +1406,18 @@ mod pg_tests {
         .await
         .expect("revoked api key inserts");
 
-        let result = exchange_service()
+        let result = exchange_service(&audit)
             .execute(&mut conn, key.secret, "req-revoked")
             .await;
 
         assert!(matches!(result, Err(ExchangeError::NotFound)));
+        drain(&audit).await;
     }
 
     #[tokio::test]
     async fn hash_mismatch_rejected() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let card_ref = test_service_card_ref();
         let key = WyrdApiKey::generate(tenant);
@@ -1414,11 +1442,12 @@ mod pg_tests {
         .await
         .expect("api key with wrong hash inserts");
 
-        let result = exchange_service()
+        let result = exchange_service(&audit)
             .execute(&mut conn, key.secret, "req-hash-mismatch")
             .await;
 
         assert!(matches!(result, Err(ExchangeError::HashMismatch)));
+        drain(&audit).await;
     }
 
     /// Card name of the seeded actor.
@@ -1465,20 +1494,23 @@ mod pg_tests {
         )
     }
 
-    /// Exchange `subject` and `actor` tokens for a Bifrost token.
+    /// Exchange `subject` and `actor` tokens for a Bifrost token, then commit
+    /// every audit decision the exchange staged.
     ///
     /// # Errors
     /// Returns the [`DelegateError`] the exchange refuses with, unchanged.
     ///
     /// # Panics
-    /// Panics when the tenant connection cannot be opened.
+    /// Panics when the tenant connection cannot be opened or the staged
+    /// decisions do not drain.
     async fn exchange(
         fixture: &PgFixture,
         subject: String,
         actor: String,
     ) -> Result<super::ExchangedToken, DelegateError> {
         let conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        delegate_service()
+        let service = delegate_service(&outbox(fixture));
+        let result = service
             .execute(
                 conn,
                 SecretString::from(subject),
@@ -1486,7 +1518,9 @@ mod pg_tests {
                 TokenAudience::Bifrost,
                 &Uuid::now_v7().to_string(),
             )
-            .await
+            .await;
+        drain(service.issuer.audit()).await;
+        result
     }
 
     /// Committed Bifrost exchange decisions `(outcome, permission, principal,
@@ -1636,6 +1670,7 @@ mod pg_tests {
     #[tokio::test]
     async fn an_exchange_names_subject_and_actor_and_carries_only_the_intersection() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let table = Uuid::from_u128(0x51);
         let actor = seed_actor(
@@ -1680,7 +1715,7 @@ mod pg_tests {
             .await
             .expect("exchange succeeds");
 
-        let verifier = delegate_service().verifier;
+        let verifier = delegate_service(&audit).verifier;
         assert!(
             verifier.verify(&exchanged.access_token, &tenant).is_err(),
             "a Bifrost token is refused on a general Wyrd surface"
@@ -1725,16 +1760,18 @@ mod pg_tests {
         };
         assert_eq!(subject_principal_id.as_uuid(), subject_id);
         assert_eq!(actor_principal_id.as_uuid(), actor);
+        drain(&audit).await;
     }
 
-    /// An audit store that refuses the append fails the exchange closed: no
-    /// token and no committed decision.
+    /// An audit store that refuses the commit never refuses the exchange:
+    /// permissions block, audits do not. The token is issued and no decision
+    /// reaches staging.
     ///
     /// # Panics
     /// Panics when the append privilege cannot be revoked or restored, the
-    /// exchange is not refused as audit-unavailable, or any decision commits.
+    /// exchange is refused, or any decision commits.
     #[tokio::test]
-    async fn a_refused_exchange_audit_issues_no_token() {
+    async fn a_refused_exchange_audit_still_issues_the_token() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let actor = seed_actor(&fixture, serde_json::json!([])).await;
@@ -1756,13 +1793,8 @@ mod pg_tests {
             .await
             .expect("append privilege restored");
         assert!(
-            matches!(
-                result,
-                Err(DelegateError::Issuance(IssuanceError::Wyrd(
-                    WyrdError::AuditUnavailable { .. }
-                )))
-            ),
-            "an unrecordable exchange is refused as audit-unavailable, got: {result:?}"
+            result.is_ok(),
+            "an audit failure never refuses an exchange, got: {result:?}"
         );
         assert!(exchange_outcomes(&fixture).await.is_empty());
     }

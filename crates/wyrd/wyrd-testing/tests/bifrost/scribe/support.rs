@@ -52,7 +52,6 @@ pub(super) async fn register_table(
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await
         .expect("the catalog registers the table");

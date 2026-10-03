@@ -1584,6 +1584,9 @@ async fn an_operator_configures_and_removes_federated_platform_sign_in() {
             .fetch_one(&superuser)
             .await
             .expect("the root principal exists");
+    srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await
+        .expect("audit outbox settles");
     for (principal, expected) in [
         (root_id.as_str(), "global_admin"),
         (
@@ -1609,6 +1612,9 @@ async fn an_operator_configures_and_removes_federated_platform_sign_in() {
 
     // A federated sign-in presents a provider token, not a credential, so
     // there is no credential of this principal's for a decision to name.
+    srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await
+        .expect("audit outbox settles");
     let attributed: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM vala.audit_staging
           WHERE operation = 'platform.authz' AND principal_id = $1::uuid
@@ -2060,6 +2066,9 @@ async fn a_failed_provisioning_can_be_retried_with_the_same_slug() {
     // Both creation decisions name the slug. The retry proposed a fresh tenant
     // id that the directory discarded in favour of the original, so a decision
     // recorded against a proposed id would name a tenant that does not exist.
+    srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await
+        .expect("audit outbox settles");
     let creation_resources: Vec<String> = sqlx::query_scalar(
         "SELECT resource FROM vala.audit_staging
           WHERE operation = 'platform.authz' AND permission = 'tenants:write'
@@ -2141,12 +2150,10 @@ fn assert_safe_problem(body: &Value, code: &str) {
     }
 }
 
-/// An injected store failure and an unreadable grant both fail safely.
+/// An unreadable grant fails safely.
 ///
-/// These are the two shapes the platform plane can fail in that a caller has no
-/// business seeing: a database error raised underneath the canonical audit
-/// append, and a grant row the server itself cannot deserialize. Both used to
-/// serialize their source text into `details`.
+/// A grant row the server itself cannot deserialize is a failure a caller has
+/// no business seeing; it used to serialize its source text into `details`.
 #[tokio::test]
 async fn served_platform_failures_disclose_nothing_internal() {
     let srv = WyrdTestServer::start_in_process()
@@ -2157,51 +2164,11 @@ async fn served_platform_failures_disclose_nothing_internal() {
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
 
-    // A fault underneath the canonical audit append, installed the same way the
-    // card registration journey installs its own.
     let superuser = srv
         .pg_fixture()
         .superuser_pool()
         .await
         .expect("superuser pool opens");
-    sqlx::query(
-        r"CREATE OR REPLACE FUNCTION vala.test_fail_platform_authz_audit()
-           RETURNS trigger LANGUAGE plpgsql AS $$
-           BEGIN
-             IF NEW.operation = 'platform.authz' THEN
-               RAISE EXCEPTION 'injected platform authorization audit failure';
-             END IF;
-             RETURN NEW;
-           END;
-           $$;",
-    )
-    .execute(&superuser)
-    .await
-    .expect("failure function installs");
-    sqlx::query(
-        r"CREATE TRIGGER test_fail_platform_authz_audit
-           BEFORE INSERT ON vala.audit_staging
-           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_platform_authz_audit()",
-    )
-    .execute(&superuser)
-    .await
-    .expect("failure trigger installs");
-
-    let resp = srv
-        .oneshot(platform_post(
-            "/platform/tenants",
-            &session,
-            json!({ "slug": "unrecordable", "display_name": "Unrecordable" }),
-        ))
-        .await
-        .expect("tenant route responds");
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert_safe_problem(&body_json(resp).await, "WYRD_SPEC_500_INTERNAL");
-
-    sqlx::query("DROP TRIGGER test_fail_platform_authz_audit ON vala.audit_staging")
-        .execute(&superuser)
-        .await
-        .expect("failure trigger drops");
 
     // A grant row the server cannot read back is a serialization failure on the
     // authenticated path itself, before any handler runs.
@@ -2222,15 +2189,19 @@ async fn served_platform_failures_disclose_nothing_internal() {
     assert_safe_problem(&body_json(resp).await, "WYRD_SPEC_500_INTERNAL");
 }
 
-/// A tenant mutation whose decision cannot be recorded happens at all.
+/// A tenant mutation whose decision cannot be committed still happens.
 ///
-/// Audit is fail-closed, and the append shares the mutation's transaction, so
-/// the guarantee is not merely that the caller sees an error: the principal
-/// must not exist afterwards and no audit row may survive for it either. This
-/// forces the append to fail the way the card registration journey does, at the
-/// database, so nothing in the server is mocked out of the path.
+/// Permissions block and audits do not: the decision is staged on the
+/// non-blocking audit outbox, so a staging insert refused at the database
+/// costs the caller nothing. The principal is created, no audit row is staged
+/// for it, and the lost decision is counted under the `auth` surface.
+///
+/// # Panics
+/// Panics when the mutation is refused, the principal is missing, an audit row
+/// survives, or the failure is not counted.
 #[tokio::test]
-async fn an_unrecordable_tenant_mutation_leaves_nothing_behind() {
+async fn an_unrecordable_tenant_mutation_still_happens() {
+    let failures = wyrd_testing::AuditCommitFailures::install().expect("metrics recorder installs");
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -2277,8 +2248,10 @@ async fn an_unrecordable_tenant_mutation_leaves_nothing_behind() {
         .expect("principal route responds");
     let status = resp.status();
     let body = body_json(resp).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "refused: {body}");
-    assert_eq!(body["code"], "WYRD_VALA_500_AUDIT_UNAVAILABLE");
+    assert!(status.is_success(), "created: {body}");
+    srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await
+        .expect("audit outbox settles");
 
     sqlx::query("DROP TRIGGER test_fail_principal_create_audit ON vala.audit_staging")
         .execute(&superuser)
@@ -2291,7 +2264,7 @@ async fn an_unrecordable_tenant_mutation_leaves_nothing_behind() {
     .fetch_one(&superuser)
     .await
     .expect("principal count reads");
-    assert_eq!(principals, 0, "the refused principal was never created");
+    assert_eq!(principals, 1, "the principal was created");
 
     let audits: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM vala.audit_staging WHERE operation = 'auth.principal.create'",
@@ -2299,7 +2272,8 @@ async fn an_unrecordable_tenant_mutation_leaves_nothing_behind() {
     .fetch_one(&superuser)
     .await
     .expect("audit count reads");
-    assert_eq!(audits, 0, "no allowance survives the refused mutation");
+    assert_eq!(audits, 0, "the lost decision staged no row");
+    assert!(failures.count("auth") >= 1, "the lost decision is counted");
 }
 
 /// The deployment root is rotatable through Wyrd, with no outage and no SQL.
@@ -2462,6 +2436,9 @@ async fn an_operator_rotates_the_deployment_root_credential() {
         .await
         .expect("superuser pool for staged audit");
     // What travels is the credential's id, never the credential.
+    srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await
+        .expect("audit outbox settles");
     let leaked: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM vala.audit_staging WHERE to_jsonb(audit_staging)::text LIKE $1",
     )
@@ -2602,6 +2579,9 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
         .superuser_pool()
         .await
         .expect("superuser pool opens");
+    srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await
+        .expect("audit outbox settles");
     let unknown_decisions: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM vala.audit_staging \
           WHERE operation = 'auth.principal.revoke' AND resource = $1",
@@ -3182,8 +3162,8 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
 /// Every durable provisioning stage, failed in turn, leaves nothing usable and
 /// converges on one tenant when retried.
 ///
-/// The stages are the actual commit boundaries the workflow crosses: the
-/// directory claim's audit row, the role seed, the administrative principal,
+/// The stages are the actual commit boundaries the workflow crosses: the role
+/// seed, the administrative principal,
 /// its grant, its credential, the tenant transaction's own commit, and the
 /// promotion to active. Each one is forced to fail by a trigger scoped to that
 /// stage's slug, so the server's real error path — not a test's idea of it —
@@ -3221,9 +3201,7 @@ async fn every_durable_provisioning_stage_fails_closed_and_retries_clean() {
              target text := TG_ARGV[0];
              mine boolean;
          BEGIN
-             IF TG_TABLE_NAME = 'audit_staging' THEN
-                 mine := NEW.resource = 'tenant_slug:' || target;
-             ELSIF TG_TABLE_NAME = 'tenants' THEN
+             IF TG_TABLE_NAME = 'tenants' THEN
                  mine := NEW.slug = target AND NEW.status = 'active';
              ELSE
                  mine := EXISTS (
@@ -3240,13 +3218,7 @@ async fn every_durable_provisioning_stage_fails_closed_and_retries_clean() {
     .await
     .expect("the injection function is created");
 
-    let stages: [(&str, &str, &str); 7] = [
-        (
-            "claim-audit",
-            "CREATE TRIGGER fail_stage BEFORE INSERT ON vala.audit_staging
-             FOR EACH ROW EXECUTE FUNCTION wyrd.injected_stage_failure('stage-claim-audit')",
-            "DROP TRIGGER fail_stage ON vala.audit_staging",
-        ),
+    let stages: [(&str, &str, &str); 6] = [
         (
             "role-seed",
             "CREATE TRIGGER fail_stage BEFORE INSERT ON wyrd.auth_roles
@@ -3996,10 +3968,21 @@ async fn stop_failing_writes(pool: &PgPool, label: &str, table: &str) {
 
 /// Count staged authorization decisions for one operation and outcome.
 ///
+/// Settles `srv`'s audit outbox first, so every decision already staged is
+/// counted.
+///
 /// # Panics
 ///
-/// Panics when the staging table cannot be read.
-async fn staged_decisions(pool: &PgPool, operation: &str, outcome: &str) -> i64 {
+/// Panics when the outbox does not settle or the staging table cannot be read.
+async fn staged_decisions(
+    srv: &WyrdTestServer,
+    pool: &PgPool,
+    operation: &str,
+    outcome: &str,
+) -> i64 {
+    srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await
+        .expect("audit outbox settles");
     sqlx::query_scalar(
         "SELECT count(*) FROM vala.audit_staging
           WHERE operation = $1 AND outcome = $2",
@@ -4013,8 +3996,8 @@ async fn staged_decisions(pool: &PgPool, operation: &str, outcome: &str) -> i64 
 
 /// An authorized request that changes nothing still records the decision.
 ///
-/// Every route here evaluates the caller's permission, allows it, appends the
-/// decision on that transaction, and then discovers there is nothing to do:
+/// Every route here evaluates the caller's permission, allows it, stages the
+/// decision on the audit outbox, and then discovers there is nothing to do:
 /// the credential is unknown or belongs to someone else, the revoke is a
 /// replay, no connection is configured, the principal does not exist,
 /// suspending it would strand the deployment, or the issuer or binding is
@@ -4050,7 +4033,7 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
     // Each case: the request, the status it must answer with, and what it is.
     // `platform.authz` is one operation, so the cases are counted one at a time
     // against the running total rather than filtered apart.
-    let mut expected = staged_decisions(&superuser, "platform.authz", "allowed").await;
+    let mut expected = staged_decisions(&srv, &superuser, "platform.authz", "allowed").await;
     let unknown = uuid::Uuid::now_v7();
     let cases: Vec<(Request<Body>, StatusCode, &str)> = vec![
         (
@@ -4103,7 +4086,7 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
         assert_eq!(resp.status(), status, "{what} answers {status}");
         expected += 1;
         assert_eq!(
-            staged_decisions(&superuser, "platform.authz", "allowed").await,
+            staged_decisions(&srv, &superuser, "platform.authz", "allowed").await,
             expected,
             "{what} records exactly one allowed decision"
         );
@@ -4132,7 +4115,7 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
     );
     expected += 1;
     assert_eq!(
-        staged_decisions(&superuser, "platform.authz", "allowed").await,
+        staged_decisions(&srv, &superuser, "platform.authz", "allowed").await,
         expected,
         "a last-admin conflict records exactly one allowed decision"
     );
@@ -4163,13 +4146,13 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
         .expect("status route responds");
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        staged_decisions(&superuser, "platform.authz", "allowed").await,
+        staged_decisions(&srv, &superuser, "platform.authz", "allowed").await,
         expected,
         "a request refused on syntax opens no decision to record"
     );
 
     // The tenant plane has the same shape: the delete finds nothing, and the
-    // decision appended on that transaction has to commit with the answer.
+    // decision staged before it still commits.
     let created = body_json(
         srv.oneshot(platform_post(
             "/platform/tenants",
@@ -4192,7 +4175,7 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
     // Resuming a tenant that is already active is the replayed transition: it
     // changes nothing and is refused, but the permission was evaluated.
     let tenant_id = created["tenant"]["id"].as_str().expect("tenant id");
-    let before = staged_decisions(&superuser, "platform.authz", "allowed").await;
+    let before = staged_decisions(&srv, &superuser, "platform.authz", "allowed").await;
     let resp = srv
         .oneshot(platform_request(
             Method::PUT,
@@ -4208,7 +4191,7 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
         "a replayed resume answers 404"
     );
     assert_eq!(
-        staged_decisions(&superuser, "platform.authz", "allowed").await,
+        staged_decisions(&srv, &superuser, "platform.authz", "allowed").await,
         before + 1,
         "a replayed resume records exactly one allowed decision"
     );
@@ -4254,14 +4237,14 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
             "creating a principal with a role that does not exist",
         ),
     ] {
-        let before = staged_decisions(&superuser, operation, "allowed").await;
+        let before = staged_decisions(&srv, &superuser, operation, "allowed").await;
         let resp = srv
             .oneshot_authenticated(&admin, request)
             .await
             .expect("principal route responds");
         assert_eq!(resp.status(), status, "{what} answers {status}");
         assert_eq!(
-            staged_decisions(&superuser, operation, "allowed").await,
+            staged_decisions(&srv, &superuser, operation, "allowed").await,
             before + 1,
             "{what} records exactly one allowed decision"
         );
@@ -4292,7 +4275,7 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
             "deleting a binding that is not configured",
         ),
     ] {
-        let before = staged_decisions(&superuser, operation, "allowed").await;
+        let before = staged_decisions(&srv, &superuser, operation, "allowed").await;
         let resp = srv
             .oneshot_authenticated(&admin, tenant_request(Method::DELETE, uri, None))
             .await
@@ -4303,7 +4286,7 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
             "{what} answers 404 Not Found"
         );
         assert_eq!(
-            staged_decisions(&superuser, operation, "allowed").await,
+            staged_decisions(&srv, &superuser, operation, "allowed").await,
             before + 1,
             "{what} records exactly one allowed decision"
         );
@@ -4312,10 +4295,16 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
 
 /// Count staged platform authorization rows by outcome.
 ///
+/// Settles `srv`'s audit outbox first, so every decision already staged is
+/// counted.
+///
 /// # Panics
 ///
-/// Panics when the staging table cannot be read.
-async fn staged_platform_decisions(pool: &PgPool, outcome: &str) -> i64 {
+/// Panics when the outbox does not settle or the staging table cannot be read.
+async fn staged_platform_decisions(srv: &WyrdTestServer, pool: &PgPool, outcome: &str) -> i64 {
+    srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await
+        .expect("audit outbox settles");
     sqlx::query_scalar(
         "SELECT count(*) FROM vala.audit_staging
           WHERE operation = 'platform.authz' AND outcome = $1",
@@ -4326,21 +4315,23 @@ async fn staged_platform_decisions(pool: &PgPool, outcome: &str) -> i64 {
     .expect("decision count reads")
 }
 
-/// A failed platform mutation leaves no allowance saying it was permitted.
+/// A failed platform mutation records the decision it evaluated and no effect.
 ///
-/// REQ-037 makes the decision and its effect one transaction. The failure mode
-/// it exists for is durable and silent: a recorded allowance for an operation
-/// that never happened is indistinguishable, to anyone auditing afterwards,
-/// from one that did. Four mutation classes cover the plane's write surface —
-/// the identity connection, a credential, a principal's status, and a tenant's
-/// admission — and each is driven through the real route with its own table's
-/// writes failing.
+/// The audit row records an authorization decision, not the operation's
+/// outcome: the decision is staged on the audit outbox as soon as permission
+/// is evaluated, before the mutation runs and outside its transaction. Four
+/// mutation classes cover the plane's write surface — the identity connection,
+/// a credential, a principal's status, and a tenant's admission — and each is
+/// driven through the real route with its own table's writes failing. Each
+/// refuses, records exactly one allowance, and leaves no effect.
 ///
-/// Denials are the control. They commit on their own by design, because a
-/// refusal is durable evidence of an attempt and there is no effect to pair it
-/// with.
+/// A refused caller is the control: it earns no allowance.
+///
+/// # Panics
+/// Panics when a failed mutation reports success, records other than one
+/// allowance, or leaves an effect behind.
 #[tokio::test]
-async fn a_failed_platform_mutation_leaves_no_allowance() {
+async fn a_failed_platform_mutation_records_its_decision_and_no_effect() {
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -4412,9 +4403,8 @@ async fn a_failed_platform_mutation_leaves_no_allowance() {
             .await
             .expect("root principal reads");
 
-    // Every allowance recorded so far is legitimate; the assertions below are
-    // about what the *failed* attempts add.
-    let baseline = staged_platform_decisions(&superuser, "allowed").await;
+    // The assertions below are about what each *failed* attempt adds.
+    let mut expected = staged_platform_decisions(&srv, &superuser, "allowed").await;
 
     let classes: Vec<(&str, &str, &str, Request<Body>)> = vec![
         (
@@ -4478,10 +4468,11 @@ async fn a_failed_platform_mutation_leaves_no_allowance() {
             status.is_server_error(),
             "the {label} mutation must refuse rather than report success: {status}"
         );
+        expected += 1;
         assert_eq!(
-            staged_platform_decisions(&superuser, "allowed").await,
-            baseline,
-            "the {label} failure rolled back its own allowance"
+            staged_platform_decisions(&srv, &superuser, "allowed").await,
+            expected,
+            "the {label} failure records exactly its one allowance"
         );
     }
 
@@ -4525,7 +4516,7 @@ async fn a_failed_platform_mutation_leaves_no_allowance() {
     // — because every credential this plane issues carries the fixed platform
     // grant, so the only refusal an HTTP caller can provoke is the session
     // extractor's, which evaluates no permission and stages nothing.
-    let allowances = staged_platform_decisions(&superuser, "allowed").await;
+    let allowances = staged_platform_decisions(&srv, &superuser, "allowed").await;
     let tenant_admin = tenant_token(&srv, &tenant_credential)
         .await
         .expect("the tenant administrator authenticates");
@@ -4544,7 +4535,7 @@ async fn a_failed_platform_mutation_leaves_no_allowance() {
         "tenant authority never reaches the platform plane"
     );
     assert_eq!(
-        staged_platform_decisions(&superuser, "allowed").await,
+        staged_platform_decisions(&srv, &superuser, "allowed").await,
         allowances,
         "a refused caller earns no allowance"
     );

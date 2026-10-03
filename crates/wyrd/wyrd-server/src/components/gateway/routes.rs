@@ -178,8 +178,7 @@ pub(crate) async fn gateway_payload_object(
         &Permission::gateway_payload_read(),
         PAYLOAD_OBJECT_OPERATION,
         &resource,
-    )
-    .await?;
+    )?;
     let table = TableRef::new(BifrostNamespace::Gateway, "calls");
     let table_uid = state
         .bifrost
@@ -202,8 +201,7 @@ pub(crate) async fn gateway_payload_object(
         &scoped,
         PAYLOAD_OBJECT_OPERATION,
         &resource,
-    )
-    .await?;
+    )?;
     let bytes = state
         .storage
         .get_object(&path)

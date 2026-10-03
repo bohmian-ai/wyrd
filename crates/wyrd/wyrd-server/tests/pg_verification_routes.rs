@@ -324,6 +324,10 @@ async fn decisions(
     operation: &str,
     principal: Uuid,
 ) -> Vec<(String, String)> {
+    server
+        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await
+        .expect("audit outbox settles");
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
         .await
@@ -872,7 +876,7 @@ async fn system_writer_token_is_refused_by_every_public_token_grant() {
     let minted = server
         .state()
         .auth
-        .tenant_issuer()
+        .tenant_issuer(&server.state().audit_outbox)
         .expect("test state has a tenant issuer")
         .issue_system_token(&mut conn, &verifier)
         .await

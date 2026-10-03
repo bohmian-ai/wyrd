@@ -583,7 +583,6 @@ impl CloseoutJourney {
                     Field::new("payload", DataType::Binary, false),
                 ],
                 physical_layout: None,
-                audit: None,
             })
             .await
             .expect("payload table registration");

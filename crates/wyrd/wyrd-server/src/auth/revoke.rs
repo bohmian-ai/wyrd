@@ -95,7 +95,6 @@ pub async fn revoke_principal(
         "auth.principal.revoke",
         &format!("principal:{target_id}"),
     )
-    .await
     .map_err(WyrdErrorResponse::from)?;
     decision.detail = Some(AuditDetail::PrincipalRevocation {
         principal_id: target_id,
@@ -103,13 +102,11 @@ pub async fn revoke_principal(
         reason,
         delegation_chain: wyrd_runtime::audit_delegation_chain(&caller.delegation_chain),
     });
+    state.audit_outbox.stage(caller.data_tenant_id, decision);
 
     let mut conn = acquire_conn(&state, tenant).await?;
-    audit::append_on(&mut conn, &decision)
-        .await
-        .map_err(WyrdErrorResponse::from)?;
-    // A miss is an authorized decision with no effect, so its allowance
-    // commits; any other failure drops `conn` and rolls the allowance back.
+    // A miss is an authorized decision with no effect, so the transaction
+    // commits nothing; any other failure drops `conn` and rolls back.
     let outcome =
         revoke_principal_in_conn(&mut conn, target_id, request.principal_kind, tenant).await;
     if let Err(error) = &outcome

@@ -1506,92 +1506,24 @@ async fn a_malformed_administrative_identifier_answers_with_a_documented_problem
     server.shutdown().await.expect("server shuts down");
 }
 
-/// An audit store the server cannot append to must fail the decision closed
-/// with the stable code its own operation documents.
-///
-/// The shared authorization path stages its row through the Vala outbox, so the
-/// reachable refusal is `WYRD_VALA_500_AUDIT_UNAVAILABLE` — not the credential
-/// issuance catalog's `WYRD_AUDIT_503_UNAVAILABLE`, which only the auth grant
-/// handlers reach.
-///
-/// The failure is injected at the store: the canonical staging table is renamed
-/// out from under the append, which is the one dependency every authorization
-/// decision shares, so no handler-level seam has to be stubbed.
-#[tokio::test]
-async fn an_unavailable_audit_store_answers_with_a_code_the_operation_documents() {
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("test server starts");
-    let document = served_document(&server).await;
-    let writer = server
-        .bootstrap_service("openapi-audit", &["writer"])
-        .await
-        .expect("service bootstraps");
-    let token = server
-        .exchange_api_key(writer.api_key().expect("machine has key"))
-        .await
-        .expect("api key exchanges");
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .await
-        .expect("superuser pool opens");
-    sqlx::query("ALTER TABLE vala.audit_staging RENAME TO audit_staging_offline")
-        .execute(&pool)
-        .await
-        .expect("audit staging goes offline");
-
-    let response = server
-        .oneshot_authenticated(
-            &token,
-            Request::builder()
-                .method("POST")
-                .uri(format!(
-                    "/v1/cards/upload/{}/part-url?part_number=1",
-                    UploadId::new()
-                ))
-                .body(Body::empty())
-                .expect("request builds"),
-        )
-        .await
-        .expect("router responds");
-
-    let status = response.status();
-    let problem = problem_json(response).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{problem}");
-    let code = problem["code"].as_str().expect("problem carries a code");
-    assert_eq!(code, "WYRD_VALA_500_AUDIT_UNAVAILABLE");
-    assert!(
-        documented_description(&document, "/v1/cards/upload/{id}/part-url", "post", 500)
-            .contains(code),
-        "the owning operation names {code} on its 500"
-    );
-
-    sqlx::query("ALTER TABLE vala.audit_staging_offline RENAME TO audit_staging")
-        .execute(&pool)
-        .await
-        .expect("audit staging comes back");
-
-    server.shutdown().await.expect("server shuts down");
-}
-
-/// A credential exchange whose audit cannot be staged fails closed with the
-/// stable code `/auth/token` documents.
+/// A credential exchange whose audit cannot be staged still grants a token.
 ///
 /// `/auth/token` is the one operation every caller reaches before it has a
-/// session, so the set of refusals it declares is the set a client has to be
-/// able to branch on. The audit-unavailable arm is the one that used to go
-/// undeclared: it is reachable from a perfectly valid credential, and it is the
-/// arm that proves the grant and its audit commit together.
+/// session. Its decision is staged on the non-blocking audit outbox, so a
+/// staging insert refused at the store costs the grant nothing: the exchange
+/// answers `200` and the lost decision is counted under the `auth` surface.
 ///
-/// The failure is injected at the store — the canonical staging table is
-/// renamed out from under the append — so no handler seam has to be stubbed.
+/// The failure is injected at the store with a trigger scoped to the exchange
+/// operation, so no handler seam is stubbed and no other decision is refused.
+///
+/// # Panics
+/// Panics when the exchange is refused or the failure is not counted.
 #[tokio::test]
-async fn an_unstageable_exchange_audit_answers_with_a_code_the_token_operation_documents() {
+async fn an_unstageable_exchange_audit_still_grants_a_token() {
+    let failures = wyrd_testing::AuditCommitFailures::install().expect("metrics recorder installs");
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
-    let document = served_document(&server).await;
     let service = server
         .bootstrap_service("openapi-token-audit", &["reader"])
         .await
@@ -1606,10 +1538,24 @@ async fn an_unstageable_exchange_audit_answers_with_a_code_the_token_operation_d
         .superuser_pool()
         .await
         .expect("superuser pool opens");
-    sqlx::query("ALTER TABLE vala.audit_staging RENAME TO audit_staging_offline")
-        .execute(&pool)
-        .await
-        .expect("audit staging goes offline");
+    sqlx::raw_sql(
+        r"CREATE OR REPLACE FUNCTION vala.test_fail_token_exchange_audit()
+           RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN
+             IF NEW.operation = 'auth.token.exchange' THEN
+               RAISE EXCEPTION 'injected token exchange audit failure';
+             END IF;
+             RETURN NEW;
+           END;
+           $$;
+         DROP TRIGGER IF EXISTS test_fail_token_exchange_audit ON vala.audit_staging;
+         CREATE TRIGGER test_fail_token_exchange_audit
+           BEFORE INSERT ON vala.audit_staging
+           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_token_exchange_audit();",
+    )
+    .execute(&pool)
+    .await
+    .expect("token exchange audit failure installs");
 
     let response = server
         .oneshot(
@@ -1630,19 +1576,17 @@ async fn an_unstageable_exchange_audit_answers_with_a_code_the_token_operation_d
         .expect("router responds");
 
     let status = response.status();
-    let problem = problem_json(response).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{problem}");
-    let code = problem["code"].as_str().expect("problem carries a code");
-    assert_eq!(code, "WYRD_AUDIT_503_UNAVAILABLE");
-    assert!(
-        documented_description(&document, "/auth/token", "post", 503).contains(code),
-        "the token operation names {code} on its 503"
-    );
-
-    sqlx::query("ALTER TABLE vala.audit_staging_offline RENAME TO audit_staging")
+    let body = problem_json(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    server
+        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await
+        .expect("audit outbox settles");
+    sqlx::query("DROP TRIGGER test_fail_token_exchange_audit ON vala.audit_staging")
         .execute(&pool)
         .await
-        .expect("audit staging comes back");
+        .expect("token exchange audit failure drops");
+    assert!(failures.count("auth") >= 1, "the lost decision is counted");
 
     server.shutdown().await.expect("server shuts down");
 }

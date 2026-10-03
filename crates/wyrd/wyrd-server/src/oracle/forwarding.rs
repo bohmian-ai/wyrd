@@ -309,7 +309,6 @@ impl ReadyOracleForwarder {
         let claims = self
             .authority
             .verify_forward_query(&context, self.local_node_id, fence, chrono::Utc::now())
-            .await
             .map_err(|_| BifrostError::QueryPeerSecurity)?;
         self.execute_local(claims).await
     }

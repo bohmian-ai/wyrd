@@ -19,6 +19,7 @@ use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use secrecy::ExposeSecret;
+use std::sync::Arc;
 use uuid::Uuid;
 use wyrd_auth::platform_authz::{
     PlatformAuthorization, platform_credential_resource, platform_principal_resource,
@@ -89,7 +90,7 @@ async fn issue_credential(
     let Path(principal_id) = principal_id.map_err(|rejection| path_rejection(&rejection))?;
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone());
+    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.audit_outbox));
     let mut decision = authorize(
         &authz,
         &caller,
@@ -148,6 +149,7 @@ async fn list_credentials(
     let pool = operator(&state)?;
     authorize_read(
         &pool,
+        &state.audit_outbox,
         &caller,
         &Permission::platform_credential_read(),
         &platform_principal_resource(principal_id),
@@ -216,7 +218,7 @@ async fn revoke_credential(
         ids.map_err(|rejection| path_rejection(&rejection))?;
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone());
+    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.audit_outbox));
     let mut decision = authorize(
         &authz,
         &caller,

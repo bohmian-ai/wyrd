@@ -466,7 +466,10 @@ impl VerificationRuntimeBuilder<'_> {
             Capability::Fitter(Arc::new(fitter)),
             Capability::OperatorWorker(Arc::new(worker)),
         ];
-        match (self.state.auth.tenant_issuer(), self.ingest_endpoint) {
+        match (
+            self.state.auth.tenant_issuer(&self.state.audit_outbox),
+            self.ingest_endpoint,
+        ) {
             (Some(issuer), Some(endpoint)) => {
                 let drift = DriftEngine::new(
                     self.state.clone(),

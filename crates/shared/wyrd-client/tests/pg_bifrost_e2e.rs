@@ -177,15 +177,22 @@ mod pg_tests {
     /// assertion reads the transient table directly and names the exact
     /// operation and resource so unrelated staging cannot affect it.
     ///
+    /// The server's audit outbox settles first, so every staged decision is
+    /// counted.
+    ///
     /// # Panics
     ///
-    /// Panics when the tenant connection, audit query, or read transaction fails.
+    /// Panics when the outbox does not settle, or the tenant connection, audit
+    /// query, or read transaction fails.
     async fn staged_audit_count(
         srv: &WyrdTestServer,
         tenant: DataTenantId,
         operation: &str,
         resource: &str,
     ) -> i64 {
+        srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+            .await
+            .expect("audit outbox settles");
         let mut conn = srv
             .tenant_conn_for(tenant)
             .await
@@ -238,7 +245,6 @@ mod pg_tests {
                 user_fields: vec![Field::new("value", DataType::Int64, false)],
                 tenant: srv.data_tenant_id(),
                 physical_layout: None,
-                audit: None,
             })
             .await
             .expect("register lifecycle table");
@@ -404,39 +410,6 @@ mod pg_tests {
             .await
             .expect_err("under-privileged lifecycle status is denied");
         assert_eq!(sdk_code(&denied_status), "WYRD_PERMISSION_403_DENIED_RBAC");
-        let controls = srv
-            .state()
-            .bifrost
-            .query_controls()
-            .expect("query controls");
-        let before_failed_audit = controls
-            .get(srv.data_tenant_id(), request_id.clone())
-            .await
-            .expect("query remains active before audit fault");
-        assert!(!before_failed_audit.cancellation_requested);
-        srv.fail_query_cancel_attempt_audit();
-        let audit_failure = query
-            .cancel(&request_id)
-            .await
-            .expect_err("pre-dispatch audit failure refuses cancellation");
-        assert_eq!(sdk_code(&audit_failure), "WYRD_VALA_500_AUDIT_UNAVAILABLE");
-        srv.restore_query_cancel_attempt_audit();
-        let after_failed_audit = controls
-            .get(srv.data_tenant_id(), request_id.clone())
-            .await
-            .expect("query remains active after audit fault");
-        assert!(!after_failed_audit.cancellation_requested);
-        assert_eq!(
-            staged_audit_count(
-                &srv,
-                srv.data_tenant_id(),
-                "vala.query.running.cancel",
-                &lifecycle_resource(&request_id),
-            )
-            .await,
-            0,
-            "a refused cancellation audit stages no transient row"
-        );
         assert!(
             query
                 .cancel(&request_id)
@@ -800,7 +773,6 @@ mod pg_tests {
                 ],
                 tenant: srv.data_tenant_id(),
                 physical_layout: None,
-                audit: None,
             })
             .await
             .expect("register Oracle journey table");
@@ -882,7 +854,6 @@ mod pg_tests {
                 ],
                 tenant: srv.data_tenant_id(),
                 physical_layout: None,
-                audit: None,
             })
             .await
             .expect("register multi-batch journey table");
@@ -1039,7 +1010,6 @@ mod pg_tests {
                 ],
                 tenant: srv.data_tenant_id(),
                 physical_layout: None,
-                audit: None,
             })
             .await
             .expect("register the dynamic journey table");
@@ -1265,7 +1235,6 @@ mod pg_tests {
                 ],
                 tenant: srv.data_tenant_id(),
                 physical_layout: None,
-                audit: None,
             })
             .await
             .expect("register SDK journey table");
@@ -1376,7 +1345,6 @@ mod pg_tests {
                 ],
                 tenant: srv.data_tenant_id(),
                 physical_layout: None,
-                audit: None,
             })
             .await
             .expect("register timeout-retry table");

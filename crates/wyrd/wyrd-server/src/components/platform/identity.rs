@@ -16,7 +16,9 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value as JsonValue;
+use std::sync::Arc;
 use uuid::Uuid;
+use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_auth::pg_resolvers::{client_auth_label, seal_platform_client_secret};
 use wyrd_auth::platform_authz::{
     PLATFORM_ADMINS_RESOURCE, PLATFORM_CONNECTION_RESOURCE, PlatformAuthorization,
@@ -118,8 +120,8 @@ pub(super) fn operator(state: &AppState) -> Result<OperatorPool, WyrdErrorRespon
 ///
 /// # Errors
 /// Returns a permission error when the grant does not cover `required`, and an
-/// internal error when the decision cannot be recorded — in which case nothing
-/// is performed.
+/// internal error when the transaction cannot be opened — in which case
+/// nothing is performed.
 pub(super) async fn authorize<'a>(
     authz: &'a PlatformAuthorization,
     caller: &PlatformCaller,
@@ -151,21 +153,23 @@ pub(super) async fn commit_decision(decision: TenantConn<'_>) -> Result<(), Wyrd
     })
 }
 
-/// Authorize a read and release its record immediately.
+/// Authorize a read and release its transaction immediately.
 ///
 /// A read has no effect to pair the allowance with, so holding the transaction
-/// open across it would buy nothing.
+/// open across it would buy nothing. The decision is staged on `audit`, the
+/// process audit outbox.
 ///
 /// # Errors
 /// Returns a permission error when the grant does not cover `required`, and an
-/// internal error when the decision cannot be recorded or committed.
+/// internal error when the transaction cannot be opened or committed.
 pub(super) async fn authorize_read(
     pool: &OperatorPool,
+    audit: &Arc<AuditOutbox>,
     caller: &PlatformCaller,
     required: &Permission,
     resource: &str,
 ) -> Result<(), WyrdErrorResponse> {
-    let authz = PlatformAuthorization::new(pool.clone());
+    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(audit));
     let decision = authorize(&authz, caller, required, resource).await?;
     commit_decision(decision).await
 }
@@ -200,7 +204,7 @@ async fn configure_connection(
 ) -> Result<Json<PlatformOidcConnectionView>, WyrdErrorResponse> {
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone());
+    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.audit_outbox));
     let mut decision = authorize(
         &authz,
         &caller,
@@ -305,6 +309,7 @@ async fn read_connection(
     let pool = operator(&state)?;
     authorize_read(
         &pool,
+        &state.audit_outbox,
         &caller,
         &Permission::platform_identity_read(),
         PLATFORM_CONNECTION_RESOURCE,
@@ -362,7 +367,7 @@ async fn remove_connection(
 ) -> Result<StatusCode, WyrdErrorResponse> {
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone());
+    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.audit_outbox));
     let mut decision = authorize(
         &authz,
         &caller,
@@ -435,7 +440,7 @@ async fn register_admin(
     // the name an operator would retry with.
     //
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone());
+    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.audit_outbox));
     // The id is minted before the decision so the record names the principal
     // this request creates. Nothing has adopted an existing row here — unlike
     // tenant provisioning — so the minted id is the one that is written.
@@ -529,6 +534,7 @@ async fn list_platform_admins(
     let pool = operator(&state)?;
     authorize_read(
         &pool,
+        &state.audit_outbox,
         &caller,
         &Permission::platform_identity_read(),
         PLATFORM_ADMINS_RESOURCE,
@@ -606,7 +612,7 @@ async fn set_admin_status(
 
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone());
+    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.audit_outbox));
     let mut decision = authorize(
         &authz,
         &caller,
@@ -663,9 +669,10 @@ fn login_service(state: &AppState) -> Result<PlatformLogin, WyrdErrorResponse> {
             details: serde_json::json!({ "plane": "platform" }),
         })
     })?;
-    let sessions = std::sync::Arc::new(wyrd_auth::platform_sessions::PlatformSessions::new(
+    let sessions = Arc::new(wyrd_auth::platform_sessions::PlatformSessions::new(
         pool.clone(),
         issuing_key,
+        Arc::clone(&state.audit_outbox),
     ));
     Ok(PlatformLogin::new(
         pool,
@@ -773,10 +780,6 @@ fn platform_authz_error(error: &PlatformAuthzError, required: &Permission) -> Wy
                 details: serde_json::json!({ "permission": required.to_string() }),
             })
         }
-        PlatformAuthzError::AuditUnavailable(reason) => WyrdErrorResponse::from(internal_failure(
-            "platform authorization could not be audited",
-            &reason,
-        )),
         PlatformAuthzError::Transaction(error) => {
             WyrdErrorResponse::from(internal_failure("platform authorization failed", &error))
         }

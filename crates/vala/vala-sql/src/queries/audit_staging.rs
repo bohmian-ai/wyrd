@@ -2,11 +2,13 @@
 //! `vala.audit_chain_head`, `vala.audit_staging`, and the publisher's own
 //! progress row, `vala.audit_publication`.
 //!
-//! `append_audit` runs in the audited operation's own [`TenantConn`]
-//! transaction: it advances the per-tenant chain head under a `FOR UPDATE`
-//! lock, computes the SHA256 entry hash in Rust (this module owns the canonical
-//! encoding), inserts the append-only row, and bumps the head — all so the audit
-//! row commits atomically with the operation it records.
+//! The canonical append advances the per-tenant chain head under a `FOR
+//! UPDATE` lock, computes the SHA256 entry hash in Rust (this module owns the
+//! canonical encoding), inserts the append-only rows, and bumps the head. It is
+//! private to this crate: [`crate::audit_outbox::AuditOutbox`] is the only
+//! production writer, committing each tenant's batch in its own transaction.
+//! The `test-support` feature exposes [`append_audit`] and
+//! [`append_audit_batch`] for tests that seed staging directly.
 // raw-query grep allowlist: audit staging tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use sha2::{Digest, Sha256};
@@ -18,13 +20,30 @@ use crate::row_types::audit_staging::AuditStagingRow;
 
 /// Append one hash-chained audit row for the connection's tenant, returning its `seq`.
 ///
-/// This is [`append_audit_batch`] with one event, so a single row and a batch
-/// share one chaining and hashing path.
+/// Test-only seeding entry point over the canonical append; production audit
+/// stages through [`crate::audit_outbox::AuditOutbox`].
 ///
 /// # Errors
 /// Returns [`SqlError`] when any statement fails or an RLS policy rejects a row.
+#[cfg(feature = "test-support")]
 pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Result<i64, SqlError> {
-    append_audit_batch(conn, std::slice::from_ref(event)).await
+    append_audit_events(conn, std::slice::from_ref(event)).await
+}
+
+/// Append hash-chained audit rows for the connection's tenant, in order,
+/// returning the chain head's `seq` afterwards.
+///
+/// Test-only seeding entry point over the canonical append; production audit
+/// stages through [`crate::audit_outbox::AuditOutbox`].
+///
+/// # Errors
+/// Returns [`SqlError`] when any statement fails or an RLS policy rejects a row.
+#[cfg(feature = "test-support")]
+pub async fn append_audit_batch(
+    conn: &mut TenantConn<'_>,
+    events: &[AuditEvent],
+) -> Result<i64, SqlError> {
+    append_audit_events(conn, events).await
 }
 
 /// Append hash-chained audit rows for the connection's tenant, in order,
@@ -41,15 +60,14 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
 /// Every statement names [`TenantConn::data_tenant_id`] explicitly rather than
 /// leaning on the row-level-security policy to supply it. Under the application
 /// role the two agree and nothing changes; the explicit predicate is what makes
-/// the append correct on the operator boundary too, where row-level security is
-/// bypassed and an unqualified `FOR UPDATE` would lock — and an unqualified
-/// `UPDATE` would rewrite — every tenant's chain head. Platform-plane decisions
-/// stage through that boundary under `DataTenantId::SYSTEM_OWNER`, which is
-/// why this is the one canonical append for both planes.
+/// the append correct on a boundary where row-level security is bypassed and
+/// an unqualified `FOR UPDATE` would lock — and an unqualified `UPDATE` would
+/// rewrite — every tenant's chain head. Platform-plane decisions
+/// stage under `DataTenantId::SYSTEM_OWNER` like any other tenant.
 ///
 /// # Errors
 /// Returns [`SqlError`] when any statement fails or an RLS policy rejects a row.
-pub async fn append_audit_batch(
+pub(crate) async fn append_audit_events(
     conn: &mut TenantConn<'_>,
     events: &[AuditEvent],
 ) -> Result<i64, SqlError> {

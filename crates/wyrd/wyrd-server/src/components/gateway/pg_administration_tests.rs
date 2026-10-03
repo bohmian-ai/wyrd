@@ -35,7 +35,6 @@ use wyrd_spec::ids::{
 };
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::security::SecretRef;
-use wyrd_spec::vala::BifrostError;
 use wyrd_sql::queries::gateway::{GatewayAccountingEntryWrite, append_gateway_accounting_entry};
 use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
@@ -123,6 +122,26 @@ fn gateway_config(tenant: DataTenantId) -> GatewayConfig {
         )]),
         ..Default::default()
     }
+}
+
+/// Waits until every decision `state` staged has committed or been counted
+/// lost.
+///
+/// Decisions are staged before their effect, so a commit can still be opening
+/// its connection when the test's last request returns. A test settles before
+/// its fixture drops the database: a commit stranded mid-login holds up every
+/// `DROP DATABASE` in the cluster until Postgres times the login out.
+///
+/// # Panics
+///
+/// Panics when the outbox does not settle within thirty seconds.
+pub(super) async fn settle_audit(state: &AppState) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    assert_eq!(
+        state.audit_outbox.settle(deadline).await,
+        0,
+        "audit settles"
+    );
 }
 
 /// Builds a caller in `tenant` holding exactly `permissions`.
@@ -281,6 +300,7 @@ async fn gateway_credential_lifecycle_rotates_revokes_and_redacts() {
             .await,
         Err(WyrdError::GatewayResourceNotFound { .. })
     ));
+    settle_audit(&state).await;
 }
 
 /// Proves source validation and the resolution inputs of both credential
@@ -369,6 +389,7 @@ async fn gateway_credential_sources_resolve_from_operator_config() {
         ("ext", GatewayCredentialSource::ExternalSecret { backend, reference })
             if backend.as_str() == "vault" && reference.as_str() == "anthropic/team#api_key"
     ));
+    settle_audit(&state).await;
 }
 
 /// Builds one tenant keyring whose per-version material derives from `seed`,
@@ -558,6 +579,7 @@ async fn gateway_managed_secrets_persist_sealed_and_bound_envelopes() {
         open("managed").expect("still opens").expose_secret(),
         SUBMITTED
     );
+    settle_audit(&state).await;
 }
 
 /// Returns the details of an invalid-configuration rejection.
@@ -690,6 +712,7 @@ async fn gateway_credential_sources_stay_within_operator_assignments() {
         deepseek.assignment.as_ref().and_then(|a| a.host.as_deref()),
         Some("api.deepseek.example")
     );
+    settle_audit(&state).await;
 }
 
 /// Proves deployment credential checks, reference-guarded delete, idempotent
@@ -816,6 +839,7 @@ async fn gateway_deployments_guard_credential_references() {
         gateway.deployment(&admin, &name).await,
         Err(WyrdError::GatewayResourceNotFound { .. })
     ));
+    settle_audit(&state).await;
 }
 
 /// Proves RBAC per operation class, decision audit, and tenant isolation.
@@ -894,6 +918,10 @@ async fn gateway_administration_is_authorized_audited_and_tenant_isolated() {
         1
     );
 
+    state
+        .audit_outbox
+        .settle(std::time::Instant::now() + std::time::Duration::from_secs(30))
+        .await;
     let decisions = audit_decisions(&fixture, tenant).await;
     let expected: Vec<(String, String)> = [
         ("gateway.provider_credential.list", "denied"),
@@ -907,6 +935,7 @@ async fn gateway_administration_is_authorized_audited_and_tenant_isolated() {
     .map(|(op, outcome)| (op.to_owned(), outcome.to_owned()))
     .collect();
     assert_eq!(decisions, expected);
+    settle_audit(&state).await;
 }
 
 /// Proves fallback defaults, replacement, and idempotent delete.
@@ -936,6 +965,7 @@ async fn gateway_fallback_policy_replaces_and_resets() {
         gateway.fallback(&admin).await.expect("reset"),
         GatewayFallbackPolicy::default()
     );
+    settle_audit(&state).await;
 }
 
 /// Proves governance validation, pricing immutability, and retention of
@@ -1068,6 +1098,7 @@ async fn gateway_governance_retains_referenced_pricing() {
         .map(|p| (p.version.as_str(), p.active))
         .collect();
     assert_eq!(versions, vec![("v1", false), ("v2", false), ("v3", false)]);
+    settle_audit(&state).await;
 }
 
 /// Proves capture validation and content-driven versioning.
@@ -1130,13 +1161,15 @@ async fn gateway_capture_policy_versions_only_on_change() {
         .await
         .expect("handler read");
     assert_eq!(read, repeat);
+    settle_audit(&state).await;
 }
 
 /// Proves every authorized outcome — success, validation, not-found, and
 /// conflict — records exactly one allowed decision, and that an unreachable
-/// standalone audit append refuses a failed operation.
+/// audit database refuses nothing: the operation answers as it would have and
+/// its lost decision leaves no row.
 #[tokio::test]
-async fn gateway_failed_operations_keep_one_allowed_decision_and_fail_closed() {
+async fn gateway_failed_operations_keep_one_allowed_decision_and_never_wait_on_audit() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let state = test_state(&fixture).await;
     let tenant = fixture.data_tenant_id();
@@ -1201,6 +1234,10 @@ async fn gateway_failed_operations_keep_one_allowed_decision_and_fail_closed() {
     .into_iter()
     .map(|(op, outcome)| (op.to_owned(), outcome.to_owned()))
     .collect();
+    state
+        .audit_outbox
+        .settle(std::time::Instant::now() + std::time::Duration::from_secs(30))
+        .await;
     assert_eq!(audit_decisions(&fixture, tenant).await, expected);
 
     let unreachable = PgPoolOptions::new()
@@ -1210,21 +1247,25 @@ async fn gateway_failed_operations_keep_one_allowed_decision_and_fail_closed() {
     let refused = GatewayAdministration::new(&broken)
         .revoke_credential(&admin, &credential_name("absent"))
         .await
-        .expect_err("audit recovery fails");
+        .expect_err("an absent credential is not found");
     assert!(
-        matches!(
-            refused,
-            WyrdError::Vala {
-                error: BifrostError::AuditUnavailable { .. }
-            }
-        ),
-        "{refused:?}"
+        matches!(refused, WyrdError::GatewayResourceNotFound { .. }),
+        "an unreachable audit database refuses nothing: {refused:?}"
+    );
+    assert_eq!(
+        broken
+            .audit_outbox
+            .settle(std::time::Instant::now() + std::time::Duration::from_secs(30))
+            .await,
+        0,
+        "the lost decision settles"
     );
     assert_eq!(
         audit_decisions(&fixture, tenant).await,
         expected,
-        "no decision survives an unrecorded failure"
+        "the lost decision leaves no row"
     );
+    settle_audit(&state).await;
 }
 
 /// Proves policy resets are writes: write-only principals reset both policies
@@ -1248,6 +1289,7 @@ async fn gateway_policy_resets_require_write() {
         .expect("writer resets governance");
     assert!(gateway.delete_fallback(&deleter).await.is_err());
     assert!(gateway.delete_governance(&deleter).await.is_err());
+    settle_audit(&state).await;
 }
 
 /// Proves malformed, shape-invalid, and untyped gateway bodies become the
@@ -1284,6 +1326,7 @@ async fn gateway_body_rejections_render_wyrd_problems() {
         assert_eq!(problem["code"], "WYRD_GATEWAY_400_INVALID_CONFIGURATION");
         assert_eq!(problem["details"]["field"], "body");
     }
+    settle_audit(&state).await;
 }
 
 /// Waits until `waiters` lock requests in `fixture`'s database are blocked on a
@@ -1480,4 +1523,5 @@ async fn gateway_concurrent_replacements_are_last_committed_and_family_independe
         gateway.governance(&admin).await.expect("governance"),
         governance
     );
+    settle_audit(&state).await;
 }

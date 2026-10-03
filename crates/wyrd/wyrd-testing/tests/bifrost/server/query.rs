@@ -252,7 +252,6 @@ async fn signed_forwarding_preserves_shorter_absolute_deadline() -> Result<(), S
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await?;
     let query = request(&format!("SELECT value FROM vala.bifrost.{table}"));
@@ -342,7 +341,6 @@ async fn prove_shared_query_surfaces() -> Result<(), ServerJourneyError> {
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await?;
     let sql = format!("SELECT value FROM vala.bifrost.{table} ORDER BY value");
@@ -607,7 +605,6 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await?;
 
@@ -932,8 +929,6 @@ async fn tenant_scoped_roles_reach_only_their_granted_bifrost_tables() {
 
 /// Stable code a principal receives for a table its grants do not cover.
 const QUERY_FORBIDDEN: &str = "WYRD_VALA_403_QUERY_FORBIDDEN";
-/// Stable code substituted when a refusal's own audit append cannot commit.
-const AUDIT_UNAVAILABLE: &str = "WYRD_VALA_500_AUDIT_UNAVAILABLE";
 /// Audited operation name the public query route decides under.
 const QUERY_OPERATION: &str = "vala.query.sync";
 /// Audited operation name Oracle commits one accepted read decision under.
@@ -1044,13 +1039,6 @@ async fn prove_object_scoped_role_matrix() -> Result<(), ServerJourneyError> {
         )
         .into());
     }
-
-    // The denial fails closed on its own append: an unrecordable refusal is
-    // reported as audit-unavailable, never as a plain rejection.
-    server.fail_query_object_denial_audit();
-    refuses_with(&analyst, TRACES_SQL, AUDIT_UNAVAILABLE).await?;
-    server.restore_query_object_denial_audit();
-    refuses(&analyst, TRACES_SQL).await?;
 
     prove_scoped_bearer_over_grpc(&server, &analyst).await?;
 
@@ -1711,7 +1699,6 @@ async fn query_edge_timeout_yields_to_oracle_deadline() -> Result<(), ServerJour
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await?;
     let base = server.base_url().ok_or("missing HTTP URL")?.to_owned();
@@ -1824,7 +1811,6 @@ async fn silent_remote_oracle_delivery_yields_typed_query_timeout() -> Result<()
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await?;
     cluster.refresh_oracle_snapshots().await?;

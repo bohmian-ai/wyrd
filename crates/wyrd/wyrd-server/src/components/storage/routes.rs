@@ -93,8 +93,7 @@ async fn init(
         &caller,
         "storage.upload.init",
         &format!("card:{}", body.card_uid),
-    )
-    .await?;
+    )?;
     let idempotency_key = extract_idempotency_key(&headers)?;
     let storage_caller = storage_caller(&caller);
     service::upload_init(
@@ -158,8 +157,7 @@ async fn part_url(
         &caller,
         "storage.upload.part_url",
         &format!("upload:{upload_id}"),
-    )
-    .await?;
+    )?;
     let storage_caller = storage_caller(&caller);
     service::upload_part_url(
         &state.storage,
@@ -230,8 +228,7 @@ async fn complete(
         &caller,
         "storage.upload.complete",
         &format!("upload:{upload_id}"),
-    )
-    .await?;
+    )?;
     let storage_caller = storage_caller(&caller);
     service::upload_complete(
         &state.storage,
@@ -296,8 +293,7 @@ async fn abort(
         &caller,
         "storage.upload.abort",
         &format!("upload:{upload_id}"),
-    )
-    .await?;
+    )?;
     let storage_caller = storage_caller(&caller);
     service::upload_abort(
         &state.storage,
@@ -370,8 +366,7 @@ async fn local_blob(
         &caller,
         "storage.upload.local_blob",
         &format!("upload:{upload_id}"),
-    )
-    .await?;
+    )?;
     let storage_caller = storage_caller(&caller);
     service::upload_local_blob(
         &state.storage,
@@ -424,8 +419,7 @@ async fn download_init(
         &caller,
         "storage.download.init",
         &format!("card:{}", body.card_uid),
-    )
-    .await?;
+    )?;
     let storage_caller = storage_caller(&caller);
     service::download_init(&state.storage, state.postgres.wyrd(), &storage_caller, body)
         .await
@@ -504,8 +498,7 @@ async fn download_local_blob(
         &caller,
         "storage.download.local_blob",
         &format!("object:{path}"),
-    )
-    .await?;
+    )?;
     let (file, len) = service::download_local_blob(&state.storage, caller.data_tenant_id, path)
         .await
         .map_err(WyrdErrorResponse::from)?;
@@ -561,10 +554,12 @@ pub(crate) fn extract_idempotency_key(
 
 /// Evaluate and audit the card-write permission for one storage mutation.
 ///
-/// Storage routes own no transaction of their own — the service opens its own —
-/// so the verdict is recorded in its own tenant transaction before the mutation
-/// is dispatched, and an append failure refuses the request.
-async fn authorize_card_write(
+/// The verdict is staged on the process audit outbox before the mutation is
+/// dispatched; the request never waits for the audit commit.
+///
+/// # Errors
+/// Returns the public permission error when the caller lacks `card:write`.
+fn authorize_card_write(
     state: &AppState,
     caller: &Caller,
     operation: &str,
@@ -577,22 +572,23 @@ async fn authorize_card_write(
         operation,
         resource,
     )
-    .await
     .map_err(WyrdErrorResponse::from)
 }
 
 /// Evaluate and audit the card-read permission for one storage read.
 ///
 /// A permitted download is the moment a principal is allowed at the artifact
-/// bytes, so its decision row is written before any plan or stream is produced.
-async fn authorize_card_read(
+/// bytes, so its decision row is staged before any plan or stream is produced.
+///
+/// # Errors
+/// Returns the public permission error when the caller lacks `card:read`.
+fn authorize_card_read(
     state: &AppState,
     caller: &Caller,
     operation: &str,
     resource: &str,
 ) -> Result<(), WyrdErrorResponse> {
     audit::authorize(state, caller, &Permission::card_read(), operation, resource)
-        .await
         .map_err(WyrdErrorResponse::from)
 }
 

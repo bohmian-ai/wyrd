@@ -38,6 +38,8 @@ use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
 use crate::components::auth::PlatformCaller;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
+use std::sync::Arc;
+use vala_sql::audit_outbox::AuditOutbox;
 
 /// Role a tenant administrative principal is granted at provisioning.
 ///
@@ -64,9 +66,6 @@ pub enum ProvisionError {
     /// The slug is already taken by another tenant.
     #[error("tenant slug is already in use")]
     SlugTaken,
-    /// Authorization could not be recorded, so provisioning did not proceed.
-    #[error("provisioning could not be audited: {0}")]
-    AuditUnavailable(String),
     /// The named tenant is not one that may be acted on: it does not exist,
     /// is soft-deleted, or is in a lifecycle state other than active. The
     /// causes deliberately share one variant so a refusal cannot be used to
@@ -81,17 +80,13 @@ pub enum ProvisionError {
 impl From<PlatformAuthzError> for ProvisionError {
     /// Carry an authorization outcome into the provisioning vocabulary.
     ///
-    /// The three arms stay distinct on purpose: a denial is the caller's
-    /// answer, an unrecordable decision is a refusal to proceed at all, and a
-    /// transaction failure is a store fault that leaves the tenant visibly
-    /// incomplete. Collapsing any pair would make a provisioning attempt
+    /// The two arms stay distinct on purpose: a denial is the caller's answer,
+    /// and a transaction failure is a store fault that leaves the tenant
+    /// visibly incomplete. Collapsing them would make a provisioning attempt
     /// indistinguishable from a refused one.
     fn from(error: PlatformAuthzError) -> Self {
         match error {
             PlatformAuthzError::Denied { .. } => Self::Denied,
-            PlatformAuthzError::AuditUnavailable(error) => {
-                Self::AuditUnavailable(error.to_string())
-            }
             PlatformAuthzError::Transaction(error) => Self::Store(error.to_string()),
         }
     }
@@ -110,6 +105,8 @@ pub struct TenantProvisioning {
     /// lent to it as an already-acquired [`TenantConn`], so provisioning
     /// cannot open a transaction against a tenant its caller did not name.
     operator: OperatorPool,
+    /// Process audit outbox every platform decision is staged on.
+    audit: Arc<AuditOutbox>,
 }
 
 impl Debug for TenantProvisioning {
@@ -120,10 +117,11 @@ impl Debug for TenantProvisioning {
 }
 
 impl TenantProvisioning {
-    /// Bind provisioning to the platform boundary it owns.
+    /// Bind provisioning to the platform boundary it owns and the process
+    /// audit outbox its decisions are staged on.
     #[must_use]
-    pub const fn new(operator: OperatorPool) -> Self {
-        Self { operator }
+    pub const fn new(operator: OperatorPool, audit: Arc<AuditOutbox>) -> Self {
+        Self { operator, audit }
     }
 
     /// Claim the directory row and report which tenant the work belongs to.
@@ -134,8 +132,8 @@ impl TenantProvisioning {
     /// attempt's id rather than the proposed one, and a connection bound to the
     /// discarded proposal would write the new tenant's rows nowhere useful.
     ///
-    /// The authorization decision and the directory row commit together, so a
-    /// tenant never exists without a recorded decision permitting it. On
+    /// The authorization decision is staged on the process audit outbox before
+    /// the directory row is written. On
     /// return the tenant exists but is not usable; the caller acquires a
     /// [`TenantConn`] for the returned id and passes it to [`Self::provision`],
     /// which owns every outcome from here including marking the tenant failed.
@@ -143,9 +141,7 @@ impl TenantProvisioning {
     /// # Errors
     /// Returns [`ProvisionError::Denied`] when the caller lacks
     /// `tenants:write`, [`ProvisionError::SlugTaken`] when the slug is in use,
-    /// [`ProvisionError::AuditUnavailable`] when the decision cannot be
-    /// recorded — in which case nothing is created — and
-    /// [`ProvisionError::Store`] when a write fails.
+    /// and [`ProvisionError::Store`] when a write fails.
     #[tracing::instrument(level = "info", skip(self, caller), fields(slug = %request.slug), err)]
     pub async fn claim(
         &self,
@@ -155,7 +151,7 @@ impl TenantProvisioning {
         let data_tenant_id = DataTenantId::new_v7();
 
         // The handle must outlive the transaction it lends out.
-        let authz = PlatformAuthorization::new(self.operator.clone());
+        let authz = PlatformAuthorization::new(self.operator.clone(), Arc::clone(&self.audit));
         let mut conn = authz
             .authorize(
                 &caller.context,
@@ -287,8 +283,7 @@ impl TenantProvisioning {
     ///
     /// # Errors
     /// Returns [`ProvisionError::Denied`] when the caller lacks `tenants:read`,
-    /// [`ProvisionError::AuditUnavailable`] when the decision cannot be
-    /// recorded, and [`ProvisionError::Store`] when the read fails.
+    /// and [`ProvisionError::Store`] when the read fails.
     #[tracing::instrument(level = "info", skip(self, caller), err)]
     pub async fn list(
         &self,
@@ -316,9 +311,8 @@ impl TenantProvisioning {
     ///
     /// # Errors
     /// Returns [`ProvisionError::Denied`] when the caller lacks `tenants:read`,
-    /// [`ProvisionError::TenantUnavailable`] when no such row exists,
-    /// [`ProvisionError::AuditUnavailable`] when the decision cannot be
-    /// recorded, and [`ProvisionError::Store`] when the read fails.
+    /// [`ProvisionError::TenantUnavailable`] when no such row exists, and
+    /// [`ProvisionError::Store`] when the read fails.
     #[tracing::instrument(level = "info", skip(self, caller), fields(tenant = %tenant_id), err)]
     pub async fn inspect(
         &self,
@@ -346,9 +340,7 @@ impl TenantProvisioning {
     /// # Errors
     /// Returns [`ProvisionError::Denied`] when the caller lacks
     /// `tenants:suspend`, [`ProvisionError::TenantUnavailable`] when the tenant
-    /// is not in the state the transition requires,
-    /// [`ProvisionError::AuditUnavailable`] when the decision cannot be
-    /// recorded — in which case nothing changes — and
+    /// is not in the state the transition requires, and
     /// [`ProvisionError::Store`] when the write fails.
     #[tracing::instrument(level = "info", skip(self, caller), fields(tenant = %tenant_id), err)]
     pub async fn set_suspended(
@@ -358,7 +350,7 @@ impl TenantProvisioning {
         suspended: bool,
     ) -> Result<(), ProvisionError> {
         // The handle must outlive the transaction it lends out.
-        let authz = PlatformAuthorization::new(self.operator.clone());
+        let authz = PlatformAuthorization::new(self.operator.clone(), Arc::clone(&self.audit));
         let mut decision = authz
             .authorize(
                 &caller.context,
@@ -398,14 +390,13 @@ impl TenantProvisioning {
     ///
     /// # Errors
     /// Returns [`ProvisionError::Denied`] when the caller lacks `tenants:read`,
-    /// [`ProvisionError::AuditUnavailable`] when the decision cannot be
-    /// recorded, and [`ProvisionError::Store`] when the commit fails.
+    /// and [`ProvisionError::Store`] when the commit fails.
     async fn authorize_read(
         &self,
         caller: &PlatformCaller,
         resource: &str,
     ) -> Result<(), ProvisionError> {
-        let authz = PlatformAuthorization::new(self.operator.clone());
+        let authz = PlatformAuthorization::new(self.operator.clone(), Arc::clone(&self.audit));
         let decision = authz
             .authorize(
                 &caller.context,

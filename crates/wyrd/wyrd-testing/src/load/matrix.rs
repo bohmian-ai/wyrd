@@ -721,7 +721,6 @@ async fn provision_tables(
                 user_fields: fields.clone(),
                 tenant: *tenant,
                 physical_layout: None,
-                audit: None,
             })
             .await
             .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?;

@@ -16,7 +16,7 @@ use wyrd_spec::ids::{
     BindingId, CardUid, IdempotencyKey, VerificationExecutionId, VerificationRunId,
 };
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
+use wyrd_spec::vala::api::AuditOutcome;
 use wyrd_spec::verification::{
     ExecuteVerificationRequest, ExecuteVerificationResponse, StartVerificationRunRequest,
     VerificationBindingStatus, VerificationRunInput, VerificationRunStatus, VerificationRunTarget,
@@ -187,8 +187,7 @@ impl<'a> VerificationControl<'a> {
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read`,
     /// [`WyrdError::VerificationBindingNotFound`] when the tenant has no such
-    /// binding, [`WyrdError::AuditUnavailable`] when the decision cannot be
-    /// recorded, and a registry unavailability error when the read fails.
+    /// binding, and a registry unavailability error when the read fails.
     pub(crate) async fn get_binding(
         &self,
         caller: &Caller,
@@ -201,8 +200,7 @@ impl<'a> VerificationControl<'a> {
             &Permission::card_read(),
             GET_BINDING,
             &resource,
-        )
-        .await?;
+        )?;
         let mut conn = self
             .state
             .registry_tenant_conn(caller.data_tenant_id)
@@ -227,7 +225,6 @@ impl<'a> VerificationControl<'a> {
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read`,
     /// [`WyrdError::VerificationRunNotFound`] when the tenant has no such run,
-    /// [`WyrdError::AuditUnavailable`] when the decision cannot be recorded,
     /// and a registry unavailability error when the read fails.
     pub(crate) async fn get_run(
         &self,
@@ -241,8 +238,7 @@ impl<'a> VerificationControl<'a> {
             &Permission::card_read(),
             GET_RUN,
             &resource,
-        )
-        .await?;
+        )?;
         let mut conn = self
             .state
             .registry_tenant_conn(caller.data_tenant_id)
@@ -261,15 +257,15 @@ impl<'a> VerificationControl<'a> {
 
     /// Durably enqueue one manual Drift run for the authenticated caller.
     ///
-    /// Validates the window, then evaluates `evals:run`; a denial is audited
-    /// standalone. In one tenant transaction it then checks a Card-bound
-    /// caller's signed scope over the exact subject, appends the single
-    /// allow or deny decision, and enqueues the run with the caller as
-    /// requester — never as a binding owner. A request carrying `key` replays
-    /// the requester's earlier run for the same body and is refused for a
-    /// different one. Refusals commit only their decision row. When the
-    /// transaction fails before committing, the allow decision is recorded
-    /// standalone so an evaluated permission is never lost.
+    /// Validates the window, then evaluates `evals:run`. In one tenant
+    /// transaction it then checks a Card-bound caller's signed scope over the
+    /// exact subject and enqueues the run with the caller as requester —
+    /// never as a binding owner. The single allow or deny decision is staged
+    /// on [`AppState::audit_outbox`] as soon as it is known, so the enqueue
+    /// transaction never touches the tenant audit chain and the request never
+    /// waits for the audit commit. A request carrying `key` replays the
+    /// requester's earlier run for the same body and is refused for a
+    /// different one.
     ///
     /// # Errors
     /// Returns [`WyrdError::VerificationInvalidWindow`] for an invalid window,
@@ -278,8 +274,7 @@ impl<'a> VerificationControl<'a> {
     /// binding, [`WyrdError::VerificationInvalidTarget`] for an unrunnable
     /// target, [`WyrdError::VerificationNotReady`] for an unfitted baseline,
     /// [`WyrdError::RegistryIdempotencyConflict`] when `key` was used for a
-    /// different request, [`WyrdError::AuditUnavailable`] when a decision
-    /// cannot be recorded, and a registry unavailability error when the
+    /// different request, and a registry unavailability error when the
     /// transaction fails.
     pub(crate) async fn start_run(
         &self,
@@ -289,35 +284,16 @@ impl<'a> VerificationControl<'a> {
     ) -> Result<VerificationRunId, WyrdError> {
         request.validate()?;
         let resource = target_resource(&request.target);
-        let allowed = audit::authorize_recording_denial(
-            self.state,
-            caller,
-            &Permission::eval_run(),
-            START_RUN,
-            &resource,
-        )
-        .await?;
-        let committed = self
-            .enqueue(caller, request, key, &allowed, &resource)
-            .await;
-        audit::record_unless_committed(self.state, caller, &allowed, committed).await?
-    }
-
-    /// Run the manual request transaction and commit its decision.
-    ///
-    /// The outer result is `Err` only when nothing committed; the inner
-    /// result is the committed answer, including committed refusals.
-    ///
-    /// # Errors
-    /// Returns the registry or audit error of a transaction that did not commit.
-    async fn enqueue(
-        &self,
-        caller: &Caller,
-        request: &StartVerificationRunRequest,
-        key: Option<&IdempotencyKey>,
-        allowed: &AuditEvent,
-        resource: &str,
-    ) -> Result<Result<VerificationRunId, WyrdError>, WyrdError> {
+        if let Err(reason) = self
+            .state
+            .authz
+            .permission_check
+            .check(&caller.principal, &Permission::eval_run())
+            .into_result()
+        {
+            self.stage_decision(caller, START_RUN, &resource, AuditOutcome::Denied);
+            return Err(permission_deny_reason_to_wyrd(reason));
+        }
         let mut conn = self
             .state
             .registry_tenant_conn(caller.data_tenant_id)
@@ -327,9 +303,10 @@ impl<'a> VerificationControl<'a> {
             .await?
         {
             drop(conn);
-            return Ok(self.deny_scope(caller, START_RUN, resource).await);
+            self.stage_decision(caller, START_RUN, &resource, AuditOutcome::Denied);
+            return Err(Self::scope_denied(&resource));
         }
-        audit::append_on(&mut conn, allowed).await?;
+        self.stage_decision(caller, START_RUN, &resource, AuditOutcome::Allowed);
         let digest = serde_json::to_vec(request)
             .map(|body| Sha256::digest(body).to_vec())
             .map_err(registry_db_error)?;
@@ -349,7 +326,7 @@ impl<'a> VerificationControl<'a> {
             .await
             .map_err(registry_db_error)?;
         conn.commit().await.map_err(registry_db_error)?;
-        Ok(match outcome {
+        match outcome {
             ManualEnqueueOutcome::Enqueued(run_id) | ManualEnqueueOutcome::Replayed(run_id) => {
                 Ok(run_id)
             }
@@ -359,7 +336,7 @@ impl<'a> VerificationControl<'a> {
                 details: serde_json::json!({ "header": "Idempotency-Key" }),
             }),
             ManualEnqueueOutcome::Refused(refusal) => Err(refusal_error(refusal, &request.target)),
-        })
+        }
     }
 
     /// Execute one exact Verifier over supplied input and return its judgment.
@@ -409,7 +386,7 @@ impl<'a> VerificationControl<'a> {
             .check(&caller.principal, &Permission::eval_run())
             .into_result()
         {
-            self.stage_execute_decision(caller, &resource, AuditOutcome::Denied);
+            self.stage_decision(caller, EXECUTE, &resource, AuditOutcome::Denied);
             return Err(permission_deny_reason_to_wyrd(reason));
         }
         let telemetry = ExecutionTelemetry::start(ExecutionMode::Direct);
@@ -498,10 +475,10 @@ impl<'a> VerificationControl<'a> {
             && caller.principal.card_ref().is_some()
             && !caller.principal.authorizes_card(&exact_ref(subject))
         {
-            self.stage_execute_decision(caller, resource, AuditOutcome::Denied);
+            self.stage_decision(caller, EXECUTE, resource, AuditOutcome::Denied);
             return Err(Self::scope_denied(resource));
         }
-        self.stage_execute_decision(caller, resource, AuditOutcome::Allowed);
+        self.stage_decision(caller, EXECUTE, resource, AuditOutcome::Allowed);
         match (verifier, subject) {
             (Some(verifier), Some(subject)) if available(&verifier) && available(&subject) => {
                 let reference = exact_ref(&verifier);
@@ -518,17 +495,23 @@ impl<'a> VerificationControl<'a> {
         }
     }
 
-    /// Stage one direct execution decision on the process audit outbox
-    /// without waiting for its commit.
+    /// Stage one `evals:run` decision for `operation` on the process audit
+    /// outbox without waiting for its commit.
     ///
     /// A decision the outbox cannot commit is logged and counted by the
-    /// writer, never returned: audit does not block execution.
-    fn stage_execute_decision(&self, caller: &Caller, resource: &str, outcome: AuditOutcome) {
+    /// writer, never returned: audit does not block a run start or execution.
+    fn stage_decision(
+        &self,
+        caller: &Caller,
+        operation: &str,
+        resource: &str,
+        outcome: AuditOutcome,
+    ) {
         self.state.audit_outbox.stage(
             caller.data_tenant_id,
             audit::audit_event(
                 caller,
-                EXECUTE,
+                operation,
                 resource,
                 &Permission::eval_run().to_string(),
                 outcome,
@@ -542,37 +525,6 @@ impl<'a> VerificationControl<'a> {
             message: "the caller's Card scope does not cover the verified subject".to_owned(),
             details: serde_json::json!({ "resource": resource }),
         }
-    }
-
-    /// Record a Card-scope denial standalone and return the refusal.
-    ///
-    /// The caller's dropped transaction holds no decision, so the denial
-    /// commits alone; a failed denial append can therefore never fall back to
-    /// recording the allowed decision.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::AuditUnavailable`] when the denial cannot be
-    /// recorded, otherwise [`WyrdError::PermissionDeniedRbac`].
-    async fn deny_scope<T>(
-        &self,
-        caller: &Caller,
-        operation: &str,
-        resource: &str,
-    ) -> Result<T, WyrdError> {
-        let denied = audit::audit_event(
-            caller,
-            operation,
-            resource,
-            &Permission::eval_run().to_string(),
-            AuditOutcome::Denied,
-        );
-        audit::record_audit(
-            self.state.postgres.vala_pool(),
-            caller.data_tenant_id,
-            &denied,
-        )
-        .await?;
-        Err(Self::scope_denied(resource))
     }
 
     /// Read one Card of the caller's tenant, or `None` when it is absent.

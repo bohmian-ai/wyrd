@@ -679,20 +679,16 @@ impl<'a> GatewayAdministration<'a> {
         })
     }
 
-    /// Authorizes one operation and runs it with its allowed decision audited
-    /// exactly once.
+    /// Authorizes one operation, stages its decision, and runs it.
     ///
-    /// A denial is recorded standalone and refused before any work starts.
-    /// Otherwise the allowed decision is appended to a fresh tenant
-    /// transaction handed to `work`, which MUST commit that transaction as its
-    /// final fallible step. When `work` (or opening the transaction) fails,
-    /// nothing committed, so the same decision is recorded standalone before
-    /// the original error is returned.
+    /// The decision is staged on the process audit outbox exactly once, before
+    /// any work starts; a denial is refused there. Otherwise a fresh tenant
+    /// transaction is handed to `work`, which MUST commit it as its final
+    /// fallible step.
     ///
     /// # Errors
-    /// Returns the mapped permission denial, `work`'s own error, and
-    /// `AuditUnavailable` — replacing any other error — when the decision
-    /// cannot be recorded on either path.
+    /// Returns the mapped permission denial, an unavailable store, or `work`'s
+    /// own error.
     async fn audited<T, Fut>(
         &self,
         caller: &Caller,
@@ -704,23 +700,13 @@ impl<'a> GatewayAdministration<'a> {
     where
         Fut: Future<Output = Result<T, WyrdError>>,
     {
-        let allowed =
-            audit::authorize_recording_denial(self.state, caller, required, operation, resource)
-                .await?;
-        let result = async {
-            let mut conn = self
-                .postgres
-                .tenant_conn(caller.data_tenant_id)
-                .await
-                .map_err(unavailable)?;
-            audit::append_on(&mut conn, &allowed).await?;
-            work(conn).await
-        }
-        .await;
-        if result.is_err() {
-            audit::record_audit(self.postgres.vala_pool(), caller.data_tenant_id, &allowed).await?;
-        }
-        result
+        audit::authorize(self.state, caller, required, operation, resource)?;
+        let conn = self
+            .postgres
+            .tenant_conn(caller.data_tenant_id)
+            .await
+            .map_err(unavailable)?;
+        work(conn).await
     }
 
     /// Checks that a credential source lies within an operator assignment for

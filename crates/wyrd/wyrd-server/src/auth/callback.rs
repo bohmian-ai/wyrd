@@ -54,7 +54,10 @@ pub async fn exchange_authorization_code(
 ) -> Result<TokenResponse, WyrdErrorResponse> {
     let tenant_id = resolve_callback_tenant(state, headers).await?;
     let service = wyrd_auth::callback::AuthorizationCodeExchange {
-        issuer: state.auth.tenant_issuer().ok_or_else(auth_not_configured)?,
+        issuer: state
+            .auth
+            .tenant_issuer(&state.audit_outbox)
+            .ok_or_else(auth_not_configured)?,
         verifier: state
             .auth
             .external_verifier
@@ -267,7 +270,7 @@ mod pg_tests {
         .expect_err("missing state fails");
 
         assert_eq!(error.0.code(), "WYRD_AUTH_400_INVALID_STATE");
-        let audit = audit_rows(&fixture).await;
+        let audit = audit_rows(&fixture, &state).await;
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].0, Uuid::nil());
         assert_eq!(audit[0].1, "denied");
@@ -308,7 +311,7 @@ mod pg_tests {
         .expect_err("stored issuer rejects");
 
         assert_eq!(error.0.code(), "WYRD_AUTH_401_INVALID_TOKEN");
-        let audit = audit_rows(&fixture).await;
+        let audit = audit_rows(&fixture, &state).await;
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].0, Uuid::nil());
         assert_eq!(audit[0].1, "denied");
@@ -362,7 +365,7 @@ mod pg_tests {
         );
         assert_ne!(audit_principal_id, Uuid::nil());
         assert_eq!(refresh_token_count(&fixture, audit_principal_id).await, 1);
-        let audit = audit_rows(&fixture).await;
+        let audit = audit_rows(&fixture, &state).await;
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].0, audit_principal_id);
         assert_eq!(audit[0].1, "allowed");
@@ -409,7 +412,7 @@ mod pg_tests {
         .expect_err("wrong audience rejects");
 
         assert_eq!(error.0.code(), "WYRD_AUTH_401_INVALID_TOKEN");
-        let audit = audit_rows(&fixture).await;
+        let audit = audit_rows(&fixture, &state).await;
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].0, Uuid::nil());
         assert_eq!(audit[0].1, "denied");
@@ -558,13 +561,12 @@ mod pg_tests {
             .map_err(WyrdErrorResponse::from);
         if let Err(error) = &result {
             audit_authorization_code_failure(
-                state.postgres.wyrd(),
+                &state.audit_outbox,
                 tenant_id,
                 audit_principal_id,
                 request_id,
                 &error.0,
-            )
-            .await;
+            );
         }
         result
     }
@@ -594,7 +596,7 @@ mod pg_tests {
         AuthorizationCodeExchange {
             issuer: state
                 .auth
-                .tenant_issuer()
+                .tenant_issuer(&state.audit_outbox)
                 .expect("test state has issuing key"),
             verifier: state
                 .auth
@@ -748,11 +750,21 @@ mod pg_tests {
     }
 
     /// Staged `auth.token.exchange` events as `(principal_id, outcome, detail)`,
-    /// oldest first.
+    /// oldest first, read after `state`'s audit outbox settles.
     ///
     /// # Panics
-    /// Panics when the query fails or a detail is not JSON.
-    async fn audit_rows(fixture: &PgFixture) -> Vec<(Uuid, String, serde_json::Value)> {
+    /// Panics when the outbox does not settle, the query fails, or a detail is
+    /// not JSON.
+    async fn audit_rows(
+        fixture: &PgFixture,
+        state: &AppState,
+    ) -> Vec<(Uuid, String, serde_json::Value)> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert_eq!(
+            state.audit_outbox.settle(deadline).await,
+            0,
+            "audit settles"
+        );
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
             "SELECT principal_id, outcome, detail

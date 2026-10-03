@@ -15,6 +15,7 @@ use axum::Json;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use secrecy::{ExposeSecret, SecretString};
+use std::sync::Arc;
 use wyrd_auth::platform_sessions::{
     DEFAULT_PLATFORM_TOKEN_TTL_MINUTES, PlatformSessionError, PlatformSessions,
 };
@@ -103,7 +104,7 @@ async fn platform_token(
         return Err(not_configured());
     };
 
-    let sessions = PlatformSessions::new(operator, issuing_key);
+    let sessions = PlatformSessions::new(operator, issuing_key, Arc::clone(&state.audit_outbox));
     let presented = SecretString::from(request.credential.expose().to_owned());
     match sessions.exchange(&presented, req_id).await {
         Ok(session) => Ok(Json(PlatformTokenResponse {
@@ -155,7 +156,7 @@ async fn recover_tenant_admin(
     let Some(operator) = state.postgres.operator_pool() else {
         return Err(not_configured());
     };
-    let recovery = TenantRecovery::new(operator);
+    let recovery = TenantRecovery::new(operator, Arc::clone(&state.audit_outbox));
     let conn = state
         .postgres
         .tenant_conn(request.tenant_id)
@@ -206,7 +207,7 @@ async fn create_tenant(
     let Some(operator) = state.postgres.operator_pool() else {
         return Err(not_configured());
     };
-    let provisioning = TenantProvisioning::new(operator);
+    let provisioning = TenantProvisioning::new(operator, Arc::clone(&state.audit_outbox));
 
     // Two phases because the tenant id is only settled by the directory claim:
     // a resumed attempt adopts the failed attempt's id. The connection is
@@ -245,7 +246,7 @@ fn provision_error(error: ProvisionError) -> WyrdErrorResponse {
             message: "no active tenant to act on".to_owned(),
             details: serde_json::json!({ "resource": "tenant" }),
         }),
-        ProvisionError::AuditUnavailable(reason) | ProvisionError::Store(reason) => {
+        ProvisionError::Store(reason) => {
             WyrdErrorResponse::from(internal_failure("tenant provisioning failed", &reason))
         }
     }
@@ -378,6 +379,6 @@ fn directory(state: &AppState) -> Result<TenantProvisioning, WyrdErrorResponse> 
     state
         .postgres
         .operator_pool()
-        .map(TenantProvisioning::new)
+        .map(|operator| TenantProvisioning::new(operator, Arc::clone(&state.audit_outbox)))
         .ok_or_else(not_configured)
 }

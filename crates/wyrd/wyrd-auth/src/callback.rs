@@ -6,6 +6,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
+use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_auth_oidc::{ClientAuth, OidcProvider, ScreenedHttp, TrustedIssuer};
 use wyrd_auth_verify::ExternalVerifier;
 use wyrd_runtime::{PrincipalId, RoleRef};
@@ -19,9 +20,7 @@ use wyrd_sql::queries::auth::{
 };
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
 
-use crate::audit::{
-    TOKEN_EXCHANGE_OPERATION, auth_event, auth_failure_code, record_auth_audit_best_effort,
-};
+use crate::audit::{TOKEN_EXCHANGE_OPERATION, auth_event, auth_failure_code};
 use crate::error::{auth_error_to_wyrd, screen_error};
 use crate::exchange_api_key::role_refs;
 use crate::issuance::TenantTokenIssuer;
@@ -127,13 +126,12 @@ impl AuthorizationCodeExchange {
             Ok(token) => Ok(token),
             Err(error) => {
                 audit_authorization_code_failure(
-                    postgres,
+                    self.issuer.audit(),
                     tenant_id,
                     audit_principal_id,
                     request_id,
                     &error,
-                )
-                .await;
+                );
                 Err(error)
             }
         }
@@ -366,14 +364,14 @@ pub async fn ensure_user_identity(
     Ok(canonical)
 }
 
-/// Best-effort audit of a refused human authorization-code exchange.
+/// Stage the audit of a refused human authorization-code exchange.
 ///
 /// Stages one denied `auth.token.exchange` event carrying the closed failure
-/// code in its own transaction. `principal_id` is nil when the refusal happened
-/// before a user was resolved. Staging failures are logged, never returned, so
-/// the caller's original error still reaches the client.
-pub async fn audit_authorization_code_failure(
-    postgres: &WyrdPostgres,
+/// code on the process outbox. `principal_id` is nil when the refusal happened
+/// before a user was resolved. Staging never waits and never fails, so the
+/// caller's original error still reaches the client.
+pub fn audit_authorization_code_failure(
+    audit: &AuditOutbox,
     tenant_id: DataTenantId,
     principal_id: Uuid,
     request_id: &str,
@@ -390,7 +388,7 @@ pub async fn audit_authorization_code_failure(
             error_code: auth_failure_code(error),
         },
     );
-    record_auth_audit_best_effort(postgres.app_pool(), tenant_id, &event).await;
+    audit.stage(tenant_id, event);
 }
 
 /// Verify the OIDC nonce bound to the login state.

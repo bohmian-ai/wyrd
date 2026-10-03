@@ -29,7 +29,7 @@ use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verification::{InactivityTimeout, binding_activity};
 use wyrd_sql::queries::verifier_runs::{ScheduleOutcome, ScheduleSkip, VerifierRunQueue};
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
-use wyrd_testing::{Bootstrap, WyrdTestServer};
+use wyrd_testing::{AuditCommitFailures, Bootstrap, WyrdTestServer};
 
 /// Seed a dependency row directly so the journey can exercise non-Active states.
 ///
@@ -533,6 +533,10 @@ async fn registration_replays_through_public_authenticated_route() {
         replay_body["outcomes"][0]["card_ref"]["uid"],
         first_body["outcomes"][0]["card_ref"]["uid"]
     );
+    server
+        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await
+        .expect("audit outbox settles");
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
         .await
@@ -1715,6 +1719,10 @@ async fn composite_registration_returns_leaf_first_outcomes_and_root() {
     let prompt_uid: CardUid =
         serde_json::from_value(body["outcomes"][0]["card_ref"]["uid"].clone())
             .expect("prompt outcome contains a UID");
+    server
+        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await
+        .expect("audit outbox settles");
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
         .await
@@ -2077,9 +2085,19 @@ async fn card_reconciler_dead_letters_after_three_failures() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Completion refuses and leaves the card Pending when its decision audit fails.
+/// Completion activates the Card even when its decision audit cannot commit.
+///
+/// The decision is staged on the non-blocking audit outbox, so a staging
+/// insert refused for `card.registration.complete` costs the request nothing:
+/// the Card becomes active, no completion row is staged, and the lost decision
+/// is counted under the `card` surface.
+///
+/// # Panics
+/// Panics when the server cannot start, the completion is refused, the Card is
+/// not active, a completion row is staged, or the failure is not counted.
 #[tokio::test(flavor = "current_thread")]
-async fn completion_audit_failure_keeps_card_pending() {
+async fn completion_succeeds_when_its_decision_audit_fails() {
+    let failures = AuditCommitFailures::install().expect("metrics recorder installs");
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -2156,8 +2174,15 @@ async fn completion_audit_failure_keeps_card_pending() {
         .expect("completion responds");
     let completion_status = completion.status();
     let completion_body = response_json(completion).await;
-    assert_eq!(completion_status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(completion_body["code"], "WYRD_VALA_500_AUDIT_UNAVAILABLE");
+    assert_eq!(completion_status, StatusCode::OK, "{completion_body}");
+    assert_eq!(completion_body["outcomes"][0]["status"], "active");
+    assert_eq!(
+        server
+            .wait_oracle_audit_staged(Duration::from_secs(30))
+            .await
+            .expect("audit outbox settles"),
+        0
+    );
 
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
@@ -2169,8 +2194,8 @@ async fn completion_audit_failure_keeps_card_pending() {
             .fetch_one(&mut **conn.transaction())
             .await
             .expect("card state reads");
-    assert_eq!(card_state.0, "pending");
-    assert!(card_state.1.is_none());
+    assert_eq!(card_state.0, "active");
+    assert!(card_state.1.is_some());
     let complete_audits: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM vala.audit_staging WHERE operation = 'card.registration.complete'",
     )
@@ -2179,13 +2204,19 @@ async fn completion_audit_failure_keeps_card_pending() {
     .expect("completion audit count reads");
     assert_eq!(complete_audits, 0);
     conn.commit().await.expect("assertion transaction commits");
+    assert!(failures.count("card") >= 1, "the lost decision is counted");
 
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Delete refuses and keeps the card Active when its decision audit fails.
+/// Delete removes the Card even when its decision audit cannot commit.
+///
+/// # Panics
+/// Panics when the server cannot start, the delete is refused, the Card is not
+/// deleted, a delete row is staged, or the failure is not counted.
 #[tokio::test(flavor = "current_thread")]
-async fn delete_audit_failure_keeps_card_active() {
+async fn delete_succeeds_when_its_decision_audit_fails() {
+    let failures = AuditCommitFailures::install().expect("metrics recorder installs");
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -2240,10 +2271,18 @@ async fn delete_audit_failure_keeps_card_active() {
         .oneshot_authenticated(&jwt, request)
         .await
         .expect("delete responds");
-    let status = response.status();
-    let body = response_json(response).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(body["code"], "WYRD_VALA_500_AUDIT_UNAVAILABLE");
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response_json(response).await
+    );
+    assert_eq!(
+        server
+            .wait_oracle_audit_staged(Duration::from_secs(30))
+            .await
+            .expect("audit outbox settles"),
+        0
+    );
 
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
@@ -2263,9 +2302,10 @@ async fn delete_audit_failure_keeps_card_active() {
     .fetch_one(&mut **conn.transaction())
     .await
     .expect("delete audit count reads");
-    assert_eq!(card_status, "active");
+    assert_eq!(card_status, "deleted");
     assert_eq!(delete_audits, 0);
     conn.commit().await.expect("assertion transaction commits");
+    assert!(failures.count("card") >= 1, "the lost decision is counted");
     server.shutdown().await.expect("test server shuts down");
 }
 
@@ -2301,6 +2341,10 @@ async fn delete_by_ref_not_found_records_one_decision() {
         .expect("delete responds");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
+    server
+        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await
+        .expect("audit outbox settles");
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
         .await
@@ -2459,13 +2503,14 @@ async fn blob_storage_failure_leaves_durable_failure_state() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Refuse the whole composite when the registration decision audit fails.
+/// Register the whole composite even when its decision audit cannot commit.
 ///
 /// # Panics
-/// Panics when the server cannot start, the registration is not refused, or a
-/// Card row survives the failed decision audit.
+/// Panics when the server cannot start, the registration is refused, any Card
+/// of the composite is missing, or the failure is not counted.
 #[tokio::test(flavor = "current_thread")]
-async fn registration_refuses_when_its_decision_audit_fails() {
+async fn registration_succeeds_when_its_decision_audit_fails() {
+    let failures = AuditCommitFailures::install().expect("metrics recorder installs");
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -2510,8 +2555,14 @@ async fn registration_refuses_when_its_decision_audit_fails() {
         .expect("registration responds");
     let status = response.status();
     let body = response_json(response).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-    assert_eq!(body["code"], "WYRD_VALA_500_AUDIT_UNAVAILABLE");
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        server
+            .wait_oracle_audit_staged(Duration::from_secs(30))
+            .await
+            .expect("audit outbox settles"),
+        0
+    );
 
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
@@ -2531,9 +2582,10 @@ async fn registration_refuses_when_its_decision_audit_fails() {
     .fetch_one(&mut **conn.transaction())
     .await
     .expect("card count reads");
-    assert_eq!(operation_count, 0);
-    assert_eq!(card_count, 0);
+    assert_eq!(operation_count, 1);
+    assert_eq!(card_count, 3);
     conn.commit().await.expect("assertion transaction commits");
+    assert!(failures.count("card") >= 1, "the lost decision is counted");
 
     server.shutdown().await.expect("test server shuts down");
 }
@@ -3395,6 +3447,10 @@ async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
 /// # Panics
 /// Panics when the tenant connection or the read fails.
 async fn registration_audits(server: &WyrdTestServer, principal: Uuid) -> Vec<(String, String)> {
+    server
+        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await
+        .expect("audit outbox settles");
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
         .await
@@ -4008,7 +4064,7 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
     server
         .state()
         .auth
-        .tenant_issuer()
+        .tenant_issuer(&server.state().audit_outbox)
         .expect("test state has a tenant issuer")
         .issue_system_token(&mut conn, &verifier)
         .await

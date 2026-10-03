@@ -206,6 +206,10 @@ impl Harness {
     /// # Panics
     /// Panics when the staging read fails.
     async fn writes(&self) -> Vec<(String, String, String)> {
+        self.server
+            .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+            .await
+            .expect("audit outbox settles");
         sqlx::query_as(
             "SELECT principal_kind, resource, outcome FROM vala.audit_staging \
              WHERE data_tenant_id = $1 AND operation = 'bifrost.record.write' AND seq > $2 \
@@ -223,6 +227,10 @@ impl Harness {
     /// # Panics
     /// Panics when the staging read fails.
     async fn audit_operations(&self) -> Vec<String> {
+        self.server
+            .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+            .await
+            .expect("audit outbox settles");
         sqlx::query_scalar(
             "SELECT operation FROM vala.audit_staging \
              WHERE data_tenant_id = $1 AND seq > $2 ORDER BY seq",
@@ -454,6 +462,10 @@ impl Harness {
     /// # Panics
     /// Panics when the staging read fails.
     async fn max_audit_seq(&self) -> i64 {
+        self.server
+            .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+            .await
+            .expect("audit outbox settles");
         sqlx::query_scalar(
             "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_staging WHERE data_tenant_id = $1",
         )

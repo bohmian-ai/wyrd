@@ -214,8 +214,6 @@ struct WyrdTestServerInner {
     node_id: NodeId,
     /// Atomic one-shot query truncation controls for language journeys.
     query_stream_fault: QueryStreamFaultController,
-    /// Atomic lifecycle-audit fault controls for causal query tests.
-    query_control_audit_fault: wyrd_server::state::QueryControlAuditFaultController,
     /// Every notification-backed schema stall armed, newest last.
     ///
     /// Retained so a journey holding several stalled queries can still resolve
@@ -269,6 +267,47 @@ pub struct BifrostQueryResourceSnapshot {
     pub peer_slots: u64,
 }
 
+/// Reads the process audit outbox's commit-failure counter.
+///
+/// Every audited surface stages its decision on one non-blocking outbox, and a
+/// decision that cannot commit is counted in
+/// `audit_outbox_commit_failures_total{surface}` rather than refusing the
+/// request. A journey proving that installs the server's process-global
+/// Prometheus recorder through this owner and reads the counter after settling
+/// the outbox. Installation succeeds once per process, which matches the
+/// one-process-per-test lanes that run these journeys.
+#[derive(Debug, Clone)]
+pub struct AuditCommitFailures {
+    /// Render handle of the installed process-global recorder.
+    handle: metrics_exporter_prometheus::PrometheusHandle,
+}
+
+impl AuditCommitFailures {
+    /// Installs the server's process-global metrics recorder.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Audit`] when a recorder is already
+    /// installed in this process or bucket setup fails.
+    pub fn install() -> Result<Self, WyrdTestServerError> {
+        wyrd_server::app::metrics::install_recorder()
+            .map(|handle| Self { handle })
+            .map_err(|error| WyrdTestServerError::Audit(error.to_string()))
+    }
+
+    /// Returns the lost-decision count for one audited `surface`, the first
+    /// segment of the decision's operation; a series never recorded reads zero.
+    #[must_use]
+    pub fn count(&self, surface: &str) -> u64 {
+        let series = format!("audit_outbox_commit_failures_total{{surface=\"{surface}\"}} ");
+        self.handle
+            .render()
+            .lines()
+            .find_map(|line| line.strip_prefix(series.as_str()))
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .map_or(0, |value| value as u64)
+    }
+}
+
 /// Production-owner Oracle residual state captured without a test adapter.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OracleRuntimeInspection {
@@ -282,7 +321,7 @@ pub struct OracleRuntimeInspection {
     pub peer_running: u64,
     /// Analytical graph grants a leader's admit stream still holds open.
     pub held_grants: u64,
-    /// Oracle audit outbox commits still in flight.
+    /// Process audit outbox commits still in flight.
     pub audit_pending: u64,
     /// Active Oracle-owned process/query scratch directories.
     pub spill_directories: u64,
@@ -1202,30 +1241,6 @@ impl WyrdTestServer {
             .set_next(QueryStreamFault::EofAfterBatch);
     }
 
-    /// Fails cancellation audit gates before owner dispatch until restored.
-    pub fn fail_query_cancel_attempt_audit(&self) {
-        self.inner.query_control_audit_fault.fail_cancel_attempts();
-    }
-
-    /// Restores cancellation audit gates after a deterministic fault.
-    pub fn restore_query_cancel_attempt_audit(&self) {
-        self.inner
-            .query_control_audit_fault
-            .restore_cancel_attempts();
-    }
-
-    /// Fails the authoritative object-denial audit append until restored.
-    pub fn fail_query_object_denial_audit(&self) {
-        self.inner.query_control_audit_fault.fail_object_denials();
-    }
-
-    /// Restores the authoritative object-denial audit append.
-    pub fn restore_query_object_denial_audit(&self) {
-        self.inner
-            .query_control_audit_fault
-            .restore_object_denials();
-    }
-
     /// Stall the next query after its schema frame using test-tier notifications.
     pub fn stall_next_query_after_schema(&self) {
         let stall = self.inner.query_stream_fault.stall_next_after_schema();
@@ -1358,7 +1373,8 @@ impl WyrdTestServer {
             self.inner.state.bifrost_query().ok_or_else(|| {
                 WyrdTestServerError::Start("Oracle runtime is not hosted".to_owned())
             })?;
-        let (admission, audit_pending) = runtime.oracle_runtime_inspection();
+        let admission = runtime.oracle_runtime_inspection();
+        let audit_pending = self.inner.state.audit_outbox.pending();
         let (spill_directories, spill_files, spill_file_bytes) = self.inspect_oracle_spill()?;
         Ok(OracleRuntimeInspection {
             active_queries: admission.active_queries,
@@ -1603,28 +1619,29 @@ impl WyrdTestServer {
             .collect()
     }
 
-    /// Wait until no Oracle audit outbox commit is still in flight.
+    /// Wait until no audit outbox commit is still in flight.
     ///
-    /// Oracle stages each read decision in `vala.audit_staging` from a
-    /// background task, so a journey that asserts on staging first waits for
-    /// those commits. The returned count is the real residual; a nonzero
-    /// return within `budget` means commits did not finish.
+    /// Every surface stages its decisions in `vala.audit_staging` through the
+    /// process audit outbox's background writer, so a journey that asserts on
+    /// staging first waits for those commits without closing the outbox. The
+    /// returned count is the real residual; a nonzero return within `budget`
+    /// means commits did not finish.
     ///
     /// # Errors
     ///
-    /// Returns a start error when this server does not host an Oracle role.
+    /// This wait itself cannot fail; the `Result` keeps the projected Python
+    /// and TypeScript harness signatures unchanged.
     pub async fn wait_oracle_audit_staged(
         &self,
         budget: std::time::Duration,
     ) -> Result<u64, WyrdTestServerError> {
-        let deadline = std::time::Instant::now() + budget;
-        loop {
-            let pending = self.oracle_runtime_inspection()?.audit_pending;
-            if pending == 0 || std::time::Instant::now() >= deadline {
-                return Ok(pending);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
+        let residual = self
+            .inner
+            .state
+            .audit_outbox
+            .settle(std::time::Instant::now() + budget)
+            .await;
+        Ok(residual as u64)
     }
 
     /// Counts retained audit rows matching one predicate, through the read path.
@@ -1865,9 +1882,9 @@ impl WyrdTestServer {
     ///
     /// This is synchronization, never an assertion source: it settles the
     /// server-owned publisher so a following retained-history read sees every
-    /// decision committed so far. Oracle's read-decision commits are tracked
-    /// tasks that land in staging slightly after the query returns, so those
-    /// are drained first; the chain head then reports the publisher's own
+    /// decision committed so far. Every decision lands in staging through the
+    /// audit outbox slightly after its request returns, so the outbox is
+    /// settled first; the chain head then reports the publisher's own
     /// progress as its `published_seq` catching up to the chain head's `last_seq`. A tenant with no
     /// chain-head row has appended nothing and owes nothing.
     ///
@@ -1878,14 +1895,12 @@ impl WyrdTestServer {
         &self,
         tenant: DataTenantId,
     ) -> Result<(), WyrdTestServerError> {
-        if self.oracle_runtime_inspection().is_ok() {
-            let pending = self.wait_oracle_audit_staged(RETAINED_AUDIT_BUDGET).await?;
-            if pending != 0 {
-                return Err(WyrdTestServerError::Audit(format!(
-                    "read-audit commits did not finish: {pending} pending after \
-                     {RETAINED_AUDIT_BUDGET:?}"
-                )));
-            }
+        let pending = self.wait_oracle_audit_staged(RETAINED_AUDIT_BUDGET).await?;
+        if pending != 0 {
+            return Err(WyrdTestServerError::Audit(format!(
+                "audit outbox commits did not finish: {pending} pending after \
+                 {RETAINED_AUDIT_BUDGET:?}"
+            )));
         }
         let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
         let deadline = std::time::Instant::now() + RETAINED_AUDIT_BUDGET;
@@ -1966,12 +1981,14 @@ impl WyrdTestServer {
     /// describe it serves, so this is the server-observed describe count a
     /// journey uses to prove a writer reused its cached schema. Start the
     /// server without audit publication: the publisher retires staged rows,
-    /// which would shrink the count mid-test.
+    /// which would shrink the count mid-test. The count first waits for the
+    /// audit outbox to commit every decision already staged.
     ///
     /// # Errors
     /// Returns an error when the fixture's superuser pool cannot be acquired
     /// or the audit query fails.
     pub async fn table_describe_count(&self, fqn: &str) -> Result<i64, WyrdTestServerError> {
+        self.wait_oracle_audit_staged(RETAINED_AUDIT_BUDGET).await?;
         let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM vala.audit_staging WHERE data_tenant_id = $1 \
@@ -2008,67 +2025,6 @@ impl WyrdTestServer {
         .fetch_one(&pool)
         .await
         .map_err(sql)
-    }
-
-    /// Make every fixture-tenant describe of `fqn` fail until restored.
-    ///
-    /// Installs a Postgres trigger that refuses the describe's audit append, so
-    /// the real server fails closed with `WYRD_VALA_500_AUDIT_UNAVAILABLE` for that
-    /// one table while every other describe proceeds. This lets a journey drive
-    /// the startup refusal of either fixed observation table independently.
-    /// Installing again replaces the previous fault; undo it with
-    /// [`Self::restore_table_describe`].
-    ///
-    /// # Errors
-    /// Returns [`WyrdTestServerError::Unsupported`] when `fqn` is not a plain
-    /// dotted identifier, and an SQL error when the trigger cannot be installed.
-    pub async fn fail_table_describe(&self, fqn: &str) -> Result<(), WyrdTestServerError> {
-        // Trigger arguments are literals, so the FQN is interpolated only after
-        // proving it cannot close the quote.
-        if fqn.is_empty()
-            || !fqn
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.')
-        {
-            return Err(WyrdTestServerError::Unsupported(format!(
-                "describe fault needs a plain table FQN, got {fqn:?}"
-            )));
-        }
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
-        for statement in [
-            "CREATE OR REPLACE FUNCTION vala.wyrd_test_fail_describe() RETURNS trigger \
-             LANGUAGE plpgsql AS $$ BEGIN \
-             IF NEW.operation = 'vala.bifrost.describe' AND NEW.resource = TG_ARGV[0] \
-             AND NEW.data_tenant_id = TG_ARGV[1]::uuid THEN \
-             RAISE EXCEPTION 'test fault: describe of % refused', NEW.resource; \
-             END IF; RETURN NEW; END $$"
-                .to_owned(),
-            "DROP TRIGGER IF EXISTS wyrd_test_fail_describe ON vala.audit_staging".to_owned(),
-            format!(
-                "CREATE TRIGGER wyrd_test_fail_describe BEFORE INSERT ON vala.audit_staging \
-                 FOR EACH ROW EXECUTE FUNCTION vala.wyrd_test_fail_describe('{fqn}', '{}')",
-                self.data_tenant_id().as_uuid()
-            ),
-        ] {
-            sqlx::query(sqlx::AssertSqlSafe(statement))
-                .execute(&pool)
-                .await
-                .map_err(sql)?;
-        }
-        Ok(())
-    }
-
-    /// Remove the fault [`Self::fail_table_describe`] installed, if any.
-    ///
-    /// # Errors
-    /// Returns an SQL error when the trigger cannot be dropped.
-    pub async fn restore_table_describe(&self) -> Result<(), WyrdTestServerError> {
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
-        sqlx::query("DROP TRIGGER IF EXISTS wyrd_test_fail_describe ON vala.audit_staging")
-            .execute(&pool)
-            .await
-            .map_err(sql)?;
-        Ok(())
     }
 
     /// Rewrite the registered schema fingerprint of the fixture tenant's table
@@ -2703,6 +2659,7 @@ impl WyrdTestServer {
         wyrd_auth::platform_sessions::PlatformSessions::new(
             self.operator_pool(),
             std::sync::Arc::clone(&self.inner.issuing_key),
+            std::sync::Arc::clone(&self.inner.state.audit_outbox),
         )
         .issue_federated(
             &issuer,
@@ -2791,7 +2748,7 @@ impl WyrdTestServer {
             .inner
             .state
             .auth
-            .tenant_issuer()
+            .tenant_issuer(&self.inner.state.audit_outbox)
             .ok_or_else(|| WyrdTestServerError::Auth("no issuing key".to_owned()))?;
         let exchanged = issuer
             .issue(
@@ -4524,11 +4481,8 @@ impl WyrdTestServerBuilder {
             tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
         );
         let query_stream_fault = QueryStreamFaultController::default();
-        let query_control_audit_fault =
-            wyrd_server::state::QueryControlAuditFaultController::default();
         let mut state = AppState::new(postgres, storage, bifrost_runtime, shutdown)
             .with_query_stream_fault(query_stream_fault.clone())
-            .with_query_control_audit_fault(query_control_audit_fault.clone())
             .with_auth(wyrd_server::components::auth::ServerAuth {
                 issuing_key: Some(Arc::clone(&issuing_key)),
                 token_verifier: (!self.omit_token_verifier).then(|| Arc::clone(&verifier)),
@@ -4616,7 +4570,6 @@ impl WyrdTestServerBuilder {
                 forge_process_role: self.forge_process_role,
                 node_id,
                 query_stream_fault,
-                query_control_audit_fault,
                 query_stream_stall: std::sync::Mutex::new(Vec::new()),
                 _coordination_runtime: coordination_runtime,
                 _compaction_runtime: compaction_runtime,

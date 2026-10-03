@@ -560,16 +560,19 @@ async fn reads_are_served_while_audit_commits_wait_on_the_chain_head()
     Ok(())
 }
 
-/// Reads the process total of Oracle audit decisions that did not commit.
+/// Reads the process total of outbox audit decisions that did not commit.
 ///
-/// A family the recorder has not yet seen reads as zero.
+/// Sums every `surface` series of the outbox failure counter; a family the
+/// recorder has not yet seen reads as zero.
 fn commit_failures(metrics: &metrics_exporter_prometheus::PrometheusHandle) -> u64 {
     metrics
         .render()
         .lines()
-        .find_map(|line| line.strip_prefix("oracle_audit_commit_failures_total "))
-        .and_then(|value| value.trim().parse::<f64>().ok())
-        .map_or(0, |value| value as u64)
+        .filter(|line| line.starts_with("audit_outbox_commit_failures_total"))
+        .filter_map(|line| line.rsplit_once(' '))
+        .filter_map(|(_, value)| value.trim().parse::<f64>().ok())
+        .map(|value| value as u64)
+        .sum()
 }
 
 /// One stalled tenant does not hold retained history back for another tenant.
@@ -710,12 +713,22 @@ async fn system_owner_security_rejections_retain_once() -> Result<(), ServerJour
     await_drained(&server, system).await?;
     let before = retained_audit_batches(&server, system).await?;
 
-    PostgresPeerSecurityAudit::try_new(&server.state().postgres)
-        .await
-        .map_err(|_| "the booted server carries the exact system sentinel")?
-        .append_unverified_ticket_rejection(BifrostSecurityViolationKind::PeerUnknownKey)
-        .await
-        .map_err(|_| "the system-owner rejection commits to staging")?;
+    PostgresPeerSecurityAudit::try_new(
+        &server.state().postgres,
+        std::sync::Arc::clone(&server.state().audit_outbox),
+    )
+    .await
+    .map_err(|_| "the booted server carries the exact system sentinel")?
+    .append_unverified_ticket_rejection(BifrostSecurityViolationKind::PeerUnknownKey);
+    let unsettled = server
+        .state()
+        .audit_outbox
+        .settle(std::time::Instant::now() + PUBLICATION_BUDGET)
+        .await;
+    assert_eq!(
+        unsettled, 0,
+        "the system-owner rejection commits to staging"
+    );
 
     await_drained(&server, system).await?;
     assert_eq!(
@@ -837,6 +850,171 @@ async fn retained_history_carries_both_credential_shapes() -> Result<(), ServerJ
         1,
         "the credentialed decision names the key it was made with"
     );
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Unwraps a machine bootstrap into its raw API key.
+///
+/// # Errors
+/// Returns an error when the bootstrap is a user principal.
+fn machine_key(bootstrap: wyrd_testing::Bootstrap) -> Result<String, ServerJourneyError> {
+    match bootstrap {
+        wyrd_testing::Bootstrap::Machine { api_key, .. } => {
+            Ok(secrecy::ExposeSecret::expose_secret(&api_key).to_owned())
+        }
+        wyrd_testing::Bootstrap::User { .. } => Err("expected a machine principal".into()),
+    }
+}
+
+/// A Gate write and a run start succeed while every audit commit fails.
+///
+/// Permissions block and audits do not. After setup, a trigger refuses every
+/// insert into `vala.audit_staging`, so each decision the two requests stage
+/// fails to commit. Through the public client, the Gate write still becomes
+/// durable and the manual run still starts; once the outbox settles, both lost
+/// decisions are counted under their surfaces and none reached staging.
+///
+/// # Errors
+/// Returns the server, client, or Postgres failure.
+///
+/// # Panics
+/// Panics when either request is refused, a decision reaches staging, or a
+/// surface's lost decision is not counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn a_gate_write_and_a_run_start_succeed_while_audit_commits_fail()
+-> Result<(), ServerJourneyError> {
+    let failures = wyrd_testing::AuditCommitFailures::install()?;
+    let root = tempfile::tempdir()?;
+    let verifier = root.path().join("verifier.yaml");
+    std::fs::write(
+        &verifier,
+        "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: audit-loss-drift\n  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: drift\n    spec:\n      method: Custom\n      signal:\n        kind: Metric\n        name: score\n      condition:\n        kind: Statistical\n      profile:\n        kind: Custom\n        metric_name: score\n        baseline_value: 1.0\n        alert_threshold: 0.5\n",
+    )?;
+    let service = root.path().join("service.yaml");
+    std::fs::write(
+        &service,
+        "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: audit-loss-service\n  version: 1.0.0\n  space: default\nspec:\n  verified_by:\n    - verifier:\n        kind: Verifier\n        name: audit-loss-drift\n        version: 1.0.0\n        space: default\n      runs_on:\n        kind: schedule\n        cron: \"0 2 * * *\"\n",
+    )?;
+
+    let server = WyrdTestServer::start_bound().await?;
+    let base_url = server
+        .base_url()
+        .ok_or("bound server has a URL")?
+        .to_owned();
+    let grpc_url = server.grpc_url();
+    let client = |credential: &str| {
+        wyrd_client::bifrost::client_from_options(
+            Some(&base_url),
+            Some(credential),
+            grpc_url.as_deref(),
+        )
+    };
+    let admin = client(&machine_key(
+        server
+            .bootstrap_service("audit_loss_admin", &["admin"])
+            .await?,
+    )?)?;
+    let cards = wyrd_client::cards::Cards::with_client(wyrd_client::WyrdClient::clone(&admin));
+    Box::pin(cards.register_from_path(&verifier)).await?;
+    let receipt = Box::pin(cards.register_from_path(&service)).await?;
+    let binding_id = cards
+        .get(wyrd_client::cards::CardSelector::exact(
+            receipt.root.clone(),
+        ))
+        .await?
+        .status
+        .and_then(|status| status.verification)
+        .ok_or("a binding owner serves verification status")?
+        .binding_ids[0];
+    let runner = wyrd_client::Verification::with_client(client(&machine_key(
+        server
+            .credential_registered_service(&receipt.root, &["writer"])
+            .await?,
+    )?)?);
+    let dataset = format!("vala.datasets.audit_loss_{}", uuid::Uuid::now_v7().simple());
+    let table = wyrd_client::bifrost::TableConfig::from_json_schema(
+        &dataset,
+        &serde_json::json!({
+            "type": "object",
+            "properties": { "value": { "type": "integer" } },
+            "required": ["value"],
+        }),
+    )?;
+    let writer = wyrd_client::Bifrost::connect_with_table(&admin, table).await?;
+    writer.register().await?;
+    server
+        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await?;
+
+    let superuser = server.pg_fixture().superuser_pool().await?;
+    sqlx::raw_sql(
+        r"CREATE OR REPLACE FUNCTION vala.test_lose_every_audit()
+           RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN
+             RAISE EXCEPTION 'injected audit commit failure';
+           END;
+           $$;
+         CREATE TRIGGER test_lose_every_audit
+           BEFORE INSERT ON vala.audit_staging
+           FOR EACH ROW EXECUTE FUNCTION vala.test_lose_every_audit();",
+    )
+    .execute(&superuser)
+    .await?;
+    let staged_before: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
+        .fetch_one(&superuser)
+        .await?;
+
+    writer.insert(
+        serde_json::to_vec(&serde_json::json!({ "value": 1 }))?,
+        wyrd_client::bifrost::Correlation::default(),
+    )?;
+    writer.flush().await?;
+    let run_request: wyrd_client::verification::StartVerificationRunRequest =
+        serde_json::from_value(serde_json::json!({
+            "target": { "kind": "binding", "binding_id": binding_id.to_string() },
+            "input": {
+                "kind": "drift_window",
+                "start": "2026-09-17T00:00:00Z",
+                "end": "2026-09-17T01:00:00Z",
+            },
+        }))?;
+    let run_id = runner.start_run(&run_request, None).await?;
+    assert_eq!(
+        runner.get_run(&run_id).await?.run_id,
+        run_id,
+        "the run started"
+    );
+    writer.shutdown().await?;
+    server
+        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await?;
+
+    let staged_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
+        .fetch_one(&superuser)
+        .await?;
+    sqlx::raw_sql("DROP TRIGGER test_lose_every_audit ON vala.audit_staging")
+        .execute(&superuser)
+        .await?;
+    assert_eq!(
+        staged_after, staged_before,
+        "no lost decision reached staging"
+    );
+    assert!(
+        failures.count("bifrost") >= 1,
+        "the Gate write's lost decision is counted"
+    );
+    assert!(
+        failures.count("verification") >= 1,
+        "the run start's lost decision is counted"
+    );
+    server.flush_bifrost().await?;
+    let rows = wyrd_client::Bifrost::query_only(&admin)
+        .sql(&format!("SELECT value FROM {dataset}"))
+        .await?;
+    assert_eq!(rows.num_rows(), 1, "the unaudited Gate write is durable");
 
     server.shutdown().await?;
     Ok(())

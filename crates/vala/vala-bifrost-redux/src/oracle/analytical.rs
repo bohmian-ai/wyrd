@@ -73,7 +73,7 @@ use super::dispatcher::{
     BifrostPeerTls, GraphLeaseRequest, PendingGraphActivation, ReservationRegistry,
 };
 use super::participant_cut::OracleQueryAttemptCut;
-use super::peer::{AuthorizedStage, OracleStageAuthority, PeerSecurityError, StageOperationV1};
+use super::peer::{AuthorizedStage, OracleStageAuthority, StageOperationV1};
 use super::telemetry::{
     AnalyticalAttemptOutcome, AnalyticalStageOperation, record_stage_operation,
 };
@@ -1698,10 +1698,7 @@ impl AnalyticalStageIngress {
                     error = %error,
                     "Oracle analytical stage authority refused a stage message"
                 );
-                match error {
-                    PeerSecurityError::AuditUnavailable => BifrostError::QueryAuditUnavailable,
-                    _ => BifrostError::QueryPeerSecurity,
-                }
+                BifrostError::QueryPeerSecurity
             })?;
         let key = attempt_key(&authorized)?;
         let request = graph_lease_request(&authorized, key.graph())?;
@@ -3724,11 +3721,11 @@ mod tests {
             binding: &super::super::peer::StageBinding,
             body: &[u8],
             _now: DateTime<Utc>,
-        ) -> Result<AuthorizedStage, PeerSecurityError> {
+        ) -> Result<AuthorizedStage, crate::oracle::peer::PeerSecurityError> {
             let claims = <super::super::peer::StageTicketClaims as prost::Message>::decode(
                 context.claims_bytes.as_slice(),
             )
-            .map_err(|_| PeerSecurityError::Claims)?;
+            .map_err(|_| crate::oracle::peer::PeerSecurityError::Claims)?;
             let digest = super::super::peer::stage_body_digest(body)?;
             claims.verify_binding(binding, &digest)?;
             Ok(AuthorizedStage {

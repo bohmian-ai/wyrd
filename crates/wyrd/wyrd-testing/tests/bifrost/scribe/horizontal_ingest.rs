@@ -359,7 +359,6 @@ async fn register_table(cluster: &WyrdTestCluster, tenant: DataTenantId, name: &
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await
         .expect("the shared catalog registers the table");

@@ -18,7 +18,7 @@ use wyrd_spec::request_id::RequestId;
 
 use crate::auth::callback::exchange_authorization_code;
 use crate::auth::card_scope::{
-    MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_REFRESH, audit_scope_mint_failure_best_effort,
+    MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_REFRESH, stage_scope_mint_failure_audit,
 };
 use crate::auth::credential_verify::verify_presented;
 use crate::auth::exchange_api_key::{
@@ -68,8 +68,8 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
 /// unusable credential — including a reused, revoked, or expired refresh token
 /// and an invalid subject or actor token — a `404` when the actor's principal or
 /// the presented workload assertion matches no principal, and a `503` when the
-/// auth backend or the audit path is unavailable. The grant and its exchange
-/// audit commit together, so a refusal serves no token.
+/// auth backend is unavailable. The exchange decision is staged on the process
+/// audit outbox and never refuses the grant.
 #[utoipa::path(
     post,
     path = "/auth/token",
@@ -138,7 +138,10 @@ async fn token(
                     return Err(WyrdErrorResponse::from(api_key_invalid()));
                 }
             };
-            let issuer = state.auth.tenant_issuer().ok_or_else(auth_not_configured)?;
+            let issuer = state
+                .auth
+                .tenant_issuer(&state.audit_outbox)
+                .ok_or_else(auth_not_configured)?;
             let mut conn = state
                 .postgres
                 .tenant_conn(parsed.tenant_id)
@@ -156,14 +159,13 @@ async fn token(
                 Ok(exchanged) => exchanged,
                 Err(error) => {
                     let wyrd = map_exchange_error_to_wyrd(&mut conn, &prefix, error).await;
-                    audit_scope_mint_failure_best_effort(
-                        state.postgres.app_pool(),
+                    stage_scope_mint_failure_audit(
+                        &state.audit_outbox,
                         parsed.tenant_id,
                         req_id,
                         MINT_KIND_API_KEY_EXCHANGE,
                         &wyrd,
-                    )
-                    .await;
+                    );
                     return Err(WyrdErrorResponse::from(wyrd));
                 }
             };
@@ -177,7 +179,10 @@ async fn token(
             actor_token_type: _,
             audience,
         } => {
-            let issuer = state.auth.tenant_issuer().ok_or_else(auth_not_configured)?;
+            let issuer = state
+                .auth
+                .tenant_issuer(&state.audit_outbox)
+                .ok_or_else(auth_not_configured)?;
             let verifier = state
                 .auth
                 .token_verifier
@@ -191,8 +196,8 @@ async fn token(
                 .tenant_conn(tenant_id)
                 .await
                 .map_err(sql_error)?;
-            // The exchange commits its own authorization decision, so a
-            // refusal after the policy decision is still durably audited.
+            // The exchange stages its own authorization decision, so a
+            // refusal after the policy decision is still audited.
             let exchanged = DelegateToken { issuer, verifier }
                 .execute(
                     conn,
@@ -213,7 +218,10 @@ async fn token(
                 .tenant_conn(tenant_id)
                 .await
                 .map_err(sql_error)?;
-            let issuer = state.auth.tenant_issuer().ok_or_else(auth_not_configured)?;
+            let issuer = state
+                .auth
+                .tenant_issuer(&state.audit_outbox)
+                .ok_or_else(auth_not_configured)?;
             let exchanged = RefreshTokens { issuer }
                 .execute(&mut conn, SecretString::from(secret), req_id)
                 .await;
@@ -232,14 +240,13 @@ async fn token(
                         conn.commit().await.map_err(sql_error)?;
                     }
                     let wyrd = WyrdError::from(error);
-                    audit_scope_mint_failure_best_effort(
-                        state.postgres.app_pool(),
+                    stage_scope_mint_failure_audit(
+                        &state.audit_outbox,
                         tenant_id,
                         req_id,
                         MINT_KIND_REFRESH,
                         &wyrd,
-                    )
-                    .await;
+                    );
                     return Err(WyrdErrorResponse::from(wyrd));
                 }
             };
@@ -380,32 +387,32 @@ async fn issue_key(
         "auth.api_key.issue",
         &format!("card:{}", request.card_ref.name),
     )
-    .await
     .map_err(WyrdErrorResponse::from)?;
 
-    // The allowance rides the same transaction as the key it permits. A
-    // refusal is durable on its own — a denied attempt is evidence whether or
-    // not anything followed it — but an allowance is not: committing it first
-    // would leave a record permitting a key that a later failure never issued.
+    // The decision is staged as soon as it is made; the issued key is
+    // recorded separately once its transaction commits.
+    state
+        .audit_outbox
+        .stage(audited_caller.data_tenant_id, decision);
     let tenant = caller.principal().tenant_id;
     let mut conn = state
         .postgres
         .tenant_conn(tenant)
         .await
         .map_err(sql_error)?;
-    crate::audit::append_on(&mut conn, &decision)
-        .await
-        .map_err(WyrdErrorResponse::from)?;
     let service = IssueApiKey::default();
     let issued = service
         .execute(&mut conn, request, caller.principal())
         .await
         .map_err(|error| WyrdErrorResponse::from(WyrdError::from(error)))?;
-    service
-        .audit(&mut conn, &issued, caller.principal(), req_id)
-        .await
-        .map_err(WyrdErrorResponse::from)?;
     conn.commit().await.map_err(sql_error)?;
+    service.audit(
+        &state.audit_outbox,
+        tenant,
+        &issued,
+        caller.principal(),
+        req_id,
+    );
 
     Ok(Json(issued.response))
 }
@@ -697,13 +704,19 @@ mod pg_tests {
         let expected_request_id = request_id.as_str().to_owned();
 
         let response = issue_key(
-            State(state),
+            State(state.clone()),
             caller,
             Some(Extension(request_id)),
             Json(request),
         )
         .await
         .expect("issue key succeeds");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert_eq!(
+            state.audit_outbox.settle(deadline).await,
+            0,
+            "audit settles"
+        );
 
         assert_eq!(response.0.card_ref, card_ref);
         assert!(!response.0.prefix.is_empty());
@@ -753,15 +766,19 @@ mod pg_tests {
         );
     }
 
-    /// A failure after authorization commits neither the key nor the allowance.
+    /// A failure after authorization records its allowance and no key.
     ///
     /// The caller holds `service_accounts:write`, so the decision is an
     /// allowance — but the named Card binds no principal, so issuance fails
-    /// after it. The allowance rides the issuing transaction, so it rolls back
-    /// with the effect it was permitting: a record saying a key was allowed,
-    /// with no key anywhere, is the mismatch the canonical audit rule forbids.
+    /// after it. The audit row records the authorization decision, not the
+    /// operation's outcome: it is staged on the audit outbox before issuance
+    /// runs, so the allowance survives while no key exists.
+    ///
+    /// # Panics
+    /// Panics when the issue succeeds, the allowance is missing, or a key
+    /// exists.
     #[tokio::test]
-    async fn a_failed_issue_commits_neither_the_key_nor_its_allowance() {
+    async fn a_failed_issue_records_its_allowance_and_no_key() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
 
@@ -781,7 +798,7 @@ mod pg_tests {
             expires_in_seconds: None,
         };
 
-        let error = issue_key(State(state), caller, None, Json(request))
+        let error = issue_key(State(state.clone()), caller, None, Json(request))
             .await
             .expect_err("an unbound card cannot be issued a key");
         assert!(
@@ -790,6 +807,12 @@ mod pg_tests {
             error.0
         );
 
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert_eq!(
+            state.audit_outbox.settle(deadline).await,
+            0,
+            "audit settles"
+        );
         let mut verify_conn = fixture.tenant_conn().await.expect("verify conn opens");
         let staged: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM vala.audit_staging
@@ -801,7 +824,10 @@ mod pg_tests {
         .fetch_one(&mut **verify_conn.transaction())
         .await
         .expect("allowance count reads");
-        assert_eq!(staged, 0, "a failed issue leaves no committed allowance");
+        assert_eq!(
+            staged, 1,
+            "the failed issue records the decision it evaluated"
+        );
 
         let keys: i64 =
             sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_api_keys WHERE data_tenant_id = $1")

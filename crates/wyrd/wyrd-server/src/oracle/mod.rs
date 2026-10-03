@@ -14,7 +14,6 @@ mod lifecycle_transport;
 mod peer_audit;
 mod peer_authority;
 mod peer_service;
-mod query_audit;
 mod tail_discovery;
 
 #[cfg(feature = "test-support")]
@@ -30,7 +29,6 @@ pub use peer_authority::OraclePeerAuthority;
 pub use peer_service::{OraclePeerGrpc, ScribeFragmentExecutor};
 #[cfg(feature = "test-support")]
 pub use peer_service::{ScribeFragmentFault, arm_scribe_fragment_fault_for_test};
-pub use query_audit::OracleQueryAudit;
 pub use tail_discovery::RegistryTailStreamDiscovery;
 #[cfg(feature = "test-support")]
 pub use tail_discovery::{arm_tail_listing_stale_for_test, arm_tail_listing_stall_for_test};

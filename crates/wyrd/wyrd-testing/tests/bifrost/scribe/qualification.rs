@@ -231,7 +231,6 @@ async fn register_payload_table(
             ],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await
         .expect("the catalog registers the payload table");

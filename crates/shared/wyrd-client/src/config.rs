@@ -50,8 +50,11 @@ pub struct ClientConfig {
     /// Optional tenant selector: a tenant route key, the one `wyrd auth login`
     /// takes. It picks one saved user login for this server and is the tenant
     /// a workload token's exchange asks for, ahead of an ambient
-    /// `WYRD_TENANT`. A bearer or API key already names its tenant, so
-    /// resolving one beside a selector is refused.
+    /// `WYRD_TENANT`. Without it, the newest saved login for this server is
+    /// used; with it, a server whose saved logins all belong to other tenants
+    /// is refused with `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE`. A bearer or API
+    /// key already names its tenant, so resolving one beside a selector is
+    /// refused.
     pub tenant: Option<String>,
     /// Token cache mode.
     pub token_cache: TokenCacheMode,

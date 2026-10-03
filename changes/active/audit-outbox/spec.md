@@ -1,6 +1,6 @@
 ---
 id: SPEC-audit-outbox
-revision: 1
+revision: 2
 status: approved
 ---
 
@@ -43,6 +43,9 @@ clause in `AGENTS.md` and `architecture/wyrd-design.md` permitted mode 3.
 
 ## Scope
 
+- One generic outbox type in a shared crate (REQ-008), with audit as its
+  first sink. The Eval run-request outbox (verified-change-contract REQ-077)
+  becomes its second sink.
 - One server-owned audit outbox (generalized from `OracleQueryAudit`) used by
   every audited surface in `wyrd-server`, `wyrd-auth`, Gate, Oracle, gateway,
   and verification.
@@ -78,9 +81,20 @@ contended tenant does not delay other tenants' audit.
 ### REQ-003 — Audit never refuses or delays a request
 
 No request returns an error because an audit write failed, and no request
-waits on an audit commit. A full queue or failed commit is logged with the
-operation and request id and counted in one `audit_outbox_commit_failures_total`
-counter labelled by surface; the event is lost.
+waits on an audit commit. The outbox has no count limit and never drops an
+event because Postgres is slow or unavailable. A tenant batch whose connection,
+append, or commit fails stays queued at the front of that tenant's queue,
+absorbs that tenant's later events behind it, and is retried with exponential
+backoff. Other tenants keep committing. Every failed attempt is logged with the
+tenant and error and counted in `outbox_write_failures_total{outbox="audit"}`. No memory is preallocated for queues or batches. A batch may be
+split only to fit one statement's parameter limit.
+
+### REQ-003a — Accepted loss
+
+An event is lost only when the process stops abruptly, or when graceful
+shutdown reaches its deadline with the event still unwritten. Shutdown counts
+every event it leaves unwritten in `outbox_events_lost_total{outbox="audit"}`
+and logs it.
 
 ### REQ-004 — Audit-unavailable errors removed
 
@@ -106,15 +120,46 @@ them.
 
 ### REQ-007 — Shutdown
 
-Graceful shutdown stops accepting new events, commits what is queued until the
-shutdown deadline, and reports the remainder.
+Graceful shutdown stops accepting new events and keeps committing and
+retrying what is queued until the shutdown deadline. It reports the remainder
+and counts it as lost (REQ-003a).
+
+### REQ-008 — Generic outbox machinery
+
+The queue and writer are one generic type in a shared crate with no SQL
+dependency. Audit and Eval run requests each create their own instance, so a
+slow database on one side does not delay the other. Each use supplies only a
+sink: its item type, a metric label, and one call that writes one tenant's
+items in one transaction, all or nothing. The generic type owns the following.
+
+- Non-blocking staging.
+- The unbounded queue and the pending count, exported as the
+  `outbox_pending{outbox}` gauge.
+- Per-tenant grouping, with at most one write in flight per tenant.
+- A bounded number of tenants written at once, set by the constructor (audit
+  uses 4).
+- Retry of a failed write, at the front of its tenant's queue, with backoff
+  from 50 ms doubling to 5 s.
+- Idle signalling for tests, graceful-shutdown flush, and loss counting.
+- The metrics `outbox_write_failures_total{outbox}`,
+  `outbox_events_lost_total{outbox}`, and `outbox_pending{outbox}`.
+
+No other outbox implementation exists.
+
+### REQ-009 — Retried audit writes do not duplicate
+
+Every audit event carries an event ID assigned when it is staged. Staged audit
+is unique per (tenant, event ID). A write retried after an unknown commit
+outcome skips events already staged, without consuming a sequence number or
+breaking the hash chain. This requires a migration on `vala.audit_staging`.
 
 ## Invariants
 
 - INV-001: Every permission check completes before its operation proceeds or
   is refused.
 - INV-002: Per-tenant audit sequence and hash chain remain gap-free and
-  ordered for committed events.
+  ordered for committed events. A retried batch commits before any later event
+  of the same tenant.
 - INV-003: Tenant isolation: each batch commits under its own tenant binding.
 - INV-004: One audit write path and one publisher.
 
@@ -124,8 +169,12 @@ shutdown deadline, and reports the remainder.
   change across HTTP, gRPC proto, Python/TypeScript/Rust SDK error mapping, and
   generated docs).
 - Audit for durable writes (Card registration, provisioning, key issuance) is
-  no longer atomic with the write: a committed write whose event is lost to a
-  failed commit or abrupt process loss has no audit row.
+  no longer atomic with the write: a committed write whose event is lost to
+  abrupt process loss or an expired shutdown deadline has no audit row. A
+  failed commit is retried, never dropped.
+- The generic outbox type and its sink trait in a shared crate (REQ-008).
+- The audit event ID and the (tenant, event ID) uniqueness on
+  `vala.audit_staging` (REQ-009, migration).
 - Moving publication progress out of `vala.audit_chain_head` (migration).
 - Removal of the "not yet converted" clause from `AGENTS.md` and
   `architecture/wyrd-design.md`.
@@ -136,24 +185,39 @@ shutdown deadline, and reports the remainder.
   calls the staging append. Static check or test.
 - AC-002 (REQ-003, REQ-004): For each surface family (Gate write, start_run,
   Card registration, auth token grant, admin, Oracle), an injected audit
-  commit failure leaves the request successful and increments the counter.
-  Isolated tests; one user-journey test proves a Gate write and a run start
-  succeed with audit failing.
+  commit failure leaves the request successful and increments the failure
+  counter. Once the failure clears, the event commits exactly once in chain
+  order. Isolated tests. One user-journey test proves that a Gate write and a
+  run start succeed while audit fails, and that their events commit after
+  recovery.
 - AC-003 (REQ-002, INV-002): Concurrent decisions for one tenant from two
   replicas commit gap-free, ordered chains. Integration test on Postgres.
 - AC-004 (REQ-006): The publisher advances retained history while appends run
   continuously against the same tenant. Integration test.
-- AC-005 (scale): In `mise run bench:capacity` (verified-change-contract
+- AC-005 (scale): Proved on the integrated branch after merge. In `mise run bench:capacity` (verified-change-contract
   REQ-171), the audit outbox meets that run's saturation SLO in every judged
   step and the two-replica scale-out step passes. No separate audit
   benchmark exists.
 - AC-006 (REQ-004): `mise run codegen:check` and the OpenAPI contract test pass
   with the codes removed; no reference remains.
-- AC-007 (REQ-007): Shutdown commits queued events within the deadline.
+- AC-007 (REQ-007, REQ-003a): Shutdown commits queued events within the
+  deadline. Events still unwritten at the deadline are counted in
+  `outbox_events_lost_total{outbox="audit"}`.
+- AC-008 (REQ-008): Focused tests of the generic type with a test sink prove
+  the following.
+  - A failed write is retried and committed exactly once, in order, ahead of
+    that tenant's later items.
+  - One failing tenant does not delay another tenant.
+  - There is no count limit.
+  - Shutdown flushes until the deadline and counts the remainder as lost.
+  - `pending` returns to zero.
+- AC-009 (REQ-009): Retrying a batch after its commit already succeeded
+  produces no duplicate staged rows and a gap-free chain. Postgres
+  integration test.
 
 ## Open material decisions
 
-None for revision 1.
+None for revision 2.
 
 ## Authority links
 
@@ -167,3 +231,14 @@ None for revision 1.
   batched, non-blocking outbox after the capacity benchmark showed synchronous
   per-request chain-head locking reduced two-replica throughput below one
   replica.
+- Revision 2 (2026-10-03, approved): A failed commit is retried with backoff and
+  never dropped. The queue limit and preallocation are removed. Loss is limited
+  to abrupt process stop and an expired graceful-shutdown deadline, and is
+  counted. This aligns with the approved consistency principle in
+  `architecture/bifrost-design.md` and with the Eval run-request outbox
+  (verified-change-contract REQ-077, rev 60), which will share this outbox's
+  machinery. Adds REQ-008: one generic outbox type with per-use sinks and
+outbox-labelled metrics. Adds REQ-009: an audit event ID with (tenant, event
+ID) uniqueness, so a retry after an unknown commit outcome cannot duplicate
+audit. Source: r1 review FIND-AUDIT-OUTBOX-1. Approved by the user on
+2026-10-03.

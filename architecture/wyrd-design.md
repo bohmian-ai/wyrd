@@ -1277,6 +1277,15 @@ implementation. A Trigger never fires on its own: nothing runs merely because
 a Trigger Card is registered, and one schedule occurrence shared by two
 subjects creates two subject-scoped runs, never one mixed-subject run.
 
+Eval run creation follows Scribe's acknowledgement and never delays it.
+After the ack, the server puts one run request per committed record into an
+in-process outbox. One writer drains it, one multi-row insert per tenant,
+keyed by binding and record, so a repeated request inserts nothing. The
+outbox has no count limit and never drops a request because PostgreSQL is
+slow or down: a failed write keeps its batch and retries with backoff.
+Graceful shutdown flushes the outbox. A hard kill loses only unwritten
+requests, and every loss the process observes is counted and logged.
+
 External pushes are deliberately not an activation — Rule 7 ("Wyrd reads, it
 does not push") means external data enters through a `Source`.
 

@@ -1267,22 +1267,22 @@ async fn enqueue_attempts(superuser: &sqlx::PgPool, count: i64) -> Result<i64, S
     }
 }
 
-/// A post-ACK enqueue failure through the integrated Gate, Scribe, and Eval
-/// path keeps the acknowledged observation readable and invents no run or
-/// result, and a same-batch-ID retry is acknowledged as a replay without a
-/// second enqueue attempt.
+/// A post-ACK run-creation outage through the integrated Gate, Scribe, and
+/// Eval path keeps the acknowledged observation readable and invents no run
+/// or result while it lasts; the run-request outbox retries, and once
+/// PostgreSQL accepts the writes every acknowledged record has exactly one run
+/// per binding, a same-batch-ID replay adding none.
 ///
 /// A trigger refuses every observation run insert after counting the attempt
-/// in a sequence, so the one failed enqueue is observed deterministically
-/// before the replay, and the replay's absence of an attempt is checked after a
-/// distinct sentinel frame acknowledged behind it has had its attempt counted.
+/// in a sequence, so refused writes, and the retries that follow, are observed
+/// before the trigger is dropped.
 ///
 /// # Errors
 /// Returns server, registration, query, or fixture errors, or a description of
 /// the first mismatch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
-async fn integrated_enqueue_failure_preserves_ack() -> Result<(), ServerJourneyError> {
+async fn integrated_enqueue_outage_preserves_ack_and_recovers() -> Result<(), ServerJourneyError> {
     let root = tempfile::tempdir()?;
     let service = write_graph(root.path());
     let bundle = root.path().join("bundle");
@@ -1339,14 +1339,8 @@ async fn integrated_enqueue_failure_preserves_ack() -> Result<(), ServerJourneyE
             unstamped_observation(&subject, &sentinel),
         )
         .await?;
-    // A replay enqueue would be spawned before the sentinel's; once the
-    // sentinel's attempt is counted, an extra attempt shows as a third.
-    let attempts = enqueue_attempts(&superuser, 2).await?;
-    if attempts != 2 {
-        return Err(
-            format!("{attempts} enqueue attempts for one original and one sentinel").into(),
-        );
-    }
+    // The outbox keeps retrying the refused requests.
+    enqueue_attempts(&superuser, 3).await?;
 
     server.flush_bifrost().await?;
     let stored = texts(
@@ -1360,12 +1354,29 @@ async fn integrated_enqueue_failure_preserves_ack() -> Result<(), ServerJourneyE
     if stored != [Some(record.clone())] {
         return Err(format!("the acknowledged batch is not stored once: {stored:?}").into());
     }
-    sqlx::query("DROP TRIGGER eval_journey_refuse ON wyrd.verifier_runs")
-        .execute(&superuser)
-        .await?;
     let runs = seed.observation_runs().await?;
     if !runs.is_empty() {
         return Err(format!("a refused enqueue invented runs: {runs:?}").into());
+    }
+    sqlx::query("DROP TRIGGER eval_journey_refuse ON wyrd.verifier_runs")
+        .execute(&superuser)
+        .await?;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let runs = loop {
+        let runs = seed.observation_runs().await?;
+        if runs.len() >= 2 * AGENT_BINDINGS {
+            break runs;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("the outbox never recovered: {runs:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    for id in [&record, &sentinel] {
+        let made = runs.iter().filter(|run| &run.record_id == id).count();
+        if made != AGENT_BINDINGS {
+            return Err(format!("record {id} has {made} runs: {runs:?}").into());
+        }
     }
     // No result ever published leaves the results table unregistered.
     let results = ScheduledQueryCaller::new(
@@ -1386,7 +1397,7 @@ async fn integrated_enqueue_failure_preserves_ack() -> Result<(), ServerJourneyE
         Err(error) => return Err(error.into()),
     };
     if results != 0 {
-        return Err(format!("a refused enqueue invented {results} results").into());
+        return Err(format!("run creation alone invented {results} results").into());
     }
     server.shutdown().await?;
     Ok(())

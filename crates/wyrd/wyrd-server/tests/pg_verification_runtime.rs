@@ -33,6 +33,7 @@ use wyrd_server::verification::engines::{EngineOutcome, VerifierReport};
 use wyrd_server::verification::fault::{PublicationFault, SentBatch};
 use wyrd_server::verification::fitter::{BaselineFitter, FitGate};
 use wyrd_server::verification::health::RuntimeCapability;
+use wyrd_server::verification::observations::ObservationRunOutbox;
 use wyrd_server::verification::runner::{EngineScript, RESULT_PUBLICATION_FAILED};
 use wyrd_server::verification::{CapabilityCrash, RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
@@ -42,7 +43,7 @@ use wyrd_spec::ids::{BindingId, CardUid, FeatureName, VerificationRunId};
 use wyrd_spec::verification::{DriftWindow, FrozenTarget, VerificationError};
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::storage::artifact_metadata::{self, NewArtifactMetadata};
-use wyrd_sql::queries::verifier_runs::TerminalStatus;
+use wyrd_sql::queries::verifier_runs::{ObservationRecord, TerminalStatus};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::logs::LogCapture;
 use wyrd_testing::verification::{RunRow, VerificationFixture};
@@ -2421,4 +2422,112 @@ async fn fit_claim_committed_after_shutdown_is_released_unfitted() {
         .execute(&harness.assertion)
         .await
         .expect("hold function drops");
+}
+
+/// Add or drop a constraint that makes PostgreSQL refuse every new run row,
+/// standing in for a database that cannot accept the outbox's writes.
+///
+/// # Panics
+/// Panics when the DDL fails.
+async fn refuse_run_writes(assertion: &PgPool, refuse: bool) {
+    let ddl = if refuse {
+        "ALTER TABLE wyrd.verifier_runs ADD CONSTRAINT outbox_outage CHECK (false) NOT VALID"
+    } else {
+        "ALTER TABLE wyrd.verifier_runs DROP CONSTRAINT outbox_outage"
+    };
+    sqlx::query(ddl)
+        .execute(assertion)
+        .await
+        .expect("outage constraint changes");
+}
+
+/// The tenant's observation run record IDs, sorted.
+///
+/// # Panics
+/// Panics when the runs cannot be read.
+async fn observation_records(seed: &VerificationFixture) -> Vec<String> {
+    let mut records: Vec<String> = seed
+        .observation_runs()
+        .await
+        .expect("observation runs read")
+        .into_iter()
+        .map(|run| run.record_id)
+        .collect();
+    records.sort();
+    records
+}
+
+/// The Eval run-request outbox keeps every request while PostgreSQL refuses
+/// its writes and retries; once writes succeed, exactly one run exists per
+/// record, a repeated request adds none, graceful shutdown flushes what it
+/// holds, and a request still unwritten at the shutdown deadline is reported.
+///
+/// # Panics
+/// Panics when a request is dropped during the outage, a run is duplicated or
+/// missing, or shutdown misreports what it left unwritten.
+#[tokio::test]
+async fn observation_outbox_retains_through_an_outage_and_flushes_at_shutdown() {
+    let harness = Harness::start().await;
+    let seed = &harness.seed;
+    let (owner, principal) = seed.service("eval-owner").await.expect("owner registers");
+    let verifier = seed
+        .verifier(
+            "eval",
+            &serde_json::json!({ "implementation": { "kind": "eval", "spec": { "tasks": {} } } }),
+        )
+        .await
+        .expect("Eval Verifier registers");
+    seed.bind_observations(&owner, &verifier)
+        .await
+        .expect("binding projects");
+    seed.activate(principal).await.expect("owner activates");
+    let tenant = harness.server.pg_fixture().data_tenant_id();
+    let record = |record_id: &str| ObservationRecord {
+        subject: owner.clone(),
+        record_id: record_id.to_owned(),
+        event_time: Utc::now(),
+    };
+    let postgres = harness.server.state().postgres.wyrd().clone();
+    let outbox = ObservationRunOutbox::new(postgres.clone());
+
+    refuse_run_writes(&harness.assertion, true).await;
+    outbox.stage(tenant, vec![record("r-1"), record("r-2")]);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(outbox.pending(), 2, "the outage drops no request");
+    assert!(observation_records(seed).await.is_empty());
+
+    refuse_run_writes(&harness.assertion, false).await;
+    outbox.stage(tenant, vec![record("r-1"), record("r-3")]);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while outbox.pending() != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the outbox never recovered"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(observation_records(seed).await, ["r-1", "r-2", "r-3"]);
+
+    outbox.stage(tenant, vec![record("r-4")]);
+    assert_eq!(
+        outbox.shutdown(std::time::Instant::now() + WAIT).await,
+        0,
+        "graceful shutdown flushes the queue"
+    );
+    assert_eq!(
+        observation_records(seed).await,
+        ["r-1", "r-2", "r-3", "r-4"]
+    );
+
+    let stranded = ObservationRunOutbox::new(postgres);
+    refuse_run_writes(&harness.assertion, true).await;
+    stranded.stage(tenant, vec![record("r-5")]);
+    assert_eq!(
+        stranded
+            .shutdown(std::time::Instant::now() + Duration::from_millis(300))
+            .await,
+        1,
+        "a request unwritten at the deadline is reported"
+    );
+    refuse_run_writes(&harness.assertion, false).await;
 }

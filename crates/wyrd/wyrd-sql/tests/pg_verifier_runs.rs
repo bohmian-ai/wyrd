@@ -32,7 +32,7 @@ use wyrd_sql::queries::verification::{
     BindingActivation, FrozenTarget, NewBinding, project_bindings, record_machine_authentication,
 };
 use wyrd_sql::queries::verifier_runs::{
-    ClaimedRun, EnqueueOutcome, EnqueueRefusal, ManualEnqueueOutcome, ObservationOutcome,
+    ClaimedRun, EnqueueOutcome, EnqueueRefusal, ManualEnqueueOutcome, ObservationRecord,
     QueueCounts, RequestKey, RetryOutcome, RunInput, RunOrigin, RunRequest, ScheduleOutcome,
     ScheduleSkip, Settlement, TerminalStatus, TraceWaitOutcome, VerifierRunQueue,
 };
@@ -1615,15 +1615,41 @@ async fn claim_reports_postgres_measured_queue_wait_and_age() {
     );
 }
 
-/// A committed observation enqueues one run per active `observations_ready`
-/// binding of its subject: a replay finds the same run, a scheduled binding on
-/// the same subject is untouched, and an inactive owner creates nothing.
+/// One committed record of `subject`.
+fn record(subject: &CardUid, record_id: &str) -> ObservationRecord {
+    ObservationRecord {
+        subject: subject.clone(),
+        record_id: record_id.to_owned(),
+        event_time: at(22, 11, 59),
+    }
+}
+
+/// A binding's observation runs as `(record_id, ordinal)` in ordinal order.
 ///
 /// # Panics
-/// Panics when a non-observation binding enqueues, a replay creates a second
-/// run, or an inactive owner's binding enqueues.
+/// Panics when the runs cannot be read.
+async fn ordinals(conn: &mut TenantConn<'_>, binding: BindingId) -> Vec<(String, i64)> {
+    sqlx::query_as(
+        "SELECT input_record_id, observation_ordinal FROM wyrd.verifier_runs \
+          WHERE binding_id = $1 AND origin = 'observation' ORDER BY observation_ordinal",
+    )
+    .bind(binding.as_uuid())
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("ordinals read")
+}
+
+/// A batch of records for several subjects inserts one run per (active
+/// `observations_ready` binding, record): two bindings of one subject each
+/// take every record of it, a scheduled binding and an inactive owner's
+/// binding take none, and a record repeated in the batch runs once.
+/// Resubmitting the batch inserts nothing and consumes no ordinal, so a later
+/// record numbers straight after the first batch.
+///
+/// # Panics
+/// Panics when a run count or ordinal differs.
 #[tokio::test]
-async fn observation_enqueue_targets_active_ready_bindings_once() {
+async fn observation_batches_insert_once_per_binding_and_record() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
     let queue = VerifierRunQueue::default();
@@ -1631,92 +1657,108 @@ async fn observation_enqueue_targets_active_ready_bindings_once() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let verifier = register_verifier(&mut conn, &actor, "eval", eval()).await;
+    let assertion = register_verifier(&mut conn, &actor, "assertion", eval()).await;
+    let judge = register_verifier(&mut conn, &actor, "judge", eval()).await;
     let drift = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
-    let (live_owner, live) = register_service(&mut conn, &actor, "live").await;
-    let ready = bind(
+    let (live, live_principal) = register_service(&mut conn, &actor, "live").await;
+    let first = bind(
         &mut conn,
-        &live_owner,
-        &verifier,
+        &live,
+        &assertion,
         BindingActivation::ObservationsReady,
         Vec::new(),
     )
     .await;
-    bind(&mut conn, &live_owner, &drift, daily(), Vec::new()).await;
-    record_machine_authentication(&mut conn, live)
-        .await
-        .expect("live activation records");
-    let (stale_owner, stale) = register_service(&mut conn, &actor, "stale").await;
-    let inactive = bind(
+    let second = bind(
         &mut conn,
-        &stale_owner,
-        &verifier,
+        &live,
+        &judge,
         BindingActivation::ObservationsReady,
         Vec::new(),
     )
     .await;
-    record_machine_authentication(&mut conn, stale)
-        .await
-        .expect("stale activation records");
-    age_activity(&mut conn, stale, Duration::days(2)).await;
-    let event_time = at(22, 11, 59);
+    bind(&mut conn, &live, &drift, daily(), Vec::new()).await;
+    let (other, other_principal) = register_service(&mut conn, &actor, "other").await;
+    let other_binding = bind(
+        &mut conn,
+        &other,
+        &assertion,
+        BindingActivation::ObservationsReady,
+        Vec::new(),
+    )
+    .await;
+    let (stale, stale_principal) = register_service(&mut conn, &actor, "stale").await;
+    bind(
+        &mut conn,
+        &stale,
+        &assertion,
+        BindingActivation::ObservationsReady,
+        Vec::new(),
+    )
+    .await;
+    for principal in [live_principal, other_principal, stale_principal] {
+        record_machine_authentication(&mut conn, principal)
+            .await
+            .expect("activation records");
+    }
+    age_activity(&mut conn, stale_principal, Duration::days(2)).await;
+    let batch = [
+        record(&live, "r-1"),
+        record(&other, "o-1"),
+        record(&stale, "s-1"),
+        record(&live, "r-2"),
+        record(&live, "r-1"),
+    ];
 
-    let first = queue
-        .enqueue_observation(&mut conn, &live_owner, "record-1", event_time)
+    let inserted = queue
+        .enqueue_observation_batch(&mut conn, &batch)
         .await
-        .expect("observation enqueues");
-    let [(binding, ObservationOutcome::Enqueue(outcome))] = first.as_slice() else {
-        panic!("expected exactly one enqueue, got {first:?}");
-    };
-    assert_eq!(*binding, ready);
-    let run = enqueued(*outcome);
+        .expect("batch enqueues");
+    assert_eq!(inserted, 5, "two live bindings x two records, one other");
     assert_eq!(
         queue
-            .enqueue_observation(&mut conn, &live_owner, "record-1", event_time)
+            .enqueue_observation_batch(&mut conn, &batch)
             .await
-            .expect("replay answers"),
-        vec![(
-            ready,
-            ObservationOutcome::Enqueue(EnqueueOutcome::AlreadyEnqueued(run))
-        )]
+            .expect("repeat answers"),
+        0,
+        "a repeated batch inserts nothing"
     );
+    assert_eq!(run_count(&mut conn).await, 5);
     assert_eq!(
         queue
-            .enqueue_observation(&mut conn, &stale_owner, "record-1", event_time)
+            .enqueue_observation_batch(&mut conn, &[record(&live, "r-3")])
             .await
-            .expect("inactive answers"),
-        vec![(inactive, ObservationOutcome::Inactive)]
+            .expect("later record enqueues"),
+        2
     );
-    assert_eq!(run_count(&mut conn).await, 1);
-    let second = queue
-        .enqueue_observation(&mut conn, &live_owner, "record-2", event_time)
-        .await
-        .expect("second observation enqueues");
-    let [(_, ObservationOutcome::Enqueue(outcome))] = second.as_slice() else {
-        panic!("expected exactly one enqueue, got {second:?}");
+    let numbered = |records: &[(&str, i64)]| -> Vec<(String, i64)> {
+        records
+            .iter()
+            .map(|(record, ordinal)| ((*record).to_owned(), *ordinal))
+            .collect()
     };
-    let claimed = claim(&queue, &mut conn).await;
+    for binding in [first, second] {
+        assert_eq!(
+            ordinals(&mut conn, binding).await,
+            numbered(&[("r-1", 1), ("r-2", 2), ("r-3", 3)]),
+            "no repeat consumed an ordinal"
+        );
+    }
     assert_eq!(
-        (claimed.lease.run_id, claimed.observation_ordinal),
-        (run, Some(1))
-    );
-    let claimed = claim(&queue, &mut conn).await;
-    assert_eq!(
-        (claimed.lease.run_id, claimed.observation_ordinal),
-        (enqueued(*outcome), Some(2))
+        ordinals(&mut conn, other_binding).await,
+        numbered(&[("o-1", 1)])
     );
 }
 
 /// Two frames that name the same two subjects in opposite orders serialize
 /// instead of deadlocking.
 ///
-/// One acknowledged frame mixes rows for every subject its producer emitted,
-/// in emission order, and enqueues them in one transaction. Locking each
-/// binding as its row arrived let two such frames hold one binding each and
-/// wait on the other until Postgres aborted one, losing that frame's runs.
-/// The frame-level enqueue locks every binding it will touch up front, in
-/// binding order, so the second frame waits at its first statement and then
-/// completes.
+/// One outbox batch mixes records for every subject its producers emitted,
+/// in arrival order, and enqueues them in one transaction. Locking each
+/// binding as its record arrived let two such batches hold one binding each
+/// and wait on the other until Postgres aborted one. The batch enqueue locks
+/// every binding it will touch up front, in binding order, so the second
+/// batch waits at its first statement and then completes.
 ///
 /// # Panics
 /// Panics when the second frame does not wait for the first, either frame
@@ -1748,15 +1790,11 @@ async fn frames_naming_subjects_in_opposite_orders_serialize() {
         subjects.push(owner);
     }
     setup.commit().await.expect("setup commits");
-    let event_time = at(22, 11, 59);
     let [x, y] = [&subjects[0], &subjects[1]];
 
     let mut first = fixture.tenant_conn().await.expect("first opens");
     let made = queue
-        .enqueue_observations(
-            &mut first,
-            &[(x, "a-1", event_time), (y, "a-2", event_time)],
-        )
+        .enqueue_observation_batch(&mut first, &[record(x, "a-1"), record(y, "a-2")])
         .await
         .expect("first frame enqueues");
     assert_eq!(made, 2);
@@ -1764,10 +1802,7 @@ async fn frames_naming_subjects_in_opposite_orders_serialize() {
     let mut probe = fixture.tenant_conn().await.expect("probe opens");
     let second_frame = async {
         let made = queue
-            .enqueue_observations(
-                &mut second,
-                &[(y, "b-1", event_time), (x, "b-2", event_time)],
-            )
+            .enqueue_observation_batch(&mut second, &[record(y, "b-1"), record(x, "b-2")])
             .await
             .expect("second frame enqueues without a deadlock");
         second.commit().await.expect("second commits");

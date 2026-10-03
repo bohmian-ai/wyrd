@@ -35,6 +35,9 @@ use wyrd_spec::verification::{
 use crate::queries::verification::{BindingSchedule, InactivityTimeout, binding_activity};
 use crate::{OperatorPool, TenantConn};
 
+/// The Verifier `implementation.kind` that consumes an Eval record.
+const EVAL_IMPLEMENTATION: &str = "eval";
+
 /// Resolve a binding target's frozen identities, readiness, and implementation.
 const RESOLVE_BINDING_SQL: &str = r#"
     SELECT b.verifier_uid, v.version AS verifier_version,
@@ -108,18 +111,58 @@ const LOCK_OBSERVATION_BINDING_SQL: &str = r#"
        FOR NO KEY UPDATE
 "#;
 
-/// Lock every `observations_ready` binding of a frame's subjects until commit.
+/// Lock and list every `observations_ready` binding of a batch's subjects
+/// until commit.
 ///
 /// Rows are locked in `binding_id` order (the lock sits above the sort), so
 /// two transactions that touch overlapping bindings acquire them in the same
 /// order and one simply waits for the other instead of forming a cycle.
 const LOCK_OBSERVATION_SUBJECTS_SQL: &str = r#"
-    SELECT 1
+    SELECT binding_id, subject_card_uid
       FROM wyrd.verification_bindings
      WHERE activation = 'observations_ready'
        AND subject_card_uid = ANY($1)
      ORDER BY binding_id
        FOR NO KEY UPDATE
+"#;
+
+/// Insert one observation run per unseen `(binding, record)` of a batch in
+/// one statement, due at PostgreSQL's statement time.
+///
+/// `$1..$4` are parallel arrays of run ID, binding, record ID, and event time
+/// in batch order. Rows whose record already has a run of that binding, and
+/// later repeats inside the batch, are removed before numbering, so a repeat
+/// inserts nothing and consumes no ordinal. Ordinals continue each binding's
+/// maximum in batch order; the caller holds every binding's row lock from
+/// [`LOCK_OBSERVATION_SUBJECTS_SQL`], so this statement's snapshot already sees
+/// every committed predecessor. The frozen identities, Trigger, and Operators
+/// come from the locked binding and its Verifier Card.
+const INSERT_OBSERVATION_RUNS_SQL: &str = r#"
+    INSERT INTO wyrd.verifier_runs (
+        run_id, data_tenant_id, verifier_uid, verifier_version, subject_card_uid,
+        origin, owner_card_uid, binding_id, trigger_uid, trigger_digest, operators,
+        input_record_id, input_event_time, max_attempts,
+        next_attempt_at, created_at, updated_at, observation_ordinal
+    )
+    SELECT r.run_id, wyrd.current_tenant(), b.verifier_uid, v.version, b.subject_card_uid,
+           'observation', b.owner_card_uid, b.binding_id, b.trigger_uid, b.trigger_digest,
+           b.operators, r.record_id, r.event_time, $5,
+           statement_timestamp(), statement_timestamp(), statement_timestamp(),
+           COALESCE((SELECT max(x.observation_ordinal)
+                       FROM wyrd.verifier_runs x
+                      WHERE x.binding_id = r.binding_id AND x.origin = 'observation'), 0)
+             + row_number() OVER (PARTITION BY r.binding_id ORDER BY r.position)
+      FROM (SELECT DISTINCT ON (u.binding_id, u.record_id) u.*
+              FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::timestamptz[])
+                   WITH ORDINALITY AS u(run_id, binding_id, record_id, event_time, position)
+             WHERE NOT EXISTS (SELECT 1 FROM wyrd.verifier_runs e
+                                WHERE e.binding_id = u.binding_id
+                                  AND e.origin = 'observation'
+                                  AND e.input_record_id = u.record_id)
+             ORDER BY u.binding_id, u.record_id, u.position) r
+      JOIN wyrd.verification_bindings b ON b.binding_id = r.binding_id
+      JOIN wyrd.cards v ON v.card_uid = b.verifier_uid
+    ON CONFLICT DO NOTHING
 "#;
 
 /// Find the run that already holds a scheduled occurrence or observation record.
@@ -337,15 +380,6 @@ const AWAIT_TRACE_SQL: &str = r#"
     RETURNING next_attempt_at
 "#;
 
-/// List a subject's `observations_ready` bindings in identity order.
-const OBSERVATION_BINDINGS_SQL: &str = r#"
-    SELECT binding_id
-      FROM wyrd.verification_bindings
-     WHERE activation = 'observations_ready'
-       AND subject_card_uid = $1
-     ORDER BY binding_id
-"#;
-
 /// Read one run's control-plane status.
 const RUN_STATUS_SQL: &str = r#"
     SELECT run_id, status, requested_by_principal_id, result_id, error
@@ -463,7 +497,7 @@ impl RunInput {
     const fn implementation(&self) -> &'static str {
         match self {
             Self::DriftWindow(_) => "drift",
-            Self::EvalRecord { .. } => "eval",
+            Self::EvalRecord { .. } => EVAL_IMPLEMENTATION,
         }
     }
 }
@@ -741,13 +775,16 @@ pub enum TraceWaitOutcome {
     StaleLease,
 }
 
-/// What one observation did for one matching `observations_ready` binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObservationOutcome {
-    /// The shared enqueue path created, found, or refused the run.
-    Enqueue(EnqueueOutcome),
-    /// The binding owner was not runtime-active, so no run was created.
-    Inactive,
+/// One committed Eval observation awaiting its runs: the request the server's
+/// run-request outbox hands to [`VerifierRunQueue::enqueue_observation_batch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationRecord {
+    /// Subject Card the observation was emitted for.
+    pub subject: CardUid,
+    /// Logical input record ID, unique per binding's runs.
+    pub record_id: String,
+    /// Committed observation's server event time, frozen on the run.
+    pub event_time: DateTime<Utc>,
 }
 
 /// Terminal execution states that carry no verdict.
@@ -1016,7 +1053,7 @@ impl VerifierRunQueue {
             return Ok(EnqueueOutcome::Refused(EnqueueRefusal::BindingNotFound));
         };
         let input = request.input();
-        if let Some(refusal) = resolved.refusal(&input)? {
+        if let Some(refusal) = resolved.refusal(input.implementation())? {
             return Ok(EnqueueOutcome::Refused(refusal));
         }
         let verifier_version = resolved
@@ -1386,97 +1423,101 @@ impl VerifierRunQueue {
         )
     }
 
-    /// Enqueue one Eval run per `observations_ready` binding of `subject`.
+    /// Enqueue one Eval run per active `observations_ready` binding of each
+    /// subject for every record of a batch, in one insert statement.
     ///
-    /// Called after the observation is durably committed, never inside its
-    /// ingest transaction. Each binding whose owner is runtime-active goes
-    /// through the shared enqueue path with the exact `record_id` and the
-    /// committed row's server `event_time`, so a replayed observation finds
-    /// its existing run instead of creating another. Bindings of other
-    /// subjects or tenants are never read: the caller's tenant transaction
-    /// scopes the lookup.
+    /// Called after the observations are durably committed, never inside
+    /// their ingest transaction. One statement locks and lists every
+    /// `observations_ready` binding of the batch's subjects in binding order,
+    /// so concurrent batches touching the same bindings serialize instead of
+    /// deadlocking. Each binding whose owner is runtime-active and whose
+    /// Verifier, subject, and implementation accept an Eval record
+    /// contributes one row per record of its subject; one
+    /// [`INSERT_OBSERVATION_RUNS_SQL`] then writes them all. A record that
+    /// already has a run of a binding inserts nothing, so a repeated batch is
+    /// a no-op. Bindings of other tenants are never read: the caller's tenant
+    /// transaction scopes every lookup. Returns the number of runs inserted.
     ///
     /// # Errors
-    /// Returns the database error when a read or insert fails, or a decode
-    /// error when a stored identity is malformed; runs inserted earlier in the
-    /// same transaction roll back with it.
+    /// Returns the database error when the lock, a read, or the insert fails,
+    /// or a decode error when a stored identity or readiness is malformed;
+    /// nothing from the batch survives the caller's rollback.
     #[tracing::instrument(
-        skip(self, conn, record_id),
-        fields(operation = "verification.runs.enqueue_observation")
+        skip(self, conn, records),
+        fields(operation = "verification.runs.enqueue_observation_batch", records = records.len())
     )]
-    pub async fn enqueue_observation(
+    pub async fn enqueue_observation_batch(
         &self,
         conn: &mut TenantConn<'_>,
-        subject: &CardUid,
-        record_id: &str,
-        event_time: DateTime<Utc>,
-    ) -> Result<Vec<(BindingId, ObservationOutcome)>, SqlxError> {
-        let bindings: Vec<Uuid> = sqlx::query_scalar(OBSERVATION_BINDINGS_SQL)
-            .bind(subject.as_uuid())
+        records: &[ObservationRecord],
+    ) -> Result<u64, SqlxError> {
+        let subjects: Vec<Uuid> = records
+            .iter()
+            .map(|record| record.subject.as_uuid())
+            .collect();
+        let bindings: Vec<(Uuid, Uuid)> = sqlx::query_as(LOCK_OBSERVATION_SUBJECTS_SQL)
+            .bind(subjects)
             .fetch_all(&mut **conn.transaction())
             .await?;
-        let mut outcomes = Vec::with_capacity(bindings.len());
-        for binding in bindings {
-            let binding_id = stored(BindingId::new(binding))?;
-            let active = binding_activity(conn, binding_id, self.inactivity)
+        let (mut run_ids, mut binding_ids, mut record_ids, mut event_times) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (binding, subject) in bindings {
+            if !self
+                .accepts_records(conn, stored(BindingId::new(binding))?)
                 .await?
-                .is_some_and(|activity| activity.active);
-            let outcome = if active {
-                let request = RunRequest::Observation {
-                    binding_id,
-                    record_id: record_id.to_owned(),
-                    event_time,
-                };
-                ObservationOutcome::Enqueue(self.enqueue(conn, &request).await?)
-            } else {
-                ObservationOutcome::Inactive
-            };
-            outcomes.push((binding_id, outcome));
+            {
+                continue;
+            }
+            for record in records
+                .iter()
+                .filter(|record| record.subject.as_uuid() == subject)
+            {
+                run_ids.push(VerificationRunId::new_v7().as_uuid());
+                binding_ids.push(binding);
+                record_ids.push(record.record_id.as_str());
+                event_times.push(record.event_time);
+            }
         }
-        Ok(outcomes)
-    }
-
-    /// Enqueue the Eval runs of every row in one acknowledged frame.
-    ///
-    /// `observations` are `(subject, record_id, event_time)` in frame order.
-    /// One statement first locks every `observations_ready` binding of the
-    /// frame's distinct subjects in binding order; each row then goes through
-    /// [`Self::enqueue_observation`] in frame order, whose per-binding lock is
-    /// already held. A frame mixes rows of several subjects in emission order,
-    /// so locking each binding as its row arrived let two concurrent frames
-    /// lock the same bindings in opposite orders and deadlock. Returns the
-    /// number of per-binding outcomes, enqueued, replayed, refused, or
-    /// inactive.
-    ///
-    /// # Errors
-    /// Returns the database error when the lock, a read, or an insert fails,
-    /// or a decode error when a stored identity is malformed; runs inserted
-    /// earlier in the same transaction roll back with it.
-    #[tracing::instrument(
-        skip(self, conn, observations),
-        fields(operation = "verification.runs.enqueue_observations", rows = observations.len())
-    )]
-    pub async fn enqueue_observations(
-        &self,
-        conn: &mut TenantConn<'_>,
-        observations: &[(&CardUid, &str, DateTime<Utc>)],
-    ) -> Result<usize, SqlxError> {
-        let subjects: Vec<Uuid> = observations
-            .iter()
-            .map(|(subject, _, _)| subject.as_uuid())
-            .collect();
-        sqlx::query(LOCK_OBSERVATION_SUBJECTS_SQL)
-            .bind(subjects)
+        if run_ids.is_empty() {
+            return Ok(0);
+        }
+        let inserted = sqlx::query(INSERT_OBSERVATION_RUNS_SQL)
+            .bind(run_ids)
+            .bind(binding_ids)
+            .bind(record_ids)
+            .bind(event_times)
+            .bind(self.retry.max_attempts)
             .execute(&mut **conn.transaction())
             .await?;
-        let mut outcomes = 0;
-        for (subject, record_id, event_time) in observations {
-            outcomes += self
-                .enqueue_observation(conn, subject, record_id, *event_time)
-                .await?
-                .len();
+        Ok(inserted.rows_affected())
+    }
+
+    /// Whether `binding` takes observation runs now: its owner is
+    /// runtime-active and its target accepts an Eval record (Verifier ready,
+    /// subject available, Eval implementation).
+    ///
+    /// # Errors
+    /// Returns the database error when a read fails, or a decode error when
+    /// the stored readiness is malformed.
+    async fn accepts_records(
+        &self,
+        conn: &mut TenantConn<'_>,
+        binding: BindingId,
+    ) -> Result<bool, SqlxError> {
+        let active = binding_activity(conn, binding, self.inactivity)
+            .await?
+            .is_some_and(|activity| activity.active);
+        if !active {
+            return Ok(false);
         }
-        Ok(outcomes)
+        let resolved: Option<ResolvedTarget> = sqlx::query_as(RESOLVE_BINDING_SQL)
+            .bind(binding.as_uuid())
+            .fetch_optional(&mut **conn.transaction())
+            .await?;
+        match resolved {
+            Some(resolved) => Ok(resolved.refusal(EVAL_IMPLEMENTATION)?.is_none()),
+            None => Ok(false),
+        }
     }
 
     /// Return a claimed run to the queue with its attempt refunded.
@@ -1699,7 +1740,7 @@ impl ResolvedTarget {
     ///
     /// # Errors
     /// Returns [`SqlxError::Decode`] when the stored readiness is unknown.
-    fn refusal(&self, input: &RunInput) -> Result<Option<EnqueueRefusal>, SqlxError> {
+    fn refusal(&self, implementation: &str) -> Result<Option<EnqueueRefusal>, SqlxError> {
         let readiness: VerifierReadiness = stored(self.readiness.parse())?;
         if readiness != VerifierReadiness::Ready {
             return Ok(Some(EnqueueRefusal::NotReady(readiness)));
@@ -1707,7 +1748,7 @@ impl ResolvedTarget {
         if !self.subject_available {
             return Ok(Some(EnqueueRefusal::SubjectUnavailable));
         }
-        if self.implementation.as_deref() != Some(input.implementation()) {
+        if self.implementation.as_deref() != Some(implementation) {
             return Ok(Some(EnqueueRefusal::InputMismatch));
         }
         Ok(None)

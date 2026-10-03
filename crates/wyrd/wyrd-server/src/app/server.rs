@@ -870,6 +870,12 @@ impl BoundServer {
                 }),
             )
         };
+        // Gate has closed and Scribe has drained, so no acknowledgement can
+        // still stage a run request; write what the run outbox holds. Losses
+        // are counted and logged by the outbox.
+        if let Some(outbox) = self.state.bifrost.observation_runs() {
+            outbox.shutdown(deadline).await;
+        }
         // Every request has finished and Oracle has drained, so no decision
         // can still be staged; commit what the shared outbox holds.
         let uncommitted = self.state.audit_outbox.shutdown(deadline).await;

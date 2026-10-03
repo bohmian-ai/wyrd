@@ -156,3 +156,32 @@ git diff --check
 The focused tests must prove the two diagnosed gaps directly; the broad UI
 lane is regression evidence, not a substitute. Full identity journeys run once
 at change review.
+
+## Remediation Evidence
+
+The lead direction `lead-direction-FIND-TASK-011-2.md` reverses FIND-TASK-011-2. Logout follows standard practice:
+- the cookie and the cached access token are always cleared;
+- RFC 7009 revocation is best-effort;
+- a failure is logged with no token values and is not shown as a failed logout.
+
+So acceptance criteria 3–4 are replaced, and the second focused test is named for the reversed behavior.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| 1. FIND-TASK-011-1: an opaque refresh token is sealed under the application-session bound and forwarded unchanged | `browser-sessions.ts`: `establish` no longer decodes the refresh token, and `sessionLifetimeSeconds` (12 h) bounds both credential kinds | `browser-sessions.test.ts` `accepts an opaque refresh token and forwards it unchanged`: a non-JWT refresh token yields the cookie with `maxAge` 12 h and reaches `refreshTokenGrant` unchanged | PASS |
+| 2. A terminal refresh refusal clears only this session | `access` returns `null` on `ResponseBodyError`; `read` clears that tenant's cookie | Same test: `invalid_grant` clears the refused session's cookie, and another browser's cookie stays | PASS |
+| 3–4 (as reversed by lead direction): logout always signs out; revocation is best-effort and logged without secrets | `BrowserSessions.logout` clears the cookie and cache, then calls `tokenRevocation` in a try/catch with a `console.warn` carrying the tenant and the error name only | `browser-sessions.test.ts` `failed refresh-token revocation still signs out`: logout resolves, the cookie is cleared, one warning contains no token, and a replayed cookie renews through the server (the cache entry is gone) and is refused | PASS |
+| 5. API-key logout clears local state without revoking the key | `logout` returns before revocation for `kind === 'api_key'` | Journey `OIDC-off credential UI`: the key still exchanges after logout | PASS |
+| 6. No prohibited mechanism enters the diff | No retry, store, setting, endpoint, claim or parser added; the JWT decode is deleted | Diff review | PASS |
+| Lead: the mix-up helper asserts the server's one response | `expectMixedCallbackRefused` requires 303 to `/login/callback` with `error=access_denied` and no `code` | Filtered UI journey: 4/4 tests passed | PASS |
+
+Commands (all exited 0):
+
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/server/auth/browser-sessions.test.ts -t 'accepts an opaque refresh token and forwards it unchanged'`
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/server/auth/browser-sessions.test.ts -t 'failed refresh-token revocation still signs out'`
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check` (0 errors)
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test` (33 files, 179 tests)
+- `CARGO_TARGET_DIR=… mise exec -- env WYRD_IDENTITY_TARGET=ui WYRD_IDENTITY_FILTER=production_ui_bff_journey mise run test:identity:journey` (4/4 UI journey tests passed; the host test passed)
+- `CARGO_TARGET_DIR=… mise run fmt`
+- `CARGO_TARGET_DIR=… mise run lints`
+- `git diff --check`

@@ -10,8 +10,11 @@ import { reject, type TenantContext } from './session';
 const sessionPrefix = 'wyrd_session_';
 const loginCookie = 'wyrd_login';
 const loginLifetimeSeconds = 5 * 60;
-/** An API-key session has no refresh-token expiry of its own; it lasts one working day. */
-const apiKeyLifetimeSeconds = 12 * 60 * 60;
+/**
+ * Application-session bound for both credential kinds. The refresh token is
+ * opaque to this client (RFC 6749 §1.5); the server's refusal ends it sooner.
+ */
+const sessionLifetimeSeconds = 12 * 60 * 60;
 /** Renew a cached access token this long before it expires. */
 const renewalMarginMs = 5_000;
 const tenantKeyPattern = /^[a-z0-9][a-z0-9_-]{0,62}$/;
@@ -250,16 +253,11 @@ export class BrowserSessions {
     tokens: client.TokenEndpointResponse,
     cookies: Cookies
   ): Promise<void> {
-    const lifetime =
-      kind === 'refresh'
-        ? (decodeJwt(credential).exp ?? 0) - Math.floor(Date.now() / 1000)
-        : apiKeyLifetimeSeconds;
-    if (!(lifetime > 0)) reject('upstream');
     this.cache(credential, tokens.access_token);
     const sealed: Sealed = { tenant, kind, credential };
-    cookies.set(this.cookieName(tenant), await this.seal(sealed, lifetime), {
+    cookies.set(this.cookieName(tenant), await this.seal(sealed, sessionLifetimeSeconds), {
       ...cookieOptions,
-      maxAge: lifetime
+      maxAge: sessionLifetimeSeconds
     });
   }
 
@@ -335,19 +333,28 @@ export class BrowserSessions {
     return new BrowserSession(tenantKey, access);
   }
 
-  /** Revoke this tenant's refresh token (RFC 7009) and clear its cookie; idempotent. */
+  /**
+   * Sign out of this tenant: always clear its cookie and cached access token,
+   * then revoke its refresh token (RFC 7009) best-effort. A revocation failure
+   * is logged without token values and does not fail the logout.
+   */
   async logout(tenantKey: string, url: URL, cookies: Cookies): Promise<void> {
     const sealed = await this.sealed(tenantKey, cookies);
     cookies.delete(this.cookieName(tenantKey), { path: '/' });
     if (!sealed) return;
     this.#access.delete(this.hash(sealed.credential));
     // An operator API key is never revoked by signing out of the UI.
-    if (sealed.kind === 'refresh')
-      await client
-        .tokenRevocation(await this.configuration(url.origin), sealed.credential, {
-          token_type_hint: 'refresh_token'
-        })
-        .catch(() => reject('upstream'));
+    if (sealed.kind !== 'refresh') return;
+    try {
+      await client.tokenRevocation(await this.configuration(url.origin), sealed.credential, {
+        token_type_hint: 'refresh_token'
+      });
+    } catch (cause) {
+      console.warn('wyrd-ui logout: refresh token revocation failed', {
+        tenant: tenantKey,
+        error: cause instanceof Error ? cause.name : 'unknown'
+      });
+    }
   }
 
   /** Switch to `target`: its own session when the server still renews it, else its sign-in. */

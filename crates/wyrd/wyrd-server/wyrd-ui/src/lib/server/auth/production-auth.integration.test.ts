@@ -233,8 +233,8 @@ async function ssoLogin(
  * login's state, as a mix-up or injection attacker would: every parameter the
  * provider sent (`code`, any RFC 9207 `iss`, and the rest) is kept and only
  * `state` is replaced. The server issues no code: it refuses that other
- * login back to the BFF with an OAuth `error` (or rejects the request
- * outright), and the browser holding that login gets no session.
+ * login back to the BFF with an OAuth `error`, and the browser holding that
+ * login gets no session.
  */
 async function expectMixedCallbackRefused(
   browser: Browser,
@@ -247,18 +247,12 @@ async function expectMixedCallbackRefused(
   const mixed = await fetch(`${journey.servers[0]}/auth/callback?${query}`, {
     redirect: 'manual'
   });
-  let completion = '/login/callback';
-  if (mixed.status === 303) {
-    const returned = new URL(mixed.headers.get('location')!);
-    expect(returned.origin + returned.pathname).toBe(`${journey.origin}/login/callback`);
-    expect(returned.searchParams.get('error')).toBeTruthy();
-    expect(returned.searchParams.has('code')).toBe(false);
-    completion = returned.pathname + returned.search;
-  } else {
-    expect(mixed.status, await mixed.clone().text()).toBeGreaterThanOrEqual(400);
-    expect(mixed.status).toBeLessThan(500);
-  }
-  const done = await browser.go(1, completion);
+  expect(mixed.status, await mixed.clone().text()).toBe(303);
+  const returned = new URL(mixed.headers.get('location')!);
+  expect(returned.origin + returned.pathname).toBe(`${journey.origin}/login/callback`);
+  expect(returned.searchParams.get('error')).toBe('access_denied');
+  expect(returned.searchParams.has('code')).toBe(false);
+  const done = await browser.go(1, returned.pathname + returned.search);
   expect(done.headers.get('location')).toBe(`/t/${tenant}/login?login=failed`);
   expect(browser.cookies.has(sessionCookie(tenant))).toBe(false);
 }

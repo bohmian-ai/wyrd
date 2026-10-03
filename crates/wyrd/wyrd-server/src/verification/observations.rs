@@ -53,9 +53,9 @@ impl ObservationEnqueue {
 
     /// Enqueue runs for every subject-bearing row of one acknowledged frame.
     ///
-    /// Opens one tenant transaction, calls the queue's observation enqueue per
-    /// row, and commits once, so a failure part-way leaves no run from this
-    /// frame.
+    /// Opens one tenant transaction, hands every row to the queue's frame-level
+    /// observation enqueue, which locks the frame's bindings in one order, and
+    /// commits once, so a failure part-way leaves no run from this frame.
     ///
     /// # Errors
     /// Returns a description of the decode, connection, query, or commit failure.
@@ -76,15 +76,15 @@ impl ObservationEnqueue {
             .tenant_conn(tenant)
             .await
             .map_err(|error| error.to_string())?;
-        let mut outcomes = 0;
-        for key in &keys {
-            outcomes += self
-                .queue
-                .enqueue_observation(&mut conn, &key.card_uid, &key.record_id, key.event_time)
-                .await
-                .map_err(|error| error.to_string())?
-                .len();
-        }
+        let observations: Vec<_> = keys
+            .iter()
+            .map(|key| (&key.card_uid, key.record_id.as_str(), key.event_time))
+            .collect();
+        let outcomes = self
+            .queue
+            .enqueue_observations(&mut conn, &observations)
+            .await
+            .map_err(|error| error.to_string())?;
         conn.commit().await.map_err(|error| error.to_string())?;
         Ok(outcomes)
     }

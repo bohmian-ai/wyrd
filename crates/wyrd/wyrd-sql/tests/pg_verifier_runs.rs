@@ -1707,6 +1707,92 @@ async fn observation_enqueue_targets_active_ready_bindings_once() {
     );
 }
 
+/// Two frames that name the same two subjects in opposite orders serialize
+/// instead of deadlocking.
+///
+/// One acknowledged frame mixes rows for every subject its producer emitted,
+/// in emission order, and enqueues them in one transaction. Locking each
+/// binding as its row arrived let two such frames hold one binding each and
+/// wait on the other until Postgres aborted one, losing that frame's runs.
+/// The frame-level enqueue locks every binding it will touch up front, in
+/// binding order, so the second frame waits at its first statement and then
+/// completes.
+///
+/// # Panics
+/// Panics when the second frame does not wait for the first, either frame
+/// fails, or the frames do not make one run per row.
+#[tokio::test]
+async fn frames_naming_subjects_in_opposite_orders_serialize() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierRunQueue::default();
+    let mut setup = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let verifier = register_verifier(&mut setup, &actor, "eval", eval()).await;
+    let mut subjects = Vec::new();
+    for name in ["assertion", "judge"] {
+        let (owner, principal) = register_service(&mut setup, &actor, name).await;
+        bind(
+            &mut setup,
+            &owner,
+            &verifier,
+            BindingActivation::ObservationsReady,
+            Vec::new(),
+        )
+        .await;
+        record_machine_authentication(&mut setup, principal)
+            .await
+            .expect("activation records");
+        subjects.push(owner);
+    }
+    setup.commit().await.expect("setup commits");
+    let event_time = at(22, 11, 59);
+    let [x, y] = [&subjects[0], &subjects[1]];
+
+    let mut first = fixture.tenant_conn().await.expect("first opens");
+    let made = queue
+        .enqueue_observations(
+            &mut first,
+            &[(x, "a-1", event_time), (y, "a-2", event_time)],
+        )
+        .await
+        .expect("first frame enqueues");
+    assert_eq!(made, 2);
+    let mut second = fixture.tenant_conn().await.expect("second opens");
+    let mut probe = fixture.tenant_conn().await.expect("probe opens");
+    let second_frame = async {
+        let made = queue
+            .enqueue_observations(
+                &mut second,
+                &[(y, "b-1", event_time), (x, "b-2", event_time)],
+            )
+            .await
+            .expect("second frame enqueues without a deadlock");
+        second.commit().await.expect("second commits");
+        made
+    };
+    tokio::pin!(second_frame);
+    let raced = tokio::select! {
+        made = &mut second_frame => Some(made),
+        () = await_blocked_backend(&mut probe) => None,
+    };
+    assert_eq!(
+        raced, None,
+        "the second frame waits for every binding the first frame holds"
+    );
+    first.commit().await.expect("first commits");
+    assert_eq!(second_frame.await, 2);
+    drop(probe);
+
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    assert_eq!(run_count(&mut conn).await, 4);
+}
+
 /// Waiting for a trace refunds the attempt and requeues after the poll delay;
 /// once the fixed deadline measured from the run's creation passes, the run
 /// settles `timed_out` with no result, and a stale token changes nothing.

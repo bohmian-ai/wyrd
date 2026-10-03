@@ -108,6 +108,20 @@ const LOCK_OBSERVATION_BINDING_SQL: &str = r#"
        FOR NO KEY UPDATE
 "#;
 
+/// Lock every `observations_ready` binding of a frame's subjects until commit.
+///
+/// Rows are locked in `binding_id` order (the lock sits above the sort), so
+/// two transactions that touch overlapping bindings acquire them in the same
+/// order and one simply waits for the other instead of forming a cycle.
+const LOCK_OBSERVATION_SUBJECTS_SQL: &str = r#"
+    SELECT 1
+      FROM wyrd.verification_bindings
+     WHERE activation = 'observations_ready'
+       AND subject_card_uid = ANY($1)
+     ORDER BY binding_id
+       FOR NO KEY UPDATE
+"#;
+
 /// Find the run that already holds a scheduled occurrence or observation record.
 const EXISTING_RUN_SQL: &str = r#"
     SELECT run_id
@@ -1410,6 +1424,49 @@ impl VerifierRunQueue {
                 ObservationOutcome::Inactive
             };
             outcomes.push((binding_id, outcome));
+        }
+        Ok(outcomes)
+    }
+
+    /// Enqueue the Eval runs of every row in one acknowledged frame.
+    ///
+    /// `observations` are `(subject, record_id, event_time)` in frame order.
+    /// One statement first locks every `observations_ready` binding of the
+    /// frame's distinct subjects in binding order; each row then goes through
+    /// [`Self::enqueue_observation`] in frame order, whose per-binding lock is
+    /// already held. A frame mixes rows of several subjects in emission order,
+    /// so locking each binding as its row arrived let two concurrent frames
+    /// lock the same bindings in opposite orders and deadlock. Returns the
+    /// number of per-binding outcomes, enqueued, replayed, refused, or
+    /// inactive.
+    ///
+    /// # Errors
+    /// Returns the database error when the lock, a read, or an insert fails,
+    /// or a decode error when a stored identity is malformed; runs inserted
+    /// earlier in the same transaction roll back with it.
+    #[tracing::instrument(
+        skip(self, conn, observations),
+        fields(operation = "verification.runs.enqueue_observations", rows = observations.len())
+    )]
+    pub async fn enqueue_observations(
+        &self,
+        conn: &mut TenantConn<'_>,
+        observations: &[(&CardUid, &str, DateTime<Utc>)],
+    ) -> Result<usize, SqlxError> {
+        let subjects: Vec<Uuid> = observations
+            .iter()
+            .map(|(subject, _, _)| subject.as_uuid())
+            .collect();
+        sqlx::query(LOCK_OBSERVATION_SUBJECTS_SQL)
+            .bind(subjects)
+            .execute(&mut **conn.transaction())
+            .await?;
+        let mut outcomes = 0;
+        for (subject, record_id, event_time) in observations {
+            outcomes += self
+                .enqueue_observation(conn, subject, record_id, *event_time)
+                .await?
+                .len();
         }
         Ok(outcomes)
     }

@@ -369,9 +369,21 @@ mod tests {
         for exact in ["1.2.3", "1.2.3-rc.1", "1.2.3+build.7", "1.2.3-rc.1+build.7"] {
             let block: VersionBlock = serde_json::from_value(serde_json::json!(exact)).unwrap();
             assert_eq!(block.as_str(), exact);
-            assert_eq!(serde_json::to_value(&block).unwrap(), serde_json::json!(exact));
+            assert_eq!(
+                serde_json::to_value(&block).unwrap(),
+                serde_json::json!(exact)
+            );
         }
-        for invalid in ["^1.0.0", "~1.2", ">=1.0.0", "*", "1.2", "1", "", "not-a-version"] {
+        for invalid in [
+            "^1.0.0",
+            "~1.2",
+            ">=1.0.0",
+            "*",
+            "1.2",
+            "1",
+            "",
+            "not-a-version",
+        ] {
             assert!(
                 serde_json::from_value::<VersionBlock>(serde_json::json!(invalid)).is_err(),
                 "{invalid:?} must not deserialize as an exact version"

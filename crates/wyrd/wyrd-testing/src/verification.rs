@@ -481,19 +481,11 @@ impl VerificationFixture {
         Ok(())
     }
 
-    /// Bring one armed schedule cursor due no earlier than the present on
-    /// both the database and this process's clock.
+    /// Bring one armed schedule cursor to database statement time.
     ///
     /// Dueness is PostgreSQL's decision, so a scheduling test places the
     /// cursor where the due predicate fires rather than moving a process
-    /// clock. The cursor is also the occurrence's exclusive window end, which
-    /// the Drift engine compares with `wyrd_event_time` values an in-process
-    /// Scribe stamped from this process's clock. The database clock may lag
-    /// that clock (a VM-backed Postgres), so the cursor is the later of
-    /// `statement_timestamp()` and this process's `now`: every observation
-    /// acknowledged before the call falls inside the window, and the
-    /// scheduler claims the occurrence once the database clock reaches the
-    /// cursor.
+    /// clock.
     ///
     /// # Errors
     /// Returns [`VerificationFixtureError`] when the update fails.
@@ -504,10 +496,9 @@ impl VerificationFixture {
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
         sqlx::query(
             "UPDATE wyrd.verification_bindings \
-                SET next_run_at = GREATEST(statement_timestamp(), $2) WHERE binding_id = $1",
+                SET next_run_at = statement_timestamp() WHERE binding_id = $1",
         )
         .bind(binding.as_uuid())
-        .bind(chrono::Utc::now())
         .execute(&mut **conn.transaction())
         .await?;
         conn.commit().await?;

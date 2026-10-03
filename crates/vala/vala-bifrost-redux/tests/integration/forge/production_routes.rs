@@ -2171,6 +2171,25 @@ fn pull_until_drained(
     })
 }
 
+/// Names the decision scenario's tracked tables, the first due ones first.
+///
+/// # Panics
+///
+/// Panics when a generated name is not a valid table identity.
+fn decision_keys(fixture: &PromotionIntegrationFixture) -> Vec<ForgeTableKey> {
+    (0..DECISION_TABLES)
+        .map(|index| ForgeTableKey {
+            tenant: fixture.tenant,
+            table: ForgeTaskTableIdentity::new(
+                "wyrd-redux",
+                fixture.binding.table_ref.namespace.as_str(),
+                format!("decision_{index}"),
+            )
+            .expect("decision table identity"),
+        })
+        .collect()
+}
+
 /// The leader decides commits, pulls, and reports from memory alone.
 ///
 /// The leader's routes — the ones a peer compactor reaches — are driven
@@ -2217,17 +2236,7 @@ async fn leader_decision_has_no_catalog_io() {
         compaction_enabled: true,
         ..ForgeTableSettings::default()
     };
-    let keys = (0..DECISION_TABLES)
-        .map(|index| ForgeTableKey {
-            tenant: fixture.tenant,
-            table: ForgeTaskTableIdentity::new(
-                "wyrd-redux",
-                fixture.binding.table_ref.namespace.as_str(),
-                format!("decision_{index}"),
-            )
-            .expect("decision table identity"),
-        })
-        .collect::<Vec<_>>();
+    let keys = decision_keys(&fixture);
     let notify = |index: usize, snapshot_id: i64| {
         forge
             .accept_commit_notice(

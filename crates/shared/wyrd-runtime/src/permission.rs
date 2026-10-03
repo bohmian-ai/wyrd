@@ -88,6 +88,9 @@ pub enum Resource {
     Policy,
     /// Trigger cards.
     Triggers,
+    /// Accepted server Workflow runs: submission, inspection, and
+    /// cancellation.
+    Workflows,
     /// Service and agent API-key principals.
     ServiceAccounts,
     /// Human user administration.
@@ -219,6 +222,7 @@ impl Resource {
             Self::Audit => "audit",
             Self::Policy => "policy",
             Self::Triggers => "triggers",
+            Self::Workflows => "workflows",
             Self::ServiceAccounts => "service_accounts",
             Self::Users => "users",
             Self::Tenants => "tenants",
@@ -448,6 +452,17 @@ impl Permission {
         Self {
             resource: Resource::Triggers,
             action: Action::Write,
+            scope: PermissionScope::All,
+        }
+    }
+
+    /// Submit, inspect, and cancel the caller's own accepted server
+    /// Workflow runs.
+    #[must_use]
+    pub const fn workflow_run() -> Self {
+        Self {
+            resource: Resource::Workflows,
+            action: Action::Run,
             scope: PermissionScope::All,
         }
     }
@@ -785,6 +800,7 @@ fn parse_resource(value: &str) -> Result<Resource, PermissionParseError> {
         "audit" => Resource::Audit,
         "policy" => Resource::Policy,
         "triggers" => Resource::Triggers,
+        "workflows" => Resource::Workflows,
         "service_accounts" => Resource::ServiceAccounts,
         "users" => Resource::Users,
         "bifrost_table" => Resource::BifrostTable,
@@ -965,6 +981,7 @@ mod tests {
             Resource::Audit,
             Resource::Policy,
             Resource::Triggers,
+            Resource::Workflows,
             Resource::ServiceAccounts,
             Resource::Users,
             Resource::AnyOf(vec![Resource::Operators, Resource::Evals]),

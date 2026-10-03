@@ -10,8 +10,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
 use vala_bifrost_redux::forge::{
-    Forge, ForgeClock, ForgeRoleReadiness, ForgeScheduler, ForgeSchedulerTrigger, ForgeTableKey,
-    ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig,
+    Forge, ForgeClock, ForgeCompactionType, ForgeObjectStore, ForgeRoleReadiness, ForgeScheduler,
+    ForgeSchedulerTrigger, ForgeTableKey, ForgeWorker, ForgeWorkerCompletionObserver,
+    ForgeWorkerConfig,
 };
 use vala_sql::queries::forge_tasks::{ForgeEnqueueBatch, ForgeTasks};
 use vala_sql::row_types::forge_tasks::{
@@ -19,6 +20,7 @@ use vala_sql::row_types::forge_tasks::{
     NewForgeTask, ORPHAN_CLEANUP_PAYLOAD_VERSION,
 };
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
@@ -1700,4 +1702,269 @@ async fn promotion_notification_only_after_iceberg_commit() {
         Some(1),
         "a pass with no promotion debt counts nothing"
     );
+}
+
+/// Plans one fresh managed attempt of `compaction_type` over the fixture table.
+///
+/// # Panics
+///
+/// Panics when the attempt context cannot be built or planning fails.
+async fn planned_paths(
+    promoted: &PromotedRewriteFixture,
+    forge: &Forge,
+    compaction_type: ForgeCompactionType,
+) -> (i64, Vec<BTreeSet<String>>) {
+    let cancel = CancellationToken::new();
+    let planned = forge
+        .managed_rewrite(
+            &promoted.fixture.binding,
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            &cancel,
+        )
+        .expect("the attempt context builds")
+        .plan(compaction_type)
+        .await
+        .expect("planning the current head succeeds");
+    let groups = planned
+        .plans
+        .iter()
+        .map(|planned| {
+            planned
+                .plan
+                .file_group
+                .data_files
+                .iter()
+                .map(|task| task.data_file_path.clone())
+                .collect()
+        })
+        .collect();
+    (planned.evidence.base_snapshot_id, groups)
+}
+
+/// A dispatched worker plans from the table's current Iceberg head.
+///
+/// The leader names a table and a task type, never files, so every file
+/// decision is the worker's, made against the head it loads. Full, the
+/// default, consumes every live file at that head; `SmallFiles` consumes the
+/// small ones, which here is all of them; Auto keeps upstream's five-small-file
+/// floor; `FilesWithDelete` finds nothing on a table without deletes; and a
+/// copy-on-write table plans one table-wide Full group whatever type it names.
+/// Through the production worker, a type that finds nothing still reports
+/// success and publishes no snapshot. A real rewrite then draws on the shared
+/// root: with every byte held, growth is refused or spilled, and once released
+/// the rewrite completes and returns every Forge byte and spill file. The
+/// held Scribe charge beside Forge growth and spill placement are proven at
+/// the pool itself by `rewrite_pool_charges_root_and_releases_on_cancel`,
+/// because Scribe's charge entry point is crate-private.
+///
+/// # Panics
+///
+/// Panics when planning ignores the current head or the requested type, when
+/// a no-plan dispatch fails or publishes, or when a rewrite leaves governed
+/// bytes or spill files behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn worker_selects_current_iceberg_files() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let promoted = PromotedRewriteFixture::start("worker_selects").await;
+    let store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let forge = promoted.forge(
+        promoted.fixture.catalog.iceberg_catalog(),
+        Arc::clone(&store) as Arc<dyn ForgeObjectStore>,
+    );
+    let live = promoted.fixture.live_data_paths().await;
+    let head = promoted
+        .load_table()
+        .await
+        .metadata()
+        .current_snapshot()
+        .expect("a promoted head")
+        .snapshot_id();
+    assert!(
+        (2..5).contains(&live.len()),
+        "the fixture offers small files below Auto's floor: {live:?}"
+    );
+
+    for compaction_type in [ForgeCompactionType::Full, ForgeCompactionType::SmallFiles] {
+        let (base, groups) = planned_paths(&promoted, &forge, compaction_type).await;
+        assert_eq!(base, head, "{compaction_type:?} plans the current head");
+        assert_eq!(
+            groups.iter().flatten().cloned().collect::<BTreeSet<_>>(),
+            live,
+            "{compaction_type:?} consumes every live small file"
+        );
+    }
+    for compaction_type in [
+        ForgeCompactionType::Auto,
+        ForgeCompactionType::FilesWithDelete,
+    ] {
+        let (base, groups) = planned_paths(&promoted, &forge, compaction_type).await;
+        assert_eq!(base, head, "{compaction_type:?} plans the current head");
+        assert!(
+            groups.is_empty(),
+            "{compaction_type:?} selects nothing here: {groups:?}"
+        );
+    }
+    set_table_properties(
+        &promoted.fixture.catalog,
+        &promoted.fixture.binding,
+        &[("write.delete.mode", "copy-on-write")],
+    )
+    .await;
+    let cow_head = promoted
+        .load_table()
+        .await
+        .metadata()
+        .current_snapshot()
+        .expect("a head")
+        .snapshot_id();
+    let (base, groups) =
+        planned_paths(&promoted, &forge, ForgeCompactionType::FilesWithDelete).await;
+    assert_eq!(base, cow_head, "copy-on-write plans the current head");
+    assert_eq!(
+        groups,
+        vec![live.clone()],
+        "copy-on-write plans one table-wide Full group whatever type it names"
+    );
+
+    assert_rewrite_draws_on_shared_root(&promoted, &forge).await;
+}
+
+/// Runs a real rewrite under a full shared root, then under a free one.
+///
+/// With every byte held, the rewrite's growth is refused and the attempt
+/// fails holding nothing; once released, the rewrite completes and returns
+/// every Forge byte and spill file.
+///
+/// # Panics
+///
+/// Panics when the full root admits the rewrite, the free root refuses it, or
+/// a finished rewrite leaves governed bytes or spill files behind.
+async fn assert_rewrite_draws_on_shared_root(
+    promoted: &PromotedRewriteFixture,
+    forge: &Arc<Forge>,
+) {
+    let occupant = promoted.fixture.forge_resources.occupy_root_for_test();
+    let refused = promoted
+        .run_attempt(forge, Uuid::now_v7(), CancellationToken::new())
+        .await;
+    let occupied = promoted
+        .fixture
+        .forge_resources
+        .snapshot()
+        .expect("held snapshot");
+    drop(occupant);
+    assert!(
+        refused.failure.is_some(),
+        "a rewrite cannot grow through a full shared root: {:?}",
+        refused.handoffs
+    );
+    assert_eq!(
+        occupied.forge_memory_used_bytes, occupied.governed_memory_used_bytes,
+        "the occupant is the only holder once the refused rewrite returned"
+    );
+    drop(refused);
+    let run = promoted
+        .run_attempt(forge, Uuid::now_v7(), CancellationToken::new())
+        .await;
+    assert!(
+        run.failure.is_none(),
+        "the released root admits the rewrite: {:?}",
+        run.failure
+    );
+    drop(run);
+    let released = promoted
+        .fixture
+        .forge_resources
+        .snapshot()
+        .expect("released snapshot");
+    assert_eq!(
+        (
+            released.forge_memory_used_bytes,
+            released.governed_memory_used_bytes
+        ),
+        (0, 0),
+        "a finished rewrite returns every Forge byte"
+    );
+    assert_eq!(
+        std::fs::read_dir(&promoted.fixture.forge_spill)
+            .expect("the Forge spill root is readable")
+            .count(),
+        0,
+        "a finished rewrite leaves nothing under the Forge spill root"
+    );
+}
+
+/// A dispatched task type that finds nothing reports success and publishes nothing.
+///
+/// # Panics
+///
+/// Panics when the dispatch fails, publishes a snapshot, or stays owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn worker_reports_no_plan_dispatch_as_success() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let fixture = PromotionIntegrationFixture::start("no_plan_dispatch").await;
+    set_table_properties(
+        &fixture.catalog,
+        &fixture.binding,
+        &[("wyrd.forge.compaction.type", "files-with-delete")],
+    )
+    .await;
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let mut supervisor = SupervisedPromotion::start_serial(
+        &fixture,
+        fixture.catalog.iceberg_catalog(),
+        Arc::clone(&store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    supervisor.run_one_success().await;
+    let key = ForgeTableKey {
+        tenant: fixture.tenant,
+        table: identity(&fixture),
+    };
+    let owes = |supervisor: &SupervisedPromotion| {
+        supervisor
+            .forge()
+            .held_leader_term()
+            .is_some_and(|term| term.schedule().owes_compaction(&key))
+    };
+    assert!(
+        owes(&supervisor),
+        "the promotion commit makes the table owe compaction"
+    );
+    let snapshots = snapshot_count(&fixture).await;
+
+    supervisor.restart_worker();
+    supervisor.settle_one_success().await;
+
+    assert!(
+        !owes(&supervisor),
+        "a no-plan success settles the owed compaction"
+    );
+    assert_eq!(
+        snapshot_count(&fixture).await,
+        snapshots,
+        "a dispatch that planned nothing publishes nothing"
+    );
+    assert_eq!(store.output_writers(), 0, "planning nothing writes nothing");
+    supervisor.shutdown().await;
+}
+
+/// Counts the fixture table's Iceberg snapshots.
+///
+/// # Panics
+///
+/// Panics when the table cannot be loaded.
+async fn snapshot_count(fixture: &PromotionIntegrationFixture) -> usize {
+    fixture
+        .catalog
+        .iceberg_catalog()
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("fixture table")
+        .metadata()
+        .snapshots()
+        .count()
 }

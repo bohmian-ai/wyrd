@@ -1118,7 +1118,7 @@ impl ForgeTasks {
         self.apply_transition(conn, transition, None).await
     }
 
-    /// Atomically marks exact Prepared work successful and requests fresh planning.
+    /// Atomically marks exact Prepared or no-op Running work successful and requests fresh planning.
     ///
     /// The task identity, tenant connection, and table identity are validated
     /// before the audited transition. The successor demand is advanced in the
@@ -1128,7 +1128,9 @@ impl ForgeTasks {
     /// # Errors
     ///
     /// Returns conflict unless the transition is an exact Prepared-to-Succeeded
-    /// transition for the supplied tenant/table, or returns SQL errors.
+    /// transition for the supplied tenant/table, or Running-to-Succeeded for a
+    /// [`TaskProgressEffect::NoOpAcknowledged`] attempt that planned nothing,
+    /// or returns SQL errors.
     /// Caller rollback removes both the terminal state and successor demand.
     ///
     /// # Cancellation
@@ -1141,11 +1143,15 @@ impl ForgeTasks {
         table: &ForgeTaskTableIdentity,
         progress_effect: TaskProgressEffect,
     ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
-        if transition.expected != ForgeTaskState::Prepared
+        // A no-op acknowledgement may have planned nothing, in which case it
+        // never prepared a publication and settles straight from Running.
+        let settles_from_running = transition.expected == ForgeTaskState::Running
+            && matches!(progress_effect, TaskProgressEffect::NoOpAcknowledged { .. });
+        if !(transition.expected == ForgeTaskState::Prepared || settles_from_running)
             || transition.next != ForgeTaskState::Succeeded
         {
             return Err(SqlError::Conflict {
-                detail: "Forge successful continuation requires Prepared-to-Succeeded".to_owned(),
+                detail: "Forge successful continuation requires Prepared-to-Succeeded, or Running-to-Succeeded for a no-op acknowledgement".to_owned(),
             });
         }
         let bound: bool = sqlx::query_scalar(

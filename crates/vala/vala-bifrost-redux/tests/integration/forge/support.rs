@@ -804,9 +804,9 @@ pub(crate) struct PromotionIntegrationFixture {
     /// Validated Forge limits every supervised pair is built with.
     pub(crate) config: ForgeConfig,
     /// Forge capability every supervised Forge owner is built with.
-    forge_resources: vala_bifrost_redux::resources::ForgeResources,
+    pub(crate) forge_resources: vala_bifrost_redux::resources::ForgeResources,
     /// Existing spill directory every supervised Forge owner leases.
-    forge_spill: std::path::PathBuf,
+    pub(crate) forge_spill: std::path::PathBuf,
     /// Real Scribe retained so its owned WAL and workers outlive the seals,
     /// and reused by [`PromotionIntegrationFixture::seal_more`] to publish
     /// further hot objects through the same writer.

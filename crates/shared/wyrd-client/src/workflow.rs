@@ -8,7 +8,7 @@
 //! to the foreign Skald type, so loading lives here. Loading never registers,
 //! executes, or resolves execution secrets.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use skald_workflow::{Workflow as SkaldWorkflow, WorkflowInput, WorkflowResult, WorkflowRun};
 use wyrd_spec::envelope::CardKind;
@@ -36,11 +36,17 @@ impl Workflow {
     /// the same identity. Resolved validation runs before the Workflow is
     /// returned, so a refusal dispatches nothing.
     ///
-    /// Cancellation may stop after completed filesystem or registry reads; no
-    /// partial Workflow is returned and nothing durable is written.
+    /// The synchronous bundle load and entry canonicalization run together on
+    /// Tokio's blocking pool, so filesystem reads never occupy the polling
+    /// thread. Cancellation may stop after completed filesystem or registry
+    /// reads, and an already started bundle read may finish after the future
+    /// is dropped; no partial Workflow is returned and nothing durable is
+    /// written.
     ///
     /// # Errors
-    /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` carrying the loader
+    /// Returns `WYRD_WORKFLOW_500_INTERNAL` when the blocking load task panics
+    /// or is cancelled by runtime shutdown;
+    /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` carrying the loader
     /// diagnostics when the bundle fails to load or `path` does not define
     /// exactly one Workflow Card; the client configuration error when an
     /// external ref needs a client that cannot be built; the Cards read and
@@ -49,17 +55,13 @@ impl Workflow {
     /// and the hydration and validation errors of
     /// [`SkaldWorkflow::from_card_bodies`].
     pub async fn from_path(path: impl AsRef<Path>) -> Result<Self, WyrdError> {
-        let path = path.as_ref();
-        let tree = wyrd_loader::load(path).map_err(|error| WyrdError::RegistryInvalidCardSpec {
-            message: format!("workflow bundle failed to load: {error}"),
-            details: serde_json::json!({ "path": path, "diagnostics": error.diagnostics }),
-        })?;
-        let entry = path.canonicalize().map_err(|error| {
-            WyrdError::registry_invalid_card_spec(format!(
-                "workflow path {} cannot be resolved: {error}",
-                path.display()
-            ))
-        })?;
+        let path = path.as_ref().to_path_buf();
+        let (tree, entry) = tokio::task::spawn_blocking(move || load_bundle(&path))
+            .await
+            .map_err(|error| WyrdError::WorkflowInternal {
+                message: format!("workflow bundle load task failed: {error}"),
+                details: serde_json::json!({ "boundary": "workflow_bundle_load" }),
+            })??;
         let (workflow, mut bodies) = WorkflowBodies::authored(&tree, &entry)?;
         let refs = bodies.external_refs(&workflow);
         if !refs.is_empty() {
@@ -92,6 +94,30 @@ impl Workflow {
     pub fn into_skald(self) -> SkaldWorkflow {
         self.inner
     }
+}
+
+/// Load the authored bundle at `path` and canonicalize its entry file.
+///
+/// This is the synchronous filesystem half of [`Workflow::from_path`], which
+/// runs it on the blocking pool. The canonical entry identifies the Workflow
+/// file among the loaded tree's sources.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` carrying the loader
+/// diagnostics when the bundle fails to load, or naming `path` when it cannot
+/// be canonicalized.
+fn load_bundle(path: &Path) -> Result<(wyrd_loader::LoadedTree, PathBuf), WyrdError> {
+    let tree = wyrd_loader::load(path).map_err(|error| WyrdError::RegistryInvalidCardSpec {
+        message: format!("workflow bundle failed to load: {error}"),
+        details: serde_json::json!({ "path": path, "diagnostics": error.diagnostics }),
+    })?;
+    let entry = path.canonicalize().map_err(|error| {
+        WyrdError::registry_invalid_card_spec(format!(
+            "workflow path {} cannot be resolved: {error}",
+            path.display()
+        ))
+    })?;
+    Ok((tree, entry))
 }
 
 impl From<SkaldWorkflow> for Workflow {

@@ -140,3 +140,11 @@ this documentation-only correction under `AGENTS.md`.
 The next `$wyrd-task-review` must reassess the complete original
 base-to-new-candidate range, the original task, all six remediation tasks, and
 all prior verdicts; it must not review only the R6 delta.
+
+## Implementation evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-003-15`: PyO3 `Workflow.run` help matches the stubs | `sdks/wyrd-sdk-python/src/workflow.rs` `Workflow.run` opening now matches `python/wyrd/stubs/agent.pyi`, including run-start secret reads; commit `2ddc56734` | `cargo fmt --all --check`, `mise run codegen:check`, `git diff --check`: clean | PASS |
+
+Closed at human direction ("fix it and move on to the next task") without a further review round.

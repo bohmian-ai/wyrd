@@ -2295,6 +2295,14 @@ impl Oracle {
             .await?;
         if let Some(telemetry) = query_telemetry.as_mut() {
             telemetry.admitted();
+            // A registry cancel marks this query cancelled even before it has
+            // a stream that could mark itself.
+            if let Some(entry) = self
+                .running_queries
+                .get(context.data_tenant_id, &context.request_id)
+            {
+                telemetry.explicit_cancelled = entry.telemetry_cancelled();
+            }
         }
         let bound = match self.audit_and_bind(
             CutAuditInput {
@@ -5102,6 +5110,45 @@ mod tests {
             observed,
             "canonical stream metric was not recorded: {snapshot:?}"
         );
+    }
+
+    /// A registry cancel before the stream exists records the query cancelled.
+    ///
+    /// The telemetry owner shares the registered entry's marker, so the cancel
+    /// classifies the pre-stream terminal, while a query that fails before its
+    /// stream without any cancel is still recorded as failed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either pre-stream terminal records a different outcome.
+    #[test]
+    fn oracle_pre_stream_registry_cancel_records_cancelled() {
+        let recorder = wyrd_bench::BenchmarkRecorder::new();
+        metrics::with_local_recorder(&recorder, || {
+            let registry = RunningQueryRegistry::new();
+            let tenant_id = DataTenantId::new_v7();
+            let request_id = RequestId::now_v7();
+            let entry = running::tests::entry(tenant_id, request_id.clone());
+            assert!(registry.insert(entry.clone()));
+            let mut cancelled = OracleTelemetry::start_query(QueryClass::Analytical);
+            cancelled.explicit_cancelled = entry.telemetry_cancelled();
+            assert!(registry.cancel(tenant_id, &request_id).is_some());
+            drop(cancelled);
+
+            drop(OracleTelemetry::start_query(QueryClass::Analytical));
+        });
+        let snapshot = recorder.snapshot();
+        for outcome in ["cancelled", "failed"] {
+            let count = snapshot
+                .histograms
+                .iter()
+                .find(|(series, _)| {
+                    series.starts_with("oracle_query_duration_seconds{")
+                        && series.contains(&format!("outcome=\"{outcome}\""))
+                })
+                .map(|(_, histogram)| histogram.count);
+            assert_eq!(count, Some(1), "{outcome}: {snapshot:?}");
+        }
     }
 
     /// Drives every locally observable Oracle capacity signal exactly once.

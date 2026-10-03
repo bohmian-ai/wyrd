@@ -233,3 +233,17 @@ unrelated to the launcher. The Windows proof is therefore the `webbrowser` crate
 plus the deletion of all `cmd /C start` code. No per-OS launch path remains in `wyrd-cli`.
 
 Non-goals stayed excluded, and no file outside the expected write set changed.
+
+### Exact-selector evidence (TASK-012-R1, FIND-TASK-012-4)
+
+Each command below ran under `CARGO_TARGET_DIR` set to the repo `target/` and reported `1 test run: 1 passed`.
+
+```text
+mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=transport::config::tests::remote_cleartext_malformed_and_unsupported_targets_are_refused)'
+mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=transport::config::tests::https_and_loopback_http_are_accepted)'
+mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=auth::tests::token_exchange_refuses_remote_cleartext)'
+mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=saved_login::tests::canonical_origin_is_the_url_origin)'
+mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=saved_login::tests::unsafe_and_corrupt_stores_fail_closed)'
+mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=auth::tests::token_exchange_never_follows_a_redirect)'
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-client --test pg_auth_e2e_against_fixture -E 'test(=pg_tests::wyrd_client_authenticates_via_wyrd_access_token_header)'"
+```

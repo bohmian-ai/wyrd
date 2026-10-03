@@ -7,6 +7,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
@@ -97,6 +98,37 @@ pub(crate) async fn register_table(
         binding: TenantTableBinding::resolve((tenant, table_ref))
             .expect("the registered table resolves to its physical binding"),
     }
+}
+
+/// Opts one registered table into Forge compaction, due on every commit.
+///
+/// Compaction is off by default, as in `RisingWave`; a table opts in through
+/// its own Iceberg properties. A snapshot-count trigger of one makes each
+/// promotion commit due on the next compactor pull, so a journey never waits
+/// out the hourly interval.
+///
+/// # Panics
+///
+/// Panics when the table cannot be loaded or the property commit fails.
+pub(crate) async fn enable_compaction(server: &WyrdTestServer, binding: &TenantTableBinding) {
+    let catalog = server.bifrost_catalog().iceberg_catalog();
+    let table = catalog
+        .load_table(&binding.table_ident())
+        .await
+        .expect("the compacting table loads");
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_table_properties()
+        .set("wyrd.forge.enable-compaction".to_owned(), "true".to_owned())
+        .set(
+            "wyrd.forge.compaction.trigger-snapshot-count".to_owned(),
+            "1".to_owned(),
+        )
+        .apply(tx)
+        .expect("Forge compaction settings");
+    tx.commit_once(catalog.as_ref())
+        .await
+        .expect("Forge compaction settings commit");
 }
 
 /// Builds a unique table name for one journey.

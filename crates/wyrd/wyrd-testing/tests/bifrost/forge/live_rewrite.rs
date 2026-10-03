@@ -12,8 +12,8 @@ use wyrd_testing::bifrost::{WyrdTestCluster, shared_process_telemetry_for_test};
 
 use crate::public_support::{
     JourneyTable, ManagedRow, append_values, assert_tenant_scoped_not_found, canonical_order,
-    public_rows_returned, read_managed_rows, register_table, rows_digest, tenant_client,
-    unique_table,
+    enable_compaction, public_rows_returned, read_managed_rows, register_table, rows_digest,
+    tenant_client, unique_table,
 };
 
 /// Longest a journey waits for one production Forge attempt to return.
@@ -1306,6 +1306,8 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     let shared_name = unique_table("rewrite_recovery");
     let shared = register_table(server, owner, &shared_name).await;
     let neighbour_shared = register_table(server, neighbour, &shared_name).await;
+    enable_compaction(server, &shared.binding).await;
+    enable_compaction(server, &neighbour_shared.binding).await;
     assert_eq!(
         shared.qualified, neighbour_shared.qualified,
         "both tenants must be registering the identical table name"
@@ -1315,6 +1317,7 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         "one logical name must resolve to two disjoint physical tables"
     );
     let neighbour_only = register_table(server, neighbour, &unique_table("neighbour_only")).await;
+    enable_compaction(server, &neighbour_only.binding).await;
     let owner_client = tenant_client(server, owner).await;
     let neighbour_client = tenant_client(server, neighbour).await;
 
@@ -2113,6 +2116,8 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
             .expect("undeclared registration"),
         RegisterOutcome::Created
     );
+    enable_compaction(server, &declared.binding).await;
+    enable_compaction(server, &undeclared.binding).await;
     let described = |table: &JourneyTable| {
         let client = &client;
         let fqn = table.qualified.clone();
@@ -2249,6 +2254,7 @@ async fn failed_memory_attempt_retries_without_partial_publication() {
     let server = cluster.server(0).expect("the embedded pod is running");
     let tenant = cluster.data_tenant_id();
     let table = register_table(server, tenant, &unique_table("memory_retry")).await;
+    enable_compaction(server, &table.binding).await;
     let client = tenant_client(server, tenant).await;
     let mut expected = Vec::new();
     for half in 0..2_i64 {

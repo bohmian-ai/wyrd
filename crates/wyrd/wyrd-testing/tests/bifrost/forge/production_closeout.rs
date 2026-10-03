@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::public_support::{
-    JourneyTable, ManagedRow, append_values, canonical_order, read_managed_rows, register_table,
-    tenant_client, unique_table,
+    JourneyTable, ManagedRow, append_values, canonical_order, enable_compaction, read_managed_rows,
+    register_table, tenant_client, unique_table,
 };
 use arrow::array::{BinaryBuilder, Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -590,10 +590,12 @@ impl CloseoutJourney {
             })
             .await
             .expect("payload table registration");
+        let binding = TenantTableBinding::resolve((tenant, table_ref)).expect("table binding");
+        enable_compaction(self.scribe(), &binding).await;
         JourneyTable {
             qualified: format!("{}.{name}", BifrostNamespace::Datasets.as_str()),
             name,
-            binding: TenantTableBinding::resolve((tenant, table_ref)).expect("table binding"),
+            binding,
         }
     }
 
@@ -1169,6 +1171,7 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     let name = unique_table("geometry");
     let table = journey.register_payload_table(tenant, name).await;
     let neighbour_table = register_table(journey.scribe(), neighbour, &table.name).await;
+    enable_compaction(journey.scribe(), &neighbour_table.binding).await;
     journey.declare_geometry(&table.binding).await;
     journey.declare_geometry(&neighbour_table.binding).await;
     let target = journey.declared_target_bytes(&table.binding).await;
@@ -1458,6 +1461,7 @@ impl ReaderCleanupJourney {
             .register_payload_table(tenant, unique_table("retained_reader"))
             .await;
         let neighbour_table = register_table(roles.scribe(), neighbour, &table.name).await;
+        enable_compaction(roles.scribe(), &neighbour_table.binding).await;
         let writer = tenant_client(roles.scribe(), tenant).await;
         let reader = tenant_client(roles.oracle(), tenant).await;
         let neighbour_writer = tenant_client(roles.scribe(), neighbour).await;
@@ -1740,6 +1744,7 @@ impl OrphanJourney {
             .register_payload_table(tenant, unique_table("never_published"))
             .await;
         let neighbour_table = register_table(roles.scribe(), neighbour, &table.name).await;
+        enable_compaction(roles.scribe(), &neighbour_table.binding).await;
         let writer = tenant_client(roles.scribe(), tenant).await;
         let reader = tenant_client(roles.oracle(), tenant).await;
         let neighbour_writer = tenant_client(roles.scribe(), neighbour).await;

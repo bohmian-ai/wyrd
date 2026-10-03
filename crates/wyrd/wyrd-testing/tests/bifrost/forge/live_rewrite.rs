@@ -849,13 +849,17 @@ struct RecoveryTelemetry {
     /// Plans the attempt admitted, each of which publishes independently and
     /// is therefore the ceiling on how many catalog commits it may submit.
     plans: usize,
-    /// Live data files the operation promised to remove.
+    /// Live data files the recovered operation promised to remove, plus those
+    /// the recovering dispatch's own later rewrites removed.
     input_files: u64,
-    /// Managed data files the operation promised to add.
+    /// Managed data files the recovered operation promised to add, plus those
+    /// the recovering dispatch's own later rewrites added.
     output_files: u64,
-    /// Byte volume the landed snapshot recorded as removed.
+    /// Byte volume the landed snapshot and the later rewrites recorded as
+    /// removed.
     input_bytes: u64,
-    /// Byte volume the landed snapshot recorded as added.
+    /// Byte volume the landed snapshot and the later rewrites recorded as
+    /// added.
     output_bytes: u64,
     /// Rows public appends acknowledged inside the journey window.
     acknowledged_rows: u64,
@@ -1030,7 +1034,7 @@ fn assert_recovery_telemetry(
 
     // 3b. A result is what a settlement committed, never a Rust `Ok`. The
     //     released attempt wrote nothing durable, so its trace names no
-    //     result; the task's last settled execution names its durable state.
+    //     result.
     for span in executions
         .iter()
         .filter(|span| attribute(span, "attempt_id") == Some(facts.attempt_id.to_string().as_str()))
@@ -1052,10 +1056,13 @@ fn assert_recovery_telemetry(
         .iter()
         .rev()
         .find_map(|span| attribute(span, "result"));
+    // The leader owns a dispatched task's retry: the lapsed claim is closed by
+    // reclaim rather than re-run, and the recovery settles under the leader's
+    // next dispatch, whose success 3c observes.
     assert_eq!(
         (settled_result, facts.task_state.as_str()),
-        (Some("succeeded"), "succeeded"),
-        "the task's last settled execution reports the durable state it committed: {executions:?}"
+        (None, "cancelled"),
+        "the released task is closed by reclaim, not settled by a second owner: {executions:?}"
     );
 
     // 3c. Each settled small-files execution is one trace and one counted
@@ -1135,7 +1142,9 @@ fn assert_recovery_telemetry(
         "the reconciliation settled the recovered small-files attempt: {recovered}"
     );
 
-    // 5. The counted recovery volume is the manifest-derived volume.
+    // 5. The counted recovery volume is the manifest-derived volume: the
+    //    recovered operation counted once, plus whatever the recovering
+    //    dispatch then rewrote under its own operations.
     for (family, expected) in [
         ("bifrost_forge_input_files_total", facts.input_files),
         ("bifrost_forge_input_bytes_total", facts.input_bytes),
@@ -1801,6 +1810,11 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     })
     .await
     .expect("the owner releases the attempt it cannot account for");
+    // Recovery is a fresh leader dispatch that reconciles from retained
+    // evidence and then publishes its own rewrite, so the lost-response fault
+    // ends with the attempt it simulated; left armed, it would refuse that
+    // rewrite too.
+    uncertainty.resolve_uncertainty();
 
     let mut settled = false;
     for _ in 0..DRAIN_PASS_BUDGET {
@@ -1871,25 +1885,37 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         phase, "recovered",
         "the successor settles its predecessor's own operation as recovered"
     );
+    // Recovery is the leader's next dispatch: it settles the landed operation
+    // from evidence and may then compact the table's current files under its
+    // own operation. What it must never do is publish the landed rewrite again.
     let recovered = rewrite_snapshots(&cluster, &shared.binding).await;
-    assert_eq!(
-        recovered.len(),
-        rewrites_after_commit,
-        "recovery published no second rewrite snapshot: {recovered:?}"
-    );
     let still = recovered
         .iter()
         .find(|snapshot| snapshot.snapshot_id == rewrite_snapshot_id)
         .expect("the recovered snapshot is the one the uncertain commit landed");
     assert_eq!(
         still.added_data, landed.added_data,
-        "recovery produced no new managed output"
+        "the landed rewrite's own output is unchanged by recovery"
     );
-    assert_eq!(
-        live_cut(&cluster, &shared.binding).await,
-        rewritten_cut,
-        "recovery left the live cut exactly as the uncertain commit did"
+    assert!(
+        recovered
+            .iter()
+            .filter(|other| other.snapshot_id != rewrite_snapshot_id)
+            .all(|later| later.added_data.is_disjoint(&landed.added_data)
+                && later.summary.get("forge.operation_id")
+                    != landed.summary.get("forge.operation_id")),
+        "recovery never republishes the landed operation: {recovered:?}"
     );
+    // Rewrites the recovering dispatch published after the landed one; their
+    // volume is counted in the recovery window alongside the recovered one's.
+    let successors = recovered
+        .iter()
+        .filter(|later| {
+            published
+                .iter()
+                .all(|before| before.snapshot_id != later.snapshot_id)
+        })
+        .collect::<Vec<_>>();
 
     // Tenant isolation across the whole recovery, at the platform layer too.
     assert_eq!(
@@ -1961,10 +1987,18 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
             task_state: durable_task_state(&cluster, landed_task).await,
             attempt_id: landed_attempt,
             plans: attempt_plan_count(&observer, landed_attempt),
-            input_files: landed.removed_data.len() as u64,
-            output_files: landed.added_data.len() as u64,
-            input_bytes: landed.removed_bytes,
-            output_bytes: landed.added_bytes,
+            input_files: (landed.removed_data.len()
+                + successors
+                    .iter()
+                    .map(|s| s.removed_data.len())
+                    .sum::<usize>()) as u64,
+            output_files: (landed.added_data.len()
+                + successors.iter().map(|s| s.added_data.len()).sum::<usize>())
+                as u64,
+            input_bytes: landed.removed_bytes
+                + successors.iter().map(|s| s.removed_bytes).sum::<u64>(),
+            output_bytes: landed.added_bytes
+                + successors.iter().map(|s| s.added_bytes).sum::<u64>(),
             acknowledged_rows: (owner_expected.len()
                 + neighbour_shared_expected.len()
                 + neighbour_only_expected.len()) as u64,

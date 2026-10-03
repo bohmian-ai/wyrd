@@ -760,6 +760,43 @@ impl CloseoutJourney {
         .expect("the abandoned rewrite and its retry both settle");
     }
 
+    /// Waits until the leader no longer owes `binding`'s table a compaction.
+    ///
+    /// A refused dispatch closes its row and leaves the retry to the leader,
+    /// which re-dispatches the table on a later worker pull; until that retry
+    /// settles the debt, planning admits no orphan cleanup for the table.
+    ///
+    /// # Panics
+    /// Panics if the debt outlives the rewrite bound or a worker fails for an
+    /// unexpected reason.
+    async fn settle_owed_compaction(&self, binding: &TenantTableBinding) {
+        let key = ForgeTableKey {
+            tenant: binding.tenant,
+            table: vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity::new(
+                vala_bifrost_redux::catalog::BIFROST_CATALOG_NAME,
+                binding.logical_namespace.as_str(),
+                binding.table_ref.name.as_str(),
+            )
+            .expect("table identity"),
+        };
+        let owed = || {
+            self.coordinator()
+                .state()
+                .forge_coordinator()
+                .and_then(|forge| forge.held_leader_term())
+                .is_some_and(|term| term.schedule().owes_compaction(&key))
+        };
+        tokio::time::timeout(REWRITE_BOUND, async {
+            while owed() {
+                let next = self.observer.attempts() + 1;
+                self.observer.wait_for_attempts_at_least(next).await;
+                self.drain_tasks_allowing_injected_refusal().await;
+            }
+        })
+        .await
+        .expect("the leader's retry settles the refused table's debt");
+    }
+
     /// Settles the planning pass the coordinator runs as soon as it starts.
     ///
     /// A coordinator plans immediately on start, so a fixture that drives its
@@ -1863,6 +1900,7 @@ impl OrphanJourney {
         let drive = async {
             roles.scheduler_pass().await;
             roles.drain_tasks_allowing_injected_refusal().await;
+            roles.settle_owed_compaction(&table.binding).await;
         };
         let inspect = async {
             tokio::time::timeout(

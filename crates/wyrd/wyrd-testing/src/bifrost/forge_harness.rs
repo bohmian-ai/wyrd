@@ -362,6 +362,14 @@ impl CommitUncertaintyCatalog {
             .store(true, Ordering::Release);
     }
 
+    /// Lets commits through again once the simulated lost response has been
+    /// reconciled, so later rewrites publish instead of inheriting the fault.
+    pub fn resolve_uncertainty(&self) {
+        self.controls
+            .uncertainty_active
+            .store(false, Ordering::Release);
+    }
+
     /// Pause after the real catalog has accepted one commit.
     pub fn pause_after_commit(&self) {
         self.controls.update_attempts.store(0, Ordering::Release);

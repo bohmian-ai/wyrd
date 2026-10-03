@@ -54,11 +54,9 @@
         <p>Deactivating stops new sign-ins and session renewal through this connection. Access already issued stays valid until it expires (at most five minutes).</p>
         <div class="row">
           <form method="POST" action="?/deactivate">
-            <input type="hidden" name="csrf" value={data.session.csrf} />
             <button class="app-control" type="submit">Deactivate</button>
           </form>
           <form method="POST" action="?/remove">
-            <input type="hidden" name="csrf" value={data.session.csrf} />
             <input type="hidden" name="id" value={active.id} />
             <button class="app-control" type="submit">Remove</button>
           </form>
@@ -78,19 +76,16 @@
         </dl>
         <div class="row">
           <form method="POST" action="?/test">
-            <input type="hidden" name="csrf" value={data.session.csrf} />
             <input type="hidden" name="revision" value={candidate.revision} />
             <button class="app-control" type="submit" title="Sign in at the provider once to test this revision; no session is created">Test sign-in</button>
           </form>
           <form method="POST" action="?/remove">
-            <input type="hidden" name="csrf" value={data.session.csrf} />
             <input type="hidden" name="id" value={candidate.id} />
             <button class="app-control" type="submit">Remove</button>
           </form>
         </div>
         {#if tested}
           <form class="stack" method="POST" action="?/activate">
-            <input type="hidden" name="csrf" value={data.session.csrf} />
             <input type="hidden" name="revision" value={candidate.revision} />
             <label for="recovery">Recovery API key</label>
             <input id="recovery" class="app-input" type="password" name="recoveryApiKey" required autocomplete="off" />
@@ -100,7 +95,6 @@
         {/if}
       {/if}
       <form class="stack" method="POST" action="?/stage">
-        <input type="hidden" name="csrf" value={data.session.csrf} />
         <input type="hidden" name="revision" value={candidate?.revision ?? ''} />
         <label for="issuer">Issuer URL</label>
         <input id="issuer" class="app-input" name="issuer" type="url" required value={candidate?.issuer ?? ''} />

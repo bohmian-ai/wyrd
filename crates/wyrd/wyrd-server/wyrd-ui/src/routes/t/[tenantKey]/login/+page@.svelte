@@ -19,15 +19,17 @@
         <StateBlock state={issue.status >= 500 ? 'error' : 'unauthorized'} title={issue.status >= 500 ? 'Sign-in unavailable' : issue.title} detail={issue.status >= 500 ? 'Please try again later.' : issue.remediation} code={issue.code} />
       </div>
     {/if}
-    {#if data.sso}
+    {#if !issue || issue.status < 500}
       <form method="POST" action="?/sso"><button class="app-control primary wide" type="submit">Sign in with SSO</button></form>
-    {:else if !data.problem || data.problem.status < 500}
-      <form class="api-key" method="POST" action="?/apiKey">
-        <label for="api-key">API key</label>
-        <input id="api-key" class="app-input" type="password" name="apiKey" required autocomplete="off" />
-        <p>This tenant has no SSO connection. Use an existing Wyrd API key for this tenant; it is kept on the server, never in this browser.</p>
-        <button class="app-control primary wide" type="submit">Sign in with API key</button>
-      </form>
+      <details>
+        <summary>Sign in with an operator API key</summary>
+        <form class="api-key" method="POST" action="?/apiKey">
+          <label for="api-key">API key</label>
+          <input id="api-key" class="app-input" type="password" name="apiKey" required autocomplete="off" />
+          <p>For a tenant without SSO. Use an existing Wyrd API key for this tenant; this browser keeps it only inside an encrypted, HttpOnly cookie.</p>
+          <button class="app-control primary wide" type="submit">Sign in with API key</button>
+        </form>
+      </details>
     {/if}
   </div>
 </main>
@@ -74,9 +76,15 @@
     text-align: center;
     overflow-wrap: anywhere;
   }
+  summary {
+    font: 12px var(--font-sans);
+    color: var(--muted);
+    cursor: pointer;
+  }
   .api-key {
     display: grid;
     gap: 10px;
+    padding-top: 12px;
   }
   label {
     font: 700 11px var(--font-mono);

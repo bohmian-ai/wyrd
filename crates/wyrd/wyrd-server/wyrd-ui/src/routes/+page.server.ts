@@ -9,7 +9,7 @@ import {
 } from '$lib/server/development';
 import { fail, isHttpError, redirect } from '@sveltejs/kit';
 import { reject, sessionCookie, sessionLifetime, sessions } from '$lib/server/auth/session';
-import { serverSessions } from '$lib/server/auth/server-sessions';
+import { browserSessions } from '$lib/server/auth/browser-sessions';
 import { problem, safeProblem } from '$lib/server/problem';
 import { serverReady } from '$lib/server/upstream';
 import type { Actions, PageServerLoad } from './$types';
@@ -49,12 +49,11 @@ export const actions: Actions = {
       return fail(400, { problem: problem('validation'), reauthentication: null });
     redirect(303, `/t/${encodeURIComponent(key.trim())}/login`);
   },
-  mockData: async ({ locals, request, cookies }) => {
+  mockData: async ({ request, cookies }) => {
     if (!dev || request.headers.get('origin') !== new URL(request.url).origin)
       return fail(403, { problem: problem('denied'), reauthentication: null });
     const data = await request.formData();
     try {
-      if (locals.session) sessions.checkAction(locals.session, request, data.get('csrf'));
       const enabled = data.get('enabled');
       if (enabled !== 'true' && enabled !== 'false') reject('denied');
       const destination = data.get('returnTo');
@@ -78,7 +77,7 @@ export const actions: Actions = {
       throw cause;
     }
   },
-  loginScenario: async ({ locals, request, cookies }) => {
+  loginScenario: async ({ request, cookies }) => {
     if (
       !dev ||
       !mockDataEnabled(cookies) ||
@@ -87,7 +86,6 @@ export const actions: Actions = {
       return fail(403, { problem: problem('denied'), reauthentication: null });
     try {
       const data = await request.formData();
-      if (locals.session) sessions.checkAction(locals.session, request, data.get('csrf'));
       const scenario = data.get('scenario');
       if (scenario !== 'single' && scenario !== 'multiple' && scenario !== 'none')
         reject('denied');
@@ -136,22 +134,17 @@ export const actions: Actions = {
     const session = sessions.read(id).session!;
     redirect(303, sessions.destination(session) ?? '/');
   },
-  switch: async ({ locals, request, cookies }) => {
+  switch: async ({ locals, request, cookies, url }) => {
     try {
       const data = await request.formData();
       const key = data.get('tenantKey');
       if (typeof key !== 'string') reject('denied');
-      if (!localAuthEnabled()) {
-        const from = data.get('from');
-        if (typeof from !== 'string') reject('denied');
-        redirect(303, await serverSessions.switch(from, key, cookies, request, data.get('csrf')));
-      }
+      if (!localAuthEnabled()) redirect(303, await browserSessions.switch(key, url, cookies));
       if (!locals.session) reject('unauthenticated');
-      sessions.checkAction(locals.session, request, data.get('csrf'));
       const reauthentication = sessions.reauthenticationTenant(locals.session, key);
       if (reauthentication)
         return fail(401, { problem: problem('unauthenticated'), reauthentication });
-      const destination = sessions.switch(locals.session, key, request, data.get('csrf'));
+      const destination = sessions.switch(locals.session, key);
       redirect(303, destination);
     } catch (cause) {
       if (isHttpError(cause))
@@ -166,25 +159,24 @@ export const actions: Actions = {
       const data = await request.formData();
       const key = data.get('tenantKey');
       if (typeof key !== 'string') reject('denied');
-      sessions.reauthenticate(locals.session, key, request, data.get('csrf'));
-      redirect(303, sessions.switch(locals.session, key, request, data.get('csrf')));
+      sessions.reauthenticate(locals.session, key);
+      redirect(303, sessions.switch(locals.session, key));
     } catch (cause) {
       if (isHttpError(cause))
         return fail(cause.status, { problem: safeProblem(cause), reauthentication: null });
       throw cause;
     }
   },
-  logout: async ({ locals, request, cookies }) => {
+  logout: async ({ locals, request, cookies, url }) => {
     try {
       const data = await request.formData();
       if (!localAuthEnabled()) {
         const key = data.get('tenantKey');
         if (typeof key !== 'string') reject('denied');
-        await serverSessions.logout(key, cookies, request, data.get('csrf'));
+        await browserSessions.logout(key, url, cookies);
         redirect(303, `/t/${encodeURIComponent(key)}/login`);
       }
       if (!locals.session) reject('unauthenticated');
-      sessions.checkAction(locals.session, request, data.get('csrf'));
       sessions.remove(cookies.get(sessionCookie)!);
       cookies.delete(sessionCookie, { path: '/' });
       redirect(303, '/');

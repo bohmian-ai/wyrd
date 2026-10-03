@@ -7,7 +7,6 @@ const tenant = { key: 'acme', name: 'Acme' };
 const session = {
   subject: { id: 'user', name: 'Jordan Reyes' },
   tenants: [tenant],
-  csrf: 'csrf',
   expiresAt: 1
 };
 const children = createRawSnippet(() => ({ render: () => '<h1>Workspace</h1>' }));
@@ -34,7 +33,7 @@ test('exactly six tenant-relative destinations and static single-tenant identity
   expect(view.getByRole('link', { name: 'Skip to content' })).toHaveAttribute('href', '#main');
 });
 
-test('multiple tenants have searchable CSRF-protected switching and accessible mobile navigation', async () => {
+test('multiple tenants have searchable switching and accessible mobile navigation', async () => {
   const view = render(Shell, {
     tenant,
     session: { ...session, tenants: [tenant, { key: 'research', name: 'Research' }] },
@@ -47,7 +46,6 @@ test('multiple tenants have searchable CSRF-protected switching and accessible m
   expect(view.queryByRole('button', { name: 'Acme' })).toBeNull();
   const destination = view.getByRole('button', { name: 'Research' });
   expect(destination.closest('form')).toHaveAttribute('action', '/?/switch');
-  expect(destination.closest('form')?.querySelector('[name="csrf"]')).toHaveValue('csrf');
   const menu = view.getByRole('button', { name: /^Menu$/ });
   await fireEvent.click(menu);
   expect(menu).toHaveAttribute('aria-expanded', 'true');

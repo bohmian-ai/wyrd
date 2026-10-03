@@ -1,7 +1,7 @@
-import { fail, isHttpError, redirect, type Cookies } from '@sveltejs/kit';
+import { fail, isHttpError, redirect } from '@sveltejs/kit';
 import { reject } from '$lib/server/auth/session';
-import { checkAction, problemKind, serverSessions } from '$lib/server/auth/server-sessions';
-import { problem, safeProblem } from '$lib/server/problem';
+import type { BrowserSession } from '$lib/server/auth/browser-sessions';
+import { problem, problemKind, safeProblem } from '$lib/server/problem';
 import type { Actions, PageServerLoad, RequestEvent } from './$types';
 
 /** Redacted connection projection of `GET /v1/identity/oidc/connections`. */
@@ -26,22 +26,21 @@ export type Connections = {
 
 /** Call the tenant connection API as the signed-in principal; non-2xx becomes a safe problem. */
 async function call(
-  tenantKey: string,
-  cookies: Cookies,
+  session: BrowserSession,
   method: string,
   path: string,
   body?: unknown
 ): Promise<Response> {
-  const response = await serverSessions.api(tenantKey, cookies, method, path, body);
+  const response = await session.api(method, path, body);
   if (!response.ok) reject(await problemKind(response));
   return response;
 }
 
-export const load: PageServerLoad = async ({ locals, params, cookies }) => {
+export const load: PageServerLoad = async ({ locals }) => {
   // Connection administration is a server contract; the development identity has no server session.
-  if (!locals.serverSession) return { connections: null, problem: problem('upstream') };
+  if (!locals.browserSession) return { connections: null, problem: problem('upstream') };
   try {
-    const response = await call(params.tenantKey, cookies, 'GET', '/identity/oidc/connections');
+    const response = await call(locals.browserSession, 'GET', '/identity/oidc/connections');
     return { connections: (await response.json()) as Connections, problem: null };
   } catch (cause) {
     if (!isHttpError(cause)) throw cause;
@@ -49,16 +48,15 @@ export const load: PageServerLoad = async ({ locals, params, cookies }) => {
   }
 }
 
-/** Run one CSRF-checked mutation and render its refusal as a safe problem. */
+/** Run one mutation as the signed-in principal and render its refusal as a safe problem. */
 async function mutate(
   event: RequestEvent,
-  run: (form: FormData, tenantKey: string) => Promise<unknown>
+  run: (form: FormData, session: BrowserSession) => Promise<unknown>
 ) {
   try {
     const form = await event.request.formData();
-    checkAction(event.locals, event.request, form.get('csrf'));
-    if (!event.locals.serverSession) reject('unauthenticated');
-    await run(form, event.params.tenantKey);
+    if (!event.locals.browserSession) reject('unauthenticated');
+    await run(form, event.locals.browserSession);
     return { done: true };
   } catch (cause) {
     if (!isHttpError(cause)) throw cause;
@@ -95,14 +93,14 @@ function roleMap(source: string): Record<string, string[]> {
 
 export const actions: Actions = {
   stage: (event) =>
-    mutate(event, async (form, key) => {
+    mutate(event, async (form, session) => {
       const clientAuth = text(form, 'clientAuth');
       if (!['SecretBasic', 'SecretPost', 'Public'].includes(clientAuth)) reject('validation');
       const secret = text(form, 'clientSecret');
       const email = text(form, 'emailClaim');
       const groups = text(form, 'groupsClaim');
       const expected = text(form, 'revision');
-      await call(key, event.cookies, 'PUT', '/identity/oidc/candidate', {
+      await call(session, 'PUT', '/identity/oidc/candidate', {
         issuer: text(form, 'issuer'),
         client_id: text(form, 'clientId'),
         client_auth: clientAuth,
@@ -122,8 +120,8 @@ export const actions: Actions = {
    */
   test: async (event) => {
     let authorizationUrl: string | undefined;
-    const result = await mutate(event, async (form, key) => {
-      const response = await call(key, event.cookies, 'POST', '/identity/oidc/candidate/test', {
+    const result = await mutate(event, async (form, session) => {
+      const response = await call(session, 'POST', '/identity/oidc/candidate/test', {
         expected_revision: revision(form)
       });
       ({ authorization_url: authorizationUrl } = (await response.json()) as {
@@ -134,20 +132,20 @@ export const actions: Actions = {
     redirect(303, authorizationUrl);
   },
   activate: (event) =>
-    mutate(event, (form, key) =>
-      call(key, event.cookies, 'POST', '/identity/oidc/candidate/activate', {
+    mutate(event, (form, session) =>
+      call(session, 'POST', '/identity/oidc/candidate/activate', {
         expected_revision: revision(form),
         recovery_api_key: text(form, 'recoveryApiKey')
       })
     ),
   deactivate: (event) =>
-    mutate(event, (_, key) =>
-      call(key, event.cookies, 'POST', '/identity/oidc/active/deactivate')
+    mutate(event, (_, session) =>
+      call(session, 'POST', '/identity/oidc/active/deactivate')
     ),
   remove: (event) =>
-    mutate(event, (form, key) => {
+    mutate(event, (form, session) => {
       const id = text(form, 'id');
       if (!/^[0-9a-f-]{36}$/i.test(id)) reject('validation');
-      return call(key, event.cookies, 'DELETE', `/identity/oidc/connections/${id}`);
+      return call(session, 'DELETE', `/identity/oidc/connections/${id}`);
     })
 };

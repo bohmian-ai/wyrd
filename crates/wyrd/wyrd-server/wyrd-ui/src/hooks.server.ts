@@ -1,7 +1,7 @@
 import { error, redirect, type Handle, type HandleServerError } from '@sveltejs/kit';
 import { localAuthEnabled, mockDataEnabled } from '$lib/server/development';
 import { sessionCookie, sessions } from '$lib/server/auth/session';
-import { serverSessions } from '$lib/server/auth/server-sessions';
+import { browserSessions } from '$lib/server/auth/browser-sessions';
 import { WyrdClient } from '$lib/server/wyrd';
 import { problem } from '$lib/server/problem';
 
@@ -16,15 +16,15 @@ export const handle: Handle = async ({ event, resolve }) => {
     event.locals.sessionProblem = null;
     if (tenantKey) {
       // Hooks run on every request, including actions and data requests whose layouts are cached.
-      const session = await serverSessions.read(tenantKey, event.cookies);
+      const session = await browserSessions.read(tenantKey, event.url, event.cookies);
       if (!session) {
         if (event.request.method === 'GET' && !event.isDataRequest)
           redirect(303, `/t/${encodeURIComponent(tenantKey)}/login`);
         const value = problem('unauthenticated');
         error(value.status, { ...value, message: value.title });
       }
-      event.locals.serverSession = session;
-      event.locals.tenant = serverSessions.context(session);
+      event.locals.browserSession = session;
+      event.locals.tenant = session.context();
       // Mock projections belong to the development identity only.
       event.locals.wyrd = new WyrdClient(event.locals.tenant, false);
     }

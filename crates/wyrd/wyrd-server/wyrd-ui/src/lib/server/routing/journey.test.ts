@@ -51,7 +51,7 @@ afterAll(async () => {
   }
 });
 
-test('real browser-facing loads and actions contain credentials, enforce CSRF, and isolate tenant tabs', async () => {
+test('real browser-facing loads and actions contain credentials and isolate tenant tabs', async () => {
   const entry = await fetch(origin);
   const entryHtml = await entry.text();
   expect(entryHtml).toContain('Sign in with SSO');
@@ -80,20 +80,14 @@ test('real browser-facing loads and actions contain credentials, enforce CSRF, a
   const html = await chooser.text();
   expect(html).toContain('Choose a tenant');
   expect(html).not.toContain(cookie.split('=')[1]);
-  const csrf = html.match(/name="csrf" value="([a-f0-9]+)"/)![1];
-  const post = (body: URLSearchParams, requestOrigin = origin) =>
+  const post = (body: URLSearchParams) =>
     fetch(`${origin}/?/switch`, {
       method: 'POST',
-      headers: { accept: 'text/html', cookie, origin: requestOrigin },
+      headers: { accept: 'text/html', cookie, origin },
       body,
       redirect: 'manual'
     });
-  expect((await post(new URLSearchParams({ tenantKey: 'research' }))).status).toBe(403);
-  expect(
-    (await post(new URLSearchParams({ tenantKey: 'research', csrf }), 'https://other.example'))
-      .status
-  ).toBe(403);
-  const switched = await post(new URLSearchParams({ tenantKey: 'research', csrf }));
+  const switched = await post(new URLSearchParams({ tenantKey: 'research' }));
   expect(switched.status).toBe(303);
   expect(switched.headers.get('location')).toBe('/t/research');
   const otherTab = await fetch(`${origin}/t/acme`, { headers: { cookie } });
@@ -108,7 +102,7 @@ test('real browser-facing loads and actions contain credentials, enforce CSRF, a
     fetch(`${origin}/?/mockData`, {
       method: 'POST',
       headers: { accept: 'text/html', cookie, origin: requestOrigin },
-      body: new URLSearchParams({ enabled, csrf, returnTo: '/t/acme' }),
+      body: new URLSearchParams({ enabled, returnTo: '/t/acme' }),
       redirect: 'manual'
     });
   expect((await toggle('false', 'https://other.example')).status).toBe(403);
@@ -143,7 +137,7 @@ test('real browser-facing loads and actions contain credentials, enforce CSRF, a
   const logout = await fetch(`${origin}/?/logout`, {
     method: 'POST',
     headers: { accept: 'text/html', cookie, origin },
-    body: new URLSearchParams({ csrf }),
+    body: new URLSearchParams(),
     redirect: 'manual'
   });
   expect(logout.status).toBe(303);
@@ -169,10 +163,7 @@ test('mock SSO resolves configured organization and dev access scenarios without
   expect(login.headers.get('location')).toBe('/t/acme');
   const cookie = login.headers.get('set-cookie')!.split(';')[0];
   expect((await fetch(`${origin}/t/research`, { headers: { cookie } })).status).toBe(403);
-  const home = await (await fetch(`${origin}/t/acme`, { headers: { cookie } })).text();
-  const csrf = home.match(/name="csrf" value="([a-f0-9]+)"/)![1];
-  expect((await post('loginScenario', { scenario: 'none' }, cookie)).status).toBe(403);
-  const scenario = await post('loginScenario', { scenario: 'none', csrf }, cookie);
+  const scenario = await post('loginScenario', { scenario: 'none' }, cookie);
   expect(scenario.status).toBe(303);
   const revoked = await fetch(`${origin}/t/acme`, { headers: { cookie }, redirect: 'manual' });
   expect(revoked.status).toBe(303);

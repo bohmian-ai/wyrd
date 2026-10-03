@@ -17,3 +17,21 @@ export function safeProblem(cause: unknown): WyrdProblem {
   }
   return problem('internal');
 }
+
+type ProblemKind = keyof typeof examples;
+const kindByStatus: Record<number, ProblemKind> = {
+  400: 'validation',
+  401: 'unauthenticated',
+  403: 'denied',
+  404: 'notFound',
+  409: 'conflict'
+};
+
+/** Map a Wyrd problem response to a known safe problem kind: by code, then by status. */
+export async function problemKind(response: Response): Promise<ProblemKind> {
+  const known = safeProblem(await response.json().catch(() => null));
+  const byCode = Object.entries(kindByStatus).find(
+    ([, kind]) => problem(kind).code === known.code
+  )?.[1];
+  return byCode ?? kindByStatus[response.status] ?? 'upstream';
+}

@@ -84,7 +84,7 @@
         {#if session.tenants.length > 1}
           <details class="tenant-menu">
             <summary aria-label="Current tenant">{tenant.name}</summary>
-            <TenantChooser {session} from={tenant.key} />
+            <TenantChooser {session} />
           </details>
         {:else}
           <span aria-label="Current tenant">{tenant.name}</span>
@@ -92,7 +92,6 @@
         <details class="principal">
           <summary>{session.subject.name}</summary>
           <form method="POST" action="/?/logout">
-            <input type="hidden" name="csrf" value={session.csrf} />
             <input type="hidden" name="tenantKey" value={tenant.key} />
             <button class="app-control" type="submit">Sign out</button>
           </form>

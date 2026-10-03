@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { SessionMetadata } from '$lib/views';
-  let { session, from }: { session: SessionMetadata; from?: string } = $props();
+  let { session }: { session: SessionMetadata } = $props();
   let search = $state('');
   let matches = $derived(
     session.tenants.filter((tenant) =>
@@ -14,8 +14,6 @@
   <label for={id}>Search tenants</label>
   <input id={id} class="app-input" placeholder="⌕ filter tenants" type="search" bind:value={search} />
   <form method="POST" action="/?/switch">
-    <input type="hidden" name="csrf" value={session.csrf} />
-    {#if from}<input type="hidden" name="from" value={from} />{/if}
     {#each matches as tenant (tenant.key)}
       <button class="app-control" type="submit" name="tenantKey" value={tenant.key}>{tenant.name}</button>
     {:else}

@@ -1,13 +1,13 @@
 import { env } from '$env/dynamic/private';
 
 /** `localhost` or a literal loopback address, as normalized by the URL parser. */
-const loopback = (hostname: string) =>
+export const loopback = (hostname: string) =>
   hostname === 'localhost' || hostname === '[::1]' || /^127\.\d+\.\d+\.\d+$/.test(hostname);
 
 /**
  * Internal Wyrd server origin; the application image points it at the
- * co-located Rust listener. This one origin carries the BFF service key and
- * session credentials, so it must be `https:`; plaintext `http:` is allowed
+ * co-located Rust listener. This one origin carries the `wyrd-ui` client secret
+ * and session credentials, so it must be `https:`; plaintext `http:` is allowed
  * only for `localhost` and literal loopback addresses. Only an absent value
  * takes the loopback default; an explicit empty value is refused like any
  * other invalid one. Throws on any other value, before a caller can send a

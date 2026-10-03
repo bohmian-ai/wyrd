@@ -31,7 +31,7 @@
     <span class="brand"><img src={logo} alt="" width="28" height="28" /><span class="wordmark">bohmian</span></span>
     <span class="product">WYRD</span>
     {#if data.session}
-      <details><summary class="app-control">{data.session.subject.name}</summary><form method="POST" action="?/logout"><input type="hidden" name="csrf" value={data.session.csrf} /><button class="app-control" type="submit">Sign out</button></form></details>
+      <details><summary class="app-control">{data.session.subject.name}</summary><form method="POST" action="?/logout"><button class="app-control" type="submit">Sign out</button></form></details>
     {/if}
     <button class="app-control" type="button" onclick={toggleMode} aria-label={`Switch to ${theme.mode === 'dark' ? 'light' : 'dark'} mode`}>◐ {theme.mode === 'dark' ? 'Light' : 'Dark'}</button>
   </header>
@@ -55,7 +55,6 @@
     {:else if reauthentication}
       <p>This tenant requires a fresh sign-in before you continue.</p>
       <form method="POST" action="?/reauthenticate">
-        <input type="hidden" name="csrf" value={data.session.csrf} />
         <input type="hidden" name="tenantKey" value={reauthentication.key} />
         <button class="app-control primary sign-in" type="submit">Sign in with SSO</button>
       </form>

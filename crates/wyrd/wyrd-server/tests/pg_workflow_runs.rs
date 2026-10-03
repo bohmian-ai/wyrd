@@ -564,21 +564,6 @@ impl Fixture {
             .collect()
     }
 
-    /// Decisions of `operation` for `principal` with `outcome`.
-    async fn decisions_for(
-        &self,
-        operation: &str,
-        principal: &Principal,
-        outcome: &str,
-    ) -> Vec<Decision> {
-        let id = principal.bootstrap.id().to_string();
-        self.decisions(operation)
-            .await
-            .into_iter()
-            .filter(|decision| decision.principal == id && decision.outcome == outcome)
-            .collect()
-    }
-
     /// Wait for every gateway call task, whose settlement records the call's
     /// ledger entry and invoke decision.
     ///
@@ -692,6 +677,19 @@ async fn bootstrap(server: &WyrdTestServer, name: &str, roles: &[&str]) -> Princ
     );
     let token = server.exchange_api_key(&key).await.expect("key exchanges");
     Principal { bootstrap, token }
+}
+
+/// The decisions among `decisions` made for `principal` with `outcome`.
+fn made_for<'a>(
+    decisions: &'a [Decision],
+    principal: &Principal,
+    outcome: &str,
+) -> Vec<&'a Decision> {
+    let id = principal.bootstrap.id().to_string();
+    decisions
+        .iter()
+        .filter(|decision| decision.principal == id && decision.outcome == outcome)
+        .collect()
 }
 
 /// `principal` with a token signed by the restarted `server`.
@@ -1044,33 +1042,25 @@ async fn admission_is_audited_and_side_effect_free_on_refusal() {
     assert_eq!(fixture.upstream.arrivals(), 6);
 
     let resource = "workflow:engineering/code-review@1.0.0";
+    let creates = fixture.decisions("workflow.run.create").await;
+    let reads = fixture.decisions("workflow.run.read").await;
     for denied in [&reader, &runtime_admin] {
-        let decisions = fixture
-            .decisions_for("workflow.run.create", denied, "denied")
-            .await;
-        assert_eq!(decisions.len(), 1, "{decisions:?}");
-        assert_eq!(decisions[0].permission, "workflows:run");
-        assert_eq!(decisions[0].resource, resource);
-        let reads = fixture
-            .decisions_for("workflow.run.read", denied, "denied")
-            .await;
-        assert_eq!(reads.len(), 1, "{reads:?}");
-        assert_eq!(reads[0].resource, format!("workflow-run:{unknown}"));
+        let create = made_for(&creates, denied, "denied");
+        assert_eq!(create.len(), 1, "{create:?}");
+        assert_eq!(create[0].permission, "workflows:run");
+        assert_eq!(create[0].resource, resource);
+        let read = made_for(&reads, denied, "denied");
+        assert_eq!(read.len(), 1, "{read:?}");
+        assert_eq!(read[0].resource, format!("workflow-run:{unknown}"));
     }
-    let allowed = fixture
-        .decisions_for("workflow.run.create", &fixture.runner, "allowed")
-        .await;
+    let allowed = made_for(&creates, &fixture.runner, "allowed");
     assert_eq!(allowed.len(), runner_allowed, "{allowed:?}");
     for accepted in [&writer, &agent, &fixture.admin] {
-        let allowed = fixture
-            .decisions_for("workflow.run.create", accepted, "allowed")
-            .await;
+        let allowed = made_for(&creates, accepted, "allowed");
         assert_eq!(allowed.len(), 1, "{allowed:?}");
     }
     assert!(
-        fixture
-            .decisions("workflow.run.create")
-            .await
+        creates
             .iter()
             .all(|decision| !decision.detail.contains("secret_marker")),
         "decisions carry no request input"
@@ -1268,9 +1258,8 @@ async fn accepted_authority_outlives_submission_only() {
     assert_eq!(run_of(replay), finished, "a replay never refreshes the run");
     assert_eq!(fixture.upstream.arrivals(), 3);
     fixture.settle_gateway().await;
-    let invocations = fixture
-        .decisions_for("gateway.invoke", &fixture.runner, "allowed")
-        .await;
+    let invocations = fixture.decisions("gateway.invoke").await;
+    let invocations = made_for(&invocations, &fixture.runner, "allowed");
     assert_eq!(
         invocations.len(),
         3,
@@ -1284,8 +1273,8 @@ async fn accepted_authority_outlives_submission_only() {
 /// space for the Card read, and the model sees the complete results.
 /// Malformed arguments, non-SELECT SQL, an exceeded result ceiling, and an
 /// unknown Card reach the model only as redacted stable codes; a call to an
-/// undeclared tool fails the run. A caller without Card or table grants is
-/// denied, and a grant added after acceptance does not widen the run.
+/// undeclared tool fails the run. A caller without Card or query grants is
+/// denied, and grants added after acceptance do not widen the run.
 /// Cancelling a run while its query is held settles the query's resources
 /// before the cancel answers, and a later query still runs.
 ///
@@ -1352,11 +1341,7 @@ async fn declared_tools_use_captured_scopes_and_owned_services() {
         .server
         .seed_role(
             "workflow_limited",
-            &[
-                Permission::workflow_run(),
-                Permission::bifrost_query_read(),
-                openai_invoke(),
-            ],
+            &[Permission::workflow_run(), openai_invoke()],
         )
         .await
         .expect("limited role seeds");
@@ -1369,9 +1354,9 @@ async fn declared_tools_use_captured_scopes_and_owned_services() {
     fixture.upstream.wait_arrivals(before + 1).await;
     fixture
         .server
-        .grant_role(&limited.bootstrap, "reader")
+        .grant_role(&limited.bootstrap, RUNNER_ROLE)
         .await
-        .expect("reader role grants");
+        .expect("runner role grants");
     fixture.upstream.reply(tool_calls(&[
         ("query", "bifrost.query", json!({ "sql": select })),
         ("card", "cards.get", prompt),
@@ -1423,13 +1408,10 @@ async fn declared_tools_use_captured_scopes_and_owned_services() {
             .contains("second")
     );
 
-    let card_reads = fixture
-        .decisions_for("card.read.ref", &fixture.runner, "allowed")
-        .await;
-    assert_eq!(card_reads.len(), 2, "{card_reads:?}");
-    let denied = fixture
-        .decisions_for("card.read.ref", &limited, "denied")
-        .await;
+    let card_reads = fixture.decisions("card.read.ref").await;
+    let allowed = made_for(&card_reads, &fixture.runner, "allowed");
+    assert_eq!(allowed.len(), 2, "{allowed:?}");
+    let denied = made_for(&card_reads, &limited, "denied");
     assert_eq!(denied.len(), 1, "{denied:?}");
 }
 
@@ -1518,9 +1500,8 @@ async fn server_routes_keep_gateway_and_external_ownership() {
         "WYRD_WORKFLOW_503_BINDING_UNAVAILABLE",
     );
     assert_eq!(fixture.upstream.arrivals(), 2);
-    let invocations = fixture
-        .decisions_for("gateway.invoke", &fixture.runner, "allowed")
-        .await;
+    let invocations = fixture.decisions("gateway.invoke").await;
+    let invocations = made_for(&invocations, &fixture.runner, "allowed");
     assert_eq!(invocations.len(), 1, "{invocations:?}");
 }
 
@@ -1680,7 +1661,7 @@ async fn lifecycle_races_retention_and_shutdown() {
 
 #[tokio::test(flavor = "multi_thread")]
 /// Graph bounds refuse a Workflow with too many steps, too many dependency
-/// edges counting duplicates, or too many resolved body bytes, and an
+/// edges, or too many resolved body bytes, and an
 /// oversized input, all before any provider call and without leaking the
 /// only active slot. A step result over its bound fails the run with a
 /// complete bounded snapshot that carries none of the oversized output.
@@ -1705,7 +1686,7 @@ async fn graph_and_snapshot_limits_preserve_sibling_services() {
     let runner = &fixture.runner.token;
     let extra_step = |id: &str| {
         format!(
-            "    - id: {id}\n      action:\n        type: agent\n        target: ./agents/security.yaml\n      inputs:\n        code: input.code\n\n    - id: correctness"
+            "    - id: {id}\n      action:\n        type: agent\n        target:\n          kind: Agent\n          name: security-reviewer\n          version: \"1.0.0\"\n      inputs:\n        code: input.code\n\n    - id: correctness"
         )
     };
     let wide = code_review_variant("wide-review", |yaml| {
@@ -1713,11 +1694,12 @@ async fn graph_and_snapshot_limits_preserve_sibling_services() {
             .replacen("    - id: correctness", &extra_step("extra_two"), 1)
     });
     let dense = code_review_variant("dense-review", |yaml| {
-        yaml.replacen(
-            "depends_on: [security, correctness]",
-            "depends_on: [security, correctness, security]",
-            1,
-        )
+        yaml.replacen("    - id: correctness", &extra_step("extra_one"), 1)
+            .replacen(
+                "depends_on: [security, correctness]",
+                "depends_on: [security, correctness, extra_one]",
+                1,
+            )
     });
     let heavy = single_step("heavy-review", "[]", WYRD_GATEWAY, 20_000);
     let bulky = single_step("bulky-review", "[]", WYRD_GATEWAY, 0);

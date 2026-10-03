@@ -585,8 +585,7 @@ impl Benchmark {
     ///
     /// # Cancellation
     ///
-    /// Not cancelled by [`Benchmark::run`]; each replica stop is synchronous
-    /// and bounded by [`STOP_GRACE`].
+    /// Not cancelled by [`Benchmark::run`]; see [`stop_replicas`].
     async fn clean_up(&mut self) -> (Option<String>, Vec<std::result::Result<f64, String>>) {
         let Some(mut deployment) = self.deployment.take() else {
             return (None, Vec::new());
@@ -601,14 +600,7 @@ impl Benchmark {
                 Ok(())
             })
             .await;
-        let mut shutdown = Vec::new();
-        for replica in deployment.replicas.drain(..).rev() {
-            let log = self
-                .output
-                .join(format!("server-{}.log", replica.ordinal()));
-            shutdown.push(replica.stop(&log).map_err(|error| error.to_string()));
-        }
-        shutdown.reverse();
+        let shutdown = stop_replicas(std::mem::take(&mut deployment.replicas), &self.output).await;
         (failure, shutdown)
     }
 
@@ -652,6 +644,36 @@ impl Benchmark {
     fn deployment_mut(&mut self) -> Result<&mut Deployment> {
         Ok(self.deployment.as_mut().ok_or("no deployment yet")?)
     }
+}
+
+/// Stops `replicas` newest first, copying each log into `output` as
+/// `server-<ordinal>.log`, and returns each stop's seconds or error in
+/// ordinal order.
+///
+/// Each [`LocalServer::stop`] is synchronous and may wait out the whole
+/// [`STOP_GRACE`] before its kill, reap, and log copy, so it runs on Tokio's
+/// blocking pool while this future awaits it; the async workers stay free
+/// for timers and other tasks during cleanup. A stop that panics is reported
+/// as that replica's error.
+///
+/// # Cancellation
+///
+/// Dropping the future abandons the stop in progress, which still finishes
+/// on the blocking pool; later replicas are killed by their `Drop`.
+async fn stop_replicas(
+    replicas: Vec<LocalServer>,
+    output: &Path,
+) -> Vec<std::result::Result<f64, String>> {
+    let mut shutdown = Vec::new();
+    for replica in replicas.into_iter().rev() {
+        let log = output.join(format!("server-{}.log", replica.ordinal()));
+        let stopped =
+            tokio::task::spawn_blocking(move || replica.stop(&log).map_err(|e| e.to_string()))
+                .await;
+        shutdown.push(stopped.unwrap_or_else(|error| Err(error.to_string())));
+    }
+    shutdown.reverse();
+    shutdown
 }
 
 /// The identity of the measured `binary`: path, size, and modification
@@ -731,13 +753,16 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, ExitStatus, Stdio};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use clap::Parser as _;
     use tokio::time::Instant;
 
-    use super::{Benchmark, Cli, Lifetime};
+    use super::{Benchmark, Cli, Lifetime, LocalServer, stop_replicas};
 
     /// A benchmark that cannot finish fails when its measuring share ends,
     /// and a cleanup that cannot finish stops at its own reserve, so both
@@ -776,10 +801,10 @@ mod tests {
     }
 
     /// A stand-in `wyrd-server` for the stalled-setup proof: `migrate`
-    /// succeeds, serving answers `/readyz` from a static file server, and
-    /// `setup` logs to stderr and never exits. Each invocation records its
-    /// pid, the serve its working directory, and each `setup` its tenant in
-    /// `scratch`.
+    /// succeeds, serving answers `/readyz` from a static file server and
+    /// exits cleanly two seconds after `SIGTERM`, and `setup` logs to stderr
+    /// and never exits. Each invocation records its pid, the serve its
+    /// working directory, and each `setup` its tenant in `scratch`.
     const STALLING_SERVER: &str = r#"#!/bin/sh
 case "$1" in
   migrate) exit 0 ;;
@@ -792,9 +817,27 @@ case "$1" in
     echo $$ > "SCRATCH/serve.pid"
     pwd > "SCRATCH/serve.cwd"
     touch readyz
-    exec python3 -m http.server --bind 127.0.0.1 8080 ;;
+    exec python3 -c 'import http.server as h, signal, sys, time
+signal.signal(signal.SIGTERM, lambda *_: (time.sleep(2), sys.exit(0)))
+h.ThreadingHTTPServer(("127.0.0.1", 8080), h.SimpleHTTPRequestHandler).serve_forever()' ;;
 esac
 "#;
+
+    /// Writes `program` into `path` with `SCRATCH` replaced by `scratch` and
+    /// makes it executable.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the file cannot be written.
+    fn stand_in(path: &Path, program: &str, scratch: &Path) {
+        std::fs::write(
+            path,
+            program.replace("SCRATCH", &scratch.display().to_string()),
+        )
+        .expect("write the stand-in");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in executable");
+    }
 
     /// Whether process `pid` is gone, reaped rather than left a zombie.
     fn reaped(scratch: &Path, file: &str) -> bool {
@@ -822,13 +865,7 @@ esac
         unsafe { std::env::set_var("WYRD_TEST_DATABASE_ADMIN_URL", "postgres://unused") };
         let scratch = tempfile::tempdir().expect("scratch directory");
         let server = scratch.path().join("wyrd-server");
-        std::fs::write(
-            &server,
-            STALLING_SERVER.replace("SCRATCH", &scratch.path().display().to_string()),
-        )
-        .expect("write the stand-in");
-        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755))
-            .expect("make the stand-in executable");
+        stand_in(&server, STALLING_SERVER, scratch.path());
         let cli = Cli::parse_from([
             "capacity",
             "--server-binary",
@@ -895,5 +932,223 @@ esac
         );
         assert!(report["report"]["setup_seconds"].is_null());
         std::fs::remove_dir_all(root).expect("remove the kept replica directory");
+    }
+
+    /// A replica that takes two seconds to exit after `SIGTERM` stops off
+    /// the test runtime's only worker: a heartbeat task on that worker keeps
+    /// ticking while it stops, and the stop still waits for the clean exit,
+    /// reaps the process, keeps its log, and reports its time.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the heartbeat stalls, the stop fails or is too quick, the
+    /// replica survives, or its log is lost.
+    #[tokio::test]
+    #[ignore = "starts a stand-in server in a systemd user scope on port 8080; needs a delegating systemd user manager and python3"]
+    async fn a_slow_replica_stop_leaves_the_runtime_free() {
+        // SAFETY: nextest runs this test alone in its process, and no other
+        // thread reads the environment yet. `LocalServer::start` only checks
+        // that the Postgres wrapper set it; the stand-in never connects.
+        unsafe { std::env::set_var("WYRD_TEST_DATABASE_ADMIN_URL", "postgres://unused") };
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let server = scratch.path().join("wyrd-server");
+        stand_in(&server, STALLING_SERVER, scratch.path());
+        let replica = LocalServer::start(&server, &[], &[])
+            .await
+            .expect("the stand-in serves");
+        let output = scratch.path().join("capacity");
+        std::fs::create_dir_all(&output).expect("output directory");
+
+        let beats = Arc::new(AtomicUsize::new(0));
+        let heartbeat = tokio::spawn({
+            let beats = Arc::clone(&beats);
+            async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    beats.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+        let shutdown = stop_replicas(vec![replica], &output).await;
+        let beats = beats.load(Ordering::Relaxed);
+        heartbeat.abort();
+
+        assert!(
+            beats >= 10,
+            "the heartbeat ticked {beats} times during the stop"
+        );
+        assert!(
+            matches!(shutdown.as_slice(), [Ok(seconds)] if *seconds >= 2.0),
+            "the stop waited for the clean exit: {shutdown:?}"
+        );
+        assert!(
+            reaped(scratch.path(), "serve.pid"),
+            "the replica was reaped"
+        );
+        assert!(
+            output.join("server-0.log").is_file(),
+            "the replica's log is kept"
+        );
+    }
+
+    /// A stand-in `docker` or `cargo` for the task proofs. It logs its name
+    /// and first argument; when that argument is `HANG` it ignores `SIGTERM`
+    /// and starts a descendant that ignores it too, records its pid, and
+    /// sleeps, then waits for it, so only a `SIGKILL` stops either.
+    const TASK_STAND_IN: &str = r#"#!/bin/sh
+echo "NAME $1" >> SCRATCH/calls
+if [ "$1" = "HANG" ]; then
+  trap '' TERM
+  sh -c 'echo $$ > SCRATCH/descendant.pid; exec sleep 600' &
+  wait
+fi
+"#;
+
+    /// A stand-in Postgres wrapper: it logs its start, runs its command, and
+    /// logs its teardown on exit, including after `SIGTERM`, as the real
+    /// wrapper tears its database down.
+    const WRAPPER_STAND_IN: &str = r#"#!/usr/bin/env bash
+echo wrapper >> SCRATCH/calls
+trap 'echo teardown >> SCRATCH/calls' EXIT
+trap 'exit 143' TERM
+shift
+"$@"
+"#;
+
+    /// Runs the `bench:capacity` script exactly as `mise.toml` defines it,
+    /// except for a `limit`-second deadline, from a scratch directory with
+    /// stand-ins for `docker`, `cargo`, and the Postgres wrapper; the
+    /// `docker` one hangs on `docker_hang` and the `cargo` one on
+    /// `cargo_hang`. Returns the scratch directory, the task's exit status,
+    /// and how long it took. `HOME` points at the scratch directory so the
+    /// wrapped login shell keeps the stand-ins first on `PATH`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the task or a stand-in cannot be written or run.
+    fn run_task(
+        limit: u64,
+        docker_hang: &str,
+        cargo_hang: &str,
+    ) -> (tempfile::TempDir, ExitStatus, Duration) {
+        let mise =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../mise.toml"))
+                .expect("read mise.toml");
+        let task = &mise[mise
+            .find("[tasks.\"bench:capacity\"]")
+            .expect("the task exists")..];
+        let open = "run = '''\n";
+        let script = &task[task.find(open).expect("the task runs a script") + open.len()..];
+        let script = &script[..script.find("\n'''").expect("the script ends")];
+        assert_eq!(script.matches("30 * 60").count(), 1, "one 30-minute limit");
+        let script = script.replace("30 * 60", &limit.to_string());
+
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let bin = scratch.path().join("bin");
+        let wrapper = scratch.path().join("scripts/postgres");
+        std::fs::create_dir_all(&bin).expect("stand-in directory");
+        std::fs::create_dir_all(&wrapper).expect("wrapper directory");
+        let program =
+            |name: &str, hang: &str| TASK_STAND_IN.replace("NAME", name).replace("HANG", hang);
+        stand_in(
+            &bin.join("docker"),
+            &program("docker", docker_hang),
+            scratch.path(),
+        );
+        stand_in(
+            &bin.join("cargo"),
+            &program("cargo", cargo_hang),
+            scratch.path(),
+        );
+        stand_in(
+            &wrapper.join("with-test-postgres.sh"),
+            WRAPPER_STAND_IN,
+            scratch.path(),
+        );
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path)))
+            .expect("PATH joins");
+        let stderr = std::fs::File::create(scratch.path().join("stderr")).expect("stderr file");
+        let started = std::time::Instant::now();
+        let status = Command::new("sh")
+            .args(["-o", "errexit", "-c", &script])
+            .current_dir(scratch.path())
+            .env("PATH", path)
+            .env("HOME", scratch.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr)
+            .status()
+            .expect("run the task");
+        (scratch, status, started.elapsed())
+    }
+
+    /// Whether the process whose pid `scratch/file` holds no longer runs:
+    /// gone, or a zombie its new parent has yet to reap.
+    fn stopped(scratch: &Path, file: &str) -> bool {
+        let pid =
+            std::fs::read_to_string(scratch.join(file)).expect("the stand-in recorded its pid");
+        std::fs::read_to_string(PathBuf::from(format!("/proc/{}/stat", pid.trim()))).map_or(
+            true,
+            |stat| {
+                stat.rsplit(')')
+                    .next()
+                    .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+            },
+        )
+    }
+
+    /// The calls the task stand-ins logged, in order.
+    fn calls(scratch: &Path) -> String {
+        std::fs::read_to_string(scratch.join("calls")).expect("the stand-ins logged")
+    }
+
+    /// A setup step before the Postgres wrapper whose descendant ignores
+    /// `SIGTERM` cannot hold the task past its deadline: its whole process
+    /// group is killed within its share, the task fails, and no later step
+    /// starts.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the task succeeds, outlives its deadline, leaves the
+    /// descendant running, or starts a later step.
+    #[test]
+    #[ignore = "runs the bench:capacity task script with stand-ins for about 7 s"]
+    fn a_hung_setup_step_is_killed_with_its_descendants_by_the_deadline() {
+        let (scratch, status, took) = run_task(12, "compose", "-");
+
+        assert!(!status.success(), "the task fails");
+        assert!(took < Duration::from_secs(12), "the task took {took:?}");
+        assert!(
+            stopped(scratch.path(), "descendant.pid"),
+            "the descendant was killed"
+        );
+        assert_eq!(calls(scratch.path()), "docker compose\n", "no later step");
+    }
+
+    /// The benchmark run inside the Postgres wrapper, whose descendant
+    /// ignores `SIGTERM`, cannot hold the task past its deadline: its whole
+    /// process group is killed within its share, the wrapper still tears
+    /// down, and the task fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the task succeeds, outlives its deadline, leaves the
+    /// descendant running, or skips a step or the teardown.
+    #[test]
+    #[ignore = "runs the bench:capacity task script with stand-ins for about 30 s"]
+    fn a_hung_benchmark_run_is_killed_with_its_descendants_by_the_deadline() {
+        let (scratch, status, took) = run_task(40, "-", "run");
+
+        assert!(!status.success(), "the task fails");
+        assert!(took < Duration::from_secs(40), "the task took {took:?}");
+        assert!(
+            stopped(scratch.path(), "descendant.pid"),
+            "the descendant was killed"
+        );
+        assert_eq!(
+            calls(scratch.path()),
+            "docker compose\ndocker compose\nwrapper\ncargo build\ncargo run\nteardown\n"
+        );
     }
 }

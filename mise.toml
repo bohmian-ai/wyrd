@@ -509,43 +509,51 @@ description = "Opt-in benchmark (REQ-171, AC-040, AC-041): Wyrd's one server cap
 env = { WYRD_STORAGE_URL = "s3://wyrd-storage-test", WYRD_STORAGE_ENDPOINT_URL = "http://localhost:9000", AWS_REGION = "us-east-1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret" }
 run = '''
 # One absolute 30-minute deadline over the whole command (REQ-171), fixed
-# before the first setup action and exported to every step. Each step gets
-# only what remains: the capacity binary finishes its report 60 s before the
-# deadline, the build and the binary are stopped 30 s before it, and the
-# Postgres wrapper, which tears its database down on TERM, 10 s before it.
-# `--foreground` keeps every step in the task's process group, so Ctrl-C
-# still reaches it.
+# before the first setup action and exported to every step. `phase RESERVE
+# KILL COMMAND...` runs one step in its own process group until RESERVE
+# seconds before the deadline, then TERMs the whole group and KILLs it KILL
+# seconds later; once the step ends, any descendant still in the group is
+# killed too, so no step outlives its share or leaves a process behind. A
+# TERM or INT reaching the shell is forwarded to the step's group. The
+# capacity binary finishes its report 60 s before the deadline, the build and
+# the binary are stopped 30 s before it and killed by 10 s before it, and the
+# Postgres wrapper, which tears its database down on TERM, 10 s before it and
+# killed by 5 s before it. The wrapped bash defines the same `phase` from the
+# exported text.
 WYRD_CAPACITY_STARTED=$(date +%s)
 WYRD_CAPACITY_DEADLINE=$((WYRD_CAPACITY_STARTED + 30 * 60))
 export WYRD_CAPACITY_STARTED WYRD_CAPACITY_DEADLINE
-budget() {
-  left=$((WYRD_CAPACITY_DEADLINE - $1 - $(date +%s)))
-  [ "$left" -gt 0 ] || { echo "bench:capacity passed its 30-minute limit" >&2; return 124; }
-  echo "$left"
-}
-seconds=$(budget 0)
-timeout --foreground "$seconds" docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml up -d --wait rustfs
-seconds=$(budget 0)
-timeout --foreground "$seconds" docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml run --rm rustfs-setup
-seconds=$(budget 10)
-timeout --foreground --kill-after=5 "$seconds" scripts/postgres/with-test-postgres.sh -- bash -lc '
+phase='phase() {
+  seconds=$((WYRD_CAPACITY_DEADLINE - $1 - $(date +%s)))
+  kill_after=$2
+  shift 2
+  [ "$seconds" -gt 0 ] || { echo "bench:capacity passed its 30-minute limit" >&2; return 124; }
+  timeout --kill-after="$kill_after" "$seconds" "$@" &
+  pid=$!
+  trap "kill -TERM $pid 2>/dev/null" INT TERM
+  status=0
+  wait "$pid" || status=$?
+  while kill -0 "$pid" 2>/dev/null; do status=0; wait "$pid" || status=$?; done
+  trap - INT TERM
+  pkill -KILL -g "$pid" || true
+  return "$status"
+}'
+export phase
+eval "$phase"
+phase 10 5 docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml up -d --wait rustfs
+phase 10 5 docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml run --rm rustfs-setup
+phase 10 5 scripts/postgres/with-test-postgres.sh -- bash -lc '
 set -euo pipefail
-budget() {
-  local left=$((WYRD_CAPACITY_DEADLINE - $1 - $(date +%s)))
-  ((left > 0)) || { echo "bench:capacity passed its 30-minute limit" >&2; return 124; }
-  echo "$left"
-}
+eval "$phase"
 binary=()
-seconds=$(budget 30)
 if [[ " $* " == *" --profile "* ]]; then
   CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes" \
-    timeout --foreground "$seconds" cargo build --locked --release -p wyrd-server --features cloud --target-dir target/profiling
+    phase 30 20 cargo build --locked --release -p wyrd-server --features cloud --target-dir target/profiling
   binary=(--server-binary target/profiling/release/wyrd-server)
 else
-  timeout --foreground "$seconds" cargo build --locked --release -p wyrd-server --features cloud
+  phase 30 20 cargo build --locked --release -p wyrd-server --features cloud
 fi
-seconds=$(budget 30)
-timeout --foreground --kill-after=20 "$seconds" cargo run --locked --release -p wyrd-testing --bin capacity -- "${binary[@]}" "$@"' _
+phase 30 20 cargo run --locked --release -p wyrd-testing --bin capacity -- "${binary[@]}" "$@"' _
 '''
 
 [tasks."test:bifrost:journey:otlp"]

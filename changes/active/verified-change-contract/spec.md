@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 59
+revision: 60
 status: approved
 ---
 
@@ -586,7 +586,7 @@ flows are listed in its "Input and queue boundary" section.
   inactive without changing Card lifecycle or credential status. Suspending
   or deleting the principal makes it inactive immediately.
 - **REQ-108**: Before creating a binding-driven Verifier run, the scheduler
-  or the Eval run insert in Scribe's batch fence MUST restrict new work to runtime-active exact
+  or the Eval run-request flusher MUST restrict new work to runtime-active exact
   owners. An inactive occurrence MUST create no activation or run and MUST NOT
   be backfilled after later authentication. Reauthentication starts eligibility
   with the next schedule occurrence after that authentication. A later
@@ -769,20 +769,29 @@ multi-table transaction design survives as an alternative.
   surface. This change MUST NOT retain it as a hidden second Eval execution
   path or repurpose it as continuous Eval. Future offline dataset evaluation
   may define its own Verifier-backed route when that journey ships.
-- **REQ-077**: An acknowledged Eval observation MUST never lose its runs.
-  Scribe's batch-fence transaction for a `vala.eval.observations` batch MUST
-  also insert, through one `wyrd-sql` statement, one verifier_runs row per
-  matching active `observations_ready` binding for every record in the batch,
-  keyed by tenant, binding, and record identity so a replayed batch inserts
-  nothing new. The row MUST freeze `input_record_id` and `input_event_time`,
-  where `input_event_time` is the exact server-managed `wyrd_event_time`
-  assigned to the committed observation, not the client-authored
-  `created_at`. Scribe acknowledges the batch only after that transaction
-  commits, so an acknowledged observation always has its runs and a failed
-  insert fails the batch like any other fence failure. There is no
-  process-local activation backlog, post-acknowledgement handoff, or separate
-  activation outbox table. Scribe stays ignorant of Verifiers: the statement
-  is owned by `wyrd-sql` and reached through the `vala-sql` re-export.
+- **REQ-077**: Eval runs MUST be created through a batched run-request
+  outbox, the same shape as the audit outbox. Scribe acknowledges an Eval
+  observation batch on its own durable boundary, and the client never waits
+  for run creation. After that acknowledgement the server places one run
+  request per committed record in its in-process outbox. A background flusher
+  writes queued requests to Postgres in one multi-row insert per tenant,
+  creating one `verifier_runs` row per matching active `observations_ready`
+  binding. Rows are keyed by tenant, binding, and record identity, so a
+  repeated request inserts nothing new. Each row MUST freeze `input_record_id`
+  and `input_event_time`, where `input_event_time` is the exact server-managed
+  `wyrd_event_time` assigned to the committed observation, not the
+  client-authored `created_at`.
+  - The outbox has no count limit and never drops a request because Postgres
+    is slow or unavailable. A failed flush keeps its batch and retries with
+    backoff.
+  - Graceful shutdown flushes the outbox before the process exits.
+  - A hard process kill loses only the requests not yet flushed. The user
+    accepted that loss, as for audit. Every loss the process can observe is
+    counted and logged.
+  - The fixed 256-entry activation backlog and its drop-on-full behavior are
+    removed.
+  - Scribe does not write `verifier_runs`, and no crate's transaction writes
+    another crate's tables.
 - **REQ-078**: Postgres owns `verification_bindings`, `drift_baselines`,
   `verifier_runs`, `operator_dispatches`, and tenant Operator connections:
   exact identities,
@@ -1344,7 +1353,7 @@ table on `(data_tenant_id, result_id)`.
   canonical client queue/IPC observation ingest, Bifrost query, server-internal
   result writes, scheduling or transactional Eval enqueue,
   result persistence, and status. Cron, manual activation, worker lease,
-  retry, Eval enqueue in the batch fence, single-copy result writes, Operator fanout,
+  retry, the Eval run-request outbox, single-copy result writes, Operator fanout,
   notification delivery, restart, authorization, and tenant isolation are
   required evidence. Offline dataset/scenario evaluation is excluded from
   this initial journey.
@@ -1358,7 +1367,7 @@ table on `(data_tenant_id, result_id)`.
   Oracle reads, `vala-drift` fitting/scoring, and `vala-eval` planning/executor
   and result types. Only the missing binding projection, generic scheduling,
   run/dispatch control state, Drift baseline fitting orchestration, Eval
-  run insert in the batch fence, media binding through the existing judge path,
+  run-request outbox, media binding through the existing judge path,
   result-table writers, and public status/manual surfaces are added. No new
   downstream projector, observation envelope, Eval engine, generic
   broker, or Alert persistence path is permitted.
@@ -1988,8 +1997,8 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   Verifier with deterministic and LLM-judge tasks, authored pass_gate, and
   observations_ready binding; emits existing EvalRecordObservation through
   observe:eval over wyrd-client/wyrd-queue's canonical IPC path; and proves
-  the new vala.eval.observations row and its verifier_runs rows commit in
-  the same Scribe batch-fence transaction.
+  the new vala.eval.observations row is acknowledged without waiting for run
+  creation, and its runs appear through the run-request outbox.
   The created run MUST retain the committed row's exact `record_id` and
   server-managed `wyrd_event_time`, and its input read MUST demonstrate UTC-day
   partition pruning with those frozen values even when client `created_at`
@@ -1999,9 +2008,10 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   tenant-scoped query. A workflow that skips a task MUST persist
   its `TaskRunOutcome::Skipped` beside every `Ran` task outcome, while the
   common result's `details` serializes `EvalWorkflowSummary`. A forced
-  run-insert failure MUST fail the batch without an acknowledgement, and the
-  client's resend MUST land the observation once with exactly one run per
-  matching binding. A failing
+  Postgres outage during a flush MUST keep the requests and create exactly one
+  run per matching binding once Postgres returns. A repeated request MUST
+  create no duplicate. Graceful shutdown MUST flush queued requests before
+  exit. A failing
   pass_gate creates one dispatch per configured Operator; a passing gate
   creates none; an absent gate persists `completed/inconclusive` and creates
   none. A sampled-out record persists one zero-count summary, zero item rows,
@@ -2178,7 +2188,7 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
 - **AC-020**: Supporting integration tests MUST exercise the real Postgres
   registration/auth/binding/run/dispatch seams, Oracle/Scribe result and
   observation seams, scheduler claim and lease expiry, baseline fitting,
-  the Eval run insert in the batch fence, and Operator retry/fanout. Unit tests cover
+  the Eval run-request outbox, and Operator retry/fanout. Unit tests cover
   pure Drift/Eval validation, cron-window calculation, verdict mapping,
   sampling and pass-gate branches, and stable public errors. These lower
   tiers support, but do not replace, AC-012–AC-019 user journeys. The
@@ -2428,7 +2438,7 @@ published image pinned by an immutable registry digest before release.
 
 ## Open material decisions
 
-None for revision 59.
+None for revision 60.
 
 Revision 39 records the user's narrow deletion: remove the always-allow
 hook and its fake `invoke` policy attribution without redesigning delegation.
@@ -2464,6 +2474,17 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 
 ## Revision history
 
+- **Revision 60 Eval run-request outbox (2026-10-03, approved):** Revision
+  59 had Scribe insert `verifier_runs` in its batch-fence transaction. That
+  breaks the repository rule that no crate's transaction writes another
+  crate's tables (`architecture/v1/00-foundations/sql-foundation.md:75`,
+  enforced by two `vala-sql` checks). The alternative of writing runs before
+  acknowledging would make clients wait. The user chose a batched run-request
+  outbox like audit's instead. The acknowledgement covers receipt only, a
+  flusher writes runs in batches and retries rather than dropping, and
+  graceful shutdown flushes. The user explicitly accepted losing unflushed
+  requests on a hard process kill. REQ-077 and AC-014 change.
+
 - **Revision 59 Verifier runtime under load (2026-10-03, approved):** An
   independent architecture review (Codex gpt-5.6-sol, medium) found that one
   run could write more than one result, because each retry built a new result
@@ -2482,7 +2503,8 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
     - Verifiers are cached per process (REQ-182).
     - A run holds a connection only for its claim, result store, settle, and
       shared lease renewal (REQ-185).
-    - Eval runs are inserted in Scribe's batch-fence transaction (REQ-077).
+    - Eval run creation is moved off the acknowledgement path (REQ-077,
+      superseded by revision 60).
     - The SYSTEM tokens are removed.
     - Revision 58's half-pool bound (the first REQ-178, which also duplicated
       the capture writer's ID) is withdrawn.

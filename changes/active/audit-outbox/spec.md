@@ -1,6 +1,6 @@
 ---
 id: SPEC-audit-outbox
-revision: 3
+revision: 4
 status: approved
 ---
 
@@ -146,20 +146,21 @@ items in one transaction, all or nothing. The generic type owns the following.
 
 No other outbox implementation exists.
 
-### REQ-009 — Retried audit writes are detectable, not silently duplicated
+### REQ-009 — A committed audit write is never retried
 
-Every audit event carries an event ID assigned when it is staged. Staged audit
-is unique per (tenant, event ID): a write retried after an unknown commit
-outcome skips events still staged, without consuming a sequence number or
-breaking the hash chain. This requires a migration on `vala.audit_staging`.
+The audit writer retries a batch only after Postgres confirms that the earlier
+attempt did not commit. The writer records the transaction ID of each write
+(`pg_current_xact_id()`). When the commit returns an error, it asks Postgres
+for that transaction's outcome (`pg_xact_status`) and acts on the answer:
 
-The event ID is also carried into every retained `vala.system.audit_log` row.
-If the publisher retires a staged row before an unknown-outcome retry reaches
-it, the retry can stage that event once more; the retained log then holds two
-rows with the same (tenant, event ID). Delivery is therefore at least once, and
-a duplicate is always identifiable by event ID. Audit reads that count or list
-decisions collapse rows sharing a (tenant, event ID). No second audit table,
-ledger, WAL, or retirement delay is added.
+- committed: the write succeeded and is not retried;
+- aborted: the batch is retried;
+- in progress, or Postgres unreachable: the writer waits and asks again, and
+  re-sends nothing until the outcome is known.
+
+Each decision is therefore staged, and retained, exactly once. Audit staging
+and the retained audit log carry no event ID, and readers do no deduplication.
+No second audit table, ledger, WAL, relay, or retirement delay is added.
 
 ## Invariants
 
@@ -181,10 +182,9 @@ ledger, WAL, or retirement delay is added.
   abrupt process loss or an expired shutdown deadline has no audit row. A
   failed commit is retried, never dropped.
 - The generic outbox type and its sink trait in a shared crate (REQ-008).
-- The audit event ID, the (tenant, event ID) uniqueness on
-  `vala.audit_staging`, and the `event_id` column on the retained
-  `vala.system.audit_log` schema (REQ-009, migration and retained-schema
-  change).
+- Resolving an unknown commit outcome from Postgres transaction status
+  before any retry (REQ-009). No event-ID column exists on staging or on the
+  retained audit log.
 - Moving publication progress out of `vala.audit_chain_head` (migration).
 - Removal of the "not yet converted" clause from `AGENTS.md` and
   `architecture/wyrd-design.md`.
@@ -221,15 +221,15 @@ ledger, WAL, or retirement delay is added.
   - There is no count limit.
   - Shutdown flushes until the deadline and counts the remainder as lost.
   - `pending` returns to zero.
-- AC-009 (REQ-009): Retrying a batch after its commit already succeeded, while
-  the row is still staged, produces no duplicate staged rows and a gap-free
-  chain. A retry after the publisher has retired the row produces at most one
-  extra retained row, carrying the same event ID, and audit reads collapse it.
-  Postgres integration tests through the production publisher.
+- AC-009 (REQ-009): A commit that succeeds in Postgres but returns an error to
+  the writer is not retried. A commit that is aborted is retried and commits
+  once. Repeated ambiguous commits, with the publisher retiring rows in
+  between, leave exactly one retained row per decision and a gap-free chain.
+  Postgres integration tests through the production writer and publisher.
 
 ## Open material decisions
 
-None for revision 3.
+None for revision 4.
 
 ## Authority links
 
@@ -261,3 +261,11 @@ audit. Source: r1 review FIND-AUDIT-OUTBOX-1. Approved by the user on
   log and readers collapse rows sharing it. Rejected: a retirement delay (not
   guaranteed, grows staging by the delay's volume) and a separate event-ID
   table (contradicts one audit write path).
+- Revision 4 (2026-10-03, approved on user direction "write the code so these
+  types of issues are not representable"): the r3 review showed that event-ID
+  deduplication cannot bound duplicates, because each ambiguous commit followed
+  by retirement adds another retained copy. Root cause: the writer retried
+  without knowing whether the previous commit had succeeded. The writer now
+  resolves the outcome from Postgres transaction status before any retry, so a
+  duplicate cannot be written. The event-ID columns, the staging migration, and
+  reader deduplication from revisions 2 and 3 are removed.

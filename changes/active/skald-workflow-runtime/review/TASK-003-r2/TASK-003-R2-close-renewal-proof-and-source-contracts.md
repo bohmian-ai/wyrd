@@ -160,3 +160,58 @@ finding ID. Route this remediation directly to `$wyrd-implement`. The next
 `$wyrd-task-review` must reassess the complete original
 base-to-new-candidate range, the original task, both remediation tasks, and all
 prior verdicts; it must not review only the R2 delta.
+
+## Implementation evidence
+
+Implementation commits: `df7afbe1c` (native-`401` ordering and direct
+proofs) and `84ccd5dcf` (imports and rustdoc). Every cargo/mise command ran
+with `CARGO_TARGET_DIR=/home/thorrester/Documents/GitHub/wyrd/target
+CARGO_BUILD_JOBS=12`.
+
+Reuse: renewal stays on `AuthMiddleware::force_refresh` inside
+`HttpTransport::post_native`; the only change keeps the body-read `Result`
+until after the `401` branch. The direct proofs extend the existing
+`public_gateway_call_context_and_errors` selector with a loopback
+`TcpListener` fixture of the kind already used in
+`crates/shared/wyrd-client/tests/transport/http.rs` and
+`cards_transport.rs`; wiremock cannot cut off a body or report a request
+before answering it.
+
+Sweep: the whole `58d07d726..HEAD` Rust diff was scanned for qualified type
+paths in added declarations, for added functions with panic paths lacking
+`# Panics`, and for added async or durable operations lacking cancellation
+contracts. Beyond the ledger's cited lines, the sweep also fixed
+`workflow/local.rs` (`std::sync::Arc` cast), the `workflow/mod.rs` test module
+(qualified client, auth, transport, and `PoisonError` paths), the
+`wyrd-spec` policy test closure, the `FALLBACK_HEADER`,
+`GatewayFallbackOverride`, and `URL_SAFE_NO_PAD` paths in the new
+`pg_invocation_tests` items, and added cancellation contracts to
+`PublicWyrdGatewayCaller::call` and `Workflow::run_with`.
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-003-2` | `crates/shared/wyrd-client/src/transport/http.rs` `post_native`: body-read result held, `force_refresh` on every `401`, renewal error propagated first, then `Ok((status, bytes?))` | `public_gateway_call_context_and_errors` cut-off-`401` case: requests are exactly `/auth/token`, `/v1/chat/completions`, `/auth/token`, and the outcome is `ProviderError::Connect`. RED: with the old ordering it failed with `left: ["/auth/token", "/v1/chat/completions"]`. The complete-body renewal-success and renewal-failure cases still pass | PASS |
+| `FIND-TASK-003-6` | `Bytes` (http.rs), `LoadedTree` (workflow/mod.rs), `Request`/`Method` (workflow_transport.rs), `Prompt` (route.rs), `Response`/`Request` (pg_invocation_tests.rs), and the `SkaldWorkflow`/`ClientWorkflow` aliases (wyrd-sdk-python workflow.rs) come from module import blocks. No wrapper or check added | static review; `mise run lints` exit 0 | PASS |
+| `FIND-TASK-003-7` | `# Panics` on `client`, `run_id`, `create_request`, `received`, `chat_request`, `gateway_call`, `fallback`, `api_key_client`, `model_posts`, both test functions, and the new `read_request`/`raw_server` (workflow_transport.rs); `fallback_header_round_trips_and_refuses` (policy.rs); `FallbackIngress::model_ref` and `fallback_headers` (pg_invocation_tests.rs) | static review; `mise run lints` exit 0 | PASS |
+| `FIND-TASK-003-8` | rustdoc on `Workflows::create`, `Workflows::cancel` (remote.rs), and `post_native` (http.rs), plus `PublicWyrdGatewayCaller::call` and `Workflow::run_with`, states that dropping the future abandons local IO only, that server acceptance, cancellation, or model dispatch may already have happened and is not rolled back, and what a retry means | static review; `mise run lints` exit 0 | PASS |
+| `FIND-TASK-003-9` | `public_gateway_call_context_and_errors`: an unanswered loopback reply holds the model POST open; the token is cancelled only after the server reports `/v1/chat/completions`; the call has a 300 s deadline inside a 30 s outer bound | selector PASS: `SKALD_PROVIDERS_408_TIMEOUT` returned through cancellation, with no further request reported | PASS |
+
+| Command | Result |
+|---|---|
+| `mise exec -- cargo nextest run --locked -p wyrd-client --test workflow_transport -E 'test(=public_gateway_call_context_and_errors)'` | 1 passed, 1 skipped (RED with the old ordering recorded above) |
+| `mise exec -- cargo nextest run --locked -p wyrd-client --test workflow_transport -E 'test(=shared_workflow_client_contract)'` | 1 passed, 1 skipped |
+| `mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=workflow::tests::selected_local_dependencies_use_shared_config) \| test(=workflow::tests::from_path_uses_existing_loader)'` | 2 passed, 220 skipped |
+| `mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=gateway::policy::tests::fallback_header_round_trips_and_refuses)'` | 1 passed, 905 skipped |
+| `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --lib -E "test(=components::gateway::pg_invocation_tests::public_ingress_workflow_fallback)"'` | exit 0; 1 passed, 481 skipped |
+| `mise run py:setup` | exit 0; no stub drift (clean tree) |
+| `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cd sdks/wyrd-sdk-python && uv run python -m pytest -q -m integration "tests/integration/gateway/test_workflow_gateway_context.py::test_loaded_workflow_calls_the_gateway_through_its_loading_client"'` | 1 passed |
+| `mise run fmt` | exit 0, no changes |
+| `mise run lints` | exit 0 |
+| `mise run codegen:check` | exit 0 |
+| `mise run check:client-tier`; `mise run check:sdk-client-tier`; `mise run check:pyo3-scope` | exit 0 each |
+| `git diff --check 58d07d726` | exit 0, after removing a trailing blank line at the end of `review/TASK-003-r2/verdict.md` |
+
+Non-goals held: no dependency, public API, configuration, feature, check,
+setting, option, allowlist, retry, or production cancellation mechanism was
+added. JSON/framed/gRPC retry owners are unchanged. No Python-visible
+behavior changed (aliases only), so no Python source or stub changed.

@@ -16,6 +16,10 @@ use wyrd_spec::error::WyrdError;
 
 use crate::cards::{CardGraphHydrator, CardSelector, Cards, WorkflowBodies};
 
+mod remote;
+
+pub use remote::Workflows;
+
 /// A loaded, validated Workflow ready to run on the local Skald runtime.
 #[derive(Debug, Clone)]
 pub struct Workflow {

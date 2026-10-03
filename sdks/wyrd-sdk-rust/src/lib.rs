@@ -43,6 +43,7 @@ mod tests {
         let _ = super::WyrdClient::from_parts;
         let _ = super::Gateway::new;
         let _ = super::Workflow::as_skald;
+        let _ = super::Workflows::new;
         let _ = super::cards::Cards::workflow;
     }
 }

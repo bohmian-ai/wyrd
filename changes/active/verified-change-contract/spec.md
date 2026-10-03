@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 62
+revision: 63
 status: approved
 ---
 
@@ -1476,6 +1476,15 @@ table on `(data_tenant_id, result_id)`.
   seconds`. The window stays `[start, T)`. The 30-second wait lets
   observations stamped before `T` finish ingest before the window is read.
   It is a fixed value, not configuration.
+- **REQ-187**: Every observation row a first-class SDK emits MUST carry a
+  `wyrd_event_time` set once in `wyrd-client`, from the client clock, at the
+  moment the emit is called. A caller-supplied `wyrd_event_time` is kept, never
+  overwritten. Batching, linger, retry, and flush delay MUST NOT change it.
+  Scribe still stamps receipt time only for rows from other producers that omit
+  the column, and still refuses values outside its acceptance window. An
+  observation that reaches the server more than 30 seconds after its scheduled
+  window ended is stored, but that window has already been read and does not
+  count it.
 
 - **REQ-152**: Verification coordination MUST use PostgreSQL as its clock.
   PostgreSQL MUST write and evaluate runtime activity, schedule eligibility,
@@ -2485,6 +2494,13 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 
 ## Revision history
 
+- **Revision 63 Observations carry their own event time (2026-10-03, approved
+  on user direction):** SDK observations omitted `wyrd_event_time`, so Scribe
+  stamped the batch's receipt time and a buffered observation landed in the
+  window it arrived in rather than the one it happened in. REQ-187 makes
+  `wyrd-client` stamp the event time when the observation is emitted, for all
+  three SDKs. Scribe's acceptance window (30 days past, 24 hours future) keeps
+  rows held through an outage admissible.
 - **Revision 62 Late observations reach their window (2026-10-03, approved on
   user direction):** A scheduled Drift occurrence was claimed the instant
   PostgreSQL reached its window end. An observation stamped just before the end

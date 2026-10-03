@@ -1,6 +1,6 @@
 //! `PyO3` boundary for `wyrd.agent.Workflow` and `wyrd.agent.WorkflowRun`.
 //!
-//! [`PyWorkflow`] wraps the shared [`wyrd_client::Workflow`], which keeps the
+//! [`PyWorkflow`] wraps the shared [`ClientWorkflow`], which keeps the
 //! client a Workflow was loaded through: each method converts its Python
 //! arguments at the boundary and delegates to the native builder, validator,
 //! codec, or executor, which own every rule.
@@ -13,7 +13,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyList, PyModule, PyString};
 use serde_json::Value;
 use skald_agent::Agent;
-use skald_workflow::{Workflow, WorkflowInput, step_id_for_name};
+use skald_workflow::{Workflow as SkaldWorkflow, WorkflowInput, step_id_for_name};
+use wyrd_client::Workflow as ClientWorkflow;
 use wyrd_spec::card::common::ParameterValue;
 use wyrd_spec::card::workflow::{WorkflowBinding, WorkflowRun};
 use wyrd_spec::error::WyrdError;
@@ -201,16 +202,16 @@ fn step_id_from_agent(agent: &Agent) -> WyrdPyResult<String> {
 }
 
 /// Python `wyrd.agent.Workflow`: authoring and local run surface over the
-/// shared [`wyrd_client::Workflow`].
+/// shared [`ClientWorkflow`].
 ///
-/// Chaining methods replace the native [`Workflow`] with the builder's
+/// Chaining methods replace the native [`SkaldWorkflow`] with the builder's
 /// result, so a failed call leaves the Python object unchanged, and keep the
 /// client a loaded Workflow was read through, so its runs reach the same
 /// server.
 #[pyclass(module = "wyrd.agent", name = "Workflow")]
 pub struct PyWorkflow {
     /// Shared Workflow every method delegates to.
-    inner: wyrd_client::Workflow,
+    inner: ClientWorkflow,
 }
 
 #[pymethods]
@@ -244,7 +245,7 @@ impl PyWorkflow {
     ) -> WyrdPyResult<Self> {
         let labels = coerce_labels(labels)?;
         let annotations = coerce_annotations(annotations)?;
-        let mut wf = Workflow::new(name);
+        let mut wf = SkaldWorkflow::new(name);
         if let Some(version) = version {
             wf = wf.with_version(version);
         }
@@ -270,7 +271,7 @@ impl PyWorkflow {
     #[pyo3(signature = (name, *agents))]
     fn sequential(py: Python<'_>, name: String, agents: Vec<Py<PyAny>>) -> WyrdPyResult<Self> {
         let agents = extract_agents(py, agents)?;
-        Ok(Self::from(Workflow::sequential(name, agents)?))
+        Ok(Self::from(SkaldWorkflow::sequential(name, agents)?))
     }
 
     /// Build a workflow whose steps run in parallel with no dependencies.
@@ -288,7 +289,7 @@ impl PyWorkflow {
     #[pyo3(signature = (name, *agents))]
     fn parallel(py: Python<'_>, name: String, agents: Vec<Py<PyAny>>) -> WyrdPyResult<Self> {
         let agents = extract_agents(py, agents)?;
-        Ok(Self::from(Workflow::parallel(name, agents)?))
+        Ok(Self::from(SkaldWorkflow::parallel(name, agents)?))
     }
 
     /// Append `agent` as a new step with no dependencies.
@@ -506,12 +507,12 @@ impl PyWorkflow {
     ///
     /// # Errors
     ///
-    /// Returns the error of the shared [`wyrd_client::Workflow::from_path`],
+    /// Returns the error of the shared [`ClientWorkflow::from_path`],
     /// raised in Python as the `WyrdError` with the codes listed above.
     #[staticmethod]
     fn from_path(py: Python<'_>, path: PathBuf) -> WyrdPyResult<Self> {
         let workflow =
-            py.detach(|| wyrd_runtime::runtime().block_on(wyrd_client::Workflow::from_path(path)))?;
+            py.detach(|| wyrd_runtime::runtime().block_on(ClientWorkflow::from_path(path)))?;
         Ok(Self::from(workflow))
     }
 
@@ -529,7 +530,7 @@ impl PyWorkflow {
     fn from_yaml(yaml: &str) -> WyrdPyResult<Self> {
         let tool_resolver = skald_tool::default_registry();
         let prompt_resolver = skald_agent::default_prompt_resolver();
-        let inner = Workflow::from_yaml_str(yaml, tool_resolver, prompt_resolver)?;
+        let inner = SkaldWorkflow::from_yaml_str(yaml, tool_resolver, prompt_resolver)?;
         Ok(Self::from(inner))
     }
 
@@ -562,19 +563,19 @@ impl PyWorkflow {
     }
 }
 
-impl From<Workflow> for PyWorkflow {
+impl From<SkaldWorkflow> for PyWorkflow {
     /// Wrap a natively built Workflow for Python; it was loaded through no
     /// client.
-    fn from(inner: Workflow) -> Self {
+    fn from(inner: SkaldWorkflow) -> Self {
         Self {
             inner: inner.into(),
         }
     }
 }
 
-impl From<wyrd_client::Workflow> for PyWorkflow {
+impl From<ClientWorkflow> for PyWorkflow {
     /// Wrap a loaded shared Workflow for Python, keeping its loading client.
-    fn from(inner: wyrd_client::Workflow) -> Self {
+    fn from(inner: ClientWorkflow) -> Self {
         Self { inner }
     }
 }

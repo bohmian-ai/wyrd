@@ -53,7 +53,9 @@ impl WyrdGatewayCaller for PublicWyrdGatewayCaller {
     ///
     /// The request is projected before any IO, so an unservable dialect
     /// dispatches nothing. The HTTP exchange is raced against `cancellation`
-    /// and bounded by `call.timeout`; either drops the in-flight request.
+    /// and bounded by `call.timeout`; either drops the in-flight request. A
+    /// request already sent may have been accepted and dispatched by the
+    /// gateway; dropping it does not roll that back, and it is never resent.
     ///
     /// # Errors
     /// Returns [`ProviderError::BadRequest`] for a dialect the public gateway

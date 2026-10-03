@@ -15,6 +15,7 @@ use skald_runtime::ProviderRegistry;
 use skald_workflow::{
     Workflow as SkaldWorkflow, WorkflowInput, WorkflowResult, WorkflowRun, WorkflowRunOptions,
 };
+use wyrd_loader::LoadedTree;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 
@@ -113,6 +114,9 @@ impl Workflow {
     /// configuration is refused by Skald before any dispatch. Loading a
     /// Workflow never performs this preparation.
     ///
+    /// Dropping the future stops the run locally. A model call already sent
+    /// to a gateway or provider is not rolled back, and nothing is resent.
+    ///
     /// # Errors
     /// Returns the client configuration error when the shared configuration
     /// cannot be read, `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` when no gateway
@@ -180,7 +184,7 @@ impl Workflow {
 /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` carrying the loader
 /// diagnostics when the bundle fails to load, or naming `path` when it cannot
 /// be canonicalized.
-fn load_bundle(path: &Path) -> Result<(wyrd_loader::LoadedTree, PathBuf), WyrdError> {
+fn load_bundle(path: &Path) -> Result<(LoadedTree, PathBuf), WyrdError> {
     let tree = wyrd_loader::load(path).map_err(|error| WyrdError::RegistryInvalidCardSpec {
         message: format!("workflow bundle failed to load: {error}"),
         details: serde_json::json!({ "path": path, "diagnostics": error.diagnostics }),
@@ -276,10 +280,11 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, PoisonError};
 
     use async_trait::async_trait;
-    use serde_json::json;
+    use secrecy::SecretString;
+    use serde_json::{Value, json};
     use skald_providers::ProviderError;
     use skald_spec::ProviderResponse;
     use skald_spec::wire::openai_chat::OpenAiChatResponse;
@@ -291,6 +296,11 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use crate::auth::AuthMiddleware;
+    use crate::config::ClientConfig;
+    use crate::transport::HttpTransport;
+    use crate::transport::config::HttpConfig;
+    use crate::transport::credential::ResolvedCredential;
 
     /// Deterministic gateway answering each reviewer by its system role.
     #[derive(Default)]
@@ -320,7 +330,7 @@ mod tests {
             };
             self.requests
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(PoisonError::into_inner)
                 .push(request);
             Ok(chat_text(text))
         }
@@ -398,9 +408,8 @@ mod tests {
         );
 
         let gateway = Arc::new(ReviewGateway::default());
-        let dependencies =
-            WorkflowExecutionDependencies::new(skald_runtime::ProviderRegistry::new())
-                .with_wyrd_gateway(Arc::clone(&gateway) as Arc<dyn WyrdGatewayCaller>);
+        let dependencies = WorkflowExecutionDependencies::new(ProviderRegistry::new())
+            .with_wyrd_gateway(Arc::clone(&gateway) as Arc<dyn WyrdGatewayCaller>);
         let input = serde_json::Map::from_iter([(
             "code".to_owned(),
             json!("diff --git a/src/auth.rs b/src/auth.rs"),
@@ -416,7 +425,7 @@ mod tests {
         let requests = gateway
             .requests
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .clone();
         assert_eq!(requests.len(), 3);
         let last = requests.last().expect("final request recorded");
@@ -462,7 +471,7 @@ mod tests {
             gateway
                 .requests
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(PoisonError::into_inner)
                 .len(),
             3,
             "refused loads dispatch nothing"
@@ -501,7 +510,7 @@ mod tests {
         config: &LocalWorkflowConfig,
     ) -> WorkflowResult<WorkflowRun> {
         let dependencies = SelectedRoutes::of(workflow.as_skald().spec())
-            .dependencies(skald_runtime::ProviderRegistry::new(), config, None)
+            .dependencies(ProviderRegistry::new(), config, None)
             .await?;
         let input = serde_json::Map::from_iter([("code".to_owned(), json!("diff"))]);
         workflow
@@ -653,14 +662,14 @@ mod tests {
         };
         let input = serde_json::Map::from_iter([("code".to_owned(), json!("diff"))]);
         let run = gateway
-            .run_with(&skald_runtime::ProviderRegistry::new(), input)
+            .run_with(&ProviderRegistry::new(), input)
             .await
             .expect("gateway run starts");
         assert_eq!(run.status, WorkflowRunStatus::Succeeded);
         let requests = wyrd.received_requests().await.unwrap_or_default();
         assert_eq!(requests.len(), 3);
         assert!(requests.iter().all(|request| {
-            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap_or_default();
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
             body["model"] == json!("openai/gpt-5-5")
                 && request
                     .headers
@@ -675,21 +684,19 @@ mod tests {
     /// # Panics
     /// Panics when the fixed test client cannot be assembled.
     fn bearer_client(base_url: &str) -> WyrdClient {
-        let mut config = crate::config::ClientConfig::default();
+        let mut config = ClientConfig::default();
         config.http.base_url = base_url.to_owned();
-        let auth = crate::auth::AuthMiddleware::new(
+        let auth = AuthMiddleware::new(
             &config,
-            crate::transport::credential::ResolvedCredential::BearerToken(
-                secrecy::SecretString::from("test-bearer"),
-            ),
+            ResolvedCredential::BearerToken(SecretString::from("test-bearer")),
         )
         .expect("auth builds");
-        let transport = crate::transport::HttpTransport::new(
-            &crate::transport::config::HttpConfig {
+        let transport = HttpTransport::new(
+            &HttpConfig {
                 base_url: base_url.to_owned(),
-                ..crate::transport::config::HttpConfig::default()
+                ..HttpConfig::default()
             },
-            std::sync::Arc::clone(&auth),
+            Arc::clone(&auth),
         )
         .expect("transport builds");
         WyrdClient::from_parts(auth, transport, config.grpc)

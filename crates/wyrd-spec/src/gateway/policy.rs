@@ -574,10 +574,10 @@ mod tests {
 
     use super::{
         GatewayCapturePolicyWrite, GatewayFallbackOverride, GatewayFallbackPolicy,
-        GatewayGovernancePolicy,
+        GatewayGovernancePolicy, MAX_FALLBACK_HEADER_BYTES,
     };
     use crate::gateway::ModelRef;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     /// Builds a `ModelRef` JSON document.
     fn model(provider: &str, name: &str) -> serde_json::Value {
@@ -620,6 +620,12 @@ mod tests {
 
     /// Proves the fallback header round-trips through its exact encoding and
     /// refuses every malformed, oversized, or invalid value as `fallback`.
+    ///
+    /// # Panics
+    /// Panics when the fixed requested model or override fixture stops
+    /// parsing or encoding, the encoding is not the exact unpadded base64url
+    /// JCS document, or any malformed value is accepted or refused under a
+    /// field other than `fallback`.
     #[test]
     fn fallback_header_round_trips_and_refuses() {
         let requested = ModelRef::from_projection("openai/gpt-4o").expect("model");
@@ -636,13 +642,13 @@ mod tests {
             Ok(fallback)
         );
 
-        let encode = |document: serde_json::Value| URL_SAFE_NO_PAD.encode(document.to_string());
+        let encode = |document: Value| URL_SAFE_NO_PAD.encode(document.to_string());
         let oversized_json = encode(json!({"candidates": [model("a-a", &"x".repeat(5000))]}));
         for value in [
             String::new(),
             "not base64!".to_owned(),
             URL_SAFE.encode(r#"{"candidates":[]}"#),
-            "A".repeat(super::MAX_FALLBACK_HEADER_BYTES + 1),
+            "A".repeat(MAX_FALLBACK_HEADER_BYTES + 1),
             oversized_json,
             encode(json!({"candidates": [model("a-a", "x")], "extra": true})),
             encode(json!({"candidates": []})),

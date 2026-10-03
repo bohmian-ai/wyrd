@@ -14,8 +14,9 @@ use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse as _;
+use axum::response::{IntoResponse as _, Response};
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{TimeDelta, Utc};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -31,7 +32,7 @@ use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_sql::ValaPostgres;
 use wiremock::matchers::{body_partial_json, header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::{Bifrost as BifrostClient, WyrdClient};
 use wyrd_dev_fixtures::pg::PgFixture;
@@ -48,10 +49,11 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::GatewayAccess;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{
-    CurrencyCode, GatewayAccountingEntryId, GatewayAccountingEntryV1, GatewayBudgetReservationId,
-    GatewayCallId, GatewayCallOutcome, GatewayCaptureMode, GatewayCapturePolicyWrite,
-    GatewayDecimal, GatewayLimit, GatewayLimitSubject, GatewayOperation, GatewayPayloadField,
-    GatewayPolicySubject, GatewayPolicyTarget, GatewayUsageAmount, ModelRef, ProviderDeployment,
+    CurrencyCode, FALLBACK_HEADER, GatewayAccountingEntryId, GatewayAccountingEntryV1,
+    GatewayBudgetReservationId, GatewayCallId, GatewayCallOutcome, GatewayCaptureMode,
+    GatewayCapturePolicyWrite, GatewayDecimal, GatewayFallbackOverride, GatewayLimit,
+    GatewayLimitSubject, GatewayOperation, GatewayPayloadField, GatewayPolicySubject,
+    GatewayPolicyTarget, GatewayUsageAmount, ModelRef, ProviderDeployment,
 };
 use wyrd_spec::ids::{ProviderCredentialName, ProviderDeploymentName, ProviderId};
 use wyrd_spec::request_id::RequestId;
@@ -5316,6 +5318,10 @@ impl FallbackIngress {
     }
 
     /// Exact model reference of deployment `suffix`.
+    ///
+    /// # Panics
+    /// Panics when the fixed provider and model names stop forming a valid
+    /// model projection.
     fn model_ref(self, suffix: &str) -> ModelRef {
         model(&format!("{}/{}", self.provider(), self.model(suffix)))
     }
@@ -5326,7 +5332,7 @@ impl FallbackIngress {
         state: &AppState,
         caller: Result<Caller, WyrdErrorResponse>,
         headers: HeaderMap,
-    ) -> axum::response::Response {
+    ) -> Response {
         let state = State(state.clone());
         let requested = self.model("a");
         let messages = json!([{"role": "user", "content": "hi"}]);
@@ -5414,14 +5420,18 @@ async fn mount_fallback_upstream(upstream: &MockServer) {
 }
 
 /// Encodes `candidates` as a `wyrd-gateway-fallback` header map.
+///
+/// # Panics
+/// Panics when the override cannot be serialized or its unpadded base64url
+/// encoding is not a valid header value; both hold for every model reference.
 fn fallback_headers(candidates: &[ModelRef]) -> HeaderMap {
-    let fallback = wyrd_spec::gateway::GatewayFallbackOverride {
+    let fallback = GatewayFallbackOverride {
         candidates: candidates.to_vec(),
     };
     let value = fallback.to_header_value().expect("override encodes");
     let mut headers = HeaderMap::new();
     headers.insert(
-        wyrd_spec::gateway::FALLBACK_HEADER,
+        FALLBACK_HEADER,
         value.parse().expect("base64url is a header value"),
     );
     headers
@@ -5535,7 +5545,7 @@ async fn public_ingress_workflow_fallback() {
             })
         }),
     );
-    let reached = |requests: &[wiremock::Request], name: &str| {
+    let reached = |requests: &[Request], name: &str| {
         requests.iter().any(|request| {
             request.url.path().contains(name)
                 || serde_json::from_slice::<Value>(&request.body)
@@ -5576,16 +5586,13 @@ async fn public_ingress_workflow_fallback() {
             "{ingress:?}: the override reaches b"
         );
 
-        let encode = |document: Value| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(document.to_string())
-        };
+        let encode = |document: Value| URL_SAFE_NO_PAD.encode(document.to_string());
         let requested = json!({"provider": ingress.provider(), "model": ingress.model("a")});
         let refused = [
             ("malformed", vec!["%%%".to_owned()]),
             ("empty value", vec![String::new()]),
             ("repeated", {
-                let value = fallback_headers(&[ingress.model_ref("b")])
-                    [wyrd_spec::gateway::FALLBACK_HEADER]
+                let value = fallback_headers(&[ingress.model_ref("b")])[FALLBACK_HEADER]
                     .to_str()
                     .expect("ascii")
                     .to_owned();
@@ -5601,10 +5608,7 @@ async fn public_ingress_workflow_fallback() {
         for (case, values) in refused {
             let mut headers = HeaderMap::new();
             for value in values {
-                headers.append(
-                    wyrd_spec::gateway::FALLBACK_HEADER,
-                    value.parse().expect("header value"),
-                );
+                headers.append(FALLBACK_HEADER, value.parse().expect("header value"));
             }
             let dispatched = upstream.received_requests().await.expect("recording").len();
             let answer = ingress.call(&state, Ok(caller.clone()), headers).await;
@@ -5657,9 +5661,9 @@ async fn public_ingress_workflow_fallback() {
 
     let requests = upstream.received_requests().await.expect("recording");
     assert!(
-        requests.iter().all(|request| !request
-            .headers
-            .contains_key(wyrd_spec::gateway::FALLBACK_HEADER)),
+        requests
+            .iter()
+            .all(|request| !request.headers.contains_key(FALLBACK_HEADER)),
         "the header never reaches a provider"
     );
     drain_gateway(&state).await;

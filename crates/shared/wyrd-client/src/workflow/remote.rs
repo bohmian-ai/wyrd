@@ -45,6 +45,12 @@ impl Workflows {
     /// already-accepted run instead of starting another. First acceptance
     /// answers `202` and a replay `200`; both carry the run snapshot.
     ///
+    /// Dropping the future only abandons the local request. Once a submission
+    /// has been sent, the server may already have accepted and started the
+    /// run even though its snapshot is never observed; nothing is rolled
+    /// back. The key lives only for this call, so calling `create` again is a
+    /// new submission and can start a second run.
+    ///
     /// # Errors
     /// Returns the server's stable request, permission, resolution,
     /// validation, admission, or idempotency-conflict error, or a transport
@@ -71,7 +77,13 @@ impl Workflows {
 
     /// Request cancellation and return the resulting snapshot.
     ///
-    /// Cancelling an already-terminal run returns it unchanged.
+    /// Cancelling an already-terminal run returns it unchanged. Because
+    /// cancellation is idempotent, a lost answer is safe to request again.
+    ///
+    /// Dropping the future only abandons the local request. Once the request
+    /// has been sent, the server may already have applied the cancellation
+    /// even though the resulting snapshot is never observed; read the run with
+    /// [`Self::get`] to learn its state.
     ///
     /// # Errors
     /// Returns the server's permission or not-found error, or a transport

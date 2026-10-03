@@ -10,6 +10,7 @@
 //! the run before any dispatch.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use reqwest::header::HeaderName;
 use skald_runtime::ProviderRegistry;
@@ -95,8 +96,9 @@ impl SelectedRoutes {
             WorkflowExecutionDependencies::new(native).with_external_gateways(bindings);
         Ok(match gateway.filter(|_| self.wyrd_gateway) {
             Some(client) => dependencies
-                .with_wyrd_gateway(std::sync::Arc::new(PublicWyrdGatewayCaller::new(client))
-                    as std::sync::Arc<dyn WyrdGatewayCaller>),
+                .with_wyrd_gateway(
+                    Arc::new(PublicWyrdGatewayCaller::new(client)) as Arc<dyn WyrdGatewayCaller>
+                ),
             None => dependencies,
         })
     }

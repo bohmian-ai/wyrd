@@ -22,7 +22,7 @@ use http::header::{HeaderMap, HeaderName, HeaderValue};
 use secrecy::{ExposeSecret, SecretString};
 use skald_providers::{EndpointPolicy, ExternalGatewayClient, ProviderError, ProviderStream};
 use skald_runtime::{Provider, ProviderRegistry};
-use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
+use skald_spec::{Prompt, ProviderName, ProviderRequest, ProviderResponse};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
@@ -283,7 +283,7 @@ impl WorkflowExecutionDependencies {
         field: &str,
         route: &LlmRoute,
         fallback: Option<&GatewayFallbackOverride>,
-        prompt: &skald_spec::Prompt,
+        prompt: &Prompt,
     ) -> WorkflowResult<StepRoute> {
         match route {
             LlmRoute::Native => Ok(StepRoute::Native),

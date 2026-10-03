@@ -1,4 +1,4 @@
-//! Typed, redacted detail carried by the transactional audit event.
+//! Typed, redacted detail carried by the staged audit event.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

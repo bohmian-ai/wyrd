@@ -153,7 +153,7 @@ pub(crate) mod test_outbox {
     use std::time::{Duration, Instant};
 
     use vala_sql::ValaPostgres;
-    use vala_sql::audit_outbox::AuditOutbox;
+    use vala_sql::audit_outbox::{AuditOutbox, AuditSink};
     use wyrd_dev_fixtures::pg::PgFixture;
 
     /// Upper bound for the outbox to commit everything a test staged.
@@ -162,14 +162,32 @@ pub(crate) mod test_outbox {
     /// An outbox committing through the fixture's application pool, exactly as
     /// the server's does.
     pub(crate) fn outbox(fixture: &PgFixture) -> Arc<AuditOutbox> {
-        AuditOutbox::new(ValaPostgres::from_pool(fixture.app_pool().clone()))
+        AuditSink::outbox(ValaPostgres::from_pool(fixture.app_pool().clone()))
+    }
+
+    /// Proves `outbox` cannot commit what a test staged while audit staging
+    /// refuses writes.
+    ///
+    /// The writer retries a failed batch from 50 ms backoff, so one second of
+    /// settling covers several attempts; the staged decisions must all remain
+    /// pending, neither committed nor dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics when fewer than `staged` decisions remain pending.
+    pub(crate) async fn assert_retrying(outbox: &AuditOutbox, staged: usize) {
+        assert_eq!(
+            outbox.settle(Instant::now() + Duration::from_secs(1)).await,
+            staged,
+            "a decision whose commit fails stays queued for retry"
+        );
     }
 
     /// Commits everything staged on `outbox` before a test reads staging.
     ///
     /// Shutting the outbox down is the drain: it stops intake and waits for the
-    /// writer, so every decision staged before the call is committed (or
-    /// counted as failed) when this returns.
+    /// writer, so every decision staged before the call is committed when
+    /// this returns.
     ///
     /// # Panics
     ///
@@ -178,7 +196,7 @@ pub(crate) mod test_outbox {
         assert_eq!(
             outbox.shutdown(Instant::now() + DRAIN_BUDGET).await,
             0,
-            "every staged auth decision is committed or dropped"
+            "every staged auth decision is committed"
         );
     }
 }

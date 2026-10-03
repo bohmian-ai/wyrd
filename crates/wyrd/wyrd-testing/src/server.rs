@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wyrd_sql::OperatorPool;
 
 use arrow::datatypes::{DataType, Field, Schema};
@@ -18,6 +18,7 @@ use axum::http::{HeaderValue, Request, Response, StatusCode, header};
 use base64::Engine as _;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ed25519_dalek::VerifyingKey;
+use metrics_exporter_prometheus::PrometheusHandle;
 use secrecy::{ExposeSecret, SecretString};
 use tempfile::TempDir;
 use thiserror::Error;
@@ -267,19 +268,20 @@ pub struct BifrostQueryResourceSnapshot {
     pub peer_slots: u64,
 }
 
-/// Reads the process audit outbox's commit-failure counter.
+/// Reads the process audit outbox's write-failure counter.
 ///
-/// Every audited surface stages its decision on one non-blocking outbox, and a
-/// decision that cannot commit is counted in
-/// `audit_outbox_commit_failures_total{surface}` rather than refusing the
-/// request. A journey proving that installs the server's process-global
-/// Prometheus recorder through this owner and reads the counter after settling
-/// the outbox. Installation succeeds once per process, which matches the
+/// Every audited surface stages its decision on one non-blocking outbox. A
+/// tenant batch that cannot commit is retried, never dropped, and each failed
+/// attempt is counted in `outbox_write_failures_total{outbox="audit"}` rather
+/// than refusing the request. A journey proving that installs the server's
+/// process-global Prometheus recorder through this owner, waits for a failed
+/// attempt, then restores the database and proves the decision commits.
+/// Installation succeeds once per process, which matches the
 /// one-process-per-test lanes that run these journeys.
 #[derive(Debug, Clone)]
 pub struct AuditCommitFailures {
     /// Render handle of the installed process-global recorder.
-    handle: metrics_exporter_prometheus::PrometheusHandle,
+    handle: PrometheusHandle,
 }
 
 impl AuditCommitFailures {
@@ -294,17 +296,37 @@ impl AuditCommitFailures {
             .map_err(|error| WyrdTestServerError::Audit(error.to_string()))
     }
 
-    /// Returns the lost-decision count for one audited `surface`, the first
-    /// segment of the decision's operation; a series never recorded reads zero.
+    /// Returns the failed audit write attempts so far; a series never recorded
+    /// reads zero.
     #[must_use]
-    pub fn count(&self, surface: &str) -> u64 {
-        let series = format!("audit_outbox_commit_failures_total{{surface=\"{surface}\"}} ");
+    pub fn count(&self) -> u64 {
         self.handle
             .render()
             .lines()
-            .find_map(|line| line.strip_prefix(series.as_str()))
+            .find_map(|line| line.strip_prefix("outbox_write_failures_total{outbox=\"audit\"} "))
             .and_then(|value| value.trim().parse::<f64>().ok())
             .map_or(0, |value| value as u64)
+    }
+
+    /// Waits up to `budget` until at least one audit write attempt has failed,
+    /// returning the count.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Audit`] when no attempt failed in time.
+    pub async fn await_failure(&self, budget: Duration) -> Result<u64, WyrdTestServerError> {
+        let deadline = Instant::now() + budget;
+        loop {
+            let count = self.count();
+            if count > 0 {
+                return Ok(count);
+            }
+            if Instant::now() >= deadline {
+                return Err(WyrdTestServerError::Audit(format!(
+                    "no audit write attempt failed within {budget:?}"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }
 

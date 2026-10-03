@@ -1,5 +1,5 @@
 mod pg_tests {
-    //! SQL integration tests for transactional audit staging.
+    //! SQL integration tests for audit staging.
     //!
     //! Covers the per-tenant gapless hash chain, append-only enforcement, tenant
     //! isolation, and tenant-scoped reads.

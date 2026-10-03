@@ -422,6 +422,50 @@ async fn protected_tenant_operations_document_no_revocation_refusal() {
     server.shutdown().await.expect("server shuts down");
 }
 
+/// No operation documents a refusal caused by audit.
+///
+/// Permissions block and audits do not: every decision is staged on the
+/// non-blocking process audit outbox, so no response can be an audit failure.
+/// A response description that pairs audit with unavailability or failure
+/// would tell a caller to handle a refusal the server never emits.
+///
+/// # Panics
+///
+/// Panics when the server cannot start or any response description names an
+/// audit-caused failure.
+#[tokio::test]
+async fn no_operation_documents_an_audit_caused_refusal() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let mut defects = Vec::new();
+
+    for (path, item) in document["paths"].as_object().expect("paths object") {
+        for (method, operation) in item.as_object().expect("path item is an object") {
+            let Some(responses) = operation["responses"].as_object() else {
+                continue;
+            };
+            for (status, response) in responses {
+                let description = response["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_lowercase();
+                if description.contains("audit")
+                    && ["unavailable", "could not", "cannot", "fail"]
+                        .iter()
+                        .any(|failure| description.contains(failure))
+                {
+                    defects.push(format!("{method} {path} {status}: {description}"));
+                }
+            }
+        }
+    }
+    assert!(defects.is_empty(), "{}", defects.join("\n"));
+
+    server.shutdown().await.expect("server shuts down");
+}
+
 /// Every public Bifrost table, query, and lifecycle operation publishes its
 /// pre-stream refusals as typed `WyrdProblem` bodies.
 #[tokio::test]
@@ -1511,13 +1555,15 @@ async fn a_malformed_administrative_identifier_answers_with_a_documented_problem
 /// `/auth/token` is the one operation every caller reaches before it has a
 /// session. Its decision is staged on the non-blocking audit outbox, so a
 /// staging insert refused at the store costs the grant nothing: the exchange
-/// answers `200` and the lost decision is counted under the `auth` surface.
+/// answers `200`, the failed audit write is counted, and the retried decision
+/// commits exactly once after the store accepts it again.
 ///
 /// The failure is injected at the store with a trigger scoped to the exchange
-/// operation, so no handler seam is stubbed and no other decision is refused.
+/// operation, so no handler seam is stubbed.
 ///
 /// # Panics
-/// Panics when the exchange is refused or the failure is not counted.
+/// Panics when the exchange is refused, the failure is not counted, or the
+/// decision does not commit once after recovery.
 #[tokio::test]
 async fn an_unstageable_exchange_audit_still_grants_a_token() {
     let failures = wyrd_testing::AuditCommitFailures::install().expect("metrics recorder installs");
@@ -1538,6 +1584,19 @@ async fn an_unstageable_exchange_audit_still_grants_a_token() {
         .superuser_pool()
         .await
         .expect("superuser pool opens");
+    let exchanges = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM vala.audit_staging WHERE operation = 'auth.token.exchange'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("exchange decisions read")
+    };
+    server
+        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await
+        .expect("audit outbox settles");
+    let exchanges_before = exchanges().await;
     sqlx::raw_sql(
         r"CREATE OR REPLACE FUNCTION vala.test_fail_token_exchange_audit()
            RETURNS trigger LANGUAGE plpgsql AS $$
@@ -1578,15 +1637,27 @@ async fn an_unstageable_exchange_audit_still_grants_a_token() {
     let status = response.status();
     let body = problem_json(response).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    server
-        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+    failures
+        .await_failure(std::time::Duration::from_secs(30))
         .await
-        .expect("audit outbox settles");
+        .expect("the failed audit write is counted");
     sqlx::query("DROP TRIGGER test_fail_token_exchange_audit ON vala.audit_staging")
         .execute(&pool)
         .await
         .expect("token exchange audit failure drops");
-    assert!(failures.count("auth") >= 1, "the lost decision is counted");
+    assert_eq!(
+        server
+            .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+            .await
+            .expect("audit outbox settles"),
+        0,
+        "the retried decision drains"
+    );
+    assert_eq!(
+        exchanges().await,
+        exchanges_before + 1,
+        "the decision commits exactly once after recovery"
+    );
 
     server.shutdown().await.expect("server shuts down");
 }

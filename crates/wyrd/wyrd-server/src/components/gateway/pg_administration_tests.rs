@@ -12,10 +12,8 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use url::Url;
 use uuid::Uuid;
-use vala_sql::ValaPostgres;
 use wyrd_crypt::SecretKey;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_gateway::{
@@ -50,15 +48,9 @@ const BINDING_VARIABLE: &str = "WYRD_TEST_OPENAI_KEY";
 /// Builds server state with one environment binding and one external secret
 /// backend.
 pub(super) async fn test_state(fixture: &PgFixture) -> AppState {
-    state_with_vala(fixture, fixture.vala_postgres().clone()).await
-}
-
-/// Builds the gateway test state over `vala`, the pool behind standalone audit
-/// appends, so a test can make audit recovery unreachable.
-pub(super) async fn state_with_vala(fixture: &PgFixture, vala: ValaPostgres) -> AppState {
     let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(
         fixture.wyrd_postgres().clone(),
-        vala,
+        fixture.vala_postgres().clone(),
     ));
     let root = tempfile::tempdir()
         .expect("gateway storage tempdir")
@@ -1165,9 +1157,9 @@ async fn gateway_capture_policy_versions_only_on_change() {
 }
 
 /// Proves every authorized outcome — success, validation, not-found, and
-/// conflict — records exactly one allowed decision, and that an unreachable
-/// audit database refuses nothing: the operation answers as it would have and
-/// its lost decision leaves no row.
+/// conflict — records exactly one allowed decision, and that a failing audit
+/// write refuses nothing: the operation answers as it would have, and its
+/// decision commits once staging recovers.
 #[tokio::test]
 async fn gateway_failed_operations_keep_one_allowed_decision_and_never_wait_on_audit() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1240,30 +1232,39 @@ async fn gateway_failed_operations_keep_one_allowed_decision_and_never_wait_on_a
         .await;
     assert_eq!(audit_decisions(&fixture, tenant).await, expected);
 
-    let unreachable = PgPoolOptions::new()
-        .acquire_timeout(std::time::Duration::from_secs(1))
-        .connect_lazy_with(PgConnectOptions::new().host("127.0.0.1").port(1));
-    let broken = state_with_vala(&fixture, ValaPostgres::from_pool(unreachable)).await;
-    let refused = GatewayAdministration::new(&broken)
+    let _ = crate::app::metrics::test_prometheus_handle();
+    fixture
+        .fail_audit_staging()
+        .await
+        .expect("audit failure installs");
+    let refused = gateway
         .revoke_credential(&admin, &credential_name("absent"))
         .await
         .expect_err("an absent credential is not found");
     assert!(
         matches!(refused, WyrdError::GatewayResourceNotFound { .. }),
-        "an unreachable audit database refuses nothing: {refused:?}"
+        "a failing audit write refuses nothing: {refused:?}"
     );
-    assert_eq!(
-        broken
-            .audit_outbox
-            .settle(std::time::Instant::now() + std::time::Duration::from_secs(30))
-            .await,
-        0,
-        "the lost decision settles"
-    );
+    crate::test_support::await_audit_write_failure().await;
     assert_eq!(
         audit_decisions(&fixture, tenant).await,
         expected,
-        "the lost decision leaves no row"
+        "nothing is staged while audit fails"
+    );
+    fixture
+        .restore_audit_staging()
+        .await
+        .expect("audit staging restores");
+    settle_audit(&state).await;
+    let mut recovered = expected;
+    recovered.push((
+        "gateway.provider_credential.revoke".to_owned(),
+        "allowed".to_owned(),
+    ));
+    assert_eq!(
+        audit_decisions(&fixture, tenant).await,
+        recovered,
+        "the retried decision commits exactly once, in order"
     );
     settle_audit(&state).await;
 }

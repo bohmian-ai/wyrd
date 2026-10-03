@@ -15,6 +15,8 @@ use vala_bifrost_redux::forge::Forge as ForgeCoordinator;
 use vala_bifrost_redux::forge::ForgeWorker;
 use vala_bifrost_redux::gate::Gate;
 use vala_bifrost_redux::oracle::Oracle as OracleEngine;
+#[cfg(feature = "test-support")]
+use vala_bifrost_redux::oracle::OracleRuntimeInspection;
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::oracle::follower::{PhysicalPlanFollower, ScribeTailResolver};
 use vala_bifrost_redux::oracle::peer::{PeerSecurityAudit, PeerTicketVerifier};
@@ -22,7 +24,7 @@ use vala_bifrost_redux::oracle::{AuthorizedQueryContext, OracleQueryStream, Runn
 use vala_bifrost_redux::resources::{BifrostRoleResources, OracleResources, ScribeResources};
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailService;
-use vala_sql::audit_outbox::AuditOutbox;
+use vala_sql::audit_outbox::{AuditOutbox, AuditSink};
 use wyrd_auth_verify::TokenVerifier;
 use wyrd_gateway::{GatewayEngine, ManagedSecretKeys};
 use wyrd_storage::StorageHandle;
@@ -619,7 +621,7 @@ impl Oracle {
     /// Captures Oracle resource reservations.
     #[cfg(feature = "test-support")]
     #[must_use]
-    pub fn oracle_runtime_inspection(&self) -> vala_bifrost_redux::oracle::OracleRuntimeInspection {
+    pub fn oracle_runtime_inspection(&self) -> OracleRuntimeInspection {
         self.engine.runtime_inspection()
     }
 
@@ -2207,7 +2209,7 @@ impl AppState {
         let (reporter, _service) = wyrd_tonic::tonic_health::server::health_reporter();
         let audit_outbox = bifrost
             .audit_outbox()
-            .map_or_else(|| AuditOutbox::new(postgres.vala().clone()), Arc::clone);
+            .map_or_else(|| AuditSink::outbox(postgres.vala().clone()), Arc::clone);
         let gateway_capture = Arc::new(crate::components::gateway::GatewayCapture::for_bifrost(
             &bifrost,
         ));

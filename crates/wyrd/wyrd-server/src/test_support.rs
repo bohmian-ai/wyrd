@@ -185,3 +185,27 @@ pub(crate) async fn test_pool() -> sqlx::PgPool {
 pub(crate) async fn test_tenant() -> wyrd_spec::DataTenantId {
     shared()._fixture.data_tenant_id()
 }
+
+/// Waits up to thirty seconds until the process audit outbox has counted a
+/// failed write in `outbox_write_failures_total{outbox="audit"}`.
+///
+/// Audit-failure tests call this before restoring staging, so the retried
+/// decision they then observe is proven to have failed at least once first.
+/// The process recorder is the shared test recorder.
+///
+/// # Panics
+///
+/// Panics when no failed audit write is counted in time.
+pub(crate) async fn await_audit_write_failure() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !crate::app::metrics::test_prometheus_handle()
+        .render()
+        .contains("outbox_write_failures_total{outbox=\"audit\"}")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no failed audit write was counted"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}

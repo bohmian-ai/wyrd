@@ -304,6 +304,7 @@ async fn create_trusted_issuer(
         ),
     )
     .map_err(WyrdErrorResponse::from)?;
+    state.audit_outbox.stage(caller.data_tenant_id, decision);
 
     // The only network call on any admin path, and only at create: discovery
     // resolves jwks_uri. A runtime read must never re-discover.
@@ -331,7 +332,6 @@ async fn create_trusted_issuer(
         .map_err(seal_error)?;
 
     let mut conn = acquire_conn(&state, &caller).await?;
-    state.audit_outbox.stage(caller.data_tenant_id, decision);
     insert_trusted_issuer(&mut conn, &write)
         .await
         .map_err(|error| map_write_error(error, AdminWriteTarget::TrustedIssuer))?;
@@ -380,9 +380,9 @@ async fn list_trusted_issuers(
         "trusted_issuers",
     )
     .map_err(WyrdErrorResponse::from)?;
+    state.audit_outbox.stage(caller.data_tenant_id, decision);
 
     let mut conn = acquire_conn(&state, &caller).await?;
-    state.audit_outbox.stage(caller.data_tenant_id, decision);
     let rows = trusted_issuers_for_tenant(&mut conn)
         .await
         .map_err(sql_unavailable)?;
@@ -448,9 +448,9 @@ async fn delete_trusted_issuer_route(
         &format!("trusted_issuer:{issuer}"),
     )
     .map_err(WyrdErrorResponse::from)?;
+    state.audit_outbox.stage(caller.data_tenant_id, decision);
 
     let mut conn = acquire_conn(&state, &caller).await?;
-    state.audit_outbox.stage(caller.data_tenant_id, decision);
 
     // --cascade removes the referencing bindings first so the issuer delete is
     // not blocked by the FK ON DELETE RESTRICT. Without it, a live binding makes
@@ -532,6 +532,7 @@ async fn create_workload_binding(
         ),
     )
     .map_err(WyrdErrorResponse::from)?;
+    state.audit_outbox.stage(caller.data_tenant_id, decision);
 
     let binding = WorkloadBinding {
         tenant_id: caller.principal.tenant_id,
@@ -543,7 +544,6 @@ async fn create_workload_binding(
     let write = binding_write_from_binding(&binding).map_err(internal_error)?;
 
     let mut conn = acquire_conn(&state, &caller).await?;
-    state.audit_outbox.stage(caller.data_tenant_id, decision);
     insert_workload_binding(&mut conn, &write)
         .await
         .map_err(|error| map_binding_write_error(error, &binding.issuer))?;
@@ -597,12 +597,12 @@ async fn list_workload_bindings(
         "workload_bindings",
     )
     .map_err(WyrdErrorResponse::from)?;
+    state.audit_outbox.stage(caller.data_tenant_id, decision);
 
     // Normalize the issuer filter to the stored form so a trailing slash does
     // not silently miss; the subject is matched verbatim.
     let issuer = filter.issuer.as_deref().map(normalize_issuer);
     let mut conn = acquire_conn(&state, &caller).await?;
-    state.audit_outbox.stage(caller.data_tenant_id, decision);
     let rows =
         workload_bindings_for_tenant(&mut conn, issuer.as_deref(), filter.subject.as_deref())
             .await
@@ -663,9 +663,9 @@ async fn delete_workload_binding_route(
         &format!("workload_binding:{issuer}:{}", query.subject),
     )
     .map_err(WyrdErrorResponse::from)?;
+    state.audit_outbox.stage(caller.data_tenant_id, decision);
 
     let mut conn = acquire_conn(&state, &caller).await?;
-    state.audit_outbox.stage(caller.data_tenant_id, decision);
     let removed = delete_workload_binding(&mut conn, &issuer, &query.subject)
         .await
         .map_err(|error| map_write_error(error, AdminWriteTarget::WorkloadBinding))?;
@@ -1618,48 +1618,52 @@ mod pg_tests {
         rows
     }
 
-    /// Point `state`'s audit outbox at an unreachable database.
+    /// Makes every audit write to the fixture's staging table fail.
     ///
-    /// Every decision the state stages afterwards fails to commit, which is the
-    /// lever separating "the effect committed and its record did not" from
-    /// "neither did" without touching the shared staging table other tests read.
     /// The process metrics recorder is installed first, because a counter
     /// increment made before any recorder exists is discarded.
-    fn lose_audit(state: &mut AppState) {
-        let _ = crate::app::metrics::test_prometheus_handle();
-        let unreachable = sqlx::postgres::PgPoolOptions::new()
-            .acquire_timeout(Duration::from_secs(2))
-            .connect_lazy_with(
-                sqlx::postgres::PgConnectOptions::new()
-                    .host("127.0.0.1")
-                    .port(1),
-            );
-        state.audit_outbox = vala_sql::audit_outbox::AuditOutbox::new(
-            vala_sql::ValaPostgres::from_pool(unreachable),
-        );
-    }
-
-    /// Settle `state`'s audit outbox and assert the admin surface counted a
-    /// lost decision.
     ///
     /// # Panics
     ///
-    /// Panics when the outbox does not settle or no failure is counted.
-    async fn assert_admin_audit_lost(state: &AppState) {
-        settle_audit(state).await;
-        assert!(
-            crate::app::metrics::test_prometheus_handle()
-                .render()
-                .contains("audit_outbox_commit_failures_total{surface=\"admin\"}"),
-            "the lost decision is counted"
-        );
+    /// Panics when the failure trigger cannot be installed.
+    async fn fail_audit(fixture: &PgFixture) {
+        let _ = crate::app::metrics::test_prometheus_handle();
+        fixture
+            .fail_audit_staging()
+            .await
+            .expect("audit failure installs");
     }
 
-    /// An unrecordable issuer create still registers its issuer.
+    /// Waits for a failed audit write, restores staging, and returns the
+    /// committed `(outcome, count)` rows for `operation`.
+    ///
+    /// Proves both halves of an audit failure: the write was attempted and
+    /// counted while staging refused it, and the retried decision commits once
+    /// staging accepts it again.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no failed write is counted within thirty seconds, staging
+    /// cannot be restored, or the decisions do not settle.
+    async fn recovered_rows(
+        fixture: &PgFixture,
+        state: &AppState,
+        operation: &str,
+    ) -> Vec<(String, i64)> {
+        crate::test_support::await_audit_write_failure().await;
+        fixture
+            .restore_audit_staging()
+            .await
+            .expect("audit staging restores");
+        decision_rows(fixture, state, operation).await
+    }
+
+    /// An issuer create whose audit cannot be written still registers its
+    /// issuer, and its decision commits once staging recovers.
     ///
     /// Permissions block and audits do not: the decision is staged on the
-    /// non-blocking audit outbox, so a decision that cannot be committed costs
-    /// the create nothing and is counted instead.
+    /// non-blocking audit outbox, so a failed audit write costs the create
+    /// nothing and is retried.
     ///
     /// # Panics
     ///
@@ -1668,9 +1672,9 @@ mod pg_tests {
     async fn an_unrecordable_issuer_create_still_writes_its_issuer() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let mut state = test_state(&fixture).await;
+        let state = test_state(&fixture).await;
         let (_server, issuer) = discovery_server().await;
-        lose_audit(&mut state);
+        fail_audit(&fixture).await;
 
         let _ = create_trusted_issuer(
             State(state.clone()),
@@ -1679,7 +1683,6 @@ mod pg_tests {
         )
         .await
         .expect("an unrecordable create still succeeds");
-        assert_admin_audit_lost(&state).await;
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let row = trusted_issuer_by_url(&mut conn, issuer.as_str())
@@ -1687,10 +1690,15 @@ mod pg_tests {
             .expect("query succeeds");
         conn.commit().await.expect("commit");
         assert!(row.is_some(), "the create registered its issuer");
-        settle_audit(&state).await;
+        assert_eq!(
+            recovered_rows(&fixture, &state, "admin.trusted_issuer.create").await,
+            vec![("allowed".to_owned(), 1)],
+            "the retried allowance commits exactly once"
+        );
     }
 
-    /// An unrecordable binding create still writes its binding.
+    /// A binding create whose audit cannot be written still writes its
+    /// binding, and its decision commits once staging recovers.
     ///
     /// # Panics
     ///
@@ -1699,9 +1707,9 @@ mod pg_tests {
     async fn an_unrecordable_binding_create_still_writes_its_binding() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let mut state = test_state(&fixture).await;
+        let state = test_state(&fixture).await;
         seed_issuer(&fixture, tenant).await;
-        lose_audit(&mut state);
+        fail_audit(&fixture).await;
 
         let _ = create_workload_binding(
             State(state.clone()),
@@ -1715,7 +1723,6 @@ mod pg_tests {
         )
         .await
         .expect("an unrecordable binding create still succeeds");
-        assert_admin_audit_lost(&state).await;
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let bindings = workload_bindings_for_tenant(&mut conn, None, None)
@@ -1723,7 +1730,54 @@ mod pg_tests {
             .expect("query succeeds");
         conn.commit().await.expect("commit");
         assert_eq!(bindings.len(), 1, "the create wrote its binding");
-        settle_audit(&state).await;
+        assert_eq!(
+            recovered_rows(&fixture, &state, "admin.workload_binding.create").await,
+            vec![("allowed".to_owned(), 1)],
+            "the retried allowance commits exactly once"
+        );
+    }
+
+    /// A binding create that cannot open its tenant connection still stages
+    /// its allowance.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start, the create does not fail, or the
+    /// allowance is not staged exactly once.
+    #[tokio::test]
+    async fn a_binding_create_without_a_connection_stages_its_allowance() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let mut state = test_state(&fixture).await;
+        let unreachable = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(2))
+            .connect_lazy_with(
+                sqlx::postgres::PgConnectOptions::new()
+                    .host("127.0.0.1")
+                    .port(1),
+            );
+        state.postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(
+            wyrd_sql::WyrdPostgres::from_pools(unreachable, None),
+            fixture.vala_postgres().clone(),
+        ));
+
+        let _ = create_workload_binding(
+            State(state.clone()),
+            writer(tenant),
+            Json(CreateWorkloadBindingRequest {
+                issuer: IssuerUrl::new(SEEDED_ISSUER).expect("issuer is valid"),
+                subject: "system:serviceaccount:default/sa".to_owned(),
+                audience: None,
+                card_ref: sample_card_ref(),
+            }),
+        )
+        .await
+        .expect_err("a create without a tenant connection is refused");
+        assert_eq!(
+            decision_rows(&fixture, &state, "admin.workload_binding.create").await,
+            vec![("allowed".to_owned(), 1)],
+            "the allowance is staged before the connection is acquired"
+        );
     }
 
     /// A revocation that finds no principal commits its one allowed decision.
@@ -1761,18 +1815,18 @@ mod pg_tests {
         settle_audit(&state).await;
     }
 
-    /// A discovery failure refuses the create and records no allowance.
+    /// A discovery failure refuses the create but keeps its allowance.
     ///
-    /// The allowance belongs to the write transaction, and discovery runs before
-    /// that transaction exists. So there is no issuer and no row claiming one was
-    /// permitted — an allowance without its effect would read, afterwards, as an
-    /// issuer someone registered and then hid.
+    /// The permission is decided before discovery, the one outbound call on
+    /// any admin path, so the allowed decision is staged before that call can
+    /// fail the request. The audit log then shows the permitted attempt, and
+    /// no issuer exists.
     ///
     /// # Panics
     ///
     /// Panics when the fixture cannot start or any assertion fails.
     #[tokio::test]
-    async fn a_failed_discovery_leaves_no_allowance_and_no_issuer() {
+    async fn a_failed_discovery_keeps_its_allowance_and_creates_no_issuer() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let state = test_state(&fixture).await;
@@ -1789,11 +1843,10 @@ mod pg_tests {
         .expect_err("discovery failure refuses the create");
         assert!(matches!(error.0, WyrdError::DiscoveryUnavailable { .. }));
 
-        assert!(
-            decision_rows(&fixture, &state, "admin.trusted_issuer.create")
-                .await
-                .is_empty(),
-            "a create refused before its decision recorded nothing"
+        assert_eq!(
+            decision_rows(&fixture, &state, "admin.trusted_issuer.create").await,
+            vec![("allowed".to_owned(), 1)],
+            "the allowance is staged before discovery"
         );
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let row = trusted_issuer_by_url(&mut conn, issuer.as_str())

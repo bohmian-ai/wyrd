@@ -2189,16 +2189,19 @@ async fn served_platform_failures_disclose_nothing_internal() {
     assert_safe_problem(&body_json(resp).await, "WYRD_SPEC_500_INTERNAL");
 }
 
-/// A tenant mutation whose decision cannot be committed still happens.
+/// A tenant mutation whose decision cannot be committed still happens, and its
+/// decision commits once the database recovers.
 ///
 /// Permissions block and audits do not: the decision is staged on the
 /// non-blocking audit outbox, so a staging insert refused at the database
 /// costs the caller nothing. The principal is created, no audit row is staged
-/// for it, and the lost decision is counted under the `auth` surface.
+/// for it while the insert is refused, and the failed write is counted. Once
+/// the insert is accepted again, the retried decision commits exactly once.
 ///
 /// # Panics
 /// Panics when the mutation is refused, the principal is missing, an audit row
-/// survives, or the failure is not counted.
+/// is staged while audit fails, the failure is not counted, or the decision
+/// does not commit once after recovery.
 #[tokio::test]
 async fn an_unrecordable_tenant_mutation_still_happens() {
     let failures = wyrd_testing::AuditCommitFailures::install().expect("metrics recorder installs");
@@ -2249,14 +2252,10 @@ async fn an_unrecordable_tenant_mutation_still_happens() {
     let status = resp.status();
     let body = body_json(resp).await;
     assert!(status.is_success(), "created: {body}");
-    srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+    failures
+        .await_failure(std::time::Duration::from_secs(30))
         .await
-        .expect("audit outbox settles");
-
-    sqlx::query("DROP TRIGGER test_fail_principal_create_audit ON vala.audit_staging")
-        .execute(&superuser)
-        .await
-        .expect("failure trigger drops");
+        .expect("the failed audit write is counted");
 
     let principals: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM wyrd.auth_service_accounts WHERE name = 'unrecordable-runner'",
@@ -2266,14 +2265,32 @@ async fn an_unrecordable_tenant_mutation_still_happens() {
     .expect("principal count reads");
     assert_eq!(principals, 1, "the principal was created");
 
-    let audits: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging WHERE operation = 'auth.principal.create'",
-    )
-    .fetch_one(&superuser)
-    .await
-    .expect("audit count reads");
-    assert_eq!(audits, 0, "the lost decision staged no row");
-    assert!(failures.count("auth") >= 1, "the lost decision is counted");
+    let creates = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM vala.audit_staging WHERE operation = 'auth.principal.create'",
+        )
+        .fetch_one(&superuser)
+        .await
+        .expect("audit count reads")
+    };
+    assert_eq!(creates().await, 0, "no row is staged while audit fails");
+
+    sqlx::query("DROP TRIGGER test_fail_principal_create_audit ON vala.audit_staging")
+        .execute(&superuser)
+        .await
+        .expect("failure trigger drops");
+    assert_eq!(
+        srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+            .await
+            .expect("audit outbox settles"),
+        0,
+        "the retried decision drains"
+    );
+    assert_eq!(
+        creates().await,
+        1,
+        "the decision commits exactly once after recovery"
+    );
 }
 
 /// The deployment root is rotatable through Wyrd, with no outage and no SQL.

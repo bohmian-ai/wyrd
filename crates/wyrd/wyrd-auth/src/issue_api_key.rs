@@ -39,7 +39,7 @@ pub struct IssueApiKey {
     pub settings: ApiKeySettings,
 }
 
-/// Internal result carrying non-wire fields needed by transactional audit.
+/// Internal result carrying non-wire fields the staged audit event needs.
 #[derive(Debug, Clone)]
 pub struct IssuedApiKey {
     /// Wire response.

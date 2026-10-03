@@ -557,7 +557,7 @@ mod pg_tests {
     use wyrd_spec::vala::api::AuditDetail;
     use wyrd_sql::TenantConn;
 
-    use crate::audit::test_outbox::{drain, outbox};
+    use crate::audit::test_outbox::{assert_retrying, drain, outbox};
     use crate::credential_verify;
     use vala_sql::audit_outbox::AuditOutbox;
     use wyrd_sql::queries::auth::{ApiKeyStatus, grant_role_to_service_account, insert_role};
@@ -1760,12 +1760,14 @@ mod pg_tests {
     }
 
     /// An audit store that refuses the commit never refuses the exchange:
-    /// permissions block, audits do not. The token is issued and no decision
-    /// reaches staging.
+    /// permissions block, audits do not. The token is issued, no decision
+    /// reaches staging while the store refuses, and the retried decision
+    /// commits exactly once when it recovers.
     ///
     /// # Panics
     /// Panics when the append privilege cannot be revoked or restored, the
-    /// exchange is refused, or any decision commits.
+    /// exchange is refused, a decision commits while the store refuses, or
+    /// the allowance does not commit exactly once after recovery.
     #[tokio::test]
     async fn a_refused_exchange_audit_still_issues_the_token() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1777,21 +1779,32 @@ mod pg_tests {
             .await
             .expect("append privilege revoked");
 
-        let result = exchange(
-            &fixture,
-            subject_token(tenant, PermissionSet::new()),
-            actor_token(actor, tenant),
-        )
-        .await;
+        let audit = outbox(&fixture);
+        let result = delegate_service(&audit)
+            .execute(
+                fixture.tenant_conn().await.expect("tenant conn opens"),
+                SecretString::from(subject_token(tenant, PermissionSet::new())),
+                SecretString::from(actor_token(actor, tenant)),
+                TokenAudience::Bifrost,
+                &Uuid::now_v7().to_string(),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "an audit failure never refuses an exchange, got: {result:?}"
+        );
+        assert_retrying(&audit, 1).await;
+        assert!(exchange_outcomes(&fixture).await.is_empty());
 
         sqlx::query("GRANT INSERT ON vala.audit_staging TO wyrd_app")
             .execute(&admin)
             .await
             .expect("append privilege restored");
-        assert!(
-            result.is_ok(),
-            "an audit failure never refuses an exchange, got: {result:?}"
+        drain(&audit).await;
+        assert_eq!(
+            exchange_outcomes(&fixture).await,
+            [("allowed".to_owned(), TOKEN_EXCHANGE_OPERATION.to_owned())],
+            "the retried allowance commits exactly once"
         );
-        assert!(exchange_outcomes(&fixture).await.is_empty());
     }
 }

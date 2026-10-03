@@ -3252,7 +3252,13 @@ mod tests {
     use wyrd_spec::DataTenantId;
 
     use super::*;
+    use wyrd_spec::vala::api::PeerContext;
     use wyrd_spec::vala::api::QueryClass;
+
+    use super::super::peer::{
+        PeerSecurityError, StageBinding, StageTicketClaims, stage_body_digest,
+    };
+    use prost::Message as _;
 
     /// Counts batches only as the *caller* drives the returned stream.
     ///
@@ -3716,16 +3722,14 @@ mod tests {
         /// Returns the production refusal for any bound-field mismatch.
         async fn authorize_stage(
             &self,
-            context: &wyrd_spec::vala::api::PeerContext,
-            binding: &super::super::peer::StageBinding,
+            context: &PeerContext,
+            binding: &StageBinding,
             body: &[u8],
             _now: DateTime<Utc>,
-        ) -> Result<AuthorizedStage, crate::oracle::peer::PeerSecurityError> {
-            let claims = <super::super::peer::StageTicketClaims as prost::Message>::decode(
-                context.claims_bytes.as_slice(),
-            )
-            .map_err(|_| crate::oracle::peer::PeerSecurityError::Claims)?;
-            let digest = super::super::peer::stage_body_digest(body)?;
+        ) -> Result<AuthorizedStage, PeerSecurityError> {
+            let claims = StageTicketClaims::decode(context.claims_bytes.as_slice())
+                .map_err(|_| PeerSecurityError::Claims)?;
+            let digest = stage_body_digest(body)?;
             claims.verify_binding(binding, &digest)?;
             Ok(AuthorizedStage {
                 claims,

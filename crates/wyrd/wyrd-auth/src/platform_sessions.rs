@@ -423,7 +423,7 @@ mod pg_tests {
 
     use super::PlatformSessions;
     use crate::audit::TOKEN_EXCHANGE_OPERATION;
-    use crate::audit::test_outbox::{drain, outbox};
+    use crate::audit::test_outbox::{assert_retrying, drain, outbox};
     use crate::platform_credentials::issue_platform_credential;
 
     /// The issuer these tests register federated identities against.
@@ -614,13 +614,14 @@ mod pg_tests {
     /// permissions block, audits do not.
     ///
     /// The credential is verified and its last-used touch commits with the
-    /// grant; the grant record is staged afterwards and its failed commit is
-    /// counted, never returned.
+    /// grant; the grant record is staged afterwards, its failed commit is
+    /// retried rather than returned, and it commits exactly once when the
+    /// audit store recovers.
     ///
     /// # Panics
     /// Panics when the exchange is refused, when a grant record reaches
-    /// staging while its insert privilege is revoked, or when the credential's
-    /// use is not recorded.
+    /// staging while its insert privilege is revoked or not exactly once after
+    /// it returns, or when the credential's use is not recorded.
     #[tokio::test]
     async fn an_unrecordable_grant_still_returns_the_session() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -641,22 +642,27 @@ mod pg_tests {
         )
         .exchange(&secret, "req-platform-unauditable")
         .await;
-        drain(&audit).await;
-
-        sqlx::query("GRANT INSERT ON vala.audit_staging TO wyrd_app")
-            .execute(&admin)
-            .await
-            .expect("append privilege restored");
-
         assert!(
             result.is_ok(),
             "an audit failure never refuses a platform grant, got: {result:?}"
         );
+        assert_retrying(&audit, 1).await;
         assert!(
             staged_grant_attribution(&fixture, principal)
                 .await
                 .is_empty(),
             "the refused commit leaves no grant record"
+        );
+
+        sqlx::query("GRANT INSERT ON vala.audit_staging TO wyrd_app")
+            .execute(&admin)
+            .await
+            .expect("append privilege restored");
+        drain(&audit).await;
+        assert_eq!(
+            staged_grant_attribution(&fixture, principal).await.len(),
+            1,
+            "the retried grant record commits exactly once"
         );
         let touched: Option<Option<chrono::DateTime<chrono::Utc>>> = sqlx::query_scalar(
             "SELECT last_used_at FROM platform.credentials WHERE principal_id = $1",

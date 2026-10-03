@@ -832,19 +832,19 @@ impl Drop for AdmissionWaitTelemetryGuard {
 
 /// Narrow, non-blocking audit collaborator owned by the serving composition root.
 ///
-/// Both methods only stage the event and return: the writer commits it to the
-/// tenant audit outbox from a tracked task, and owns counting and logging a
-/// commit that fails. Rows are never held for that commit.
+/// Both methods only stage the event and return: the outbox writer commits it
+/// to the tenant's audit chain in the background and retries a commit that
+/// fails. Rows are never held for that commit.
 pub trait OracleAudit: Send + Sync {
     /// Stages the immutable read-decision detail after admission.
-    fn append_read_decision(
+    fn stage_read_decision(
         &self,
         context: &AuthorizedQueryContext,
         decision: BifrostQueryReadDecision,
     );
 
     /// Stages a tenant or peer security event.
-    fn append_security_violation(
+    fn stage_security_violation(
         &self,
         context: VerifiedSecurityContext,
         violation: BifrostSecurityViolation,
@@ -853,7 +853,7 @@ pub trait OracleAudit: Send + Sync {
 
 impl OracleAudit for AuditOutbox {
     /// Stages the immutable read decision on the query tenant's chain.
-    fn append_read_decision(
+    fn stage_read_decision(
         &self,
         context: &AuthorizedQueryContext,
         decision: BifrostQueryReadDecision,
@@ -868,7 +868,7 @@ impl OracleAudit for AuditOutbox {
     }
 
     /// Stages a verified security violation on the query tenant's chain.
-    fn append_security_violation(
+    fn stage_security_violation(
         &self,
         context: VerifiedSecurityContext,
         violation: BifrostSecurityViolation,
@@ -964,7 +964,7 @@ pub struct BifrostSecurityViolation {
 ///
 /// Peer transport and fencing proofs assert on routing, reservation, and frame
 /// behavior, not on the audit chain. Binding this writer keeps the worker's
-/// real fail-closed audit call on the path while removing the Postgres
+/// real non-blocking audit call on the path while removing the Postgres
 /// dependency those proofs do not need. Any test that asserts audit content
 /// must use a writer that actually records.
 #[cfg(any(test, feature = "test-support"))]
@@ -974,7 +974,7 @@ pub struct AcceptingOracleAudit;
 #[cfg(any(test, feature = "test-support"))]
 impl OracleAudit for AcceptingOracleAudit {
     /// Discards the read decision.
-    fn append_read_decision(
+    fn stage_read_decision(
         &self,
         _context: &AuthorizedQueryContext,
         _decision: BifrostQueryReadDecision,
@@ -982,7 +982,7 @@ impl OracleAudit for AcceptingOracleAudit {
     }
 
     /// Discards the security violation.
-    fn append_security_violation(
+    fn stage_security_violation(
         &self,
         _context: VerifiedSecurityContext,
         _violation: BifrostSecurityViolation,
@@ -2544,7 +2544,7 @@ impl Oracle {
                 "event_class" => "tenant_file"
             )
             .increment(1);
-            audit.append_security_violation(
+            audit.stage_security_violation(
                 VerifiedSecurityContext {
                     query,
                     query_digest: None,
@@ -2802,7 +2802,7 @@ impl Oracle {
             input.deadline,
         )
         .inspect_err(|error| tracing::error!(error = %error, "Oracle read decision is invalid"))?;
-        self.audit.append_read_decision(input.context, decision);
+        self.audit.stage_read_decision(input.context, decision);
         Ok(())
     }
 

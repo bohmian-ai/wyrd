@@ -109,17 +109,15 @@ Enforced by `check:client-tier`:
   that evaluates a principal's permission is recorded — allowed and denied
   alike — with the principal, permission, resource, and outcome. Correlate
   related rows with request and typed domain identifiers.
-- Except for the non-blocking paths named below, every audited decision appends
-  its record in the same transaction as the decision, before the operation
-  proceeds or refuses. A decision that cannot be recorded that way fails closed.
-  Engine-internal transitions that evaluate no permission are lineage, not
-  audit.
-- Oracle read decisions, tenant tripwires, and gateway invocation decisions are
-  the durability exceptions: each uses the same canonical hash-chained staging
-  append from a tracked, non-blocking task, so abrupt process loss can lose an
-  uncommitted event there and no other audit table, WAL, relay, or log sink
-  exists. Gateway administration is not in that set and stays transactional and
-  fail-closed.
+- Every audited decision is staged on the one process audit outbox once the
+  decision is known, outside the operation's transaction. The operation never
+  waits for, or is refused by, the audit commit. Engine-internal transitions
+  that evaluate no permission are lineage, not audit.
+- The outbox commits through the canonical hash-chained staging append and
+  retries a failed commit without dropping it; a stage-time event id keeps a
+  retry from staging a decision twice. Abrupt process loss, or a graceful
+  shutdown that reaches its deadline, can lose an uncommitted decision; no
+  other audit table, WAL, relay, or log sink exists.
 - `vala.audit_staging` is transient write-ahead state; retained history is
   `vala.system.audit_log`. Staged rows are garbage-collected once the per-tenant
   watermark has advanced past them.

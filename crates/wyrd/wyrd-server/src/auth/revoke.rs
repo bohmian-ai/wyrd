@@ -23,14 +23,12 @@ use wyrd_sql::TenantConn;
 /// next token; a token it already holds lapses at its five-minute expiry.
 ///
 /// Revocation is an administrative authorization boundary: the
-/// `service_accounts:write` verdict is audited for both outcomes. A refusal is
-/// durable on its own, because a denied attempt is evidence whether or not
-/// anything followed it. An allowance is appended to the same transaction as
-/// the suspension and commits with it, so the record and the effect cannot
-/// disagree. An authorized revoke that names no principal of that kind is still
-/// an authorization decision: its allowance commits with no effect before the
-/// not-found refusal returns. A store failure rolls back the allowance and any
-/// effect together.
+/// `service_accounts:write` verdict is audited for both outcomes. Either
+/// decision is staged on the process audit outbox as soon as it is reached,
+/// before the suspension runs, and never delays or fails the request. An
+/// authorized revoke that names no principal of that kind, or whose store
+/// write fails, is still an authorization decision: its allowance is staged
+/// regardless of the effect.
 ///
 /// The request body is the contract, not decoration. Its `principal_kind`
 /// selects the table the id is resolved in, and its `reason` is folded into

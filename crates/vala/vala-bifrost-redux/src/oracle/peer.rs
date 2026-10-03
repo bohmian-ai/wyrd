@@ -732,10 +732,10 @@ pub struct PeerSecurityAuditError;
 /// for, or depends on, the audit commit.
 pub trait PeerSecurityAudit: Send + Sync {
     /// Stages a rejection whose claims cannot select an audit tenant.
-    fn append_unverified_ticket_rejection(&self, violation: BifrostSecurityViolationKind);
+    fn stage_unverified_ticket_rejection(&self, violation: BifrostSecurityViolationKind);
 
     /// Stages a violation on the context-named tenant's audit chain.
-    fn append_verified_ticket_violation(
+    fn stage_verified_ticket_violation(
         &self,
         tenant_id: DataTenantId,
         violation: BifrostSecurityViolationKind,

@@ -59,9 +59,8 @@ pub fn platform_credentials_router() -> OpenApiRouter<AppState> {
 /// logged, or traced, and no later read can recover it.
 ///
 /// # Errors
-/// Returns a stable Wyrd error when the caller is unauthorized, the decision
-/// cannot be audited — in which case nothing is minted — the principal does not
-/// exist, or the write fails.
+/// Returns a stable Wyrd error when the caller is unauthorized, the principal
+/// does not exist, or the write fails.
 #[utoipa::path(
     post,
     path = "/platform/admins/{principal_id}/credentials",
@@ -75,8 +74,7 @@ pub fn platform_credentials_router() -> OpenApiRouter<AppState> {
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform credential administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -120,8 +118,8 @@ async fn issue_credential(
 /// List a platform principal's credential metadata, newest first.
 ///
 /// # Errors
-/// Returns a stable Wyrd error when the caller is unauthorized, the decision
-/// cannot be audited, or the read fails.
+/// Returns a stable Wyrd error when the caller is unauthorized or the read
+/// fails.
 #[utoipa::path(
     get,
     path = "/platform/admins/{principal_id}/credentials",
@@ -134,8 +132,7 @@ async fn issue_credential(
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform credential administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -184,9 +181,8 @@ async fn list_credentials(
 /// is exactly what an operator needs to find in the audit log.
 ///
 /// # Errors
-/// Returns a stable Wyrd error when the caller is unauthorized, the decision
-/// cannot be audited, the credential is not this principal's or is already
-/// retired, or the write fails.
+/// Returns a stable Wyrd error when the caller is unauthorized, the credential
+/// is not this principal's or is already retired, or the write fails.
 #[utoipa::path(
     delete,
     path = "/platform/admins/{principal_id}/credentials/{credential_id}",
@@ -203,8 +199,7 @@ async fn list_credentials(
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No live credential for this platform principal \
           (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]

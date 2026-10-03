@@ -127,7 +127,7 @@ impl OraclePeerGrpc {
     /// there is no security auditor to stage on.
     fn audit_denial(&self, violation: BifrostSecurityViolationKind) -> Result<(), Status> {
         self.security_audit()?
-            .append_unverified_ticket_rejection(violation);
+            .stage_unverified_ticket_rejection(violation);
         Ok(())
     }
 

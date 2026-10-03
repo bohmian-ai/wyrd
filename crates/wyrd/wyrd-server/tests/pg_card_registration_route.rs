@@ -2085,16 +2085,61 @@ async fn card_reconciler_dead_letters_after_three_failures() {
     server.shutdown().await.expect("test server shuts down");
 }
 
+/// Drops the failure `trigger` on `vala.audit_staging`, settles the audit
+/// outbox, and counts the tenant's staged `operation` decisions.
+///
+/// Proves the retry half of an audit-failure case: the decision the trigger
+/// kept failing is still queued and commits once the database accepts it.
+///
+/// # Panics
+/// Panics when the trigger cannot be dropped, the outbox does not drain, or
+/// the staging read fails.
+async fn recovered_decisions(
+    server: &WyrdTestServer,
+    superuser: &sqlx::PgPool,
+    trigger: &str,
+    operation: &str,
+) -> i64 {
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "DROP TRIGGER {trigger} ON vala.audit_staging"
+    )))
+    .execute(superuser)
+    .await
+    .expect("failure trigger drops");
+    assert_eq!(
+        server
+            .wait_oracle_audit_staged(Duration::from_secs(30))
+            .await
+            .expect("audit outbox settles"),
+        0,
+        "the retried decisions drain"
+    );
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging WHERE operation = $1")
+            .bind(operation)
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("decision count reads");
+    conn.commit().await.expect("assertion transaction commits");
+    count
+}
+
 /// Completion activates the Card even when its decision audit cannot commit.
 ///
 /// The decision is staged on the non-blocking audit outbox, so a staging
 /// insert refused for `card.registration.complete` costs the request nothing:
-/// the Card becomes active, no completion row is staged, and the lost decision
-/// is counted under the `card` surface.
+/// the Card becomes active, no completion row is staged, and the failed write
+/// is counted. Once the insert is accepted again, the retried decision commits
+/// exactly once.
 ///
 /// # Panics
 /// Panics when the server cannot start, the completion is refused, the Card is
-/// not active, a completion row is staged, or the failure is not counted.
+/// not active, a completion row is staged while audit fails, the failure is not
+/// counted, or the decision does not commit once after recovery.
 #[tokio::test(flavor = "current_thread")]
 async fn completion_succeeds_when_its_decision_audit_fails() {
     let failures = AuditCommitFailures::install().expect("metrics recorder installs");
@@ -2176,13 +2221,10 @@ async fn completion_succeeds_when_its_decision_audit_fails() {
     let completion_body = response_json(completion).await;
     assert_eq!(completion_status, StatusCode::OK, "{completion_body}");
     assert_eq!(completion_body["outcomes"][0]["status"], "active");
-    assert_eq!(
-        server
-            .wait_oracle_audit_staged(Duration::from_secs(30))
-            .await
-            .expect("audit outbox settles"),
-        0
-    );
+    failures
+        .await_failure(Duration::from_secs(30))
+        .await
+        .expect("the failed audit write is counted");
 
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
@@ -2204,7 +2246,17 @@ async fn completion_succeeds_when_its_decision_audit_fails() {
     .expect("completion audit count reads");
     assert_eq!(complete_audits, 0);
     conn.commit().await.expect("assertion transaction commits");
-    assert!(failures.count("card") >= 1, "the lost decision is counted");
+    assert_eq!(
+        recovered_decisions(
+            &server,
+            &superuser,
+            "test_fail_card_completion_audit",
+            "card.registration.complete"
+        )
+        .await,
+        1,
+        "the retried decision commits exactly once after recovery"
+    );
 
     server.shutdown().await.expect("test server shuts down");
 }
@@ -2213,7 +2265,8 @@ async fn completion_succeeds_when_its_decision_audit_fails() {
 ///
 /// # Panics
 /// Panics when the server cannot start, the delete is refused, the Card is not
-/// deleted, a delete row is staged, or the failure is not counted.
+/// deleted, a delete row is staged while audit fails, the failure is not
+/// counted, or the decision does not commit once after recovery.
 #[tokio::test(flavor = "current_thread")]
 async fn delete_succeeds_when_its_decision_audit_fails() {
     let failures = AuditCommitFailures::install().expect("metrics recorder installs");
@@ -2276,13 +2329,10 @@ async fn delete_succeeds_when_its_decision_audit_fails() {
         "{}",
         response_json(response).await
     );
-    assert_eq!(
-        server
-            .wait_oracle_audit_staged(Duration::from_secs(30))
-            .await
-            .expect("audit outbox settles"),
-        0
-    );
+    failures
+        .await_failure(Duration::from_secs(30))
+        .await
+        .expect("the failed audit write is counted");
 
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
@@ -2305,7 +2355,17 @@ async fn delete_succeeds_when_its_decision_audit_fails() {
     assert_eq!(card_status, "deleted");
     assert_eq!(delete_audits, 0);
     conn.commit().await.expect("assertion transaction commits");
-    assert!(failures.count("card") >= 1, "the lost decision is counted");
+    assert_eq!(
+        recovered_decisions(
+            &server,
+            &superuser,
+            "test_fail_card_delete_audit",
+            "card.registration.delete"
+        )
+        .await,
+        1,
+        "the retried decision commits exactly once after recovery"
+    );
     server.shutdown().await.expect("test server shuts down");
 }
 
@@ -2507,7 +2567,8 @@ async fn blob_storage_failure_leaves_durable_failure_state() {
 ///
 /// # Panics
 /// Panics when the server cannot start, the registration is refused, any Card
-/// of the composite is missing, or the failure is not counted.
+/// of the composite is missing, the failure is not counted, or the decision
+/// does not commit once after recovery.
 #[tokio::test(flavor = "current_thread")]
 async fn registration_succeeds_when_its_decision_audit_fails() {
     let failures = AuditCommitFailures::install().expect("metrics recorder installs");
@@ -2556,13 +2617,10 @@ async fn registration_succeeds_when_its_decision_audit_fails() {
     let status = response.status();
     let body = response_json(response).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    assert_eq!(
-        server
-            .wait_oracle_audit_staged(Duration::from_secs(30))
-            .await
-            .expect("audit outbox settles"),
-        0
-    );
+    failures
+        .await_failure(Duration::from_secs(30))
+        .await
+        .expect("the failed audit write is counted");
 
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
@@ -2585,7 +2643,17 @@ async fn registration_succeeds_when_its_decision_audit_fails() {
     assert_eq!(operation_count, 1);
     assert_eq!(card_count, 3);
     conn.commit().await.expect("assertion transaction commits");
-    assert!(failures.count("card") >= 1, "the lost decision is counted");
+    assert_eq!(
+        recovered_decisions(
+            &server,
+            &superuser,
+            "test_fail_registration_decision_audit",
+            "card.registration.create"
+        )
+        .await,
+        1,
+        "the retried decision commits exactly once after recovery"
+    );
 
     server.shutdown().await.expect("test server shuts down");
 }

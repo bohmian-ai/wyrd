@@ -117,12 +117,19 @@ non-tail WAL is a no-go and invokes full restore or incident escalation.
 
 ### Audit commit path
 
-1. A rising `audit_outbox_commit_failures_total` means authorization decisions
-   on the labelled `surface` are not reaching `vala.audit_staging`. Requests
-   keep succeeding. Restore Postgres or tenant connection capacity; the logged
-   error names the tenant, operation, and request id.
-2. Decisions that failed to commit are not replayed. Record the window from
-   the failure logs as an audit gap.
+1. A rising `outbox_write_failures_total{outbox="audit"}` means authorization
+   decisions are not reaching `vala.audit_staging`. Requests keep succeeding.
+   The failed decisions stay queued and are retried with backoff, so
+   `outbox_pending{outbox="audit"}` grows while the failure lasts. Restore
+   Postgres or tenant connection capacity; the logged error names the tenant
+   and the failure.
+2. Once Postgres recovers, the queued decisions commit exactly once and the
+   pending gauge returns toward zero. A retry never stages a decision twice.
+3. Decisions are lost only at abrupt process loss, or when graceful shutdown
+   reaches its deadline with them unwritten. Shutdown counts those in
+   `outbox_events_lost_total{outbox="audit"}`; record a nonzero count with its
+   window from the shutdown log as an audit gap. Avoid restarting a replica
+   whose audit outbox is still pending while Postgres is unavailable.
 
 ### Peer path
 
@@ -138,8 +145,7 @@ non-tail WAL is a no-go and invokes full restore or incident escalation.
 
 ### Go/no-go
 
-Oracle is ready only when the acceptance WAL is writable and recoverable, relay
-lag is within its bound, canonical audit append is healthy, query resources
+Oracle is ready only when query resources
 release exactly once, peer trust is current, and cancellation, peer-loss, and
 terminal-stream journeys pass. A skipped audit frame or stream interpreted as
 success after terminal failure is a no-go.

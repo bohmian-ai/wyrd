@@ -171,7 +171,7 @@ impl OraclePeerAuthority {
         error: PeerSecurityError,
     ) -> PeerSecurityError {
         self.security_audit
-            .append_unverified_ticket_rejection(violation);
+            .stage_unverified_ticket_rejection(violation);
         error
     }
 
@@ -253,7 +253,7 @@ impl OraclePeerAuthority {
         error: PeerSecurityError,
     ) -> Result<T, PeerSecurityError> {
         self.security_audit
-            .append_unverified_ticket_rejection(violation);
+            .stage_unverified_ticket_rejection(violation);
         Err(error)
     }
 
@@ -424,7 +424,7 @@ impl OraclePeerAuthority {
     ) -> Result<AuthorizedStage, PeerSecurityError> {
         record_stage_authority(binding.operation.telemetry(), outcome);
         self.security_audit
-            .append_unverified_ticket_rejection(violation);
+            .stage_unverified_ticket_rejection(violation);
         Err(error)
     }
 
@@ -442,7 +442,7 @@ impl OraclePeerAuthority {
     ) -> Result<AuthorizedStage, PeerSecurityError> {
         record_stage_authority(binding.operation.telemetry(), outcome);
         self.security_audit
-            .append_verified_ticket_violation(tenant_id, violation);
+            .stage_verified_ticket_violation(tenant_id, violation);
         Err(error)
     }
 }
@@ -534,7 +534,7 @@ mod tests {
 
     impl PeerSecurityAudit for RecordingPeerAudit {
         /// Captures an unattributable rejection as a system-chain call.
-        fn append_unverified_ticket_rejection(&self, violation: BifrostSecurityViolationKind) {
+        fn stage_unverified_ticket_rejection(&self, violation: BifrostSecurityViolationKind) {
             self.calls
                 .lock()
                 .expect("audit mutex")
@@ -542,7 +542,7 @@ mod tests {
         }
 
         /// Captures a rejection with its context tenant.
-        fn append_verified_ticket_violation(
+        fn stage_verified_ticket_violation(
             &self,
             tenant_id: DataTenantId,
             violation: BifrostSecurityViolationKind,

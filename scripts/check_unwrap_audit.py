@@ -29,9 +29,13 @@ class Finding:
 
 
 def is_ignored_path(path: Path) -> bool:
-    """Return whether `path` is a Rust test/example path."""
+    """Return whether `path` is a Rust test/example path.
+
+    A `tests.rs` file is the out-of-line body of a `#[cfg(test)] mod tests;`
+    declaration, so it is test code wherever it sits.
+    """
     parts = path.relative_to(ROOT).parts
-    return "tests" in parts or "examples" in parts
+    return "tests" in parts or "examples" in parts or path.name == "tests.rs"
 
 
 def read_string_literal(text: str, i: int) -> tuple[int, str] | None:

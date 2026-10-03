@@ -614,9 +614,9 @@ impl<'a> GatewayInvocation<'a> {
     /// call (requested model), only skips a candidate (fallback), or hides the
     /// model from a listing. The decision row is staged on the process audit
     /// outbox, so no invocation waits on Postgres to record its own decision; a
-    /// failed commit is logged and counted under
-    /// `audit_outbox_commit_failures_total`, and an abrupt process loss may
-    /// drop decisions that had not yet committed.
+    /// failed commit is logged, counted under
+    /// `outbox_write_failures_total{outbox="audit"}`, and retried, and an
+    /// abrupt process loss may drop decisions that had not yet committed.
     ///
     /// # Errors
     /// Returns the deny reason when `caller` may not invoke `model`.

@@ -109,10 +109,10 @@ pub(super) fn operator(state: &AppState) -> Result<OperatorPool, WyrdErrorRespon
 
 /// Authorize one platform identity operation and hand back its open decision.
 ///
-/// The returned transaction already carries the allowance row, so the caller
-/// performs its mutation on it and commits once through [`commit_decision`].
-/// A read-only caller commits it immediately: there is no effect to pair the
-/// record with.
+/// The decision is already staged on the process audit outbox when this
+/// returns, so the caller performs its mutation on the returned transaction
+/// and commits once through [`commit_decision`]. A read-only caller commits it
+/// immediately: there is no effect to perform.
 ///
 /// The authorization handle owns the pool the transaction borrows from, so it
 /// is returned alongside and must outlive the connection. `resource` is the
@@ -139,11 +139,11 @@ pub(super) async fn authorize<'a>(
         .map_err(|error| platform_authz_error(&error, required))
 }
 
-/// Commit an allowance together with whatever the caller wrote on it.
+/// Commit whatever the caller wrote on an authorized transaction.
 ///
 /// # Errors
-/// Returns an internal error when the commit fails, in which case neither the
-/// effect nor the allowance is durable.
+/// Returns an internal error when the commit fails, in which case the effect
+/// is not durable; the decision was staged separately and is still recorded.
 pub(super) async fn commit_decision(decision: TenantConn<'_>) -> Result<(), WyrdErrorResponse> {
     decision.commit().await.map_err(|error| {
         WyrdErrorResponse::from(internal_failure(
@@ -155,8 +155,8 @@ pub(super) async fn commit_decision(decision: TenantConn<'_>) -> Result<(), Wyrd
 
 /// Authorize a read and release its transaction immediately.
 ///
-/// A read has no effect to pair the allowance with, so holding the transaction
-/// open across it would buy nothing. The decision is staged on `audit`, the
+/// A read has no effect to commit, so holding the transaction open across it
+/// would buy nothing. The decision is staged on `audit`, the
 /// process audit outbox.
 ///
 /// # Errors
@@ -191,8 +191,7 @@ pub(super) async fn authorize_read(
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform identity administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -296,8 +295,7 @@ async fn configure_connection(
         (status = 403, description = "Platform identity administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No connection configured (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -355,8 +353,7 @@ async fn read_connection(
         (status = 403, description = "Platform identity administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No connection configured (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -421,8 +418,7 @@ async fn remove_connection(
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 409, description = "Name or matching claim already registered \
           (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -521,8 +517,7 @@ async fn register_admin(
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform identity administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -588,8 +583,7 @@ async fn list_platform_admins(
         (status = 404, description = "Platform principal not found (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
         (status = 409, description = "Would leave the deployment with no active principal \
           (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]

@@ -2058,11 +2058,13 @@ mod pg_tests {
     /// Completing a registration is a receiving authorization boundary whose
     /// permission verdict is staged on the server's non-blocking audit outbox.
     /// A trigger refuses that one staging insert; the CLI still completes the
-    /// registration and exits `0`, and the server counts the lost decision.
+    /// registration and exits `0`, the server counts the failed audit write, and
+    /// the retried decision commits exactly once after the trigger is dropped.
     ///
     /// # Panics
     /// Panics when the embedded server or fixture setup fails, the CLI does not
-    /// complete the registration, or the lost decision is not counted.
+    /// complete the registration, the failed write is not counted, or the
+    /// decision does not commit once after recovery.
     #[tokio::test]
     async fn apply_completes_when_completion_decision_audit_fails() {
         let failures =
@@ -2122,15 +2124,32 @@ mod pg_tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        server
-            .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        failures
+            .await_failure(std::time::Duration::from_secs(30))
             .await
-            .expect("audit outbox settles");
+            .expect("the failed audit write is counted");
         sqlx::query("DROP TRIGGER test_fail_cli_card_completion_audit ON vala.audit_staging")
             .execute(&superuser)
             .await
             .expect("failure trigger drops");
-        assert!(failures.count("card") >= 1, "the lost decision is counted");
+        assert_eq!(
+            server
+                .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+                .await
+                .expect("audit outbox settles"),
+            0,
+            "the retried decision drains"
+        );
+        let completions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_staging WHERE operation = 'card.registration.complete'",
+        )
+        .fetch_one(&superuser)
+        .await
+        .expect("completion decisions read");
+        assert_eq!(
+            completions, 1,
+            "the decision commits exactly once after recovery"
+        );
         stop_cli_server(server, shutdown, serve_handle).await;
     }
 

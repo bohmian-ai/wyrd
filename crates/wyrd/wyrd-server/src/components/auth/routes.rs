@@ -339,7 +339,7 @@ async fn callback(
 /// # Errors
 /// Returns a `401` without a usable token, a `403` without
 /// `service_accounts:write`, a `404` when the named principal does not exist in
-/// this tenant, a `500` when the write or its audit fails, and a `503` when the
+/// this tenant, a `500` when the write fails, and a `503` when the
 /// store is unavailable or no token verifier is configured.
 #[utoipa::path(
     post,

@@ -44,7 +44,8 @@ pub async fn callback(
 /// Returns [`WyrdErrorResponse`] when the callback tenant cannot be resolved
 /// from the request, or when the grant itself is refused — unknown, consumed,
 /// or expired login state, a refused code or unverifiable id token, an
-/// inactive user, or a failed role, issuance, or audit write.
+/// inactive user, or a failed role or issuance write. An audit write never
+/// fails the grant.
 pub async fn exchange_authorization_code(
     state: &AppState,
     headers: &HeaderMap,
@@ -123,6 +124,7 @@ mod pg_tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use secrecy::SecretString;
+    use serde_json::Value;
     use uuid::Uuid;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -618,7 +620,7 @@ mod pg_tests {
             .expect("wiremock URI is valid")
     }
 
-    fn ed_jwks_json(kid: &str) -> serde_json::Value {
+    fn ed_jwks_json(kid: &str) -> Value {
         serde_json::json!({
             "keys": [{
                 "kty": "OKP",
@@ -629,12 +631,7 @@ mod pg_tests {
         })
     }
 
-    fn external_claims(
-        audience: &str,
-        nonce: &str,
-        email: Option<&str>,
-        groups: &[&str],
-    ) -> serde_json::Value {
+    fn external_claims(audience: &str, nonce: &str, email: Option<&str>, groups: &[&str]) -> Value {
         let now = Utc::now();
         let mut claims = serde_json::json!({
             "sub": "ext-user@idp.example.com",
@@ -651,7 +648,7 @@ mod pg_tests {
         claims
     }
 
-    fn encode_external_token(claims: &serde_json::Value) -> String {
+    fn encode_external_token(claims: &Value) -> String {
         let mut header = Header::new(Algorithm::EdDSA);
         header.kid = Some(EXTERNAL_KID.to_owned());
         let key = EncodingKey::from_ed_pem(PRIVATE_KEY_PEM.as_bytes())
@@ -755,10 +752,7 @@ mod pg_tests {
     /// # Panics
     /// Panics when the outbox does not settle, the query fails, or a detail is
     /// not JSON.
-    async fn audit_rows(
-        fixture: &PgFixture,
-        state: &AppState,
-    ) -> Vec<(Uuid, String, serde_json::Value)> {
+    async fn audit_rows(fixture: &PgFixture, state: &AppState) -> Vec<(Uuid, String, Value)> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         assert_eq!(
             state.audit_outbox.settle(deadline).await,
@@ -784,7 +778,7 @@ mod pg_tests {
     }
 
     /// Canonical detail of a refused exchange with `error_code`.
-    fn auth_failure_detail(error_code: &str) -> serde_json::Value {
+    fn auth_failure_detail(error_code: &str) -> Value {
         serde_json::json!({ "kind": "auth_failure", "error_code": error_code })
     }
 

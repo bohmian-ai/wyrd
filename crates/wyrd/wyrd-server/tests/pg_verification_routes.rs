@@ -1347,15 +1347,17 @@ async fn direct_execution_refusals_are_stable() {
 
 /// A direct execution whose decision cannot be audited still executes: audit
 /// is non-blocking, so the allowed caller gets its judgment and the Card-bound
-/// caller without subject scope gets its permission refusal, while neither
-/// decision reaches the outbox.
+/// caller without subject scope gets its permission refusal. Neither decision
+/// reaches staging while audit fails; both are retried and commit exactly once
+/// when it recovers.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, the failure
-/// trigger cannot be installed, a route fails to respond, or any status, code,
-/// or audit expectation fails.
+/// trigger cannot be installed or dropped, a route fails to respond, or any
+/// status, code, or audit expectation fails.
 #[tokio::test(flavor = "current_thread")]
 async fn direct_execution_does_not_wait_on_audit() {
+    let failures = wyrd_testing::AuditCommitFailures::install().expect("metrics recorder installs");
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1403,9 +1405,32 @@ async fn direct_execution_does_not_wait_on_audit() {
     let (status, problem) = post_execute(&server, &machine_token, body).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
     assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
-    for principal in [caller, machine.id().as_uuid()] {
-        assert!(execute_decisions(&server, principal).await.is_empty());
-    }
+    failures
+        .await_failure(std::time::Duration::from_secs(30))
+        .await
+        .expect("the failed audit write is counted");
+    let staged: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_staging WHERE operation = 'verification.execute'",
+    )
+    .fetch_one(&superuser)
+    .await
+    .expect("staging reads");
+    assert_eq!(staged, 0, "no decision is staged while audit fails");
+
+    sqlx::query("DROP TRIGGER test_fail_execute_audit ON vala.audit_staging")
+        .execute(&superuser)
+        .await
+        .expect("failure trigger drops");
+    assert_eq!(
+        execute_decisions(&server, caller).await,
+        vec![("evals:run".to_owned(), "allowed".to_owned())],
+        "the allowance commits exactly once after recovery"
+    );
+    assert_eq!(
+        execute_decisions(&server, machine.id().as_uuid()).await,
+        vec![("evals:run".to_owned(), "denied".to_owned())],
+        "the denial commits exactly once after recovery"
+    );
     server.shutdown().await.expect("test server shuts down");
 }
 

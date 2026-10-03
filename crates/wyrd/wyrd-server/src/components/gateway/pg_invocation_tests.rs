@@ -19,7 +19,6 @@ use base64::Engine as _;
 use chrono::{TimeDelta, Utc};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
@@ -29,7 +28,6 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_sql::ValaPostgres;
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_dev_fixtures::pg::PgFixture;
@@ -63,7 +61,7 @@ use super::capture::object_path;
 use super::capture::recording::RecordingScribe;
 use super::ledger::{GatewayLedger, LedgerCall};
 use super::pg_administration_tests::{
-    admin, audit_decisions, await_lock_waiters, keyring, managed_keys, state_with_vala, test_state,
+    admin, audit_decisions, await_lock_waiters, keyring, managed_keys, test_state,
 };
 use super::{
     GatewayAdministration, GatewayCallRequest, GatewayCallResponse, GatewayCapture,
@@ -700,16 +698,17 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
 }
 
 /// An authorized invoke dispatches without waiting on its own audit commit,
-/// and a commit that cannot land neither refuses the call nor leaves a row.
+/// and a commit that cannot land neither refuses the call nor is lost.
 ///
 /// The invocation audit is non-blocking: the decision is staged on the
-/// process audit outbox, so an unreachable audit database costs the call
-/// nothing.
+/// process audit outbox, so a failing audit write costs the call nothing. The
+/// failed write is counted and retried, and the decision commits exactly once
+/// when staging recovers.
 ///
 /// # Panics
 ///
-/// Panics when the invoke fails, waits for the unreachable audit database, or
-/// leaves an audit decision behind.
+/// Panics when the invoke fails, waits for the failing audit write, stages a
+/// decision while audit fails, or does not commit it once after recovery.
 #[tokio::test]
 async fn gateway_invocation_dispatches_without_waiting_for_the_audit_append() {
     let recorder = SeriesRecorder::default();
@@ -717,23 +716,17 @@ async fn gateway_invocation_dispatches_without_waiting_for_the_audit_append() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let dispatch = Scripted::shared();
-    let healthy = replica(&fixture, dispatch.clone()).await;
-    configure(&healthy, tenant, json!([]), json!([]), "allow_unpriced").await;
-    drain_gateway(&healthy).await;
+    let state = replica(&fixture, dispatch.clone()).await;
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    drain_gateway(&state).await;
     let before = audit_decisions(&fixture, tenant).await;
-    let unreachable = PgPoolOptions::new()
-        .acquire_timeout(Duration::from_secs(2))
-        .connect_lazy_with(PgConnectOptions::new().host("127.0.0.1").port(1));
-    let broken = state_with_vala(&fixture, ValaPostgres::from_pool(unreachable))
+    fixture
+        .fail_audit_staging()
         .await
-        .with_gateway_engine(GatewayEngine::new(
-            CredentialResolver::default(),
-            DeploymentHealth::default(),
-            dispatch.clone(),
-        ));
+        .expect("audit failure installs");
     dispatch.push(Step::Return(completed(10, 5)));
     let started = std::time::Instant::now();
-    GatewayInvocation::new(&broken)
+    GatewayInvocation::new(&state)
         .invoke(
             &invoker(tenant, 1, [model_access("acme/a")]),
             request("acme/a", None, Duration::from_secs(10)),
@@ -742,29 +735,49 @@ async fn gateway_invocation_dispatches_without_waiting_for_the_audit_append() {
         .expect("an unaudited allow still dispatches");
     assert!(
         started.elapsed() < Duration::from_secs(2),
-        "the call waited for the unreachable audit database"
+        "the call waited for the failing audit write"
     );
     assert_eq!(dispatch.seen(), ["dep-a"]);
 
-    // The failed commit settles on the outbox, is counted and logged there,
-    // and persists no decision.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !recorder
+        .series
+        .lock()
+        .expect("series")
+        .contains("outbox_write_failures_total{outbox=audit}")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the failed audit write is counted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(
-        broken.audit_outbox.settle(deadline).await,
-        0,
-        "the staged decision settles"
+        audit_decisions(&fixture, tenant).await,
+        before,
+        "nothing is staged while audit fails"
     );
-    assert_eq!(audit_decisions(&fixture, tenant).await, before);
-    assert!(
-        recorder
-            .series
-            .lock()
-            .expect("series")
-            .contains("audit_outbox_commit_failures_total{surface=gateway}"),
-        "the failed commit is counted"
+    let queued = state.audit_outbox.pending();
+    fixture
+        .restore_audit_staging()
+        .await
+        .expect("audit staging restores");
+    drain_gateway(&state).await;
+    let after = audit_decisions(&fixture, tenant).await;
+    let recovered = &after[before.len()..];
+    assert_eq!(
+        recovered.len(),
+        queued,
+        "every queued decision commits exactly once: {recovered:?}"
     );
-    drain_gateway(&broken).await;
-    drain_gateway(&healthy).await;
+    assert_eq!(
+        recovered
+            .iter()
+            .filter(|decision| *decision == &("gateway.invoke".to_owned(), "allowed".to_owned()))
+            .count(),
+        1,
+        "the invoke's allowance commits exactly once: {recovered:?}"
+    );
 }
 
 /// Public handler and internal seam share one pipeline: the requested model

@@ -61,7 +61,7 @@ use crate::state::{
     AppState, Forge, ForgeCompactionRuntime, Oracle, ProductionValidationError, Scribe,
     ScribeCoordinationRuntime,
 };
-use vala_sql::audit_outbox::AuditOutbox;
+use vala_sql::audit_outbox::{AuditOutbox, AuditSink};
 
 const DEFAULT_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const DEFAULT_HINT_CAPACITY: usize = 1_024;
@@ -1020,7 +1020,7 @@ pub async fn compose_bifrost(
 
     // The one process audit outbox: Gate, Oracle, peer security, and every
     // request-path decision stage on it; `BoundServer::run` drains it last.
-    let audit_outbox = AuditOutbox::new(postgres.vala().clone());
+    let audit_outbox = AuditSink::outbox(postgres.vala().clone());
     let scribe = if let Some(parts) = scribe {
         let fragment_security_audit = Arc::new(
             crate::oracle::PostgresPeerSecurityAudit::try_new(&postgres, Arc::clone(&audit_outbox))

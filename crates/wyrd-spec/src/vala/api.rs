@@ -2419,7 +2419,7 @@ mod tests {
     }
 }
 
-// ── Audit event (S3.C5 — transactional audit staging) ────────────────────────
+// ── Audit event (staged through the process audit outbox) ───────────────────
 
 /// How the acting principal authenticated for an audited data-plane op.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -2449,9 +2449,11 @@ pub enum AuditOutcome {
 
 /// One audited authorization decision.
 ///
-/// Every boundary that evaluates a principal's permission appends exactly one
-/// hash-chained `AuditEvent` row, in the same transaction as the decision,
-/// before the operation proceeds or is refused. The hash-chain canonical
+/// Every boundary that evaluates a principal's permission stages exactly one
+/// `AuditEvent` on the process audit outbox once the decision is known,
+/// outside the operation's transaction; the operation proceeds or is refused
+/// without waiting for the event to commit. The outbox later commits it as one
+/// hash-chained staging row. The hash-chain canonical
 /// encoding and per-tenant `seq` are owned by `vala-sql`; this type is the
 /// Arrow-free, PyO3-free wire/codegen shape.
 ///

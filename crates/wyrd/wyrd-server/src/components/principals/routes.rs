@@ -406,8 +406,8 @@ async fn list_credentials(
 /// contains.
 ///
 /// # Errors
-/// Returns a stable Wyrd error when the caller is unauthorized, the decision
-/// cannot be audited, or the read fails.
+/// Returns a stable Wyrd error when the caller is unauthorized or the read
+/// fails.
 pub(crate) async fn list_credentials_for(
     state: &AppState,
     caller: &Caller,

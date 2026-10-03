@@ -240,7 +240,7 @@ mod pg_tests {
     use wyrd_sql::queries::platform::principals::insert_platform_principal;
 
     use super::{PLATFORM_AUTHZ_OPERATION, PlatformAuthorization, PlatformAuthzError};
-    use crate::audit::test_outbox::{drain, outbox};
+    use crate::audit::test_outbox::{assert_retrying, drain, outbox};
     use std::sync::Arc;
 
     /// A platform context holding exactly `permissions`, backed by a real row.
@@ -548,12 +548,14 @@ mod pg_tests {
     }
 
     /// When the canonical audit log cannot accept the decision, the operation
-    /// is still authorized: permissions block, audits do not.
+    /// is still authorized: permissions block, audits do not. The decision is
+    /// retried rather than lost and commits exactly once when the log recovers.
     ///
     /// # Panics
     ///
-    /// Panics when the fixture cannot start, the decision is refused, or a
-    /// row reaches staging while its insert privilege is revoked.
+    /// Panics when the fixture cannot start, the decision is refused, a row
+    /// reaches staging while its insert privilege is revoked, or the decision
+    /// does not commit exactly once after the privilege returns.
     #[tokio::test]
     async fn an_unrecordable_decision_still_authorizes() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -583,13 +585,15 @@ mod pg_tests {
             .await
             .expect("an audit failure never refuses an authorized operation");
         conn.commit().await.expect("operation commits");
-        drain(&audit).await;
+        assert_retrying(&audit, 1).await;
+        assert_eq!(staged_rows(&fixture, principal, "allowed").await, 0);
 
         sqlx::query("GRANT INSERT ON vala.audit_staging TO wyrd_app")
             .execute(&admin)
             .await
             .expect("privilege restored");
+        drain(&audit).await;
 
-        assert_eq!(staged_rows(&fixture, principal, "allowed").await, 0);
+        assert_eq!(staged_rows(&fixture, principal, "allowed").await, 1);
     }
 }

@@ -9,6 +9,7 @@ use tokio::runtime::Runtime;
 pub mod audit;
 pub mod builtin_roles;
 pub mod otel;
+pub mod outbox;
 pub mod permission;
 pub mod permission_check;
 pub mod principal;

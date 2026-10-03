@@ -87,12 +87,12 @@ impl PostgresPeerSecurityAudit {
 
 impl PeerSecurityAudit for PostgresPeerSecurityAudit {
     /// Stages an untrusted-ticket rejection on the platform/system audit chain.
-    fn append_unverified_ticket_rejection(&self, violation: BifrostSecurityViolationKind) {
+    fn stage_unverified_ticket_rejection(&self, violation: BifrostSecurityViolationKind) {
         self.stage(DataTenantId::SYSTEM_OWNER, violation);
     }
 
     /// Stages a signed-ticket rejection on the cryptographically verified tenant chain.
-    fn append_verified_ticket_violation(
+    fn stage_verified_ticket_violation(
         &self,
         tenant_id: DataTenantId,
         violation: BifrostSecurityViolationKind,
@@ -104,6 +104,7 @@ impl PeerSecurityAudit for PostgresPeerSecurityAudit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vala_sql::audit_outbox::AuditSink;
     use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
 
     /// Production peer audit stages exact system and verified-tenant identities.
@@ -120,12 +121,12 @@ mod tests {
             fixture.wyrd_postgres().clone(),
             fixture.vala_postgres().clone(),
         );
-        let outbox = AuditOutbox::new(fixture.vala_postgres().clone());
+        let outbox = AuditSink::outbox(fixture.vala_postgres().clone());
         let writer = PostgresPeerSecurityAudit::try_new(&postgres, Arc::clone(&outbox))
             .await
             .expect("exact sentinel enables peer audit");
-        writer.append_unverified_ticket_rejection(BifrostSecurityViolationKind::PeerUnknownKey);
-        writer.append_verified_ticket_violation(
+        writer.stage_unverified_ticket_rejection(BifrostSecurityViolationKind::PeerUnknownKey);
+        writer.stage_verified_ticket_violation(
             fixture.data_tenant_id(),
             BifrostSecurityViolationKind::PeerAudience,
         );
@@ -185,7 +186,7 @@ mod tests {
         assert!(
             PostgresPeerSecurityAudit::try_new(
                 &postgres,
-                AuditOutbox::new(fixture.vala_postgres().clone())
+                AuditSink::outbox(fixture.vala_postgres().clone())
             )
             .await
             .is_err(),
@@ -204,7 +205,7 @@ mod tests {
         assert!(
             PostgresPeerSecurityAudit::try_new(
                 &postgres,
-                AuditOutbox::new(fixture.vala_postgres().clone())
+                AuditSink::outbox(fixture.vala_postgres().clone())
             )
             .await
             .is_err(),

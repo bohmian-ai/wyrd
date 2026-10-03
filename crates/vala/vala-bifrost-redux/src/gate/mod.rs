@@ -259,15 +259,15 @@ pub fn initialize_gate_metrics() {
 ///
 /// Gate evaluates and enforces the RBAC permission itself; the sink only
 /// stages the decision and returns. Permissions block, audits do not: a
-/// decision that fails to commit is counted and logged by the sink and never
-/// refuses or delays the write.
+/// decision that fails to commit is retried by the outbox and never refuses or
+/// delays the write.
 ///
 /// [`Gate`] is parameterized over the sink, so the server composes the process
 /// [`AuditOutbox`] and crate-local tests compose their recording double, both
 /// statically.
 pub trait GateAudit: Send + Sync {
     /// Stages one `bifrost_record:write` decision for `auth` on `resource`.
-    fn append_write_decision(&self, auth: &AuthContext, resource: &str, outcome: AuditOutcome);
+    fn stage_write_decision(&self, auth: &AuthContext, resource: &str, outcome: AuditOutcome);
 }
 
 impl GateAudit for AuditOutbox {
@@ -278,7 +278,7 @@ impl GateAudit for AuditOutbox {
     /// delegation chain, names its actors through the same
     /// [`AuditDetail::DelegationAttribution`] projection HTTP and Oracle audit
     /// use. A direct call keeps no detail.
-    fn append_write_decision(&self, auth: &AuthContext, resource: &str, outcome: AuditOutcome) {
+    fn stage_write_decision(&self, auth: &AuthContext, resource: &str, outcome: AuditOutcome) {
         let mut event = AuditEvent::new(
             auth.request_id.clone(),
             None,
@@ -521,7 +521,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         } else {
             AuditOutcome::Denied
         };
-        audit.append_write_decision(auth, &table.fqn(), outcome);
+        audit.stage_write_decision(auth, &table.fqn(), outcome);
         decision
     }
 
@@ -1544,12 +1544,7 @@ mod tests {
 
     impl GateAudit for RecordingAudit {
         /// Records the decision in memory, in staging order.
-        fn append_write_decision(
-            &self,
-            _auth: &AuthContext,
-            resource: &str,
-            outcome: AuditOutcome,
-        ) {
+        fn stage_write_decision(&self, _auth: &AuthContext, resource: &str, outcome: AuditOutcome) {
             self.decisions
                 .lock()
                 .expect("recording audit lock is uncontended")

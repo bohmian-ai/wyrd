@@ -68,9 +68,10 @@ impl AuthorizationCodeExchange {
     /// # Errors
     /// Returns [`WyrdError`] when the login state is unknown, already consumed,
     /// or expired, when the issuer refuses the code or its id token fails
-    /// verification, when role persistence or successor issuance fails, or when
-    /// the decision cannot be audited. Every refusal is audited before it is
-    /// returned, and the grant transaction commits or rolls back whole.
+    /// verification, or when role persistence or successor issuance fails.
+    /// Every refusal's decision is staged on the process audit outbox before it
+    /// is returned, and the grant transaction commits or rolls back whole; an
+    /// audit write never fails the grant.
     pub async fn execute(
         &self,
         postgres: &WyrdPostgres,
@@ -168,9 +169,10 @@ impl AuthorizationCodeExchange {
     /// permissions of the roles just recorded.
     ///
     /// # Errors
-    /// Returns [`WyrdError`] when identity or role persistence, issuance, the
-    /// canonical audit append, or the commit fails; no session is returned
-    /// unless all of them committed together.
+    /// Returns [`WyrdError`] when identity or role persistence, issuance, or
+    /// the commit fails; no session is returned unless all of them committed
+    /// together. The grant's audit decision is staged on the process outbox
+    /// and never fails the exchange.
     async fn finish_authorization_code_exchange(
         &self,
         input: FinishAuthorizationCodeInput<'_>,

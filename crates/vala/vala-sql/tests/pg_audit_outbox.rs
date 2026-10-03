@@ -1,8 +1,9 @@
 //! Postgres integration tests for the process audit outbox.
 //!
 //! Covers gap-free chains under concurrent outboxes (two replicas), tenant
-//! independence while one tenant's chain head is contended, and shutdown
-//! draining. Run via `mise run test:bifrost:integration:sql`.
+//! independence while one tenant's chain head is contended, shutdown draining
+//! and loss accounting, and idempotent retries. Run via
+//! `mise run test:bifrost:integration:sql`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,8 +11,9 @@ use std::time::{Duration, Instant};
 use sqlx::PgPool;
 use sqlx::types::Uuid;
 use vala_sql::ValaPostgres;
-use vala_sql::audit_outbox::AuditOutbox;
+use vala_sql::audit_outbox::{AuditSink, StagedAuditEvent};
 use wyrd_dev_fixtures::pg::PgFixture;
+use wyrd_runtime::outbox::OutboxSink;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
@@ -80,9 +82,24 @@ async fn await_staged(superuser: &PgPool, tenant: DataTenantId, rows: usize) {
     }
 }
 
+/// Asserts `rows` form one gap-free chain from `seq` 1 whose every row links
+/// its predecessor.
+///
+/// # Panics
+///
+/// Panics on a gap or a broken link.
+fn assert_chain(rows: &[(i64, Vec<u8>, Vec<u8>)]) {
+    let mut prev_hash = vec![0_u8; 32];
+    for (expected, (seq, prev, entry)) in (1_i64..).zip(rows) {
+        assert_eq!(*seq, expected, "the chain has no gap");
+        assert_eq!(*prev, prev_hash, "row {seq} links its predecessor");
+        prev_hash.clone_from(entry);
+    }
+}
+
 /// Two outboxes, standing in for two replicas, staging concurrently for one
-/// tenant commit one gap-free chain whose every row links its predecessor
-/// (AC-003, INV-002), and each shutdown drains its queue (AC-007).
+/// tenant commit one gap-free chain whose every row links its predecessor,
+/// and each shutdown drains its queue.
 ///
 /// # Panics
 ///
@@ -92,8 +109,8 @@ async fn await_staged(superuser: &PgPool, tenant: DataTenantId, rows: usize) {
 async fn two_outboxes_commit_one_gap_free_chain_and_drain_on_shutdown() {
     let (fixture, superuser, tenants) = setup(1).await;
     let tenant = tenants[0];
-    let first = AuditOutbox::new(ValaPostgres::from_pool(fixture.app_pool().clone()));
-    let second = AuditOutbox::new(ValaPostgres::from_pool(fixture.app_pool().clone()));
+    let first = AuditSink::outbox(ValaPostgres::from_pool(fixture.app_pool().clone()));
+    let second = AuditSink::outbox(ValaPostgres::from_pool(fixture.app_pool().clone()));
     let stagers: Vec<_> = [Arc::clone(&first), Arc::clone(&second)]
         .into_iter()
         .map(|outbox| {
@@ -117,19 +134,14 @@ async fn two_outboxes_commit_one_gap_free_chain_and_drain_on_shutdown() {
 
     let rows = staged(&superuser, tenant).await;
     assert_eq!(rows.len(), 1_000, "every staged decision committed once");
-    let mut prev_hash = vec![0_u8; 32];
-    for (expected, (seq, prev, entry)) in (1_i64..).zip(&rows) {
-        assert_eq!(*seq, expected, "the chain has no gap");
-        assert_eq!(*prev, prev_hash, "row {seq} links its predecessor");
-        prev_hash.clone_from(entry);
-    }
+    assert_chain(&rows);
 
     first.stage(tenant, event("bifrost.after_shutdown"));
     assert_eq!(first.pending(), 0, "a shut-down outbox accepts nothing");
 }
 
-/// A tenant whose chain head is held does not delay another tenant's audit
-/// (REQ-002), and its own decisions commit once the holder releases.
+/// A tenant whose chain head is held does not delay another tenant's audit,
+/// and its own decisions commit once the holder releases.
 ///
 /// # Panics
 ///
@@ -139,7 +151,7 @@ async fn two_outboxes_commit_one_gap_free_chain_and_drain_on_shutdown() {
 async fn a_contended_tenant_does_not_delay_another_tenants_audit() {
     let (fixture, superuser, tenants) = setup(2).await;
     let (held, free) = (tenants[0], tenants[1]);
-    let outbox = AuditOutbox::new(ValaPostgres::from_pool(fixture.app_pool().clone()));
+    let outbox = AuditSink::outbox(ValaPostgres::from_pool(fixture.app_pool().clone()));
 
     let mut holder = vala_sql::TenantConn::acquire(fixture.app_pool(), held)
         .await
@@ -168,4 +180,65 @@ async fn a_contended_tenant_does_not_delay_another_tenants_audit() {
         0,
         "nothing remains pending"
     );
+}
+
+/// Writing a batch again after its commit already landed stages nothing twice.
+///
+/// This is the retry after an unknown commit outcome: the outbox cannot tell
+/// whether a failed write committed, so it writes the same events again, now
+/// alongside a newer one. Only the newer event is staged, and the skipped
+/// events consume no `seq`, so the chain stays gap-free.
+///
+/// # Panics
+///
+/// Panics when the fixture or a write fails, an event is staged twice, or the
+/// chain has a gap or a broken link.
+#[tokio::test]
+async fn rewriting_a_committed_batch_stages_each_event_once() {
+    let (fixture, superuser, tenants) = setup(1).await;
+    let tenant = tenants[0];
+    let sink = AuditSink::new(ValaPostgres::from_pool(fixture.app_pool().clone()));
+    let mut batch: Vec<StagedAuditEvent> = vec![
+        event("bifrost.retry.1").into(),
+        event("bifrost.retry.2").into(),
+    ];
+
+    sink.write(tenant, &batch)
+        .await
+        .expect("first write commits");
+    batch.push(event("bifrost.retry.3").into());
+    sink.write(tenant, &batch).await.expect("retry commits");
+
+    let rows = staged(&superuser, tenant).await;
+    assert_eq!(rows.len(), 3, "each event is staged exactly once");
+    assert_chain(&rows);
+}
+
+/// Shutdown keeps retrying a failing write until its deadline, then reports
+/// the unwritten events as lost instead of waiting forever.
+///
+/// # Panics
+///
+/// Panics when the fixture fails, shutdown overruns its deadline, or the lost
+/// count is not exactly the staged events.
+#[tokio::test]
+async fn shutdown_reports_events_unwritten_at_the_deadline_as_lost() {
+    let (fixture, superuser, tenants) = setup(1).await;
+    let tenant = tenants[0];
+    fixture
+        .fail_audit_staging()
+        .await
+        .expect("audit failure installs");
+    let outbox = AuditSink::outbox(ValaPostgres::from_pool(fixture.app_pool().clone()));
+    outbox.stage(tenant, event("bifrost.lost.1"));
+    outbox.stage(tenant, event("bifrost.lost.2"));
+
+    let started = Instant::now();
+    let lost = outbox.shutdown(started + Duration::from_millis(500)).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "shutdown honors its deadline"
+    );
+    assert_eq!(lost, 2, "both unwritten events are reported lost");
+    assert!(staged(&superuser, tenant).await.is_empty());
 }

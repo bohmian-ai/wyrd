@@ -11,8 +11,9 @@
 //! operation proceeds or refuses, and its decision is staged as soon as it is
 //! known, allowed and denied alike. Staging never waits for, or fails on, the
 //! audit commit: the outbox commits in the background, a failed commit is
-//! logged and counted on `audit_outbox_commit_failures_total`, and an event can
-//! be lost on abrupt process loss.
+//! logged, counted on `outbox_write_failures_total{outbox="audit"}`, and
+//! retried, and an event can be lost only on abrupt process loss or at the
+//! graceful-shutdown deadline.
 
 pub mod publication;
 

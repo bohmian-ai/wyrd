@@ -636,12 +636,10 @@ and deletes through the watermark together; a stale completion neither moves the
 watermark backwards nor clears a newer bound. A crash between publication and
 that settlement replays the identical frozen range, which Scribe's durable
 batch-id dedup fence absorbs, so recovery retries without duplicating the
-retained event. Each retained row also carries the event id the audit outbox
-assigned its decision. An audit write retried after an unknown commit outcome
-skips events still staged, but one whose row was already published and retired
-is staged and retained once more, so retained delivery is at least once and
-audit reads that count or list decisions collapse rows sharing a tenant and
-event id. No legacy direct-Iceberg relay or separate `platform.audit_log`
+retained event. The audit writer stages each decision once: when a commit
+returns an error it resolves the transaction's outcome from Postgres
+(`pg_xact_status`) and retries only an aborted write, so retained history holds
+one row per decision and readers do no deduplication. No legacy direct-Iceberg relay or separate `platform.audit_log`
 may become a second historical authority.
 
 Audit events are appended only where an authorization decision was made. Scribe

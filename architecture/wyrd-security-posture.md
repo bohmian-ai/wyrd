@@ -362,15 +362,13 @@ decision is known, outside the operation's transaction, and never waits for
 the commit. The outbox has no count limit: a tenant batch whose commit fails
 stays at the front of that tenant's queue and is retried with backoff while
 other tenants keep committing, each failed attempt logged with its tenant and
-counted in `outbox_write_failures_total{outbox="audit"}`. Each decision carries
-an event id assigned when it is staged, and staging is unique per tenant and
-event id, so a retry after an unknown commit outcome skips a decision that is
-still staged. The event id is carried into every retained
-`vala.system.audit_log` row; if publication retired the staged row before the
-retry reached it, the retry stages it once more, so retained delivery is at
-least once and audit reads that count or list decisions collapse rows sharing
-a tenant and event id. A decision is lost only at abrupt process loss, or when graceful
-shutdown reaches its deadline with it still unwritten; shutdown counts those
+counted in `outbox_write_failures_total{outbox="audit"}`. A commit that returns
+an error is resolved from Postgres transaction status (`pg_xact_status`) before
+any retry: a committed batch is not written again, an aborted one is retried,
+and the writer waits while the outcome is still unknown. Each decision is
+therefore staged and retained once. A decision is lost only at abrupt process
+loss, when graceful shutdown reaches its deadline with it still unwritten, or
+when Postgres no longer holds the status of its failed commit; each is counted
 in `outbox_events_lost_total{outbox="audit"}`. Scribe batch commits and Forge
 maintenance transitions evaluate no permission: they are recorded as lineage
 in `vala.scribe_batch_commits` and `vala.forge_operations` and emit no audit

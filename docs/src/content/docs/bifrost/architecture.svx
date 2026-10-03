@@ -323,12 +323,11 @@ deterministic row projection.
 The audit row captures: operation name, principal ID, tenant, timestamp,
 decision (allow/deny), result, and detail field. Permissions block; audits do
 not. An audit write that fails never refuses or delays the operation: the
-outbox retries it with backoff until it commits, and a retry skips a decision
-that is still staged. Every retained row carries its decision's event id: a
-retry that arrives after publication retired the staged row stages it once
-more, so readers that count or list decisions collapse rows sharing an
-`event_id`. A decision is lost only at abrupt process loss or when graceful
-shutdown reaches its deadline with it unwritten. Engine-internal transitions —
+outbox retries it with backoff until it commits. A commit that returns an error
+is resolved from Postgres transaction status first, so a committed decision is
+never written twice and each decision is retained once. A decision is lost only
+at abrupt process loss, when graceful shutdown reaches its deadline with it
+unwritten, or when Postgres no longer holds the status of its failed commit. Engine-internal transitions —
 Scribe batch commits, Forge maintenance, audit publication — evaluate no
 permission and record lineage in their own operational tables instead.
 

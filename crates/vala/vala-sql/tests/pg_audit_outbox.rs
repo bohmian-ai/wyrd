@@ -1,8 +1,8 @@
 //! Postgres integration tests for the process audit outbox.
 //!
 //! Covers gap-free chains under concurrent outboxes (two replicas), tenant
-//! independence while one tenant's chain head is contended, shutdown draining
-//! and loss accounting, and idempotent retries. Run via
+//! independence while one tenant's chain head is contended, and shutdown
+//! draining and loss accounting. Run via
 //! `mise run test:bifrost:integration:sql`.
 
 use std::sync::Arc;
@@ -11,9 +11,8 @@ use std::time::{Duration, Instant};
 use sqlx::PgPool;
 use sqlx::types::Uuid;
 use vala_sql::ValaPostgres;
-use vala_sql::audit_outbox::{AuditSink, StagedAuditEvent};
+use vala_sql::audit_outbox::AuditSink;
 use wyrd_dev_fixtures::pg::PgFixture;
-use wyrd_runtime::outbox::OutboxSink;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
@@ -180,38 +179,6 @@ async fn a_contended_tenant_does_not_delay_another_tenants_audit() {
         0,
         "nothing remains pending"
     );
-}
-
-/// Writing a batch again after its commit already landed stages nothing twice.
-///
-/// This is the retry after an unknown commit outcome: the outbox cannot tell
-/// whether a failed write committed, so it writes the same events again, now
-/// alongside a newer one. Only the newer event is staged, and the skipped
-/// events consume no `seq`, so the chain stays gap-free.
-///
-/// # Panics
-///
-/// Panics when the fixture or a write fails, an event is staged twice, or the
-/// chain has a gap or a broken link.
-#[tokio::test]
-async fn rewriting_a_committed_batch_stages_each_event_once() {
-    let (fixture, superuser, tenants) = setup(1).await;
-    let tenant = tenants[0];
-    let sink = AuditSink::new(ValaPostgres::from_pool(fixture.app_pool().clone()));
-    let mut batch: Vec<StagedAuditEvent> = vec![
-        event("bifrost.retry.1").into(),
-        event("bifrost.retry.2").into(),
-    ];
-
-    sink.write(tenant, &batch)
-        .await
-        .expect("first write commits");
-    batch.push(event("bifrost.retry.3").into());
-    sink.write(tenant, &batch).await.expect("retry commits");
-
-    let rows = staged(&superuser, tenant).await;
-    assert_eq!(rows.len(), 3, "each event is staged exactly once");
-    assert_chain(&rows);
 }
 
 /// Shutdown keeps retrying a failing write until its deadline, then reports

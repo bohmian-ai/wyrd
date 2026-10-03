@@ -24,6 +24,7 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 metrics = { workspace = true }
 sqlx = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 wyrd-runtime = { workspace = true }

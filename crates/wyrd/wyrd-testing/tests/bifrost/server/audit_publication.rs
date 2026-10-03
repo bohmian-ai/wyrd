@@ -1,14 +1,13 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
-use tokio::sync::Notify;
+use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use vala_bifrost_redux::oracle::peer::PeerSecurityAudit;
-use vala_sql::TenantConn;
-use vala_sql::audit_outbox::{AuditSink, StagedAuditEvent};
+use vala_sql::audit_outbox::AuditSink;
 use vala_sql::queries::audit_staging::{
     AuditPublicationRange, append_audit, freeze_publication_range, list_publication_batch,
 };
-use wyrd_runtime::outbox::{Outbox, OutboxSink};
+use vala_sql::{TenantConn, ValaPostgres};
 use wyrd_server::audit::publication::{AuditPublisher, PublishOutcome};
 use wyrd_server::oracle::PostgresPeerSecurityAudit;
 use wyrd_spec::DataTenantId;
@@ -818,236 +817,237 @@ async fn retained_matching(
     Ok(outcome.rows)
 }
 
-/// Production audit sink whose armed write commits and then reports failure.
-///
-/// That is the unknown commit outcome of a connection that broke after
-/// Postgres committed: the outbox keeps the batch and retries it. The write
-/// after an armed one waits for a single `retry` permit before committing, so
-/// the journey decides what the publisher does to staging before the retry
-/// runs; every later write commits at once.
-struct UnknownOutcomeSink {
-    /// The production audit sink every write commits through.
-    inner: AuditSink,
-    /// Set by the journey to make the next write lose its acknowledgement.
-    lose_next_ack: Arc<AtomicBool>,
-    /// Set by a lost acknowledgement so the retry waits for `retry`.
-    hold_retry: AtomicBool,
-    /// Notified once an armed write has committed.
-    committed: Arc<Notify>,
-    /// Released by the journey to let a held retry commit.
-    retry: Arc<Notify>,
+/// Where a [`CommitCutter`] breaks the next proxied `COMMIT`.
+#[derive(Clone, Copy)]
+enum Cut {
+    /// Forwards the `COMMIT`, then drops Postgres's reply and closes the
+    /// client: the transaction commits, but the writer sees its commit fail.
+    AckLost,
+    /// Closes both sides instead of forwarding the `COMMIT`: Postgres aborts
+    /// the transaction once its client is gone, and the writer sees its
+    /// commit fail.
+    CommitLost,
 }
 
-impl OutboxSink for UnknownOutcomeSink {
-    type Item = StagedAuditEvent;
-    type Error = String;
-    const NAME: &'static str = "audit_unknown_outcome";
+/// TCP proxy in front of the test Postgres that breaks one armed commit.
+///
+/// It relays the Postgres wire protocol byte for byte and frames only the
+/// client's messages, so it recognizes the simple-query `COMMIT` SQLx sends
+/// to end a transaction. Every other connection and statement passes through
+/// untouched, so the pool behind it, including the fresh connection the audit
+/// writer resolves a failed commit on, behaves as a direct pool would.
+struct CommitCutter {
+    /// Address the proxied pool connects to.
+    addr: std::net::SocketAddr,
+    /// The cut the next proxied `COMMIT` takes, when armed.
+    armed: Arc<Mutex<Option<Cut>>>,
+    /// How many armed cuts were performed.
+    fired: Arc<AtomicUsize>,
+}
 
-    /// Commits `events` through the production sink, then either reports the
-    /// armed failure or, for a held retry, first waits for its permit.
+impl CommitCutter {
+    /// Starts the proxy on a loopback port in front of `upstream`'s server.
     ///
     /// # Errors
+    /// Returns the bind failure.
+    async fn start(upstream: &PgConnectOptions) -> Result<Self, ServerJourneyError> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let target = (upstream.get_host().to_owned(), upstream.get_port());
+        let armed = Arc::new(Mutex::new(None));
+        let fired = Arc::new(AtomicUsize::new(0));
+        let (accept_armed, accept_fired) = (Arc::clone(&armed), Arc::clone(&fired));
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let (armed, fired) = (Arc::clone(&accept_armed), Arc::clone(&accept_fired));
+                let target = target.clone();
+                tokio::spawn(async move {
+                    if let Ok(upstream) = tokio::net::TcpStream::connect(target).await {
+                        let _closed = relay(client, upstream, &armed, &fired).await;
+                    }
+                });
+            }
+        });
+        Ok(Self { addr, armed, fired })
+    }
+
+    /// Arms `cut` for the next proxied `COMMIT`.
+    fn arm(&self, cut: Cut) {
+        *self.armed.lock().expect("cut lock is never poisoned") = Some(cut);
+    }
+
+    /// How many armed cuts were performed so far.
+    fn fired(&self) -> usize {
+        self.fired.load(Ordering::Acquire)
+    }
+
+    /// A Vala handle whose pool reaches Postgres through this proxy, as the
+    /// role and database of `upstream`, without TLS so the proxy can frame
+    /// the protocol.
     ///
-    /// Returns the production sink's failure, or the injected lost
-    /// acknowledgement after an armed write committed.
-    async fn write(&self, tenant: DataTenantId, events: &[StagedAuditEvent]) -> Result<(), String> {
-        if self.lose_next_ack.swap(false, Ordering::AcqRel) {
-            self.inner
-                .write(tenant, events)
-                .await
-                .map_err(|error| error.to_string())?;
-            self.hold_retry.store(true, Ordering::Release);
-            self.committed.notify_one();
-            return Err("connection lost after the audit commit".to_owned());
-        }
-        if self.hold_retry.swap(false, Ordering::AcqRel) {
-            self.retry.notified().await;
-        }
-        self.inner
-            .write(tenant, events)
-            .await
-            .map_err(|error| error.to_string())
+    /// # Errors
+    /// Returns the connection failure.
+    async fn vala(&self, upstream: &PgConnectOptions) -> Result<ValaPostgres, ServerJourneyError> {
+        let options = upstream
+            .clone()
+            .host(&self.addr.ip().to_string())
+            .port(self.addr.port())
+            .ssl_mode(PgSslMode::Disable);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await?;
+        Ok(ValaPostgres::from_pool(pool))
     }
 }
 
-/// Counts this tenant's staged rows carrying `event_id`.
+/// Relays one proxied connection, performing an armed cut at its `COMMIT`.
+///
+/// Server bytes are relayed by a separate task. For [`Cut::AckLost`] the
+/// `COMMIT` is forwarded only after that task is told to swallow what follows,
+/// so Postgres commits but the client reads no reply; returning then closes the
+/// write side toward Postgres after the `COMMIT`, and the relay closes the
+/// client once the reply arrives. For [`Cut::CommitLost`] the `COMMIT` is
+/// never forwarded, so Postgres sees its client leave mid-transaction.
 ///
 /// # Errors
-/// Returns the tenant-connection or query failure Postgres raised.
-async fn staged_copies(
-    server: &WyrdTestServer,
-    tenant: DataTenantId,
-    event_id: uuid::Uuid,
-) -> Result<i64, ServerJourneyError> {
-    let mut conn = server.tenant_conn_for(tenant).await?;
-    let copies = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging WHERE event_id = $1")
-        .bind(event_id)
-        .fetch_one(&mut **conn.transaction())
-        .await?;
-    conn.commit().await?;
-    Ok(copies)
+/// Returns the read or write failure of either side.
+async fn relay(
+    client: tokio::net::TcpStream,
+    upstream: tokio::net::TcpStream,
+    armed: &Mutex<Option<Cut>>,
+    fired: &AtomicUsize,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (mut client_rx, mut client_tx) = client.into_split();
+    let (mut upstream_rx, mut upstream_tx) = upstream.into_split();
+    let swallow = Arc::new(AtomicBool::new(false));
+    let replies_swallow = Arc::clone(&swallow);
+    tokio::spawn(async move {
+        let mut buffer = vec![0_u8; 8192];
+        loop {
+            let read = upstream_rx.read(&mut buffer).await?;
+            if read == 0 || replies_swallow.load(Ordering::Acquire) {
+                return Ok::<_, std::io::Error>(());
+            }
+            client_tx.write_all(&buffer[..read]).await?;
+        }
+    });
+
+    // The startup message carries no type byte, only its length.
+    let mut length = [0_u8; 4];
+    client_rx.read_exact(&mut length).await?;
+    let mut startup = vec![0_u8; (u32::from_be_bytes(length) as usize).saturating_sub(4)];
+    client_rx.read_exact(&mut startup).await?;
+    upstream_tx.write_all(&length).await?;
+    upstream_tx.write_all(&startup).await?;
+
+    loop {
+        let mut header = [0_u8; 5];
+        if client_rx.read_exact(&mut header).await.is_err() {
+            return Ok(());
+        }
+        let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let mut body = vec![0_u8; length.saturating_sub(4)];
+        client_rx.read_exact(&mut body).await?;
+        if header[0] == b'Q' && body == b"COMMIT\0" {
+            let cut = armed.lock().expect("cut lock is never poisoned").take();
+            match cut {
+                Some(Cut::AckLost) => {
+                    swallow.store(true, Ordering::Release);
+                    upstream_tx.write_all(&header).await?;
+                    upstream_tx.write_all(&body).await?;
+                    fired.fetch_add(1, Ordering::AcqRel);
+                    return Ok(());
+                }
+                Some(Cut::CommitLost) => {
+                    fired.fetch_add(1, Ordering::AcqRel);
+                    return Ok(());
+                }
+                None => {}
+            }
+        }
+        upstream_tx.write_all(&header).await?;
+        upstream_tx.write_all(&body).await?;
+    }
 }
 
-/// Reads the staged `seq` of the one row carrying `event_id`.
+/// A failed audit commit is resolved from Postgres before any retry, so each
+/// decision is staged and retained exactly once.
+///
+/// The production audit outbox writes through a proxy that breaks one armed
+/// `COMMIT` at a time, while the server's own publisher retires staged rows.
+/// Three times in a row a commit lands in Postgres but its acknowledgement is
+/// lost: the writer resolves the transaction as committed, sends nothing again,
+/// and the publisher retires the row before the next round. Then a commit is
+/// lost before Postgres sees it: the writer resolves the transaction as
+/// aborted and the outbox retries the batch, which commits once. Every
+/// decision is retained exactly once, and the tenant's retained chain holds
+/// every `seq` up to its head exactly once.
 ///
 /// # Errors
-/// Returns the tenant-connection or query failure, including no such row.
-async fn staged_seq(
-    server: &WyrdTestServer,
-    tenant: DataTenantId,
-    event_id: uuid::Uuid,
-) -> Result<i64, ServerJourneyError> {
-    let mut conn = server.tenant_conn_for(tenant).await?;
-    let seq = sqlx::query_scalar("SELECT seq FROM vala.audit_staging WHERE event_id = $1")
-        .bind(event_id)
-        .fetch_one(&mut **conn.transaction())
-        .await?;
-    conn.commit().await?;
-    Ok(seq)
-}
-
-/// An unknown-outcome audit retry is skipped while its row is staged, and
-/// after retirement adds at most one retained copy that audit reads collapse.
-///
-/// Both halves drive the production audit sink through a generic outbox whose
-/// armed write commits and then reports failure, and both rely on the server's
-/// own publisher. In the first, the committed row is fenced so the publisher
-/// cannot retire it; the retry finds the event id still staged and commits
-/// nothing, so exactly one retained row carries it. In the second, the
-/// publisher retires the committed row before the retry, with a later decision
-/// of the same tenant staged behind it. The retry stages the event once more,
-/// ahead of the later decision, so retained history holds two rows with the
-/// same event id; raw history shows both, while the harness's audit count and
-/// listing return the decision once. The outbox ends with nothing pending.
-///
-/// # Errors
-/// Returns the server, Postgres, publication, or query failure.
+/// Returns the server, proxy, Postgres, publication, or query failure.
 ///
 /// # Panics
-/// Panics when the staged retry duplicates, the retired retry adds anything
-/// other than one copy, the copy follows the later decision, an audit read
-/// counts the decision twice, or work stays pending.
+/// Panics when a cut does not fire or the outbox leaves work pending or lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
-async fn unknown_outcome_retries_retain_each_decision_at_most_twice_and_read_once()
+async fn ambiguous_audit_commits_retain_each_decision_exactly_once()
 -> Result<(), ServerJourneyError> {
     let server = WyrdTestServer::start_bound().await?;
     await_server_ready(server.base_url().ok_or("missing HTTP URL")?).await?;
     let tenant = server.data_tenant_id();
-    let operation = format!(
-        "wyrd.journey.audit_unknown_outcome.{}",
-        uuid::Uuid::now_v7().simple()
-    );
-    let lose_next_ack = Arc::new(AtomicBool::new(false));
-    let committed = Arc::new(Notify::new());
-    let retry = Arc::new(Notify::new());
-    let outbox = Outbox::new(
-        UnknownOutcomeSink {
-            inner: AuditSink::new(server.state().postgres.vala().clone()),
-            lose_next_ack: Arc::clone(&lose_next_ack),
-            hold_retry: AtomicBool::new(false),
-            committed: Arc::clone(&committed),
-            retry: Arc::clone(&retry),
-        },
-        1,
-    );
+    let suffix = uuid::Uuid::now_v7().simple().to_string();
+    let upstream = server.state().postgres.vala().pool().connect_options();
+    let cutter = CommitCutter::start(&upstream).await?;
+    let outbox = AuditSink::outbox(cutter.vala(&upstream).await?);
     let settle = || std::time::Instant::now() + PUBLICATION_BUDGET;
 
-    // A retry while the committed row is still staged commits nothing.
-    let staged = StagedAuditEvent::from(decision(&operation));
-    lose_next_ack.store(true, Ordering::Release);
-    outbox.stage(tenant, staged.clone());
-    committed.notified().await;
-    let seq = staged_seq(&server, tenant, staged.event_id).await?;
-    let fence = fence_staged_rows(
-        &server,
-        tenant,
-        AuditPublicationRange {
-            seq_lo: seq,
-            seq_hi: seq,
-        },
-    )
-    .await?;
-    retry.notify_one();
-    assert_eq!(outbox.settle(settle()).await, 0, "the staged retry settles");
-    assert_eq!(
-        staged_copies(&server, tenant, staged.event_id).await?,
-        1,
-        "a retry while the row is staged stages nothing more"
-    );
-    release_fence(fence).await?;
-    server.await_audit_published(tenant).await?;
-    await_retained_where(
-        &server,
-        tenant,
-        &format!("event_id = '{}'", staged.event_id),
-        1,
-    )
-    .await?;
+    for round in 1..=3 {
+        let operation = format!("wyrd.journey.audit_ack_lost.{round}.{suffix}");
+        cutter.arm(Cut::AckLost);
+        outbox.stage(tenant, decision(&operation));
+        assert_eq!(outbox.settle(settle()).await, 0, "round {round} settles");
+        assert_eq!(
+            cutter.fired(),
+            round,
+            "round {round} lost its acknowledgement"
+        );
+        server.await_audit_published(tenant).await?;
+        await_drained(&server, tenant).await?;
+        await_retained(&server, tenant, &operation, 1).await?;
+    }
 
-    // A retry after the publisher retired the committed row stages it once more.
-    let retired = StagedAuditEvent::from(decision(&operation));
-    let later = StagedAuditEvent::from(decision(&operation));
-    lose_next_ack.store(true, Ordering::Release);
-    outbox.stage(tenant, retired.clone());
-    committed.notified().await;
-    outbox.stage(tenant, later.clone());
-    server.await_audit_published(tenant).await?;
+    let aborted = format!("wyrd.journey.audit_commit_lost.{suffix}");
+    cutter.arm(Cut::CommitLost);
+    outbox.stage(tenant, decision(&aborted));
     assert_eq!(
-        staged_copies(&server, tenant, retired.event_id).await?,
+        outbox.settle(settle()).await,
         0,
-        "the publisher retired the committed row before the retry"
+        "the aborted batch is retried"
     );
-    retry.notify_one();
-    assert_eq!(outbox.settle(settle()).await, 0, "the retry drains");
-    assert_eq!(outbox.pending(), 0);
+    assert_eq!(
+        cutter.fired(),
+        4,
+        "the commit was lost before Postgres saw it"
+    );
     server.await_audit_published(tenant).await?;
+    await_retained(&server, tenant, &aborted, 1).await?;
 
-    let retired_rows = format!("event_id = '{}'", retired.event_id);
-    await_retained_where(&server, tenant, &retired_rows, 2).await?;
-    await_retained_where(
-        &server,
-        tenant,
-        &format!("event_id = '{}'", later.event_id),
-        1,
-    )
-    .await?;
-    let later_seq = server
-        .retained_audit_records(
-            tenant,
-            "arrow_cast(seq, 'Utf8') AS seq_text",
-            &format!("event_id = '{}'", later.event_id),
-        )
-        .await?
-        .first()
-        .and_then(|record| record.first().cloned().flatten())
-        .ok_or("the later decision is retained")?
-        .parse::<i64>()?;
-    await_retained_where(
-        &server,
-        tenant,
-        &format!("{retired_rows} AND seq < {later_seq}"),
-        2,
-    )
-    .await?;
-    server
-        .await_retained_audit_count(tenant, &retired_rows, 1)
+    let mut conn = server.tenant_conn_for(tenant).await?;
+    let head: i64 = sqlx::query_scalar("SELECT last_seq FROM vala.audit_chain_head")
+        .fetch_one(&mut **conn.transaction())
         .await?;
-    assert_eq!(
-        server
-            .retained_audit_records(tenant, "operation", &retired_rows)
-            .await?
-            .len(),
-        1,
-        "an audit listing returns the re-staged decision once"
-    );
-    assert_eq!(
-        server
-            .retained_audit_operation_count(tenant, &operation)
-            .await?,
-        3,
-        "an audit count sees three decisions across four retained rows"
-    );
+    conn.commit().await?;
+    server.await_audit_published(tenant).await?;
+    await_retained_where(
+        &server,
+        tenant,
+        &format!("seq <= {head}"),
+        u64::try_from(head)?,
+    )
+    .await?;
 
     assert_eq!(outbox.shutdown(settle()).await, 0, "nothing is lost");
     server.shutdown().await?;

@@ -259,10 +259,12 @@ not create parallel audit writers.
 
 The outbox commits each tenant's decisions in order through the canonical
 append. A failed commit is retried at the front of its tenant's queue with
-backoff, never dropped, and each decision's stage-time event id keeps a retry
-from staging it twice. A decision is lost only at abrupt process loss or when
-graceful shutdown reaches its deadline with it unwritten; no other audit
-table, WAL, relay, or log sink exists to prevent that.
+backoff, never dropped, and only after Postgres transaction status confirms
+the earlier commit aborted, so a retry never stages a decision twice. A
+decision is lost only at abrupt process loss, when graceful shutdown reaches
+its deadline with it unwritten, or when Postgres no longer holds the status of
+its failed commit; no other audit table, WAL, relay, or log sink exists to
+prevent that.
 
 `vala.audit_staging` is transient write-ahead state with no external consumer.
 Contiguous, tenant-scoped ranges are projected idempotently into retained

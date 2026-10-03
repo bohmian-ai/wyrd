@@ -114,10 +114,11 @@ Enforced by `check:client-tier`:
   waits for, or is refused by, the audit commit. Engine-internal transitions
   that evaluate no permission are lineage, not audit.
 - The outbox commits through the canonical hash-chained staging append and
-  retries a failed commit without dropping it; a stage-time event id keeps a
-  retry from staging a decision twice. Abrupt process loss, or a graceful
-  shutdown that reaches its deadline, can lose an uncommitted decision; no
-  other audit table, WAL, relay, or log sink exists.
+  retries a failed commit without dropping it, only after Postgres transaction
+  status confirms the commit aborted, so a retry never stages a decision
+  twice. Abrupt process loss, a graceful shutdown that reaches its deadline,
+  or a failed commit whose status Postgres no longer holds can lose a
+  decision; no other audit table, WAL, relay, or log sink exists.
 - `vala.audit_staging` is transient write-ahead state; retained history is
   `vala.system.audit_log`. Staged rows are garbage-collected once the per-tenant
   watermark has advanced past them.

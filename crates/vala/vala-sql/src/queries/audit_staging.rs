@@ -11,36 +11,31 @@
 //! [`append_audit_batch`] for tests that seed staging directly.
 // raw-query grep allowlist: audit staging tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
-use std::collections::HashSet;
-
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use wyrd_spec::vala::api::{AuditEvent, AuditOutcome, audit_detail_canonical_json};
 use wyrd_sql::TenantConn;
 
 use crate::SqlError;
-use crate::audit_outbox::StagedAuditEvent;
 use crate::row_types::audit_staging::AuditStagingRow;
 
 /// Append one hash-chained audit row for the connection's tenant, returning its `seq`.
 ///
-/// Test-only seeding entry point over the canonical append; it assigns the
-/// event a fresh event id. Production audit stages through
-/// [`crate::audit_outbox::AuditOutbox`].
+/// Test-only seeding entry point over the canonical append; production audit
+/// stages through [`crate::audit_outbox::AuditOutbox`].
 ///
 /// # Errors
 /// Returns [`SqlError`] when any statement fails or an RLS policy rejects a row.
 #[cfg(feature = "test-support")]
 pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Result<i64, SqlError> {
-    append_audit_events(conn, &[StagedAuditEvent::from(event.clone())]).await
+    append_audit_events(conn, std::slice::from_ref(event)).await
 }
 
 /// Append hash-chained audit rows for the connection's tenant, in order,
 /// returning the chain head's `seq` afterwards.
 ///
-/// Test-only seeding entry point over the canonical append; it assigns each
-/// event a fresh event id. Production audit stages through
-/// [`crate::audit_outbox::AuditOutbox`].
+/// Test-only seeding entry point over the canonical append; production audit
+/// stages through [`crate::audit_outbox::AuditOutbox`].
 ///
 /// # Errors
 /// Returns [`SqlError`] when any statement fails or an RLS policy rejects a row.
@@ -49,29 +44,22 @@ pub async fn append_audit_batch(
     conn: &mut TenantConn<'_>,
     events: &[AuditEvent],
 ) -> Result<i64, SqlError> {
-    let staged: Vec<StagedAuditEvent> =
-        events.iter().cloned().map(StagedAuditEvent::from).collect();
-    append_audit_events(conn, &staged).await
+    append_audit_events(conn, events).await
 }
 
 /// Append hash-chained audit rows for the connection's tenant, in order,
-/// skipping events already staged, and return the chain head's `seq`
-/// afterwards.
+/// returning the chain head's `seq` afterwards.
 ///
-/// Locks `vala.audit_chain_head` under `FOR UPDATE` once, drops every event
-/// whose event id the tenant has already staged, chains the rest in memory
-/// from the locked head, inserts them in one statement, and advances the head
-/// once. Concurrent appends for the same tenant therefore still serialize into
-/// a gapless sequence, a batch pays the lock and its round trips once rather
-/// than once per row, and a batch retried after an unknown commit outcome
-/// skips each event still staged without consuming a `seq`; an event whose row
-/// publication already retired is staged again under its event id. Runs inside
-/// the caller's transaction so the rows are durable exactly when — and only
-/// when — the caller commits. An empty or fully staged batch changes nothing and
-/// returns the current head.
+/// Locks `vala.audit_chain_head` under `FOR UPDATE` once, chains every event
+/// in memory from the locked head, inserts all rows in one statement, and
+/// advances the head once. Concurrent appends for the same tenant therefore
+/// still serialize into a gapless sequence, but a batch pays the lock and its
+/// round trips once rather than once per row. Runs inside the caller's
+/// transaction so the rows are durable exactly when — and only when — the
+/// caller commits. An empty batch changes nothing and returns the current head.
 ///
 /// Row-level security through the [`TenantConn`] is the tenant boundary: the
-/// head lock, the already-staged lookup, and the head update see only the
+/// head lock and the head update see only the
 /// connection's tenant. Its id is bound only where a row is inserted.
 /// Platform-plane decisions stage under `DataTenantId::SYSTEM_OWNER` through
 /// that tenant's ordinary connection.
@@ -80,7 +68,7 @@ pub async fn append_audit_batch(
 /// Returns [`SqlError`] when any statement fails or an RLS policy rejects a row.
 pub(crate) async fn append_audit_events(
     conn: &mut TenantConn<'_>,
-    events: &[StagedAuditEvent],
+    events: &[AuditEvent],
 ) -> Result<i64, SqlError> {
     let data_tenant_id = conn.data_tenant_id().as_uuid();
     let conn = &mut **conn.transaction();
@@ -110,31 +98,8 @@ pub(crate) async fn append_audit_events(
         return Ok(seq);
     }
 
-    let event_ids: Vec<Uuid> = events.iter().map(|staged| staged.event_id).collect();
-    let already_staged: HashSet<Uuid> = sqlx::query_scalar(
-        r#"
-        SELECT event_id
-          FROM vala.audit_staging
-         WHERE event_id = ANY($1::uuid[])
-        "#,
-    )
-    .bind(&event_ids)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(SqlError::from)?
-    .into_iter()
-    .collect();
-    let fresh: Vec<&StagedAuditEvent> = events
-        .iter()
-        .filter(|staged| !already_staged.contains(&staged.event_id))
-        .collect();
-    if fresh.is_empty() {
-        return Ok(seq);
-    }
-
-    let mut rows = AuditRows::with_capacity(fresh.len());
-    for staged in fresh {
-        let event = &staged.event;
+    let mut rows = AuditRows::with_capacity(events.len());
+    for event in events {
         seq += 1;
         let card_ref = event.card_ref.as_ref().map(ToString::to_string);
         let detail = event.detail.as_ref().map(audit_detail_canonical_json);
@@ -145,7 +110,6 @@ pub(crate) async fn append_audit_events(
             card_ref.as_deref(),
             detail.as_deref(),
         );
-        rows.event_id.push(staged.event_id);
         rows.seq.push(seq);
         rows.prev_hash
             .push(std::mem::replace(&mut prev_hash, entry_hash.to_vec()));
@@ -166,18 +130,17 @@ pub(crate) async fn append_audit_events(
     sqlx::query(
         r#"
         INSERT INTO vala.audit_staging
-            (data_tenant_id, event_id, seq, prev_hash, entry_hash, request_id,
-             trace_id, operation, resource, card_ref, principal_id,
-             principal_kind, credential_id, permission, outcome, detail)
+            (data_tenant_id, seq, prev_hash, entry_hash, request_id, trace_id,
+             operation, resource, card_ref, principal_id, principal_kind,
+             credential_id, permission, outcome, detail)
         SELECT $1, row.*
-          FROM UNNEST($2::uuid[], $3::bigint[], $4::bytea[], $5::bytea[],
+          FROM UNNEST($2::bigint[], $3::bytea[], $4::bytea[], $5::text[],
                       $6::text[], $7::text[], $8::text[], $9::text[],
-                      $10::text[], $11::uuid[], $12::text[], $13::uuid[],
-                      $14::text[], $15::text[], $16::text[]) AS row
+                      $10::uuid[], $11::text[], $12::uuid[], $13::text[],
+                      $14::text[], $15::text[]) AS row
         "#,
     )
     .bind(data_tenant_id)
-    .bind(&rows.event_id)
     .bind(&rows.seq)
     .bind(&rows.prev_hash)
     .bind(&rows.entry_hash)
@@ -216,8 +179,6 @@ pub(crate) async fn append_audit_events(
 /// Each field holds one column for every row of the batch, in chain order, so
 /// the rows bind as `UNNEST` arrays of one statement.
 struct AuditRows<'a> {
-    /// Event id the outbox assigned each decision when it was staged.
-    event_id: Vec<Uuid>,
     /// Gapless chain sequence of each row.
     seq: Vec<i64>,
     /// Hash of the row before each row.
@@ -252,7 +213,6 @@ impl AuditRows<'_> {
     /// Creates empty column arrays sized for `rows` rows.
     fn with_capacity(rows: usize) -> Self {
         Self {
-            event_id: Vec::with_capacity(rows),
             seq: Vec::with_capacity(rows),
             prev_hash: Vec::with_capacity(rows),
             entry_hash: Vec::with_capacity(rows),
@@ -288,7 +248,7 @@ pub async fn list_audit_events_for_resource(
 ) -> Result<Vec<AuditStagingRow>, SqlError> {
     sqlx::query_as::<_, AuditStagingRow>(
         r#"
-        SELECT data_tenant_id, event_id, seq, entry_hash, prev_hash, request_id, trace_id,
+        SELECT data_tenant_id, seq, entry_hash, prev_hash, request_id, trace_id,
                operation, resource, card_ref, principal_id, principal_kind,
                credential_id, permission, outcome, detail, created_at
           FROM vala.audit_staging
@@ -321,7 +281,7 @@ pub async fn list_publication_batch(
 ) -> Result<Vec<AuditStagingRow>, SqlError> {
     sqlx::query_as::<_, AuditStagingRow>(
         r#"
-        SELECT data_tenant_id, event_id, seq, entry_hash, prev_hash, request_id, trace_id,
+        SELECT data_tenant_id, seq, entry_hash, prev_hash, request_id, trace_id,
                operation, resource, card_ref, principal_id, principal_kind,
                credential_id, permission, outcome, detail, created_at
           FROM vala.audit_staging
@@ -454,7 +414,7 @@ pub async fn list_publication_range(
 ) -> Result<Vec<AuditStagingRow>, SqlError> {
     sqlx::query_as::<_, AuditStagingRow>(
         r#"
-        SELECT data_tenant_id, event_id, seq, entry_hash, prev_hash, request_id, trace_id,
+        SELECT data_tenant_id, seq, entry_hash, prev_hash, request_id, trace_id,
                operation, resource, card_ref, principal_id, principal_kind,
                credential_id, permission, outcome, detail, created_at
           FROM vala.audit_staging

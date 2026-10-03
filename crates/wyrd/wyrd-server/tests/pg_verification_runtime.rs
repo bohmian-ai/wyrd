@@ -1276,6 +1276,142 @@ async fn verifier_runs_execute_beyond_the_former_permit_ceilings() {
     runtime.stop().await;
 }
 
+/// Two runtimes composed on one queue, as two replicas run them, claim every
+/// queued run exactly once between them.
+///
+/// Both runtimes hold their executions, so neither can settle and free work
+/// before the other has claimed; once every run is claimed, each runtime has
+/// executed some and their executions sum to the run count. After release,
+/// every run completes on its first attempt and exactly one summary per run
+/// is durable. Integration level rather than a two-process journey: a
+/// release-server replica cannot script or hold its engine, so a second
+/// execution of one run would be invisible to a journey; this composes the
+/// same `VerificationRuntime` each replica runs on the shared Postgres
+/// queue.
+///
+/// # Panics
+/// Panics when a run is executed twice or not at all, one runtime claims
+/// nothing, a run needs a second attempt, or the durable summaries differ
+/// from the run count.
+#[tokio::test]
+async fn two_replicas_claim_each_queued_run_exactly_once() {
+    const RUNS: usize = 100;
+    let harness = Harness::start().await;
+    let scripts = [EngineScript::default(), EngineScript::default()];
+    for script in &scripts {
+        script.hold();
+        for _ in 0..RUNS {
+            script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+        }
+    }
+    let replicas = [
+        harness.spawn(Harness::limits(), &scripts[0]),
+        harness.spawn(Harness::limits(), &scripts[1]),
+    ];
+    let mut runs = Vec::new();
+    for _ in 0..RUNS {
+        runs.push(harness.enqueue().await);
+    }
+    let executed = || scripts[0].entered() + scripts[1].entered();
+    wait_until("every run claimed", || executed() == RUNS).await;
+    assert!(
+        scripts.iter().all(|script| script.entered() > 0),
+        "both replicas claim work: {} and {}",
+        scripts[0].entered(),
+        scripts[1].entered()
+    );
+    for script in &scripts {
+        script.release();
+    }
+    for run in runs {
+        let row = harness.wait_run(run, status("completed")).await;
+        assert_eq!(row.attempts, 1, "one claim per run: {row:?}");
+    }
+    assert_eq!(executed(), RUNS, "no run executes twice");
+    let rows = harness.durable_rows().await;
+    assert_eq!(
+        rows.get(RESULTS),
+        Some(&i64::try_from(RUNS).expect("run count fits")),
+        "one durable summary per run: {rows:?}"
+    );
+    for replica in replicas {
+        replica.stop().await;
+    }
+}
+
+/// A tenant flooding the queue does not delay another tenant's queued run:
+/// each claim round takes one run per due tenant, so the quiet tenant's run,
+/// enqueued after the whole flood, is claimed in the first round instead of
+/// after the flood drains.
+///
+/// Every execution is held, so each run keeps the lease its claim set and
+/// claim order is read back from PostgreSQL's lease deadlines rather than
+/// from test timing. Integration level against Postgres rather than a
+/// journey: the order of claims is not observable through any client
+/// surface, and holding executions needs the scripted engine.
+///
+/// # Panics
+/// Panics when more than one flood run is claimed before the quiet run, or
+/// any run fails to complete after release.
+#[tokio::test]
+async fn a_flooding_tenant_does_not_delay_another_tenants_run() {
+    const FLOOD: usize = 60;
+    let harness = Harness::start().await;
+    let quiet_tenant = DataTenantId::new_v7();
+    harness
+        .server
+        .pg_fixture()
+        .seed_additional_tenant_with_uuid(quiet_tenant, "verification-quiet")
+        .await
+        .expect("quiet tenant seeds");
+    let (quiet, quiet_subject, quiet_verifier) = seed_tenant(&harness.server, quiet_tenant).await;
+    let mut flood = Vec::new();
+    for _ in 0..FLOOD {
+        flood.push(harness.enqueue().await);
+    }
+    let now = Utc::now();
+    let quiet_run = quiet
+        .enqueue_direct(
+            &quiet_verifier,
+            &quiet_subject,
+            DriftWindow {
+                start: now - chrono::Duration::hours(1),
+                end: now,
+            },
+        )
+        .await
+        .expect("quiet run enqueues");
+    let script = EngineScript::default();
+    script.hold();
+    for _ in 0..=FLOOD {
+        script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+    }
+    let runtime = harness.spawn(Harness::limits(), &script);
+    wait_until("every run claimed", || script.entered() == FLOOD + 1).await;
+
+    let (_, quiet_lease) = harness.lease(quiet_run).await;
+    let ahead: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM wyrd.verifier_runs \
+         WHERE data_tenant_id = $1 AND lease_expires_at < $2",
+    )
+    .bind(harness.seed.tenant().as_uuid())
+    .bind(quiet_lease.expect("the quiet run is leased"))
+    .fetch_one(&harness.assertion)
+    .await
+    .expect("flood claims read");
+    assert!(
+        ahead <= 1,
+        "the quiet run is claimed in the first round, behind {ahead} flood runs"
+    );
+
+    script.release();
+    wait_run_in(&quiet, quiet_run, status("completed")).await;
+    for run in flood {
+        harness.wait_run(run, status("completed")).await;
+    }
+    runtime.stop().await;
+}
+
 /// Insert a pending baseline fit of `verifier` from `data` in `seed`'s tenant.
 ///
 /// # Panics

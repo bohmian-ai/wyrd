@@ -69,7 +69,7 @@ http-body-util = "0.1"
 opendal = { workspace = true }
 parquet = { workspace = true }
 rand = { workspace = true }
-# The verification capacity benchmark serves its judge mock over trusted TLS.
+# The capacity benchmark serves its judge mock over trusted TLS.
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 # Roots the bound server's Eval judge at the test gateway's mock upstream.
@@ -145,25 +145,10 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-client-reqwest",
 ] }
 
-# The opt-in single-pod query capacity benchmark. Run only through
-# `mise run bench:bifrost:query-capacity`; only its unit tests run in a lane,
-# with the crate's other tests.
+# The opt-in server capacity benchmark (REQ-171). Run only through
+# `mise run bench:capacity`; only its unit tests run in a lane, with the
+# crate's other tests.
 [[bin]]
-name = "bifrost_query_capacity"
-path = "src/bin/bifrost_query_capacity/main.rs"
-bench = false
-
-# The opt-in verification capacity benchmark. Run only through
-# `mise run bench:verification:capacity`; only its unit tests run in a lane,
-# with the crate's other tests.
-[[bin]]
-name = "verification_capacity"
-path = "src/bin/verification_capacity/main.rs"
-bench = false
-
-# The opt-in client ingest capacity benchmark (AC-041). Run only through
-# `mise run bench:bifrost:ingest-capacity`; only its unit tests run in a lane.
-[[bin]]
-name = "bifrost_ingest_capacity"
-path = "src/bin/bifrost_ingest_capacity/main.rs"
+name = "capacity"
+path = "src/bin/capacity/main.rs"
 bench = false

@@ -100,8 +100,8 @@ impl QueueConfig {
 impl Default for QueueConfig {
     /// 256 MiB budget, 5 ms linger, one send in flight, 30 s send
     /// deadline, and 4 MiB messages. One send in flight is the smallest value
-    /// that sustains 50,000 rows/s in the AC-041 ingest benchmark
-    /// (`mise run bench:bifrost:ingest-capacity`): a busy slot lets staging
+    /// that sustains 50,000 rows/s under the AC-041 ingest load
+    /// (`mise run bench:capacity`): a busy slot lets staging
     /// grow, so batches scale with load rather than with the slot count.
     fn default() -> Self {
         Self {

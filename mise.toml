@@ -504,39 +504,56 @@ hide = true
 description = "wyrd-testing `oracle` binary, whole"
 run = "cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all"
 
-[tasks."bench:bifrost:query-capacity"]
-description = "Opt-in benchmark: one release wyrd-server started through the local-development journey (migrate, serve, setup) in an 8-CPU/16-GiB systemd user scope, driven through the public Rust client: write 10M events, check every answer, selective and small-aggregate sweeps, medium, table, broad-window and full-scan reads, reads while writing, and a full query queue. `-- --heavy` writes 100M rows and runs the broad window and full scan. Fails on any FAIL row. Linux with a delegating systemd user manager; part of no gate or verify lane."
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'cargo build --locked --release -p wyrd-server && cargo run --locked --release -p wyrd-testing --bin bifrost_query_capacity -- \"$@\"' _"
-
-[tasks."bench:verification:capacity"]
-description = "Opt-in benchmark (REQ-171, AC-040): release cloud wyrd-server replicas in peer mode over the storage emulators' RustFS service and its provisioned test bucket, as the kind deployment runs them, each in an 8-CPU/16-GiB systemd user scope, started through the local-development journey. Open-loop public-client load of one production mix every step: a noisy tenant sending queued and direct PSI, SPC, Custom, assertion Eval and LLM-judge Eval work at once, and a quiet tenant sending queued assertions. A 30 s warmup, a 1-replica ramp of 60 s steps at 50/100/200/400 per second that stops at its first unsustainable step, then 180 s sustained steps at the highest sustainable rate on 1 and 2 replicas; within 30 minutes. One summary row per step with a per-kind breakdown; reconciles every request, checks overlap, cross-replica claims and fairness, and applies the direct-mode overhead objective to the 1-replica sustained step; writes target/verification-capacity/. `-- --profile` builds a frame-pointer profiling binary into target/profiling and captures every step with perf as diagnostic evidence. Linux with a delegating systemd user manager; part of no gate or verify lane."
+[tasks."bench:capacity"]
+description = "Opt-in benchmark (REQ-171, AC-040, AC-041): Wyrd's one server capacity benchmark. Release cloud wyrd-server replicas in peer mode over Postgres and the storage emulators' RustFS service, as the kind deployment runs them, each in an 8-CPU/16-GiB systemd user scope, started through the local-development journey. One production mix over four identical tenants, open-loop through the public Rust client: at level L, direct and queued verification at L/2 each across PSI, SPC, Custom, assertion Eval and LLM-judge Eval, Scribe ingest of 2.5*L Drift observations of 100 features through WyrdState, and Oracle queries at L/2. Warmup 30 s at 50, 1-replica ramp of 60 s steps at 50/100/200/400 stopping at the first SLO miss (knee K), 180 s sustained at K on 1 and on 2 replicas, then 180 s at 2K on 2 replicas; within 30 minutes. Golden-signal SLOs judged per step (traffic >=95%, zero errors, direct overhead p95 < 10 ms, client queue drain <= 1 s, every backlog drained within 60 s); passes when the 1-replica sustained step and both 2-replica steps pass. Writes target/capacity/. `-- --profile` builds a frame-pointer profiling binary into target/profiling and captures every step with perf as diagnostic evidence. Linux with a delegating systemd user manager; part of no gate or verify lane."
 env = { WYRD_STORAGE_URL = "s3://wyrd-storage-test", WYRD_STORAGE_ENDPOINT_URL = "http://localhost:9000", AWS_REGION = "us-east-1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret" }
 run = '''
-docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml up -d --wait rustfs
-docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml run --rm rustfs-setup
-scripts/postgres/with-test-postgres.sh -- bash -lc '
+# One absolute 30-minute deadline over the whole command (REQ-171), fixed
+# before the first setup action and exported to every step. `phase RESERVE
+# KILL COMMAND...` runs one step in its own process group until RESERVE
+# seconds before the deadline, then TERMs the whole group and KILLs it KILL
+# seconds later; once the step ends, any descendant still in the group is
+# killed too, so no step outlives its share or leaves a process behind. A
+# TERM or INT reaching the shell is forwarded to the step's group. The
+# capacity binary finishes its report 60 s before the deadline, the build and
+# the binary are stopped 30 s before it and killed by 10 s before it, and the
+# Postgres wrapper, which tears its database down on TERM, 10 s before it and
+# killed by 5 s before it. The wrapped bash defines the same `phase` from the
+# exported text.
+WYRD_CAPACITY_STARTED=$(date +%s)
+WYRD_CAPACITY_DEADLINE=$((WYRD_CAPACITY_STARTED + 30 * 60))
+export WYRD_CAPACITY_STARTED WYRD_CAPACITY_DEADLINE
+phase='phase() {
+  seconds=$((WYRD_CAPACITY_DEADLINE - $1 - $(date +%s)))
+  kill_after=$2
+  shift 2
+  [ "$seconds" -gt 0 ] || { echo "bench:capacity passed its 30-minute limit" >&2; return 124; }
+  timeout --kill-after="$kill_after" "$seconds" "$@" &
+  pid=$!
+  trap "kill -TERM $pid 2>/dev/null" INT TERM
+  status=0
+  wait "$pid" || status=$?
+  while kill -0 "$pid" 2>/dev/null; do status=0; wait "$pid" || status=$?; done
+  trap - INT TERM
+  pkill -KILL -g "$pid" || true
+  return "$status"
+}'
+export phase
+eval "$phase"
+phase 10 5 docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml up -d --wait rustfs
+phase 10 5 docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml run --rm rustfs-setup
+phase 10 5 scripts/postgres/with-test-postgres.sh -- bash -lc '
 set -euo pipefail
+eval "$phase"
 binary=()
 if [[ " $* " == *" --profile "* ]]; then
   CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes" \
-    cargo build --locked --release -p wyrd-server --features cloud --target-dir target/profiling
+    phase 30 20 cargo build --locked --release -p wyrd-server --features cloud --target-dir target/profiling
   binary=(--server-binary target/profiling/release/wyrd-server)
 else
-  cargo build --locked --release -p wyrd-server --features cloud
+  phase 30 20 cargo build --locked --release -p wyrd-server --features cloud
 fi
-cargo run --locked --release -p wyrd-testing --bin verification_capacity -- "${binary[@]}" "$@"' _
-'''
-
-[tasks."bench:bifrost:ingest-capacity"]
-description = "Opt-in benchmark (AC-041): one release cloud wyrd-server over the storage emulators' RustFS service and its provisioned test bucket, in an 8-CPU/16-GiB systemd user scope, started through the local-development journey. One WyrdState emits open-loop Drift observations of 100 features: 500 obs/s for --seconds (default 60) with the default queue, judged on zero QUEUE_FULL, flat client bytes, drain within 1 s and exactly 100 durable rows per record_id; then a 1,000 obs/s step, a 50 ms acknowledgement-delay step and a --max-in-flight sweep (default 1,2,4,8), reported only. Writes target/bifrost-ingest-capacity/. Linux with a delegating systemd user manager; part of no gate or verify lane."
-env = { WYRD_STORAGE_URL = "s3://wyrd-storage-test", WYRD_STORAGE_ENDPOINT_URL = "http://localhost:9000", AWS_REGION = "us-east-1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret" }
-run = '''
-docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml up -d --wait rustfs
-docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml run --rm rustfs-setup
-scripts/postgres/with-test-postgres.sh -- bash -lc '
-set -euo pipefail
-cargo build --locked --release -p wyrd-server --features cloud
-cargo run --locked --release -p wyrd-testing --bin bifrost_ingest_capacity -- "$@"' _
+phase 30 20 cargo run --locked --release -p wyrd-testing --bin capacity -- "${binary[@]}" "$@"' _
 '''
 
 [tasks."test:bifrost:journey:otlp"]

@@ -611,8 +611,10 @@ read-decision event is staged without waiting; the outbox writer commits it to
 the canonical tenant hash-chain staging table in a per-tenant batch, and the
 `AuditPublisher` retains it like every other event. Rows are not held for that
 commit; a failed commit is logged, counted through
-`outbox_write_failures_total{outbox="audit"}`, and retried until it lands, and
-shutdown drains the outbox to its deadline. One logical query produces one read-audit event; distributed stages
+`outbox_write_failures_total{outbox="audit"}`, and retried until it lands. The
+`outbox_pending{outbox="audit"}` gauge reports decisions the process still owns
+before their commit or counted loss, and shutdown drains the outbox to its
+deadline. One logical query produces one read-audit event; distributed stages
 produce none. An Interactive event records `Local` execution on one node; an
 Analytical event records `Distributed` execution over every Oracle in the
 frozen participant cut, leader included, with the followers as its workers.

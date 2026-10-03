@@ -1,15 +1,15 @@
 ---
 id: TASK-008-CLOSEOUT
 kind: implementation
-status: proposed
+status: review
 caller_approval: approved
-planning_result: SPEC_REVISION_REQUIRED
 spec: SPEC-verified-change-contract
-spec_revision: 49
-requirements: [REQ-089, REQ-101, REQ-114, REQ-115, REQ-135, REQ-136, REQ-137, REQ-145, REQ-146, REQ-151, REQ-152, INV-015, AC-017, AC-020, AC-021, AC-022, AC-023, AC-024, AC-030, AC-032, AC-033, REQ-172, REQ-173, REQ-174, REQ-175, REQ-176, REQ-177, INV-019, AC-041, AC-042, REQ-178, REQ-179, REQ-180, INV-020, AC-043]
+spec_revision: 57
+requirements: [REQ-089, REQ-101, REQ-114, REQ-115, REQ-135, REQ-136, REQ-137, REQ-145, REQ-146, REQ-151, REQ-152, INV-015, AC-017, AC-020, AC-021, AC-022, AC-023, AC-024, AC-030, AC-032, AC-033, REQ-172, REQ-173, REQ-174, REQ-175, REQ-176, REQ-177, INV-019, REQ-171, AC-040, AC-041, AC-042, REQ-178, REQ-179, REQ-180, INV-020, AC-043]
 depends_on: [TASK-005, TASK-006, TASK-009, TASK-010, TASK-012]
 continues: TASK-008
 intended_to_replace: task-008-recovery.md
+remediation: review/TASK-008-r1/TASK-008-CLOSEOUT-R1-capacity-closure.md
 ---
 
 ## Closeout Tracker (required)
@@ -20,6 +20,11 @@ planning, the audit outbox, and the revision-59 Verifier runtime. It also
 lists the integration steps that follow. TASK-008 closeout is not complete
 until every row in that tracker is **Done**. Its status is updated whenever a
 workstream changes state.
+
+> Current contract: spec revision 57, in review. The revision 49 planning
+> notes below, including their `SPEC_REVISION_REQUIRED` result, are history;
+> the revision 57 `bench:capacity` contract is the section
+> `bench:capacity implementation (revision 57)` and its remediation task.
 
 ## Outcome and Value
 
@@ -1490,6 +1495,94 @@ An independent reviewer compared Forge planning with the local RisingWave copy a
 - Worker claims serialize on one cursor row.
 
 The target design, concurrent per-table demand claims, is drafted as `changes/active/forge-concurrent-planning/spec.md` revision 1, which awaits approval.
+
+### bench:capacity implementation (revision 57)
+
+Commits `dec4213fa` (benchmark), `4c99f8448` (tests moved out of the
+benchmark), `4bb5d3aa2` (report readability). Owner:
+`crates/wyrd/wyrd-testing/src/bin/capacity/` (`main.rs`, `load.rs`,
+`step.rs`, `evidence.rs`, `report.rs`, `fixture.rs`, `judge.rs`,
+`profile.rs`); task `bench:capacity` in `mise.toml`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-171: one benchmark `bench:capacity`, the two old tasks and their binaries deleted | `mise.toml` `[tasks."bench:capacity"]`; one `[[bin]] capacity` in `wyrd-testing/Cargo.toml`; `bin/verification_capacity/` renamed, `bin/bifrost_ingest_capacity/` and the OTLP collector deleted | `git grep` finds the old names only in historical task/spec text | PASS |
+| REQ-171 workload: four identical tenants; direct and queued at L/2 over five kinds; ingest 2.5·L Drift observations × 100 features via `WyrdState` default queue; Oracle L/2 split lookup/aggregate over the last 5 min | `load.rs::{mix, Lane::drive, Request, query}`, `main.rs::TENANTS` | `mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(=load::tests::mix_offers_the_required_rates)'` (1 passed); `mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(=load::tests::queries_read_the_last_five_minutes)'` (1 passed) | PASS |
+| REQ-171 steps: warmup, ramp to first SLO miss (knee K), sustained K on 1 and 2 replicas, scale-out 2K on 2 | `main.rs` flow, `step.rs::Deployment::run` | smoke run below executed every step | PASS |
+| REQ-171 SLOs per cell: traffic ≥ 95%, zero errors, overhead p95 < 10 ms with ≥ 1,000 samples in 1-replica sustained, ingest drain ≤ 1 s and no QUEUE_FULL, every backlog drained in 60 s; latency/CPU/memory reported | `report.rs::{step_row, op_row, overhead}`, `step.rs::{ops, drain}`, `evidence.rs::{Scrapes::overhead, scribe_backlog, Queue::backlog}` (one SQL probe over `wyrd.verifier_runs`, `vala.audit_staging`/`vala.audit_chain_head`, `vala.forge_planning_demands`) | `mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(=report::tests::every_slo_failure_fails_the_step)'` (1 passed); `mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(=evidence::tests::quantile_reads_bucket_deltas)'` (1 passed); `mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(=evidence::tests::raw_percentiles_use_nearest_rank)'` (1 passed) | PASS |
+| REQ-171 verdict and report: passes when 1-replica sustained and both 2-replica steps pass; one row per step then per operation; `--profile` kept | `report.rs::{Report::passed, verdict_steps, render}`; `mise.toml` profiling branch | `mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(=report::tests::verdict_needs_every_verdict_step)'` (1 passed) | PASS |
+| AC-040 overhead SLO from the sustained 1-replica step | `report.rs::overhead` marks a short kind `< 1,000` | smoke report | PASS |
+| AC-041 ingest SLOs at or below the knee | `load.rs` ingest lane times `flush()`; QUEUE_FULL counted as an error | smoke report | PASS |
+| (a) exactly-once queued claims across two replicas | `crates/wyrd/wyrd-server/tests/pg_verification_runtime.rs::two_replicas_claim_each_queued_run_exactly_once` | `WYRD_LOG=info scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test pg_verification_runtime -E 'test(=two_replicas_claim_each_queued_run_exactly_once)'` | PASS |
+| (b) tenant fairness for queued runs | `pg_verification_runtime.rs::a_flooding_tenant_does_not_delay_another_tenants_run` | same command with `-E 'test(=a_flooding_tenant_does_not_delay_another_tenants_run)'` | PASS |
+| (c) failed LLM-judge verdict on the Rust direct path | `sdks/wyrd-sdk-rust/tests/drift_verification.rs` `REJECTED_ANSWER` judged row in `DirectJourney::assert_judgments` | `scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p wyrd-sdk-rust --test drift_verification -P journey --run-ignored=all -E 'test(=direct_execution_judges_supplied_input_through_the_sdk)'` | PASS |
+| (c) SPC passed and failed on the Rust direct path | existing rows in `DirectJourney::assert_judgments` | same command | PASS |
+| (c) queued Custom failed verdict | existing `assert_direct_scores` Custom `failed` in `drift_methods_fit_score_persist_and_dispatch` | same wrapper, `-E 'test(=drift_methods_fit_score_persist_and_dispatch)'` | PASS |
+| (d) AC-041: 100 features per `record_id`, exactly once | `sdks/wyrd-sdk-rust/tests/observe_run.rs::sustained_hundred_feature_drift_lands_exactly_once_with_flat_client_bytes` (1,500 observations, 1,500 groups of 100) | `scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p wyrd-sdk-rust --test observe_run -P journey --run-ignored=all -E 'test(=sustained_hundred_feature_drift_lands_exactly_once_with_flat_client_bytes)'` | PASS |
+| (e) AC-041: flat client-owned bytes under sustained emission | same test: late-third max ≤ early-third max + one `max_message_bytes`, 0 after flush | same command | PASS |
+
+Why (a) and (b) are integration tests, not process journeys: a release
+replica cannot script or hold its engine, so a journey cannot observe a
+second execution of one run or the order of claims. Both tests compose the
+`VerificationRuntime` every replica runs on the shared Postgres queue. (a)
+holds both runtimes until all 100 runs are claimed, requires both to claim,
+and checks `attempts == 1` and exactly 100 durable summaries. (b) reads claim
+order from PostgreSQL lease deadlines: the quiet tenant's run, enqueued after
+a 60-run flood, is claimed behind at most one flood run.
+
+Diagnosis while writing (b):
+
+- **Symptom:** with a 200-run flood, `wait_run_in` panicked with
+  `PoolTimedOut` after release.
+- **Evidence:** Gate writes failed with `audit outbox unavailable: ... pool
+  timed out`, and publications waited more than 4 s for a connection.
+- **Cause:** releasing 201 held executions at once makes 201 publications
+  compete for the test server's Postgres pool. The ordering assertion had
+  already passed.
+- **Fix site:** the test's flood size. 60 runs still separate round-robin
+  claiming (≤ 1 ahead) from FIFO (60 ahead).
+
+Also fixed: `observe_run.rs` existing burst-test casts failed
+`-D warnings` clippy, so the constants became `u32` with `From`
+conversions.
+
+Other commands:
+
+- `mise run fmt`: clean.
+- `mise exec -- cargo clippy --locked -p wyrd-testing --all-targets --all-features -- -D warnings`: clean.
+- `mise exec -- cargo clippy --locked -p wyrd-sdk-rust --all-targets --all-features -- -D warnings`: clean.
+- `mise run lints`: clean.
+- `mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity`: 6 passed.
+- `git diff --check`: clean.
+
+Smoke run, reduced durations, not the full benchmark:
+
+`WYRD_LOG=info mise run bench:capacity -- --levels 20 --warmup-seconds 5 --ramp-seconds 10 --sustained-seconds 15`
+
+Every step ran, the report rendered, and both replicas shut down cleanly.
+
+- Zero errors in every step.
+- Every backlog drained in ≤ 4.9 s.
+- Ingest drain ≤ 0.07 s.
+- Overhead ≤ 0.5 ms.
+- Exit 1, as expected at these durations. The 1-replica sustained step fails the sample floor (n 32 < 1,000), and short windows bias queued traffic low (91–93%). That second point is explained below.
+
+Material risks:
+
+1. **Queued traffic counts runs settled inside the arrival window.** Claim
+   polling (1 s) shifts roughly 1 s of completions past the window. That is
+   about 9% of a 15 s smoke window but under 1% of a 180 s sustained step.
+2. **If the knee is 50, the 1-replica sustained step fails AC-040 by
+   construction.** It would yield 900 direct samples per kind
+   (1.25/s × 4 tenants × 180 s), below 1,000.
+
+Non-goals stayed excluded:
+
+- No production code changed.
+- No benchmark asserts fairness, claims, or judgment correctness.
+- `bench:bifrost:query-capacity` was not touched.
+
+IMPLEMENTED
 
 ## Specification Revision 51
 

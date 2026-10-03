@@ -995,3 +995,122 @@ async fn drift_burst_survives_a_byte_budget_override() {
     );
     server.shutdown().await.expect("test server shuts down");
 }
+
+/// Features of one AC-041 Drift observation, one tall row each.
+const SUSTAINED_FEATURES: u16 = 100;
+
+/// Drift observations the sustained journey emits per second.
+const SUSTAINED_RATE: u16 = 100;
+
+/// Seconds the sustained journey emits for.
+const SUSTAINED_SECONDS: u16 = 15;
+
+/// How often the sustained journey samples client-owned bytes.
+const OWNED_BYTES_SAMPLE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// AC-041 against a real server: one `WyrdState` with the default queue emits
+/// paced Drift observations of 100 features for 15 seconds. Client-owned bytes
+/// stay flat — the last third of the samples never exceeds the first third by
+/// more than one maximum message — and return to zero once drained; every
+/// observation then reads back exactly once, as one `record_id` of exactly 100
+/// rows.
+///
+/// # Panics
+/// Panics when an emit fails other than with a resubmitted `QUEUE_FULL`, the
+/// client bytes grow, or any observation is lost, duplicated, or split.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn sustained_hundred_feature_drift_lands_exactly_once_with_flat_client_bytes() {
+    let root = tempfile::tempdir().expect("fixture root creates");
+    let service = write_service_graph(root.path());
+    let bundle = root.path().join("bundle");
+    let server = Box::pin(WyrdTestServer::builder().start_bound())
+        .await
+        .expect("test server starts");
+    let admin = machine_key(&server, "rust_sustained_admin", &["admin"]).await;
+    let receipt = hydrate_bundle(&connect(&server, &admin), root.path(), &service, &bundle).await;
+    let credential = card_bound_key(&server, &receipt, &[]).await;
+    let state = WyrdState::from_path(&bundle).expect("complete bundle loads offline");
+    state
+        .start_bifrost_with_config(&connect(&server, &credential), None, QueueConfig::default())
+        .await
+        .expect("the default queue starts");
+
+    let run = state.run();
+    let run_id = run.run_id().as_str().to_owned();
+    let model = run.for_card("model").expect("model view resolves");
+    let observations = SUSTAINED_RATE * SUSTAINED_SECONDS;
+    let mut samples = Vec::new();
+    let began = tokio::time::Instant::now();
+    let mut next_sample = began;
+    for observation in 0..observations {
+        tokio::time::sleep_until(
+            began
+                + std::time::Duration::from_secs_f64(
+                    f64::from(observation) / f64::from(SUSTAINED_RATE),
+                ),
+        )
+        .await;
+        if tokio::time::Instant::now() >= next_sample {
+            samples.push(
+                state
+                    .bifrost_metrics()
+                    .expect("a started state reports its queue")
+                    .owned_bytes,
+            );
+            next_sample += OWNED_BYTES_SAMPLE;
+        }
+        let features: serde_json::Map<String, serde_json::Value> = (0..SUSTAINED_FEATURES)
+            .map(|feature| {
+                (
+                    format!("f{feature}"),
+                    serde_json::json!(f64::from((observation + feature) % 100)),
+                )
+            })
+            .collect();
+        emit_with_resubmit(&state, &model, &serde_json::Value::Object(features)).await;
+    }
+    let third = samples.len() / 3;
+    let early = samples[..third].iter().copied().max().unwrap_or(0);
+    let late = samples[samples.len() - third..]
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let message = QueueConfig::default().max_message_bytes;
+    assert!(
+        late <= early + message,
+        "client-owned bytes grew under sustained emission: early max {early}, late max {late}"
+    );
+    state.flush().await.expect("the sustained emission drains");
+    assert_eq!(
+        state
+            .bifrost_metrics()
+            .expect("a started state reports its queue")
+            .owned_bytes,
+        0,
+        "a drained queue owns no bytes"
+    );
+    state.shutdown().await.expect("the state stops");
+    server.flush_bifrost().await.expect("flush server Scribe");
+
+    let groups: Vec<RecordCount> = Bifrost::query_only(&connect(&server, &admin))
+        .sql_as(&format!(
+            "SELECT COUNT(*) AS n FROM vala.drift.observations \
+             WHERE run_id = '{run_id}' GROUP BY record_id"
+        ))
+        .await
+        .expect("sustained rows read back");
+    assert_eq!(
+        groups.len(),
+        usize::from(observations),
+        "one record_id per observation"
+    );
+    assert!(
+        groups
+            .iter()
+            .all(|group| group.n == i64::from(SUSTAINED_FEATURES)),
+        "every observation landed all 100 features exactly once"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}

@@ -160,3 +160,45 @@ session cannot work across replicas without server-side session state.
 [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636);
 [RFC 7009](https://www.rfc-editor.org/rfc/rfc7009);
 [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414).
+
+## Implementation Evidence
+
+UI paths are relative to `crates/wyrd/wyrd-server/wyrd-ui/src`. The journey is
+`lib/server/auth/production-auth.integration.test.ts`, hosted by
+`crates/wyrd/wyrd-server/tests/identity_ui_e2e.rs`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| UI journeys AC-002 and AC-003 pass | `lib/server/auth/browser-sessions.ts` (`BrowserSessions.begin`/`complete`/`read`, openid-client 6.8.8 `discovery`, `buildAuthorizationUrl` + S256 PKCE + state, `authorizationCodeGrant`); `routes/login/callback/+server.ts`; `hooks.server.ts` | Journey tests `production SSO crosses replicas` (sign-in, an authorized admin action, a reader denied an admin action) and `production multi-provider tenant switch` (including mix-up callback refusals) | PASS |
+| Two BFF replicas share a session through the cookie, in front of two Wyrd replicas (AC-007) | `identity_ui_e2e.rs` runs BFF 0 against replica A and BFF 1 against replica B (TLS hop); `WyrdTestServer::start_bound_replica` in `crates/wyrd/wyrd-testing/src/server.rs`; jose `dir`/`A256GCM` cookie keyed by HKDF of the client secret | Journey: the code is redeemed at one BFF, and the other BFF serves the session by renewing it with `refreshTokenGrant` | PASS |
+| No token appears in page data or URLs | `BrowserSession` keeps the access token in a private `#token` field; `BrowserSessions.metadata` is the single source of browser-visible metadata | Journey `expectNoSecrets` checks pages, `__data.json`, redirects and Set-Cookie. `expectEncrypted` asserts every session and login cookie is a JWE containing no clear JWT. The operator key never appears in responses. | PASS |
+| An old-connection session cannot refresh after replacement (REQ-016) | `BrowserSessions.access` renews on cache miss; a refused refresh clears the cookie | Journey test `production provider replacement settings`: after activation the session ends on its next renewal, and replaying the old cookie at either BFF goes to sign-in | PASS |
+| Logout revokes only this login (FIND-TASK-003-18) | `BrowserSessions.logout` calls `tokenRevocation(..., {token_type_hint: 'refresh_token'})` and clears the cookie; an operator API key is never revoked | Journey: two logins for one user. The first logs out; replaying its cookie cannot refresh; the second still renews on a BFF that had not cached it. | PASS |
+| OIDC-off API-key login works (AC-001) | `routes/t/[tenantKey]/login/api-key/+page.server.ts` uses `genericGrantRequest` with RFC 8693 token exchange | Journey test `OIDC-off credential UI`: a bad key gets 401, a cross-site post gets 403, a reader is denied admin, logout works, an admin stages a candidate | PASS |
+| Tenant switch revalidates membership (REQ-015) | `BrowserSessions.switch` reads the target tenant's own cookie and renews it with the server | Journey: switching to a tenant with no session goes to its login; a tenant with a session opens; forged and crossed cookies are cleared | PASS |
+| `server-sessions.ts`, the flow cookie, the custom CSRF token and `/login/complete` are gone | `git rm` of `lib/server/auth/server-sessions.ts` and `routes/login/complete/+server.ts`; CSRF fields removed from every form; SvelteKit `csrf.checkOrigin` plus `SameSite=Lax` | `git grep` finds no `WYRD_BFF_SERVICE_KEY`, `internal/bff`, `x-wyrd-bff-key`, `login/complete` or `wyrd_flow` outside `changes/`. The journey gets 403 for cross-site posts from the built server. | PASS |
+| FIND-TASK-010-1 closure: openid-client completes code + PKCE, refresh and revoke against the real server | `browser-sessions.ts` | All three steps run in `production SSO crosses replicas` | PASS |
+
+Decisions (team lead, recorded as approved):
+
+1. **REQ-010 recovery sign-in.** Routine sign-in is SSO; "Sign in with SSO" is the login page's only primary action. The operator API-key form is on its own recovery page, `/t/{tenant}/login/api-key`. Both the login page and the sign-in problem page link to it. A tenant without an Active SSO connection gets `access_denied` from `/auth/authorize`, and the BFF renders the problem page.
+   - Journey: the OIDC-off tenant's SSO attempt returns to the problem page, which links to recovery.
+   - Journey: the SSO-active tenant shows SSO, and its recovery page still signs in with an operator key.
+2. **An API-key session's tenant is the key's own tenant.** The server scopes every call by the exchanged token. No server change, mapping endpoint or claim was added.
+   - Two earlier assertions were dropped: "an SSO tenant refuses an API key" and "another tenant's key is refused at this page".
+   - Replacement assertion: another tenant's key signed in at this tenant's recovery page does not see this tenant's staged connection, and the server refuses to remove it.
+
+Material limit: each BFF keeps a session's cached access token until it expires (access-token TTL). Logout clears the browser cookie at once and revokes the refresh token. A replayed cookie on a replica that still caches the token keeps working until the token expires, the same window any bearer access token has.
+
+Non-goals: no server-side session store, no second role mapper, no `@auth/sveltekit`, and no hand-written OAuth calls. The only change outside the UI, journey host and lane is a test-harness method in `wyrd-testing`.
+
+Commands (all exited 0):
+
+- `CARGO_TARGET_DIR=… mise exec -- env WYRD_IDENTITY_TARGET=ui WYRD_IDENTITY_FILTER=production_ui_bff_journey mise run test:identity:journey` (4 UI journey tests passed; the host test passed)
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/server/routing/journey.test.ts -t 'real browser-facing loads and actions contain credentials and isolate tenant tabs'`
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/features/changes/ChangesJourney.test.ts -t 'incomplete draft saves, resumes, and accepts multiple subjects and requirements'`
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check` (0 errors, 0 warnings)
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test` (32 files, 177 tests passed)
+- `CARGO_TARGET_DIR=… mise run fmt`
+- `CARGO_TARGET_DIR=… mise run lints`
+- `git diff --check`

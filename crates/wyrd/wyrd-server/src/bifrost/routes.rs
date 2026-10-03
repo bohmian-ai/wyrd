@@ -47,7 +47,7 @@ pub fn router() -> OpenApiRouter<AppState> {
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other catalog-backed refusal, each carrying \
           its own stable code from the Bifrost catalog (WYRD_VALA_500_BIFROST_INTERNAL, \
-          WYRD_VALA_500_BIFROST_METADATA_MISMATCH, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+          WYRD_VALA_500_BIFROST_METADATA_MISMATCH)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
 )]
@@ -86,7 +86,7 @@ pub(crate) async fn register(
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other catalog-backed refusal, each carrying \
           its own stable code from the Bifrost catalog (WYRD_VALA_500_BIFROST_INTERNAL, \
-          WYRD_VALA_500_BIFROST_METADATA_MISMATCH, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+          WYRD_VALA_500_BIFROST_METADATA_MISMATCH)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
 )]
@@ -131,7 +131,7 @@ pub(crate) async fn list(
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other catalog-backed refusal, each carrying \
           its own stable code from the Bifrost catalog (WYRD_VALA_500_BIFROST_INTERNAL, \
-          WYRD_VALA_500_BIFROST_METADATA_MISMATCH, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+          WYRD_VALA_500_BIFROST_METADATA_MISMATCH)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
 )]

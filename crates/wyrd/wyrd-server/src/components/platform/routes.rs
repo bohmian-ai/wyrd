@@ -2,8 +2,9 @@
 //!
 //! Every route here takes [`PlatformCaller`], so a tenant identity cannot reach
 //! them: the extractor is the only producer of a platform-scoped context and it
-//! accepts only a platform session. Authorization and its audit record happen
-//! inside each operation, in the transaction that performs it.
+//! accepts only a platform session. Authorization happens inside each
+//! operation, which stages its decision on the process audit outbox without
+//! waiting for the commit.
 //!
 //! These routes sit outside the `/v1` nest deliberately. That nest is
 //! default-deny on *tenant* access tokens, so a platform session would be
@@ -15,6 +16,7 @@ use axum::Json;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use secrecy::{ExposeSecret, SecretString};
+use std::sync::Arc;
 use wyrd_auth::platform_sessions::{
     DEFAULT_PLATFORM_TOKEN_TTL_MINUTES, PlatformSessionError, PlatformSessions,
 };
@@ -74,8 +76,7 @@ pub fn platform_auth_router() -> OpenApiRouter<AppState> {
         (status = 200, description = "Short-lived platform session", body = PlatformTokenResponse),
         (status = 401, description = "Credential rejected, indistinguishably for every cause \
           (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     // No session exists yet at this operation, so it clears the document-wide
     // requirement instead of inheriting it.
@@ -103,7 +104,7 @@ async fn platform_token(
         return Err(not_configured());
     };
 
-    let sessions = PlatformSessions::new(operator, issuing_key);
+    let sessions = PlatformSessions::new(operator, issuing_key, Arc::clone(&state.audit_outbox));
     let presented = SecretString::from(request.credential.expose().to_owned());
     match sessions.exchange(&presented, req_id).await {
         Ok(session) => Ok(Json(PlatformTokenResponse {
@@ -141,8 +142,7 @@ async fn platform_token(
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No active tenant to recover, indistinguishably for every \
           cause (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -155,7 +155,7 @@ async fn recover_tenant_admin(
     let Some(operator) = state.postgres.operator_pool() else {
         return Err(not_configured());
     };
-    let recovery = TenantRecovery::new(operator);
+    let recovery = TenantRecovery::new(operator, Arc::clone(&state.audit_outbox));
     let conn = state
         .postgres
         .tenant_conn(request.tenant_id)
@@ -192,8 +192,7 @@ fn not_configured() -> WyrdErrorResponse {
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Tenant creation not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 409, description = "Slug already in use by a live tenant (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -206,7 +205,7 @@ async fn create_tenant(
     let Some(operator) = state.postgres.operator_pool() else {
         return Err(not_configured());
     };
-    let provisioning = TenantProvisioning::new(operator);
+    let provisioning = TenantProvisioning::new(operator, Arc::clone(&state.audit_outbox));
 
     // Two phases because the tenant id is only settled by the directory claim:
     // a resumed attempt adopts the failed attempt's id. The connection is
@@ -245,7 +244,7 @@ fn provision_error(error: ProvisionError) -> WyrdErrorResponse {
             message: "no active tenant to act on".to_owned(),
             details: serde_json::json!({ "resource": "tenant" }),
         }),
-        ProvisionError::AuditUnavailable(reason) | ProvisionError::Store(reason) => {
+        ProvisionError::Store(reason) => {
             WyrdErrorResponse::from(internal_failure("tenant provisioning failed", &reason))
         }
     }
@@ -264,8 +263,7 @@ fn provision_error(error: ProvisionError) -> WyrdErrorResponse {
          body = TenantListResponse),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Tenant reading not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -298,8 +296,7 @@ async fn list_tenants(
         (status = 403, description = "Tenant reading not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such tenant, indistinguishably for every cause \
           (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -336,8 +333,7 @@ async fn inspect_tenant(
         (status = 403, description = "Tenant suspension not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "Tenant is not in the state this transition requires \
           (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -378,6 +374,6 @@ fn directory(state: &AppState) -> Result<TenantProvisioning, WyrdErrorResponse> 
     state
         .postgres
         .operator_pool()
-        .map(TenantProvisioning::new)
+        .map(|operator| TenantProvisioning::new(operator, Arc::clone(&state.audit_outbox)))
         .ok_or_else(not_configured)
 }

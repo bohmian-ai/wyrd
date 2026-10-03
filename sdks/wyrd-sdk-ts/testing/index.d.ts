@@ -184,27 +184,6 @@ export declare class NativeWyrdTestServer {
    */
   tableDescribeCount(fqn: string): number
   /**
-   * Make every describe of one table FQN fail until restored.
-   *
-   * The server answers the failed describe with
-   * `WYRD_VALA_500_AUDIT_UNAVAILABLE`.
-   *
-   * # Errors
-   *
-   * Returns a napi error when the harness is closed, the FQN is not a
-   * dotted identifier, or installing the fault fails.
-   */
-  failTableDescribe(fqn: string): void
-  /**
-   * Remove the describe fault installed by `fail_table_describe`.
-   *
-   * # Errors
-   *
-   * Returns a napi error when the harness is closed or removing the fault
-   * fails.
-   */
-  restoreTableDescribe(): void
-  /**
    * Rewrite table `fqn`'s registered schema fingerprint, as a server-side
    * schema change leaves it, so a writer holding the earlier describe is
    * refused with `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`.

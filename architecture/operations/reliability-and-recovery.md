@@ -28,12 +28,14 @@ defaults may aid development but never become an implicit production promise.
 At minimum, deployments measure:
 
 - HTTP/gRPC/MCP availability and latency by bounded route family and outcome;
-- authentication, permission, policy, and audit availability;
+- authentication, permission, and policy availability, and audit outbox health:
+  `outbox_pending`, `outbox_write_failures_total`, and
+  `outbox_events_lost_total`, each labelled `outbox="audit"`;
 - Scribe admission latency, queue age, fairness, WAL fsync latency, staged-run
   age, persistence lag, object publication, replay, and rejection;
 - Oracle interactive and analytical queue age, execution latency, result
-  outcome, cancellation, terminal peer failure, memory, exchange, spill,
-  audit commit failures, and partial-result prevention;
+  outcome, cancellation, terminal peer failure, memory, exchange, spill, and
+  partial-result prevention;
 - Forge demand age, claim age, lease expiry, plan-estimate accuracy, local FIFO
   age, running estimated memory and parallelism, worker loss, attempt outcome,
   rewrite debt, commit conflict, uncertain publication, reconciliation,
@@ -69,9 +71,11 @@ Overload is bounded and explicit:
   protected resource floor.
 - Postgres and external dependencies use bounded pools, timeouts, and
   backpressure. An exhausted dependency does not trigger unbounded retries or
-  queue growth.
+  queue growth, with one deliberate exception: the audit outbox has no count
+  limit and retries with capped backoff, because holding a decision in memory
+  is preferred to dropping it.
 
-When a protected floor, durable volume, audit path, or safety invariant is
+When a protected floor, durable volume, or safety invariant is
 exhausted, the responsible surface rejects new work. It does not borrow across
 tenant or role boundaries, disable an audit, drop accepted data, or return a
 partial success.
@@ -145,9 +149,8 @@ fabricate task completion to make health checks pass.
 
 ## Oracle failure boundaries
 
-- Query admission fsyncs the local audit acceptance WAL before any result row
-  can be returned. Relay lag blocks readiness or admission according to the
-  deployment's bounded audit backlog policy.
+- Query admission stages its read decision on the process audit outbox and
+  never waits for, or is refused by, that decision's commit.
 - Interactive and analytical execution share one immutable deadline and a
   query-owned cancellation tree. Cancellation joins every descendant and
   releases memory, exchange, spill, peer, and admission resources.
@@ -218,8 +221,9 @@ publication. Publication is itself an engine transition and appends no audit.
 ## Dependency and regional failure
 
 - Postgres unavailability stops mutations, policy decisions that require
-  durable state, Forge transitions, and any audit path that cannot satisfy its
-  defined durability boundary. Requests fail with stable retry semantics.
+  durable state, and Forge transitions. Requests fail with stable retry
+  semantics. Audit decisions stay queued in the process audit outbox and are
+  retried until Postgres recovers; they never fail a request.
 - Object-store unavailability stops publication and queries requiring missing
   objects. Scribe retains accepted data within governed local durability;
   resource exhaustion then stops admission.

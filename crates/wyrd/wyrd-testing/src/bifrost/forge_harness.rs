@@ -1814,7 +1814,6 @@ async fn create_fixture_table(
             user_fields: fields,
             tenant,
             physical_layout: Some(daily_layout_declaration()),
-            audit: None,
         })
         .await
         .expect("production Forge fixture table");

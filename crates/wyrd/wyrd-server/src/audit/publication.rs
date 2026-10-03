@@ -46,7 +46,7 @@ const PUBLICATION_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Tenant cycles the publisher runs at once, across overlapping sweeps.
 ///
-/// Tenants publish concurrently so one tenant waiting on its chain head,
+/// Tenants publish concurrently so one tenant waiting on its progress row,
 /// Scribe, or Postgres cannot stall every tenant behind it. The bound is fixed
 /// rather than configurable: it exists to keep the publisher's demand on the
 /// Vala pool and the local Scribe predictable, so a deeper tenant directory
@@ -186,7 +186,7 @@ impl AuditPublisher {
     /// Each tenant cycle runs as its own task in [`TenantCycles`], which
     /// outlives the sweep that started it. A sweep never waits for a cycle to
     /// finish, only for a free slot, so a cycle blocked mid-settlement on a
-    /// held chain head or staging row delays its own tenant and nobody else:
+    /// held progress row or staging row delays its own tenant and nobody else:
     /// later sweeps keep re-listing the directory and publishing every other
     /// tenant.
     ///
@@ -361,7 +361,7 @@ impl AuditPublisher {
     ///
     /// # Errors
     /// Returns [`AuditPublicationError::Staging`] when the tenant transaction
-    /// cannot be acquired, the locked chain-head read times out or fails, the
+    /// cannot be acquired, the locked progress-row read times out or fails, the
     /// bound update fails, or the commit fails. Nothing is frozen unless the
     /// commit succeeds; a failed transaction rolls back on drop and the next
     /// sweep retries the unchanged range.

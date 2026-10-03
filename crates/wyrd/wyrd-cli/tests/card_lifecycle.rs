@@ -2053,19 +2053,22 @@ mod pg_tests {
         stop_cli_server(server, shutdown, serve_handle).await;
     }
 
-    /// Prove `wyrd apply` fails closed when the completion decision cannot be audited.
+    /// Prove `wyrd apply` completes when the completion decision cannot be audited.
     ///
-    /// Completing a registration is a receiving authorization boundary, so its
-    /// permission verdict is appended before the backend completion runs. A
-    /// trigger refuses that one append; the CLI must surface the stable
-    /// audit-unavailable error and its generic exit code rather than a
-    /// completed registration.
+    /// Completing a registration is a receiving authorization boundary whose
+    /// permission verdict is staged on the server's non-blocking audit outbox.
+    /// A trigger refuses that one staging insert; the CLI still completes the
+    /// registration and exits `0`, the server counts the failed audit write, and
+    /// the retried decision commits exactly once after the trigger is dropped.
     ///
     /// # Panics
-    /// Panics when the embedded server or fixture setup fails, or the CLI does
-    /// not report the fail-closed refusal.
+    /// Panics when the embedded server or fixture setup fails, the CLI does not
+    /// complete the registration, the failed write is not counted, or the
+    /// decision does not commit once after recovery.
     #[tokio::test]
-    async fn apply_refuses_when_completion_decision_audit_fails() {
+    async fn apply_completes_when_completion_decision_audit_fails() {
+        let failures =
+            wyrd_testing::AuditCommitFailures::install().expect("metrics recorder installs");
         let temp = tempfile::tempdir().expect("tempdir creates");
         let path = write_prompt(&temp);
         let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
@@ -2116,15 +2119,36 @@ mod pg_tests {
 
         assert_eq!(
             output.status.code(),
-            Some(1),
+            Some(0),
             "stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(first_stderr_json(&output)["status"], 500);
+        failures
+            .await_failure(std::time::Duration::from_secs(30))
+            .await
+            .expect("the failed audit write is counted");
+        sqlx::query("DROP TRIGGER test_fail_cli_card_completion_audit ON vala.audit_staging")
+            .execute(&superuser)
+            .await
+            .expect("failure trigger drops");
         assert_eq!(
-            first_stderr_json(&output)["code"],
-            "WYRD_VALA_500_AUDIT_UNAVAILABLE"
+            server
+                .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+                .await
+                .expect("audit outbox settles"),
+            0,
+            "the retried decision drains"
+        );
+        let completions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_staging WHERE operation = 'card.registration.complete'",
+        )
+        .fetch_one(&superuser)
+        .await
+        .expect("completion decisions read");
+        assert_eq!(
+            completions, 1,
+            "the decision commits exactly once after recovery"
         );
         stop_cli_server(server, shutdown, serve_handle).await;
     }

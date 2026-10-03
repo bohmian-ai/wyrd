@@ -42,9 +42,10 @@ use crate::scribe::preprocess::{correlation_data_identity, logical_data_identity
 use crate::tables::{
     CallsTable, DomainTable, ResultFeaturesTable, ResultItemsTable, ResultsTable, TableError,
 };
+use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::DataTenantId;
-use wyrd_spec::vala::api::{AuditOutcome, BifrostQueryRequest};
+use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome, BifrostQueryRequest};
 use wyrd_spec::vala::error::BifrostError;
 
 /// Maps a canonical OTLP projection failure to its ingest refusal.
@@ -254,30 +255,48 @@ pub fn initialize_gate_metrics() {
     metrics::gauge!("bifrost_gate_active_streams", "operation" => "query").set(0.0);
 }
 
-/// Durable sink for the write-authorization decisions Gate reaches.
+/// Non-blocking sink for the write-authorization decisions Gate reaches.
 ///
-/// Gate evaluates the RBAC permission but owns no database, so the composition
-/// root supplies the tenant-scoped writer. The append is mandatory: a decision
-/// that cannot be recorded refuses the write rather than admitting it unaudited.
+/// Gate evaluates and enforces the RBAC permission itself; the sink only
+/// stages the decision and returns. Permissions block, audits do not: a
+/// decision that fails to commit is retried by the outbox and never refuses or
+/// delays the write.
 ///
-/// The trait exists because the writer lives in a crate Gate must not depend
-/// on, not because the sink is chosen at runtime: [`Gate`] is parameterized over
-/// it, so the server composes its Postgres writer and crate-local tests compose
-/// their recording double, both statically.
-#[wyrd_tonic::tonic::async_trait]
+/// [`Gate`] is parameterized over the sink, so the server composes the process
+/// [`AuditOutbox`] and crate-local tests compose their recording double, both
+/// statically.
 pub trait GateAudit: Send + Sync {
-    /// Records one `bifrost_record:write` decision for `auth` on `resource`.
+    /// Stages one `bifrost_record:write` decision for `auth` on `resource`.
+    fn stage_write_decision(&self, auth: &AuthContext, resource: &str, outcome: AuditOutcome);
+}
+
+impl GateAudit for AuditOutbox {
+    /// Stages the decision on the caller's tenant chain.
     ///
-    /// # Errors
-    ///
-    /// Returns [`IngestError::AuditUnavailable`] when the row cannot be
-    /// committed; the caller must then refuse the write.
-    async fn append_write_decision(
-        &self,
-        auth: &AuthContext,
-        resource: &str,
-        outcome: AuditOutcome,
-    ) -> Result<(), IngestError>;
+    /// The row is attributed to the verified principal — the subject a
+    /// delegated token acts for — and, when the token carries a non-empty
+    /// delegation chain, names its actors through the same
+    /// [`AuditDetail::DelegationAttribution`] projection HTTP and Oracle audit
+    /// use. A direct call keeps no detail.
+    fn stage_write_decision(&self, auth: &AuthContext, resource: &str, outcome: AuditOutcome) {
+        let mut event = AuditEvent::new(
+            auth.request_id.clone(),
+            None,
+            "bifrost.record.write".to_owned(),
+            resource.to_owned(),
+            auth.principal.card_ref().cloned(),
+            auth.principal.id,
+            auth.principal.kind.tag(),
+            "bifrost:record:write".to_owned(),
+            outcome,
+        );
+        if !auth.delegation_chain.is_empty() {
+            event = event.with_detail(AuditDetail::DelegationAttribution {
+                delegation_chain: wyrd_runtime::audit_delegation_chain(&auth.delegation_chain),
+            });
+        }
+        self.stage(auth.tenant, event);
+    }
 }
 
 /// Receives Eval observation frames after Scribe has durably acknowledged them.
@@ -305,7 +324,7 @@ pub trait ObservationAck: Send + Sync {
 /// Gate owns authentication, request bounds, and transport response ordering.
 /// The Scribe dependency is mandatory at construction.
 ///
-/// `A` is the durable audit sink this Gate records write decisions through.
+/// `A` is the non-blocking audit sink this Gate stages write decisions on.
 /// There is one production sink and one test sink, so the choice is made
 /// statically by the composition root rather than through runtime dispatch.
 pub struct Gate<A: GateAudit + 'static> {
@@ -315,10 +334,11 @@ pub struct Gate<A: GateAudit + 'static> {
     query: Option<Arc<dyn OracleQueryDispatch>>,
     /// Post-acknowledgement hook for Eval observation frames, when composed.
     observations: Option<Arc<dyn ObservationAck>>,
-    /// Durable sink for write-authorization decisions.
+    /// Non-blocking sink for write-authorization decisions.
     ///
     /// Absent only where no Scribe is attached: a Gate that cannot write also
-    /// reaches no write decision. Every ingest path refuses when it is missing.
+    /// reaches no write decision. Every ingest path refuses as an internal
+    /// composition defect when it is missing.
     audit: Option<Arc<A>>,
     /// Immutable transport and typed-ingress bounds.
     limits: IngestLimits,
@@ -458,10 +478,10 @@ impl<A: GateAudit + 'static> Gate<A> {
         self
     }
 
-    /// Attaches the durable sink every write decision is recorded through.
+    /// Attaches the sink every write decision is staged on.
     ///
-    /// A Gate with a Scribe but no sink refuses every write, because it cannot
-    /// record the decision that would admit it. The sink's type is fixed by `A`
+    /// A Gate with a Scribe but no sink refuses every write as an internal
+    /// composition defect. The sink's type is fixed by `A`
     /// at the composition root, so no call here selects an implementation at
     /// runtime.
     #[must_use]
@@ -470,19 +490,21 @@ impl<A: GateAudit + 'static> Gate<A> {
         self
     }
 
-    /// Evaluates the table-scoped write permission and durably records the decision.
+    /// Evaluates the table-scoped write permission and stages the decision.
     ///
     /// The verification result tables accept only the scoped SYSTEM writer, and
     /// `vala.gateway.calls` accepts only the reserved gateway capture principal.
-    /// Every allowed or denied decision is recorded before admission proceeds.
+    /// Every allowed or denied decision is staged on the audit sink without
+    /// waiting, then the verdict is enforced.
     ///
     /// `native_frame` supplies the Arrow IPC payload for native writes. OTLP
     /// callers pass `None` because they cannot write verification results.
     ///
     /// # Errors
     ///
-    /// Returns the permission or reserved-table refusal, an audit failure, or
-    /// a mapped destination error when the table cannot be resolved.
+    /// Returns the permission or reserved-table refusal, a mapped destination
+    /// error when the table cannot be resolved, or [`IngestError::Internal`]
+    /// when the Gate was composed without an audit sink.
     async fn authorize_record_write(
         &self,
         auth: &AuthContext,
@@ -492,16 +514,14 @@ impl<A: GateAudit + 'static> Gate<A> {
         let audit = self
             .audit
             .as_ref()
-            .ok_or_else(|| IngestError::AuditUnavailable("gate has no audit sink".to_owned()))?;
+            .ok_or_else(|| IngestError::Internal("gate has no audit sink".to_owned()))?;
         let decision = self.record_write_verdict(auth, table, native_frame).await?;
         let outcome = if decision.is_ok() {
             AuditOutcome::Allowed
         } else {
             AuditOutcome::Denied
         };
-        audit
-            .append_write_decision(auth, &table.fqn(), outcome)
-            .await?;
+        audit.stage_write_decision(auth, &table.fqn(), outcome);
         decision
     }
 
@@ -1494,7 +1514,7 @@ mod tests {
 
     /// Recording [`GateAudit`] double standing in for the tenant-scoped writer.
     ///
-    /// Gate refuses every write it cannot record, so a Gate under test needs a
+    /// Gate refuses every write when composed without a sink, so a Gate under test needs a
     /// sink before any authorization path is reachable at all. This keeps the
     /// decisions in memory so a test can assert what was recorded.
     struct RecordingAudit {
@@ -1522,19 +1542,13 @@ mod tests {
         }
     }
 
-    #[wyrd_tonic::tonic::async_trait]
     impl GateAudit for RecordingAudit {
-        async fn append_write_decision(
-            &self,
-            _auth: &AuthContext,
-            resource: &str,
-            outcome: AuditOutcome,
-        ) -> Result<(), IngestError> {
+        /// Records the decision in memory, in staging order.
+        fn stage_write_decision(&self, _auth: &AuthContext, resource: &str, outcome: AuditOutcome) {
             self.decisions
                 .lock()
                 .expect("recording audit lock is uncontended")
                 .push((resource.to_owned(), outcome));
-            Ok(())
         }
     }
 
@@ -1845,14 +1859,14 @@ mod tests {
     /// Gate records the write decision before it admits or refuses the write.
     ///
     /// Two halves share one test because they are the same invariant seen from
-    /// both sides. A Gate with no sink must refuse before it even evaluates the
+    /// both sides. A Gate composed with no sink must refuse before it even evaluates the
     /// permission, so an unrecorded write never reaches Scribe. A Gate with a
     /// sink must have the refusal already in the sink by the time the caller
     /// sees it, and still hand Scribe nothing.
     #[tokio::test]
     async fn gate_enforces_bifrost_record_write() {
         let scribe_calls = Arc::new(AtomicUsize::new(0));
-        // A Gate that cannot record its decision refuses before evaluating one,
+        // A Gate composed without a sink refuses before evaluating a decision,
         // so an unrecorded write never reaches Scribe.
         let unrecorded = Gate::<RecordingAudit>::with_test_scribe(
             Arc::new(CountingScribe::new(Arc::clone(&scribe_calls))),
@@ -1865,8 +1879,8 @@ mod tests {
                 decoded_trace(ExportTraceServiceRequest::default()),
             )
             .await
-            .expect_err("a Gate with no audit sink must fail closed");
-        assert!(matches!(error, IngestError::AuditUnavailable(_)));
+            .expect_err("a Gate composed without an audit sink must refuse");
+        assert!(matches!(error, IngestError::Internal(_)));
         assert_eq!(scribe_calls.load(Ordering::Relaxed), 0);
 
         let audit = RecordingAudit::new();

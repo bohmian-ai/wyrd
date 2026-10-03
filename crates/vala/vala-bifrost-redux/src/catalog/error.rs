@@ -44,9 +44,6 @@ pub enum BifrostCatalogError {
     /// The physical tenant/table binding is invalid.
     #[error("invalid tenant table binding: {0}")]
     InvalidBinding(String),
-    /// Registration audit could not be appended atomically with the control row.
-    #[error("audit outbox unavailable: {0}")]
-    AuditUnavailable(String),
     /// `DataFusion` provider construction failed.
     #[error("datafusion provider error: {0}")]
     DataFusion(#[from] datafusion::error::DataFusionError),
@@ -69,7 +66,6 @@ impl BifrostCatalogError {
             Self::UnstableCut { .. } | Self::AmbiguousPublication => {
                 PublicError::QueryVisibilityUnavailable
             }
-            Self::AuditUnavailable(detail) => PublicError::AuditUnavailable { detail },
             Self::DataFusion(error) => {
                 tracing::error!(error = %error, "Redux DataFusion provider construction failed");
                 PublicError::CatalogUnreachable {

@@ -274,12 +274,6 @@ fn bifrost_error_from_code(
         "WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE" => {
             BifrostError::RunningQueryControlUnavailable
         }
-        "WYRD_VALA_500_AUDIT_UNAVAILABLE" => BifrostError::AuditUnavailable {
-            detail: message
-                .strip_prefix("audit outbox unavailable: ")
-                .unwrap_or(message)
-                .to_owned(),
-        },
         "WYRD_VALA_429_QUERY_ADMISSION_REJECTED" => BifrostError::QueryAdmissionRejected,
         "WYRD_VALA_429_QUERY_QUEUE_FULL" => BifrostError::QueryQueueFull,
         "WYRD_VALA_503_QUERY_RESOURCES_EXHAUSTED" => BifrostError::QueryResourcesExhausted,
@@ -299,7 +293,6 @@ fn bifrost_error_from_code(
         "WYRD_VALA_403_QUERY_FORBIDDEN" => BifrostError::QueryForbidden,
         "WYRD_VALA_502_QUERY_STREAM_PROTOCOL" => BifrostError::QueryStreamProtocol,
         "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE" => BifrostError::QueryStreamIncomplete,
-        "WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE" => BifrostError::QueryAuditUnavailable,
         "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE" => BifrostError::QueryResultTooLarge,
         // The enforced ceiling is configured, not universal. A caller that only
         // learns "too large" cannot resize its batch to fit; it has to guess at
@@ -512,7 +505,6 @@ mod tests {
             ("WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND", 404),
             ("WYRD_VALA_409_RUNNING_QUERY_CONFLICT", 409),
             ("WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE", 503),
-            ("WYRD_VALA_500_AUDIT_UNAVAILABLE", 500),
         ] {
             let error = from_problem_json(&serde_json::json!({
                 "code": code,

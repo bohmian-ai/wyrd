@@ -452,11 +452,7 @@ mod error_mapper_tests {
         }
 
         for error in [
-            WyrdError::AuditUnavailable {
-                message: "audit unavailable".to_owned(),
-                details: serde_json::json!({}),
-            },
-            wyrd_spec::vala::error::BifrostError::QueryMemoryRequestTooLarge.into(),
+            WyrdError::from(wyrd_spec::vala::error::BifrostError::QueryMemoryRequestTooLarge),
             wyrd_spec::vala::error::BifrostError::QueryExecutionFailed.into(),
             wyrd_spec::vala::error::BifrostError::QueryResourcesExhausted.into(),
             wyrd_spec::vala::error::BifrostError::PayloadTooLarge { bytes: 1, limit: 1 }.into(),
@@ -635,7 +631,6 @@ mod error_mapper_tests {
             DelegationDepthExceededVerify,
             PrincipalNotFound,
             AuthVerifyUnavailable,
-            AuditUnavailable,
             MissingRequiredField,
             PermissionUnauthenticated,
             PermissionDeniedRbac,

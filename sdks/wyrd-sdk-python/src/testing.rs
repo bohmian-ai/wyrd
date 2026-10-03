@@ -712,28 +712,6 @@ impl WyrdTestServer {
             .map_err(py_error)
     }
 
-    /// Make describes of a fixture table fail until restored.
-    ///
-    /// # Errors
-    /// Raises a harness error when the fault cannot be installed.
-    fn fail_table_describe(&self, fqn: &str) -> WyrdPyResult<()> {
-        let server = self.started()?;
-        wyrd_runtime::runtime()
-            .block_on(server.fail_table_describe(fqn))
-            .map_err(py_error)
-    }
-
-    /// Remove the active table-describe fault.
-    ///
-    /// # Errors
-    /// Raises a harness error when the fault cannot be removed.
-    fn restore_table_describe(&self) -> WyrdPyResult<()> {
-        let server = self.started()?;
-        wyrd_runtime::runtime()
-            .block_on(server.restore_table_describe())
-            .map_err(py_error)
-    }
-
     /// Return the fixture tenant's durable Oracle read-decision count.
     ///
     /// # Errors

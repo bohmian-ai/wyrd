@@ -32,7 +32,10 @@ pub async fn exchange_jwt_bearer(
 ) -> Result<ExchangedToken, WyrdErrorResponse> {
     let tenant_id = resolve_workload_tenant(state, headers, tenant).await?;
     let service = wyrd_auth::jwt_bearer::JwtBearer {
-        issuer: state.auth.tenant_issuer().ok_or_else(auth_not_configured)?,
+        issuer: state
+            .auth
+            .tenant_issuer(&state.audit_outbox)
+            .ok_or_else(auth_not_configured)?,
         verifier: state
             .auth
             .external_verifier
@@ -201,7 +204,7 @@ mod pg_tests {
             "workload jwt-bearer grant must not issue a refresh token"
         );
 
-        let rows = audit_rows(&fixture, tenant).await;
+        let rows = audit_rows(&fixture, &state, tenant).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].subject_principal_id, rows[0].actor_principal_id);
         assert_eq!(rows[0].error_tag, "");
@@ -299,7 +302,7 @@ mod pg_tests {
         .expect_err("wrong audience rejected");
         assert!(matches!(error.0, WyrdError::InvalidToken { .. }));
 
-        let rows = audit_rows(&fixture, tenant).await;
+        let rows = audit_rows(&fixture, &state, tenant).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].subject_principal_id, Uuid::nil());
         assert_eq!(rows[0].actor_principal_id, Uuid::nil());
@@ -532,7 +535,10 @@ mod pg_tests {
             .await
             .expect("tenant conn opens");
         let exchanged = crate::auth::exchange_api_key::ExchangeApiKey {
-            issuer: state.auth.tenant_issuer().expect("issuing key configured"),
+            issuer: state
+                .auth
+                .tenant_issuer(&state.audit_outbox)
+                .expect("issuing key configured"),
         }
         .execute(&mut conn, SecretString::from(token), "req-api-key")
         .await
@@ -792,7 +798,22 @@ mod pg_tests {
         key.secret.expose_secret().to_owned()
     }
 
-    async fn audit_rows(fixture: &PgFixture, tenant: DataTenantId) -> Vec<AuditRow> {
+    /// Staged `auth.token.exchange` events for `tenant`, newest first, read
+    /// after `state`'s audit outbox settles.
+    ///
+    /// # Panics
+    /// Panics when the outbox does not settle or the query fails.
+    async fn audit_rows(
+        fixture: &PgFixture,
+        state: &AppState,
+        tenant: DataTenantId,
+    ) -> Vec<AuditRow> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert_eq!(
+            state.audit_outbox.settle(deadline).await,
+            0,
+            "audit settles"
+        );
         let mut conn = fixture
             .tenant_conn_for(tenant)
             .await

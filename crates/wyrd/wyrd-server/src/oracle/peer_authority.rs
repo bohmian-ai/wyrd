@@ -111,10 +111,8 @@ impl OraclePeerAuthority {
     /// forwarded query is admitted.
     ///
     /// # Errors
-    /// Returns a durably audited closed security error for every invalid
-    /// envelope, or [`PeerSecurityError::AuditUnavailable`] when the refusal
-    /// cannot be recorded.
-    pub async fn verify_forward_query(
+    /// Returns an audited closed security error for every invalid envelope.
+    pub fn verify_forward_query(
         &self,
         context: &PeerContext,
         expected_worker: NodeId,
@@ -122,22 +120,18 @@ impl OraclePeerAuthority {
         now: DateTime<Utc>,
     ) -> Result<ForwardQueryClaims, PeerSecurityError> {
         if context.claims_bytes.is_empty() || context.claims_bytes.len() > MAX_FORWARD_QUERY_BYTES {
-            return Err(self
-                .forwarding_rejection(
-                    BifrostSecurityViolationKind::PeerSignature,
-                    PeerSecurityError::Malformed,
-                )
-                .await);
+            return Err(self.forwarding_rejection(
+                BifrostSecurityViolationKind::PeerSignature,
+                PeerSecurityError::Malformed,
+            ));
         }
         let claims: ForwardQueryClaims = match serde_json::from_slice(&context.claims_bytes) {
             Ok(claims) => claims,
             Err(_) => {
-                return Err(self
-                    .forwarding_rejection(
-                        BifrostSecurityViolationKind::PeerSignature,
-                        PeerSecurityError::Malformed,
-                    )
-                    .await);
+                return Err(self.forwarding_rejection(
+                    BifrostSecurityViolationKind::PeerSignature,
+                    PeerSecurityError::Malformed,
+                ));
             }
         };
         let violation = if claims.protocol_version != 1 || claims.audience != expected_worker {
@@ -159,31 +153,26 @@ impl OraclePeerAuthority {
             None
         };
         if let Some((kind, error)) = violation {
-            return Err(self.forwarding_rejection(kind, error).await);
+            return Err(self.forwarding_rejection(kind, error));
         }
         Ok(claims)
     }
 
-    /// Audits one forwarding rejection on the system chain and substitutes
-    /// audit-unavailable on append failure.
+    /// Stages one forwarding rejection on the system chain and returns the
+    /// rejection unchanged.
     ///
     /// A forwarding envelope names its tenant in unsigned claims that no
     /// receiver state has bound yet, so a refusal is never attributed to that
     /// tenant: a connected peer must not be able to write into a foreign
     /// tenant's audit chain by forging one.
-    async fn forwarding_rejection(
+    fn forwarding_rejection(
         &self,
         violation: BifrostSecurityViolationKind,
         error: PeerSecurityError,
     ) -> PeerSecurityError {
-        match self
-            .security_audit
-            .append_unverified_ticket_rejection(violation)
-            .await
-        {
-            Ok(()) => error,
-            Err(_) => PeerSecurityError::AuditUnavailable,
-        }
+        self.security_audit
+            .stage_unverified_ticket_rejection(violation);
+        error
     }
 
     /// Checks one fragment context against this receiver before plan decode.
@@ -197,7 +186,7 @@ impl OraclePeerAuthority {
     /// # Errors
     /// Returns a closed, durably audited security error for a malformed,
     /// misaddressed, stale-fence, or expired context.
-    pub async fn verify_before_decode(
+    pub fn verify_before_decode(
         &self,
         context: &PeerContext,
         expected_worker: NodeId,
@@ -205,32 +194,26 @@ impl OraclePeerAuthority {
         now: DateTime<Utc>,
     ) -> Result<VerifiedClaimsBytes, PeerSecurityError> {
         if context.claims_bytes.is_empty() || context.claims_bytes.len() > MAX_CLAIMS_BYTES {
-            return self
-                .reject_unverified(
-                    BifrostSecurityViolationKind::PeerSignature,
-                    PeerSecurityError::Malformed,
-                )
-                .await;
+            return self.reject_unverified(
+                BifrostSecurityViolationKind::PeerSignature,
+                PeerSecurityError::Malformed,
+            );
         }
         let Ok(claims) = PeerTicketClaims::decode(context.claims_bytes.as_slice()) else {
-            return self
-                .reject_unverified(
-                    BifrostSecurityViolationKind::PeerSignature,
-                    PeerSecurityError::Malformed,
-                )
-                .await;
+            return self.reject_unverified(
+                BifrostSecurityViolationKind::PeerSignature,
+                PeerSecurityError::Malformed,
+            );
         };
         if uuid::Uuid::from_slice(&claims.tenant_id)
             .ok()
             .and_then(|tenant| DataTenantId::new(tenant).ok())
             .is_none()
         {
-            return self
-                .reject_unverified(
-                    BifrostSecurityViolationKind::PeerTenant,
-                    PeerSecurityError::Claims,
-                )
-                .await;
+            return self.reject_unverified(
+                BifrostSecurityViolationKind::PeerTenant,
+                PeerSecurityError::Claims,
+            );
         }
         let violation = if claims.audience != expected_worker.as_uuid().as_bytes() {
             Some((
@@ -251,29 +234,26 @@ impl OraclePeerAuthority {
             None
         };
         if let Some((violation, error)) = violation {
-            return self.reject_unverified(violation, error).await;
+            return self.reject_unverified(violation, error);
         }
         Ok(VerifiedClaimsBytes(context.claims_bytes.clone()))
     }
 
-    /// Commits a system-chain audit before returning a pre-binding rejection.
+    /// Stages a system-chain audit before returning a pre-binding rejection.
     ///
     /// Every fragment and forwarding refusal lands here: until the caller
     /// matches the context against its own query and reservation state, the
     /// tenant the context names is an unsigned claim, not an attribution.
     ///
     /// # Errors
-    /// Returns [`PeerSecurityError::AuditUnavailable`] when the required row cannot commit;
-    /// otherwise returns the original closed rejection.
-    async fn reject_unverified<T>(
+    /// Always returns the original closed rejection.
+    fn reject_unverified<T>(
         &self,
         violation: BifrostSecurityViolationKind,
         error: PeerSecurityError,
     ) -> Result<T, PeerSecurityError> {
         self.security_audit
-            .append_unverified_ticket_rejection(violation)
-            .await
-            .map_err(|_| PeerSecurityError::AuditUnavailable)?;
+            .stage_unverified_ticket_rejection(violation);
         Err(error)
     }
 
@@ -295,9 +275,8 @@ impl OraclePeerAuthority {
     /// # Errors
     ///
     /// Returns the audited closed rejection for a malformed, wrong-body,
-    /// misbound, or expired context, and [`PeerSecurityError::AuditUnavailable`]
-    /// when the rejection itself cannot be recorded.
-    pub async fn verify_reservation(
+    /// misbound, or expired context.
+    pub fn verify_reservation(
         &self,
         context: &PeerContext,
         binding: &ReservationBinding,
@@ -307,28 +286,22 @@ impl OraclePeerAuthority {
         if context.claims_bytes.is_empty()
             || context.claims_bytes.len() > MAX_RESERVATION_CLAIMS_BYTES
         {
-            return self
-                .reject_unverified(
-                    BifrostSecurityViolationKind::PeerSignature,
-                    PeerSecurityError::Malformed,
-                )
-                .await;
+            return self.reject_unverified(
+                BifrostSecurityViolationKind::PeerSignature,
+                PeerSecurityError::Malformed,
+            );
         }
         let body_digest = match reservation_body_digest(body) {
             Ok(digest) => digest,
             Err(error) => {
-                return self
-                    .reject_unverified(BifrostSecurityViolationKind::PeerFragment, error)
-                    .await;
+                return self.reject_unverified(BifrostSecurityViolationKind::PeerFragment, error);
             }
         };
         let Ok(claims) = ReservationTicketClaims::decode(context.claims_bytes.as_slice()) else {
-            return self
-                .reject_unverified(
-                    BifrostSecurityViolationKind::PeerSignature,
-                    PeerSecurityError::Malformed,
-                )
-                .await;
+            return self.reject_unverified(
+                BifrostSecurityViolationKind::PeerSignature,
+                PeerSecurityError::Malformed,
+            );
         };
         if let Err(error) = claims.verify_binding(binding, &body_digest) {
             let violation = match error {
@@ -337,15 +310,13 @@ impl OraclePeerAuthority {
                 PeerSecurityError::Body => BifrostSecurityViolationKind::PeerFragment,
                 _ => BifrostSecurityViolationKind::PeerStageBinding,
             };
-            return self.reject_unverified(violation, error).await;
+            return self.reject_unverified(violation, error);
         }
         if !context_expiry_valid(claims.expires_at_ms, now) {
-            return self
-                .reject_unverified(
-                    BifrostSecurityViolationKind::PeerReplay,
-                    PeerSecurityError::Expired,
-                )
-                .await;
+            return self.reject_unverified(
+                BifrostSecurityViolationKind::PeerReplay,
+                PeerSecurityError::Expired,
+            );
         }
         Ok(claims)
     }
@@ -361,7 +332,7 @@ impl OraclePeerAuthority {
     /// 4. a field-by-field match against the receiver's own [`StageBinding`];
     /// 5. the absolute query deadline and the context's own short expiry.
     ///
-    /// Every refusal commits a durable audit row before it returns, and emits
+    /// Every refusal stages an audit row before it returns, and emits
     /// closed-label stage-authority telemetry. Refusals up to and including a
     /// binding mismatch are audited on the system chain; only an expiry after
     /// the claims matched the receiver's binding is attributed to its tenant.
@@ -369,10 +340,9 @@ impl OraclePeerAuthority {
     /// # Errors
     ///
     /// Returns [`PeerSecurityError::Malformed`], `Body`, `Operation`,
-    /// `Audience`, `Fence`, `Claims`, `Expired`, or
-    /// [`PeerSecurityError::AuditUnavailable`] when the required audit row
-    /// cannot commit. A rejection never returns claims.
-    async fn authorize_stage_inner(
+    /// `Audience`, `Fence`, `Claims`, or `Expired`. A rejection never returns
+    /// claims.
+    fn authorize_stage_inner(
         &self,
         context: &PeerContext,
         binding: &StageBinding,
@@ -380,71 +350,59 @@ impl OraclePeerAuthority {
         now: DateTime<Utc>,
     ) -> Result<AuthorizedStage, PeerSecurityError> {
         if context.claims_bytes.is_empty() || context.claims_bytes.len() > MAX_STAGE_CLAIMS_BYTES {
-            return self
-                .reject_stage_unverified(
-                    binding,
-                    BifrostSecurityViolationKind::PeerSignature,
-                    PeerSecurityError::Malformed,
-                    AnalyticalStageAuthorityOutcome::Malformed,
-                )
-                .await;
+            return self.reject_stage_unverified(
+                binding,
+                BifrostSecurityViolationKind::PeerSignature,
+                PeerSecurityError::Malformed,
+                AnalyticalStageAuthorityOutcome::Malformed,
+            );
         }
         let body_digest = match stage_body_digest(body) {
             Ok(digest) => digest,
             Err(error) => {
-                return self
-                    .reject_stage_unverified(
-                        binding,
-                        BifrostSecurityViolationKind::PeerFragment,
-                        error,
-                        AnalyticalStageAuthorityOutcome::Body,
-                    )
-                    .await;
+                return self.reject_stage_unverified(
+                    binding,
+                    BifrostSecurityViolationKind::PeerFragment,
+                    error,
+                    AnalyticalStageAuthorityOutcome::Body,
+                );
             }
         };
         let Ok(claims) = StageTicketClaims::decode(context.claims_bytes.as_slice()) else {
-            return self
-                .reject_stage_unverified(
-                    binding,
-                    BifrostSecurityViolationKind::PeerSignature,
-                    PeerSecurityError::Malformed,
-                    AnalyticalStageAuthorityOutcome::Malformed,
-                )
-                .await;
+            return self.reject_stage_unverified(
+                binding,
+                BifrostSecurityViolationKind::PeerSignature,
+                PeerSecurityError::Malformed,
+                AnalyticalStageAuthorityOutcome::Malformed,
+            );
         };
         let Some(tenant_id) = uuid::Uuid::from_slice(&claims.tenant_id)
             .ok()
             .and_then(|tenant| DataTenantId::new(tenant).ok())
         else {
-            return self
-                .reject_stage_unverified(
-                    binding,
-                    BifrostSecurityViolationKind::PeerTenant,
-                    PeerSecurityError::Claims,
-                    AnalyticalStageAuthorityOutcome::Binding,
-                )
-                .await;
+            return self.reject_stage_unverified(
+                binding,
+                BifrostSecurityViolationKind::PeerTenant,
+                PeerSecurityError::Claims,
+                AnalyticalStageAuthorityOutcome::Binding,
+            );
         };
         if let Err(error) = claims.verify_binding(binding, &body_digest) {
             // The claimed tenant has not matched the receiver's binding yet, so
             // it cannot choose whose audit chain records this refusal.
             let (violation, outcome) = stage_binding_violation(&error);
-            return self
-                .reject_stage_unverified(binding, violation, error, outcome)
-                .await;
+            return self.reject_stage_unverified(binding, violation, error, outcome);
         }
         if claims.absolute_deadline_ms <= now.timestamp_millis()
             || !context_expiry_valid(claims.expires_at_ms, now)
         {
-            return self
-                .reject_stage_verified(
-                    binding,
-                    tenant_id,
-                    BifrostSecurityViolationKind::PeerStageBinding,
-                    PeerSecurityError::Expired,
-                    AnalyticalStageAuthorityOutcome::Expired,
-                )
-                .await;
+            return self.reject_stage_verified(
+                binding,
+                tenant_id,
+                BifrostSecurityViolationKind::PeerStageBinding,
+                PeerSecurityError::Expired,
+                AnalyticalStageAuthorityOutcome::Expired,
+            );
         }
         record_stage_authority(
             binding.operation.telemetry(),
@@ -453,12 +411,11 @@ impl OraclePeerAuthority {
         Ok(AuthorizedStage { claims, tenant_id })
     }
 
-    /// Audits and counts a stage rejection with no attributable tenant.
+    /// Stages and counts a stage rejection with no attributable tenant.
     ///
     /// # Errors
-    /// Returns [`PeerSecurityError::AuditUnavailable`] when the system-chain row
-    /// cannot commit; otherwise returns the original closed rejection.
-    async fn reject_stage_unverified(
+    /// Always returns the original closed rejection.
+    fn reject_stage_unverified(
         &self,
         binding: &StageBinding,
         violation: BifrostSecurityViolationKind,
@@ -467,18 +424,15 @@ impl OraclePeerAuthority {
     ) -> Result<AuthorizedStage, PeerSecurityError> {
         record_stage_authority(binding.operation.telemetry(), outcome);
         self.security_audit
-            .append_unverified_ticket_rejection(violation)
-            .await
-            .map_err(|_| PeerSecurityError::AuditUnavailable)?;
+            .stage_unverified_ticket_rejection(violation);
         Err(error)
     }
 
-    /// Audits and counts a stage rejection against the context tenant chain.
+    /// Stages and counts a stage rejection against the context tenant chain.
     ///
     /// # Errors
-    /// Returns [`PeerSecurityError::AuditUnavailable`] when the tenant-scoped row
-    /// cannot commit; otherwise returns the original closed rejection.
-    async fn reject_stage_verified(
+    /// Always returns the original closed rejection.
+    fn reject_stage_verified(
         &self,
         binding: &StageBinding,
         tenant_id: DataTenantId,
@@ -488,9 +442,7 @@ impl OraclePeerAuthority {
     ) -> Result<AuthorizedStage, PeerSecurityError> {
         record_stage_authority(binding.operation.telemetry(), outcome);
         self.security_audit
-            .append_verified_ticket_violation(tenant_id, violation)
-            .await
-            .map_err(|_| PeerSecurityError::AuditUnavailable)?;
+            .stage_verified_ticket_violation(tenant_id, violation);
         Err(error)
     }
 }
@@ -501,8 +453,7 @@ impl OracleStageAuthority for OraclePeerAuthority {
     ///
     /// # Errors
     ///
-    /// Returns the closed failure for the first check that did not pass, or an
-    /// audit-unavailable refusal when the required durable row cannot commit.
+    /// Returns the closed failure for the first check that did not pass.
     async fn authorize_stage(
         &self,
         context: &PeerContext,
@@ -511,7 +462,6 @@ impl OracleStageAuthority for OraclePeerAuthority {
         now: DateTime<Utc>,
     ) -> Result<AuthorizedStage, PeerSecurityError> {
         self.authorize_stage_inner(context, binding, body, now)
-            .await
     }
 }
 
@@ -529,7 +479,6 @@ impl PeerTicketVerifier for OraclePeerAuthority {
         now: DateTime<Utc>,
     ) -> Result<VerifiedClaimsBytes, PeerSecurityError> {
         self.verify_before_decode(context, expected_worker, expected_worker_fence, now)
-            .await
     }
 }
 
@@ -570,7 +519,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use vala_bifrost_redux::oracle::peer::{
-        PeerSecurityAudit, PeerSecurityAuditError, ReservationOperationV1, StageOperationV1,
+        PeerSecurityAudit, ReservationOperationV1, StageOperationV1,
     };
 
     /// One captured audit call, where `None` denotes the system chain.
@@ -583,66 +532,25 @@ mod tests {
         calls: Mutex<Vec<AuditCall>>,
     }
 
-    /// Refuses every append to prove security rejection remains fail-closed.
-    struct FailingPeerAudit;
-
-    #[async_trait::async_trait]
-    impl PeerSecurityAudit for FailingPeerAudit {
-        /// Refuses the system-chain append.
-        ///
-        /// # Errors
-        /// Always returns [`PeerSecurityAuditError`] to exercise fail-closed behavior.
-        async fn append_unverified_ticket_rejection(
-            &self,
-            _violation: BifrostSecurityViolationKind,
-        ) -> Result<(), PeerSecurityAuditError> {
-            Err(PeerSecurityAuditError)
-        }
-
-        /// Refuses the tenant-chain append.
-        ///
-        /// # Errors
-        /// Always returns [`PeerSecurityAuditError`] to exercise fail-closed behavior.
-        async fn append_verified_ticket_violation(
-            &self,
-            _tenant_id: DataTenantId,
-            _violation: BifrostSecurityViolationKind,
-        ) -> Result<(), PeerSecurityAuditError> {
-            Err(PeerSecurityAuditError)
-        }
-    }
-
-    #[async_trait::async_trait]
     impl PeerSecurityAudit for RecordingPeerAudit {
         /// Captures an unattributable rejection as a system-chain call.
-        ///
-        /// # Errors
-        /// This recorder never fails.
-        async fn append_unverified_ticket_rejection(
-            &self,
-            violation: BifrostSecurityViolationKind,
-        ) -> Result<(), PeerSecurityAuditError> {
+        fn stage_unverified_ticket_rejection(&self, violation: BifrostSecurityViolationKind) {
             self.calls
                 .lock()
                 .expect("audit mutex")
                 .push((None, violation));
-            Ok(())
         }
 
         /// Captures a rejection with its context tenant.
-        ///
-        /// # Errors
-        /// This recorder never fails.
-        async fn append_verified_ticket_violation(
+        fn stage_verified_ticket_violation(
             &self,
             tenant_id: DataTenantId,
             violation: BifrostSecurityViolationKind,
-        ) -> Result<(), PeerSecurityAuditError> {
+        ) {
             self.calls
                 .lock()
                 .expect("audit mutex")
                 .push((Some(tenant_id), violation));
-            Ok(())
         }
     }
 
@@ -689,12 +597,10 @@ mod tests {
 
         authority
             .verify_reservation(&context, &binding, body, Utc::now())
-            .await
             .expect("a correct reservation context is authorized");
         assert_eq!(
             authority
                 .verify_reservation(&context, &binding, b"substituted-request", Utc::now())
-                .await
                 .expect_err("a substituted body is refused"),
             PeerSecurityError::Body
         );
@@ -715,7 +621,6 @@ mod tests {
                     body,
                     Utc::now()
                 )
-                .await
                 .expect_err("a context for another operation does not authorize a reserve"),
             PeerSecurityError::Operation
         );
@@ -726,7 +631,6 @@ mod tests {
         assert_eq!(
             authority
                 .verify_reservation(&context, &stale, body, Utc::now())
-                .await
                 .expect_err("a restarted follower refuses the old fence"),
             PeerSecurityError::Fence
         );
@@ -1060,69 +964,56 @@ mod tests {
             .expect("context");
 
         assert_eq!(
-            authority
-                .verify_before_decode(
-                    &PeerContext {
-                        claims_bytes: vec![0xff]
-                    },
-                    worker,
-                    7,
-                    now
-                )
-                .await,
+            authority.verify_before_decode(
+                &PeerContext {
+                    claims_bytes: vec![0xff]
+                },
+                worker,
+                7,
+                now
+            ),
             Err(PeerSecurityError::Malformed)
         );
         assert_eq!(
-            authority
-                .verify_before_decode(
-                    &PeerContext {
-                        claims_bytes: vec![0; MAX_CLAIMS_BYTES + 1]
-                    },
-                    worker,
-                    7,
-                    now
-                )
-                .await,
+            authority.verify_before_decode(
+                &PeerContext {
+                    claims_bytes: vec![0; MAX_CLAIMS_BYTES + 1]
+                },
+                worker,
+                7,
+                now
+            ),
             Err(PeerSecurityError::Malformed)
         );
         assert_eq!(
-            authority
-                .verify_before_decode(&context, NodeId::new(uuid::Uuid::from_u128(9)), 7, now)
-                .await,
+            authority.verify_before_decode(&context, NodeId::new(uuid::Uuid::from_u128(9)), 7, now),
             Err(PeerSecurityError::Audience)
         );
         assert_eq!(
-            authority
-                .verify_before_decode(&context, worker, 8, now)
-                .await,
+            authority.verify_before_decode(&context, worker, 8, now),
             Err(PeerSecurityError::Fence)
         );
         let expired = claims(worker, 7, tenant_id, now - chrono::Duration::seconds(20))
             .to_context()
             .expect("expired context");
         assert_eq!(
-            authority
-                .verify_before_decode(&expired, worker, 7, now)
-                .await,
+            authority.verify_before_decode(&expired, worker, 7, now),
             Err(PeerSecurityError::Expired)
         );
         let mut distant = claims(worker, 7, tenant_id, now);
         distant.expires_at_ms = (now + chrono::Duration::minutes(5)).timestamp_millis();
         assert_eq!(
-            authority
-                .verify_before_decode(
-                    &distant.to_context().expect("distant context"),
-                    worker,
-                    7,
-                    now
-                )
-                .await,
+            authority.verify_before_decode(
+                &distant.to_context().expect("distant context"),
+                worker,
+                7,
+                now
+            ),
             Err(PeerSecurityError::Expired),
             "a context outliving the bounded window is refused"
         );
         authority
             .verify_before_decode(&context, worker, 7, now)
-            .await
             .expect("a correctly addressed context is accepted");
         assert_eq!(
             *audit.calls.lock().expect("audit mutex"),
@@ -1134,25 +1025,6 @@ mod tests {
                 (None, BifrostSecurityViolationKind::PeerReplay),
                 (None, BifrostSecurityViolationKind::PeerReplay),
             ]
-        );
-    }
-
-    /// A security audit outage masks rejection details and never permits the context.
-    #[tokio::test]
-    async fn oracle_peer_authority_fails_closed_when_security_audit_is_unavailable() {
-        let authority = OraclePeerAuthority::new(Arc::new(FailingPeerAudit));
-        let worker = NodeId::new(uuid::Uuid::from_u128(1));
-        let tenant_id = DataTenantId::new_v7();
-        let now = Utc::now();
-        let context = claims(worker, 7, tenant_id, now)
-            .to_context()
-            .expect("context");
-
-        assert_eq!(
-            authority
-                .verify_before_decode(&context, worker, 8, now)
-                .await,
-            Err(PeerSecurityError::AuditUnavailable)
         );
     }
 
@@ -1211,7 +1083,6 @@ mod tests {
 
         let verified = authority
             .verify_forward_query(&claims.to_context().expect("context"), worker, 11, now)
-            .await
             .expect("a correct forwarding envelope is authorized");
         assert_eq!(verified.context.data_tenant_id, tenant);
         assert_eq!(verified.context.request_id, claims.context.request_id);
@@ -1246,7 +1117,6 @@ mod tests {
             assert_eq!(
                 authority
                     .verify_forward_query(&refused.to_context().expect("context"), worker, 11, now)
-                    .await
                     .expect_err("a misaddressed or expired envelope is refused"),
                 expected
             );
@@ -1261,7 +1131,6 @@ mod tests {
                     11,
                     now
                 )
-                .await
                 .expect_err("an undecodable envelope is refused"),
             PeerSecurityError::Malformed
         );

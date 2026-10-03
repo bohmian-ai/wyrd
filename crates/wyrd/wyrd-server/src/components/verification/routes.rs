@@ -59,8 +59,6 @@ pub fn verification_router() -> OpenApiRouter<AppState> {
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such binding in the caller's tenant \
           (WYRD_VERIFICATION_404_BINDING_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
           configured for the access token (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
@@ -110,8 +108,6 @@ async fn get_binding(
           Idempotency-Key was used for a different request \
           (WYRD_VERIFICATION_409_VERIFIER_NOT_READY, WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT)",
          body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
           configured for the access token (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
@@ -164,8 +160,6 @@ async fn start_run(
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such run in the caller's tenant \
           (WYRD_VERIFICATION_404_RUN_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
           configured for the access token (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)

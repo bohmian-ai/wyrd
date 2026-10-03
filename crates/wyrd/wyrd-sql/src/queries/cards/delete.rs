@@ -38,8 +38,8 @@ pub struct CardDeleteState {
 
 /// Soft-delete a card: set `status = 'deleted'`.
 ///
-/// Idempotent on already-deleted cards. The caller records the authorization
-/// audit through the server's outbox write in the same transaction.
+/// Idempotent on already-deleted cards. The caller stages the authorization
+/// decision on the server's audit outbox, outside this transaction.
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_404_CARD_NOT_FOUND` when the uid is not present.

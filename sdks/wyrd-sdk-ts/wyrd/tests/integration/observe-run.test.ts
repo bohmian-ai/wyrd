@@ -147,30 +147,6 @@ function hex(value: unknown): string | null {
   return value == null ? null : Buffer.from(value as Uint8Array).toString("hex");
 }
 
-/**
- * Refuse startup once per fixed table whose describe the server fails.
- *
- * Drift fails first; Eval fails after Drift already described. Each refusal
- * carries the server's stable code and leaves the state startable.
- */
-async function assertFixedTablePreflightRefusals(
-  server: NativeWyrdTestServer,
-  state: WyrdState,
-  credential: string,
-): Promise<void> {
-  for (const table of FIXED_TABLES) {
-    server.failTableDescribe(table);
-    try {
-      const refused = await rejection(
-        state.startBifrost({ serverUrl: server.baseUrl, credential, grpcUrl: server.grpcUrl }),
-      );
-      expect(refused.code, table).toBe("WYRD_VALA_500_AUDIT_UNAVAILABLE");
-    } finally {
-      server.restoreTableDescribe();
-    }
-  }
-}
-
 describe("scoped observation journey", () => {
   it("emits Drift, Eval, and generic rows correlated to their subject Cards", async () => {
     const root = mkdtempSync(join(tmpdir(), "wyrd-ts-observe-"));
@@ -212,7 +188,6 @@ describe("scoped observation journey", () => {
       );
 
       const state = WyrdState.fromPath(bundle);
-      await assertFixedTablePreflightRefusals(server, state, credential);
       await state.startBifrost({
         serverUrl: server.baseUrl,
         credential,

@@ -10,13 +10,11 @@ use iceberg::spec::{FormatVersion, TableMetadata, TableProperties, Transform};
 use iceberg::{Catalog as _, Error as IcebergError, TableCreation};
 use iceberg_catalog_sql::SqlCatalog;
 use sha2::{Digest as _, Sha256};
+use vala_sql::ValaPostgres;
 use vala_sql::queries::file_list::HotFileCatalog;
-use vala_sql::{TenantConn, ValaPostgres};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::WYRD_EVENT_TIME;
-use wyrd_spec::vala::api::{
-    AuditEvent, BifrostTableDescription, BifrostTableEntry, PhysicalLayoutWire,
-};
+use wyrd_spec::vala::api::{BifrostTableDescription, BifrostTableEntry, PhysicalLayoutWire};
 
 use crate::catalog::error::BifrostCatalogError;
 use crate::catalog::event_time::{EventTimeBoundsDefect, EventTimeStatistics};
@@ -92,8 +90,6 @@ pub struct CreateTableRequest {
     /// default layout. `Some` is canonicalized and validated against the
     /// complete physical schema before any durable mutation.
     pub physical_layout: Option<PhysicalLayoutWire>,
-    /// Optional audit event committed with the tenant-scoped control row.
-    pub audit: Option<AuditEvent>,
 }
 
 /// Immutable metadata cut for one tenant-qualified sealed table.
@@ -958,7 +954,7 @@ impl BifrostCatalog {
     ///
     /// # Errors
     /// Returns a typed catalog error for invalid fields/bindings, metadata drift,
-    /// Iceberg failures, SQL failures, or audit failures.
+    /// Iceberg failures, or SQL failures.
     pub async fn create_table(
         &self,
         request: CreateTableRequest,
@@ -990,7 +986,7 @@ impl BifrostCatalog {
     ///
     /// # Errors
     /// Returns a typed catalog error when the dataset name, schema, physical table,
-    /// compaction target, control row, or audit event is invalid.
+    /// compaction target, or control row is invalid.
     pub async fn register_dataset(
         &self,
         tenant: DataTenantId,
@@ -998,7 +994,6 @@ impl BifrostCatalog {
         user_fields: Vec<Field>,
         physical_layout: Option<PhysicalLayoutWire>,
         compaction_target_file_size_bytes: Option<u64>,
-        audit: Option<AuditEvent>,
     ) -> Result<TableUid, BifrostCatalogError> {
         if table.namespace != BifrostNamespace::Datasets {
             return Err(BifrostCatalogError::MetadataMismatch(
@@ -1011,7 +1006,6 @@ impl BifrostCatalog {
                 user_fields,
                 tenant,
                 physical_layout,
-                audit,
             },
             None,
             compaction_target_file_size_bytes,
@@ -1041,7 +1035,6 @@ impl BifrostCatalog {
                 user_fields: (definition.arrow_fields)(),
                 tenant,
                 physical_layout: Some((definition.physical_layout)()),
-                audit: None,
             },
             Some((definition.schema)()),
             None,
@@ -1131,9 +1124,6 @@ impl BifrostCatalog {
             let physical = self.catalog.load_table(&table_ident).await?;
             self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
             assert_compaction_target(physical.metadata(), compaction_target_file_size_bytes, &fqn)?;
-            // A concurrent winner already created the row; this request's
-            // verdict still commits once, in the transaction that observed it.
-            append_registration_audit(&mut conn, request.audit.as_ref(), &fqn).await?;
             conn.commit().await?;
             return TableUid::from_row(&row.table_uid, &row.fqn);
         }
@@ -1162,7 +1152,6 @@ impl BifrostCatalog {
             &layout_json,
         )
         .await?;
-        append_registration_audit(&mut conn, request.audit.as_ref(), &fqn).await?;
         conn.commit().await?;
         Ok(table_uid)
     }
@@ -1705,32 +1694,6 @@ fn resolve_registration_layout(
     Ok((arrow_schema, layout))
 }
 
-/// Appends a caller registration's authorization verdict on its catalog transaction.
-///
-/// Both registration exits that commit — a fresh create and a concurrent
-/// winner's matching row — call this immediately before commit, so the verdict
-/// and the observed catalog state commit or roll back together. Built-in
-/// registrations carry no event and append nothing.
-///
-/// # Errors
-/// Returns [`BifrostCatalogError::AuditUnavailable`] when the staging append fails.
-async fn append_registration_audit(
-    conn: &mut TenantConn<'_>,
-    audit: Option<&AuditEvent>,
-    fqn: &str,
-) -> Result<(), BifrostCatalogError> {
-    let Some(event) = audit else {
-        return Ok(());
-    };
-    vala_sql::queries::audit_staging::append_audit(conn, event)
-        .await
-        .map(|_| ())
-        .map_err(|error| {
-            tracing::error!(error = %error, table = %fqn, "Redux catalog audit append failed");
-            BifrostCatalogError::AuditUnavailable("audit outbox append failed".to_owned())
-        })
-}
-
 async fn acquire_table_advisory_lock(
     conn: &mut wyrd_sql::TenantConn<'_>,
     tenant: DataTenantId,
@@ -2246,7 +2209,6 @@ mod production_pin_tests {
                     )],
                     None,
                     None,
-                    None,
                 )
                 .await
                 .expect("dataset registers");
@@ -2320,7 +2282,6 @@ mod production_pin_tests {
                         arrow::datatypes::DataType::Int64,
                         true,
                     )],
-                    None,
                     None,
                     None,
                 )
@@ -2446,7 +2407,6 @@ mod production_pin_tests {
                     )],
                     None,
                     None,
-                    None,
                 )
                 .await
                 .expect("dataset registers");
@@ -2568,7 +2528,6 @@ mod production_pin_tests {
                         arrow::datatypes::DataType::Int64,
                         true,
                     )],
-                    None,
                     None,
                     None,
                 )

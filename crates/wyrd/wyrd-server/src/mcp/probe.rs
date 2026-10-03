@@ -217,9 +217,7 @@ pub async fn invoke(
         None => ProbeArguments::default(),
     };
 
-    QueryAuthority::new(state, &caller, OPERATION, RESOURCE)
-        .authorize()
-        .await?;
+    QueryAuthority::new(state, &caller, OPERATION, RESOURCE).authorize()?;
 
     // Held for the whole invocation, including cancellation cleanup and result
     // construction, so process shutdown cannot report a clean drain while this

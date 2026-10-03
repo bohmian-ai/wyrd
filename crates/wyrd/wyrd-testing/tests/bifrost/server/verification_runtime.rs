@@ -681,7 +681,7 @@ impl<'a> ResultLayoutJourney<'a> {
         let issuer = server
             .state()
             .auth
-            .tenant_issuer()
+            .tenant_issuer(&server.state().audit_outbox)
             .ok_or("the server has no tenant issuer")?;
         let mut conn = server.state().postgres.wyrd().tenant_conn(tenant).await?;
         let token = issuer.issue_system_token(&mut conn, &verifier).await?;

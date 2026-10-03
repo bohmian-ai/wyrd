@@ -44,7 +44,8 @@ pub async fn callback(
 /// Returns [`WyrdErrorResponse`] when the callback tenant cannot be resolved
 /// from the request, or when the grant itself is refused — unknown, consumed,
 /// or expired login state, a refused code or unverifiable id token, an
-/// inactive user, or a failed role, issuance, or audit write.
+/// inactive user, or a failed role or issuance write. An audit write never
+/// fails the grant.
 pub async fn exchange_authorization_code(
     state: &AppState,
     headers: &HeaderMap,
@@ -54,7 +55,10 @@ pub async fn exchange_authorization_code(
 ) -> Result<TokenResponse, WyrdErrorResponse> {
     let tenant_id = resolve_callback_tenant(state, headers).await?;
     let service = wyrd_auth::callback::AuthorizationCodeExchange {
-        issuer: state.auth.tenant_issuer().ok_or_else(auth_not_configured)?,
+        issuer: state
+            .auth
+            .tenant_issuer(&state.audit_outbox)
+            .ok_or_else(auth_not_configured)?,
         verifier: state
             .auth
             .external_verifier
@@ -120,6 +124,7 @@ mod pg_tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use secrecy::SecretString;
+    use serde_json::Value;
     use uuid::Uuid;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -267,7 +272,7 @@ mod pg_tests {
         .expect_err("missing state fails");
 
         assert_eq!(error.0.code(), "WYRD_AUTH_400_INVALID_STATE");
-        let audit = audit_rows(&fixture).await;
+        let audit = audit_rows(&fixture, &state).await;
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].0, Uuid::nil());
         assert_eq!(audit[0].1, "denied");
@@ -308,7 +313,7 @@ mod pg_tests {
         .expect_err("stored issuer rejects");
 
         assert_eq!(error.0.code(), "WYRD_AUTH_401_INVALID_TOKEN");
-        let audit = audit_rows(&fixture).await;
+        let audit = audit_rows(&fixture, &state).await;
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].0, Uuid::nil());
         assert_eq!(audit[0].1, "denied");
@@ -362,7 +367,7 @@ mod pg_tests {
         );
         assert_ne!(audit_principal_id, Uuid::nil());
         assert_eq!(refresh_token_count(&fixture, audit_principal_id).await, 1);
-        let audit = audit_rows(&fixture).await;
+        let audit = audit_rows(&fixture, &state).await;
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].0, audit_principal_id);
         assert_eq!(audit[0].1, "allowed");
@@ -409,7 +414,7 @@ mod pg_tests {
         .expect_err("wrong audience rejects");
 
         assert_eq!(error.0.code(), "WYRD_AUTH_401_INVALID_TOKEN");
-        let audit = audit_rows(&fixture).await;
+        let audit = audit_rows(&fixture, &state).await;
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].0, Uuid::nil());
         assert_eq!(audit[0].1, "denied");
@@ -558,13 +563,12 @@ mod pg_tests {
             .map_err(WyrdErrorResponse::from);
         if let Err(error) = &result {
             audit_authorization_code_failure(
-                state.postgres.wyrd(),
+                &state.audit_outbox,
                 tenant_id,
                 audit_principal_id,
                 request_id,
                 &error.0,
-            )
-            .await;
+            );
         }
         result
     }
@@ -594,7 +598,7 @@ mod pg_tests {
         AuthorizationCodeExchange {
             issuer: state
                 .auth
-                .tenant_issuer()
+                .tenant_issuer(&state.audit_outbox)
                 .expect("test state has issuing key"),
             verifier: state
                 .auth
@@ -616,7 +620,7 @@ mod pg_tests {
             .expect("wiremock URI is valid")
     }
 
-    fn ed_jwks_json(kid: &str) -> serde_json::Value {
+    fn ed_jwks_json(kid: &str) -> Value {
         serde_json::json!({
             "keys": [{
                 "kty": "OKP",
@@ -627,12 +631,7 @@ mod pg_tests {
         })
     }
 
-    fn external_claims(
-        audience: &str,
-        nonce: &str,
-        email: Option<&str>,
-        groups: &[&str],
-    ) -> serde_json::Value {
+    fn external_claims(audience: &str, nonce: &str, email: Option<&str>, groups: &[&str]) -> Value {
         let now = Utc::now();
         let mut claims = serde_json::json!({
             "sub": "ext-user@idp.example.com",
@@ -649,7 +648,7 @@ mod pg_tests {
         claims
     }
 
-    fn encode_external_token(claims: &serde_json::Value) -> String {
+    fn encode_external_token(claims: &Value) -> String {
         let mut header = Header::new(Algorithm::EdDSA);
         header.kid = Some(EXTERNAL_KID.to_owned());
         let key = EncodingKey::from_ed_pem(PRIVATE_KEY_PEM.as_bytes())
@@ -748,11 +747,18 @@ mod pg_tests {
     }
 
     /// Staged `auth.token.exchange` events as `(principal_id, outcome, detail)`,
-    /// oldest first.
+    /// oldest first, read after `state`'s audit outbox settles.
     ///
     /// # Panics
-    /// Panics when the query fails or a detail is not JSON.
-    async fn audit_rows(fixture: &PgFixture) -> Vec<(Uuid, String, serde_json::Value)> {
+    /// Panics when the outbox does not settle, the query fails, or a detail is
+    /// not JSON.
+    async fn audit_rows(fixture: &PgFixture, state: &AppState) -> Vec<(Uuid, String, Value)> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert_eq!(
+            state.audit_outbox.settle(deadline).await,
+            0,
+            "audit settles"
+        );
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
             "SELECT principal_id, outcome, detail
@@ -772,7 +778,7 @@ mod pg_tests {
     }
 
     /// Canonical detail of a refused exchange with `error_code`.
-    fn auth_failure_detail(error_code: &str) -> serde_json::Value {
+    fn auth_failure_detail(error_code: &str) -> Value {
         serde_json::json!({ "kind": "auth_failure", "error_code": error_code })
     }
 

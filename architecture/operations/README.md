@@ -22,7 +22,7 @@ Readiness therefore requires:
 - required schema versions and database-role separation;
 - reachable authoritative Postgres and object storage;
 - loaded authentication, signing, and peer keys;
-- active audit path, including the Oracle local acceptance WAL and relay;
+- active audit path: the one process audit outbox and its writer;
 - healthy staging publication into retained `vala.system.audit_log`, including
   bounded retry and retirement state;
 - initialized resource governors and writable role-owned durable volumes;
@@ -47,7 +47,7 @@ for it.
 | Common | Typed configuration, release-manifest compatibility, required Postgres role/pool, applied migration set, schema/RLS/sentinel verification, telemetry and secret-provider health |
 | Public serving | Gateway/listener transport, token verifier and JWKS state, permission resolver, policy decision point, canonical audit writer, route contracts and request governors |
 | Scribe | Object storage, stable node identity, WAL/staged persistent volume, resource governors, recovery reconciliation, live-tail peer identity and listener |
-| Oracle | Object storage and catalog, query memory/scratch governors, persistent audit-acceptance WAL, bounded relay health, peer trust and analytical capacity |
+| Oracle | Object storage and catalog, query memory/scratch governors, peer trust and analytical capacity |
 | Forge coordinator | Object storage and Iceberg catalog, `OperatorPool`, durable demand/task/lease state, scheduler resources, reconciliation and cleanup cursors |
 | Forge worker | Object storage and Iceberg catalog, authenticated assignment/peer trust, `OperatorPool`, task/lease/fence state, pod-local estimated-memory/parallelism admission, cancellation and reconciliation health |
 

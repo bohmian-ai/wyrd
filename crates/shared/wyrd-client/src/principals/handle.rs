@@ -130,9 +130,8 @@ impl Principals {
     /// rotated.
     ///
     /// # Errors
-    /// Returns a Wyrd error when the caller lacks principal administration, the
-    /// principal is unknown in this tenant, or the revocation decision cannot be
-    /// audited.
+    /// Returns a Wyrd error when the caller lacks principal administration or
+    /// the principal is unknown in this tenant.
     pub async fn revoke_principal(
         &self,
         principal_id: &PrincipalId,

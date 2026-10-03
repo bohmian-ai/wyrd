@@ -775,7 +775,6 @@ async fn seed_fixture_table(
             ],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await?;
     let (fingerprint, _) = catalog.table_registration(&table_ref, tenant).await?;

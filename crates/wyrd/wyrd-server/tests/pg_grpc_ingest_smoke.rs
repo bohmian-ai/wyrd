@@ -192,7 +192,6 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
             vec![Field::new("value", DataType::Int64, false)],
             None,
             None,
-            None,
         )
         .await
         .expect("tail fixture dataset registers for the authenticated tenant");
@@ -592,7 +591,6 @@ async fn embedded_ingest_resolves_catalog_and_durably_acknowledges_arrow() {
             vec![Field::new("value", DataType::Int64, false)],
             None,
             None,
-            None,
         )
         .await
         .expect("logical dataset registers for the authenticated tenant");
@@ -929,7 +927,7 @@ impl SystemWriterHarness {
         .expect("verifier card ref parses");
         let system_jwt = state
             .auth
-            .tenant_issuer()
+            .tenant_issuer(&state.audit_outbox)
             .expect("test state has a tenant issuer")
             .issue_system_token(&mut conn, &verifier)
             .await
@@ -945,6 +943,10 @@ impl SystemWriterHarness {
             .superuser_pool()
             .await
             .expect("fixture exposes a migrator assertion pool");
+        server
+            .wait_oracle_audit_staged(Duration::from_secs(30))
+            .await
+            .expect("audit outbox settles");
         let seq_before: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_staging WHERE data_tenant_id = $1",
         )
@@ -998,6 +1000,10 @@ impl SystemWriterHarness {
     /// Panics when audit staging cannot be read or a decision names a
     /// permission other than `bifrost:record:write`.
     async fn write_decisions(&self) -> Vec<(bool, String, String, String)> {
+        self.server
+            .wait_oracle_audit_staged(Duration::from_secs(30))
+            .await
+            .expect("audit outbox settles");
         let decisions: Vec<(uuid::Uuid, String, String, String, String)> = sqlx::query_as(
             "SELECT principal_id, principal_kind, resource, permission, outcome \
              FROM vala.audit_staging \
@@ -1252,7 +1258,10 @@ async fn system_result_writes_require_the_exact_signed_verifier_scope() {
 async fn system_drift_reader_reads_only_the_observation_table() {
     let harness = SystemWriterHarness::start("system-drift-reader").await;
     let state = harness.server.state();
-    let issuer = state.auth.tenant_issuer().expect("tenant issuer");
+    let issuer = state
+        .auth
+        .tenant_issuer(&state.audit_outbox)
+        .expect("tenant issuer");
     let mint = || async {
         let mut conn = wyrd_sql::TenantConn::acquire(state.postgres.app_pool(), harness.tenant)
             .await

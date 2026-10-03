@@ -130,18 +130,16 @@ Locked cross-cutting decisions that any contributor must honor:
   are blocking; audits are non-blocking. Every permission check completes
   before the operation proceeds or refuses, and its decision is staged on the
   non-blocking audit outbox without the request waiting for the commit; a
-  failed commit is logged and counted and never fails the operation. Oracle
-  reads, tenant tripwires, gateway invocations, and direct verification
-  execution follow this rule today; surfaces not yet converted still append
-  in the deciding transaction until they move to the outbox. Engine-internal
-  transitions —
+  failed commit is logged and counted and never fails the operation. Every
+  audited surface follows this rule; no error exists to report an audit
+  write failure. Engine-internal transitions —
   Scribe batch commits, Forge maintenance — evaluate no permission and are
   recorded as lineage in their own operational tables, never as audit.
 - There is one audit write path and one publisher. Every audit event is
   committed to `vala.audit_staging` through the canonical append, and only the
   `AuditPublisher` moves staged rows into `vala.system.audit_log` via Scribe.
-  Non-blocking decisions use that same path from tracked, non-blocking server
-  work; no other audit table, WAL, relay, or log sink exists.
+  The process audit outbox is the only caller of that append; no other audit
+  table, WAL, relay, or log sink exists.
 - Bifrost clients use `wyrd_client::Bifrost` over the crate's shared HTTP and
   gRPC transport. Rust, Python, and TypeScript project that same facade. Gate, Scribe,
   Oracle, and Forge remain server owners and never become client types.
@@ -404,7 +402,7 @@ missing higher one.
 3. **Unit tests — supporting.** A single function or type in isolation, IO-free,
    credential-free, in the fast lane. Use them for pure logic, error/`WyrdError`
    mapping, and negative branches that are cleaner to force in-process than
-   end-to-end (e.g. an injected audit-append failure → fail-closed refusal).
+   end-to-end (e.g. an injected audit commit failure → counted, never refused).
 
 Rule: every new user/agent-facing capability ships a user-journey test. Pushing
 a user-observable behavior — especially a negative flow — down to a unit test

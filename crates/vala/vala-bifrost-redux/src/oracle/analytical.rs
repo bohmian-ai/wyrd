@@ -73,7 +73,7 @@ use super::dispatcher::{
     BifrostPeerTls, GraphLeaseRequest, PendingGraphActivation, ReservationRegistry,
 };
 use super::participant_cut::OracleQueryAttemptCut;
-use super::peer::{AuthorizedStage, OracleStageAuthority, PeerSecurityError, StageOperationV1};
+use super::peer::{AuthorizedStage, OracleStageAuthority, StageOperationV1};
 use super::telemetry::{
     AnalyticalAttemptOutcome, AnalyticalStageOperation, record_stage_operation,
 };
@@ -1660,8 +1660,7 @@ impl AnalyticalStageIngress {
     /// # Errors
     ///
     /// Returns [`BifrostError::QueryPeerSecurity`] for every authorization,
-    /// identity, or binding failure, [`BifrostError::QueryAuditUnavailable`]
-    /// when the required refusal audit could not commit,
+    /// identity, or binding failure,
     /// [`BifrostError::QueryAdmissionRejected`] when this follower cannot admit
     /// the graph's envelope, and [`BifrostError::QueryExecutionFailed`] when the
     /// named graph is already draining.
@@ -1698,10 +1697,7 @@ impl AnalyticalStageIngress {
                     error = %error,
                     "Oracle analytical stage authority refused a stage message"
                 );
-                match error {
-                    PeerSecurityError::AuditUnavailable => BifrostError::QueryAuditUnavailable,
-                    _ => BifrostError::QueryPeerSecurity,
-                }
+                BifrostError::QueryPeerSecurity
             })?;
         let key = attempt_key(&authorized)?;
         let request = graph_lease_request(&authorized, key.graph())?;
@@ -3256,7 +3252,13 @@ mod tests {
     use wyrd_spec::DataTenantId;
 
     use super::*;
+    use wyrd_spec::vala::api::PeerContext;
     use wyrd_spec::vala::api::QueryClass;
+
+    use super::super::peer::{
+        PeerSecurityError, StageBinding, StageTicketClaims, stage_body_digest,
+    };
+    use prost::Message as _;
 
     /// Counts batches only as the *caller* drives the returned stream.
     ///
@@ -3720,16 +3722,14 @@ mod tests {
         /// Returns the production refusal for any bound-field mismatch.
         async fn authorize_stage(
             &self,
-            context: &wyrd_spec::vala::api::PeerContext,
-            binding: &super::super::peer::StageBinding,
+            context: &PeerContext,
+            binding: &StageBinding,
             body: &[u8],
             _now: DateTime<Utc>,
         ) -> Result<AuthorizedStage, PeerSecurityError> {
-            let claims = <super::super::peer::StageTicketClaims as prost::Message>::decode(
-                context.claims_bytes.as_slice(),
-            )
-            .map_err(|_| PeerSecurityError::Claims)?;
-            let digest = super::super::peer::stage_body_digest(body)?;
+            let claims = StageTicketClaims::decode(context.claims_bytes.as_slice())
+                .map_err(|_| PeerSecurityError::Claims)?;
+            let digest = stage_body_digest(body)?;
             claims.verify_binding(binding, &digest)?;
             Ok(AuthorizedStage {
                 claims,

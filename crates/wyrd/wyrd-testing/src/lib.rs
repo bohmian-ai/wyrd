@@ -15,7 +15,7 @@ pub mod verification;
 pub use oidc_fixture::{DiscoveryFixture, KeycloakAdmin, LoginResult, OidcIssuerFixture};
 pub use principal::Bootstrap;
 pub use server::{
-    OracleRuntimeInspection, WyrdTestServer, WyrdTestServerBuilder, WyrdTestServerError,
-    server_postgres_from_fixture,
+    AuditCommitFailures, OracleRuntimeInspection, WyrdTestServer, WyrdTestServerBuilder,
+    WyrdTestServerError, server_postgres_from_fixture,
 };
 pub use time::ClockHandle;

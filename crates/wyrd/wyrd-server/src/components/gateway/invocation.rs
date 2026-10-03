@@ -389,8 +389,8 @@ impl<'a> GatewayInvocation<'a> {
     /// Latency: on the request path, with sequential Postgres round trips:
     /// the tenant snapshot load and the reservation commit in
     /// [`Self::admit`]. Every invoke-decision audit, here and per fallback
-    /// model in [`Self::route`], is staged on `gateway_tasks` and is not a
-    /// request-path round trip.
+    /// model in [`Self::route`], is staged on the process audit outbox and is
+    /// not a request-path round trip.
     ///
     /// # Errors
     /// Returns `ServiceUnavailable` while the server drains,
@@ -612,12 +612,11 @@ impl<'a> GatewayInvocation<'a> {
     ///
     /// Returns the verdict; the caller decides whether a denial refuses the
     /// call (requested model), only skips a candidate (fallback), or hides the
-    /// model from a listing. The decision row is appended by a task spawned on
-    /// [`AppState::gateway_tasks`] rather than awaited here, so no invocation
-    /// waits on Postgres to record its own decision and shutdown still drains
-    /// the append. A staged append that fails is logged and counted under
-    /// `gateway_audit_commit_failures_total`; that decision keeps no row, and
-    /// an abrupt process loss may drop appends that had not yet committed.
+    /// model from a listing. The decision row is staged on the process audit
+    /// outbox, so no invocation waits on Postgres to record its own decision; a
+    /// failed commit is logged, counted under
+    /// `outbox_write_failures_total{outbox="audit"}`, and retried, and an
+    /// abrupt process loss may drop decisions that had not yet committed.
     ///
     /// # Errors
     /// Returns the deny reason when `caller` may not invoke `model`.
@@ -655,19 +654,7 @@ impl<'a> GatewayInvocation<'a> {
             &permission.to_string(),
             outcome,
         );
-        let pool = self.state.postgres.vala_pool().clone();
-        let tenant = caller.data_tenant_id;
-        self.state.gateway_tasks.spawn(async move {
-            if let Err(error) = audit::record_audit(&pool, tenant, &event).await {
-                metrics::counter!("gateway_audit_commit_failures_total").increment(1);
-                tracing::error!(
-                    %error,
-                    operation = %event.operation,
-                    request_id = %event.request_id,
-                    "gateway invoke decision did not commit to the audit outbox"
-                );
-            }
-        });
+        self.state.audit_outbox.stage(caller.data_tenant_id, event);
         verdict
     }
 

@@ -1,37 +1,27 @@
-//! Data-plane audit threading for the C2 handlers (S3.C5).
+//! Data-plane audit threading for the HTTP, MCP, and gRPC handlers.
 //!
-//! Every audited HTTP data-plane operation (register/install, query, RBAC deny)
-//! appends one hash-chained `AuditEvent` row into the
-//! transactional `vala.audit_staging`. The attribution is derived from the
-//! resolved [`Caller`]: `principal_id`/`principal_kind`/`card_ref` come straight
-//! off the `Principal` and `request_id` off the caller.
+//! Every audited operation (register/install, query, RBAC deny, administration)
+//! stages one `AuditEvent` on the process audit outbox
+//! ([`vala_sql::audit_outbox::AuditOutbox`], held as `AppState::audit_outbox`).
+//! The attribution is derived from the resolved [`Caller`]:
+//! `principal_id`/`principal_kind`/`card_ref` come straight off the `Principal`
+//! and `request_id` off the caller.
 //!
-//! A same-tx append (register) is threaded directly on the operation's
-//! `TenantConn`; a standalone append (query, RBAC deny) uses
-//! [`record_audit`], which owns its own short transaction. On both of those
-//! paths a failed append is fail-closed: the enclosing op is refused with
-//! `WYRD_VALA_500_AUDIT_UNAVAILABLE`.
-//!
-//! The named non-blocking paths — Oracle read decisions, tenant tripwires, and
-//! gateway invocation decisions — call this same canonical append from a
-//! tracked task instead, so the decision does not wait on it and an authorized
-//! call is not refused when it fails; the failure is counted and the event can
-//! be lost on abrupt process loss. Gateway *administration* is not in that set
-//! and stays transactional and fail-closed.
+//! Permissions block; audits do not. The permission check completes before the
+//! operation proceeds or refuses, and its decision is staged as soon as it is
+//! known, allowed and denied alike. Staging never waits for, or fails on, the
+//! audit commit: the outbox commits in the background, a failed commit is
+//! logged, counted on `outbox_write_failures_total{outbox="audit"}`, and
+//! retried only once Postgres confirms it aborted. An event can be lost only on
+//! abrupt process loss, at the graceful-shutdown deadline, or when Postgres no
+//! longer holds the status of its failed commit.
 
 pub mod publication;
 
-use std::fmt::Display;
-
-use sqlx::PgPool;
-use vala_sql::TenantConn;
-use vala_sql::queries::audit_staging::append_audit;
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::BifrostError as ValaError;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
 
 use crate::components::auth::Caller;
@@ -114,136 +104,41 @@ pub fn audit_event_unauthenticated(
     }
 }
 
-/// Map an audit-append failure to the fail-closed public code, never leaking the
-/// underlying SQL/connection detail across the boundary.
-pub fn audit_unavailable(error: impl Display) -> WyrdError {
-    tracing::error!(error = %error, "audit append failed; refusing operation");
-    ValaError::AuditUnavailable {
-        detail: "audit append failed".to_owned(),
-    }
-    .into()
-}
-
-/// Append one audit row on an existing operation transaction (same-tx path).
+/// Evaluate one receiving permission and stage the verdict exactly once.
 ///
-/// The row commits exactly when the caller commits `conn`, so it is durable iff
-/// the audited operation is.
+/// This is the shared owner of the "decide, stage the decision, then act"
+/// boundary. The verdict is staged on the process audit outbox before the
+/// caller proceeds or is refused, so an allowed operation is never unaudited and
+/// a refusal is never silent, and the request never waits for the audit commit.
+///
+/// Use [`authorize_recording_denial`] instead when the allowed row must carry
+/// an operation-specific detail before it is staged.
 ///
 /// # Errors
-/// Returns [`WyrdError::AuditUnavailable`] when the append fails.
-pub async fn append_on(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Result<(), WyrdError> {
-    append_audit(conn, event).await.map_err(audit_unavailable)?;
-    Ok(())
-}
-
-/// Append one audit row in its own tenant-scoped transaction (standalone path).
-///
-/// # Errors
-/// Returns [`WyrdError::AuditUnavailable`] when acquiring the connection, the
-/// append, or the commit fails.
-pub async fn record_audit(
-    pool: &PgPool,
-    tenant: DataTenantId,
-    event: &AuditEvent,
-) -> Result<(), WyrdError> {
-    let mut conn = TenantConn::acquire(pool, tenant)
-        .await
-        .map_err(audit_unavailable)?;
-    append_audit(&mut conn, event)
-        .await
-        .map_err(audit_unavailable)?;
-    conn.commit().await.map_err(audit_unavailable)?;
-    Ok(())
-}
-
-/// Pass a committed operation result through; when its transaction did not
-/// commit, record the already-allowed decision standalone so an evaluated
-/// permission is never lost, then return the operation's error.
-///
-/// Every error from an operation transaction means nothing committed,
-/// including its in-transaction append, so the decision is recorded exactly
-/// once here.
-///
-/// # Errors
-/// Returns [`WyrdError::AuditUnavailable`] when the standalone record fails,
-/// otherwise the uncommitted operation's own error.
-pub(crate) async fn record_unless_committed<T>(
-    state: &AppState,
-    caller: &Caller,
-    allowed: &AuditEvent,
-    result: Result<T, WyrdError>,
-) -> Result<T, WyrdError> {
-    if result.is_err() {
-        record_audit(state.postgres.vala_pool(), caller.data_tenant_id, allowed).await?;
-    }
-    result
-}
-
-/// Appends one owned audit event in its own tenant-scoped transaction.
-///
-/// This adapter keeps event and pool ownership inside transport futures that
-/// must remain `Send`; durability and fail-closed behavior match
-/// [`record_audit`].
-///
-/// # Errors
-///
-/// Returns [`WyrdError::AuditUnavailable`] when acquiring, appending, or
-/// committing fails.
-pub async fn record_audit_owned(
-    pool: PgPool,
-    tenant: DataTenantId,
-    event: AuditEvent,
-) -> Result<(), WyrdError> {
-    tokio::spawn(async move {
-        let mut conn = TenantConn::acquire(&pool, tenant)
-            .await
-            .map_err(audit_unavailable)?;
-        append_audit(&mut conn, &event)
-            .await
-            .map_err(audit_unavailable)?;
-        conn.commit().await.map_err(audit_unavailable)?;
-        Ok(())
-    })
-    .await
-    .map_err(audit_unavailable)?
-}
-
-/// Evaluate one receiving permission and audit the verdict exactly once.
-///
-/// This is the shared owner of the "audit the decision, then act" boundary. The
-/// verdict is appended in its own tenant transaction before the caller proceeds
-/// or is refused, so an allowed operation cannot run unaudited and a refusal
-/// cannot be silent. An append failure fails closed: the operation is refused
-/// with [`WyrdError::AuditUnavailable`] even when the verdict was `Allow`.
-///
-/// Use [`authorize_recording_denial`] instead when the allowed path already owns
-/// a transaction that the allowed row must commit with.
-///
-/// # Errors
-/// Returns the mapped denial error when the principal lacks `required`, and
-/// [`WyrdError::AuditUnavailable`] when the decision row cannot be persisted.
-pub async fn authorize(
+/// Returns the mapped denial error when the principal lacks `required`.
+pub fn authorize(
     state: &AppState,
     caller: &Caller,
     required: &Permission,
     operation: &str,
     resource: &str,
 ) -> Result<(), WyrdError> {
-    let denial = authorize_recording_denial(state, caller, required, operation, resource).await?;
-    record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &denial).await
+    let allowed = authorize_recording_denial(state, caller, required, operation, resource)?;
+    state.audit_outbox.stage(caller.data_tenant_id, allowed);
+    Ok(())
 }
 
-/// Evaluate one receiving permission, audit a denial, and hand back the allowed row.
+/// Evaluate one receiving permission, stage a denial, and hand back the allowed row.
 ///
-/// Denials are recorded standalone because there is no operation transaction to
-/// join. The returned `Allowed` event is *not* yet durable: the caller MUST
-/// [`append_on`] it inside the transaction that performs the operation, so the
-/// decision and its effect commit together.
+/// A denial is staged here because it carries no operation detail. The
+/// returned `Allowed` event is *not* yet staged: the caller enriches it with
+/// its operation-specific detail and MUST stage it on `state.audit_outbox`
+/// before performing the operation, so every evaluated allowance is recorded
+/// whether or not the operation later succeeds.
 ///
 /// # Errors
-/// Returns the mapped denial error when the principal lacks `required`, and
-/// [`WyrdError::AuditUnavailable`] when the denial row cannot be persisted.
-pub async fn authorize_recording_denial(
+/// Returns the mapped denial error when the principal lacks `required`.
+pub fn authorize_recording_denial(
     state: &AppState,
     caller: &Caller,
     required: &Permission,
@@ -263,7 +158,7 @@ pub async fn authorize_recording_denial(
             &required.to_string(),
             AuditOutcome::Denied,
         );
-        record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &denied).await?;
+        state.audit_outbox.stage(caller.data_tenant_id, denied);
         return Err(permission_deny_reason_to_wyrd(reason));
     }
     Ok(audit_event(
@@ -278,24 +173,20 @@ pub async fn authorize_recording_denial(
 /// Evaluate and audit the `service_accounts:write` gate for one admin operation.
 ///
 /// Credential administration shares one permission across issuance, trusted
-/// issuers, workload bindings, and principal revocation, and every one of those
-/// handlers owns a tenant transaction. A denial is recorded standalone here,
-/// because a refusal has no operation to join; the returned `Allowed` event MUST
-/// be [`append_on`]ed to the transaction that performs the operation, so a
-/// failed, rolled-back, or not-found administrative write leaves no allowance
-/// claiming it happened.
+/// issuers, workload bindings, and principal revocation. A denial is staged
+/// here; the returned `Allowed` event lets the handler attach its
+/// operation-specific detail and MUST be staged on `state.audit_outbox` before
+/// the handler performs the operation.
 ///
 /// The verdict comes from the configured `PermissionCheck` through
-/// [`authorize_recording_denial`], so the audited decision, the response, and
-/// the effect all follow the same runtime owner. `action` is the existing
-/// human-readable intent kept so the public refusal message stays exactly what
-/// it was.
+/// [`authorize_recording_denial`], so the audited decision and the response
+/// follow the same runtime owner. `action` is the existing human-readable
+/// intent kept so the public refusal message stays exactly what it was.
 ///
 /// # Errors
 /// Returns [`WyrdError::PermissionDeniedRbac`] when the configured checker denies
-/// `service_accounts:write`, and [`WyrdError::AuditUnavailable`] when the denial
-/// row cannot be persisted.
-pub async fn authorize_service_accounts_write(
+/// `service_accounts:write`.
+pub fn authorize_service_accounts_write(
     state: &AppState,
     caller: &Caller,
     action: &str,
@@ -303,13 +194,13 @@ pub async fn authorize_service_accounts_write(
     resource: &str,
 ) -> Result<AuditEvent, WyrdError> {
     let required = Permission::service_accounts_write();
-    authorize_recording_denial(state, caller, &required, operation, resource)
-        .await
-        .map_err(|error| match error {
+    authorize_recording_denial(state, caller, &required, operation, resource).map_err(|error| {
+        match error {
             WyrdError::PermissionDeniedRbac { .. } => WyrdError::PermissionDeniedRbac {
                 message: format!("{required} permission required to {action}"),
                 details: serde_json::json!({ "required": required.to_string() }),
             },
             other => other,
-        })
+        }
+    })
 }

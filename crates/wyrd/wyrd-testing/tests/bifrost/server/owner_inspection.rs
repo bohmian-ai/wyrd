@@ -166,7 +166,6 @@ async fn scribe_wal_fault_is_role_local() -> Result<(), super::query::ServerJour
             )],
             tenant: server.data_tenant_id(),
             physical_layout: None,
-            audit: None,
         })
         .await?;
     let fqn = format!("vala.bifrost.{table}");
@@ -306,7 +305,6 @@ async fn failed_wal_replay_is_role_local() -> Result<(), super::query::ServerJou
             )],
             tenant: server.data_tenant_id(),
             physical_layout: None,
-            audit: None,
         })
         .await?;
     let fqn = format!("vala.bifrost.{table}");

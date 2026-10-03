@@ -535,51 +535,6 @@ impl NativeWyrdTestServer {
         result
     }
 
-    /// Make every describe of one table FQN fail until restored.
-    ///
-    /// The server answers the failed describe with
-    /// `WYRD_VALA_500_AUDIT_UNAVAILABLE`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a napi error when the harness is closed, the FQN is not a
-    /// dotted identifier, or installing the fault fails.
-    #[napi]
-    pub fn fail_table_describe(&self, fqn: String) -> Result<()> {
-        let guard = self
-            .server
-            .lock()
-            .map_err(|_| napi::Error::from_reason("test server lock poisoned".to_owned()))?;
-        let server = guard
-            .as_ref()
-            .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
-        let result = wyrd_runtime::runtime()
-            .block_on(server.fail_table_describe(&fqn))
-            .map_err(|error| napi::Error::from_reason(error.to_string()));
-        drop(fqn);
-        result
-    }
-
-    /// Remove the describe fault installed by `fail_table_describe`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a napi error when the harness is closed or removing the fault
-    /// fails.
-    #[napi]
-    pub fn restore_table_describe(&self) -> Result<()> {
-        let guard = self
-            .server
-            .lock()
-            .map_err(|_| napi::Error::from_reason("test server lock poisoned".to_owned()))?;
-        let server = guard
-            .as_ref()
-            .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
-        wyrd_runtime::runtime()
-            .block_on(server.restore_table_describe())
-            .map_err(|error| napi::Error::from_reason(error.to_string()))
-    }
-
     /// Rewrite table `fqn`'s registered schema fingerprint, as a server-side
     /// schema change leaves it, so a writer holding the earlier describe is
     /// refused with `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`.
@@ -724,7 +679,6 @@ async fn start_test_server_async(
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant: server.data_tenant_id(),
             physical_layout: None,
-            audit: None,
         })
         .await
         .map_err(|error| napi::Error::from_reason(error.to_string()))?;

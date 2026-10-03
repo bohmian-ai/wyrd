@@ -2,7 +2,7 @@
 //!
 //! Three owners share one rule: every mutation that changes what Forge may
 //! destroy first takes a `FOR UPDATE` lock on a single row, in one order, and
-//! commits with the audit its caller appends in the same transaction. The order
+//! commits in its caller's transaction. The order
 //! is always the `vala.cluster_nodes` Oracle role row, then
 //! `vala.oracle_reader_epochs`, then the table's
 //! `vala.bifrost_table_maintenance_authority` row; nothing here takes the

@@ -55,12 +55,13 @@ use crate::boot::data_root::{BifrostDataRoot, BifrostDataRootError};
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::operators::keys::{KeyError, KeyFailure, OperatorKeys};
 use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry, WyrdServerConfig};
-use crate::oracle::{OraclePeerAuthority, OracleQueryAudit, PostgresPeerSecurityAudit};
+use crate::oracle::{OraclePeerAuthority, PostgresPeerSecurityAudit};
 use crate::postgres::ServerPostgres;
 use crate::state::{
     AppState, Forge, ForgeCompactionRuntime, Oracle, ProductionValidationError, Scribe,
     ScribeCoordinationRuntime,
 };
+use vala_sql::audit_outbox::{AuditOutbox, AuditSink};
 
 const DEFAULT_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const DEFAULT_HINT_CAPACITY: usize = 1_024;
@@ -1017,12 +1018,12 @@ pub async fn compose_bifrost(
         None
     };
 
-    let query_audit = roles
-        .contains(&BifrostRuntimeRole::Oracle)
-        .then(|| OracleQueryAudit::new(postgres.vala().clone()));
+    // The one process audit outbox: Gate, Oracle, peer security, and every
+    // request-path decision stage on it; `BoundServer::run` drains it last.
+    let audit_outbox = AuditSink::outbox(postgres.vala().clone());
     let scribe = if let Some(parts) = scribe {
         let fragment_security_audit = Arc::new(
-            crate::oracle::PostgresPeerSecurityAudit::try_new(&postgres)
+            crate::oracle::PostgresPeerSecurityAudit::try_new(&postgres, Arc::clone(&audit_outbox))
                 .await
                 .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
         );
@@ -1059,13 +1060,13 @@ pub async fn compose_bifrost(
         advertise_addr: &advertise_addr,
         peer_tls: peer_tls.clone(),
         local_scribe: scribe.clone(),
-        audit: query_audit.clone(),
+        audit: Arc::clone(&audit_outbox),
         shutdown: shutdown.clone(),
     }
     .build()
     .await?;
     let forwarding_audit = Arc::new(
-        PostgresPeerSecurityAudit::try_new(&postgres)
+        PostgresPeerSecurityAudit::try_new(&postgres, Arc::clone(&audit_outbox))
             .await
             .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
     );
@@ -1111,9 +1112,7 @@ pub async fn compose_bifrost(
     .with_query_dispatch(
         Arc::clone(&query_forwarder) as Arc<dyn vala_bifrost_redux::contracts::OracleQueryDispatch>
     )
-    .with_audit(Arc::new(
-        crate::bifrost::gate_audit::PostgresGateAudit::new(postgres.as_ref().clone()),
-    ))
+    .with_audit(Arc::clone(&audit_outbox))
     .with_observation_ack(Arc::new(
         crate::verification::observations::ObservationEnqueue::new(postgres.wyrd().clone()),
     ));
@@ -1128,6 +1127,7 @@ pub async fn compose_bifrost(
             token_verifier,
             query_forwarder: Some(query_forwarder),
             query_controls: Some(query_controls),
+            audit_outbox,
             #[cfg(feature = "test-support")]
             resources: Some(bifrost_resources.clone()),
         }),
@@ -1559,8 +1559,8 @@ struct OracleRoleBuilder<'a> {
     peer_tls: Option<BifrostPeerTls>,
     /// Co-located Scribe a process-local Oracle lists and reads in-process.
     local_scribe: Option<Arc<crate::state::Scribe>>,
-    /// Query audit for the leader's read decisions and tenant refusals.
-    audit: Option<Arc<OracleQueryAudit>>,
+    /// Process audit outbox for the leader's read decisions and tenant refusals.
+    audit: Arc<AuditOutbox>,
     /// One process-wide shutdown token injected into every Oracle owner.
     shutdown: CancellationToken,
 }
@@ -1612,11 +1612,8 @@ impl<'a> OracleRoleBuilder<'a> {
         // The same immutable identity serves Scribe-tail discovery and the
         // Analytical east-west plane; naming it twice would let the two drift.
         let tail_tls = peer_tls.clone();
-        let audit = audit.ok_or_else(|| {
-            ServerBootError::OraclePeer("selected Oracle role has no query audit owner".to_owned())
-        })?;
         let security_audit = Arc::new(
-            PostgresPeerSecurityAudit::try_new(&postgres)
+            PostgresPeerSecurityAudit::try_new(&postgres, Arc::clone(&audit))
                 .await
                 .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
         );
@@ -1800,7 +1797,7 @@ impl<'a> OracleRoleBuilder<'a> {
                 resources,
                 reconciliation_limit_bytes,
             },
-            audit: audit.clone(),
+            audit,
             reservations,
             stage_authority: Some(stage_authority),
             peer_tls,
@@ -1822,7 +1819,6 @@ impl<'a> OracleRoleBuilder<'a> {
             role,
             peer,
             cluster,
-            audit,
             resources: oracle_resources,
             shutdown,
         })
@@ -1862,8 +1858,6 @@ struct BuiltOracleRole {
     peer: Arc<crate::oracle::OraclePeerRuntime>,
     /// Cluster owner used for activation and snapshot publication.
     cluster: Arc<ClusterRegistry>,
-    /// Outbox writer for Oracle read decisions and tenant tripwires.
-    audit: Arc<OracleQueryAudit>,
     /// Root-derived Oracle resource capability.
     resources: vala_bifrost_redux::resources::OracleResources,
     /// One process-wide shutdown token retained through lifecycle publication.
@@ -1891,7 +1885,6 @@ impl BuiltOracleRole {
             role,
             peer,
             cluster,
-            audit,
             resources,
             shutdown,
         } = self;
@@ -1936,7 +1929,6 @@ impl BuiltOracleRole {
             catalog,
             registered_role: role.clone(),
             cluster: Arc::clone(&cluster),
-            audit,
             lifecycle_transport,
             resources,
             peer,

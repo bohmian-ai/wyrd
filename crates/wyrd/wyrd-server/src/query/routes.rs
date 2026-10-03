@@ -98,16 +98,14 @@ pub fn router() -> OpenApiRouter<AppState> {
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 409, description = "The query's owner moved while the request was in \
           flight (WYRD_VALA_409_RUNNING_QUERY_CONFLICT)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 503, description = "The query-control or Oracle role is unavailable, the \
-          decision could not be audited, or no verifier is configured for the access token \
+        (status = 503, description = "The query-control or Oracle role is unavailable, or \
+          no verifier is configured for the access token \
           (WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE, WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE, \
-          WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other query refusal, each carrying its own \
           stable code (WYRD_VALA_429_QUERY_QUEUE_FULL, WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
           WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
-          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED)",
          body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
@@ -147,16 +145,14 @@ pub(crate) async fn list_running_queries(
           tenant (WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 409, description = "The query's owner moved while the request was in \
           flight (WYRD_VALA_409_RUNNING_QUERY_CONFLICT)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 503, description = "The query-control or Oracle role is unavailable, the \
-          decision could not be audited, or no verifier is configured for the access token \
+        (status = 503, description = "The query-control or Oracle role is unavailable, or \
+          no verifier is configured for the access token \
           (WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE, WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE, \
-          WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other query refusal, each carrying its own \
           stable code (WYRD_VALA_429_QUERY_QUEUE_FULL, WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
           WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
-          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED)",
          body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
@@ -204,16 +200,14 @@ pub(crate) async fn get_running_query(
           tenant (WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 409, description = "The query's owner moved while the request was in \
           flight (WYRD_VALA_409_RUNNING_QUERY_CONFLICT)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 503, description = "The query-control or Oracle role is unavailable, the \
-          decision could not be audited, or no verifier is configured for the access token \
+        (status = 503, description = "The query-control or Oracle role is unavailable, or \
+          no verifier is configured for the access token \
           (WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE, WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE, \
-          WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other query refusal, each carrying its own \
           stable code (WYRD_VALA_429_QUERY_QUEUE_FULL, WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
           WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
-          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED)",
          body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
@@ -271,16 +265,15 @@ pub(crate) async fn cancel_running_query(
           unacceptable credentials (WYRD_PERMISSION_403_DENIED_RBAC, \
           WYRD_VALA_403_QUERY_PEER_SECURITY)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "The Oracle role is unavailable, visibility could not be \
-          resolved, the decision could not be audited, no verifier is configured for \
+          resolved, no verifier is configured for \
           the access token, or the admitted query exhausted its execution memory and \
           must not be retried unchanged (WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE, \
-          WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE, WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
+          WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE, \
           WYRD_VALA_503_QUERY_RESOURCES_EXHAUSTED, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other query refusal, each carrying its own \
           stable code (WYRD_VALA_429_QUERY_QUEUE_FULL, WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
           WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
-          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED)",
          body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"

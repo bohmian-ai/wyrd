@@ -199,7 +199,6 @@ fn terminal_bifrost_error(terminal: &QueryTerminalFrame) -> BifrostError {
             BifrostError::QueryReconciliationInvariant
         }
         Some(QueryTerminalErrorCode::QueryPeerSecurity) => BifrostError::QueryPeerSecurity,
-        Some(QueryTerminalErrorCode::QueryAuditUnavailable) => BifrostError::QueryAuditUnavailable,
         Some(QueryTerminalErrorCode::CatalogUnreachable) => {
             BifrostError::CatalogUnreachable { detail }
         }
@@ -2141,10 +2140,6 @@ mod tests {
             (
                 QueryTerminalErrorCode::QueryPeerSecurity,
                 BifrostError::QueryPeerSecurity,
-            ),
-            (
-                QueryTerminalErrorCode::QueryAuditUnavailable,
-                BifrostError::QueryAuditUnavailable,
             ),
             (
                 QueryTerminalErrorCode::CatalogUnreachable,

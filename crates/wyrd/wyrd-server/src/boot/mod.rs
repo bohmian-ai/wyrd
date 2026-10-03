@@ -1503,7 +1503,7 @@ fn attach_config_fields(
         )))
 }
 
-/// Reseal every stored provider and browser-session secret under the current
+/// Reseal every stored provider and workload-issuer client secret under the current
 /// sealing write key, or prove a keyless deployment stores none.
 ///
 /// This is the rewrap step of sealing-key rotation: with the new key configured
@@ -1520,9 +1520,8 @@ fn attach_config_fields(
 ///
 /// # Errors
 /// Returns [`ServerBootError::SealingKey`] when no sealing key is configured
-/// and any provider or browser-session ciphertext is stored (expired but
-/// unpurged sessions included), or the
-/// store cannot be read to prove there is none.
+/// and any provider or workload-issuer ciphertext is stored, or the store
+/// cannot be read to prove there is none.
 pub async fn rewrap_sealed_secrets(
     operator: Option<OperatorPool>,
     keyring: Option<Arc<SealingKeyring>>,
@@ -1533,8 +1532,8 @@ pub async fn rewrap_sealed_secrets(
     let keyless = keyring.is_none();
     match SealedSecretRewrap::new(operator, keyring).run().await {
         Ok(report) if keyless && report.remaining > 0 => Err(ServerBootError::SealingKey(format!(
-            "{} stored sealed secret(s) (provider client secrets or browser-session \
-                 credentials) exist but no sealing key is configured; configure the key \
+            "{} stored sealed secret(s) (provider or workload-issuer client \
+                 secrets) exist but no sealing key is configured; configure the key \
                  they were sealed under",
             report.remaining
         ))),

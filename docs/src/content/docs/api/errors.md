@@ -10,6 +10,8 @@ order: 21
 
 Wyrd returns errors as structured RFC 9457 Problem Details objects (`application/problem+json`). Agents and SDK clients must preserve the full structure and must not collapse errors into prose.
 
+The one exception is the OAuth 2.0 endpoints (`/auth/token`, `/auth/platform/token`, `/auth/device_authorization`, and `/auth/revoke`). They return the standard RFC 6749 section 5.2 JSON body (`error`, `error_description`), as OAuth clients expect, and the server logs each refusal under its Wyrd code. See [SSO and OIDC](/self-hosting/sso-and-oidc/#oauth-endpoints).
+
 This page is the generated error catalog. For how an agent should act on these errors, see [Error remediation](/for-agents/error-remediation/).
 
 ## Client transport codes

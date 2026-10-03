@@ -23,9 +23,10 @@ pub enum AuthCommand {
     /// Sign in to a tenant through the browser and save the Wyrd user login
     /// every local SDK uses; no token is printed.
     Login(login::LoginArgs),
-    /// End a saved login: revoke its refresh chain and delete it locally.
+    /// End a saved login: delete it locally, then revoke it on the server
+    /// best-effort.
     Logout(login::LogoutArgs),
-    /// Show saved logins (server, tenant, principal, expiry) without tokens.
+    /// Show saved logins (server, tenant, expiry) without tokens.
     Status,
     /// Rotate a Wyrd refresh token and print the new access and refresh tokens.
     Refresh(refresh::RefreshArgs),

@@ -204,7 +204,7 @@ pub async fn revoke_refresh(
 /// Revoke every active token in one login's rotation chain: the row `root_id`
 /// and every descendant reached through `rotated_from`.
 ///
-/// Other chains of the same principal — its other browser sessions, CLI, or
+/// Other chains of the same principal — its other web-app, CLI, or
 /// SDK logins — are untouched. Callers serialize against rotation by holding
 /// [`lock_refresh_family`] for the chain's principal first, so no successor
 /// can be inserted outside the update. Returns the number of rows revoked.

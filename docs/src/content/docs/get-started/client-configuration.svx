@@ -109,19 +109,40 @@ assembling transports per request.
 Keep credentials out of `config.toml`. The client resolves credentials in this
 order, stopping at the first available source:
 
-1. An API key supplied explicitly on `ClientConfig::api_key`.
+1. A credential supplied explicitly on `ClientConfig::credential`.
 2. `WYRD_ACCESS_TOKEN`.
 3. `WYRD_WORKLOAD_TOKEN` with the selected tenant key (the client `tenant`
    option or `client.tenant`, else `WYRD_TENANT`).
 4. `WYRD_API_KEY`.
-5. `[default].api_key` in `credentials.toml` under the selected config
+5. A saved user login for this server, written by `wyrd auth login`.
+6. `[default].api_key` in `credentials.toml` under the selected config
    directory.
 
 The tenant selector is a tenant route key, the one `wyrd auth login --tenant`
-takes. It selects a saved user login (without it, the most recent login for
-the server is used) and names the tenant a workload token is exchanged for. An access token or API key already names its tenant, so
-selecting a tenant beside one fails with `WYRD_CLIENT_400_CONFIG_INVALID`
-instead of being ignored.
+takes. It names the tenant a workload token is exchanged for, and it selects a
+saved user login. Without it, the newest login for the server is used. With it,
+the login for that tenant is used; if this server has saved logins only for
+other tenants, the client fails with `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE`
+rather than acting in the wrong tenant. An access token or API key already
+names its tenant, so selecting a tenant beside one fails with
+`WYRD_CLIENT_400_CONFIG_INVALID` instead of being ignored.
+
+### Saved user logins
+
+A person signs in once with `wyrd auth login --server URL --tenant KEY`. The
+CLI uses OAuth 2.0 device authorization
+([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)): it prints a one-time
+code, opens the verification page in a browser, and saves the resulting Wyrd
+login under `[[logins]]` in `credentials.toml`, keyed by server origin and
+tenant. Every Rust, Python, and TypeScript client then uses it with no extra
+setup. A client renews the access token shortly before it expires with the
+saved refresh token, which rotates on every use; concurrent clients share one
+renewal through the file's lock. A refused renewal fails with
+`WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE`: run `wyrd auth login` again.
+`wyrd auth logout` deletes the login locally, then revokes it on the server
+best-effort. An access token already issued stays valid until it expires, at
+most five minutes. Saved logins are for people; a deployed Service or Agent
+uses an API key or workload identity.
 
 For local development, the credentials file can look like this:
 
@@ -195,6 +216,7 @@ override for the one process that needs a different endpoint or API key.
 | Card space remains `default` | The process started outside the repository boundary, or `wyrd.toml` failed validation and was soft-failed by the card constructor. |
 | The client reports no credentials | Check the credential chain and the selected config directory's `credentials.toml`. |
 | Workload identity has no tenant | Set `WYRD_TENANT` or `client.tenant` alongside `WYRD_WORKLOAD_TOKEN`. |
+| `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` | The saved login expired or was revoked, or the selected tenant has no saved login for this server. Run `wyrd auth login --server URL --tenant KEY`. |
 | Disk caching does not persist | Use `kind = "disk"`, take the key from `[default].api_key`, and keep `credentials.toml` owner-only (`0600`) in a writable config directory. |
 
 ## Related

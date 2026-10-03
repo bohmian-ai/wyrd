@@ -10,10 +10,10 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
 use vala_bifrost_redux::forge::{
-    DEFAULT_REPORT_TIMEOUT, Forge, ForgeClock, ForgeCompactionDispatch, ForgeCompactionOutcome,
-    ForgeCompactionType, ForgeObjectStore, ForgeRoleReadiness, ForgeScheduler,
-    ForgeSchedulerTrigger, ForgeTableKey, ForgeWorker, ForgeWorkerCompletionObserver,
-    ForgeWorkerConfig,
+    DEFAULT_REPORT_TIMEOUT, Forge, ForgeClock, ForgeCommitNotice, ForgeCompactionDispatch,
+    ForgeCompactionOutcome, ForgeCompactionType, ForgeObjectStore, ForgeRoleReadiness,
+    ForgeScheduler, ForgeSchedulerTrigger, ForgeTableKey, ForgeTableSettings, ForgeWorker,
+    ForgeWorkerCompletionObserver, ForgeWorkerConfig,
 };
 use vala_sql::queries::forge_tasks::{ForgeEnqueueBatch, ForgeTasks};
 use vala_sql::row_types::forge_tasks::{
@@ -2092,6 +2092,212 @@ async fn report_preserves_later_commits_and_ignores_stale() {
         (settled.pending_commits, settled.in_flight),
         (1, None),
         "the redispatch consumes only what it captured"
+    );
+    supervisor.shutdown().await;
+}
+
+/// Tables the leader tracks in the decision-cost scenario.
+const DECISION_TABLES: usize = 10_000;
+/// Tracked tables whose commit makes them due in that scenario.
+const DECISION_DUE_TABLES: usize = 1_000;
+/// Concurrent compactors pulling from the leader in that scenario.
+const DECISION_PULLERS: usize = 32;
+
+/// Returns the `permille`-th per-mille element of `samples`, sorting them in place.
+fn quantile(samples: &mut [Duration], permille: usize) -> Duration {
+    samples.sort_unstable();
+    let last = samples.len().saturating_sub(1);
+    samples[(last * permille).div_ceil(1000).min(last)]
+}
+
+/// Pulls and reports from `pullers` OS threads until nothing is due.
+///
+/// Each thread pulls four tasks at a time through the leader's peer-facing
+/// routes and reports every dispatch it received as succeeded, so the one
+/// schedule lock sees the contention of a sustained backlog.
+///
+/// Returns every pull's latency and every dispatched table.
+///
+/// # Panics
+///
+/// Panics when a route refuses the held term or a dispatch's own report does
+/// not apply.
+fn pull_until_drained(
+    forge: &Forge,
+    token: i64,
+    pullers: usize,
+) -> (Vec<Duration>, Vec<ForgeTableKey>) {
+    std::thread::scope(|scope| {
+        let handles = (0..pullers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut pulls = Vec::new();
+                    let mut dispatched = Vec::new();
+                    loop {
+                        let pulled = Instant::now();
+                        let tasks = forge
+                            .serve_compaction_pull(token, 4)
+                            .expect("the held term serves the pull");
+                        pulls.push(pulled.elapsed());
+                        if tasks.is_empty() {
+                            return (pulls, dispatched);
+                        }
+                        for task in tasks {
+                            assert!(
+                                forge
+                                    .serve_compaction_report(
+                                        token,
+                                        &task.key,
+                                        task.task_id,
+                                        ForgeCompactionOutcome::Succeeded,
+                                    )
+                                    .expect("the held term serves the report"),
+                                "the dispatch's own report applies"
+                            );
+                            dispatched.push(task.key);
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("puller thread"))
+            .fold((Vec::new(), Vec::new()), |(mut pulls, mut keys), (p, k)| {
+                pulls.extend(p);
+                keys.extend(k);
+                (pulls, keys)
+            })
+    })
+}
+
+/// The leader decides commits, pulls, and reports from memory alone.
+///
+/// The leader's routes — the ones a peer compactor reaches — are driven
+/// directly, without a worker, over a fixture whose catalog and object store
+/// count every load and read. Ten thousand tables are tracked; one thousand
+/// are due. Thirty-two OS threads then pull and report concurrently until
+/// nothing is due, which is the contention the one schedule lock sees under a
+/// sustained backlog. Every due table is dispatched exactly once, and not one
+/// catalog load or object read happens anywhere on the leader's side. The
+/// per-stage p50/p99, table count, commit rate, and puller count are printed as
+/// evidence; latency gates belong to the release-built capacity benchmark.
+///
+/// # Panics
+///
+/// Panics when a leader decision touches the catalog or object store, a due
+/// table is dispatched twice or never, or a route refuses the held term.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn leader_decision_has_no_catalog_io() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let fixture = PromotionIntegrationFixture::start("leader_decision").await;
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
+    let supervisor = SupervisedPromotion::start_serial(
+        &fixture,
+        Arc::clone(&seam) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    supervisor.schedule_only().await;
+    let forge = supervisor.forge();
+    let token = forge
+        .held_leader_term()
+        .expect("the pass acquired the term")
+        .fencing_token();
+    let (loads, attempts, reads) = (seam.loads(), seam.attempts(), store.stats());
+
+    let due = ForgeTableSettings {
+        compaction_enabled: true,
+        trigger_snapshot_count: 1,
+        ..ForgeTableSettings::default()
+    };
+    let idle = ForgeTableSettings {
+        compaction_enabled: true,
+        ..ForgeTableSettings::default()
+    };
+    let keys = (0..DECISION_TABLES)
+        .map(|index| ForgeTableKey {
+            tenant: fixture.tenant,
+            table: ForgeTaskTableIdentity::new(
+                "wyrd-redux",
+                fixture.binding.table_ref.namespace.as_str(),
+                format!("decision_{index}"),
+            )
+            .expect("decision table identity"),
+        })
+        .collect::<Vec<_>>();
+    let notify = |index: usize, snapshot_id: i64| {
+        forge
+            .accept_commit_notice(
+                token,
+                ForgeCommitNotice {
+                    key: keys[index].clone(),
+                    snapshot_id,
+                    settings: if index < DECISION_DUE_TABLES {
+                        due.clone()
+                    } else {
+                        idle.clone()
+                    },
+                },
+            )
+            .expect("the held term accepts the notice");
+    };
+    for index in DECISION_DUE_TABLES..DECISION_TABLES {
+        notify(index, 1);
+    }
+    let started = Instant::now();
+    let mut commit_updates = (DECISION_DUE_TABLES..DECISION_TABLES)
+        .map(|index| {
+            let warm = Instant::now();
+            notify(index, 2);
+            warm.elapsed()
+        })
+        .collect::<Vec<_>>();
+    let commit_rate = f64::from(u32::try_from(commit_updates.len()).expect("bounded table count"))
+        / started.elapsed().as_secs_f64();
+    for index in 0..DECISION_DUE_TABLES {
+        notify(index, 1);
+    }
+
+    let (mut pulls, dispatched) = pull_until_drained(&forge, token, DECISION_PULLERS);
+
+    // The fixture's own promoted table is due as well.
+    let promoted = ForgeTableKey {
+        tenant: fixture.tenant,
+        table: identity(&fixture),
+    };
+    let expected = keys[..DECISION_DUE_TABLES]
+        .iter()
+        .chain([&promoted])
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        dispatched.len(),
+        expected.len(),
+        "no due table is dispatched twice"
+    );
+    assert_eq!(
+        dispatched.iter().collect::<BTreeSet<_>>(),
+        expected,
+        "every due table is dispatched, and only due tables"
+    );
+    assert_eq!(
+        (seam.loads(), seam.attempts(), store.stats()),
+        (loads, attempts, reads),
+        "leader decisions perform no catalog or object-store IO"
+    );
+    eprintln!(
+        "evidence forge-leader tables={DECISION_TABLES} due={DECISION_DUE_TABLES} \
+         pullers={DECISION_PULLERS} commit_updates_per_s={commit_rate:.0} \
+         commit_update_p50={:?} commit_update_p99={:?} pulls={} pull_p50={:?} pull_p99={:?} \
+         pull_max={:?}",
+        quantile(&mut commit_updates, 500),
+        quantile(&mut commit_updates, 990),
+        pulls.len(),
+        quantile(&mut pulls, 500),
+        quantile(&mut pulls, 990),
+        quantile(&mut pulls, 1000),
     );
     supervisor.shutdown().await;
 }

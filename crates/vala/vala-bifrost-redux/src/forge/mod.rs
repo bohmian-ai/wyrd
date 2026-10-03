@@ -46,10 +46,13 @@ pub use error::ForgeError;
 #[cfg(feature = "test-support")]
 pub use leader::ForgeTrackView;
 pub use leader::{
-    DEFAULT_REPORT_TIMEOUT, ForgeCommitNotice, ForgeCompactionDispatch, ForgeSchedule,
-    ForgeTableKey,
+    DEFAULT_REPORT_TIMEOUT, ForgeCommitNotice, ForgeCompactionDispatch, ForgeCompactionOutcome,
+    ForgeSchedule, ForgeTableKey,
 };
-pub use leadership::{ForgeHeldTerm, ForgeLeaderPeer};
+pub use leadership::{
+    ForgeHeldTerm, ForgeLeaderPeer, dispatch_from_wire, dispatch_to_wire, outcome_from_wire,
+    outcome_to_wire, table_key_from_wire,
+};
 pub use managed::{
     ForgeManagedRewrite, ForgePlannedAttempt, ForgePlannedRewrite, ForgeRewriteEvidence,
     ForgeRewriteOutcome, ForgeTablePolicy, ForgeUnsettledOutput, RewriteHandoff,
@@ -329,6 +332,45 @@ impl Forge {
     ) -> Result<(), ForgeError> {
         self.leadership
             .accept(Some(fencing_token), notice, self.core.clock.now()?)
+    }
+
+    /// Answers one remote compactor pull addressed to the term `fencing_token`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::FenceLost`] when this coordinator does not hold
+    /// that term, and clock errors.
+    pub fn serve_compaction_pull(
+        &self,
+        fencing_token: i64,
+        limit: usize,
+    ) -> Result<Vec<ForgeCompactionDispatch>, ForgeError> {
+        self.leadership
+            .serve_pull(Some(fencing_token), limit, self.core.clock.now()?)
+    }
+
+    /// Applies one remote compactor report addressed to the term `fencing_token`.
+    ///
+    /// Returns whether the report matched the table's current task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::FenceLost`] when this coordinator does not hold
+    /// that term, and clock errors.
+    pub fn serve_compaction_report(
+        &self,
+        fencing_token: i64,
+        key: &ForgeTableKey,
+        task_id: uuid::Uuid,
+        outcome: ForgeCompactionOutcome,
+    ) -> Result<bool, ForgeError> {
+        self.leadership.serve_report(
+            Some(fencing_token),
+            key,
+            task_id,
+            outcome,
+            self.core.clock.now()?,
+        )
     }
 
     /// Returns this Forge clock for test-only fixture reconstruction.

@@ -60,6 +60,17 @@ pub struct ForgeCompactionDispatch {
     pub compaction_type: ForgeCompactionType,
 }
 
+/// What a compactor reports for one dispatched task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgeCompactionOutcome {
+    /// The task finished, including a plan that found nothing to rewrite.
+    Succeeded,
+    /// The task failed; the table is due again immediately.
+    Failed,
+    /// The task was never started, so its delivery failed.
+    NotStarted,
+}
+
 /// Lifecycle of one table's compaction track.
 #[derive(Debug, Clone)]
 enum TrackState {
@@ -189,9 +200,10 @@ impl CompactionTrack {
         }
     }
 
-    /// Returns a selected task to Idle, due now, without consuming commits.
+    /// Returns a selected or undelivered task to Idle, due now, without
+    /// consuming commits.
     fn revert_pre_dispatch(&mut self, now: DateTime<Utc>) {
-        if matches!(self.state, TrackState::PendingDispatch { .. }) {
+        if self.is_processing() {
             self.state = TrackState::Idle {
                 next_compaction_at: now,
             };
@@ -406,30 +418,17 @@ impl ForgeSchedule {
             .collect()
     }
 
-    /// Returns a dispatched task to Idle when it could not be handed over.
-    ///
-    /// Commits are preserved and the table is due immediately.
-    pub fn revert_dispatch(&self, dispatch: &ForgeCompactionDispatch, now: DateTime<Utc>) {
-        let mut inner = self.lock();
-        if let Some(track) = inner.tracks.get_mut(&dispatch.key)
-            && track.is_task(dispatch.task_id)
-        {
-            track.state = TrackState::PendingDispatch {
-                pending_at_dispatch: 0,
-                watermark: None,
-            };
-            track.revert_pre_dispatch(now);
-        }
-    }
-
     /// Applies one worker report; a report for any other task is ignored.
+    ///
+    /// [`ForgeCompactionOutcome::NotStarted`] is `RisingWave`'s failed send: the
+    /// task returns to Idle, due now, with every commit intact.
     ///
     /// Returns whether the report matched the table's current task.
     pub fn report(
         &self,
         key: &ForgeTableKey,
         task_id: Uuid,
-        success: bool,
+        outcome: ForgeCompactionOutcome,
         now: DateTime<Utc>,
     ) -> bool {
         let mut inner = self.lock();
@@ -441,10 +440,13 @@ impl ForgeSchedule {
             tracing::warn!(%task_id, "stale Forge compaction report ignored");
             return false;
         }
-        if success {
-            track.finish_success(now);
-        } else {
-            track.finish_failed(now);
+        match outcome {
+            ForgeCompactionOutcome::Succeeded => track.finish_success(now),
+            ForgeCompactionOutcome::Failed => track.finish_failed(now),
+            ForgeCompactionOutcome::NotStarted => {
+                track.revert_pre_dispatch(now);
+                return true;
+            }
         }
         if track.remove_after_finish {
             inner.tracks.remove(key);
@@ -592,7 +594,12 @@ mod tests {
             1,
             "a manual request forces dispatch while disabled"
         );
-        assert!(schedule.report(&key("manual"), manual[0].task_id, true, start));
+        assert!(schedule.report(
+            &key("manual"),
+            manual[0].task_id,
+            ForgeCompactionOutcome::Succeeded,
+            start
+        ));
         assert!(
             schedule.track_for_test(&key("manual")).is_none(),
             "a disabled manual track is removed"
@@ -617,10 +624,20 @@ mod tests {
             "one current task per table"
         );
         assert!(
-            !schedule.report(&key("t"), Uuid::now_v7(), true, start),
+            !schedule.report(
+                &key("t"),
+                Uuid::now_v7(),
+                ForgeCompactionOutcome::Succeeded,
+                start
+            ),
             "a stale task id is ignored"
         );
-        assert!(schedule.report(&key("t"), first.task_id, true, start));
+        assert!(schedule.report(
+            &key("t"),
+            first.task_id,
+            ForgeCompactionOutcome::Succeeded,
+            start
+        ));
         assert_eq!(
             schedule
                 .track_for_test(&key("t"))
@@ -631,7 +648,12 @@ mod tests {
         );
 
         let second = schedule.pull(4, start).remove(0);
-        assert!(schedule.report(&key("t"), second.task_id, false, start));
+        assert!(schedule.report(
+            &key("t"),
+            second.task_id,
+            ForgeCompactionOutcome::Failed,
+            start
+        ));
         let third = schedule.pull(4, start).remove(0);
         assert!(
             schedule
@@ -645,11 +667,29 @@ mod tests {
             "a timed-out task is reconsidered on the next pull"
         );
         assert!(
-            !schedule.report(&key("t"), third.task_id, true, start),
+            !schedule.report(
+                &key("t"),
+                third.task_id,
+                ForgeCompactionOutcome::Succeeded,
+                start
+            ),
             "the timed-out task's report is stale"
         );
 
-        schedule.revert_dispatch(&retried[0], start);
+        assert!(schedule.report(
+            &key("t"),
+            retried[0].task_id,
+            ForgeCompactionOutcome::NotStarted,
+            start
+        ));
+        assert_eq!(
+            schedule
+                .track_for_test(&key("t"))
+                .expect("track")
+                .pending_commits,
+            1,
+            "a failed hand-over keeps its commits"
+        );
         assert_eq!(
             schedule.pull(4, start).len(),
             1,

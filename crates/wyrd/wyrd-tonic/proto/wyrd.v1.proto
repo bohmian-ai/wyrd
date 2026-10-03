@@ -84,6 +84,9 @@ service ScribeCapturePeerService {
 // token, so a replaced or expired leader refuses rather than counting a commit.
 service ForgeLeaderPeerService {
   rpc NotifyPromotion(NotifyForgePromotionRequest) returns (NotifyForgePromotionResponse);
+  // A compactor's capacity pull; the response is its acknowledgement.
+  rpc PullCompaction(PullForgeCompactionRequest) returns (PullForgeCompactionResponse);
+  rpc ReportCompaction(ReportForgeCompactionRequest) returns (ReportForgeCompactionResponse);
 }
 service OraclePeerService {
   // Held graph grant. The first message admits or refuses; an admitted grant
@@ -122,6 +125,23 @@ message NotifyForgePromotionRequest {
   sint64 snapshot_id = 5; map<string, string> properties = 6;
 }
 message NotifyForgePromotionResponse {}
+// At most limit table-level tasks; the leader never names files.
+message PullForgeCompactionRequest { sint64 fencing_token = 1; uint32 limit = 2; }
+message ForgeCompactionTask {
+  string task_id = 1; string tenant_id = 2; string namespace = 3; string table = 4;
+  string branch = 5; string compaction_type = 6;
+}
+message PullForgeCompactionResponse { repeated ForgeCompactionTask tasks = 1; }
+// NOT_STARTED returns an undelivered task to Idle with its commits intact.
+enum ForgeCompactionOutcome {
+  FORGE_COMPACTION_OUTCOME_UNSPECIFIED = 0; FORGE_COMPACTION_OUTCOME_SUCCEEDED = 1;
+  FORGE_COMPACTION_OUTCOME_FAILED = 2; FORGE_COMPACTION_OUTCOME_NOT_STARTED = 3;
+}
+message ReportForgeCompactionRequest {
+  sint64 fencing_token = 1; string task_id = 2; string tenant_id = 3; string namespace = 4;
+  string table = 5; ForgeCompactionOutcome outcome = 6;
+}
+message ReportForgeCompactionResponse { bool matched = 1; }
 enum QueryClass { QUERY_CLASS_UNSPECIFIED = 0; QUERY_CLASS_INTERACTIVE = 1; QUERY_CLASS_ANALYTICAL = 2; }
 enum ClusterRole { CLUSTER_ROLE_UNSPECIFIED = 0; CLUSTER_ROLE_SCRIBE = 1; CLUSTER_ROLE_ORACLE = 2; }
 message OracleRoleFence { string node_id = 1; ClusterRole role = 2; uint64 fencing_token = 3; }

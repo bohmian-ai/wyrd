@@ -165,7 +165,7 @@ pub struct ForgeBuildConfig {
     ///
     /// A restarted process that reclaims the same identity reclaims its own
     /// live lease immediately instead of waiting out the lease TTL on standby,
-    /// which would leave a sole coordinator unready for that whole TTL. The
+    /// which would leave planning stalled for that whole TTL. The
     /// identity must never be shared by two live processes, the same
     /// invariant the worker's claim owner already relies on.
     pub scheduler_owner: uuid::Uuid,

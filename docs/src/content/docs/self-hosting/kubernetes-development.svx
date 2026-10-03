@@ -274,8 +274,12 @@ Bifrost data.
 
 ## Adding replicas
 
-A second `all` replica is a standby, not more capacity. To scale out, run
-peer mode, which changes the storage and networking requirements:
+Scale out by adding `all` replicas first, and move to role-specific pods only
+when one workload outgrows that shape. Every `all` replica serves ingest and
+reads. Forge planning is a singleton held by a lease, so one replica plans while
+the others stand by, ready, and take over if it stops; every replica still runs
+compaction. More than one replica needs peer mode, which changes the storage and
+networking requirements:
 
 - `WYRD_PEER_ADDRESS` on every pod, from its own pod IP, and `WYRD_PEER_TLS_DIR`
   holding a dedicated CA and one shared `wyrd-peer` leaf.

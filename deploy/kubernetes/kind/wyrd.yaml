@@ -1,11 +1,11 @@
 # Wyrd workloads for the kind autoscaling journey. Apply after `infra.yaml`,
 # the `wyrd-secrets` and `wyrd-peer-tls` Secrets, and the migrate Job.
 #
-# `wyrd-core` is one fixed `all` replica: it owns the only Scribe and Forge
-# coordination. A second `all` replica would be a standby Forge coordinator,
-# which is unready by design, so the autoscaled tier is `wyrd-oracle`: the
-# `oracle` target serves the public API and executes reads on its own Oracle,
-# fetching live rows from the anchor's Scribe tail over mTLS. It owns no Scribe
+# `wyrd-core` is one `all` replica. Production scales out by adding `all`
+# replicas first; this journey proves the next step, a role-specific read tier,
+# so its autoscaled tier is `wyrd-oracle`: the `oracle` target serves the
+# public API and executes reads on its own Oracle, fetching live rows from the
+# core replica's Scribe tail over mTLS. It owns no Scribe
 # WAL or node identity, so it is a Deployment on ephemeral scratch. The
 # HorizontalPodAutoscaler grows it from one replica to two on its measured
 # successful Oracle-executed read rate.

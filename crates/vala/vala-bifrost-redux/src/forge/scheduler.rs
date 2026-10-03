@@ -280,12 +280,13 @@ impl Forge {
                         "succeeded"
                     },
                 );
-                // Readiness is authority, not liveness: only a pass that held
-                // the fence and acknowledged everything it was asked to plan
-                // proves this replica is the coordinator work should route to.
-                // A standby replica lost the fence to a live peer, and a pass
-                // that stopped at its per-wake budget left demand unplanned.
-                readiness.publish(!outcome.standby && !outcome.incomplete);
+                // Planning is a singleton fenced by a lease, so a replica that
+                // finds a live peer holding it is a healthy standby: it reached
+                // the coordination store, its workers keep executing the
+                // durable queue, and it takes over when the lease lapses. Only
+                // a fence holder whose pass stopped at its per-wake budget,
+                // leaving demand unplanned, is unready.
+                readiness.publish(outcome.standby || !outcome.incomplete);
                 if outcome.standby {
                     tracing::debug!(triggered, "Forge scheduler remains on standby");
                     #[cfg(feature = "test-support")]

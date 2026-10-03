@@ -21,8 +21,8 @@ const SECOND: usize = 1;
 
 /// `oracle` pod launched into the running topology.
 ///
-/// A second `all` replica would be a standby Forge coordinator, which is
-/// unready by design, so the joiner selects exactly the role that scales out.
+/// The joiner selects only the Oracle role, so the journey proves a read-tier
+/// pod with no Scribe of its own executes against the running topology.
 const JOINED: usize = 2;
 
 /// Rows the first pod writes and publishes.

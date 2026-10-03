@@ -1568,20 +1568,21 @@ async fn forge_coordinator_readiness_follows_a_completed_pass() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// A standby pass leaves the coordinator unready, and the next complete fenced
-/// pass under a reclaimed fence restores it.
+/// A standby pass leaves the coordinator ready, and so does the complete fenced
+/// pass that reclaims the fence once the peer's lease lapses.
 ///
-/// Readiness answers whether this replica currently holds the authority the
-/// role promises. A standby replica lost the fence to a live peer, so it plans
-/// nothing. Routing maintenance to it is routing it to a coordinator that will
-/// not do the work.
+/// Planning is a singleton fenced by a lease, so a second replica that finds a
+/// live peer holding it is a healthy standby, not a failed one: it reached the
+/// coordination store, its workers keep executing the durable queue, and it
+/// takes over when the lease lapses. Scaling out with more `all` replicas
+/// depends on every one of them reporting ready.
 ///
 /// # Panics
 ///
 /// Panics when a standby or completed pass publishes the wrong bit.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn coordinator_standby_pass_is_not_ready() {
+async fn coordinator_standby_pass_is_ready() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1618,8 +1619,8 @@ async fn coordinator_standby_pass_is_not_ready() {
 
     drive_scheduler_pass(&server, "standby pass").await;
     assert!(
-        !readiness.is_ready(),
-        "a standby replica holds no fence and is not a ready coordinator"
+        readiness.is_ready(),
+        "a standby replica behind a live peer's fence is a ready coordinator"
     );
 
     // Releasing the fence lets the very next pass complete under this replica.

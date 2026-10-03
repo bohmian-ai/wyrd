@@ -145,18 +145,21 @@ impl PyWyrdState {
 
     /// Connect this state's one Bifrost writer and describe both fixed tables.
     ///
-    /// The four arguments are `Bifrost(...)`'s and pass straight through to it,
-    /// including its environment and default resolution. Synchronous because a
-    /// caller starts Bifrost once at application start, not on a hot path.
+    /// The transport arguments are `Bifrost(...)`'s and pass straight through to
+    /// it, including its environment and default resolution.
+    /// `client_byte_limit_bytes` overrides the handle-wide ingestion byte
+    /// budget (256 MiB by default). Synchronous because a caller starts
+    /// Bifrost once at application start, not on a hot path.
     ///
     /// # Errors
     ///
     /// Raises `WYRD_SDK_409_BIFROST_ALREADY_STARTED` when this state already
     /// started Bifrost, `WYRD_SDK_409_BIFROST_CLOSED` after a successful
-    /// shutdown, and the catalog error for a missing credential, an undialable
-    /// ingest channel, or a missing, unauthorized, or incompatible fixed
-    /// observation table.
-    #[pyo3(signature = (table=None, server_url=None, credential=None, grpc_url=None))]
+    /// shutdown, `WYRD_CLIENT_400_CONFIG_INVALID` for a byte budget too small
+    /// to seal one message, and the catalog error for a missing credential, an
+    /// undialable ingest channel, or a missing, unauthorized, or incompatible
+    /// fixed observation table.
+    #[pyo3(signature = (table=None, server_url=None, credential=None, grpc_url=None, client_byte_limit_bytes=None))]
     fn start_bifrost(
         &self,
         py: Python<'_>,
@@ -164,12 +167,17 @@ impl PyWyrdState {
         server_url: Option<&str>,
         credential: Option<&str>,
         grpc_url: Option<&str>,
+        client_byte_limit_bytes: Option<usize>,
     ) -> CardPyResult<()> {
         let client = client_from_options(server_url, credential, grpc_url)
             .map_err(|error| WyrdPyError::from(WyrdError::from(error)))?;
         let table = table.map(PyTableConfig::into_native);
         py.detach(|| {
-            wyrd_runtime::runtime().block_on(self.inner.start_bifrost_with(&client, table))
+            wyrd_runtime::runtime().block_on(self.inner.start_bifrost_with_config(
+                &client,
+                table,
+                wyrd_queue::QueueConfig::with_client_byte_limit(client_byte_limit_bytes),
+            ))
         })
         .map_err(WyrdPyError::from)
     }

@@ -2,68 +2,88 @@
 
 use std::time::Duration;
 
-/// Tuning knobs for the two-stage producer.
+use crate::error::WyrdQueueError;
+
+/// Tuning knobs for one client handle's producers.
 ///
-/// Defaults are sane local-development values; a surface crate overrides them
-/// per deployment. All capacities are row counts except `max_message_bytes`.
+/// The only memory bound is `client_byte_limit_bytes`, shared by every
+/// producer of the handle; nothing is preallocated from it. Values are
+/// honoured as configured once [`Self::validate`] accepts them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueConfig {
-    /// Handle-wide ceiling for all client-owned row, IPC, and retry bytes.
-    /// Values above 32 MiB are clamped by [`Self::client_byte_limit`].
+    /// Handle-wide ceiling for every client-owned row, sealed-batch,
+    /// in-flight, and retained byte. One `max_message_bytes` of it is kept
+    /// back from admission so admitted rows can always be sealed.
     pub client_byte_limit_bytes: usize,
-    /// Maximum distinct producers a handle may register. Values above 64 are
-    /// clamped by [`Self::max_producers`].
-    pub max_producers: usize,
-    /// Stage-1 bounded `tokio::mpsc` depth (the caller-facing hand-off).
-    pub channel_capacity: usize,
-    /// Stage-2 `crossbeam_queue::ArrayQueue` staging depth.
-    pub staging_capacity: usize,
-    /// Size trigger: seal once staging holds at least this many rows.
-    pub flush_max_rows: usize,
-    /// Time trigger: seal every this many milliseconds. `0` disables the timer.
-    pub flush_interval_ms: u64,
-    /// Drain/await deadline (ms) for an in-flight `send` → `WYRD_CLIENT_504_FLUSH_TIMEOUT`.
+    /// How long the first staged row may wait for neighbours before its
+    /// producer seals a batch. `0` seals as soon as rows are staged.
+    pub linger_ms: u64,
+    /// Sealed batches one producer may have in flight at once.
+    pub max_in_flight: usize,
+    /// Send deadline (ms) for one sink attempt; an elapsed deadline retains
+    /// the batch as an ambiguous outcome.
     pub flush_timeout_ms: u64,
-    /// Sealed IPC ceiling (bytes). An oversize seal splits across batches; a
-    /// single row over the ceiling → `WYRD_CLIENT_413_PAYLOAD_TOO_LARGE`.
+    /// Sealed IPC ceiling (bytes), which is also the staged-byte seal target.
+    /// A single row over the ceiling → `WYRD_CLIENT_413_PAYLOAD_TOO_LARGE`.
     pub max_message_bytes: usize,
 }
 
 impl QueueConfig {
-    /// The accepted default and maximum Rust-client byte ownership ceiling.
-    pub const MAX_CLIENT_BYTE_LIMIT: usize = 32 * 1024 * 1024;
-    /// The accepted maximum producer, live-batch, retry, and command cardinality.
-    pub const MAX_LIVE_ENTRIES: usize = 64;
+    /// The default handle-wide byte budget: 256 MiB.
+    pub const DEFAULT_CLIENT_BYTE_LIMIT: usize = 256 * 1024 * 1024;
 
-    /// Returns the handle byte ceiling after enforcing the accepted policy cap.
+    /// The default configuration with an optional handle-wide byte budget.
+    ///
+    /// The one door SDK boundaries use for their byte-budget override: `None`
+    /// keeps [`Self::DEFAULT_CLIENT_BYTE_LIMIT`]. The value is not checked
+    /// here; connecting refuses a budget that cannot seal a message through
+    /// [`Self::validate`].
     #[must_use]
-    pub fn client_byte_limit(&self) -> usize {
-        self.client_byte_limit_bytes
-            .min(Self::MAX_CLIENT_BYTE_LIMIT)
+    pub fn with_client_byte_limit(client_byte_limit_bytes: Option<usize>) -> Self {
+        Self {
+            client_byte_limit_bytes: client_byte_limit_bytes
+                .unwrap_or(Self::DEFAULT_CLIENT_BYTE_LIMIT),
+            ..Self::default()
+        }
     }
 
-    /// Returns the producer cardinality after enforcing the accepted policy cap.
-    #[must_use]
-    pub fn max_producers(&self) -> usize {
-        self.max_producers.min(Self::MAX_LIVE_ENTRIES)
+    /// Checks that the configuration can admit and seal at least one message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdQueueError::ConfigInvalid`] when `max_message_bytes` or
+    /// `max_in_flight` is zero, or when `client_byte_limit_bytes` is smaller
+    /// than one message of admission plus one message of sealing headroom.
+    pub fn validate(&self) -> Result<(), WyrdQueueError> {
+        if self.max_message_bytes == 0 {
+            return Err(WyrdQueueError::ConfigInvalid {
+                field: "max_message_bytes",
+                reason: "must be positive".to_owned(),
+            });
+        }
+        if self.max_in_flight == 0 {
+            return Err(WyrdQueueError::ConfigInvalid {
+                field: "max_in_flight",
+                reason: "must be positive".to_owned(),
+            });
+        }
+        let minimum = self.max_message_bytes.saturating_mul(2);
+        if self.client_byte_limit_bytes < minimum {
+            return Err(WyrdQueueError::ConfigInvalid {
+                field: "client_byte_limit_bytes",
+                reason: format!(
+                    "{} is below {minimum}: one max_message_bytes of rows plus one of sealing headroom",
+                    self.client_byte_limit_bytes
+                ),
+            });
+        }
+        Ok(())
     }
 
-    /// Returns the accepted stage-one row ceiling without permitting growth.
+    /// Returns the linger before a staged row forces a seal.
     #[must_use]
-    pub(crate) fn channel_capacity(&self) -> usize {
-        self.channel_capacity.clamp(1, 1_024)
-    }
-
-    /// Returns the accepted staging row ceiling without permitting growth.
-    #[must_use]
-    pub(crate) fn staging_capacity(&self) -> usize {
-        self.staging_capacity.clamp(1, 4_096)
-    }
-
-    /// Returns the accepted per-producer seal row ceiling without permitting growth.
-    #[must_use]
-    pub(crate) fn flush_max_rows(&self) -> usize {
-        self.flush_max_rows.clamp(1, 50_000)
+    pub(crate) fn linger(&self) -> Duration {
+        Duration::from_millis(self.linger_ms)
     }
 
     /// Returns the bounded send deadline, treating zero as one millisecond.
@@ -78,14 +98,13 @@ impl QueueConfig {
 }
 
 impl Default for QueueConfig {
+    /// 256 MiB budget, 5 ms linger, four sends in flight, 30 s send
+    /// deadline, and 4 MiB messages.
     fn default() -> Self {
         Self {
-            client_byte_limit_bytes: Self::MAX_CLIENT_BYTE_LIMIT,
-            max_producers: Self::MAX_LIVE_ENTRIES,
-            channel_capacity: 1024,
-            staging_capacity: 4096,
-            flush_max_rows: 50_000,
-            flush_interval_ms: 1000,
+            client_byte_limit_bytes: Self::DEFAULT_CLIENT_BYTE_LIMIT,
+            linger_ms: 5,
+            max_in_flight: 4,
             flush_timeout_ms: 30_000,
             max_message_bytes: 4 * 1024 * 1024,
         }

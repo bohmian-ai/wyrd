@@ -685,3 +685,81 @@ def query_values(server: WyrdTestServer, credential: str, table: str) -> list[in
     """Read every caller-owned ``value`` in ``table``."""
     query = Bifrost(server_url=server.base_url, credential=credential)
     return [row["value"] for row in query.sql(f"SELECT value FROM {table}").to_arrow().to_pylist()]
+
+
+BURST_OBSERVATIONS = 1_000
+BURST_FEATURES = 9
+UNSEALABLE_BUDGET = 1024
+BURST_BUDGET = 16 * 1024 * 1024
+
+
+def emit_with_resubmit(state: WyrdState, view: Run, features: dict[str, float]) -> None:
+    """Emit one Drift observation, flushing and resubmitting it on ``QUEUE_FULL``.
+
+    Admission is all-or-none per observation, so a refused observation admitted
+    no row and resubmitting it after the flush duplicates nothing.
+    """
+    while True:
+        try:
+            view.observe.drift(features)
+            return
+        except wyrd.WyrdError as error:
+            if error.code != "WYRD_CLIENT_429_QUEUE_FULL":
+                raise
+            state.flush()
+
+
+@pytest.mark.integration
+def test_drift_burst_survives_a_byte_budget_override(tmp_path: Path) -> None:
+    """A 1,000 x 9 Drift burst through a budget override lands exactly once per row."""
+    with WyrdTestServer() as server:
+        service = write_service_graph(tmp_path)
+        bundle = tmp_path / "bundle"
+        admin = server.bootstrap_service(["admin"], name=f"py-burst-{uuid4().hex[:12]}")
+        cards = Cards(server_url=server.base_url, credential=admin)
+        cards.register_from_path(str(tmp_path / "observe-prompt.yaml"))
+        cards.register_from_path(str(tmp_path / "observe-model.yaml"))
+        root = cards.register_from_path(str(service)).root
+        pull_bundle(server, admin, root, bundle)
+        credential = server.credential_registered_service(
+            f"{root.space}/Service/{root.name}@{root.version}", []
+        )
+        state = WyrdState.from_path(bundle, interfaces={"model": NoopModelInterface()})
+
+        with pytest.raises(wyrd.WyrdError) as unsealable:
+            state.start_bifrost(
+                server_url=server.base_url,
+                credential=credential,
+                client_byte_limit_bytes=UNSEALABLE_BUDGET,
+            )
+        assert unsealable.value.code == "WYRD_CLIENT_400_CONFIG_INVALID"
+        state.start_bifrost(
+            server_url=server.base_url,
+            credential=credential,
+            client_byte_limit_bytes=BURST_BUDGET,
+        )
+
+        run = state.run()
+        model = run.for_card("model")
+        for observation in range(BURST_OBSERVATIONS):
+            emit_with_resubmit(
+                state,
+                model,
+                {f"feature_{feature}": observation + feature / 10 for feature in range(BURST_FEATURES)},
+            )
+        state.shutdown()
+        server.flush_bifrost()
+
+        counts = (
+            Bifrost(server_url=server.base_url, credential=admin)
+            .sql(
+                "SELECT COUNT(*) AS n FROM vala.drift.observations "
+                f"WHERE run_id = '{run.run_id}' GROUP BY record_id"
+            )
+            .to_arrow()
+            .column("n")
+            .to_pylist()
+        )
+        assert len(counts) == BURST_OBSERVATIONS, "one record_id per observation"
+        assert set(counts) == {BURST_FEATURES}, "every observation landed every feature once"
+        assert sum(counts) == BURST_OBSERVATIONS * BURST_FEATURES

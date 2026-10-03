@@ -293,16 +293,19 @@ impl Bifrost {
     /// then the environment chain exactly as before. With `client`, the
     /// supplied Rust `WyrdClient` — plain or delegated — is used as is, so no
     /// second credential is resolved; it cannot be combined with
-    /// `server_url`, `credential`, or `grpc_url`.
+    /// `server_url`, `credential`, or `grpc_url`. `client_byte_limit_bytes`
+    /// overrides the handle-wide ingestion byte budget (256 MiB by default).
     ///
     /// # Errors
     ///
-    /// Raises `WyrdError` carrying `WYRD_SPEC_400_VALIDATION` when `client` is
+    /// Raises `WyrdError` carrying `WYRD_CLIENT_400_CONFIG_INVALID` when the
+    /// byte budget cannot seal one message, and
+    /// `WYRD_SPEC_400_VALIDATION` when `client` is
     /// combined with a transport option, `WYRD_CLIENT_401_NO_CREDENTIALS` when
     /// nothing in the chain resolves a credential, and the catalog code for a
     /// failure to dial the ingest channel.
     #[new]
-    #[pyo3(signature = (table=None, server_url=None, credential=None, grpc_url=None, client=None))]
+    #[pyo3(signature = (table=None, server_url=None, credential=None, grpc_url=None, client=None, client_byte_limit_bytes=None))]
     fn __new__(
         py: Python<'_>,
         table: Option<PyTableConfig>,
@@ -310,6 +313,7 @@ impl Bifrost {
         credential: Option<&str>,
         grpc_url: Option<&str>,
         client: Option<PyRef<'_, crate::client::PyWyrdClient>>,
+        client_byte_limit_bytes: Option<usize>,
     ) -> WyrdPyResult<Self> {
         let client = match client {
             Some(_) if server_url.is_some() || credential.is_some() || grpc_url.is_some() => {
@@ -327,7 +331,7 @@ impl Bifrost {
                 wyrd_runtime::runtime().block_on(NativeBifrost::connect_with_config(
                     &client,
                     table,
-                    wyrd_queue::QueueConfig::default(),
+                    wyrd_queue::QueueConfig::with_client_byte_limit(client_byte_limit_bytes),
                 ))
             })
             .map_err(client_error)?;

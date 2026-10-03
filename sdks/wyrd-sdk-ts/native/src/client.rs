@@ -8,7 +8,6 @@ use napi_derive::napi;
 use secrecy::SecretString;
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::Bifrost;
-use wyrd_queue::QueueConfig;
 use wyrd_spec::auth::TokenAudience;
 use wyrd_spec::error::WyrdError;
 
@@ -123,8 +122,8 @@ impl NativeWyrdClient {
     /// # Errors
     ///
     /// Returns a napi error only when the supplied table config is not one
-    /// serialized `TableConfig`; the conflict and ingest-dial failures are
-    /// returned as catalog metadata.
+    /// serialized `TableConfig`; the conflict, byte-budget, and ingest-dial
+    /// failures are returned as catalog metadata.
     #[napi]
     pub async fn connect_bifrost(
         &self,
@@ -132,6 +131,7 @@ impl NativeWyrdClient {
         server_url: Option<String>,
         credential: Option<String>,
         grpc_url: Option<String>,
+        client_byte_limit_bytes: Option<i64>,
     ) -> napi::Result<NativeBifrostConnection> {
         if server_url.is_some() || credential.is_some() || grpc_url.is_some() {
             return Ok(NativeBifrostConnection {
@@ -145,7 +145,12 @@ impl NativeWyrdClient {
         }
         let table = table.map(|table| table.parse()).transpose()?;
         Ok(NativeBifrostConnection::from_outcome(
-            Bifrost::connect_with_config(&self.client, table, QueueConfig::default()).await,
+            Bifrost::connect_with_config(
+                &self.client,
+                table,
+                crate::queue_config(client_byte_limit_bytes),
+            )
+            .await,
         ))
     }
 }

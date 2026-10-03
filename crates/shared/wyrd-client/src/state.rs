@@ -564,6 +564,20 @@ impl WyrdState {
         self.bifrost.started()
     }
 
+    /// Point-in-time bounded-ownership accounting for this state's one writer.
+    ///
+    /// Test-harness only: a capacity benchmark samples `owned_bytes` while
+    /// runs emit through the state, which a separately connected `Bifrost`
+    /// cannot see because it owns a different writer. Reads atomics; no IO.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup and
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown.
+    #[cfg(feature = "test-support")]
+    pub fn bifrost_metrics(&self) -> Result<crate::bifrost::BifrostMetrics, WyrdError> {
+        Ok(self.started_bifrost()?.bifrost.metrics())
+    }
+
     /// Return the exact root Card reference.
     #[must_use]
     pub fn root_ref(&self) -> &CardRef {

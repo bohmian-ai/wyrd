@@ -154,11 +154,14 @@ class WyrdState:
         server_url: str | None = None,
         credential: str | None = None,
         grpc_url: str | None = None,
+        client_byte_limit_bytes: int | None = None,
     ) -> None:
         """Connect this state's one Bifrost writer and describe the fixed tables.
 
-        The four arguments are ``Bifrost(...)``'s and pass straight through,
-        including its environment and default resolution. Startup describes
+        The transport arguments are ``Bifrost(...)``'s and pass straight through,
+        including its environment and default resolution.
+        ``client_byte_limit_bytes`` overrides the handle-wide ingestion byte
+        budget (256 MiB by default). Startup describes
         ``vala.drift.observations`` and ``vala.eval.observations`` before
         succeeding, so a run can never enqueue against a missing, unauthorized,
         or incompatible system table. ``table`` keeps its existing Bifrost
@@ -167,9 +170,10 @@ class WyrdState:
         Raises:
             WyrdError: ``WYRD_SDK_409_BIFROST_ALREADY_STARTED`` when this state
                 already started Bifrost, ``WYRD_SDK_409_BIFROST_CLOSED`` after a
-                successful shutdown, or the catalog code for a missing
-                credential, an undialable ingest channel, or a fixed table that
-                is absent, unauthorized, or incompatible.
+                successful shutdown, ``WYRD_CLIENT_400_CONFIG_INVALID`` for a
+                byte budget too small to seal one message, or the catalog code
+                for a missing credential, an undialable ingest channel, or a
+                fixed table that is absent, unauthorized, or incompatible.
         """
         ...
 

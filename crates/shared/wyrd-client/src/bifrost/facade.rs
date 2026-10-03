@@ -110,13 +110,15 @@ impl Bifrost {
 
     /// Build a client with explicit producer tuning.
     ///
-    /// The tuning seam tests and long-running writers need — a zero flush
-    /// interval for a deterministic journey, a smaller channel for a saturation
-    /// test — without making [`QueueConfig`] part of the ordinary constructor.
+    /// The tuning seam for a larger or smaller handle byte budget, a longer
+    /// linger for a deterministic journey, or a different send concurrency,
+    /// without making [`QueueConfig`] part of the ordinary constructor.
     ///
     /// # Errors
     ///
-    /// As [`Bifrost::connect`].
+    /// Returns [`BifrostClientError::Queue`] carrying
+    /// `WYRD_CLIENT_400_CONFIG_INVALID` before dialling when `config` fails
+    /// [`QueueConfig::validate`], and otherwise as [`Bifrost::connect`].
     pub async fn connect_with_config(
         client: &WyrdClient,
         table: Option<TableConfig>,
@@ -175,12 +177,15 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// Returns a transport error when the ingest channel cannot be dialled.
+    /// Returns [`BifrostClientError::Queue`] when `config` fails
+    /// [`QueueConfig::validate`], and a transport error when the ingest
+    /// channel cannot be dialled.
     async fn assemble(
         client: &WyrdClient,
         table: Option<TableConfig>,
         mut config: QueueConfig,
     ) -> Result<Self, BifrostClientError> {
+        config.validate().map_err(BifrostClientError::Queue)?;
         let transport = BifrostGrpcTransport::connect(client)
             .await
             .map_err(BifrostClientError::from)?;

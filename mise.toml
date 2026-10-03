@@ -527,6 +527,18 @@ fi
 cargo run --locked --release -p wyrd-testing --bin verification_capacity -- "${binary[@]}" "$@"' _
 '''
 
+[tasks."bench:bifrost:ingest-capacity"]
+description = "Opt-in benchmark (AC-041): one release cloud wyrd-server over the storage emulators' RustFS service and its provisioned test bucket, in an 8-CPU/16-GiB systemd user scope, started through the local-development journey. One WyrdState emits open-loop Drift observations of 100 features: 500 obs/s for --seconds (default 60) with the default queue, judged on zero QUEUE_FULL, flat client bytes, drain within 1 s and exactly 100 durable rows per record_id; then a 1,000 obs/s step, a 50 ms acknowledgement-delay step and a --max-in-flight sweep (default 1,2,4,8), reported only. Writes target/bifrost-ingest-capacity/. Linux with a delegating systemd user manager; part of no gate or verify lane."
+env = { WYRD_STORAGE_URL = "s3://wyrd-storage-test", WYRD_STORAGE_ENDPOINT_URL = "http://localhost:9000", AWS_REGION = "us-east-1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret" }
+run = '''
+docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml up -d --wait rustfs
+docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml run --rm rustfs-setup
+scripts/postgres/with-test-postgres.sh -- bash -lc '
+set -euo pipefail
+cargo build --locked --release -p wyrd-server --features cloud
+cargo run --locked --release -p wyrd-testing --bin bifrost_ingest_capacity -- "$@"' _
+'''
+
 [tasks."test:bifrost:journey:otlp"]
 description = "Tier-1 journeys: OTLP trace, log, metric, mixed-batch and negative protocol surfaces"
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:otlp:inner'"

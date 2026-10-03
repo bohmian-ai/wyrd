@@ -22,6 +22,9 @@ mod service;
 
 pub use batches::{BatchAnswer, GatewayBatches};
 pub use capture::GatewayCapture;
+#[cfg(test)]
+pub(crate) use capture::recording;
+pub(crate) use capture::{CaptureBatch, CaptureTable};
 pub use ingress::gateway_ingress_router;
 pub(crate) use invocation::unconnected_engine;
 pub use invocation::{GatewayCallRequest, GatewayCallResponse, GatewayInvocation};

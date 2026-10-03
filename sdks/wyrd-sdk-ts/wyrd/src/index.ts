@@ -699,6 +699,10 @@ export class Bifrost {
    * `client` reuses an existing, possibly delegated, {@link WyrdClient} for
    * authentication and transport. It cannot be combined with `serverUrl`,
    * `credential`, or `grpcUrl`; doing so throws `WYRD_SPEC_400_VALIDATION`.
+   *
+   * `clientByteLimitBytes` overrides the handle-wide ingestion byte budget
+   * (256 MiB by default); a budget too small to seal one message throws
+   * `WYRD_CLIENT_400_CONFIG_INVALID`.
    */
   static async connect(
     options:
@@ -708,6 +712,7 @@ export class Bifrost {
           readonly credential?: string;
           readonly grpcUrl?: string;
           readonly client?: never;
+          readonly clientByteLimitBytes?: number;
         }
       | {
           readonly table?: TableConfig;
@@ -715,6 +720,7 @@ export class Bifrost {
           readonly serverUrl?: never;
           readonly credential?: never;
           readonly grpcUrl?: never;
+          readonly clientByteLimitBytes?: number;
         } = {},
   ): Promise<Bifrost> {
     const connection =
@@ -724,12 +730,14 @@ export class Bifrost {
             options.serverUrl,
             options.credential,
             options.grpcUrl,
+            options.clientByteLimitBytes,
           )
         : await wyrdClientNative(options.client).connectBifrost(
             options.table?.native,
             options.serverUrl,
             options.credential,
             options.grpcUrl,
+            options.clientByteLimitBytes,
           );
     return new Bifrost(nativeHandle(connection.bifrost, connection.error));
   }
@@ -1899,10 +1907,13 @@ export class WyrdState {
    * `vala.eval.observations` before resolving, so a run can never enqueue
    * against a missing, unauthorized, or incompatible system table. `table`
    * keeps its existing Bifrost meaning and does not choose a run's destination.
+   * `clientByteLimitBytes` overrides the handle-wide ingestion byte budget
+   * (256 MiB by default).
    *
-   * @throws a {@link WyrdError} for a second start, a closed state, a missing
-   * credential, an undialable ingest channel, or a fixed table that is absent,
-   * unauthorized, or incompatible.
+   * @throws a {@link WyrdError} for a second start, a closed state, a byte
+   * budget too small to seal one message (`WYRD_CLIENT_400_CONFIG_INVALID`), a
+   * missing credential, an undialable ingest channel, or a fixed table that is
+   * absent, unauthorized, or incompatible.
    */
   async startBifrost(
     options: {
@@ -1910,6 +1921,7 @@ export class WyrdState {
       readonly serverUrl?: string;
       readonly credential?: string;
       readonly grpcUrl?: string;
+      readonly clientByteLimitBytes?: number;
     } = {},
   ): Promise<void> {
     lifecycleValue<null>(
@@ -1918,6 +1930,7 @@ export class WyrdState {
         options.serverUrl,
         options.credential,
         options.grpcUrl,
+        options.clientByteLimitBytes,
       ),
     );
   }

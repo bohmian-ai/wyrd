@@ -586,10 +586,10 @@ export declare class NativeWyrdClient {
    * # Errors
    *
    * Returns a napi error only when the supplied table config is not one
-   * serialized `TableConfig`; the conflict and ingest-dial failures are
-   * returned as catalog metadata.
+   * serialized `TableConfig`; the conflict, byte-budget, and ingest-dial
+   * failures are returned as catalog metadata.
    */
-  connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): Promise<NativeBifrostConnection>
+  connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, clientByteLimitBytes?: number | undefined | null): Promise<NativeBifrostConnection>
 }
 
 /**
@@ -650,10 +650,10 @@ export declare class NativeWyrdState {
    * # Errors
    *
    * Returns a napi error when `table` is not one serialized `TableConfig`;
-   * a second start, a closed state, and credential, dial, and fixed-table
-   * failures are returned in [`NativeLifecycleResult`].
+   * a second start, a closed state, and credential, byte-budget, dial, and
+   * fixed-table failures are returned in [`NativeLifecycleResult`].
    */
-  startBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): Promise<NativeLifecycleResult>
+  startBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, clientByteLimitBytes?: number | undefined | null): Promise<NativeLifecycleResult>
   /**
    * Opens one invocation over this state, targeting `card` or the root Service.
    *
@@ -698,10 +698,10 @@ export declare class NativeWyrdState {
  * # Errors
  *
  * Returns a napi error only when the supplied table config is not one
- * serialized `TableConfig`; credential and ingest-dial failures are returned
- * as catalog metadata.
+ * serialized `TableConfig`; credential, byte-budget, and ingest-dial failures
+ * are returned as catalog metadata.
  */
-export declare function connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): Promise<NativeBifrostConnection>
+export declare function connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, clientByteLimitBytes?: number | undefined | null): Promise<NativeBifrostConnection>
 
 /**
  * Builds one Card registry handle without performing IO.

@@ -124,7 +124,6 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 chrono-tz = "0.10"
 croner = { version = "4", default-features = false, features = ["chrono"] }
 dashmap = "6.1"
-crossbeam-queue = "0.3"
 flate2 = "1.*"
 zstd = "0.13"
 walkdir = "2.*"

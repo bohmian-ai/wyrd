@@ -57,14 +57,10 @@ pub(crate) struct WriterPool {
 /// Point-in-time settlement accounting for one [`crate::bifrost::Bifrost`] client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BifrostMetrics {
-    /// Producers currently registered under the bounded handle pool.
+    /// Producers currently registered under the handle pool.
     pub producers: usize,
-    /// Bytes held by queued rows or a sealed batch owner.
+    /// Bytes held by queued rows, sealed frames, and retained batches.
     pub owned_bytes: usize,
-    /// Lifetime charges for constructed producer queue and control slots.
-    pub fixed_storage_bytes: usize,
-    /// Total handle reservation including dynamic ownership and fixed storage.
-    pub total_reserved_bytes: usize,
     /// Sealed batches not yet terminally acknowledged, cancelled, or poisoned.
     pub live_batches: usize,
     /// Ambiguous batches retained for a retry rather than released.
@@ -124,10 +120,8 @@ impl WriterPool {
     ///
     /// This is a point-in-time telemetry view: concurrent inserts or background
     /// drains can change individual counters immediately after it is returned.
-    /// A durable batch ACK reports zero dynamic bytes, batches, retry entries,
-    /// and pending controls. Constructed producers retain their fixed storage
-    /// charge until [`Self::shutdown`] removes them; then total reservation is
-    /// also zero.
+    /// A durable batch ACK reports zero bytes, batches, retry entries, and
+    /// pending controls; an idle producer holds no bytes.
     ///
     /// # Panics
     ///
@@ -137,18 +131,13 @@ impl WriterPool {
     pub(crate) fn metrics(&self) -> BifrostMetrics {
         let ClientByteMetrics {
             owned_bytes,
-            fixed_storage_bytes,
-            total_reserved_bytes,
             live_batches,
             retry_entries,
-            ..
         } = self.budget.metrics();
         let producers = self.producers.lock().expect("producer pool poisoned");
         BifrostMetrics {
             producers: producers.len(),
             owned_bytes,
-            fixed_storage_bytes,
-            total_reserved_bytes,
             live_batches,
             retry_entries,
             pending_controls: producers
@@ -334,9 +323,9 @@ impl WriterPool {
     /// created or returned after the snapshot. Once each producer enters its
     /// draining state, new rows are rejected and buffered rows are sent before
     /// this method returns. Direct Arrow sends admitted before closure are
-    /// awaited until each settles. Terminally drained
-    /// producers are removed and release their fixed-storage guards; a timed
-    /// out ambiguous producer stays retained for a later shutdown retry.
+    /// awaited until each settles. Terminally drained producers are removed;
+    /// a producer still holding an ambiguous batch stays for a later shutdown
+    /// retry.
     ///
     /// # Errors
     /// Returns the first [`WyrdQueueError`] reported by a producer shutdown
@@ -400,9 +389,8 @@ impl WriterPool {
     ///
     /// # Errors
     ///
-    /// Returns [`WyrdQueueError::QueueFull`] once the pool has closed,
-    /// [`WyrdQueueError::Backpressure`] when the producer ceiling is reached, and
-    /// the producer construction error otherwise.
+    /// Returns [`WyrdQueueError::QueueFull`] once the pool has closed, and the
+    /// producer construction error otherwise.
     ///
     /// # Panics
     ///
@@ -422,9 +410,6 @@ impl WriterPool {
                 .then(|| Arc::clone(producer))
         }) {
             return Ok(producer);
-        }
-        if pool.len() >= self.config.max_producers() {
-            return Err(WyrdQueueError::Backpressure);
         }
         let producer = Arc::new(Producer::with_budget(
             table,
@@ -600,7 +585,7 @@ mod tests {
         assert_eq!(acked_at_return, 1, "shutdown awaited the admitted send");
         assert_eq!(metrics.live_batches, 0);
         assert_eq!(metrics.owned_bytes, 0);
-        assert_eq!(metrics.total_reserved_bytes, 0);
+        assert_eq!(metrics.owned_bytes, 0);
         writer
             .await
             .expect("writer task")
@@ -678,6 +663,5 @@ mod tests {
         assert_eq!(metrics.producers, 0);
         assert_eq!(metrics.owned_bytes, 0);
         assert_eq!(metrics.live_batches, 0);
-        assert_eq!(metrics.total_reserved_bytes, 0);
     }
 }

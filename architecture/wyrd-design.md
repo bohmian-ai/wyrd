@@ -176,14 +176,12 @@ not a passive integration or inventory product.
     result write, or `bifrost_query:read` scoped to the tenant's registered
     `vala.drift.observations` table. No token carries both. Platform authority
     is a grant held at platform scope, not a property of a kind, and neither
-    plane's credential or token is accepted by the other. Gateway capture runs
-    as the reserved
-    `GATEWAY_CAPTURE_PRINCIPAL`: a tenant-bound, card-free `Service` with an
-    empty `card_ref_scope`, only the informational `gateway_capture` Role, no
-    delegation, and a token of at most 900 s minted only by internal server
-    paths; no public credential, workload, refresh, delegation, or
-    impersonation flow can issue it, and it never replaces the invocation
-    caller in audit. `wyrd apply -f service.yaml` (or an Agent card) creates
+    plane's credential or token is accepted by the other. Gateway capture is a
+    server-internal write, not a principal that authenticates: captured rows
+    carry the reserved `GATEWAY_CAPTURE_PRINCIPAL`, which, like
+    `PLATFORM_AUDIT_PRINCIPAL`, never appears in a token. Every issuer refuses
+    it, every verifier rejects a token naming it, and it never replaces the
+    invocation caller in audit. `wyrd apply -f service.yaml` (or an Agent card) creates
     or updates the principal row idempotently, keyed on
     `(tenant_id, card_kind, card_uid)`; re-apply preserves the same
     `principal_id`. No secret is returned. Credentials are issued out-of-band
@@ -504,14 +502,17 @@ credential's non-secret id.
 Wyrd principals are UUID-backed runtime identities that exist independently of
 any credential: issuing, rotating, revoking, or losing a credential never
 creates, destroys, or alters a principal or its role grants. The reserved
-`GATEWAY_CAPTURE_PRINCIPAL` is the one card-free `Service` the server mints
-itself: a short-lived (at most 900 s) token binding one tenant and only that
-tenant's exactly two Bifrost record-write grants, for its `vala.gateway.calls`
-and `vala.traces.spans` table UIDs, in the signed `permissions` claim (the
-`gateway_capture` Role it carries is informational and has no stored row).
-Gate reserves `vala.gateway.calls` to it and confines it to those two tables;
-a capture table recreated under a new UID stays denied until a server restart
-rebuilds the capture producer.
+`GATEWAY_CAPTURE_PRINCIPAL` is not a credential-bearing identity: it is the
+id Scribe stamps on rows gateway capture writes server-internally, holding no
+token, role, or grant. Each `wyrd-server` process owns one capture writer,
+chosen from pod topology (`WYRD_TARGET`): it submits in-process when Scribe
+runs in the pod, and otherwise over the peer plane through a capture-only RPC
+to a live, ready Scribe. A capture is delivered when Scribe acknowledges it
+before the call's deadline; backpressure and an unavailable Scribe are retried
+with bounded backoff until then, and anything else drops the capture with a
+counted reason without changing the call. No per-tenant client, queue, or
+backlog outlives the call. Gate refuses every public write to
+`vala.gateway.calls`.
 `Service` and
 `Agent` principal is always card-bound and a deployed `Service` carries its
 Card — the `card_ref` is discriminated on `PrincipalKind`, and the JWT carries a

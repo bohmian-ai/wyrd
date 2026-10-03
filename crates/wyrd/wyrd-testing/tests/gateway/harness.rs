@@ -346,7 +346,7 @@ pub(crate) async fn token(server: &WyrdTestServer, name: &str, roles: &[&str]) -
 ///
 /// # Panics
 /// Panics when bootstrap fails or returns a user.
-async fn api_key(server: &WyrdTestServer, name: &str, roles: &[&str]) -> SecretString {
+pub(crate) async fn api_key(server: &WyrdTestServer, name: &str, roles: &[&str]) -> SecretString {
     let Bootstrap::Machine { api_key, .. } = server
         .bootstrap_service(name, roles)
         .await
@@ -361,7 +361,7 @@ async fn api_key(server: &WyrdTestServer, name: &str, roles: &[&str]) -> SecretS
 ///
 /// # Panics
 /// Panics when the exchange fails.
-async fn exchange(server: &WyrdTestServer, key: &SecretString) -> String {
+pub(crate) async fn exchange(server: &WyrdTestServer, key: &SecretString) -> String {
     server
         .exchange_api_key(key)
         .await

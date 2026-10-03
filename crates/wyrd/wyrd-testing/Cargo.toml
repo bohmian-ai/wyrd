@@ -157,3 +157,10 @@ bench = false
 name = "verification_capacity"
 path = "src/bin/verification_capacity/main.rs"
 bench = false
+
+# The opt-in client ingest capacity benchmark (AC-041). Run only through
+# `mise run bench:bifrost:ingest-capacity`; only its unit tests run in a lane.
+[[bin]]
+name = "bifrost_ingest_capacity"
+path = "src/bin/bifrost_ingest_capacity/main.rs"
+bench = false

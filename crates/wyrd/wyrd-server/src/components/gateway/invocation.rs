@@ -806,15 +806,15 @@ impl<'a> GatewayInvocation<'a> {
         })
     }
 
-    /// Projects and enqueues the capture of one terminal call, if selected.
+    /// Projects and delivers the capture of one terminal call, if selected.
     ///
-    /// Runs after the caller has its answer and never waits for publication;
-    /// every drop is counted by [`GatewayCapture::record`]. The whole capture —
-    /// request content, object get, put, and read-back, and first-use producer
-    /// construction — is bounded by the admitted call's absolute deadline, so
-    /// a hung dependency cannot hold facts, object bytes, or this task past
-    /// the call. On expiry the partial work is dropped, releasing what it
-    /// held, no row is enqueued (the enqueue itself never awaits), and one
+    /// Runs after the caller has its answer; every outcome is counted by
+    /// [`GatewayCapture::record`]. The whole capture — request content, object
+    /// get, put, and read-back, and every Scribe submission — is bounded by
+    /// the admitted call's absolute deadline, so a hung dependency cannot hold
+    /// facts, object bytes, or this task past the call. Delivery itself stops
+    /// retrying at that deadline with its own drop reason; work still running
+    /// when it passes is dropped, releasing what it held, and one
     /// [`CaptureDrop::Unavailable`] is recorded.
     async fn capture(state: &AppState, call: &AdmittedCall, facts: Option<CallFacts>) {
         let Some(mut facts) = facts else {
@@ -831,7 +831,11 @@ impl<'a> GatewayInvocation<'a> {
             }
             match CallCapture::from_facts(facts) {
                 Ok(capture) => {
-                    state.gateway_capture.publish(state, &capture).await.ok();
+                    state
+                        .gateway_capture
+                        .publish(state, &capture, call.deadline)
+                        .await
+                        .ok();
                 }
                 Err(drop) => GatewayCapture::record(call.call_id, Err(drop)),
             }

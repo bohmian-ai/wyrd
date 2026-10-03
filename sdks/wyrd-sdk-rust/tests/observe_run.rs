@@ -910,3 +910,119 @@ async fn issued_card_key_writes_and_queries_within_its_scope_only() {
     );
     server.shutdown().await.expect("test server shuts down");
 }
+
+/// The number of Drift observations one burst emits.
+const BURST_OBSERVATIONS: usize = 1_000;
+
+/// The features every burst observation carries, one tall row each.
+const BURST_FEATURES: usize = 9;
+
+/// A byte budget smaller than one maximum message plus its sealing headroom.
+const UNSEALABLE_BUDGET: usize = 1024;
+
+/// A budget override above the 8 MiB floor the default 4 MiB message needs.
+const BURST_BUDGET: usize = 16 * 1024 * 1024;
+
+/// One `record_id` group of the burst read-back.
+#[derive(Debug, Deserialize)]
+struct RecordCount {
+    /// Rows that share this observation's `record_id`.
+    n: i64,
+}
+
+/// Emit one Drift observation, flushing and resubmitting it on `QUEUE_FULL`.
+///
+/// Admission is all-or-none per observation, so a refused observation admitted
+/// no row and the same features can be resubmitted after the flush frees the
+/// budget without duplicating any row.
+///
+/// # Panics
+/// Panics when the emit fails with anything but `QUEUE_FULL`, or the flush fails.
+async fn emit_with_resubmit(state: &WyrdState, view: &Run, features: &serde_json::Value) {
+    loop {
+        match view.observe().drift(features, None) {
+            Ok(()) => return,
+            Err(error) if error.code() == "WYRD_CLIENT_429_QUEUE_FULL" => {
+                state.flush().await.expect("a flush frees the budget");
+            }
+            Err(error) => panic!("drift emit failed: {error:?}"),
+        }
+    }
+}
+
+/// An uninterrupted 1,000-observation × 9-feature Drift burst through a
+/// byte-budget override reads back exactly 9,000 rows, 1,000 `record_id`s, and
+/// 9 rows per id, and a budget too small to seal a message is refused at
+/// startup without consuming the state's one start.
+///
+/// # Panics
+/// Panics when the unsealable budget starts, the burst loses or duplicates a
+/// row, or any read-back count differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn drift_burst_survives_a_byte_budget_override() {
+    let root = tempfile::tempdir().expect("fixture root creates");
+    let service = write_service_graph(root.path());
+    let bundle = root.path().join("bundle");
+    let server = Box::pin(WyrdTestServer::builder().start_bound())
+        .await
+        .expect("test server starts");
+    let admin = machine_key(&server, "rust_burst_admin", &["admin"]).await;
+    let receipt = hydrate_bundle(&connect(&server, &admin), root.path(), &service, &bundle).await;
+    let credential = card_bound_key(&server, &receipt, &[]).await;
+    let state = WyrdState::from_path(&bundle).expect("complete bundle loads offline");
+    let client = connect(&server, &credential);
+
+    let refused = state
+        .start_bifrost_with_config(
+            &client,
+            None,
+            QueueConfig::with_client_byte_limit(Some(UNSEALABLE_BUDGET)),
+        )
+        .await
+        .expect_err("a budget that cannot seal one message is refused");
+    assert_eq!(refused.code(), "WYRD_CLIENT_400_CONFIG_INVALID");
+    state
+        .start_bifrost_with_config(
+            &client,
+            None,
+            QueueConfig::with_client_byte_limit(Some(BURST_BUDGET)),
+        )
+        .await
+        .expect("the refused start left the state startable");
+
+    let run = state.run();
+    let run_id = run.run_id().as_str().to_owned();
+    let model = run.for_card("model").expect("model view resolves");
+    for observation in 0..BURST_OBSERVATIONS {
+        let features: serde_json::Map<String, serde_json::Value> = (0..BURST_FEATURES)
+            .map(|feature| {
+                (
+                    format!("feature_{feature}"),
+                    serde_json::json!(observation as f64 + feature as f64 / 10.0),
+                )
+            })
+            .collect();
+        emit_with_resubmit(&state, &model, &serde_json::Value::Object(features)).await;
+    }
+    state.shutdown().await.expect("the burst drains");
+    server.flush_bifrost().await.expect("flush server Scribe");
+
+    let groups: Vec<RecordCount> = Bifrost::query_only(&connect(&server, &admin))
+        .sql_as(&format!(
+            "SELECT COUNT(*) AS n FROM vala.drift.observations \
+             WHERE run_id = '{run_id}' GROUP BY record_id"
+        ))
+        .await
+        .expect("burst rows read back");
+    assert_eq!(groups.len(), BURST_OBSERVATIONS, "one record_id per observation");
+    assert!(
+        groups.iter().all(|group| group.n == BURST_FEATURES as i64),
+        "every observation landed all of its features exactly once"
+    );
+    assert_eq!(
+        groups.iter().map(|group| group.n).sum::<i64>(),
+        (BURST_OBSERVATIONS * BURST_FEATURES) as i64
+    );
+    server.shutdown().await.expect("test server shuts down");
+}

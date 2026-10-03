@@ -10,18 +10,12 @@ import json
 
 
 def main() -> None:
-    mock = {
-        "label": "demo",
-        "fail_on_flush": None,
+    transport = {
+        "transport": "mock",
+        "params": {"label": "demo", "fail_on_drain": None},
     }
-    queue = {
-        "transport": {"transport": "mock", "params": mock},
-        "flush_max_rows": 100,
-        "flush_interval_ms": 100,
-        "channel_capacity": 10,
-    }
-    encoded = json.dumps(queue, indent=2, sort_keys=True)
-    assert json.loads(encoded) == queue
+    encoded = json.dumps(transport, indent=2, sort_keys=True)
+    assert json.loads(encoded) == transport
     print(encoded)
 
 

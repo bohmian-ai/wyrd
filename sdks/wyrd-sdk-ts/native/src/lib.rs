@@ -500,6 +500,18 @@ fn apply_compaction_target(config: TableConfig, bytes: Option<f64>) -> Result<Ta
     }
 }
 
+/// The queue configuration for an optional JavaScript byte-budget override.
+///
+/// `None` keeps the 256 MiB default. A negative number cannot be a budget, so
+/// it becomes zero, which connecting refuses with
+/// `WYRD_CLIENT_400_CONFIG_INVALID` like any budget too small to seal one
+/// message.
+pub(crate) fn queue_config(client_byte_limit_bytes: Option<i64>) -> QueueConfig {
+    QueueConfig::with_client_byte_limit(
+        client_byte_limit_bytes.map(|limit| usize::try_from(limit).unwrap_or(0)),
+    )
+}
+
 /// The one Bifrost client: query any authorized table, write to the active one.
 ///
 /// Mirrors the Python binding: both are thin conversions over the one
@@ -523,14 +535,15 @@ pub struct NativeBifrost {
 /// # Errors
 ///
 /// Returns a napi error only when the supplied table config is not one
-/// serialized `TableConfig`; credential and ingest-dial failures are returned
-/// as catalog metadata.
+/// serialized `TableConfig`; credential, byte-budget, and ingest-dial failures
+/// are returned as catalog metadata.
 #[napi]
 pub async fn connect_bifrost(
     table: Option<NativeTableConfig>,
     server_url: Option<String>,
     credential: Option<String>,
     grpc_url: Option<String>,
+    client_byte_limit_bytes: Option<i64>,
 ) -> Result<NativeBifrostConnection> {
     let table = table.map(|table| table.parse()).transpose()?;
     let connected = match wyrd_client::bifrost::client_from_options(
@@ -538,7 +551,10 @@ pub async fn connect_bifrost(
         credential.as_deref(),
         grpc_url.as_deref(),
     ) {
-        Ok(client) => Bifrost::connect_with_config(&client, table, QueueConfig::default()).await,
+        Ok(client) => {
+            Bifrost::connect_with_config(&client, table, queue_config(client_byte_limit_bytes))
+                .await
+        }
         Err(error) => Err(error),
     };
     Ok(NativeBifrostConnection::from_outcome(connected))

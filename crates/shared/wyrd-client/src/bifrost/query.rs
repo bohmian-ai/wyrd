@@ -149,7 +149,7 @@ impl From<&BifrostClientError> for WyrdError {
 
 /// Projects one client-tier queue refusal onto its catalog variant.
 ///
-/// Saturation, drain, and payload refusals keep their own `WYRD_CLIENT_*`
+/// Saturation, drain, payload, and configuration refusals keep their own `WYRD_CLIENT_*`
 /// codes so a caller can retry a full queue without parsing error text; a sink
 /// failure is already a catalog error and passes through unchanged.
 fn queue_catalog_error(error: &WyrdQueueError) -> WyrdError {
@@ -161,6 +161,10 @@ fn queue_catalog_error(error: &WyrdQueueError) -> WyrdError {
         }
         WyrdQueueError::FlushTimeout => WyrdError::ClientFlushTimeout { message, details },
         WyrdQueueError::PayloadTooLarge => WyrdError::ClientPayloadTooLarge { message, details },
+        WyrdQueueError::ConfigInvalid { field, reason } => WyrdError::ClientConfigInvalid {
+            message,
+            details: serde_json::json!({ "field": field, "reason": reason }),
+        },
         WyrdQueueError::SchemaParse(detail) => WyrdError::Vala {
             error: BifrostError::SchemaParse {
                 detail: detail.clone(),

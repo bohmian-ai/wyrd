@@ -45,6 +45,9 @@ pub const SAMPLES: u32 = 1_000;
 /// Numeric features of the baseline; PSI reads all of them (AC-040).
 const FEATURES: usize = 8;
 
+/// Drift rows one seeded observation lands: one per feature plus `score`.
+const ROWS_PER_SAMPLE: u64 = FEATURES as u64 + 1;
+
 /// Features SPC reads (AC-040).
 const SPC_FEATURES: usize = 4;
 
@@ -341,13 +344,18 @@ impl Tenant {
     }
 
     /// Emits [`SAMPLES`] Drift observations of the Model through one Service
-    /// lifetime, waits until all of them are queryable, and returns the
+    /// lifetime, waits until all of their rows are queryable, and returns the
     /// window that holds exactly them.
+    ///
+    /// Each observation lands one row per feature plus its `score`. Admission
+    /// is all-or-none per observation, so one refused with `QUEUE_FULL`
+    /// admitted no row and is resubmitted unchanged once a flush frees the
+    /// budget.
     ///
     /// # Errors
     ///
-    /// Returns an emit, drain, or query failure, or a window that never
-    /// settles within [`SETTLE`].
+    /// Returns an emit failure other than `QUEUE_FULL`, a flush, drain, or
+    /// query failure, or a window that never settles within [`SETTLE`].
     async fn seed(&self) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
         let start = Utc::now();
         let state = WyrdState::from_path(&self.bundle)?;
@@ -362,9 +370,16 @@ impl Tenant {
                 features.insert(format!("f{feature}"), value(row, feature).into());
             }
             features.insert("score".to_owned(), 1.2.into());
-            model
-                .observe()
-                .drift(&serde_json::Value::Object(features), None)?;
+            let features = serde_json::Value::Object(features);
+            loop {
+                match model.observe().drift(&features, None) {
+                    Ok(()) => break,
+                    Err(error) if error.code() == "WYRD_CLIENT_429_QUEUE_FULL" => {
+                        state.flush().await?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
         }
         state.shutdown().await?;
         let end = Utc::now() + chrono::TimeDelta::seconds(1);
@@ -372,7 +387,7 @@ impl Tenant {
         while self
             .count("SELECT COUNT(*) AS n FROM vala.drift.observations")
             .await?
-            < u64::from(SAMPLES)
+            < u64::from(SAMPLES) * ROWS_PER_SAMPLE
         {
             if tokio::time::Instant::now() > deadline {
                 return Err("the seeded Drift window never became queryable".into());

@@ -419,3 +419,82 @@ describe("scoped observation journey", () => {
     }
   }, 90_000);
 });
+
+const BURST_OBSERVATIONS = 1_000;
+const BURST_FEATURES = 9;
+const UNSEALABLE_BUDGET = 1024;
+const BURST_BUDGET = 16 * 1024 * 1024;
+
+describe("Drift burst under a byte-budget override", () => {
+  it("lands every row of a 1,000 x 9 burst exactly once", async () => {
+    const root = mkdtempSync(join(tmpdir(), "wyrd-ts-burst-"));
+    const service = writeServiceGraph(root);
+    const bundle = join(root, "bundle");
+    const server = startTestServer();
+    try {
+      const cards = Cards.connect({ serverUrl: server.baseUrl, credential: server.apiKey });
+      await cards.registerFromPath(join(root, "observe-prompt.yaml"));
+      const receipt = await cards.registerFromPath(service);
+      await cards.hydrate(receipt.root, bundle);
+      const credential = server.credentialRegisteredService(
+        `${receipt.root.space}/Service/${receipt.root.name}@${receipt.root.version}`,
+        [],
+      );
+      const state = WyrdState.fromPath(bundle);
+      const connection = { serverUrl: server.baseUrl, credential, grpcUrl: server.grpcUrl };
+
+      const unsealable = await rejection(
+        state.startBifrost({ ...connection, clientByteLimitBytes: UNSEALABLE_BUDGET }),
+      );
+      expect(unsealable.code).toBe("WYRD_CLIENT_400_CONFIG_INVALID");
+      await state.startBifrost({ ...connection, clientByteLimitBytes: BURST_BUDGET });
+
+      const run = state.run();
+      const model = run.forCard("model");
+      for (let observation = 0; observation < BURST_OBSERVATIONS; observation += 1) {
+        const features = Object.fromEntries(
+          Array.from({ length: BURST_FEATURES }, (_, feature) => [
+            `feature_${feature}`,
+            observation + feature / 10,
+          ]),
+        );
+        // Admission is all-or-none per observation, so a refused observation
+        // admitted no row and resubmitting it after a flush duplicates nothing.
+        for (;;) {
+          try {
+            model.observe.drift(features);
+            break;
+          } catch (error) {
+            if (!(error instanceof WyrdError) || error.code !== "WYRD_CLIENT_429_QUEUE_FULL") {
+              throw error;
+            }
+            await state.flush();
+          }
+        }
+      }
+      await state.shutdown();
+      server.flushBifrost();
+
+      const reader = await Bifrost.connect({
+        serverUrl: server.baseUrl,
+        credential: server.apiKey,
+        grpcUrl: server.grpcUrl,
+      });
+      const counts = (
+        await reader.sql(
+          `SELECT COUNT(*) AS n FROM vala.drift.observations
+             WHERE run_id = '${run.runId}' GROUP BY record_id`,
+        )
+      )
+        .toArrow()
+        .toArray()
+        .map((row) => Number(row.toJSON().n));
+      expect(counts).toHaveLength(BURST_OBSERVATIONS);
+      expect(new Set(counts)).toEqual(new Set([BURST_FEATURES]));
+      expect(counts.reduce((total, n) => total + n, 0)).toBe(BURST_OBSERVATIONS * BURST_FEATURES);
+      await reader.shutdown();
+    } finally {
+      server.shutdown();
+    }
+  }, 120_000);
+});

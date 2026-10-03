@@ -799,15 +799,6 @@ impl BoundServer {
         let gateway_drained = tokio::time::timeout_at(deadline, self.state.gateway_tasks.wait())
             .await
             .is_ok();
-        // Drained calls have enqueued their capture; publish it within the
-        // same deadline. Evidence still buffered at the deadline may be lost,
-        // which capture permits before Scribe acknowledgement.
-        if tokio::time::timeout_at(deadline, self.state.gateway_capture.shutdown())
-            .await
-            .is_err()
-        {
-            tracing::warn!("gateway capture did not drain before the shutdown deadline");
-        }
         let terminal = match terminal {
             Some(message) => Some(message),
             None if !mcp_drained => {

@@ -37,6 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bytes(".wyrd.v1.InsertBatchRequest.arrow_ipc")
         .bytes(".wyrd.v1.InsertBatchRequest.wyrd_batch_id")
         .bytes(".wyrd.v1.InsertBatchResponse.wyrd_batch_id")
+        .bytes(".wyrd.v1.IngestCaptureRequest.arrow_ipc")
         .file_descriptor_set_path(&descriptor)
         .compile_protos(&[proto], &[proto_dir])?;
 

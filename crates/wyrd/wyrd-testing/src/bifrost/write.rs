@@ -59,7 +59,7 @@ impl BifrostWriter {
             &client,
             None,
             QueueConfig {
-                flush_interval_ms: 0,
+                linger_ms: 60_000,
                 ..QueueConfig::default()
             },
         )

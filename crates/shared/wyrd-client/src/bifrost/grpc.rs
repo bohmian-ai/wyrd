@@ -446,10 +446,9 @@ mod tests {
     use crate::auth::AuthMiddleware;
     use crate::config::ClientConfig;
     use crate::transport::HttpTransport;
-    use crate::transport::credential::{AccessTokenSource, MintedAccessToken, ResolvedCredential};
+    use crate::transport::credential::ResolvedCredential;
     use secrecy::SecretString;
     use tokio::sync::Mutex;
-    use wyrd_spec::auth::SecretBearer;
     use wyrd_tonic::tonic::Response;
     use wyrd_tonic::tonic::transport::Server;
     use wyrd_tonic::wyrd::v1::InsertBatchResponse;
@@ -608,7 +607,7 @@ mod tests {
         )
         .await
         .expect("real test gRPC transport connects");
-        let budget = ClientByteBudget::new(QueueConfig::MAX_CLIENT_BYTE_LIMIT);
+        let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
         let request_id = RequestId::now_v7();
         let retried = SealedBatch {
             request_id: Some(request_id.clone()),
@@ -729,18 +728,16 @@ mod tests {
         }
     }
 
-    /// Sends `sends` consecutive one-row batches, each enqueued and flushed in
-    /// turn, through a real facade over `credential` against `service`, whose
-    /// producer asks for a 1 ms send deadline, then shuts the facade down.
-    /// `http_timeout_ms` bounds each token exchange and so sizes the
-    /// transport's authentication budget.
+    /// Sends one one-row batch through a real facade authenticated by a
+    /// static bearer against `service`, whose producer asks for a 1 ms send
+    /// deadline, then shuts the facade down.
     ///
     /// Every send ends without an acknowledgement, so the outcome is
     /// ambiguous: the queue must retain the oldest batch with its bytes and
     /// retry slot, report no loss, and refuse to report shutdown as drained.
     ///
-    /// Returns the RPC attempts `attempts` counted when the flushes returned,
-    /// the loss observer's reports, and the facade's auth owner.
+    /// Returns the RPC attempts `attempts` counted when the flush returned and
+    /// the loss observer's reports.
     ///
     /// # Panics
     ///
@@ -750,10 +747,7 @@ mod tests {
     async fn retain_held_batch<S: BifrostIngestService>(
         service: S,
         attempts: &AtomicUsize,
-        credential: ResolvedCredential,
-        http_timeout_ms: u64,
-        sends: usize,
-    ) -> (usize, Vec<u64>, Arc<AuthMiddleware>) {
+    ) -> (usize, Vec<u64>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test port binds");
         let address = listener.local_addr().expect("test address resolves");
         drop(listener);
@@ -771,20 +765,20 @@ mod tests {
                 timeout_ms: 50,
                 ..crate::transport::GrpcConfig::default()
             },
-            http: crate::transport::HttpConfig {
-                timeout_ms: http_timeout_ms,
-                ..crate::transport::HttpConfig::default()
-            },
             ..ClientConfig::default()
         };
-        let auth = AuthMiddleware::new(&config, credential).expect("test auth builds");
+        let auth = AuthMiddleware::new(
+            &config,
+            ResolvedCredential::BearerToken(SecretString::from("test-token")),
+        )
+        .expect("test auth builds");
         let http = HttpTransport::new(&config.http, auth.clone()).expect("test HTTP layer builds");
         let client = WyrdClient::from_parts(Arc::clone(&auth), http, config.grpc);
         let bifrost = crate::bifrost::Bifrost::connect_with_config(
             &client,
             None,
             QueueConfig {
-                flush_interval_ms: 0,
+                linger_ms: 60_000,
                 flush_timeout_ms: 1,
                 ..QueueConfig::default()
             },
@@ -805,18 +799,16 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))])
             .expect("test batch builds");
-        for _ in 0..sends {
-            bifrost
-                .enqueue_batch("events", batch.clone(), None)
-                .expect("batch admitted");
-            match bifrost.flush().await {
-                Ok(())
-                | Err(BifrostClientError::Queue(
-                    WyrdQueueError::Sink(WyrdError::ServiceUnavailable { .. })
-                    | WyrdQueueError::FlushTimeout,
-                )) => {}
-                Err(error) => panic!("unexpected flush failure: {error}"),
-            }
+        bifrost
+            .enqueue_batch("events", batch, None)
+            .expect("batch admitted");
+        match bifrost.flush().await {
+            Ok(())
+            | Err(BifrostClientError::Queue(
+                WyrdQueueError::Sink(WyrdError::ServiceUnavailable { .. })
+                | WyrdQueueError::FlushTimeout,
+            )) => {}
+            Err(error) => panic!("unexpected flush failure: {error}"),
         }
         let flushed = attempts.load(Ordering::Acquire);
         let metrics = bifrost.metrics();
@@ -833,7 +825,7 @@ mod tests {
             .expect_err("an unacknowledged batch is not drained");
         server.abort();
         let losses = losses.lock().await.clone();
-        (flushed, losses, auth)
+        (flushed, losses)
     }
 
     /// A producer whose own send deadline is shorter than one call cannot
@@ -854,218 +846,13 @@ mod tests {
     async fn held_calls_exhaust_one_transport_budget_then_retain() {
         let service = HeldIngest::default();
         let attempts = Arc::clone(&service.attempts);
-        let (flushed, losses, _auth) = retain_held_batch(
-            service,
-            &attempts,
-            ResolvedCredential::BearerToken(SecretString::from("test-token")),
-            crate::transport::HttpConfig::default().timeout_ms,
-            1,
-        )
-        .await;
+        let (flushed, losses) = retain_held_batch(service, &attempts).await;
         let configured = BifrostTransportConfig::default().max_frame_retries as usize + 1;
         assert!(
             (configured..2 * configured).contains(&flushed),
             "one attempt set: {flushed}"
         );
         assert!(losses.is_empty(), "ambiguity is not a loss: {losses:?}");
-    }
-
-    /// Real gRPC service refusing the first minted credential as
-    /// unauthenticated and holding every later attempt open until the client's
-    /// per-call deadline.
-    #[derive(Clone, Default)]
-    struct RefreshHeldIngest {
-        /// Attempts that reached the RPC boundary.
-        attempts: Arc<AtomicUsize>,
-    }
-
-    #[wyrd_tonic::tonic::async_trait]
-    impl BifrostIngestService for RefreshHeldIngest {
-        /// Refuses `token-1` as unauthenticated and holds any other credential.
-        ///
-        /// # Errors
-        ///
-        /// Returns `Unauthenticated` for `token-1`; otherwise never returns.
-        async fn insert_batch(
-            &self,
-            request: Request<InsertBatchRequest>,
-        ) -> Result<Response<InsertBatchResponse>, Status> {
-            self.attempts.fetch_add(1, Ordering::AcqRel);
-            if request
-                .metadata()
-                .get("x-wyrd-access-token")
-                .is_some_and(|token| token == "Bearer token-1")
-            {
-                return Err(Status::unauthenticated("stale credential"));
-            }
-            std::future::pending().await
-        }
-    }
-
-    /// With renewable authentication, one `Unauthenticated` refusal, a refresh
-    /// slower than a whole call, and every later call held to its deadline,
-    /// the refresh spends the transport's one budget instead of extending it
-    /// past the producer's send deadline: the accepted batch receives at most
-    /// the configured attempt set (plus the retained batch's first scheduled
-    /// retry, which may land before the count is read), and the ambiguous
-    /// outcome retains the batch instead of reporting a loss.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the refusal is not followed by a resend, the batch exceeds
-    /// the configured attempt set, its loss is reported other than once,
-    /// ownership is retained, or shutdown sends it again.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn delayed_refresh_spends_one_transport_budget_then_retains() {
-        let service = RefreshHeldIngest::default();
-        let attempts = Arc::clone(&service.attempts);
-        let source = Arc::new(SequencedSource {
-            minted: AtomicUsize::new(0),
-            refresh_delay: Duration::from_millis(200),
-        });
-        let (flushed, losses, _auth) = retain_held_batch(
-            service,
-            &attempts,
-            ResolvedCredential::Renewable(source.clone()),
-            crate::transport::HttpConfig::default().timeout_ms,
-            1,
-        )
-        .await;
-        let attempt_set = BifrostTransportConfig::default().max_frame_retries as usize + 2;
-        assert_eq!(
-            source.minted.load(Ordering::Acquire),
-            2,
-            "one forced refresh"
-        );
-        assert!(
-            (2..=attempt_set + 1).contains(&flushed),
-            "the refusal is resent within one attempt set: {flushed}"
-        );
-        assert!(losses.is_empty(), "ambiguity is not a loss: {losses:?}");
-    }
-
-    /// A renewable mint that blocks past the whole transport budget cannot
-    /// hold the queue's send: the transport's deadline still fires, so each
-    /// flush and the shutdown complete, the oldest batch is retained rather
-    /// than reported lost, and no RPC attempt starts, all before the source is
-    /// released. A second batch sent after the first
-    /// deadline cancelled its waiter reuses the still-running mint instead of
-    /// starting another. Once released, the same auth owner serves that
-    /// mint's token and refreshes normally.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a flush or shutdown is not bounded, an RPC attempt or a
-    /// second concurrent mint starts, a loss is reported, ownership is
-    /// released, or the released owner cannot authenticate.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blocking_mint_spends_one_transport_budget_then_retains() {
-        for sends in [1, 2] {
-            let service = HeldIngest::default();
-            let attempts = Arc::clone(&service.attempts);
-            let (release, held) = std::sync::mpsc::sync_channel::<()>(0);
-            let source = Arc::new(HeldSource {
-                minted: AtomicUsize::new(0),
-                held: std::sync::Mutex::new(held),
-            });
-            let (flushed, losses, auth) = tokio::time::timeout(
-                Duration::from_secs(30),
-                retain_held_batch(
-                    service,
-                    &attempts,
-                    ResolvedCredential::Renewable(source.clone()),
-                    50,
-                    sends,
-                ),
-            )
-            .await
-            .expect("a blocked mint cannot hold the flushes and shutdown");
-            assert_eq!(
-                source.minted.load(Ordering::Acquire),
-                1,
-                "later sends and shutdown reuse the one running mint"
-            );
-            assert_eq!(flushed, 0, "no RPC attempt starts");
-            assert!(losses.is_empty(), "ambiguity is not a loss: {losses:?}");
-
-            drop(release);
-            auth.bearer()
-                .await
-                .expect("the released mint serves the next caller");
-            assert_eq!(source.minted.load(Ordering::Acquire), 1);
-            auth.force_refresh()
-                .await
-                .expect("a later renewable refresh completes");
-            assert_eq!(source.minted.load(Ordering::Acquire), 2);
-        }
-    }
-
-    /// Renewable source whose every mint blocks until its release sender is
-    /// dropped.
-    struct HeldSource {
-        /// Number of mints started.
-        minted: AtomicUsize,
-        /// Receiver that unblocks every mint once the test drops its sender.
-        held: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
-    }
-
-    impl AccessTokenSource for HeldSource {
-        /// Stable identity of the test producer.
-        fn identity(&self) -> &str {
-            "held-test-source"
-        }
-
-        /// Counts the mint, blocks until released, then mints a long-lived
-        /// token.
-        ///
-        /// # Errors
-        ///
-        /// Never fails.
-        ///
-        /// # Panics
-        ///
-        /// Panics when the release receiver's lock is poisoned.
-        fn mint(&self) -> Result<MintedAccessToken, crate::error::WyrdClientError> {
-            self.minted.fetch_add(1, Ordering::AcqRel);
-            let _released = self.held.lock().expect("release receiver locks").recv();
-            Ok(MintedAccessToken {
-                access_token: SecretBearer::new("held-token".to_owned()),
-                expires_at: chrono::Utc::now() + chrono::Duration::seconds(900),
-            })
-        }
-    }
-
-    /// Renewable source minting `token-1`, `token-2`, … and counting mints.
-    struct SequencedSource {
-        /// Number of tokens minted so far.
-        minted: AtomicUsize,
-        /// How long every mint after the first takes, standing in for a slow
-        /// refresh.
-        refresh_delay: Duration,
-    }
-
-    impl AccessTokenSource for SequencedSource {
-        /// Stable identity of the test producer.
-        fn identity(&self) -> &str {
-            "sequenced-test-source"
-        }
-
-        /// Mints the next sequenced token with a long lifetime, blocking for
-        /// the refresh delay after the first.
-        ///
-        /// # Errors
-        ///
-        /// Never fails.
-        fn mint(&self) -> Result<MintedAccessToken, crate::error::WyrdClientError> {
-            let ordinal = self.minted.fetch_add(1, Ordering::AcqRel) + 1;
-            if ordinal > 1 {
-                std::thread::sleep(self.refresh_delay);
-            }
-            Ok(MintedAccessToken {
-                access_token: SecretBearer::new(format!("token-{ordinal}")),
-                expires_at: chrono::Utc::now() + chrono::Duration::seconds(900),
-            })
-        }
     }
 
     /// Ingest service that accepts only the refreshed `token-2` credential.
@@ -1108,8 +895,8 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics when the refused batch is not resent once with a freshly minted
-    /// renewable token.
+    /// Panics when the refused batch is not resent once with a freshly
+    /// exchanged token.
     #[tokio::test]
     async fn unauthenticated_refusal_forces_one_shared_refresh_and_resends() {
         let service = RefreshGatedIngest::default();
@@ -1123,31 +910,56 @@ mod tests {
         );
         tokio::task::yield_now().await;
 
+        let exchange = wiremock::MockServer::start().await;
+        for token in ["token-1", "token-2"] {
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "access_token": token,
+                        "token_type": "Bearer",
+                        "expires_at": chrono::Utc::now() + chrono::Duration::seconds(900),
+                    }),
+                ))
+                .up_to_n_times(1)
+                .mount(&exchange)
+                .await;
+        }
         let config = ClientConfig {
             grpc: crate::transport::GrpcConfig {
                 endpoint: format!("http://{address}"),
                 connect_retries: 0,
                 ..crate::transport::GrpcConfig::default()
             },
+            http: crate::transport::HttpConfig {
+                base_url: exchange.uri(),
+                ..crate::transport::HttpConfig::default()
+            },
             ..ClientConfig::default()
         };
-        let source = Arc::new(SequencedSource {
-            minted: AtomicUsize::new(0),
-            refresh_delay: Duration::ZERO,
-        });
-        let auth = AuthMiddleware::new(&config, ResolvedCredential::Renewable(source.clone()))
-            .expect("test auth builds");
+        let auth = AuthMiddleware::new(
+            &config,
+            ResolvedCredential::ApiKey(SecretString::from("wyrd_sk_tenant_visible_secret")),
+        )
+        .expect("test auth builds");
         let http = HttpTransport::new(&config.http, auth.clone()).expect("test HTTP layer builds");
         let client = WyrdClient::from_parts(auth, http, config.grpc);
         let transport = BifrostGrpcTransport::connect(&client)
             .await
             .expect("real test gRPC transport connects");
-        let budget = ClientByteBudget::new(QueueConfig::MAX_CLIENT_BYTE_LIMIT);
+        let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
         transport
             .insert_batch(&sealed_batch(&budget, vec![1]))
             .await
             .expect("refreshed credential acknowledges");
-        assert_eq!(source.minted.load(Ordering::Acquire), 2);
+        assert_eq!(
+            exchange
+                .received_requests()
+                .await
+                .expect("requests are recorded")
+                .len(),
+            2,
+            "one initial exchange and one forced refresh"
+        );
         assert_eq!(
             *service.tokens.lock().await,
             vec!["Bearer token-1".to_owned(), "Bearer token-2".to_owned()]

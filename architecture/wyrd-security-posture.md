@@ -68,15 +68,17 @@ Card-free machine principal therefore carries no emit scope. `tenant_admin`,
 `global_admin`, and `user` never bind a Card — an administrative or human
 identity is not a registered AI-system component.
 
-Gateway capture runs as the reserved `GATEWAY_CAPTURE_PRINCIPAL`, a
-tenant-bound, card-free `service` principal. Only the server's signing key
-issues it, as a token of at most 900 seconds carrying an empty Card-reference
-scope, only the informational `gateway_capture` Role, and exactly the two
-table-scoped record-write grants for `vala.gateway.calls` and
-`vala.traces.spans`, which the verifier requires. Public credential,
-workload, refresh, delegation, and impersonation flows refuse it; it never
-appears in a delegation chain, holds no persisted credential, and never
-replaces the invocation caller in audit.
+Gateway capture is a server-internal write that holds no token, evaluates no
+permission, and writes no audit decision. Its rows carry the reserved
+`GATEWAY_CAPTURE_PRINCIPAL`, which, like `PLATFORM_AUDIT_PRINCIPAL`, never
+appears in a token: every issuer refuses it, every verifier rejects a token
+naming it, it never appears in a delegation chain, and it never replaces the
+invocation caller in audit. Gate refuses every public write to
+`vala.gateway.calls`. A pod without Scribe sends capture over the peer plane's
+capture-only RPC, admitted by `wyrd-peer` mTLS alone; that RPC accepts only the
+two capture tables and never the reserved system tenant, so a compromised
+cluster member, already out of scope, is the only caller that could misuse
+it.
 
 Card-bound identities are provisioned idempotently by tenant, principal kind,
 Card kind, and Card UID. Re-applying a Card preserves the principal identity.

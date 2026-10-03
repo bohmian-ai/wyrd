@@ -11525,7 +11525,7 @@ dependencies = [
  "arrow",
  "arrow-schema",
  "async-trait",
- "crossbeam-queue",
+ "futures-util",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",

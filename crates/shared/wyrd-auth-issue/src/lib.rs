@@ -18,16 +18,13 @@ use wyrd_auth_verify::{
     AccessTokenClaims, ActClaim, Kid, PLATFORM_TOKEN_SCOPE, PlatformAccessTokenClaims,
     RefreshTokenClaims, TokenAudience, TokenPrincipalRef,
 };
-use wyrd_runtime::builtin_roles::{GATEWAY_CAPTURE_ROLE, gateway_capture_permissions};
 use wyrd_runtime::{PermissionSet, PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalKindTag};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::reference::CardRefScope;
 
-pub use wyrd_auth_verify::{
-    GATEWAY_CAPTURE_TOKEN_MAX_TTL_SECONDS, MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH,
-};
+pub use wyrd_auth_verify::{MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH};
 
 /// OWASP-recommended Argon2id memory cost in KiB.
 pub const ARGON2_M_COST_KIB: u32 = 19_456;
@@ -94,9 +91,6 @@ pub enum IssueError {
     /// Principal card reference was missing or mismatched.
     #[error("principal card_ref is missing or mismatched")]
     InvalidCardRef,
-    /// A gateway capture token was requested for the reserved platform tenant.
-    #[error("gateway capture tokens cannot bind the reserved SYSTEM_OWNER tenant")]
-    ReservedTenant,
     /// Encoded token would exceed the verifier bearer-token size limit.
     #[error("token too large: encoded length {encoded_len} exceeds limit {limit}")]
     CardScopeTooLarge {
@@ -196,9 +190,9 @@ impl IssuingKey {
     /// Mint a tenant access token for one resolved grant.
     ///
     /// The public tenant access-token path. It refuses the reserved
-    /// [`GATEWAY_CAPTURE_PRINCIPAL`], which only
-    /// [`Self::issue_gateway_capture_access_token`] mints, then signs through
-    /// [`Self::sign_access_token`].
+    /// [`GATEWAY_CAPTURE_PRINCIPAL`], which gateway capture stamps on its
+    /// server-internal writes and which never appears in a token, then signs
+    /// through [`Self::sign_access_token`].
     ///
     /// # Errors
     /// Returns [`IssueError::InvalidPrincipalKind`] for the reserved capture
@@ -212,61 +206,6 @@ impl IssuingKey {
             return Err(IssueError::InvalidPrincipalKind);
         }
         self.sign_access_token(grant, ttl)
-    }
-
-    /// Mint a short-lived access token for the reserved gateway capture principal.
-    ///
-    /// This is the only issue path for [`GATEWAY_CAPTURE_PRINCIPAL`]. The token
-    /// names that id as a card-free [`PrincipalKindTag::Service`] with an empty
-    /// Card-reference scope, binds exactly `tenant_id`, carries only the
-    /// [`GATEWAY_CAPTURE_ROLE`] and its two table-scoped record writes derived
-    /// here from `calls_uid` and `spans_uid` by [`gateway_capture_permissions`],
-    /// has no delegation chain, and is not attributed to any stored credential.
-    /// Only `wyrd-server`'s internal capture credential source calls it; no
-    /// public exchange, refresh, or delegation route does.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`IssueError::ReservedTenant`] for `SYSTEM_OWNER`,
-    /// [`IssueError::InvalidTtl`] when `ttl` is not positive or exceeds
-    /// [`GATEWAY_CAPTURE_TOKEN_MAX_TTL_SECONDS`], or a signing error.
-    ///
-    /// # Panics
-    ///
-    /// Never in practice: the constant capture role name is a valid [`RoleRef`].
-    pub fn issue_gateway_capture_access_token(
-        &self,
-        tenant_id: DataTenantId,
-        calls_uid: Uuid,
-        spans_uid: Uuid,
-        ttl: Duration,
-    ) -> Result<String, IssueError> {
-        if tenant_id == DataTenantId::SYSTEM_OWNER {
-            return Err(IssueError::ReservedTenant);
-        }
-        if ttl.num_seconds() > GATEWAY_CAPTURE_TOKEN_MAX_TTL_SECONDS as i64 {
-            return Err(IssueError::InvalidTtl);
-        }
-        let role = RoleRef::new(GATEWAY_CAPTURE_ROLE).expect("the capture role name is valid");
-        self.sign_access_token(
-            AccessGrant {
-                principal: TokenPrincipalRef {
-                    id: GATEWAY_CAPTURE_PRINCIPAL,
-                    kind: PrincipalKindTag::Service,
-                    tenant_id,
-                    card_ref: None,
-                    card_ref_scope: CardRefScope::default(),
-                },
-                roles: vec![role],
-                permissions: gateway_capture_permissions(calls_uid, spans_uid)
-                    .into_iter()
-                    .collect(),
-                credential_id: None,
-                act: None,
-                audience: TokenAudience::Wyrd,
-            },
-            ttl,
-        )
     }
 
     /// Sign one tenant access token for a resolved grant.
@@ -368,8 +307,7 @@ impl IssuingKey {
     /// the signed `exp` and the durable refresh row that records it are derived
     /// from one clock. Callers that persist the token pass the `PostgreSQL`
     /// issuance instant of their own transaction. The reserved capture
-    /// identity is refused before signing: it only ever holds the short-lived
-    /// access token minted by [`Self::issue_gateway_capture_access_token`].
+    /// identity is refused before signing: it never appears in a token.
     ///
     /// # Errors
     /// Returns [`IssueError::InvalidPrincipalKind`] for the SYSTEM kind or
@@ -567,7 +505,6 @@ mod tests {
         RefreshTokenClaims, TokenAudience, TokenPrincipalRef, decode_kid, public_key_from_pem,
         verify_eddsa,
     };
-    use wyrd_runtime::builtin_roles::{GATEWAY_CAPTURE_ROLE, gateway_capture_permissions};
     use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
@@ -618,56 +555,15 @@ mod tests {
         assert_eq!(claims.jti.len(), 26);
     }
 
-    /// Proves the capture token is a tenant-bound card-free Service holding
-    /// only the capture Role and its two table-scoped writes, and that the
-    /// public issue paths cannot mint the reserved identity.
+    /// Proves no public issue path mints the reserved capture identity, in
+    /// any principal kind or delegation shape.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any reserved shape yields a token or a different error.
     #[test]
-    fn issue_gateway_capture_access_token_is_a_card_free_service_with_only_the_capture_role() {
+    fn issue_access_token_refuses_the_reserved_capture_identity() {
         let key = issuing_key();
-        let (calls_uid, spans_uid) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
-        let claims = verify_access_token(
-            &key.issue_gateway_capture_access_token(
-                tenant_id(),
-                calls_uid,
-                spans_uid,
-                Duration::minutes(5),
-            )
-            .expect("capture token issues"),
-        );
-        assert_eq!(claims.principal.kind, PrincipalKindTag::Service);
-        assert_eq!(claims.principal.id, GATEWAY_CAPTURE_PRINCIPAL);
-        assert_eq!(claims.principal.tenant_id, tenant_id());
-        assert_eq!(claims.principal.card_ref, None);
-        assert!(claims.principal.card_ref_scope.as_slice().is_empty());
-        assert_eq!(claims.cid, None);
-        assert_eq!(claims.roles, vec![role(GATEWAY_CAPTURE_ROLE)]);
-        assert_eq!(
-            claims.permissions,
-            gateway_capture_permissions(calls_uid, spans_uid)
-                .into_iter()
-                .collect::<PermissionSet>()
-        );
-        assert_eq!(claims.act, None);
-        assert_eq!(claims.sub, GATEWAY_CAPTURE_PRINCIPAL.to_string());
-        assert!(matches!(
-            key.issue_gateway_capture_access_token(
-                DataTenantId::SYSTEM_OWNER,
-                calls_uid,
-                spans_uid,
-                Duration::minutes(5)
-            ),
-            Err(IssueError::ReservedTenant)
-        ));
-        assert!(matches!(
-            key.issue_gateway_capture_access_token(
-                tenant_id(),
-                calls_uid,
-                spans_uid,
-                Duration::minutes(16)
-            ),
-            Err(IssueError::InvalidTtl)
-        ));
-
         let caller = ActClaim {
             sub: user_principal().id.to_string(),
             principal: user_principal(),
@@ -687,7 +583,7 @@ mod tests {
                 key.issue_access_token(
                     AccessGrant {
                         act,
-                        ..grant(reserved, vec![role(GATEWAY_CAPTURE_ROLE)])
+                        ..grant(reserved, vec![role("runtime_admin")])
                     },
                     Duration::minutes(5),
                 ),

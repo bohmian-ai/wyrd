@@ -146,16 +146,15 @@ mod sdk {
         br#"{"id": 1}"#.to_vec()
     }
 
-    /// Config that saturates fast: a stalled sink parks the drain, the tiny channel
-    /// fills, and further enqueues return queue-full.
+    /// Config that saturates fast: every row seals at once, a stalled sink
+    /// never releases a frame, the small byte budget fills, and further
+    /// enqueues return queue-full.
     fn saturating_config() -> QueueConfig {
         QueueConfig {
-            channel_capacity: 2,
-            staging_capacity: 8,
-            flush_max_rows: 1,
-            flush_interval_ms: 0,
+            client_byte_limit_bytes: 8 * 1024,
+            linger_ms: 0,
             flush_timeout_ms: 60_000,
-            max_message_bytes: 4 * 1024 * 1024,
+            max_message_bytes: 2 * 1024,
             ..QueueConfig::default()
         }
     }
@@ -277,86 +276,27 @@ mod sdk {
             .expect("an uncorrelated row is a valid write");
     }
 
-    /// Refuses a distinct producer before the handle grows beyond its configured cap.
+    /// One handle serves a thousand tables with no producer cap, and an idle
+    /// producer holds no bytes.
     #[test]
-    fn bifrost_producer_cap_refuses_before_registry_growth() {
-        let bifrost = pool(
-            Arc::new(MockSink::new()),
-            QueueConfig {
-                max_producers: 1,
-                ..QueueConfig::default()
-            },
-        );
+    fn a_thousand_tables_share_one_handle_budget() {
+        let bifrost = pool(Arc::new(MockSink::new()), QueueConfig::default());
         let schema = test_schema();
-        bifrost
-            .insert("ns.first", &schema, row(), Some(card()), None)
-            .expect("first producer accepted");
-        assert!(matches!(
-            bifrost.insert("ns.second", &schema, row(), Some(card()), None),
-            Err(wyrd_queue::WyrdQueueError::Backpressure)
-        ));
-        assert_eq!(
-            bifrost.producer_count(),
-            1,
-            "rejection precedes pool growth"
-        );
-    }
-
-    /// Admits at most the default 64 producer envelopes inside one 32 MiB owner.
-    #[test]
-    fn default_producer_envelopes_charge_before_registry_growth() {
-        let bifrost = pool(
-            Arc::new(MockSink::new()),
-            QueueConfig {
-                // Disable timer work so the test isolates default cardinality
-                // admission rather than concurrent frame construction.
-                flush_interval_ms: 0,
-                ..QueueConfig::default()
-            },
-        );
-        let schema = test_schema();
-        for index in 0..QueueConfig::MAX_LIVE_ENTRIES {
+        for index in 0..1_000 {
             bifrost
                 .insert(
-                    &format!("ns.capacity_{index}"),
+                    &format!("ns.table_{index}"),
                     &schema,
                     row(),
                     Some(card()),
                     None,
                 )
-                .expect("default producer envelope fits before construction");
+                .expect("no table count is refused");
         }
-        let admitted = bifrost.metrics();
-        assert_eq!(admitted.producers, QueueConfig::MAX_LIVE_ENTRIES);
-        assert!(
-            admitted.total_reserved_bytes <= QueueConfig::MAX_CLIENT_BYTE_LIMIT,
-            "fixed and dynamic ownership stays inside the one 32 MiB budget: {admitted:?}"
-        );
-        assert!(matches!(
-            bifrost.insert("ns.capacity_overflow", &schema, row(), Some(card()), None),
-            Err(wyrd_queue::WyrdQueueError::Backpressure)
-        ));
-        let refused = bifrost.metrics();
-        assert_eq!(
-            refused.producers,
-            QueueConfig::MAX_LIVE_ENTRIES,
-            "refusal occurs before the registry can grow"
-        );
-        assert!(
-            refused.total_reserved_bytes <= QueueConfig::MAX_CLIENT_BYTE_LIMIT,
-            "refusal cannot oversubscribe the owner: {refused:?}"
-        );
-        let shutdown = bifrost.shutdown();
-        assert!(
-            shutdown.is_ok(),
-            "default producer cleanup: {shutdown:?}; metrics={:?}",
-            bifrost.metrics()
-        );
-        assert_eq!(
-            bifrost.metrics().total_reserved_bytes,
-            0,
-            "shutdown removes producer fixed-storage charges"
-        );
+        assert_eq!(bifrost.metrics().producers, 1_000);
+        bifrost.shutdown().expect("every table drains");
+        let settled = bifrost.metrics();
+        assert_eq!((settled.producers, settled.owned_bytes), (0, 0));
     }
 
     /// A saturated queue reaches the caller of the public client as a stable
@@ -510,15 +450,14 @@ mod sdk {
         );
     }
 
-    /// Flush visits every producer and shutdown releases fixed storage after terminal settlement.
+    /// Flush visits every producer and shutdown removes terminally settled producers.
     #[test]
     fn lifecycle_drains_all_producers_after_first_error() {
         let sink = Arc::new(LifecycleSink::default());
         let bifrost = pool(
             Arc::clone(&sink) as Arc<dyn BatchSink<ClientByteGuard>>,
             QueueConfig {
-                flush_max_rows: 2,
-                flush_interval_ms: 0,
+                linger_ms: 60_000,
                 ..QueueConfig::default()
             },
         );
@@ -538,7 +477,7 @@ mod sdk {
 
         bifrost
             .shutdown()
-            .expect("terminally settled producers release their fixed storage on shutdown");
+            .expect("terminally settled producers shut down");
         assert!(
             bifrost
                 .insert("b", &schema, row(), Some(card()), None)

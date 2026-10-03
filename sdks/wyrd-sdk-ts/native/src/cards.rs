@@ -266,8 +266,8 @@ impl NativeWyrdState {
     /// # Errors
     ///
     /// Returns a napi error when `table` is not one serialized `TableConfig`;
-    /// a second start, a closed state, and credential, dial, and fixed-table
-    /// failures are returned in [`NativeLifecycleResult`].
+    /// a second start, a closed state, and credential, byte-budget, dial, and
+    /// fixed-table failures are returned in [`NativeLifecycleResult`].
     // justification: napi boundary; generated object and string arguments arrive owned
     #[allow(clippy::needless_pass_by_value)]
     #[napi]
@@ -277,6 +277,7 @@ impl NativeWyrdState {
         server_url: Option<String>,
         credential: Option<String>,
         grpc_url: Option<String>,
+        client_byte_limit_bytes: Option<i64>,
     ) -> Result<NativeLifecycleResult> {
         let state = match &self.state {
             Ok(state) => state,
@@ -293,7 +294,14 @@ impl NativeWyrdState {
                 return Ok(NativeLifecycleResult::from_wyrd(&WyrdError::from(&error)));
             }
         };
-        NativeLifecycleResult::outcome(Box::pin(state.start_bifrost_with(&client, table)).await)
+        NativeLifecycleResult::outcome(
+            Box::pin(state.start_bifrost_with_config(
+                &client,
+                table,
+                crate::queue_config(client_byte_limit_bytes),
+            ))
+            .await,
+        )
     }
 
     /// Opens one invocation over this state, targeting `card` or the root Service.

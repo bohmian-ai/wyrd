@@ -40,10 +40,9 @@ pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use crate::scribe::execution_lanes::require_card_scope;
 use crate::scribe::preprocess::{correlation_data_identity, logical_data_identity};
 use crate::tables::{
-    CallsTable, DomainTable, ResultFeaturesTable, ResultItemsTable, ResultsTable, SpansTable,
-    TableError,
+    CallsTable, DomainTable, ResultFeaturesTable, ResultItemsTable, ResultsTable, TableError,
 };
-use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalId};
+use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::{AuditOutcome, BifrostQueryRequest};
 use wyrd_spec::vala::error::BifrostError;
@@ -510,13 +509,11 @@ impl<A: GateAudit + 'static> Gate<A> {
     ///
     /// The checks run cheapest first. A principal holding `BifrostRecord`
     /// `Write` under no scope at all is refused before any catalog work. The
-    /// exact `vala.gateway.calls` table is reserved to the gateway capture
-    /// principal, so every other principal, a wildcard holder included, is
-    /// refused next; the rest of `vala.gateway` is not reserved. The capture
-    /// principal is in turn confined to `vala.gateway.calls` and
-    /// `vala.traces.spans`: any other destination is refused before Scribe
-    /// resolves it, whatever its token carries. Otherwise
-    /// Scribe resolves the tenant's registered table UID and the principal must
+    /// exact `vala.gateway.calls` table is written only by the server's
+    /// internal gateway capture writer, which never passes Gate, so every
+    /// public principal, a wildcard holder or one claiming the capture
+    /// identity included, is refused next; the rest of `vala.gateway` is not
+    /// reserved. Otherwise Scribe resolves the tenant's registered table UID and the principal must
     /// hold `BifrostRecord` `Write` covering that exact table object scope.
     ///
     /// # Errors
@@ -564,24 +561,9 @@ impl<A: GateAudit + 'static> Gate<A> {
                 return Ok(scope);
             }
         }
-        if table.namespace == BifrostNamespace::Gateway
-            && table.name == CallsTable::NAME
-            && principal.id != GATEWAY_CAPTURE_PRINCIPAL
-        {
+        if table.namespace == BifrostNamespace::Gateway && table.name == CallsTable::NAME {
             return Ok(Err(IngestError::ReservedBuiltinWriteDenied {
                 table: table.fqn(),
-            }));
-        }
-        let capture_destination = (table.namespace == BifrostNamespace::Gateway
-            && table.name == CallsTable::NAME)
-            || (table.namespace == BifrostNamespace::Traces && table.name == SpansTable::NAME);
-        if principal.id == GATEWAY_CAPTURE_PRINCIPAL && !capture_destination {
-            return Ok(Err(IngestError::RbacDenied {
-                detail: format!(
-                    "principal {} may write only vala.gateway.calls and vala.traces.spans, not {}",
-                    principal.id,
-                    table.fqn()
-                ),
             }));
         }
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
@@ -1233,7 +1215,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use async_trait::async_trait;
     use futures_util::StreamExt as _;
-    use wyrd_runtime::builtin_roles::gateway_capture_permissions;
     use wyrd_runtime::{
         Action, Permission, PermissionScope, PermissionSet, Principal, PrincipalKind, Resource,
     };
@@ -1916,19 +1897,20 @@ mod tests {
         );
     }
 
-    /// Only the gateway capture principal may write the exact call table, and
-    /// it may write nothing but the call and span tables.
+    /// No public principal can write the gateway call table through Gate.
     ///
-    /// A wildcard holder is refused before Scribe resolves anything; the
-    /// capture principal reaches Scribe with its scoped grants for
-    /// `vala.gateway.calls` and `vala.traces.spans`, yet is refused any other
-    /// table before resolution, even when its principal carries a wildcard.
-    /// Every verdict is recorded against the table it targeted.
+    /// Capture is a server-internal write that never passes Gate, so a
+    /// wildcard holder and a principal claiming the capture identity are both
+    /// refused before Scribe resolves anything, and each refusal is recorded
+    /// against the table it targeted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either write is admitted, reaches Scribe, or is not
+    /// recorded as denied.
     #[tokio::test]
     async fn gate_reserves_the_gateway_call_table_to_the_capture_principal() {
-        let calls_uid = random_uid();
-        let spans_uid = random_uid();
-        let scribe = ResolvingScribe::new(calls_uid);
+        let scribe = ResolvingScribe::new(random_uid());
         let audit = RecordingAudit::new();
         let gate = Gate::<RecordingAudit>::with_test_scribe(
             Arc::clone(&scribe) as Arc<dyn crate::contracts::Scribe>,
@@ -1937,90 +1919,32 @@ mod tests {
         )
         .with_audit(Arc::clone(&audit));
         let limits = IngestLimits::default();
+        let wildcard = [Permission {
+            resource: Resource::Wildcard,
+            action: Action::Wildcard,
+            scope: PermissionScope::All,
+        }];
 
-        let wildcard = context_with(
-            PrincipalId::new(uuid::Uuid::now_v7()),
-            PrincipalKind::User,
-            [Permission {
-                resource: Resource::Wildcard,
-                action: Action::Wildcard,
-                scope: PermissionScope::All,
-            }],
-        );
-        let error = gate
-            .dispatch_native_frame(&limits, &wildcard, native_frame("vala.gateway.calls"))
-            .await
-            .expect_err("a wildcard holder cannot write the reserved call table");
-        assert!(matches!(
-            error,
-            IngestError::ReservedBuiltinWriteDenied { .. }
-        ));
+        for principal in [PrincipalId::new(uuid::Uuid::now_v7()), GATEWAY_CAPTURE_PRINCIPAL] {
+            let context = context_with(principal, PrincipalKind::User, wildcard.clone());
+            let error = gate
+                .dispatch_native_frame(&limits, &context, native_frame("vala.gateway.calls"))
+                .await
+                .expect_err("no public principal writes the reserved call table");
+            assert!(matches!(
+                error,
+                IngestError::ReservedBuiltinWriteDenied { .. }
+            ));
+        }
         assert_eq!(scribe.resolved.load(Ordering::Relaxed), 0);
-
-        let capture = context_with(
-            GATEWAY_CAPTURE_PRINCIPAL,
-            PrincipalKind::Service {
-                card_ref: None,
-                card_ref_scope: wyrd_runtime::CardRefScope::default(),
-            },
-            gateway_capture_permissions(
-                uuid::Uuid::from_bytes(*calls_uid.as_bytes()),
-                uuid::Uuid::from_bytes(*spans_uid.as_bytes()),
-            ),
-        );
-        gate.dispatch_native_frame(&limits, &capture, native_frame("vala.gateway.calls"))
-            .await
-            .expect("the capture principal writes its scoped call table");
-        let error = gate
-            .dispatch_native_frame(&limits, &capture, native_frame("vala.logs.records"))
-            .await
-            .expect_err("the capture principal is confined to its scoped tables");
-        assert!(matches!(error, IngestError::RbacDenied { .. }));
-        let widened = context_with(
-            GATEWAY_CAPTURE_PRINCIPAL,
-            PrincipalKind::Service {
-                card_ref: None,
-                card_ref_scope: wyrd_runtime::CardRefScope::default(),
-            },
-            [Permission {
-                resource: Resource::Wildcard,
-                action: Action::Wildcard,
-                scope: PermissionScope::All,
-            }],
-        );
-        let error = gate
-            .dispatch_native_frame(&limits, &widened, native_frame("vala.gateway.runs"))
-            .await
-            .expect_err("no grant widens the capture principal past its two tables");
-        assert!(matches!(error, IngestError::RbacDenied { .. }));
-        assert_eq!(
-            scribe.resolved.load(Ordering::Relaxed),
-            1,
-            "only the call-table write reached Scribe resolution"
-        );
-        assert_eq!(scribe.ingested.load(Ordering::Relaxed), 1);
+        assert_eq!(scribe.ingested.load(Ordering::Relaxed), 0);
         assert_eq!(
             audit.decisions(),
             vec![
                 ("vala.gateway.calls".to_owned(), AuditOutcome::Denied),
-                ("vala.gateway.calls".to_owned(), AuditOutcome::Allowed),
-                ("vala.logs.records".to_owned(), AuditOutcome::Denied),
-                ("vala.gateway.runs".to_owned(), AuditOutcome::Denied),
+                ("vala.gateway.calls".to_owned(), AuditOutcome::Denied),
             ]
         );
-
-        let spans_scribe = ResolvingScribe::new(spans_uid);
-        let spans_gate = Gate::<RecordingAudit>::with_test_scribe(
-            Arc::clone(&spans_scribe) as Arc<dyn crate::contracts::Scribe>,
-            test_interceptor(),
-            IngestLimits::default(),
-        )
-        .with_audit(RecordingAudit::new());
-        spans_gate
-            .dispatch_native_frame(&limits, &capture, native_frame("vala.traces.spans"))
-            .await
-            .expect("the capture principal writes its scoped span table");
-        assert_eq!(spans_scribe.ingested.load(Ordering::Relaxed), 1);
     }
 
     /// A table-scoped record write is authorized against the resolved UID.

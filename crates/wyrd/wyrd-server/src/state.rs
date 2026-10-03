@@ -2259,6 +2259,9 @@ impl AppState {
             || crate::oracle::OracleQueryAudit::new(postgres.vala().clone()),
             |oracle| Arc::clone(oracle.audit()),
         );
+        let gateway_capture = Arc::new(crate::components::gateway::GatewayCapture::for_bifrost(
+            &bifrost,
+        ));
         Self {
             audit_outbox,
             postgres,
@@ -2281,7 +2284,7 @@ impl AppState {
             gateway: Arc::default(),
             gateway_secret_keys: Arc::default(),
             gateway_engine: Arc::new(crate::components::gateway::unconnected_engine()),
-            gateway_capture: Arc::default(),
+            gateway_capture,
             grpc_health: reporter,
             readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),
             peer_plane: Arc::new(crate::app::peer_plane::PeerPlaneStatus::default()),

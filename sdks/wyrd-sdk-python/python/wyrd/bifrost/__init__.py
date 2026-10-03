@@ -412,6 +412,7 @@ class _BifrostBase:
         credential: str | None = None,
         grpc_url: str | None = None,
         client: WyrdClient | None = None,
+        client_byte_limit_bytes: int | None = None,
     ) -> None:
         """Connect one client, optionally already bound to a write target.
 
@@ -430,11 +431,15 @@ class _BifrostBase:
                 ``on_behalf_of``. Bifrost then uses its authentication and
                 transport; it cannot be combined with ``server_url``,
                 ``credential``, or ``grpc_url``.
+            client_byte_limit_bytes: the handle-wide ingestion byte budget
+                shared by every table this client writes. 256 MiB if omitted.
 
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` when ``client`` is combined
                 with a transport argument; ``WYRD_CLIENT_401_NO_CREDENTIALS``
-                when the credential chain yielded nothing.
+                when the credential chain yielded nothing;
+                ``WYRD_CLIENT_400_CONFIG_INVALID`` when the byte budget is too
+                small to seal one message.
 
         """
 
@@ -444,6 +449,7 @@ class _BifrostBase:
             credential,
             grpc_url,
             client,
+            client_byte_limit_bytes,
         )
 
     def use_table(self, table: TableConfig) -> TableConfig | None:

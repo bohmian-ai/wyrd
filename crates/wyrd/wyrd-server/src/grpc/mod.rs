@@ -12,6 +12,7 @@ pub use wyrd_tonic::error;
 pub use wyrd_tonic::health::WyrdHealthSentinel;
 pub use wyrd_tonic::server::*;
 
+mod capture_peer;
 mod otlp;
 #[cfg(debug_assertions)]
 #[doc(hidden)]
@@ -424,10 +425,16 @@ pub fn build_peer_grpc(
         ),
     );
     let router = match state.bifrost_ingest() {
-        Some(scribe) => router.add_service(GrpcTransportAdmissionService::new_peer(
-            scribe_tail::ScribeTailGrpc::new(scribe.tail_service()).into_server(),
-            transport.clone(),
-        )),
+        Some(scribe) => router
+            .add_service(GrpcTransportAdmissionService::new_peer(
+                scribe_tail::ScribeTailGrpc::new(scribe.tail_service()).into_server(),
+                transport.clone(),
+            ))
+            .add_service(GrpcTransportAdmissionService::new_peer(
+                capture_peer::ScribeCapturePeerGrpc::new(Arc::clone(scribe.scribe()) as _)
+                    .into_server(),
+                transport.clone(),
+            )),
         None => router,
     };
     let router = match state

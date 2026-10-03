@@ -709,14 +709,14 @@ mod pg_tests {
         }
     }
 
+    /// Config that saturates fast: every row seals at once, a stalled sink
+    /// never releases a frame, and the small byte budget fills.
     fn saturating_config() -> QueueConfig {
         QueueConfig {
-            channel_capacity: 2,
-            staging_capacity: 8,
-            flush_max_rows: 1,
-            flush_interval_ms: 0,
+            client_byte_limit_bytes: 8 * 1024,
+            linger_ms: 0,
             flush_timeout_ms: 60_000,
-            max_message_bytes: 4 * 1024 * 1024,
+            max_message_bytes: 2 * 1024,
             ..QueueConfig::default()
         }
     }
@@ -1417,7 +1417,7 @@ mod pg_tests {
             Some(table(&table_fqn)),
             Arc::new(BifrostIngestSink::new(recording.clone())),
             QueueConfig {
-                flush_interval_ms: 0,
+                linger_ms: 60_000,
                 ..QueueConfig::default()
             },
         );
@@ -1523,9 +1523,9 @@ mod pg_tests {
         conn.commit().await.expect("commit tenant-scoped read");
         bifrost.shutdown().await.expect("settled producer shutdown");
         assert_eq!(
-            bifrost.metrics().total_reserved_bytes,
+            bifrost.metrics().owned_bytes,
             0,
-            "shutdown releases the producer's fixed queue reservation"
+            "shutdown leaves no client bytes reserved"
         );
         srv.shutdown().await.expect("server shutdown");
     }

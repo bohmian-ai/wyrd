@@ -17,7 +17,7 @@ wyrd-spec = { workspace = true }
 wyrd-runtime = { workspace = true }
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
-crossbeam-queue = { workspace = true }
+futures-util = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }

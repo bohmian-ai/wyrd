@@ -264,7 +264,7 @@ fn bifrost_for(server: &DescribeServer) -> Bifrost {
         server,
         Arc::new(MockSink::new()),
         QueueConfig {
-            flush_interval_ms: 0,
+            linger_ms: 60_000,
             ..QueueConfig::default()
         },
     )
@@ -535,7 +535,7 @@ async fn ambiguous_shutdown_retries_the_same_batch_on_the_same_state() {
             &server,
             Arc::clone(&sink),
             QueueConfig {
-                flush_interval_ms: 0,
+                linger_ms: 60_000,
                 ..QueueConfig::default()
             },
         ))

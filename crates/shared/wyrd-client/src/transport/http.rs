@@ -129,6 +129,10 @@ pub struct HttpTransport {
 }
 
 impl std::fmt::Debug for HttpTransport {
+    /// Prints only the normalized, userinfo-free deployment origin. The pool,
+    /// the auth middleware, and the configured URL spelling are omitted, so no
+    /// credential or credential-bearing URL reaches a log line through this
+    /// value.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpTransport")
             .field("origin", &self.origin)

@@ -146,8 +146,8 @@ pub const HTTP_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// Configuration for the HTTP transport.
 ///
 /// The HTTP transport is a fallback for environments where gRPC is unavailable
-/// or blocked. Ingest routes are appended by the client at call time;
-/// `base_url` is the common prefix.
+/// or blocked. [`HttpConfig::validate`] reduces `base_url` to its deployment
+/// origin, and every route is appended to that origin at call time.
 ///
 /// This config carries transport wiring only. Authentication is owned by
 /// `AuthMiddleware`, which injects the `x-wyrd-access-token` credential per
@@ -155,9 +155,11 @@ pub const HTTP_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HttpConfig {
-    /// Base URL for all ingest routes. Must be non-empty. Ingest routes
-    /// (`/api/v1/observations`, `/api/v1/records`, etc.) are appended at
-    /// call time.
+    /// Deployment URL. Must be non-empty, HTTPS or loopback HTTP, and free
+    /// of userinfo. It is normalized to its origin, `scheme://host[:port]`;
+    /// any path, query, or fragment is discarded before client endpoints are
+    /// built, and routes (`/auth/token`, `/api/v1/observations`, etc.) are
+    /// appended to that origin at call time.
     ///
     /// Example: `"https://wyrd-ingest.example.com"`.
     /// Default: [`HTTP_DEFAULT_BASE_URL`] (`"http://localhost:8080"`).
@@ -349,7 +351,13 @@ mod tests {
     use crate::error::WyrdClientError;
     use wyrd_spec::operator_connection::HttpsOrigin;
 
-    /// The base-URL decision for `base_url`, through [`HttpConfig::validate`].
+    /// The base-URL decision for `base_url`, through [`HttpConfig::validate`]
+    /// on an otherwise default config.
+    ///
+    /// # Errors
+    /// Propagates the [`WyrdClientError::Config`] refusal of
+    /// [`HttpConfig::validate`] for an empty, unparsable, non-HTTPS remote,
+    /// unsupported-scheme, host-less, or userinfo-carrying `base_url`.
     fn origin(base_url: &str) -> Result<HttpsOrigin, WyrdClientError> {
         HttpConfig {
             base_url: base_url.to_owned(),
@@ -361,6 +369,10 @@ mod tests {
     /// Remote cleartext in any scheme spelling, malformed targets,
     /// unsupported schemes, and URL userinfo are refused, and no refusal
     /// repeats the userinfo.
+    ///
+    /// # Panics
+    /// Panics when any listed URL is accepted, or when a refusal's message
+    /// contains the userinfo name or password.
     #[test]
     fn remote_cleartext_malformed_and_unsupported_targets_are_refused() {
         for url in [
@@ -391,6 +403,10 @@ mod tests {
     /// HTTPS in any spelling and loopback HTTP are accepted, and every
     /// case, default-port, path, query, and fragment spelling of one
     /// deployment yields the same root origin.
+    ///
+    /// # Panics
+    /// Panics when any listed URL is refused, or its origin differs from the
+    /// expected normalized root origin.
     #[test]
     fn https_and_loopback_http_are_accepted() {
         for (url, expected) in [

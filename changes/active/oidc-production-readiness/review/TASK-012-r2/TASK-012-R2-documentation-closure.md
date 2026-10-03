@@ -138,3 +138,13 @@ git diff --check
 These are the narrowest lanes covering the documentation-only Rust and
 manifest write set. No runtime test, journey, full language sweep, or aggregate
 is required.
+
+## Implementation Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-012-3` | Rustdoc on the diagnostic boundary of `AuthMiddleware::fmt`, `HttpTransport::fmt` and `TokenExchange::fmt`: each prints only the normalized origin. `# Errors` on the test helper `origin`. `# Panics` on `remote_cleartext_malformed_and_unsupported_targets_are_refused`, `https_and_loopback_http_are_accepted` and `token_exchange_never_follows_a_redirect`. `HttpConfig` and `base_url` now describe origin normalization and that path, query and fragment are discarded. The redirect test and the `Cargo.toml` `oauth2` comment now say `oauth2` owns device and refresh, while the adapter carries the RFC 8693, RFC 7523 and RFC 7009 form POSTs. The `transport_config_http` and `transport_config_enum` schemas (published copy and test golden) were regenerated with `cargo run -p wyrd-client --example gen_schemas`; the change is description text only. | `mise run fmt`; `cargo clippy --locked -p wyrd-client -p wyrd-cli --all-targets --all-features -- -D warnings`; `cargo doc --locked -p wyrd-client --no-deps` (exit 0); the `transport` target's `schema_drift` tests (4/4); `git diff --check` | PASS |
+
+No runtime or configuration behavior changed.
+
+`cargo doc` still prints two private intra-doc link warnings, both on lines this remediation did not touch: `bifrost/facade.rs:130` and the module doc at `saved_login.rs:8`.

@@ -208,8 +208,9 @@ pub struct TokenExchange {
 }
 
 impl Debug for TokenExchange {
-    /// Prints the target without the pool, which carries no secret but no
-    /// useful detail either.
+    /// Prints only the normalized, userinfo-free deployment origin, never the
+    /// configured URL spelling. The pool and `oauth2` client are omitted;
+    /// they carry no secret but no useful detail either.
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("TokenExchange")
             .field("origin", &self.origin)
@@ -634,6 +635,11 @@ pub struct AuthMiddleware {
 }
 
 impl Debug for AuthMiddleware {
+    /// Prints the credential source (already redacted by its own `Debug`), the
+    /// credentials-file handle, and the deployment as the exchange's
+    /// normalized, userinfo-free origin. The configured URL spelling is never
+    /// printed, so userinfo or a secret-bearing path or query cannot reach a
+    /// log line through this value.
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("AuthMiddleware")
             .field("credential", &self.credential)
@@ -1807,8 +1813,16 @@ mod tests {
     }
 
     /// A `307` or `308` from the token or revocation route fails the
-    /// `oauth2` refresh and revocation and the form-POST exchange alike, and
-    /// never replays a secret body at the redirect target.
+    /// `oauth2` refresh, the RFC 7523 form-POST grant, and the RFC 7009
+    /// revocation form POST alike, since all three go through the
+    /// redirect-free adapter, and never replays a secret body at the redirect
+    /// target.
+    ///
+    /// # Panics
+    /// Panics when a mock server cannot bind, the exchange does not build,
+    /// any of the three redirected calls succeeds, the redirector does not
+    /// see exactly three requests per status, or the redirect target sees any
+    /// request (a replayed body).
     #[tokio::test]
     async fn token_exchange_never_follows_a_redirect() {
         let target = spawn_mock("HTTP/1.1 200 OK", token_body("stolen", 3600)).await;

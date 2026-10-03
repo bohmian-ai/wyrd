@@ -190,3 +190,46 @@ client, or if an SDK would need its own token logic.
 [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628);
 [RFC 8693](https://www.rfc-editor.org/rfc/rfc8693);
 [RFC 7523](https://www.rfc-editor.org/rfc/rfc7523).
+
+## Implementation Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-004 saved-login and CLI journeys pass on `oauth2` | `wyrd-client/src/auth.rs` `TokenExchange::{device_authorization, device_access_token, refresh}` on `oauth2::BasicClient` over the `AuthHttp` adapter; `wyrd-cli/src/auth/login.rs`; `wyrd-testing/src/human_login.rs` | identity journeys `cli`/`cli_device_login_journey`, `rust`/`saved_user_auth_journey`, `python`/`test_saved_user_auth_journey`, `typescript`/`saved user auth journey` all exit 0 | PASS |
+| Concurrent refresh under the file lock replays no rotated token | `saved_login.rs` renews via `exchange.refresh` while holding the file lock | identity journey `client`/`concurrent_saved_renewal` exit 0 | PASS |
+| `--no-browser` works | `login.rs` `run` prints the URL and skips `webbrowser::open` | `cli_device_login_journey` (drives `--no-browser`) | PASS |
+| FIND-TASK-004-5 | `transport/config.rs` parsed `HttpConfig` validation, used by `TokenExchange::new` | `transport::config::tests::remote_cleartext_malformed_and_unsupported_targets_are_refused`, `transport::config::tests::https_and_loopback_http_are_accepted`, `auth::tests::token_exchange_refuses_remote_cleartext` | PASS |
+| FIND-TASK-004-9 | `saved_login.rs` `canonical_origin` (`Url::origin`, userinfo refused) | `saved_login::tests::canonical_origin_is_the_url_origin` | PASS |
+| FIND-TASK-004-10 | `credentials_file.rs` `check_owned(.., 0o022)` | `saved_login::tests::unsafe_and_corrupt_stores_fail_closed` | PASS |
+| FIND-TASK-004-13 (client) | `AuthHttp` reqwest client with `redirect::Policy::none()` for every grant and revocation | `auth::tests::token_exchange_never_follows_a_redirect` (refresh, JWT bearer, revoke: 3 hits on the redirector, 0 on the target) | PASS |
+| FIND-TASK-004-14 | `webbrowser::open(url)` replaces the per-OS launcher | `cargo check -p webbrowser --target x86_64-pc-windows-msvc` exit 0; see limits | PASS |
+| AC-005 API-key and workload journeys still pass | `TokenExchange::exchange` form POST via the shared adapter | `pg_auth_e2e_against_fixture` `pg_tests::wyrd_client_authenticates_via_wyrd_access_token_header` (in `test:shared`); identity journey `server`/`workload_jwt_bearer_journey_keycloak` exit 0 | PASS |
+| No hand device/refresh POST/decode or `open_browser` launcher; no `oauth2` default feature | hand device/refresh code, `poll`, `open_in_browser` and `browser_command` deleted; `Cargo.toml` `oauth2` keeps `default-features = false` | `check:workspace-hack`, `check:client-tier`, `check:cli-client-tier`, `check:sdk-client-tier` exit 0 | PASS |
+
+Lanes, all exit 0 (`CARGO_TARGET_DIR` set to the repo `target/`): `mise run test:shared` (732 passed),
+`mise exec -- cargo nextest run --locked -p wyrd-cli --lib` (60 passed), `mise run codegen:check`,
+`mise run ts:napi:check`, `mise run check:unwrap-audit`, `mise run fmt`, `mise run lints`,
+`git diff --check`. No Python or TypeScript source changed, so the `py:*` and `ts:typecheck` lanes were not
+required.
+
+Diagnosis (three `transport/http.rs` tests failed in `test:shared`):
+- **Symptom:** API-key re-exchange returned `the auth response does not decode: missing field expires_in`.
+- **Evidence:** the `token_response` mock emitted `expires_at`.
+- **Cause:** the shared exchange decodes the RFC 6749 §5.1 `TokenResponse`, which the server sends with
+  `expires_in`, so the mock was the one off-contract.
+- **Fix site:** the test fixture, which now emits `expires_in`. The `auth.rs` unit fixture received the same
+  correction.
+
+Lead-decided deviation: RFC 7009 revocation is one form-encoded POST (`token`,
+`token_type_hint=refresh_token`, client authenticated as for the other grants) through the redirect-free
+adapter. Any 2xx counts as success; anything else becomes the existing best-effort "revocation not
+confirmed" warning, and logout always clears local credentials. `oauth2` 5.0's `revoke_token` refuses
+non-HTTPS URLs, which would have broken loopback logout; this is noted in rustdoc on
+`revoke_refresh_token`.
+
+Limit: a full `cargo check -p wyrd-cli --target x86_64-pc-windows-msvc` stops in the C build scripts of
+`blake3`, `zstd-sys` and `aws-lc-sys`, because this host has no Windows C cross toolchain. That failure is
+unrelated to the launcher. The Windows proof is therefore the `webbrowser` crate's Windows-target check
+plus the deletion of all `cmd /C start` code. No per-OS launch path remains in `wyrd-cli`.
+
+Non-goals stayed excluded, and no file outside the expected write set changed.

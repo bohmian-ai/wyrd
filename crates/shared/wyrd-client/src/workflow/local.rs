@@ -74,7 +74,13 @@ impl SelectedRoutes {
     /// When a step uses `wyrd_gateway`, `gateway` serves it through the
     /// public ingress; without one Skald refuses the run before dispatch.
     /// Each selected binding present in `config` has its secret headers
-    /// resolved now; bindings no route selects are never read.
+    /// resolved now, in binding-name order; bindings no route selects are
+    /// never read. Preparing dependencies dispatches no model call.
+    ///
+    /// On error or when the future is dropped, secrets of earlier bindings
+    /// may already have been read; they are discarded with the partial
+    /// dependencies. A secret read already started on the blocking pool
+    /// finishes on its own after a drop, and its value is discarded.
     ///
     /// # Errors
     /// Returns `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` when a selected
@@ -107,7 +113,12 @@ impl SelectedRoutes {
 /// Resolve one configured binding's secret headers.
 ///
 /// Each secret is read by the shared [`read_secret_ref`] on the blocking
-/// pool, under its owner-only, bounded file rule.
+/// pool, under its owner-only, bounded file rule, one header at a time.
+///
+/// On error or when the future is dropped, earlier headers' secrets may
+/// already have been read; they are discarded with the partial binding. A
+/// read already started on the blocking pool finishes on its own after a
+/// drop, and its value is discarded.
 ///
 /// # Errors
 /// Returns `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` for an invalid header name

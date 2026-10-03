@@ -715,9 +715,14 @@ class Workflow:
         ...
 
     def run(self, input: str | Mapping[str, Any] | None = None) -> WorkflowRun:
-        """Run this workflow against the process-local provider registry.
+        """Run this workflow, preparing only what its step routes select.
 
-        Dependencies order steps only; data reaches a step solely through its
+        Native steps use the process-local provider registry. Steps routed to
+        the Wyrd gateway call the server and credential this Workflow was
+        loaded through, or the ambient client configuration when it was built
+        locally. Steps routed to an external gateway use the bindings named in
+        the shared client configuration; only the selected bindings' secrets
+        are read, at run start. Dependencies order steps only; data reaches a step solely through its
         declared bindings.
 
         Args:

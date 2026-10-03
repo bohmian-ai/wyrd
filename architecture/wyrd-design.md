@@ -431,6 +431,17 @@ runtime logic. Language SDKs project that facade; no public loader or hydrator
 is required. Shared local execution configuration serves SDKs and CLI, while
 Skald remains independent of registry IO and server tenancy.
 
+A `wyrd_gateway` step calls the existing authenticated public gateway ingress.
+Its per-step fallback travels in the optional `wyrd-gateway-fallback` request
+header: unpadded base64url over the JCS UTF-8 serialization of a
+`GatewayFallbackOverride`, at most 8 KiB encoded and 4 KiB decoded. The ingress
+authenticates the caller before parsing the header, refuses a repeated,
+malformed, oversized, empty, duplicated, or self-listing value with
+`WYRD_GATEWAY_400_INVALID_REQUEST` naming `fallback` before any dispatch, and
+consumes the header without forwarding it to a provider. Without the header,
+tenant fallback policy applies unchanged, so unmodified clients behave as
+before.
+
 ### Mcp
 MCP server registration. The server enumerates its own tools at runtime; we do
 not shadow them as cards.

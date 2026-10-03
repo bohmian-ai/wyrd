@@ -306,13 +306,21 @@ impl Queue {
 
     /// One drain poll: every replica's scrape from `scrape`, then the
     /// durable [`Queue::backlog`], combined by [`Backlog::with_replicas`].
-    /// Returns the backlog and the scrapes that judged it.
+    /// A nonempty reading is returned at once; an empty one is taken again,
+    /// scrape then durable read, and that latest reading is returned with
+    /// its scrapes. Zero is accepted only when all four observations are
+    /// empty.
     ///
-    /// The first scrape covers a decision pending before the durable read
-    /// that commits during it. A decision first created after that scrape
-    /// is in neither, so a combined reading that would otherwise be empty
-    /// takes a second scrape and adds what it still holds; zero is accepted
-    /// only when that later scrape is empty too, and it is the one returned.
+    /// Why four suffice: an audit decision is pending in a replica until its
+    /// staging row commits, and its row stays owed until publication. An
+    /// empty first durable read shows every expected run created and
+    /// terminal, so no step-caused decision can be produced after it. Each
+    /// decision is therefore either still pending at the second scrape, or
+    /// committed before the second durable read, which runs after that
+    /// scrape and sees its row until publication. A decision created after
+    /// the first scrape, or one whose commit crosses the first durable read,
+    /// cannot slip between the observations. Repetition and the deadline
+    /// stay with the caller's drain loop.
     ///
     /// # Errors
     ///
@@ -337,7 +345,11 @@ impl Queue {
             return Ok((backlog, scrapes));
         }
         let scrapes = scrape().await?;
-        Ok((backlog.with_replicas(&scrapes), scrapes))
+        let backlog = self
+            .backlog(since, stopped, activations)
+            .await?
+            .with_replicas(&scrapes);
+        Ok((backlog, scrapes))
     }
 
     /// Every run created since `since`, tallied by Verifier UID.
@@ -558,6 +570,13 @@ mod pg_tests {
     /// first and then starts the second's transaction, so the second row is
     /// stamped after the stop.
     ///
+    /// A last read is issued after a drain poll's first scrape with the
+    /// chain head held again, then released and committed inside the poll's
+    /// second scrape, after its first durable read and before the scrape
+    /// reads the replica. The replica no longer owns it, so only the poll's
+    /// second durable read can, and the cell stays nonzero until that row
+    /// is published.
+    ///
     /// # Errors
     ///
     /// Returns the server, client, Postgres, or publication failure.
@@ -701,6 +720,70 @@ mod pg_tests {
             drain_read(&queue, &metrics, stopped).await?.audit,
             0,
             "publication past every row empties the audit cell"
+        );
+
+        let mut fence = server.tenant_conn_for(tenant).await?;
+        sqlx::query("SELECT last_seq FROM vala.audit_chain_head FOR UPDATE")
+            .fetch_all(&mut **fence.transaction())
+            .await?;
+        let mut fence = Some(fence);
+        let mut scrapes = 0;
+        let (crossed, _) = queue
+            .poll(stopped, stopped, 0, async || {
+                scrapes += 1;
+                if scrapes == 1 {
+                    let scrape = vec![Metrics::parse(&metrics.render())];
+                    assert_eq!(
+                        scrape[0].sum(AUDIT_PENDING, &[]),
+                        0.0,
+                        "the decision is created after the first scrape"
+                    );
+                    oracle.sql(&sql).await?;
+                    await_blocked_writer(&queue).await?;
+                    return Ok(scrape);
+                }
+                assert_eq!(
+                    queue.backlog(stopped, stopped, 0).await?.audit,
+                    0,
+                    "the first durable read ran before the held commit"
+                );
+                fence.take().ok_or("one held commit")?.commit().await?;
+                let deadline = tokio::time::Instant::now() + WAIT;
+                while pending(&metrics) > 0.0 {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err("the released decision never committed".into());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let scrape = vec![Metrics::parse(&metrics.render())];
+                assert_eq!(
+                    scrape[0].sum(AUDIT_PENDING, &[]),
+                    0.0,
+                    "the commit leaves the replica before the second scrape"
+                );
+                Ok(scrape)
+            })
+            .await?;
+        assert_eq!(scrapes, 2, "the empty first reading is taken again");
+        assert!(
+            fence.is_none(),
+            "the second scrape released the held commit"
+        );
+        drop(fence);
+        assert_eq!(
+            crossed.audit, 1,
+            "the second durable read sees the commit that crossed the first"
+        );
+        assert_eq!(
+            drain_read(&queue, &metrics, stopped).await?.audit,
+            1,
+            "the crossed row stays owed above the watermark"
+        );
+        publish_all(&publisher, tenant).await?;
+        assert_eq!(
+            drain_read(&queue, &metrics, stopped).await?.audit,
+            0,
+            "publication past the crossed row empties the audit cell"
         );
         server.shutdown().await?;
         Ok(())

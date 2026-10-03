@@ -1,7 +1,7 @@
 ---
 id: TASK-008-CLOSEOUT-R6
 kind: remediation
-status: ready
+status: implemented
 spec: changes/active/verified-change-contract/spec.md
 spec_revision: 57
 original_task: changes/active/verified-change-contract/tasks/task-008-closeout.md
@@ -177,3 +177,37 @@ server/audit journey, the focused `release_server` selection, `mise run fmt`,
 `mise run lints`, and `git diff --check`. Use the repository-managed setup
 wrapper for Postgres/live-server tests. Do not substitute the deferred full
 `mise run bench:capacity` qualification for the focused handoff proof.
+
+## Implementation evidence
+
+Integrator direction: `Queue::poll` always takes the empty reading again as
+scrape then durable read (`S1 -> Q1 -> S2 -> Q2`), accepts zero only when all
+four are empty, and otherwise returns the latest combined value. The
+completeness argument is in its rustdoc. Drain loop and judge unchanged.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-R6-1 terminating poll closes the post-snapshot handoff | `Queue::poll` (`capacity/evidence.rs`): when `S1 + Q1` is empty it scrapes again and calls `Queue::backlog` after that scrape, combining `Q2` with `S2` | Focused proof below; red check: returning `Q1` combined with `S2` (no `Q2`) fails `the second durable read sees the commit that crossed the first`, `left: 0, right: 1` | PASS |
+| AC-R6-2 public Oracle proof exercises both sides | Same `pg_tests` proof keeps its still-pending phase (`late.audit == 1`) and adds a crossed phase: chain head held; read issued after `S1` (asserted pending 0 in `S1`); `Q1` runs with the writer blocked; inside `S2` a durable read asserts audit 0, the commit is released, pending is awaited to 0 and asserted 0 in `S2`; poll returns audit 1, a later drain read stays 1, publication makes it 0 | `evidence::pg_tests::the_audit_backlog_holds_from_a_pending_decision_until_its_publication` passes | PASS |
+| AC-R6-3 adjacent evidence unchanged | Only `capacity/evidence.rs` changed (poll + proof) | Pure arithmetic and drain-edge tests 2/2; full capacity target with ignored 20/20; fixed-port pair 2/2 (serialized); `release_server::tests` 2/2; `test:bifrost:journey:server` 29/29 | PASS |
+
+Non-goals held: no public, durable, audit, publisher, timeout, SLO, report,
+test-placement, or nextest change. `FIND-TASK-008-CLOSEOUT-13` stays deferred;
+default `bench:capacity` not run; no AC-040/AC-041 qualification claimed.
+
+### Commands
+
+```bash
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && \
+  mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity --run-ignored=only \
+  -E 'test(=evidence::pg_tests::the_audit_backlog_holds_from_a_pending_decision_until_its_publication)'"  # 1 passed; red without Q2: 1 failed
+mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity \
+  -E 'test(=evidence::tests::pending_decisions_add_to_staged_audit_rows) | test(=step::tests::a_backlog_drains_only_within_the_limit)'  # 2 passed
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && \
+  mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity --run-ignored=all"    # 20 passed
+mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity --run-ignored=all \
+  -E 'test(=tests::a_stalled_tenant_setup_stops_the_run_by_its_deadline) | test(=tests::a_slow_replica_stop_leaves_the_runtime_free)'  # 2 passed
+mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(/^release_server::tests::/)'  # 2 passed
+mise run test:bifrost:journey:server                                                           # 29 passed
+mise run fmt && mise run lints && git diff --check                                             # clean
+```

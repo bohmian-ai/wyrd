@@ -158,3 +158,22 @@ Record implementation locations, exact commands, selected counts, and results
 in this task. The next `$wyrd-task-review` reassesses the complete cumulative
 candidate against the original task and all four remediation packets.
 
+
+## Implementation Evidence
+
+Implemented in `8986513ec` on `wyrd/skald-workflow-runtime/TASK-003`.
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-TASK-003-10 | `workflow/mod.rs::load_local_setup` calls `GlobalConfig::load()` at most once (when bindings are needed, or a gateway client must be built) and passes that snapshot to the new pure `local_setup_from`, which derives the bindings from `global.workflow` and builds any client-less gateway client with `WyrdClient::with_config(ClientConfig::from_global_with_env(&global))`. `WyrdClient::from_global` is no longer called on this path. The whole step still runs inside the approved `spawn_blocking` in `run_with`. | New `workflow::tests::mixed_routes_use_one_config_snapshot`: one parsed snapshot carrying `[client] http_url` and a `review-gateway` binding yields exactly that binding and a gateway client whose `server_url()` is the snapshot URL (credential from `WYRD_API_KEY` under `ENV_MUTEX`, the existing pattern in `config.rs`). Python retained-client journey rerun after the shared `run_with` change. | PASS |
+
+Commands (all exit 0, `CARGO_TARGET_DIR=<repo>/target CARGO_BUILD_JOBS=12`):
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-client --lib --test workflow_transport -E 'test(/workflow::/) | test(=public_gateway_call_context_and_errors) | test(=shared_workflow_client_contract)'   # 5 passed
+mise exec -- cargo clippy --locked -p wyrd-client --all-targets --all-features -- -D warnings
+mise exec -- cargo fmt --check -p wyrd-client
+mise run py:setup
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cd sdks/wyrd-sdk-python && uv run python -m pytest -q -m integration "tests/integration/gateway/test_workflow_gateway_context.py::test_loaded_workflow_calls_the_gateway_through_its_loading_client"'   # 1 passed
+git diff --check
+```

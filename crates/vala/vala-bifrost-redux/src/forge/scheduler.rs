@@ -262,9 +262,15 @@ impl Forge {
         )
         .await;
         match result {
-            Ok(leader) => {
-                span.record("result", if leader { "leader" } else { "standby" });
+            Ok(None) => {
+                span.record("result", "standby");
                 readiness.publish(true);
+            }
+            Ok(Some(complete)) => {
+                span.record("result", "succeeded");
+                // A standby is healthy; only a leader whose pass stopped at its
+                // per-wake budget, leaving demand unplanned, is unready.
+                readiness.publish(complete);
             }
             Err(error) => {
                 span.record("result", "failed");
@@ -282,7 +288,8 @@ impl Forge {
 
     /// Holds the leader term for one pass and runs the leader's work.
     ///
-    /// Returns whether this replica leads after the pass.
+    /// Returns `None` when this replica is a standby after the pass, or
+    /// whether the leader's pass planned all of its demand.
     ///
     /// # Errors
     ///
@@ -293,21 +300,22 @@ impl Forge {
         scheduler: &mut ForgeScheduler<'_>,
         executor: &ForgeWorker,
         stop: &CancellationToken,
-    ) -> Result<bool, ForgeError> {
+    ) -> Result<Option<bool>, ForgeError> {
         let acquired = self.leadership.heartbeat().await?;
         if self.leadership.held().is_none() {
-            return Ok(false);
+            return Ok(None);
         }
         let planning = matches!(pass, ForgePass::Planning);
-        let promoted = if acquired || planning {
+        let owed = if acquired || planning {
             self.sweep_promotion_debt(executor, stop).await?
         } else {
             false
         };
-        // ponytail: a pass that promoted plans nothing else, keeping the old
-        // one-slot order where promotion outranks rewrite; drop it once
-        // rewrite is driven by the leader's commit tracks.
-        if planning && !promoted {
+        // ponytail: a pass that found promotion owed plans nothing else,
+        // keeping the old one-slot order where promotion outranks rewrite;
+        // drop it once rewrite is driven by the leader's commit tracks.
+        let mut complete = true;
+        if planning && !owed {
             let outcome = scheduler.schedule_once(stop).await?;
             tracing::debug!(
                 demands_seen = outcome.demands_seen,
@@ -315,8 +323,9 @@ impl Forge {
                 incomplete = outcome.incomplete,
                 "Forge demand planning pass completed"
             );
+            complete = !outcome.incomplete;
         }
-        Ok(self.leadership.held().is_some())
+        Ok(self.leadership.held().is_some().then_some(complete))
     }
 
     /// Promotes every table that still owes Scribe hot objects.
@@ -330,7 +339,8 @@ impl Forge {
     /// Returns the debt read's SQL error; per-table failures are logged and
     /// left for the next sweep.
     ///
-    /// Returns whether any table was promoted.
+    /// Returns whether any table owed a promotion, whether this sweep ran it,
+    /// left it to an attempt already active or queued, or failed it.
     async fn sweep_promotion_debt(
         &self,
         executor: &ForgeWorker,
@@ -343,19 +353,20 @@ impl Forge {
                 .tables_owing_promotion()
                 .await
                 .map_err(ForgeError::Sql)?;
-        let mut promoted = false;
+        let mut owed = false;
         for (tenant, table) in tables {
             if stop.is_cancelled() {
                 break;
             }
             match self.promote_table(executor, tenant, &table, stop).await {
-                Ok(done) => promoted |= done,
+                Ok(table_owed) => owed |= table_owed,
                 Err(error) => {
+                    owed = true;
                     tracing::warn!(error = %error, table = %table.table, "Forge promotion sweep failed for one table");
                 }
             }
         }
-        Ok(promoted)
+        Ok(owed)
     }
 
     /// Waits for the deterministic test trigger that requests one extra pass.

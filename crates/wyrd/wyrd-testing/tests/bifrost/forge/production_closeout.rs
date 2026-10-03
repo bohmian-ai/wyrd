@@ -1239,15 +1239,9 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         .restart_node(journey.coordinator_node)
         .await
         .expect("coordinator starts after complete ingestion");
+    // The new leader promotes all owed debt inside its boot pass, so the
+    // promoted cut is read before any driven pass can rewrite it.
     journey.await_boot_pass().await;
-    for server in journey.cluster.servers().iter() {
-        server
-            .forge_clock()
-            .advance(chrono::Duration::days(1))
-            .expect("closed partition");
-    }
-    journey.scheduler_pass().await;
-    journey.drain_tasks().await;
     let (promoted_snapshot, inputs) = journey.live_files(&table.binding).await;
     assert_eq!(
         inputs.len(),
@@ -1256,6 +1250,12 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     );
     let (neighbour_promoted, _) = journey.live_files(&neighbour_table.binding).await;
     let published_before = journey.snapshot_count(&table.binding).await;
+    for server in journey.cluster.servers().iter() {
+        server
+            .forge_clock()
+            .advance(chrono::Duration::days(1))
+            .expect("closed partition");
+    }
     // The managed core first normalizes promoted-file identity, then packs
     // current-recipe files. Continue packing residues until a pass is unchanged.
     let mut replacement = journey.live_files(&table.binding).await;
@@ -1487,12 +1487,12 @@ impl ReaderCleanupJourney {
             .restart_node(roles.coordinator_node)
             .await
             .expect("coordinator starts");
+        // The boot pass promotes the owed debt, so the promoted inputs are
+        // read before any driven pass can rewrite them.
         roles.await_boot_pass().await;
-        roles.advance_maintenance(chrono::Duration::hours(2));
-        roles.scheduler_pass().await;
-        roles.drain_tasks().await;
         let (_, earlier_files) = roles.live_files(&table.binding).await;
         assert!(earlier_files.len() >= 2, "two real promoted inputs");
+        roles.advance_maintenance(chrono::Duration::hours(2));
         let earlier_object = earlier_files.keys().next().expect("earlier object").clone();
         let (old_snapshot, old_files) = roles.compact_small_table(&table.binding).await;
         assert!(!old_files.contains_key(&earlier_object));

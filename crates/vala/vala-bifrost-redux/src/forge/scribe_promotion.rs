@@ -653,8 +653,10 @@ impl Forge {
     /// Promotes what one table owes through `executor`, the coordinator's own
     /// attempt executor.
     ///
-    /// Returns `false` when nothing is owed or the table already has an active
-    /// attempt; the leader's promotion-debt sweep retries the latter.
+    /// Returns whether the table owes a promotion. An owed promotion that
+    /// already has an active or queued attempt is left to that attempt and
+    /// still returns `true`, so the pass plans no rewrite over the table's
+    /// unsettled publication; the leader's promotion-debt sweep retries it.
     ///
     /// # Errors
     ///
@@ -673,7 +675,8 @@ impl Forge {
         };
         // Boxed: the full attempt future is deep, and inlining it into every
         // supervisor future that promotes overflows the compiler's layout depth.
-        Box::pin(executor.execute_accepted(Uuid::now_v7(), &task, stop)).await
+        Box::pin(executor.execute_accepted(Uuid::now_v7(), &task, stop)).await?;
+        Ok(true)
     }
 
     /// Returns the exact promotion task one table owes, without running it.

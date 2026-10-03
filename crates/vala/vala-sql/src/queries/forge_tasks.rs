@@ -541,7 +541,10 @@ impl ForgeTasks {
     /// evidence: it exists from acceptance, under `task_id`, so the ordinary
     /// start, prepared, terminal and recovery transitions apply unchanged.
     /// Returns `None` without effect when the table already has an active
-    /// attempt or the exact plan was already recorded.
+    /// attempt, already queues a ready or retryable task of the same strategy
+    /// (that task resumes through the ordinary claim path, so a failed
+    /// attempt's prepared publication is reconciled rather than duplicated),
+    /// or the exact plan was already recorded.
     ///
     /// # Errors
     /// Returns [`SqlError::Conflict`] for an expired-cleanup task, an invalid
@@ -572,7 +575,11 @@ impl ForgeTasks {
         let plan = crate::row_types::forge_tasks::plan_to_value(&task.plan);
         let row = sqlx::query_as::<_, ForgeTaskClaimSqlRow>(
             r#"INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,attempt_id,claimed_by,claim_expires_at,ready_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'claimed',$12,$13,statement_timestamp()+($14*interval '1 second'),statement_timestamp())
+               SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'claimed',$12,$13,statement_timestamp()+($14*interval '1 second'),statement_timestamp()
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM vala.forge_tasks
+                   WHERE data_tenant_id=$2 AND catalog_name=$3 AND namespace_name=$4 AND table_name=$5
+                     AND strategy=$6 AND state IN ('ready','retryable'))
                ON CONFLICT DO NOTHING
                RETURNING data_tenant_id AS execution_tenant_id,task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,estimated_files,estimated_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,evidence,attempt_count,failure_class,next_eligible_at,ready_at,created_at,updated_at"#,
         )

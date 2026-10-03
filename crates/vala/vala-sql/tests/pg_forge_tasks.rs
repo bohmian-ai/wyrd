@@ -4205,7 +4205,8 @@ mod pg_tests {
     /// The leader or accepting executor chooses Forge work; the row only
     /// records the attempt. The insert must return the claimed attempt under
     /// the caller's task id, refuse a second active attempt on the same table
-    /// without error, and admit a different table.
+    /// without error, refuse to duplicate that table's queued retry, and admit
+    /// a different table.
     ///
     /// # Panics
     /// Panics when the claimed row is missing, unclaimed, or a busy table admits
@@ -4233,6 +4234,23 @@ mod pg_tests {
             .await
             .expect("busy insert");
         assert!(busy.is_none(), "one active attempt per table");
+
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET state='retryable', attempt_id=NULL, claimed_by=NULL, \
+             claim_expires_at=NULL, failure_class='transient_coordination' WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .execute(fixture.operator_pool().pool())
+        .await
+        .expect("attempt settles retryable");
+        assert!(
+            tasks
+                .insert_claimed(Uuid::now_v7(), &task(tenant, "events", 5), owner, 30)
+                .await
+                .expect("queued insert")
+                .is_none(),
+            "queued work for the same table and strategy is retried, not duplicated"
+        );
 
         assert!(
             tasks

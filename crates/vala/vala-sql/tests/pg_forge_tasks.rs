@@ -4267,4 +4267,75 @@ mod pg_tests {
             "a zero lease is refused"
         );
     }
+    /// A fair claim that loses a table's active slot to a concurrent accepted
+    /// attempt claims nothing instead of failing.
+    ///
+    /// The claim's snapshot cannot see an attempt another transaction is still
+    /// inserting, so it selects the table's queued task and then waits on the
+    /// one-active-attempt index. Once that attempt commits, the claim must
+    /// report nothing claimable; surfacing the unique violation stops the
+    /// worker loop that called it.
+    ///
+    /// # Panics
+    /// Panics when the claim errors, claims the busy table, or never blocks on
+    /// the competing attempt.
+    #[tokio::test]
+    async fn fair_claim_yields_table_to_concurrent_accepted_attempt() {
+        let (fixture, admin) = setup().await;
+        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
+        let tenant = fixture.data_tenant_id();
+        tasks
+            .enqueue(&task(tenant, "events", 1))
+            .await
+            .expect("queued task");
+        let accepted = tasks
+            .enqueue(&task(tenant, "events", 2))
+            .await
+            .expect("second task on the same table");
+
+        let mut competing = fixture
+            .operator_pool()
+            .pool()
+            .begin()
+            .await
+            .expect("competing transaction");
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET state='claimed', attempt_id=$2, claimed_by=$2, \
+             claim_expires_at=statement_timestamp() + interval '30 seconds' WHERE task_id=$1",
+        )
+        .bind(accepted)
+        .bind(Uuid::now_v7())
+        .execute(&mut *competing)
+        .await
+        .expect("competing attempt takes the table's active slot");
+
+        let claimer = tokio::spawn({
+            let tasks = tasks.clone();
+            async move { tasks.claim_fair(Uuid::now_v7(), limits(4), None).await }
+        });
+        tokio::time::timeout(StdDuration::from_secs(10), async {
+            loop {
+                let (waiting,): (i64,) = sqlx::query_as(
+                    "SELECT count(*) FROM pg_stat_activity \
+                     WHERE wait_event_type = 'Lock' AND query LIKE '%forge_tasks%'",
+                )
+                .fetch_one(&admin)
+                .await
+                .expect("lock waits");
+                if waiting > 0 {
+                    return;
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the claim waits on the competing attempt");
+        competing.commit().await.expect("competing attempt commits");
+
+        let claimed = claimer
+            .await
+            .expect("claim task joins")
+            .expect("losing the active slot is not an error");
+        assert!(claimed.is_none(), "the busy table yields nothing to claim");
+    }
 }

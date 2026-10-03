@@ -34,6 +34,9 @@ const CLAIM_TASK_PROJECTION: &str = "t.task_id,t.data_tenant_id,t.catalog_name,t
 /// Exact `PostgreSQL`-16 fair-claim statement used by production and scale-plan proof.
 pub const FAIR_CLAIM_SQL: &str = include_str!("forge_fair_claim.sql");
 
+/// Partial unique index admitting one claimed, running or prepared task per table.
+const PUBLICATION_ACTIVE_INDEX: &str = "forge_tasks_publication_active";
+
 /// Claim limits enforced atomically by `PostgreSQL`.
 #[derive(Debug, Clone, Copy)]
 pub struct ForgeClaimLimits {
@@ -710,7 +713,8 @@ impl ForgeTasks {
     ///
     /// Returns [`SqlError::Conflict`] for zero or overflowing limits,
     /// invariant errors for malformed persisted rows, and query errors for
-    /// transaction failures.
+    /// transaction failures. Losing the table's active slot to a concurrent
+    /// accepted attempt is not an error: it claims nothing.
     ///
     /// # Cancellation
     ///
@@ -754,7 +758,19 @@ impl ForgeTasks {
             .bind(recovery_only)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(SqlError::from)?;
+            .map_err(SqlError::from);
+        // A concurrent `insert_claimed` the claim's snapshot could not see
+        // takes the table's one active slot first; that table simply has
+        // nothing claimable this turn, and the dropped transaction rolls the
+        // cursor advance back.
+        let row = match row {
+            Err(SqlError::UniqueViolation { constraint })
+                if constraint == PUBLICATION_ACTIVE_INDEX =>
+            {
+                return Ok(None);
+            }
+            row => row?,
+        };
         let task = row.map(TryInto::try_into).transpose()?;
         tx.commit().await.map_err(SqlError::from)?;
         Ok(task)

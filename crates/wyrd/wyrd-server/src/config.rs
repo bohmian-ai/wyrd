@@ -1743,7 +1743,10 @@ impl ServerWorkflowConfig {
             ("max_retained_global", self.max_retained_global),
             ("max_retained_per_tenant", self.max_retained_per_tenant),
             ("max_steps_per_run", self.max_steps_per_run),
-            ("max_dependency_edges_per_run", self.max_dependency_edges_per_run),
+            (
+                "max_dependency_edges_per_run",
+                self.max_dependency_edges_per_run,
+            ),
             ("max_resolved_graph_bytes", self.max_resolved_graph_bytes),
             ("max_input_bytes", self.max_input_bytes),
             ("max_step_result_bytes", self.max_step_result_bytes),
@@ -5967,7 +5970,10 @@ origin = "https://llm.example"
 api_key = "plaintext"
 "#
         ));
-        assert!(unknown.is_err(), "an unknown binding member must be refused");
+        assert!(
+            unknown.is_err(),
+            "an unknown binding member must be refused"
+        );
         assert!(toml::from_str::<ServerWorkflowConfig>("max_runs = 1").is_err());
     }
 
@@ -5992,13 +5998,19 @@ api_key = "plaintext"
             ("max_dependency_edges_per_run", |c| {
                 c.max_dependency_edges_per_run = 0;
             }),
-            ("max_resolved_graph_bytes", |c| c.max_resolved_graph_bytes = 0),
+            ("max_resolved_graph_bytes", |c| {
+                c.max_resolved_graph_bytes = 0
+            }),
             ("max_input_bytes", |c| c.max_input_bytes = 0),
             ("max_step_result_bytes", |c| c.max_step_result_bytes = 0),
             ("max_run_bytes", |c| c.max_run_bytes = 0),
-            ("default_timeout_seconds", |c| c.default_timeout_seconds = 7201),
+            ("default_timeout_seconds", |c| {
+                c.default_timeout_seconds = 7201
+            }),
             ("max_active_per_tenant", |c| c.max_active_per_tenant = 33),
-            ("max_retained_per_tenant", |c| c.max_retained_per_tenant = 129),
+            ("max_retained_per_tenant", |c| {
+                c.max_retained_per_tenant = 129
+            }),
             ("max_step_result_bytes", |c| c.max_run_bytes = 1024),
         ];
         for (field, mutate) in refused {

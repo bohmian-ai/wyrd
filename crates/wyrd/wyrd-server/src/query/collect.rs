@@ -155,10 +155,8 @@ impl QueryArguments {
     /// Returns [`InvalidQueryArguments`] when the SQL is blank or oversized,
     /// the deadline is zero, or either ceiling is zero or above its maximum.
     pub(crate) fn validate(&self) -> Result<(), InvalidQueryArguments> {
-        let invalid = |reason: &'static str, details: JsonValue| InvalidQueryArguments {
-            reason,
-            details,
-        };
+        let invalid =
+            |reason: &'static str, details: JsonValue| InvalidQueryArguments { reason, details };
         if self.sql.trim().is_empty() {
             return Err(invalid("sql must not be blank", serde_json::json!({})));
         }

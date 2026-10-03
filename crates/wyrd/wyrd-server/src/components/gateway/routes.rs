@@ -1828,7 +1828,10 @@ pub(super) fn openai_error(error: &WyrdError) -> Response {
 /// `n`, Responses by `max_output_tokens`, and a request without that maximum
 /// is unbounded; Embeddings produce no output tokens. Other operations have no
 /// token bound here.
-pub(super) fn usage_bound(operation: GatewayOperation, body: &Value) -> Option<Vec<GatewayUsageAmount>> {
+pub(super) fn usage_bound(
+    operation: GatewayOperation,
+    body: &Value,
+) -> Option<Vec<GatewayUsageAmount>> {
     let field = |name: &str| body.get(name).and_then(Value::as_u64);
     let output = match operation {
         GatewayOperation::ChatCompletions => Some(

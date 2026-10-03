@@ -28,6 +28,6 @@ pub(crate) use invocation::unconnected_engine;
 pub use invocation::{GatewayCallRequest, GatewayCallResponse, GatewayInvocation};
 pub use routes::gateway_router;
 pub use service::GatewayAdministration;
-pub(crate) use workflow::ServerWyrdGatewayCaller;
 pub(crate) use service::invalid;
+pub(crate) use workflow::ServerWyrdGatewayCaller;
 pub use wyrd_gateway::{GatewayCredentialSnapshot, GatewayCredentialSource, GatewayTenantSnapshot};

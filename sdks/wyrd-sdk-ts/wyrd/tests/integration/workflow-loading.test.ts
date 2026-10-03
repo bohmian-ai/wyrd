@@ -183,16 +183,35 @@ describe("Workflow loading", () => {
         expect(run.workflow?.uid).toBe(workflowUid);
       }
 
-      // 7. Mixed, wrong-kind, and unauthorized selectors are refused.
+      // 7. Mixed, malformed, wrong-kind, and unauthorized selectors are refused.
       // The WorkflowSelector type already rejects this mix; the cast proves
       // the runtime refuses it too, for callers without type checking.
       const mixedSelector = {
         uid: workflowUid,
         space: "workflow-loading",
       } as unknown as WorkflowSelector;
-      expect((await rejection(reader.workflow.load(mixedSelector))).code).toBe(
-        "WYRD_WORKFLOW_400_INVALID_CARD_REF",
-      );
+      const mixedError = await rejection(reader.workflow.load(mixedSelector));
+      expect(mixedError.code).toBe("WYRD_WORKFLOW_400_INVALID_CARD_REF");
+      expect(mixedError.status).toBe(400);
+      expect(mixedError.details).toEqual({ field: "selector" });
+
+      // Each malformed value is refused before any registry read and names
+      // its field. The outsider cannot read Cards, so a registry read would
+      // fail with WYRD_PERMISSION_403_DENIED_RBAC instead.
+      const named = { space: "workflow-loading", name: "code-review", version: "1.0.0" };
+      const malformed: [WorkflowSelector, string][] = [
+        [{ uid: "not-a-uid" }, "uid"],
+        [{ ...named, space: "Not A Space" }, "space"],
+        [{ ...named, name: "not a name" }, "name"],
+        [{ ...named, version: "^1.0.0" }, "version"],
+        [{ ...named, version: "1.0" }, "version"],
+      ];
+      for (const [selector, field] of malformed) {
+        const error = await rejection(outsider.workflow.load(selector));
+        expect(error.code, field).toBe("WYRD_WORKFLOW_400_INVALID_CARD_REF");
+        expect(error.status, field).toBe(400);
+        expect(error.details, field).toEqual({ field });
+      }
       // An Agent's UID names no Workflow.
       const agentUid = ref(team, "security-reviewer").uid ?? "";
       expect((await rejection(reader.workflow.load({ uid: agentUid }))).code).toBe(

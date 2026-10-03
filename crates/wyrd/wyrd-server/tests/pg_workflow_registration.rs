@@ -797,14 +797,20 @@ async fn fetches_and_executes_locked_workflow_graph() {
             "WYRD_REGISTRY_400_CARD_REF_UID_NOT_RESOLVABLE_HERE",
         ),
         (
-            card_ref("Workflow", "code-review", "^1.0.0", None),
-            "WYRD_REGISTRY_400_INVALID_CARD_SPEC",
-        ),
-        (
             card_ref("Agent", "security-reviewer", "1.0.0", None),
             "WYRD_WORKFLOW_400_INVALID_CARD_REF",
         ),
     ];
+    let ranged = json!({
+        "kind": "Workflow",
+        "name": "code-review",
+        "version": "^1.0.0",
+        "space": "engineering",
+    });
+    assert!(
+        serde_json::from_value::<CardRef>(ranged).is_err(),
+        "a version range cannot become an exact Workflow reference"
+    );
     for (reference, code) in refusals {
         let error: WyrdError = workflows
             .load(&CardSelector::exact(reference.clone()))

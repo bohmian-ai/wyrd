@@ -11619,6 +11619,7 @@ dependencies = [
  "tokio",
  "wyrd-client",
  "wyrd-queue",
+ "wyrd-semver",
  "wyrd-spec",
 ]
 

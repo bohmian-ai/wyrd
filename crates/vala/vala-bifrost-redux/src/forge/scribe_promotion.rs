@@ -1032,7 +1032,7 @@ impl Forge {
         let timeout = self.core.config.iceberg_total_retry_timeout;
         let catalog = self.core.catalog.as_ref();
         let outcome = async move {
-            let commit = transaction.commit(catalog);
+            let commit = transaction.commit_once(catalog);
             tokio::pin!(commit);
             tokio::select! {
                 response = tokio::time::timeout(timeout, &mut commit) => match response {

@@ -816,7 +816,7 @@ impl Forge {
             });
         }
         require_running(stop)?;
-        let commit = transaction.commit(self.core.catalog.as_ref());
+        let commit = transaction.commit_once(self.core.catalog.as_ref());
         tokio::pin!(commit);
         let committed = tokio::select! {
             response = tokio::time::timeout(

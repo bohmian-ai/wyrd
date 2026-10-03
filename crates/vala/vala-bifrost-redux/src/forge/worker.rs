@@ -2839,6 +2839,11 @@ impl ForgeWorker {
     /// reconciliation pass classifies, whether this worker exited cleanly, was
     /// killed, or simply lost one commit response and kept running.
     ///
+    /// A leader dispatch behind the attempt is reported failed, which is volatile
+    /// leader state rather than a durable write: the table becomes due again
+    /// instead of waiting out its report deadline, and its re-dispatch is not
+    /// started while this task's durable row still holds the table.
+    ///
     /// A local closure failure is logged rather than returned: nothing durable
     /// depends on the closure, and an unreleased fence lapses on its own TTL.
     async fn release_unresolved_attempt(&self, state: ForgeAttemptState) {
@@ -2872,6 +2877,15 @@ impl ForgeWorker {
                 worker = %self.owner, task_id = %task_id, error = %error,
                 "Forge table lease release failed; the fence lapses on its TTL"
             );
+        }
+        let dispatch = self
+            .dispatched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&task_id);
+        if let Some(dispatch) = dispatch {
+            self.report_dispatch(&dispatch, ForgeCompactionOutcome::Failed)
+                .await;
         }
         // The one final snapshot of what this attempt may have written is read
         // before its shared context is dropped, so a successor's operator has

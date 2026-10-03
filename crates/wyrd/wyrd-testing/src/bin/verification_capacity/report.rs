@@ -2,14 +2,15 @@
 //! verdicts over every step, rendered as Markdown and JSON.
 //!
 //! Correctness fails on loss, duplication, a wrong judgment, or a failed
-//! durable run. Coexistence fails when a mixed step does not complete every
-//! kind in every progress slice, or a multi-replica queued step does not
-//! execute on every replica exactly once per run. Fairness fails when the
-//! quiet tenant or any background tenant completes nothing during noisy
-//! traffic. Performance applies AC-040: at the highest sustainable direct
-//! step of each non-judge case, solo and mixed, on one replica, at least
-//! [`MIN_SAMPLES`] engine-overhead samples with 95% at or below 9 ms. Missing
-//! evidence never passes.
+//! durable run. Coexistence fails when a scored step does not complete every
+//! kind of the noisy tenant in every progress slice, or a multi-replica step
+//! does not execute queued work on every replica exactly once per run.
+//! Fairness fails when the quiet tenant completes nothing during a
+//! sustained step. Performance applies AC-040: in the
+//! one-replica sustained step, which must itself be sustainable, each
+//! non-judge kind's direct lane needs at least [`MIN_SAMPLES`]
+//! engine-overhead samples with 95% at or below 9 ms. Missing evidence never
+//! passes.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -66,15 +67,28 @@ fn achieved(record: &Record, lane: &LaneRecord) -> f64 {
     lane.progress.iter().sum::<u64>() as f64 / record.window_seconds
 }
 
-/// Whether every lane of `record` achieved [`SUSTAINED`] of its offered rate
-/// with no missed arrival or refusal, and its runs drained within one step.
+/// Whether `record` is sustainable (AC-040): the whole step achieved
+/// [`SUSTAINED`] of its offered rate with no missed arrival or refusal, and
+/// its runs drained within the drain budget.
 pub fn sustainable(record: &Record) -> bool {
+    let offered: f64 = record.lanes.iter().map(|lane| lane.rate).sum();
+    let achieved: f64 = record.lanes.iter().map(|lane| achieved(record, lane)).sum();
     record.outstanding_at_deadline == 0
-        && record.lanes.iter().all(|lane| {
-            lane.tally.missed == 0
-                && lane.tally.rejected.is_empty()
-                && achieved(record, lane) >= SUSTAINED * lane.rate
-        })
+        && achieved >= SUSTAINED * offered
+        && record
+            .lanes
+            .iter()
+            .all(|lane| lane.tally.missed == 0 && lane.tally.rejected.is_empty())
+}
+
+/// The step's name and replica count, unique within one run.
+fn label(record: &Record) -> String {
+    format!("{} on {} replica(s)", record.plan.name(), record.replicas)
+}
+
+/// Whether `lane` belongs to the noisy tenant, which carries the measured mix.
+fn noisy(lane: &LaneRecord) -> bool {
+    lane.tenant == "m0"
 }
 
 impl Report {
@@ -111,7 +125,7 @@ impl Report {
         for record in &self.records {
             for profile in &record.profiles {
                 checks.push(Check {
-                    name: format!("profile {} replica {}", record.plan.name(), profile.replica),
+                    name: format!("profile {} replica {}", label(record), profile.replica),
                     passed: profile.failure.is_none(),
                     detail: profile
                         .failure
@@ -128,56 +142,57 @@ impl Report {
         self.checks().iter().all(|check| check.passed)
     }
 
-    /// AC-040 checks: one per non-judge kind and case on one direct replica.
+    /// AC-040 checks: one per non-judge kind, from the noisy tenant's direct
+    /// lane in the one-replica sustained step.
     fn performance(&self) -> Vec<Check> {
-        let mut checks = Vec::new();
-        for case in ["solo", "mixed"] {
-            for kind in OBJECTIVE_KINDS {
-                let name = format!("AC-040 direct {case} {kind} overhead p95 < 10 ms");
-                let candidates = self.records.iter().filter(|record| {
-                    record.replicas == 1
-                        && record.plan.path == "direct"
-                        && if case == "solo" {
-                            record.plan.case == kind
-                        } else {
-                            record.plan.case == "mixed"
-                        }
-                });
-                let best = candidates
-                    .filter(|record| sustainable(record))
-                    .max_by(|a, b| a.plan.rate.total_cmp(&b.plan.rate));
-                let Some(record) = best else {
-                    checks.push(Check {
+        let step = self
+            .records
+            .iter()
+            .find(|record| record.replicas == 1 && record.plan.path == "sustained");
+        OBJECTIVE_KINDS
+            .iter()
+            .map(|kind| {
+                let name = format!("AC-040 direct {kind} overhead p95 < 10 ms");
+                let Some(record) = step else {
+                    return Check {
                         name,
                         passed: false,
-                        detail: "no sustainable step was measured".to_owned(),
-                    });
-                    continue;
+                        detail: "no sustained step ran: no ramp step was sustainable".to_owned(),
+                    };
                 };
-                let Some(lane) = record.lanes.iter().find(|lane| lane.kind == kind) else {
-                    checks.push(Check {
+                let Some(lane) = record
+                    .lanes
+                    .iter()
+                    .find(|lane| noisy(lane) && lane.mode == "direct" && lane.kind == *kind)
+                else {
+                    return Check {
                         name,
                         passed: false,
-                        detail: "the step has no lane of this kind".to_owned(),
-                    });
-                    continue;
+                        detail: "the step has no direct lane of this kind".to_owned(),
+                    };
                 };
                 let server = &lane.server;
                 let share = server.overhead_within_bound.unwrap_or(0.0);
-                checks.push(Check {
+                Check {
                     name,
-                    passed: server.overhead_samples >= MIN_SAMPLES && share >= 0.95,
+                    passed: sustainable(record)
+                        && server.overhead_samples >= MIN_SAMPLES
+                        && share >= 0.95,
                     detail: format!(
-                        "at {}/s: {:.0} samples, {:.1}% ≤ 9 ms, p95 bucket {}",
+                        "at {}/s{}: {:.0} samples, {:.1}% ≤ 9 ms, p95 bucket {}",
                         record.plan.rate,
+                        if sustainable(record) {
+                            ""
+                        } else {
+                            " (not sustainable)"
+                        },
                         server.overhead_samples,
                         share * 100.0,
                         seconds_ms(server.overhead.p95)
                     ),
-                });
-            }
-        }
-        checks
+                }
+            })
+            .collect()
     }
 
     /// Writes `report{suffix}.md` and `report{suffix}.json` into `output`.
@@ -213,39 +228,18 @@ impl Report {
         );
         let _ = writeln!(
             text,
-            "| replicas | path | case | step/s | tenant | kind | mode | offered/s | achieved/s | sent/accepted/missed | refused | verdicts (wrong) | client p50/95/99 ms | terminal p50/95/99 ms | run p95 s | phase p95 s | overhead p50/95/99 ms (n, ≤9 ms) | task-start p95 µs | backlog deadline/final | sustainable |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            "## Steps\n\n| step | replicas | offered/s | achieved/s | sent/accepted/missed | refused | wrong verdicts | client p50/95/99 ms | backlog deadline/final | drain s | sustainable |\n|---|---|---|---|---|---|---|---|---|---|---|"
+        );
+        for record in &self.records {
+            let _ = writeln!(text, "{}", summary(record));
+        }
+        let _ = writeln!(
+            text,
+            "\n## Per-kind breakdown\n\nNoisy tenant m0 carries the mix; the quiet tenant m1 sends queued assertions.\n\n| step | replicas | tenant | kind | mode | offered/s | achieved/s | sent/accepted/missed | refused | verdicts (wrong) | client p50/95/99 ms | terminal p50/95/99 ms | run p95 s | phase p95 s | overhead p50/95/99 ms (n, ≤9 ms) | task-start p95 µs |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
         );
         for record in &self.records {
             for lane in &record.lanes {
-                if record.plan.path == "fairness" && lane.tenant.starts_with("bg") {
-                    continue;
-                }
                 let _ = writeln!(text, "{}", row(record, lane));
-            }
-            if record.plan.path == "fairness" {
-                let background: Vec<&LaneRecord> = record
-                    .lanes
-                    .iter()
-                    .filter(|lane| lane.tenant.starts_with("bg"))
-                    .collect();
-                let progressed = background
-                    .iter()
-                    .filter(|lane| lane.progress.iter().sum::<u64>() > 0)
-                    .count();
-                let latency: Vec<u64> = background
-                    .iter()
-                    .filter_map(|lane| lane.runs.as_ref())
-                    .flat_map(|runs| runs.latency_us.iter().copied())
-                    .collect();
-                let terminal = Percentiles::raw(&latency, 1e-3);
-                let _ = writeln!(
-                    text,
-                    "| {} | fairness | background | - | {} tenants | eval_assertion | queued | - | - | - | - | - | - | {} | - | - | - | - | - | {progressed}/{} progressed |",
-                    record.replicas,
-                    background.len(),
-                    ms3(terminal),
-                    background.len()
-                );
             }
         }
         let _ = writeln!(
@@ -376,11 +370,9 @@ fn row(record: &Record, lane: &LaneRecord) -> String {
         .map(|(phase, p95)| format!("{phase} {}", seconds(*p95)))
         .collect();
     format!(
-        "| {} | {} | {} | {} | {} | {} | {} | {:.1} | {:.1} | {}/{}/{} | {refused} | {verdicts} | {} | {} | {} | {} | {}/{}/{} ({:.0}, {}) | {} | {}/{} | {} |",
+        "| {} | {} | {} | {} | {} | {:.1} | {:.1} | {}/{}/{} | {refused} | {verdicts} | {} | {} | {} | {} | {}/{}/{} ({:.0}, {}) | {} |",
+        record.plan.name(),
         record.replicas,
-        record.plan.path,
-        record.plan.case,
-        record.plan.rate,
         lane.tenant,
         lane.kind,
         lane.mode,
@@ -407,8 +399,48 @@ fn row(record: &Record, lane: &LaneRecord) -> String {
         lane.task_start_us
             .p95
             .map_or("-".to_owned(), |p95| format!("{p95:.0}")),
+    )
+}
+
+/// One summary row for `record`: every lane's counts, refusals, and raw
+/// client samples together.
+fn summary(record: &Record) -> String {
+    let mut refused = BTreeMap::<&str, u64>::new();
+    let mut samples = Vec::new();
+    let (mut sent, mut accepted, mut missed, mut wrong) = (0, 0, 0, 0);
+    for lane in &record.lanes {
+        sent += lane.tally.started;
+        accepted += lane.tally.accepted;
+        missed += lane.tally.missed;
+        wrong += lane.tally.wrong_verdicts;
+        samples.extend_from_slice(&lane.tally.client_us);
+        for (code, count) in &lane.tally.rejected {
+            *refused.entry(code.as_str()).or_default() += count;
+        }
+    }
+    let refused = if refused.is_empty() {
+        "0".to_owned()
+    } else {
+        refused
+            .iter()
+            .map(|(code, count)| format!("{count}× {code}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "| {} | {} | {:.1} | {:.1} | {sent}/{accepted}/{missed} | {refused} | {wrong} | {} | {}/{} | {:.1} | {} |",
+        record.plan.name(),
+        record.replicas,
+        record.lanes.iter().map(|lane| lane.rate).sum::<f64>(),
+        record
+            .lanes
+            .iter()
+            .map(|lane| achieved(record, lane))
+            .sum::<f64>(),
+        ms3(Percentiles::raw(&samples, 1e-3)),
         record.outstanding_at_deadline,
         record.outstanding_final,
+        record.drain_seconds,
         if sustainable(record) { "yes" } else { "no" }
     )
 }
@@ -444,7 +476,7 @@ fn seconds_ms(bound: Option<f64>) -> String {
 
 /// Reconciliation checks of one step.
 fn correctness(record: &Record) -> Vec<Check> {
-    let name = record.plan.name();
+    let name = label(record);
     let mut wrong = 0;
     let mut lost = Vec::new();
     let mut failed = BTreeMap::<String, u64>::new();
@@ -494,74 +526,77 @@ fn correctness(record: &Record) -> Vec<Check> {
 
 /// Coexistence, claim, and fairness checks of one step.
 fn coexistence(record: &Record) -> Vec<Check> {
-    let name = record.plan.name();
+    let name = label(record);
     let mut checks = Vec::new();
-    if record.plan.case == "mixed" && record.plan.path != "fairness" {
-        let stalled: Vec<String> = record
-            .lanes
-            .iter()
-            .filter(|lane| lane.progress.is_empty() || lane.progress.contains(&0))
-            .map(|lane| format!("{} {} {:?}", lane.kind, lane.mode, lane.progress))
-            .collect();
+    if record.plan.path == "warmup" {
+        return checks;
+    }
+    let stalled: Vec<String> = record
+        .lanes
+        .iter()
+        .filter(|lane| noisy(lane))
+        .filter(|lane| lane.progress.is_empty() || lane.progress.contains(&0))
+        .map(|lane| format!("{} {} {:?}", lane.kind, lane.mode, lane.progress))
+        .collect();
+    checks.push(Check {
+        name: format!("{name} overlap"),
+        passed: stalled.is_empty(),
+        detail: if stalled.is_empty() {
+            "every kind completed work in every 5 s slice".to_owned()
+        } else {
+            format!("slices without a completion: {}", stalled.join("; "))
+        },
+    });
+    if record.replicas > 1 {
+        // Exporter attempts are per kind across every tenant, so they are
+        // compared with every tenant's runs of that kind.
+        let mut kinds = BTreeMap::<&str, (Vec<f64>, f64, u64, u64)>::new();
+        for lane in record.lanes.iter().filter(|lane| lane.mode == "queued") {
+            let entry = kinds.entry(lane.kind).or_insert_with(|| {
+                (
+                    lane.server.attempts_per_replica.clone(),
+                    lane.server.attempts,
+                    0,
+                    0,
+                )
+            });
+            entry.2 += lane.runs.as_ref().map_or(0, |runs| runs.created);
+            entry.3 += lane.runs.as_ref().map_or(0, |runs| runs.retried);
+        }
+        let mut problems = Vec::new();
+        for (kind, (per_replica, attempts, runs, retried)) in &kinds {
+            if per_replica.iter().any(|count| *count <= 0.0) {
+                problems.push(format!("{kind}: attempts per replica {per_replica:?}"));
+            }
+            if (attempts - *runs as f64).abs() > *retried as f64 {
+                problems.push(format!(
+                    "{kind}: {attempts} attempts for {runs} runs ({retried} retried)"
+                ));
+            }
+        }
         checks.push(Check {
-            name: format!("{name} overlap"),
-            passed: stalled.is_empty(),
-            detail: if stalled.is_empty() {
-                "every kind completed work in every 5 s slice".to_owned()
+            name: format!("{name} cross-replica claims"),
+            passed: problems.is_empty(),
+            detail: if problems.is_empty() {
+                "every replica executed queued work, one attempt per run".to_owned()
             } else {
-                format!("slices without a completion: {}", stalled.join("; "))
+                problems.join("; ")
             },
         });
     }
-    if record.replicas > 1 && record.plan.path != "fairness" {
-        let mut problems = Vec::new();
-        for lane in record.lanes.iter().filter(|lane| lane.mode == "queued") {
-            let runs = lane.runs.as_ref().map_or(0, |runs| runs.created);
-            let retried = lane.runs.as_ref().map_or(0, |runs| runs.retried);
-            if lane
-                .server
-                .attempts_per_replica
-                .iter()
-                .any(|count| *count <= 0.0)
-            {
-                problems.push(format!(
-                    "{}: attempts per replica {:?}",
-                    lane.kind, lane.server.attempts_per_replica
-                ));
-            }
-            if (lane.server.attempts - runs as f64).abs() > retried as f64 {
-                problems.push(format!(
-                    "{}: {} attempts for {runs} runs ({retried} retried)",
-                    lane.kind, lane.server.attempts
-                ));
-            }
-        }
-        if record.lanes.iter().any(|lane| lane.mode == "queued") {
-            checks.push(Check {
-                name: format!("{name} cross-replica claims"),
-                passed: problems.is_empty(),
-                detail: if problems.is_empty() {
-                    "every replica executed queued work, one attempt per run".to_owned()
-                } else {
-                    problems.join("; ")
-                },
-            });
-        }
-    }
-    if record.plan.path == "fairness" {
+    if record.plan.path == "sustained" {
         let idle: Vec<String> = record
             .lanes
             .iter()
-            .filter(|lane| !lane.tenant.starts_with("m0"))
+            .filter(|lane| !noisy(lane))
             .filter(|lane| lane.progress.iter().sum::<u64>() == 0)
             .map(|lane| format!("{} {} {}", lane.tenant, lane.kind, lane.mode))
             .collect();
         checks.push(Check {
-            name: format!("{name} quiet and background progress"),
+            name: format!("{name} quiet-tenant progress"),
             passed: idle.is_empty(),
             detail: if idle.is_empty() {
-                "the quiet tenant and every background tenant completed work during noisy traffic"
-                    .to_owned()
+                "the quiet tenant completed work during noisy traffic".to_owned()
             } else {
                 format!("no completion during noisy traffic: {}", idle.join(", "))
             },
@@ -601,15 +636,15 @@ mod tests {
         }
     }
 
-    /// A one-replica direct solo step of `lanes` over a 10 s window.
+    /// A one-replica ramp step of `lanes` over a 10 s window.
     fn record(lanes: Vec<LaneRecord>) -> Record {
         Record {
             replicas: 1,
             plan: Plan {
-                path: "direct",
-                case: "drift_psi".to_owned(),
+                path: "ramp",
                 rate: 1.0,
                 seconds: 10.0,
+                drain_budget: 10.0,
                 lanes: Vec::new(),
                 profiled: false,
             },
@@ -641,8 +676,8 @@ mod tests {
         assert!(!passed(vec![lane("queued", 10, 10, Some(11))]));
     }
 
-    /// A step is sustainable only when every lane completes at least 95% of
-    /// its offered rate and nothing is outstanding at the deadline.
+    /// A step is sustainable only when it completes at least 95% of its
+    /// offered rate and nothing is outstanding at the deadline.
     ///
     /// # Panics
     ///
@@ -677,7 +712,7 @@ mod tests {
             .into_iter()
             .filter(|check| check.name.starts_with("AC-040"))
             .collect();
-        assert_eq!(objectives.len(), 8);
+        assert_eq!(objectives.len(), 4);
         assert!(objectives.iter().all(|check| !check.passed));
         assert!(!report.passed());
     }

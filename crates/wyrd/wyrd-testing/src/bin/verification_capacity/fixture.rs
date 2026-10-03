@@ -2,13 +2,13 @@
 //! application would through the public client, and the AC-040 reference
 //! workloads they verify.
 //!
-//! A measured tenant registers a Parquet baseline Data Card of
+//! Each tenant registers a Parquet baseline Data Card of
 //! [`BASELINE_ROWS`] rows, PSI, SPC, and Custom Drift Verifiers, an
 //! assertion Eval and an LLM-judge Eval Verifier, and a Service whose Model
 //! component emits Drift samples and whose two Agent components are each
 //! Eval-verified on `observations_ready`. It waits for both baselines to fit
 //! and seeds one window of [`SAMPLES`] Drift observations that every queued
-//! Drift run reads. A background tenant registers only the assertion Agent.
+//! Drift run reads.
 //! Registration gives each Service principal the `workload` role, so its
 //! Card-bound key emits; the administrator runs and executes Verifiers.
 
@@ -202,17 +202,16 @@ struct Count {
 }
 
 impl Tenant {
-    /// Provisions `setup`'s tenant under `root`: every workload when
-    /// `measured`, otherwise only the assertion Agent.
+    /// Provisions `setup`'s tenant under `root` with every workload.
     ///
     /// # Errors
     ///
     /// Returns a client, registration, fit, hydration, key, or seeding
     /// failure.
-    pub async fn provision(setup: &SetupTenant, root: &Path, measured: bool) -> Result<Self> {
+    pub async fn provision(setup: &SetupTenant, root: &Path) -> Result<Self> {
         let directory = root.join(&setup.slug);
         std::fs::create_dir_all(&directory)?;
-        write_graph(&directory, measured)?;
+        write_graph(&directory)?;
         let admin = connect(SERVER_URL, &setup.api_key)?;
         let cards = Cards::with_client(WyrdClient::clone(&admin));
         let register = |name: &str| {
@@ -222,19 +221,17 @@ impl Tenant {
         };
         let mut verifiers = Vec::new();
         let mut fits = Vec::new();
-        if measured {
-            register("baseline.yaml").await?;
-            for (kind, name) in [
-                (Kind::Psi, "psi.yaml"),
-                (Kind::Spc, "spc.yaml"),
-                (Kind::Custom, "custom.yaml"),
-                (Kind::Judge, "judge.yaml"),
-            ] {
-                let root = register(name).await?.root;
-                verifiers.push((kind, uid(&root.uid)?));
-                if matches!(kind, Kind::Psi | Kind::Spc) {
-                    fits.push((kind, root));
-                }
+        register("baseline.yaml").await?;
+        for (kind, name) in [
+            (Kind::Psi, "psi.yaml"),
+            (Kind::Spc, "spc.yaml"),
+            (Kind::Custom, "custom.yaml"),
+            (Kind::Judge, "judge.yaml"),
+        ] {
+            let root = register(name).await?.root;
+            verifiers.push((kind, uid(&root.uid)?));
+            if matches!(kind, Kind::Psi | Kind::Spc) {
+                fits.push((kind, root));
             }
         }
         verifiers.push((
@@ -253,26 +250,24 @@ impl Tenant {
                     expires_in_seconds: None,
                 }),
             )
-            .await?;
+            .await
+            .map_err(|error| format!("issuing the Service key: {error}"))?;
         let bundle = directory.join("bundle");
         Box::pin(CardGraphHydrator::new(cards.registry_context()).hydrate(
             &CardSelector::exact(service.root.clone()),
             &bundle,
             HydrationMode::Complete,
         ))
-        .await?;
+        .await
+        .map_err(|error| format!("hydrating the Service bundle: {error}"))?;
         let state = WyrdState::from_path(&bundle)?;
         let component =
             |alias: &str| -> Result<CardUid> { uid(&state.run_for_card(alias)?.card_ref().uid) };
-        let model_uid = if measured {
-            Some(component("model")?)
-        } else {
-            None
-        };
+        let model_uid = component("model")?;
         let mut targets = Vec::new();
         for (kind, verifier) in verifiers {
             let subject = if kind.is_drift() {
-                model_uid.clone().ok_or("a Drift workload has a Model")?
+                model_uid.clone()
             } else {
                 component(kind.agent_alias())?
             };
@@ -287,12 +282,17 @@ impl Tenant {
             targets,
             window: None,
         };
-        if measured {
-            for (kind, root) in fits {
-                await_fit(&cards, kind, root).await?;
-            }
-            tenant.window = Some(tenant.seed().await?);
+        for (kind, root) in fits {
+            await_fit(&cards, kind, root)
+                .await
+                .map_err(|error| format!("awaiting the {kind:?} baseline fit: {error}"))?;
         }
+        tenant.window = Some(
+            tenant
+                .seed()
+                .await
+                .map_err(|error| format!("seeding Drift observations: {error}"))?,
+        );
         Ok(tenant)
     }
 
@@ -476,13 +476,12 @@ fn write_baseline(directory: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Writes the tenant's Card graph into `directory`: every workload when
-/// `measured`, otherwise the assertion Agent alone.
+/// Writes the tenant's Card graph, every workload, into `directory`.
 ///
 /// # Errors
 ///
 /// Returns the baseline or file write failure.
-fn write_graph(directory: &Path, measured: bool) -> Result<()> {
+fn write_graph(directory: &Path) -> Result<()> {
     let verifier = |name: &str, implementation: &str| {
         format!(
             "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: {name}\n  version: 1.0.0\n  space: default\nspec:\n  implementation:\n{implementation}"
@@ -520,21 +519,20 @@ fn write_graph(directory: &Path, measured: bool) -> Result<()> {
         ),
     ];
     let mut components = binding("assert", "assert.yaml");
-    if measured {
-        let bytes = write_baseline(directory)?;
-        let hex = format!("{:x}", sha2::Sha256::digest(&bytes));
-        let digest = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&bytes));
-        let columns: String = (0..FEATURES)
-            .map(|feature| format!("      - name: f{feature}\n        dtype: float64\n"))
-            .collect();
-        files.push((
+    let bytes = write_baseline(directory)?;
+    let hex = format!("{:x}", sha2::Sha256::digest(&bytes));
+    let digest = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&bytes));
+    let columns: String = (0..FEATURES)
+        .map(|feature| format!("      - name: f{feature}\n        dtype: float64\n"))
+        .collect();
+    files.push((
             "baseline.yaml".to_owned(),
             format!(
                 "apiVersion: wyrd/v1\nkind: Data\nmetadata:\n  name: capacity-baseline\n  version: 1.0.0\n  space: default\nspec:\n  interface:\n    kind: Parquet\n    meta:\n      compression: Snappy\n  schema:\n    columns:\n{columns}  card_refs: []\n  stats:\n    row_count: {BASELINE_ROWS}\n    col_count: {FEATURES}\n    byte_count: {len}\n    sha256: {hex}\nartifacts:\n  - relative_path: data/data.parquet\n    sha256: {digest}\n    size_bytes: {len}\n    content_type: application/vnd.apache.parquet\n",
                 len = bytes.len()
             ),
         ));
-        files.push((
+    files.push((
             "psi.yaml".to_owned(),
             verifier(
                 "capacity-psi",
@@ -544,7 +542,7 @@ fn write_graph(directory: &Path, measured: bool) -> Result<()> {
                 ),
             ),
         ));
-        files.push((
+    files.push((
             "spc.yaml".to_owned(),
             verifier(
                 "capacity-spc",
@@ -554,29 +552,28 @@ fn write_graph(directory: &Path, measured: bool) -> Result<()> {
                 ),
             ),
         ));
-        files.push((
+    files.push((
             "custom.yaml".to_owned(),
             verifier(
                 "capacity-custom",
                 "    kind: drift\n    spec:\n      method: Custom\n      signal:\n        kind: Metric\n        name: score\n      condition:\n        kind: Statistical\n      profile:\n        kind: Custom\n        metric_name: score\n        baseline_value: 1.0\n        alert_threshold: 0.5\n",
             ),
         ));
-        files.push(("judge-prompt.json".to_owned(), judge_prompt()?));
-        files.push((
+    files.push(("judge-prompt.json".to_owned(), judge_prompt()?));
+    files.push((
             "judge.yaml".to_owned(),
             verifier(
                 "capacity-judge",
                 "    kind: eval\n    spec:\n      pass_gate: {kind: all_pass}\n      tasks:\n        answer: {kind: assertion, id: answer, context_path: $.answer, operator: equals, expected: \"yes\"}\n        judge:\n          kind: llm_judge\n          id: judge\n          judge_ref: {prompt: ./judge-prompt.json, tool_names: [], run_config: {max_iterations: 1}}\n          context_path: $.answer\n          operator: equals\n          expected: {passed: true}\n          max_retries: 0\n",
             ),
         ));
-        files.push(("judge-agent.yaml".to_owned(), agent("judge")));
-        files.push((
+    files.push(("judge-agent.yaml".to_owned(), agent("judge")));
+    files.push((
             "model.yaml".to_owned(),
             "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: capacity-model\n  version: 1.0.0\n  space: default\nspec:\n  interface:\n    kind: Custom\n    meta:\n      framework_version: 0.1.0\n      loader_module: fixture\n      loader_class: TinyModel\n      extra: {}\n  task_type: Other\n  signature:\n    inputs:\n      - name: f0\n        dtype: float64\n    outputs:\n      - name: score\n        dtype: float64\n  card_refs: []\n".to_owned(),
         ));
-        components.push_str("    - alias: model\n      ref: ./model.yaml\n");
-        components.push_str(&binding("judge", "judge.yaml"));
-    }
+    components.push_str("    - alias: model\n      ref: ./model.yaml\n");
+    components.push_str(&binding("judge", "judge.yaml"));
     files.push((
         "service.yaml".to_owned(),
         format!(

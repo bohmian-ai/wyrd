@@ -6,10 +6,10 @@
 //! another's evidence. Drain waits for every sent request, flushes the client
 //! queues, then waits until every run created since the step start is
 //! terminal and every accepted queued Eval observation has activated its
-//! run. Work still outstanding one step length after the arrivals stop marks
+//! run. Work still outstanding one ramp step after the arrivals stop marks
 //! the step unsustainable; work still outstanding at [`DRAIN_LIMIT`] is
-//! reported as backlog and contaminates nothing only because the ladder for
-//! that path stops there.
+//! reported as backlog and contaminates nothing only because the ramp stops
+//! there.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -32,8 +32,12 @@ use crate::profile::{Capture, Profile};
 /// Longest a step may take to drain before its backlog is reported.
 const DRAIN_LIMIT: Duration = Duration::from_secs(300);
 
-/// Width of a progress slice: a mixed step must complete every kind in each.
+/// Width of a progress slice: a scored step must complete every kind of the
+/// noisy tenant in each.
 const SLICE: Duration = Duration::from_secs(5);
+
+/// Queued assertion arrivals per second of the quiet tenant.
+const QUIET_RATE: f64 = 2.0;
 
 /// The deployment every step runs against.
 pub struct Deployment {
@@ -57,17 +61,19 @@ pub struct Deployment {
     pub binary: serde_json::Value,
 }
 
-/// What a step measures.
+/// What a step measures: the production mix of [`mix`] at one rate.
 #[derive(Debug, Clone, Serialize)]
 pub struct Plan {
-    /// Path name: `queued`, `direct`, `combined`, `fairness`, or `warmup`.
+    /// Step name: `warmup`, `ramp`, or `sustained`.
     pub path: &'static str,
-    /// Case name: a workload label or `mixed`.
-    pub case: String,
-    /// Offered executions per second per path, across every kind.
+    /// The noisy tenant's offered executions per second, across both paths
+    /// and every kind.
     pub rate: f64,
     /// Arrival window, seconds.
     pub seconds: f64,
+    /// Seconds after the arrivals stop by which outstanding work must drain
+    /// for the step to be sustainable: one ramp step.
+    pub drain_budget: f64,
     /// The lanes.
     #[serde(skip)]
     pub lanes: Vec<Lane>,
@@ -78,7 +84,7 @@ pub struct Plan {
 impl Plan {
     /// Stable name of the step, used for artifact directories.
     pub fn name(&self) -> String {
-        format!("{}-{}-{}", self.path, self.case, self.rate)
+        format!("{}-{}", self.path, self.rate)
     }
 }
 
@@ -260,7 +266,7 @@ impl Deployment {
         for clients in &self.clients {
             clients.flush().await?;
         }
-        let deadline = drained + window;
+        let deadline = drained + Duration::from_secs_f64(plan.drain_budget);
         let mut outstanding_at_deadline = None;
         let outstanding_final = loop {
             let (outstanding, created) = self.queue.progress(since).await?;
@@ -395,18 +401,29 @@ impl Deployment {
     }
 }
 
-/// Lanes of `kinds` for `tenant` on `mode`, each at `per_kind` arrivals per
-/// second.
-pub fn lanes(tenant: usize, kinds: &[Kind], mode: Mode, per_kind: f64) -> Vec<Lane> {
-    kinds
-        .iter()
-        .map(|kind| Lane {
-            tenant,
-            kind: *kind,
+/// The production mix at `rate`.
+///
+/// Tenant 0, the noisy tenant, splits `rate` evenly across the queued and
+/// direct paths and every [`Kind`]. Tenant 1, the quiet tenant, sends queued
+/// assertions at [`QUIET_RATE`]. Every step drives this same mix, so per-kind
+/// and per-path figures are breakdowns of one realistic workload.
+pub fn mix(rate: f64) -> Vec<Lane> {
+    let per_lane = rate / (2 * Kind::ALL.len()) as f64;
+    let noisy = [Mode::Queued, Mode::Direct].into_iter().flat_map(|mode| {
+        Kind::ALL.into_iter().map(move |kind| Lane {
+            tenant: 0,
+            kind,
             mode,
-            rate: per_kind,
+            rate: per_lane,
         })
-        .collect()
+    });
+    let quiet = Lane {
+        tenant: 1,
+        kind: Kind::Assertion,
+        mode: Mode::Queued,
+        rate: QUIET_RATE,
+    };
+    noisy.chain([quiet]).collect()
 }
 
 /// The driver process's user plus system CPU seconds.

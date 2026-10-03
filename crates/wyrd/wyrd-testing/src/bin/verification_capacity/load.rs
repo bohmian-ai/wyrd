@@ -99,22 +99,30 @@ pub struct Tally {
 pub struct TenantClients {
     /// Administrator Verification handles.
     verification: Vec<Verification>,
-    /// Service lifetimes emitting Eval observations.
+    /// Service lifetimes emitting Eval observations, one per replica.
     states: Vec<WyrdState>,
 }
 
 impl TenantClients {
     /// Connects `tenant` to every replica in `urls`; Service lifetimes start
-    /// only when `observes`.
+    /// only when `observes`. Each
+    /// administrator client exchanges its token here, so no step opens with
+    /// every tenant authenticating at once.
     ///
     /// # Errors
     ///
-    /// Returns a client, bundle, or Bifrost start failure.
+    /// Returns a client, token exchange, bundle, or Bifrost start failure.
     pub async fn connect(tenant: &Tenant, urls: &[String], observes: bool) -> Result<Self> {
         let mut verification = Vec::new();
         let mut states = Vec::new();
         for url in urls {
-            verification.push(Verification::with_client(tenant.admin(url)?));
+            let admin = tenant.admin(url)?;
+            admin
+                .auth()
+                .bearer()
+                .await
+                .map_err(|error| format!("exchanging the administrator token: {error}"))?;
+            verification.push(Verification::with_client(admin));
             if observes {
                 let state = WyrdState::from_path(&tenant.bundle)?;
                 state

@@ -33,15 +33,22 @@ pub const SERVER_URL: &str = "http://127.0.0.1:8080";
 /// The server's default public HTTP port, which replica 0 binds.
 const HTTP_PORT: u16 = 8080;
 
-/// The server's default gRPC port, which replica 0 binds.
-const GRPC_PORT: u16 = 50051;
-
 /// The server's default Bifrost peer port, which replica 0 binds.
 const PEER_PORT: u16 = 50052;
 
 /// Port offset between consecutive replicas' listeners. The metrics
 /// listener follows the HTTP port by the server's default of one.
 const REPLICA_PORT_STRIDE: u16 = 10;
+
+/// Base of a joined replica's gRPC port. Replica 0 keeps the server defaults,
+/// 50051 for gRPC and [`PEER_PORT`] for peers. Those lie in
+/// Linux's ephemeral range (32768-60999); replica 0 binds them before any
+/// load, but a replica joining mid-run would race outbound connections that
+/// already took those local ports, so joined replicas listen below the range.
+const JOINED_GRPC_PORT: u16 = 30051;
+
+/// Base of a joined replica's Bifrost peer port; see [`JOINED_GRPC_PORT`].
+const JOINED_PEER_PORT: u16 = 30052;
 
 /// CPUs of quota in the pod envelope.
 pub const CPUS: u64 = 8;
@@ -183,7 +190,9 @@ impl LocalServer {
 
     /// Starts replica `ordinal` of this deployment: `binary` serving the same
     /// Postgres and store from its own working directory and envelope, with
-    /// every listener offset by `ordinal` strides. Nothing is migrated or set
+    /// every listener offset by `ordinal` strides from its base: HTTP from
+    /// the server default, gRPC and peer from [`JOINED_GRPC_PORT`] and
+    /// [`JOINED_PEER_PORT`]. Nothing is migrated or set
     /// up; the replica serves the tenants this server provisioned.
     ///
     /// Several replicas need peer mode: give every replica, including this
@@ -382,9 +391,11 @@ impl LocalServer {
     /// # Errors
     ///
     /// Returns an error when the process exits, carrying the last lines of
-    /// its log, or the timeout passes.
+    /// its log, or the timeout passes, carrying the last `/readyz` body,
+    /// which names each unready check.
     async fn await_ready(&mut self) -> Result<()> {
         let deadline = Instant::now() + READY_TIMEOUT;
+        let mut last = String::new();
         while Instant::now() < deadline {
             if let Some(child) = self.child.as_mut()
                 && let Some(status) = child.try_wait()?
@@ -398,15 +409,15 @@ impl LocalServer {
                 )
                 .into());
             }
-            if reqwest::get(format!("{}/readyz", self.url()))
-                .await
-                .is_ok_and(|response| response.status().is_success())
-            {
-                return Ok(());
+            if let Ok(response) = reqwest::get(format!("{}/readyz", self.url())).await {
+                if response.status().is_success() {
+                    return Ok(());
+                }
+                last = response.text().await.unwrap_or_default();
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        Err("wyrd-server never reported ready".into())
+        Err(format!("wyrd-server never reported ready; last /readyz: {last}").into())
     }
 
     /// Finds the process's cgroup-v2 directory from `/proc/<pid>/cgroup`.
@@ -456,10 +467,18 @@ impl LocalServer {
 
 impl Drop for LocalServer {
     /// Kills and reaps the server when [`LocalServer::stop`] was not reached.
+    /// That only happens when the caller failed, so the working directory
+    /// and its `server.log` are kept and their path printed for diagnosis.
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
+            self.root.disable_cleanup(true);
+            eprintln!(
+                "replica {} stopped abnormally; its log is kept at {}",
+                self.ordinal,
+                self.root.path().join("server.log").display()
+            );
         }
     }
 }
@@ -576,11 +595,16 @@ fn operator(
             )
             .env(
                 "WYRD_GRPC_BIND",
-                format!("127.0.0.1:{}", replica_port(GRPC_PORT, ordinal)),
+                format!("127.0.0.1:{}", replica_port(JOINED_GRPC_PORT, ordinal)),
             );
     }
     if env.iter().any(|(name, _)| *name == "WYRD_PEER_TLS_DIR") {
-        let peer = format!("127.0.0.1:{}", replica_port(PEER_PORT, ordinal));
+        let base = if ordinal == 0 {
+            PEER_PORT
+        } else {
+            JOINED_PEER_PORT
+        };
+        let peer = format!("127.0.0.1:{}", replica_port(base, ordinal));
         command
             .env("WYRD_BIFROST_PEER_BIND_ADDR", &peer)
             .env("WYRD_PEER_ADDRESS", &peer);

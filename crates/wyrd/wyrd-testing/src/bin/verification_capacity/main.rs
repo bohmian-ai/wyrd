@@ -9,14 +9,16 @@
 //! workloads; the driver then offers open-loop load through the public
 //! client in fixed steps.
 //!
-//! Each replica count runs a warmup, then a ladder per path: queued, direct,
-//! each kind alone and all kinds mixed, then queued and direct together.
-//! A ladder stops at its first unsustainable step. A fairness step follows:
-//! one noisy tenant at the top step beside a quiet tenant and every
-//! background tenant. Every step drains before the next. The report in
-//! `target/verification-capacity/` reconciles every request, checks
-//! coexistence, cross-replica claims, and fairness, and applies the AC-040
-//! overhead objective. Missing evidence never passes.
+//! Every step drives one production mix: a noisy tenant sending queued and
+//! direct work of every kind at once, and a quiet tenant sending queued
+//! assertions. The run is a warmup, a ramp on one replica that stops at its
+//! first unsustainable rate, then a sustained step at the highest
+//! sustainable rate on one replica and again on two. Every step drains
+//! before the next. The report in `target/verification-capacity/` has one
+//! summary row per step with a per-kind, per-path breakdown, reconciles
+//! every request, checks coexistence, cross-replica claims, and fairness,
+//! and applies the AC-040 overhead objective to the one-replica sustained
+//! step. Missing evidence never passes.
 //!
 //! Run through `mise run bench:verification:capacity`; `-- --profile` adds
 //! per-step `perf` captures of a frame-pointer build, as diagnostic evidence
@@ -42,11 +44,11 @@ use wyrd_testing::release_server::{CPUS, LocalServer, MEMORY_BYTES};
 
 use collector::Collector;
 use evidence::Queue;
-use fixture::{Kind, Tenant};
+use fixture::Tenant;
 use judge::Judge;
-use load::{MAX_IN_FLIGHT, Mode, TenantClients};
+use load::{MAX_IN_FLIGHT, TenantClients};
 use report::{Report, sustainable};
-use step::{Deployment, Plan, Record, lanes, permits};
+use step::{Deployment, Plan, mix, permits};
 
 /// Error type of every benchmark step: the binary only reports it.
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -54,30 +56,37 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 /// Fraction of its own traces the server samples and exports.
 const SAMPLE_RATIO: &str = "0.05";
 
-/// Queued arrivals per second of each background tenant in the fairness
-/// step.
-const BACKGROUND_RATE: f64 = 0.5;
+/// Arrival window of the unscored warmup, seconds.
+const WARMUP_SECONDS: f64 = 30.0;
+
+/// Replicas of the second sustained step.
+const REPLICAS: u16 = 2;
 
 /// Peer certificate name every replica presents and dials.
 const PEER_NAME: &str = "wyrd-peer";
+
+/// Spacing between tenants whose clients authenticate. Each replica limits
+/// `/auth/*` to a burst of 20 then 10 requests per second per peer IP, and
+/// every tenant here comes from one loopback address; one tenant makes up to
+/// four such requests per replica, so this spacing stays under the refill
+/// rate instead of tripping the limiter.
+const AUTH_SPACING: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// Command-line settings.
 #[derive(Debug, Parser)]
 #[command(about = "Measures verification capacity of release wyrd-server replicas")]
 struct Cli {
-    /// Offered executions per second per path, across every kind, in ladder
-    /// order.
-    #[arg(long, value_delimiter = ',', default_value = "10,25,50,100,200")]
+    /// The noisy tenant's offered executions per second at each ramp step,
+    /// across both paths and every kind, in order.
+    #[arg(long, value_delimiter = ',', default_value = "50,100,200,400")]
     steps: Vec<f64>,
-    /// Arrival window of every step, seconds.
-    #[arg(long, default_value_t = 30.0)]
+    /// Arrival window of each ramp step, seconds; also the drain deadline of
+    /// every step.
+    #[arg(long, default_value_t = 60.0)]
     step_seconds: f64,
-    /// Replica counts to measure, in order.
-    #[arg(long, value_delimiter = ',', default_value = "1,2")]
-    replicas: Vec<u16>,
-    /// Background tenants in the fairness step.
-    #[arg(long, default_value_t = 70)]
-    background: usize,
+    /// Arrival window of each sustained step, seconds.
+    #[arg(long, default_value_t = 180.0)]
+    sustained_seconds: f64,
     /// Capture every step with `perf`; the report is then diagnostic.
     #[arg(long)]
     profile: bool,
@@ -119,8 +128,7 @@ async fn benchmark(cli: Cli) -> Result<bool> {
     let collector = Arc::new(Collector::start().await?);
     let judge = Arc::new(Judge::start(&work.path().join("judge")).await?);
     let peer = BifrostPeerCa::generate(PEER_NAME)?;
-    let max_replicas = cli.replicas.iter().copied().max().unwrap_or(1);
-    let peer_dirs = (0..max_replicas)
+    let peer_dirs = (0..REPLICAS)
         .map(|ordinal| {
             Ok(peer
                 .materialize(&work.path().join("peer"), &format!("replica-{ordinal}"))?
@@ -130,6 +138,15 @@ async fn benchmark(cli: Cli) -> Result<bool> {
         })
         .collect::<Result<Vec<_>>>()?;
     let ca_file = judge.ca_file().display().to_string();
+    // One workload signing key for every replica, as the kind deployment
+    // mounts one secret into every pod: a token one replica mints must verify
+    // on every other replica.
+    let signing_key = work.path().join("signing.pem");
+    std::fs::write(
+        &signing_key,
+        wyrd_auth_issue::IssuingKey::generate_ephemeral_pem()?.expose_secret(),
+    )?;
+    let signing_key = signing_key.display().to_string();
     let env = |ordinal: u16| -> Vec<(&str, &str)> {
         vec![
             ("WYRD_OTLP_ENDPOINT", collector.trace_endpoint()),
@@ -147,18 +164,20 @@ async fn benchmark(cli: Cli) -> Result<bool> {
                 "WYRD_PEER_TLS_DIR",
                 peer_dirs[usize::from(ordinal)].as_str(),
             ),
+            // Every replica is `all`, the recommended first way to scale out.
+            // They share one signing key so a token either one mints verifies
+            // on the other.
+            ("WYRD_SIGNING_KEY_FILE", signing_key.as_str()),
         ]
     };
 
-    let slugs: Vec<String> = ["m0".to_owned(), "m1".to_owned()]
-        .into_iter()
-        .chain((0..cli.background).map(|index| format!("bg{index}")))
-        .collect();
-    let slug_refs: Vec<&str> = slugs.iter().map(String::as_str).collect();
-    let first = LocalServer::start(&binary, &slug_refs, &env(0)).await?;
+    let first = LocalServer::start(&binary, &["m0", "m1"], &env(0)).await?;
+    let mut auth_pace = tokio::time::interval(AUTH_SPACING);
+    auth_pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut tenants = Vec::new();
-    for (index, setup) in first.tenants().iter().enumerate() {
-        tenants.push(Tenant::provision(setup, &work.path().join("tenants"), index < 2).await?);
+    for setup in first.tenants() {
+        auth_pace.tick().await;
+        tenants.push(Tenant::provision(setup, &work.path().join("tenants")).await?);
     }
     let setup_seconds = started.elapsed().as_secs_f64();
 
@@ -173,37 +192,54 @@ async fn benchmark(cli: Cli) -> Result<bool> {
         profiles: cli.profile.then(|| profiles.clone()),
         binary: identity(&binary, cli.profile)?,
     };
+    let plan = |path, rate, seconds| Plan {
+        path,
+        rate,
+        seconds,
+        drain_budget: cli.step_seconds,
+        lanes: mix(rate),
+        profiled: cli.profile,
+    };
+    let lowest = cli.steps.first().copied().ok_or("--steps names no rate")?;
+    let warmup = plan("warmup", lowest, WARMUP_SECONDS);
+    let ramp: Vec<Plan> = cli
+        .steps
+        .iter()
+        .map(|rate| plan("ramp", *rate, cli.step_seconds))
+        .collect();
     let mut records = Vec::new();
-    for count in cli.replicas.iter().copied() {
-        for clients in deployment.clients.drain(..) {
-            clients.shutdown().await?;
+    connect(&mut deployment, &mut auth_pace).await?;
+    records.push(deployment.run(warmup).await?);
+    let mut knee = None;
+    for step in ramp {
+        let rate = step.rate;
+        let record = deployment.run(step).await?;
+        let sustained = sustainable(&record);
+        records.push(record);
+        if !sustained {
+            break;
         }
-        while deployment.replicas.len() < usize::from(count) {
+        knee = Some(rate);
+    }
+    if let Some(rate) = knee {
+        records.push(
+            deployment
+                .run(plan("sustained", rate, cli.sustained_seconds))
+                .await?,
+        );
+        while deployment.replicas.len() < usize::from(REPLICAS) {
             let ordinal = u16::try_from(deployment.replicas.len())?;
             let replica = deployment.replicas[0]
                 .start_replica(&binary, ordinal, &env(ordinal))
                 .await?;
             deployment.replicas.push(replica);
         }
-        let urls: Vec<String> = deployment
-            .replicas
-            .iter()
-            .take(usize::from(count))
-            .map(LocalServer::url)
-            .collect();
-        for tenant in &deployment.tenants {
+        connect(&mut deployment, &mut auth_pace).await?;
+        records.push(
             deployment
-                .clients
-                .push(Arc::new(TenantClients::connect(tenant, &urls, true).await?));
-        }
-        ladders(
-            &deployment,
-            &cli.steps,
-            cli.step_seconds,
-            cli.profile,
-            &mut records,
-        )
-        .await?;
+                .run(plan("sustained", rate, cli.sustained_seconds))
+                .await?,
+        );
     }
     for clients in deployment.clients.drain(..) {
         clients.shutdown().await?;
@@ -234,8 +270,9 @@ async fn benchmark(cli: Cli) -> Result<bool> {
             "memory_bytes": MEMORY_BYTES,
             "steps": cli.steps,
             "step_seconds": cli.step_seconds,
-            "replicas": cli.replicas,
-            "background_tenants": cli.background,
+            "sustained_seconds": cli.sustained_seconds,
+            "warmup_seconds": WARMUP_SECONDS,
+            "replicas": REPLICAS,
             "max_in_flight": MAX_IN_FLIGHT,
             "sample_ratio": SAMPLE_RATIO,
             "binary": deployment.binary,
@@ -249,100 +286,24 @@ async fn benchmark(cli: Cli) -> Result<bool> {
     Ok(report.passed())
 }
 
-/// Runs the warmup, every path's ladder, the combined ladder, and the
-/// fairness step against `deployment`, appending each step's record.
+/// Replaces every tenant's clients with ones connected to every replica of
+/// `deployment`, one tenant per `pace` tick so the replicas' per-IP `/auth/*`
+/// limit is never tripped.
 ///
 /// # Errors
 ///
-/// Returns the first step failure.
-async fn ladders(
-    deployment: &Deployment,
-    steps: &[f64],
-    seconds: f64,
-    profiled: bool,
-    records: &mut Vec<Record>,
-) -> Result<()> {
-    let per_kind = |rate: f64| rate / Kind::ALL.len() as f64;
-    let lowest = steps.first().copied().unwrap_or(10.0);
-    let highest = steps.last().copied().unwrap_or(lowest);
-    let plan = |path, case: &str, rate, lanes| Plan {
-        path,
-        case: case.to_owned(),
-        rate,
-        seconds,
-        lanes,
-        profiled,
-    };
-    let mut warmup = lanes(0, &Kind::ALL, Mode::Queued, per_kind(lowest));
-    warmup.extend(lanes(0, &Kind::ALL, Mode::Direct, per_kind(lowest)));
-    records.push(
+/// Returns a client shutdown or connect failure.
+async fn connect(deployment: &mut Deployment, pace: &mut tokio::time::Interval) -> Result<()> {
+    for clients in deployment.clients.drain(..) {
+        clients.shutdown().await?;
+    }
+    let urls: Vec<String> = deployment.replicas.iter().map(LocalServer::url).collect();
+    for tenant in &deployment.tenants {
+        pace.tick().await;
         deployment
-            .run(plan("warmup", "all", lowest, warmup))
-            .await?,
-    );
-
-    for mode in [Mode::Queued, Mode::Direct] {
-        for kind in Kind::ALL {
-            for rate in steps.iter().copied() {
-                let record = deployment
-                    .run(plan(
-                        mode.label(),
-                        kind.label(),
-                        rate,
-                        lanes(0, &[kind], mode, rate),
-                    ))
-                    .await?;
-                let stop = !sustainable(&record);
-                records.push(record);
-                if stop {
-                    break;
-                }
-            }
-        }
-        for rate in steps.iter().copied() {
-            let record = deployment
-                .run(plan(
-                    mode.label(),
-                    "mixed",
-                    rate,
-                    lanes(0, &Kind::ALL, mode, per_kind(rate)),
-                ))
-                .await?;
-            let stop = !sustainable(&record);
-            records.push(record);
-            if stop {
-                break;
-            }
-        }
+            .clients
+            .push(Arc::new(TenantClients::connect(tenant, &urls, true).await?));
     }
-    for rate in steps.iter().copied() {
-        let mut both = lanes(0, &Kind::ALL, Mode::Queued, per_kind(rate));
-        both.extend(lanes(0, &Kind::ALL, Mode::Direct, per_kind(rate)));
-        let record = deployment
-            .run(plan("combined", "mixed", rate, both))
-            .await?;
-        let stop = !sustainable(&record);
-        records.push(record);
-        if stop {
-            break;
-        }
-    }
-
-    let mut fairness = lanes(0, &Kind::ALL, Mode::Queued, per_kind(highest));
-    fairness.extend(lanes(1, &[Kind::Assertion], Mode::Queued, per_kind(lowest)));
-    for tenant in 2..deployment.tenants.len() {
-        fairness.extend(lanes(
-            tenant,
-            &[Kind::Assertion],
-            Mode::Queued,
-            BACKGROUND_RATE,
-        ));
-    }
-    records.push(
-        deployment
-            .run(plan("fairness", "mixed", highest, fairness))
-            .await?,
-    );
     Ok(())
 }
 
@@ -399,7 +360,7 @@ async fn main() -> ExitCode {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(error) => {
-            eprintln!("verification capacity benchmark failed: {error}");
+            eprintln!("verification capacity benchmark failed: {error}\n{error:?}");
             ExitCode::FAILURE
         }
     }

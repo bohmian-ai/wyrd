@@ -28,9 +28,9 @@ use vala_sql::row_types::forge_operations::ForgeOperationFamily;
 use vala_sql::row_types::forge_tasks::{
     ExpiredCleanupCandidateRequest, ExpiredCleanupOutcome, ExpiredCleanupPayload,
     FORGE_TASK_PAYLOAD_VERSION, ForgeClaimStrategy, ForgeCleanupCandidate, ForgePreparedTaskClaim,
-    ForgeTask, ForgeTaskClaim, NewForgeTask, ForgeTaskEvidence, ForgeTaskRowEvidence, ForgeTaskState,
+    ForgeTask, ForgeTaskClaim, ForgeTaskEvidence, ForgeTaskRowEvidence, ForgeTaskState,
     ForgeTaskStrategy, ForgeTaskTableIdentity, ForgeTaskTransition, MAINTENANCE_STRATEGIES,
-    SnapshotWatermark, TaskProgressEffect,
+    NewForgeTask, SnapshotWatermark, TaskProgressEffect,
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
@@ -3333,6 +3333,7 @@ impl ForgeWorker {
         else {
             return Ok(false);
         };
+        super::metrics::ForgeTelemetry::record_task_created(task.strategy);
         #[cfg(feature = "test-support")]
         if let Some(observer) = &self.completion_observer {
             observer.record_lifecycle(ForgeLifecycleEvent::Planned {
@@ -3342,7 +3343,30 @@ impl ForgeWorker {
                 inputs: task.plan.inputs.clone(),
             });
         }
-        self.execute_claim(claim, shutdown).await
+        let result = self.execute_claim(claim, shutdown).await;
+        // Observed exactly like a claimed attempt, so a scenario waits on one
+        // seam whichever route ran the task.
+        #[cfg(feature = "test-support")]
+        self.observe_settled_claim(task_id, &ForgeClaimStrategy::Known(task.strategy), &result)
+            .await;
+        result
+    }
+
+    /// Promotes what one table owes through this executor, as the coordinator does.
+    ///
+    /// # Errors
+    ///
+    /// Returns every failure the coordinator's promotion route returns.
+    #[cfg(feature = "test-support")]
+    pub async fn promote_for_test(
+        &self,
+        tenant: DataTenantId,
+        table_ref: &vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity,
+        shutdown: &CancellationToken,
+    ) -> Result<bool, ForgeError> {
+        self.forge
+            .promote_table(self, tenant, table_ref, shutdown)
+            .await
     }
 
     /// Executes one exact claimed task through validation, table fencing,
@@ -4434,18 +4458,22 @@ impl ForgeWorker {
                     ForgeClaimStrategy::Known(ForgeTaskStrategy::ScribePromotion)
                 ) {
                     self.forge
-                        .notify_promotion_commit(claim.data_tenant_id, &claim.table_ref, &publication.table)
+                        .notify_promotion_commit(
+                            claim.data_tenant_id,
+                            &claim.table_ref,
+                            &publication.table,
+                        )
                         .await;
                 }
                 self.committed_evidence(binding, &publication.table)
-                .await
-                .map(|evidence| {
-                    (
-                        evidence,
-                        ForgeExecutionEvidenceState::Fresh,
-                        publication.volume,
-                    )
-                })
+                    .await
+                    .map(|evidence| {
+                        (
+                            evidence,
+                            ForgeExecutionEvidenceState::Fresh,
+                            publication.volume,
+                        )
+                    })
             }
             ForgeDispatchResult::Cleaned(evidence) => {
                 Ok((*evidence, ForgeExecutionEvidenceState::Prepared, None))

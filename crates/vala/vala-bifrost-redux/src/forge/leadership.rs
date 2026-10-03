@@ -186,7 +186,10 @@ impl ForgeLeadership {
         else {
             return Ok(false);
         };
-        tracing::info!(fencing_token, "Forge leader term acquired with an empty schedule");
+        tracing::info!(
+            fencing_token,
+            "Forge leader term acquired with an empty schedule"
+        );
         self.set_held(Some(Arc::new(ForgeHeldTerm {
             fencing_token,
             schedule: ForgeSchedule::new(DEFAULT_REPORT_TIMEOUT),

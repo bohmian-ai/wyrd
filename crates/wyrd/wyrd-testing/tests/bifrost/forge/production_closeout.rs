@@ -2298,12 +2298,18 @@ async fn one_leader_failover_volatile_state() {
     journey.pass(first).await;
     journey.pass(second).await;
     let leaders = journey.leaders();
-    assert_eq!(leaders.len(), 1, "exactly one coordinator leads: {leaders:?}");
+    assert_eq!(
+        leaders.len(),
+        1,
+        "exactly one coordinator leads: {leaders:?}"
+    );
     let (leader, first_token) = leaders[0];
     let standby = if leader == first { second } else { first };
 
     // A commit promoted on the standby reaches the leader over the peer route.
-    let table = journey.register_scheduled_table(standby, "leader_failover").await;
+    let table = journey
+        .register_scheduled_table(standby, "leader_failover")
+        .await;
     journey.write_hot(standby, &table, &[1, 2, 3]).await;
     journey.await_promoted(&table).await;
     let key = journey.key(&table);
@@ -2313,16 +2319,26 @@ async fn one_leader_failover_volatile_state() {
         .schedule()
         .track_for_test(&key)
         .expect("the leader tracks the promoted table");
-    assert_eq!(counted.pending_commits, 1, "one promotion is one Iceberg commit");
+    assert_eq!(
+        counted.pending_commits, 1,
+        "one promotion is one Iceberg commit"
+    );
     assert_eq!(journey.held(standby).map(|term| term.fencing_token()), None);
 
     // Graceful stop resigns; the standby takes over on its next pass.
     let stopped = Instant::now();
-    journey.cluster.stop_node(leader).await.expect("leader stops");
+    journey
+        .cluster
+        .stop_node(leader)
+        .await
+        .expect("leader stops");
     journey.pass(standby).await;
     let successor = journey.held(standby).expect("the standby takes over");
     eprintln!("Forge leader failover took {:?}", stopped.elapsed());
-    assert!(successor.fencing_token() > first_token, "a new term is minted");
+    assert!(
+        successor.fencing_token() > first_token,
+        "a new term is minted"
+    );
     assert_eq!(
         successor.schedule().sizes_for_test(),
         (0, 0, 0),
@@ -2341,7 +2357,10 @@ async fn one_leader_failover_volatile_state() {
     // The restarted former leader is a standby while the successor's term lives.
     journey.cluster.restart_node(leader).await.expect("restart");
     journey.pass(leader).await;
-    assert_eq!(journey.leaders(), vec![(standby, successor.fencing_token())]);
+    assert_eq!(
+        journey.leaders(),
+        vec![(standby, successor.fencing_token())]
+    );
     journey.cluster.shutdown().await.expect("cluster drains");
 }
 
@@ -2366,7 +2385,9 @@ async fn restart_recovers_hot_promotion_with_empty_schedule() {
         .expect("the only coordinator leads")
         .fencing_token();
 
-    let before = journey.register_scheduled_table(leader, "restart_before").await;
+    let before = journey
+        .register_scheduled_table(leader, "restart_before")
+        .await;
     journey.write_hot(leader, &before, &[1, 2]).await;
     journey.await_promoted(&before).await;
     assert!(
@@ -2379,8 +2400,14 @@ async fn restart_recovers_hot_promotion_with_empty_schedule() {
         "the first term tracks its table"
     );
 
-    journey.cluster.stop_node(leader).await.expect("leader stops");
-    let lost = journey.register_scheduled_table(scribe, "restart_lost").await;
+    journey
+        .cluster
+        .stop_node(leader)
+        .await
+        .expect("leader stops");
+    let lost = journey
+        .register_scheduled_table(scribe, "restart_lost")
+        .await;
     journey.write_hot(scribe, &lost, &[7, 8, 9]).await;
     assert!(
         journey.unpromoted(&lost).await > 0,
@@ -2389,11 +2416,19 @@ async fn restart_recovers_hot_promotion_with_empty_schedule() {
 
     journey.cluster.restart_node(leader).await.expect("restart");
     journey.pass(leader).await;
-    assert_eq!(journey.unpromoted(&lost).await, 0, "the sweep promoted the debt");
-    let term = journey.held(leader).expect("the restarted coordinator leads");
+    assert_eq!(
+        journey.unpromoted(&lost).await,
+        0,
+        "the sweep promoted the debt"
+    );
+    let term = journey
+        .held(leader)
+        .expect("the restarted coordinator leads");
     assert!(term.fencing_token() > first_token, "a new term is minted");
     assert!(
-        term.schedule().track_for_test(&journey.key(&before)).is_none(),
+        term.schedule()
+            .track_for_test(&journey.key(&before))
+            .is_none(),
         "no track survives the restart"
     );
     assert_eq!(

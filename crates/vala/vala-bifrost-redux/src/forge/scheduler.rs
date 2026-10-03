@@ -176,7 +176,8 @@ impl Forge {
         #[cfg(not(feature = "test-support"))]
         let quiet = false;
         let now = tokio::time::Instant::now();
-        let mut ticker = tokio::time::interval_at(if quiet { now + interval } else { now }, interval);
+        let mut ticker =
+            tokio::time::interval_at(if quiet { now + interval } else { now }, interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut heartbeat = tokio::time::interval_at(now + LEADER_HEARTBEAT, LEADER_HEARTBEAT);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -188,10 +189,7 @@ impl Forge {
                     match hint {
                         Some(hint) => {
                             let (binding, _) = hint.into_parts();
-                            tokio::select! {
-                                () = shutdown.cancelled() => break,
-                                () = self.promote_hinted(&executor, binding, &shutdown) => {}
-                            }
+                            self.promote_hinted(&executor, binding, &shutdown).await;
                         }
                         None => hints_open = false,
                     }
@@ -201,10 +199,10 @@ impl Forge {
                 _ = ticker.tick() => ForgePass::Planning,
                 () = self.await_triggered_pass() => ForgePass::Planning,
             };
-            tokio::select! {
-                () = shutdown.cancelled() => break,
-                () = self.run_pass(pass, &mut scheduler, &executor, &shutdown, &readiness) => {}
-            }
+            // Not raced against shutdown: an in-flight promotion observes the
+            // token and drains, releasing its lease as a worker attempt does.
+            self.run_pass(pass, &mut scheduler, &executor, &shutdown, &readiness)
+                .await;
         }
         if let Err(error) = self.leadership.resign().await {
             tracing::warn!(error = %error, "Forge leader term was not resigned; it will expire");
@@ -228,7 +226,10 @@ impl Forge {
             binding.logical_namespace.clone(),
             binding.table_ref.name.clone(),
         ) {
-            Ok(table) => self.promote_table(executor, binding.tenant, &table, stop).await,
+            Ok(table) => {
+                self.promote_table(executor, binding.tenant, &table, stop)
+                    .await
+            }
             Err(error) => Err(ForgeError::Sql(error)),
         };
         if let Err(error) = promoted {
@@ -298,10 +299,15 @@ impl Forge {
             return Ok(false);
         }
         let planning = matches!(pass, ForgePass::Planning);
-        if acquired || planning {
-            self.sweep_promotion_debt(executor, stop).await?;
-        }
-        if planning {
+        let promoted = if acquired || planning {
+            self.sweep_promotion_debt(executor, stop).await?
+        } else {
+            false
+        };
+        // ponytail: a pass that promoted plans nothing else, keeping the old
+        // one-slot order where promotion outranks rewrite; drop it once
+        // rewrite is driven by the leader's commit tracks.
+        if planning && !promoted {
             let outcome = scheduler.schedule_once(stop).await?;
             tracing::debug!(
                 demands_seen = outcome.demands_seen,
@@ -323,28 +329,33 @@ impl Forge {
     ///
     /// Returns the debt read's SQL error; per-table failures are logged and
     /// left for the next sweep.
+    ///
+    /// Returns whether any table was promoted.
     async fn sweep_promotion_debt(
         &self,
         executor: &ForgeWorker,
         stop: &CancellationToken,
-    ) -> Result<(), ForgeError> {
+    ) -> Result<bool, ForgeError> {
         // ponytail: sequential sweep inside the supervisor loop; fan out over
         // the executor if promotion debt after failover ever delays heartbeats.
-        let tables = vala_sql::queries::forge_tasks::ForgeTasks::new(
-            self.core.operator_pool.clone(),
-        )
-        .tables_owing_promotion()
-        .await
-        .map_err(ForgeError::Sql)?;
+        let tables =
+            vala_sql::queries::forge_tasks::ForgeTasks::new(self.core.operator_pool.clone())
+                .tables_owing_promotion()
+                .await
+                .map_err(ForgeError::Sql)?;
+        let mut promoted = false;
         for (tenant, table) in tables {
             if stop.is_cancelled() {
                 break;
             }
-            if let Err(error) = self.promote_table(executor, tenant, &table, stop).await {
-                tracing::warn!(error = %error, table = %table.table, "Forge promotion sweep failed for one table");
+            match self.promote_table(executor, tenant, &table, stop).await {
+                Ok(done) => promoted |= done,
+                Err(error) => {
+                    tracing::warn!(error = %error, table = %table.table, "Forge promotion sweep failed for one table");
+                }
             }
         }
-        Ok(())
+        Ok(promoted)
     }
 
     /// Waits for the deterministic test trigger that requests one extra pass.

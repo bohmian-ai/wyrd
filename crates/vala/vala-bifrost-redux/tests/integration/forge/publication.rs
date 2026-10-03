@@ -93,8 +93,8 @@ async fn assert_one_bound_rewrite(fixture: &PromotionIntegrationFixture) -> uuid
 ///
 /// Planning first. A table that still owes Scribe a publication must not start
 /// a rewrite, or the rewrite would reason about a live set that is about to
-/// change underneath it, so the pass that sees both demands plans the
-/// promotion. Once nothing is owed, the pass binds exactly one rewrite task,
+/// change underneath it, so the pass that sees both promotes and binds
+/// nothing else. Once nothing is owed, the pass binds exactly one rewrite task,
 /// and it binds it completely: the base snapshot, the exact input identities,
 /// and the canonical plan hash are all durable before any worker can claim it.
 /// A second pass over the same unchanged table must add nothing, because the
@@ -126,7 +126,8 @@ async fn rewrite_scheduler_dispatches_only_after_promotion_and_authority() {
         "the rewrite route starts from a promoted live set: {promoted:?}"
     );
 
-    // Promotion outranks the rewrite debt that live set already owes.
+    // Promotion outranks the rewrite debt that live set already owes: the
+    // leader's pass that promotes the new hot objects binds no rewrite.
     fixture.seal_more(2).await;
     supervisor.schedule_only().await;
     let planned = fixture.forge_tasks().await;
@@ -137,19 +138,8 @@ async fn rewrite_scheduler_dispatches_only_after_promotion_and_authority() {
         "a table that still owes a promotion cannot start a rewrite: {planned:?}"
     );
     assert!(
-        planned.iter().any(|task| task.state == "ready"),
-        "the outstanding promotion demand planned a schedulable task: {planned:?}"
-    );
-
-    // Settle that promotion through the production worker, without a planning
-    // pass: a pass taken while the promotion is still in flight can bind a
-    // rewrite against the pre-promotion snapshot, and the next statement is
-    // about exactly one rewrite bound to the settled cut.
-    supervisor.restart_worker();
-    supervisor.settle_one_success().await;
-    assert!(
         fixture.file_rows().await.iter().all(|row| row.compacted),
-        "the table owes no further promotion"
+        "the pass promoted every outstanding hot object"
     );
 
     // With nothing owed, one pass binds exactly one fully bound rewrite task.

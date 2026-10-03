@@ -33,8 +33,8 @@ use wyrd_spec::DataTenantId;
 use super::compact::ForgeGroupKey;
 use super::error::ForgeError;
 use super::identity::task_table_binding;
-use super::lease::ForgeLease;
 use super::leader::{ForgeCommitNotice, ForgeTableKey};
+use super::lease::ForgeLease;
 use super::planner::{ForgePlanCandidate, ForgeTableSnapshot, plan_table};
 use super::settings::ForgeTableSettings;
 use super::{Forge, ForgeWorker};
@@ -674,6 +674,25 @@ impl Forge {
         // Boxed: the full attempt future is deep, and inlining it into every
         // supervisor future that promotes overflows the compiler's layout depth.
         Box::pin(executor.execute_accepted(Uuid::now_v7(), &task, stop)).await
+    }
+
+    /// Returns the exact promotion task one table owes, without running it.
+    ///
+    /// Production hands this task straight to the coordinator's executor.
+    /// Scenarios about the worker claim path enqueue the same task instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns the binding, demand-read, catalog and planning failures
+    /// [`Self::promote_table`] would return.
+    #[cfg(feature = "test-support")]
+    pub async fn promotion_task_for_test(
+        &self,
+        tenant: DataTenantId,
+        table_ref: &ForgeTaskTableIdentity,
+    ) -> Result<Option<NewForgeTask>, ForgeError> {
+        let binding = task_table_binding(tenant, tenant, table_ref)?;
+        self.promotion_task(&binding, table_ref).await
     }
 
     /// Reports one committed promotion to the live leader.

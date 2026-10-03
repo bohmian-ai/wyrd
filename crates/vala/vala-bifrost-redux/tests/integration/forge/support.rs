@@ -580,6 +580,15 @@ impl PromotionCatalogSeam {
         self.stall_response_budget.store(count, Ordering::Release);
     }
 
+    /// Release the parked commit to the real catalog.
+    ///
+    /// `notify_one` stores a permit, so the release holds even when the parked
+    /// call has not yet started waiting.
+    pub(crate) fn release_parked_commit(&self) {
+        self.reject_parked.store(false, Ordering::Release);
+        self.parked_release.notify_one();
+    }
+
     /// Release the parked commit as a definite conflict.
     pub(crate) fn reject_parked_commit(&self) {
         self.reject_parked.store(true, Ordering::Release);
@@ -1072,6 +1081,37 @@ impl PromotionIntegrationFixture {
             })
             .expect("fixture Forge"),
         )
+    }
+
+    /// Promotes every table that owes hot objects through the coordinator route.
+    ///
+    /// Reads the same `file_list` debt the leader sweeps and promotes each
+    /// table with a production executor over `forge`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the debt read, the executor or any promotion fails.
+    pub(crate) async fn promote_owed(&self, forge: &Arc<Forge>) {
+        let executor = ForgeWorker::new(
+            Arc::clone(forge),
+            ForgeWorkerConfig::default(),
+            Uuid::now_v7(),
+        )
+        .expect("fixture promotion executor");
+        let owed = vala_sql::queries::forge_tasks::ForgeTasks::new(self.operator_pool.clone())
+            .tables_owing_promotion()
+            .await
+            .expect("promotion debt");
+        for (tenant, table) in owed {
+            assert!(
+                executor
+                    .promote_for_test(tenant, &table, &CancellationToken::new())
+                    .await
+                    .expect("coordinator promotion"),
+                "{} promotes",
+                table.table
+            );
+        }
     }
 
     /// Reads the promotion settlement columns of the fixture table, in durable order.
@@ -1958,8 +1998,26 @@ impl SupervisedPromotion {
     ///
     /// Panics when the scheduler misses its deterministic bound.
     async fn schedule_once(&self) {
+        let expected = self.request_pass();
+        self.await_pass(expected).await;
+    }
+
+    /// Requests one production pass without awaiting it.
+    ///
+    /// Returns the completed-pass count that marks the requested pass done,
+    /// for a scenario that must act while the pass is still running.
+    pub(crate) fn request_pass(&self) -> usize {
         let expected = self.scheduler_trigger.completed_passes().saturating_add(1);
         self.scheduler_trigger.request_pass();
+        expected
+    }
+
+    /// Awaits the pass whose completion count [`Self::request_pass`] returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the scheduler misses its deterministic bound.
+    pub(crate) async fn await_pass(&self, expected: usize) {
         tokio::time::timeout(
             FIXTURE_BOUND,
             self.scheduler_trigger.wait_for_passes_at_least(expected),
@@ -1981,7 +2039,7 @@ impl SupervisedPromotion {
         let expected_errors = self.worker_observer.returned_errors().len();
         self.worker_observer.hold_after_next_attempt_for_test();
         self.start_armed_worker();
-        self.schedule_once().await;
+        let pass = self.request_pass();
         tokio::time::timeout(
             FIXTURE_BOUND,
             self.worker_observer.wait_for_held_attempt_for_test(),
@@ -1995,6 +2053,7 @@ impl SupervisedPromotion {
             self.worker_observer.returned_errors()
         );
         self.stop_worker().await;
+        self.await_pass(pass).await;
         assert_eq!(self.worker_observer.completed(), expected);
     }
 
@@ -2090,7 +2149,7 @@ impl SupervisedPromotion {
             .saturating_add(1);
         self.worker_observer.hold_after_next_attempt_for_test();
         self.start_armed_worker();
-        self.schedule_once().await;
+        let pass = self.request_pass();
         tokio::time::timeout(FIXTURE_BOUND, during)
             .await
             .expect("parked production commit seam bound");
@@ -2101,6 +2160,7 @@ impl SupervisedPromotion {
         .await
         .expect("production Forge worker attempt bound");
         self.stop_worker().await;
+        self.await_pass(pass).await;
         assert_eq!(
             self.worker_observer.returned_errors().len(),
             expected_errors,
@@ -2129,7 +2189,7 @@ impl SupervisedPromotion {
         let errors_before = self.worker_observer.returned_errors().len();
         let released_before = self.worker_observer.released_attempts_for_test().len();
         self.start_armed_worker();
-        self.schedule_once().await;
+        let pass = self.request_pass();
         tokio::time::timeout(FIXTURE_BOUND, during)
             .await
             .expect("parked production commit seam bound");
@@ -2141,6 +2201,7 @@ impl SupervisedPromotion {
         .await
         .expect("production Forge unresolved-release bound");
         self.stop_worker().await;
+        self.await_pass(pass).await;
         assert_eq!(
             self.worker_observer.returned_errors().len(),
             errors_before,
@@ -2168,11 +2229,12 @@ impl SupervisedPromotion {
     {
         let settled_before = self.worker_observer.returned_errors().len();
         self.start_armed_worker();
-        self.schedule_once().await;
+        let pass = self.request_pass();
         tokio::time::timeout(FIXTURE_BOUND, during)
             .await
             .expect("parked production commit seam bound");
         self.join_worker().await;
+        self.await_pass(pass).await;
         assert_eq!(
             self.worker_observer.returned_errors().len(),
             settled_before,
@@ -2194,7 +2256,7 @@ impl SupervisedPromotion {
         let before = self.worker_observer.returned_errors();
         self.worker_observer.hold_after_next_attempt_for_test();
         self.start_armed_worker();
-        self.schedule_once().await;
+        let pass = self.request_pass();
         tokio::time::timeout(
             FIXTURE_BOUND,
             self.worker_observer.wait_for_held_attempt_for_test(),
@@ -2202,6 +2264,7 @@ impl SupervisedPromotion {
         .await
         .expect("production Forge worker attempt bound");
         self.stop_worker().await;
+        self.await_pass(pass).await;
         let after = self.worker_observer.returned_errors();
         assert_eq!(
             after.len(),
@@ -2239,7 +2302,7 @@ impl SupervisedPromotion {
             .hold_after_next_rewrite_handoff_for_test();
         self.worker_observer.hold_after_next_attempt_for_test();
         self.start_armed_worker();
-        self.schedule_once().await;
+        let pass = self.request_pass();
         tokio::time::timeout(
             FIXTURE_BOUND,
             self.worker_observer
@@ -2258,6 +2321,7 @@ impl SupervisedPromotion {
         .await
         .expect("production Forge worker attempt bound");
         self.stop_worker().await;
+        self.await_pass(pass).await;
         let after = self.worker_observer.returned_errors();
         assert_eq!(
             after.len(),
@@ -2268,6 +2332,11 @@ impl SupervisedPromotion {
             .last()
             .expect("one error was just returned")
             .to_owned()
+    }
+
+    /// Borrows the token the coordinator, and its inline promotions, observe as shutdown.
+    pub(crate) fn coordinator_stop(&self) -> CancellationToken {
+        self.scheduler_stop.clone()
     }
 
     /// Borrows the token production worker execution observes as shutdown.

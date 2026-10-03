@@ -49,11 +49,11 @@ pub use leader::{
     DEFAULT_REPORT_TIMEOUT, ForgeCommitNotice, ForgeCompactionDispatch, ForgeSchedule,
     ForgeTableKey,
 };
+pub use leadership::{ForgeHeldTerm, ForgeLeaderPeer};
 pub use managed::{
     ForgeManagedRewrite, ForgePlannedAttempt, ForgePlannedRewrite, ForgeRewriteEvidence,
     ForgeRewriteOutcome, ForgeTablePolicy, ForgeUnsettledOutput, RewriteHandoff,
 };
-pub use leadership::{ForgeHeldTerm, ForgeLeaderPeer};
 pub use metrics::ForgeTelemetry;
 pub use planner::{ForgePlanCandidate, PlannedForgeTask};
 pub use planning_scheduler::{ForgeScheduleOutcome, ForgeScheduler};

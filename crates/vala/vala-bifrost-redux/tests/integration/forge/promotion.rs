@@ -213,7 +213,7 @@ async fn scribe_promotion_integration_deadline_expires_before_conflict_retry() {
 
 /// Cancellation drains a parked promotion without settling anything.
 ///
-/// The worker is cancelled while its commit is parked before delegation, so
+/// The coordinator is cancelled while its inline promotion commit is parked, so
 /// acceptance is unknown by construction. Draining must therefore release the
 /// attempt and its lease while leaving the operation Prepared: settling it
 /// either way would claim knowledge the worker does not have, and holding the
@@ -234,11 +234,11 @@ async fn scribe_promotion_integration_cancellation_drains_without_settlement() {
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
         ForgeClock::system(),
     );
-    let worker_stop = forge.worker_stop();
+    let coordinator_stop = forge.coordinator_stop();
     let forge = forge
         .run_one_failure_while(async {
             catalog.wait_for_parked_commit().await;
-            worker_stop.cancel();
+            coordinator_stop.cancel();
             catalog.wait_for_parked_commit_drop().await;
         })
         .await;

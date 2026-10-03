@@ -5,12 +5,13 @@
 //! arbitration order and the immutability of the orphan plan it produces.
 
 use chrono::{Duration as ChronoDuration, Utc};
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
 use vala_bifrost_redux::forge::{
-    ForgeClock, ForgeRoleReadiness, ForgeScheduler, ForgeSchedulerTrigger, ForgeWorker,
-    ForgeWorkerCompletionObserver, ForgeWorkerConfig,
+    Forge, ForgeClock, ForgeRoleReadiness, ForgeScheduler, ForgeSchedulerTrigger, ForgeTableKey,
+    ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig,
 };
 use vala_sql::queries::forge_tasks::{ForgeEnqueueBatch, ForgeTasks};
 use vala_sql::row_types::forge_tasks::{
@@ -255,6 +256,11 @@ async fn enqueue(
         .await
         .expect("scheduler lease")
         .expect("uncontended fence");
+    // Scribe hints no longer record demand, so the acknowledged row is made here.
+    tasks
+        .upsert_periodic(fixture.tenant, &identity(fixture))
+        .await
+        .expect("table demand");
     let (demands, _) = tasks
         .planning_demands(owner, fence, 8)
         .await
@@ -274,6 +280,19 @@ async fn enqueue(
         )
         .await
         .expect("the arbitrated task enqueues");
+}
+
+/// Returns the exact promotion the fixture table owes.
+///
+/// # Panics
+///
+/// Panics when the task cannot be built or nothing is owed.
+async fn owed_promotion(fixture: &PromotionIntegrationFixture, forge: &Forge) -> NewForgeTask {
+    forge
+        .promotion_task_for_test(fixture.tenant, &identity(fixture))
+        .await
+        .expect("promotion task builds")
+        .expect("the sealed rows are owed a promotion")
 }
 
 /// Reads every Forge task this fixture's tenant owns, in creation order.
@@ -1011,13 +1030,16 @@ async fn scheduler_discovers_roster_despite_failed_demand() {
     assert_eq!(scheduler.complete_publications_for_test(), 0);
 }
 
-/// Inventory includes live rewrite inputs even while promotion has admission priority.
+/// Planner debt is live rewrite input only; hot objects are promotion debt.
+///
+/// Promotion is the leader's own sweep over `file_list`, so sealed hot objects
+/// never enter the planner's compaction inventory, before or after more seal.
 ///
 /// # Panics
 /// Panics when exact production-discovered debt or its published gauge differs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Postgres, Iceberg, and object storage"]
-async fn scheduler_debt_includes_rewrite_and_promotion() {
+async fn scheduler_debt_is_live_rewrite_input_only() {
     let telemetry = ForgeTelemetryCheckpoint::install();
     let fixture = PromotionIntegrationFixture::start("cycle_debt").await;
     let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
@@ -1028,44 +1050,32 @@ async fn scheduler_debt_includes_rewrite_and_promotion() {
         ForgeWorkerCompletionObserver::default(),
         ForgeSchedulerTrigger::default(),
     );
-    let mut scheduler = ForgeScheduler::new(&forge).expect("scheduler");
+    let owner = Uuid::now_v7();
+    let mut scheduler = ForgeScheduler::with_owner_for_test(&forge, owner).expect("scheduler");
     let stop = CancellationToken::new();
     let bytes: i64 = sqlx::query_scalar("SELECT sum(file_size)::bigint FROM vala.file_list")
         .fetch_one(fixture.operator_pool.pool())
         .await
         .expect("exact sealed input bytes");
-    let promotion = scheduler
+    let hot_only = scheduler
         .schedule_once(&stop)
         .await
-        .expect("promotion discovery");
-    assert!(!promotion.incomplete);
+        .expect("hot-only discovery");
+    assert!(!hot_only.incomplete);
     assert_eq!(
         (
-            promotion.compaction_debt_files,
-            promotion.compaction_debt_bytes
+            hot_only.compaction_debt_files,
+            hot_only.compaction_debt_bytes
         ),
-        (2, u64::try_from(bytes).expect("nonnegative file bytes"))
+        (0, 0),
+        "sealed hot objects are not planner debt"
     );
-    let worker = ForgeWorker::new(
-        Arc::clone(&forge),
-        ForgeWorkerConfig::default(),
-        Uuid::now_v7(),
-    )
-    .expect("production worker");
-    assert!(
-        worker
-            .execute_one_for_test(&stop)
-            .await
-            .expect("real promotion"),
-        "the promotion task is claimed; tasks at {}: {:?}",
-        chrono::Utc::now(),
-        fixture.forge_tasks().await
-    );
+    fixture.promote_owed(&forge).await;
     let executed = telemetry.snapshot();
     assert_eq!(
         counter_total(&executed, "bifrost_forge_task_attempts_total", &[]),
         1,
-        "the execute-one fixture adapter observes exactly one ordinary episode"
+        "the coordinator promotion observes exactly one ordinary episode"
     );
     assert_eq!(
         counter_total(
@@ -1083,36 +1093,27 @@ async fn scheduler_debt_includes_rewrite_and_promotion() {
     assert_eq!(
         (rewrite.compaction_debt_files, rewrite.compaction_debt_bytes),
         (2, u64::try_from(bytes).expect("nonnegative file bytes")),
-        "live rewrite debt survives hot promotion settlement"
+        "promoted objects become live rewrite debt"
     );
     fixture.seal_more(2).await;
-    let combined_bytes: i64 =
-        sqlx::query_scalar("SELECT sum(file_size)::bigint FROM vala.file_list")
-            .fetch_one(fixture.operator_pool.pool())
-            .await
-            .expect("hot plus live bytes");
-    let combined = scheduler
+    let after_seal = scheduler
         .schedule_once(&stop)
         .await
-        .expect("simultaneous candidates");
-    assert!(!combined.incomplete);
+        .expect("discovery after more hot objects");
+    assert!(!after_seal.incomplete);
     assert_eq!(
         (
-            combined.compaction_debt_files,
-            combined.compaction_debt_bytes
+            after_seal.compaction_debt_files,
+            after_seal.compaction_debt_bytes
         ),
-        (
-            4,
-            u64::try_from(combined_bytes).expect("nonnegative file bytes")
-        )
+        (2, u64::try_from(bytes).expect("nonnegative file bytes")),
+        "newly sealed hot objects add no planner debt"
     );
-    let snapshot = telemetry.snapshot();
     assert_inventory(
-        &snapshot,
-        4,
-        u64::try_from(combined_bytes).expect("file bytes"),
+        &telemetry.snapshot(),
+        2,
+        u64::try_from(bytes).expect("file bytes"),
     );
-    eprintln!("debt promotion/rewrite=(2,{bytes}); simultaneous=(4,{combined_bytes})");
 }
 
 /// Bounded pages replace a complete inventory only after all unequal table debts
@@ -1136,6 +1137,7 @@ async fn scheduler_publishes_complete_cycle_inventory() {
     );
     let mut scheduler = ForgeScheduler::new(&forge).expect("scheduler");
     let stop = CancellationToken::new();
+    fixture.promote_owed(&forge).await;
     let previous = scheduler
         .schedule_once(&stop)
         .await
@@ -1144,6 +1146,7 @@ async fn scheduler_publishes_complete_cycle_inventory() {
     assert_eq!(previous.compaction_debt_files, 2);
     fixture.seal_more(1).await;
     fixture.register_and_seal_table("b_inventory", 4).await;
+    fixture.promote_owed(&forge).await;
     let expected_bytes: i64 =
         sqlx::query_scalar("SELECT sum(file_size)::bigint FROM vala.file_list")
             .fetch_one(fixture.operator_pool.pool())
@@ -1241,12 +1244,9 @@ async fn worker_malformed_known_payload_observes_one_refusal() {
         ForgeWorkerCompletionObserver::default(),
         ForgeSchedulerTrigger::default(),
     );
-    let mut scheduler = ForgeScheduler::new(&forge).expect("scheduler");
     let stop = CancellationToken::new();
-    scheduler
-        .schedule_once(&stop)
-        .await
-        .expect("real promotion plan");
+    let promotion = owed_promotion(&fixture, &forge).await;
+    enqueue(&fixture, &promotion, Utc::now(), Uuid::now_v7()).await;
     sqlx::query("UPDATE vala.forge_tasks SET plan=jsonb_set(plan,'{inputs}','[]')")
         .execute(fixture.operator_pool.pool())
         .await
@@ -1325,12 +1325,9 @@ async fn worker_prepared_recovery_observes_one_ownership_episode() {
         observer.clone(),
         ForgeSchedulerTrigger::default(),
     );
-    let mut scheduler = ForgeScheduler::new(&forge).expect("scheduler");
     let stop = CancellationToken::new();
-    scheduler
-        .schedule_once(&stop)
-        .await
-        .expect("real promotion plan");
+    let promotion = owed_promotion(&fixture, &forge).await;
+    enqueue(&fixture, &promotion, Utc::now(), Uuid::now_v7()).await;
     fixture.prepare_recovery_episode(&forge, &stop).await;
     let state = "prepared";
     observer.hold_after_claims_for_test(1);
@@ -1610,6 +1607,7 @@ async fn scheduler_open_cycle_tracks_roster_changes() {
     );
     let mut scheduler = ForgeScheduler::new(&forge).expect("scheduler");
     let stop = CancellationToken::new();
+    fixture.promote_owed(&forge).await;
     let first = scheduler
         .schedule_once(&stop)
         .await
@@ -1628,6 +1626,7 @@ async fn scheduler_open_cycle_tracks_roster_changes() {
     .await
     .expect("retire observed table");
     fixture.register_and_seal_table("c_joins", 3).await;
+    fixture.promote_owed(&forge).await;
     let second = scheduler
         .schedule_once(&stop)
         .await
@@ -1670,11 +1669,8 @@ async fn worker_prepared_fatal_closes_before_release_and_observation() {
         ForgeSchedulerTrigger::default(),
     );
     let stop = CancellationToken::new();
-    ForgeScheduler::new(&forge)
-        .expect("scheduler")
-        .schedule_once(&stop)
-        .await
-        .expect("plan");
+    let promotion = owed_promotion(&fixture, &forge).await;
+    enqueue(&fixture, &promotion, Utc::now(), Uuid::now_v7()).await;
     fixture.prepare_recovery_episode(&forge, &stop).await;
     sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=now()+interval '1 hour', evidence=jsonb_set(evidence,'{committed_snapshot_id}','999999')")
         .execute(fixture.operator_pool.pool()).await.expect("live foreign Prepared claim");
@@ -1820,25 +1816,8 @@ async fn a_promotion_planned_in_the_settlement_window_is_superseded() {
     let scheduler_owner = Uuid::now_v7();
     // Captured before the promotion runs: once it settles SQL these rows are no
     // longer promotable, so arbitration would produce nothing to rebind.
-    let planned = ForgeScheduler::with_owner_for_test(&forge, scheduler_owner)
-        .expect("fixture scheduler")
-        .arbitrate_demand_for_test(&demand(&fixture, observed))
-        .await
-        .expect("production arbitration runs")
-        .into_iter()
-        .find(|task| task.strategy == ForgeTaskStrategy::ScribePromotion)
-        .expect("the sealed rows are owed a promotion");
-
-    let mut scheduler =
-        ForgeScheduler::with_owner_for_test(&forge, scheduler_owner).expect("scheduler");
-    let discovery = scheduler
-        .schedule_once(&stop)
-        .await
-        .expect("promotion discovery");
-    assert!(
-        !discovery.standby,
-        "this scheduler owns the planning lease for the discovery pass: {discovery:?}"
-    );
+    let planned = owed_promotion(&fixture, &forge).await;
+    enqueue(&fixture, &planned, observed, scheduler_owner).await;
     let worker = ForgeWorker::new(
         Arc::clone(&forge),
         ForgeWorkerConfig::default(),
@@ -1883,14 +1862,8 @@ async fn a_promotion_planned_in_the_settlement_window_is_superseded() {
     );
 
     fixture.seal_more(2).await;
-    let replan = scheduler
-        .schedule_once(&stop)
-        .await
-        .expect("the remaining demand is replanned");
-    assert!(
-        !replan.standby,
-        "this scheduler still owns the planning lease for the replanning pass: {replan:?}"
-    );
+    let replan = owed_promotion(&fixture, &forge).await;
+    enqueue(&fixture, &replan, Utc::now(), scheduler_owner).await;
     assert!(
         worker
             .execute_one_for_test(&stop)
@@ -1901,5 +1874,92 @@ async fn a_promotion_planned_in_the_settlement_window_is_superseded() {
     assert!(
         fixture.live_data_paths().await.len() > promoted.len(),
         "demand sealed after the superseded task is promoted"
+    );
+}
+
+/// The leader counts a promotion only once its Iceberg commit has returned.
+///
+/// The fixture's sealed hot objects are Scribe publication alone. The new
+/// leader's acquisition sweep promotes them inline, and the catalog seam parks
+/// that fast append: while parked the leader holds its term but tracks
+/// nothing. Releasing the append yields exactly one pending commit, and a
+/// later pass with no debt left adds none.
+///
+/// # Panics
+///
+/// Panics when the leader counts hot publication, misses the committed
+/// promotion, or counts it twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn promotion_notification_only_after_iceberg_commit() {
+    let fixture = PromotionIntegrationFixture::start("notify_after_commit").await;
+    let catalog = fixture.catalog.iceberg_catalog();
+    let loaded = catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("fixture table");
+    let tx = Transaction::new(&loaded);
+    let tx = tx
+        .update_table_properties()
+        .set("wyrd.forge.enable-compaction".to_owned(), "true".to_owned())
+        .apply(tx)
+        .expect("Forge table settings");
+    tx.commit_once(catalog.as_ref())
+        .await
+        .expect("Forge table settings commit");
+
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let seam = PromotionCatalogSeam::new(catalog, store.read_counter());
+    seam.park_next_commit();
+    let supervised = SupervisedPromotion::start(
+        &fixture,
+        Arc::clone(&seam) as Arc<dyn iceberg::Catalog>,
+        store as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    let first = supervised.request_pass();
+    timeout(OWNERSHIP_BOUND, seam.wait_for_parked_commit())
+        .await
+        .expect("the acquisition sweep reaches the promotion commit");
+
+    let forge = supervised.forge();
+    let key = ForgeTableKey {
+        tenant: fixture.tenant,
+        table: identity(&fixture),
+    };
+    let term = forge
+        .held_leader_term()
+        .expect("the pass acquired the term");
+    assert!(
+        term.schedule().track_for_test(&key).is_none(),
+        "hot publication alone is not an Iceberg commit"
+    );
+
+    seam.release_parked_commit();
+    supervised.await_pass(first).await;
+    let counted = term
+        .schedule()
+        .track_for_test(&key)
+        .expect("the committed promotion is counted");
+    assert_eq!(
+        counted.pending_commits, 1,
+        "one promotion is one notification"
+    );
+    assert!(
+        fixture
+            .file_rows()
+            .await
+            .iter()
+            .all(|row| row.committed_snapshot_id.is_some()),
+        "the sweep promoted every hot object"
+    );
+
+    supervised.schedule_only().await;
+    assert_eq!(
+        term.schedule()
+            .track_for_test(&key)
+            .map(|track| track.pending_commits),
+        Some(1),
+        "a pass with no promotion debt counts nothing"
     );
 }

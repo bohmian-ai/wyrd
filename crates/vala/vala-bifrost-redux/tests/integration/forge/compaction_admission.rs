@@ -1234,28 +1234,15 @@ async fn plan_two_ready_rewrites(
         .register_and_seal_table("wide_fifo_b", 4)
         .await;
 
-    // Promote both tables first, and only then plan their compaction. Settling
-    // as the tables are planned would compact one of them before the other owed
-    // anything, which is the opposite of the state under test. The worker is
-    // stopped by every settle helper, so it is rearmed between passes.
-    let mut worker_running = true;
+    // Promote both tables first, and only then plan their compaction. The
+    // leader promotes inline on its own pass, so the worker stays stopped
+    // until both tables are published and nothing is compacted early.
+    supervisor.stop_worker().await;
     for _ in 0..12 {
         if promotions_succeeded(&promoted.fixture).await >= 2 {
             break;
         }
         supervisor.schedule_only().await;
-        if tenant_tasks(&promoted.fixture)
-            .await
-            .iter()
-            .all(|(_, _, state, _)| state != "ready")
-        {
-            continue;
-        }
-        if !worker_running {
-            supervisor.restart_worker();
-        }
-        supervisor.settle_some_success().await;
-        worker_running = false;
     }
     assert!(
         promotions_succeeded(&promoted.fixture).await >= 2,
@@ -2119,10 +2106,9 @@ async fn cancelling_one_waiting_task_keeps_the_other_tenant(
 
 /// Registers, seals, and publishes every named table before it owes compaction.
 ///
-/// Passes are requested only while some table still has no promotion planned at
-/// all. Every further pass would also plan compaction for the tables already
-/// published, and the running worker would compact away the very debt the
-/// caller needs them to owe.
+/// The leader promotes inline on its own pass, and a pass that promoted binds
+/// no compaction, so the worker stays stopped and nothing compacts away the
+/// very debt the caller needs these tables to owe.
 ///
 /// # Panics
 ///
@@ -2142,35 +2128,23 @@ async fn promote_tables(
             .register_and_seal_table_for(*tenant, name, 2)
             .await;
     }
-    supervisor.restart_worker();
-    supervisor.start_worker();
     let settled = tokio::time::timeout(ADMISSION_BOUND, async {
         loop {
-            let mut unplanned = false;
             let mut unsettled = false;
             for (tenant, name) in tables {
-                let promotion = tasks_of(&promoted.fixture, *tenant).await.into_iter().find(
-                    |(_, strategy, _, table)| strategy == "scribe_promotion" && table == name,
+                unsettled |= !tasks_of(&promoted.fixture, *tenant).await.into_iter().any(
+                    |(_, strategy, state, table)| {
+                        strategy == "scribe_promotion" && state == "succeeded" && table == *name
+                    },
                 );
-                match promotion {
-                    None => {
-                        unplanned = true;
-                        unsettled = true;
-                    }
-                    Some((_, _, state, _)) => unsettled |= state != "succeeded",
-                }
             }
             if !unsettled {
                 return;
             }
-            if unplanned {
-                supervisor.schedule_only().await;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            supervisor.schedule_only().await;
         }
     })
     .await;
-    supervisor.stop_worker().await;
     assert!(
         settled.is_ok(),
         "every registered table publishes before it owes compaction: {:?}",

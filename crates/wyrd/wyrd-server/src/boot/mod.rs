@@ -15,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::forge::{
-    Forge as ForgeCoordinator, ForgeBuildConfig, ForgeLeaderPeer, ForgeClock, ForgeConfig, ForgeObjectPages,
-    ForgeObjectStore, ForgeTelemetry, ForgeWorker, ForgeWorkerConfig,
+    Forge as ForgeCoordinator, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeLeaderPeer,
+    ForgeObjectPages, ForgeObjectStore, ForgeTelemetry, ForgeWorker, ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::oracle::dispatcher::{
@@ -970,10 +970,8 @@ pub async fn compose_bifrost(
         // A peer-mode coordinator publishes its private listener with every
         // leader term, so commit notices from other replicas reach the leader.
         let coordinator = Arc::new(match &peer_tls {
-            Some(tls) => coordinator.with_leader_peer(ForgeLeaderPeer::new(
-                advertise_addr.clone(),
-                tls.clone(),
-            )),
+            Some(tls) => coordinator
+                .with_leader_peer(ForgeLeaderPeer::new(advertise_addr.clone(), tls.clone())),
             None => coordinator,
         });
         // Only the Forge worker role runs admitted compaction plans, so only it

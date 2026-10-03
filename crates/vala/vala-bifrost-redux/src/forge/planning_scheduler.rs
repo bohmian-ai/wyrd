@@ -726,14 +726,15 @@ impl<'forge> ForgeScheduler<'forge> {
             .rewrite_candidate(&table)
             .await?
             .filter(|candidate| super::phase::admits_new_effect(candidate.strategy));
-        let (compaction_debt_files, compaction_debt_bytes) = rewrite_candidate
-            .iter()
-            .fold((0_u64, 0_u64), |(files, bytes), candidate| {
-                (
-                    files.saturating_add(candidate.inputs.len() as u64),
-                    bytes.saturating_add(candidate.bytes),
-                )
-            });
+        let (compaction_debt_files, compaction_debt_bytes) =
+            rewrite_candidate
+                .iter()
+                .fold((0_u64, 0_u64), |(files, bytes), candidate| {
+                    (
+                        files.saturating_add(candidate.inputs.len() as u64),
+                        bytes.saturating_add(candidate.bytes),
+                    )
+                });
         let candidates = rewrite_candidate
             .into_iter()
             .chain(maintenance_candidate)

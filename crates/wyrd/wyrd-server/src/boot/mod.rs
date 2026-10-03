@@ -1102,7 +1102,7 @@ pub async fn compose_bifrost(
         vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(&token_verifier));
     let ingest_limits = scribe_config.ingest_limits();
     let observation_runs =
-        crate::verification::observations::ObservationRunOutbox::new(postgres.wyrd().clone());
+        crate::verification::observations::ObservationRunSink::outbox(postgres.wyrd().clone());
     let gate = match scribe.as_ref() {
         Some(runtime) => vala_bifrost_redux::gate::Gate::with_scribe(
             Arc::clone(runtime.ingest()),
@@ -1115,7 +1115,9 @@ pub async fn compose_bifrost(
         Arc::clone(&query_forwarder) as Arc<dyn vala_bifrost_redux::contracts::OracleQueryDispatch>
     )
     .with_audit(Arc::clone(&audit_outbox))
-    .with_observation_ack(Arc::clone(&observation_runs) as _);
+    .with_observation_ack(Arc::new(
+        crate::verification::observations::ObservationEnqueue::new(Arc::clone(&observation_runs)),
+    ));
     Ok(crate::state::ComposedBifrost {
         bifrost: crate::state::Bifrost::assembled(crate::state::BifrostComposition {
             gate,

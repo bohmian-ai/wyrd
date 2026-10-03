@@ -33,7 +33,7 @@ use wyrd_server::verification::engines::{EngineOutcome, VerifierReport};
 use wyrd_server::verification::fault::{PublicationFault, SentBatch};
 use wyrd_server::verification::fitter::{BaselineFitter, FitGate};
 use wyrd_server::verification::health::RuntimeCapability;
-use wyrd_server::verification::observations::ObservationRunOutbox;
+use wyrd_server::verification::observations::ObservationRunSink;
 use wyrd_server::verification::runner::{EngineScript, VERIFIER_UNAVAILABLE};
 use wyrd_server::verification::{CapabilityCrash, RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
@@ -2439,27 +2439,31 @@ async fn observation_outbox_retains_through_an_outage_and_flushes_at_shutdown() 
         event_time: Utc::now(),
     };
     let postgres = harness.server.state().postgres.wyrd().clone();
-    let outbox = ObservationRunOutbox::new(postgres.clone());
+    let outbox = ObservationRunSink::outbox(postgres.clone());
 
     refuse_run_writes(&harness.assertion, true).await;
-    outbox.stage(tenant, vec![record("r-1"), record("r-2")]);
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert_eq!(outbox.pending(), 2, "the outage drops no request");
+    outbox.stage(tenant, record("r-1"));
+    outbox.stage(tenant, record("r-2"));
+    assert_eq!(
+        outbox
+            .settle(std::time::Instant::now() + Duration::from_millis(400))
+            .await,
+        2,
+        "the outage drops no request"
+    );
     assert!(observation_records(seed).await.is_empty());
 
     refuse_run_writes(&harness.assertion, false).await;
-    outbox.stage(tenant, vec![record("r-1"), record("r-3")]);
-    let deadline = tokio::time::Instant::now() + WAIT;
-    while outbox.pending() != 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the outbox never recovered"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    outbox.stage(tenant, record("r-1"));
+    outbox.stage(tenant, record("r-3"));
+    assert_eq!(
+        outbox.settle(std::time::Instant::now() + WAIT).await,
+        0,
+        "the outbox recovers once writes succeed"
+    );
     assert_eq!(observation_records(seed).await, ["r-1", "r-2", "r-3"]);
 
-    outbox.stage(tenant, vec![record("r-4")]);
+    outbox.stage(tenant, record("r-4"));
     assert_eq!(
         outbox.shutdown(std::time::Instant::now() + WAIT).await,
         0,
@@ -2470,9 +2474,9 @@ async fn observation_outbox_retains_through_an_outage_and_flushes_at_shutdown() 
         ["r-1", "r-2", "r-3", "r-4"]
     );
 
-    let stranded = ObservationRunOutbox::new(postgres);
+    let stranded = ObservationRunSink::outbox(postgres);
     refuse_run_writes(&harness.assertion, true).await;
-    stranded.stage(tenant, vec![record("r-5")]);
+    stranded.stage(tenant, record("r-5"));
     assert_eq!(
         stranded
             .shutdown(std::time::Instant::now() + Duration::from_millis(300))

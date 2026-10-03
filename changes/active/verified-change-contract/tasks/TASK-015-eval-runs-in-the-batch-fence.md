@@ -1,7 +1,7 @@
 ---
 id: TASK-015
 kind: implementation
-status: ready
+status: review
 spec: SPEC-verified-change-contract
 spec_revision: 60
 requirements: [REQ-077, REQ-108, AC-014]
@@ -264,3 +264,61 @@ Exact focused commands above; `mise run fmt`, `mise run lints`,
 
 - [Approved spec revision 60](../spec.md): REQ-077, REQ-108, AC-014.
 - `crates/wyrd/wyrd-server/src/oracle/query_audit.rs` (outbox shape).
+
+## Implementation Evidence
+
+Generic outbox (`crates/shared/wyrd-runtime/src/outbox.rs`) unchanged. The
+"Safe to retry" audit note above is stale: audit resolves ambiguous commits
+through `pg_xact_status` (audit-outbox spec revision 4); Eval relies only on
+its `(tenant, binding, record)` key with `ON CONFLICT DO NOTHING`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| One multi-row insert per tenant batch, idempotent, no ordinal consumed by a repeat (Scenario 1) | `VerifierRunQueue::enqueue_observation_batch` (`wyrd-sql/src/queries/verifier_runs.rs`); per-row `enqueue_observations` absent | `scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p wyrd-sql --test pg_verifier_runs -E 'test(=observation_batches_insert_once_per_binding_and_record)'` | PASS |
+| `ObservationRunSink` is one `OutboxSink`; `ObservationRunOutbox = Outbox<ObservationRunSink>`; hand-written queue and writer deleted | `wyrd-server/src/verification/observations.rs` | `cargo check --workspace --all-targets --all-features`; `mise run lints` | PASS |
+| Wired where the hand-written outbox was (state, boot, shutdown) | `boot/mod.rs` (`ObservationRunSink::outbox`, `ObservationEnqueue` Gate hook); `state.rs` and `app/server.rs` unchanged over the alias | `mise run test:bifrost:journey:server` | PASS |
+| Outage retains and retries, recovery creates one run per record, repeat adds none, graceful shutdown flushes, deadline loss reported (Scenario 2, AC-014) | generic outbox over the sink | `scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test pg_verification_runtime -E 'test(=observation_outbox_retains_through_an_outage_and_flushes_at_shutdown)'` | PASS |
+| Generic metrics `outbox="eval_run_requests"` replace `verification_observation_enqueue_failures_total` | `ObservationRunSink::NAME`; undecodable frame counts `outbox_events_lost_total{outbox="eval_run_requests"}` | `grep -r verification_observation_enqueue crates` → none | PASS |
+| No count limit, no drop on failure, no Scribe/`vala-sql` write to `verifier_runs`, no client wait | generic outbox; Gate stages synchronously after the acknowledgement | journey + integration lanes | PASS |
+| Continuous Eval journeys green under revision 60 | `eval_verification.rs` updated (below) | `mise run test:bifrost:journey:server`: 31/31 passed | PASS |
+
+Other lanes: `mise run test:sql` (185 + 6 + 118 + 2 passed),
+`mise run test:bifrost:integration:server` (89 passed), `mise run fmt`,
+`mise run lints`, `git diff --check`: all clean.
+
+### Diagnosis: two Eval journeys failing on the outbox
+
+- **Symptom:** `continuous_eval_runs_the_terminal_matrix` ("only 0 of 28 runs
+  were enqueued") and `sealed_replay_on_a_later_day_activates_once` ("only 1
+  of 2 activations reached the queue"), in both the WIP and the generic outbox.
+- **Evidence:** with `WYRD_LOG=info,wyrd_runtime=debug`, the trace shows
+  `outbox write failed; retrying outbox="eval_run_requests" ... items=1`, then
+  `items=8` every 5 s, and at shutdown `lost=8`. The sealed-replay barrier
+  counted `pg_blocking_pids` backends.
+- **Cause:** both tests encoded the pre-revision-60 per-frame fail-open
+  enqueue. The terminal matrix refused one record for good and asserted it
+  never got a run, which is a drop that REQ-077 forbids. The retained
+  refused record shares its tenant's batch, so later records stayed blocked.
+  The sealed-replay barrier expected one Postgres transaction per frame, but
+  the outbox allows one write in flight per tenant, so the sentinel waits in
+  memory.
+- **Fix site:** the tests. An independent read-only diagnostician confirmed
+  that production code behaves as REQ-077 requires.
+  - The terminal matrix drops its refused pre-phase and its "never a run"
+    assertion. `integrated_enqueue_outage_preserves_ack_and_recovers` and the
+    `pg_verification_runtime` outbox test cover outage and recovery.
+  - The sealed replay checks `observation_runs().pending() == 2` after the
+    sentinel's acknowledgement, which is deterministic because Gate stages
+    before it responds.
+  - The obsolete `blocked_activations` helper is removed.
+
+Also fixed: a Step 1 merge-resolution leftover in
+`sdks/wyrd-sdk-rust/tests/observe_run.rs` (`u32::try_from` on `u16`), caught
+by Clippy.
+
+Risk (spec gap, not changed): a permanently failing item, such as a
+constraint violation, blocks its tenant's backlog in either outbox until
+shutdown. REQ-077 covers only a slow or unavailable Postgres.
+
+Non-goals kept: no generic outbox change, no Scribe or `vala-sql` writes to
+`verifier_runs`, and no unrelated files.

@@ -669,60 +669,6 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
         .mount(&provider)
         .await;
 
-    let superuser = server.pg_fixture().superuser_pool().await?;
-    // A post-commit enqueue failure: while this trigger stands, every
-    // observation run insert fails after Scribe has acknowledged the row.
-    sqlx::query(
-        "CREATE FUNCTION wyrd.eval_journey_refuse() RETURNS trigger LANGUAGE plpgsql AS \
-         $$BEGIN RAISE EXCEPTION 'eval journey refuses this enqueue'; END$$",
-    )
-    .execute(&superuser)
-    .await?;
-    sqlx::query(
-        "CREATE TRIGGER eval_journey_refuse BEFORE INSERT ON wyrd.verifier_runs \
-         FOR EACH ROW WHEN (NEW.origin = 'observation') \
-         EXECUTE FUNCTION wyrd.eval_journey_refuse()",
-    )
-    .execute(&superuser)
-    .await?;
-    let state = start_state(&bundle, &client).await;
-    emit(
-        &state.run().for_card("agent")?,
-        &json!({ "answer": "yes", "marker": "refused" }),
-        None,
-        None,
-    );
-    state.shutdown().await?;
-    server.flush_bifrost().await?;
-    let refused = record_id(&server, tenant, "refused").await?;
-    let refused_at = texts(
-        &query(
-            &server,
-            tenant,
-            format!(
-                "SELECT CAST(wyrd_event_time AS BIGINT) FROM vala.eval.observations \
-                 WHERE record_id = '{refused}'"
-            ),
-        )
-        .await?,
-    )?;
-    let [Some(refused_at)] = refused_at.as_slice() else {
-        return Err(format!("the refused row has no single event time: {refused_at:?}").into());
-    };
-    // Narrow the refusal to the acknowledged row whatever the hook's timing:
-    // every later observation is received strictly after it.
-    let cutoff = chrono::DateTime::from_timestamp_micros(refused_at.parse()?)
-        .ok_or("the refused event time is out of range")?;
-    // The cutoff is a timestamp this journey formatted from a parsed integer.
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE OR REPLACE TRIGGER eval_journey_refuse BEFORE INSERT ON wyrd.verifier_runs \
-         FOR EACH ROW WHEN (NEW.input_event_time <= '{}'::timestamptz) \
-         EXECUTE FUNCTION wyrd.eval_journey_refuse()",
-        cutoff.to_rfc3339()
-    )))
-    .execute(&superuser)
-    .await?;
-
     // The matrix records are received one day ahead of the SDK's own clock,
     // so each row's client `created_at` and managed `wyrd_event_time` fall on
     // different UTC days and only a read by the frozen managed day finds it.
@@ -1024,9 +970,6 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
         "timed_out",
     )
     .await?;
-    if runs.iter().any(|run| run.record_id == refused) {
-        return Err("the refused enqueue created a run".into());
-    }
     server.shutdown().await?;
     Ok(())
 }
@@ -1063,50 +1006,16 @@ fn unstamped_observation(subject: &wyrd_spec::reference::CardRef, record: &str) 
     builder.finish_ipc().expect("the observation frame encodes")
 }
 
-/// Poll until at least `count` observation-enqueue transactions are blocked,
-/// and return how many are.
-///
-/// Each acknowledged frame enqueues in one transaction: the first blocks at
-/// its run insert behind the test's `wyrd.verifier_runs` lock, and each later
-/// one blocks on the per-binding observation lock the earlier activation holds.
-/// Every blocked backend of this test's own database is therefore one
-/// activation Gate spawned; no verification runtime runs, so no other writer
-/// waits, and sibling journeys' databases are excluded.
-///
-/// # Errors
-/// Returns a query error or a timeout naming the observed count.
-async fn blocked_activations(
-    superuser: &sqlx::PgPool,
-    count: i64,
-) -> Result<i64, ServerJourneyError> {
-    let deadline = tokio::time::Instant::now() + WAIT;
-    loop {
-        let waiting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity \
-              WHERE datname = current_database() \
-                AND cardinality(pg_blocking_pids(pid)) > 0",
-        )
-        .fetch_one(superuser)
-        .await?;
-        if waiting >= count {
-            return Ok(waiting);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("only {waiting} of {count} activations reached the queue").into());
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
 /// A sealed replay of an unstamped observation on a later receipt day is
 /// acknowledged but never activates runs: only the attempt that committed the
 /// batch enqueues, so every run freezes the stored row's `wyrd_event_time` and
 /// the row reads back from its original day.
 ///
 /// Run inserts are held behind a table lock while the original, two concurrent
-/// replays one day later, and a distinct sentinel frame are acknowledged; the
-/// sentinel's activation is the barrier after which exactly two activations
-/// (original and sentinel) may wait.
+/// replays one day later, and a distinct sentinel frame are acknowledged.
+/// Gate stages run requests before each acknowledgement returns, so once the
+/// sentinel is acknowledged the run-request outbox must hold exactly two
+/// requests (original and sentinel); a staged replay would add to them.
 ///
 /// # Errors
 /// Returns server, registration, query, or fixture errors, or a description of
@@ -1150,7 +1059,6 @@ async fn sealed_replay_on_a_later_day_activates_once() -> Result<(), ServerJourn
     let before = chrono::Utc::now();
     ingest.insert(OBSERVATIONS, batch, frame.clone()).await?;
     let after = chrono::Utc::now();
-    blocked_activations(&superuser, 1).await?;
     scribe.shift_receipt_clock_for_test(Duration::from_secs(86_400));
     let (first, second) = tokio::join!(
         ingest.insert(OBSERVATIONS, batch, frame.clone()),
@@ -1166,11 +1074,19 @@ async fn sealed_replay_on_a_later_day_activates_once() -> Result<(), ServerJourn
             unstamped_observation(&subject, &sentinel),
         )
         .await?;
-    let activations = blocked_activations(&superuser, 2).await?;
+    // Gate stages run requests before each acknowledgement returns, and the
+    // held lock keeps the original's write in flight, so the outbox now holds
+    // exactly the original and the sentinel; a staged replay would add to it.
+    let activations = server
+        .state()
+        .bifrost
+        .observation_runs()
+        .ok_or("the server owns no run-request outbox")?
+        .pending();
     scribe.shift_receipt_clock_for_test(Duration::ZERO);
     lock.commit().await?;
     if activations != 2 {
-        return Err(format!("{activations} activations for one original and one sentinel").into());
+        return Err(format!("{activations} run requests for one original and one sentinel").into());
     }
 
     // Four `observations_ready` bindings observe `agent`; each frame

@@ -80,7 +80,11 @@ mint the key once before retry. `HttpTransport::request_json_with_headers` in
 adapt inside that owner for native-envelope errors and remaining timeout rather
 than creating a new reqwest client or publicly exposing arbitrary headers.
 Existing auth refresh/retry stays request-local; accepted-job authority is a
-server host rule, not an auth exemption for this local adapter.
+server host rule, not an auth exemption for this local adapter. A native model
+call is sent once and never resent: on a `401` the adapter renews the refused
+credential through the existing auth owner (`AuthMiddleware::force_refresh`),
+propagates a renewal failure as that owner's authentication error, and
+otherwise returns the original native refusal.
 
 Consume `WyrdGatewayCall` exactly as TASK-001/spec define. Public ingress uses
 `GatewayCallRequest` in `components/gateway/invocation.rs`; preserve existing
@@ -94,7 +98,8 @@ Remaining timeout and correlation never enter the native provider request.
 
 Packet-local native-error contract: parse the existing OpenAI, Anthropic, or
 Google protocol error envelope. Keep HTTP status, a redacted safe message, and
-its stable Wyrd code when present; OpenAI's safe `param` becomes optional
+its stable Wyrd code when present (a recognized code's message is its
+derive-backed catalog title, never envelope text); OpenAI's safe `param` becomes optional
 `field`. No other native-envelope member becomes portable error details.
 The in-process WyrdError projection retains only `details.field` and the same
 safe status/code/message/remediation fields. If no Wyrd code is present, map

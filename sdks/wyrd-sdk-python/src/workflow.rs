@@ -1,8 +1,9 @@
 //! `PyO3` boundary for `wyrd.agent.Workflow` and `wyrd.agent.WorkflowRun`.
 //!
-//! [`PyWorkflow`] wraps the Rust-native [`skald_workflow::Workflow`]: each
-//! method converts its Python arguments at the boundary and delegates to the
-//! native builder, validator, codec, or executor, which own every rule.
+//! [`PyWorkflow`] wraps the shared [`wyrd_client::Workflow`], which keeps the
+//! client a Workflow was loaded through: each method converts its Python
+//! arguments at the boundary and delegates to the native builder, validator,
+//! codec, or executor, which own every rule.
 //! [`PyWorkflowRun`] projects the portable [`WorkflowRun`] wire snapshot.
 
 use std::collections::{BTreeMap, HashMap};
@@ -200,14 +201,16 @@ fn step_id_from_agent(agent: &Agent) -> WyrdPyResult<String> {
 }
 
 /// Python `wyrd.agent.Workflow`: authoring and local run surface over the
-/// native [`Workflow`].
+/// shared [`wyrd_client::Workflow`].
 ///
-/// Chaining methods replace `inner` with the native builder's result, so a
-/// failed call leaves the Python object unchanged.
+/// Chaining methods replace the native [`Workflow`] with the builder's
+/// result, so a failed call leaves the Python object unchanged, and keep the
+/// client a loaded Workflow was read through, so its runs reach the same
+/// server.
 #[pyclass(module = "wyrd.agent", name = "Workflow")]
 pub struct PyWorkflow {
-    /// Native Workflow every method delegates to.
-    inner: Workflow,
+    /// Shared Workflow every method delegates to.
+    inner: wyrd_client::Workflow,
 }
 
 #[pymethods]
@@ -249,7 +252,7 @@ impl PyWorkflow {
             wf = wf.with_space(space);
         }
         let inner = wf.with_labels(labels).with_annotations(annotations);
-        Ok(Self { inner })
+        Ok(Self::from(inner))
     }
 
     /// Build a workflow whose steps run sequentially.
@@ -267,8 +270,7 @@ impl PyWorkflow {
     #[pyo3(signature = (name, *agents))]
     fn sequential(py: Python<'_>, name: String, agents: Vec<Py<PyAny>>) -> WyrdPyResult<Self> {
         let agents = extract_agents(py, agents)?;
-        let inner = Workflow::sequential(name, agents)?;
-        Ok(Self { inner })
+        Ok(Self::from(Workflow::sequential(name, agents)?))
     }
 
     /// Build a workflow whose steps run in parallel with no dependencies.
@@ -286,8 +288,7 @@ impl PyWorkflow {
     #[pyo3(signature = (name, *agents))]
     fn parallel(py: Python<'_>, name: String, agents: Vec<Py<PyAny>>) -> WyrdPyResult<Self> {
         let agents = extract_agents(py, agents)?;
-        let inner = Workflow::parallel(name, agents)?;
-        Ok(Self { inner })
+        Ok(Self::from(Workflow::parallel(name, agents)?))
     }
 
     /// Append `agent` as a new step with no dependencies.
@@ -305,7 +306,8 @@ impl PyWorkflow {
         agent: &Bound<'py, Agent>,
     ) -> WyrdPyResult<PyRefMut<'py, Self>> {
         let agent = agent.borrow().clone();
-        slf.inner = slf.inner.clone().add(agent)?;
+        let workflow = slf.inner.as_skald_mut();
+        *workflow = workflow.clone().add(agent)?;
         Ok(slf)
     }
 
@@ -330,7 +332,8 @@ impl PyWorkflow {
     ) -> WyrdPyResult<PyRefMut<'py, Self>> {
         let agent = agent.borrow().clone();
         let deps = coerce_after(py, after)?;
-        slf.inner = slf.inner.clone().add_after(agent, deps)?;
+        let workflow = slf.inner.as_skald_mut();
+        *workflow = workflow.clone().add_after(agent, deps)?;
         Ok(slf)
     }
 
@@ -356,7 +359,8 @@ impl PyWorkflow {
             .into_iter()
             .map(|(name, value)| Ok((name, parameter_from_py(&value)?)))
             .collect::<WyrdPyResult<BTreeMap<_, _>>>()?;
-        slf.inner = slf.inner.clone().with_inputs(inputs)?;
+        let workflow = slf.inner.as_skald_mut();
+        *workflow = workflow.clone().with_inputs(inputs)?;
         Ok(slf)
     }
 
@@ -382,7 +386,8 @@ impl PyWorkflow {
         inputs: HashMap<String, String>,
     ) -> WyrdPyResult<PyRefMut<'py, Self>> {
         let bindings = bindings_from_py("inputs", inputs)?;
-        slf.inner = slf.inner.clone().with_step_inputs(step_id, bindings)?;
+        let workflow = slf.inner.as_skald_mut();
+        *workflow = workflow.clone().with_step_inputs(step_id, bindings)?;
         Ok(slf)
     }
 
@@ -403,7 +408,8 @@ impl PyWorkflow {
         outputs: HashMap<String, String>,
     ) -> WyrdPyResult<PyRefMut<'_, Self>> {
         let outputs = bindings_from_py("outputs", outputs)?;
-        slf.inner = slf.inner.clone().with_outputs(outputs)?;
+        let workflow = slf.inner.as_skald_mut();
+        *workflow = workflow.clone().with_outputs(outputs)?;
         Ok(slf)
     }
 
@@ -413,41 +419,43 @@ impl PyWorkflow {
     ///     `WyrdError`: For any contract, binding, Prompt-variable, output, or
     ///         route error that would fail a run before dispatch.
     fn validate(&self) -> WyrdPyResult<()> {
-        Ok(self.inner.validate()?)
+        Ok(self.inner.as_skald().validate()?)
     }
 
     /// Set the workflow's semantic version in place.
     fn set_version(&mut self, version: String) {
-        self.inner = self.inner.clone().with_version(version);
+        let workflow = self.inner.as_skald_mut();
+        *workflow = workflow.clone().with_version(version);
     }
 
     /// Set the workflow's space in place.
     fn set_space(&mut self, space: String) {
-        self.inner = self.inner.clone().with_space(space);
+        let workflow = self.inner.as_skald_mut();
+        *workflow = workflow.clone().with_space(space);
     }
 
     /// Return the workflow name.
     #[getter]
     fn name(&self) -> Option<&str> {
-        self.inner.name_str()
+        self.inner.as_skald().name_str()
     }
 
     /// Return the workflow version.
     #[getter]
     fn version(&self) -> Option<&str> {
-        self.inner.version_str()
+        self.inner.as_skald().version_str()
     }
 
     /// Return the workflow space.
     #[getter]
     fn space(&self) -> Option<&str> {
-        self.inner.space_str()
+        self.inner.as_skald().space_str()
     }
 
     /// Return the ordered step ids.
     #[getter]
     fn steps(&self) -> Vec<String> {
-        self.inner.step_ids()
+        self.inner.as_skald().step_ids()
     }
 
     /// Serialize this workflow to a canonical envelope YAML string.
@@ -455,7 +463,7 @@ impl PyWorkflow {
     /// Raises:
     ///     `WyrdError`: When identity or codec fails.
     fn to_yaml(&self) -> WyrdPyResult<String> {
-        Ok(self.inner.to_yaml_string()?)
+        Ok(self.inner.as_skald().to_yaml_string()?)
     }
 
     /// Save this workflow to disk as canonical envelope YAML.
@@ -466,7 +474,7 @@ impl PyWorkflow {
     /// Raises:
     ///     `WyrdError`: When identity, IO, or codec fails.
     fn save(&self, path: PathBuf) -> WyrdPyResult<()> {
-        Ok(self.inner.save(path)?)
+        Ok(self.inner.as_skald().save(path)?)
     }
 
     /// Load an authored Workflow file and the Cards it references.
@@ -504,7 +512,7 @@ impl PyWorkflow {
     fn from_path(py: Python<'_>, path: PathBuf) -> WyrdPyResult<Self> {
         let workflow =
             py.detach(|| wyrd_runtime::runtime().block_on(wyrd_client::Workflow::from_path(path)))?;
-        Ok(Self::from(workflow.into_skald()))
+        Ok(Self::from(workflow))
     }
 
     /// Parse a workflow from a canonical envelope YAML string.
@@ -522,14 +530,16 @@ impl PyWorkflow {
         let tool_resolver = skald_tool::default_registry();
         let prompt_resolver = skald_agent::default_prompt_resolver();
         let inner = Workflow::from_yaml_str(yaml, tool_resolver, prompt_resolver)?;
-        Ok(Self { inner })
+        Ok(Self::from(inner))
     }
 
     /// Run this workflow against the process-local provider registry.
     ///
-    /// Steps routed to an external gateway use the bindings named in the
-    /// shared client configuration; only selected bindings' secrets are read.
-    /// The GIL is released while the shared Wyrd runtime drives the native
+    /// Steps routed to the Wyrd gateway call the server and credential this
+    /// Workflow was loaded through, or the ambient client configuration when
+    /// it was built locally. Steps routed to an external gateway use the
+    /// bindings named in the shared client configuration; only selected
+    /// bindings' secrets are read. The GIL is released while the shared Wyrd runtime drives the native
     /// executor to its terminal snapshot.
     ///
     /// Args:
@@ -547,15 +557,24 @@ impl PyWorkflow {
     #[pyo3(signature = (input = None))]
     fn run(&self, py: Python<'_>, input: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<PyWorkflowRun> {
         let input = workflow_input_from_py(input)?;
-        let workflow = wyrd_client::Workflow::from(self.inner.clone());
-        let run = py.detach(|| wyrd_runtime::runtime().block_on(workflow.run(input)))?;
+        let run = py.detach(|| wyrd_runtime::runtime().block_on(self.inner.run(input)))?;
         Ok(PyWorkflowRun { run })
     }
 }
 
 impl From<Workflow> for PyWorkflow {
-    /// Wrap a hydrated native Workflow for Python.
+    /// Wrap a natively built Workflow for Python; it was loaded through no
+    /// client.
     fn from(inner: Workflow) -> Self {
+        Self {
+            inner: inner.into(),
+        }
+    }
+}
+
+impl From<wyrd_client::Workflow> for PyWorkflow {
+    /// Wrap a loaded shared Workflow for Python, keeping its loading client.
+    fn from(inner: wyrd_client::Workflow) -> Self {
         Self { inner }
     }
 }

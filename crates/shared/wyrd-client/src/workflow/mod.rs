@@ -156,6 +156,13 @@ impl Workflow {
         &self.inner
     }
 
+    /// Mutably borrow the hydrated Skald Workflow, for authoring edits that
+    /// keep the client that loaded it.
+    #[must_use]
+    pub fn as_skald_mut(&mut self) -> &mut SkaldWorkflow {
+        &mut self.inner
+    }
+
     /// Take the hydrated Skald Workflow.
     #[must_use]
     pub fn into_skald(self) -> SkaldWorkflow {
@@ -266,6 +273,8 @@ impl WorkflowCards<'_> {
 /// Authored-file loading over the checked-in code-review bundle.
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
@@ -468,11 +477,8 @@ mod tests {
         let path = dir.join("review-secret");
         std::fs::write(&path, contents).expect("secret writes");
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .expect("secret restricts");
-        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("secret restricts");
         path
     }
 

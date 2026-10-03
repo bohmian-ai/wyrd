@@ -2635,7 +2635,7 @@ impl PyWorkflowCards {
         let workflow = py
             .detach(|| wyrd_runtime::runtime().block_on(self.inner.workflow().load(&selector)))
             .map_err(WyrdPyError::from)?;
-        Ok(PyWorkflow::from(workflow.into_skald()))
+        Ok(PyWorkflow::from(workflow))
     }
 }
 

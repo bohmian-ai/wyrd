@@ -62,7 +62,7 @@ use crate::state::{
     ScribeCoordinationRuntime,
 };
 
-const DEFAULT_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const DEFAULT_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_hours(1);
 const DEFAULT_HINT_CAPACITY: usize = 1_024;
 const ORACLE_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Number of listing entries the production Forge object store groups into one
@@ -436,13 +436,6 @@ fn resolve_forge_config(
             .orphan_gc_ttl_secs
             .map(std::time::Duration::from_secs)
             .unwrap_or(base.orphan_gc_ttl),
-        maintenance_trigger_snapshot_count: forge_runtime
-            .maintenance_trigger_snapshot_count
-            .unwrap_or(base.maintenance_trigger_snapshot_count),
-        maintenance_trigger_interval: forge_runtime
-            .maintenance_trigger_interval_secs
-            .map(std::time::Duration::from_secs)
-            .unwrap_or(base.maintenance_trigger_interval),
         orphan_gc_max_list_pages: forge_runtime
             .orphan_gc_max_list_pages
             .unwrap_or(base.orphan_gc_max_list_pages),
@@ -2490,8 +2483,6 @@ mod tests {
             snapshot_retention_secs: Some(7_200),
             retain_last: Some(3),
             orphan_gc_ttl_secs: Some(3_600),
-            maintenance_trigger_snapshot_count: Some(8),
-            maintenance_trigger_interval_secs: Some(900),
             orphan_gc_max_list_pages: Some(64),
             orphan_gc_run_budget_secs: Some(30),
             maintenance_interval_secs: Some(45),
@@ -2506,11 +2497,6 @@ mod tests {
         );
         assert_eq!(config.retain_last, 3);
         assert_eq!(config.orphan_gc_ttl, std::time::Duration::from_secs(3_600));
-        assert_eq!(config.maintenance_trigger_snapshot_count, 8);
-        assert_eq!(
-            config.maintenance_trigger_interval,
-            std::time::Duration::from_secs(900)
-        );
         assert_eq!(config.orphan_gc_max_list_pages, 64);
         assert_eq!(
             config.orphan_gc_run_budget,

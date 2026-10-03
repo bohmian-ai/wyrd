@@ -1,4 +1,4 @@
-//! Supervision for Forge leadership, hinted promotion and leader passes.
+//! Supervision for Forge leadership, hinted promotion and the leader timer.
 
 use std::sync::Arc;
 #[cfg(feature = "test-support")]
@@ -10,17 +10,8 @@ use uuid::Uuid;
 
 use super::error::ForgeError;
 use super::leadership::LEADER_HEARTBEAT;
-use super::{Forge, ForgeScheduler, ForgeWorker, ForgeWorkerConfig};
+use super::{Forge, ForgeWorker, ForgeWorkerConfig};
 use crate::maintenance::StagingFileCommitted;
-
-/// The kind of supervised pass the loop runs next.
-#[derive(Debug, Clone, Copy)]
-enum ForgePass {
-    /// Renew or contend for the leader term only.
-    Heartbeat,
-    /// Hold the term, sweep promotion debt and plan durable demand.
-    Planning,
-}
 
 /// Test-tier control and observation for a supervised production scheduler loop.
 ///
@@ -31,6 +22,8 @@ enum ForgePass {
 pub struct ForgeSchedulerTrigger {
     /// Wakeup consumed by the production supervisor select loop.
     requested: Arc<tokio::sync::Notify>,
+    /// Wakeup consumed by the leader maintenance timer loop.
+    maintenance: Arc<tokio::sync::Notify>,
     /// Completed scheduler passes observed after their durable result returns.
     completed: Arc<AtomicUsize>,
     /// Wakeup for deterministic test waits on completed passes.
@@ -77,6 +70,14 @@ impl ForgeSchedulerTrigger {
         self.requested.notify_one();
     }
 
+    /// Request one leader maintenance pass from the production timer loop.
+    ///
+    /// The pass runs manifest rewrite, snapshot expiry and cleanup exactly as
+    /// one timer tick does, and counts as one completed pass.
+    pub fn request_maintenance(&self) {
+        self.maintenance.notify_one();
+    }
+
     /// Return the number of production scheduler passes that have returned.
     #[must_use]
     pub fn completed_passes(&self) -> usize {
@@ -102,6 +103,11 @@ impl ForgeSchedulerTrigger {
         self.requested.notified().await;
     }
 
+    /// Wait for one maintenance request without exposing the timer loop.
+    async fn wait_for_maintenance(&self) {
+        self.maintenance.notified().await;
+    }
+
     /// Record that the real supervised pass returned, including handled failures.
     fn record_completed_pass(&self) {
         self.completed.fetch_add(1, Ordering::AcqRel);
@@ -122,15 +128,15 @@ impl Drop for ForgeReadinessGuard {
 }
 
 impl Forge {
-    /// Runs leader election, hinted promotion and the leader's passes until
-    /// cancellation.
+    /// Runs leader election, hinted promotion and the leader's maintenance
+    /// timer until cancellation.
     ///
     /// Every coordinator contends for the one leader term on a heartbeat and
     /// promotes the Scribe hot objects its own hints name, through a private
-    /// attempt executor. Only the term holder sweeps `file_list` promotion
-    /// debt — on acquisition and on every planning pass — and plans the table
-    /// work still driven by durable demand. The term is resigned on stop, so a
-    /// standby takes over at once.
+    /// attempt executor. The term holder sweeps `file_list` promotion debt on
+    /// every heartbeat. A separate timer runs the leader's Iceberg maintenance
+    /// pass, so a long pass never delays term renewal. The term is resigned on
+    /// stop, so a standby takes over at once.
     ///
     /// # Errors
     /// Returns [`ForgeError::AlreadyRunning`] for duplicate supervision or a
@@ -155,59 +161,89 @@ impl Forge {
             ForgeWorkerConfig::default(),
             Uuid::now_v7(),
         )?;
+        tokio::join!(
+            self.supervise(&executor, &shutdown, &readiness),
+            self.maintain(&executor, &shutdown),
+        );
+        if let Err(error) = self.leadership.resign().await {
+            tracing::warn!(error = %error, "Forge leader term was not resigned; it will expire");
+        }
+        Ok(())
+    }
+
+    /// Renews the term on a heartbeat and promotes hinted tables until stop.
+    async fn supervise(
+        &self,
+        executor: &ForgeWorker,
+        shutdown: &CancellationToken,
+        readiness: &super::ForgeRoleReadiness,
+    ) {
+        // The first heartbeat waits one period, so a test that owns the
+        // trigger arranges its scenario before any unsolicited pass.
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + LEADER_HEARTBEAT,
+            LEADER_HEARTBEAT,
+        );
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut hints_open = true;
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                hint = self.receive_hint(), if hints_open => {
+                    match hint {
+                        Some(hint) => {
+                            let (binding, _) = hint.into_parts();
+                            self.promote_hinted(executor, binding, shutdown).await;
+                        }
+                        None => hints_open = false,
+                    }
+                }
+                _ = heartbeat.tick() => self.run_pass(executor, shutdown, readiness).await,
+                () = self.await_triggered_pass() => {
+                    self.run_pass(executor, shutdown, readiness).await;
+                    #[cfg(feature = "test-support")]
+                    self.record_completed_pass();
+                }
+            }
+        }
+    }
+
+    /// Runs the leader maintenance timer until stop.
+    ///
+    /// Like `RisingWave`'s GC loop, the first tick fires at once. A replica
+    /// without the term skips the tick. A test that owns this loop drives
+    /// every pass itself, so its timer waits one full interval.
+    async fn maintain(&self, executor: &ForgeWorker, shutdown: &CancellationToken) {
+        let interval = self.core.maintenance_interval;
         #[cfg(feature = "test-support")]
-        let test_owner = self
+        let quiet = self
             .core
             .scheduler_trigger
             .as_ref()
-            .and_then(ForgeSchedulerTrigger::owner_for_test);
-        #[cfg(feature = "test-support")]
-        let mut scheduler = match test_owner {
-            Some(owner) => ForgeScheduler::with_owner_for_test(self, owner)?,
-            None => ForgeScheduler::new(self)?,
-        };
-        #[cfg(not(feature = "test-support"))]
-        let mut scheduler = ForgeScheduler::new(self)?;
-        let interval = self.core.maintenance_interval;
-        // A test that owns this scheduler drives every pass itself, so its
-        // loop stays quiet until asked rather than racing the arrangement.
-        #[cfg(feature = "test-support")]
-        let quiet = test_owner.is_some();
+            .and_then(ForgeSchedulerTrigger::owner_for_test)
+            .is_some();
         #[cfg(not(feature = "test-support"))]
         let quiet = false;
         let now = tokio::time::Instant::now();
         let mut ticker =
             tokio::time::interval_at(if quiet { now + interval } else { now }, interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut heartbeat = tokio::time::interval_at(now + LEADER_HEARTBEAT, LEADER_HEARTBEAT);
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut hints_open = true;
         loop {
-            let pass = tokio::select! {
+            tokio::select! {
                 () = shutdown.cancelled() => break,
-                hint = self.receive_hint(), if hints_open => {
-                    match hint {
-                        Some(hint) => {
-                            let (binding, _) = hint.into_parts();
-                            self.promote_hinted(&executor, binding, &shutdown).await;
-                        }
-                        None => hints_open = false,
-                    }
-                    continue;
-                }
-                _ = heartbeat.tick() => ForgePass::Heartbeat,
-                _ = ticker.tick() => ForgePass::Planning,
-                () = self.await_triggered_pass() => ForgePass::Planning,
-            };
-            // Not raced against shutdown: an in-flight promotion observes the
-            // token and drains, releasing its lease as a worker attempt does.
-            self.run_pass(pass, &mut scheduler, &executor, &shutdown, &readiness)
-                .await;
+                _ = ticker.tick() => {}
+                () = self.await_triggered_maintenance() => {}
+            }
+            // Boxed: the pass nests every attempt future, and inlining it in
+            // this loop's state machine overflows the server's layout depth.
+            tracing::Instrument::instrument(
+                Box::pin(self.run_maintenance(executor, shutdown)),
+                tracing::info_span!("bifrost.forge.maintenance.pass", role = "server"),
+            )
+            .await;
+            #[cfg(feature = "test-support")]
+            self.record_completed_pass();
         }
-        if let Err(error) = self.leadership.resign().await {
-            tracing::warn!(error = %error, "Forge leader term was not resigned; it will expire");
-        }
-        Ok(())
     }
 
     /// Promotes what one hinted table owes on this coordinator.
@@ -237,16 +273,13 @@ impl Forge {
         }
     }
 
-    /// Runs one heartbeat or planning pass and publishes readiness.
+    /// Runs one heartbeat pass and publishes readiness.
     ///
-    /// Every pass first renews or contends for the leader term. A replica that
-    /// finds another live leader is a healthy standby. The term holder sweeps
-    /// promotion debt on acquisition and on every planning pass, and runs the
-    /// demand-driven table planning on planning passes.
+    /// Every pass renews or contends for the leader term. A replica that
+    /// finds another live leader is a healthy standby; the term holder then
+    /// sweeps promotion debt.
     async fn run_pass(
         &self,
-        pass: ForgePass,
-        scheduler: &mut ForgeScheduler<'_>,
         executor: &ForgeWorker,
         stop: &CancellationToken,
         readiness: &super::ForgeRoleReadiness,
@@ -256,76 +289,42 @@ impl Forge {
             result = tracing::field::Empty,
             role = "server",
         );
-        let result = tracing::Instrument::instrument(
-            self.lead(pass, scheduler, executor, stop),
-            span.clone(),
-        )
-        .await;
+        let result = tracing::Instrument::instrument(self.lead(executor, stop), span.clone()).await;
         match result {
-            Ok(None) => {
-                span.record("result", "standby");
+            Ok(leader) => {
+                span.record("result", if leader { "succeeded" } else { "standby" });
                 readiness.publish(true);
-            }
-            Ok(Some(complete)) => {
-                span.record("result", "succeeded");
-                // A standby is healthy; only a leader whose pass stopped at its
-                // per-wake budget, leaving demand unplanned, is unready.
-                readiness.publish(complete);
             }
             Err(error) => {
                 span.record("result", "failed");
-                tracing::error!(error = %error, ?pass, "Forge leader pass failed");
+                tracing::error!(error = %error, "Forge leader pass failed");
                 // Cleared before the next pass, so a coordinator whose
                 // dependency failed stops being routed to immediately.
                 readiness.publish(false);
             }
         }
-        #[cfg(feature = "test-support")]
-        if matches!(pass, ForgePass::Planning) {
-            self.record_completed_pass();
-        }
     }
 
-    /// Holds the leader term for one pass and runs the leader's work.
+    /// Holds the leader term for one heartbeat and sweeps promotion debt.
     ///
-    /// Returns `None` when this replica is a standby after the pass, or
-    /// whether the leader's pass planned all of its demand.
+    /// Returns whether this replica holds the term after the pass.
     ///
     /// # Errors
     ///
-    /// Returns election, promotion-debt read and demand-planning failures.
+    /// Returns election and promotion-debt read failures.
     async fn lead(
         &self,
-        pass: ForgePass,
-        scheduler: &mut ForgeScheduler<'_>,
         executor: &ForgeWorker,
         stop: &CancellationToken,
-    ) -> Result<Option<bool>, ForgeError> {
-        let acquired = self.leadership.heartbeat().await?;
+    ) -> Result<bool, ForgeError> {
+        self.leadership.heartbeat().await?;
         if self.leadership.held().is_none() {
-            return Ok(None);
+            return Ok(false);
         }
-        let planning = matches!(pass, ForgePass::Planning);
-        let owed = if acquired || planning {
-            self.sweep_promotion_debt(executor, stop).await?
-        } else {
-            false
-        };
-        // ponytail: a pass that found promotion owed plans nothing else,
-        // keeping the old one-slot order where promotion outranks rewrite;
-        // drop it once rewrite is driven by the leader's commit tracks.
-        let mut complete = true;
-        if planning && !owed {
-            let outcome = scheduler.schedule_once(stop).await?;
-            tracing::debug!(
-                demands_seen = outcome.demands_seen,
-                tasks_enqueued = outcome.tasks_enqueued,
-                incomplete = outcome.incomplete,
-                "Forge demand planning pass completed"
-            );
-            complete = !outcome.incomplete;
-        }
-        Ok(self.leadership.held().is_some().then_some(complete))
+        // ponytail: one indexed debt read per heartbeat; gate it on
+        // acquisition plus a slower tick if the read ever shows up.
+        self.sweep_promotion_debt(executor, stop).await?;
+        Ok(self.leadership.held().is_some())
     }
 
     /// Promotes every table that still owes Scribe hot objects.
@@ -369,10 +368,23 @@ impl Forge {
         Ok(owed)
     }
 
-    /// Waits for the deterministic test trigger that requests one extra pass.
+    /// Waits for the deterministic test trigger that requests one maintenance pass.
     ///
     /// Production has no such trigger, so the future never resolves there and
-    /// the surrounding `select!` is driven only by ticks, hints, and shutdown.
+    /// the timer loop is driven only by its ticks and shutdown.
+    async fn await_triggered_maintenance(&self) {
+        #[cfg(feature = "test-support")]
+        if let Some(trigger) = &self.core.scheduler_trigger {
+            trigger.wait_for_maintenance().await;
+            return;
+        }
+        std::future::pending::<()>().await;
+    }
+
+    /// Waits for the deterministic test trigger that requests one leader pass.
+    ///
+    /// Production has no such trigger, so the future never resolves there and
+    /// the supervisor `select!` is driven only by ticks, hints, and shutdown.
     async fn await_triggered_pass(&self) {
         #[cfg(feature = "test-support")]
         if let Some(trigger) = &self.core.scheduler_trigger {

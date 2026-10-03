@@ -35,8 +35,8 @@ use vala_bifrost_redux::catalog::{
 };
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeClock, ForgeClockControl, ForgeConfig, ForgeError,
-    ForgeObjectStore, ForgeRoleReadiness, ForgeScheduler, ForgeSchedulerTrigger, ForgeTelemetry,
-    ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig,
+    ForgeObjectStore, ForgeRoleReadiness, ForgeSchedulerTrigger, ForgeTelemetry, ForgeWorker,
+    ForgeWorkerCompletionObserver, ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
@@ -51,6 +51,8 @@ use vala_bifrost_redux::scribe::{
     ScribeIngressCpuPool, ScribePersistenceConfig, ScribePersistenceCpuPool, ScribePressureConfig,
     ScribeWalIoPool,
 };
+use vala_sql::queries::forge_tasks::ForgeTasks;
+use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
 use wyrd_spec::DataTenantId;
 
 /// Bounded wait every fixture handshake uses instead of a sleep.
@@ -824,15 +826,15 @@ pub(crate) struct PromotionIntegrationFixture {
 }
 
 impl PromotionIntegrationFixture {
-    /// Plans the fixture's real promotion and returns its production worker with
-    /// the requested existing observer gates, without starting that worker yet.
+    /// Enqueues the fixture's owed promotion and returns its production worker
+    /// with the requested existing observer gates, without starting it yet.
     ///
     /// # Panics
-    /// Panics when scheduler construction, planning, or worker construction fails.
+    /// Panics when the promotion cannot be built or enqueued, or worker
+    /// construction fails.
     pub(crate) async fn plan_worker_for_test(
         &self,
         observer: ForgeWorkerCompletionObserver,
-        stop: &CancellationToken,
     ) -> ForgeWorker {
         let store = CountingObjectStore::new(Arc::clone(&self.staging));
         let forge = self.build_forge_for_test(
@@ -842,11 +844,21 @@ impl PromotionIntegrationFixture {
             observer,
             ForgeSchedulerTrigger::default(),
         );
-        ForgeScheduler::new(&forge)
-            .expect("scheduler")
-            .schedule_once(stop)
+        let identity = ForgeTaskTableIdentity::new(
+            "wyrd-redux",
+            self.binding.table_ref.namespace.as_str(),
+            &self.binding.table_ref.name,
+        )
+        .expect("fixture table identity");
+        let promotion = forge
+            .promotion_task_for_test(self.tenant, &identity)
             .await
-            .expect("plan");
+            .expect("promotion task builds")
+            .expect("the sealed rows are owed a promotion");
+        ForgeTasks::new(self.operator_pool.clone())
+            .enqueue(&promotion)
+            .await
+            .expect("the promotion enqueues");
         ForgeWorker::new(forge, ForgeWorkerConfig::default(), Uuid::now_v7()).expect("worker")
     }
 
@@ -1869,6 +1881,20 @@ impl SupervisedPromotion {
     /// Panics when the scheduler misses its deterministic bound.
     async fn schedule_once(&self) {
         let expected = self.request_pass();
+        self.await_pass(expected).await;
+    }
+
+    /// Request and await one leader maintenance pass.
+    ///
+    /// The pass runs on the production timer loop: manifest rewrite, snapshot
+    /// expiry and cleanup for the held term's maintenance members.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the pass misses its deterministic bound.
+    pub(crate) async fn maintain_only(&self) {
+        let expected = self.scheduler_trigger.completed_passes().saturating_add(1);
+        self.scheduler_trigger.request_maintenance();
         self.await_pass(expected).await;
     }
 

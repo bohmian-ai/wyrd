@@ -65,16 +65,41 @@ the other transaction part of its own commit.
 
 ## The Forge scheduler
 
-The production scheduler runs a maintenance tick at a fixed interval. Each tick
-does the following:
+Forge follows RisingWave's Iceberg maintenance model. One replica holds the
+Forge leader term, elected through a single Postgres row with a heartbeat and
+expiry. Every replica can run Forge work; only the leader decides what runs.
 
-1. Discover tenant/table pairs from `vala.file_list` using the operator pool.
-2. Sort the work by tenant and fully qualified table name so repeated ticks are
-   predictable.
-3. Resolve the table binding and acquire the lease for that tenant/table.
-4. Run the stages in order: compaction reconciliation, compaction, snapshot
-   expiry, live-set construction, and orphan GC.
-5. Release the lease even when a stage fails or shutdown cancels the tick.
+The leader's schedule lives in memory and starts empty on every new term:
+
+1. **Promotion.** On acquiring the term and on each heartbeat, the leader reads
+   outstanding `vala.file_list` promotion debt and promotes sealed staged files
+   into Iceberg. A promotion lost with a dead leader is therefore recovered by
+   its successor.
+2. **Compaction.** Each successful Iceberg commit notifies the leader, which
+   counts pending commits per table. A table becomes due when its commit count
+   or compaction interval is reached. Compactors on any replica pull due table
+   identities up to their free capacity; the worker loads the current Iceberg
+   files and plans the rewrite itself, then reports the result.
+3. **Maintenance.** An hourly leader timer (`maintenance_interval_secs`) rewrites
+   small manifests for tables that opt in, then expires snapshots, then cleans
+   up the files that expiry left unreferenced and never-published orphans. An
+   error on one table is logged and the pass continues with the next table.
+
+A table joins the maintenance sets on its next Iceberg commit after a leader
+change. Per-table Iceberg properties control the work:
+
+| Property | Default | Effect |
+| --- | --- | --- |
+| `wyrd.forge.enable-compaction` | `false` | Enables automatic data-file compaction. |
+| `wyrd.forge.enable-snapshot-expiration` | `true` | Expires snapshots older than retention (24 hours by default). |
+| `wyrd.forge.enable-manifest-rewrite` | `false` | Merges small manifests before expiry. Format-v3 tables are skipped. |
+| `commit.manifest.target-size-bytes` | 8 MiB | Manifest-rewrite target size. |
+| `commit.manifest.min-count-to-merge` | 100 | Minimum small manifests that trigger a merge. |
+
+Snapshot expiry never moves past the snapshot an in-flight compaction
+observed, and skips a table whose in-flight task observed none. The worker's
+final check still protects Oracle reader pins, unresolved operations, and the
+current head before anything is deleted.
 
 The lease scope is:
 
@@ -228,9 +253,9 @@ transition after a replacement worker has taken over.
 ## Telemetry
 
 `forge/metrics.rs` is the only Forge metric owner, and it publishes exactly the
-fifteen Prometheus families below. They answer the operational questions
-Forge is accountable for: how much work is demanded, how much is queued and how
-old it is, how much this process is doing right now, how attempts ended, how
+eleven Prometheus families below. They answer the operational questions
+Forge is accountable for: how much work is created, how much this process is
+doing right now, how attempts ended, how
 long they took, why they failed, and how much physical data moved.
 
 Everything else stays where it is already authoritative. Lease, fence, catalog,
@@ -242,7 +267,7 @@ carries a tenant, table, task, attempt, snapshot, path, or request label.
 ### Label vocabularies
 
 `task_type` names the maintenance route, and every family carries it except the
-two planning gauges and the expired-snapshot counter:
+expired-snapshot counter:
 
 | Value | What it does |
 | --- | --- |
@@ -275,20 +300,14 @@ failure:
 | `capacity_refused` | The compaction queue refused every plan for waiting-parallelism capacity or per-plan size. |
 | `internal_invariant` | An internal invariant failed; this is a defect, not a condition. |
 
-### The fifteen families
+### The eleven families
 
-Process-local families are produced by whichever replica did the work and sum
-across replicas. Coordinator-owned gauges describe one durable, cluster-wide
-fact published by the fenced planning coordinator after a complete pass — they
-must be read with `max`, never summed.
+Every family is process-local: it is produced by whichever replica did the work
+and sums across replicas.
 
 | Family | Type | Labels | Updated when | Zero and absence | Owner |
 | --- | --- | --- | --- | --- | --- |
-| `bifrost_forge_planning_demands` | gauge | — | After a complete fenced planning pass | Always exported; zero means no outstanding demand | Coordinator-owned |
-| `bifrost_forge_oldest_planning_demand_timestamp_seconds` | gauge | — | After a complete fenced planning pass | Always exported; zero means no outstanding demand | Coordinator-owned |
-| `bifrost_forge_tasks_created_total` | counter | `task_type` | After the enqueue transaction commits, once per inserted row | Absent until a task of that type is created; conflicted plans count nothing | Coordinator-owned |
-| `bifrost_forge_pending_tasks` | gauge | `task_type` | After a complete fenced planning pass | All five types always exported; zero means an empty queue | Coordinator-owned |
-| `bifrost_forge_oldest_pending_task_timestamp_seconds` | gauge | `task_type` | After a complete fenced planning pass | All five types always exported; zero means nothing is pending | Coordinator-owned |
+| `bifrost_forge_tasks_created_total` | counter | `task_type` | After the task row is inserted, once per inserted row | Absent until a task of that type is created; conflicted plans count nothing | Process-local |
 | `bifrost_forge_active_tasks` | gauge | `task_type` | Incremented on a successful claim, decremented when the attempt's guard drops | All five types always exported; a non-zero steady state is a leak | Process-local |
 | `bifrost_forge_task_attempts_total` | counter | `task_type`, `result` | From the result the worker's settlement transaction committed; the durable row is read back only when that outcome is unknown to the worker (slot-fatal error, a release that matched no row, or a claim retained after an effect) | Absent until an attempt of that pair settles | Process-local |
 | `bifrost_forge_task_duration_seconds` | histogram | `task_type`, `result` | With the attempt counter; measures claim through durable result | Absent until an attempt of that pair settles; excludes queue time | Process-local |
@@ -299,10 +318,6 @@ must be read with `max`, never summed.
 | `bifrost_forge_output_bytes_total` | counter | `task_type` | After a committed or recovered effect | Absent until an effect publishes bytes | Process-local |
 | `bifrost_forge_deleted_objects_total` | counter | `task_type` | At the delete boundary itself, once per accepted delete of a freshly proven-present, eligible object | Pre-delete-missing, refused, and already-absent recovery paths count nothing | Process-local |
 | `bifrost_forge_snapshots_expired_total` | counter | — | After committed or recovered expiration settlement | Counts individual snapshots, not tasks | Process-local |
-
-The two timestamp gauges publish the stored Unix second, never an age computed
-at publication time. Query the age with `time() - <gauge>` so it keeps growing
-if the coordinator itself stalls.
 
 ### Dashboard examples
 
@@ -321,10 +336,6 @@ histogram_quantile(
   sum by (le, task_type) (rate(bifrost_forge_task_duration_seconds_bucket[15m]))
 )
 
-# Age of the oldest pending task, and of the oldest planning demand.
-time() - max by (task_type) (bifrost_forge_oldest_pending_task_timestamp_seconds > 0)
-time() - max(bifrost_forge_oldest_planning_demand_timestamp_seconds > 0)
-
 # Physical throughput and deletion rate.
 sum by (task_type) (rate(bifrost_forge_input_bytes_total[5m]))
 sum by (task_type) (rate(bifrost_forge_output_bytes_total[5m]))
@@ -332,16 +343,13 @@ sum by (task_type) (rate(bifrost_forge_deleted_objects_total[5m]))
 
 # Orphan-cleanup progress.
 sum(rate(bifrost_forge_deleted_objects_total{task_type="orphan_cleanup"}[30m]))
-time() - max(bifrost_forge_oldest_pending_task_timestamp_seconds{task_type="orphan_cleanup"} > 0)
 
 # Role readiness and process liveness.
 min by (role) (bifrost_role_ready)
 up{job="wyrd"}
 ```
 
-Process counters, histograms, and the active-task gauge sum across replicas.
-The coordinator-owned gauges describe one fenced durable observation, so
-summing them multiplies the same fact by the number of scrapers; use `max`.
+Counters, histograms, and the active-task gauge sum across replicas.
 
 ### Why there is no orphan-backlog gauge
 
@@ -349,8 +357,8 @@ An orphan backlog is only knowable by scanning object storage against the live
 table set. That scan is expensive, is not current by the time it finishes, and
 a partial scan produces a number that is not safely comparable to the previous
 one or aggregatable across replicas — publishing it invites alerts on an
-artifact of scan progress. Watch orphan cleanup instead through the age of its
-oldest pending task, its attempt and failure rates, its physical delete rate,
+artifact of scan progress. Watch orphan cleanup instead through its attempt and
+failure rates, its physical delete rate,
 role readiness, the cleanup traces, and the durable GC cursor rows, all of
 which are exact at the moment they are written.
 
@@ -359,9 +367,7 @@ which are exact at the moment they are written.
 `GET /metrics` is the Prometheus scrape endpoint. It is served by Wyrd's
 separate metrics listener, enabled by default and normally bound to loopback on
 the HTTP port plus one. In a split deployment, scrape every server replica and
-every Forge-worker replica: each publishes the process-local families for the
-work it did, and each publishes the coordinator-owned gauges only while it
-holds the planning fence.
+every Forge-worker replica: each publishes the families for the work it did.
 
 That endpoint is unrelated to OTLP ingestion at `POST /v1/metrics`, which
 accepts metrics from your own instrumented applications, and to stored
@@ -373,8 +379,9 @@ The implementation follows the lifecycle described above:
 
 | File | Responsibility |
 | --- | --- |
-| `forge/scheduler.rs` | Supervised scheduler loop, tick cadence, hint intake, and shutdown. |
-| `forge/planning_scheduler.rs` | Discovery, demand arbitration, and durable task enqueue. |
+| `forge/scheduler.rs` | Leader heartbeat, promotion sweep, hint intake, the maintenance timer, and shutdown. |
+| `forge/leader.rs` | The leader's in-memory compaction tracks, pulls, reports, and maintenance membership. |
+| `forge/gc.rs` | The leader maintenance pass: manifest rewrite, snapshot expiry, and cleanup. |
 | `forge/worker.rs` | Claim, fenced dispatch, settlement, and recovery reconciliation. |
 | `forge/planner.rs` | Candidate selection and durable task identity. |
 | `forge/metrics.rs` | The sole Forge metric owner and its closed label schema. |

@@ -31,8 +31,9 @@ struct ExpiryState {
     claims: i64,
     /// Current operation phase, if the projection row exists.
     operation_phase: Option<String>,
-    /// Current planning-demand generation for the table.
-    demand_generation: Option<i64>,
+    /// Whether a committed expiration left a cleanup handoff for the
+    /// leader's next maintenance pass to consume.
+    cleanup_handoff: bool,
 }
 
 /// Reads the complete durable expiration state for one task and table.
@@ -63,21 +64,23 @@ async fn expiry_state(fixture: &PromotionIntegrationFixture, task_id: Uuid) -> E
     .fetch_optional(pool)
     .await
     .expect("operation phase");
-    let demand_generation: Option<i64> = sqlx::query_scalar(
-        "SELECT generation FROM vala.forge_planning_demands \
-         WHERE data_tenant_id = $1 AND namespace_name = $2 AND table_name = $3",
+    let identity = vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity::new(
+        "wyrd-redux",
+        fixture.binding.table_ref.namespace.as_str(),
+        &fixture.binding.table_ref.name,
     )
-    .bind(fixture.tenant.as_uuid())
-    .bind(fixture.binding.table_ref.namespace.as_str())
-    .bind(&fixture.binding.table_ref.name)
-    .fetch_optional(pool)
-    .await
-    .expect("planning demand");
+    .expect("fixture table identity");
+    let cleanup_handoff =
+        vala_sql::queries::forge_tasks::ForgeTasks::new(fixture.operator_pool.clone())
+            .unconsumed_expiration_handoff(fixture.tenant, &identity)
+            .await
+            .expect("cleanup handoff read")
+            .is_some();
     ExpiryState {
         task_state,
         claims,
         operation_phase,
-        demand_generation,
+        cleanup_handoff,
     }
 }
 
@@ -251,7 +254,7 @@ async fn prepared_claim_releases_sql_before_iceberg_and_hands_exact_names_to_cle
         supervised,
         control: _control,
         watermark,
-    } = expirable_table("expiry_bracket", false).await;
+    } = expirable_table("expiry_bracket").await;
     let forge = supervised.forge();
 
     reject_releases_every_claim(&fixture, &seam, &store, &forge, watermark).await;
@@ -274,7 +277,10 @@ async fn prepared_claim_releases_sql_before_iceberg_and_hands_exact_names_to_cle
         .execute(fixture.operator_pool.pool())
         .await
         .expect("a new owner takes the prepared task over");
-    let before_demand = prepared.demand_generation;
+    assert!(
+        !prepared.cleanup_handoff,
+        "a prepared expiration hands nothing off"
+    );
     let deletes_before = store.deletes();
     let evidence = forge
         .run_snapshot_expiry_for_test(&fixture.binding, settle_task, attempt, settling_worker)
@@ -291,9 +297,8 @@ async fn prepared_claim_releases_sql_before_iceberg_and_hands_exact_names_to_cle
     assert_eq!(settled.claims, 0);
     assert_eq!(settled.operation_phase.as_deref(), Some("committed"));
     assert!(
-        settled.demand_generation > before_demand,
-        "settlement creates cleanup demand: {before_demand:?} -> {:?}",
-        settled.demand_generation
+        settled.cleanup_handoff,
+        "settlement hands its cleanup to the leader's next pass"
     );
     assert_eq!(
         store.deletes(),
@@ -343,16 +348,11 @@ pub(super) async fn head_watermark(fixture: &PromotionIntegrationFixture) -> (i6
 
 /// Promotes twice and ages the clock so the older snapshot is expirable.
 ///
-/// `worker_routed` enables the fixture's `snapshot_expiry_enabled` config so a
-/// maintenance dispatch reaches the expiry owner. It is a fixture capability
-/// flag, not production phase activation, which TASK-055 still owns.
-///
 /// # Panics
 ///
 /// Panics when the fixture cannot promote twice or the table has no head.
-pub(super) async fn expirable_table(name: &str, worker_routed: bool) -> ExpirableTable {
-    let mut fixture = PromotionIntegrationFixture::start(name).await;
-    fixture.config.snapshot_expiry_enabled = worker_routed;
+pub(super) async fn expirable_table(name: &str) -> ExpirableTable {
+    let fixture = PromotionIntegrationFixture::start(name).await;
     let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
     let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
     let (clock, control) = manual_clock();
@@ -494,7 +494,7 @@ async fn retryable_catalog_failure_retains_prepared_authority() {
         supervised,
         control: _control,
         watermark,
-    } = expirable_table("expiry_lost_response", false).await;
+    } = expirable_table("expiry_lost_response").await;
     let forge = supervised.forge();
 
     let attempt = Uuid::now_v7();
@@ -563,8 +563,8 @@ async fn retryable_catalog_failure_retains_prepared_authority() {
     assert_eq!(settled.claims, 0);
     assert_eq!(settled.operation_phase.as_deref(), Some("recovered"));
     assert!(
-        settled.demand_generation > retained.demand_generation,
-        "recovered settlement creates cleanup demand"
+        !retained.cleanup_handoff && settled.cleanup_handoff,
+        "recovered settlement hands its cleanup to the leader's next pass"
     );
     assert_eq!(
         store.deletes(),
@@ -636,7 +636,7 @@ async fn worker_settled_expiration_returns_success_without_a_second_transition()
         supervised,
         control: _control,
         watermark,
-    } = expirable_table("expiry_worker_settles", true).await;
+    } = expirable_table("expiry_worker_settles").await;
     let worker = ForgeWorker::new(
         supervised.forge(),
         ForgeWorkerConfig::default(),
@@ -681,10 +681,9 @@ async fn worker_settled_expiration_returns_success_without_a_second_transition()
     assert_eq!(settled.task_state, "succeeded");
     assert_eq!(settled.claims, 0);
     assert_eq!(settled.operation_phase.as_deref(), Some("committed"));
-    assert_eq!(
-        settled.demand_generation,
-        Some(before.demand_generation.unwrap_or(0) + 1),
-        "settlement advances planning demand exactly once"
+    assert!(
+        !before.cleanup_handoff && settled.cleanup_handoff,
+        "settlement hands its cleanup to the leader's next pass"
     );
     let owner: Option<Uuid> =
         sqlx::query_scalar("SELECT claimed_by FROM vala.forge_tasks WHERE task_id = $1")
@@ -741,7 +740,7 @@ impl ConcurrentSettlementEvent {
 /// Panics when the attempt does not return success, when a terminal owner is
 /// written twice, or when any durable expiration fact is not the settled one.
 async fn settled_expiration_outranks(event: ConcurrentSettlementEvent) {
-    let table = expirable_table(event.fixture_name(), true).await;
+    let table = expirable_table(event.fixture_name()).await;
     let worker = ForgeWorker::new(
         table.supervised.forge(),
         ForgeWorkerConfig::default(),
@@ -788,10 +787,9 @@ async fn settled_expiration_outranks(event: ConcurrentSettlementEvent) {
         Some("committed"),
         "{event:?}"
     );
-    assert_eq!(
-        settled.demand_generation,
-        Some(before.demand_generation.unwrap_or(0) + 1),
-        "{event:?} advances planning demand exactly once"
+    assert!(
+        !before.cleanup_handoff && settled.cleanup_handoff,
+        "{event:?} hands its cleanup to the leader's next pass"
     );
 
     table.supervised.shutdown().await;
@@ -883,7 +881,7 @@ async fn assert_orphan_survives_expiration(
 /// owner cannot delete the same object afterwards.
 #[tokio::test]
 async fn worker_expiration_never_runs_orphan_cleanup() {
-    let fresh = expirable_table("expiry_no_orphan_fresh", true).await;
+    let fresh = expirable_table("expiry_no_orphan_fresh").await;
     let orphan = seed_never_published_object(&fresh.fixture).await;
     let deletes_before = fresh.store.deletes();
     let worker = ForgeWorker::new(
@@ -910,7 +908,7 @@ async fn worker_expiration_never_runs_orphan_cleanup() {
     assert_orphan_survives_expiration(&fresh, &orphan, deletes_before).await;
     fresh.supervised.shutdown().await;
 
-    let recovered = expirable_table("expiry_no_orphan_takeover", true).await;
+    let recovered = expirable_table("expiry_no_orphan_takeover").await;
     let orphan = seed_never_published_object(&recovered.fixture).await;
     let deletes_before = recovered.store.deletes();
     let forge = recovered.supervised.forge();

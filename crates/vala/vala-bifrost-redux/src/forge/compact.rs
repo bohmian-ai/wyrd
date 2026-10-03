@@ -29,15 +29,6 @@ pub(crate) const DEFAULT_SMALL_FILE_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 /// or registered, compacts toward the same soft target unless its own
 /// `write.target-file-size-bytes` property says otherwise.
 pub const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
-/// Default commit count past `retain_last` that makes snapshot expiry due on
-/// its own. Chosen well above ordinary per-tick compaction commit counts so a
-/// table under steady ingest still accrues history before maintenance fires,
-/// but far below `max_retained_snapshots_per_table` so history never wedges.
-const DEFAULT_MAINTENANCE_TRIGGER_SNAPSHOT_COUNT: usize = 32;
-/// Default oldest-snapshot age that makes snapshot expiry due when at least one
-/// commit exists past `retain_last`. Bounds retained-history age for a
-/// low-commit table that never reaches the count trigger.
-const DEFAULT_MAINTENANCE_TRIGGER_INTERVAL: Duration = Duration::from_hours(1);
 /// Default cap on metadata records one maintenance pass visits. Retained from
 /// the per-tick bound that previously governed every Forge pass, so a single
 /// manifest rewrite or cleanup traversal stays bounded on a fragmented table.
@@ -84,9 +75,6 @@ pub struct ForgeConfig {
     pub snapshot_retention: Duration,
     /// Number of snapshots retained along each current/ref ancestry.
     pub retain_last: usize,
-    /// Whether periodic snapshot expiry is enabled for this Forge owner.
-    pub snapshot_expiry_enabled: bool,
-    /// Whether periodic fragmented-manifest rewrite is enabled.
     /// Independent small-file candidacy threshold used by live planning.
     pub small_file_threshold_bytes: u64,
     /// Soft rewrite file target for a table without its own
@@ -96,8 +84,6 @@ pub struct ForgeConfig {
     /// changing the deployment default also moves every table that never
     /// declared an override.
     pub default_target_file_size_bytes: u64,
-    /// Maximum bytes packed into one selected manifest rewrite bin.
-    /// Minimum count required for the newest under-filled manifest bin.
     /// Age after which an unreferenced object may be deleted.
     pub orphan_gc_ttl: Duration,
     /// Maximum orphan candidates considered in one GC batch.
@@ -122,15 +108,6 @@ pub struct ForgeConfig {
     pub max_open_operations_per_table: usize,
     /// Maximum retained snapshots traversed by one reconciliation observation.
     pub max_retained_snapshots_per_table: usize,
-    /// Count of accumulated commits past `retain_last` that makes snapshot
-    /// expiry due on its own, independent of compaction backlog. Evaluated
-    /// every planning tick so maintenance can never be starved by compaction
-    /// load; see [`super::planning_scheduler`].
-    pub maintenance_trigger_snapshot_count: usize,
-    /// Age of the oldest retained snapshot past which snapshot expiry becomes
-    /// due, provided at least one commit exists past `retain_last`. Paired with
-    /// `maintenance_trigger_snapshot_count` as a count-OR-interval trigger.
-    pub maintenance_trigger_interval: Duration,
     /// Maximum object-store listing pages an orphan-GC candidate scan consumes
     /// in one run. Bounds a single run's listing work on a table whose orphan
     /// prefix holds more pages than one run should walk; a run that hits the cap
@@ -158,7 +135,6 @@ impl Default for ForgeConfig {
             audit_page_size: 256,
             snapshot_retention: Duration::from_hours(24),
             retain_last: 1,
-            snapshot_expiry_enabled: false,
             small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
             default_target_file_size_bytes: DEFAULT_TARGET_FILE_SIZE_BYTES,
             orphan_gc_ttl: Duration::from_hours(24),
@@ -169,8 +145,6 @@ impl Default for ForgeConfig {
             max_hints_per_wake: 256,
             max_open_operations_per_table: DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE,
             max_retained_snapshots_per_table: DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE,
-            maintenance_trigger_snapshot_count: DEFAULT_MAINTENANCE_TRIGGER_SNAPSHOT_COUNT,
-            maintenance_trigger_interval: DEFAULT_MAINTENANCE_TRIGGER_INTERVAL,
             orphan_gc_max_list_pages: DEFAULT_ORPHAN_GC_MAX_LIST_PAGES,
             orphan_gc_run_budget: DEFAULT_ORPHAN_GC_RUN_BUDGET,
         }
@@ -206,8 +180,6 @@ impl ForgeConfig {
             || self.max_hints_per_wake == 0
             || self.max_open_operations_per_table == 0
             || self.max_retained_snapshots_per_table == 0
-            || self.maintenance_trigger_snapshot_count == 0
-            || self.maintenance_trigger_interval.is_zero()
             || self.orphan_gc_max_list_pages == 0
             || self.orphan_gc_run_budget.is_zero()
         {

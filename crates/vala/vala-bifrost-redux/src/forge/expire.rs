@@ -21,10 +21,9 @@ use vala_sql::row_types::forge_tasks::{
     ForgeCleanupCandidate, ForgeCleanupCategory, ForgeCleanupPath, ForgeTaskEvidence,
     ForgeTaskTableIdentity, SnapshotWatermark,
 };
-use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{AuditDetail, ForgeSnapshotExpirePhase, StoragePath};
 
-use crate::catalog::{BIFROST_CATALOG_NAME, TableRef, TenantTableBinding};
+use crate::catalog::{BIFROST_CATALOG_NAME, TenantTableBinding};
 #[cfg(test)]
 use crate::namespaces::BifrostNamespace;
 
@@ -125,15 +124,6 @@ pub fn select_expirable_snapshots(
 }
 
 impl Forge {
-    /// Discover the ordered durable table set for one periodic tick.
-    ///
-    /// # Errors
-    ///
-    /// Returns a SQL error when no complete discovery set can be formed.
-    pub(super) async fn discover_tables(&self) -> Result<(Vec<ForgeTableKey>, usize), ForgeError> {
-        self.discover_tables_inner().await
-    }
-
     /// Reconcile and expire snapshots while retaining the shared table fence.
     ///
     /// # Errors
@@ -213,43 +203,7 @@ impl Forge {
     }
 }
 
-/// Discover tenant/table pairs from active durable catalog registrations.
-///
-/// Invalid rows are counted and skipped so one malformed table identity does
-/// not prevent maintenance for the remaining tables.
 impl Forge {
-    async fn discover_tables_inner(&self) -> Result<(Vec<ForgeTableKey>, usize), ForgeError> {
-        let rows = vala_sql::queries::forge_catalog_operator::list_active_tables_for_operator(
-            &self.core.operator_pool,
-        )
-        .await
-        .map_err(ForgeError::Sql)?;
-        let mut failures = 0;
-        let mut tables = Vec::new();
-        for row in rows {
-            let table: Result<ForgeTableKey, ForgeError> = (|| {
-                let tenant = DataTenantId::try_from(row.data_tenant_id).map_err(|error| {
-                    ForgeError::SnapshotExpiry {
-                        detail: error.to_string(),
-                    }
-                })?;
-                let table_ref =
-                    TableRef::parse_fqn(&row.fqn).ok_or_else(|| ForgeError::SnapshotExpiry {
-                        detail: format!("invalid registered Bifrost FQN `{}`", row.fqn),
-                    })?;
-                Ok(ForgeTableKey { tenant, table_ref })
-            })();
-            match table {
-                Ok(table) => tables.push(table),
-                Err(error) => {
-                    failures += 1;
-                    tracing::warn!(error = %error, "Forge table discovery skipped an invalid row");
-                }
-            }
-        }
-        Ok((tables, failures))
-    }
-
     /// Reconcile this task's prepared expiry, then expire eligible snapshots.
     ///
     /// Current and reference heads, plus their retained ancestry, are protected by
@@ -1518,6 +1472,8 @@ fn expiry_operation_id(key: &ForgeTableKey, cutoff_ms: i64, selected: &[i64]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::TableRef;
+    use wyrd_spec::DataTenantId;
 
     #[test]
     fn snapshot_selection_never_includes_current_or_retained_head() {

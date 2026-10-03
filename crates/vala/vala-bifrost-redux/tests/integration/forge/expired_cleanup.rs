@@ -12,13 +12,13 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::TenantTableBinding;
 use vala_bifrost_redux::forge::{
-    Forge, ForgeError, ForgeScheduler, ForgeWorker, ForgeWorkerConfig,
+    Forge, ForgeError, ForgeWorker, ForgeWorkerConfig, cleanup_projection,
 };
 use vala_bifrost_redux::oracle::reader_pins::{
     OracleReaderAuthority, OracleReaderAuthorityConfig, RecordingEpochTerminator,
 };
 use vala_sql::queries::cluster_nodes::ClusterNodes;
-use vala_sql::queries::forge_tasks::{ForgeEnqueueBatch, ForgeTasks};
+use vala_sql::queries::forge_tasks::ForgeTasks;
 use vala_sql::queries::oracle_reader_authority::BIFROST_CATALOG_NAME;
 use vala_sql::row_types::cluster_nodes::RoleRegistration;
 use vala_sql::row_types::forge_tasks::{
@@ -87,7 +87,7 @@ async fn cursor(
 /// Panics when the expiration does not settle with candidates or the cleanup
 /// task cannot be planned and enqueued.
 async fn drained_expiration(name: &str) -> DrainedExpiration {
-    let table = expirable_table(name, true).await;
+    let table = expirable_table(name).await;
     let worker = ForgeWorker::new(
         table.supervised.forge(),
         ForgeWorkerConfig::default(),
@@ -120,33 +120,12 @@ async fn drained_expiration(name: &str) -> DrainedExpiration {
         .expect("the settled expiration left one handoff");
     assert!(!payload.cleanup_candidates.is_empty());
 
-    // The supervised production scheduler holds the singleton planning fence;
-    // ageing it out lets this test own one deterministic planning pass.
-    sqlx::query("UPDATE vala.forge_scheduler_state SET expires_at = now() - interval '1 hour'")
-        .execute(table.fixture.operator_pool.pool())
-        .await
-        .expect("the live scheduler fence ages out");
-    let owner = Uuid::now_v7();
-    let fence = tasks
-        .acquire_scheduler(owner, 30)
-        .await
-        .expect("scheduler lease")
-        .expect("uncontended fence");
-    let (demands, _) = tasks
-        .planning_demands(owner, fence, 8)
-        .await
-        .expect("demands");
-    let demand = demands
-        .into_iter()
-        .find(|value| value.table_ref == identity)
-        .expect("settlement created cleanup demand");
-    let forge = table.supervised.forge();
-    let projected: NewForgeTask = ForgeScheduler::with_owner_for_test(&forge, owner)
-        .expect("fixture scheduler")
-        .expired_cleanup_task_for_test(&demand)
-        .await
-        .expect("the fixed bounded projection builds")
-        .expect("one unconsumed handoff projects one cleanup task");
+    let key = vala_bifrost_redux::forge::ForgeTableKey {
+        tenant: table.fixture.tenant,
+        table: identity.clone(),
+    };
+    let projected: NewForgeTask =
+        cleanup_projection(&key, &payload).expect("the fixed bounded projection builds");
     assert_eq!(projected.strategy, ForgeTaskStrategy::ExpiredCleanup);
     assert_eq!(projected.base_snapshot_id, payload.committed_snapshot_id);
     assert_eq!(
@@ -154,22 +133,10 @@ async fn drained_expiration(name: &str) -> DrainedExpiration {
         payload.cleanup_candidates.len()
     );
     assert!(projected.plan.inputs.is_empty());
-
-    assert_eq!(
-        tasks
-            .enqueue_and_acknowledge(
-                owner,
-                fence,
-                &demand,
-                ForgeEnqueueBatch {
-                    executable: std::slice::from_ref(&projected),
-                },
-            )
-            .await
-            .expect("cleanup enqueue")
-            .len(),
-        1
-    );
+    tasks
+        .enqueue(&projected)
+        .await
+        .expect("the handoff admits one cleanup enqueue");
     let cleanup_id: Uuid =
         sqlx::query_scalar("SELECT task_id FROM vala.forge_tasks WHERE strategy='expired_cleanup'")
             .fetch_one(table.fixture.operator_pool.pool())

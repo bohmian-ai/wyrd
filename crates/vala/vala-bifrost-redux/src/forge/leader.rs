@@ -370,6 +370,15 @@ impl ForgeSchedule {
         }
     }
 
+    /// Re-applies one table's current settings to both maintenance sets.
+    ///
+    /// The timer calls this when a member's settings no longer enable the
+    /// maintenance it was due, so the table leaves that set until a later
+    /// commit re-enables it.
+    pub fn refresh_membership(&self, key: &ForgeTableKey, settings: &ForgeTableSettings) {
+        Self::apply_membership(&mut self.lock(), key, settings);
+    }
+
     /// Selects up to `limit` oldest due tables and dispatches them.
     ///
     /// Timed-out tasks first return to Idle, due immediately, exactly as

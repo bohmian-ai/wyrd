@@ -5520,26 +5520,25 @@ impl ForgeWorker {
                         .to_owned(),
             });
         }
-        let expiry_evidence =
-            if intent.snapshot_expiry_due && self.forge.core.config.snapshot_expiry_enabled {
-                self.forge
-                    .run_snapshot_expiry_for_table(
-                        lease,
-                        &key,
-                        binding,
-                        &ExpiryTaskAuthority {
-                            task: claim.task_id,
-                            attempt,
-                            worker: self.owner,
-                        },
-                        self.forge.core.clock.now()?,
-                        stop,
-                    )
-                    .await?
-                    .settled_evidence
-            } else {
-                None
-            };
+        let expiry_evidence = if intent.snapshot_expiry_due {
+            self.forge
+                .run_snapshot_expiry_for_table(
+                    lease,
+                    &key,
+                    binding,
+                    &ExpiryTaskAuthority {
+                        task: claim.task_id,
+                        attempt,
+                        worker: self.owner,
+                    },
+                    self.forge.core.clock.now()?,
+                    stop,
+                )
+                .await?
+                .settled_evidence
+        } else {
+            None
+        };
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
         }
@@ -8378,7 +8377,7 @@ impl ForgeWorker {
                 || evidence.deleted_candidate_count > 0,
         );
         self.tasks
-            .terminal_and_request_replan(
+            .terminal_success(
                 &mut terminal,
                 ForgeTaskTransition {
                     task_id: claim.task_id,
@@ -8422,7 +8421,7 @@ impl ForgeWorker {
             .await
             .map_err(ForgeError::Sql)?;
         self.tasks
-            .terminal_and_request_replan(&mut terminal, transition, table_ref, progress_effect)
+            .terminal_success(&mut terminal, transition, table_ref, progress_effect)
             .await
             .map_err(ForgeError::Sql)?;
         lease.assert_transaction_fence(&mut terminal).await?;
@@ -8480,8 +8479,6 @@ impl ForgeWorker {
         }
         conn.commit().await.map_err(ForgeError::Sql)?;
         Self::record_settled_failure(claim, ForgeFailureClass::DataRefusal);
-        self.request_replan(claim.data_tenant_id, &claim.table_ref)
-            .await?;
         Ok(durable_task_result((ForgeTaskState::Failed, class)).unwrap_or(ForgeTaskResult::Failed))
     }
 
@@ -8658,11 +8655,11 @@ impl ForgeWorker {
         conn.commit().await.map_err(ForgeError::Sql)
     }
 
-    /// Atomically cancels a superseded claim and creates its successor demand.
+    /// Atomically cancels a superseded claim; the leader's next pass replans.
     ///
     /// # Errors
     ///
-    /// Returns tenant transaction, exact lifecycle, audit, release, demand,
+    /// Returns tenant transaction, exact lifecycle, audit, release,
     /// or commit errors. Rollback preserves the original claim for repair.
     async fn cancel_superseded(&self, claim: &ForgeTaskClaim) -> Result<(), ForgeError> {
         let mut conn = self
@@ -8677,29 +8674,6 @@ impl ForgeWorker {
             .await
             .map_err(ForgeError::Sql)?;
         conn.commit().await.map_err(ForgeError::Sql)
-    }
-
-    /// Re-enqueues authoritative planning after one terminal table mutation.
-    ///
-    /// # Errors
-    ///
-    /// Returns SQL errors when the durable periodic demand cannot be advanced.
-    async fn request_replan(
-        &self,
-        data_tenant_id: DataTenantId,
-        table_ref: &ForgeTaskTableIdentity,
-    ) -> Result<(), ForgeError> {
-        let table = ForgeTaskTableIdentity::new(
-            table_ref.catalog.clone(),
-            table_ref.namespace.clone(),
-            table_ref.table.clone(),
-        )
-        .map_err(ForgeError::Sql)?;
-        self.tasks
-            .upsert_periodic(data_tenant_id, &table)
-            .await
-            .map(|_| ())
-            .map_err(ForgeError::Sql)
     }
 
     /// Reports whether the loaded current snapshot is the exact task commit.

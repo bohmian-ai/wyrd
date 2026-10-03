@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use metrics::Gauge;
-use num_traits::ToPrimitive;
 use vala_sql::row_types::forge_tasks::{ForgeFailureClass, ForgeTaskStrategy};
 
 /// Every `task_type` label Forge publishes, in durable strategy order.
@@ -30,12 +29,8 @@ pub(super) const TASK_TYPES: [ForgeTaskStrategy; 5] = [
 
 /// The exact public Forge family inventory, used by documentation coverage.
 #[cfg(test)]
-pub(super) const FORGE_METRIC_FAMILIES: [&str; 15] = [
-    "bifrost_forge_planning_demands",
-    "bifrost_forge_oldest_planning_demand_timestamp_seconds",
+pub(super) const FORGE_METRIC_FAMILIES: [&str; 11] = [
     "bifrost_forge_tasks_created_total",
-    "bifrost_forge_pending_tasks",
-    "bifrost_forge_oldest_pending_task_timestamp_seconds",
     "bifrost_forge_active_tasks",
     "bifrost_forge_task_attempts_total",
     "bifrost_forge_task_duration_seconds",
@@ -85,20 +80,6 @@ impl ForgeTaskResult {
     }
 }
 
-/// One authoritative pending-task observation for a single work type.
-///
-/// Produced by a complete durable scan and published together with its peers
-/// so an absent work type still exports an explicit zero.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct ForgePendingTasks {
-    /// Work type this observation describes.
-    pub(super) task_type: ForgeTaskStrategy,
-    /// Count of rows whose state is exactly `ready` or `retryable`.
-    pub(super) count: u64,
-    /// Unix seconds of the oldest such row's `ready_at`, or zero when none.
-    pub(super) oldest_ready_at_unix: i64,
-}
-
 /// Registered Forge metric handles retained by one Forge owner.
 ///
 /// Only the gauges are registered here, because a gauge must export an
@@ -106,31 +87,15 @@ pub(super) struct ForgePendingTasks {
 /// are obtained at their emission site so Forge never publishes a series for a
 /// label combination no production event ever produced.
 pub struct ForgeTelemetry {
-    /// Unacknowledged planning demands after a complete fenced scan.
-    planning_demands: Gauge,
-    /// Unix seconds of the oldest unacknowledged planning demand.
-    oldest_planning_demand: Gauge,
-    /// `Ready` or `Retryable` durable tasks by work type.
-    pending_tasks: BTreeMap<ForgeTaskStrategy, Gauge>,
-    /// Unix seconds of the oldest pending task's `ready_at` by work type.
-    oldest_pending_task: BTreeMap<ForgeTaskStrategy, Gauge>,
     /// Attempts this process currently holds unsettled, by work type.
     active_tasks: BTreeMap<ForgeTaskStrategy, Gauge>,
 }
 
 impl ForgeTelemetry {
-    /// Registers the seven gauges that must export zero before first use.
+    /// Registers the per-task-type active gauges that must export zero first.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            planning_demands: zeroed_gauge("bifrost_forge_planning_demands"),
-            oldest_planning_demand: zeroed_gauge(
-                "bifrost_forge_oldest_planning_demand_timestamp_seconds",
-            ),
-            pending_tasks: zeroed_task_type_gauges("bifrost_forge_pending_tasks"),
-            oldest_pending_task: zeroed_task_type_gauges(
-                "bifrost_forge_oldest_pending_task_timestamp_seconds",
-            ),
             active_tasks: zeroed_task_type_gauges("bifrost_forge_active_tasks"),
         }
     }
@@ -226,32 +191,6 @@ impl ForgeTelemetry {
         metrics::counter!("bifrost_forge_snapshots_expired_total").increment(snapshots);
     }
 
-    /// Publishes the authoritative planning demand count and oldest timestamp.
-    ///
-    /// The timestamp is the stored demand time in Unix seconds, never an age
-    /// recomputed at publication, so `time() - timestamp` keeps growing if this
-    /// producer later stalls.
-    pub(super) fn publish_planning_status(&self, demands: u64, oldest_requested_at_unix: i64) {
-        self.planning_demands.set(exact(demands));
-        self.oldest_planning_demand
-            .set(oldest_requested_at_unix.to_f64().unwrap_or(0.0));
-    }
-
-    /// Publishes pending counts and oldest `ready_at` for every work type.
-    ///
-    /// Work types absent from `observations` publish explicit zeroes, so an
-    /// emptied queue is visible rather than a stale retained value.
-    pub(super) fn publish_pending_tasks(&self, observations: &[ForgePendingTasks]) {
-        for task_type in TASK_TYPES {
-            let observed = observations
-                .iter()
-                .find(|observation| observation.task_type == task_type);
-            self.pending_tasks[&task_type].set(observed.map_or(0.0, |o| exact(o.count)));
-            self.oldest_pending_task[&task_type]
-                .set(observed.map_or(0.0, |o| o.oldest_ready_at_unix.to_f64().unwrap_or(0.0)));
-        }
-    }
-
     /// Opens one balanced active-task guard for the duration of an attempt.
     ///
     /// The gauge is incremented here and decremented exactly once when the
@@ -293,13 +232,6 @@ impl Drop for ForgeActiveTask {
     }
 }
 
-/// Registers one unlabelled gauge and publishes its explicit zero.
-fn zeroed_gauge(name: &'static str) -> Gauge {
-    let gauge = metrics::gauge!(name);
-    gauge.set(0.0);
-    gauge
-}
-
 /// Registers one gauge per `task_type` and publishes each explicit zero.
 fn zeroed_task_type_gauges(name: &'static str) -> BTreeMap<ForgeTaskStrategy, Gauge> {
     TASK_TYPES
@@ -310,14 +242,6 @@ fn zeroed_task_type_gauges(name: &'static str) -> BTreeMap<ForgeTaskStrategy, Ga
             (task_type, gauge)
         })
         .collect()
-}
-
-/// Converts an exact durable count to its gauge value without silent wrapping.
-///
-/// Counts beyond `f64`'s exact integer range saturate rather than wrap so a
-/// pathological value reads as implausibly large instead of plausibly small.
-fn exact(value: u64) -> f64 {
-    value.to_f64().unwrap_or(f64::MAX)
 }
 
 #[cfg(test)]
@@ -450,12 +374,6 @@ mod tests {
                 ForgeTelemetry::record_task_failure(ForgeTaskStrategy::SmallFiles, reason);
             }
             ForgeTelemetry::record_snapshots_expired(3);
-            telemetry.publish_planning_status(4, 1_767_312_000);
-            telemetry.publish_pending_tasks(&[ForgePendingTasks {
-                task_type: ForgeTaskStrategy::SmallFiles,
-                count: 2,
-                oldest_ready_at_unix: 1_767_311_000,
-            }]);
 
             drop(telemetry.active_task(ForgeTaskStrategy::SmallFiles));
             let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -475,8 +393,8 @@ mod tests {
         );
         assert_eq!(
             registered.gauges.len(),
-            2 + 3 * TASK_TYPES.len(),
-            "construction registers exactly the scalar and per-task-type gauges"
+            TASK_TYPES.len(),
+            "construction registers exactly the per-task-type active gauges"
         );
         for (series, value) in &registered.gauges {
             assert!(

@@ -1006,7 +1006,6 @@ impl ForgeOperations<'_> {
             Some(request.evidence),
         )
         .await?;
-        advance_planning_demand(&mut tx, tenant, request.table).await?;
 
         tx.commit().await.map_err(SqlError::from)?;
         Ok(ForgeOperationTransition::Applied)
@@ -1093,10 +1092,9 @@ impl ForgeOperations<'_> {
         self.delete_claims(&mut tx, operation_id).await?;
         self.resolve_task(&mut tx, "cancelled", request.authority, None)
             .await?;
-        let demand_generation = advance_planning_demand(&mut tx, tenant, request.table).await?;
 
         tx.commit().await.map_err(SqlError::from)?;
-        Ok(ForgeExpirationResetOutcome::Applied { demand_generation })
+        Ok(ForgeExpirationResetOutcome::Applied)
     }
 
     /// Returns this task's unresolved claims, letting reconciliation find the
@@ -1596,28 +1594,6 @@ pub(crate) async fn list_table_protection_in_operator_tx(
         records.push(record);
     }
     Ok(records)
-}
-
-/// Advances the table's periodic planning demand so a resolved expiration is
-/// never durable without a request to replan against the new metadata.
-///
-/// # Errors
-/// Returns [`SqlError::Query`] when the upsert fails.
-async fn advance_planning_demand(
-    tx: &mut Transaction<'_, Postgres>,
-    tenant: DataTenantId,
-    table: &ForgeClaimTable,
-) -> Result<i64, SqlError> {
-    sqlx::query_scalar::<_, i64>(
-        "INSERT INTO vala.forge_planning_demands (data_tenant_id,catalog_name,namespace_name,table_name,last_source) VALUES ($1,$2,$3,$4,'periodic') ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name) DO UPDATE SET last_requested_at=statement_timestamp(),last_source='periodic',generation=vala.forge_planning_demands.generation+1,acknowledged_snapshot_id=NULL,acknowledged_commit_count=NULL RETURNING generation",
-    )
-    .bind(tenant.as_uuid())
-    .bind(&table.catalog_name)
-    .bind(&table.namespace_name)
-    .bind(&table.table_name)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(SqlError::from)
 }
 
 /// Returns the exact ascending snapshot selection carried by a snapshot-expiry

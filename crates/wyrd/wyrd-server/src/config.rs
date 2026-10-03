@@ -235,7 +235,7 @@ pub struct ForgeRuntimeConfig {
     #[serde(default)]
     pub per_tenant_active_cap: Option<usize>,
     /// Age (seconds) after which old Iceberg snapshots become eligible for
-    /// expiry. Must be positive when set. Default 432000 (120 hours).
+    /// expiry. Must be positive when set. Default 86400 (24 hours).
     #[serde(default)]
     pub snapshot_retention_secs: Option<u64>,
     /// Number of snapshots retained along each current/ref ancestry. Must be
@@ -247,17 +247,6 @@ pub struct ForgeRuntimeConfig {
     /// orphan GC. Must be positive when set. Default 86400 (24 hours).
     #[serde(default)]
     pub orphan_gc_ttl_secs: Option<u64>,
-    /// Count of accumulated commits past `retain_last` that makes snapshot
-    /// expiry due on its own, independent of compaction backlog. Must be at
-    /// least 1 when set. Default 32.
-    #[serde(default)]
-    pub maintenance_trigger_snapshot_count: Option<usize>,
-    /// Oldest-retained-snapshot age (seconds) past which snapshot expiry
-    /// becomes due when at least one commit exists past `retain_last`. Paired
-    /// with `maintenance_trigger_snapshot_count` as a count-OR-interval
-    /// trigger. Must be positive when set. Default 3600 (1 hour).
-    #[serde(default)]
-    pub maintenance_trigger_interval_secs: Option<u64>,
     /// Maximum object-store listing pages one orphan-GC candidate scan walks
     /// before yielding cleanly to a successor run. Must be at least 1 when set.
     /// Default 1024.
@@ -267,8 +256,9 @@ pub struct ForgeRuntimeConfig {
     /// Partial. Must be positive when set. Default 120 (2 minutes).
     #[serde(default)]
     pub orphan_gc_run_budget_secs: Option<u64>,
-    /// Interval (seconds) between Forge maintenance scheduler ticks. Must be
-    /// positive when set. Default 60.
+    /// Interval (seconds) between the Forge leader's manifest-rewrite,
+    /// snapshot-expiry and cleanup passes. Must be positive when set.
+    /// Default 3600 (1 hour).
     #[serde(default)]
     pub maintenance_interval_secs: Option<u64>,
     /// Soft rewrite file target for every table that declares no
@@ -3727,8 +3717,6 @@ mod tests {
         assert_eq!(forge.snapshot_retention_secs, None);
         assert_eq!(forge.retain_last, None);
         assert_eq!(forge.orphan_gc_ttl_secs, None);
-        assert_eq!(forge.maintenance_trigger_snapshot_count, None);
-        assert_eq!(forge.maintenance_trigger_interval_secs, None);
         assert_eq!(forge.orphan_gc_max_list_pages, None);
         assert_eq!(forge.orphan_gc_run_budget_secs, None);
         assert_eq!(forge.maintenance_interval_secs, None);
@@ -3744,8 +3732,6 @@ per_tenant_active_cap = 2
 snapshot_retention_secs = 7200
 retain_last = 3
 orphan_gc_ttl_secs = 3600
-maintenance_trigger_snapshot_count = 8
-maintenance_trigger_interval_secs = 900
 orphan_gc_max_list_pages = 64
 orphan_gc_run_budget_secs = 30
 maintenance_interval_secs = 45
@@ -3756,8 +3742,6 @@ maintenance_interval_secs = 45
         assert_eq!(forge.snapshot_retention_secs, Some(7200));
         assert_eq!(forge.retain_last, Some(3));
         assert_eq!(forge.orphan_gc_ttl_secs, Some(3600));
-        assert_eq!(forge.maintenance_trigger_snapshot_count, Some(8));
-        assert_eq!(forge.maintenance_trigger_interval_secs, Some(900));
         assert_eq!(forge.orphan_gc_max_list_pages, Some(64));
         assert_eq!(forge.orphan_gc_run_budget_secs, Some(30));
         assert_eq!(forge.maintenance_interval_secs, Some(45));

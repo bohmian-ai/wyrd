@@ -17,6 +17,7 @@ pub(crate) mod error;
 pub(crate) mod expire;
 mod expiry_gates;
 mod expiry_policy;
+mod gc;
 mod identity;
 mod leader;
 mod leadership;
@@ -29,7 +30,6 @@ pub(crate) mod orphan_gc;
 mod path;
 mod phase;
 mod planner;
-mod planning_scheduler;
 mod protection_roots;
 pub(crate) mod publication;
 mod reader_protection;
@@ -59,7 +59,6 @@ pub use managed::{
 };
 pub use metrics::ForgeTelemetry;
 pub use planner::{ForgePlanCandidate, PlannedForgeTask};
-pub use planning_scheduler::{ForgeScheduleOutcome, ForgeScheduler};
 #[cfg(feature = "test-support")]
 pub use scheduler::ForgeSchedulerTrigger;
 pub use settings::{ForgeCompactionType, ForgeTableSettings};
@@ -69,6 +68,8 @@ pub use worker::{ForgeWorker, ForgeWorkerConfig};
 
 #[cfg(feature = "test-support")]
 pub use expiry_gates::ExpiryTestControls;
+#[cfg(feature = "test-support")]
+pub use gc::cleanup_projection;
 #[cfg(feature = "test-support")]
 pub use lease::{ForgeLease, forge_lease_key};
 #[cfg(feature = "test-support")]
@@ -227,8 +228,6 @@ pub(crate) struct ForgeCore {
     config: ForgeConfig,
     /// Delay between periodic scheduler ticks.
     maintenance_interval: Duration,
-    /// Durable process identity that owns the singleton scheduler fence.
-    scheduler_owner: uuid::Uuid,
     /// Wall clock shared by periodic and hinted maintenance batches.
     clock: ForgeClock,
     /// Optional observer notified only after a supervised worker returns success.
@@ -283,7 +282,6 @@ impl Forge {
             object_store: build.object_store,
             config: build.config,
             maintenance_interval: build.maintenance_interval,
-            scheduler_owner: build.scheduler_owner,
             clock: build.clock,
             #[cfg(feature = "test-support")]
             completion_observer: build.completion_observer,

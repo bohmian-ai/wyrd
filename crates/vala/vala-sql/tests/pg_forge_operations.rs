@@ -1776,8 +1776,7 @@ mod pg_tests {
         /// Captured as one tuple so a corruption case can compare the complete
         /// state before and after the refusal instead of asserting each fact
         /// separately: total claim rows, the operation phase, the task state,
-        /// the tenant's highest planning-demand generation, and the audit
-        /// chain length.
+        /// and the audit chain length.
         ///
         /// # Panics
         ///
@@ -1787,7 +1786,7 @@ mod pg_tests {
             tenant: DataTenantId,
             operation_id: Uuid,
             task_id: Uuid,
-        ) -> (i64, Option<String>, String, i64, i64) {
+        ) -> (i64, Option<String>, String, i64) {
             let claims: i64 =
                 sqlx::query_scalar("SELECT count(*) FROM vala.forge_snapshot_expiration_claims")
                     .fetch_one(superuser)
@@ -1800,18 +1799,10 @@ mod pg_tests {
             .fetch_optional(superuser)
             .await
             .expect("operation phase");
-            let demand: i64 = sqlx::query_scalar(
-                "SELECT COALESCE(max(generation),-1) FROM vala.forge_planning_demands WHERE data_tenant_id=$1",
-            )
-            .bind(tenant.as_uuid())
-            .fetch_one(superuser)
-            .await
-            .expect("planning demand generation");
             (
                 claims,
                 phase,
                 task_state_of(superuser, task_id).await,
-                demand,
                 count_audit(superuser, tenant).await,
             )
         }
@@ -2000,10 +1991,11 @@ mod pg_tests {
                 .reset_snapshot_expiration(operator, tenant, &reset_request)
                 .await
                 .expect("reset applies");
-            let ForgeExpirationResetOutcome::Applied { demand_generation } = reset else {
-                panic!("first reset applies: {reset:?}");
-            };
-            assert!(demand_generation > 0, "reset advanced planning demand");
+            assert_eq!(
+                reset,
+                ForgeExpirationResetOutcome::Applied,
+                "first reset applies"
+            );
             assert_eq!(
                 count_claims(&superuser, operation_id).await,
                 0,
@@ -2107,7 +2099,7 @@ mod pg_tests {
             // current execution authority, never preparation identity, so any
             // divergence must refuse reconciliation input, reset, and
             // settlement without touching claims, operation state, the task,
-            // planning demand, or the audit chain.
+            // or the audit chain.
             let settle_reset_request = ForgeExpirationResetRequest {
                 authority: &settle_authority,
                 table: &table,
@@ -2325,7 +2317,7 @@ mod pg_tests {
                     )
                     .await,
                     before,
-                    "a refused {label} leaves claims, operation, task, demand, and audit unchanged"
+                    "a refused {label} leaves claims, operation, task, and audit unchanged"
                 );
 
                 sqlx::query(AssertSqlSafe(restore.as_str()))

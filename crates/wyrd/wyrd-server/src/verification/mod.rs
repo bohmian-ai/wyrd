@@ -9,23 +9,24 @@
 //! runtime holds no process-local registry, so any process may crash and
 //! another reclaims its leases.
 
+pub mod authority;
 mod claims;
 pub mod direct;
 pub mod drift;
 pub mod engines;
 pub mod eval;
+#[cfg(feature = "test-support")]
+pub mod fault;
 pub mod fitter;
 pub mod health;
 pub mod observations;
 pub mod operators;
 pub mod permits;
-pub mod publisher;
 pub mod results;
 pub mod runner;
 pub mod scheduler;
 pub mod telemetry;
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 #[cfg(feature = "test-support")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,12 +39,11 @@ use wyrd_sql::queries::verifier_runs::VerifierRunQueue;
 use crate::state::AppState;
 
 use self::drift::DriftEngine;
+#[cfg(feature = "test-support")]
+use self::fault::PublicationFault;
 use self::fitter::BaselineFitter;
 use self::health::{RuntimeCapability, VerificationHealth};
 use self::operators::{OperatorDelivery, OperatorWorker, ProviderEndpoints};
-#[cfg(feature = "test-support")]
-use self::publisher::PublicationFault;
-use self::publisher::ResultPublisher;
 #[cfg(feature = "test-support")]
 use self::runner::EngineScript;
 use self::runner::{VerifierEngines, VerifierRunner};
@@ -228,7 +228,6 @@ impl VerificationRuntime {
             state,
             limits: RuntimeLimits::default(),
             providers: None,
-            ingest_endpoint: None,
             endpoints: ProviderEndpoints::default(),
             #[cfg(feature = "test-support")]
             publication_fault: None,
@@ -305,14 +304,12 @@ impl VerificationRuntime {
 /// Composes a [`VerificationRuntime`] from server state and wiring choices.
 pub struct VerificationRuntimeBuilder<'a> {
     /// Server state supplying the Wyrd Postgres owner, the operator pool,
-    /// the token issuer, and health.
+    /// the capture writer, and health.
     state: &'a AppState,
     /// Runtime bounds.
     limits: RuntimeLimits,
     /// Model providers Eval judges call; the state's judge providers when `None`.
     providers: Option<Arc<skald_runtime::ProviderRegistry>>,
-    /// Scribe-bearing gRPC endpoint results are published through.
-    ingest_endpoint: Option<String>,
     /// Slack and PagerDuty endpoints Operators deliver to.
     endpoints: ProviderEndpoints,
     /// Test-only publication faults.
@@ -342,37 +339,6 @@ impl VerificationRuntimeBuilder<'_> {
         self
     }
 
-    /// Publish results through `endpoint`, a Scribe-bearing gRPC URL.
-    #[must_use]
-    pub fn ingest_endpoint(mut self, endpoint: String) -> Self {
-        self.ingest_endpoint = Some(endpoint);
-        self
-    }
-
-    /// Publish results through this process's own gRPC listener at `addr`.
-    ///
-    /// Applies only when no explicit endpoint was configured and this process
-    /// hosts a Scribe; the listener is always plaintext because public TLS
-    /// terminates at the edge. Otherwise the runner stays uncomposed unless an
-    /// explicit endpoint is set.
-    #[must_use]
-    pub fn local_ingest(mut self, addr: Option<SocketAddr>) -> Self {
-        if self.ingest_endpoint.is_none()
-            && self.state.bifrost_ingest().is_some()
-            && let Some(mut addr) = addr
-        {
-            if addr.ip().is_unspecified() {
-                addr.set_ip(if addr.is_ipv4() {
-                    Ipv4Addr::LOCALHOST.into()
-                } else {
-                    Ipv6Addr::LOCALHOST.into()
-                });
-            }
-            self.ingest_endpoint = Some(format!("http://{addr}"));
-        }
-        self
-    }
-
     /// Deliver fixed-provider Operators to `endpoints` (mock providers).
     #[cfg(feature = "test-support")]
     #[must_use]
@@ -381,7 +347,7 @@ impl VerificationRuntimeBuilder<'_> {
         self
     }
 
-    /// Inject test-only publication faults.
+    /// Write results through `fault` wrapped around this pod's own Scribe.
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn publication_fault(mut self, fault: PublicationFault) -> Self {
@@ -410,12 +376,12 @@ impl VerificationRuntimeBuilder<'_> {
     ///
     /// The scheduler and the Drift baseline fitter need the operator pool;
     /// the fitter also reads Data Card artifacts from server storage. The
-    /// runner additionally needs the tenant token issuer and an ingest
-    /// endpoint, and reads Drift observations through the ordinary query
-    /// service, local or peer-forwarded; without the issuer or endpoint it is not
-    /// composed and therefore not required, so health is not degraded by an
-    /// intentionally absent capability. Every composed capability is marked
-    /// required on the shared health.
+    /// runner additionally needs the process's capture writer to reach a
+    /// Scribe, in-process or over the peer plane, and reads its inputs through
+    /// the ordinary query service, local or peer-forwarded; without a
+    /// reachable Scribe it is not composed and therefore not required, so
+    /// health is not degraded by an intentionally absent capability. Every
+    /// composed capability is marked required on the shared health.
     #[must_use]
     pub fn build(self) -> Option<VerificationRuntime> {
         let Some(operator) = self.state.postgres.operator_pool() else {
@@ -466,55 +432,46 @@ impl VerificationRuntimeBuilder<'_> {
             Capability::Fitter(Arc::new(fitter)),
             Capability::OperatorWorker(Arc::new(worker)),
         ];
-        match (self.state.auth.tenant_issuer(), self.ingest_endpoint) {
-            (Some(issuer), Some(endpoint)) => {
-                let drift = DriftEngine::new(
-                    self.state.clone(),
-                    issuer.clone(),
-                    self.limits.execution_timeout,
-                );
-                let publisher = ResultPublisher::new(postgres.clone(), issuer, endpoint);
-                #[cfg(feature = "test-support")]
-                let publisher = match self.publication_fault {
-                    Some(fault) => publisher.with_fault(fault),
-                    None => publisher,
-                };
-                let runner = VerifierRunner::new(
-                    postgres.clone(),
-                    operator,
-                    queue,
-                    publisher,
-                    VerifierEngines::new(
-                        drift,
-                        self::eval::EvalEngine::new(
-                            self.state.clone(),
-                            self.providers
-                                .unwrap_or_else(|| Arc::clone(&self.state.judge_providers)),
-                            self.limits.trace_deadline,
-                        ),
+        let writer = Arc::clone(&self.state.gateway_capture);
+        #[cfg(feature = "test-support")]
+        let writer = match (self.publication_fault, self.state.bifrost.scribe()) {
+            (Some(fault), Some(scribe)) => {
+                Arc::new(crate::components::gateway::GatewayCapture::local(Arc::new(
+                    fault.wrap(Arc::clone(scribe.scribe()) as _),
+                )))
+            }
+            _ => writer,
+        };
+        if writer.reaches_scribe() {
+            let runner = VerifierRunner::new(
+                postgres.clone(),
+                operator,
+                queue,
+                writer,
+                VerifierEngines::new(
+                    DriftEngine::new(self.state.clone(), self.limits.execution_timeout),
+                    self::eval::EvalEngine::new(
+                        self.state.clone(),
+                        self.providers
+                            .unwrap_or_else(|| Arc::clone(&self.state.judge_providers)),
+                        self.limits.trace_deadline,
                     ),
-                    self.limits,
-                );
-                #[cfg(feature = "test-support")]
-                let runner = match self.engine_script {
-                    Some(script) => runner.with_engine_script(script),
-                    None => runner,
-                };
-                #[cfg(feature = "test-support")]
-                let runner = match self.crash {
-                    Some(crash) => runner.with_crash(crash),
-                    None => runner,
-                };
-                capabilities.push(Capability::Runner(Arc::new(runner)));
-            }
-            (None, _) => {
-                tracing::warn!("Verifier runner not composed: no tenant token issuer");
-            }
-            (_, None) => {
-                tracing::warn!(
-                    "Verifier runner not composed: no Scribe-bearing ingest endpoint; set verification.ingest_endpoint"
-                );
-            }
+                ),
+                self.limits,
+            );
+            #[cfg(feature = "test-support")]
+            let runner = match self.engine_script {
+                Some(script) => runner.with_engine_script(script),
+                None => runner,
+            };
+            #[cfg(feature = "test-support")]
+            let runner = match self.crash {
+                Some(crash) => runner.with_crash(crash),
+                None => runner,
+            };
+            capabilities.push(Capability::Runner(Arc::new(runner)));
+        } else {
+            tracing::warn!("Verifier runner not composed: this pod reaches no Scribe");
         }
         let health = Arc::clone(&self.state.verification);
         for capability in &capabilities {

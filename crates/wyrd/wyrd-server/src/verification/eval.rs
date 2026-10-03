@@ -22,7 +22,8 @@ use serde_json::{Map, Value, json};
 use skald_runtime::ProviderRegistry;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
-use vala_bifrost_redux::oracle::AuthorizedQueryContext;
+use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::namespaces::BifrostNamespace;
 
 use vala_eval::orchestrator::{
     AgentCardResolver, MediaResolver, OrchestratorError, PromptCardResolver, ScenarioScoring,
@@ -32,12 +33,7 @@ use vala_eval::sampling::RecordSample;
 use vala_eval::{
     EvalExecError, EvalReport, InMemoryTraceSource, JudgeError, JudgeInvoker, MediaBindings,
 };
-use vala_sql::queries::olap_catalog::get_by_fqn;
-use wyrd_runtime::permission::PermissionSet;
-use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
-use wyrd_runtime::{
-    Action, BifrostPermissionScope, BifrostTableScope, Permission, PermissionScope,
-};
+use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::agent::AgentSpec;
 
@@ -46,11 +42,9 @@ use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::VerificationRunId;
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::reference::InlineableRef;
-use wyrd_spec::request_id::RequestId;
 use wyrd_spec::storage::StorageBackendKind;
-use wyrd_spec::vala::api::{AuthMethod, BifrostQueryRequest};
+use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::eval::media::MediaRef as EvalMediaRef;
 use wyrd_spec::vala::eval::record::EvalRecordObservation;
@@ -60,7 +54,6 @@ use wyrd_spec::vala::trace::{
     InstrumentationScope, Resource, SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus,
 };
 use wyrd_spec::verification::{VerificationError, VerificationVerdict};
-use wyrd_sql::queries::auth::system_principal_id;
 use wyrd_sql::queries::cards::{get_card_by_ref, get_card_by_uid};
 use wyrd_sql::queries::verifier_runs::{ClaimedRun, RunInput, TerminalStatus};
 use wyrd_storage::tenant_path;
@@ -68,6 +61,7 @@ use wyrd_storage::{StorageError, StorageHandle};
 use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValueList, any_value};
 use wyrd_tonic::prost::Message as _;
 
+use super::authority::{SystemReadAuthority, SystemReadAuthorityError};
 use super::engines::{EngineOutcome, VerifierReport};
 use super::telemetry::{ExecutionTelemetry, Phase, WaitSink};
 use crate::query::scheduled::ScheduledQueryCaller;
@@ -160,9 +154,14 @@ impl EvalEngine {
         let run_id = run.lease.run_id;
         let read = telemetry
             .phase(Phase::InputRead, async {
-                let reader = BifrostReader::new(&self.state, tenant, telemetry.waits())
-                    .await
-                    .map_err(ReadStart::Authority)?;
+                let reader = BifrostReader::new(
+                    &self.state,
+                    tenant,
+                    run.system_principal,
+                    telemetry.waits(),
+                )
+                .await
+                .map_err(ReadStart::Authority)?;
                 let record = reader
                     .record(&run.subject_card_uid.to_string(), record_id, *event_time)
                     .await
@@ -475,154 +474,50 @@ impl From<WyrdError> for ReadError {
     }
 }
 
-/// Logical schema and table of each tenant table continuous Eval reads its
-/// inputs from: committed observations and their trace spans. The System read
-/// authority reaches exactly these tables and nothing else.
-const EVAL_INPUT_TABLES: [(&str, &str); 2] = [("eval", "observations"), ("traces", "spans")];
-
-/// Why the tenant's System principal cannot be authorized to read Eval inputs.
-#[derive(Debug, thiserror::Error)]
-pub enum EvalReadAuthorityError {
-    /// The tenant has no active System principal with a `UUIDv7` id.
-    #[error("the tenant has no active System principal")]
-    SystemPrincipalMissing,
-    /// Reading the System principal or the input table identities failed.
-    #[error("the Eval read authority is unavailable: {0}")]
-    Unavailable(String),
-    /// The authorized context's tenant invariant does not hold.
-    #[error(transparent)]
-    Context(#[from] BifrostError),
-}
-
-/// The tenant's persisted System principal, authorized by the server to read
-/// exactly continuous Eval's input tables.
-///
-/// This is the same credentialless, role-free, per-tenant principal whose
-/// exact-Verifier `bifrost_record:write` token publishes verification results,
-/// with a separate server-minted read authority: one `bifrost_query:read`
-/// grant per existing [`EVAL_INPUT_TABLES`] table, scoped to that table's
-/// registered UID. It never carries a general query grant, never names a
-/// Verifier write scope, and is never issued as a token; Oracle authorizes and
-/// audits every read under it like any caller's.
-#[derive(Debug, Clone)]
-pub struct EvalReadAuthority {
-    /// The System principal's authorized query context for one tenant.
-    context: AuthorizedQueryContext,
-}
-
-impl EvalReadAuthority {
-    /// Resolve `tenant`'s System principal and mint its Eval input read scope.
-    ///
-    /// Reads the stored System principal id under the tenant's RLS bind, then
-    /// the registered UID of each Eval input table the tenant already has; a
-    /// table not yet created (a tenant's span table appears with its first
-    /// export) gets no grant, so a read of it stays not-found. Nothing is
-    /// written, so both transactions end without commit.
-    ///
-    /// # Errors
-    /// Returns [`EvalReadAuthorityError::SystemPrincipalMissing`] when the
-    /// tenant has no active `UUIDv7` System principal,
-    /// [`EvalReadAuthorityError::Unavailable`] when a control-plane read fails
-    /// or a stored table UID is malformed, and
-    /// [`EvalReadAuthorityError::Context`] when the context's tenant invariant
-    /// fails.
-    pub async fn resolve(
-        state: &AppState,
-        tenant: DataTenantId,
-    ) -> Result<Self, EvalReadAuthorityError> {
-        let unavailable =
-            |error: &dyn std::fmt::Display| EvalReadAuthorityError::Unavailable(error.to_string());
-        let mut conn = state
-            .postgres
-            .tenant_conn(tenant)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        let id = system_principal_id(&mut conn)
-            .await
-            .map_err(|error| unavailable(&error))?
-            .filter(|id| id.get_version_num() == 7)
-            .ok_or(EvalReadAuthorityError::SystemPrincipalMissing)?;
-        drop(conn);
-        let mut conn = state
-            .postgres
-            .vala()
-            .tenant_conn(tenant)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        let mut grants = Vec::with_capacity(EVAL_INPUT_TABLES.len());
-        for (schema, table) in EVAL_INPUT_TABLES {
-            let Some(row) = get_by_fqn(&mut conn, &format!("vala.{schema}.{table}"))
-                .await
-                .map_err(|error| unavailable(&error))?
-            else {
-                continue;
-            };
-            let table_uid =
-                uuid::Uuid::from_slice(&row.table_uid).map_err(|error| unavailable(&error))?;
-            grants.push(Permission {
-                resource: wyrd_runtime::Resource::BifrostQuery,
-                action: Action::Read,
-                scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
-                    catalog: "vala".to_owned(),
-                    schema: schema.to_owned(),
-                    table_uid,
-                })),
-            });
-        }
-        let principal = Principal::new(
-            PrincipalId::new(id),
-            PrincipalKind::System {
-                card_ref_scope: CardRefScope::default(),
-            },
-            tenant,
-            Vec::new(),
-            PermissionSet::from_iter(grants),
-        );
-        let context = AuthorizedQueryContext::try_new(
-            principal,
-            tenant,
-            RequestId::now_v7(),
-            None,
-            AuthMethod::Internal,
-            Permission::bifrost_query_read(),
-        )?;
-        Ok(Self { context })
-    }
-
-    /// The System principal's authorized query context.
-    #[must_use]
-    pub const fn context(&self) -> &AuthorizedQueryContext {
-        &self.context
-    }
+/// Each tenant table continuous Eval reads its inputs from: committed
+/// observations and their trace spans. The SYSTEM read authority reaches
+/// exactly these tables and nothing else.
+fn eval_input_tables() -> [TableRef; 2] {
+    [
+        TableRef::new(BifrostNamespace::Eval, "observations"),
+        TableRef::new(BifrostNamespace::Traces, "spans"),
+    ]
 }
 
 /// Tenant-scoped Bifrost reads of Eval inputs through the ordinary query entry.
 struct BifrostReader {
-    /// Caller bound to the tenant System principal's Eval input read authority.
+    /// Caller bound to the tenant SYSTEM principal's Eval input read authority.
     caller: ScheduledQueryCaller,
     /// The executing run's wait sink every query stream is recorded on.
     waits: WaitSink,
 }
 
 impl BifrostReader {
-    /// Bind a reader for `tenant` to its [`EvalReadAuthority`], recording
-    /// the authority resolution and every later query on `waits`.
+    /// Bind a reader for `tenant` to the SYSTEM read authority over
+    /// [`eval_input_tables`], recording the authority resolution and every
+    /// later query on `waits`.
     ///
     /// # Errors
-    /// Returns every [`EvalReadAuthority::resolve`] failure; no read is
-    /// attempted without the System principal's authority.
+    /// Returns every [`SystemReadAuthority::resolve`] failure; no read is
+    /// attempted without the SYSTEM principal's authority.
     async fn new(
         state: &AppState,
         tenant: DataTenantId,
+        principal: Option<PrincipalId>,
         waits: WaitSink,
-    ) -> Result<Self, EvalReadAuthorityError> {
+    ) -> Result<Self, SystemReadAuthorityError> {
         let authority = waits
-            .wait(EvalReadAuthority::resolve(state, tenant))
+            .wait(SystemReadAuthority::resolve(
+                state,
+                tenant,
+                principal,
+                &eval_input_tables(),
+            ))
             .await?;
         Ok(Self {
             caller: ScheduledQueryCaller::new(
                 state.clone(),
-                authority.context,
+                authority.into_context(),
                 CancellationToken::new(),
             ),
             waits,
@@ -1066,7 +961,7 @@ fn int32(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<i32>, Str
 /// The first failure of an Eval input read: authority or record.
 enum ReadStart {
     /// The System principal's read authority could not be resolved.
-    Authority(EvalReadAuthorityError),
+    Authority(SystemReadAuthorityError),
     /// The frozen record could not be read.
     Record(ReadError),
 }

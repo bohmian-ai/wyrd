@@ -199,7 +199,9 @@ const EXHAUST_EXPIRED_SQL: &str = r#"
 /// Availability, expiry, and the new lease deadline are all PostgreSQL's
 /// statement time; `$2` is only the lease length in milliseconds, so a pod
 /// whose clock differs from the database can neither claim early nor hold a
-/// lease the database believes already expired.
+/// lease the database believes already expired. The claim also returns the
+/// tenant's active SYSTEM principal, which the run's input reads and result
+/// rows are attributed to, so no later phase reads it.
 const CLAIM_RUN_SQL: &str = r#"
     WITH candidate AS (
         SELECT run_id, COALESCE(next_attempt_at, lease_expires_at) AS due_at
@@ -224,7 +226,9 @@ const CLAIM_RUN_SQL: &str = r#"
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - candidate.due_at)
                            * 1000)::bigint) AS queue_wait_ms,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - r.created_at)
-                           * 1000)::bigint) AS age_ms
+                           * 1000)::bigint) AS age_ms,
+              (SELECT a.id FROM wyrd.auth_service_accounts a
+                WHERE a.principal_kind = 'system' AND a.status = 'active') AS system_principal_id
 "#;
 
 /// Complete a leased run, or re-apply the same completion idempotently.
@@ -699,6 +703,10 @@ pub struct ClaimedRun {
     /// How long before this claim the run was created by its trigger: the
     /// claim statement's PostgreSQL instant less `created_at`. Telemetry only.
     pub age: std::time::Duration,
+    /// The tenant's active SYSTEM principal, read in the claim transaction;
+    /// `None` when the tenant has none. Result rows are attributed to it and
+    /// input reads run as it.
+    pub system_principal: Option<PrincipalId>,
 }
 
 /// Outcome of a token-fenced settlement.
@@ -1749,6 +1757,8 @@ struct ClaimedRunRow {
     queue_wait_ms: i64,
     /// Milliseconds since the run was created.
     age_ms: i64,
+    /// The tenant's active SYSTEM principal.
+    system_principal_id: Option<Uuid>,
 }
 
 impl ClaimedRunRow {
@@ -1814,6 +1824,7 @@ impl ClaimedRunRow {
                 self.queue_wait_ms,
             ))?),
             age: std::time::Duration::from_millis(stored(u64::try_from(self.age_ms))?),
+            system_principal: self.system_principal_id.map(PrincipalId::new),
         })
     }
 }

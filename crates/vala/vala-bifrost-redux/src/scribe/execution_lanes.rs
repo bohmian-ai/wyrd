@@ -744,41 +744,6 @@ fn validate_card_scope(rows: &RecordBatch, principal: &Principal) -> Result<(), 
     Ok(())
 }
 
-/// Requires every row of `rows` to carry one in-scope `card_ref`.
-///
-/// This is the mandatory form of [`validate_card_scope`] that Gate applies to
-/// the SYSTEM writer's verification-result batches before recording its one
-/// canonical write decision. Where the optional form admits an absent column
-/// or a null row as uncorrelated, a result row must be attributable, so the
-/// batch must declare exactly one `card_ref` field with no null value; every
-/// value is then parsed and authorized by the shared optional check. Scribe
-/// still runs the optional check and trusted UID stamping on admission, so
-/// this adds a precondition without replacing either.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::CardScopeDenied`] when the batch declares zero or
-/// several `card_ref` fields, any row is null, or [`validate_card_scope`]
-/// refuses the column type, a value's grammar, or its scope.
-pub(crate) fn require_card_scope(
-    rows: &RecordBatch,
-    principal: &Principal,
-) -> Result<(), ScribeError> {
-    let schema = rows.schema();
-    let mut fields = schema
-        .fields()
-        .iter()
-        .enumerate()
-        .filter(|(_, field)| field.name() == CARD_REF);
-    let (Some((index, _)), None) = (fields.next(), fields.next()) else {
-        return Err(ScribeError::CardScopeDenied);
-    };
-    if rows.column(index).null_count() != 0 {
-        return Err(ScribeError::CardScopeDenied);
-    }
-    validate_card_scope(rows, principal)
-}
-
 /// Lifts a caller-supplied `run_id` column out of a payload, if it carries one.
 ///
 /// `run_id` is a correlation name the caller may echo, so the column is taken

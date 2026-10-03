@@ -3,8 +3,9 @@
 //! [`VerifierRunner`] claims and starts runs without execution-count permits.
 //! Each claimed run loads its exact Verifier Card, goes through the one closed dispatch over
 //! [`VerifierImplementation`], and ends in exactly one fenced transition the
-//! runner applies itself: a completed report is published as the tenant's
-//! SYSTEM writer and then completed; a retryable failure is retried within
+//! runner applies itself: a completed report is written through the process's
+//! capture writer, attributed to the tenant's SYSTEM principal and the exact
+//! Verifier, and then completed; a retryable failure is retried within
 //! the run's attempt budget; a terminal failure is terminated without a
 //! verdict; and work abandoned by shutdown is released with its attempt
 //! refunded. Claims and settlements are engine mechanics, not authorization
@@ -46,9 +47,9 @@ use super::drift::DriftEngine;
 use super::engines::{EngineOutcome, VerifierReport};
 use super::eval::EvalEngine;
 use super::health::RuntimeCapability;
-use super::publisher::ResultPublisher;
 use super::results::{ResultPayloadBuilder, ResultRun};
 use super::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
+use crate::components::gateway::{GatewayCapture, VerifierAttribution};
 
 /// Stable error code when the exact Verifier Card cannot be loaded or is not
 /// a Verifier.
@@ -59,6 +60,9 @@ pub const EXECUTION_TIMED_OUT: &str = "execution_timed_out";
 pub const RESULT_INVALID: &str = "result_invalid";
 /// Stable error code when a completed result was not durably acknowledged.
 pub const RESULT_PUBLICATION_FAILED: &str = "result_publication_failed";
+/// Stable error code when the tenant has no active `UUIDv7` SYSTEM principal
+/// to attribute a result to.
+pub const SYSTEM_PRINCIPAL_MISSING: &str = "system_principal_missing";
 
 /// The single transition one claimed run ends in.
 #[derive(Debug, Clone, PartialEq)]
@@ -120,8 +124,8 @@ impl VerifierEngines {
 
     /// Executes one claimed run through the arm its implementation names.
     ///
-    /// Drift reads as the SYSTEM principal scoped to the exact `verifier`;
-    /// Eval executes the run's continuous evaluation for `tenant`. Each arm
+    /// Drift and Eval read their inputs as the tenant's SYSTEM principal the
+    /// claim returned. Each arm
     /// records its input-read, preparation, and wait intervals on
     /// `telemetry`. Every failure is carried in the returned
     /// [`EngineOutcome`], not raised.
@@ -129,15 +133,12 @@ impl VerifierEngines {
         &self,
         tenant: DataTenantId,
         run: &ClaimedRun,
-        verifier: &CardRef,
         implementation: &VerifierImplementation,
         telemetry: &ExecutionTelemetry,
     ) -> EngineOutcome {
         match implementation {
             VerifierImplementation::Drift(spec) => {
-                self.drift
-                    .verify(tenant, verifier, run, spec, telemetry)
-                    .await
+                self.drift.verify(tenant, run, spec, telemetry).await
             }
             VerifierImplementation::Eval(spec) => {
                 self.eval.execute(tenant, run, spec, telemetry).await
@@ -157,8 +158,8 @@ pub struct VerifierRunner {
     queue: VerifierRunQueue,
     /// Shared claim loop owning durable claims, shutdown, and drain.
     claims: ClaimLoop,
-    /// Remote result publication.
-    publisher: ResultPublisher,
+    /// The process's one capture writer, which also writes results.
+    writer: Arc<GatewayCapture>,
     /// The Drift and Eval arms a claimed run dispatches to.
     engines: VerifierEngines,
     /// Runtime bounds.
@@ -180,7 +181,7 @@ impl VerifierRunner {
         postgres: WyrdPostgres,
         operator: OperatorPool,
         queue: VerifierRunQueue,
-        publisher: ResultPublisher,
+        writer: Arc<GatewayCapture>,
         engines: VerifierEngines,
         limits: RuntimeLimits,
     ) -> Self {
@@ -189,7 +190,7 @@ impl VerifierRunner {
             postgres,
             operator,
             queue,
-            publisher,
+            writer,
             engines,
             limits,
             #[cfg(feature = "test-support")]
@@ -262,7 +263,7 @@ impl VerifierRunner {
                 Phase::Engine,
                 tokio::time::timeout(
                     self.limits.execution_timeout,
-                    self.dispatch(tenant, run, &verifier, &implementation, telemetry),
+                    self.dispatch(tenant, run, &implementation, telemetry),
                 )
                 .instrument(tracing::info_span!("verification.engine")),
             )
@@ -347,14 +348,12 @@ impl VerifierRunner {
 
     /// The one closed dispatch over Verifier implementations.
     ///
-    /// The run executes through [`VerifierEngines`] for `tenant` and the exact
-    /// `verifier`. Under `test-support` a scripted outcome, when queued,
+    /// The run executes through [`VerifierEngines`] for `tenant`. Under `test-support` a scripted outcome, when queued,
     /// replaces the arm.
     async fn dispatch(
         &self,
         tenant: DataTenantId,
         run: &ClaimedRun,
-        verifier: &CardRef,
         implementation: &VerifierImplementation,
         telemetry: &ExecutionTelemetry,
     ) -> EngineOutcome {
@@ -365,17 +364,20 @@ impl VerifierRunner {
             return outcome;
         }
         self.engines
-            .execute(tenant, run, verifier, implementation, telemetry)
+            .execute(tenant, run, implementation, telemetry)
             .await
     }
 
-    /// Publish `report` as the run's result and map the attempt to a transition.
+    /// Write `report` as the run's result and map the attempt to a transition.
     ///
     /// Mints one result ID and one producer event time shared by every row —
     /// a result fact this process observes, not a coordination instant —
-    /// writes every batch through the publisher, and completes only after the
-    /// summary is acknowledged. An encoding failure terminates `errored`; an
-    /// unacknowledged or timed-out publication retries.
+    /// encodes every batch once, and writes each through the capture writer
+    /// as the tenant SYSTEM principal scoped to the exact `verifier`, details
+    /// before the summary, completing only after the summary is
+    /// acknowledged. A tenant without an active `UUIDv7` SYSTEM principal or
+    /// an encoding failure terminates `errored`; an unacknowledged or
+    /// timed-out write retries.
     async fn publish(
         &self,
         tenant: DataTenantId,
@@ -384,6 +386,18 @@ impl VerifierRunner {
         report: &VerifierReport,
         started_at: DateTime<Utc>,
     ) -> Transition {
+        let Some(principal) = run
+            .system_principal
+            .filter(|principal| principal.as_uuid().get_version_num() == 7)
+        else {
+            return Transition::Terminate(
+                TerminalStatus::Errored,
+                failure(
+                    SYSTEM_PRINCIPAL_MISSING,
+                    "the tenant has no SYSTEM principal to attribute the result to",
+                ),
+            );
+        };
         let result_id = VerificationResultId::new_v7();
         let event_time = Utc::now();
         let verifier_ref = CardRef {
@@ -400,7 +414,17 @@ impl VerifierRunner {
             event_time,
         )
         .build(report)
-        {
+        .and_then(|payload| {
+            let batches = payload.encode(
+                tenant,
+                &VerifierAttribution {
+                    run_id: run.lease.run_id,
+                    verifier: verifier.clone(),
+                    principal,
+                },
+            )?;
+            Ok((payload, batches))
+        }) {
             Ok(payload) => payload,
             Err(error) => {
                 tracing::warn!(run_id = %run.lease.run_id, %error, "verification result encoding failed");
@@ -410,10 +434,14 @@ impl VerifierRunner {
                 );
             }
         };
-        let published = tokio::time::timeout(
-            self.limits.publication_timeout,
-            self.publisher.publish(tenant, verifier, &payload),
-        )
+        let (payload, batches) = payload;
+        let never = CancellationToken::new();
+        let published = tokio::time::timeout(self.limits.publication_timeout, async {
+            for batch in &batches {
+                self.writer.write_result(batch, &never).await?;
+            }
+            Ok::<_, crate::components::gateway::CaptureDrop>(())
+        })
         .await;
         match published {
             Ok(Ok(())) => Transition::Complete {
@@ -422,8 +450,8 @@ impl VerifierRunner {
                 summary: report.summary(),
                 counts: report.counts(),
             },
-            Ok(Err(error)) => {
-                tracing::warn!(run_id = %run.lease.run_id, %error, "verification result publication failed");
+            Ok(Err(drop)) => {
+                tracing::warn!(run_id = %run.lease.run_id, reason = drop.reason(), "verification result write failed");
                 Transition::Retry(failure(
                     RESULT_PUBLICATION_FAILED,
                     "result publication was not acknowledged",

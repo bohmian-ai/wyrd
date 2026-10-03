@@ -280,7 +280,6 @@ fn spawn_runtime(server: &WyrdTestServer, provider: &str) -> (CancellationToken,
             trace_deadline: Duration::from_secs(20),
             ..RuntimeLimits::default()
         })
-        .ingest_endpoint(server.grpc_url().expect("bound server serves gRPC"))
         .providers(Arc::new(providers))
         .build()
         .expect("the runtime composes");
@@ -319,6 +318,40 @@ async fn settle(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("runs never settled ({} of {count}): {runs:?}", runs.len()).into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Poll as the superuser until every observation run is terminal, bringing
+/// each retry's deadline due, without reading the Cards table.
+///
+/// [`settle`] names each run's Verifier from its Card, so it cannot poll while
+/// a test policy makes tenant Card reads fail; the superuser bypasses row
+/// security and reads only the run queue.
+///
+/// # Errors
+/// Returns a query error or a timeout naming the open run count.
+async fn settle_without_cards(superuser: &sqlx::PgPool) -> Result<(), ServerJourneyError> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        sqlx::query(
+            "UPDATE wyrd.verifier_runs SET next_attempt_at = statement_timestamp() \
+              WHERE status = 'retrying'",
+        )
+        .execute(superuser)
+        .await?;
+        let open: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM wyrd.verifier_runs WHERE origin = 'observation' \
+                AND status NOT IN ('completed', 'errored', 'timed_out')",
+        )
+        .fetch_one(superuser)
+        .await?;
+        if open == 0 {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("{open} observation runs never settled").into());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -1948,17 +1981,17 @@ fn forbidden(outcome: &Result<u64, wyrd_spec::error::WyrdError>) -> bool {
 }
 
 /// Continuous Eval reads only under the tenant's stored System principal and
-/// its server-minted Eval input scope, and fails closed without it.
+/// its tokenless Eval input scope, and fails closed without it.
 ///
-/// With the System principal absent, the run's record read is refused before
-/// any Oracle read: the run errors `eval_record_unavailable` with no result
-/// and no System read decision. Restored, the authority names that stored
-/// principal with exactly one table-scoped read grant per Eval input table and
-/// no role, credential, or Verifier scope. It reads the committed observation,
-/// but Oracle refuses (and audits as `denied` for the same principal) a table
-/// outside the scope and an input table the scope was narrowed away from. A
-/// context presenting it for another tenant is refused before Oracle, and a
-/// tenant with no System principal of its own resolves no authority.
+/// With the System principal absent, the claim returns none and the run's
+/// record read is refused before any Oracle read: the run errors
+/// `eval_record_unavailable` with no result and no System read decision.
+/// Restored, the authority names that stored principal with exactly one
+/// table-scoped read grant per Eval input table and no role, credential, or
+/// Verifier scope. It reads the committed observation, but Oracle refuses
+/// (and audits as `denied` for the same principal) a table outside the scope
+/// and an input table the scope was narrowed away from. A context presenting
+/// it for another tenant is refused before Oracle.
 ///
 /// # Errors
 /// Returns server, registration, query, or fixture errors, or a description of
@@ -1966,11 +1999,17 @@ fn forbidden(outcome: &Result<u64, wyrd_spec::error::WyrdError>) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn continuous_eval_read_authority_fails_closed() -> Result<(), ServerJourneyError> {
-    use wyrd_server::verification::eval::{EvalReadAuthority, EvalReadAuthorityError};
+    use vala_bifrost_redux::catalog::TableRef;
+    use vala_bifrost_redux::namespaces::BifrostNamespace;
+    use wyrd_server::verification::authority::{SystemReadAuthority, SystemReadAuthorityError};
 
     let journey = TraceJourney::start().await?;
     let (server, tenant) = (&journey.server, journey.tenant);
     let system = journey.seed.system_principal();
+    let inputs = [
+        TableRef::new(BifrostNamespace::Eval, "observations"),
+        TableRef::new(BifrostNamespace::Traces, "spans"),
+    ];
     export_span(server, &journey.token, LANDED_TRACE).await;
     journey
         .emit(
@@ -1982,8 +2021,11 @@ async fn continuous_eval_read_authority_fails_closed() -> Result<(), ServerJourn
 
     // Missing: no System principal, no read.
     set_system_principal(server, tenant, false).await?;
-    let missing = EvalReadAuthority::resolve(server.state(), tenant).await;
-    if !matches!(missing, Err(EvalReadAuthorityError::SystemPrincipalMissing)) {
+    let missing = SystemReadAuthority::resolve(server.state(), tenant, None, &inputs).await;
+    if !matches!(
+        missing,
+        Err(SystemReadAuthorityError::SystemPrincipalMissing)
+    ) {
         return Err(format!("a tenant without a System principal resolved {missing:?}").into());
     }
     let provider = MockServer::start().await;
@@ -2005,7 +2047,13 @@ async fn continuous_eval_read_authority_fails_closed() -> Result<(), ServerJourn
     set_system_principal(server, tenant, true).await?;
 
     // The resolved authority is the stored principal, narrowly scoped.
-    let authority = EvalReadAuthority::resolve(server.state(), tenant).await?;
+    let authority = SystemReadAuthority::resolve(
+        server.state(),
+        tenant,
+        Some(wyrd_spec::auth::PrincipalId::new(system)),
+        &inputs,
+    )
+    .await?;
     let principal = &authority.context().principal;
     let table_reads = principal
         .effective_permissions
@@ -2078,7 +2126,7 @@ async fn continuous_eval_read_authority_fails_closed() -> Result<(), ServerJourn
         return Err(format!("under-scoped reads were not refused: {outside:?}, {spans:?}").into());
     }
 
-    // Wrong tenant: refused before Oracle, and no foreign authority resolves.
+    // Wrong tenant: refused before Oracle.
     let foreign = DataTenantId::new_v7();
     let crossed = vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(
         context.principal.clone(),
@@ -2093,10 +2141,6 @@ async fn continuous_eval_read_authority_fails_closed() -> Result<(), ServerJourn
         Err(wyrd_spec::vala::error::BifrostError::QueryTenantInvariant)
     ) {
         return Err(format!("a cross-tenant System context was accepted: {crossed:?}").into());
-    }
-    let foreign_authority = EvalReadAuthority::resolve(server.state(), foreign).await;
-    if foreign_authority.is_ok() {
-        return Err("a tenant with no System principal resolved an authority".into());
     }
 
     // Audit: one allowed read and two denials, all the stored principal.
@@ -2128,7 +2172,7 @@ async fn continuous_eval_read_authority_fails_closed() -> Result<(), ServerJourn
 const PROVIDER_SENTINEL: &str = "PROVIDER-SENTINEL-4f1c";
 /// Object name of an in-tenant media URI that names no stored object.
 const LOCATOR_SENTINEL: &str = "LOCATOR-SENTINEL-8a2d";
-/// Text a Postgres read of the tenant's principals raises.
+/// Text a Postgres read of the tenant's Cards raises.
 const SQL_SENTINEL: &str = "SQL-SENTINEL-c93e";
 
 /// Continuous Eval failures persist and expose only stable codes and fixed
@@ -2136,8 +2180,8 @@ const SQL_SENTINEL: &str = "SQL-SENTINEL-c93e";
 ///
 /// A provider that fails with a sentinel body, a media URI whose private
 /// object key is a sentinel, and a Postgres read that raises a sentinel while
-/// the Eval read authority resolves each settle their gated run `errored`
-/// with the stable code. The public run status and every persisted
+/// the claimed run loads its Verifier Card each settle their gated run
+/// `errored` with the stable code. The public run status and every persisted
 /// `VerificationError` of the tenant carry none of the sentinels.
 ///
 /// # Errors
@@ -2207,8 +2251,9 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
     tokio::time::timeout(WAIT, task).await??;
 
     // A Postgres failure: while this policy stands, every tenant read of the
-    // principals table raises the sentinel, so the Eval read authority cannot
-    // resolve. Only the runtime reads that table until the policy is dropped.
+    // Cards table raises the sentinel, so a claimed run cannot load its
+    // Verifier. The claim and its settlement read no Card, and the record's
+    // runs are enqueued before the policy is created.
     let state = start_state(&bundle, &client).await;
     emit(
         &state.run().for_card("agent")?,
@@ -2238,26 +2283,27 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
     .execute(&superuser)
     .await?;
     sqlx::query(
-        "CREATE POLICY eval_errors_refuse ON wyrd.auth_service_accounts AS RESTRICTIVE \
+        "CREATE POLICY eval_errors_refuse ON wyrd.cards AS RESTRICTIVE \
          FOR SELECT USING (wyrd.eval_errors_refuse())",
     )
     .execute(&superuser)
     .await?;
     let (stop, task) = spawn_runtime(&server, &provider.uri());
-    let runs = settle(&seed, queued + AGENT_BINDINGS).await;
+    let settled = settle_without_cards(&superuser).await;
     stop.cancel();
     tokio::time::timeout(WAIT, task).await??;
-    sqlx::query("DROP POLICY eval_errors_refuse ON wyrd.auth_service_accounts")
+    sqlx::query("DROP POLICY eval_errors_refuse ON wyrd.cards")
         .execute(&superuser)
         .await?;
-    let runs = runs?;
+    settled?;
+    let runs = settle(&seed, queued + AGENT_BINDINGS).await?;
 
     let verification =
         wyrd_client::verification::Verification::with_client(connect(&server, &admin));
     for (record, code) in [
         (&provider_id, "eval_execution_failed"),
         (&locator_id, "eval_execution_failed"),
-        (&sql_id, "eval_record_unavailable"),
+        (&sql_id, "verifier_unavailable"),
     ] {
         let run = run_of(&runs, "eval-gated", record)?;
         assert_unresulted(&server, tenant, run, "errored").await?;

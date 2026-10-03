@@ -168,13 +168,11 @@ not a passive integration or inventory product.
     `card_ref_scope` authorization set derived at mint time, while a tenant
     administrative or tenant-created automation principal is representable
     with no Card and therefore no emit scope. `User` is the marker for human
-    identity. `System` is a tenant-local server identity used only for
-    canonical verification-result publication and the fixed Drift observation
-    read. It has no public credential, role, refresh, workload, delegation, or
-    principal-management path; the server mints each short-lived token with
-    exactly one UID-bearing Verifier scope and exactly one fixed capability:
-    result write, or `bifrost_query:read` scoped to the tenant's registered
-    `vala.drift.observations` table. No token carries both. Platform authority
+    identity. `System` is a tenant-local server identity that attributes
+    verification results and authorizes Verifier input reads in-process. It
+    never appears in a token: no issuer mints one, every verifier rejects a
+    `system` claim set, and it has no public credential, role, refresh,
+    workload, delegation, or principal-management path. Platform authority
     is a grant held at platform scope, not a property of a kind, and neither
     plane's credential or token is accepted by the other. Gateway capture is a
     server-internal write, not a principal that authenticates: captured rows
@@ -511,8 +509,12 @@ to a live, ready Scribe. A capture is delivered when Scribe acknowledges it
 before the call's deadline; backpressure and an unavailable Scribe are retried
 with bounded backoff until then, and anything else drops the capture with a
 counted reason without changing the call. No per-tenant client, queue, or
-backlog outlives the call. Gate refuses every public write to
-`vala.gateway.calls`.
+backlog outlives the call. The same writer submits Verifier results to the
+three result tables, attributed to the tenant's `System` principal and the
+run's exact Verifier Card, which Scribe stamps as `principal_id` and
+`card_uid`; a result batch is never dropped for time and is retried under its
+own batch id until Scribe acknowledges it. Gate refuses every public write to
+`vala.gateway.calls` and the three result tables.
 `Service` and
 `Agent` principal is always card-bound and a deployed `Service` carries its
 Card — the `card_ref` is discriminated on `PrincipalKind`, and the JWT carries a

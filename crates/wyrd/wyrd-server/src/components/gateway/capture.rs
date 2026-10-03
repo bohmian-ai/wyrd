@@ -11,9 +11,15 @@
 //! no audit decision. Delivery is bounded by the call's deadline, so a slow,
 //! saturated, or unavailable Bifrost drops the capture with a counted reason
 //! and never changes the call. A disabled policy never reaches this module.
+//!
+//! The same writer carries Verifier result batches along the same route,
+//! attributed to the tenant SYSTEM principal and the run's exact Verifier.
+//! Those share the transport but not the delivery policy: a result batch is
+//! never dropped, and is retried until acknowledged or the run's lease is lost.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,6 +35,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::cluster::ClusterRegistry;
@@ -38,16 +45,21 @@ use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::tables::gateway::CallsTable;
 use vala_bifrost_redux::tables::signal::correlation_fields;
 use vala_bifrost_redux::tables::traces::project_resource_spans;
-use vala_bifrost_redux::tables::{DomainTable, SpansTable};
+use vala_bifrost_redux::tables::{
+    DomainTable, ResultFeaturesTable, ResultItemsTable, ResultsTable, SpansTable,
+};
 use wyrd_gateway::{AttemptRecord, IngressDialect, MediaRequest, UploadContent};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalId};
+use wyrd_spec::envelope::CardKind;
 use wyrd_spec::gateway::{
     GATEWAY_JSON_MAX_BYTES, GatewayAccountingEntryV1, GatewayAttemptSpanFieldsV1, GatewayCallId,
     GatewayCallOutcome, GatewayCallPayloadV1, GatewayCaptureMode, GatewayCapturePolicy,
     GatewayOperation, GatewayPayloadField, GatewayPayloadObjectRefV1, ModelRef,
 };
+use wyrd_spec::ids::{CardUid, VerificationRunId};
+use wyrd_spec::reference::{CardRef, CardRefScope};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::NodeId;
 use wyrd_storage::StorageError;
@@ -60,8 +72,8 @@ use wyrd_tonic::otlp::trace::v1::status::StatusCode;
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 use wyrd_tonic::tonic::Code;
 use wyrd_tonic::tonic::transport::Channel;
-use wyrd_tonic::wyrd::v1::IngestCaptureRequest;
 use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_client::ScribeCapturePeerServiceClient;
+use wyrd_tonic::wyrd::v1::{IngestCaptureRequest, VerifierResultAttribution};
 
 use crate::state::{AppState, Bifrost};
 
@@ -171,30 +183,53 @@ impl CaptureDrop {
     }
 }
 
-/// One of the only two destinations gateway capture writes.
+/// One of the five destinations the capture writer submits to: the two
+/// gateway capture tables and the three Verifier result tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CaptureTable {
     /// `vala.gateway.calls`, one row per captured call.
     Calls,
     /// `vala.traces.spans`, one span per captured attempt.
     Spans,
+    /// `vala.verification.results`, one canonical summary row per Verifier run.
+    Results,
+    /// `vala.drift.result_features`, the Drift result's feature rows.
+    DriftFeatures,
+    /// `vala.eval.result_items`, the Eval result's task rows.
+    EvalItems,
 }
 
 impl CaptureTable {
+    /// Every destination, in a fixed order.
+    const ALL: [Self; 5] = [
+        Self::Calls,
+        Self::Spans,
+        Self::Results,
+        Self::DriftFeatures,
+        Self::EvalItems,
+    ];
+
     /// Fully qualified table name, which the peer RPC carries.
     pub(crate) const fn fqn(self) -> &'static str {
         match self {
             Self::Calls => "vala.gateway.calls",
             Self::Spans => "vala.traces.spans",
+            Self::Results => "vala.verification.results",
+            Self::DriftFeatures => "vala.drift.result_features",
+            Self::EvalItems => "vala.eval.result_items",
         }
     }
 
-    /// Resolves a fully qualified name to a capture destination, refusing any
-    /// other table.
+    /// Resolves a fully qualified name to a destination, refusing any other
+    /// table.
     pub(crate) fn from_fqn(fqn: &str) -> Option<Self> {
-        [Self::Calls, Self::Spans]
-            .into_iter()
-            .find(|table| table.fqn() == fqn)
+        Self::ALL.into_iter().find(|table| table.fqn() == fqn)
+    }
+
+    /// Whether this destination is a Verifier result table, which is written
+    /// only under a [`VerifierAttribution`].
+    pub(crate) const fn is_result(self) -> bool {
+        matches!(self, Self::Results | Self::DriftFeatures | Self::EvalItems)
     }
 
     /// Logical Bifrost table this destination names.
@@ -202,27 +237,109 @@ impl CaptureTable {
         match self {
             Self::Calls => TableRef::new(BifrostNamespace::Gateway, CallsTable::NAME),
             Self::Spans => TableRef::new(BifrostNamespace::Traces, SpansTable::NAME),
+            Self::Results => TableRef::new(BifrostNamespace::Verification, ResultsTable::NAME),
+            Self::DriftFeatures => {
+                TableRef::new(BifrostNamespace::Drift, ResultFeaturesTable::NAME)
+            }
+            Self::EvalItems => TableRef::new(BifrostNamespace::Eval, ResultItemsTable::NAME),
         }
     }
 }
 
-/// One encoded capture batch bound for one tenant's capture destination.
+/// The frozen run identity a Verifier result batch is written under.
+///
+/// Every value comes from the run's frozen Postgres row and the tenant's
+/// stored SYSTEM principal, never from a Verifier or the Arrow payload. The
+/// frame principal built from it is the tenant SYSTEM principal scoped to
+/// exactly this Verifier, so Scribe stamps that principal as `principal_id`
+/// and the Verifier UID as `card_uid`, and refuses a row whose `card_ref`
+/// names another Card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifierAttribution {
+    /// The run the result belongs to.
+    pub(crate) run_id: VerificationRunId,
+    /// The exact Verifier Card, carrying its UID.
+    pub(crate) verifier: CardRef,
+    /// The tenant's SYSTEM principal.
+    pub(crate) principal: PrincipalId,
+}
+
+impl VerifierAttribution {
+    /// Projects this attribution onto the peer RPC, the Verifier reference
+    /// and its UID as separate fields.
+    fn to_wire(&self) -> VerifierResultAttribution {
+        VerifierResultAttribution {
+            run_id: self.run_id.to_string(),
+            verifier_ref: CardRef {
+                uid: None,
+                ..self.verifier.clone()
+            }
+            .to_string(),
+            verifier_uid: self
+                .verifier
+                .uid
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            principal_id: self.principal.to_string(),
+        }
+    }
+
+    /// Parses a peer-submitted attribution.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static reason when the run or principal id is malformed, the
+    /// reference is not an exact Verifier Card reference, or the UID is
+    /// malformed.
+    pub(crate) fn from_wire(wire: &VerifierResultAttribution) -> Result<Self, &'static str> {
+        let run_id = wire
+            .run_id
+            .parse::<VerificationRunId>()
+            .map_err(|_| "result run_id is not a run id")?;
+        let mut verifier = CardRef::from_str(&wire.verifier_ref)
+            .map_err(|_| "result verifier_ref is not a Card reference")?;
+        if verifier.kind != CardKind::Verifier || verifier.uid.is_some() {
+            return Err("result verifier_ref does not name a Verifier version");
+        }
+        verifier.uid = Some(
+            wire.verifier_uid
+                .parse::<CardUid>()
+                .map_err(|_| "result verifier_uid is not a Card UID")?,
+        );
+        let principal = wire
+            .principal_id
+            .parse::<PrincipalId>()
+            .map_err(|_| "result principal_id is not a principal id")?;
+        Ok(Self {
+            run_id,
+            verifier,
+            principal,
+        })
+    }
+}
+
+/// One encoded batch bound for one tenant's capture or result destination.
 ///
 /// The local writer and the peer service both submit through
 /// [`Self::into_frame`], so a batch is identical in-process and over the peer
-/// plane. Cloning shares the encoded bytes.
+/// plane. A result table's batch carries its [`VerifierAttribution`] and a
+/// capture table's carries none; the peer service refuses any other
+/// combination. Cloning shares the encoded bytes.
 #[derive(Debug, Clone)]
 pub(crate) struct CaptureBatch {
     /// Tenant the rows belong to.
     pub(crate) tenant: DataTenantId,
-    /// Capture destination.
+    /// Destination table.
     pub(crate) table: CaptureTable,
     /// Deterministic identity Scribe deduplicates resubmissions on.
     pub(crate) batch_id: Uuid,
-    /// Request that admitted the call.
+    /// Request that admitted the call, or that the result write runs under.
     pub(crate) request_id: RequestId,
     /// The batch as one Arrow IPC stream.
     pub(crate) ipc: Bytes,
+    /// The run identity of a Verifier result batch; `None` for capture.
+    pub(crate) verifier: Option<VerifierAttribution>,
 }
 
 impl CaptureBatch {
@@ -248,6 +365,7 @@ impl CaptureBatch {
             batch_id: Self::derive_id(tenant, call_id, table),
             request_id,
             ipc: Bytes::from(ipc),
+            verifier: None,
         })
     }
 
@@ -275,20 +393,26 @@ impl CaptureBatch {
         Uuid::from_bytes(bytes)
     }
 
-    /// Builds the Scribe frame for this batch under the capture principal.
+    /// Builds the Scribe frame for this batch.
     ///
-    /// The principal carries no permission: capture is a server-internal
-    /// write that evaluates none, exactly like audit publication, and its id
-    /// is what Scribe stamps on the captured rows.
+    /// A capture batch is submitted under the reserved capture principal; a
+    /// result batch under the tenant SYSTEM principal whose Card scope is
+    /// exactly the frozen Verifier, from which Scribe stamps `card_uid`. The
+    /// principal carries no permission: both are server-internal writes that
+    /// evaluate none, exactly like audit publication, and its id is what
+    /// Scribe stamps as the rows' `principal_id`.
     pub(crate) fn into_frame(self) -> ScribeIngressFrame {
-        ScribeIngressFrame {
-            principal: Principal::new(
-                GATEWAY_CAPTURE_PRINCIPAL,
-                PrincipalKind::User,
-                self.tenant,
-                Vec::new(),
-                PermissionSet::new(),
+        let (id, kind) = match &self.verifier {
+            None => (GATEWAY_CAPTURE_PRINCIPAL, PrincipalKind::User),
+            Some(attribution) => (
+                attribution.principal,
+                PrincipalKind::System {
+                    card_ref_scope: CardRefScope::own(&attribution.verifier),
+                },
             ),
+        };
+        ScribeIngressFrame {
+            principal: Principal::new(id, kind, self.tenant, Vec::new(), PermissionSet::new()),
             authenticated_tenant: self.tenant,
             table: self.table.table_ref(),
             expected_schema_fingerprint: None,
@@ -632,6 +756,7 @@ impl CapturePeers {
                 batch_id: batch.batch_id.to_string(),
                 request_id: batch.request_id.as_str().to_owned(),
                 arrow_ipc: batch.ipc.clone(),
+                verifier: batch.verifier.as_ref().map(VerifierAttribution::to_wire),
             })
             .await
             .map(|_| ())
@@ -688,7 +813,7 @@ impl GatewayCapture {
 
     /// Builds a writer submitting in-process to `scribe`, standing in for a
     /// pod's own Scribe.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn local(scribe: Arc<dyn Scribe>) -> Self {
         Self {
             route: CaptureRoute::Local(scribe),
@@ -734,6 +859,98 @@ impl GatewayCapture {
         capture.objects.persist(state, capture.tenant).await?;
         for batch in capture.batches()? {
             until_deadline(deadline, |attempt| self.submit(&batch, attempt)).await?;
+        }
+        Ok(())
+    }
+
+    /// Whether this process reaches any Scribe, in-process or over the peer
+    /// plane.
+    pub(crate) const fn reaches_scribe(&self) -> bool {
+        !matches!(self.route, CaptureRoute::Unavailable)
+    }
+
+    /// Writes one Verifier result batch until Scribe acknowledges it.
+    ///
+    /// Unlike capture, a result batch is never dropped for time: retryable
+    /// refusals (backpressure, an unavailable peer) are retried with the same
+    /// bounded backoff for as long as `lost` is not cancelled, which the
+    /// runner cancels when the run's lease is lost or the work is abandoned.
+    /// A peer refusal redirects the next attempt to the next ready Scribe.
+    /// Resubmissions reuse the batch's identity, so Scribe's batch-id dedup
+    /// absorbs a write that was durable but unacknowledged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a terminal refusal at once, or the latest retryable refusal
+    /// once `lost` is cancelled.
+    ///
+    /// # Cancellation
+    ///
+    /// An attempt in flight when `lost` fires is dropped; whether Scribe
+    /// accepted it is unknown, and a later write of the same batch is absorbed
+    /// by dedup.
+    pub(crate) async fn write_result(
+        &self,
+        batch: &CaptureBatch,
+        lost: &CancellationToken,
+    ) -> Result<(), CaptureDrop> {
+        let mut pause = RETRY_INITIAL;
+        let mut latest = CaptureDrop::Unavailable;
+        for ordinal in 0.. {
+            latest = tokio::select! {
+                () = lost.cancelled() => return Err(latest),
+                submitted = self.submit(batch, ordinal) => match submitted {
+                    Ok(()) => return Ok(()),
+                    Err(refusal) if refusal.is_retryable() => refusal,
+                    Err(refusal) => return Err(refusal),
+                },
+            };
+            tokio::select! {
+                () = lost.cancelled() => return Err(latest),
+                () = tokio::time::sleep(pause) => {}
+            }
+            pause = (pause * 2).min(RETRY_MAX);
+        }
+        Err(latest)
+    }
+
+    /// Writes every batch of `payload` exactly as the runner does: encoded
+    /// for `tenant` under the attribution of `principal` running `verifier`
+    /// in `run_id`, details before the summary, each until acknowledged.
+    ///
+    /// A test seam for journeys that must fix a result's event time or move
+    /// Scribe's receipt clock between batches, both of which the runner owns.
+    /// `before` receives each batch's index just before it is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns the encoding error, or the reason of a terminal write refusal.
+    #[cfg(feature = "test-support")]
+    pub async fn write_result_payload_for_test(
+        &self,
+        payload: &crate::verification::results::ResultPayload,
+        tenant: DataTenantId,
+        run_id: VerificationRunId,
+        verifier: &CardRef,
+        principal: PrincipalId,
+        mut before: impl FnMut(usize),
+    ) -> Result<(), String> {
+        let batches = payload
+            .encode(
+                tenant,
+                &VerifierAttribution {
+                    run_id,
+                    verifier: verifier.clone(),
+                    principal,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let never = CancellationToken::new();
+        for (index, batch) in batches.iter().enumerate() {
+            before(index);
+            self.write_result(batch, &never)
+                .await
+                .map_err(|drop| drop.reason().to_owned())?;
         }
         Ok(())
     }
@@ -1281,10 +1498,15 @@ mod tests {
     use wyrd_spec::ids::ProviderDeploymentName;
     use wyrd_tonic::tonic::Code;
 
+    use tokio_util::sync::CancellationToken;
+    use wyrd_spec::ids::{CardUid, VerificationRunId};
+    use wyrd_spec::reference::CardRef;
+
     use super::recording::RecordingScribe;
     use super::{
         CallCapture, CallFacts, CaptureBatch, CaptureDrop, CaptureRoute, CaptureTable,
-        GatewayCapture, PayloadObjects, object_path, request_content, until_deadline,
+        GatewayCapture, PayloadObjects, VerifierAttribution, object_path, request_content,
+        until_deadline,
     };
 
     /// Secret planted under credential-shaped keys; must never be persisted.
@@ -1726,6 +1948,91 @@ mod tests {
         );
     }
 
+    /// Proves a Verifier result batch is submitted under the tenant SYSTEM
+    /// principal scoped to exactly its Verifier, is retried through
+    /// saturation without a deadline until acknowledged, and stops only when
+    /// its lease is lost, with a terminal refusal ending it at once.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the frame, its attribution, or a write outcome differs.
+    #[tokio::test(start_paused = true)]
+    async fn result_batches_submit_under_the_system_principal() {
+        let tenant = DataTenantId::new_v7();
+        let mut verifier: CardRef = "default/Verifier/drift-check@1.0.0"
+            .parse()
+            .expect("a Verifier reference");
+        verifier.uid = Some(CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid"));
+        let principal = PrincipalId::new(uuid::Uuid::now_v7());
+        let batch = CaptureBatch {
+            tenant,
+            table: CaptureTable::Results,
+            batch_id: uuid::Uuid::now_v7(),
+            request_id: wyrd_spec::request_id::RequestId::now_v7(),
+            ipc: CallCapture::from_facts(facts(policy(GatewayCaptureMode::Metadata, &[])))
+                .expect("metadata projects")
+                .batches()
+                .expect("batches encode")
+                .remove(0)
+                .ipc,
+            verifier: Some(VerifierAttribution {
+                run_id: VerificationRunId::new_v7(),
+                verifier: verifier.clone(),
+                principal,
+            }),
+        };
+        let busy = || ScribeError::IngestBusy {
+            table: "vala.verification.results".to_owned(),
+        };
+
+        let scribe = Arc::new(RecordingScribe::default());
+        for _ in 0..20 {
+            scribe.refuse_next(busy());
+        }
+        let writer = GatewayCapture::local(Arc::clone(&scribe) as _);
+        let started = Instant::now();
+        assert_eq!(
+            writer.write_result(&batch, &CancellationToken::new()).await,
+            Ok(())
+        );
+        assert!(
+            Instant::now() - started > Duration::from_secs(5),
+            "results outlast any capture deadline"
+        );
+        let received = scribe.received();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].table, "vala.verification.results");
+        assert_eq!(received[0].tenant, tenant);
+        assert_eq!(received[0].principal, principal);
+        assert_eq!(received[0].card_scope, [verifier]);
+
+        let saturated = Arc::new(RecordingScribe::default());
+        for _ in 0..1_000 {
+            saturated.refuse_next(busy());
+        }
+        let writer = GatewayCapture::local(Arc::clone(&saturated) as _);
+        let lost = CancellationToken::new();
+        let cancel = lost.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            cancel.cancel();
+        });
+        assert_eq!(
+            writer.write_result(&batch, &lost).await,
+            Err(CaptureDrop::Saturated)
+        );
+        assert!(saturated.received().is_empty());
+
+        let refusing = Arc::new(RecordingScribe::default());
+        refusing.refuse_next(ScribeError::InvalidFrame);
+        let writer = GatewayCapture::local(Arc::clone(&refusing) as _);
+        assert_eq!(
+            writer.write_result(&batch, &CancellationToken::new()).await,
+            Err(CaptureDrop::Rejected)
+        );
+        assert_eq!(refusing.attempts(), 1);
+    }
+
     /// Proves in-process refusals and peer status codes classify into the
     /// same retryable and terminal drops.
     ///
@@ -1778,6 +2085,7 @@ pub(crate) mod recording {
     };
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::reference::CardRef;
     use wyrd_spec::request_id::RequestId;
 
     /// One frame the recording Scribe acknowledged.
@@ -1787,6 +2095,8 @@ pub(crate) mod recording {
         pub(crate) tenant: DataTenantId,
         /// Principal the frame was submitted under.
         pub(crate) principal: PrincipalId,
+        /// Card scope of that principal, from which Scribe stamps `card_uid`.
+        pub(crate) card_scope: Vec<CardRef>,
         /// Fully qualified destination table.
         pub(crate) table: String,
         /// Request the frame was admitted under.
@@ -1886,6 +2196,11 @@ pub(crate) mod recording {
             self.received.lock().expect("received").push(Received {
                 tenant: frame.authenticated_tenant,
                 principal: frame.principal.id,
+                card_scope: frame
+                    .principal
+                    .card_ref_scope()
+                    .map(|scope| scope.as_slice().to_vec())
+                    .unwrap_or_default(),
                 table: frame.table.fqn(),
                 request_id: frame.request_id,
                 rows,

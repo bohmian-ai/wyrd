@@ -1001,13 +1001,18 @@ the namespace does not create another storage or authorization model.
 
 Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
 `BifrostQuery`. Generic writes cannot target reserved or system-managed tables;
-`vala.gateway.calls` accepts no public write at all: Gate refuses every
-principal, and only server-internal gateway capture writes it, together with
-the capture spans in `vala.traces.spans`. A pod without Scribe submits that
-capture through `ScribeCapturePeerService.IngestCapture` on the peer listener,
-which the same `wyrd-peer` mTLS admits; the request names its tenant and one of
-those two tables explicitly, carries no token, and is refused for the reserved
-system tenant or any other table. Sensitive-column metadata remains descriptive; table query
+`vala.gateway.calls` and the three verification result tables
+(`vala.verification.results`, `vala.drift.result_features`,
+`vala.eval.result_items`) accept no public write at all: Gate refuses every
+principal. Only the server-internal capture writer writes them, together with
+the capture spans in `vala.traces.spans`; result batches carry a Verifier
+attribution (run, exact Verifier Card, tenant `System` principal) that Scribe
+stamps as `principal_id` and `card_uid`. A pod without Scribe submits through
+`ScribeCapturePeerService.IngestCapture` on the peer listener, which the same
+`wyrd-peer` mTLS admits; the request names its tenant and one of those five
+tables explicitly, carries no token, carries an attribution exactly when the
+table is a result table, and is refused for the reserved system tenant or any
+other table. Sensitive-column metadata remains descriptive; table query
 permission governs every column, including GenAI fields stored on trace spans,
 except that a projection reaching the `vala.gateway.calls` request or response
 payload columns also requires the tenant-wide gateway payload-read permission.

@@ -361,7 +361,6 @@ impl Delivery {
     ) -> Running {
         let runtime = VerificationRuntime::builder(state)
             .limits(limits)
-            .ingest_endpoint(self.server.grpc_url().expect("bound server serves gRPC"))
             .engine_script(script.clone())
             .crash_switch(crash.clone())
             .provider_endpoints(endpoints)

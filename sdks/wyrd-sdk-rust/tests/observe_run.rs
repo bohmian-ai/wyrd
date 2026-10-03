@@ -994,12 +994,14 @@ async fn drift_burst_survives_a_byte_budget_override() {
     let run = state.run();
     let run_id = run.run_id().as_str().to_owned();
     let model = run.for_card("model").expect("model view resolves");
-    for observation in 0..BURST_OBSERVATIONS {
-        let features: serde_json::Map<String, serde_json::Value> = (0..BURST_FEATURES)
+    let observations = u32::try_from(BURST_OBSERVATIONS).expect("the burst size fits u32");
+    let feature_count = u32::try_from(BURST_FEATURES).expect("the feature count fits u32");
+    for observation in 0..observations {
+        let features: serde_json::Map<String, serde_json::Value> = (0..feature_count)
             .map(|feature| {
                 (
                     format!("feature_{feature}"),
-                    serde_json::json!(observation as f64 + feature as f64 / 10.0),
+                    serde_json::json!(f64::from(observation) + f64::from(feature) / 10.0),
                 )
             })
             .collect();
@@ -1021,12 +1023,14 @@ async fn drift_burst_survives_a_byte_budget_override() {
         "one record_id per observation"
     );
     assert!(
-        groups.iter().all(|group| group.n == BURST_FEATURES as i64),
+        groups
+            .iter()
+            .all(|group| group.n == i64::from(feature_count)),
         "every observation landed all of its features exactly once"
     );
     assert_eq!(
         groups.iter().map(|group| group.n).sum::<i64>(),
-        (BURST_OBSERVATIONS * BURST_FEATURES) as i64
+        i64::from(observations) * i64::from(feature_count)
     );
     server.shutdown().await.expect("test server shuts down");
 }

@@ -17,7 +17,7 @@ use wyrd_auth_oidc::{
     IssuerConfigResolver, IssuerVerification, JwksCache, OidcError, OidcKid, map_claims,
 };
 use wyrd_runtime::{
-    DelegationStep, Permission, PermissionSet, Principal, PrincipalId, PrincipalKind,
+    DelegationStep, PermissionSet, Principal, PrincipalId, PrincipalKind,
     PrincipalRef as RuntimePrincipalRef, RoleRef,
 };
 use wyrd_spec::DataTenantId;
@@ -755,25 +755,20 @@ impl AccessTokenClaims {
     /// permissions are the `permissions` claim and nothing is read from a
     /// store. `roles` is copied through as informational metadata.
     ///
-    /// A `system` principal takes a separate, closed path through
-    /// [`Self::system_kind`]: its claims must match exactly what the tenant
-    /// issuer mints for the internal verification-result writer.
+    /// The tenant SYSTEM principal is an attribution identity that never
+    /// appears in a token, so every `system` claim set is refused.
     ///
     /// # Errors
-    /// Returns an error when the reserved capture identity or `system`
-    /// claim set deviates from the SYSTEM contract, the delegation chain is
-    /// too deep or malformed, or the expiry timestamp is out of range.
+    /// Returns an error when the token names the reserved capture identity or
+    /// a `system` principal, the delegation chain is too deep or malformed, or
+    /// the expiry timestamp is out of range.
     pub fn into_verified(&self) -> Result<VerifiedToken, AuthError> {
         self.enforce_reserved_capture_identity()?;
-        let kind = if self.principal.kind == PrincipalKindTag::System {
-            self.system_kind()?
-        } else {
-            wire_kind_into_principal_kind(
-                self.principal.kind,
-                self.principal.card_ref.as_ref(),
-                &self.principal.card_ref_scope,
-            )?
-        };
+        let kind = wire_kind_into_principal_kind(
+            self.principal.kind,
+            self.principal.card_ref.as_ref(),
+            &self.principal.card_ref_scope,
+        )?;
         let principal = Principal::new(
             self.principal.id,
             kind,
@@ -790,47 +785,6 @@ impl AccessTokenClaims {
             principal,
             delegation_chain,
             exp,
-        })
-    }
-
-    /// Resolve a `system` claim set into the SYSTEM principal kind.
-    ///
-    /// The internal SYSTEM principal is minted with a closed shape, and
-    /// anything else signed under its tag is treated as forged: the id is a
-    /// `UUIDv7` equal to `sub`; there is no root Card, role, credential, or
-    /// delegation chain; the permissions are exactly one fixed purpose —
-    /// `bifrost_record:write` for result publication, or one
-    /// [`Permission::drift_table_read`] for the Drift observation read, never
-    /// both; the scope is exactly one UID-bearing Verifier Card; and the
-    /// tenant is a customer tenant, never `SYSTEM_OWNER`, because each SYSTEM
-    /// principal is provisioned inside the one tenant whose results it writes.
-    ///
-    /// # Errors
-    /// Returns [`AuthError::InvalidToken`] when any of those conditions fails.
-    fn system_kind(&self) -> Result<PrincipalKind, AuthError> {
-        let principal = &self.principal;
-        let scope = principal.card_ref_scope.as_slice();
-        let conforms = principal.id.as_uuid().get_version_num() == 7
-            && principal.tenant_id != DataTenantId::SYSTEM_OWNER
-            && self.sub == principal.id.to_string()
-            && principal.card_ref.is_none()
-            && self.roles.is_empty()
-            && self.cid.is_none()
-            && self.act.is_none()
-            && (self.permissions == PermissionSet::from_iter([Permission::bifrost_record_write()])
-                || matches!(
-                    self.permissions.iter().collect::<Vec<_>>().as_slice(),
-                    [permission] if permission.is_drift_table_read()
-                ))
-            && matches!(
-                scope,
-                [member] if member.kind == CardKind::Verifier && member.uid.is_some()
-            );
-        if !conforms {
-            return Err(AuthError::InvalidToken);
-        }
-        Ok(PrincipalKind::System {
-            card_ref_scope: principal.card_ref_scope.clone(),
         })
     }
 }
@@ -878,9 +832,8 @@ fn wire_kind_into_principal_kind(
         // is the type-level half of the control-plane boundary: even a validly
         // signed token cannot smuggle a platform identity into a tenant.
         (PrincipalKindTag::GlobalAdmin, _) => Err(AuthError::InvalidToken),
-        // The internal SYSTEM writer resolves only through
-        // `AccessTokenClaims::system_kind`; it never appears as a delegation
-        // layer, because it takes part in no delegation or impersonation flow.
+        // The tenant SYSTEM principal is an attribution identity only; it is
+        // never issued a token, so no signed claim set may name it.
         (PrincipalKindTag::System, _) => Err(AuthError::InvalidToken),
         (PrincipalKindTag::TenantAdmin, Some(_)) => Err(AuthError::InvalidCardRef),
         (PrincipalKindTag::TenantAdmin, None) => Ok(PrincipalKind::TenantAdmin),
@@ -1637,236 +1590,37 @@ mod tests {
         assert!(matches!(result, Err(AuthError::BadTokenFormat)));
     }
 
-    /// A signed SYSTEM token scoped to one UID-bearing Verifier resolves to a
-    /// cardless `System` principal whose only authority is that Verifier.
+    /// Every signed `system` claim set is refused, including the two shapes
+    /// the server once minted for result writes and Drift reads, because the
+    /// SYSTEM principal is an attribution identity that never holds a token.
     ///
     /// # Panics
-    /// Panics when the conforming token is refused or resolves to anything
-    /// other than the single-Verifier SYSTEM principal.
+    /// Panics when any `system` claim set verifies.
     #[test]
-    fn token_verifier_accepts_system_token_scoped_to_one_verifier() {
+    fn token_verifier_refuses_every_system_claim_set() {
         let verifier_ref = uid_card_ref(CardKind::Verifier, "drift");
-        let claims = system_claims(&verifier_ref);
-        let token = SecretString::from(encode_eddsa_with_kid(&claims));
-
-        let verified = verifier(WyrdAuthVerifySettings::default())
-            .verify(&token, &tenant_id())
-            .expect("conforming system token verifies");
-
-        assert_eq!(
-            verified.principal.kind,
-            PrincipalKind::System {
-                card_ref_scope: CardRefScope::own(&verifier_ref)
-            }
-        );
-        assert_eq!(verified.principal.card_ref(), None);
-        assert!(verified.principal.roles.is_empty());
-        assert_eq!(verified.principal.credential_id, None);
-        assert!(verified.delegation_chain.is_empty());
-        assert_eq!(
-            verified.principal.effective_permissions,
-            PermissionSet::from_iter([Permission::bifrost_record_write()])
-        );
-    }
-
-    /// The SYSTEM Drift read shape — the same closed claim set carrying only
-    /// one `vala.drift` table-scoped `bifrost_query:read` — resolves to the
-    /// same single-Verifier `System` principal holding exactly that read.
-    ///
-    /// # Panics
-    /// Panics when the conforming read token is refused or gains authority.
-    #[test]
-    fn token_verifier_accepts_system_drift_read_token() {
-        let verifier_ref = uid_card_ref(CardKind::Verifier, "drift");
-        let read = Permission::drift_table_read(uuid::Uuid::now_v7());
-        let claims = AccessTokenClaims {
-            permissions: PermissionSet::from_iter([read.clone()]),
-            ..system_claims(&verifier_ref)
+        let write = system_claims(&verifier_ref);
+        let read = AccessTokenClaims {
+            permissions: PermissionSet::from_iter([Permission {
+                scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
+                    catalog: "vala".to_owned(),
+                    schema: "drift".to_owned(),
+                    table_uid: uuid::Uuid::now_v7(),
+                })),
+                ..Permission::bifrost_query_read()
+            }]),
+            ..write.clone()
         };
-        let token = SecretString::from(encode_eddsa_with_kid(&claims));
-
-        let verified = verifier(WyrdAuthVerifySettings::default())
-            .verify(&token, &tenant_id())
-            .expect("conforming system read token verifies");
-
-        assert_eq!(
-            verified.principal.kind,
-            PrincipalKind::System {
-                card_ref_scope: CardRefScope::own(&verifier_ref)
-            }
-        );
-        assert_eq!(
-            verified.principal.effective_permissions,
-            PermissionSet::from_iter([read])
-        );
-    }
-
-    /// Every deviation from the SYSTEM token contract is refused as an invalid
-    /// token, so no forged or widened claim set can act as the result writer.
-    ///
-    /// # Panics
-    /// Panics when any violating claim set resolves to a principal.
-    #[test]
-    fn into_verified_rejects_every_system_contract_violation() {
-        let verifier_ref = uid_card_ref(CardKind::Verifier, "drift");
-        let base = system_claims(&verifier_ref);
-        let non_v7: PrincipalId = "01890f28-7c4a-4cc3-98e7-4f4a3c2d1b00"
-            .parse()
-            .expect("static v4 principal id is valid");
-        let uidless = CardRef {
-            uid: None,
-            ..verifier_ref.clone()
-        };
-        let with_scope = |scope: CardRefScope| AccessTokenClaims {
+        let unscoped = AccessTokenClaims {
             principal: TokenPrincipalRef {
-                card_ref_scope: scope,
-                ..base.principal.clone()
+                card_ref_scope: CardRefScope::default(),
+                ..write.principal.clone()
             },
-            ..base.clone()
+            ..write.clone()
         };
-        let cases: Vec<(&str, AccessTokenClaims)> = vec![
-            (
-                "non-UUIDv7 principal",
-                AccessTokenClaims {
-                    sub: non_v7.to_string(),
-                    principal: TokenPrincipalRef {
-                        id: non_v7,
-                        ..base.principal.clone()
-                    },
-                    ..base.clone()
-                },
-            ),
-            (
-                "subject differs from principal",
-                AccessTokenClaims {
-                    sub: "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b0f".to_owned(),
-                    ..base.clone()
-                },
-            ),
-            (
-                "root card",
-                AccessTokenClaims {
-                    principal: TokenPrincipalRef {
-                        card_ref: Some(verifier_ref.clone()),
-                        ..base.principal.clone()
-                    },
-                    ..base.clone()
-                },
-            ),
-            (
-                "role",
-                AccessTokenClaims {
-                    roles: vec![role()],
-                    ..base.clone()
-                },
-            ),
-            ("empty scope", with_scope(CardRefScope::default())),
-            (
-                "multi-member scope",
-                with_scope(CardRefScope::from_root_and_members(
-                    &verifier_ref,
-                    [uid_card_ref(CardKind::Verifier, "other")],
-                )),
-            ),
-            (
-                "non-Verifier scope member",
-                with_scope(CardRefScope::own(&uid_card_ref(
-                    CardKind::Service,
-                    "billing",
-                ))),
-            ),
-            (
-                "scope member without uid",
-                with_scope(CardRefScope::own(&uidless)),
-            ),
-            (
-                "widened permissions",
-                AccessTokenClaims {
-                    permissions: PermissionSet::from_iter([
-                        Permission::bifrost_record_write(),
-                        Permission::card_read(),
-                    ]),
-                    ..base.clone()
-                },
-            ),
-            (
-                "both SYSTEM purposes",
-                AccessTokenClaims {
-                    permissions: PermissionSet::from_iter([
-                        Permission::bifrost_record_write(),
-                        Permission::drift_table_read(uuid::Uuid::now_v7()),
-                    ]),
-                    ..base.clone()
-                },
-            ),
-            (
-                "unscoped query read",
-                AccessTokenClaims {
-                    permissions: PermissionSet::from_iter([Permission::bifrost_query_read()]),
-                    ..base.clone()
-                },
-            ),
-            (
-                "query read of another schema",
-                AccessTokenClaims {
-                    permissions: PermissionSet::from_iter([Permission {
-                        scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(
-                            BifrostTableScope {
-                                catalog: "vala".to_owned(),
-                                schema: "traces".to_owned(),
-                                table_uid: uuid::Uuid::now_v7(),
-                            },
-                        )),
-                        ..Permission::bifrost_query_read()
-                    }]),
-                    ..base.clone()
-                },
-            ),
-            (
-                "two drift table reads",
-                AccessTokenClaims {
-                    permissions: PermissionSet::from_iter([
-                        Permission::drift_table_read(uuid::Uuid::now_v7()),
-                        Permission::drift_table_read(uuid::Uuid::now_v7()),
-                    ]),
-                    ..base.clone()
-                },
-            ),
-            (
-                "missing permission",
-                AccessTokenClaims {
-                    permissions: PermissionSet::from_iter([Permission::card_read()]),
-                    ..base.clone()
-                },
-            ),
-            (
-                "credential attribution",
-                AccessTokenClaims {
-                    cid: Some("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b0c".to_owned()),
-                    ..base.clone()
-                },
-            ),
-            (
-                "delegation chain",
-                AccessTokenClaims {
-                    act: Some(Box::new(act_chain(1))),
-                    ..base.clone()
-                },
-            ),
-            (
-                "system-owner tenant",
-                AccessTokenClaims {
-                    principal: TokenPrincipalRef {
-                        tenant_id: DataTenantId::SYSTEM_OWNER,
-                        ..base.principal.clone()
-                    },
-                    ..base.clone()
-                },
-            ),
-        ];
-
-        for (label, claims) in cases {
-            let result = claims.into_verified();
+        for (label, claims) in [("write", write), ("read", read), ("unscoped", unscoped)] {
+            let token = SecretString::from(encode_eddsa_with_kid(&claims));
+            let result = verifier(WyrdAuthVerifySettings::default()).verify(&token, &tenant_id());
             assert!(
                 matches!(result, Err(AuthError::InvalidToken)),
                 "{label}: {result:?}"
@@ -1896,24 +1650,7 @@ mod tests {
         assert!(matches!(result, Err(AuthError::InvalidToken)), "{result:?}");
     }
 
-    /// A SYSTEM token signed for one tenant cannot be replayed in another.
-    ///
-    /// # Panics
-    /// Panics when the verifier admits the token under a foreign tenant.
-    #[test]
-    fn token_verifier_rejects_system_token_for_another_tenant() {
-        let claims = system_claims(&uid_card_ref(CardKind::Verifier, "drift"));
-        let token = SecretString::from(encode_eddsa_with_kid(&claims));
-        let wrong_tenant = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b09"
-            .parse()
-            .expect("static tenant id is valid");
-
-        let result = verifier(WyrdAuthVerifySettings::default()).verify(&token, &wrong_tenant);
-
-        assert!(matches!(result, Err(AuthError::InvalidToken)), "{result:?}");
-    }
-
-    /// Build the conforming claim set the tenant issuer mints for the SYSTEM
+    /// Build the claim set the server once minted for the SYSTEM result
     /// writer: no roles, credential, or delegation; exactly
     /// `bifrost_record:write`; and a scope of exactly `verifier_ref`.
     fn system_claims(verifier_ref: &CardRef) -> AccessTokenClaims {

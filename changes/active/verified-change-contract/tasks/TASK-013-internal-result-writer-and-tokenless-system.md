@@ -1,7 +1,7 @@
 ---
 id: TASK-013
 kind: implementation
-status: ready
+status: review
 spec: SPEC-verified-change-contract
 spec_revision: 59
 requirements: [REQ-086, REQ-114, INV-021, AC-023, AC-030, AC-043]
@@ -180,3 +180,46 @@ server and `wyrd-testing` tests, `architecture/wyrd-design.md`,
 - [Approved spec revision 59](../spec.md): REQ-086, REQ-114, REQ-178..180,
   INV-021, AC-023, AC-030, AC-043.
 - `AGENTS.md`, `architecture/wyrd-design.md`, `architecture/bifrost-design.md`.
+
+## Implementation Evidence
+
+### Acceptance matrix
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| No result write touches Gate, a token, or the public listener | `verification/publisher.rs` deleted; `VerifierRunner` writes through `AppState::gateway_capture` (`GatewayCapture::write_result`, local Scribe or peer RPC); `ingest_endpoint` config and docs removed | `pg_verification_runtime` (26/26); `verification_runtime::runner_without_local_scribe_publishes_through_a_peer_scribe` | PASS |
+| Gate refuses every public result-table write | `gate/mod.rs` reserves the three result tables with `vala.gateway.calls`; SYSTEM branch removed | `gate::tests::public_result_table_writes_are_refused_for_every_principal`; `pg_grpc_ingest_smoke::{public_result_writes_are_refused_over_grpc, forged_tenant_result_writes_are_refused}` | PASS |
+| Peer RPC admits exactly five tables | `grpc/capture_peer.rs`, `wyrd.v1.proto` result attribution | `grpc::capture_peer::tests::requests_are_confined_to_tenant_capture_destinations` | PASS |
+| Result rows carry SYSTEM `principal_id`, exact Verifier `card_uid`, explicit IDs; mismatched `card_ref` refused | `VerifierAttribution` frame principal; Scribe stamps from it | `components::gateway::capture::tests::result_batches_submit_under_the_system_principal`; `verification_runtime::result_layout_partitions_blooms_and_prunes_by_result` | PASS |
+| Issuer refuses SYSTEM; verification refuses `kind=system` | `wyrd-auth-issue`, `wyrd-auth-verify`, `wyrd-auth/issuance.rs` | `issue_access_token_refuses_every_system_grant`, `token_verifier_refuses_every_system_claim_set`, `into_verified_rejects_system_delegation_layer`, `public_grants_refuse_the_system_principal`; `test:principals:integration` | PASS |
+| Drift and Eval read through one tokenless SYSTEM read authority | `verification/authority.rs` `SystemReadAuthority`; SYSTEM principal read in the claim (`CLAIM_RUN_SQL`) | `pg_grpc_ingest_smoke::system_read_authority_reads_only_the_named_table`; `verification_runtime::drift_runner_without_local_oracle_reads_through_a_peer`; `eval_verification::continuous_eval_read_authority_fails_closed` | PASS |
+| Architecture and docs no longer describe SYSTEM tokens or an ingest endpoint | `wyrd-design.md`, `bifrost-design.md`, `wyrd-security-posture.md`, `configuration.svx` | `mise run docs:check` | PASS |
+
+### Test changes with reasons
+
+- `pg_verification_routes` SYSTEM-token public-grant test deleted: a SYSTEM
+  token can no longer be minted; the refusal is covered by the issuer and
+  verifier unit tests above.
+- `pg_verification_runtime::schedulers_create_one_run_per_occurrence_across_ticks_and_restart`:
+  a runtime now composes its runner whenever the pod reaches a Scribe, so the
+  "scheduler-only, no endpoint" premise is unreachable on a single server; the
+  test keeps its one-run-per-occurrence and health assertions.
+- `eval_verification::continuous_eval_failures_publish_only_stable_errors`:
+  the SYSTEM principal is now read in the claim, so a failing principals read
+  stalls the claim rather than failing a run. The Postgres leg now raises its
+  sentinel on Card reads, failing the Verifier load (`verifier_unavailable`);
+  the sentinel still never reaches status or persisted errors.
+- The cluster journey's "unrouted runner composes nothing" negative was dropped;
+  it needs a pod reaching no Scribe, which the cluster spec cannot stage.
+
+### Commands
+
+```
+mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --lib -E 'test(=grpc::capture_peer::tests::requests_are_confined_to_tenant_capture_destinations)'
+mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --lib -E 'test(=components::gateway::capture::tests::result_batches_submit_under_the_system_principal)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=gate::tests::public_result_table_writes_are_refused_for_every_principal)'
+mise run fmt; mise run lints; mise run docs:check
+mise run test:bifrost:integration:server; mise run test:bifrost:integration:redux
+mise run test:principals:integration; mise run test:cards:integration; mise run test:operators:integration
+mise run test:vala; mise run test:bifrost:journey:server
+```

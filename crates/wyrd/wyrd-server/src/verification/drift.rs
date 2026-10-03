@@ -9,12 +9,12 @@
 //! fitted edges and labels, and window bounds are escaped typed literals; a
 //! Verifier contributes no SQL text.
 //!
-//! Each run issues exactly one statement as the tenant's SYSTEM Drift reader: the engine mints a
-//! token holding only `bifrost_query:read` on the tenant's registered
-//! observation table, verifies it through the server's ordinary token
-//! verifier, and dispatches through the ordinary query service — capability
-//! admission, Gate, and a local or peer-forwarded Oracle — so no Oracle need
-//! run in this process. Oracle's table authorization enforces the read and
+//! Each run issues exactly one statement as the tenant's SYSTEM principal
+//! under a tokenless read authority holding only `bifrost_query:read` on the
+//! tenant's registered observation table, dispatched through the ordinary
+//! query entry to a local or peer-forwarded Oracle, so no Oracle need run in
+//! this process. A tenant that never registered the table scores an empty
+//! window. Oracle's table authorization enforces the read and
 //! records the read decision. The shared scheduled-query consumer settles
 //! every stream, and each decoded aggregate batch is folded as it arrives.
 //!
@@ -27,7 +27,7 @@
 //! as `Drift(None)`, the inconclusive result without a report; nothing is
 //! dropped or imputed. An empty Custom
 //! window and a non-finite Custom mean are unscorable the same way. A
-//! transient mint, query, or registry failure retries; a missing, legacy, or
+//! transient authority, query, or registry failure retries; a missing, legacy, or
 //! mismatched fitted baseline or a malformed aggregate terminates.
 
 use std::time::Duration;
@@ -37,27 +37,26 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use datafusion::sql::sqlparser::ast::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
+use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_drift::psi::BinType;
 use vala_drift::{
     DriftReport, DriftScoreError, FITTED_FORMAT, FittedBaseline, PsiBaseline, SpcBaseline,
     SpcScorer, score_custom_mean, score_psi_counts,
 };
-use wyrd_auth::issuance::TenantTokenIssuer;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::drift::{DriftProfile, DriftSpec, PsiProfile};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardUid, FeatureName};
-use wyrd_spec::reference::CardRef;
-use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::verification::{DriftWindow, VerificationError};
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::verifier_runs::{ClaimedRun, RunInput, TerminalStatus};
 
+use super::authority::{SystemReadAuthority, SystemReadAuthorityError};
 use super::engines::{EngineOutcome, VerifierReport};
 use super::telemetry::{ExecutionTelemetry, Phase, StreamWaits};
-use crate::components::auth::Caller;
 use crate::query::scheduled::ScheduledQueryCaller;
 use crate::state::AppState;
 
@@ -647,10 +646,8 @@ pub fn fold_custom(batch: &RecordBatch, row: &mut Option<Option<f64>>) -> Result
 
 /// Owner of Drift execution: baseline loading, SYSTEM reads, scoring.
 pub struct DriftEngine {
-    /// Server state owning Postgres, the token verifier, and the query service.
+    /// Server state owning Postgres, the Bifrost catalog, and the query service.
     state: AppState,
-    /// The one tenant token issuer the SYSTEM Drift reader is minted through.
-    issuer: TenantTokenIssuer,
     /// Fitted baseline reads.
     baselines: FittedBaselines,
     /// Deadline of one aggregate query.
@@ -658,38 +655,34 @@ pub struct DriftEngine {
 }
 
 impl DriftEngine {
-    /// Build an engine reading through `state` as readers minted by `issuer`.
+    /// Build an engine reading through `state` as each run's SYSTEM principal.
     #[must_use]
-    pub fn new(state: AppState, issuer: TenantTokenIssuer, query_timeout: Duration) -> Self {
+    pub fn new(state: AppState, query_timeout: Duration) -> Self {
         Self {
             baselines: FittedBaselines::new(state.clone()),
             state,
-            issuer,
             query_timeout,
         }
     }
 
-    /// Execute one claimed Drift run of `verifier` for `tenant`.
+    /// Execute one claimed Drift run for `tenant`.
     ///
     /// Loads the fitted baseline (PSI/SPC), runs one fixed aggregate
-    /// statement as the tenant's SYSTEM Drift reader, and scores the folded
+    /// statement under the tenant's tokenless SYSTEM read authority, and
+    /// scores the folded
     /// aggregates. Baseline retrieval and statement construction are the
     /// `prepare` phase, the streaming read is `input_read`, and the baseline
-    /// read, token mint, and gaps between streamed batches are waits on
+    /// read, read authority, and gaps between streamed batches are waits on
     /// `telemetry`. Never fails: every failure is the [`EngineOutcome`] it
     /// maps to.
     pub async fn verify(
         &self,
         tenant: DataTenantId,
-        verifier: &CardRef,
         run: &ClaimedRun,
         spec: &DriftSpec,
         telemetry: &ExecutionTelemetry,
     ) -> EngineOutcome {
-        match self
-            .try_verify(tenant, verifier, run, spec, telemetry)
-            .await
-        {
+        match self.try_verify(tenant, run, spec, telemetry).await {
             Ok(report) => EngineOutcome::Completed(VerifierReport::Drift(report)),
             Err(outcome) => outcome,
         }
@@ -702,7 +695,6 @@ impl DriftEngine {
     async fn try_verify(
         &self,
         tenant: DataTenantId,
-        verifier: &CardRef,
         run: &ClaimedRun,
         spec: &DriftSpec,
         telemetry: &ExecutionTelemetry,
@@ -721,7 +713,7 @@ impl DriftEngine {
         let reader = Reader {
             engine: self,
             tenant,
-            verifier,
+            run,
             telemetry,
         };
         match spec.profile.as_ref() {
@@ -860,63 +852,47 @@ impl FittedBaselines {
     }
 }
 
-/// The SYSTEM Drift reader of one run: its tenant and attributed Verifier.
+/// The SYSTEM observation read of one run: its tenant and claimed run.
 struct Reader<'a> {
-    /// Engine owning the server state and issuer.
+    /// Engine owning the server state.
     engine: &'a DriftEngine,
-    /// Run tenant every read is minted for.
+    /// Run tenant every read is authorized in.
     tenant: DataTenantId,
-    /// Exact Verifier the read token is attributed to.
-    verifier: &'a CardRef,
+    /// The claimed run, carrying the tenant's SYSTEM principal.
+    run: &'a ClaimedRun,
     /// The execution whose input-read phase and waits this reader records.
     telemetry: &'a ExecutionTelemetry,
 }
 
 impl Reader<'_> {
-    /// Mint and verify a fresh SYSTEM Drift read token and derive its caller.
+    /// Authorize the run's SYSTEM principal to read the observation table.
     ///
     /// Returns `Ok(None)` when the tenant has never registered the observation
-    /// table, so there is nothing to read.
+    /// table, so there is nothing to read and the window is empty.
     ///
     /// # Errors
-    /// Retries when the tenant connection, mint, or verification fails.
-    async fn caller(&self) -> Result<Option<Caller>, EngineOutcome> {
-        let unavailable =
-            |error: &dyn std::fmt::Display| retry(DRIFT_QUERY_FAILED, error.to_string());
-        let mut conn = self
-            .engine
-            .state
-            .postgres
-            .wyrd()
-            .tenant_conn(self.tenant)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        let Some(token) = self
-            .engine
-            .issuer
-            .issue_system_drift_read_token(&mut conn, self.verifier)
-            .await
-            .map_err(|error| unavailable(&error))?
-        else {
-            return Ok(None);
-        };
-        drop(conn);
-        let verifier = self
-            .engine
-            .state
-            .auth
-            .token_verifier
-            .as_deref()
-            .ok_or_else(|| retry(DRIFT_QUERY_FAILED, "no token verifier is configured"))?;
-        let verified = verifier
-            .verify(&token.access_token, &self.tenant)
-            .map_err(|error| unavailable(&error))?;
-        Ok(Some(Caller {
-            data_tenant_id: self.tenant,
-            principal: verified.principal,
-            request_id: RequestId::now_v7(),
-            delegation_chain: verified.delegation_chain,
-        }))
+    /// Terminates `errored` when the run has no `UUIDv7` SYSTEM principal and
+    /// retries when the table identity cannot be read.
+    async fn authority(&self) -> Result<Option<SystemReadAuthority>, EngineOutcome> {
+        let authority = SystemReadAuthority::resolve(
+            &self.engine.state,
+            self.tenant,
+            self.run.system_principal,
+            &[TableRef::new(BifrostNamespace::Drift, "observations")],
+        )
+        .await
+        .map_err(|error| match error {
+            SystemReadAuthorityError::SystemPrincipalMissing => {
+                terminal(super::runner::SYSTEM_PRINCIPAL_MISSING, error.to_string())
+            }
+            error => retry(DRIFT_QUERY_FAILED, error.to_string()),
+        })?;
+        Ok((!authority
+            .context()
+            .principal
+            .effective_permissions
+            .is_empty())
+        .then_some(authority))
     }
 
     /// Run `sql` as a fresh reader and hand each decoded batch to `fold`.
@@ -924,12 +900,12 @@ impl Reader<'_> {
     /// A tenant with no observation table reads nothing and `fold` is never
     /// called. The stream is consumed and settled by the shared scheduled
     /// consumer; a batch `fold` refuses terminates the run as invalid. The
-    /// whole read is the `input_read` phase; the token mint and the gaps
+    /// whole read is the `input_read` phase; the authority and the gaps
     /// between streamed batches are waits, while folding stays local work.
     ///
     /// # Errors
-    /// Retries a mint, admission, query, or stream failure; terminates on a
-    /// malformed aggregate.
+    /// Retries an authority, admission, query, or stream failure; terminates
+    /// on a missing SYSTEM principal or a malformed aggregate.
     async fn fold<F>(&self, sql: String, fold: F) -> Result<(), EngineOutcome>
     where
         F: FnMut(&RecordBatch) -> Result<(), String>,
@@ -943,25 +919,24 @@ impl Reader<'_> {
             .await
     }
 
-    /// The body of [`fold`](Self::fold): mint, query, and fold the stream.
+    /// The body of [`fold`](Self::fold): authorize, query, and fold the stream.
     ///
     /// # Errors
-    /// Retries a mint, admission, query, or stream failure; terminates on a
-    /// malformed aggregate.
+    /// Retries an authority, admission, query, or stream failure; terminates
+    /// on a missing SYSTEM principal or a malformed aggregate.
     async fn read<F>(&self, sql: String, mut fold: F) -> Result<(), EngineOutcome>
     where
         F: FnMut(&RecordBatch) -> Result<(), String>,
     {
-        let Some(caller) = self.telemetry.wait(self.caller()).await? else {
+        let Some(authority) = self.telemetry.wait(self.authority()).await? else {
             return Ok(());
         };
         let failed = |error: WyrdError| retry(DRIFT_QUERY_FAILED, error.to_string());
-        let query = ScheduledQueryCaller::authenticated(
+        let query = ScheduledQueryCaller::new(
             self.engine.state.clone(),
-            caller,
+            authority.into_context(),
             CancellationToken::new(),
-        )
-        .map_err(failed)?;
+        );
         let request = BifrostQueryRequest {
             sql,
             deadline_ms: Some(

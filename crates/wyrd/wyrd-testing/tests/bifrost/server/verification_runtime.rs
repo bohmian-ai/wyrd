@@ -1,14 +1,15 @@
 //! Verification runtime journey on a role-separated cluster.
 //!
 //! The runner lives on an Oracle-only node with no local Scribe, so the only
-//! way its result can reach Bifrost is the tenant SYSTEM token over gRPC to
-//! the Scribe node's public ingest endpoint. The journey schedules one
+//! way its result can reach Bifrost is the gateway capture writer's peer
+//! ingest RPC to the Scribe node. The journey schedules one
 //! binding-created run, lets the runtime execute and publish a non-empty Drift
 //! result, and reads the summary and its feature rows back through the
 //! server's own query entry, asserting every identity they carry. A second
 //! journey runs the production Drift engine on the Scribe-only node, which
 //! hosts no Oracle, so its observation read must be forwarded to a peer
-//! Oracle under the tenant's SYSTEM Drift reader and audited there.
+//! Oracle under the tenant's tokenless SYSTEM read authority and audited
+//! there.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +31,7 @@ use wyrd_server::verification::health::RuntimeCapability;
 use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::runner::EngineScript;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId, VerificationRunId};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::BifrostQueryRequest;
@@ -52,18 +54,17 @@ const WAIT: Duration = Duration::from_secs(60);
 const DAY: Duration = Duration::from_secs(86_400);
 
 /// A runner on a node without local Scribe publishes a binding-created Drift
-/// result through the configured ingest endpoint and completes the run. Its
-/// summary and both feature rows are queryable through the Oracle and carry
-/// the exact tenant SYSTEM writer, Verifier, subject, owner, binding, run,
-/// result, and one shared event time. Without an endpoint the same node
-/// composes no runner.
+/// result through the gateway capture writer's peer ingest RPC and completes
+/// the run. Its summary and both feature rows are queryable through the
+/// Oracle and carry the exact tenant SYSTEM principal, Verifier, subject,
+/// owner, binding, run, result, and one shared event time.
 ///
 /// # Errors
 /// Returns cluster, seeding, runtime, publication, or query errors, or a
 /// description of the first identity that does not match.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
-async fn runner_without_local_scribe_publishes_through_the_ingest_endpoint()
+async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
 -> Result<(), ServerJourneyError> {
     let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::role_separated()).await?;
     let tenant = cluster.data_tenant_id();
@@ -74,13 +75,6 @@ async fn runner_without_local_scribe_publishes_through_the_ingest_endpoint()
         .ok_or("the cluster composed no Scribe")?;
     if oracle.state().bifrost_ingest().is_some() {
         return Err("the runner node must have no local ingest".into());
-    }
-
-    let unrouted = VerificationRuntime::builder(oracle.state())
-        .build()
-        .ok_or("the runtime did not compose")?;
-    if unrouted.composes(RuntimeCapability::Runner) {
-        return Err("a node without Scribe or an endpoint composed a runner".into());
     }
 
     let seed = VerificationFixture::provision(oracle.state().postgres.wyrd(), tenant).await?;
@@ -106,12 +100,11 @@ async fn runner_without_local_scribe_publishes_through_the_ingest_endpoint()
         }))?,
     ))));
     let runtime = VerificationRuntime::builder(oracle.state())
-        .ingest_endpoint(scribe.grpc_url().ok_or("missing Scribe gRPC URL")?)
         .engine_script(script)
         .build()
         .ok_or("the runtime did not compose")?;
     if !runtime.composes(RuntimeCapability::Runner) {
-        return Err("an explicit ingest endpoint did not compose the runner".into());
+        return Err("a node reaching a peer Scribe did not compose the runner".into());
     }
     let stop = CancellationToken::new();
     let task = tokio::spawn(runtime.run(stop.clone()));
@@ -191,9 +184,9 @@ async fn runner_without_local_scribe_publishes_through_the_ingest_endpoint()
 
 /// A runner on a pod without a local Oracle completes a real Drift run.
 ///
-/// The Scribe-only node composes the runtime with its own ingest endpoint.
-/// Its Custom Verifier's observation read is minted as the tenant SYSTEM
-/// Drift reader and forwarded by Gate to a peer Oracle, which records one
+/// The Scribe-only node composes the runtime over its own Scribe. Its Custom
+/// Verifier's observation read runs under the tenant SYSTEM read authority
+/// and is forwarded to a peer Oracle, which records one
 /// audited read decision; the run completes with a published result. The
 /// registered table is empty for the subject, so the run is inconclusive.
 ///
@@ -236,7 +229,6 @@ async fn drift_runner_without_local_oracle_reads_through_a_peer() -> Result<(), 
     let reads = audit_rows(scribe, tenant, "bifrost.query.read_decision").await?;
 
     let runtime = VerificationRuntime::builder(scribe.state())
-        .ingest_endpoint(scribe.grpc_url().ok_or("missing Scribe gRPC URL")?)
         .build()
         .ok_or("the runtime did not compose")?;
     let stop = CancellationToken::new();
@@ -278,7 +270,7 @@ const MONTHLY: &str = "0 0 1 * *";
 /// Bifrost facade. Two Custom Drift Verifiers, one that drifts on the
 /// observed mean and one that does not, are bound to that subject. The
 /// production runtime on the Oracle-only node executes both runs and
-/// publishes through the Scribe endpoint. The observation table then holds
+/// publishes through a peer Scribe. The observation table then holds
 /// exactly the two client rows, attributed to the client principal and the
 /// subject Card with no Verifier or binding column and no per-binding copy,
 /// while each binding's single result is selected by its `binding_id` alone
@@ -354,7 +346,6 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
     cluster.refresh_oracle_snapshots().await?;
 
     let runtime = VerificationRuntime::builder(oracle.state())
-        .ingest_endpoint(scribe.grpc_url().ok_or("missing Scribe gRPC URL")?)
         .build()
         .ok_or("the runtime did not compose")?;
     let stop = CancellationToken::new();
@@ -637,10 +628,10 @@ struct ScanEvidence {
 /// The single-node cluster, tenant, and SYSTEM writer the layout journey
 /// publishes and reads through.
 ///
-/// Owns the identities every published result repeats — the subject and the
-/// SYSTEM token's Verifier — and the server whose Scribe the writer reaches,
-/// so each publication, query, and storage inspection reads them from one
-/// place.
+/// Owns the identities every published result repeats — the subject, the
+/// Verifier, and the tenant SYSTEM principal — and the server whose Scribe
+/// the internal result writer reaches, so each publication, query, and
+/// storage inspection reads them from one place.
 struct ResultLayoutJourney<'a> {
     /// The cluster whose telemetry and storage root the journey inspects.
     cluster: &'a WyrdTestCluster,
@@ -650,18 +641,18 @@ struct ResultLayoutJourney<'a> {
     tenant: DataTenantId,
     /// The verified subject.
     subject: CardUid,
-    /// The UID-bearing Verifier the SYSTEM token is scoped to.
+    /// The UID-bearing Verifier every result is attributed to.
     verifier: CardRef,
-    /// Public Bifrost facade authenticated as the tenant SYSTEM writer.
-    bifrost: Bifrost,
+    /// The tenant SYSTEM principal every result is attributed to.
+    system: PrincipalId,
 }
 
 impl<'a> ResultLayoutJourney<'a> {
-    /// Provision the tenant's SYSTEM writer, a subject and a Verifier, the
-    /// three result tables, and a SYSTEM-authenticated Bifrost facade.
+    /// Provision the tenant's SYSTEM principal, a subject and a Verifier, and
+    /// the three result tables.
     ///
     /// # Errors
-    /// Returns a seeding, provisioning, minting, or connection error.
+    /// Returns a seeding or provisioning error.
     async fn start(cluster: &'a WyrdTestCluster) -> Result<Self, ServerJourneyError> {
         let tenant = cluster.data_tenant_id();
         let server = cluster.server(0).ok_or("missing mixed node")?;
@@ -678,31 +669,19 @@ impl<'a> ResultLayoutJourney<'a> {
                 .ensure_builtin_table_for_test(tenant, namespace, name)
                 .await?;
         }
-        let issuer = server
-            .state()
-            .auth
-            .tenant_issuer()
-            .ok_or("the server has no tenant issuer")?;
-        let mut conn = server.state().postgres.wyrd().tenant_conn(tenant).await?;
-        let token = issuer.issue_system_token(&mut conn, &verifier).await?;
-        drop(conn);
-        let client = wyrd_client::bifrost::client_from_options(
-            server.base_url(),
-            Some(token.access_token.expose_secret()),
-            server.grpc_url().as_deref(),
-        )?;
         Ok(Self {
             cluster,
             server,
             tenant,
             subject,
             verifier,
-            bifrost: Bifrost::connect(&client).await?,
+            system: PrincipalId::new(seed.system_principal()),
         })
     }
 
     /// Publish one result with `event_time` through the production payload
-    /// builder and flush it into its own file; returns its `result_id`.
+    /// builder and the internal result writer, and flush it into its own
+    /// file; returns its `result_id`.
     ///
     /// With `straddle`, Scribe's receipt clock moves one day ahead after the
     /// detail batch is acknowledged and before the summary is sent, so the
@@ -749,6 +728,7 @@ impl<'a> ResultLayoutJourney<'a> {
             ),
         };
         let result = VerificationResultId::new_v7();
+        let run_id = VerificationRunId::new_v7();
         let verifier_ref = CardRef {
             uid: None,
             ..self.verifier.clone()
@@ -756,7 +736,7 @@ impl<'a> ResultLayoutJourney<'a> {
         .to_string();
         let payload = ResultPayloadBuilder::new(
             ResultRun {
-                run_id: VerificationRunId::new_v7(),
+                run_id,
                 verifier_version: "1.0.0",
                 subject_card_uid: &self.subject,
                 owner_card_uid: Some(&self.subject),
@@ -775,13 +755,23 @@ impl<'a> ResultLayoutJourney<'a> {
             .server
             .bifrost_scribe()
             .ok_or("the mixed node owns no Scribe")?;
-        let batches = payload.batches();
-        for (index, batch) in batches.iter().enumerate() {
-            if straddle && index + 1 == batches.len() {
-                scribe.shift_receipt_clock_for_test(DAY);
-            }
-            self.bifrost.write_batch(&batch.table, &batch.batch).await?;
-        }
+        let summary = payload.batches().len() - 1;
+        self.server
+            .state()
+            .gateway_capture
+            .write_result_payload_for_test(
+                &payload,
+                self.tenant,
+                run_id,
+                &self.verifier,
+                self.system,
+                |index| {
+                    if straddle && index == summary {
+                        scribe.shift_receipt_clock_for_test(DAY);
+                    }
+                },
+            )
+            .await?;
         scribe.shift_receipt_clock_for_test(Duration::ZERO);
         self.server.flush_bifrost().await?;
         Ok(result)

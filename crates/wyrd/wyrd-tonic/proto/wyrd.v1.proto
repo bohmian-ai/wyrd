@@ -73,9 +73,10 @@ message CancelRunningQueryResponse { string request_id = 1; bool cancellation_st
 service ScribeTailService {
   rpc ListActiveStreams(ListActiveStreamsRequest) returns (ListActiveStreamsResponse);
 }
-// Gateway capture's server-internal write from a pod without a local Scribe.
-// Served only where Scribe runs, on the mutually authenticated peer listener;
-// it admits only the two capture destinations and never a reserved tenant.
+// Server-internal writes from a pod without a local Scribe: gateway capture
+// and Verifier results. Served only where Scribe runs, on the mutually
+// authenticated peer listener; it admits only the two capture destinations
+// and the three Verifier result tables, and never a reserved tenant.
 service ScribeCapturePeerService {
   rpc IngestCapture(IngestCaptureRequest) returns (IngestCaptureResponse);
 }
@@ -102,11 +103,18 @@ message TailStreamIdentity { string node_id = 1; uint64 writer_epoch = 2; }
 message ListActiveStreamsRequest { TenantTableBinding binding = 1; }
 message ActiveTailStream { TimePartition time_partition = 1; TailStreamIdentity stream = 2; }
 message ListActiveStreamsResponse { repeated ActiveTailStream streams = 1; }
-// One capture batch: tenant and destination are explicit because the caller
-// holds no token. batch_id is the deterministic UUID Scribe deduplicates on.
+// One server-internal batch: tenant and destination are explicit because the
+// caller holds no token. batch_id is the deterministic UUID Scribe
+// deduplicates on. verifier is present exactly for a Verifier result table.
 message IngestCaptureRequest {
   string tenant_id = 1; string table = 2; string batch_id = 3; string request_id = 4;
-  bytes arrow_ipc = 5;
+  bytes arrow_ipc = 5; VerifierResultAttribution verifier = 6;
+}
+// The frozen run identity a Verifier result batch is written under: the run,
+// the exact Verifier Card reference and UID Scribe stamps as card_uid, and the
+// tenant SYSTEM principal Scribe stamps as principal_id.
+message VerifierResultAttribution {
+  string run_id = 1; string verifier_ref = 2; string verifier_uid = 3; string principal_id = 4;
 }
 message IngestCaptureResponse {}
 enum QueryClass { QUERY_CLASS_UNSPECIFIED = 0; QUERY_CLASS_INTERACTIVE = 1; QUERY_CLASS_ANALYTICAL = 2; }

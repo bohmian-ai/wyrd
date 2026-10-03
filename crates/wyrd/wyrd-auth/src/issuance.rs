@@ -8,11 +8,8 @@
 //! issuance audit — so a grant change or suspension governs the very next
 //! token on every path, and no path can drift from the others.
 //!
-//! The internal mints, [`TenantTokenIssuer::issue_system_token`] and
-//! [`TenantTokenIssuer::issue_system_drift_read_token`], sign the tenant's
-//! credentialless SYSTEM principal a token scoped to one Verifier for exactly
-//! one fixed purpose. They have no grant evidence to verify and no public entry
-//! path.
+//! The tenant SYSTEM principal is an attribution identity only: no path here
+//! mints a token for it, and every public grant refuses it as inactive.
 
 use std::sync::Arc;
 
@@ -20,20 +17,17 @@ use chrono::{DateTime, Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use uuid::Uuid;
-use vala_sql::queries::olap_catalog::get_by_fqn;
 use wyrd_auth_issue::{AccessGrant, IssueError, IssuingKey};
 use wyrd_auth_verify::{ActClaim, TokenAudience, TokenPrincipalRef};
 use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef};
 use wyrd_spec::auth::{PrincipalKindTag, SecretBearer, TokenResponse, TokenType};
-use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::reference::{CardRef, CardRefScope};
+use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_spec::vala::audit_detail::CardScopeMintKind;
 use wyrd_sql::queries::auth::{
     RoleRow, insert_refresh_token, insert_refresh_token_rotated, list_service_account_roles,
-    list_user_roles, refresh_issuance_instant, roles_by_name, service_account_by_id,
-    system_principal_id, user_by_id,
+    list_user_roles, refresh_issuance_instant, roles_by_name, service_account_by_id, user_by_id,
 };
 use wyrd_sql::queries::platform::tenant_resolver::tenant_admits_credentials;
 use wyrd_sql::queries::verification::record_machine_authentication;
@@ -45,9 +39,6 @@ use crate::card_scope::{
     resolve_card_ref_scope, write_scope_mint_success_audit,
 };
 use crate::exchange_api_key::{principal_kind_wire, role_refs, token_hash};
-
-/// Canonical Bifrost table the SYSTEM Drift reader may read.
-const DRIFT_OBSERVATIONS: &str = "vala.drift.observations";
 
 /// Tenant token lifetimes.
 #[derive(Debug, Clone)]
@@ -267,13 +258,6 @@ pub enum IssuanceError {
     /// A Card-scope or audit step failed with its own stable error.
     #[error("wyrd error")]
     Wyrd(#[from] WyrdError),
-    /// The tenant has no provisioned SYSTEM writer, or its stored id is not a
-    /// `UUIDv7`, so no verification-result token can be minted for it.
-    #[error("tenant system principal is missing or malformed")]
-    SystemPrincipalInvalid,
-    /// The requested SYSTEM scope is not a UID-bearing Verifier Card.
-    #[error("system token scope must be one UID-bearing Verifier card")]
-    SystemScopeInvalid,
 }
 
 impl From<IssuanceError> for WyrdError {
@@ -316,13 +300,6 @@ impl From<IssuanceError> for WyrdError {
                 }
             }
             IssuanceError::Wyrd(error) => error,
-            IssuanceError::SystemPrincipalInvalid | IssuanceError::SystemScopeInvalid => {
-                tracing::error!(error = %error, "system token mint refused");
-                WyrdError::Internal {
-                    message: "system token mint refused".to_owned(),
-                    details: json!({}),
-                }
-            }
         }
     }
 }
@@ -478,122 +455,6 @@ impl TenantTokenIssuer {
             .await?;
         }
 
-        Ok(ExchangedToken {
-            access_token: SecretString::from(access_token),
-            refresh_token: None,
-            token_type: TokenType::Bearer,
-            expires_at,
-        })
-    }
-
-    /// Mint the tenant's internal SYSTEM writer a token scoped to one Verifier.
-    ///
-    /// The server's own verification-result writes run under this token. It
-    /// reads, in the caller's transaction, whether the tenant admits
-    /// credentials and the tenant's persisted SYSTEM principal, then signs a
-    /// normal tenant access token whose principal is `kind=system` with no root
-    /// Card, whose scope is exactly `verifier`, and whose authority is exactly
-    /// `bifrost_record:write` — no roles, no credential attribution, no
-    /// delegation. The lifetime is the configured access TTL capped at five
-    /// minutes. This is internal plumbing, not an authorization decision, so it
-    /// appends no audit; Gate audits each admission the token is spent on.
-    ///
-    /// # Errors
-    /// Returns [`IssuanceError::SystemScopeInvalid`] when `verifier` is not a
-    /// UID-bearing Verifier Card, [`IssuanceError::TenantNotAdmitting`] for a
-    /// tenant that admits no credentials,
-    /// [`IssuanceError::SystemPrincipalInvalid`] when the tenant has no SYSTEM
-    /// principal or its id is not a `UUIDv7`, [`IssuanceError::Database`] when a
-    /// read fails, and [`IssuanceError::Issue`] when signing fails.
-    #[tracing::instrument(level = "debug", skip(self, conn), fields(verifier = %verifier), err)]
-    pub async fn issue_system_token(
-        &self,
-        conn: &mut TenantConn<'_>,
-        verifier: &CardRef,
-    ) -> Result<ExchangedToken, IssuanceError> {
-        self.issue_system(conn, verifier, Permission::bifrost_record_write())
-            .await
-    }
-
-    /// Mint the tenant's SYSTEM Drift reader a token scoped to one Verifier.
-    ///
-    /// The Drift runner reads its run's observations through the ordinary query
-    /// service under this token. It resolves, in the caller's transaction, the
-    /// UID of the tenant's registered `vala.drift.observations` table without
-    /// creating it, then signs the same closed SYSTEM claim set as
-    /// [`Self::issue_system_token`] whose only authority is
-    /// [`Permission::drift_table_read`] of that table. The Verifier scope is
-    /// attribution only: Oracle's table authorization enforces the read, and
-    /// the runner's fixed SQL, not this token, limits subject, series, and
-    /// window. Like the result-write mint it appends no audit; Oracle audits
-    /// each read the token is spent on.
-    ///
-    /// Returns `Ok(None)` when the tenant has never registered the observation
-    /// table, which the runner scores as an empty window.
-    ///
-    /// # Errors
-    /// Returns the errors of [`Self::issue_system_token`], and
-    /// [`IssuanceError::Store`] when the table row cannot be read or its
-    /// stored UID is not 16 bytes.
-    #[tracing::instrument(level = "debug", skip(self, conn), fields(verifier = %verifier), err)]
-    pub async fn issue_system_drift_read_token(
-        &self,
-        conn: &mut TenantConn<'_>,
-        verifier: &CardRef,
-    ) -> Result<Option<ExchangedToken>, IssuanceError> {
-        let Some(table) = get_by_fqn(conn, DRIFT_OBSERVATIONS).await? else {
-            return Ok(None);
-        };
-        let table_uid = Uuid::from_slice(&table.table_uid).map_err(|_| {
-            IssuanceError::Store(SqlError::InvariantViolation {
-                detail: "stored Bifrost table UID is not 16 bytes".to_owned(),
-            })
-        })?;
-        self.issue_system(conn, verifier, Permission::drift_table_read(table_uid))
-            .await
-            .map(Some)
-    }
-
-    /// Sign the closed SYSTEM claim set for `verifier` carrying only `permission`.
-    ///
-    /// # Errors
-    /// Returns the errors documented on [`Self::issue_system_token`].
-    async fn issue_system(
-        &self,
-        conn: &mut TenantConn<'_>,
-        verifier: &CardRef,
-        permission: Permission,
-    ) -> Result<ExchangedToken, IssuanceError> {
-        if verifier.kind != CardKind::Verifier || verifier.uid.is_none() {
-            return Err(IssuanceError::SystemScopeInvalid);
-        }
-        let tenant = conn.data_tenant_id();
-        if !tenant_admits_credentials(conn, tenant).await? {
-            return Err(IssuanceError::TenantNotAdmitting);
-        }
-        let principal_id = system_principal_id(conn)
-            .await?
-            .filter(|id| id.get_version_num() == 7)
-            .ok_or(IssuanceError::SystemPrincipalInvalid)?;
-        let ttl = self.settings.access_ttl.min(Duration::minutes(5));
-        let expires_at = Utc::now() + ttl;
-        let access_token = self.issuing_key.issue_access_token(
-            AccessGrant {
-                principal: TokenPrincipalRef {
-                    id: PrincipalId::new(principal_id),
-                    kind: PrincipalKindTag::System,
-                    tenant_id: tenant,
-                    card_ref: None,
-                    card_ref_scope: CardRefScope::own(verifier),
-                },
-                roles: Vec::new(),
-                permissions: PermissionSet::from_iter([permission]),
-                credential_id: None,
-                act: None,
-                audience: TokenAudience::Wyrd,
-            },
-            ttl,
-        )?;
         Ok(ExchangedToken {
             access_token: SecretString::from(access_token),
             refresh_token: None,
@@ -943,7 +804,7 @@ mod pg_tests {
         public_key_from_pem,
     };
     use wyrd_dev_fixtures::pg::PgFixture;
-    use wyrd_runtime::{Permission, PermissionSet, PrincipalId, PrincipalKind};
+    use wyrd_runtime::{Permission, PermissionSet, PrincipalId};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
@@ -1340,172 +1201,6 @@ mod pg_tests {
 
         assert!(grants_card_read(&session.access_token, tenant));
         assert!(session.refresh_token.is_some(), "a human session renews");
-    }
-
-    /// Build a UID-bearing Verifier reference, the only admissible SYSTEM scope.
-    ///
-    /// # Panics
-    /// Panics when a static identity component is invalid.
-    fn verifier_card_ref(name: &str) -> CardRef {
-        CardRef {
-            kind: CardKind::Verifier,
-            name: wyrd_spec::ids::CardName::new(name).expect("static name is valid"),
-            version: wyrd_semver::VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(wyrd_spec::ids::SpaceName::new("prod").expect("static space is valid")),
-            uid: Some(CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid card UID")),
-        }
-    }
-
-    /// Count every staged audit row across tenants.
-    ///
-    /// # Panics
-    /// Panics when the migrator pool or the count fails.
-    async fn staged_audit_rows(fixture: &PgFixture) -> i64 {
-        let pool = fixture.superuser_pool().await.expect("migrator pool");
-        sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
-            .fetch_one(&pool)
-            .await
-            .expect("audit rows count")
-    }
-
-    /// The SYSTEM mint round-trips through the request-path verifier as the
-    /// tenant's persisted writer scoped to exactly one Verifier, with only
-    /// `bifrost_record:write`, no roles, credential, or delegation, a lifetime
-    /// of at most five minutes, and no audit row of its own. The token is
-    /// refused under any other tenant.
-    ///
-    /// # Panics
-    /// Panics when minting fails, the verified principal deviates from the
-    /// SYSTEM contract, the mint stages audit, or another tenant accepts it.
-    #[tokio::test]
-    async fn issue_system_token_round_trips_one_verifier_scope_without_audit() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let other_tenant = fixture
-            .seed_additional_tenant(&format!("system-other-{}", Uuid::now_v7()))
-            .await
-            .expect("second tenant seeds");
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let writer = provision_system_principal(&mut conn)
-            .await
-            .expect("writer provisions");
-        let verifier_ref = verifier_card_ref("drift");
-        let audit_before = staged_audit_rows(&fixture).await;
-        let long_lived = TenantTokenIssuer::new(
-            issuing_key(),
-            TokenExchangeSettings {
-                access_ttl: chrono::Duration::hours(1),
-                refresh_ttl: chrono::Duration::days(1),
-            },
-        );
-
-        let issued_at = Utc::now();
-        let minted = long_lived
-            .issue_system_token(&mut conn, &verifier_ref)
-            .await
-            .expect("system token mints");
-        conn.commit().await.expect("mint transaction commits");
-
-        assert_eq!(
-            staged_audit_rows(&fixture).await,
-            audit_before,
-            "minting is not an authorization decision and stages no audit"
-        );
-        assert!(minted.refresh_token.is_none());
-        assert!(
-            minted.expires_at
-                <= issued_at + chrono::Duration::minutes(5) + chrono::Duration::seconds(1)
-        );
-        let verified = verifier()
-            .verify(&minted.access_token, &tenant)
-            .expect("system token verifies");
-        assert_eq!(verified.principal.id, PrincipalId::new(writer));
-        assert_eq!(
-            verified.principal.kind,
-            PrincipalKind::System {
-                card_ref_scope: CardRefScope::own(&verifier_ref)
-            }
-        );
-        assert_eq!(verified.principal.card_ref(), None);
-        assert!(verified.principal.roles.is_empty());
-        assert_eq!(verified.principal.credential_id, None);
-        assert!(verified.delegation_chain.is_empty());
-        assert_eq!(
-            verified.principal.effective_permissions,
-            PermissionSet::from_iter([Permission::bifrost_record_write()])
-        );
-        assert!(verified.principal.authorizes_card(&verifier_ref));
-        assert!(
-            !verified
-                .principal
-                .authorizes_card(&verifier_card_ref("other")),
-            "the scope names exactly the requested Verifier"
-        );
-        assert!(
-            verified.exp <= issued_at + chrono::Duration::minutes(5) + chrono::Duration::seconds(1),
-            "the token outlives no five-minute window"
-        );
-        assert!(
-            verifier()
-                .verify(&minted.access_token, &other_tenant)
-                .is_err(),
-            "a SYSTEM token cannot be replayed in another tenant"
-        );
-    }
-
-    /// The SYSTEM mint refuses a scope that is not exactly one UID-bearing
-    /// Verifier, a tenant with no provisioned writer, and a writer whose
-    /// stored id is not a `UUIDv7`.
-    ///
-    /// # Panics
-    /// Panics when any malformed request mints a token.
-    #[tokio::test]
-    async fn issue_system_token_refuses_bad_scopes_and_missing_or_malformed_writers() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let verifier_ref = verifier_card_ref("drift");
-
-        let missing = issuer().issue_system_token(&mut conn, &verifier_ref).await;
-        assert!(
-            matches!(missing, Err(IssuanceError::SystemPrincipalInvalid)),
-            "an unprovisioned tenant has no writer: {missing:?}"
-        );
-
-        provision_system_principal(&mut conn)
-            .await
-            .expect("writer provisions");
-        let service = CardRef {
-            kind: CardKind::Service,
-            ..verifier_ref.clone()
-        };
-        let uidless = CardRef {
-            uid: None,
-            ..verifier_ref.clone()
-        };
-        for scope in [service, uidless] {
-            let result = issuer().issue_system_token(&mut conn, &scope).await;
-            assert!(
-                matches!(result, Err(IssuanceError::SystemScopeInvalid)),
-                "{scope} is not an admissible SYSTEM scope: {result:?}"
-            );
-        }
-        conn.commit().await.expect("writer commits");
-
-        let pool = fixture.superuser_pool().await.expect("migrator pool");
-        sqlx::query(
-            "UPDATE wyrd.auth_service_accounts SET id = gen_random_uuid() \
-              WHERE data_tenant_id = $1 AND principal_kind = 'system'",
-        )
-        .bind(fixture.data_tenant_id().as_uuid())
-        .execute(&pool)
-        .await
-        .expect("writer id is replaced with a UUIDv4");
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn reopens");
-        let malformed = issuer().issue_system_token(&mut conn, &verifier_ref).await;
-        assert!(
-            matches!(malformed, Err(IssuanceError::SystemPrincipalInvalid)),
-            "a non-UUIDv7 writer is refused: {malformed:?}"
-        );
     }
 
     /// No public tenant grant can mint for the SYSTEM writer: API-key exchange,

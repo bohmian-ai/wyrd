@@ -5,10 +5,11 @@
 //! one tenant through [`VerificationFixture`], and composes a
 //! [`VerificationRuntime`] on that server's own state with a scripted engine.
 //! Coordination deadlines are PostgreSQL's, so a test that needs one to elapse
-//! places the row itself in the past through the fixture. Results travel as the tenant SYSTEM writer over gRPC to
-//! the server's Scribe; run state is read back from `wyrd.verifier_runs` and
-//! every Gate decision from `vala.audit_staging`, whose publisher is disabled
-//! so staged rows stay observable.
+//! places the row itself in the past through the fixture. Results travel
+//! through the server's internal capture writer to its own Scribe, wrapped in
+//! a [`PublicationFault`] that records every submitted batch; run state is
+//! read back from `wyrd.verifier_runs` and audit from `vala.audit_staging`,
+//! whose publisher is disabled so staged rows stay observable.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -29,9 +30,9 @@ use uuid::Uuid;
 use vala_drift::{DriftReport, DriftVerdict, FeatureDriftReport};
 use wyrd_server::verification::drift::DRIFT_INVALID;
 use wyrd_server::verification::engines::{EngineOutcome, VerifierReport};
+use wyrd_server::verification::fault::{PublicationFault, SentBatch};
 use wyrd_server::verification::fitter::{BaselineFitter, FitGate};
 use wyrd_server::verification::health::RuntimeCapability;
-use wyrd_server::verification::publisher::{PublicationFault, SentBatch};
 use wyrd_server::verification::runner::{EngineScript, RESULT_PUBLICATION_FAILED};
 use wyrd_server::verification::{CapabilityCrash, RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
@@ -67,6 +68,8 @@ struct Harness {
     verifier: CardUid,
     /// Superuser pool for audit staging assertions.
     assertion: PgPool,
+    /// Faults and the submitted-batch record every runtime writes through.
+    fault: PublicationFault,
     /// Highest staged audit sequence before the test acted.
     audit_floor: i64,
 }
@@ -96,6 +99,7 @@ impl Harness {
             subject,
             verifier,
             assertion,
+            fault: PublicationFault::default(),
             audit_floor: 0,
         };
         harness.audit_floor = harness.max_audit_seq().await;
@@ -116,36 +120,30 @@ impl Harness {
         }
     }
 
-    /// Compose a full runtime publishing through this server's gRPC listener.
+    /// Compose a full runtime writing results through this server's Scribe
+    /// wrapped in the harness's [`PublicationFault`].
     ///
     /// # Panics
-    /// Panics when the server is not bound or the runtime cannot compose.
+    /// Panics when the runtime cannot compose.
     fn runtime(
         &self,
         limits: RuntimeLimits,
         script: &EngineScript,
-        fault: &PublicationFault,
         crash: &CapabilityCrash,
     ) -> VerificationRuntime {
         VerificationRuntime::builder(self.server.state())
             .limits(limits)
-            .ingest_endpoint(self.server.grpc_url().expect("bound server serves gRPC"))
             .engine_script(script.clone())
-            .publication_fault(fault.clone())
+            .publication_fault(self.fault.clone())
             .crash_switch(crash.clone())
             .build()
             .expect("the runtime composes")
     }
 
-    /// Spawn a full runtime with `script` and default faults; returns its
-    /// stop token and task.
+    /// Spawn a full runtime with `script` and no crash; returns its stop
+    /// token and task.
     fn spawn(&self, limits: RuntimeLimits, script: &EngineScript) -> RunningRuntime {
-        RunningRuntime::spawn(self.runtime(
-            limits,
-            script,
-            &PublicationFault::default(),
-            &CapabilityCrash::default(),
-        ))
+        RunningRuntime::spawn(self.runtime(limits, script, &CapabilityCrash::default()))
     }
 
     /// Enqueue one manual direct run over the hour before now.
@@ -200,22 +198,14 @@ impl Harness {
         wait_run_in(&self.seed, run, done).await
     }
 
-    /// Every Gate write decision staged for the tenant since the floor, as
-    /// `(principal_kind, resource, outcome)` in staging order.
-    ///
-    /// # Panics
-    /// Panics when the staging read fails.
-    async fn writes(&self) -> Vec<(String, String, String)> {
-        sqlx::query_as(
-            "SELECT principal_kind, resource, outcome FROM vala.audit_staging \
-             WHERE data_tenant_id = $1 AND operation = 'bifrost.record.write' AND seq > $2 \
-             ORDER BY seq",
-        )
-        .bind(self.seed.tenant().as_uuid())
-        .bind(self.audit_floor)
-        .fetch_all(&self.assertion)
-        .await
-        .expect("staged write decisions")
+    /// The destination table of every result batch the runtime submitted to
+    /// Scribe, in submission order, resends included.
+    fn writes(&self) -> Vec<String> {
+        self.fault
+            .sent()
+            .into_iter()
+            .map(|sent| sent.table)
+            .collect()
     }
 
     /// Every staged audit operation for the tenant since the floor.
@@ -234,20 +224,20 @@ impl Harness {
         .expect("staged audit operations")
     }
 
-    /// Wait until exactly `count` Gate write decisions are staged.
+    /// Wait until at least `count` result batches were submitted.
     ///
     /// # Panics
     /// Panics when the count is not reached within [`WAIT`].
-    async fn wait_writes(&self, count: usize) -> Vec<(String, String, String)> {
+    async fn wait_writes(&self, count: usize) -> Vec<String> {
         let deadline = tokio::time::Instant::now() + WAIT;
         loop {
-            let writes = self.writes().await;
+            let writes = self.writes();
             if writes.len() >= count {
                 return writes;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "expected {count} staged writes, saw {writes:?}"
+                "expected {count} submitted batches, saw {writes:?}"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -595,14 +585,9 @@ fn sent_to(fault: &PublicationFault, table: &str) -> Vec<SentBatch> {
         .collect()
 }
 
-/// The `(principal_kind, resource, outcome)` of one allowed SYSTEM write.
-fn system_write(table: &str) -> (String, String, String) {
-    ("system".to_owned(), table.to_owned(), "allowed".to_owned())
-}
-
-/// A completed Drift run writes its feature details and then its summary as
-/// the tenant SYSTEM writer, completes with a result, stages no audit beyond
-/// those two Gate decisions, and records the runtime metrics.
+/// A completed Drift run writes its feature details and then its summary
+/// through the internal result writer, completes with a result, stages no
+/// audit, and records the runtime metrics.
 ///
 /// # Panics
 /// Panics when the run does not complete, the writes differ in order, kind,
@@ -624,16 +609,13 @@ async fn completed_run_publishes_details_then_summary_and_records_metrics() {
     );
     assert_eq!(row.error_code, None);
     assert_eq!(
-        harness.writes().await,
-        vec![system_write(FEATURES), system_write(RESULTS)]
+        harness.writes(),
+        vec![FEATURES.to_owned(), RESULTS.to_owned()]
     );
     assert_eq!(
         harness.audit_operations().await,
-        vec![
-            "bifrost.record.write".to_owned(),
-            "bifrost.record.write".to_owned()
-        ],
-        "claims and settlements stage no audit; only the Gate's write decisions do"
+        Vec::<String>::new(),
+        "claims, settlements, and internal result writes evaluate no permission and stage no audit"
     );
     runtime.stop().await;
 
@@ -961,7 +943,7 @@ async fn unscored_drift_publishes_only_the_summary() {
     let run = harness.enqueue().await;
 
     harness.wait_run(run, status("completed")).await;
-    assert_eq!(harness.writes().await, vec![system_write(RESULTS)]);
+    assert_eq!(harness.writes(), vec![RESULTS.to_owned()]);
     runtime.stop().await;
 }
 
@@ -980,13 +962,14 @@ async fn unscorable_verifier_errors_without_publishing() {
     let row = harness.wait_run(run, status("errored")).await;
     assert_eq!(row.error_code.as_deref(), Some(DRIFT_INVALID));
     assert_eq!(row.result_id, None, "no verdict is fabricated");
-    assert!(harness.writes().await.is_empty());
+    assert!(harness.writes().is_empty());
     runtime.stop().await;
 }
 
-/// A summary that is not acknowledged leaves the acknowledged details written,
-/// retries the run instead of completing it, and the next attempt publishes a
-/// fresh detail batch and summary before completing. The fresh detail batch
+/// A summary that is not acknowledged within the publication budget leaves
+/// the acknowledged details written, retries the run instead of completing
+/// it, and the next attempt publishes a fresh detail batch and summary before
+/// completing. The fresh detail batch
 /// carries a new batch ID and Scribe keeps both attempts' detail rows, so a
 /// fresh `write_batch` is never treated as a deduplicated replay.
 ///
@@ -1000,12 +983,14 @@ async fn unacknowledged_summary_retries_with_a_fresh_result() {
     let script = EngineScript::default();
     script.push(EngineOutcome::Completed(drifting_report()));
     script.push(EngineOutcome::Completed(drifting_report()));
-    let fault = PublicationFault::default();
-    fault.fail_next(RESULTS);
+    let fault = &harness.fault;
+    fault.hang_next(RESULTS);
     let runtime = RunningRuntime::spawn(harness.runtime(
-        Harness::limits(),
+        RuntimeLimits {
+            publication_timeout: Duration::from_secs(1),
+            ..Harness::limits()
+        },
         &script,
-        &fault,
         &CapabilityCrash::default(),
     ));
     let run = harness.enqueue().await;
@@ -1013,20 +998,16 @@ async fn unacknowledged_summary_retries_with_a_fresh_result() {
     let row = harness.wait_run(run, status("retrying")).await;
     assert_eq!(row.error_code.as_deref(), Some(RESULT_PUBLICATION_FAILED));
     assert_eq!(row.result_id, None);
-    assert_eq!(harness.writes().await, vec![system_write(FEATURES)]);
+    assert_eq!(harness.writes(), vec![FEATURES.to_owned()]);
 
     harness.expire(run).await;
     let row = harness.wait_run(run, status("completed")).await;
     assert_eq!(row.attempts, 2);
     assert_eq!(
-        harness.writes().await,
-        vec![
-            system_write(FEATURES),
-            system_write(FEATURES),
-            system_write(RESULTS)
-        ]
+        harness.writes(),
+        vec![FEATURES.to_owned(), FEATURES.to_owned(), RESULTS.to_owned()]
     );
-    let features = sent_to(&fault, FEATURES);
+    let features = sent_to(fault, FEATURES);
     assert_eq!(features.len(), 2, "one detail batch per attempt");
     assert_ne!(
         features[0].batch_id, features[1].batch_id,
@@ -1055,12 +1036,11 @@ async fn lost_result_ack_replays_the_identical_sealed_batch_and_scribe_deduplica
     let harness = Harness::start().await;
     let script = EngineScript::default();
     script.push(EngineOutcome::Completed(drifting_report()));
-    let fault = PublicationFault::default();
+    let fault = &harness.fault;
     fault.lose_ack_next(RESULTS);
     let runtime = RunningRuntime::spawn(harness.runtime(
         Harness::limits(),
         &script,
-        &fault,
         &CapabilityCrash::default(),
     ));
     let run = harness.enqueue().await;
@@ -1068,7 +1048,7 @@ async fn lost_result_ack_replays_the_identical_sealed_batch_and_scribe_deduplica
     let row = harness.wait_run(run, status("completed")).await;
     assert_eq!(row.attempts, 1, "the replay settled inside one attempt");
     assert!(row.result_id.is_some());
-    let summaries = sent_to(&fault, RESULTS);
+    let summaries = sent_to(fault, RESULTS);
     assert_eq!(
         summaries.len(),
         2,
@@ -1078,17 +1058,13 @@ async fn lost_result_ack_replays_the_identical_sealed_batch_and_scribe_deduplica
         summaries[0], summaries[1],
         "the replay carries the identical table, batch ID, and sealed bytes"
     );
-    let details = sent_to(&fault, FEATURES);
+    let details = sent_to(fault, FEATURES);
     assert_eq!(details.len(), 1);
     assert_ne!(details[0].batch_id, summaries[0].batch_id);
     assert_eq!(
-        harness.writes().await,
-        vec![
-            system_write(FEATURES),
-            system_write(RESULTS),
-            system_write(RESULTS)
-        ],
-        "each request, replay included, is one Gate decision"
+        harness.writes(),
+        vec![FEATURES.to_owned(), RESULTS.to_owned(), RESULTS.to_owned()],
+        "each submission, replay included, is recorded"
     );
     runtime.stop().await;
     let rows = harness.durable_rows().await;
@@ -1130,7 +1106,7 @@ async fn retryable_engine_failures_exhaust_to_errored() {
     let row = harness.wait_run(run, status("errored")).await;
     assert_eq!(row.attempts, 3);
     assert_eq!(row.error_code.as_deref(), Some("engine_unavailable"));
-    assert!(harness.writes().await.is_empty());
+    assert!(harness.writes().is_empty());
     runtime.stop().await;
 }
 
@@ -1194,7 +1170,7 @@ async fn cancellation_and_deadline_settle_without_a_verdict() {
     assert_eq!(row.error_code.as_deref(), Some("execution_timed_out"));
     assert_eq!(row.result_id, None);
     script.release();
-    assert!(harness.writes().await.is_empty());
+    assert!(harness.writes().is_empty());
     runtime.stop().await;
 }
 
@@ -1432,12 +1408,7 @@ async fn crashed_runner_restarts_and_reclaims_without_duplicates() {
     script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
     script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
     let crash = CapabilityCrash::default();
-    let runtime = RunningRuntime::spawn(harness.runtime(
-        Harness::limits(),
-        &script,
-        &PublicationFault::default(),
-        &crash,
-    ));
+    let runtime = RunningRuntime::spawn(harness.runtime(Harness::limits(), &script, &crash));
     let health = std::sync::Arc::clone(&harness.server.state().verification);
     wait_until("runtime health", || {
         health.is_composed() && !health.is_degraded()
@@ -1459,7 +1430,7 @@ async fn crashed_runner_restarts_and_reclaims_without_duplicates() {
     harness.expire(run).await;
     let row = harness.wait_run(run, status("completed")).await;
     assert_eq!(row.attempts, 2);
-    assert_eq!(harness.writes().await, vec![system_write(RESULTS)]);
+    assert_eq!(harness.writes(), vec![RESULTS.to_owned()]);
 
     let rendered = metrics.render();
     assert!(
@@ -1540,7 +1511,7 @@ async fn shutdown_stops_claims_drains_bounded_and_restart_recovers_identity() {
             "{run} holds no live lease"
         );
     }
-    assert!(harness.writes().await.is_empty());
+    assert!(harness.writes().is_empty());
 
     script.release();
     let restarted = harness.spawn(Harness::limits(), &script);
@@ -1588,7 +1559,7 @@ async fn shutdown_releases_runs_still_in_flight_after_the_grace() {
             .verification
             .is_up(RuntimeCapability::Runner)
     );
-    assert!(harness.writes().await.is_empty());
+    assert!(harness.writes().is_empty());
 }
 
 /// Shutdown waits for a run that finishes within the drain grace and lets it
@@ -1612,16 +1583,15 @@ async fn shutdown_drains_runs_that_finish_within_the_grace() {
     stopping.await.expect("the runtime stops");
     let row = harness.seed.run(run).await.expect("run reads");
     assert_eq!(row.status, "completed");
-    assert_eq!(harness.writes().await, vec![system_write(RESULTS)]);
+    assert_eq!(harness.writes(), vec![RESULTS.to_owned()]);
 }
 
-/// Concurrent schedulers ticking the same due occurrence, and a scheduler
-/// restarted after them, create exactly one run; a scheduler-only runtime
-/// does not require the runner, so health is not degraded.
+/// Concurrent runtimes ticking the same due occurrence, and a runtime
+/// restarted after them, create exactly one run, and health is not degraded.
 ///
 /// # Panics
-/// Panics when a duplicate run is created, the runner is composed without an
-/// endpoint, or health degrades.
+/// Panics when a duplicate run is created, the scheduler is not composed, or
+/// health degrades.
 #[tokio::test]
 async fn schedulers_create_one_run_per_occurrence_across_ticks_and_restart() {
     let harness = Harness::start().await;
@@ -1641,20 +1611,16 @@ async fn schedulers_create_one_run_per_occurrence_across_ticks_and_restart() {
         .await
         .expect("owner activates");
     harness.make_due(binding).await;
-    let scheduler_only = || {
+    let runtime = || {
         VerificationRuntime::builder(harness.server.state())
             .limits(Harness::limits())
             .build()
-            .expect("the scheduler composes")
+            .expect("the runtime composes")
     };
-    let first = scheduler_only();
+    let first = runtime();
     assert!(first.composes(RuntimeCapability::Scheduler));
-    assert!(
-        !first.composes(RuntimeCapability::Runner),
-        "no endpoint, no runner"
-    );
     let first = RunningRuntime::spawn(first);
-    let second = RunningRuntime::spawn(scheduler_only());
+    let second = RunningRuntime::spawn(runtime());
     let deadline = tokio::time::Instant::now() + WAIT;
     while harness.seed.runs().await.expect("runs read").is_empty() {
         assert!(
@@ -1668,16 +1634,11 @@ async fn schedulers_create_one_run_per_occurrence_across_ticks_and_restart() {
     first.stop().await;
     second.stop().await;
 
-    let restarted = RunningRuntime::spawn(scheduler_only());
+    let restarted = RunningRuntime::spawn(runtime());
     tokio::time::sleep(Duration::from_millis(300)).await;
     restarted.stop().await;
     let runs = harness.seed.runs().await.expect("runs read");
     assert_eq!(runs.len(), 1, "one run per occurrence");
-    assert_eq!(
-        harness.seed.run(runs[0]).await.expect("run reads").status,
-        "pending",
-        "a scheduler-only runtime never claims"
-    );
 }
 
 /// The production bound server composes the runtime when enabled, reports it
@@ -1958,7 +1919,7 @@ async fn cancelled_runner_rolls_back_its_blocked_claim() {
         "the claim rolled back: no lease and no charged attempt"
     );
     assert_eq!(script.entered(), 0, "nothing executed");
-    assert!(harness.writes().await.is_empty(), "nothing published");
+    assert!(harness.writes().is_empty(), "nothing published");
 }
 
 /// Advisory lock key the commit-race test's deferred trigger waits on.
@@ -2036,7 +1997,7 @@ async fn claim_committed_after_cancellation_is_released_unexecuted() {
     );
     assert_eq!(expires, None, "the released run holds no live lease");
     assert_eq!(script.entered(), 0, "the released claim never executed");
-    assert!(harness.writes().await.is_empty(), "nothing published");
+    assert!(harness.writes().is_empty(), "nothing published");
 
     sqlx::query("DROP TRIGGER test_hold_claim_commit ON wyrd.verifier_runs")
         .execute(&harness.assertion)
@@ -2085,12 +2046,11 @@ async fn crash_after_detail_ack_reclaims_the_same_run_before_dispatch() {
     let script = EngineScript::default();
     script.push(EngineOutcome::Completed(drifting_report()));
     script.push(EngineOutcome::Completed(drifting_report()));
-    let fault = PublicationFault::default();
+    let fault = &harness.fault;
     fault.hang_next(RESULTS);
     let crash = CapabilityCrash::default();
     let health = std::sync::Arc::clone(&harness.server.state().verification);
-    let runtime =
-        RunningRuntime::spawn(harness.runtime(Harness::limits(), &script, &fault, &crash));
+    let runtime = RunningRuntime::spawn(harness.runtime(Harness::limits(), &script, &crash));
     wait_until("runtime health", || {
         health.is_composed() && !health.is_degraded()
     })
@@ -2106,7 +2066,7 @@ async fn crash_after_detail_ack_reclaims_the_same_run_before_dispatch() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(
-        sent_to(&fault, RESULTS).is_empty(),
+        sent_to(fault, RESULTS).is_empty(),
         "the summary is blocked before it is sent"
     );
     crash.crash_next(RuntimeCapability::Runner);
@@ -2143,12 +2103,8 @@ async fn crash_after_detail_ack_reclaims_the_same_run_before_dispatch() {
         "the failed binding result dispatches its Operator once completed"
     );
     assert_eq!(
-        harness.writes().await,
-        vec![
-            system_write(FEATURES),
-            system_write(FEATURES),
-            system_write(RESULTS)
-        ]
+        harness.writes(),
+        vec![FEATURES.to_owned(), FEATURES.to_owned(), RESULTS.to_owned()]
     );
     runtime.stop().await;
     let rows = harness.durable_rows().await;

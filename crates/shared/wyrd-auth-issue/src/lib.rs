@@ -219,9 +219,9 @@ impl IssuingKey {
     /// encoded token must fit the verifier's bearer-size limit.
     ///
     /// # Errors
-    /// Returns [`IssueError::InvalidPrincipalKind`] for a platform-scope kind,
-    /// or when the internal SYSTEM writer would carry a role, a credential, or
-    /// take part in delegation on either side,
+    /// Returns [`IssueError::InvalidPrincipalKind`] for a platform-scope kind
+    /// or when the tenant SYSTEM principal is the subject or any delegation
+    /// layer, because it never appears in a token,
     /// [`IssueError::InvalidCardRef`] when kind and Card binding disagree,
     /// [`IssueError::DelegationDepthExceeded`] when the resulting chain would
     /// exceed [`MAX_DELEGATION_DEPTH`], [`IssueError::InvalidTtl`] for a
@@ -251,10 +251,9 @@ impl IssuingKey {
             audience,
         } = grant;
         validate_principal_ref(&principal)?;
-        let system_involved = principal.kind == PrincipalKindTag::System
-            || std::iter::successors(act.as_deref(), |claim| claim.act.as_deref())
-                .any(|claim| claim.principal.kind == PrincipalKindTag::System);
-        if system_involved && (!roles.is_empty() || credential_id.is_some() || act.is_some()) {
+        if std::iter::successors(act.as_deref(), |claim| claim.act.as_deref())
+            .any(|claim| claim.principal.kind == PrincipalKindTag::System)
+        {
             return Err(IssueError::InvalidPrincipalKind);
         }
         if let Some(card_ref) = &principal.card_ref {
@@ -300,8 +299,8 @@ impl IssuingKey {
     /// Mint a refresh token for a principal that holds a session, from an
     /// explicit instant.
     ///
-    /// The internal SYSTEM writer never holds a session: it is re-minted per
-    /// verification run, so a refresh token for it is refused.
+    /// The tenant SYSTEM principal never appears in a token, so a refresh
+    /// token for it is refused.
     ///
     /// `issued_at` is supplied by the caller rather than sampled here so that
     /// the signed `exp` and the durable refresh row that records it are derived
@@ -464,10 +463,9 @@ fn act_depth(act: Option<&ActClaim>) -> usize {
 ///
 /// Card binding is a property of a machine principal: an agent must carry an
 /// Agent card, a service may carry a Service card or none at all, and an
-/// administrative or human principal must carry none. The internal SYSTEM
-/// writer carries no root Card; its authority is its signed Verifier scope. A
-/// platform-scope kind is rejected outright because tenant-scope tokens are not
-/// issued for it.
+/// administrative or human principal must carry none. A platform-scope kind
+/// and the tenant SYSTEM principal, an attribution identity only, are rejected
+/// outright because no tenant-scope token is issued for either.
 ///
 /// # Errors
 /// Returns [`IssueError::InvalidCardRef`] when the kind and Card binding
@@ -480,15 +478,13 @@ fn validate_principal_ref(principal: &TokenPrincipalRef) -> Result<(), IssueErro
         // A platform-scope principal is never issued a tenant-scope token. The
         // platform plane has its own credential path, so a token request
         // carrying this kind is malformed rather than merely unauthorized.
-        (PrincipalKindTag::GlobalAdmin, _) => Err(IssueError::InvalidPrincipalKind),
-        (
-            PrincipalKindTag::TenantAdmin | PrincipalKindTag::User | PrincipalKindTag::System,
-            None,
-        ) => Ok(()),
-        (
-            PrincipalKindTag::TenantAdmin | PrincipalKindTag::User | PrincipalKindTag::System,
-            Some(_),
-        ) => Err(IssueError::InvalidCardRef),
+        (PrincipalKindTag::GlobalAdmin | PrincipalKindTag::System, _) => {
+            Err(IssueError::InvalidPrincipalKind)
+        }
+        (PrincipalKindTag::TenantAdmin | PrincipalKindTag::User, None) => Ok(()),
+        (PrincipalKindTag::TenantAdmin | PrincipalKindTag::User, Some(_)) => {
+            Err(IssueError::InvalidCardRef)
+        }
         (PrincipalKindTag::Service, Some(CardKind::Service) | None) => Ok(()),
         (PrincipalKindTag::Agent, Some(CardKind::Agent)) => Ok(()),
         (PrincipalKindTag::Service | PrincipalKindTag::Agent, _) => Err(IssueError::InvalidCardRef),
@@ -908,40 +904,14 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    /// A SYSTEM grant signs as a cardless, role-free, direct token carrying
-    /// exactly its Verifier scope.
+    /// The tenant SYSTEM principal never appears in a token: the only signing
+    /// path refuses it as the subject in any shape, as a delegation layer, and
+    /// as a refresh subject.
     ///
     /// # Panics
-    /// Panics when the conforming SYSTEM grant is refused or its claims are
-    /// reshaped by signing.
+    /// Panics when any grant naming the SYSTEM principal is signed.
     #[test]
-    fn issue_access_token_signs_a_direct_system_grant() {
-        let principal = system_principal();
-        let token = issuing_key()
-            .issue_access_token(
-                AccessGrant {
-                    permissions: PermissionSet::from_iter([Permission::bifrost_record_write()]),
-                    ..grant(principal.clone(), Vec::new())
-                },
-                Duration::minutes(5),
-            )
-            .expect("system token issues");
-        let claims = verify_access_token(&token);
-
-        assert_eq!(claims.principal, principal);
-        assert!(claims.roles.is_empty());
-        assert_eq!(claims.cid, None);
-        assert_eq!(claims.act, None);
-    }
-
-    /// The SYSTEM writer holds no role, credential, Card binding, or
-    /// delegation, so the only signing path refuses any grant that would give
-    /// it one — and refuses it as a delegation caller or refresh subject.
-    ///
-    /// # Panics
-    /// Panics when any SYSTEM grant outside that closed shape is signed.
-    #[test]
-    fn issue_access_token_refuses_widened_system_grants() {
+    fn issue_access_token_refuses_every_system_grant() {
         let system = system_principal();
         let system_actor = || ActClaim {
             sub: system.id.to_string(),
@@ -949,6 +919,23 @@ mod tests {
             act: None,
         };
         let cases: Vec<(&str, AccessGrant)> = vec![
+            (
+                "direct result write",
+                AccessGrant {
+                    permissions: PermissionSet::from_iter([Permission::bifrost_record_write()]),
+                    ..grant(system.clone(), Vec::new())
+                },
+            ),
+            (
+                "card bound",
+                grant(
+                    TokenPrincipalRef {
+                        card_ref: Some(card_ref(CardKind::Verifier)),
+                        ..system.clone()
+                    },
+                    Vec::new(),
+                ),
+            ),
             ("role", grant(system.clone(), vec![role("runtime_admin")])),
             (
                 "credential",
@@ -985,21 +972,6 @@ mod tests {
             );
         }
 
-        let bound = issuing_key().issue_access_token(
-            grant(
-                TokenPrincipalRef {
-                    card_ref: Some(card_ref(CardKind::Verifier)),
-                    ..system.clone()
-                },
-                Vec::new(),
-            ),
-            Duration::minutes(5),
-        );
-        assert!(
-            matches!(bound, Err(IssueError::InvalidCardRef)),
-            "{bound:?}"
-        );
-
         let refresh = issuing_key().issue_refresh_token(
             PrincipalKindTag::System,
             system.id,
@@ -1013,8 +985,8 @@ mod tests {
         );
     }
 
-    /// The internal SYSTEM writer projection scoped to one UID-bearing
-    /// Verifier, as the tenant issuer builds it.
+    /// A SYSTEM principal projection scoped to one UID-bearing Verifier, the
+    /// shape the server once signed for result writes.
     ///
     /// # Panics
     /// Panics when a static identity component is invalid.

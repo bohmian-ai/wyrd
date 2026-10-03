@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 60
+revision: 61
 status: approved
 ---
 
@@ -599,6 +599,11 @@ flows are listed in its "Input and queue boundary" section.
   Agent binding uses that Agent's principal activity. Activity is an
   admission gate for new binding-created runs, not a reason to cancel an
   already-admitted run whose input was frozen while active.
+  An Eval observation creates runs only for `observations_ready` bindings
+  whose exact owner's principal is the principal that wrote the observation.
+  That writer has just authenticated, so the Eval run-request flusher does no
+  separate activity check. Scheduled and Trigger runs keep the activity gate
+  above.
 
 The contract mapping is:
 
@@ -2438,7 +2443,7 @@ published image pinned by an immutable registry digest before release.
 
 ## Open material decisions
 
-None for revision 60.
+None for revision 61.
 
 Revision 39 records the user's narrow deletion: remove the always-allow
 hook and its fake `invoke` policy attribution without redesigning delegation.
@@ -2474,6 +2479,13 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 
 ## Revision history
 
+- **Revision 61 Eval runs follow the writer (2026-10-03, approved on user
+  direction):** The TASK-015 review found that the flusher created runs for
+  every binding on the observation's subject and checked each owner's
+  activity when the request was written, which could backfill another owner
+  that authenticated after the observation. The user directed that an Eval
+  observation written by principal A runs only bindings owned by A, and that
+  the activity gate applies to scheduled and Trigger runs. REQ-108 now says so.
 - **Revision 60 Eval run-request outbox (2026-10-03, approved):** Revision
   59 had Scribe insert `verifier_runs` in its batch-fence transaction. That
   breaks the repository rule that no crate's transaction writes another

@@ -182,18 +182,18 @@ fn none() -> Cell {
 }
 
 /// The overhead cell of `record`: every non-judge kind below the bound,
-/// with the sample floor in the one-replica sustained step; the judge kind
-/// is shown for diagnosis.
+/// with the sample floor in the one-replica sustained step, where a kind
+/// short of it is marked `< 1,000`; the judge kind is shown for diagnosis.
 fn overhead(record: &Record) -> Cell {
     let mut pass = true;
     let mut parts = Vec::new();
     for overhead in &record.overhead {
         let judged = OBJECTIVE_KINDS.contains(&overhead.kind);
-        let ok = overhead.p95.is_some_and(|p95| p95 < OVERHEAD_LIMIT)
-            && (!record.plan.sample_floor || overhead.samples >= MIN_SAMPLES);
+        let short = record.plan.sample_floor && overhead.samples < MIN_SAMPLES;
+        let ok = overhead.p95.is_some_and(|p95| p95 < OVERHEAD_LIMIT) && !short;
         pass &= !judged || ok;
         parts.push(format!(
-            "{}{} {} (n {:.0})",
+            "{}{} {} (n {:.0}{})",
             if judged && !ok { "✗ " } else { "" },
             overhead.kind,
             overhead
@@ -203,7 +203,8 @@ fn overhead(record: &Record) -> Cell {
                 } else {
                     format!("≤{} ms", p95 * 1e3)
                 }),
-            overhead.samples
+            overhead.samples,
+            if short { " < 1,000" } else { "" }
         ));
     }
     Cell::judged(pass, parts.join(", "))

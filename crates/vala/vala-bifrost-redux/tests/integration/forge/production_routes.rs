@@ -31,7 +31,7 @@ use super::snapshot_expiration::{
 };
 use super::support::{
     CountingObjectStore, ForgeTelemetryCheckpoint, PromotionCatalogSeam,
-    PromotionIntegrationFixture, SupervisedPromotion, manual_clock,
+    PromotionIntegrationFixture, SupervisedPromotion, manual_clock, set_table_properties,
 };
 
 /// Maximum diagnostic wait for a claimed ownership episode.
@@ -39,10 +39,10 @@ const OWNERSHIP_BOUND: Duration = Duration::from_secs(15);
 
 /// Starts one expirable table whose only planner candidate is expiration.
 ///
-/// The shared expirable fixture also owes a small-file rewrite, which would
-/// make every pass in this test choose that candidate. Raising the small-file
-/// threshold to one byte removes the rewrite candidate at its source without
-/// disabling any route, so the arbitration order stays the thing under test.
+/// The shared expirable fixture opts into compaction, so the leader would owe
+/// it a rewrite and orphan cleanup would yield to that. Opting this table out
+/// through its own properties removes the owed rewrite at its source, so the
+/// arbitration order stays the thing under test.
 ///
 /// # Panics
 ///
@@ -50,7 +50,12 @@ const OWNERSHIP_BOUND: Duration = Duration::from_secs(15);
 async fn expirable_table_without_rewrite_debt(name: &str) -> ExpirableTable {
     let mut fixture = PromotionIntegrationFixture::start(name).await;
     fixture.config.snapshot_expiry_enabled = true;
-    fixture.config.small_file_threshold_bytes = 1;
+    set_table_properties(
+        &fixture.catalog,
+        &fixture.binding,
+        &[("wyrd.forge.enable-compaction", "false")],
+    )
+    .await;
     let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
     let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
     let (clock, control) = manual_clock();
@@ -856,7 +861,8 @@ fn assert_route_data_flow(
 /// Drives the real coordinator and worker until an orphan-cleanup task settles.
 ///
 /// Earlier passes still owe compaction, so this also proves the orphan route is
-/// reached without pre-empting the strategies ahead of it. Returns the settled
+/// reached without pre-empting the strategies ahead of it: the worker runs
+/// whenever a row is claimable or the leader still owes the table a rewrite. Returns the settled
 /// task id and every distinct durable cursor observed along the way.
 ///
 /// # Panics
@@ -889,7 +895,15 @@ async fn drive_until_orphan_settles(
         .fetch_one(fixture.operator_pool.pool())
         .await
         .expect("claimable Forge tasks are readable");
-        if claimable > 0 {
+        // An owed compaction lives only in the leader's schedule until a
+        // worker pulls it, so it is pending work exactly like a queued row.
+        let owed = supervisor.forge().held_leader_term().is_some_and(|term| {
+            term.schedule().owes_compaction(&ForgeTableKey {
+                tenant: fixture.tenant,
+                table: identity(fixture),
+            })
+        });
+        if claimable > 0 || owed {
             supervisor.restart_worker();
             supervisor.settle_some_success().await;
         }

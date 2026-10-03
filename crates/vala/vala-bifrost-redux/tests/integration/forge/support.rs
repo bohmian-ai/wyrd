@@ -2635,24 +2635,43 @@ async fn create_table(
 /// # Panics
 /// Panics when the table cannot be loaded or the property commit fails.
 async fn enable_compaction(catalog: &BifrostCatalog, binding: &TenantTableBinding) {
+    set_table_properties(
+        catalog,
+        binding,
+        &[
+            ("wyrd.forge.enable-compaction", "true"),
+            ("wyrd.forge.compaction.trigger-snapshot-count", "1"),
+        ],
+    )
+    .await;
+}
+
+/// Commits Iceberg table properties, such as the fixture table's Forge settings.
+///
+/// The leader reads these settings from the table on each promotion commit it
+/// is notified of, so they govern every later commit.
+///
+/// # Panics
+/// Panics when the table cannot be loaded or the property commit fails.
+pub async fn set_table_properties(
+    catalog: &BifrostCatalog,
+    binding: &TenantTableBinding,
+    properties: &[(&str, &str)],
+) {
     let iceberg = catalog.iceberg_catalog();
     let table = iceberg
         .load_table(&binding.table_ident())
         .await
         .expect("fixture table load");
     let tx = Transaction::new(&table);
-    let tx = tx
-        .update_table_properties()
-        .set("wyrd.forge.enable-compaction".to_owned(), "true".to_owned())
-        .set(
-            "wyrd.forge.compaction.trigger-snapshot-count".to_owned(),
-            "1".to_owned(),
-        )
-        .apply(tx)
-        .expect("fixture Forge settings");
+    let mut update = tx.update_table_properties();
+    for (key, value) in properties {
+        update = update.set((*key).to_owned(), (*value).to_owned());
+    }
+    let tx = update.apply(tx).expect("fixture table properties");
     tx.commit_once(iceberg.as_ref())
         .await
-        .expect("fixture Forge settings commit");
+        .expect("fixture table properties commit");
 }
 
 /// Drives one real Scribe append and seal for the fixture table.

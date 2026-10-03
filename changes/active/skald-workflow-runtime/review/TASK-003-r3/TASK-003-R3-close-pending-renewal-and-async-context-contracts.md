@@ -140,3 +140,25 @@ finding ID. Route this task directly to `$wyrd-implement`. The next
 `$wyrd-task-review` must reassess the complete original base-to-new-candidate
 range, the original task, all three remediation tasks, and all prior verdicts;
 it must not review only the R3 delta.
+
+## Implementation Evidence
+
+Implemented in `7b3d03c18` on `wyrd/skald-workflow-runtime/TASK-003`. The human authorized this fourth remediation round on 2026-10-03.
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-TASK-003-2 | `transport/http.rs::post_native` checks the status and calls `force_refresh` on `401` before reading the body; body is read afterwards. Rustdoc states renewal precedes the body read. | New case in `public_gateway_call_context_and_errors`: a `401` head with a pending, never-finished body (`Reply::Hold`) yields `/auth/token`, `/v1/chat/completions`, `/auth/token`, then the caller deadline ends the call. RED with the old order: `left: ["/auth/token", "/v1/chat/completions"]`. GREEN after the fix. | PASS |
+| FIND-TASK-003-10 | `workflow/mod.rs`: `run_with` runs the new sync `load_local_setup` (config load + gateway client build) via `spawn_blocking`; `from_path` builds `Cards::new` via `spawn_blocking`. Shared `blocking_task_failed` maps join failures to `WYRD_WORKFLOW_500_INTERNAL`. Secret reads were already on the blocking pool (`local.rs::resolve_binding`). Swept `wyrd-client/src` for every `GlobalConfig::load`/`from_global`/`Cards::new` call: the remaining sites are synchronous constructors, not async paths. | `workflow::tests::selected_local_dependencies_use_shared_config`, `workflow::tests::from_path_uses_existing_loader`, `shared_workflow_client_contract` pass. | PASS |
+| FIND-TASK-003-11 | `auth.rs::AuthMiddleware::force_refresh` rustdoc distinguishes the replay-safe transport (refresh then retry once) from the native gateway call (refresh, no retry). | `force_refresh_re_exchanges_once`, `workload_force_refresh_re_exchanges_once` pass. | PASS |
+| FIND-TASK-003-12 | `Workflow::into_skald` rustdoc states it drops the loading client and automatic shared dependencies, pointing to `as_skald`/`as_skald_mut`. | Rustdoc only. | PASS |
+
+Commands (all exit 0, run with `CARGO_TARGET_DIR=<repo>/target CARGO_BUILD_JOBS=12`):
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-client --lib --test workflow_transport -E 'test(/workflow::/) | test(=public_gateway_call_context_and_errors) | test(=shared_workflow_client_contract) | test(/force_refresh/)'   # 6 passed
+mise exec -- cargo clippy --locked -p wyrd-client --all-targets --all-features -- -D warnings
+mise exec -- cargo fmt --check -p wyrd-client
+git diff --check
+```
+
+The RED run temporarily restored the previous body-first ordering in `post_native` and failed exactly on the new assertion; the fix was restored before committing. Non-goals stayed excluded: no retry or replay of the model POST was added, and no new configuration, check or mechanism was introduced.

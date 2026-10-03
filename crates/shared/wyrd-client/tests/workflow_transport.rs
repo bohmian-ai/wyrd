@@ -10,9 +10,13 @@ use serde_json::{Value, json};
 use skald_providers::{ProviderError, RemoteProblem};
 use skald_spec::{ProviderRequest, ProviderResponse};
 use skald_workflow::{WorkflowGatewayCorrelation, WyrdGatewayCall, WyrdGatewayCaller};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio_util::sync::CancellationToken;
+use wiremock::http::Method;
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::HttpTransport;
@@ -28,6 +32,10 @@ use wyrd_spec::ids::WorkflowRunId;
 const RUN_ID: &str = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b20";
 
 /// Build a bearer-authenticated [`WyrdClient`] pointed at `base_url`.
+///
+/// # Panics
+/// Panics when the fixed bearer credential or `base_url` cannot assemble the
+/// client's authentication or HTTP transport.
 fn client(base_url: &str) -> WyrdClient {
     let mut config = ClientConfig::default();
     config.http.base_url = base_url.to_owned();
@@ -48,6 +56,9 @@ fn client(base_url: &str) -> WyrdClient {
 }
 
 /// The fixed run identity as its typed ID.
+///
+/// # Panics
+/// Panics when [`RUN_ID`] stops parsing as a Workflow run ID.
 fn run_id() -> WorkflowRunId {
     RUN_ID.parse().expect("fixed run id is a UUIDv7")
 }
@@ -71,6 +82,9 @@ fn run_json(status: &str) -> Value {
 }
 
 /// The create request every create case submits.
+///
+/// # Panics
+/// Panics when the fixed request document stops decoding as a create request.
 fn create_request() -> CreateWorkflowRunRequest {
     serde_json::from_value(json!({
         "workflow": {"kind": "Workflow", "name": "triage", "version": "1.0.0", "space": "team"},
@@ -97,7 +111,10 @@ async fn mount(
 }
 
 /// Every request the server has received, in arrival order.
-async fn received(server: &MockServer) -> Vec<wiremock::Request> {
+///
+/// # Panics
+/// Panics when the mock server was started without request recording.
+async fn received(server: &MockServer) -> Vec<Request> {
     server
         .received_requests()
         .await
@@ -105,6 +122,10 @@ async fn received(server: &MockServer) -> Vec<wiremock::Request> {
 }
 
 /// Create, get, cancel, and wait project the exact run routes and snapshots.
+///
+/// # Panics
+/// Panics when a fixture fails to build or decode, or a request, key, status,
+/// or error differs from the asserted run contract.
 #[tokio::test]
 async fn shared_workflow_client_contract() {
     // First acceptance answers 202 and an idempotent replay 200; both decode
@@ -278,12 +299,14 @@ async fn shared_workflow_client_contract() {
     assert!(
         requests
             .iter()
-            .all(|request| request.method == wiremock::http::Method::GET
-                && request.url.path() == run_path())
+            .all(|request| request.method == Method::GET && request.url.path() == run_path())
     );
 }
 
 /// An OpenAI Chat request whose body names a model the caller must replace.
+///
+/// # Panics
+/// Panics when the fixed request document stops decoding as a Chat request.
 fn chat_request() -> ProviderRequest {
     ProviderRequest::OpenAiChatCompletion(
         serde_json::from_value(json!({
@@ -310,6 +333,9 @@ fn chat_answer() -> Value {
 }
 
 /// A gateway call for `request` on `model` with `fallback` and `timeout`.
+///
+/// # Panics
+/// Panics when `model` or the fixed run ID is not a valid identity.
 fn gateway_call(
     request: ProviderRequest,
     model: &str,
@@ -330,6 +356,9 @@ fn gateway_call(
 }
 
 /// A fallback override naming `candidate`.
+///
+/// # Panics
+/// Panics when `candidate` is not a valid model projection.
 fn fallback(candidate: &str) -> GatewayFallbackOverride {
     GatewayFallbackOverride {
         candidates: vec![ModelRef::from_projection(candidate).expect("candidate")],
@@ -354,6 +383,10 @@ fn catalog_problem(code: &str, status: u16, field: Option<&str>) -> RemoteProble
 
 /// Build an API-key [`WyrdClient`] pointed at `base_url`, so an
 /// authentication refusal renews through a real `/auth/token` exchange.
+///
+/// # Panics
+/// Panics when the fixed API key or `base_url` cannot assemble the client's
+/// authentication or HTTP transport.
 fn api_key_client(base_url: &str) -> WyrdClient {
     let mut config = ClientConfig::default();
     config.http.base_url = base_url.to_owned();
@@ -373,18 +406,121 @@ fn api_key_client(base_url: &str) -> WyrdClient {
     WyrdClient::from_parts(auth, transport, config.grpc)
 }
 
-/// A successful `/auth/token` answer issuing `access`.
-fn token_answer(access: &str) -> ResponseTemplate {
-    ResponseTemplate::new(200).set_body_json(json!({
+/// A successful `/auth/token` body issuing `access`.
+fn token_json(access: &str) -> Value {
+    json!({
         "access_token": access,
         "refresh_token": "unused",
         "token_type": "Bearer",
         "expires_at": "2099-01-01T00:00:00Z"
-    }))
+    })
+}
+
+/// A successful `/auth/token` answer issuing `access`.
+fn token_answer(access: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(token_json(access))
+}
+
+/// A complete HTTP/1.1 answer with `status` and JSON `body` that closes its
+/// connection.
+fn raw_reply(status: &str, body: &Value) -> String {
+    let body = body.to_string();
+    format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// Read one HTTP/1.1 request and its `content-length` body from `stream`.
+///
+/// Returns the request path, or `None` when the client closes first.
+///
+/// # Panics
+/// Panics when the socket read fails or the request head is not a UTF-8
+/// HTTP/1.1 head with a numeric `content-length`.
+async fn read_request(stream: &mut TcpStream) -> Option<String> {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head = std::str::from_utf8(&request[..end]).expect("UTF-8 request head");
+            let length = head
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .map_or(0, |(_, value)| {
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .expect("numeric content-length")
+                });
+            if request.len() >= end + 4 + length {
+                let target = head.split_whitespace().nth(1).expect("request target");
+                return Some(target.to_owned());
+            }
+        }
+        let read = stream.read(&mut buffer).await.expect("request reads");
+        if read == 0 {
+            return None;
+        }
+        request.extend_from_slice(&buffer[..read]);
+    }
+}
+
+/// Serve `replies` in order on a loopback listener, one connection each, and
+/// report every request path as soon as the request has fully arrived.
+///
+/// An empty reply holds its connection open, unanswered, until the client
+/// closes it. Requests after the last reply are still reported and their
+/// connections closed unanswered, so a resend is always observed. Returns
+/// the server's base URL and the receiver of request paths.
+///
+/// # Panics
+/// Panics when the listener cannot bind; the serving task panics when a
+/// connection cannot be accepted, read, or written.
+async fn raw_server(replies: Vec<String>) -> (String, UnboundedReceiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener binds");
+    let base_url = format!(
+        "http://{}",
+        listener.local_addr().expect("listener address")
+    );
+    let (paths, received) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut replies = replies.into_iter();
+        loop {
+            let (mut stream, _) = listener.accept().await.expect("connection accepts");
+            let Some(path) = read_request(&mut stream).await else {
+                continue;
+            };
+            paths.send(path).expect("the test receives request paths");
+            match replies.next() {
+                Some(reply) if reply.is_empty() => {
+                    let closed = stream.read(&mut [0_u8; 1]).await.expect("held read");
+                    assert_eq!(closed, 0, "the client sends nothing more");
+                }
+                Some(reply) => stream
+                    .write_all(reply.as_bytes())
+                    .await
+                    .expect("reply writes"),
+                None => {}
+            }
+        }
+    });
+    (base_url, received)
+}
+
+/// Every request path a [`raw_server`] has reported so far, in arrival order.
+fn reported(paths: &mut UnboundedReceiver<String>) -> Vec<String> {
+    std::iter::from_fn(|| paths.try_recv().ok()).collect()
 }
 
 /// Every model POST the server received, skipping credential exchanges.
-async fn model_posts(server: &MockServer) -> Vec<wiremock::Request> {
+///
+/// # Panics
+/// Panics when the mock server was started without request recording.
+async fn model_posts(server: &MockServer) -> Vec<Request> {
     received(server)
         .await
         .into_iter()
@@ -408,7 +544,13 @@ fn problem(outcome: Result<ProviderResponse, ProviderError>) -> RemoteProblem {
 /// cancellation, and timeouts stop locally; native error envelopes become
 /// redacted problems keeping only status, Wyrd code, OpenAI `param`, and the
 /// code's catalog title and remediation; a `401` is sent once and renews the
-/// credential instead of replaying the model call.
+/// credential instead of replaying the model call, even when its body cannot
+/// be read.
+///
+/// # Panics
+/// Panics when a fixture fails to build, decode, or bind, or a request,
+/// header, model, outcome, error category, or request count differs from the
+/// asserted gateway contract.
 #[tokio::test]
 async fn public_gateway_call_context_and_errors() {
     // Concurrent calls on one caller carry only their own fallback header.
@@ -561,8 +703,8 @@ async fn public_gateway_call_context_and_errors() {
         vec![json!("openai/gpt-r"), json!("claude-a"), Value::Null]
     );
 
-    // Vertex and a cancelled run stop before any request; a slow answer times
-    // out at the call's own deadline.
+    // Vertex and an already cancelled run stop before any request; a slow
+    // answer times out at the call's own deadline.
     let vertex = ProviderRequest::Vertex(
         serde_json::from_value(json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}))
             .expect("vertex"),
@@ -610,6 +752,36 @@ async fn public_gateway_call_context_and_errors() {
         .await
         .expect_err("the call's deadline bounds it");
     assert_eq!(timed_out.code(), "SKALD_PROVIDERS_408_TIMEOUT");
+
+    // Cancelling the run once its model call has reached the gateway stops the
+    // pending call long before the call's own deadline, without a resend.
+    let (base_url, mut paths) = raw_server(vec![String::new()]).await;
+    let pending = PublicWyrdGatewayCaller::new(client(&base_url));
+    let cancellation = CancellationToken::new();
+    let call = pending.call(
+        gateway_call(
+            chat_request(),
+            "openai/gpt-a",
+            None,
+            Duration::from_secs(300),
+        ),
+        &cancellation,
+    );
+    let cancel_once_dispatched = async {
+        assert_eq!(paths.recv().await.as_deref(), Some("/v1/chat/completions"));
+        cancellation.cancel();
+    };
+    let (outcome, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(call, cancel_once_dispatched)
+    })
+    .await
+    .expect("cancellation, not the 300 s deadline, ends the call");
+    let stopped = outcome.expect_err("a cancelled run stops the pending call");
+    assert_eq!(stopped.code(), "SKALD_PROVIDERS_408_TIMEOUT");
+    assert!(
+        reported(&mut paths).is_empty(),
+        "the model call is not resent"
+    );
 
     // Native error envelopes keep only the safe common fields.
     let refusal = |status: u16, route: &str, body: Value| {
@@ -863,4 +1035,29 @@ async fn public_gateway_call_context_and_errors() {
         ("WYRD_AUTH_401_API_KEY_INVALID", 401)
     );
     assert_eq!(model_posts(&unrenewable).await.len(), 1);
+
+    // A 401 whose body is cut off after its headers still renews the
+    // credential, without resending the model call, and then reports the
+    // unread body as a transport failure.
+    let (base_url, mut paths) = raw_server(vec![
+        raw_reply("200 OK", &token_json("tok-a")),
+        "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: 64\r\nconnection: close\r\n\r\n{\"error\"".to_owned(),
+        raw_reply("200 OK", &token_json("tok-b")),
+    ])
+    .await;
+    let outcome = PublicWyrdGatewayCaller::new(api_key_client(&base_url))
+        .call(
+            gateway_call(chat_request(), "openai/gpt-a", None, deadline),
+            &token,
+        )
+        .await;
+    assert!(
+        matches!(outcome, Err(ProviderError::Connect { .. })),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        reported(&mut paths),
+        ["/auth/token", "/v1/chat/completions", "/auth/token"],
+        "one model POST, then one renewal"
+    );
 }

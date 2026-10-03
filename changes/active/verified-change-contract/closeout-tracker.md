@@ -23,7 +23,7 @@ Rules for every worktree:
 | 2 | Benchmark fixes (reviews R1–R5) | verified-change-contract rev 57 | `agent-a82d72f51901e1dc5` / `worktree-agent-a82d72f51901e1dc5` | `1d05642bf` | R5 verdict FIX_REQUIRED: 2 findings, both accepted as valid. FIND-16: replica shutdown must sit on an owner struct. FIND-17: the audit drain must count decisions still held in a replica's memory and committed rows that arrive after the stop. A fresh implementer is fixing them | R6 Codex review after the fixes |
 | 3 | Forge concurrent planning (TASK-001, TASK-002) | forge-concurrent-planning rev 2 | `agent-ac58f45cb5b747685` / `worktree-agent-ac58f45cb5b747685` | `be922f434` | r2 verdict FIX_REQUIRED: 8 findings, all accepted as valid (failover deadline and kill proof, shutdown release error, worker expiry delay, full failed batch, AC-010 compaction proof, raw transaction, task revision, exact commands). The live_rewrite test change was judged sound. A fresh implementer is fixing them | r3 Codex review after the fixes |
 | 4 | Audit outbox (3 tasks) | audit-outbox rev 1 | `agent-aad682fbca5074900` / `worktree-agent-aad682fbca5074900` | `f451d52be` | All 3 tasks implemented (T01 `0fa3d0d6b`, T02 `d2af088b9`, T03 `f451d52be`), all lanes green; r1 Codex review running | Validate r1 findings, then fix or merge |
-| 5 | Verifier runtime under load (TASK-013, 014, 015) | verified-change-contract rev 59 (`5e5623a2e`) + rev 60 (`82f142580`) | `agent-a0ed64ce133bff9d3` / `worktree-agent-a0ed64ce133bff9d3` | `8b7218a92` | TASK-013 done (results through capture writer, no SYSTEM tokens; net −1,100 lines). TASK-015 paused because its outbox duplicated the audit outbox. Agent now on TASK-014 | TASK-015 after the audit outbox merges: one shared generic outbox for audit and Eval run requests. Then a Codex review |
+| 5 | Verifier runtime under load (TASK-013, 014, 015) | verified-change-contract rev 59 (`5e5623a2e`) + rev 60 (`82f142580`) | `agent-a0ed64ce133bff9d3` / `worktree-agent-a0ed64ce133bff9d3` | `8b7218a92` | TASK-013 done (results through capture writer, no SYSTEM tokens; net −1,100 lines). TASK-015 paused because its outbox duplicated the audit outbox. Agent now on TASK-014 | TASK-015 after the audit outbox merges (see Shared outbox machinery). Then a Codex review |
 
 ### 2. Benchmark fixes
 
@@ -76,6 +76,54 @@ Rules for every worktree:
   and renew its lease.
 - Drift runs its SQL and scores what comes back. It has no completeness check.
 - Proof: AC-044, plus the revised AC-014, AC-023, AC-030 and AC-043.
+
+### Shared outbox machinery (TASK-015, after the audit outbox merges)
+
+The first TASK-015 attempt hand-wrote an Eval run-request outbox that copied
+the audit outbox's queue, pending counter, stop signal, writer task, retry
+backoff and per-tenant grouping. That copy is not allowed. TASK-015 instead:
+
+- Moves the audit outbox's queue and writer machinery into one generic outbox
+  type in a shared crate. It owns the queue, pending count, idle signal, stop,
+  writer task, per-tenant grouping, retry with backoff, no count limit,
+  never-drop retention, graceful-shutdown flush, and counting and logging of
+  losses.
+- Leaves each use with only what is specific to it: the item type and one
+  "write this tenant's items" call. Audit's call writes to `vala.audit_staging`
+  through Vala's Postgres. Eval's call is the multi-row
+  `enqueue_observation_batch` insert through Wyrd's Postgres.
+- Uses one shared type with **separate instances** for audit and Eval, not one
+  queue. They write to different databases owned by different crates (no
+  cross-crate SQL), and a slow database for one must not hold up the other.
+  Each instance has its own queue and writer, so sharing the type costs no
+  throughput.
+- Each writer writes a tenant's queued items in one multi-row insert. If a
+  single writer per instance is ever measured as the limit, write tenants
+  concurrently inside the shared type. Never add a second outbox.
+- Keeps the work-in-progress parts that are not duplicates: deriving run
+  requests from Eval frames, the multi-row insert SQL, removing the 256 cap,
+  the wiring, and the tests. Deletes the duplicate machinery.
+- Proves both instances with their existing audit and Eval tests. Adds focused
+  tests of the shared type for retry without drop, shutdown flush, and loss
+  counting.
+
+## Order of work
+
+1. Now, in parallel: the audit outbox r1 review and fix loop; the benchmark
+   R5 fixes then the R6 review (which checks only that the R5 findings are
+   closed and nothing regressed); the Forge r2 fixes then the r3 review; and
+   verifier runtime TASK-014.
+2. Merge the audit outbox into `TASK-008` first. The benchmark and the
+   verifier runtime both depend on it.
+3. Merge Forge any time after PASS. It does not overlap with the others.
+4. Merge the benchmark after the audit outbox. While merging, point its
+   pending-audit metric at the new audit outbox and rerun its focused tests.
+5. Verifier runtime, last:
+   - merge the current `TASK-008` into its worktree;
+   - run TASK-015 (the shared outbox machinery);
+   - its own Codex review until PASS;
+   - merge.
+6. Closeout steps below, on the fully merged branch.
 
 ## Integration and closeout (after workstreams 2–5 pass review)
 

@@ -2,12 +2,14 @@
 //!
 //! Both capabilities drain a durable, tenant-scoped, leased queue the same
 //! way: claim one item per due tenant each round in its own committed
-//! transaction that races shutdown, then spawn the claimed item. Only Operator
-//! delivery takes execution permits before claiming. On shutdown admit no
-//! further claim, give in-flight work the drain grace, then cancel and let it
-//! release its lease. [`ClaimLoop`] owns that mechanism; each capability
-//! implements [`LeasedWork`] to supply only its due-tenant list, claim,
-//! process-and-settle, and late-claim release steps.
+//! transaction that races shutdown, then spawn the claimed item. A round
+//! considers every tenant with claimable work; there is no tenant limit. Only
+//! Operator delivery takes execution permits before claiming. An item refused
+//! by a full shared resource pauses claiming until a running item finishes.
+//! On shutdown admit no further claim, give in-flight work the drain grace,
+//! then cancel and let it release its lease. [`ClaimLoop`] owns that
+//! mechanism; each capability implements [`LeasedWork`] to supply only its
+//! due-tenant list, claim, process-and-settle, and late-claim release steps.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -25,9 +27,6 @@ use super::RuntimeLimits;
 use super::health::RuntimeCapability;
 use super::permits::OperatorPermits;
 
-/// Tenants examined per claim round, most overdue first.
-const TENANTS_PER_ROUND: i64 = 64;
-
 /// The capability-specific steps of one leased queue.
 ///
 /// Implemented by the Verifier runner and the Operator worker; the claim
@@ -42,14 +41,11 @@ pub(super) trait LeasedWork: Send + Sync + 'static {
     /// when the capability accounts for its own activity.
     const ACTIVE_GAUGE: Option<&'static str>;
 
-    /// Up to `limit` tenants with claimable work, most overdue first.
+    /// Every tenant with claimable work, most overdue first.
     ///
     /// # Errors
     /// Returns [`SqlError`] when the cross-tenant read fails.
-    fn due_tenants(
-        &self,
-        limit: i64,
-    ) -> impl Future<Output = Result<Vec<DataTenantId>, SqlError>> + Send;
+    fn due_tenants(&self) -> impl Future<Output = Result<Vec<DataTenantId>, SqlError>> + Send;
 
     /// Claim the tenant's next item inside `conn`'s uncommitted transaction.
     ///
@@ -65,7 +61,9 @@ pub(super) trait LeasedWork: Send + Sync + 'static {
     /// `abandon` cancels the item past the drain grace; a retryable failure
     /// observed after `stop` should be released rather than charged.
     /// `spawned_at` is the process-monotonic instant the loop spawned the
-    /// item, so its first poll can measure task-start delay.
+    /// item, so its first poll can measure task-start delay. Resolves to
+    /// `true` when a full shared resource refused the item, which the loop
+    /// answers by claiming nothing new until a running item finishes.
     fn process(
         self: Arc<Self>,
         tenant: DataTenantId,
@@ -73,7 +71,7 @@ pub(super) trait LeasedWork: Send + Sync + 'static {
         stop: CancellationToken,
         abandon: CancellationToken,
         spawned_at: Instant,
-    ) -> impl Future<Output = ()> + Send;
+    ) -> impl Future<Output = bool> + Send;
 
     /// Release an item whose claim committed after shutdown began, with its
     /// attempt refunded and without executing it; failures are logged and
@@ -127,7 +125,9 @@ impl ClaimLoop {
     ///
     /// Each turn claims one item per due tenant and spawns it; Operator work
     /// holds its delivery permit. An empty round waits the poll interval or until an
-    /// item finishes. On `stop` no further claim is admitted (an uncommitted
+    /// item finishes. Once an item reports a shared-resource refusal, rounds
+    /// are skipped until a running item finishes (or none is running). On
+    /// `stop` no further claim is admitted (an uncommitted
     /// claim rolls back and a claim committed after `stop` is released
     /// unexecuted), items spawned before `stop` get the drain grace to settle,
     /// and any still running are then cancelled through `abandon` and release
@@ -140,20 +140,26 @@ impl ClaimLoop {
     pub(super) async fn run<W: LeasedWork>(&self, work: &Arc<W>, stop: CancellationToken) {
         let abandon = CancellationToken::new();
         let mut spawned = JoinSet::new();
+        let mut paused = false;
         while !stop.is_cancelled() {
             #[cfg(feature = "test-support")]
             if let Some(crash) = &self.crash {
                 crash.check(W::CAPABILITY);
             }
-            let claimed = match self.claim_round(work, &stop, &abandon, &mut spawned).await {
-                Ok(claimed) => claimed,
-                Err(error) => {
-                    tracing::warn!(capability = W::CAPABILITY.as_str(), %error, "claim round failed");
-                    0
+            paused &= !spawned.is_empty();
+            let claimed = if paused {
+                0
+            } else {
+                match self.claim_round(work, &stop, &abandon, &mut spawned).await {
+                    Ok(claimed) => claimed,
+                    Err(error) => {
+                        tracing::warn!(capability = W::CAPABILITY.as_str(), %error, "claim round failed");
+                        0
+                    }
                 }
             };
             while let Some(finished) = spawned.try_join_next() {
-                reap::<W>(finished);
+                paused = reap::<W>(finished);
             }
             self.record_active::<W>(spawned.len());
             if claimed > 0 {
@@ -162,7 +168,9 @@ impl ClaimLoop {
             tokio::select! {
                 () = stop.cancelled() => {}
                 () = tokio::time::sleep(self.poll_interval) => {}
-                Some(finished) = spawned.join_next(), if !spawned.is_empty() => reap::<W>(finished),
+                Some(finished) = spawned.join_next(), if !spawned.is_empty() => {
+                    paused = reap::<W>(finished);
+                }
             }
         }
         let drained = tokio::time::timeout(self.drain_grace, async {
@@ -190,17 +198,18 @@ impl ClaimLoop {
     /// Only Operator work takes delivery permits before the claim and drops
     /// them unused when the tenant has nothing claimable. A claim committed after `stop`
     /// fired is released at once instead of being spawned. Returns the number
-    /// of items claimed and spawned.
+    /// of items claimed and spawned. A tenant whose claim fails is logged and
+    /// skipped, so one tenant's failure never starves the rest of the round;
+    /// its rolled-back claim consumes no attempt.
     ///
     /// # Errors
-    /// Returns [`SqlError`] when the due-tenant list or a claim fails; items
-    /// claimed earlier in the round are already spawned.
+    /// Returns [`SqlError`] when the due-tenant list fails.
     async fn claim_round<W: LeasedWork>(
         &self,
         work: &Arc<W>,
         stop: &CancellationToken,
         abandon: &CancellationToken,
-        spawned: &mut JoinSet<()>,
+        spawned: &mut JoinSet<bool>,
     ) -> Result<usize, SqlError> {
         if self
             .permits
@@ -212,8 +221,9 @@ impl ClaimLoop {
         let tenants = tokio::select! {
             biased;
             () = stop.cancelled() => return Ok(0),
-            tenants = work.due_tenants(TENANTS_PER_ROUND) => tenants?,
+            tenants = work.due_tenants() => tenants?,
         };
+        let due = tenants.len();
         let mut claimed = 0;
         for tenant in tenants {
             if stop.is_cancelled()
@@ -232,8 +242,18 @@ impl ClaimLoop {
             } else {
                 None
             };
-            let Some(claim) = self.claim(work.as_ref(), tenant, stop).await? else {
-                continue;
+            let claim = match self.claim(work.as_ref(), tenant, stop).await {
+                Ok(Some(claim)) => claim,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        capability = W::CAPABILITY.as_str(),
+                        tenant = %tenant,
+                        %error,
+                        "claim failed; continuing with the next tenant"
+                    );
+                    continue;
+                }
             };
             if stop.is_cancelled() {
                 work.release_late(tenant, &claim).await;
@@ -249,9 +269,15 @@ impl ClaimLoop {
             );
             spawned.spawn(async move {
                 let _permit = permit;
-                process.await;
+                process.await
             });
         }
+        tracing::debug!(
+            capability = W::CAPABILITY.as_str(),
+            due,
+            claimed,
+            "claim round"
+        );
         Ok(claimed)
     }
 
@@ -303,11 +329,16 @@ pub(super) const fn settled(settlement: Settlement, label: &'static str) -> &'st
     }
 }
 
-/// Log a spawned item that panicked; its lease expires into a reclaim.
-fn reap<W: LeasedWork>(finished: Result<(), JoinError>) {
-    if let Err(error) = finished
-        && error.is_panic()
-    {
-        tracing::error!(capability = W::CAPABILITY.as_str(), %error, "leased work panicked; its lease will expire");
+/// Whether a finished item was refused by a full shared resource; an item
+/// that panicked is logged, and its lease expires into a reclaim.
+fn reap<W: LeasedWork>(finished: Result<bool, JoinError>) -> bool {
+    match finished {
+        Ok(refused) => refused,
+        Err(error) => {
+            if error.is_panic() {
+                tracing::error!(capability = W::CAPABILITY.as_str(), %error, "leased work panicked; its lease will expire");
+            }
+            false
+        }
     }
 }

@@ -75,7 +75,8 @@ naming it, it never appears in a delegation chain, and it never replaces the
 invocation caller in audit. Gate refuses every public write to
 `vala.gateway.calls`. A pod without Scribe sends capture over the peer plane's
 capture-only RPC, admitted by `wyrd-peer` mTLS alone; that RPC accepts only the
-two capture tables and never the reserved system tenant, so a compromised
+two capture tables and, with a Verifier attribution, the three result tables,
+and never the reserved system tenant, so a compromised
 cluster member, already out of scope, is the only caller that could misuse
 it.
 
@@ -89,16 +90,17 @@ again, so an administrator's revocation stands.
 Credential issuance is a separate privileged operation and is policy-gated.
 The verification runtime also provisions one UUIDv7 `system` principal per
 tenant, the server's own identity for continuous verification work that has no
-direct principal. It is not Card-bound or publicly manageable and has no
-credential, role grant, refresh, workload, or delegation path. It has three
-separately scoped, server-minted uses: an access token scoped to one exact
-Verifier Card for writing the reserved verification result tables; an access
-token scoped to one exact Verifier Card for reading the tenant's
-`vala.drift.observations` table; and an in-process, tokenless
-`bifrost_query:read` authority scoped by table UID to exactly continuous Eval's
-input tables (`vala.eval.observations` and `vala.traces.spans`). None is a
-general Bifrost grant, and Oracle authorizes and audits every read under them
-like any caller's. The server never fabricates a user or other identity for its
+direct principal. It is not Card-bound or publicly manageable, has no
+credential, role grant, refresh, workload, or delegation path, and never
+appears in a token: every issuer refuses it and every verifier rejects a
+`system` claim set. It has two in-process uses. It attributes verification
+results, which the server's internal capture writer submits to Scribe like
+gateway capture, without a token or Gate; Gate refuses every public write to
+the result tables. And it carries a tokenless `bifrost_query:read` authority
+scoped by table UID to exactly one run's input tables
+(`vala.drift.observations` for Drift; `vala.eval.observations` and
+`vala.traces.spans` for Eval). Neither is a general Bifrost grant, and Oracle
+authorizes and audits every read under it like any caller's. The server never fabricates a user or other identity for its
 own reads.
 
 A tenant administrator is created once, during tenant provisioning, and is the

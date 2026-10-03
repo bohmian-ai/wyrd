@@ -44,9 +44,7 @@ pub async fn get_card_by_uid(
     conn: &mut TenantConn<'_>,
     uid: &CardUid,
 ) -> Result<ParsedCardRow, WyrdError> {
-    let row = sqlx::query_as::<_, CardRow>(SELECT_BY_UID)
-        .bind(uid.as_uuid())
-        .fetch_optional(&mut **conn.transaction())
+    let row = fetch_card_row(conn, uid)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "card registry lookup failed");
@@ -56,6 +54,25 @@ pub async fn get_card_by_uid(
     ParsedCardRow::try_from(row).map_err(|e| {
         WyrdError::registry_invalid_card_spec(format!("stored card failed to parse: {e}"))
     })
+}
+
+/// Read one non-deleted Card row by UID within the current tenant, unparsed.
+///
+/// Callers that must tell a database failure, which aborts their
+/// transaction, apart from an absent or unparseable Card use this and parse
+/// with [`ParsedCardRow::try_from`]; [`get_card_by_uid`] folds both into
+/// registry errors.
+///
+/// # Errors
+/// Returns the database error when the read fails.
+pub async fn fetch_card_row(
+    conn: &mut TenantConn<'_>,
+    uid: &CardUid,
+) -> Result<Option<CardRow>, sqlx::Error> {
+    sqlx::query_as::<_, CardRow>(SELECT_BY_UID)
+        .bind(uid.as_uuid())
+        .fetch_optional(&mut **conn.transaction())
+        .await
 }
 
 /// Load one Card including a retained deleted tombstone for reconciliation.

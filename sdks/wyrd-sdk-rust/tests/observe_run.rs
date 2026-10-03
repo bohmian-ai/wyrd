@@ -957,8 +957,10 @@ async fn drift_burst_survives_a_byte_budget_override() {
     let run = state.run();
     let run_id = run.run_id().as_str().to_owned();
     let model = run.for_card("model").expect("model view resolves");
-    for observation in 0..BURST_OBSERVATIONS {
-        let features: serde_json::Map<String, serde_json::Value> = (0..BURST_FEATURES)
+    let observations = u32::from(BURST_OBSERVATIONS);
+    let feature_count = u32::from(BURST_FEATURES);
+    for observation in 0..observations {
+        let features: serde_json::Map<String, serde_json::Value> = (0..feature_count)
             .map(|feature| {
                 (
                     format!("feature_{feature}"),
@@ -986,12 +988,12 @@ async fn drift_burst_survives_a_byte_budget_override() {
     assert!(
         groups
             .iter()
-            .all(|group| group.n == i64::from(BURST_FEATURES)),
+            .all(|group| group.n == i64::from(feature_count)),
         "every observation landed all of its features exactly once"
     );
     assert_eq!(
         groups.iter().map(|group| group.n).sum::<i64>(),
-        i64::from(BURST_OBSERVATIONS) * i64::from(BURST_FEATURES)
+        i64::from(observations) * i64::from(feature_count)
     );
     server.shutdown().await.expect("test server shuts down");
 }

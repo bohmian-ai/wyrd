@@ -186,7 +186,7 @@ impl Principal {
     ///
     /// An agent always binds a Card. A service binds one only when it is a
     /// deployed workload; Card-free tenant automation, tenant administrators,
-    /// humans, and the internal SYSTEM writer return `None`.
+    /// humans, and the tenant SYSTEM principal return `None`.
     #[must_use]
     pub fn card_ref(&self) -> Option<&CardRef> {
         match &self.kind {
@@ -200,7 +200,8 @@ impl Principal {
     ///
     /// A Card-free service still reports its (empty) scope, so callers can
     /// distinguish "no emit authority" from "not a machine principal". The
-    /// internal SYSTEM writer reports its single signed Verifier scope.
+    /// tenant SYSTEM principal reports its in-process scope: exactly the
+    /// Verifier a result frame is attributed to, or empty for an input read.
     #[must_use]
     pub fn card_ref_scope(&self) -> Option<&CardRefScope> {
         match &self.kind {
@@ -376,7 +377,8 @@ mod tests {
         assert!(!principal.authorizes_card(&unrelated));
     }
 
-    /// Build the UID-bearing Verifier reference a SYSTEM token is scoped to.
+    /// Build the UID-bearing Verifier reference a SYSTEM result frame is
+    /// scoped to.
     ///
     /// # Panics
     /// Panics when a static identity component is invalid.
@@ -393,8 +395,8 @@ mod tests {
         }
     }
 
-    /// The internal SYSTEM writer binds no root Card, yet exposes its one
-    /// signed Verifier scope so ingest can authorize and stamp result rows.
+    /// The tenant SYSTEM principal binds no root Card, yet exposes the one
+    /// Verifier scope of a result frame so Scribe can stamp result rows.
     ///
     /// # Panics
     /// Panics when the kind projects a root Card, loses its scope, authorizes

@@ -1556,6 +1556,9 @@ pub struct Bifrost {
     query_forwarder: Option<Arc<crate::oracle::ReadyOracleForwarder>>,
     /// Lifecycle routing retained by every query ingress, regardless of local role.
     query_controls: Option<crate::oracle::RunningQueryControls>,
+    /// Run-request outbox Gate hands acknowledged Eval observations to;
+    /// `None` only for the ownerless unit-test shell.
+    observation_runs: Option<Arc<crate::verification::observations::ObservationRunOutbox>>,
     /// Read-only proof handle for test-tier inspection of the production graph.
     #[cfg(feature = "test-support")]
     test_resources: Option<BifrostRoleResources>,
@@ -1599,6 +1602,8 @@ pub(crate) struct BifrostComposition {
     pub(crate) query_forwarder: Option<Arc<crate::oracle::ReadyOracleForwarder>>,
     /// Shared local controls or remote-only routing for a forwarding ingress.
     pub(crate) query_controls: Option<crate::oracle::RunningQueryControls>,
+    /// Run-request outbox the Gate's observation acknowledgement stages on.
+    pub(crate) observation_runs: Arc<crate::verification::observations::ObservationRunOutbox>,
     /// The process audit outbox every audited surface of this process shares.
     pub(crate) audit_outbox: Arc<AuditOutbox>,
     /// Already-composed production resources exposed only to the test tier.
@@ -1619,6 +1624,7 @@ impl Bifrost {
             token_verifier,
             query_forwarder,
             query_controls,
+            observation_runs,
             audit_outbox,
             #[cfg(feature = "test-support")]
             resources,
@@ -1633,6 +1639,7 @@ impl Bifrost {
             token_verifier,
             query_forwarder,
             query_controls,
+            observation_runs: Some(observation_runs),
             #[cfg(feature = "test-support")]
             test_resources: resources,
             #[cfg(feature = "test-support")]
@@ -1660,6 +1667,7 @@ impl Bifrost {
             token_verifier,
             query_forwarder: None,
             query_controls: None,
+            observation_runs: None,
             test_resources: None,
             test_catalog: None,
             audit_outbox: None,
@@ -1694,6 +1702,7 @@ impl Bifrost {
             token_verifier,
             query_forwarder: None,
             query_controls: None,
+            observation_runs: None,
             test_resources: None,
             test_catalog: Some(catalog),
             audit_outbox: None,
@@ -1752,6 +1761,18 @@ impl Bifrost {
     #[must_use]
     pub fn shared_token_verifier(&self) -> Arc<TokenVerifier> {
         Arc::clone(&self.token_verifier)
+    }
+
+    /// Borrows the Eval observation run-request outbox, absent only in the
+    /// ownerless unit-test shell.
+    ///
+    /// Process shutdown drains it after Bifrost so requests staged by the last
+    /// acknowledged observations are written.
+    #[must_use]
+    pub fn observation_runs(
+        &self,
+    ) -> Option<&Arc<crate::verification::observations::ObservationRunOutbox>> {
+        self.observation_runs.as_ref()
     }
 
     /// Borrows the retained ready-Oracle forwarder, when this process has one.

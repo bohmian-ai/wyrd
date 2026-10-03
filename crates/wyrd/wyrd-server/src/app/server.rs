@@ -439,18 +439,15 @@ impl BoundServer {
 
     /// Compose this process's verification runtime from its configuration.
     ///
-    /// Results publish through `verification.ingest_endpoint` when set, and
-    /// otherwise through this process's own plaintext gRPC listener when it
-    /// hosts a Scribe. The drain grace is clipped inside the server's shutdown
-    /// budget so released leases settle before teardown aborts the task.
+    /// Results are written through the process's capture writer. The drain
+    /// grace is clipped inside the server's shutdown budget so released
+    /// leases settle before teardown aborts the task.
     fn verification_runtime(&self) -> Option<VerificationRuntime> {
         let limits = RuntimeLimits::default()
             .within_server_drain(Duration::from_millis(self.config.shutdown.drain_ms));
-        let mut builder = VerificationRuntime::builder(&self.state).limits(limits);
-        if let Some(endpoint) = &self.config.verification.ingest_endpoint {
-            builder = builder.ingest_endpoint(endpoint.clone());
-        }
-        builder.local_ingest(self.grpc_addr).build()
+        VerificationRuntime::builder(&self.state)
+            .limits(limits)
+            .build()
     }
 
     /// The bound gRPC address, or `None` when the mode does not serve gRPC.
@@ -873,6 +870,12 @@ impl BoundServer {
                 }),
             )
         };
+        // Gate has closed and Scribe has drained, so no acknowledgement can
+        // still stage a run request; write what the run outbox holds. Losses
+        // are counted and logged by the outbox.
+        if let Some(outbox) = self.state.bifrost.observation_runs() {
+            outbox.shutdown(deadline).await;
+        }
         // Every request has finished and Oracle has drained, so no decision
         // can still be staged; commit what the shared outbox holds.
         let uncommitted = self.state.audit_outbox.shutdown(deadline).await;

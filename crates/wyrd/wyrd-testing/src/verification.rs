@@ -338,6 +338,54 @@ impl VerificationFixture {
         cron: &str,
         operators: Vec<FrozenTarget>,
     ) -> Result<BindingId, VerificationFixtureError> {
+        self.bind(
+            owner,
+            subject,
+            verifier,
+            BindingActivation::Schedule {
+                cron: cron.to_owned(),
+                tz: None,
+            },
+            operators,
+        )
+        .await
+    }
+
+    /// Project one `observations_ready` binding of `verifier` on `owner`
+    /// itself, with no Operators.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError`] when the projection fails.
+    pub async fn bind_observations(
+        &self,
+        owner: &CardUid,
+        verifier: &CardUid,
+    ) -> Result<BindingId, VerificationFixtureError> {
+        self.bind(
+            owner,
+            owner,
+            verifier,
+            BindingActivation::ObservationsReady,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Project one binding of `verifier` on `subject` under `owner` with
+    /// `activation` and `operators`; the owner's own occurrence when `subject`
+    /// is `owner`, otherwise a `component` occurrence.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError`] when the projection fails or
+    /// projects no binding.
+    async fn bind(
+        &self,
+        owner: &CardUid,
+        subject: &CardUid,
+        verifier: &CardUid,
+        activation: BindingActivation,
+        operators: Vec<FrozenTarget>,
+    ) -> Result<BindingId, VerificationFixtureError> {
         let occurrence = if subject == owner {
             OWNER_OCCURRENCE_KEY
         } else {
@@ -354,10 +402,7 @@ impl VerificationFixture {
                 verifier_uid: verifier.clone(),
                 trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
                 operators,
-                activation: BindingActivation::Schedule {
-                    cron: cron.to_owned(),
-                    tz: None,
-                },
+                activation,
             }],
         )
         .await?;

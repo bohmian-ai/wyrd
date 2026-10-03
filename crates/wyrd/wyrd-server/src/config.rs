@@ -1627,13 +1627,6 @@ pub struct VerificationConfig {
     /// durable queue, so every replica may run them.
     #[serde(default = "default_verification_enabled")]
     pub enabled: bool,
-    /// Scribe-bearing gRPC endpoint Verifier results are published through.
-    ///
-    /// When unset, a process that hosts a Scribe and serves plaintext gRPC
-    /// publishes through its own listener; any other process runs no Verifier
-    /// runner until this is set.
-    #[serde(default)]
-    pub ingest_endpoint: Option<String>,
     /// Where the key-encryption keys that protect Operator connection
     /// credentials come from.
     #[serde(default)]
@@ -1646,11 +1639,10 @@ fn default_verification_enabled() -> bool {
 }
 
 impl Default for VerificationConfig {
-    /// The runtime is enabled and publishes through the local Scribe.
+    /// The runtime is enabled with the default Operator key source.
     fn default() -> Self {
         Self {
             enabled: default_verification_enabled(),
-            ingest_endpoint: None,
             operator_keys: OperatorKeysConfig::default(),
         }
     }
@@ -3022,11 +3014,6 @@ impl WyrdServerConfig {
         // verification.enabled
         if let Some(val) = env_opt("WYRD_VERIFICATION_ENABLED")? {
             self.verification.enabled = parse_flag(&val, "WYRD_VERIFICATION_ENABLED")?;
-        }
-
-        // verification.ingest_endpoint
-        if let Some(val) = env_opt("WYRD_VERIFICATION_INGEST_ENDPOINT")? {
-            self.verification.ingest_endpoint = Some(val);
         }
 
         // verification.operator_keys (WYRD_OPERATOR_KEK_*)

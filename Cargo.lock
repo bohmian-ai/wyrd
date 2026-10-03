@@ -11713,6 +11713,7 @@ dependencies = [
  "iceberg",
  "insta",
  "jsonwebtoken 9.3.1",
+ "lru",
  "metrics",
  "metrics-exporter-prometheus",
  "mimalloc",

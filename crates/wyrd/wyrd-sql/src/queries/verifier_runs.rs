@@ -27,6 +27,7 @@ use wyrd_spec::card::operator::{MAX_SUMMARY_CHARS, VerifierCounts};
 use wyrd_spec::ids::{
     BindingId, CardUid, OperatorDispatchId, VerificationResultId, VerificationRunId,
 };
+use wyrd_spec::reference::CardRef;
 use wyrd_spec::verification::{
     DriftWindow, FrozenTarget, OperatorDispatchState, VerificationBindingStatus, VerificationError,
     VerificationRunStatus, VerificationRunTarget, VerificationVerdict, VerifierReadiness,
@@ -34,6 +35,9 @@ use wyrd_spec::verification::{
 
 use crate::queries::verification::{BindingSchedule, InactivityTimeout, binding_activity};
 use crate::{OperatorPool, TenantConn};
+
+/// The Verifier `implementation.kind` that consumes an Eval record.
+const EVAL_IMPLEMENTATION: &str = "eval";
 
 /// Resolve a binding target's frozen identities, readiness, and implementation.
 const RESOLVE_BINDING_SQL: &str = r#"
@@ -108,18 +112,62 @@ const LOCK_OBSERVATION_BINDING_SQL: &str = r#"
        FOR NO KEY UPDATE
 "#;
 
-/// Lock every `observations_ready` binding of a frame's subjects until commit.
+/// Lock and list, until commit, every `observations_ready` binding whose
+/// subject and exact owner Card match a `(subject, writer)` pair of the batch.
 ///
-/// Rows are locked in `binding_id` order (the lock sits above the sort), so
-/// two transactions that touch overlapping bindings acquire them in the same
-/// order and one simply waits for the other instead of forming a cycle.
+/// `$1` and `$2` are parallel arrays of subject Card UID and the writing
+/// principal's bound Card UID, so a record runs only the bindings its writer
+/// owns (REQ-108); another owner's binding on the same subject is never
+/// selected. Rows are locked in `binding_id` order (the lock sits above the
+/// sort), so two transactions that touch overlapping bindings acquire them in
+/// the same order and one simply waits for the other instead of forming a
+/// cycle.
 const LOCK_OBSERVATION_SUBJECTS_SQL: &str = r#"
-    SELECT 1
+    SELECT binding_id, subject_card_uid, owner_card_uid
       FROM wyrd.verification_bindings
      WHERE activation = 'observations_ready'
-       AND subject_card_uid = ANY($1)
+       AND (subject_card_uid, owner_card_uid) IN (SELECT * FROM unnest($1::uuid[], $2::uuid[]))
      ORDER BY binding_id
        FOR NO KEY UPDATE
+"#;
+
+/// Insert one observation run per unseen `(binding, record)` of a batch in
+/// one statement, due at PostgreSQL's statement time.
+///
+/// `$1..$4` are parallel arrays of run ID, binding, record ID, and event time
+/// in batch order. Rows whose record already has a run of that binding, and
+/// later repeats inside the batch, are removed before numbering, so a repeat
+/// inserts nothing and consumes no ordinal. Ordinals continue each binding's
+/// maximum in batch order; the caller holds every binding's row lock from
+/// [`LOCK_OBSERVATION_SUBJECTS_SQL`], so this statement's snapshot already sees
+/// every committed predecessor. The frozen identities, Trigger, and Operators
+/// come from the locked binding and its Verifier Card.
+const INSERT_OBSERVATION_RUNS_SQL: &str = r#"
+    INSERT INTO wyrd.verifier_runs (
+        run_id, data_tenant_id, verifier_uid, verifier_version, subject_card_uid,
+        origin, owner_card_uid, binding_id, trigger_uid, trigger_digest, operators,
+        input_record_id, input_event_time, max_attempts,
+        next_attempt_at, created_at, updated_at, observation_ordinal
+    )
+    SELECT r.run_id, wyrd.current_tenant(), b.verifier_uid, v.version, b.subject_card_uid,
+           'observation', b.owner_card_uid, b.binding_id, b.trigger_uid, b.trigger_digest,
+           b.operators, r.record_id, r.event_time, $5,
+           statement_timestamp(), statement_timestamp(), statement_timestamp(),
+           COALESCE((SELECT max(x.observation_ordinal)
+                       FROM wyrd.verifier_runs x
+                      WHERE x.binding_id = r.binding_id AND x.origin = 'observation'), 0)
+             + row_number() OVER (PARTITION BY r.binding_id ORDER BY r.position)
+      FROM (SELECT DISTINCT ON (u.binding_id, u.record_id) u.*
+              FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::timestamptz[])
+                   WITH ORDINALITY AS u(run_id, binding_id, record_id, event_time, position)
+             WHERE NOT EXISTS (SELECT 1 FROM wyrd.verifier_runs e
+                                WHERE e.binding_id = u.binding_id
+                                  AND e.origin = 'observation'
+                                  AND e.input_record_id = u.record_id)
+             ORDER BY u.binding_id, u.record_id, u.position) r
+      JOIN wyrd.verification_bindings b ON b.binding_id = r.binding_id
+      JOIN wyrd.cards v ON v.card_uid = b.verifier_uid
+    ON CONFLICT DO NOTHING
 "#;
 
 /// Find the run that already holds a scheduled occurrence or observation record.
@@ -183,15 +231,17 @@ const ADVANCE_CURSOR_SQL: &str = r#"
 /// Settle every expired lease that has no attempt left as `errored`.
 ///
 /// Expiry is decided and stamped by PostgreSQL, so a lease written by one pod
-/// is never judged against another pod's clock.
+/// is never judged against another pod's clock. A run with a stored result is
+/// never exhausted: its result is decided, and the next claimant writes it.
 const EXHAUST_EXPIRED_SQL: &str = r#"
-    UPDATE wyrd.verifier_runs
+    UPDATE wyrd.verifier_runs r
        SET status = 'errored', error = $1, lease_expires_at = NULL,
            next_attempt_at = NULL, settled_at = statement_timestamp(),
            updated_at = statement_timestamp()
-     WHERE status = 'running'
-       AND lease_expires_at <= statement_timestamp()
-       AND attempts >= max_attempts
+     WHERE r.status = 'running'
+       AND r.lease_expires_at <= statement_timestamp()
+       AND r.attempts >= r.max_attempts
+       AND NOT EXISTS (SELECT 1 FROM wyrd.verifier_run_results s WHERE s.run_id = r.run_id)
 "#;
 
 /// Claim the oldest due, retry-due, or lease-expired run under a fresh lease.
@@ -199,7 +249,11 @@ const EXHAUST_EXPIRED_SQL: &str = r#"
 /// Availability, expiry, and the new lease deadline are all PostgreSQL's
 /// statement time; `$2` is only the lease length in milliseconds, so a pod
 /// whose clock differs from the database can neither claim early nor hold a
-/// lease the database believes already expired.
+/// lease the database believes already expired. The claim also returns the
+/// tenant's active SYSTEM principal, which the run's input reads and result
+/// rows are attributed to, the exact Verifier Card's status (`NULL` when the
+/// Card is absent), and the Verifier's ready fitted Drift baseline, so no
+/// later phase opens a connection to read them.
 const CLAIM_RUN_SQL: &str = r#"
     WITH candidate AS (
         SELECT run_id, COALESCE(next_attempt_at, lease_expires_at) AS due_at
@@ -224,7 +278,66 @@ const CLAIM_RUN_SQL: &str = r#"
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - candidate.due_at)
                            * 1000)::bigint) AS queue_wait_ms,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - r.created_at)
-                           * 1000)::bigint) AS age_ms
+                           * 1000)::bigint) AS age_ms,
+              (SELECT a.id FROM wyrd.auth_service_accounts a
+                WHERE a.principal_kind = 'system' AND a.status = 'active') AS system_principal_id,
+              (SELECT c.status FROM wyrd.cards c
+                WHERE c.card_uid = r.verifier_uid) AS verifier_status,
+              (SELECT b.fitted FROM wyrd.drift_baselines b
+                WHERE b.verifier_uid = r.verifier_uid AND b.state = 'ready') AS fitted_baseline
+"#;
+
+/// Read a run's stored result, in its table write order.
+const STAGED_RESULT_SQL: &str = r#"
+    SELECT result_id, event_time, verdict, summary, counts, verifier,
+           tables, batch_ids, payloads
+      FROM wyrd.verifier_run_results
+     WHERE run_id = $1
+"#;
+
+/// Lock a run still held by this lease token, so a concurrent reclaim either
+/// commits first (and this finds nothing) or waits for the caller's store.
+const LOCK_HELD_RUN_SQL: &str = r#"
+    SELECT data_tenant_id
+      FROM wyrd.verifier_runs
+     WHERE run_id = $1 AND lease_token = $2 AND status = 'running'
+       FOR UPDATE
+"#;
+
+/// Store a held run's decided result; a result already stored for the run is
+/// kept, because only the claimant that stored it could have decided it.
+const STORE_RESULT_SQL: &str = r#"
+    INSERT INTO wyrd.verifier_run_results (
+        run_id, data_tenant_id, result_id, event_time, verdict, summary,
+        counts, verifier, tables, batch_ids, payloads
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    ON CONFLICT (run_id) DO NOTHING
+"#;
+
+/// Delete a settled run's stored result.
+const DELETE_STAGED_SQL: &str = r#"
+    DELETE FROM wyrd.verifier_run_results WHERE run_id = $1
+"#;
+
+/// Renew every listed lease still held, on the database clock.
+///
+/// `$2` is the lease length and `$3` the remaining time under which a lease is
+/// renewed, both in milliseconds, so a lease is extended only once a third of
+/// it has passed. Every unexpired lease still held is returned, renewed or
+/// not; a token absent from the result has expired, been reclaimed, or been
+/// settled.
+const RENEW_LEASES_SQL: &str = r#"
+    UPDATE wyrd.verifier_runs
+       SET lease_expires_at = CASE
+               WHEN lease_expires_at <= statement_timestamp() + ($3::bigint * INTERVAL '1 millisecond')
+               THEN statement_timestamp() + ($2::bigint * INTERVAL '1 millisecond')
+               ELSE lease_expires_at
+           END,
+           updated_at = statement_timestamp()
+     WHERE status = 'running' AND lease_token = ANY($1)
+       AND lease_expires_at > statement_timestamp()
+    RETURNING lease_token
 "#;
 
 /// Complete a leased run, or re-apply the same completion idempotently.
@@ -333,15 +446,6 @@ const AWAIT_TRACE_SQL: &str = r#"
     RETURNING next_attempt_at
 "#;
 
-/// List a subject's `observations_ready` bindings in identity order.
-const OBSERVATION_BINDINGS_SQL: &str = r#"
-    SELECT binding_id
-      FROM wyrd.verification_bindings
-     WHERE activation = 'observations_ready'
-       AND subject_card_uid = $1
-     ORDER BY binding_id
-"#;
-
 /// Read one run's control-plane status.
 const RUN_STATUS_SQL: &str = r#"
     SELECT run_id, status, requested_by_principal_id, result_id, error
@@ -368,7 +472,7 @@ const BINDING_TARGETS_SQL: &str = r#"
      WHERE b.binding_id = $1
 "#;
 
-/// List tenants with claimable runs, longest-waiting tenant first.
+/// List every tenant with claimable runs, longest-waiting tenant first.
 const RUNNABLE_TENANTS_SQL: &str = r#"
     SELECT data_tenant_id
       FROM wyrd.verifier_runs
@@ -376,7 +480,6 @@ const RUNNABLE_TENANTS_SQL: &str = r#"
         OR (status = 'running' AND lease_expires_at <= statement_timestamp())
      GROUP BY data_tenant_id
      ORDER BY min(COALESCE(next_attempt_at, lease_expires_at)), data_tenant_id
-     LIMIT $1
 "#;
 
 /// List tenants with due scheduled bindings, most overdue tenant first.
@@ -459,7 +562,7 @@ impl RunInput {
     const fn implementation(&self) -> &'static str {
         match self {
             Self::DriftWindow(_) => "drift",
-            Self::EvalRecord { .. } => "eval",
+            Self::EvalRecord { .. } => EVAL_IMPLEMENTATION,
         }
     }
 }
@@ -647,7 +750,7 @@ pub struct ScheduleTick {
 /// [`OperatorDispatchQueue::claim`](crate::queries::operator_dispatches::OperatorDispatchQueue::claim)
 /// mint one, so a settlement can only be attempted by a worker that actually
 /// claimed the run or dispatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeaseToken(pub(crate) Uuid);
 
 /// The identity a runner settles a claimed run with.
@@ -660,7 +763,7 @@ pub struct RunLease {
 }
 
 /// A run claimed for execution, with every frozen identity the runner needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ClaimedRun {
     /// Settlement identity.
     pub lease: RunLease,
@@ -699,6 +802,52 @@ pub struct ClaimedRun {
     /// How long before this claim the run was created by its trigger: the
     /// claim statement's PostgreSQL instant less `created_at`. Telemetry only.
     pub age: std::time::Duration,
+    /// The tenant's active SYSTEM principal, read in the claim transaction;
+    /// `None` when the tenant has none. Result rows are attributed to it and
+    /// input reads run as it.
+    pub system_principal: Option<PrincipalId>,
+    /// Whether the exact Verifier Card exists and is not deleted, read in the
+    /// claim transaction; a cached Verifier is used only while this holds.
+    pub verifier_present: bool,
+    /// The Verifier's ready fitted Drift baseline, read in the claim
+    /// transaction; `None` when it has none.
+    pub fitted_baseline: Option<Value>,
+    /// The run's result when an earlier claimant already decided and stored
+    /// it; such a run is never executed again, only written.
+    pub staged: Option<StagedResult>,
+}
+
+/// A run's decided result as stored before any of it reaches Bifrost.
+///
+/// Every write of the run, by any claimant, submits exactly these batches;
+/// completion freezes exactly this verdict, summary, and count.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StagedResult {
+    /// The result identity every row carries and the run completes with.
+    pub result_id: VerificationResultId,
+    /// The result's producer event time.
+    pub event_time: DateTime<Utc>,
+    /// The common verdict.
+    pub verdict: VerificationVerdict,
+    /// Bounded summary frozen into failure dispatches.
+    pub summary: String,
+    /// The result's counts frozen into failure dispatches.
+    pub counts: VerifierCounts,
+    /// The exact Verifier the rows are attributed to.
+    pub verifier: CardRef,
+    /// Encoded batches in write order: details, then the summary.
+    pub batches: Vec<StagedBatch>,
+}
+
+/// One encoded result batch of a [`StagedResult`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedBatch {
+    /// Fully qualified result table.
+    pub table: String,
+    /// Identity Scribe's batch fence deduplicates on.
+    pub batch_id: Uuid,
+    /// The batch as one Arrow IPC stream.
+    pub ipc: Vec<u8>,
 }
 
 /// Outcome of a token-fenced settlement.
@@ -733,13 +882,19 @@ pub enum TraceWaitOutcome {
     StaleLease,
 }
 
-/// What one observation did for one matching `observations_ready` binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObservationOutcome {
-    /// The shared enqueue path created, found, or refused the run.
-    Enqueue(EnqueueOutcome),
-    /// The binding owner was not runtime-active, so no run was created.
-    Inactive,
+/// One committed Eval observation awaiting its runs: the request the server's
+/// run-request outbox hands to [`VerifierRunQueue::enqueue_observation_batch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationRecord {
+    /// Subject Card the observation was emitted for.
+    pub subject: CardUid,
+    /// Card the writing principal is bound to; only `observations_ready`
+    /// bindings whose exact owner is this Card take a run of it.
+    pub writer: CardUid,
+    /// Logical input record ID, unique per binding's runs.
+    pub record_id: String,
+    /// Committed observation's server event time, frozen on the run.
+    pub event_time: DateTime<Utc>,
 }
 
 /// Terminal execution states that carry no verdict.
@@ -1008,7 +1163,7 @@ impl VerifierRunQueue {
             return Ok(EnqueueOutcome::Refused(EnqueueRefusal::BindingNotFound));
         };
         let input = request.input();
-        if let Some(refusal) = resolved.refusal(&input)? {
+        if let Some(refusal) = resolved.refusal(input.implementation())? {
             return Ok(EnqueueOutcome::Refused(refusal));
         }
         let verifier_version = resolved
@@ -1209,8 +1364,113 @@ impl VerifierRunQueue {
             .bind(lease_for.num_milliseconds())
             .fetch_optional(&mut **conn.transaction())
             .await?;
-        row.map(|row| row.into_claimed(LeaseToken(token)))
-            .transpose()
+        let Some(mut claimed) = row
+            .map(|row| row.into_claimed(LeaseToken(token)))
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        let staged: Option<StagedResultRow> = sqlx::query_as(STAGED_RESULT_SQL)
+            .bind(claimed.lease.run_id.as_uuid())
+            .fetch_optional(&mut **conn.transaction())
+            .await?;
+        claimed.staged = staged.map(StagedResultRow::into_staged).transpose()?;
+        Ok(Some(claimed))
+    }
+
+    /// Store `staged` as the decided result of the run `lease` holds.
+    ///
+    /// Locks the run while this token still holds it, so a concurrent reclaim
+    /// either commits first, and this stores nothing, or waits until the
+    /// caller's transaction ends. A result already stored for the run is
+    /// kept: only the claimant that stored it could have decided it, so a
+    /// repeated store after an unacknowledged commit is [`Settlement::Applied`].
+    /// The caller commits before writing any batch to Bifrost.
+    ///
+    /// # Errors
+    /// Returns the database error when a statement fails, or an encoding error
+    /// when the verdict, counts, or Verifier reference cannot be serialized.
+    #[tracing::instrument(skip(self, conn, staged), fields(operation = "verification.runs.store_result", run_id = %lease.run_id))]
+    pub async fn store_result(
+        &self,
+        conn: &mut TenantConn<'_>,
+        lease: RunLease,
+        staged: &StagedResult,
+    ) -> Result<Settlement, SqlxError> {
+        let tenant: Option<Uuid> = sqlx::query_scalar(LOCK_HELD_RUN_SQL)
+            .bind(lease.run_id.as_uuid())
+            .bind(lease.token.0)
+            .fetch_optional(&mut **conn.transaction())
+            .await?;
+        let Some(tenant) = tenant else {
+            return Ok(Settlement::StaleLease);
+        };
+        let batches = &staged.batches;
+        let tables: Vec<&str> = batches.iter().map(|batch| batch.table.as_str()).collect();
+        let batch_ids: Vec<Uuid> = batches.iter().map(|batch| batch.batch_id).collect();
+        let payloads: Vec<&[u8]> = batches.iter().map(|batch| batch.ipc.as_slice()).collect();
+        sqlx::query(STORE_RESULT_SQL)
+            .bind(lease.run_id.as_uuid())
+            .bind(tenant)
+            .bind(staged.result_id.as_uuid())
+            .bind(staged.event_time)
+            .bind(Json(staged.verdict))
+            .bind(&staged.summary)
+            .bind(Json(staged.counts))
+            .bind(Json(&staged.verifier))
+            .bind(tables)
+            .bind(batch_ids)
+            .bind(payloads)
+            .execute(&mut **conn.transaction())
+            .await?;
+        Ok(Settlement::Applied)
+    }
+
+    /// Renew, on the database clock, every lease in `tokens` still held.
+    ///
+    /// A lease is extended to `lease_for` from PostgreSQL's statement time once
+    /// a third of it has passed; a younger lease is left as it is. An expired
+    /// lease is never revived, because another claimant may already be
+    /// reclaiming it. Returns every token that still holds an unexpired lease,
+    /// renewed or not, so a token missing from the result expired, was
+    /// reclaimed, or was settled, and its work must stop. Renewal evaluates no
+    /// permission and writes no audit.
+    ///
+    /// # Errors
+    /// Returns the database error when the update fails.
+    #[tracing::instrument(skip(self, conn, tokens), fields(operation = "verification.runs.renew", leases = tokens.len()))]
+    pub async fn renew(
+        &self,
+        conn: &mut TenantConn<'_>,
+        tokens: &[LeaseToken],
+        lease_for: Duration,
+    ) -> Result<Vec<LeaseToken>, SqlxError> {
+        let tokens: Vec<Uuid> = tokens.iter().map(|token| token.0).collect();
+        let lease = lease_for.num_milliseconds();
+        let held: Vec<Uuid> = sqlx::query_scalar(RENEW_LEASES_SQL)
+            .bind(tokens)
+            .bind(lease)
+            .bind(lease - lease / 3)
+            .fetch_all(&mut **conn.transaction())
+            .await?;
+        Ok(held.into_iter().map(LeaseToken).collect())
+    }
+
+    /// Delete the stored result of the run `lease` names, in the caller's
+    /// settlement transaction.
+    ///
+    /// # Errors
+    /// Returns the database error when the delete fails.
+    async fn delete_staged(
+        &self,
+        conn: &mut TenantConn<'_>,
+        lease: RunLease,
+    ) -> Result<(), SqlxError> {
+        sqlx::query(DELETE_STAGED_SQL)
+            .bind(lease.run_id.as_uuid())
+            .execute(&mut **conn.transaction())
+            .await?;
+        Ok(())
     }
 
     /// Settle a claimed run `completed`, pointing at its acknowledged result.
@@ -1250,6 +1510,7 @@ impl VerifierRunQueue {
         let Some((binding_id, Json(operators))) = settled else {
             return Ok(Settlement::StaleLease);
         };
+        self.delete_staged(conn, lease).await?;
         if verdict == VerificationVerdict::Failed && binding_id.is_some() {
             let summary: String = summary.chars().take(MAX_SUMMARY_CHARS).collect();
             for operator in &operators {
@@ -1314,10 +1575,11 @@ impl VerifierRunQueue {
     /// Settle a claimed run in a terminal status with no verdict.
     ///
     /// `cancelled`, `timed_out`, and `errored` runs record `error`, point at no
-    /// result, and never dispatch an Operator.
+    /// result, and never dispatch an Operator. The same transaction deletes
+    /// any stored result, which a terminal run never writes.
     ///
     /// # Errors
-    /// Returns the database error when the update fails.
+    /// Returns the database error when a statement fails.
     #[tracing::instrument(skip(self, conn, error), fields(operation = "verification.runs.terminate", run_id = %lease.run_id))]
     pub async fn terminate(
         &self,
@@ -1333,7 +1595,11 @@ impl VerifierRunQueue {
             .bind(Json(error))
             .execute(&mut **conn.transaction())
             .await?;
-        Ok(settlement(result.rows_affected()))
+        let settled = settlement(result.rows_affected());
+        if settled == Settlement::Applied {
+            self.delete_staged(conn, lease).await?;
+        }
+        Ok(settled)
     }
 
     /// Requeue a claimed run whose required trace has not landed yet.
@@ -1378,97 +1644,100 @@ impl VerifierRunQueue {
         )
     }
 
-    /// Enqueue one Eval run per `observations_ready` binding of `subject`.
+    /// Enqueue one Eval run per `observations_ready` binding the writer owns
+    /// on each record's subject, for every record of a batch, in one insert
+    /// statement.
     ///
-    /// Called after the observation is durably committed, never inside its
-    /// ingest transaction. Each binding whose owner is runtime-active goes
-    /// through the shared enqueue path with the exact `record_id` and the
-    /// committed row's server `event_time`, so a replayed observation finds
-    /// its existing run instead of creating another. Bindings of other
-    /// subjects or tenants are never read: the caller's tenant transaction
-    /// scopes the lookup.
+    /// Called after the observations are durably committed, never inside
+    /// their ingest transaction. One statement locks and lists, in binding
+    /// order, every `observations_ready` binding whose subject and exact
+    /// owner Card match a record's subject and writer, so concurrent
+    /// batches touching the same bindings serialize instead of deadlocking
+    /// and another owner's binding on the same subject takes no run
+    /// (REQ-108). Each such binding whose Verifier, subject, and
+    /// implementation accept an Eval record contributes one row per matching
+    /// record; one
+    /// [`INSERT_OBSERVATION_RUNS_SQL`] then writes them all. A record that
+    /// already has a run of a binding inserts nothing, so a repeated batch is
+    /// a no-op. Bindings of other tenants are never read: the caller's tenant
+    /// transaction scopes every lookup. Returns the number of runs inserted.
     ///
     /// # Errors
-    /// Returns the database error when a read or insert fails, or a decode
-    /// error when a stored identity is malformed; runs inserted earlier in the
-    /// same transaction roll back with it.
+    /// Returns the database error when the lock, a read, or the insert fails,
+    /// or a decode error when a stored identity or readiness is malformed;
+    /// nothing from the batch survives the caller's rollback.
     #[tracing::instrument(
-        skip(self, conn, record_id),
-        fields(operation = "verification.runs.enqueue_observation")
+        skip(self, conn, records),
+        fields(operation = "verification.runs.enqueue_observation_batch", records = records.len())
     )]
-    pub async fn enqueue_observation(
+    pub async fn enqueue_observation_batch(
         &self,
         conn: &mut TenantConn<'_>,
-        subject: &CardUid,
-        record_id: &str,
-        event_time: DateTime<Utc>,
-    ) -> Result<Vec<(BindingId, ObservationOutcome)>, SqlxError> {
-        let bindings: Vec<Uuid> = sqlx::query_scalar(OBSERVATION_BINDINGS_SQL)
-            .bind(subject.as_uuid())
+        records: &[ObservationRecord],
+    ) -> Result<u64, SqlxError> {
+        let (subjects, writers): (Vec<Uuid>, Vec<Uuid>) = records
+            .iter()
+            .map(|record| (record.subject.as_uuid(), record.writer.as_uuid()))
+            .unzip();
+        let bindings: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(LOCK_OBSERVATION_SUBJECTS_SQL)
+            .bind(subjects)
+            .bind(writers)
             .fetch_all(&mut **conn.transaction())
             .await?;
-        let mut outcomes = Vec::with_capacity(bindings.len());
-        for binding in bindings {
-            let binding_id = stored(BindingId::new(binding))?;
-            let active = binding_activity(conn, binding_id, self.inactivity)
+        let (mut run_ids, mut binding_ids, mut record_ids, mut event_times) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (binding, subject, writer) in bindings {
+            if !self
+                .accepts_records(conn, stored(BindingId::new(binding))?)
                 .await?
-                .is_some_and(|activity| activity.active);
-            let outcome = if active {
-                let request = RunRequest::Observation {
-                    binding_id,
-                    record_id: record_id.to_owned(),
-                    event_time,
-                };
-                ObservationOutcome::Enqueue(self.enqueue(conn, &request).await?)
-            } else {
-                ObservationOutcome::Inactive
-            };
-            outcomes.push((binding_id, outcome));
+            {
+                continue;
+            }
+            for record in records.iter().filter(|record| {
+                record.subject.as_uuid() == subject && record.writer.as_uuid() == writer
+            }) {
+                run_ids.push(VerificationRunId::new_v7().as_uuid());
+                binding_ids.push(binding);
+                record_ids.push(record.record_id.as_str());
+                event_times.push(record.event_time);
+            }
         }
-        Ok(outcomes)
-    }
-
-    /// Enqueue the Eval runs of every row in one acknowledged frame.
-    ///
-    /// `observations` are `(subject, record_id, event_time)` in frame order.
-    /// One statement first locks every `observations_ready` binding of the
-    /// frame's distinct subjects in binding order; each row then goes through
-    /// [`Self::enqueue_observation`] in frame order, whose per-binding lock is
-    /// already held. A frame mixes rows of several subjects in emission order,
-    /// so locking each binding as its row arrived let two concurrent frames
-    /// lock the same bindings in opposite orders and deadlock. Returns the
-    /// number of per-binding outcomes, enqueued, replayed, refused, or
-    /// inactive.
-    ///
-    /// # Errors
-    /// Returns the database error when the lock, a read, or an insert fails,
-    /// or a decode error when a stored identity is malformed; runs inserted
-    /// earlier in the same transaction roll back with it.
-    #[tracing::instrument(
-        skip(self, conn, observations),
-        fields(operation = "verification.runs.enqueue_observations", rows = observations.len())
-    )]
-    pub async fn enqueue_observations(
-        &self,
-        conn: &mut TenantConn<'_>,
-        observations: &[(&CardUid, &str, DateTime<Utc>)],
-    ) -> Result<usize, SqlxError> {
-        let subjects: Vec<Uuid> = observations
-            .iter()
-            .map(|(subject, _, _)| subject.as_uuid())
-            .collect();
-        sqlx::query(LOCK_OBSERVATION_SUBJECTS_SQL)
-            .bind(subjects)
+        if run_ids.is_empty() {
+            return Ok(0);
+        }
+        let inserted = sqlx::query(INSERT_OBSERVATION_RUNS_SQL)
+            .bind(run_ids)
+            .bind(binding_ids)
+            .bind(record_ids)
+            .bind(event_times)
+            .bind(self.retry.max_attempts)
             .execute(&mut **conn.transaction())
             .await?;
-        let mut outcomes = 0;
-        for (subject, record_id, event_time) in observations {
-            outcomes += self
-                .enqueue_observation(conn, subject, record_id, *event_time)
-                .await?
-                .len();
+        Ok(inserted.rows_affected())
+    }
+
+    /// Whether `binding`'s target accepts an Eval record now: Verifier ready,
+    /// subject available, Eval implementation.
+    ///
+    /// No owner activity is read: the record's writer is bound to the
+    /// binding's owner and has just authenticated (REQ-108).
+    ///
+    /// # Errors
+    /// Returns the database error when a read fails, or a decode error when
+    /// the stored readiness is malformed.
+    async fn accepts_records(
+        &self,
+        conn: &mut TenantConn<'_>,
+        binding: BindingId,
+    ) -> Result<bool, SqlxError> {
+        let resolved: Option<ResolvedTarget> = sqlx::query_as(RESOLVE_BINDING_SQL)
+            .bind(binding.as_uuid())
+            .fetch_optional(&mut **conn.transaction())
+            .await?;
+        match resolved {
+            Some(resolved) => Ok(resolved.refusal(EVAL_IMPLEMENTATION)?.is_none()),
+            None => Ok(false),
         }
-        Ok(outcomes)
     }
 
     /// Return a claimed run to the queue with its attempt refunded.
@@ -1576,11 +1845,12 @@ impl VerifierRunQueue {
         }))
     }
 
-    /// List up to `limit` tenants that have a claimable run at database time.
+    /// List every tenant that has a claimable run at database time.
     ///
     /// Longest-waiting tenant first, so a runner visiting tenants in order does
-    /// not let one busy tenant starve others. Read-only; claiming happens per
-    /// tenant through [`Self::claim`].
+    /// not let one busy tenant starve others. There is no tenant limit: one
+    /// claim round considers every tenant with work. Read-only; claiming
+    /// happens per tenant through [`Self::claim`].
     ///
     /// # Errors
     /// Returns the database error when the read fails, or a decode error when
@@ -1589,10 +1859,8 @@ impl VerifierRunQueue {
     pub async fn tenants_with_runnable_runs(
         &self,
         operator: &OperatorPool,
-        limit: i64,
     ) -> Result<Vec<DataTenantId>, SqlxError> {
         let rows: Vec<Uuid> = sqlx::query_scalar(RUNNABLE_TENANTS_SQL)
-            .bind(limit)
             .fetch_all(operator.pool())
             .await?;
         rows.into_iter()
@@ -1691,7 +1959,7 @@ impl ResolvedTarget {
     ///
     /// # Errors
     /// Returns [`SqlxError::Decode`] when the stored readiness is unknown.
-    fn refusal(&self, input: &RunInput) -> Result<Option<EnqueueRefusal>, SqlxError> {
+    fn refusal(&self, implementation: &str) -> Result<Option<EnqueueRefusal>, SqlxError> {
         let readiness: VerifierReadiness = stored(self.readiness.parse())?;
         if readiness != VerifierReadiness::Ready {
             return Ok(Some(EnqueueRefusal::NotReady(readiness)));
@@ -1699,7 +1967,7 @@ impl ResolvedTarget {
         if !self.subject_available {
             return Ok(Some(EnqueueRefusal::SubjectUnavailable));
         }
-        if self.implementation.as_deref() != Some(input.implementation()) {
+        if self.implementation.as_deref() != Some(implementation) {
             return Ok(Some(EnqueueRefusal::InputMismatch));
         }
         Ok(None)
@@ -1749,6 +2017,64 @@ struct ClaimedRunRow {
     queue_wait_ms: i64,
     /// Milliseconds since the run was created.
     age_ms: i64,
+    /// The tenant's active SYSTEM principal.
+    system_principal_id: Option<Uuid>,
+    /// The exact Verifier Card's status; `None` when the Card is absent.
+    verifier_status: Option<String>,
+    /// The Verifier's ready fitted Drift baseline.
+    fitted_baseline: Option<Json<Value>>,
+}
+
+/// One stored result row from [`STAGED_RESULT_SQL`].
+#[derive(sqlx::FromRow)]
+struct StagedResultRow {
+    /// Result identity.
+    result_id: Uuid,
+    /// Result event time.
+    event_time: DateTime<Utc>,
+    /// Common verdict.
+    verdict: Json<VerificationVerdict>,
+    /// Bounded summary.
+    summary: String,
+    /// Result counts.
+    counts: Json<VerifierCounts>,
+    /// Attributed Verifier.
+    verifier: Json<CardRef>,
+    /// Result tables in write order.
+    tables: Vec<String>,
+    /// Batch identities in write order.
+    batch_ids: Vec<Uuid>,
+    /// Arrow IPC streams in write order.
+    payloads: Vec<Vec<u8>>,
+}
+
+impl StagedResultRow {
+    /// Convert the stored columns into a [`StagedResult`].
+    ///
+    /// # Errors
+    /// Returns [`SqlxError::Decode`] when the result ID is not `UUIDv7`.
+    fn into_staged(self) -> Result<StagedResult, SqlxError> {
+        let batches = self
+            .tables
+            .into_iter()
+            .zip(self.batch_ids)
+            .zip(self.payloads)
+            .map(|((table, batch_id), ipc)| StagedBatch {
+                table,
+                batch_id,
+                ipc,
+            })
+            .collect();
+        Ok(StagedResult {
+            result_id: stored(VerificationResultId::new(self.result_id))?,
+            event_time: self.event_time,
+            verdict: self.verdict.0,
+            summary: self.summary,
+            counts: self.counts.0,
+            verifier: self.verifier.0,
+            batches,
+        })
+    }
 }
 
 impl ClaimedRunRow {
@@ -1814,6 +2140,12 @@ impl ClaimedRunRow {
                 self.queue_wait_ms,
             ))?),
             age: std::time::Duration::from_millis(stored(u64::try_from(self.age_ms))?),
+            system_principal: self.system_principal_id.map(PrincipalId::new),
+            verifier_present: self
+                .verifier_status
+                .is_some_and(|status| status != "deleted"),
+            fitted_baseline: self.fitted_baseline.map(|Json(fitted)| fitted),
+            staged: None,
         })
     }
 }

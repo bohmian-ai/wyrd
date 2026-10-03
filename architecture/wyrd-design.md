@@ -168,13 +168,11 @@ not a passive integration or inventory product.
     `card_ref_scope` authorization set derived at mint time, while a tenant
     administrative or tenant-created automation principal is representable
     with no Card and therefore no emit scope. `User` is the marker for human
-    identity. `System` is a tenant-local server identity used only for
-    canonical verification-result publication and the fixed Drift observation
-    read. It has no public credential, role, refresh, workload, delegation, or
-    principal-management path; the server mints each short-lived token with
-    exactly one UID-bearing Verifier scope and exactly one fixed capability:
-    result write, or `bifrost_query:read` scoped to the tenant's registered
-    `vala.drift.observations` table. No token carries both. Platform authority
+    identity. `System` is a tenant-local server identity that attributes
+    verification results and authorizes Verifier input reads in-process. It
+    never appears in a token: no issuer mints one, every verifier rejects a
+    `system` claim set, and it has no public credential, role, refresh,
+    workload, delegation, or principal-management path. Platform authority
     is a grant held at platform scope, not a property of a kind, and neither
     plane's credential or token is accepted by the other. Gateway capture is a
     server-internal write, not a principal that authenticates: captured rows
@@ -510,8 +508,12 @@ to a live, ready Scribe. A capture is delivered when Scribe acknowledges it
 before the call's deadline; backpressure and an unavailable Scribe are retried
 with bounded backoff until then, and anything else drops the capture with a
 counted reason without changing the call. No per-tenant client, queue, or
-backlog outlives the call. Gate refuses every public write to
-`vala.gateway.calls`.
+backlog outlives the call. The same writer submits Verifier results to the
+three result tables, attributed to the tenant's `System` principal and the
+run's exact Verifier Card, which Scribe stamps as `principal_id` and
+`card_uid`; a result batch is never dropped for time and is retried under its
+own batch id until Scribe acknowledges it. Gate refuses every public write to
+`vala.gateway.calls` and the three result tables.
 `Service` and
 `Agent` principal is always card-bound and a deployed `Service` carries its
 Card — the `card_ref` is discriminated on `PrincipalKind`, and the JWT carries a
@@ -990,6 +992,31 @@ not the Drift or Eval implementation, creates dispatches; each Operator owns
 its own delivery. A Verifier run never creates another Trigger. Direct
 Verifier invocation is analysis-only and dispatches nothing.
 
+The runner drains `wyrd.verifier_runs` in claim rounds. Each round considers
+every tenant with a claimable run, oldest first, with no tenant limit, and
+claims at most one run per tenant. Execution has no count limit. The shared
+resources that already admit work bound it: the Postgres pool, Oracle
+admission and memory, and the Bifrost memory budget. A run refused by one of
+them returns to the queue without consuming an attempt, and the process
+claims nothing new until one of its running runs finishes. The claim
+transaction also returns the Verifier Card's status, its spec on a cache miss,
+and any fitted Drift baseline. Parsed Verifiers are cached per process by
+tenant and Card UID in a fixed 64 MiB least-recently-used cache that is never
+shared across tenants. A deleted Verifier terminates the run `errored`.
+
+A run's result is decided once. When execution completes, the runner encodes
+the result and stores it, with its result ID, event time, batch IDs, and
+Arrow IPC bytes, in `wyrd.verifier_run_results` in one lease-fenced
+transaction before writing any of it. A stale lease stores nothing. Any later
+claimant of a run with a stored result writes those stored batches instead of
+executing again, so Scribe's batch fence absorbs every repeat. The settlement
+that completes or terminates the run deletes the stored result. While a run is
+in flight, one statement per tenant renews its leases on the PostgreSQL clock
+once a third of the lease has passed. An expired lease is never revived, and a
+renewal that no longer finds a run's token cancels that run's work. A run
+holds a connection only to claim, store, settle, and renew. The store and the
+settlement retry with backoff while the lease holds.
+
 #### Drift implementation
 Subject-less observation definition. The implementation is orthogonal: signal +
 condition + math. Subject identity is supplied by the publisher at
@@ -1273,6 +1300,15 @@ Registration rejects an activation paired with the wrong Verifier
 implementation. A Trigger never fires on its own: nothing runs merely because
 a Trigger Card is registered, and one schedule occurrence shared by two
 subjects creates two subject-scoped runs, never one mixed-subject run.
+
+Eval run creation follows Scribe's acknowledgement and never delays it.
+After the ack, the server puts one run request per committed record into an
+in-process outbox. One writer drains it, one multi-row insert per tenant,
+keyed by binding and record, so a repeated request inserts nothing. The
+outbox has no count limit and never drops a request because PostgreSQL is
+slow or down: a failed write keeps its batch and retries with backoff.
+Graceful shutdown flushes the outbox. A hard kill loses only unwritten
+requests, and every loss the process observes is counted and logged.
 
 External pushes are deliberately not an activation — Rule 7 ("Wyrd reads, it
 does not push") means external data enters through a `Source`.

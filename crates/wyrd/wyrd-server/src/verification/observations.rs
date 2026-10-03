@@ -1,211 +1,222 @@
-//! Best-effort post-acknowledgement enqueue of Eval observation runs.
+//! Post-acknowledgement Eval run requests, staged on the generic outbox.
 //!
 //! Gate hands every Eval observation frame Scribe has durably acknowledged to
-//! [`ObservationEnqueue`], which derives each row's exact `record_id`, subject,
-//! and committed `wyrd_event_time` and enqueues one run per active
-//! `observations_ready` binding in a tracked background task. The step is not
-//! part of Scribe's batch transaction and keeps no outbox or retry queue: a
-//! failure is logged and counted, the observation stays acknowledged, and no
-//! run exists for it. Gate hands over only the acknowledgement that first
-//! committed a batch, so a suppressed replay never enqueues and its later
-//! receipt instant can never be frozen as the run's event time.
+//! [`ObservationEnqueue`], which derives each row's exact `record_id`,
+//! subject, and committed `wyrd_event_time`, tags it with the Card the writing
+//! principal is bound to, and stages one run request per record on the
+//! [`ObservationRunOutbox`] without waiting. Only bindings that Card owns take
+//! a run of it, and a writer bound to no Card stages nothing (REQ-108). Gate
+//! hands over only the acknowledgement that first committed a batch, so a
+//! suppressed replay never queues and its later receipt instant can never be
+//! frozen as a run's event time.
+//!
+//! The generic [`Outbox`] owns the unbounded queue, per-tenant batching,
+//! retry with backoff, and shutdown; [`ObservationRunSink`] is its one durable
+//! call, [`VerifierRunQueue::enqueue_observation_batch`], a multi-row insert
+//! keyed by tenant, binding, and record, so a repeated write inserts nothing.
+//! Losses are counted in `outbox_events_lost_total{outbox="eval_run_requests"}`.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tokio::sync::Semaphore;
-use tokio_util::task::TaskTracker;
 use vala_bifrost_redux::gate::{AuthContext, ObservationAck};
 use vala_bifrost_redux::tables::EvalObservationsTable;
-use wyrd_runtime::Principal;
+use wyrd_runtime::outbox::{Outbox, OutboxSink};
+use wyrd_runtime::principal::Principal;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::request_id::RequestId;
-use wyrd_sql::WyrdPostgres;
-use wyrd_sql::queries::verifier_runs::VerifierRunQueue;
+use wyrd_spec::ids::CardUid;
+use wyrd_sql::queries::verifier_runs::{ObservationRecord, VerifierRunQueue};
+use wyrd_sql::{SqlError, WyrdPostgres};
 
-/// Enqueue tasks owned at once; a frame arriving beyond this is dropped and logged.
-const PENDING_LIMIT: usize = 256;
+/// Tenants the run-request writer inserts for at once, which bounds the Wyrd
+/// pool connections it may hold.
+const OBSERVATION_RUN_WRITER_CONNECTIONS: usize = 4;
 
-/// Owns the tracked, fail-open enqueue of runs for acknowledged Eval observations.
-#[derive(Clone)]
-pub struct ObservationEnqueue {
-    /// Wyrd Postgres owner each enqueue opens its tenant transaction through.
+/// The process outbox of Eval run requests: the generic outbox over
+/// [`ObservationRunSink`].
+pub type ObservationRunOutbox = Outbox<ObservationRunSink>;
+
+/// Run-request destination of the outbox: one tenant's records, one
+/// transaction, one multi-row insert into `verifier_runs`.
+pub struct ObservationRunSink {
+    /// Wyrd Postgres owner each tenant write opens its transaction through.
     postgres: WyrdPostgres,
     /// The shared durable run queue.
-    queue: VerifierRunQueue,
-    /// In-flight enqueue tasks.
-    tasks: TaskTracker,
-    /// Bounds the in-flight tasks so a stalled database cannot grow a backlog.
-    pending: Arc<Semaphore>,
+    runs: VerifierRunQueue,
+}
+
+impl ObservationRunSink {
+    /// Starts the process run-request outbox over `postgres`.
+    ///
+    /// # Panics
+    /// Panics when called outside a Tokio runtime, because the writer task is
+    /// spawned immediately.
+    #[must_use]
+    pub fn outbox(postgres: WyrdPostgres) -> Arc<ObservationRunOutbox> {
+        Outbox::new(
+            Self {
+                postgres,
+                runs: VerifierRunQueue::default(),
+            },
+            OBSERVATION_RUN_WRITER_CONNECTIONS,
+        )
+    }
+}
+
+impl OutboxSink for ObservationRunSink {
+    type Item = ObservationRecord;
+    type Error = SqlError;
+    const NAME: &'static str = "eval_run_requests";
+
+    /// Inserts one run per `observations_ready` binding the record's writer
+    /// owns on its subject in the tenant's transaction and commits it.
+    ///
+    /// Repeating the write is harmless: the insert is keyed by tenant,
+    /// binding, and record with `ON CONFLICT DO NOTHING`.
+    ///
+    /// # Errors
+    /// Returns the connection, insert, or commit failure; the outbox retries
+    /// the batch.
+    ///
+    /// # Cancellation
+    /// The outbox's shutdown deadline may drop this future mid-write.
+    /// Cancelled before `commit` is sent, the transaction rolls back and no
+    /// run exists; cancelled while `commit` resolves, the outcome is unknown
+    /// and the runs may already be durable. Either way the outbox counts the
+    /// batch in `outbox_events_lost_total`. A later repeat of the same
+    /// records is safe, because the tenant/binding/record key absorbs any run
+    /// that did commit.
+    async fn write(
+        &self,
+        tenant: DataTenantId,
+        records: &[ObservationRecord],
+    ) -> Result<(), SqlError> {
+        let mut conn = self.postgres.tenant_conn(tenant).await?;
+        self.runs
+            .enqueue_observation_batch(&mut conn, records)
+            .await
+            .map_err(SqlError::Query)?;
+        conn.commit().await
+    }
+}
+
+/// Gate's observation acknowledgement hook: decodes each acknowledged Eval
+/// frame and stages its run requests on the shared [`ObservationRunOutbox`].
+pub struct ObservationEnqueue {
+    /// Outbox the run requests are staged on.
+    runs: Arc<ObservationRunOutbox>,
 }
 
 impl ObservationEnqueue {
-    /// Build the hook over the server's Wyrd Postgres owner.
+    /// Builds the hook over the process run-request outbox.
     #[must_use]
-    pub fn new(postgres: WyrdPostgres) -> Self {
-        Self {
-            postgres,
-            queue: VerifierRunQueue::default(),
-            tasks: TaskTracker::new(),
-            pending: Arc::new(Semaphore::new(PENDING_LIMIT)),
-        }
-    }
-
-    /// Enqueue runs for every subject-bearing row of one acknowledged frame.
-    ///
-    /// Opens one tenant transaction, hands every row to the queue's frame-level
-    /// observation enqueue, which locks the frame's bindings in one order, and
-    /// commits once, so a failure part-way leaves no run from this frame.
-    ///
-    /// # Errors
-    /// Returns a description of the decode, connection, query, or commit failure.
-    async fn enqueue(
-        &self,
-        tenant: DataTenantId,
-        principal: &Principal,
-        frame: &[u8],
-        receipt_micros: i64,
-    ) -> Result<usize, String> {
-        let keys = EvalObservationsTable::acknowledged(frame, principal, receipt_micros)
-            .map_err(|error| error.to_string())?;
-        if keys.is_empty() {
-            return Ok(0);
-        }
-        let mut conn = self
-            .postgres
-            .tenant_conn(tenant)
-            .await
-            .map_err(|error| error.to_string())?;
-        let observations: Vec<_> = keys
-            .iter()
-            .map(|key| (&key.card_uid, key.record_id.as_str(), key.event_time))
-            .collect();
-        let outcomes = self
-            .queue
-            .enqueue_observations(&mut conn, &observations)
-            .await
-            .map_err(|error| error.to_string())?;
-        conn.commit().await.map_err(|error| error.to_string())?;
-        Ok(outcomes)
+    pub const fn new(runs: Arc<ObservationRunOutbox>) -> Self {
+        Self { runs }
     }
 }
 
 impl ObservationAck for ObservationEnqueue {
-    /// Spawn one tracked enqueue for the acknowledged frame and return at once.
+    /// Decodes the acknowledged frame's records and stages one run request
+    /// per record, tagged with the Card `auth`'s principal is bound to as its
+    /// writer, without waiting.
     ///
-    /// A full backlog, and any failure inside the task, is logged with the
-    /// tenant and request and counted in
-    /// `verification_observation_enqueue_failures_total`; the acknowledged
-    /// observation is never affected.
+    /// A writer bound to no Card owns no binding, so nothing is staged. A
+    /// frame that does not decode is logged and counted as lost; the
+    /// acknowledged observation is never affected.
     fn acknowledged(&self, auth: &AuthContext, frame: Bytes, receipt_micros: i64) {
-        let (tenant, request_id) = (auth.tenant, auth.request_id.clone());
-        let Ok(permit) = Arc::clone(&self.pending).try_acquire_owned() else {
-            record_failure(
-                tenant,
-                request_id.as_str(),
-                "observation enqueue backlog is full",
-            );
+        let Some(writer) = bound_card(&auth.principal) else {
             return;
         };
-        let owner = self.clone();
-        let principal = auth.principal.clone();
-        self.tasks.spawn(async move {
-            let _permit = permit;
-            let mut lost = UnfinishedEnqueue {
-                tenant,
-                request_id,
-                armed: true,
-            };
-            let result = owner
-                .enqueue(tenant, &principal, &frame, receipt_micros)
-                .await;
-            lost.armed = false;
-            if let Err(error) = result {
-                record_failure(tenant, lost.request_id.as_str(), &error);
+        match EvalObservationsTable::acknowledged(&frame, &auth.principal, receipt_micros) {
+            Ok(keys) => {
+                for key in keys {
+                    self.runs.stage(
+                        auth.tenant,
+                        ObservationRecord {
+                            subject: key.card_uid,
+                            writer: writer.clone(),
+                            record_id: key.record_id,
+                            event_time: key.event_time,
+                        },
+                    );
+                }
             }
-        });
-    }
-}
-
-/// Records an enqueue task dropped before it finished as a lost enqueue.
-///
-/// The task disarms it once `enqueue` returns, so only a task stopped mid-way
-/// (runtime teardown at process stop) records through [`Drop`].
-struct UnfinishedEnqueue {
-    /// Tenant of the acknowledged frame.
-    tenant: DataTenantId,
-    /// Request that carried the acknowledged frame.
-    request_id: RequestId,
-    /// Whether dropping still means the enqueue never completed.
-    armed: bool,
-}
-
-impl Drop for UnfinishedEnqueue {
-    /// Logs and counts the lost enqueue when still armed.
-    fn drop(&mut self) {
-        if self.armed {
-            record_failure(
-                self.tenant,
-                self.request_id.as_str(),
-                "process stopped before the observation enqueue completed",
-            );
+            Err(error) => {
+                tracing::error!(
+                    tenant = %auth.tenant,
+                    request_id = auth.request_id.as_str(),
+                    %error,
+                    "acknowledged Eval observation frame did not decode into run requests"
+                );
+                metrics::counter!("outbox_events_lost_total", "outbox" => ObservationRunSink::NAME)
+                    .increment(1);
+            }
         }
     }
 }
 
-/// Log and count one lost observation enqueue.
-fn record_failure(tenant: DataTenantId, request_id: &str, error: &str) {
-    metrics::counter!("verification_observation_enqueue_failures_total").increment(1);
-    tracing::error!(
-        %tenant,
-        request_id,
-        error,
-        "acknowledged Eval observation did not enqueue verification runs"
-    );
+/// The UID of the Card `principal` is bound to, read from the matching member
+/// of its signed Card scope, which the token mint resolves with registry UIDs.
+///
+/// Returns `None` for a principal bound to no Card (humans, tenant
+/// administrators, Card-free automation, SYSTEM) or whose root member carries
+/// no UID; such a writer owns no binding.
+fn bound_card(principal: &Principal) -> Option<CardUid> {
+    let card = principal.card_ref()?;
+    principal
+        .card_ref_scope()?
+        .as_slice()
+        .iter()
+        .find(|member| member.same_identity(card))?
+        .uid
+        .clone()
 }
 
 #[cfg(test)]
 mod tests {
-    use metrics_exporter_prometheus::PrometheusBuilder;
-    use wyrd_spec::DataTenantId;
-    use wyrd_spec::request_id::RequestId;
+    //! Writer Card resolution for Eval run requests.
 
-    use super::UnfinishedEnqueue;
+    use uuid::Uuid;
+    use wyrd_runtime::PermissionSet;
+    use wyrd_runtime::principal::{PrincipalId, PrincipalKind};
+    use wyrd_spec::reference::{CardRef, CardRefScope};
 
-    /// An armed guard dropped mid-enqueue counts one lost enqueue; a disarmed
-    /// guard counts nothing.
-    ///
-    /// # Panics
-    /// Panics when the failure counter does not match.
+    use super::*;
+
+    /// A tenant principal of `kind` with no roles or permissions.
+    fn principal(kind: PrincipalKind) -> Principal {
+        Principal::new(
+            PrincipalId::new(Uuid::now_v7()),
+            kind,
+            DataTenantId::new_v7(),
+            Vec::new(),
+            PermissionSet::new(),
+        )
+    }
+
+    /// A Service principal resolves to its root scope member's UID, while a
+    /// User and a Card-free Service resolve to no writer Card, so their
+    /// records create no Eval runs.
     #[test]
-    fn dropped_enqueue_records_failure() {
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        metrics::with_local_recorder(&recorder, || {
-            drop(UnfinishedEnqueue {
-                tenant: DataTenantId::new_v7(),
-                request_id: RequestId::now_v7(),
-                armed: false,
-            });
+    fn writer_card_is_the_bound_cards_scope_uid() {
+        let uid = CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid Card UID");
+        let root: CardRef = "prod/Service/writer@1.0.0"
+            .parse()
+            .expect("static Card reference parses");
+        let resolved = CardRef {
+            uid: Some(uid.clone()),
+            ..root.clone()
+        };
+        let bound = principal(PrincipalKind::Service {
+            card_ref: Some(root),
+            card_ref_scope: CardRefScope::own(&resolved),
         });
-        assert!(
-            !handle
-                .render()
-                .contains("verification_observation_enqueue_failures_total"),
-            "a completed enqueue records no failure"
-        );
-        metrics::with_local_recorder(&recorder, || {
-            drop(UnfinishedEnqueue {
-                tenant: DataTenantId::new_v7(),
-                request_id: RequestId::now_v7(),
-                armed: true,
-            });
+        assert_eq!(bound_card(&bound), Some(uid));
+        assert_eq!(bound_card(&principal(PrincipalKind::User)), None);
+        let card_free = principal(PrincipalKind::Service {
+            card_ref: None,
+            card_ref_scope: CardRefScope::default(),
         });
-        assert!(
-            handle
-                .render()
-                .contains("verification_observation_enqueue_failures_total 1"),
-            "a stopped enqueue records one failure"
-        );
+        assert_eq!(bound_card(&card_free), None);
     }
 }

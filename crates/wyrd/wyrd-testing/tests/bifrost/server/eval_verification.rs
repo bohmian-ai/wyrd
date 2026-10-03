@@ -15,7 +15,8 @@
 //! events and links in one stable span order bounded to the record's trace
 //! window, and that a trace over the span ceiling fails before any judge call.
 //! Provider, media-locator, and Postgres failures settle with stable codes and
-//! fixed text that expose none of their dependency detail.
+//! fixed text that expose none of their dependency detail. Two Services that
+//! bind the same Agent prove each Eval record runs only its writer's bindings.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -272,7 +273,6 @@ fn spawn_runtime(server: &WyrdTestServer, provider: &str) -> (CancellationToken,
         .limits(RuntimeLimits {
             lease: Duration::from_secs(60),
             execution_timeout: Duration::from_secs(20),
-            publication_timeout: Duration::from_secs(20),
             drain_grace: Duration::from_secs(10),
             poll_interval: Duration::from_millis(50),
             restart_backoff: Duration::from_millis(300),
@@ -280,7 +280,6 @@ fn spawn_runtime(server: &WyrdTestServer, provider: &str) -> (CancellationToken,
             trace_deadline: Duration::from_secs(20),
             ..RuntimeLimits::default()
         })
-        .ingest_endpoint(server.grpc_url().expect("bound server serves gRPC"))
         .providers(Arc::new(providers))
         .build()
         .expect("the runtime composes");
@@ -322,6 +321,36 @@ async fn settle(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Watch the run queue as the superuser for one second, twenty runtime poll
+/// intervals, while a test policy makes tenant Card reads fail, and confirm
+/// no open observation run was claimed or charged an attempt.
+///
+/// A claim reads the claimed run's Verifier Card status in its own
+/// transaction, so a failing Card read rolls the claim back and consumes no
+/// attempt. [`settle`] names each run's Verifier from its Card, so it cannot
+/// poll while the policy stands; the superuser bypasses row security and
+/// reads only the run queue.
+///
+/// # Errors
+/// Returns a query error, or the number of open runs that were claimed.
+async fn unclaimed_while_cards_fail(superuser: &sqlx::PgPool) -> Result<(), ServerJourneyError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < deadline {
+        let claimed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM wyrd.verifier_runs WHERE origin = 'observation' \
+                AND status NOT IN ('completed', 'errored', 'timed_out') \
+                AND (status <> 'pending' OR attempts <> 0)",
+        )
+        .fetch_one(superuser)
+        .await?;
+        if claimed != 0 {
+            return Err(format!("{claimed} runs were claimed while Card reads fail").into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(())
 }
 
 /// Poll until at least `count` observation runs exist while no runtime runs,
@@ -641,60 +670,6 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
         .mount(&provider)
         .await;
 
-    let superuser = server.pg_fixture().superuser_pool().await?;
-    // A post-commit enqueue failure: while this trigger stands, every
-    // observation run insert fails after Scribe has acknowledged the row.
-    sqlx::query(
-        "CREATE FUNCTION wyrd.eval_journey_refuse() RETURNS trigger LANGUAGE plpgsql AS \
-         $$BEGIN RAISE EXCEPTION 'eval journey refuses this enqueue'; END$$",
-    )
-    .execute(&superuser)
-    .await?;
-    sqlx::query(
-        "CREATE TRIGGER eval_journey_refuse BEFORE INSERT ON wyrd.verifier_runs \
-         FOR EACH ROW WHEN (NEW.origin = 'observation') \
-         EXECUTE FUNCTION wyrd.eval_journey_refuse()",
-    )
-    .execute(&superuser)
-    .await?;
-    let state = start_state(&bundle, &client).await;
-    emit(
-        &state.run().for_card("agent")?,
-        &json!({ "answer": "yes", "marker": "refused" }),
-        None,
-        None,
-    );
-    state.shutdown().await?;
-    server.flush_bifrost().await?;
-    let refused = record_id(&server, tenant, "refused").await?;
-    let refused_at = texts(
-        &query(
-            &server,
-            tenant,
-            format!(
-                "SELECT CAST(wyrd_event_time AS BIGINT) FROM vala.eval.observations \
-                 WHERE record_id = '{refused}'"
-            ),
-        )
-        .await?,
-    )?;
-    let [Some(refused_at)] = refused_at.as_slice() else {
-        return Err(format!("the refused row has no single event time: {refused_at:?}").into());
-    };
-    // Narrow the refusal to the acknowledged row whatever the hook's timing:
-    // every later observation is received strictly after it.
-    let cutoff = chrono::DateTime::from_timestamp_micros(refused_at.parse()?)
-        .ok_or("the refused event time is out of range")?;
-    // The cutoff is a timestamp this journey formatted from a parsed integer.
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE OR REPLACE TRIGGER eval_journey_refuse BEFORE INSERT ON wyrd.verifier_runs \
-         FOR EACH ROW WHEN (NEW.input_event_time <= '{}'::timestamptz) \
-         EXECUTE FUNCTION wyrd.eval_journey_refuse()",
-        cutoff.to_rfc3339()
-    )))
-    .execute(&superuser)
-    .await?;
-
     // The matrix records are received one day ahead of the SDK's own clock,
     // so each row's client `created_at` and managed `wyrd_event_time` fall on
     // different UTC days and only a read by the frozen managed day finds it.
@@ -996,9 +971,6 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
         "timed_out",
     )
     .await?;
-    if runs.iter().any(|run| run.record_id == refused) {
-        return Err("the refused enqueue created a run".into());
-    }
     server.shutdown().await?;
     Ok(())
 }
@@ -1035,50 +1007,16 @@ fn unstamped_observation(subject: &wyrd_spec::reference::CardRef, record: &str) 
     builder.finish_ipc().expect("the observation frame encodes")
 }
 
-/// Poll until at least `count` observation-enqueue transactions are blocked,
-/// and return how many are.
-///
-/// Each acknowledged frame enqueues in one transaction: the first blocks at
-/// its run insert behind the test's `wyrd.verifier_runs` lock, and each later
-/// one blocks on the per-binding observation lock the earlier activation holds.
-/// Every blocked backend of this test's own database is therefore one
-/// activation Gate spawned; no verification runtime runs, so no other writer
-/// waits, and sibling journeys' databases are excluded.
-///
-/// # Errors
-/// Returns a query error or a timeout naming the observed count.
-async fn blocked_activations(
-    superuser: &sqlx::PgPool,
-    count: i64,
-) -> Result<i64, ServerJourneyError> {
-    let deadline = tokio::time::Instant::now() + WAIT;
-    loop {
-        let waiting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity \
-              WHERE datname = current_database() \
-                AND cardinality(pg_blocking_pids(pid)) > 0",
-        )
-        .fetch_one(superuser)
-        .await?;
-        if waiting >= count {
-            return Ok(waiting);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("only {waiting} of {count} activations reached the queue").into());
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
 /// A sealed replay of an unstamped observation on a later receipt day is
 /// acknowledged but never activates runs: only the attempt that committed the
 /// batch enqueues, so every run freezes the stored row's `wyrd_event_time` and
 /// the row reads back from its original day.
 ///
 /// Run inserts are held behind a table lock while the original, two concurrent
-/// replays one day later, and a distinct sentinel frame are acknowledged; the
-/// sentinel's activation is the barrier after which exactly two activations
-/// (original and sentinel) may wait.
+/// replays one day later, and a distinct sentinel frame are acknowledged.
+/// Gate stages run requests before each acknowledgement returns, so once the
+/// sentinel is acknowledged the run-request outbox must hold exactly two
+/// requests (original and sentinel); a staged replay would add to them.
 ///
 /// # Errors
 /// Returns server, registration, query, or fixture errors, or a description of
@@ -1122,7 +1060,6 @@ async fn sealed_replay_on_a_later_day_activates_once() -> Result<(), ServerJourn
     let before = chrono::Utc::now();
     ingest.insert(OBSERVATIONS, batch, frame.clone()).await?;
     let after = chrono::Utc::now();
-    blocked_activations(&superuser, 1).await?;
     scribe.shift_receipt_clock_for_test(Duration::from_secs(86_400));
     let (first, second) = tokio::join!(
         ingest.insert(OBSERVATIONS, batch, frame.clone()),
@@ -1138,11 +1075,19 @@ async fn sealed_replay_on_a_later_day_activates_once() -> Result<(), ServerJourn
             unstamped_observation(&subject, &sentinel),
         )
         .await?;
-    let activations = blocked_activations(&superuser, 2).await?;
+    // Gate stages run requests before each acknowledgement returns, and the
+    // held lock keeps the original's write in flight, so the outbox now holds
+    // exactly the original and the sentinel; a staged replay would add to it.
+    let activations = server
+        .state()
+        .bifrost
+        .observation_runs()
+        .ok_or("the server owns no run-request outbox")?
+        .pending();
     scribe.shift_receipt_clock_for_test(Duration::ZERO);
     lock.commit().await?;
     if activations != 2 {
-        return Err(format!("{activations} activations for one original and one sentinel").into());
+        return Err(format!("{activations} run requests for one original and one sentinel").into());
     }
 
     // Four `observations_ready` bindings observe `agent`; each frame
@@ -1234,22 +1179,22 @@ async fn enqueue_attempts(superuser: &sqlx::PgPool, count: i64) -> Result<i64, S
     }
 }
 
-/// A post-ACK enqueue failure through the integrated Gate, Scribe, and Eval
-/// path keeps the acknowledged observation readable and invents no run or
-/// result, and a same-batch-ID retry is acknowledged as a replay without a
-/// second enqueue attempt.
+/// A post-ACK run-creation outage through the integrated Gate, Scribe, and
+/// Eval path keeps the acknowledged observation readable and invents no run
+/// or result while it lasts; the run-request outbox retries, and once
+/// PostgreSQL accepts the writes every acknowledged record has exactly one run
+/// per binding, a same-batch-ID replay adding none.
 ///
 /// A trigger refuses every observation run insert after counting the attempt
-/// in a sequence, so the one failed enqueue is observed deterministically
-/// before the replay, and the replay's absence of an attempt is checked after a
-/// distinct sentinel frame acknowledged behind it has had its attempt counted.
+/// in a sequence, so refused writes, and the retries that follow, are observed
+/// before the trigger is dropped.
 ///
 /// # Errors
 /// Returns server, registration, query, or fixture errors, or a description of
 /// the first mismatch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
-async fn integrated_enqueue_failure_preserves_ack() -> Result<(), ServerJourneyError> {
+async fn integrated_enqueue_outage_preserves_ack_and_recovers() -> Result<(), ServerJourneyError> {
     let root = tempfile::tempdir()?;
     let service = write_graph(root.path());
     let bundle = root.path().join("bundle");
@@ -1306,14 +1251,8 @@ async fn integrated_enqueue_failure_preserves_ack() -> Result<(), ServerJourneyE
             unstamped_observation(&subject, &sentinel),
         )
         .await?;
-    // A replay enqueue would be spawned before the sentinel's; once the
-    // sentinel's attempt is counted, an extra attempt shows as a third.
-    let attempts = enqueue_attempts(&superuser, 2).await?;
-    if attempts != 2 {
-        return Err(
-            format!("{attempts} enqueue attempts for one original and one sentinel").into(),
-        );
-    }
+    // The outbox keeps retrying the refused requests.
+    enqueue_attempts(&superuser, 3).await?;
 
     server.flush_bifrost().await?;
     let stored = texts(
@@ -1327,12 +1266,29 @@ async fn integrated_enqueue_failure_preserves_ack() -> Result<(), ServerJourneyE
     if stored != [Some(record.clone())] {
         return Err(format!("the acknowledged batch is not stored once: {stored:?}").into());
     }
-    sqlx::query("DROP TRIGGER eval_journey_refuse ON wyrd.verifier_runs")
-        .execute(&superuser)
-        .await?;
     let runs = seed.observation_runs().await?;
     if !runs.is_empty() {
         return Err(format!("a refused enqueue invented runs: {runs:?}").into());
+    }
+    sqlx::query("DROP TRIGGER eval_journey_refuse ON wyrd.verifier_runs")
+        .execute(&superuser)
+        .await?;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let runs = loop {
+        let runs = seed.observation_runs().await?;
+        if runs.len() >= 2 * AGENT_BINDINGS {
+            break runs;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("the outbox never recovered: {runs:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    for id in [&record, &sentinel] {
+        let made = runs.iter().filter(|run| &run.record_id == id).count();
+        if made != AGENT_BINDINGS {
+            return Err(format!("record {id} has {made} runs: {runs:?}").into());
+        }
     }
     // No result ever published leaves the results table unregistered.
     let results = ScheduledQueryCaller::new(
@@ -1353,7 +1309,7 @@ async fn integrated_enqueue_failure_preserves_ack() -> Result<(), ServerJourneyE
         Err(error) => return Err(error.into()),
     };
     if results != 0 {
-        return Err(format!("a refused enqueue invented {results} results").into());
+        return Err(format!("run creation alone invented {results} results").into());
     }
     server.shutdown().await?;
     Ok(())
@@ -1948,17 +1904,17 @@ fn forbidden(outcome: &Result<u64, wyrd_spec::error::WyrdError>) -> bool {
 }
 
 /// Continuous Eval reads only under the tenant's stored System principal and
-/// its server-minted Eval input scope, and fails closed without it.
+/// its tokenless Eval input scope, and fails closed without it.
 ///
-/// With the System principal absent, the run's record read is refused before
-/// any Oracle read: the run errors `eval_record_unavailable` with no result
-/// and no System read decision. Restored, the authority names that stored
-/// principal with exactly one table-scoped read grant per Eval input table and
-/// no role, credential, or Verifier scope. It reads the committed observation,
-/// but Oracle refuses (and audits as `denied` for the same principal) a table
-/// outside the scope and an input table the scope was narrowed away from. A
-/// context presenting it for another tenant is refused before Oracle, and a
-/// tenant with no System principal of its own resolves no authority.
+/// With the System principal absent, the claim returns none and the run's
+/// record read is refused before any Oracle read: the run errors
+/// `eval_record_unavailable` with no result and no System read decision.
+/// Restored, the authority names that stored principal with exactly one
+/// table-scoped read grant per Eval input table and no role, credential, or
+/// Verifier scope. It reads the committed observation, but Oracle refuses
+/// (and audits as `denied` for the same principal) a table outside the scope
+/// and an input table the scope was narrowed away from. A context presenting
+/// it for another tenant is refused before Oracle.
 ///
 /// # Errors
 /// Returns server, registration, query, or fixture errors, or a description of
@@ -1966,11 +1922,17 @@ fn forbidden(outcome: &Result<u64, wyrd_spec::error::WyrdError>) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn continuous_eval_read_authority_fails_closed() -> Result<(), ServerJourneyError> {
-    use wyrd_server::verification::eval::{EvalReadAuthority, EvalReadAuthorityError};
+    use vala_bifrost_redux::catalog::TableRef;
+    use vala_bifrost_redux::namespaces::BifrostNamespace;
+    use wyrd_server::verification::authority::{SystemReadAuthority, SystemReadAuthorityError};
 
     let journey = TraceJourney::start().await?;
     let (server, tenant) = (&journey.server, journey.tenant);
     let system = journey.seed.system_principal();
+    let inputs = [
+        TableRef::new(BifrostNamespace::Eval, "observations"),
+        TableRef::new(BifrostNamespace::Traces, "spans"),
+    ];
     export_span(server, &journey.token, LANDED_TRACE).await;
     journey
         .emit(
@@ -1982,8 +1944,11 @@ async fn continuous_eval_read_authority_fails_closed() -> Result<(), ServerJourn
 
     // Missing: no System principal, no read.
     set_system_principal(server, tenant, false).await?;
-    let missing = EvalReadAuthority::resolve(server.state(), tenant).await;
-    if !matches!(missing, Err(EvalReadAuthorityError::SystemPrincipalMissing)) {
+    let missing = SystemReadAuthority::resolve(server.state(), tenant, None, &inputs).await;
+    if !matches!(
+        missing,
+        Err(SystemReadAuthorityError::SystemPrincipalMissing)
+    ) {
         return Err(format!("a tenant without a System principal resolved {missing:?}").into());
     }
     let provider = MockServer::start().await;
@@ -2005,7 +1970,13 @@ async fn continuous_eval_read_authority_fails_closed() -> Result<(), ServerJourn
     set_system_principal(server, tenant, true).await?;
 
     // The resolved authority is the stored principal, narrowly scoped.
-    let authority = EvalReadAuthority::resolve(server.state(), tenant).await?;
+    let authority = SystemReadAuthority::resolve(
+        server.state(),
+        tenant,
+        Some(wyrd_spec::auth::PrincipalId::new(system)),
+        &inputs,
+    )
+    .await?;
     let principal = &authority.context().principal;
     let table_reads = principal
         .effective_permissions
@@ -2078,7 +2049,7 @@ async fn continuous_eval_read_authority_fails_closed() -> Result<(), ServerJourn
         return Err(format!("under-scoped reads were not refused: {outside:?}, {spans:?}").into());
     }
 
-    // Wrong tenant: refused before Oracle, and no foreign authority resolves.
+    // Wrong tenant: refused before Oracle.
     let foreign = DataTenantId::new_v7();
     let crossed = vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(
         context.principal.clone(),
@@ -2093,10 +2064,6 @@ async fn continuous_eval_read_authority_fails_closed() -> Result<(), ServerJourn
         Err(wyrd_spec::vala::error::BifrostError::QueryTenantInvariant)
     ) {
         return Err(format!("a cross-tenant System context was accepted: {crossed:?}").into());
-    }
-    let foreign_authority = EvalReadAuthority::resolve(server.state(), foreign).await;
-    if foreign_authority.is_ok() {
-        return Err("a tenant with no System principal resolved an authority".into());
     }
 
     // Audit: one allowed read and two denials, all the stored principal.
@@ -2128,16 +2095,17 @@ async fn continuous_eval_read_authority_fails_closed() -> Result<(), ServerJourn
 const PROVIDER_SENTINEL: &str = "PROVIDER-SENTINEL-4f1c";
 /// Object name of an in-tenant media URI that names no stored object.
 const LOCATOR_SENTINEL: &str = "LOCATOR-SENTINEL-8a2d";
-/// Text a Postgres read of the tenant's principals raises.
+/// Text a Postgres read of the tenant's Cards raises.
 const SQL_SENTINEL: &str = "SQL-SENTINEL-c93e";
 
 /// Continuous Eval failures persist and expose only stable codes and fixed
 /// operation text, never the dependency detail that caused them.
 ///
-/// A provider that fails with a sentinel body, a media URI whose private
-/// object key is a sentinel, and a Postgres read that raises a sentinel while
-/// the Eval read authority resolves each settle their gated run `errored`
-/// with the stable code. The public run status and every persisted
+/// A provider that fails with a sentinel body and a media URI whose private
+/// object key is a sentinel each settle their gated run `errored` with the
+/// stable code. A Postgres read of the Verifier Card that raises a sentinel
+/// fails the claim itself, so the run is neither started nor charged an
+/// attempt until the read succeeds. The public run status and every persisted
 /// `VerificationError` of the tenant carry none of the sentinels.
 ///
 /// # Errors
@@ -2207,8 +2175,10 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
     tokio::time::timeout(WAIT, task).await??;
 
     // A Postgres failure: while this policy stands, every tenant read of the
-    // principals table raises the sentinel, so the Eval read authority cannot
-    // resolve. Only the runtime reads that table until the policy is dropped.
+    // Cards table raises the sentinel. The claim reads the run's Verifier
+    // Card, so it rolls back and no run starts or spends an attempt; the
+    // record's runs are enqueued before the policy is created, and they run
+    // once the policy is dropped.
     let state = start_state(&bundle, &client).await;
     emit(
         &state.run().for_card("agent")?,
@@ -2238,18 +2208,20 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
     .execute(&superuser)
     .await?;
     sqlx::query(
-        "CREATE POLICY eval_errors_refuse ON wyrd.auth_service_accounts AS RESTRICTIVE \
+        "CREATE POLICY eval_errors_refuse ON wyrd.cards AS RESTRICTIVE \
          FOR SELECT USING (wyrd.eval_errors_refuse())",
     )
     .execute(&superuser)
     .await?;
     let (stop, task) = spawn_runtime(&server, &provider.uri());
+    let unclaimed = unclaimed_while_cards_fail(&superuser).await;
+    sqlx::query("DROP POLICY eval_errors_refuse ON wyrd.cards")
+        .execute(&superuser)
+        .await?;
+    unclaimed?;
     let runs = settle(&seed, queued + AGENT_BINDINGS).await;
     stop.cancel();
     tokio::time::timeout(WAIT, task).await??;
-    sqlx::query("DROP POLICY eval_errors_refuse ON wyrd.auth_service_accounts")
-        .execute(&superuser)
-        .await?;
     let runs = runs?;
 
     let verification =
@@ -2257,7 +2229,7 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
     for (record, code) in [
         (&provider_id, "eval_execution_failed"),
         (&locator_id, "eval_execution_failed"),
-        (&sql_id, "eval_record_unavailable"),
+        (&sql_id, "eval_execution_failed"),
     ] {
         let run = run_of(&runs, "eval-gated", record)?;
         assert_unresulted(&server, tenant, run, "errored").await?;
@@ -2282,6 +2254,183 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
         .any(|sentinel| persisted.contains(sentinel))
     {
         return Err(format!("a persisted run error leaks dependency detail: {persisted}").into());
+    }
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Write two Services, `eval-owner-a` and `eval-owner-b`, that each contain
+/// the same Agent Card M and bind it to the same assertion-only Eval Verifier
+/// with `observations_ready`. Returns the two Service paths.
+///
+/// # Panics
+/// Panics when a fixture file cannot be written.
+fn write_owner_graph(root: &Path) -> (PathBuf, PathBuf) {
+    let service = |name: &str| {
+        format!(
+            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: {name}\n  version: 1.0.0\n  space: default\nspec:\n  service_type: agent\n  components:\n    - alias: agent\n      ref: ./agent.yaml\n      verified_by:\n        - verifier: ./verifier.yaml\n          runs_on: {{kind: observations_ready}}\n"
+        )
+    };
+    let files = [
+        (
+            "agent-prompt.yaml",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: eval-agent-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-test\n  messages: [answer the question]\n".to_owned(),
+        ),
+        ("agent.yaml", agent("eval-shared-agent")),
+        (
+            "verifier.yaml",
+            verifier(
+                "eval-shared",
+                "      tasks:\n        answer: {kind: assertion, id: answer, context_path: $.answer, operator: equals, expected: \"yes\"}\n",
+            ),
+        ),
+        ("service-a.yaml", service("eval-owner-a")),
+        ("service-b.yaml", service("eval-owner-b")),
+    ];
+    for (name, body) in files {
+        std::fs::write(root.join(name), body).expect("fixture file writes");
+    }
+    (root.join("service-a.yaml"), root.join("service-b.yaml"))
+}
+
+/// Emit one Eval record about `agent` through `client`'s SDK lifetime over
+/// `bundle`, then shut it down so the record is acknowledged.
+///
+/// # Errors
+/// Returns an error when the Agent is not in the bundle or shutdown fails.
+async fn emit_as(
+    client: &WyrdClient,
+    bundle: &Path,
+    marker: &str,
+) -> Result<(), ServerJourneyError> {
+    let state = start_state(bundle, client).await;
+    emit(
+        &state.run().for_card("agent")?,
+        &json!({ "answer": "yes", "marker": marker }),
+        None,
+        None,
+    );
+    state.shutdown().await?;
+    Ok(())
+}
+
+/// Every observation run as `(owner Card name, record ID)`, sorted.
+const OWNED_RUNS_SQL: &str = "SELECT o.name, r.input_record_id FROM wyrd.verifier_runs r \
+    JOIN wyrd.cards o ON o.card_uid = r.owner_card_uid \
+    WHERE r.origin = 'observation' ORDER BY o.name, r.input_record_id";
+
+/// Poll until `count` observation runs exist, wait for the run-request outbox
+/// to hold nothing more, and return every run as `(owner Service name,
+/// record ID)`, sorted.
+///
+/// Settling after the count is reached proves no further run is on its way,
+/// so the returned set is exact.
+///
+/// # Errors
+/// Returns a query error, a timeout, or an error when the outbox does not
+/// settle.
+async fn owned_runs(
+    server: &WyrdTestServer,
+    superuser: &sqlx::PgPool,
+    count: usize,
+) -> Result<Vec<(String, String)>, ServerJourneyError> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let runs: Vec<(String, String)> =
+            sqlx::query_as(OWNED_RUNS_SQL).fetch_all(superuser).await?;
+        if runs.len() >= count {
+            let outbox = server
+                .state()
+                .bifrost
+                .observation_runs()
+                .ok_or("the server owns no run-request outbox")?;
+            let left = outbox.settle(deadline.into_std()).await;
+            if left != 0 {
+                return Err(format!("{left} run requests never settled").into());
+            }
+            return Ok(sqlx::query_as(OWNED_RUNS_SQL).fetch_all(superuser).await?);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "only {} of {count} runs were enqueued: {runs:?}",
+                runs.len()
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// An Eval record runs only the bindings its writer's Card owns (REQ-108).
+///
+/// Services A and B both contain Agent M and bind it to the same Eval
+/// Verifier. A record A writes about M runs A's binding and none of B's, and
+/// still none of B's after B authenticates; a record B writes about M runs
+/// B's binding only.
+///
+/// # Errors
+/// Returns server, registration, query, or SDK errors, or a description of the
+/// first run set that does not follow its writer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn eval_runs_follow_the_writing_owner() -> Result<(), ServerJourneyError> {
+    let root = tempfile::tempdir()?;
+    let (service_a, service_b) = write_owner_graph(root.path());
+    let (bundle_a, bundle_b) = (root.path().join("bundle-a"), root.path().join("bundle-b"));
+    let server = Box::pin(WyrdTestServer::start_bound()).await?;
+    let tenant = server.data_tenant_id();
+    let superuser = server.pg_fixture().superuser_pool().await?;
+    let admin = connect(
+        &server,
+        &api_key(
+            server
+                .bootstrap_service("eval_owner_admin", &["admin"])
+                .await?,
+        ),
+    );
+    let receipt_a = register(&admin, &service_a, &bundle_a).await;
+    let receipt_b = register(&admin, &service_b, &bundle_b).await;
+    let writer_a = connect(
+        &server,
+        &api_key(
+            server
+                .credential_registered_service(&receipt_a.root, &[])
+                .await?,
+        ),
+    );
+
+    emit_as(&writer_a, &bundle_a, "from-a").await?;
+    server.flush_bifrost().await?;
+    let from_a = record_id(&server, tenant, "from-a").await?;
+    let owner_a = "eval-owner-a".to_owned();
+    let expected = vec![(owner_a.clone(), from_a.clone())];
+    let runs = owned_runs(&server, &superuser, 1).await?;
+    if runs != expected {
+        return Err(format!("A's record ran {runs:?}, not only A's binding").into());
+    }
+
+    // B authenticates and is now active; A's record still has no run of B's.
+    let writer_b = connect(
+        &server,
+        &api_key(
+            server
+                .credential_registered_service(&receipt_b.root, &[])
+                .await?,
+        ),
+    );
+    start_state(&bundle_b, &writer_b).await.shutdown().await?;
+    let runs = owned_runs(&server, &superuser, 1).await?;
+    if runs != expected {
+        return Err(format!("B's authentication changed A's runs: {runs:?}").into());
+    }
+
+    emit_as(&writer_b, &bundle_b, "from-b").await?;
+    server.flush_bifrost().await?;
+    let from_b = record_id(&server, tenant, "from-b").await?;
+    let runs = owned_runs(&server, &superuser, 2).await?;
+    let expected = vec![(owner_a, from_a), ("eval-owner-b".to_owned(), from_b)];
+    if runs != expected {
+        return Err(format!("expected one run per writer's own binding, read {runs:?}").into());
     }
     server.shutdown().await?;
     Ok(())

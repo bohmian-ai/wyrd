@@ -4008,9 +4008,8 @@ fn machine_auth(server: &WyrdTestServer, key: &SecretString) -> Arc<AuthMiddlewa
 /// version, arms its schedule cursor, and — through the component binding —
 /// activates every binding of that Service. A cached-token request, an idle
 /// client whose token went stale, a Card-free automation principal's
-/// exchange, a delegation exchange in which the owner acts for a user, and a
-/// SYSTEM token
-/// mint write no activity. A second replica sharing the principal and a
+/// exchange, and a delegation exchange in which the owner acts for a user
+/// write no activity. A second replica sharing the principal and a
 /// request-driven stale-token re-exchange renew the one shared timestamp
 /// without moving the armed cursor. The other version stays independently
 /// gated until its own exchange. Idle expiry after the default window closes
@@ -4120,28 +4119,10 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
         .delegate(&jwt, token.expose(), TokenAudience::Wyrd)
         .await
         .expect("delegation exchanges");
-    let verifier = <CardRef as std::str::FromStr>::from_str(&format!(
-        "default/Verifier/vb-drift@1.0.0#{}",
-        Uuid::now_v7()
-    ))
-    .expect("verifier card ref parses");
-    let mut conn = server
-        .tenant_conn_for(server.data_tenant_id())
-        .await
-        .expect("tenant connection opens");
-    server
-        .state()
-        .auth
-        .tenant_issuer(&server.state().audit_outbox)
-        .expect("test state has a tenant issuer")
-        .issue_system_token(&mut conn, &verifier)
-        .await
-        .expect("SYSTEM token mints");
-    conn.commit().await.expect("SYSTEM mint commits");
     assert_eq!(
         owner_principal(&server, a_owner).await.1,
         Some(first),
-        "delegation and SYSTEM minting never renew owner activity"
+        "delegation never renews owner activity"
     );
     assert_eq!(
         owner_principal(&server, b_owner).await.1,

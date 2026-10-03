@@ -1,7 +1,7 @@
 ---
 id: TASK-008-CLOSEOUT-R6
 kind: remediation
-status: implemented
+status: review
 spec: changes/active/verified-change-contract/spec.md
 spec_revision: 57
 original_task: changes/active/verified-change-contract/tasks/task-008-closeout.md

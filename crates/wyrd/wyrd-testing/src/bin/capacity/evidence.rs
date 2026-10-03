@@ -103,6 +103,10 @@ fn scribe_backlog(scrapes: &[Metrics]) -> u64 {
         .max(0.0) as u64
 }
 
+/// The gauge each replica exports for audit decisions it still owns before
+/// their staging commit lands.
+const AUDIT_PENDING: &str = "audit_outbox_pending";
+
 /// The cumulative buckets of `family` matching `labels`, summed across
 /// every replica's scrape.
 fn merged(scrapes: &[Metrics], family: &str, labels: &[&str]) -> Vec<(f64, f64)> {
@@ -181,7 +185,7 @@ impl Backlog {
 
     /// Adds what the replicas in `scrapes` still own in process to this
     /// durable reading from [`Queue::backlog`]: Scribe's backlog, and each
-    /// replica's `audit_outbox_pending` decisions on top of the staged audit
+    /// replica's [`AUDIT_PENDING`] decisions on top of the staged audit
     /// rows. A decision is pending until its commit lands in staging, so the
     /// sum covers it from the request's return until its publication,
     /// provided `scrapes` were taken before the durable reading: a decision
@@ -189,7 +193,7 @@ impl Backlog {
     pub fn with_replicas(self, scrapes: &[Metrics]) -> Self {
         let pending = scrapes
             .iter()
-            .map(|metrics| metrics.sum("audit_outbox_pending", &[]))
+            .map(|metrics| metrics.sum(AUDIT_PENDING, &[]))
             .sum::<f64>()
             .max(0.0) as u64;
         Self {
@@ -300,6 +304,42 @@ impl Queue {
         })
     }
 
+    /// One drain poll: every replica's scrape from `scrape`, then the
+    /// durable [`Queue::backlog`], combined by [`Backlog::with_replicas`].
+    /// Returns the backlog and the scrapes that judged it.
+    ///
+    /// The first scrape covers a decision pending before the durable read
+    /// that commits during it. A decision first created after that scrape
+    /// is in neither, so a combined reading that would otherwise be empty
+    /// takes a second scrape and adds what it still holds; zero is accepted
+    /// only when that later scrape is empty too, and it is the one returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns a scrape or query failure.
+    ///
+    /// # Cancellation
+    ///
+    /// Read-only.
+    pub async fn poll(
+        &self,
+        since: DateTime<Utc>,
+        stopped: DateTime<Utc>,
+        activations: u64,
+        mut scrape: impl AsyncFnMut() -> Result<Vec<Metrics>>,
+    ) -> Result<(Backlog, Vec<Metrics>)> {
+        let scrapes = scrape().await?;
+        let backlog = self
+            .backlog(since, stopped, activations)
+            .await?
+            .with_replicas(&scrapes);
+        if !backlog.is_empty() {
+            return Ok((backlog, scrapes));
+        }
+        let scrapes = scrape().await?;
+        Ok((backlog.with_replicas(&scrapes), scrapes))
+    }
+
     /// Every run created since `since`, tallied by Verifier UID.
     ///
     /// # Errors
@@ -335,6 +375,90 @@ impl Queue {
 
 #[cfg(test)]
 mod tests {
+    use wyrd_testing::release_server::Metrics;
+
+    use super::{AUDIT_PENDING, Backlog, Percentiles, deltas, quantile, scribe_backlog};
+
+    /// The replica's pending audit decisions add to the staged rows in the
+    /// audit cell, beside an unchanged Scribe backlog.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the sum is wrong.
+    #[test]
+    fn pending_decisions_add_to_staged_audit_rows() {
+        let scrape = |pending: u32| {
+            Metrics::parse(&format!(
+                "{AUDIT_PENDING} {pending}\nbifrost_scribe_staging_live_members 1\n"
+            ))
+        };
+        let durable = Backlog {
+            audit: 3,
+            ..Backlog::default()
+        };
+        let combined = durable.with_replicas(&[scrape(2), scrape(0)]);
+        assert_eq!((combined.audit, combined.scribe), (5, 2));
+        assert!(Backlog::default().with_replicas(&[scrape(0)]).audit == 0);
+    }
+
+    /// One staged live member keeps Scribe's backlog nonzero while the
+    /// persistence queue and immutable generations read zero, and the
+    /// backlog clears with it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the backlog is wrong.
+    #[test]
+    fn staged_members_hold_the_scribe_backlog() {
+        let scrape = |staged: u32| {
+            Metrics::parse(&format!(
+                "bifrost_scribe_persistence_queue_depth 0\n\
+                 bifrost_scribe_immutable_generation_count 0\n\
+                 bifrost_scribe_staging_live_members {staged}\n"
+            ))
+        };
+        assert_eq!(scribe_backlog(&[scrape(0), scrape(1)]), 1);
+        assert_eq!(scribe_backlog(&[scrape(0), scrape(0)]), 0);
+    }
+
+    /// A quantile is the first cumulative bucket bound covering it among the
+    /// observations between two readings, and an empty interval has none.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a bound is wrong.
+    #[test]
+    fn quantile_reads_bucket_deltas() {
+        let before = [(0.1, 10.0), (1.0, 10.0), (f64::INFINITY, 10.0)];
+        let after = [(0.1, 15.0), (1.0, 105.0), (f64::INFINITY, 110.0)];
+        let step = deltas(&before, &after);
+        assert_eq!(quantile(&step, 0.05), Some(0.1));
+        assert_eq!(quantile(&step, 0.5), Some(1.0));
+        assert_eq!(quantile(&step, 0.99), Some(f64::INFINITY));
+        assert_eq!(quantile(&deltas(&after, &after), 0.5), None);
+    }
+
+    /// Raw percentiles use the nearest rank and an empty sample has none.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a percentile is wrong.
+    #[test]
+    fn raw_percentiles_use_nearest_rank() {
+        let samples: Vec<u64> = (1..=100).collect();
+        let percentiles = Percentiles::raw(&samples, 1.0);
+        assert_eq!(
+            (percentiles.p50, percentiles.p95, percentiles.p99),
+            (Some(50.0), Some(95.0), Some(99.0))
+        );
+        assert_eq!(Percentiles::raw(&[], 1.0).p50, None);
+    }
+}
+
+/// Proofs that start an in-process server on the repository Postgres
+/// wrapper's database; each stays behind its environment gate.
+#[cfg(test)]
+mod pg_tests {
     use std::time::Duration;
 
     use chrono::{DateTime, Utc};
@@ -348,15 +472,15 @@ mod tests {
     use wyrd_testing::WyrdTestServer;
     use wyrd_testing::release_server::Metrics;
 
-    use super::{Backlog, Percentiles, Queue, deltas, quantile, scribe_backlog};
+    use super::{AUDIT_PENDING, Backlog, Queue};
     use crate::Result;
 
     /// How long the held-commit proof waits for any one server move.
     const WAIT: Duration = Duration::from_secs(60);
 
-    /// The backlog a drain poll would read: the replica's `/metrics`
-    /// snapshot first, then the durable backlog at `stopped`, combined in
-    /// that order exactly as the capacity drain combines them.
+    /// The backlog a drain poll at `stopped` reads through
+    /// [`Queue::poll`], with the replica's `/metrics` snapshot as its only
+    /// scrape.
     ///
     /// # Errors
     ///
@@ -366,16 +490,17 @@ mod tests {
         metrics: &PrometheusHandle,
         stopped: DateTime<Utc>,
     ) -> Result<Backlog> {
-        let scrapes = [Metrics::parse(&metrics.render())];
-        Ok(queue
-            .backlog(stopped, stopped, 0)
-            .await?
-            .with_replicas(&scrapes))
+        let (backlog, _) = queue
+            .poll(stopped, stopped, 0, async || {
+                Ok(vec![Metrics::parse(&metrics.render())])
+            })
+            .await?;
+        Ok(backlog)
     }
 
     /// The replica's pending audit decisions in its `/metrics` snapshot.
     fn pending(metrics: &PrometheusHandle) -> f64 {
-        Metrics::parse(&metrics.render()).sum("audit_outbox_pending", &[])
+        Metrics::parse(&metrics.render()).sum(AUDIT_PENDING, &[])
     }
 
     /// Waits until Postgres shows at least one backend blocked on another's
@@ -425,7 +550,9 @@ mod tests {
     ///
     /// Publication is disabled in the server and driven by hand, so every
     /// window is held rather than raced. Two public Oracle reads run while
-    /// the chain head is locked: the first's decision blocks the writer
+    /// the chain head is locked: the first is issued inside a drain poll,
+    /// after its first scrape and before its durable read, so only the
+    /// poll's second scrape can see its decision; it blocks the writer
     /// inside its commit, the second's waits behind it, and the stop is
     /// captured after both requests return. Releasing the lock commits the
     /// first and then starts the second's transaction, so the second row is
@@ -511,8 +638,22 @@ mod tests {
         sqlx::query("SELECT last_seq FROM vala.audit_chain_head FOR UPDATE")
             .fetch_all(&mut **fence.transaction())
             .await?;
-        oracle.sql(&sql).await?;
-        await_blocked_writer(&queue).await?;
+        let mut scrapes = 0;
+        let (late, _) = queue
+            .poll(before, before, 0, async || {
+                let scrape = vec![Metrics::parse(&metrics.render())];
+                scrapes += 1;
+                if scrapes == 1 {
+                    oracle.sql(&sql).await?;
+                    await_blocked_writer(&queue).await?;
+                }
+                Ok(scrape)
+            })
+            .await?;
+        assert_eq!(
+            late.audit, 1,
+            "a decision created after the first scrape refuses the empty durable read"
+        );
         oracle.sql(&sql).await?;
         let stopped = queue.now().await?;
 
@@ -563,80 +704,5 @@ mod tests {
         );
         server.shutdown().await?;
         Ok(())
-    }
-
-    /// The replica's pending audit decisions add to the staged rows in the
-    /// audit cell, beside an unchanged Scribe backlog.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the sum is wrong.
-    #[test]
-    fn pending_decisions_add_to_staged_audit_rows() {
-        let scrape = |pending: u32| {
-            Metrics::parse(&format!(
-                "audit_outbox_pending {pending}\nbifrost_scribe_staging_live_members 1\n"
-            ))
-        };
-        let durable = Backlog {
-            audit: 3,
-            ..Backlog::default()
-        };
-        let combined = durable.with_replicas(&[scrape(2), scrape(0)]);
-        assert_eq!((combined.audit, combined.scribe), (5, 2));
-        assert!(Backlog::default().with_replicas(&[scrape(0)]).audit == 0);
-    }
-
-    /// One staged live member keeps Scribe's backlog nonzero while the
-    /// persistence queue and immutable generations read zero, and the
-    /// backlog clears with it.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the backlog is wrong.
-    #[test]
-    fn staged_members_hold_the_scribe_backlog() {
-        let scrape = |staged: u32| {
-            Metrics::parse(&format!(
-                "bifrost_scribe_persistence_queue_depth 0\n\
-                 bifrost_scribe_immutable_generation_count 0\n\
-                 bifrost_scribe_staging_live_members {staged}\n"
-            ))
-        };
-        assert_eq!(scribe_backlog(&[scrape(0), scrape(1)]), 1);
-        assert_eq!(scribe_backlog(&[scrape(0), scrape(0)]), 0);
-    }
-
-    /// A quantile is the first cumulative bucket bound covering it among the
-    /// observations between two readings, and an empty interval has none.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a bound is wrong.
-    #[test]
-    fn quantile_reads_bucket_deltas() {
-        let before = [(0.1, 10.0), (1.0, 10.0), (f64::INFINITY, 10.0)];
-        let after = [(0.1, 15.0), (1.0, 105.0), (f64::INFINITY, 110.0)];
-        let step = deltas(&before, &after);
-        assert_eq!(quantile(&step, 0.05), Some(0.1));
-        assert_eq!(quantile(&step, 0.5), Some(1.0));
-        assert_eq!(quantile(&step, 0.99), Some(f64::INFINITY));
-        assert_eq!(quantile(&deltas(&after, &after), 0.5), None);
-    }
-
-    /// Raw percentiles use the nearest rank and an empty sample has none.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a percentile is wrong.
-    #[test]
-    fn raw_percentiles_use_nearest_rank() {
-        let samples: Vec<u64> = (1..=100).collect();
-        let percentiles = Percentiles::raw(&samples, 1.0);
-        assert_eq!(
-            (percentiles.p50, percentiles.p95, percentiles.p99),
-            (Some(50.0), Some(95.0), Some(99.0))
-        );
-        assert_eq!(Percentiles::raw(&[], 1.0).p50, None);
     }
 }

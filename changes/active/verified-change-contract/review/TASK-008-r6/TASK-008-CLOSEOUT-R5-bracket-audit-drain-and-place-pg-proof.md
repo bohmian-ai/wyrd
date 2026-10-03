@@ -222,3 +222,57 @@ environment-owned tests, the owning server/audit journey lane, the focused
 that needs Postgres or a live server. Do not substitute the deferred full
 default benchmark for the focused queued-producer proof, and do not claim
 empirical AC-040/AC-041 qualification.
+
+## Implementation evidence
+
+Integrator direction narrowed AC-R5-2: prove the bracket with the smallest
+test that holds a decision pending across the durable query, reusing the
+existing held-commit harness, instead of driving a queued Drift run. The
+public Oracle read is the same producer the runner reaches; only its timing
+relative to the first scrape matters to the defect.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-R5-1 otherwise-empty drain is bracketed | New `Queue::poll` (`capacity/evidence.rs`) scrapes, reads `Queue::backlog`, combines by `Backlog::with_replicas`; only when that is empty it scrapes again, adds the post-query pending total, and returns that later scrape. `Deployment::drain` now calls it with its replica scrape; loop and `Drain::judge` unchanged. Gauge name is the single `AUDIT_PENDING` const | `evidence::pg_tests::the_audit_backlog_holds_from_a_pending_decision_until_its_publication`: chain head held, the Oracle read is issued inside the poll's first scrape callback (after the snapshot, before SQL); the poll returns `audit == 1`. Red check: skipping the second scrape fails `left: 0, right: 1` | PASS |
+| AC-R5-2 held decision across the query (narrowed, above) | Same test, built on the existing harness; later phases (pending = 2 while held, handoff ≥ 2, late row `created_at > stopped`, 2 until publication, 0 after) unchanged and now read through `Queue::poll` | Same test passes | PASS |
+| AC-R5-3 environment-owned proof at `pg_tests` | `#[cfg(test)] mod pg_tests` in `capacity/evidence.rs` holds `WAIT`, `drain_read`, `pending`, `await_blocked_writer`, `publish_all`, and the live proof; pure arithmetic/percentile tests stay in `mod tests`; `#[ignore]` gate retained | Default `--bin capacity` run: 15 passed, 5 skipped; selector updated below | PASS |
+| AC-R5-4 adjacent behavior unchanged | No workload, SLO, report, CLI, timeout, audit, or publisher change | `step::tests::a_backlog_drains_only_within_the_limit`, `evidence::tests::pending_decisions_add_to_staged_audit_rows`, full capacity target 20/20 (x3), `release_server::tests` 2/2, `test:bifrost:journey:server` 29/29 | PASS |
+
+### Diagnosis: intermittent full-capacity-target failure
+
+- **Symptom:** `--run-ignored=all` capacity run failed 19/20, once on
+  `tests::a_slow_replica_stop_leaves_the_runtime_free`, once on
+  `tests::a_stalled_tenant_setup_stops_the_run_by_its_deadline`, each at
+  ~0.4 s; each passes alone.
+- **Evidence:** stand-in boot log `OSError: [Errno 98] Address already in use`;
+  panic at `main.rs:815` is the stand-in exiting before writing its pid.
+- **Cause:** both tests boot a stand-in on the release server's fixed replica-0
+  port (`release_server.rs:31,34`, `main.rs:792`), and nextest runs them in
+  parallel. Independent read-only diagnostician reproduced it by running just
+  those two together (one fails every time). Not caused by this diff.
+- **Fix site:** `.config/nextest.toml`, new `release-server-ports` group
+  (`max-threads = 1`) for exactly those two tests under the default profile,
+  following the `peer-clusters`/`embedded-postgres` precedent. No other test
+  in the binary binds 8080; `LocalServer` is used only by this binary.
+
+### Commands
+
+```bash
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && \
+  mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity --run-ignored=only \
+  -E 'test(=evidence::pg_tests::the_audit_backlog_holds_from_a_pending_decision_until_its_publication)'"  # 1 passed
+mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity \
+  -E 'test(=evidence::tests::pending_decisions_add_to_staged_audit_rows) | test(=step::tests::a_backlog_drains_only_within_the_limit)'  # 2 passed
+mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity                        # 15 passed, 5 skipped
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && \
+  mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity --run-ignored=all"    # 20 passed (3 consecutive runs)
+mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(/^release_server::tests::/)'  # 2 passed
+mise run test:bifrost:journey:server                                                           # 29 passed
+mise run fmt && mise run lints && git diff --check                                             # clean
+```
+
+Default `bench:capacity` stays deferred to integration
+(FIND-TASK-008-CLOSEOUT-13); no AC-040/AC-041 qualification is claimed.
+Changed files: `capacity/evidence.rs`, `capacity/step.rs`,
+`.config/nextest.toml`. Integration note: when the audit outbox lands, rename
+the gauge by editing only `AUDIT_PENDING` in `capacity/evidence.rs`.

@@ -404,18 +404,16 @@ impl Deployment {
         Vec<wyrd_testing::release_server::Metrics>,
     )> {
         loop {
-            // Scrapes first: a replica's pending audit decision leaves its
-            // gauge only after its row commits, so the later durable read
-            // can over-count that handoff but never miss it.
-            let mut scrapes = Vec::new();
-            for replica in &self.replicas {
-                scrapes.push(replica.metrics().await?);
-            }
-            let backlog = self
+            let (backlog, scrapes) = self
                 .queue
-                .backlog(since, stopped, activations)
-                .await?
-                .with_replicas(&scrapes);
+                .poll(since, stopped, activations, async || {
+                    let mut scrapes = Vec::new();
+                    for replica in &self.replicas {
+                        scrapes.push(replica.metrics().await?);
+                    }
+                    Ok(scrapes)
+                })
+                .await?;
             match Drain::judge(stopped_at.elapsed(), backlog.is_empty()) {
                 Drain::Drained(seconds) => return Ok((Some(seconds), backlog, scrapes)),
                 Drain::Expired => return Ok((None, backlog, scrapes)),

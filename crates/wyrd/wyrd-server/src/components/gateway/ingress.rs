@@ -25,7 +25,8 @@ use wyrd_spec::gateway::native::{
     GatewayGeminiGenerateContentRequest, GatewayGeminiGenerateContentResponse, GoogleErrorEnvelope,
 };
 use wyrd_spec::gateway::{
-    FALLBACK_HEADER, GatewayContractError, GatewayFallbackOverride, GatewayOperation, ModelRef,
+    FALLBACK_HEADER, GatewayContractError, GatewayFallbackOverride, GatewayOperation,
+    GatewayUsageAmount, ModelRef,
 };
 use wyrd_spec::ids::{ModelId, ProviderId};
 
@@ -275,14 +276,13 @@ pub(crate) async fn anthropic_messages(
                         invalid_request(GatewayContractError::new("model", "is required"))
                     })
                     .and_then(|model| native_model("anthropic", model))?;
-                let output = body.get("max_tokens").and_then(Value::as_u64);
                 Ok(GatewayCallRequest {
                     operation: GatewayOperation::ChatCompletions,
                     ingress: IngressDialect::AnthropicMessages,
                     fallback: requested_fallback(&headers, &model)?,
                     model,
                     stream: body.get("stream") == Some(&Value::Bool(true)),
-                    usage_bound: output.and_then(|output| token_bound(&body, Some(output))),
+                    usage_bound: anthropic_usage_bound(&body),
                     body,
                     media: None,
                     batch: None,
@@ -410,6 +410,35 @@ fn gemini_call(
     }
     let model = native_model("gemini", model)?;
     let body = typed_body::<GatewayGeminiGenerateContentRequest>(request)?;
+    Ok(GatewayCallRequest {
+        operation: GatewayOperation::ChatCompletions,
+        ingress: IngressDialect::GeminiGenerateContent,
+        fallback: requested_fallback(headers, &model)?,
+        model,
+        stream,
+        usage_bound: google_usage_bound(&body),
+        body,
+        media: None,
+        batch: None,
+        deployment: None,
+        timeout: PUBLIC_CALL_TIMEOUT,
+    })
+}
+
+/// Token usage bound of an Anthropic Messages `body`, whose output is bounded
+/// by its required `max_tokens`, or `None` when it is unbounded.
+pub(super) fn anthropic_usage_bound(body: &Value) -> Option<Vec<GatewayUsageAmount>> {
+    let output = body.get("max_tokens").and_then(Value::as_u64)?;
+    token_bound(body, Some(output))
+}
+
+/// Token usage bound of a Google `GenerateContent` `body`, or `None` when it
+/// is unbounded.
+///
+/// Output is bounded by `maxOutputTokens` times `candidateCount` (default
+/// one) of its generation config, in either camel or snake case; a body
+/// without that maximum is unbounded.
+pub(super) fn google_usage_bound(body: &Value) -> Option<Vec<GatewayUsageAmount>> {
     let config = body
         .get("generationConfig")
         .or_else(|| body.get("generation_config"));
@@ -418,19 +447,7 @@ fn gemini_call(
             .and_then(|config| config.get(camel).or_else(|| config.get(snake)))
             .and_then(Value::as_u64)
     };
-    let output = field("maxOutputTokens", "max_output_tokens")
-        .and_then(|max| max.checked_mul(field("candidateCount", "candidate_count").unwrap_or(1)));
-    Ok(GatewayCallRequest {
-        operation: GatewayOperation::ChatCompletions,
-        ingress: IngressDialect::GeminiGenerateContent,
-        fallback: requested_fallback(headers, &model)?,
-        model,
-        stream,
-        usage_bound: output.and_then(|output| token_bound(&body, Some(output))),
-        body,
-        media: None,
-        batch: None,
-        deployment: None,
-        timeout: PUBLIC_CALL_TIMEOUT,
-    })
+    let output = field("maxOutputTokens", "max_output_tokens")?
+        .checked_mul(field("candidateCount", "candidate_count").unwrap_or(1))?;
+    token_bound(body, Some(output))
 }

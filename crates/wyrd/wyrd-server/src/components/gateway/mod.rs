@@ -19,6 +19,7 @@ mod pg_administration_tests;
 mod pg_invocation_tests;
 pub(crate) mod routes;
 mod service;
+mod workflow;
 
 pub use batches::{BatchAnswer, GatewayBatches};
 pub use capture::GatewayCapture;
@@ -27,5 +28,6 @@ pub(crate) use invocation::unconnected_engine;
 pub use invocation::{GatewayCallRequest, GatewayCallResponse, GatewayInvocation};
 pub use routes::gateway_router;
 pub use service::GatewayAdministration;
+pub(crate) use workflow::ServerWyrdGatewayCaller;
 pub(crate) use service::invalid;
 pub use wyrd_gateway::{GatewayCredentialSnapshot, GatewayCredentialSource, GatewayTenantSnapshot};

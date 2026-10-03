@@ -106,7 +106,6 @@ pub fn auth_failure_code(error: &WyrdError) -> AuditErrorCode {
         WyrdError::PrincipalKindCardKindMismatch { .. } | WyrdError::CardScopeTooLarge { .. } => {
             AuditErrorCode::ValidationFailed
         }
-        WyrdError::AuditUnavailable { .. } => AuditErrorCode::AuditUnavailable,
         _ => AuditErrorCode::PermissionDenied,
     }
 }

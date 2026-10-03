@@ -120,11 +120,6 @@ pub enum IngestError {
         /// Inclusive future bound (receipt + future window) in epoch-microseconds.
         future_bound_micros: i64,
     },
-    /// The authorization decision could not be durably recorded.
-    ///
-    /// Fail-closed: the write is refused rather than admitted unaudited.
-    #[error("ingest audit unavailable: {0}")]
-    AuditUnavailable(String),
     /// An internal failure with no stable client remediation.
     #[error("internal ingest error: {0}")]
     Internal(String),
@@ -138,8 +133,7 @@ pub enum IngestError {
 /// absent series and a zero series are never distinguishable, and it emits
 /// through [`IngestError::rejection_reason`] so the taxonomy is never restated
 /// at a call site.
-pub const GATE_REJECTION_REASONS: [&str; 9] = [
-    "audit_unavailable",
+pub const GATE_REJECTION_REASONS: [&str; 8] = [
     "auth",
     "permission",
     "validation",
@@ -191,7 +185,6 @@ impl IngestError {
             Self::IngressClosed => "role_unavailable",
             Self::IngestBusy { .. } | Self::WalDiskFull => "scribe_admission",
             Self::Unauthenticated(_) | Self::PrincipalUnresolved => "auth",
-            Self::AuditUnavailable(_) => "audit_unavailable",
             Self::Internal(_) => return None,
         })
     }
@@ -273,10 +266,6 @@ impl IngestError {
                 value: value_micros.to_string(),
                 past_bound: past_bound_micros.to_string(),
                 future_bound: future_bound_micros.to_string(),
-            }
-            .into(),
-            Self::AuditUnavailable(detail) => BifrostError::AuditUnavailable {
-                detail: detail.clone(),
             }
             .into(),
             Self::Internal(detail) => BifrostError::Internal {

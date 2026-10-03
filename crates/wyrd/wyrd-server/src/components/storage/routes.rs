@@ -72,9 +72,8 @@ pub fn storage_router(state: &AppState) -> OpenApiRouter<AppState> {
           another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
         (status = 409, description = "The upload record conflicts with one already stored \
           (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
-        (status = 500, description = "The storage backend or the platform store failed, or the \
-          decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "The storage backend or the platform store failed \
+          (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "No verifier is configured for the access token, or \
           the storage backend is transiently unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
@@ -135,9 +134,8 @@ struct PartUrlQuery {
          body = WyrdProblem),
         (status = 409, description = "The upload is already terminal \
           (WYRD_STORAGE_409_UPLOAD_NOT_PENDING)", body = WyrdProblem),
-        (status = 500, description = "The storage backend or the platform store failed, or the \
-          decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "The storage backend or the platform store failed \
+          (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "No verifier is configured for the access token, or \
           the storage backend is transiently unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
@@ -204,9 +202,8 @@ async fn part_url(
           advertise encryption, or the artifact row conflicts \
           (WYRD_STORAGE_409_UPLOAD_NOT_PENDING, WYRD_STORAGE_409_ENCRYPTION_MISSING, \
           WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
-        (status = 500, description = "The storage backend or the platform store failed, or the \
-          decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "The storage backend or the platform store failed \
+          (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "No verifier is configured for the access token, or \
           the storage backend is transiently unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
@@ -270,9 +267,8 @@ async fn complete(
          body = WyrdProblem),
         (status = 409, description = "The upload is already terminal \
           (WYRD_STORAGE_409_UPLOAD_NOT_PENDING)", body = WyrdProblem),
-        (status = 500, description = "The storage backend or the platform store failed, or the \
-          decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "The storage backend or the platform store failed \
+          (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "No verifier is configured for the access token, or \
           the storage backend is transiently unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
@@ -339,9 +335,8 @@ async fn abort(
          body = WyrdProblem),
         (status = 409, description = "The upload is already terminal \
           (WYRD_STORAGE_409_UPLOAD_NOT_PENDING)", body = WyrdProblem),
-        (status = 500, description = "The storage backend or the platform store failed, or the \
-          decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "The storage backend or the platform store failed \
+          (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "No verifier is configured for the access token, or \
           the storage backend is transiently unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
@@ -399,9 +394,8 @@ async fn local_blob(
         (status = 404, description = "No such card artifact, or its object is gone from the \
           backend (WYRD_SPEC_404_NOT_FOUND, WYRD_STORAGE_404_OBJECT_NOT_FOUND)",
          body = WyrdProblem),
-        (status = 500, description = "The storage backend or the platform store failed, or the \
-          decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "The storage backend or the platform store failed \
+          (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "No verifier is configured for the access token, or \
           the storage backend is transiently unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
@@ -469,9 +463,8 @@ struct LocalDownloadQuery {
           another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
         (status = 404, description = "No such stored object \
           (WYRD_STORAGE_404_OBJECT_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "The storage backend or the platform store failed, or the \
-          decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "The storage backend or the platform store failed \
+          (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "No verifier is configured for the access token, or \
           the storage backend is transiently unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \

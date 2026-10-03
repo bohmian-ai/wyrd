@@ -278,9 +278,8 @@ struct BindingFilter {
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 409, description = "The issuer is already registered for this tenant \
           (WYRD_AUTH_409_ADMIN_CONFLICT)", body = WyrdProblem),
-        (status = 500, description = "The sealing key or a tenant store write failed, or the \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "The sealing key or a tenant store write failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "OIDC discovery or the store is unavailable, or no \
           verifier is configured for the access token \
           (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, \
@@ -361,9 +360,8 @@ async fn create_trusted_issuer(
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 500, description = "A tenant store read or write failed, or the decision \
-          could not be audited (WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "A tenant store read or write failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "The store is unavailable, or no verifier is configured \
           for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
@@ -428,9 +426,8 @@ async fn list_trusted_issuers(
           (WYRD_AUTH_404_ADMIN_NOT_FOUND)", body = WyrdProblem),
         (status = 409, description = "Live workload bindings still reference the issuer and \
           cascade was not requested (WYRD_AUTH_409_ADMIN_CONFLICT)", body = WyrdProblem),
-        (status = 500, description = "A tenant store read or write failed, or the decision \
-          could not be audited (WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "A tenant store read or write failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "The store is unavailable, or no verifier is configured \
           for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
@@ -510,9 +507,8 @@ async fn delete_trusted_issuer_route(
           (WYRD_AUTH_404_ADMIN_NOT_FOUND)", body = WyrdProblem),
         (status = 409, description = "The binding already exists \
           (WYRD_AUTH_409_ADMIN_CONFLICT)", body = WyrdProblem),
-        (status = 500, description = "A tenant store read or write failed, or the decision \
-          could not be audited (WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "A tenant store read or write failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "The store is unavailable, or no verifier is configured \
           for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
@@ -580,9 +576,8 @@ async fn create_workload_binding(
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 500, description = "A tenant store read or write failed, or the decision \
-          could not be audited (WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "A tenant store read or write failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "The store is unavailable, or no verifier is configured \
           for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
@@ -646,9 +641,8 @@ async fn list_workload_bindings(
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such binding in this tenant \
           (WYRD_AUTH_404_ADMIN_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A tenant store read or write failed, or the decision \
-          could not be audited (WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "A tenant store read or write failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "The store is unavailable, or no verifier is configured \
           for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)

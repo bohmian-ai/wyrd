@@ -125,16 +125,12 @@ pub enum DelegateError {
 }
 
 impl DelegateError {
-    /// Whether the failure left the transaction unable to record a decision:
-    /// a store read, or an audit append that already failed.
+    /// Whether the failure was a store read, which leaves the transaction
+    /// unable to record a decision.
     fn is_store_failure(&self) -> bool {
         matches!(
             self,
-            Self::Database(_)
-                | Self::Issuance(
-                    IssuanceError::Database(_)
-                        | IssuanceError::Wyrd(WyrdError::AuditUnavailable { .. })
-                )
+            Self::Database(_) | Self::Issuance(IssuanceError::Database(_))
         )
     }
 }

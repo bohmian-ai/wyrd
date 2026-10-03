@@ -923,15 +923,15 @@ impl BifrostQueryReadDecision {
     ///
     /// # Errors
     ///
-    /// Returns audit unavailable when the projection violates the locked
-    /// binding, topology, retry, slot, or deadline bounds.
+    /// Returns [`BifrostError::QueryExecutionFailed`] when the projection
+    /// violates the locked binding, topology, retry, slot, or deadline bounds.
     pub fn try_new(detail: AuditDetail) -> Result<Self, BifrostError> {
         if !matches!(detail, AuditDetail::BifrostQueryReadDecision { .. }) {
-            return Err(BifrostError::QueryAuditUnavailable);
+            return Err(BifrostError::QueryExecutionFailed);
         }
         detail
             .validate()
-            .map_err(|_| BifrostError::QueryAuditUnavailable)?;
+            .map_err(|_| BifrostError::QueryExecutionFailed)?;
         Ok(Self { detail })
     }
 
@@ -2148,7 +2148,7 @@ impl Oracle {
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::QueryAuditUnavailable`] when a digest input is
+    /// Returns [`BifrostError::QueryExecutionFailed`] when a digest input is
     /// outside the bounded audit digest contract.
     fn candidate_attempt_context(
         context: &AuthorizedQueryContext,
@@ -2570,8 +2570,8 @@ impl Oracle {
     ///
     /// Returns [`BifrostError::QueryExecutionFailed`] when the session carries
     /// no bindings extension, when validation refuses the binding set, or when
-    /// the lock was already bound, and [`BifrostError::QueryAuditUnavailable`]
-    /// when the live permission digest cannot be derived.
+    /// the lock was already bound, or when the live permission digest cannot
+    /// be derived.
     ///
     /// On success the bound lock is returned so the terminal path reads the
     /// degraded sources from the same post-admission registry the leaves
@@ -2676,7 +2676,7 @@ impl Oracle {
     /// # Errors
     ///
     /// Returns [`BifrostError::QueryAdmissionRejected`] when the admitted query
-    /// no longer holds its envelope, and [`BifrostError::QueryAuditUnavailable`]
+    /// no longer holds its envelope, and [`BifrostError::QueryExecutionFailed`]
     /// when the permission digest cannot be derived.
     fn live_dispatch(
         &self,
@@ -2790,7 +2790,7 @@ impl Oracle {
     /// # Errors
     ///
     /// Returns [`BifrostError::QueryTimeout`] when no deadline remains and
-    /// [`BifrostError::QueryAuditUnavailable`] when the detail violates the
+    /// [`BifrostError::QueryExecutionFailed`] when the detail violates the
     /// bounded audit contract.
     fn audit_read_decision(&self, input: CutAuditInput<'_>) -> Result<(), BifrostError> {
         let decision = read_decision(
@@ -3834,16 +3834,18 @@ fn query_digest(value: &str) -> String {
 ///
 /// # Errors
 ///
-/// Returns audit unavailable when the locked audit scalar rejects the digest.
+/// Returns [`BifrostError::QueryExecutionFailed`] when the locked audit scalar
+/// rejects the digest.
 fn audit_digest(value: &str) -> Result<QueryAuditDigest, BifrostError> {
-    QueryAuditDigest::new(query_digest(value)).map_err(|_| BifrostError::QueryAuditUnavailable)
+    QueryAuditDigest::new(query_digest(value)).map_err(|_| BifrostError::QueryExecutionFailed)
 }
 
 /// Produces one digest from an ordered list without exposing its source values.
 ///
 /// # Errors
 ///
-/// Returns audit unavailable when the locked audit scalar rejects the digest.
+/// Returns [`BifrostError::QueryExecutionFailed`] when the locked audit scalar
+/// rejects the digest.
 fn aggregate_audit_digest<'a>(
     values: impl IntoIterator<Item = &'a str>,
 ) -> Result<QueryAuditDigest, BifrostError> {
@@ -3855,8 +3857,8 @@ fn aggregate_audit_digest<'a>(
 ///
 /// # Errors
 ///
-/// Returns audit unavailable when a digest or T1 bounded invariant is invalid,
-/// and timeout when no positive settled deadline remains.
+/// Returns [`BifrostError::QueryExecutionFailed`] when a digest or T1 bounded
+/// invariant is invalid, and timeout when no positive settled deadline remains.
 fn read_decision(
     context: &AuthorizedQueryContext,
     sql: &str,
@@ -3880,7 +3882,7 @@ fn read_decision(
             .as_millis()
             .max(1),
     )
-    .map_err(|_| BifrostError::QueryAuditUnavailable)?;
+    .map_err(|_| BifrostError::QueryExecutionFailed)?;
     BifrostQueryReadDecision::try_new(AuditDetail::BifrostQueryReadDecision {
         query_digest: audit_digest(sql)?,
         query_class,
@@ -3917,7 +3919,7 @@ fn read_decision(
 ///
 /// # Errors
 ///
-/// Returns [`BifrostError::QueryAuditUnavailable`] when an Analytical cut is
+/// Returns [`BifrostError::QueryExecutionFailed`] when an Analytical cut is
 /// empty or larger than the audit contract's node field can carry.
 fn execution_topology(
     query_class: QueryClass,
@@ -3929,7 +3931,7 @@ fn execution_topology(
             let nodes = u8::try_from(oracle_count)
                 .ok()
                 .filter(|nodes| *nodes > 0)
-                .ok_or(BifrostError::QueryAuditUnavailable)?;
+                .ok_or(BifrostError::QueryExecutionFailed)?;
             Ok((QueryExecutionMode::Distributed, nodes, nodes - 1))
         }
     }
@@ -4066,7 +4068,7 @@ pub(super) fn authorize_payload_columns(
 ///
 /// # Errors
 ///
-/// Returns [`BifrostError::QueryAuditUnavailable`] when the decision cannot be
+/// Returns [`BifrostError::QueryExecutionFailed`] when the decision cannot be
 /// canonicalized or the digest falls outside the bounded audit contract.
 pub(super) fn scoped_permission_digest(
     permission: &Permission,
@@ -4074,11 +4076,11 @@ pub(super) fn scoped_permission_digest(
 ) -> Result<QueryAuditDigest, BifrostError> {
     let mut rendered = scopes
         .iter()
-        .map(|scope| serde_json::to_string(scope).map_err(|_| BifrostError::QueryAuditUnavailable))
+        .map(|scope| serde_json::to_string(scope).map_err(|_| BifrostError::QueryExecutionFailed))
         .collect::<Result<Vec<_>, _>>()?;
     rendered.sort_unstable();
     let permission =
-        serde_json::to_string(permission).map_err(|_| BifrostError::QueryAuditUnavailable)?;
+        serde_json::to_string(permission).map_err(|_| BifrostError::QueryExecutionFailed)?;
     audit_digest(&format!("{permission}\n{}", rendered.join("\n")))
 }
 
@@ -4097,7 +4099,6 @@ const fn terminal_error_label(code: QueryTerminalErrorCode) -> &'static str {
         QueryTerminalErrorCode::QueryTenantInvariant => "query_tenant_invariant",
         QueryTerminalErrorCode::QueryReconciliationInvariant => "query_reconciliation_invariant",
         QueryTerminalErrorCode::QueryPeerSecurity => "query_peer_security",
-        QueryTerminalErrorCode::QueryAuditUnavailable => "query_audit_unavailable",
         QueryTerminalErrorCode::CatalogUnreachable => "catalog_unreachable",
         QueryTerminalErrorCode::StorageUnreachable => "storage_unreachable",
         QueryTerminalErrorCode::QueryExecutionFailed => "query_execution_failed",
@@ -4333,8 +4334,6 @@ fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostEr
         BifrostError::QueryTenantInvariant
     } else if message.contains("reconciliation invariant") {
         BifrostError::QueryReconciliationInvariant
-    } else if message.contains("audit unavailable") {
-        BifrostError::QueryAuditUnavailable
     } else {
         BifrostError::QueryExecutionFailed
     }
@@ -4907,7 +4906,6 @@ mod tests {
                 "reconciliation invariant",
                 BifrostError::QueryReconciliationInvariant,
             ),
-            ("audit unavailable", BifrostError::QueryAuditUnavailable),
         ] {
             let error = DataFusionError::Context(
                 context.to_owned(),

@@ -1211,7 +1211,7 @@
           ]
         },
         {
-          "description": "Audit staging was unavailable.",
+          "description": "Audit staging was unavailable.\n\nNo longer recorded: audit never refuses an operation. Retained so retained history that carries it still decodes.",
           "type": "string",
           "enum": [
             "AUDIT_UNAVAILABLE"

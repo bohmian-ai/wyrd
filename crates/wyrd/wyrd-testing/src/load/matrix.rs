@@ -1890,7 +1890,6 @@ fn is_retryable_read_error(error: &BifrostClientError) -> bool {
         // A role or source that has not converged yet on this node.
         "WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE",
         "WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE",
-        "WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE",
         "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
     ]
     .contains(&wyrd_spec::error::WyrdError::from(error).code())

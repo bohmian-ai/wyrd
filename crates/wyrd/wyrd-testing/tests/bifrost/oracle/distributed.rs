@@ -436,7 +436,6 @@ fn bifrost_terminal_code(error: &BifrostError) -> Option<QueryTerminalErrorCode>
             QueryTerminalErrorCode::QueryReconciliationInvariant
         }
         BifrostError::QueryPeerSecurity => QueryTerminalErrorCode::QueryPeerSecurity,
-        BifrostError::QueryAuditUnavailable => QueryTerminalErrorCode::QueryAuditUnavailable,
         BifrostError::QueryExecutionFailed => QueryTerminalErrorCode::QueryExecutionFailed,
         _ => return None,
     })

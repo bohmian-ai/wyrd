@@ -909,9 +909,7 @@ async fn await_clean_analytical(
 /// the resolved tables before any row is read.
 ///
 /// The journey also proves the denial is durable: one refusal writes exactly one
-/// tenant-bound denial event and no accepted-read event, and a refusal whose own
-/// audit append fails is reported as audit-unavailable rather than as a plain
-/// rejection. Finally a schema-scoped bearer is presented directly on the
+/// tenant-bound denial event and no accepted-read event. Finally a schema-scoped bearer is presented directly on the
 /// generated gRPC query service: its covered query drains and an uncovered one
 /// is refused before a response stream opens.
 ///

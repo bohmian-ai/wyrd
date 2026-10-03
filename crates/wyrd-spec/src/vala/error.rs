@@ -175,16 +175,6 @@ pub enum BifrostError {
     )]
     QueryStreamIncomplete,
 
-    /// The transactional query read-decision audit could not be committed.
-    #[error("query audit unavailable")]
-    #[wyrd_error(
-        code = "WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE",
-        status = 503,
-        title = "Query audit unavailable",
-        remediation = "Restore the audit/SQL dependency before retrying."
-    )]
-    QueryAuditUnavailable,
-
     /// Query execution failed after the public stream began.
     #[error("query execution failed")]
     #[wyrd_error(
@@ -518,19 +508,6 @@ pub enum BifrostError {
     )]
     Internal {
         /// Human-readable detail about the internal failure.
-        detail: String,
-    },
-
-    /// The transactional audit outbox could not durably record the operation.
-    #[error("audit outbox unavailable: {detail}")]
-    #[wyrd_error(
-        code = "WYRD_VALA_500_AUDIT_UNAVAILABLE",
-        status = 500,
-        title = "Audit outbox unavailable",
-        remediation = "The operation was refused because its audit row could not be durably recorded. Retry; if it persists, check the audit outbox and catalog database health."
-    )]
-    AuditUnavailable {
-        /// Human-readable detail about the audit-append failure.
         detail: String,
     },
 

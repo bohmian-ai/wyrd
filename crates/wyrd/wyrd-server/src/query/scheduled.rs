@@ -95,8 +95,7 @@ impl ScheduledQueryCaller {
     /// # Errors
     ///
     /// Returns the stable pre-stream query error (an object denial is
-    /// audited first, or replaced by audit-unavailable when that append
-    /// fails), a frame or Arrow decode
+    /// staged for audit first), a frame or Arrow decode
     /// error, [`WyrdError`] for a failed terminal, unconfirmed lifecycle routing,
     /// and a protocol error when
     /// the stream ended without a terminal frame.
@@ -172,8 +171,7 @@ impl ScheduledQueryCaller {
     /// # Errors
     ///
     /// Returns the stable pre-stream admission or query error. A bound-context
-    /// object denial is audited first, or replaced by audit-unavailable when
-    /// that append fails.
+    /// object denial is staged for audit first.
     async fn dispatch(&self, request: BifrostQueryRequest) -> Result<OracleQueryStream, WyrdError> {
         match &self.caller {
             Some(caller) => {

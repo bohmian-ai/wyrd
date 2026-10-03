@@ -113,15 +113,16 @@ capacity is healthy, and append/replay/live-tail journeys pass. Missing
 acknowledged authority, contradictory lineage, tenant mismatch, or corrupt
 non-tail WAL is a no-go and invokes full restore or incident escalation.
 
-## Oracle audit commit or peer failure
+## Audit commit or Oracle peer failure
 
 ### Audit commit path
 
-1. A rising `oracle_audit_commit_failures_total` means read decisions are not
-   reaching `vala.audit_staging`. Restore Postgres or tenant connection
-   capacity; the logged error names the tenant.
-2. Read decisions that failed to commit are not replayed. Record the window
-   from the failure logs as an audit gap.
+1. A rising `audit_outbox_commit_failures_total` means authorization decisions
+   on the labelled `surface` are not reaching `vala.audit_staging`. Requests
+   keep succeeding. Restore Postgres or tenant connection capacity; the logged
+   error names the tenant, operation, and request id.
+2. Decisions that failed to commit are not replayed. Record the window from
+   the failure logs as an audit gap.
 
 ### Peer path
 

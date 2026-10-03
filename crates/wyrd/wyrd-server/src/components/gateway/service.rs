@@ -89,8 +89,7 @@ impl<'a> GatewayAdministration<'a> {
     /// (undeclared and unauthorized sources are indistinguishable),
     /// `GatewayResourceConflict` when the name is revoked or a provider change
     /// would orphan a deployment, `ServiceUnavailable` when the tenant has no
-    /// usable key authority, and `ServiceUnavailable` or `AuditUnavailable`
-    /// when storage or audit fails.
+    /// usable key authority, and `ServiceUnavailable` when storage fails.
     pub async fn put_credential(
         &self,
         caller: &Caller,

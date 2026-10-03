@@ -1660,8 +1660,7 @@ impl AnalyticalStageIngress {
     /// # Errors
     ///
     /// Returns [`BifrostError::QueryPeerSecurity`] for every authorization,
-    /// identity, or binding failure, [`BifrostError::QueryAuditUnavailable`]
-    /// when the required refusal audit could not commit,
+    /// identity, or binding failure,
     /// [`BifrostError::QueryAdmissionRejected`] when this follower cannot admit
     /// the graph's envelope, and [`BifrostError::QueryExecutionFailed`] when the
     /// named graph is already draining.

@@ -322,7 +322,6 @@ pub(crate) fn terminal_error_to_bifrost(
             BifrostError::QueryReconciliationInvariant
         }
         QueryTerminalErrorCode::QueryPeerSecurity => BifrostError::QueryPeerSecurity,
-        QueryTerminalErrorCode::QueryAuditUnavailable => BifrostError::QueryAuditUnavailable,
         QueryTerminalErrorCode::CatalogUnreachable => BifrostError::CatalogUnreachable {
             detail: "Oracle typed query catalog unavailable".to_owned(),
         },

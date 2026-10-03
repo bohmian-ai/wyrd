@@ -89,19 +89,16 @@ code-generation lane.
 
 Audit is foundational across CLI, UI, MCP, Python SDK, TypeScript SDK,
 `wyrd-server`, and Vala surfaces, and it records authorization decisions rather
-than engine mechanics. Except for the non-blocking paths named below, every
-decision that evaluates a principal's permission appends one row — allowed and
-denied alike — in the same transaction as the decision, before the operation
-proceeds or refuses; a decision that cannot be recorded that way fails closed.
+than engine mechanics. Every decision that evaluates a principal's permission
+stages one row — allowed and denied alike — once the decision is known, outside
+the operation's transaction; a decision that fails to commit is logged and
+counted and never fails the operation.
 Engine-internal transitions that evaluate no permission are lineage in their
 own operational tables, never audit.
 
-Oracle read decisions, tenant tripwires, and gateway invocation decisions are
-the named exceptions: they use the same canonical append from a tracked,
-non-blocking task rather than the deciding transaction, so an authorized call
-is not refused or delayed by the write. Gateway administration is not in that
-set and stays transactional and fail-closed. Do not create alternative audit
-writers.
+Every surface stages its decision on the one process audit outbox, which is
+the canonical append's only caller, so an authorized call is never refused or
+delayed by the write. Do not create alternative audit writers.
 
 `vala.audit_staging` is transient write-ahead state. Retained history is the
 tenant-qualified Bifrost `vala.system.audit_log` projection, published through

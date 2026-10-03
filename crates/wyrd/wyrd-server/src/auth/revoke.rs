@@ -44,8 +44,7 @@ use wyrd_sql::TenantConn;
 /// `service_accounts:write`, [`WyrdError::MissingRequiredField`] when the
 /// reason is empty, oversized, or secret-like, [`WyrdError::PrincipalNotFound`]
 /// when no principal of that kind exists in the tenant,
-/// [`WyrdError::AuditUnavailable`] when the decision cannot be recorded, and an
-/// internal error when the revocation transaction cannot be acquired or
+/// and an internal error when the revocation transaction cannot be acquired or
 /// committed.
 #[utoipa::path(
     post,
@@ -65,9 +64,8 @@ use wyrd_sql::TenantConn;
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such principal of that kind in the caller's tenant \
           (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A tenant store read or write failed, or the revocation \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "A tenant store read or write failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "No verifier is configured for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),

@@ -763,8 +763,6 @@ pub enum QueryTerminalErrorCode {
     QueryReconciliationInvariant,
     /// Peer authentication, fencing, or replay validation failed.
     QueryPeerSecurity,
-    /// The read-decision audit dependency failed.
-    QueryAuditUnavailable,
     /// The table catalog was unavailable.
     CatalogUnreachable,
     /// Object storage was unavailable.

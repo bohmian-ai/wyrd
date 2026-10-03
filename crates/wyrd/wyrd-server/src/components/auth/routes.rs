@@ -93,8 +93,7 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
         (status = 500, description = "Token issuance or the server's own auth configuration \
           failed, so no token was served (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "The auth backend is unavailable \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE), or the exchange audit could not be staged, which \
-          fails the grant closed (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     // No session exists yet at this operation, so it clears the document-wide
     // requirement instead of inheriting it.
@@ -355,10 +354,10 @@ async fn callback(
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No principal is bound to the named Card \
           (WYRD_AUTH_404_ADMIN_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The store is unavailable, or the credential's own audit \
-          row could not be staged (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+        (status = 500, description = "The server's auth configuration is missing \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
+        (status = 503, description = "The store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Auth"
 )]

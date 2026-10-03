@@ -1313,8 +1313,6 @@ fn terminal_error_code(error: &datafusion::error::DataFusionError) -> QueryTermi
         QueryTerminalErrorCode::QueryTenantInvariant
     } else if message.contains("reconciliation invariant") {
         QueryTerminalErrorCode::QueryReconciliationInvariant
-    } else if message.contains("audit unavailable") {
-        QueryTerminalErrorCode::QueryAuditUnavailable
     } else {
         QueryTerminalErrorCode::QueryExecutionFailed
     }

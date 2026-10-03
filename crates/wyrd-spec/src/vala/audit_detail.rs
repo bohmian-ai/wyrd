@@ -434,6 +434,9 @@ pub enum AuditErrorCode {
     /// The caller lacked the required permission.
     PermissionDenied,
     /// Audit staging was unavailable.
+    ///
+    /// No longer recorded: audit never refuses an operation. Retained so
+    /// retained history that carries it still decodes.
     AuditUnavailable,
     /// The supplied token was invalid.
     InvalidToken,

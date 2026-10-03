@@ -21,8 +21,7 @@ controls required to operate those boundaries.
 - Security uncertainty fails closed. Verification, authorization, policy,
   tenant binding, and fencing failures deny the operation. Audit is
   non-blocking: a decision that fails to commit is logged and counted and does
-  not deny the operation, except on surfaces not yet converted to the audit
-  outbox.
+  not deny the operation.
 - Secrets are resolved from a deployment secret provider at runtime. They are
   never Card fields, generated artifacts, logs, traces, errors, or audit
   payloads.
@@ -357,11 +356,12 @@ is not an SSRF control.
 ## Audit integrity and privacy
 
 Audit cardinality follows authorization decisions, not HTTP requests and not
-engine mechanics. Permissions are blocking; audits are non-blocking. Oracle
-reads, gateway invocations, and direct verification execution stage their
-decisions on the shared audit outbox without waiting for the commit; surfaces
-not yet converted still append their audit row in the same transaction that
-made the decision. Scribe
+engine mechanics. Permissions are blocking; audits are non-blocking. Every
+audited surface stages its decision on the one process audit outbox once the
+decision is known, outside the operation's transaction, and never waits for
+the commit. A committed effect whose decision is lost to a failed commit or
+abrupt process loss has no audit row; the loss is logged with its operation
+and request id and counted in `audit_outbox_commit_failures_total`. Scribe
 batch commits and Forge maintenance transitions evaluate no permission: they
 are recorded as lineage in `vala.scribe_batch_commits` and
 `vala.forge_operations` and emit no audit event.
@@ -382,9 +382,9 @@ process loss may therefore lose an invocation event that has not committed.
 
 Direct verification execution evaluates `evals:run` and subject scope
 synchronously, then stages its one allowed or denied decision on the process
-audit outbox shared with Oracle. A full queue or failed commit is counted in
-`oracle_audit_commit_failures_total` and logged; the execution proceeds, and
-server shutdown drains the outbox.
+audit outbox shared with every surface. A full queue or failed commit is
+counted in `audit_outbox_commit_failures_total` and logged; the execution
+proceeds, and server shutdown drains the outbox.
 
 `vala.audit_staging` is transient transactional write-ahead state with no
 external consumer. Retained audit history lives in the

@@ -947,20 +947,6 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// Credential issuance audit insert failed.
-    #[error("[WYRD_AUDIT_503_UNAVAILABLE] {message}")]
-    #[wyrd_error(
-        code = "WYRD_AUDIT_503_UNAVAILABLE",
-        status = 503,
-        title = "Credential audit unavailable",
-        remediation = "Credential plaintext cannot be returned without a durable audit row. Inspect existing keys, revoke duplicates, and re-issue after audit is restored."
-    )]
-    AuditUnavailable {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
     /// Required request field is missing.
     #[error("[WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD] {message}")]
     #[wyrd_error(
@@ -3781,7 +3767,6 @@ impl WyrdError {
             | Self::GatewayDeadlineExceeded { message, details }
             | Self::AuthVerifyUnavailable { message, details }
             | Self::DiscoveryUnavailable { message, details }
-            | Self::AuditUnavailable { message, details }
             | Self::MissingRequiredField { message, details }
             | Self::PermissionUnauthenticated { message, details }
             | Self::PermissionDeniedRbac { message, details }
@@ -4682,10 +4667,6 @@ mod tests {
             },
             WyrdError::DiscoveryUnavailable {
                 message: "oidc discovery unavailable".to_owned(),
-                details: serde_json::json!({}),
-            },
-            WyrdError::AuditUnavailable {
-                message: "credential audit unavailable".to_owned(),
                 details: serde_json::json!({}),
             },
             WyrdError::PermissionUnauthenticated {

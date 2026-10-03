@@ -136,7 +136,7 @@ fn object_not_found(digest: &str) -> WyrdErrorResponse {
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Payload and captured-table read permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Catalog or storage unavailable, or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -246,7 +246,7 @@ fn invalid_name() -> WyrdErrorResponse {
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -286,7 +286,7 @@ pub(crate) async fn put_credential(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -322,7 +322,7 @@ pub(crate) async fn get_credential(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -358,7 +358,7 @@ pub(crate) async fn list_credentials(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -397,7 +397,7 @@ pub(crate) async fn revoke_credential(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -435,7 +435,7 @@ pub(crate) async fn delete_credential(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -473,7 +473,7 @@ pub(crate) async fn put_deployment(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -509,7 +509,7 @@ pub(crate) async fn get_deployment(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -544,7 +544,7 @@ pub(crate) async fn list_deployments(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -580,7 +580,7 @@ pub(crate) async fn delete_deployment(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -613,7 +613,7 @@ pub(crate) async fn put_fallback(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -641,7 +641,7 @@ pub(crate) async fn get_fallback(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -675,7 +675,7 @@ pub(crate) async fn delete_fallback(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -708,7 +708,7 @@ pub(crate) async fn put_governance(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -741,7 +741,7 @@ pub(crate) async fn get_governance(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -775,7 +775,7 @@ pub(crate) async fn delete_governance(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -808,7 +808,7 @@ pub(crate) async fn put_capture(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]

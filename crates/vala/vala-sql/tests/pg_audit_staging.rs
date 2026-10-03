@@ -155,9 +155,9 @@ mod pg_tests {
         /// The internal verification-result writer's admission decisions stage
         /// under the `system` principal kind.
         ///
-        /// Audit is fail-closed, so a kind the staging CHECK refuses would make
-        /// every Gate admission by the SYSTEM writer an audit-unavailable
-        /// refusal. The row must stage and keep the kind as written.
+        /// A kind the staging CHECK refused would lose every Gate admission
+        /// decision by the SYSTEM writer. The row must stage and keep the kind
+        /// as written.
         ///
         /// # Panics
         ///

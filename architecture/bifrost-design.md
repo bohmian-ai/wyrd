@@ -586,12 +586,13 @@ stability; pruning, vectorization, layout, and IO efficiency determine latency.
 
 ### Read audit and terminal contract
 
-Oracle read decisions use the one audit outbox. After admission, a tracked,
-non-blocking task commits the read-decision event to the canonical tenant
-hash-chain staging table, and the `AuditPublisher` retains it like every other
-event. Rows are not held for that commit; a failed commit is logged and counted
-through `oracle_audit_commit_failures_total`, and shutdown waits for pending
-commits. One logical query produces one read-audit event; distributed stages
+Oracle read decisions use the one process audit outbox. After admission the
+read-decision event is staged without waiting; the outbox writer commits it to
+the canonical tenant hash-chain staging table in a per-tenant batch, and the
+`AuditPublisher` retains it like every other event. Rows are not held for that
+commit; a failed commit is logged and counted through
+`audit_outbox_commit_failures_total{surface="bifrost"}`, and shutdown drains
+the outbox to its deadline. One logical query produces one read-audit event; distributed stages
 produce none. An Interactive event records `Local` execution on one node; an
 Analytical event records `Distributed` execution over every Oracle in the
 frozen participant cut, leader included, with the followers as its workers.
@@ -853,10 +854,8 @@ No cleanup infers safety from age or path shape alone.
   principal's permission records exactly one allowed or denied event.
   Permissions are blocking; audits are non-blocking: the check completes before
   the operation proceeds or refuses, and the event is staged on the shared
-  audit outbox without the operation waiting for its commit. Oracle read
-  decisions do not hold rows for that commit. Surfaces not yet converted still
-  append in the operation's own commit transaction and fail closed until they
-  move to the outbox.
+  audit outbox without the operation waiting for its commit, and no
+  operation holds rows for that commit or fails because of it.
 - Engine-internal transitions — Scribe batch commits, Forge maintenance, audit
   publication, reconciliation, storage lifecycle — evaluate no permission. They
   record lineage in their own operational tables and structured diagnostics,

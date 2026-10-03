@@ -453,8 +453,7 @@ impl OracleStageAuthority for OraclePeerAuthority {
     ///
     /// # Errors
     ///
-    /// Returns the closed failure for the first check that did not pass, or an
-    /// audit-unavailable refusal when the required durable row cannot commit.
+    /// Returns the closed failure for the first check that did not pass.
     async fn authorize_stage(
         &self,
         context: &PeerContext,

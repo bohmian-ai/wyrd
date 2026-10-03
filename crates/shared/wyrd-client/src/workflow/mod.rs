@@ -15,6 +15,7 @@ use skald_runtime::ProviderRegistry;
 use skald_workflow::{
     Workflow as SkaldWorkflow, WorkflowInput, WorkflowResult, WorkflowRun, WorkflowRunOptions,
 };
+use tokio::task::JoinError;
 use wyrd_loader::LoadedTree;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
@@ -55,8 +56,9 @@ impl Workflow {
     /// returned, so a refusal dispatches nothing.
     ///
     /// The synchronous bundle load and entry canonicalization run together on
-    /// Tokio's blocking pool, so filesystem reads never occupy the polling
-    /// thread. Cancellation may stop after completed filesystem or registry
+    /// Tokio's blocking pool, and so does building the [`Cards`] handle from
+    /// configuration and credential files, so filesystem reads never occupy
+    /// the polling thread. Cancellation may stop after completed filesystem or registry
     /// reads, and an already started bundle read may finish after the future
     /// is dropped; no partial Workflow is returned and nothing durable is
     /// written.
@@ -76,15 +78,14 @@ impl Workflow {
         let path = path.as_ref().to_path_buf();
         let (tree, entry) = tokio::task::spawn_blocking(move || load_bundle(&path))
             .await
-            .map_err(|error| WyrdError::WorkflowInternal {
-                message: format!("workflow bundle load task failed: {error}"),
-                details: serde_json::json!({ "boundary": "workflow_bundle_load" }),
-            })??;
+            .map_err(|error| blocking_task_failed("workflow_bundle_load", &error))??;
         let (workflow, mut bodies) = WorkflowBodies::authored(&tree, &entry)?;
         let refs = bodies.external_refs(&workflow);
         let mut client = None;
         if !refs.is_empty() {
-            let cards = Cards::new(None, None)?;
+            let cards = tokio::task::spawn_blocking(|| Cards::new(None, None))
+                .await
+                .map_err(|error| blocking_task_failed("workflow_cards_client", &error))??;
             CardGraphHydrator::new(cards.registry_context())
                 .resolve_external(&mut bodies, &refs)
                 .await?;
@@ -112,7 +113,9 @@ impl Workflow {
     /// then each selected binding it configures has its secret headers
     /// resolved, and no other binding is read. A selected binding absent from
     /// configuration is refused by Skald before any dispatch. Loading a
-    /// Workflow never performs this preparation.
+    /// Workflow never performs this preparation. Reading the configuration,
+    /// building the gateway client, and reading secrets run on Tokio's
+    /// blocking pool, so filesystem reads never occupy the polling thread.
     ///
     /// Dropping the future stops the run locally. A model call already sent
     /// to a gateway or provider is not rolled back, and nothing is resent.
@@ -130,21 +133,13 @@ impl Workflow {
         input: impl Into<WorkflowInput>,
     ) -> WorkflowResult<WorkflowRun> {
         let routes = SelectedRoutes::of(self.inner.spec());
-        let config = if routes.needs_config() {
-            GlobalConfig::load().map_err(WyrdError::from)?.workflow
-        } else {
-            LocalWorkflowConfig::default()
-        };
-        let gateway = match (&self.client, routes.needs_gateway()) {
-            (_, false) => None,
-            (Some(client), true) => Some(client.clone()),
-            (None, true) => Some(WyrdClient::from_global().map_err(|error| {
-                WyrdError::WorkflowBindingUnavailable {
-                    message: format!("no Wyrd gateway client is available: {error}"),
-                    details: serde_json::json!({ "route": "wyrd_gateway" }),
-                }
-            })?),
-        };
+        let (needs_config, needs_gateway) = (routes.needs_config(), routes.needs_gateway());
+        let loaded = self.client.clone();
+        let (config, gateway) = tokio::task::spawn_blocking(move || {
+            load_local_setup(needs_config, needs_gateway, loaded)
+        })
+        .await
+        .map_err(|error| blocking_task_failed("workflow_local_setup", &error))??;
         let dependencies = routes
             .dependencies(native.clone(), &config, gateway)
             .await?;
@@ -167,10 +162,60 @@ impl Workflow {
         &mut self.inner
     }
 
-    /// Take the hydrated Skald Workflow.
+    /// Take the hydrated Skald Workflow, dropping this facade.
+    ///
+    /// The returned Skald Workflow does not keep the client that loaded the
+    /// registered Cards, and its runs get no automatic shared dependencies:
+    /// the caller supplies every gateway, binding, and provider through
+    /// [`SkaldWorkflow::run_with_options`]. Use [`Self::as_skald`] or
+    /// [`Self::as_skald_mut`] to keep them.
     #[must_use]
     pub fn into_skald(self) -> SkaldWorkflow {
         self.inner
+    }
+}
+
+/// Read the shared configuration and gateway client a run's routes select.
+///
+/// This is the synchronous filesystem half of [`Workflow::run_with`], which
+/// runs it on the blocking pool. The shared configuration is read only when
+/// `needs_config`. A gateway client is returned only when `needs_gateway`:
+/// `loaded`, the client that loaded the Workflow's registered Cards, when
+/// present, else one built from the shared configuration and credentials.
+///
+/// # Errors
+/// Returns the client configuration error when the shared configuration
+/// cannot be read, and `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` when a gateway
+/// client is needed and none can be built.
+fn load_local_setup(
+    needs_config: bool,
+    needs_gateway: bool,
+    loaded: Option<WyrdClient>,
+) -> Result<(LocalWorkflowConfig, Option<WyrdClient>), WyrdError> {
+    let config = if needs_config {
+        GlobalConfig::load().map_err(WyrdError::from)?.workflow
+    } else {
+        LocalWorkflowConfig::default()
+    };
+    let gateway = match (loaded, needs_gateway) {
+        (_, false) => None,
+        (Some(client), true) => Some(client),
+        (None, true) => Some(WyrdClient::from_global().map_err(|error| {
+            WyrdError::WorkflowBindingUnavailable {
+                message: format!("no Wyrd gateway client is available: {error}"),
+                details: serde_json::json!({ "route": "wyrd_gateway" }),
+            }
+        })?),
+    };
+    Ok((config, gateway))
+}
+
+/// The Workflow error for a blocking-pool task that panicked or was
+/// cancelled by runtime shutdown, naming the `boundary` it ran.
+fn blocking_task_failed(boundary: &str, error: &JoinError) -> WyrdError {
+    WyrdError::WorkflowInternal {
+        message: format!("{boundary} task failed: {error}"),
+        details: serde_json::json!({ "boundary": boundary }),
     }
 }
 

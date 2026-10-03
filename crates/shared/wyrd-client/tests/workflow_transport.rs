@@ -431,6 +431,10 @@ fn raw_reply(status: &str, body: &Value) -> String {
     )
 }
 
+/// Status line and headers of a `401` refusal that promises a 64-byte body,
+/// so a reply that writes fewer bytes is truncated or left pending.
+const UNAUTHORIZED_HEAD: &str = "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: 64\r\nconnection: close\r\n\r\n";
+
 /// Read one HTTP/1.1 request and its `content-length` body from `stream`.
 ///
 /// Returns the request path, or `None` when the client closes first.
@@ -467,18 +471,27 @@ async fn read_request(stream: &mut TcpStream) -> Option<String> {
     }
 }
 
+/// One scripted answer from a [`raw_server`] connection.
+enum Reply {
+    /// Write these bytes, then close the connection.
+    Send(String),
+    /// Write these bytes (possibly none), then hold the connection open
+    /// until the client closes it, so the answer never completes.
+    Hold(String),
+}
+
 /// Serve `replies` in order on a loopback listener, one connection each, and
 /// report every request path as soon as the request has fully arrived.
 ///
-/// An empty reply holds its connection open, unanswered, until the client
-/// closes it. Requests after the last reply are still reported and their
-/// connections closed unanswered, so a resend is always observed. Returns
-/// the server's base URL and the receiver of request paths.
+/// Requests after the last reply are still reported and their connections
+/// closed unanswered, so a resend is always observed. Returns the server's
+/// base URL and the receiver of request paths.
 ///
 /// # Panics
 /// Panics when the listener cannot bind; the serving task panics when a
-/// connection cannot be accepted, read, or written.
-async fn raw_server(replies: Vec<String>) -> (String, UnboundedReceiver<String>) {
+/// connection cannot be accepted, read, or written, or when the client sends
+/// more bytes on a held connection.
+async fn raw_server(replies: Vec<Reply>) -> (String, UnboundedReceiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("listener binds");
@@ -496,14 +509,20 @@ async fn raw_server(replies: Vec<String>) -> (String, UnboundedReceiver<String>)
             };
             paths.send(path).expect("the test receives request paths");
             match replies.next() {
-                Some(reply) if reply.is_empty() => {
-                    let closed = stream.read(&mut [0_u8; 1]).await.expect("held read");
-                    assert_eq!(closed, 0, "the client sends nothing more");
-                }
-                Some(reply) => stream
+                Some(Reply::Send(reply)) => stream
                     .write_all(reply.as_bytes())
                     .await
                     .expect("reply writes"),
+                Some(Reply::Hold(partial)) => {
+                    stream
+                        .write_all(partial.as_bytes())
+                        .await
+                        .expect("partial reply writes");
+                    tokio::spawn(async move {
+                        let closed = stream.read(&mut [0_u8; 1]).await.expect("held read");
+                        assert_eq!(closed, 0, "the client sends nothing more");
+                    });
+                }
                 None => {}
             }
         }
@@ -755,7 +774,7 @@ async fn public_gateway_call_context_and_errors() {
 
     // Cancelling the run once its model call has reached the gateway stops the
     // pending call long before the call's own deadline, without a resend.
-    let (base_url, mut paths) = raw_server(vec![String::new()]).await;
+    let (base_url, mut paths) = raw_server(vec![Reply::Hold(String::new())]).await;
     let pending = PublicWyrdGatewayCaller::new(client(&base_url));
     let cancellation = CancellationToken::new();
     let call = pending.call(
@@ -1040,9 +1059,9 @@ async fn public_gateway_call_context_and_errors() {
     // credential, without resending the model call, and then reports the
     // unread body as a transport failure.
     let (base_url, mut paths) = raw_server(vec![
-        raw_reply("200 OK", &token_json("tok-a")),
-        "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: 64\r\nconnection: close\r\n\r\n{\"error\"".to_owned(),
-        raw_reply("200 OK", &token_json("tok-b")),
+        Reply::Send(raw_reply("200 OK", &token_json("tok-a"))),
+        Reply::Send(format!("{UNAUTHORIZED_HEAD}{{\"error\"")),
+        Reply::Send(raw_reply("200 OK", &token_json("tok-b"))),
     ])
     .await;
     let outcome = PublicWyrdGatewayCaller::new(api_key_client(&base_url))
@@ -1059,5 +1078,31 @@ async fn public_gateway_call_context_and_errors() {
         reported(&mut paths),
         ["/auth/token", "/v1/chat/completions", "/auth/token"],
         "one model POST, then one renewal"
+    );
+
+    // A 401 whose body never finishes arriving renews the credential as soon
+    // as the status line is read. The renewal request reaching the server
+    // while the model call's body is still pending proves renewal does not
+    // wait for the body; the caller's deadline then ends the call.
+    let (base_url, mut paths) = raw_server(vec![
+        Reply::Send(raw_reply("200 OK", &token_json("tok-a"))),
+        Reply::Hold(format!("{UNAUTHORIZED_HEAD}{{\"error\"")),
+        Reply::Send(raw_reply("200 OK", &token_json("tok-b"))),
+    ])
+    .await;
+    let outcome = PublicWyrdGatewayCaller::new(api_key_client(&base_url))
+        .call(
+            gateway_call(chat_request(), "openai/gpt-a", None, Duration::from_secs(2)),
+            &token,
+        )
+        .await;
+    assert!(
+        matches!(outcome, Err(ProviderError::Timeout { .. })),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        reported(&mut paths),
+        ["/auth/token", "/v1/chat/completions", "/auth/token"],
+        "renewal runs while the 401 body is still pending"
     );
 }

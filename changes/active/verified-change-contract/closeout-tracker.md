@@ -21,7 +21,7 @@ Rules for every worktree:
 |---|---|---|---|---|---|---|
 | 1 | Gateway capture refactor | verified-change-contract rev 54 | merged | `de3dfaca6` | **Done** | — |
 | 2 | Benchmark fixes (review R1, findings 1–12) | verified-change-contract rev 57 | `agent-a82d72f51901e1dc5` / `worktree-agent-a82d72f51901e1dc5` | `5c3bb79b3` | R3: FIX_REQUIRED, 2 valid findings (complete-command 30-min deadline; cancellation docs); fix agent running | R4 Codex review after fix |
-| 3 | Forge concurrent planning (TASK-001, TASK-002) | forge-concurrent-planning rev 1 | `agent-ac58f45cb5b747685` / `worktree-agent-ac58f45cb5b747685` | `36d8634a6` | r1: SPEC_REVISION_REQUIRED (two decisions); FIND-12 rejected because I gave the wrong base | User decision on forge spec rev 2, then remediation and r2 review |
+| 3 | Forge concurrent planning (TASK-001, TASK-002) | forge-concurrent-planning rev 1 | `agent-ac58f45cb5b747685` / `worktree-agent-ac58f45cb5b747685` | `6937c7603` (spec rev 2) | r1: SPEC_REVISION_REQUIRED; forge spec rev 2 approved (no per-tenant cap; unknown-outcome task claim lapses within 60 s); fix agent running on FIND-1..8,10,11 (FIND-9 at integration, FIND-12 rejected because I gave the wrong base) | r2 Codex review against base `ce5c09ef3` after fix |
 | 4 | Audit outbox (3 tasks) | audit-outbox rev 1 | `agent-aad682fbca5074900` / `worktree-agent-aad682fbca5074900` | `0fa3d0d6b` (in progress) | Implementing | Codex review when the agent finishes |
 | 5 | Verifier runtime under load (tasks TASK-013+) | verified-change-contract rev 59 (`5e5623a2e`) + rev 60 (`82f142580`) | new agent worktree (rev59-impl) | — | Planning and implementing | Codex review when the agent finishes |
 

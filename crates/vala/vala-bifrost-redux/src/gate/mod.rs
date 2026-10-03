@@ -1925,7 +1925,10 @@ mod tests {
             scope: PermissionScope::All,
         }];
 
-        for principal in [PrincipalId::new(uuid::Uuid::now_v7()), GATEWAY_CAPTURE_PRINCIPAL] {
+        for principal in [
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            GATEWAY_CAPTURE_PRINCIPAL,
+        ] {
             let context = context_with(principal, PrincipalKind::User, wildcard.clone());
             let error = gate
                 .dispatch_native_frame(&limits, &context, native_frame("vala.gateway.calls"))

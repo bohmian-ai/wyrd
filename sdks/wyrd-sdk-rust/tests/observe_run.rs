@@ -1015,7 +1015,11 @@ async fn drift_burst_survives_a_byte_budget_override() {
         ))
         .await
         .expect("burst rows read back");
-    assert_eq!(groups.len(), BURST_OBSERVATIONS, "one record_id per observation");
+    assert_eq!(
+        groups.len(),
+        BURST_OBSERVATIONS,
+        "one record_id per observation"
+    );
     assert!(
         groups.iter().all(|group| group.n == BURST_FEATURES as i64),
         "every observation landed all of its features exactly once"

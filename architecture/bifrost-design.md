@@ -108,6 +108,26 @@ written yet.
 
 ## Durability and visibility
 
+### Consistency principle
+
+Wyrd's high-throughput paths are eventually consistent within a few seconds,
+and their tradeoffs are known and accepted:
+
+- An acknowledgement on a high-throughput path means the server has received
+  the work. It does not guarantee the work is durable, and the caller never
+  waits for derived work. Examples of derived work are Eval run creation,
+  audit decisions, result publication, and Forge planning.
+- Derived work is batched through server-owned outboxes and becomes visible
+  within seconds. An outbox retries rather than dropping work because a
+  dependency is slow or unavailable, and graceful shutdown flushes it.
+- A hard process kill may lose work that was received but not yet flushed.
+  This loss is accepted, and every loss the process can observe is counted and
+  logged.
+- Reviews and designs MUST NOT treat these windows as defects, and MUST NOT
+  close them by making callers wait. A path that needs a stronger guarantee
+  states it explicitly in its own contract. Scribe's append acknowledgement,
+  described below, is one such path.
+
 Bifrost uses explicit authority transitions:
 
 ```text

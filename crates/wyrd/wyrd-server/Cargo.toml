@@ -89,7 +89,6 @@ wyrd-crypt = { workspace = true }
 wyrd-sql = { path = "../wyrd-sql", version = "0.0.1" }
 tower = { workspace = true, features = ["util", "timeout", "limit", "load-shed"] }
 tower-http = { workspace = true, features = ["trace", "catch-panic"] }
-tower_governor = { workspace = true }
 http-body = { workspace = true }
 http-body-util = "0.1"
 wyrd-spec = { workspace = true, features = ["server"] }
@@ -106,6 +105,7 @@ utoipa-axum = { workspace = true }
 workspace-hack.workspace = true
 tracing-subscriber = { workspace = true }
 insta = { workspace = true }
+oauth2 = { workspace = true }
 reqwest = { workspace = true }
 wyrd-storage = { workspace = true }
 temp-env = { workspace = true }

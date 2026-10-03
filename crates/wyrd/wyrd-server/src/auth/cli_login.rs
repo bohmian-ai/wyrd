@@ -1,11 +1,12 @@
-//! CLI human login HTTP adapters: the RFC 8628 device authorization endpoint,
-//! its verification page, and refresh-chain revocation at logout. The
-//! device-code token poll is a `POST /auth/token` grant.
+//! CLI human login HTTP adapters: the RFC 8628 device authorization endpoint
+//! and its verification page, and RFC 7009 token revocation. The device-code
+//! token poll is a `POST /auth/token` grant.
 //!
 //! Every route is anonymous: the CLI holds no Wyrd session yet, or is ending
 //! one, and the person approving a code signs in only after approving it.
 //! Each handler composes [`CliLogins`] from the server's auth configuration
-//! and maps its refusals to problem JSON, or to a plain page for the browser.
+//! and maps its refusals to the RFC 6749 §5.2 body, or to a plain page for
+//! the browser.
 
 use axum::Json;
 use axum::extract::{Extension, Form, Query, State};
@@ -13,78 +14,80 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use serde::Deserialize;
 use wyrd_auth::cli_logins::{CliLogins, DEVICE_VERIFICATION_PATH};
-use wyrd_spec::auth::{DeviceAuthorization, DeviceAuthorizationRequest, RevokeRefreshToken};
+use wyrd_spec::auth::{
+    DeviceAuthorization, DeviceAuthorizationRequest, OAuthClientId, OAuthErrorCode,
+    OAuthErrorResponse, TokenRevocationRequest,
+};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::request_id::RequestId;
 
 use crate::auth::auth_not_configured;
+use crate::auth::oauth::{ClientForm, OAuthError, OAuthForm, no_store};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
 /// Compose the CLI login owner from the server's human-connection owner and
-/// token verifier.
+/// tenant issuance owner.
 ///
 /// # Errors
-/// Returns a `500` when either is not configured.
-pub(crate) fn cli_logins(state: &AppState) -> Result<CliLogins, WyrdErrorResponse> {
+/// Returns [`WyrdError::Internal`] when either is not configured.
+pub(crate) fn cli_logins(state: &AppState) -> Result<CliLogins, WyrdError> {
+    let missing = || auth_not_configured().0;
     Ok(CliLogins::new(
-        state
-            .auth
-            .human_connections
-            .clone()
-            .ok_or_else(auth_not_configured)?,
-        state
-            .auth
-            .token_verifier
-            .clone()
-            .ok_or_else(auth_not_configured)?,
+        state.auth.human_connections.clone().ok_or_else(missing)?,
+        state.auth.tenant_issuer().ok_or_else(missing)?,
     ))
 }
 
 /// `POST /auth/device_authorization` — begin a CLI device login (RFC 8628
 /// §3.1).
 ///
-/// Like `POST /auth/login` it appends no audit event: it evaluates no
-/// principal permission.
+/// The public client `wyrd-cli` identifies itself with `client_id`; another
+/// client is `unauthorized_client`. Like `GET /auth/authorize` it appends no
+/// audit event: it evaluates no principal permission.
 ///
 /// # Errors
-/// Returns the refusals of [`CliLogins::authorize`] and a `500` when auth is
-/// not configured.
+/// Answers the RFC 6749 §5.2 body for a malformed request, an unidentified
+/// or other client, and every refusal of [`CliLogins::authorize`]: an
+/// unknown tenant or one without SSO is `invalid_request`.
 #[utoipa::path(
     post,
     path = "/auth/device_authorization",
-    request_body = DeviceAuthorizationRequest,
+    request_body(content = ClientForm<DeviceAuthorizationRequest>,
+        content_type = "application/x-www-form-urlencoded"),
     responses(
         (status = 200, description = "Device code issued; show `user_code`, open \
           `verification_uri_complete`, and poll `POST /auth/token` with the device_code grant \
           every `interval` seconds", body = DeviceAuthorization),
-        (status = 400, description = "The deployment has no public origin or sealing key \
-          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
-        (status = 401, description = "SSO login is not available for this tenant route key \
-          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
-        (status = 503, description = "The auth backend is unavailable \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+        (status = 400, description = "RFC 6749 §5.2 refusal: `invalid_request`, including \
+          a tenant without SSO, or `unauthorized_client`",
+          body = OAuthErrorResponse),
+        (status = 401, description = "`invalid_client`", body = OAuthErrorResponse),
+        (status = 500, description = "`server_error`", body = OAuthErrorResponse),
+        (status = 503, description = "`temporarily_unavailable`", body = OAuthErrorResponse)
     ),
-    // No session exists yet at this operation, so it clears the document-wide
-    // requirement instead of inheriting it.
-    security(()),
+    // No session exists yet at this operation: a public client names itself
+    // with `client_id` and needs nothing, a confidential client uses Basic.
+    security((), ("oauthClientBasic" = [])),
     tag = "Auth"
 )]
-#[tracing::instrument(
-    level = "debug",
-    skip(state, request),
-    fields(tenant_route_key = %request.tenant_route_key)
-)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn device_authorization(
     State(state): State<AppState>,
-    Json(request): Json<DeviceAuthorizationRequest>,
-) -> Result<Json<DeviceAuthorization>, WyrdErrorResponse> {
-    cli_logins(&state)?
-        .authorize(&request.tenant_route_key)
+    headers: HeaderMap,
+    form: OAuthForm,
+) -> Result<Response, OAuthError> {
+    match state.auth.oauth_clients.require(&headers, &form)? {
+        OAuthClientId::WyrdCli => {}
+        OAuthClientId::WyrdUi => return Err(OAuthError(OAuthErrorCode::UnauthorizedClient)),
+    }
+    let request: DeviceAuthorizationRequest = form.decode()?;
+    let device = cli_logins(&state)?
+        .authorize(&request.tenant)
         .await
-        .map(Json)
-        .map_err(WyrdErrorResponse::from)
+        .map_err(OAuthError::request)?;
+    Ok(no_store(StatusCode::OK, Json(device)))
 }
 
 /// Query of the verification page: the tenant, and the user code when the
@@ -204,7 +207,7 @@ pub async fn device_decision(
         .human_connections
         .as_ref()
         .ok_or_else(auth_not_configured)?
-        .completion_url()?
+        .require_callback()?
         .origin()
         .ascii_serialization();
     if headers
@@ -241,7 +244,7 @@ pub async fn device_decision(
 }
 
 /// A plain HTML page with `body`, which may not be framed.
-fn page(status: StatusCode, body: &str) -> Response {
+pub(crate) fn page(status: StatusCode, body: &str) -> Response {
     let mut response = (
         status,
         Html(format!(
@@ -259,38 +262,47 @@ fn page(status: StatusCode, body: &str) -> Response {
     response
 }
 
-/// `POST /auth/revoke` — end the login a refresh token belongs to.
+/// `POST /auth/revoke` — revoke a refresh token (RFC 7009 §2).
 ///
-/// RFC 7009 semantics: possession of the refresh token is the authority, and
-/// an unknown, malformed, or already revoked token also answers `204`. Only
-/// that login's refresh chain is revoked; the User's other logins continue.
-/// The revocation commits with its audit event under the request id.
+/// The client identifies itself as for the token endpoint: `wyrd-ui` with
+/// its Basic secret, `wyrd-cli` with `client_id`. Revoking a token revokes
+/// its whole login; the User's other logins continue. An unknown, malformed,
+/// or already revoked token also answers `200` (RFC 7009 §2.2), and
+/// `token_type_hint` is ignored: only refresh tokens are revocable. The
+/// revocation commits with its audit event under the request id.
 ///
 /// # Errors
-/// Returns a `503` when the store or the audit path fails and a `500` when
-/// auth is not configured.
+/// Answers the RFC 6749 §5.2 body: `invalid_client` for a missing or refused
+/// client, `invalid_request` for a malformed request or a token issued to
+/// another client, and `temporarily_unavailable` when the store or the audit
+/// path fails.
 #[utoipa::path(
     post,
     path = "/auth/revoke",
-    request_body = RevokeRefreshToken,
+    request_body(content = ClientForm<TokenRevocationRequest>,
+        content_type = "application/x-www-form-urlencoded"),
     responses(
-        (status = 204, description = "The token's login, if it named one, no longer renews"),
-        (status = 503, description = "The auth backend or audit path is unavailable \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+        (status = 200, description = "The token's login, if it named one, no longer renews"),
+        (status = 400, description = "`invalid_request`", body = OAuthErrorResponse),
+        (status = 401, description = "`invalid_client`", body = OAuthErrorResponse),
+        (status = 500, description = "`server_error`", body = OAuthErrorResponse),
+        (status = 503, description = "`temporarily_unavailable`", body = OAuthErrorResponse)
     ),
-    security(()),
+    security((), ("oauthClientBasic" = [])),
     tag = "Auth"
 )]
 #[tracing::instrument(level = "debug", skip_all)]
-pub async fn revoke_refresh_token(
+pub async fn revoke(
     State(state): State<AppState>,
     request_id: Option<Extension<RequestId>>,
-    Json(request): Json<RevokeRefreshToken>,
-) -> Result<StatusCode, WyrdErrorResponse> {
+    headers: HeaderMap,
+    form: OAuthForm,
+) -> Result<Response, OAuthError> {
+    let client = state.auth.oauth_clients.require(&headers, &form)?;
+    let request: TokenRevocationRequest = form.decode()?;
     let request_id = request_id.map_or_else(RequestId::now_v7, |Extension(id)| id);
     cli_logins(&state)?
-        .end(&request.refresh_token, request_id.as_str())
-        .await
-        .map(|()| StatusCode::NO_CONTENT)
-        .map_err(WyrdErrorResponse::from)
+        .revoke(&request.token, client, request_id.as_str())
+        .await?;
+    Ok(no_store(StatusCode::OK, ()))
 }

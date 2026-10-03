@@ -107,8 +107,11 @@ afterAll(async () => {
 async function exchange(baseUrl: string, apiKey: string): Promise<string> {
   const response = await fetch(`${baseUrl}/auth/token`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ grant_type: "wyrd_api_key", api_key: apiKey }),
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+      subject_token: apiKey,
+      subject_token_type: "urn:wyrd:oauth:token-type:api_key",
+    }),
   });
   expect(response.status).toBe(200);
   return ((await response.json()) as { access_token: string }).access_token;

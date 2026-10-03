@@ -25,6 +25,9 @@ pub const API_KEY_ISSUE_OPERATION: &str = "auth.api_key.issue";
 pub const REFRESH_FAMILY_REVOKE_OPERATION: &str = "auth.refresh.revoke_family";
 /// Operation for a card-ref scope minted into (or refused from) a token.
 pub const CARD_SCOPE_MINT_OPERATION: &str = "auth.card_scope.mint";
+/// Operation for a human login a provider callback completed: its User is
+/// signed in and its authorization code or device approval recorded.
+pub const LOGIN_OPERATION: &str = "auth.login";
 /// Operation for a human login whose provider-asserted groups changed the
 /// User's durable role assignments.
 pub const USER_ROLES_SYNC_OPERATION: &str = "auth.user.roles.sync";

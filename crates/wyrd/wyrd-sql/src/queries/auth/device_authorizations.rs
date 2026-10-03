@@ -4,10 +4,12 @@
 //! CLI polls with, and the user code the person approves.
 //! [`insert_device_authorization`] writes it, [`pending_device_authorization`]
 //! finds it by user code on the verification page,
-//! [`deny_device_authorization`] records a denial, [`poll_device_authorization`]
-//! locks it for a token poll and enforces the poll interval, and
-//! [`delete_device_authorization`] ends it together with any login state still
-//! bound to it. Forced RLS is the only tenant selection and `PostgreSQL` owns
+//! [`deny_device_authorization`] records a denial,
+//! [`approve_device_authorization`] records the signed-in principal and
+//! connection once the provider callback verified the sign-in,
+//! [`poll_device_authorization`] locks it for a token poll and enforces the
+//! poll interval, and [`delete_device_authorization`] ends it together with
+//! any login state still bound to it. Forced RLS is the only tenant selection and `PostgreSQL` owns
 //! every expiry and poll time: callers bind durations, never instants.
 // raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
@@ -17,6 +19,7 @@ use uuid::Uuid;
 use wyrd_spec::auth::Sha256Hex;
 
 use crate::TenantConn;
+use crate::row_types::auth::HumanConnectionBinding;
 
 /// Drop this tenant's device authorizations that can no longer be redeemed.
 const PURGE_EXPIRED_DEVICE_AUTHORIZATIONS_SQL: &str = r#"
@@ -32,20 +35,36 @@ const INSERT_DEVICE_AUTHORIZATION_SQL: &str = r#"
     ) VALUES ($1, $2, $3, $4, statement_timestamp() + ($5 * interval '1 second'))
 "#;
 
-/// The id of the unexpired, undenied device authorization with this user
+/// The id of the unexpired, undecided device authorization with this user
 /// code.
 const PENDING_DEVICE_AUTHORIZATION_SQL: &str = r#"
     SELECT device_id FROM wyrd.auth_device_authorizations
      WHERE user_code = $1
        AND NOT denied
+       AND principal_id IS NULL
        AND expires_at > statement_timestamp()
 "#;
 
-/// Mark the unexpired device authorization with this user code denied.
+/// Mark the unexpired, unapproved device authorization with this user code
+/// denied.
 const DENY_DEVICE_AUTHORIZATION_SQL: &str = r#"
     UPDATE wyrd.auth_device_authorizations
        SET denied = true
      WHERE user_code = $1
+       AND principal_id IS NULL
+       AND expires_at > statement_timestamp()
+"#;
+
+/// Record the approval of the unexpired, undecided device authorization with
+/// this id.
+const APPROVE_DEVICE_AUTHORIZATION_SQL: &str = r#"
+    UPDATE wyrd.auth_device_authorizations
+       SET principal_id = $2,
+           connection_id = $3,
+           connection_revision = $4
+     WHERE device_id = $1
+       AND NOT denied
+       AND principal_id IS NULL
        AND expires_at > statement_timestamp()
 "#;
 
@@ -53,7 +72,7 @@ const DENY_DEVICE_AUTHORIZATION_SQL: &str = r#"
 /// returning its state and whether the previous poll was within the interval.
 const POLL_DEVICE_AUTHORIZATION_SQL: &str = r#"
     WITH device AS (
-        SELECT device_id, denied,
+        SELECT device_id, denied, principal_id, connection_id, connection_revision,
                expires_at <= statement_timestamp() AS expired,
                COALESCE(last_polled_at > statement_timestamp() - ($2 * interval '1 second'),
                         false) AS too_fast
@@ -65,7 +84,8 @@ const POLL_DEVICE_AUTHORIZATION_SQL: &str = r#"
        SET last_polled_at = statement_timestamp()
       FROM device
      WHERE polled.device_id = device.device_id
-    RETURNING device.device_id, device.denied, device.expired, device.too_fast
+    RETURNING device.device_id, device.denied, device.principal_id, device.connection_id,
+              device.connection_revision, device.expired, device.too_fast
 "#;
 
 /// Delete the device authorization with this id and any login state still
@@ -87,10 +107,39 @@ pub struct DevicePoll {
     pub device_id: Uuid,
     /// The person denied the user code.
     pub denied: bool,
+    /// The principal that approved the user code by signing in; `None` while
+    /// pending.
+    pub principal_id: Option<Uuid>,
+    /// The connection id that sign-in went through, set with `principal_id`.
+    pub connection_id: Option<Uuid>,
+    /// That connection's revision, set with `principal_id`.
+    pub connection_revision: Option<i64>,
     /// The device code has expired.
     pub expired: bool,
     /// The previous poll was less than the interval ago.
     pub too_fast: bool,
+}
+
+impl DevicePoll {
+    /// The approving principal and the connection revision its sign-in went
+    /// through, once the device authorization is approved.
+    #[must_use]
+    pub fn approval(&self) -> Option<(Uuid, HumanConnectionBinding)> {
+        match (
+            self.principal_id,
+            self.connection_id,
+            self.connection_revision,
+        ) {
+            (Some(principal_id), Some(connection_id), Some(connection_revision)) => Some((
+                principal_id,
+                HumanConnectionBinding {
+                    connection_id,
+                    connection_revision,
+                },
+            )),
+            _ => None,
+        }
+    }
 }
 
 /// Insert a device authorization whose expiry `PostgreSQL` derives from
@@ -125,8 +174,8 @@ pub async fn insert_device_authorization(
     Ok(())
 }
 
-/// The id of this tenant's unexpired, undenied device authorization with
-/// `user_code`, if any.
+/// The id of this tenant's unexpired device authorization with `user_code`
+/// that is neither denied nor approved, if any.
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the read.
@@ -140,8 +189,8 @@ pub async fn pending_device_authorization(
         .await
 }
 
-/// Deny this tenant's unexpired device authorization with `user_code`, and
-/// return whether one was found.
+/// Deny this tenant's unexpired, unapproved device authorization with
+/// `user_code`, and return whether one was found.
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the update.
@@ -151,6 +200,28 @@ pub async fn deny_device_authorization(
 ) -> Result<bool, sqlx::Error> {
     let updated = sqlx::query(DENY_DEVICE_AUTHORIZATION_SQL)
         .bind(user_code)
+        .execute(&mut **conn.transaction())
+        .await?;
+    Ok(updated.rows_affected() == 1)
+}
+
+/// Record that `principal_id` approved this tenant's device authorization
+/// `device_id` by signing in through `connection`, and return whether it was
+/// still unexpired and undecided.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the update.
+pub async fn approve_device_authorization(
+    conn: &mut TenantConn<'_>,
+    device_id: Uuid,
+    principal_id: Uuid,
+    connection: HumanConnectionBinding,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query(APPROVE_DEVICE_AUTHORIZATION_SQL)
+        .bind(device_id)
+        .bind(principal_id)
+        .bind(connection.connection_id)
+        .bind(connection.connection_revision)
         .execute(&mut **conn.transaction())
         .await?;
     Ok(updated.rows_affected() == 1)

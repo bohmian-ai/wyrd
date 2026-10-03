@@ -64,3 +64,17 @@ pub struct HumanConnectionBinding {
     /// The connection's revision when the login began.
     pub connection_revision: i64,
 }
+
+/// What a human refresh family is bound to: the connection revision its login
+/// went through and the OAuth client it was issued to.
+///
+/// Every row of a family carries the same binding. The client decides
+/// whether a refresh rotates the token (`wyrd-cli`) or re-presents it
+/// (`wyrd-ui`), and only that client may refresh or revoke it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HumanSessionBinding {
+    /// The login connection revision.
+    pub connection: HumanConnectionBinding,
+    /// The OAuth client the session was issued to.
+    pub client: wyrd_spec::auth::OAuthClientId,
+}

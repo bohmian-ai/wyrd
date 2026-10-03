@@ -84,7 +84,7 @@ impl SavedLogin {
             origin,
             tenant_key,
             access_token: token.access_token,
-            access_expires_at: token.expires_at,
+            access_expires_at: crate::auth::expires_at(token.expires_in),
             refresh_token,
         })
     }
@@ -328,11 +328,12 @@ impl SavedLogins {
             )
         })?;
         login.access_token = rotated.access_token.clone();
-        login.access_expires_at = rotated.expires_at;
+        let expires_at = crate::auth::expires_at(rotated.expires_in);
+        login.access_expires_at = expires_at;
         self.write(&logins)?;
         Ok(MintedAccessToken {
             access_token: rotated.access_token,
-            expires_at: rotated.expires_at,
+            expires_at,
         })
     }
 

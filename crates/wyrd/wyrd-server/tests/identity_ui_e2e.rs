@@ -240,7 +240,14 @@ async fn call(
 async fn access_token(server: &str, api_key: &str) -> String {
     let body: Value = reqwest::Client::new()
         .post(format!("{server}/auth/token"))
-        .json(&json!({ "grant_type": "wyrd_api_key", "api_key": api_key }))
+        .form(&[
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            ("subject_token", api_key),
+            ("subject_token_type", "urn:wyrd:oauth:token-type:api_key"),
+        ])
         .send()
         .await
         .expect("token endpoint answers")
@@ -382,7 +389,7 @@ async fn production_ui_bff_journey() {
     let service_key = uuid::Uuid::new_v4().simple().to_string();
     let srv = WyrdTestServerBuilder::default()
         .with_public_origin(origin.parse().expect("origin parses"))
-        .with_bff_service_key(&service_key)
+        .with_ui_client_secret(&service_key)
         .with_access_ttl(chrono::Duration::seconds(30))
         .start_bound()
         .await

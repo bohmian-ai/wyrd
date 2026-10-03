@@ -2173,17 +2173,17 @@ pub struct AuthConfig {
     /// every non-OIDC path keeps working.
     #[serde(default)]
     pub public_origin: Option<url::Url>,
-    /// SHA-256 hashes of the deployment BFF service key the production UI
-    /// presents on the private browser-session channel.
+    /// SHA-256 hashes of the client secret the production UI's confidential
+    /// OAuth client `wyrd-ui` authenticates with (RFC 6749 §2.3.1).
     ///
-    /// Env-injected only. Loaded from `WYRD_BFF_SERVICE_KEY_SHA256`: one or,
+    /// Env-injected only. Loaded from `WYRD_UI_CLIENT_SECRET_SHA256`: one or,
     /// during a rotation overlap, two comma-separated lowercase-hex SHA-256
-    /// digests of the raw key. Empty leaves `/internal/bff/v1/*` unmounted, so
-    /// a deployment without the production UI exposes no session channel. The
-    /// key authorizes only browser-session operations, never tenant API
-    /// authority.
+    /// digests of the raw secret. Empty leaves `wyrd-ui` unable to
+    /// authenticate, so a deployment without the production UI accepts no
+    /// authorization-code grant. The secret authenticates only the client,
+    /// never tenant API authority.
     #[serde(skip)]
-    pub bff_service_key_hashes: Vec<Sha256Hex>,
+    pub ui_client_secret_hashes: Vec<Sha256Hex>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -3106,8 +3106,8 @@ impl WyrdServerConfig {
         if !retained.is_empty() {
             self.auth.sealing_retained_keys = retained;
         }
-        if let Some(hashes) = env_opt("WYRD_BFF_SERVICE_KEY_SHA256")? {
-            self.auth.bff_service_key_hashes = parse_bff_service_key_hashes(&hashes)?;
+        if let Some(hashes) = env_opt("WYRD_UI_CLIENT_SECRET_SHA256")? {
+            self.auth.ui_client_secret_hashes = parse_ui_client_secret_hashes(&hashes)?;
         }
         if let Some(origin) = env_opt("WYRD_PUBLIC_ORIGIN")? {
             self.auth.public_origin =
@@ -3502,16 +3502,16 @@ impl WyrdServerConfig {
 // Internal helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Parse `WYRD_BFF_SERVICE_KEY_SHA256`: one or two comma-separated
+/// Parse `WYRD_UI_CLIENT_SECRET_SHA256`: one or two comma-separated
 /// lowercase-hex SHA-256 digests, the second accepted only for a bounded
 /// rotation overlap.
 ///
 /// # Errors
 /// Returns [`ConfigError::BadEnvVar`] for an empty entry, a value that is not a
 /// SHA-256 digest, or more than two entries.
-fn parse_bff_service_key_hashes(value: &str) -> Result<Vec<Sha256Hex>, ConfigError> {
+fn parse_ui_client_secret_hashes(value: &str) -> Result<Vec<Sha256Hex>, ConfigError> {
     let bad = |message: String| ConfigError::BadEnvVar {
-        key: "WYRD_BFF_SERVICE_KEY_SHA256".to_string(),
+        key: "WYRD_UI_CLIENT_SECRET_SHA256".to_string(),
         message,
     };
     let hashes = value
@@ -3520,7 +3520,7 @@ fn parse_bff_service_key_hashes(value: &str) -> Result<Vec<Sha256Hex>, ConfigErr
         .collect::<Result<Vec<_>, _>>()?;
     if hashes.len() > 2 {
         return Err(bad(
-            "at most two key hashes (current and rotating) are accepted".to_string(),
+            "at most two secret hashes (current and rotating) are accepted".to_string(),
         ));
     }
     Ok(hashes)
@@ -3730,18 +3730,18 @@ mod tests {
     /// Serialize env-var tests so concurrent test threads cannot interfere.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// The BFF service-key hash list accepts one key or a two-key rotation
-    /// overlap and refuses malformed digests and a third key.
+    /// The `wyrd-ui` client-secret hash list accepts one secret or a
+    /// two-secret rotation overlap and refuses malformed digests and a third.
     #[test]
-    fn bff_service_key_hashes_accept_at_most_two_digests() {
+    fn ui_client_secret_hashes_accept_at_most_two_digests() {
         let one = "a".repeat(64);
         let two = format!("{one}, {}", "b".repeat(64));
         assert_eq!(
-            parse_bff_service_key_hashes(&one).expect("one key").len(),
+            parse_ui_client_secret_hashes(&one).expect("one key").len(),
             1
         );
         assert_eq!(
-            parse_bff_service_key_hashes(&two).expect("two keys").len(),
+            parse_ui_client_secret_hashes(&two).expect("two keys").len(),
             2
         );
         for bad in [
@@ -3751,7 +3751,7 @@ mod tests {
             format!("{one},"),
         ] {
             assert!(
-                parse_bff_service_key_hashes(&bad).is_err(),
+                parse_ui_client_secret_hashes(&bad).is_err(),
                 "{bad} is refused"
             );
         }

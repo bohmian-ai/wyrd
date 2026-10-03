@@ -12,8 +12,8 @@ use sha2::Digest as _;
 use utoipa::openapi::schema::{ObjectBuilder, Schema as OpenApiSchema, Type};
 use uuid::Uuid;
 
-use crate::auth::{PrincipalId, PrincipalKindTag, SecretBearer};
-use crate::ids::TenantSlug;
+use crate::auth::{OAuthClientId, PrincipalId, PrincipalKindTag, SecretBearer};
+use crate::error::WyrdError;
 
 /// Absolute URL used by auth contracts.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -171,8 +171,8 @@ impl utoipa::ToSchema for IssuerUrl {}
 /// Platform-administrator login initiation response.
 ///
 /// The platform plane posts the provider's `code` and `state` back itself, so
-/// it receives the state here. Tenant human login never does: its
-/// [`BeginLoginResponse`] carries only the authorization URL.
+/// it receives the state here. Tenant human login never does: the browser
+/// carries it to the provider inside the authorization redirect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -186,8 +186,8 @@ pub struct LoginInitResponse {
 /// A SHA-256 digest in its canonical wire form: exactly 64 lowercase
 /// hexadecimal characters.
 ///
-/// Used where a caller proves possession of a secret it keeps to itself, such
-/// as the BFF's random login flow id: the server records only the digest.
+/// Used where the server records only the digest of a secret it handed out,
+/// such as a login state, authorization code, or device code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Sha256Hex([u8; 32]);
 
@@ -334,33 +334,34 @@ const SHA256_HEX_PATTERN: &str = "^[0-9a-f]{64}$";
 #[error("expected a SHA-256 digest as 64 lowercase hexadecimal characters")]
 pub struct Sha256HexError;
 
-/// `POST /auth/login` request: begin a tenant human SSO login.
-///
-/// The route key is pre-login routing context only; it never becomes tenant
-/// authority. The BFF sends the SHA-256 of its random browser flow id, and the
-/// completed session is later redeemed only by that binding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
-pub struct BeginLogin {
-    /// The tenant's route key (its slug), as in `/t/{tenantKey}/login`.
-    pub tenant_route_key: TenantSlug,
-    /// SHA-256 of the BFF's random browser flow id.
-    pub browser_flow_hash: Sha256Hex,
-}
-
-/// How a tenant human login was initiated: the single binding its completed
-/// session is redeemed by, or the candidate test it proves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How a tenant human login was initiated: what its verified sign-in grants.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginInitiation {
-    /// A browser login bound to the BFF's flow id hash.
-    Browser(Sha256Hex),
-    /// A device-code login (RFC 8628) bound to its device authorization id.
+    /// An OAuth authorization request (RFC 6749 §4.1.1): the sign-in issues
+    /// that client an authorization code.
+    Authorize(ClientAuthorization),
+    /// A device-code login (RFC 8628) bound to its device authorization id:
+    /// the sign-in records the device's approval.
     Device(Uuid),
     /// A candidate connection test begun by this principal. Its sign-in marks
-    /// the bound candidate revision tested and issues nothing, so it has no
-    /// completion to redeem.
+    /// the bound candidate revision tested and issues nothing.
     ConnectionTest(ConnectionTester),
+}
+
+/// The validated authorization request (RFC 6749 §4.1.1) a login answers.
+///
+/// Recorded on the login state, so the authorization code the callback issues
+/// is bound to exactly this client, redirect URI, and PKCE challenge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientAuthorization {
+    /// The requesting client.
+    pub client: OAuthClientId,
+    /// The client's registered redirect URI the request named exactly.
+    pub redirect_uri: String,
+    /// The PKCE S256 code challenge (RFC 7636 §4.3).
+    pub code_challenge: String,
+    /// The client's opaque `state`, echoed on the redirect.
+    pub state: Option<String>,
 }
 
 /// The authorized caller a candidate connection test was begun by.
@@ -375,31 +376,25 @@ pub struct ConnectionTester {
     pub principal_kind: PrincipalKindTag,
 }
 
-/// `POST /auth/login` response.
-///
-/// Carries only the provider authorization URL. The login state is in that
-/// URL and nowhere else; the caller never needs it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
-pub struct BeginLoginResponse {
-    /// Provider authorization URL to send the person's browser to.
-    pub authorization_url: AbsoluteUrl,
-}
-
 /// `GET /auth/callback` query: the provider's redirect back to the common
 /// callback. It carries no tenant selector.
 ///
-/// `code` and `state` are required. The RFC 9207 `iss` response parameter is
-/// retained when present so the callback can bind the response to the
-/// issuer the login state recorded before any token-endpoint request. Other
-/// provider response parameters (Keycloak's `session_state`) are ignored, as
-/// RFC 6749 §4.1.2 requires of the client.
+/// `state` is required, with exactly one of the success `code` (RFC 6749
+/// §4.1.2) or the provider's `error` (§4.1.2.1); [`Self::response`] names
+/// which. The RFC 9207 `iss` response parameter is retained when present so
+/// the callback can bind the response to the issuer the login state recorded
+/// before any token-endpoint request. Other provider response parameters
+/// (`error_description`, Keycloak's `session_state`) are ignored, as RFC 6749
+/// §4.1.2 requires of the client, so no provider text is ever reflected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct CallbackQuery {
-    /// Authorization code from the identity provider callback.
-    pub code: SecretBearer,
+    /// Authorization code from the identity provider, on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<SecretBearer>,
+    /// The provider's RFC 6749 §4.1.2.1 error code, when it refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// Opaque login state generated by Wyrd.
     #[schemars(schema_with = "state_key_schema")]
     pub state: String,
@@ -407,6 +402,34 @@ pub struct CallbackQuery {
     /// sends one. It must equal the login's recorded issuer exactly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iss: Option<String>,
+}
+
+impl CallbackQuery {
+    /// The provider's answer: its code or its error, never both or neither.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] when the query carries both `code`
+    /// and `error`, or neither.
+    pub fn response(&self) -> Result<ProviderResponse, WyrdError> {
+        match (&self.code, &self.error) {
+            (Some(code), None) => Ok(ProviderResponse::Code(code.clone())),
+            (None, Some(error)) => Ok(ProviderResponse::Error(error.clone())),
+            _ => Err(WyrdError::Validation {
+                message: "the callback carries exactly one of `code` or `error`".to_owned(),
+                details: serde_json::json!({}),
+            }),
+        }
+    }
+}
+
+/// What the identity provider's authorization response answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderResponse {
+    /// RFC 6749 §4.1.2: the authorization code to redeem.
+    Code(SecretBearer),
+    /// RFC 6749 §4.1.2.1: the provider's error code, such as
+    /// `access_denied`.
+    Error(String),
 }
 
 /// URL validation failure.
@@ -509,9 +532,10 @@ fn openapi_url_schema(
 #[cfg(test)]
 mod tests {
     use super::{
-        AbsoluteUrl, BeginLogin, CallbackQuery, IssuerUrl, LoginInitResponse, Sha256Hex,
+        AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, ProviderResponse, Sha256Hex,
         UrlParseError,
     };
+    use crate::auth::SecretBearer;
 
     #[test]
     fn issuer_url_normalizes_trailing_slash() {
@@ -628,8 +652,7 @@ mod tests {
     }
 
     /// A callback carrying the RFC 9207 `iss` parameter retains it typed,
-    /// and one without it parses with no issuer; `code` and `state` remain
-    /// mandatory.
+    /// and one without it parses with no issuer; `state` remains mandatory.
     #[test]
     fn callback_query_retains_the_response_issuer() {
         let json = serde_json::json!({
@@ -652,8 +675,36 @@ mod tests {
             serde_json::from_value::<CallbackQuery>(serde_json::json!({ "code": "auth-code" }))
                 .is_err()
         );
+    }
+
+    /// A callback answers exactly one of the provider's `code` or `error`;
+    /// both or neither is refused, and `error_description` is never kept.
+    ///
+    /// # Panics
+    /// Panics when a response is classified differently.
+    #[test]
+    fn callback_query_carries_exactly_one_provider_response() {
+        let parse = |json| {
+            serde_json::from_value::<CallbackQuery>(json)
+                .expect("callback parses")
+                .response()
+        };
+        assert_eq!(
+            parse(serde_json::json!({ "code": "auth-code", "state": "s" })).expect("code"),
+            ProviderResponse::Code(SecretBearer::new("auth-code".to_owned()))
+        );
+        assert_eq!(
+            parse(serde_json::json!({
+                "error": "access_denied",
+                "error_description": "<script>",
+                "state": "s"
+            }))
+            .expect("error"),
+            ProviderResponse::Error("access_denied".to_owned())
+        );
+        assert!(parse(serde_json::json!({ "state": "s" })).is_err());
         assert!(
-            serde_json::from_value::<CallbackQuery>(serde_json::json!({ "state": "state-123" }))
+            parse(serde_json::json!({ "code": "c", "error": "access_denied", "state": "s" }))
                 .is_err()
         );
     }
@@ -690,24 +741,6 @@ mod tests {
         assert_eq!(
             serde_json::to_value(digest).expect("serializes"),
             serde_json::json!(wire)
-        );
-    }
-
-    /// The browser flow binding is required and unknown fields are refused.
-    #[test]
-    fn begin_login_requires_the_browser_binding() {
-        let hash = Sha256Hex::digest(b"flow").to_string();
-        let parse = |value: serde_json::Value| serde_json::from_value::<BeginLogin>(value);
-        assert!(
-            parse(serde_json::json!({"tenant_route_key": "acme", "browser_flow_hash": hash}))
-                .is_ok()
-        );
-        assert!(parse(serde_json::json!({ "tenant_route_key": "acme" })).is_err());
-        assert!(
-            parse(serde_json::json!({
-                "tenant_route_key": "acme", "browser_flow_hash": hash, "issuer": "x"
-            }))
-            .is_err()
         );
     }
 }

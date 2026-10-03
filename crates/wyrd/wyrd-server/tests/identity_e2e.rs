@@ -6,6 +6,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use base64::Engine as _;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use oauth2::TokenResponse as _;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -13,7 +14,6 @@ use url::Url;
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
-use wyrd_auth::sealing::SealedSecretRewrap;
 use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::WyrdAuthVerifySettings;
 use wyrd_cli::auth::trusted_issuer::{self, AddArgs as TrustedIssuerAddArgs, TrustedIssuerCommand};
@@ -30,8 +30,8 @@ use wyrd_semver::VersionBlock;
 use wyrd_server::config::{ClaimMappingEntry, ClientAuthEntry, IssuerEntry, WorkloadBindingEntry};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
-    IssueKeyRequest, IssueKeyResponse, IssuerTokenPolicy, IssuerUrl, LoginInitiation, PrincipalId,
-    Sha256Hex, TokenAudience, TokenResponse,
+    IssueKeyRequest, IssueKeyResponse, IssuerTokenPolicy, IssuerUrl, PrincipalId, Sha256Hex,
+    TokenAudience,
 };
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
@@ -125,24 +125,24 @@ async fn post_jwt_bearer(srv: &WyrdTestServer, assertion: &str) -> axum::http::R
 /// POST a jwt-bearer assertion at `/auth/token` routed to an explicit tenant.
 ///
 /// The host carries no tenant subdomain, so the route resolves the tenant from
-/// the body `tenant` slug. The isolation test drives the same assertion at two
-/// distinct tenant slugs to prove binding resolution is tenant-scoped.
+/// the form's `tenant` slug. The isolation test drives the same assertion at
+/// two distinct tenant slugs to prove binding resolution is tenant-scoped.
 async fn post_jwt_bearer_for_tenant(
     srv: &WyrdTestServer,
     assertion: &str,
     tenant: &str,
 ) -> axum::http::Response<Body> {
-    let body = serde_json::json!({
-        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-        "assertion": assertion,
-        "tenant": tenant,
-    });
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer")
+        .append_pair("assertion", assertion)
+        .append_pair("tenant", tenant)
+        .finish();
     srv.oneshot(
         Request::builder()
             .method(Method::POST)
             .uri("/auth/token")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_vec(&body).expect("serializes")))
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body))
             .expect("request builds"),
     )
     .await
@@ -506,22 +506,11 @@ async fn workload_jwt_bearer_unbound_subject_returns_404_keycloak() {
         .await
         .expect("server boots config-driven");
 
-    let resp = post_jwt_bearer(&srv, &assertion).await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::NOT_FOUND,
-        "unbound workload subject returns 404: {}",
-        resp.status()
-    );
-    let bytes = to_bytes(resp.into_body(), 65_536)
-        .await
-        .expect("body reads");
-    let body: Value = serde_json::from_slice(&bytes).unwrap_or_default();
-    assert_eq!(
-        response_code(&body),
-        "WYRD_AUTH_404_PRINCIPAL_NOT_FOUND",
-        "unbound subject error code; body={body}"
-    );
+    assert_jwt_bearer_refused(
+        post_jwt_bearer(&srv, &assertion).await,
+        "unbound workload subject",
+    )
+    .await;
 }
 
 /// The tenant's machine principals that record runtime activity, sorted.
@@ -976,6 +965,7 @@ const CONFIDENTIAL_HUMAN_SECRET: &str = "wyrd-human-confidential-secret";
 fn human_server_builder() -> WyrdTestServerBuilder {
     WyrdTestServerBuilder::default()
         .with_public_origin(PUBLIC_ORIGIN.parse().expect("public origin parses"))
+        .with_ui_client_secret(UI_CLIENT_SECRET)
 }
 
 /// The group map every human journey grants through: the realm's
@@ -1214,84 +1204,123 @@ async fn human_server() -> WyrdTestServer {
     srv
 }
 
-/// Path of the BFF route a completed browser login is redirected to.
-const LOGIN_COMPLETE: &str = "/login/complete";
+/// The `wyrd-ui` client secret every human journey server registers; the
+/// journey plays that confidential client at the token endpoint.
+const UI_CLIENT_SECRET: &str = "identity-journey-ui-secret";
 
-/// A fresh browser flow binding: the SHA-256 of a random flow id, as the BFF
-/// derives it from the HttpOnly flow cookie it set before beginning login.
-fn new_flow() -> Sha256Hex {
-    Sha256Hex::digest(uuid::Uuid::new_v4().as_bytes())
+/// The opaque `state` the journey's `wyrd-ui` client sends to
+/// `GET /auth/authorize` and expects echoed on every redirect back.
+const UI_STATE: &str = "journey-ui-state";
+
+/// The `wyrd-ui` client's registered redirect URI.
+fn ui_redirect() -> String {
+    format!("{PUBLIC_ORIGIN}/login/callback")
 }
 
-/// Send one auth-route request the way a well-behaved client does: a `429`
-/// from the shared per-peer auth governor is retried after the advertised
-/// `retry-after` (at least the governor's 100 ms replenish period).
-///
-/// Every journey request arrives from the same test peer, so a journey that
-/// makes more auth calls than the governor's burst would otherwise be refused
-/// by admission, not by the behavior under test. The governor refuses before
-/// any handler runs, so a retried request has consumed no login state.
+/// A fresh RFC 7636 code verifier and its S256 challenge, as the `wyrd-ui`
+/// client generates per authorization request.
+fn pkce_pair() -> (String, String) {
+    let verifier = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(<sha2::Sha256 as sha2::Digest>::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
+/// `GET /auth/authorize` as the `wyrd-ui` client for `tenant_slug` with the
+/// S256 `challenge`, under hostile `Host` and forwarded headers that must play
+/// no part; returns the status and `Location`.
 ///
 /// # Panics
-/// Panics when the router fails or the request is still refused after 50
-/// attempts.
-async fn auth_call(
+/// Panics when the request cannot be built, the router fails, or the
+/// `Location` does not parse.
+async fn authorize(
     srv: &WyrdTestServer,
-    request: impl Fn() -> Request<Body>,
-) -> axum::http::Response<Body> {
-    for _ in 0..50 {
-        let response = srv.oneshot(request()).await.expect("auth call completes");
-        if response.status() != StatusCode::TOO_MANY_REQUESTS {
-            return response;
-        }
-        let after = response
-            .headers()
-            .get(header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
-        tokio::time::sleep(StdDuration::from_secs(after).max(StdDuration::from_millis(100))).await;
-    }
-    panic!("the auth governor never admitted the request");
+    tenant_slug: &str,
+    challenge: &str,
+) -> (StatusCode, Option<Url>) {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("response_type", "code")
+        .append_pair("client_id", "wyrd-ui")
+        .append_pair("redirect_uri", &ui_redirect())
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", UI_STATE)
+        .append_pair("tenant", tenant_slug)
+        .finish();
+    let response = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/auth/authorize?{query}"))
+                .header(header::HOST, "attacker.example.net")
+                .header("x-forwarded-host", "attacker.example.net")
+                .header("x-forwarded-proto", "https")
+                .body(Body::empty())
+                .expect("authorize request builds"),
+        )
+        .await
+        .expect("auth call completes");
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.parse().expect("Location parses"));
+    (response.status(), location)
 }
 
-/// `POST /auth/login` with `body` and hostile `Host` and forwarded headers
-/// that must play no part; returns the status and JSON body.
+/// The RFC 6749 §4.1.2.1 `error` a redirect to the `wyrd-ui` client
+/// carries, after asserting it echoes the client's `state` and carries no
+/// code.
 ///
 /// # Panics
-/// Panics when the request cannot be built or the router fails.
-async fn begin_login(srv: &WyrdTestServer, host: &str, body: Value) -> (StatusCode, Value) {
-    let response = auth_call(srv, || {
-        Request::builder()
-            .method(Method::POST)
-            .uri("/auth/login")
-            .header(header::HOST, host)
-            .header("x-forwarded-host", "attacker.example.net")
-            .header("x-forwarded-proto", "https")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body.to_string()))
-            .expect("login request builds")
-    })
-    .await;
-    let status = response.status();
-    let bytes = to_bytes(response.into_body(), 65_536)
-        .await
-        .expect("login body reads");
-    (
-        status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-    )
+/// Panics when `location` is not a refusal redirect to the registered
+/// redirect URI.
+fn client_refusal(location: &str) -> String {
+    let params = client_redirect_params(location);
+    assert!(
+        !params.iter().any(|(name, _)| name == "code"),
+        "a refusal carries no code: {location}"
+    );
+    params
+        .into_iter()
+        .find_map(|(name, value)| (name == "error").then_some(value))
+        .unwrap_or_else(|| panic!("a refusal names its error: {location}"))
 }
 
-/// The begin body for a browser login of `tenant_slug` bound to `flow`.
-fn browser_begin(tenant_slug: &str, flow: &Sha256Hex) -> Value {
-    serde_json::json!({
-        "tenant_route_key": tenant_slug,
-        "browser_flow_hash": flow.to_string(),
-    })
+/// The query of a redirect to the `wyrd-ui` client's registered redirect
+/// URI, after asserting it echoes the client's `state`.
+///
+/// # Panics
+/// Panics when `location` is not the registered redirect URI or omits the
+/// state.
+fn client_redirect_params(location: &str) -> Vec<(String, String)> {
+    let url: Url = location.parse().expect("client redirect parses");
+    assert_eq!(
+        &url[..url::Position::AfterPath],
+        ui_redirect(),
+        "the redirect returns to the registered redirect URI"
+    );
+    let params: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+    assert!(
+        params.contains(&("state".to_owned(), UI_STATE.to_owned())),
+        "the redirect echoes the client state: {location}"
+    );
+    params
 }
 
-/// A provider's redirect back to Wyrd for one begun browser login.
+/// Begin an authorization request for the fixture tenant and return the
+/// RFC 6749 error it was refused with.
+///
+/// # Panics
+/// Panics when the request is not refused with a redirect to the client.
+async fn login_refusal(srv: &WyrdTestServer) -> String {
+    let (_, challenge) = pkce_pair();
+    let (status, location) = authorize(srv, FIXTURE_TENANT_SLUG, &challenge).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize redirects");
+    client_refusal(location.expect("a refusal redirects").as_str())
+}
+
+/// A provider's redirect back to Wyrd for one begun authorization request.
 struct ProviderReturn {
     /// The authorization code the provider issued.
     code: String,
@@ -1300,22 +1329,21 @@ struct ProviderReturn {
     /// The RFC 9207 issuer the provider returned, forwarded to the callback
     /// exactly as a browser following the redirect would.
     iss: Option<String>,
-    /// The browser flow binding the login was begun with.
-    flow: Sha256Hex,
+    /// The `wyrd-ui` client's PKCE verifier for the Wyrd authorization code.
+    verifier: String,
 }
 
-/// Begin a browser login for `tenant_slug` and authenticate `username` at
-/// `keycloak`, returning the provider's redirect back to Wyrd.
+/// Begin an authorization request for `tenant_slug` and authenticate
+/// `username` at `keycloak`, returning the provider's redirect back to Wyrd.
 ///
-/// `POST /auth/login` returns only the authorization URL — carrying the PKCE
-/// challenge, nonce, and state — and the Keycloak fixture submits the real
+/// `GET /auth/authorize` redirects to the provider with Wyrd's own PKCE
+/// challenge, nonce, and state, and the Keycloak fixture submits the real
 /// HTML login form. Nothing is exchanged yet, so a journey can change the
 /// tenant's connection between provider authentication and the callback.
 ///
 /// # Panics
-/// Panics when login initiation does not return `200` with only the URL,
-/// when the URL omits the PKCE challenge, nonce, or state, or when the IdP
-/// echoes a different `state`.
+/// Panics when the request does not redirect to the provider with the PKCE
+/// challenge, nonce, and state, or when the IdP echoes a different `state`.
 async fn authorization_code_for(
     srv: &WyrdTestServer,
     tenant_slug: &str,
@@ -1324,57 +1352,16 @@ async fn authorization_code_for(
     username: &str,
     password: &str,
 ) -> ProviderReturn {
-    authorization_code_bound(
-        srv,
-        tenant_slug,
-        new_flow(),
-        keycloak,
-        client_id,
-        username,
-        password,
-    )
-    .await
-}
-
-/// [`authorization_code_for`] with a caller-chosen browser flow binding, so a
-/// journey that holds the raw BFF flow id can later complete the browser
-/// session it names.
-///
-/// # Panics
-/// Panics exactly as [`authorization_code_for`] does.
-async fn authorization_code_bound(
-    srv: &WyrdTestServer,
-    tenant_slug: &str,
-    flow: Sha256Hex,
-    keycloak: &OidcIssuerFixture,
-    client_id: &str,
-    username: &str,
-    password: &str,
-) -> ProviderReturn {
-    let (status, body) = begin_login(
-        srv,
-        "attacker.example.net",
-        browser_begin(tenant_slug, &flow),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "login begins: {body}");
-    let fields: Vec<&String> = body.as_object().expect("begin body").keys().collect();
-    assert_eq!(
-        fields,
-        vec!["authorization_url"],
-        "begin returns only the URL"
-    );
-    let authz_url: Url = body["authorization_url"]
-        .as_str()
-        .expect("authorization_url present")
-        .parse()
-        .expect("authorization_url parses");
+    let (verifier, challenge) = pkce_pair();
+    let (status, location) = authorize(srv, tenant_slug, &challenge).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize redirects");
+    let authz_url = location.expect("authorize redirects to the provider");
     let query = |name: &str| {
         authz_url
             .query_pairs()
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.into_owned())
-            .unwrap_or_else(|| panic!("authorization_url carries {name}"))
+            .unwrap_or_else(|| panic!("the provider redirect carries {name}: {authz_url}"))
     };
     let (code_challenge, nonce, state) = (query("code_challenge"), query("nonce"), query("state"));
     let redirect_uri: Url = format!("{PUBLIC_ORIGIN}/auth/callback")
@@ -1400,7 +1387,7 @@ async fn authorization_code_bound(
         code: login.code,
         state: login.state,
         iss: login.iss,
-        flow,
+        verifier,
     }
 }
 
@@ -1474,15 +1461,17 @@ async fn callback_reply_with(
         query.append_pair("iss", iss);
     }
     let query = query.finish();
-    let response = auth_call(srv, || {
-        Request::builder()
-            .method(Method::GET)
-            .uri(format!("/auth/callback?{query}"))
-            .header(header::HOST, host)
-            .body(Body::empty())
-            .expect("callback request builds")
-    })
-    .await;
+    let response = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/auth/callback?{query}"))
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .expect("callback request builds"),
+        )
+        .await
+        .expect("auth call completes");
     let status = response.status();
     let location = response
         .headers()
@@ -1511,65 +1500,138 @@ async fn finish_callback(
     (reply.status, reply.problem())
 }
 
-/// Assert a browser callback completed: `303` to exactly the fixed
-/// `{PUBLIC_ORIGIN}/login/complete` with no query string, and a body that
-/// carries neither a token nor the provider code.
+/// The Wyrd authorization code a successful callback redirected the
+/// `wyrd-ui` client with, after asserting the `303` echoes the client state
+/// and the response carries neither a token nor the provider's code.
 ///
 /// # Panics
-/// Panics when any of those differ.
-fn assert_browser_completion(reply: &CallbackReply, code: &str) {
+/// Panics when the reply is not that redirect.
+fn authorized_code(reply: &CallbackReply, provider_code: &str) -> String {
     assert_eq!(
         reply.status,
         StatusCode::SEE_OTHER,
-        "a browser login completes with a redirect: {}",
+        "a login completes with a redirect: {}",
         reply.body
     );
-    assert_eq!(
-        reply.location.as_deref(),
-        Some(format!("{PUBLIC_ORIGIN}{LOGIN_COMPLETE}").as_str()),
-        "the redirect is the fixed completion route with no query"
-    );
-    for leaked in ["access_token", "refresh_token", code] {
+    let location = reply.location.as_deref().expect("the callback redirects");
+    for leaked in ["access_token", "refresh_token", provider_code] {
         assert!(
-            !reply.body.contains(leaked),
+            !reply.body.contains(leaked) && !location.contains(leaked),
             "the callback response carries no {leaked}"
         );
     }
+    client_redirect_params(location)
+        .into_iter()
+        .find_map(|(name, value)| (name == "code").then_some(value))
+        .unwrap_or_else(|| panic!("the redirect carries the code: {location}"))
 }
 
-/// Redeem the completed login bound to `flow` in `tenant` through the owner
-/// primitive the BFF completion route wraps.
-///
-/// # Errors
-/// Returns the redemption refusal.
+/// The RFC 6749 error a refused callback redirected the `wyrd-ui` client
+/// with.
 ///
 /// # Panics
-/// Panics when the server has no connection owner.
-async fn redeem(
+/// Panics when the reply is not a refusal redirect to the client.
+fn callback_refusal(reply: &CallbackReply) -> String {
+    assert_eq!(
+        reply.status,
+        StatusCode::SEE_OTHER,
+        "a refused login redirects to the client: {}",
+        reply.body
+    );
+    client_refusal(reply.location.as_deref().expect("the callback redirects"))
+}
+
+/// Present a provider return to the callback and return the RFC 6749 error
+/// the refused login redirected the client with.
+///
+/// # Panics
+/// Panics when the login is not refused with a redirect to the client.
+async fn refused_login(srv: &WyrdTestServer, code: &str, state: &str, iss: Option<&str>) -> String {
+    callback_refusal(&callback_reply(srv, code, state, iss, "test-tenant-1.wyrd.test").await)
+}
+
+/// Redeem `code` at `POST /auth/token` as the confidential `wyrd-ui` client
+/// with `verifier`, returning the status and RFC 6749 JSON body.
+///
+/// # Panics
+/// Panics when the request cannot be built or the router fails.
+async fn redeem(srv: &WyrdTestServer, code: &str, verifier: &str) -> (StatusCode, Value) {
+    let redirect_uri = ui_redirect();
+    token_call(
+        srv,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", &redirect_uri),
+            ("code_verifier", verifier),
+        ],
+    )
+    .await
+}
+
+/// `POST /auth/token` with the form `params`, authenticated as the
+/// confidential `wyrd-ui` client (`client_secret_basic`), returning the
+/// status and RFC 6749 JSON body.
+///
+/// # Panics
+/// Panics when the request cannot be built or the router fails.
+async fn token_call(srv: &WyrdTestServer, params: &[(&str, &str)]) -> (StatusCode, Value) {
+    let form = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(params)
+        .finish();
+    let (status, _, body) = token_request(
+        srv,
+        UI_CLIENT_SECRET,
+        "application/x-www-form-urlencoded",
+        form,
+    )
+    .await;
+    (status, body)
+}
+
+/// `POST /auth/token` with `body` of `content_type`, authenticated as
+/// `wyrd-ui` with `secret`, returning the status, headers, and JSON body.
+///
+/// # Panics
+/// Panics when the request cannot be built or the router fails.
+async fn token_request(
     srv: &WyrdTestServer,
-    tenant: DataTenantId,
-    flow: &Sha256Hex,
-) -> Result<TokenResponse, WyrdError> {
-    srv.state()
-        .auth
-        .human_connections
-        .as_ref()
-        .expect("the server owns human connections")
-        .redeem_completion(tenant, LoginInitiation::Browser(*flow))
+    secret: &str,
+    content_type: &str,
+    body: String,
+) -> (StatusCode, header::HeaderMap, Value) {
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("wyrd-ui:{secret}"));
+    let response = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/auth/token")
+                .header(header::AUTHORIZATION, format!("Basic {basic}"))
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body.clone()))
+                .expect("token request builds"),
+        )
         .await
+        .expect("auth call completes");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = to_bytes(response.into_body(), 65_536)
+        .await
+        .expect("token body reads");
+    (
+        status,
+        headers,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
-/// Complete one provider return through the callback and the owner's
-/// redemption, returning the session as JSON.
+/// Complete one provider return through the callback and the token
+/// endpoint, returning the session JSON.
 ///
 /// # Panics
-/// Panics when the callback is not a clean browser completion or the
-/// completion does not redeem exactly once.
-async fn complete_login(
-    srv: &WyrdTestServer,
-    tenant: DataTenantId,
-    provider: &ProviderReturn,
-) -> Value {
+/// Panics when the callback does not redirect the client with a code, or the
+/// code does not redeem exactly once.
+async fn complete_login(srv: &WyrdTestServer, provider: &ProviderReturn) -> Value {
     let reply = callback_reply(
         srv,
         &provider.code,
@@ -1578,23 +1640,21 @@ async fn complete_login(
         "attacker.example.net",
     )
     .await;
-    assert_browser_completion(&reply, &provider.code);
-    let session = redeem(srv, tenant, &provider.flow)
-        .await
-        .expect("the completion redeems");
-    assert!(
-        redeem(srv, tenant, &provider.flow).await.is_err(),
-        "a completion redeems once"
-    );
-    serde_json::to_value(session).expect("session serializes")
+    let code = authorized_code(&reply, &provider.code);
+    let (status, session) = redeem(srv, &code, &provider.verifier).await;
+    assert_eq!(status, StatusCode::OK, "the code redeems: {session}");
+    let (status, replay) = redeem(srv, &code, &provider.verifier).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a code redeems once");
+    assert_eq!(replay["error"], "invalid_grant", "{replay}");
+    session
 }
 
-/// Drive one complete browser login for the fixture tenant and return the
-/// session JSON.
+/// Drive one complete authorization-code login for the fixture tenant and
+/// return the session JSON.
 ///
-/// This is the served human path end to end: begin with a random flow
-/// binding, authenticate at Keycloak, receive the `303` from the common
-/// callback, and redeem the sealed completion once. Every human journey
+/// This is the served human path end to end: authorize as `wyrd-ui`,
+/// authenticate at Keycloak, receive the `303` with a code from the common
+/// callback, and redeem it once at the token endpoint. Every human journey
 /// starts here.
 ///
 /// # Panics
@@ -1607,7 +1667,7 @@ async fn human_login(
     password: &str,
 ) -> Value {
     let provider = authorization_code(srv, keycloak, client_id, username, password).await;
-    complete_login(srv, srv.data_tenant_id(), &provider).await
+    complete_login(srv, &provider).await
 }
 
 /// Read the Wyrd principal id a session's access token was minted for.
@@ -1627,18 +1687,231 @@ fn principal_id_of(access_token: &str) -> String {
         .to_owned()
 }
 
-/// Drive a complete config-driven human OIDC login:
+/// The off-the-shelf `oauth2` crate client the CLI journeys play `wyrd-cli`
+/// with: a public client sending its `client_id` in the form body.
+type CliClient = oauth2::basic::BasicClient<
+    oauth2::EndpointNotSet,
+    oauth2::EndpointSet,
+    oauth2::EndpointNotSet,
+    oauth2::EndpointNotSet,
+    oauth2::EndpointSet,
+>;
+
+/// The `wyrd-cli` client, configured with nothing but the endpoint URLs the
+/// server's RFC 8414 metadata publishes.
+///
+/// # Panics
+/// Panics when an endpoint URL does not parse.
+fn cli_client() -> CliClient {
+    oauth2::basic::BasicClient::new(oauth2::ClientId::new("wyrd-cli".to_owned()))
+        .set_auth_type(oauth2::AuthType::RequestBody)
+        .set_device_authorization_url(
+            oauth2::DeviceAuthorizationUrl::new(format!(
+                "{PUBLIC_ORIGIN}/auth/device_authorization"
+            ))
+            .expect("device authorization URL parses"),
+        )
+        .set_token_uri(
+            oauth2::TokenUrl::new(format!("{PUBLIC_ORIGIN}/auth/token")).expect("token URL parses"),
+        )
+}
+
+/// Serve one `oauth2` crate request through `srv`'s router, exactly as the
+/// crate's network client would deliver it.
+///
+/// # Errors
+/// Never fails: a router failure panics instead.
+///
+/// # Panics
+/// Panics when the router fails or the body cannot be read.
+async fn oauth_http(
+    srv: &WyrdTestServer,
+    request: oauth2::HttpRequest,
+) -> Result<oauth2::HttpResponse, std::convert::Infallible> {
+    let response = srv
+        .oneshot({
+            let mut rebuilt = Request::builder()
+                .method(request.method().clone())
+                .uri(request.uri().clone());
+            for (name, value) in request.headers() {
+                rebuilt = rebuilt.header(name, value);
+            }
+            rebuilt
+                .body(Body::from(request.body().clone()))
+                .expect("request rebuilds")
+        })
+        .await
+        .expect("auth call completes");
+    let (parts, body) = response.into_parts();
+    let body = to_bytes(body, 65_536).await.expect("body reads");
+    Ok(oauth2::HttpResponse::from_parts(parts, body.to_vec()))
+}
+
+/// Complete one CLI device login (RFC 8628) for the fixture tenant as
+/// `username` with the `oauth2` crate: authorize a device code, approve its
+/// user code on the verification page, sign in at the provider it redirects
+/// to, deliver the provider's return to the common callback, and poll the
+/// token endpoint until the device code redeems.
+///
+/// # Panics
+/// Panics when any step fails.
+async fn cli_login(
+    srv: &WyrdTestServer,
+    cli: &CliClient,
+    username: &str,
+    password: &str,
+) -> oauth2::basic::BasicTokenResponse {
+    let http = |request| oauth_http(srv, request);
+    let device = begin_device_login(srv, cli).await;
+    let sign_in = approve_device(srv, device.user_code().secret()).await;
+    let returned = provider_sign_in(
+        &sign_in,
+        username,
+        password,
+        &format!("{PUBLIC_ORIGIN}/auth/callback"),
+    )
+    .await;
+    let params: Vec<(String, String)> = returned.query_pairs().into_owned().collect();
+    let params: Vec<(&str, &str)> = params
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let reply = callback_reply_with(srv, &params, None, "test-tenant-1.wyrd.test").await;
+    assert_eq!(reply.status, StatusCode::OK, "the device sign-in completes");
+    assert!(reply.body.contains("Sign-in complete"), "{}", reply.body);
+    cli.exchange_device_access_token(&device)
+        .request_async(&http, tokio::time::sleep, None)
+        .await
+        .expect("the device code redeems")
+}
+
+/// Approve `user_code` for the fixture tenant on the verification page and
+/// return the provider sign-in URL it redirects to.
+///
+/// # Panics
+/// Panics when the page refuses the approval.
+async fn approve_device(srv: &WyrdTestServer, user_code: &str) -> Url {
+    let response = decide_device(srv, user_code, "approve").await;
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "approval redirects to sign-in"
+    );
+    response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|location| location.to_str().ok())
+        .expect("approval names the sign-in URL")
+        .parse()
+        .expect("sign-in URL parses")
+}
+
+/// Post `decision` (`approve` or `deny`) for `user_code` and the fixture
+/// tenant to the verification page from the deployment's origin, as the
+/// page's own form does.
+///
+/// # Panics
+/// Panics when the request cannot be built or the router fails.
+async fn decide_device(
+    srv: &WyrdTestServer,
+    user_code: &str,
+    decision: &str,
+) -> axum::http::Response<Body> {
+    let form = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("tenant", FIXTURE_TENANT_SLUG)
+        .append_pair("user_code", user_code)
+        .append_pair("decision", decision)
+        .finish();
+    srv.oneshot(
+        Request::builder()
+            .method(Method::POST)
+            .uri("/auth/device")
+            .header(header::ORIGIN, PUBLIC_ORIGIN)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(form.clone()))
+            .expect("device decision request builds"),
+    )
+    .await
+    .expect("auth call completes")
+}
+
+/// Poll `POST /auth/token` once with `device_code` as the public `wyrd-cli`
+/// client (RFC 8628 §3.4) and read the status and RFC 6749 body.
+///
+/// # Panics
+/// Panics when the request cannot be built, the router fails, or the body
+/// is not JSON.
+async fn device_poll(srv: &WyrdTestServer, device_code: &str) -> (StatusCode, Value) {
+    let form = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
+        .append_pair("device_code", device_code)
+        .append_pair("client_id", "wyrd-cli")
+        .finish();
+    let response = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/auth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(form.clone()))
+                .expect("device poll builds"),
+        )
+        .await
+        .expect("auth call completes");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 65_536)
+        .await
+        .expect("poll body reads");
+    (
+        status,
+        serde_json::from_slice(&body).expect("poll body is JSON"),
+    )
+}
+
+/// Begin one device login for the fixture tenant as `wyrd-cli` with the
+/// `oauth2` crate.
+///
+/// # Panics
+/// Panics when the device authorization request is refused.
+async fn begin_device_login(
+    srv: &WyrdTestServer,
+    cli: &CliClient,
+) -> oauth2::StandardDeviceAuthorizationResponse {
+    cli.exchange_device_code()
+        .add_extra_param("tenant", FIXTURE_TENANT_SLUG)
+        .request_async(&|request| oauth_http(srv, request))
+        .await
+        .expect("the device login begins")
+}
+
+/// Whether `result` is the RFC 6749 §5.2 `invalid_grant` refusal.
+fn is_invalid_grant<T>(
+    result: &Result<
+        T,
+        oauth2::RequestTokenError<std::convert::Infallible, oauth2::basic::BasicErrorResponse>,
+    >,
+) -> bool {
+    matches!(
+        result,
+        Err(oauth2::RequestTokenError::ServerResponse(error))
+            if *error.error() == oauth2::basic::BasicErrorResponseType::InvalidGrant
+    )
+}
+
+/// Drive a complete config-driven human OIDC login through the CLI's device
+/// grant with the off-the-shelf `oauth2` crate:
 ///   1. a tenant admin stages, tests, and activates the Keycloak connection
 ///      through `/v1/identity/oidc/*`, granting `writer` through the
 ///      `wyrd-admins` group so the federated human can be a subject,
-///   2. `POST /auth/login` with a browser flow binding → authorization URL,
-///   3. `OidcIssuerFixture::human_login` authenticates alice → code + state,
-///   4. `GET /auth/callback` → `303` to `/login/complete`, and the sealed
-///      session redeems once by the flow binding,
+///   2. `POST /auth/device_authorization` as the public `wyrd-cli` client,
+///   3. alice approves the user code and signs in at Keycloak; the common
+///      callback records only the approval,
+///   4. the device-code poll at `POST /auth/token` mints the session,
 ///   5. the human token reaches a real Card write through delegation.
 ///
-/// It then rotates the refresh token, proves the successor still authorizes,
-/// and proves a replay of the consumed token is refused and kills the successor.
+/// It then rotates the public client's refresh token, proves the successor
+/// still authorizes, and proves a replay of the consumed token is refused
+/// with `invalid_grant` and kills the successor (RFC 9700 §4.14.2).
 ///
 /// # Panics
 /// Panics when the server fails to start, a login, refresh, or check step
@@ -1646,56 +1919,43 @@ fn principal_id_of(access_token: &str) -> String {
 #[tokio::test]
 #[ignore = "requires the Keycloak and Dex identity lane"]
 async fn human_oidc_login_journey() {
-    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
-
     let srv = human_server().await;
     let baseline_activity = activated_principals(&srv).await;
+    let cli = cli_client();
+    let http = |request| oauth_http(&srv, request);
 
-    let token_body = human_login(
-        &srv,
-        &keycloak,
-        PUBLIC_HUMAN_CLIENT,
-        "alice",
-        "alice-password",
-    )
-    .await;
-    let access_token = token_body["access_token"]
-        .as_str()
-        .expect("access_token present in response");
+    let token = cli_login(&srv, &cli, "alice", "alice-password").await;
+    let access_token = token.access_token().secret();
     assert!(!access_token.is_empty(), "access token is non-empty");
 
-    // Step 4: human token reaches a real authenticated /v1 200 via delegation.
+    // Step 5: human token reaches a real authenticated /v1 200 via delegation.
     let first_actor = assert_v1_delegated_write_ok(&srv, access_token, "human-sso").await;
 
-    // Step 5: the human session carries a refresh token. Only human sessions
-    // do; a machine client re-exchanges its durable credential instead.
-    let refresh_token = token_body["refresh_token"]
-        .as_str()
-        .expect("a human session is issued a refresh token")
-        .to_owned();
-
-    // Step 6: renew the session. A real UI does this once the 15-minute access
-    // token expires; the grant does not consult the clock, so presenting the
-    // refresh token is the whole renewal.
-    let (rotated_status, rotated_body) = post_refresh(&srv, &refresh_token).await;
-    assert_eq!(
-        rotated_status,
-        StatusCode::OK,
-        "refresh rotation returns 200: {rotated_body}"
+    // Step 6: the CLI session carries a refresh token and renews by rotating
+    // it. The grant does not consult the clock, so presenting the refresh
+    // token is the whole renewal.
+    let refresh_token = token
+        .refresh_token()
+        .expect("a human session is issued a refresh token");
+    let rotated = cli
+        .exchange_refresh_token(refresh_token)
+        .request_async(&http)
+        .await
+        .expect("the refresh token rotates");
+    let successor = rotated
+        .refresh_token()
+        .expect("rotation returns the successor refresh token");
+    assert_ne!(
+        successor.secret(),
+        refresh_token.secret(),
+        "the token rotated"
     );
-    let rotated_access = rotated_body["access_token"]
-        .as_str()
-        .expect("rotation returns an access token")
-        .to_owned();
-    let successor_refresh = rotated_body["refresh_token"]
-        .as_str()
-        .expect("rotation returns the successor refresh token")
-        .to_owned();
 
     // Step 7: the successor reaches the same protected /v1 200, proving the
     // renewed session kept the authority the provider asserted at login.
     let second_actor =
-        assert_v1_delegated_write_ok(&srv, &rotated_access, "human-sso-rotated").await;
+        assert_v1_delegated_write_ok(&srv, rotated.access_token().secret(), "human-sso-rotated")
+            .await;
 
     // Neither the human login, refresh, nor delegation records new machine
     // activity. Connection setup may have activated its card-bound admin;
@@ -1710,56 +1970,169 @@ async fn human_oidc_login_journey() {
     );
 
     // Step 8: replaying the consumed token is refused and contains the theft.
-    let (replay_status, replay_body) = post_refresh(&srv, &refresh_token).await;
-    assert_eq!(
-        replay_status,
-        StatusCode::UNAUTHORIZED,
-        "replaying the consumed refresh token is refused: {replay_body}"
-    );
-    assert_eq!(
-        response_code(&replay_body),
-        "WYRD_AUTH_401_REFRESH_REUSED",
-        "replay renders the reuse code: {replay_body}"
+    let replay = cli
+        .exchange_refresh_token(refresh_token)
+        .request_async(&http)
+        .await;
+    assert!(
+        is_invalid_grant(&replay),
+        "replaying the consumed refresh token is refused: {replay:?}"
     );
 
     // Step 9: containment was committed with the refusal, so the successor the
     // attacker would hold is dead on a separate request and transaction.
-    let (successor_status, successor_body) = post_refresh(&srv, &successor_refresh).await;
-    assert_eq!(
-        successor_status,
-        StatusCode::UNAUTHORIZED,
-        "the successor cannot rotate after replay: {successor_body}"
+    let after_replay = cli
+        .exchange_refresh_token(successor)
+        .request_async(&http)
+        .await;
+    assert!(
+        is_invalid_grant(&after_replay),
+        "the successor cannot rotate after replay: {after_replay:?}"
     );
 }
 
-/// Present a refresh token to `POST /auth/token` and read the status and body.
+/// The CLI's device grant issues nothing it should not (RFC 8628 §3.5), and
+/// the authorization server publishes the endpoints the `oauth2` crate is
+/// configured with (RFC 8414):
+///   1. the metadata names the token, device, revocation, and authorization
+///      endpoints under the public origin and S256 as the only PKCE method,
+///   2. a pending code answers `authorization_pending`, then `slow_down` when
+///      polled again within the interval; an unknown code is `invalid_grant`,
+///   3. a denied code answers `access_denied` once and `invalid_grant` after,
+///   4. an expired code answers `expired_token` once and `invalid_grant`
+///      after, and can no longer be approved,
+///   5. revoking an unknown token answers `200` (RFC 7009 §2.2).
 ///
-/// The rotation half of the human session journey runs several times — renew,
-/// replay, and then the revoked successor — and each call needs the same
-/// tenant host header and JSON envelope.
-async fn post_refresh(srv: &WyrdTestServer, refresh_token: &str) -> (StatusCode, Value) {
-    let body = serde_json::json!({
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-    });
+/// No refused poll returns a token.
+///
+/// # Panics
+/// Panics when the server fails to start or any answer differs.
+#[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
+async fn device_grant_refusal_journey() {
+    let srv = human_server().await;
+    let cli = cli_client();
+
+    // Step 1: RFC 8414 metadata.
     let response = srv
         .oneshot(
             Request::builder()
-                .method(Method::POST)
-                .uri("/auth/token")
-                .header(header::HOST, "test-tenant-1.wyrd.test")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string()))
-                .expect("refresh request builds"),
+                .uri("/.well-known/oauth-authorization-server")
+                .body(Body::empty())
+                .expect("metadata request builds"),
         )
         .await
-        .expect("refresh call completes");
-    let status = response.status();
-    let bytes = to_bytes(response.into_body(), 65_536)
+        .expect("auth call completes");
+    assert_eq!(response.status(), StatusCode::OK);
+    let metadata: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), 65_536)
+            .await
+            .expect("metadata reads"),
+    )
+    .expect("metadata is JSON");
+    assert_eq!(metadata["issuer"], PUBLIC_ORIGIN, "{metadata}");
+    for (field, path) in [
+        ("authorization_endpoint", "/auth/authorize"),
+        ("token_endpoint", "/auth/token"),
+        (
+            "device_authorization_endpoint",
+            "/auth/device_authorization",
+        ),
+        ("revocation_endpoint", "/auth/revoke"),
+    ] {
+        assert_eq!(metadata[field], format!("{PUBLIC_ORIGIN}{path}"), "{field}");
+    }
+    assert_eq!(
+        metadata["code_challenge_methods_supported"],
+        serde_json::json!(["S256"])
+    );
+
+    // Step 2: pending, too fast, unknown.
+    let pending = begin_device_login(&srv, &cli).await;
+    let code = pending.device_code().secret();
+    for expected in ["authorization_pending", "slow_down"] {
+        let (status, body) = device_poll(&srv, code).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], expected, "{body}");
+    }
+    let (status, body) = device_poll(&srv, "not-a-device-code").await;
+    assert_eq!(
+        (status, &body["error"]),
+        (StatusCode::BAD_REQUEST, &serde_json::json!("invalid_grant"))
+    );
+
+    // Step 3: denied.
+    let denial = decide_device(&srv, pending.user_code().secret(), "deny").await;
+    assert_eq!(
+        denial.status(),
+        StatusCode::OK,
+        "the page records the denial"
+    );
+    for expected in ["access_denied", "invalid_grant"] {
+        let (status, body) = device_poll(&srv, code).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], expected, "{body}");
+        assert!(body.get("access_token").is_none(), "{body}");
+    }
+
+    // Step 4: expired.
+    let expiring = begin_device_login(&srv, &cli).await;
+    sqlx::query(
+        "UPDATE wyrd.auth_device_authorizations
+            SET created_at = statement_timestamp() - interval '11 minutes',
+                expires_at = statement_timestamp() - interval '1 minute'",
+    )
+    .execute(
+        &srv.pg_fixture()
+            .superuser_pool()
+            .await
+            .expect("superuser pool opens"),
+    )
+    .await
+    .expect("the device code expires");
+    let refused = decide_device(&srv, expiring.user_code().secret(), "approve").await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::BAD_REQUEST,
+        "an expired code is not approved"
+    );
+    for expected in ["expired_token", "invalid_grant"] {
+        let (status, body) = device_poll(&srv, expiring.device_code().secret()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], expected, "{body}");
+        assert!(body.get("access_token").is_none(), "{body}");
+    }
+
+    // Step 5: revoking an unknown token succeeds and revokes nothing.
+    let form = "token=not-a-token&client_id=wyrd-cli";
+    let revoked = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/auth/revoke")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(form))
+                .expect("revoke request builds"),
+        )
         .await
-        .expect("refresh body reads");
-    let parsed = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, parsed)
+        .expect("auth call completes");
+    assert_eq!(revoked.status(), StatusCode::OK);
+}
+
+/// Present a `wyrd-ui` refresh token to `POST /auth/token` as that
+/// confidential client and read the status and RFC 6749 body.
+///
+/// # Panics
+/// Panics when the request cannot be built or the router fails.
+async fn post_refresh(srv: &WyrdTestServer, refresh_token: &str) -> (StatusCode, Value) {
+    token_call(
+        srv,
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+        ],
+    )
+    .await
 }
 
 /// Revoking a human retires the session's refresh authority immediately.
@@ -1767,8 +2140,8 @@ async fn post_refresh(srv: &WyrdTestServer, refresh_token: &str) -> (StatusCode,
 /// A human session holds a short-lived access token and a refresh token. This
 /// journey drives the served path an operator actually uses: log in, use the
 /// access token, revoke the User principal through `/v1/principals/{id}/revoke`,
-/// and then show the session cannot continue — the refresh token cannot rotate,
-/// so no successor exists — while the access token already issued keeps its
+/// and then show the session cannot continue — the refresh token, which renews
+/// without rotating before the revocation, no longer renews — while the access token already issued keeps its
 /// snapshot authority only until its five-minute expiry.
 ///
 /// # Panics
@@ -1801,6 +2174,18 @@ async fn revoking_a_human_kills_the_session_refresh_authority() {
 
     // The live session works before anyone revokes it.
     assert_v1_delegated_write_ok(&srv, &access_token, "human-revoke").await;
+
+    // The confidential `wyrd-ui` refresh token does not rotate: the same
+    // token renews twice and no successor is issued.
+    for renewal in 0..2 {
+        let (status, renewed) = post_refresh(&srv, &refresh_token).await;
+        assert_eq!(status, StatusCode::OK, "renewal {renewal}: {renewed}");
+        assert!(renewed["access_token"].is_string(), "{renewed}");
+        assert!(
+            renewed.get("refresh_token").is_none(),
+            "a wyrd-ui renewal issues no successor: {renewed}"
+        );
+    }
 
     // An administrator revokes the human principal by id and kind.
     let admin = srv
@@ -1841,13 +2226,13 @@ async fn revoking_a_human_kills_the_session_refresh_authority() {
     // The access token is a self-contained snapshot and lapses at expiry.
     assert_v1_delegated_write_ok(&srv, &access_token, "human-revoke-window").await;
 
-    // The refresh half is retired in the same transaction, so rotation is
-    // refused and mints no successor for the session to continue under.
+    // The refresh half is retired in the same transaction, so renewal is
+    // refused and mints nothing for the session to continue under.
     let (refresh_status, refresh_body) = post_refresh(&srv, &refresh_token).await;
     assert_eq!(
-        refresh_status,
-        StatusCode::UNAUTHORIZED,
-        "the revoked human's refresh token cannot rotate: {refresh_body}"
+        (refresh_status, &refresh_body["error"]),
+        (StatusCode::BAD_REQUEST, &Value::from("invalid_grant")),
+        "the revoked human's refresh token cannot renew: {refresh_body}"
     );
     assert!(
         refresh_body["access_token"].is_null() && refresh_body["refresh_token"].is_null(),
@@ -1996,20 +2381,6 @@ async fn roles_sync_events(srv: &WyrdTestServer, principal_id: &str) -> i64 {
 fn assert_refused(status: StatusCode, body: &Value, expected: StatusCode, code: &str) {
     assert_eq!(status, expected, "expected {expected} {code}: {body}");
     assert_eq!(response_code(body), code, "stable code: {body}");
-}
-
-/// Begin a browser login for the fixture tenant and return the status: `200`
-/// while the tenant has an Active connection.
-///
-/// # Panics
-/// Panics when the request cannot be built or the router fails.
-async fn login_status(srv: &WyrdTestServer) -> (StatusCode, Value) {
-    begin_login(
-        srv,
-        "test-tenant-1.wyrd.test",
-        browser_begin(FIXTURE_TENANT_SLUG, &new_flow()),
-    )
-    .await
 }
 
 /// Tenant human connection administration across two tenants, one issuer.
@@ -2269,13 +2640,7 @@ async fn tenant_connection_admin_journey() {
     let (status, body) =
         call_json(&srv, &admin_a.token, Method::POST, ACTIVE_DEACTIVATE, None).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "deactivates: {body}");
-    let (status, body) = login_status(&srv).await;
-    assert_refused(
-        status,
-        &body,
-        StatusCode::UNAUTHORIZED,
-        "WYRD_AUTH_401_INVALID_TOKEN",
-    );
+    assert_eq!(login_refusal(&srv).await, "access_denied");
     let (status, body) = call_json(
         &srv,
         &admin_a.token,
@@ -2899,13 +3264,7 @@ async fn tenant_connection_rotation_journey() {
     );
     let (status, body) = call_json(&replica_b, token, Method::POST, ACTIVE_DEACTIVATE, None).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "B deactivates: {body}");
-    let (status, body) = login_status(&replica_k2).await;
-    assert_refused(
-        status,
-        &body,
-        StatusCode::UNAUTHORIZED,
-        "WYRD_AUTH_401_INVALID_TOKEN",
-    );
+    assert_eq!(login_refusal(&replica_k2).await, "access_denied");
 
     // 8. Each recovery decision is staged on the canonical audit path,
     //    attributed to the recovery principal and its verified credential;
@@ -2968,367 +3327,6 @@ async fn tenant_connection_rotation_journey() {
     replica_b.shutdown().await.expect("replica B shuts down");
 }
 
-/// Raw BFF service key the browser-session rotation journey mounts the
-/// private channel with.
-const ROTATION_BFF_KEY: &str = "browser-session-rotation-bff-key";
-
-/// A fresh 256-bit lowercase-hex value, the shape of every raw BFF flow id
-/// and CSRF token.
-fn random_hex_256() -> String {
-    Sha256Hex::digest(Uuid::new_v4().as_bytes()).to_string()
-}
-
-/// The browser-session owner a server's BFF channel serves through.
-///
-/// # Panics
-/// Panics when the server was started without a BFF service key.
-fn browser_sessions(srv: &WyrdTestServer) -> wyrd_auth::browser_sessions::BrowserSessions {
-    srv.state()
-        .auth
-        .bff
-        .as_ref()
-        .expect("the BFF channel is mounted")
-        .sessions
-        .clone()
-}
-
-/// Every non-null sealed column of the browser session `session_id` names,
-/// read as superuser in a stable column order.
-///
-/// # Panics
-/// Panics when the read fails or no session row exists.
-async fn session_envelopes(superuser: &PgPool, session_id: &SecretString) -> Vec<Vec<u8>> {
-    sqlx::query_scalar(
-        "SELECT array_remove(ARRAY[access_token_sealed, refresh_token_sealed, \
-                api_key_sealed, csrf_token_sealed], NULL) \
-         FROM wyrd.auth_browser_sessions WHERE id_hash = $1",
-    )
-    .bind(
-        Sha256Hex::digest(session_id.expose_secret().as_bytes())
-            .as_bytes()
-            .as_slice(),
-    )
-    .fetch_one(superuser)
-    .await
-    .expect("session row reads")
-}
-
-/// Make the stored access token of `session_id` stale so its next use renews
-/// through the session's mode-specific issuance path.
-///
-/// # Panics
-/// Panics when the update does not touch exactly one row.
-async fn expire_session_access(superuser: &PgPool, session_id: &SecretString) {
-    let updated = sqlx::query(
-        "UPDATE wyrd.auth_browser_sessions \
-         SET access_expires_at = statement_timestamp() - interval '1 minute' \
-         WHERE id_hash = $1",
-    )
-    .bind(
-        Sha256Hex::digest(session_id.expose_secret().as_bytes())
-            .as_bytes()
-            .as_slice(),
-    )
-    .execute(superuser)
-    .await
-    .expect("access expiry updates");
-    assert_eq!(updated.rows_affected(), 1, "exactly one session is stale");
-}
-
-/// Live browser sessions survive canonical sealing-key rotation.
-///
-/// One tenant has an Active Keycloak connection and a K1-only server with the
-/// BFF channel mounted. The journey proves:
-///   1. an SSO session (completed from a real Keycloak login bound to the raw
-///      BFF flow id) and an OIDC-off API-key session are created, with every
-///      sealed column (access, refresh or API key, CSRF) under K1;
-///   2. the canonical `SealedSecretRewrap` pass with K2 written and K1
-///      retained races a concurrent K1 renewal of the SSO access token: the
-///      pass's compare-and-swap blocks on the renewal's row lock, loses to
-///      it, and reports `remaining == 1` rather than overwriting it;
-///   3. a later pass reseals that late write and reports `remaining == 0`,
-///      leaving every session envelope current under K2;
-///   4. a keyless boot still refuses while those live envelopes exist;
-///   5. a K2-only replica reads both sessions with their original CSRF
-///      tokens, renews each through its mode (refresh rotation, API-key
-///      re-exchange), and performs each mode-specific logout: the SSO
-///      session's refresh token is revoked with it, while the API key that
-///      signed in stays valid;
-///   6. once both sessions are revoked no envelope remains, so a keyless boot
-///      proceeds.
-///
-/// # Panics
-/// Panics when any step deviates from the contract above.
-#[tokio::test]
-#[ignore = "requires the Keycloak and Dex identity lane"]
-async fn browser_session_sealing_rotation_journey() {
-    let (k1, k2) = ([0x31_u8; 32], [0x32_u8; 32]);
-    let k1_only = std::sync::Arc::new(SealingKeyring::new(SecretKey::from_bytes(k1)));
-    let k2_only = std::sync::Arc::new(SealingKeyring::new(SecretKey::from_bytes(k2)));
-    let rotating = std::sync::Arc::new(
-        SealingKeyring::new(SecretKey::from_bytes(k2)).with_retained(SecretKey::from_bytes(k1)),
-    );
-    let srv = human_server_builder()
-        .with_sealing_keyring(std::sync::Arc::clone(&k1_only))
-        .with_bff_service_key(ROTATION_BFF_KEY)
-        .start_in_process()
-        .await
-        .expect("K1 server starts");
-    let admin = tenant_admin(&srv, srv.data_tenant_id(), "session-rotation-admin").await;
-    activate_keycloak_connection(&srv, &admin, PUBLIC_HUMAN_CLIENT, "Public", None).await;
-    let superuser = srv
-        .pg_fixture()
-        .superuser_pool()
-        .await
-        .expect("superuser pool opens");
-    let operator = srv.pg_fixture().operator_pool().clone();
-    let tenant_key =
-        wyrd_spec::ids::TenantSlug::new(FIXTURE_TENANT_SLUG.to_owned()).expect("slug is valid");
-
-    // 1. Both session modes are created under K1.
-    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
-    let flow_id = SecretString::from(random_hex_256());
-    let provider = authorization_code_bound(
-        &srv,
-        FIXTURE_TENANT_SLUG,
-        Sha256Hex::digest(flow_id.expose_secret().as_bytes()),
-        &keycloak,
-        PUBLIC_HUMAN_CLIENT,
-        "alice",
-        "alice-password",
-    )
-    .await;
-    let reply = callback_reply(
-        &srv,
-        &provider.code,
-        &provider.state,
-        provider.iss.as_deref(),
-        "attacker.example.net",
-    )
-    .await;
-    assert_browser_completion(&reply, &provider.code);
-    let k1_sessions = browser_sessions(&srv);
-    let sso_csrf = SecretString::from(random_hex_256());
-    let sso = k1_sessions
-        .complete(&flow_id, &sso_csrf)
-        .await
-        .expect("the SSO browser session completes")
-        .session_id;
-    let key_csrf = SecretString::from(random_hex_256());
-    let key_session = k1_sessions
-        .exchange_api_key(&tenant_key, &admin.api_key, &key_csrf, "rotation-sign-in")
-        .await
-        .expect("the API-key browser session signs in")
-        .session_id;
-    for (session, columns) in [(&sso, 3), (&key_session, 3)] {
-        let envelopes = session_envelopes(&superuser, session).await;
-        assert_eq!(
-            envelopes.len(),
-            columns,
-            "a live session seals its mode's credentials"
-        );
-        for envelope in &envelopes {
-            assert!(
-                k2_only.open(envelope).is_err(),
-                "K1 sealed every session envelope"
-            );
-        }
-    }
-
-    // 2. A K1 renewal holding the SSO row lock wins against the canonical pass.
-    let sso_hash = Sha256Hex::digest(sso.expose_secret().as_bytes());
-    let mut renewal = superuser.begin().await.expect("renewal transaction begins");
-    let (stale_access,): (Vec<u8>,) = sqlx::query_as(
-        "SELECT access_token_sealed FROM wyrd.auth_browser_sessions \
-         WHERE id_hash = $1 FOR UPDATE",
-    )
-    .bind(sso_hash.as_bytes().as_slice())
-    .fetch_one(&mut *renewal)
-    .await
-    .expect("the renewal locks the session row");
-    let racing = SealedSecretRewrap::new(operator.clone(), Some(std::sync::Arc::clone(&rotating)));
-    let pass = tokio::spawn(async move { racing.run().await });
-    let mut blocked = false;
-    for _ in 0..300 {
-        let (waiting,): (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM pg_stat_activity \
-             WHERE wait_event_type = 'Lock' AND query LIKE '%SET access_token_sealed = $4%'",
-        )
-        .fetch_one(&superuser)
-        .await
-        .expect("activity reads");
-        if waiting > 0 {
-            blocked = true;
-            break;
-        }
-        tokio::time::sleep(StdDuration::from_millis(100)).await;
-    }
-    assert!(
-        blocked,
-        "the pass's access-token swap waits on the renewal's row lock"
-    );
-    let renewed_under_k1 = k1_only
-        .seal(
-            &k1_only
-                .open(&stale_access)
-                .expect("K1 opens the stale access token"),
-        )
-        .expect("K1 reseals the renewal");
-    sqlx::query(
-        "UPDATE wyrd.auth_browser_sessions SET access_token_sealed = $2 WHERE id_hash = $1",
-    )
-    .bind(sso_hash.as_bytes().as_slice())
-    .bind(&renewed_under_k1)
-    .execute(&mut *renewal)
-    .await
-    .expect("the renewal rewrites the access token");
-    renewal.commit().await.expect("the renewal commits");
-    let raced = pass
-        .await
-        .expect("the pass task joins")
-        .expect("the racing pass completes");
-    assert_eq!(
-        raced.remaining, 1,
-        "the swap that lost to the renewal stays remaining: {raced:?}"
-    );
-
-    // 3. The next canonical pass repairs the late write and reaches zero.
-    let settled = SealedSecretRewrap::new(operator.clone(), Some(std::sync::Arc::clone(&rotating)))
-        .run()
-        .await
-        .expect("the follow-up pass completes");
-    assert_eq!(settled.remaining, 0, "nothing still needs K1: {settled:?}");
-    assert_eq!(
-        settled.rewrapped, 1,
-        "only the late renewal was resealed: {settled:?}"
-    );
-    for session in [&sso, &key_session] {
-        for envelope in session_envelopes(&superuser, session).await {
-            assert_eq!(
-                k2_only
-                    .rewrap(&envelope)
-                    .expect("K2 opens every session envelope"),
-                None,
-                "every session envelope is current under K2"
-            );
-        }
-    }
-
-    // 4. Live session envelopes keep a keyless boot from proceeding.
-    let refused = wyrd_server::boot::rewrap_sealed_secrets(Some(operator.clone()), None)
-        .await
-        .expect_err("a keyless boot refuses while live session envelopes exist");
-    assert!(
-        matches!(refused, wyrd_server::boot::ServerBootError::SealingKey(_)),
-        "{refused:?}"
-    );
-
-    // 5. A K2-only replica serves both sessions once the K1 writer is gone.
-    let replica = srv
-        .start_replica(
-            human_server_builder()
-                .with_sealing_keyring(std::sync::Arc::clone(&k2_only))
-                .with_bff_service_key(ROTATION_BFF_KEY),
-        )
-        .await
-        .expect("a K2-only replica starts");
-    srv.shutdown().await.expect("the K1 server shuts down");
-    let sessions = browser_sessions(&replica);
-    for (session, csrf, label) in [
-        (&sso, &sso_csrf, "sso"),
-        (&key_session, &key_csrf, "api-key"),
-    ] {
-        let view = sessions
-            .read(session, "rotation-read")
-            .await
-            .unwrap_or_else(|error| panic!("{label}: K2 reads the session: {error:?}"));
-        assert_eq!(
-            view.csrf_token.expose_secret(),
-            csrf.expose_secret(),
-            "{label}: the CSRF token survives rotation"
-        );
-        let before = sessions
-            .authority(session, "rotation-authority")
-            .await
-            .unwrap_or_else(|error| panic!("{label}: K2 opens the access token: {error:?}"));
-        expire_session_access(&superuser, session).await;
-        let renewed = sessions
-            .authority(session, "rotation-renew")
-            .await
-            .unwrap_or_else(|error| panic!("{label}: K2 renews the session: {error:?}"));
-        assert_ne!(
-            renewed.access_token.expose_secret(),
-            before.access_token.expose_secret(),
-            "{label}: renewal minted a successor access token"
-        );
-        sessions
-            .read(session, "rotation-read-renewed")
-            .await
-            .unwrap_or_else(|error| panic!("{label}: the renewed session reads: {error:?}"));
-    }
-    assert_v1_delegated_write_ok(
-        &replica,
-        sessions
-            .authority(&sso, "rotation-write")
-            .await
-            .expect("the SSO session has authority")
-            .access_token
-            .expose_secret(),
-        "browser-session-k2",
-    )
-    .await;
-    let refresh = k2_only
-        .open(&session_envelopes(&superuser, &sso).await[1])
-        .expect("K2 opens the current refresh token");
-    let refresh = String::from_utf8(refresh).expect("refresh token is UTF-8");
-    sessions.logout(&sso).await.expect("SSO logout succeeds");
-    // Logout revoked the refresh token K2 opened, so presenting it is a
-    // replay of a dead family member.
-    let (status, body) = post_refresh(&replica, &refresh).await;
-    assert_refused(
-        status,
-        &body,
-        StatusCode::UNAUTHORIZED,
-        "WYRD_AUTH_401_REFRESH_REUSED",
-    );
-    assert!(
-        body.get("refresh_token").is_none() && body.get("access_token").is_none(),
-        "a logged-out SSO session's refresh token renews nothing: {body}"
-    );
-    sessions
-        .logout(&key_session)
-        .await
-        .expect("API-key logout succeeds");
-    for session in [&sso, &key_session] {
-        assert!(
-            sessions
-                .read(session, "rotation-after-logout")
-                .await
-                .is_err(),
-            "a logged-out session no longer reads"
-        );
-        assert!(
-            session_envelopes(&superuser, session).await.is_empty(),
-            "logout wiped every sealed value"
-        );
-    }
-
-    // 6. With every session revoked no envelope remains for a keyless boot.
-    wyrd_server::boot::rewrap_sealed_secrets(Some(operator), None)
-        .await
-        .expect("a keyless boot proceeds once no session envelope remains");
-    sessions
-        .exchange_api_key(
-            &tenant_key,
-            &admin.api_key,
-            &key_csrf,
-            "rotation-sign-in-again",
-        )
-        .await
-        .expect("the API key that signed in stays valid after its session's logout");
-    replica.shutdown().await.expect("replica shuts down");
-}
-
 /// Read the id of `principal`'s one API key — the credential id its
 /// verified recovery decisions are attributed to — as superuser.
 ///
@@ -3368,8 +3366,8 @@ async fn refresh_rows(srv: &WyrdTestServer, principal_id: &str) -> i64 {
 /// inserted no successor for its principal.
 ///
 /// # Panics
-/// Panics when the refresh is not `401 WYRD_AUTH_401_REFRESH_REVOKED`, it
-/// returns any token, or a refresh row was added.
+/// Panics when the refresh is not `400 invalid_grant`, it returns any token,
+/// or a refresh row was added.
 async fn assert_refresh_cut_off(srv: &WyrdTestServer, session: &Value, label: &str) {
     let principal = principal_id_of(session["access_token"].as_str().expect("access token"));
     let before = refresh_rows(srv, &principal).await;
@@ -3378,11 +3376,10 @@ async fn assert_refresh_cut_off(srv: &WyrdTestServer, session: &Value, label: &s
         session["refresh_token"].as_str().expect("refresh token"),
     )
     .await;
-    assert_refused(
-        status,
-        &body,
-        StatusCode::UNAUTHORIZED,
-        "WYRD_AUTH_401_REFRESH_REVOKED",
+    assert_eq!(
+        (status, &body["error"]),
+        (StatusCode::BAD_REQUEST, &Value::from("invalid_grant")),
+        "{label}: a stale session no longer renews: {body}"
     );
     assert!(
         body.get("refresh_token").is_none() && body.get("access_token").is_none(),
@@ -3404,9 +3401,11 @@ async fn assert_refresh_cut_off(srv: &WyrdTestServer, session: &Value, label: &s
 ///   2. B replaces the Active connection, and A refuses the old session;
 ///   3. B deactivates, and A refuses the session minted by the replacement;
 ///   4. B removes a freshly activated connection, and A refuses its session;
-///   5. a callback paused after provider authentication — held before
-///      issuance by a lock on the user-role table — fails once B's
-///      deactivation commits, and inserts no refresh row.
+///   5. a callback paused after provider authentication — held on the User's
+///      refresh-family lock while B's deactivation commits — then fences on
+///      the connection slot, refuses the login back to the client with
+///      `access_denied`, and commits no code, role change, login audit, or
+///      refresh row.
 ///
 /// # Panics
 /// Panics when any step deviates from the contract above.
@@ -3447,7 +3446,7 @@ async fn tenant_connection_session_cutoff_journey() {
 
     // 2. Replacement on B cuts off the renewed session on A.
     activate_keycloak_connection(&replica_b, &admin, PUBLIC_HUMAN_CLIENT, "Public", None).await;
-    assert_refresh_cut_off(&replica_a, &renewed, "replacement").await;
+    assert_refresh_cut_off(&replica_a, &first, "replacement").await;
 
     // 3. Deactivation on B cuts off the replacement's session on A.
     let second = sign_in().await;
@@ -3471,14 +3470,34 @@ async fn tenant_connection_session_cutoff_journey() {
     assert_eq!(status, StatusCode::NO_CONTENT, "B removes: {body}");
     assert_refresh_cut_off(&replica_a, &third, "removal").await;
 
-    // 5. A callback paused after provider IO fails once deactivation commits.
+    // 5. A login paused after provider IO is refused once deactivation
+    // commits, and commits nothing.
     activate_keycloak_connection(&replica_b, &admin, PUBLIC_HUMAN_CLIENT, "Public", None).await;
     let principal = principal_id_of(
         sign_in().await["access_token"]
             .as_str()
             .expect("access token"),
     );
-    let before = refresh_rows(&replica_a, &principal).await;
+    let superuser = replica_a
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    let committed = || async {
+        sqlx::query_as::<_, (i64, i64, i64, i64)>(
+            "SELECT (SELECT count(*) FROM wyrd.auth_refresh_tokens
+                      WHERE principal_id = $1::uuid),
+                    (SELECT count(*) FROM wyrd.auth_login_state WHERE code_hash IS NOT NULL),
+                    (SELECT count(*) FROM wyrd.auth_user_roles WHERE user_id = $1::uuid),
+                    (SELECT count(*) FROM vala.audit_staging
+                      WHERE operation IN ('auth.login', 'auth.user.roles.sync'))",
+        )
+        .bind(&principal)
+        .fetch_one(&superuser)
+        .await
+        .expect("committed effects read")
+    };
+    let before = committed().await;
     let provider = authorization_code(
         &replica_a,
         &keycloak,
@@ -3487,32 +3506,40 @@ async fn tenant_connection_session_cutoff_journey() {
         "alice-password",
     )
     .await;
-    let superuser = replica_a
-        .pg_fixture()
-        .superuser_pool()
-        .await
-        .expect("superuser pool opens");
+    // The same key `lock_refresh_family` derives for this User.
+    let family: i64 = sqlx::query_scalar(
+        "SELECT hashtextextended(
+             'wyrd.auth_refresh_tokens:' || $1::uuid::text || ':user:' || $2::uuid::text, 0)",
+    )
+    .bind(tenant.as_uuid())
+    .bind(&principal)
+    .fetch_one(&superuser)
+    .await
+    .expect("family lock key derives");
     let mut hold = superuser.begin().await.expect("hold transaction begins");
-    sqlx::query("LOCK TABLE wyrd.auth_user_roles IN EXCLUSIVE MODE")
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(family)
         .execute(&mut *hold)
         .await
-        .expect("user-role table locks");
+        .expect("the User's refresh family locks");
     let release = async {
         let deadline = tokio::time::Instant::now() + StdDuration::from_secs(30);
         loop {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
-                  WHERE c.relname = 'auth_user_roles' AND NOT l.granted",
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks
+                  WHERE locktype = 'advisory' AND NOT granted
+                    AND ((classid::bigint << 32) | objid::bigint) = $1)",
             )
+            .bind(family)
             .fetch_one(&superuser)
             .await
             .expect("lock waiters read");
-            if waiting > 0 {
+            if waiting {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the callback never reached issuance"
+                "the callback never reached its family lock"
             );
             tokio::time::sleep(StdDuration::from_millis(20)).await;
         }
@@ -3525,29 +3552,25 @@ async fn tenant_connection_session_cutoff_journey() {
         );
         hold.commit().await.expect("hold releases");
     };
-    let ((status, body), ()) = tokio::join!(
-        finish_callback(
+    let (reply, ()) = tokio::join!(
+        callback_reply(
             &replica_a,
             &provider.code,
             &provider.state,
             provider.iss.as_deref(),
+            "test-tenant-1.wyrd.test",
         ),
         release
     );
-    assert_refused(
-        status,
-        &body,
-        StatusCode::UNAUTHORIZED,
-        "WYRD_AUTH_401_INVALID_TOKEN",
+    assert_eq!(
+        callback_refusal(&reply),
+        "access_denied",
+        "the in-flight login is refused back to the client"
     );
     assert_eq!(
-        refresh_rows(&replica_a, &principal).await,
+        committed().await,
         before,
-        "the in-flight callback issued no session"
-    );
-    assert!(
-        redeem(&replica_a, tenant, &provider.flow).await.is_err(),
-        "the in-flight callback stored no completion"
+        "the in-flight login committed no session, code, role, or login audit"
     );
 
     replica_b.shutdown().await.expect("replica B shuts down");
@@ -3607,11 +3630,12 @@ async fn user_role_count(srv: &WyrdTestServer, principal_id: &str) -> i64 {
         .expect("user roles read")
 }
 
-/// Tenant human login end to end through the header-free begin, the common
-/// callback, and one-use redemption:
-///   1. alice signs in: begin returns only the authorization URL, the
-///      callback answers `303` to exactly `/login/complete` with no query and
-///      no token or code, and the sealed session redeems once;
+/// Tenant human login end to end through the header-free authorization
+/// request, the common callback, and one-use code redemption:
+///   1. alice signs in: `/auth/authorize` redirects to the provider, the
+///      callback answers `303` to the `wyrd-ui` redirect URI with a Wyrd code
+///      and the client's state but no token or provider code, and the code
+///      redeems once at the token endpoint;
 ///   2. the login created one user keyed by the Keycloak (issuer, subject);
 ///   3. alice's mapped group (`wyrd-admins` → `writer`) allows a delegated
 ///      write, while a call outside that grant (connection administration) is
@@ -3627,9 +3651,8 @@ async fn user_role_count(srv: &WyrdTestServer, principal_id: &str) -> i64 {
 async fn tenant_human_login_journey() {
     let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
     let srv = human_server().await;
-    let tenant = srv.data_tenant_id();
 
-    // 1. Begin, provider, 303, redeem once (asserted by `complete_login`).
+    // 1. Authorize, provider, 303, redeem once (asserted by `complete_login`).
     let provider = authorization_code(
         &srv,
         &keycloak,
@@ -3638,7 +3661,7 @@ async fn tenant_human_login_journey() {
         "alice-password",
     )
     .await;
-    let session = complete_login(&srv, tenant, &provider).await;
+    let session = complete_login(&srv, &provider).await;
     let access = session["access_token"].as_str().expect("access token");
     assert!(
         session["refresh_token"].is_string(),
@@ -3822,37 +3845,76 @@ async fn seed_mock_connection(srv: &WyrdTestServer, tenant: DataTenantId, issuer
     .expect("connection points at the mock provider");
 }
 
-/// Begin a browser login for `slug` and return its flow, state, and nonce.
+/// Begin a `wyrd-ui` authorization request for `slug` and return the
+/// client's PKCE verifier and the state and nonce of the provider redirect.
 ///
 /// # Panics
-/// Panics when begin is refused or the URL lacks state or nonce.
-async fn begin_mock_login(srv: &WyrdTestServer, slug: &str) -> (Sha256Hex, String, String) {
-    let flow = new_flow();
-    let (status, body) = begin_login(srv, "attacker.example.net", browser_begin(slug, &flow)).await;
-    assert_eq!(status, StatusCode::OK, "mock login begins: {body}");
-    let url: Url = body["authorization_url"]
-        .as_str()
-        .expect("authorization url")
-        .parse()
-        .expect("authorization url parses");
+/// Panics when the request does not redirect to the provider with a state
+/// and nonce.
+async fn begin_mock_login(srv: &WyrdTestServer, slug: &str) -> (String, String, String) {
+    let (verifier, challenge) = pkce_pair();
+    let (status, location) = authorize(srv, slug, &challenge).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "mock login begins");
+    let url = location.expect("authorize redirects to the provider");
     let query = |name: &str| {
         url.query_pairs()
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.into_owned())
-            .unwrap_or_else(|| panic!("authorization url carries {name}"))
+            .unwrap_or_else(|| panic!("the provider redirect carries {name}: {url}"))
     };
-    (flow, query("state"), query("nonce"))
+    (verifier, query("state"), query("nonce"))
 }
 
-/// The common callback refuses every unusable login and stores nothing:
+/// Sign alice in through `keycloak` for the fixture tenant and return the
+/// Wyrd authorization code the callback issued and its PKCE verifier.
+///
+/// # Panics
+/// Panics when the sign-in or the callback fails.
+async fn issued_code(srv: &WyrdTestServer, keycloak: &OidcIssuerFixture) -> (String, String) {
+    let provider = authorization_code(
+        srv,
+        keycloak,
+        PUBLIC_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
+    let reply = callback_reply(
+        srv,
+        &provider.code,
+        &provider.state,
+        provider.iss.as_deref(),
+        "test-tenant-1.wyrd.test",
+    )
+    .await;
+    (authorized_code(&reply, &provider.code), provider.verifier)
+}
+
+/// Assert a token-endpoint reply is the RFC 6749 §5.2 refusal `error` with
+/// `status`, carrying no token.
+///
+/// # Panics
+/// Panics when the reply differs.
+fn assert_oauth_refusal(reply: &(StatusCode, Value), status: StatusCode, error: &str, label: &str) {
+    assert_eq!(reply.0, status, "{label}: {}", reply.1);
+    assert_eq!(reply.1["error"], error, "{label}: {}", reply.1);
+    assert!(
+        reply.1.get("access_token").is_none(),
+        "{label}: a refusal serves no token"
+    );
+}
+
+/// The common callback and the token endpoint refuse every unusable login and
+/// issue nothing:
 ///   1. a wrong (tampered), unknown, replayed, or expired state is
 ///      `400 INVALID_STATE`;
-///   2. a begin request without the browser flow binding, or with an extra
-///      binding field, is refused as malformed (`422`);
-///   3. the retired `authorization_code` token grant is refused and consumes
-///      nothing — the same code and state still complete through the callback;
+///   2. a Wyrd authorization code yields no token for a wrong client secret
+///      (`401 invalid_client` with `WWW-Authenticate`), a wrong
+///      `redirect_uri`, a PKCE mismatch, or after expiry (`invalid_grant`);
+///   3. a JSON token request is `invalid_request` and consumes nothing — the
+///      same code still redeems, with `Cache-Control: no-store`;
 ///   4. a login begun for tenant B under the same issuer completes into B
-///      only, whatever `Host` the callback carried: A cannot redeem it;
+///      only, whatever `Host` the callback carried;
 ///   5. against a mock provider: a nonce, issuer, audience, signature, or
 ///      algorithm mismatch, a validly signed token without `iat`, a
 ///      multi-audience token without `azp`, an untrusted additional audience
@@ -3860,18 +3922,17 @@ async fn begin_mock_login(srv: &WyrdTestServer, slug: &str) -> (Sha256Hex, Strin
 ///      naming another client, a validly signed token whose algorithm
 ///      discovery did not advertise, an `HS256` token even when discovery
 ///      advertises `HS256` beside an asymmetric algorithm, and a provider
-///      outage are refused, leaving no completion, User, identity, role
-///      grant, or refresh row, while a valid
-///      single-audience token whose `azp` names the client completes;
-///   6. an injected audit-staging failure issues nothing: no completion and
-///      no refresh row.
+///      outage are refused back to the client (`access_denied`, or
+///      `temporarily_unavailable` for the outage), leaving no code, User,
+///      identity, role grant, or refresh row, while a valid single-audience
+///      token whose `azp` names the client completes;
+///   6. an injected audit-staging failure at redemption issues nothing: a
+///      server error and no refresh row.
 ///
-/// A discovered unsafe (cleartext or internal) provider URL and a deployment
-/// without a sealing key are proven by the `wyrd-auth` unit and Postgres
-/// tests (`login::destination_tests`, `callback::screening_tests`,
-/// `login::pg_tests::begin_without_a_sealing_key_is_refused_before_any_state`):
-/// the journey server is permissive toward local providers so Keycloak is
-/// reachable, and it always configures a sealing keyring.
+/// A discovered unsafe (cleartext or internal) provider URL is proven by the
+/// `wyrd-auth` unit tests (`login::destination_tests`,
+/// `callback::screening_tests`): the journey server is permissive toward
+/// local providers so Keycloak is reachable.
 ///
 /// # Panics
 /// Panics when any step deviates from the contract above.
@@ -3880,7 +3941,6 @@ async fn begin_mock_login(srv: &WyrdTestServer, slug: &str) -> (Sha256Hex, Strin
 async fn tenant_callback_refusal_journey() {
     let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
     let srv = human_server().await;
-    let tenant_a = srv.data_tenant_id();
     let superuser = srv
         .pg_fixture()
         .superuser_pool()
@@ -3924,7 +3984,7 @@ async fn tenant_callback_refusal_journey() {
         StatusCode::BAD_REQUEST,
         "WYRD_AUTH_400_INVALID_STATE",
     );
-    let session = complete_login(&srv, tenant_a, &provider).await;
+    let session = complete_login(&srv, &provider).await;
     let alice = principal_id_of(session["access_token"].as_str().expect("access token"));
     let (status, body) = finish_callback(
         &srv,
@@ -3942,9 +4002,13 @@ async fn tenant_callback_refusal_journey() {
     let expiring = sign_in().await;
     sqlx::query(
         "UPDATE wyrd.auth_login_state SET expires_at = now() - interval '1 second' \
-          WHERE browser_flow_hash = $1",
+          WHERE state_hash = $1",
     )
-    .bind(expiring.flow.as_bytes().as_slice())
+    .bind(
+        Sha256Hex::digest(expiring.state.as_bytes())
+            .as_bytes()
+            .as_slice(),
+    )
     .execute(&superuser)
     .await
     .expect("state expires");
@@ -3962,52 +4026,128 @@ async fn tenant_callback_refusal_journey() {
         "WYRD_AUTH_400_INVALID_STATE",
     );
 
-    // 2. Binding shape.
-    for body in [
-        serde_json::json!({
-            "tenant_route_key": FIXTURE_TENANT_SLUG,
-            "browser_flow_hash": new_flow().to_string(),
-            "device_id": uuid::Uuid::new_v4(),
-        }),
-        serde_json::json!({ "tenant_route_key": FIXTURE_TENANT_SLUG }),
+    // 2. Code-grant negatives: each refused code is spent.
+    let (code, verifier) = issued_code(&srv, &keycloak).await;
+    let redirect_uri = ui_redirect();
+    let grant = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", redirect_uri.as_str()),
+        ("code_verifier", verifier.as_str()),
+    ];
+    let (status, headers, body) = token_request(
+        &srv,
+        "not-the-ui-secret",
+        "application/x-www-form-urlencoded",
+        url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(&grant)
+            .finish(),
+    )
+    .await;
+    assert_oauth_refusal(
+        &(status, body),
+        StatusCode::UNAUTHORIZED,
+        "invalid_client",
+        "wrong client secret",
+    );
+    assert_eq!(
+        headers
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok()),
+        Some("Basic realm=\"wyrd\""),
+        "invalid_client names the authentication scheme"
+    );
+    let wrong_redirect = format!("{PUBLIC_ORIGIN}/elsewhere");
+    for (label, redirect, wrong_verifier) in [
+        ("wrong redirect_uri", wrong_redirect.as_str(), None),
+        (
+            "PKCE mismatch",
+            redirect_uri.as_str(),
+            Some("wrong-verifier"),
+        ),
+        ("expired code", redirect_uri.as_str(), None),
     ] {
-        let (status, _) = begin_login(&srv, "test-tenant-1.wyrd.test", body).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let (code, verifier) = issued_code(&srv, &keycloak).await;
+        if label == "expired code" {
+            sqlx::query(
+                "UPDATE wyrd.auth_login_state SET expires_at = now() - interval '1 second' \
+                  WHERE code_hash = $1",
+            )
+            .bind(Sha256Hex::digest(code.as_bytes()).as_bytes().as_slice())
+            .execute(&superuser)
+            .await
+            .expect("code expires");
+        }
+        let refused = token_call(
+            &srv,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", redirect),
+                ("code_verifier", wrong_verifier.unwrap_or(&verifier)),
+            ],
+        )
+        .await;
+        assert_oauth_refusal(&refused, StatusCode::BAD_REQUEST, "invalid_grant", label);
+        let retry = redeem(&srv, &code, &verifier).await;
+        assert_oauth_refusal(
+            &retry,
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "a refused code is spent",
+        );
     }
 
-    // 3. The retired token grant is refused and consumes nothing.
-    let retired = sign_in().await;
-    let response = srv
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/auth/token")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "grant_type": "authorization_code",
-                        "code": retired.code,
-                        "state": retired.state,
-                    })
-                    .to_string(),
-                ))
-                .expect("token request builds"),
-        )
-        .await
-        .expect("token call completes");
-    assert!(
-        response.status().is_client_error(),
-        "the authorization_code grant is refused: {}",
-        response.status()
+    // 3. A JSON body is not a token request and consumes nothing.
+    let (code, verifier) = issued_code(&srv, &keycloak).await;
+    let (status, _, body) = token_request(
+        &srv,
+        UI_CLIENT_SECRET,
+        "application/json",
+        serde_json::json!({
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": ui_redirect(),
+            "code_verifier": verifier,
+        })
+        .to_string(),
+    )
+    .await;
+    assert_oauth_refusal(
+        &(status, body),
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        "JSON body",
     );
-    let bytes = to_bytes(response.into_body(), 65_536)
-        .await
-        .expect("body reads");
-    assert!(
-        !String::from_utf8_lossy(&bytes).contains("access_token"),
-        "the refused grant serves no token"
+    let form = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "authorization_code")
+        .append_pair("code", &code)
+        .append_pair("redirect_uri", &ui_redirect())
+        .append_pair("code_verifier", &verifier)
+        .finish();
+    let (status, headers, session) = token_request(
+        &srv,
+        UI_CLIENT_SECRET,
+        "application/x-www-form-urlencoded",
+        form,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the unconsumed code redeems: {session}"
     );
-    complete_login(&srv, tenant_a, &retired).await;
+    assert_eq!(session["token_type"], "Bearer", "{session}");
+    for (name, value) in [
+        (header::CACHE_CONTROL, "no-store"),
+        (header::PRAGMA, "no-cache"),
+    ] {
+        assert_eq!(
+            headers.get(&name).and_then(|value| value.to_str().ok()),
+            Some(value),
+            "a token response is never cached"
+        );
+    }
 
     // 4. Same issuer, another tenant: the state alone decides the tenant.
     let tenant_b = srv
@@ -4025,29 +4165,14 @@ async fn tenant_callback_refusal_journey() {
         "alice-password",
     )
     .await;
-    let reply = callback_reply(
-        &srv,
-        &in_b.code,
-        &in_b.state,
-        in_b.iss.as_deref(),
-        "test-tenant-1.wyrd.test",
-    )
-    .await;
-    assert_browser_completion(&reply, &in_b.code);
-    assert!(
-        redeem(&srv, tenant_a, &in_b.flow).await.is_err(),
-        "tenant A cannot redeem tenant B's login"
-    );
-    let b_session = redeem(&srv, tenant_b, &in_b.flow)
-        .await
-        .expect("tenant B redeems its login");
-    let b_claims = jwt_claims(b_session.access_token.expose());
+    let b_session = complete_login(&srv, &in_b).await;
+    let b_access = b_session["access_token"].as_str().expect("access token");
     assert_eq!(
-        b_claims["principal"]["tenant_id"],
+        jwt_claims(b_access)["principal"]["tenant_id"],
         tenant_b.to_string(),
         "the session belongs to tenant B"
     );
-    assert_ne!(principal_id_of(b_session.access_token.expose()), alice);
+    assert_ne!(principal_id_of(b_access), alice);
 
     // 5. Token verification refusals against a mock provider.
     let mock = wiremock::MockServer::start().await;
@@ -4076,7 +4201,7 @@ async fn tenant_callback_refusal_journey() {
     /// case from the nonce the login began with, so each case can reply with a
     /// forged or failing token exchange.
     type Mutation<'a> = Box<dyn Fn(&str) -> wiremock::ResponseTemplate + 'a>;
-    let cases: Vec<(&str, Mutation, StatusCode, &str)> = vec![
+    let cases: Vec<(&str, Mutation, &str)> = vec![
         (
             "nonce",
             Box::new(|_| {
@@ -4086,8 +4211,7 @@ async fn tenant_callback_refusal_journey() {
                     MOCK_SIGNING_KEY,
                 ))
             }),
-            StatusCode::BAD_REQUEST,
-            "WYRD_AUTH_400_INVALID_NONCE",
+            "access_denied",
         ),
         (
             "issuer",
@@ -4096,8 +4220,7 @@ async fn tenant_callback_refusal_journey() {
                 wrong["iss"] = Value::from("https://evil.example.com");
                 id_token_reply(&sign_id_token(&eddsa, &wrong, MOCK_SIGNING_KEY))
             }),
-            StatusCode::UNAUTHORIZED,
-            "WYRD_AUTH_401_INVALID_TOKEN",
+            "access_denied",
         ),
         (
             "audience",
@@ -4106,16 +4229,14 @@ async fn tenant_callback_refusal_journey() {
                 wrong["aud"] = Value::from("another-client");
                 id_token_reply(&sign_id_token(&eddsa, &wrong, MOCK_SIGNING_KEY))
             }),
-            StatusCode::UNAUTHORIZED,
-            "WYRD_AUTH_401_INVALID_TOKEN",
+            "access_denied",
         ),
         (
             "signature",
             Box::new(|nonce| {
                 id_token_reply(&sign_id_token(&eddsa, &claims(nonce), FOREIGN_SIGNING_KEY))
             }),
-            StatusCode::UNAUTHORIZED,
-            "WYRD_AUTH_401_INVALID_TOKEN",
+            "access_denied",
         ),
         (
             "algorithm",
@@ -4123,8 +4244,7 @@ async fn tenant_callback_refusal_journey() {
                 let key = jsonwebtoken::EncodingKey::from_secret(MOCK_SIGNING_X.as_bytes());
                 id_token_reply(&jsonwebtoken::encode(&hs256, &claims(nonce), &key).expect("signs"))
             }),
-            StatusCode::UNAUTHORIZED,
-            "WYRD_AUTH_401_INVALID_TOKEN",
+            "access_denied",
         ),
         (
             "multi-audience token without azp",
@@ -4133,8 +4253,7 @@ async fn tenant_callback_refusal_journey() {
                 wrong["aud"] = serde_json::json!([MOCK_CLIENT_ID, "another-client"]);
                 id_token_reply(&sign_id_token(&eddsa, &wrong, MOCK_SIGNING_KEY))
             }),
-            StatusCode::UNAUTHORIZED,
-            "WYRD_AUTH_401_INVALID_TOKEN",
+            "access_denied",
         ),
         (
             "untrusted additional audience with azp naming the client",
@@ -4144,8 +4263,7 @@ async fn tenant_callback_refusal_journey() {
                 wrong["azp"] = Value::from(MOCK_CLIENT_ID);
                 id_token_reply(&sign_id_token(&eddsa, &wrong, MOCK_SIGNING_KEY))
             }),
-            StatusCode::UNAUTHORIZED,
-            "WYRD_AUTH_401_INVALID_TOKEN",
+            "access_denied",
         ),
         (
             "azp naming another client",
@@ -4154,8 +4272,7 @@ async fn tenant_callback_refusal_journey() {
                 wrong["azp"] = Value::from("another-client");
                 id_token_reply(&sign_id_token(&eddsa, &wrong, MOCK_SIGNING_KEY))
             }),
-            StatusCode::UNAUTHORIZED,
-            "WYRD_AUTH_401_INVALID_TOKEN",
+            "access_denied",
         ),
         (
             "missing iat",
@@ -4164,27 +4281,20 @@ async fn tenant_callback_refusal_journey() {
                 wrong.as_object_mut().expect("claims object").remove("iat");
                 id_token_reply(&sign_id_token(&eddsa, &wrong, MOCK_SIGNING_KEY))
             }),
-            StatusCode::UNAUTHORIZED,
-            "WYRD_AUTH_401_INVALID_TOKEN",
+            "access_denied",
         ),
         (
             "outage",
             Box::new(|_| wiremock::ResponseTemplate::new(503)),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "WYRD_AUTH_503_VERIFY_UNAVAILABLE",
+            "temporarily_unavailable",
         ),
     ];
-    for (label, reply_for, expected, code) in &cases {
+    for (label, reply_for, expected) in &cases {
         mount_mock_provider(&mock, id_token_reply("unused")).await;
-        let (flow, state, nonce) = begin_mock_login(&srv, "test-tenant-3").await;
+        let (_, state, nonce) = begin_mock_login(&srv, "test-tenant-3").await;
         mount_mock_provider(&mock, reply_for(&nonce)).await;
-        let (status, body) = finish_callback(&srv, "mock-code", &state, None).await;
-        assert_eq!(status, *expected, "{label}: {body}");
-        assert_eq!(response_code(&body), *code, "{label}: {body}");
-        assert!(
-            redeem(&srv, tenant_c, &flow).await.is_err(),
-            "{label}: no completion is stored"
-        );
+        let error = refused_login(&srv, "mock-code", &state, None).await;
+        assert_eq!(error, *expected, "{label}");
     }
     // A validly signed token whose algorithm discovery did not advertise is
     // refused by the advertised-set check; `HS256` advertised beside an
@@ -4206,7 +4316,7 @@ async fn tenant_callback_refusal_journey() {
         let provider = wiremock::MockServer::start().await;
         seed_mock_connection(&srv, tenant_c, &provider.uri()).await;
         mount_mock_provider_advertising(&provider, id_token_reply("unused"), advertised).await;
-        let (flow, state, nonce) = begin_mock_login(&srv, "test-tenant-3").await;
+        let (_, state, nonce) = begin_mock_login(&srv, "test-tenant-3").await;
         let mut provider_claims = claims(&nonce);
         provider_claims["iss"] = Value::from(provider.uri());
         let id_token = match hmac {
@@ -4214,17 +4324,8 @@ async fn tenant_callback_refusal_journey() {
             None => sign_id_token(header, &provider_claims, MOCK_SIGNING_KEY),
         };
         mount_mock_provider_advertising(&provider, id_token_reply(&id_token), advertised).await;
-        let (status, body) = finish_callback(&srv, "mock-code", &state, None).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{label}: {body}");
-        assert_eq!(
-            response_code(&body),
-            "WYRD_AUTH_401_INVALID_TOKEN",
-            "{label}: {body}"
-        );
-        assert!(
-            redeem(&srv, tenant_c, &flow).await.is_err(),
-            "{label}: no completion is stored"
-        );
+        let error = refused_login(&srv, "mock-code", &state, None).await;
+        assert_eq!(error, "access_denied", "{label}");
     }
     // Every refusal above happened before identity: tenant C holds no User,
     // provider identity, role grant, or refresh row.
@@ -4245,7 +4346,7 @@ async fn tenant_callback_refusal_journey() {
     );
     seed_mock_connection(&srv, tenant_c, &issuer).await;
     mount_mock_provider(&mock, id_token_reply("unused")).await;
-    let (flow, state, nonce) = begin_mock_login(&srv, "test-tenant-3").await;
+    let (verifier, state, nonce) = begin_mock_login(&srv, "test-tenant-3").await;
     let mut with_azp = claims(&nonce);
     with_azp["azp"] = Value::from(MOCK_CLIENT_ID);
     mount_mock_provider(
@@ -4254,14 +4355,16 @@ async fn tenant_callback_refusal_journey() {
     )
     .await;
     let reply = callback_reply(&srv, "mock-code", &state, None, "test-tenant-1.wyrd.test").await;
-    assert_browser_completion(&reply, "mock-code");
-    redeem(&srv, tenant_c, &flow)
-        .await
-        .expect("the unmodified mock token completes");
+    let (status, body) = redeem(&srv, &authorized_code(&reply, "mock-code"), &verifier).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the unmodified mock token completes: {body}"
+    );
 
-    // 6. An audit failure issues nothing.
+    // 6. An audit failure at redemption issues nothing.
     let before = refresh_rows(&srv, &alice).await;
-    let failing = sign_in().await;
+    let (failing_code, failing_verifier) = issued_code(&srv, &keycloak).await;
     sqlx::query(
         r#"CREATE OR REPLACE FUNCTION vala.test_fail_login_audit()
            RETURNS trigger LANGUAGE plpgsql AS $$
@@ -4284,8 +4387,7 @@ async fn tenant_callback_refusal_journey() {
     .execute(&superuser)
     .await
     .expect("failure trigger installs");
-    let (status, body) =
-        finish_callback(&srv, &failing.code, &failing.state, failing.iss.as_deref()).await;
+    let (status, body) = redeem(&srv, &failing_code, &failing_verifier).await;
     sqlx::query("DROP TRIGGER test_fail_login_audit ON vala.audit_staging")
         .execute(&superuser)
         .await
@@ -4295,8 +4397,8 @@ async fn tenant_callback_refusal_journey() {
         "a login without a durable decision fails closed: {status} {body}"
     );
     assert!(
-        redeem(&srv, tenant_a, &failing.flow).await.is_err(),
-        "the failed login stored no completion"
+        body.get("access_token").is_none(),
+        "the failed redemption serves no token: {body}"
     );
     assert_eq!(
         refresh_rows(&srv, &alice).await,
@@ -4536,7 +4638,7 @@ async fn tenant_callback_issuer_binding_journey() {
         seed_mock_connection(&srv, tenant, &provider_issuer).await;
         mount_mock_provider_discovering(provider, id_token_reply("unused"), discovery.clone())
             .await;
-        let (flow, state, nonce) = begin_mock_login(&srv, FIXTURE_TENANT_SLUG).await;
+        let (verifier, state, nonce) = begin_mock_login(&srv, FIXTURE_TENANT_SLUG).await;
         mount_mock_provider_discovering(
             provider,
             id_token_for(&provider_issuer, &nonce),
@@ -4548,18 +4650,12 @@ async fn tenant_callback_issuer_binding_journey() {
         params.extend_from_slice(extra);
         let reply = callback_reply_with(&srv, &params, iss, "test-tenant-1.wyrd.test").await;
         if completes {
-            assert_browser_completion(&reply, "mock-code");
+            let code = authorized_code(&reply, "mock-code");
             assert_eq!(token_calls(provider).await, 1, "{label}: one code exchange");
-            redeem(&srv, tenant, &flow)
-                .await
-                .unwrap_or_else(|error| panic!("{label}: the completion redeems: {error}"));
+            let (status, body) = redeem(&srv, &code, &verifier).await;
+            assert_eq!(status, StatusCode::OK, "{label}: the code redeems: {body}");
         } else {
-            assert_refused(
-                reply.status,
-                &reply.problem(),
-                StatusCode::UNAUTHORIZED,
-                "WYRD_AUTH_401_INVALID_TOKEN",
-            );
+            assert_eq!(callback_refusal(&reply), "access_denied", "{label}");
             assert_eq!(
                 token_calls(provider).await,
                 0,
@@ -4569,10 +4665,6 @@ async fn tenant_callback_issuer_binding_journey() {
                 denied().await,
                 denied_before + 1,
                 "{label}: refusal audited"
-            );
-            assert!(
-                redeem(&srv, tenant, &flow).await.is_err(),
-                "{label}: no completion is stored"
             );
             let (status, body) = finish_callback(&srv, "mock-code", &state, iss).await;
             assert_refused(
@@ -4714,13 +4806,12 @@ async fn tenant_connection_test_sign_in_journey() {
         .await
         .expect("superuser pool opens");
     let issued = || async {
-        sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+        sqlx::query_as::<_, (i64, i64, i64, i64)>(
             "SELECT (SELECT count(*) FROM wyrd.auth_users WHERE auth_type = 'oidc'),
                     (SELECT count(*) FROM wyrd.auth_refresh_tokens),
                     (SELECT count(*) FROM wyrd.auth_api_keys),
-                    (SELECT count(*) FROM wyrd.auth_browser_sessions),
                     (SELECT count(*) FROM wyrd.auth_login_state
-                      WHERE completion_sealed IS NOT NULL)",
+                      WHERE code_hash IS NOT NULL)",
         )
         .fetch_one(&superuser)
         .await
@@ -4786,7 +4877,7 @@ async fn tenant_connection_test_sign_in_journey() {
     assert_eq!(
         issued().await,
         before,
-        "a test issues no User, credential, session, or completion"
+        "a test issues no User, credential, session, or authorization code"
     );
 
     // 4. Replay: the consumed test state is refused.
@@ -4959,32 +5050,22 @@ fn machine_binding(subject: &str, audience: Option<&str>, name: &str) -> Workloa
     }
 }
 
-/// Assert a jwt-bearer refusal: a `4xx` whose code is in the `WYRD_AUTH_4`
-/// family (or exactly `code` when given) and no token.
+/// Assert a jwt-bearer refusal: the RFC 6749 §5.2 `400 invalid_grant` and
+/// no token.
 ///
 /// # Panics
 /// Panics when the exchange is accepted or refused differently.
-async fn assert_jwt_bearer_refused(
-    response: axum::http::Response<Body>,
-    code: Option<&str>,
-    label: &str,
-) {
+async fn assert_jwt_bearer_refused(response: axum::http::Response<Body>, label: &str) {
     let status = response.status();
     let bytes = to_bytes(response.into_body(), 65_536)
         .await
         .expect("body reads");
     let body: Value = serde_json::from_slice(&bytes).unwrap_or_default();
-    assert!(
-        status.is_client_error(),
-        "{label}: refused, got {status} {body}"
+    assert_eq!(
+        (status, &body["error"]),
+        (StatusCode::BAD_REQUEST, &Value::from("invalid_grant")),
+        "{label}: refused: {body}"
     );
-    match code {
-        Some(code) => assert_eq!(response_code(&body), code, "{label}: {body}"),
-        None => assert!(
-            response_code(&body).starts_with("WYRD_AUTH_4"),
-            "{label}: {body}"
-        ),
-    }
     assert!(body.get("access_token").is_none(), "{label}: no token");
 }
 
@@ -5092,21 +5173,10 @@ async fn tenant_machine_independence_journey() {
     .await;
 
     // 4. Every inexact assertion is refused.
-    assert_jwt_bearer_refused(
-        post_jwt_bearer(&srv, &wrong_issuer).await,
-        None,
-        "wrong issuer",
-    )
-    .await;
-    assert_jwt_bearer_refused(
-        post_jwt_bearer(&srv, &peer).await,
-        Some("WYRD_AUTH_404_PRINCIPAL_NOT_FOUND"),
-        "wrong subject",
-    )
-    .await;
+    assert_jwt_bearer_refused(post_jwt_bearer(&srv, &wrong_issuer).await, "wrong issuer").await;
+    assert_jwt_bearer_refused(post_jwt_bearer(&srv, &peer).await, "wrong subject").await;
     assert_jwt_bearer_refused(
         post_jwt_bearer(&srv, &foreign_audience).await,
-        None,
         "wrong audience",
     )
     .await;
@@ -5115,7 +5185,6 @@ async fn tenant_machine_independence_journey() {
         .expect("tenant B seeds");
     assert_jwt_bearer_refused(
         post_jwt_bearer_for_tenant(&srv, &bound, "test-tenant-2").await,
-        None,
         "wrong tenant",
     )
     .await;
@@ -5477,22 +5546,11 @@ async fn same_issuer_two_tenant_isolation_keycloak() {
 
     // The SAME subject token at tenant B's slug fails closed (issuer trusted,
     // binding absent under B).
-    let resp_b = post_jwt_bearer_for_tenant(&srv, &assertion, TENANT_B_SLUG).await;
-    assert_eq!(
-        resp_b.status(),
-        StatusCode::NOT_FOUND,
-        "tenant B fails closed for the unbound subject: {}",
-        resp_b.status()
-    );
-    let bytes = to_bytes(resp_b.into_body(), 65_536)
-        .await
-        .expect("body reads");
-    let body: Value = serde_json::from_slice(&bytes).unwrap_or_default();
-    assert_eq!(
-        response_code(&body),
-        "WYRD_AUTH_404_PRINCIPAL_NOT_FOUND",
-        "tenant B returns principal-not-found; body={body}"
-    );
+    assert_jwt_bearer_refused(
+        post_jwt_bearer_for_tenant(&srv, &assertion, TENANT_B_SLUG).await,
+        "tenant B fails closed for the unbound subject",
+    )
+    .await;
 
     srv.shutdown().await.expect("server shuts down cleanly");
 }
@@ -5514,26 +5572,11 @@ async fn conformance_untrusted_issuer_rejected() {
         .workload_token("wyrd-workload", "wyrd-workload-secret", "wyrd-workload")
         .await;
 
-    let resp = post_jwt_bearer(&srv, &token).await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::UNAUTHORIZED,
-        "untrusted issuer jwt-bearer returns 401: {}",
-        resp.status()
-    );
-    let bytes = to_bytes(resp.into_body(), 65_536)
-        .await
-        .expect("body reads");
-    let body: Value = serde_json::from_slice(&bytes).unwrap_or_default();
-    assert!(
-        response_code(&body).starts_with("WYRD_AUTH_401"),
-        "untrusted issuer returns 401-family error code; got={}",
-        response_code(&body)
-    );
+    assert_jwt_bearer_refused(post_jwt_bearer(&srv, &token).await, "untrusted issuer").await;
 }
 
-/// `POST /auth/login` for a route key naming no tenant returns the generic
-/// `401 INVALID_TOKEN`, whatever tenant the `Host` header names.
+/// An authorization request for a route key naming no tenant is refused
+/// back to the client with `access_denied`; no request header plays a part.
 ///
 /// # Panics
 /// Panics when the server fails to start or the refusal differs.
@@ -5545,16 +5588,13 @@ async fn conformance_login_rejects_bare_localhost_host() {
         .await
         .expect("test server starts");
 
-    for host in ["localhost", "test-tenant-1.wyrd.test"] {
-        let (status, body) =
-            begin_login(&srv, host, browser_begin("no-such-tenant", &new_flow())).await;
-        assert_refused(
-            status,
-            &body,
-            StatusCode::UNAUTHORIZED,
-            "WYRD_AUTH_401_INVALID_TOKEN",
-        );
-    }
+    let (_, challenge) = pkce_pair();
+    let (status, location) = authorize(&srv, "no-such-tenant", &challenge).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize redirects");
+    assert_eq!(
+        client_refusal(location.expect("a refusal redirects").as_str()),
+        "access_denied"
+    );
 }
 
 // ─── Key rotation (Keycloak admin API) ────────────────────────────────────────

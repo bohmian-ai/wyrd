@@ -87,27 +87,27 @@ once after an authentication refusal.
 
 All machine-facing token issuance goes through one route, `POST /auth/token`,
 which matches on the `TokenRequest` grant and dispatches to the right exchange.
-Human login is the exception: it starts at `POST /auth/login` and finishes at
-the common `GET /auth/callback`, which issues the session itself; it is not a
-`/auth/token` grant.
+Human login also ends there: the web app begins at `GET /auth/authorize` and
+redeems its authorization code at `/auth/token`, and the CLI redeems its
+device code there.
 
 <WyrdFlowDiagram
   variant="fan"
   title="/auth/token grant dispatch"
   steps={[
     { label: 'POST /auth/token', sub: 'match TokenRequest' },
-    { label: 'wyrd_api_key', sub: 'API key → access only' },
+    { label: 'authorization_code · device_code', sub: 'human login → access + refresh' },
     { label: 'jwt-bearer', sub: 'workload assertion → access only' },
     { label: 'refresh_token', sub: 'rotate → access + refresh' },
-    { label: 'token-exchange', sub: 'delegation → access only' }
+    { label: 'token-exchange', sub: 'API key or delegation → access only' }
   ]}
 />
 
 Who uses which grant:
 
 - **Humans** log in through their tenant's Active OIDC connection and receive
-  **User** tokens (access + refresh) from the common callback.
-- **Services and Agents** authenticate with an API key (`wyrd_api_key`) or a
+  **User** tokens (access + refresh) at `/auth/token`.
+- **Services and Agents** authenticate with an API key (`token-exchange`) or a
   workload assertion (`jwt-bearer`). Neither grant returns a refresh token: a
   machine renews by re-exchanging the durable credential it already holds, so
   revoking that credential ends its renewal.

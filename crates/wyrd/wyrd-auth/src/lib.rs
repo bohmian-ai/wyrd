@@ -5,7 +5,6 @@
 //! `wyrd-server`.
 
 pub mod audit;
-pub mod browser_sessions;
 pub mod callback;
 pub mod card_scope;
 pub mod cli_logins;

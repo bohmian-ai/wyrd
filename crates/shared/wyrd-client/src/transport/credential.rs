@@ -69,7 +69,7 @@ pub enum ResolvedCredential {
         /// Tenant slug for `jwt_bearer` grant routing.
         tenant: String,
     },
-    /// A Wyrd API key for the `wyrd_api_key` grant.
+    /// A Wyrd API key for the RFC 8693 API-key token exchange.
     ApiKey(SecretString),
     /// An RFC 8693 delegation: `actor` acts for the holder of `subject_token`.
     ///
@@ -136,7 +136,7 @@ pub enum CredentialSource {
         tenant: String,
     },
     /// API key floor.  Exchanged for a Wyrd access token via the
-    /// `wyrd_api_key` grant at call time.  Tier 3.
+    /// RFC 8693 API-key token exchange at call time.  Tier 3.
     ApiKey {
         /// Raw API key, redacted in `Debug`.
         key: SecretString,
@@ -156,7 +156,7 @@ impl CredentialSource {
     /// SDK surfaces take a single `credential` value rather than asking the
     /// caller which grant it belongs to. This is the one place that
     /// distinction is made: a value carrying [`API_KEY_PREFIX`] is exchanged
-    /// through the `wyrd_api_key` grant, anything else is presented verbatim
+    /// through the RFC 8693 API-key token exchange, anything else is presented verbatim
     /// as a bearer access token. Routing it in one place is what keeps the
     /// Rust, Python, and TypeScript clients from disagreeing about what a
     /// credential is.

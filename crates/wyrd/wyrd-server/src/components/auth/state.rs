@@ -40,9 +40,9 @@ pub struct ServerAuth {
     /// platform plane and a signing key exist. The begin and callback routes
     /// share it, and with it one relying-party provider cache.
     pub platform_login: Option<PlatformLogin>,
-    /// The production UI browser-session channel; `None` leaves
-    /// `/internal/bff/v1/*` unmounted.
-    pub bff: Option<crate::components::auth::bff::BffChannel>,
+    /// The registered OAuth clients the authorization-server endpoints
+    /// identify requests against.
+    pub oauth_clients: crate::auth::oauth::OAuthClients,
     /// TTL and delegation settings for token exchange responses.
     pub token_exchange_settings: TokenExchangeSettings,
 }

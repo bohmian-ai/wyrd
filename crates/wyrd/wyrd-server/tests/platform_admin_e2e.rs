@@ -85,13 +85,29 @@ fn anonymous_post(uri: &str, body: Value) -> Request<Body> {
         .expect("request builds")
 }
 
+/// Build an RFC 8693 token-exchange form POST presenting `credential` as an
+/// API-key subject token to `uri`, with no credential header.
+fn token_exchange(uri: &str, credential: &str) -> Request<Body> {
+    let form = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair(
+            "grant_type",
+            "urn:ietf:params:oauth:grant-type:token-exchange",
+        )
+        .append_pair("subject_token", credential)
+        .append_pair("subject_token_type", "urn:wyrd:oauth:token-type:api_key")
+        .finish();
+    Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(form))
+        .expect("request builds")
+}
+
 /// Exchange a platform credential for a session token.
 async fn platform_session(srv: &WyrdTestServer, credential: &str) -> String {
     let resp = srv
-        .oneshot(anonymous_post(
-            "/auth/platform/token",
-            json!({ "credential": credential }),
-        ))
+        .oneshot(token_exchange("/auth/platform/token", credential))
         .await
         .expect("token route responds");
     let status = resp.status();
@@ -154,10 +170,7 @@ async fn operator_provisions_a_usable_tenant_without_touching_the_database() {
     // 3. The returned credential is immediately usable inside the tenant, which
     //    is what "usable tenant" has to mean.
     let resp = srv
-        .oneshot(anonymous_post(
-            "/auth/token",
-            json!({ "grant_type": "wyrd_api_key", "api_key": admin_credential }),
-        ))
+        .oneshot(token_exchange("/auth/token", admin_credential))
         .await
         .expect("token exchange responds");
     let status = resp.status();
@@ -371,15 +384,12 @@ async fn an_operator_recovers_from_losing_every_platform_credential() {
     }
 
     let resp = srv
-        .oneshot(anonymous_post(
-            "/auth/platform/token",
-            json!({ "credential": root }),
-        ))
+        .oneshot(token_exchange("/auth/platform/token", &root))
         .await
         .expect("token exchange responds");
     assert_eq!(
         resp.status(),
-        StatusCode::UNAUTHORIZED,
+        StatusCode::BAD_REQUEST,
         "the deployment really has no usable platform credential left"
     );
 
@@ -729,10 +739,7 @@ async fn tenant_administration_survives_losing_every_credential() {
     );
     let replacement = recovered["credential"].as_str().expect("credential");
     let resp = srv
-        .oneshot(anonymous_post(
-            "/auth/token",
-            json!({ "grant_type": "wyrd_api_key", "api_key": replacement }),
-        ))
+        .oneshot(token_exchange("/auth/token", replacement))
         .await
         .expect("token exchange responds");
     let status = resp.status();
@@ -763,10 +770,7 @@ fn tenant_request(method: Method, uri: &str, body: Option<Value>) -> Request<Bod
 /// a journey can assert the status a real operator would see.
 async fn tenant_token(srv: &WyrdTestServer, credential: &str) -> Result<String, StatusCode> {
     let resp = srv
-        .oneshot(anonymous_post(
-            "/auth/token",
-            json!({ "grant_type": "wyrd_api_key", "api_key": credential }),
-        ))
+        .oneshot(token_exchange("/auth/token", credential))
         .await
         .expect("token route responds");
     let status = resp.status();
@@ -937,7 +941,7 @@ async fn a_tenant_rotates_an_automation_credential_without_an_outage() {
 
     assert_eq!(
         tenant_token(&srv, &first).await.unwrap_err(),
-        StatusCode::UNAUTHORIZED,
+        StatusCode::BAD_REQUEST,
         "the retired credential mints no further token"
     );
     let resp = srv
@@ -1178,7 +1182,7 @@ async fn a_revoked_credential_mints_nothing_and_its_token_lapses_at_expiry() {
 
     assert_eq!(
         tenant_token(&srv, &first).await.unwrap_err(),
-        StatusCode::UNAUTHORIZED,
+        StatusCode::BAD_REQUEST,
         "revoked credential A cannot exchange again"
     );
     assert_eq!(
@@ -2388,7 +2392,7 @@ async fn a_suspended_tenant_admits_no_credential() {
 
     assert_eq!(
         tenant_token(&srv, &credential).await.unwrap_err(),
-        StatusCode::UNAUTHORIZED,
+        StatusCode::BAD_REQUEST,
         "a suspended tenant's credential stops authenticating"
     );
 
@@ -3057,7 +3061,7 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
     );
     assert_eq!(
         tenant_token(&srv, &credential).await.unwrap_err(),
-        StatusCode::UNAUTHORIZED,
+        StatusCode::BAD_REQUEST,
         "the suspended principal's credential mints nothing new"
     );
 
@@ -4390,15 +4394,15 @@ async fn an_uninitialized_deployment_serves_tenants_and_refuses_the_platform_pla
     // The platform plane admits nobody, the same way every time.
     for attempt in 0..3 {
         let resp = srv
-            .oneshot(anonymous_post(
+            .oneshot(token_exchange(
                 "/auth/platform/token",
-                json!({ "credential": "wyrd_global_not_a_real_credential" }),
+                "wyrd_global_not_a_real_credential",
             ))
             .await
             .expect("platform token route responds");
         assert_eq!(
             resp.status(),
-            StatusCode::UNAUTHORIZED,
+            StatusCode::BAD_REQUEST,
             "attempt {attempt} is refused"
         );
         let body = body_json(resp).await;
@@ -5049,12 +5053,9 @@ async fn a_tenant_administrator_renews_by_re_exchanging_its_credential() {
         .expect("admin credential");
 
     let exchanged = body_json(
-        srv.oneshot(anonymous_post(
-            "/auth/token",
-            json!({ "grant_type": "wyrd_api_key", "api_key": credential }),
-        ))
-        .await
-        .expect("token route responds"),
+        srv.oneshot(token_exchange("/auth/token", credential))
+            .await
+            .expect("token route responds"),
     )
     .await;
     assert!(
@@ -5069,12 +5070,9 @@ async fn a_tenant_administrator_renews_by_re_exchanging_its_credential() {
     // Renewal is the second exchange of the same durable credential, and the
     // token it returns must administer the tenant exactly as the first did.
     let renewed = body_json(
-        srv.oneshot(anonymous_post(
-            "/auth/token",
-            json!({ "grant_type": "wyrd_api_key", "api_key": credential }),
-        ))
-        .await
-        .expect("token route responds"),
+        srv.oneshot(token_exchange("/auth/token", credential))
+            .await
+            .expect("token route responds"),
     )
     .await;
     let successor = renewed["access_token"]

@@ -16,10 +16,10 @@ mod pg_tests {
     use uuid::Uuid;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{LoginInitiation, Sha256Hex};
+    use wyrd_spec::auth::{ClientAuthorization, LoginInitiation, OAuthClientId, Sha256Hex};
     use wyrd_sql::queries::auth::{
-        LoginState, complete_login_state, consume_login_state, insert_login_state,
-        redeem_login_completion,
+        LoginState, consume_login_state, insert_login_state, issue_authorization_code,
+        redeem_authorization_code,
     };
     use wyrd_sql::row_types::auth::HumanConnectionBinding;
 
@@ -28,7 +28,8 @@ mod pg_tests {
         std::env::var("WYRD_DATABASE_URL").ok()
     }
 
-    /// A browser login state bound to the flow whose hash is `flow`.
+    /// An authorization-request login state for `wyrd-ui` whose PKCE
+    /// challenge is the hex of `flow`, so each login is distinguishable.
     fn login_state(flow: Sha256Hex) -> LoginState {
         LoginState {
             connection: HumanConnectionBinding {
@@ -40,7 +41,12 @@ mod pg_tests {
             redirect_uri: "https://wyrd.example.com/auth/callback".to_owned(),
             code_verifier: SecretString::from("verifier"),
             nonce: "nonce".to_owned(),
-            initiation: LoginInitiation::Browser(flow),
+            initiation: LoginInitiation::Authorize(ClientAuthorization {
+                client: OAuthClientId::WyrdUi,
+                redirect_uri: "https://ui.example.com/auth/callback".to_owned(),
+                code_challenge: flow.to_string(),
+                state: Some("client-state".to_owned()),
+            }),
         }
     }
 
@@ -94,35 +100,47 @@ mod pg_tests {
         consumed.is_some()
     }
 
-    /// Complete `state` from `tenant`'s connection and commit.
+    /// Issue the authorization code hashing to `code` on `state` from
+    /// `tenant`'s connection and commit.
     ///
     /// # Panics
     /// Panics when the statement or commit fails.
-    async fn complete(fixture: &PgFixture, tenant: DataTenantId, state: &Sha256Hex) -> bool {
+    async fn issue(
+        fixture: &PgFixture,
+        tenant: DataTenantId,
+        state: &Sha256Hex,
+        code: &Sha256Hex,
+    ) -> bool {
         let mut conn = fixture.tenant_conn_for(tenant).await.expect("conn opens");
-        let completed = complete_login_state(&mut conn, state, b"sealed", Duration::from_mins(2))
-            .await
-            .expect("complete runs");
-        conn.commit().await.expect("complete commits");
-        completed
+        let issued = issue_authorization_code(
+            &mut conn,
+            state,
+            code,
+            Uuid::now_v7(),
+            Duration::from_mins(1),
+        )
+        .await
+        .expect("issue runs");
+        conn.commit().await.expect("issue commits");
+        issued
     }
 
-    /// Redeem the completion bound to `flow` from `tenant`'s connection and
-    /// commit.
+    /// Redeem the authorization code hashing to `code` from `tenant`'s
+    /// connection and commit.
     ///
     /// # Panics
     /// Panics when the statement or commit fails.
-    async fn redeem(fixture: &PgFixture, tenant: DataTenantId, flow: Sha256Hex) -> bool {
+    async fn redeem(fixture: &PgFixture, tenant: DataTenantId, code: &Sha256Hex) -> bool {
         let mut conn = fixture.tenant_conn_for(tenant).await.expect("conn opens");
-        let sealed = redeem_login_completion(&mut conn, &LoginInitiation::Browser(flow))
+        let redeemed = redeem_authorization_code(&mut conn, code)
             .await
             .expect("redeem runs");
         conn.commit().await.expect("redeem commits");
-        sealed.is_some()
+        redeemed.is_some_and(|redeemed| redeemed.live)
     }
 
-    /// Tenant B cannot purge, consume, complete, or redeem tenant A's login
-    /// state, while tenant A performs each valid transition exactly once.
+    /// Tenant B cannot purge, consume, issue a code on, or redeem tenant A's
+    /// login state, while tenant A performs each valid transition exactly once.
     ///
     /// # Panics
     /// Panics when any cross-tenant transition takes effect or a valid one
@@ -177,16 +195,20 @@ mod pg_tests {
         assert!(consume(&fixture, tenant_a, &state).await, "A consumes");
         assert!(!consume(&fixture, tenant_a, &state).await, "once");
 
+        let code = Sha256Hex::digest(b"a-code");
         assert!(
-            !complete(&fixture, tenant_b, &state).await,
-            "B cannot complete"
+            !issue(&fixture, tenant_b, &state, &code).await,
+            "B cannot issue a code"
         );
-        assert!(complete(&fixture, tenant_a, &state).await, "A completes");
-        assert!(!complete(&fixture, tenant_a, &state).await, "once");
+        assert!(issue(&fixture, tenant_a, &state, &code).await, "A issues");
+        assert!(
+            !issue(&fixture, tenant_a, &state, &Sha256Hex::digest(b"again")).await,
+            "once"
+        );
 
-        assert!(!redeem(&fixture, tenant_b, flow).await, "B cannot redeem");
-        assert!(redeem(&fixture, tenant_a, flow).await, "A redeems");
-        assert!(!redeem(&fixture, tenant_a, flow).await, "once");
+        assert!(!redeem(&fixture, tenant_b, &code).await, "B cannot redeem");
+        assert!(redeem(&fixture, tenant_a, &code).await, "A redeems");
+        assert!(!redeem(&fixture, tenant_a, &code).await, "once");
     }
 
     /// The callback's state lookup through `WyrdPostgres` names the owning

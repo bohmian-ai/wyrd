@@ -85,28 +85,6 @@ pub enum ExchangeError {
     Issuance(IssuanceError),
 }
 
-impl ExchangeError {
-    /// Whether this is the ordinary refusal of an API key that no longer
-    /// exchanges: malformed, cross-tenant, unknown, revoked, expired, or
-    /// wrong-secret, or an inactive tenant or principal, including an
-    /// issuance lifecycle refusal ([`IssuanceError::is_refusal`]).
-    ///
-    /// A verification-task, store, or other issuance failure is internal and
-    /// must roll back rather than end a session.
-    #[must_use]
-    pub(crate) fn is_refusal(&self) -> bool {
-        match self {
-            Self::CrossTenant
-            | Self::NotFound
-            | Self::AccountDisabled
-            | Self::TenantNotAdmitting
-            | Self::HashMismatch => true,
-            Self::Issuance(error) => error.is_refusal(),
-            Self::Join(_) | Self::Database(_) => false,
-        }
-    }
-}
-
 impl From<IssuanceError> for ExchangeError {
     fn from(error: IssuanceError) -> Self {
         match error {
@@ -560,9 +538,7 @@ impl From<DelegateError> for WyrdError {
 }
 
 /// Postgres-backed API-key and token-exchange behavior, and the shared
-/// fixtures that seed users, service accounts, live API keys, and a
-/// [`BrowserSessions`](crate::browser_sessions::BrowserSessions) owner for the
-/// sibling browser-session tests.
+/// fixtures that seed users, service accounts, and live API keys.
 #[cfg(test)]
 pub(crate) mod pg_tests {
     use std::collections::HashMap;
@@ -600,13 +576,8 @@ pub(crate) mod pg_tests {
     use wyrd_sql::queries::auth::{ApiKeyStatus, grant_role_to_service_account, insert_role};
 
     use super::{DelegateError, DelegateToken, ExchangeApiKey, ExchangeError};
-    use crate::browser_sessions::BrowserSessions;
-    use crate::connections::HumanConnections;
     use crate::issuance::{IssuanceError, TenantTokenIssuer, TokenExchangeSettings};
     use crate::issue_api_key::WyrdApiKey;
-    use wyrd_auth_oidc::ScreenedHttp;
-    use wyrd_crypt::{SealingKeyring, SecretKey};
-    use wyrd_spec::ids::TenantSlug;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
@@ -1360,153 +1331,6 @@ pub(crate) mod pg_tests {
             expected,
             "the unadmitted-tenant refusal is distinguishable"
         );
-    }
-
-    /// Build the browser-session owner over the fixture's store, a fixed
-    /// test keyring, and the test issuing and verifying keys, so browser
-    /// sign-in runs the same exchange the token route does.
-    ///
-    /// # Panics
-    /// Panics when the static test public key or key id fails to load.
-    pub(crate) fn browser_sessions(fixture: &PgFixture) -> BrowserSessions {
-        let keyring = Arc::new(SealingKeyring::new(SecretKey::from_bytes([7_u8; 32])));
-        BrowserSessions::new(
-            fixture.wyrd_postgres().clone(),
-            Some(Arc::clone(&keyring)),
-            test_issuer(),
-            delegate_service().verifier,
-            HumanConnections::new(
-                fixture.wyrd_postgres().clone(),
-                Some(keyring),
-                ScreenedHttp::allowing_internal(),
-                None,
-            ),
-        )
-    }
-
-    /// Browser API-key sign-in pays exactly one verification per presented
-    /// key and refuses every invalid key identically.
-    ///
-    /// The browser entry used to parse the key and compare its tenant with
-    /// the route before the shared exchange, so a malformed key or a key of
-    /// another tenant was refused for free and was distinguishable by clock
-    /// from a live prefix with a wrong tail. Each case here — malformed, an
-    /// unknown route tenant, a key of another tenant at either route, an
-    /// unknown prefix, a wrong secret, an expired key, a revoked key, and the
-    /// valid key — must advance the process-wide verification count by
-    /// exactly one; every refusal renders the one API-key problem, only the
-    /// valid key creates a session, and that session's projection carries the
-    /// authoritative tenant id.
-    ///
-    /// # Panics
-    /// Panics when the fixture cannot start, a seed fails, or any assertion
-    /// fails.
-    #[tokio::test]
-    async fn every_browser_api_key_sign_in_costs_exactly_one_verification() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let route = TenantSlug::new(fixture.tenant_slug().to_owned()).expect("fixture slug");
-        let other_route = TenantSlug::new("browser-other").expect("static slug");
-        fixture
-            .seed_additional_tenant(other_route.as_str())
-            .await
-            .expect("second tenant seeds");
-        let card_ref = test_service_card_ref();
-
-        let unknown = WyrdApiKey::generate(tenant);
-        let revoked = WyrdApiKey::generate(tenant);
-        let expired = WyrdApiKey::generate(tenant);
-        let wrong_tail = WyrdApiKey::generate(tenant);
-        let foreign = WyrdApiKey::generate(DataTenantId::new_v7());
-
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let user_id = insert_test_user(&mut conn, tenant).await;
-        let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
-        for (key, expires_at, is_revoked) in [
-            (&revoked, Utc::now() + Duration::days(1), true),
-            (&expired, Utc::now() - Duration::hours(1), false),
-            (&wrong_tail, Utc::now() + Duration::days(1), false),
-        ] {
-            insert_lifecycle_key(
-                &mut conn,
-                tenant,
-                sa_id,
-                user_id,
-                &key.prefix,
-                expires_at,
-                is_revoked,
-            )
-            .await;
-        }
-        let (_, valid) = insert_live_api_key(&mut conn, tenant, sa_id, user_id).await;
-        conn.commit().await.expect("seed commits");
-
-        let sessions = browser_sessions(&fixture);
-        let csrf = SecretString::from("ab".repeat(32));
-        let unknown_route = TenantSlug::new("browser-unknown").expect("static slug");
-        let expected = rendered(&super::api_key_invalid());
-        let cases = [
-            (
-                "malformed",
-                &route,
-                SecretString::from("not-a-wyrd-api-key"),
-            ),
-            ("unknown_route", &unknown_route, valid.clone()),
-            ("cross_tenant_key", &route, foreign.secret),
-            ("cross_tenant_route", &other_route, valid.clone()),
-            ("unknown_prefix", &route, unknown.secret),
-            ("wrong_secret", &route, wrong_tail.secret),
-            ("expired", &route, expired.secret),
-            ("revoked", &route, revoked.secret),
-        ];
-        for (label, at, presented) in cases {
-            let before = credential_verify::verifications_performed();
-            let error = sessions
-                .exchange_api_key(at, &presented, &csrf, &format!("req-browser-{label}"))
-                .await
-                .expect_err("an invalid browser sign-in is refused");
-            assert_eq!(
-                credential_verify::verifications_performed() - before,
-                1,
-                "the browser {label} path did not perform exactly one verification"
-            );
-            assert_eq!(
-                rendered(&error),
-                expected,
-                "the browser {label} refusal is distinguishable"
-            );
-        }
-
-        let before = credential_verify::verifications_performed();
-        let created = sessions
-            .exchange_api_key(&route, &valid, &csrf, "req-browser-valid")
-            .await
-            .expect("the valid key at its own route signs in");
-        assert_eq!(
-            credential_verify::verifications_performed() - before,
-            1,
-            "the valid browser sign-in did not perform exactly one verification"
-        );
-        assert_eq!(created.tenant_key, route);
-        let view = sessions
-            .read(&created.session_id, "req-browser-read")
-            .await
-            .expect("the new session reads");
-        assert_eq!(
-            view.tenant_id, tenant,
-            "the session projection carries the authoritative tenant id"
-        );
-
-        let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_browser_sessions")
-            .fetch_one(
-                &fixture
-                    .superuser_pool()
-                    .await
-                    .expect("superuser pool opens"),
-            )
-            .await
-            .expect("session count runs");
-        assert_eq!(stored, 1, "only the valid sign-in created a session");
     }
 
     #[test]

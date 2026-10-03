@@ -1,4 +1,11 @@
-//! Refresh-token grant: single-use rotation with reuse detection (F07/F08).
+//! Refresh-token grant (RFC 6749 §6).
+//!
+//! A `wyrd-cli` refresh token is single-use: each refresh rotates it, and
+//! presenting a rotated one revokes the rest of its rotation chain (RFC 9700
+//! §4.14.2). A
+//! `wyrd-ui` refresh token belongs to a confidential client and does not
+//! rotate: each refresh mints only an access token until the session's
+//! absolute lifetime ends.
 
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
@@ -7,13 +14,14 @@ use wyrd_auth_issue::IssueError;
 use wyrd_auth_verify::RefreshTokenClaims;
 use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::OAuthClientId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    consume_active_refresh, lock_refresh_family, refresh_by_hash, revoke_refresh_family,
+    active_refresh, consume_active_refresh, lock_refresh_family, refresh_by_hash,
+    revoke_refresh_chain,
 };
-use wyrd_sql::row_types::auth::HumanConnectionBinding;
 
 use crate::audit::{
     REFRESH_FAMILY_REVOKE_OPERATION, append_auth_audit, auth_event, principal_kind_tag,
@@ -21,11 +29,12 @@ use crate::audit::{
 use crate::exchange_api_key::token_hash;
 use crate::issuance::{ExchangedToken, IssuanceError, TenantTokenIssuer};
 
-/// Refresh-token rotation service.
+/// Refresh-token grant service.
 ///
-/// Owns only the single-use rotation and reuse containment; the successor
-/// session is minted by the shared [`TenantTokenIssuer`], so a suspended user
-/// or withdrawn grant governs a renewal exactly as it governs a first login.
+/// Owns only the client-type decision, the single-use rotation, and reuse
+/// containment; every token is minted by the shared [`TenantTokenIssuer`], so
+/// a suspended user or withdrawn grant governs a renewal exactly as it
+/// governs a first login.
 #[derive(Debug, Clone)]
 pub struct RefreshTokens {
     /// The tenant issuance owner that mints the successor session.
@@ -35,10 +44,12 @@ pub struct RefreshTokens {
 /// Refresh grant failure modes.
 #[derive(Debug, thiserror::Error)]
 pub enum RefreshError {
-    /// Presented token was already rotated or revoked; family has been revoked.
+    /// Presented token was already rotated; the rest of its rotation chain
+    /// has been revoked.
     #[error("refresh token reuse detected")]
     Reused,
-    /// Presented token was never valid for this tenant, has expired, or was revoked.
+    /// Presented token was never valid for this tenant, has expired, was
+    /// revoked other than by rotation, or was issued to another client.
     #[error("refresh token not found or expired")]
     NotFound,
     /// Database operation failed.
@@ -52,29 +63,11 @@ pub enum RefreshError {
     Wyrd(#[from] WyrdError),
 }
 
-impl RefreshError {
-    /// Whether this is the ordinary refusal of a refresh token that no longer
-    /// issues: an unknown, expired, or revoked token, or an issuance
-    /// lifecycle refusal ([`IssuanceError::is_refusal`]).
-    ///
-    /// [`RefreshError::Reused`] is neither a refusal nor a failure — its
-    /// containment writes must commit — and every other variant is an
-    /// internal failure that must roll back.
-    #[must_use]
-    pub(crate) fn is_refusal(&self) -> bool {
-        match self {
-            Self::NotFound => true,
-            Self::Issuance(error) => error.is_refusal(),
-            Self::Reused | Self::Database(_) | Self::Wyrd(_) => false,
-        }
-    }
-}
-
 impl From<RefreshError> for WyrdError {
     fn from(error: RefreshError) -> Self {
         match error {
             RefreshError::Reused => WyrdError::RefreshReused {
-                message: "Refresh token family revoked due to reuse of a rotated token".to_owned(),
+                message: "Refresh token chain revoked due to reuse of a rotated token".to_owned(),
                 details: json!({}),
             },
             // A suspended user, a tenant that stopped admitting credentials,
@@ -100,7 +93,7 @@ impl From<RefreshError> for WyrdError {
 }
 
 impl RefreshTokens {
-    /// Execute the refresh-token grant.
+    /// Execute the refresh-token grant for the authenticated `client`.
     ///
     /// The full rotation, reuse-detection, and audit write run inside the
     /// transaction owned by `conn`. The caller must call `conn.commit()` on
@@ -109,20 +102,31 @@ impl RefreshTokens {
     /// Algorithm (F07 atomicity):
     /// 1. SHA-256 the presented JWT string.
     /// 2. `refresh_by_hash` — resolve the stored row only far enough to name
-    ///    its principal family; no row → return `NotFound`.
+    ///    its principal family and client; no row, or a row issued to another
+    ///    client (RFC 6749 §6), → return `NotFound`.
     /// 3. `lock_refresh_family` — serialize every refresh operation for that
     ///    family until the caller's commit, before the connection slot lock
     ///    issuance takes. A replay of an ancestor therefore classifies and
     ///    revokes only after a concurrent rotation of the current row has
     ///    committed or rolled back, so its successor cannot escape containment.
-    /// 4. `consume_active_refresh` — atomic `UPDATE … RETURNING` under the lock.
+    /// 4. A `wyrd-ui` row: `active_refresh` under the lock; an active row mints
+    ///    an access token only and the row stays as it is; anything else →
+    ///    `NotFound`.
+    /// 5. Otherwise `consume_active_refresh` — atomic `UPDATE … RETURNING`
+    ///    under the lock.
     ///    - Active → mint successor pair, insert with `rotated_from`, audit, return OK.
-    ///    - Stale → reuse detected; family revoked, audit, return Reused.
+    ///    - Rotated → reuse detected; the row's chain is revoked through
+    ///      `rotated_from`, audited, return Reused. The row is re-read under
+    ///      the lock, so a rotation that committed while this request waited
+    ///      classifies as reuse.
+    ///    - Expired or revoked otherwise (logout, administration, earlier
+    ///      containment) → `NotFound`, writing nothing.
     ///
     /// # Errors
-    /// Returns [`RefreshError::NotFound`] when no row matches the presented
-    /// token, [`RefreshError::Reused`] when a stale row is presented — the
-    /// family is revoked and the containment audited before returning — and a
+    /// Returns [`RefreshError::NotFound`] when no active row matches the
+    /// presented token and it was not rotated, [`RefreshError::Reused`] when a
+    /// rotated row is presented — its chain is revoked and the containment
+    /// audited before returning — and a
     /// store or issuance error when the successor cannot be minted. A machine
     /// refresh row cannot rotate and is refused, and a human row whose bound
     /// connection revision is missing or no longer Active is refused with
@@ -134,6 +138,7 @@ impl RefreshTokens {
         &self,
         conn: &mut TenantConn<'_>,
         presented: SecretString,
+        client: OAuthClientId,
         request_id: &str,
     ) -> Result<ExchangedToken, RefreshError> {
         let hash = token_hash(presented.expose_secret());
@@ -141,21 +146,44 @@ impl RefreshTokens {
             tracing::debug!("refresh token not found for presented hash");
             return Err(RefreshError::NotFound);
         };
+        let session = stored.human_session();
+        if session.is_some_and(|session| session.client != client) {
+            tracing::info!("refresh token presented by a client it was not issued to");
+            return Err(RefreshError::NotFound);
+        }
         lock_refresh_family(conn, &stored.principal_kind, stored.principal_id).await?;
 
+        if let Some(session) = session
+            && session.client == OAuthClientId::WyrdUi
+        {
+            let Some(active) = active_refresh(conn, &hash).await? else {
+                return Err(RefreshError::NotFound);
+            };
+            return Ok(self
+                .issuer
+                .issue_human_access(
+                    conn,
+                    active.principal_id,
+                    Some(active.id),
+                    session.connection,
+                    request_id,
+                )
+                .await?);
+        }
+
         let Some(active) = consume_active_refresh(conn, &hash).await? else {
-            // The presented row exists but is no longer active: it was
-            // already rotated, revoked, or expired. Revoke the entire
-            // principal's token family as a theft response. The family lock
-            // makes this statement see every successor a concurrent
-            // rotation committed.
-            let revoked = revoke_refresh_family(
-                conn,
-                &stored.principal_kind,
-                stored.principal_id,
-                "reuse_detected",
-            )
-            .await?;
+            // The presented row exists but is no longer active. Only a
+            // rotated predecessor is a replay; an expired or otherwise revoked
+            // row is an ordinary inactive token. The family lock makes this
+            // re-read, and the chain revocation, see every successor a
+            // concurrent rotation committed.
+            let rotated = refresh_by_hash(conn, &hash)
+                .await?
+                .is_some_and(|row| row.revoked_reason.as_deref() == Some("rotated"));
+            if !rotated {
+                return Err(RefreshError::NotFound);
+            }
+            let revoked = revoke_refresh_chain(conn, stored.id, "reuse_detected").await?;
 
             // Audit the family revocation (F08) as a refused grant.
             let owner = PrincipalId::new(stored.principal_id);
@@ -185,7 +213,7 @@ impl RefreshTokens {
                 principal_id = %stored.principal_id,
                 principal_kind = %stored.principal_kind,
                 revoked_family_rows = revoked,
-                "refresh token reuse detected; family revoked"
+                "refresh token reuse detected; rotation chain revoked"
             );
 
             return Err(RefreshError::Reused);
@@ -211,18 +239,12 @@ impl RefreshTokens {
         // A human family belongs to the exact connection revision it
         // logged in through; a row carrying no binding predates that
         // provenance and has no connection that could still admit it.
-        let (Some(connection_id), Some(connection_revision)) =
-            (active.human_connection_id, active.human_connection_revision)
-        else {
+        let Some(session) = active.human_session() else {
             tracing::warn!(
                 principal_id = %principal_id,
                 "refresh rotation refused for a family with no login connection"
             );
             return Err(RefreshError::Issuance(IssuanceError::ConnectionInactive));
-        };
-        let connection = HumanConnectionBinding {
-            connection_id,
-            connection_revision,
         };
 
         // The successor is minted from the user's current status and
@@ -232,7 +254,7 @@ impl RefreshTokens {
         // connection ends the family at its next rotation.
         let exchanged = self
             .issuer
-            .issue_human_session(conn, principal_id, Some(active.id), connection, request_id)
+            .issue_human_session(conn, principal_id, Some(active.id), session, request_id)
             .await?;
 
         tracing::debug!(
@@ -290,15 +312,16 @@ mod pg_tests {
     use wyrd_runtime::PrincipalId;
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::PrincipalKindTag;
+    use wyrd_spec::auth::{OAuthClientId, PrincipalKindTag};
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
+    use wyrd_sql::row_types::auth::HumanSessionBinding;
 
     use wyrd_sql::TenantConn;
     use wyrd_sql::queries::auth::{
-        insert_human_refresh_token, insert_refresh_token, insert_role, insert_service_account,
-        list_user_roles, refresh_by_hash, replace_user_roles,
+        active_refresh, insert_human_refresh_token, insert_refresh_token, insert_role,
+        insert_service_account, list_user_roles, refresh_by_hash, replace_user_roles,
     };
 
     use wyrd_dev_fixtures::cards::seed_backing_card;
@@ -425,7 +448,10 @@ mod pg_tests {
                 token_hash,
                 expires_at,
                 None,
-                binding,
+                HumanSessionBinding {
+                    connection: binding,
+                    client: OAuthClientId::WyrdCli,
+                },
             )
             .await
             .expect("human refresh token inserts");
@@ -460,7 +486,12 @@ mod pg_tests {
             .expect("connection reads");
 
         let exchanged = refresh_service()
-            .execute(&mut conn, refresh_jwt, "req-binding")
+            .execute(
+                &mut conn,
+                refresh_jwt,
+                OAuthClientId::WyrdCli,
+                "req-binding",
+            )
             .await
             .expect("rotation succeeds");
 
@@ -498,7 +529,12 @@ mod pg_tests {
         .await
         .expect("unbound row inserts");
         let unbound = refresh_service()
-            .execute(&mut conn, unbound_jwt, "req-unbound")
+            .execute(
+                &mut conn,
+                unbound_jwt,
+                OAuthClientId::WyrdCli,
+                "req-unbound",
+            )
             .await;
         assert!(
             matches!(
@@ -515,7 +551,7 @@ mod pg_tests {
             .await
             .expect("connection deactivates");
         let result = refresh_service()
-            .execute(&mut conn, bound_jwt, "req-inactive")
+            .execute(&mut conn, bound_jwt, OAuthClientId::WyrdCli, "req-inactive")
             .await;
         assert!(
             matches!(
@@ -552,7 +588,12 @@ mod pg_tests {
         seed_active_refresh(&mut conn, "user", user_id, &original_hash).await;
 
         let result = refresh_service()
-            .execute(&mut conn, refresh_jwt, "req-happy-rotation")
+            .execute(
+                &mut conn,
+                refresh_jwt,
+                OAuthClientId::WyrdCli,
+                "req-happy-rotation",
+            )
             .await;
 
         assert!(result.is_ok(), "rotation succeeds: {result:?}");
@@ -602,57 +643,94 @@ mod pg_tests {
         );
     }
 
+    /// Replaying a rotated token revokes only its own rotation chain.
+    ///
+    /// The replayed row's successor is retired with `reuse_detected` and one
+    /// containment audit names the replayed row, while an independent CLI
+    /// login and a non-rotating `wyrd-ui` session of the same principal stay
+    /// active (RFC 9700 §4.14.2 contains the compromised chain, not every
+    /// login of the user).
+    ///
+    /// # Panics
+    /// Panics when seeding fails, the replay is not refused as reuse, the
+    /// successor stays active, an unrelated session is revoked, or the
+    /// containment is not audited exactly once.
     #[tokio::test]
-    async fn reuse_detection_revokes_family() {
+    async fn rotated_replay_revokes_only_its_chain() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
+        let binding = seed_active_human_connection(&mut conn)
+            .await
+            .expect("connection seeds");
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        let stale_hash = hash_of(&refresh_jwt);
-
-        // Insert the token as already-revoked (simulates a previously rotated token).
+        let replayed =
+            seed_active_refresh(&mut conn, "user", user_id, &hash_of(&refresh_jwt)).await;
         sqlx::query(
-            r"
-            INSERT INTO wyrd.auth_refresh_tokens
-                (id, data_tenant_id, principal_kind, principal_id, token_hash,
-                 expires_at, revoked_at, revoked_reason)
-            VALUES ($1, $2, 'user', $3, $4, now() + interval '30 days', now(), 'rotated')
-            ",
+            "UPDATE wyrd.auth_refresh_tokens
+                SET revoked_at = now(), revoked_reason = 'rotated'
+              WHERE id = $1",
         )
-        .bind(Uuid::new_v4())
-        .bind(tenant.as_uuid())
-        .bind(user_id)
-        .bind(&stale_hash)
+        .bind(replayed)
         .execute(&mut **conn.transaction())
         .await
-        .expect("stale token inserts");
-
-        // Insert a second active token for the same principal (a sibling in the family).
-        seed_active_refresh(&mut conn, "user", user_id, "hash-active-sibling").await;
+        .expect("row rotates");
+        let expires_at = Utc::now() + Duration::days(30);
+        for (hash, rotated_from, client) in [
+            ("hash-successor", Some(replayed), OAuthClientId::WyrdCli),
+            ("hash-other-cli", None, OAuthClientId::WyrdCli),
+            ("hash-ui-session", None, OAuthClientId::WyrdUi),
+        ] {
+            insert_human_refresh_token(
+                &mut conn,
+                Uuid::new_v4(),
+                user_id,
+                hash,
+                expires_at,
+                rotated_from,
+                HumanSessionBinding {
+                    connection: binding,
+                    client,
+                },
+            )
+            .await
+            .expect("session row inserts");
+        }
 
         let result = refresh_service()
-            .execute(&mut conn, refresh_jwt, "req-reuse")
+            .execute(&mut conn, refresh_jwt, OAuthClientId::WyrdCli, "req-reuse")
             .await;
-
         assert!(
             matches!(result, Err(RefreshError::Reused)),
             "reuse detected: {result:?}"
         );
 
-        // The sibling should also be revoked.
-        let sibling = refresh_by_hash(&mut conn, "hash-active-sibling")
-            .await
-            .expect("lookup")
-            .expect("sibling exists");
-        assert_eq!(
-            sibling.revoked_reason.as_deref(),
-            Some("reuse_detected"),
-            "sibling revoked by family revoke"
-        );
+        for (hash, expected) in [
+            ("hash-successor", Some("reuse_detected")),
+            ("hash-other-cli", None),
+            ("hash-ui-session", None),
+        ] {
+            let row = refresh_by_hash(&mut conn, hash)
+                .await
+                .expect("lookup")
+                .expect("row exists");
+            assert_eq!(row.revoked_reason.as_deref(), expected, "{hash}");
+        }
+        let containments: Vec<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT credential_id FROM vala.audit_staging
+              WHERE data_tenant_id = $1 AND operation = $2 AND principal_id = $3",
+        )
+        .bind(tenant.as_uuid())
+        .bind(REFRESH_FAMILY_REVOKE_OPERATION)
+        .bind(user_id)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("audit query runs");
+        assert_eq!(containments, vec![Some(replayed)]);
     }
 
     /// F07 race: the second caller presenting the same token after the first has
@@ -675,7 +753,7 @@ mod pg_tests {
         let mut conn_a = fixture.tenant_conn().await.expect("conn_a opens");
         let token_a = SecretString::from(refresh_jwt.expose_secret().to_owned());
         let result_a = refresh_service()
-            .execute(&mut conn_a, token_a, "req-race-a")
+            .execute(&mut conn_a, token_a, OAuthClientId::WyrdCli, "req-race-a")
             .await;
         assert!(result_a.is_ok(), "first caller rotates: {result_a:?}");
         conn_a.commit().await.expect("conn_a commits");
@@ -684,7 +762,7 @@ mod pg_tests {
         let mut conn_b = fixture.tenant_conn().await.expect("conn_b opens");
         let token_b = SecretString::from(refresh_jwt.expose_secret().to_owned());
         let result_b = refresh_service()
-            .execute(&mut conn_b, token_b, "req-race-b")
+            .execute(&mut conn_b, token_b, OAuthClientId::WyrdCli, "req-race-b")
             .await;
 
         assert!(
@@ -725,53 +803,157 @@ mod pg_tests {
             issue_refresh_jwt(&key, PrincipalKindTag::Service, Uuid::new_v4(), tenant);
 
         let result = refresh_service()
-            .execute(&mut conn, refresh_jwt, "req-not-found")
+            .execute(
+                &mut conn,
+                refresh_jwt,
+                OAuthClientId::WyrdCli,
+                "req-not-found",
+            )
             .await;
 
         assert!(matches!(result, Err(RefreshError::NotFound)));
     }
 
+    /// An expired row, and a row revoked by logout, administration, or an
+    /// earlier containment, is an ordinary inactive token.
+    ///
+    /// Each is refused as `NotFound` with no write: the principal's other
+    /// active login stays active and no containment audit is recorded.
+    ///
+    /// # Panics
+    /// Panics when seeding fails, an inactive row is classified as reuse, the
+    /// active sibling is revoked, or a containment audit is written.
     #[tokio::test]
-    async fn expired_token_is_rejected() {
+    async fn inactive_rows_are_refused_without_containment() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
-        let card_ref = service_card_ref();
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
-        let sa_id = insert_test_service_account(&mut conn, user_id, &card_ref).await;
+        seed_active_refresh(&mut conn, "user", user_id, "hash-active-sibling").await;
 
-        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
-        let hash = hash_of(&refresh_jwt);
+        // Each case is retired by expiry (`None`) or by its revocation reason.
+        let cases = [
+            ("expiry", None),
+            ("logout", Some("logout")),
+            ("administration", Some("principal_revoked")),
+            ("containment", Some("reuse_detected")),
+        ];
+        for (case, reason) in cases {
+            let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
+            let id = seed_active_refresh(&mut conn, "user", user_id, &hash_of(&refresh_jwt)).await;
+            sqlx::query(
+                "UPDATE wyrd.auth_refresh_tokens
+                    SET expires_at = CASE WHEN $2::text IS NULL
+                                          THEN now() - interval '1 hour' ELSE expires_at END,
+                        revoked_at = CASE WHEN $2::text IS NULL THEN NULL ELSE now() END,
+                        revoked_reason = $2
+                  WHERE id = $1",
+            )
+            .bind(id)
+            .bind(reason)
+            .execute(&mut **conn.transaction())
+            .await
+            .expect("row retires");
 
-        // Insert with expires_at in the past and no revoked_at.
-        // consume_active_refresh filters on expires_at > now(), so this row is not consumed.
-        // refresh_by_hash has no lifecycle filter, so it finds this row and returns Reused.
-        sqlx::query(
-            r"
-            INSERT INTO wyrd.auth_refresh_tokens
-                (id, data_tenant_id, principal_kind, principal_id, token_hash, expires_at)
-            VALUES ($1, $2, 'service', $3, $4, now() - interval '1 hour')
-            ",
+            let result = refresh_service()
+                .execute(
+                    &mut conn,
+                    refresh_jwt,
+                    OAuthClientId::WyrdCli,
+                    "req-inactive",
+                )
+                .await;
+            assert!(
+                matches!(result, Err(RefreshError::NotFound)),
+                "{case}: an inactive row is not reuse: {result:?}"
+            );
+        }
+
+        let sibling = refresh_by_hash(&mut conn, "hash-active-sibling")
+            .await
+            .expect("lookup")
+            .expect("sibling exists");
+        assert!(sibling.revoked_at.is_none(), "the other login stays active");
+        let containments: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_staging
+              WHERE data_tenant_id = $1 AND operation = $2",
         )
-        .bind(Uuid::new_v4())
         .bind(tenant.as_uuid())
-        .bind(sa_id)
-        .bind(&hash)
+        .bind(REFRESH_FAMILY_REVOKE_OPERATION)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("audit query runs");
+        assert_eq!(containments, 0, "no theft is recorded");
+    }
+
+    /// `active_refresh` resolves only an active row of the bound tenant.
+    ///
+    /// Tenant selection is the `TenantConn` RLS binding alone: a row with the
+    /// same hash in another tenant is invisible, and a revoked or expired row
+    /// of this tenant is not active.
+    ///
+    /// # Panics
+    /// Panics when seeding fails or a row resolves across a tenant or after
+    /// revocation or expiry.
+    #[tokio::test]
+    async fn active_refresh_resolves_only_this_tenants_active_row() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let other = fixture
+            .seed_additional_tenant("active-refresh-other")
+            .await
+            .expect("second tenant seeds");
+
+        let mut other_conn = fixture
+            .tenant_conn_for(other)
+            .await
+            .expect("other conn opens");
+        seed_active_refresh(&mut other_conn, "service", Uuid::new_v4(), "hash-shared").await;
+        seed_active_refresh(
+            &mut other_conn,
+            "service",
+            Uuid::new_v4(),
+            "hash-other-only",
+        )
+        .await;
+        other_conn.commit().await.expect("other tenant commits");
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let active = seed_active_refresh(&mut conn, "service", Uuid::new_v4(), "hash-active").await;
+        let shared = seed_active_refresh(&mut conn, "service", Uuid::new_v4(), "hash-shared").await;
+        let expired =
+            seed_active_refresh(&mut conn, "service", Uuid::new_v4(), "hash-expired").await;
+        sqlx::query(
+            "UPDATE wyrd.auth_refresh_tokens SET revoked_at = now(), revoked_reason = 'logout'
+              WHERE id = $1",
+        )
+        .bind(shared)
         .execute(&mut **conn.transaction())
         .await
-        .expect("expired token inserts");
+        .expect("row revokes");
+        sqlx::query(
+            "UPDATE wyrd.auth_refresh_tokens SET expires_at = now() - interval '1 hour'
+              WHERE id = $1",
+        )
+        .bind(expired)
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("row expires");
 
-        let result = refresh_service()
-            .execute(&mut conn, refresh_jwt, "req-expired")
-            .await;
-
-        // Expired row is found by refresh_by_hash (no lifecycle filter) → Reused.
-        assert!(
-            matches!(result, Err(RefreshError::Reused)),
-            "expired token triggers reuse detection: {result:?}"
-        );
+        for (hash, expected, why) in [
+            ("hash-active", Some(active), "this tenant's active row"),
+            (
+                "hash-shared",
+                None,
+                "revoked here, active in another tenant",
+            ),
+            ("hash-expired", None, "expired"),
+            ("hash-other-only", None, "another tenant's row"),
+        ] {
+            let resolved = active_refresh(&mut conn, hash).await.expect("lookup");
+            assert_eq!(resolved.map(|row| row.id), expected, "{why}");
+        }
     }
 
     /// The rotation's audited grant names the refresh row it consumed.
@@ -798,7 +980,12 @@ mod pg_tests {
             .id;
 
         refresh_service()
-            .execute(&mut conn, refresh_jwt, "req-audit-check")
+            .execute(
+                &mut conn,
+                refresh_jwt,
+                OAuthClientId::WyrdCli,
+                "req-audit-check",
+            )
             .await
             .expect("rotation succeeds");
 
@@ -862,7 +1049,12 @@ mod pg_tests {
         seed_active_refresh(&mut conn, "user", user_id, &hash).await;
 
         let exchanged = refresh_service()
-            .execute(&mut conn, refresh_jwt, "req-rotation-roles")
+            .execute(
+                &mut conn,
+                refresh_jwt,
+                OAuthClientId::WyrdCli,
+                "req-rotation-roles",
+            )
             .await
             .expect("rotation succeeds");
 
@@ -916,6 +1108,7 @@ mod pg_tests {
             .execute(
                 &mut conn_a,
                 SecretString::from(refresh_jwt.expose_secret().to_owned()),
+                OAuthClientId::WyrdCli,
                 "req-replay-rotate",
             )
             .await
@@ -932,6 +1125,7 @@ mod pg_tests {
             .execute(
                 &mut conn_b,
                 SecretString::from(refresh_jwt.expose_secret().to_owned()),
+                OAuthClientId::WyrdCli,
                 "req-replay",
             )
             .await;
@@ -995,11 +1189,16 @@ mod pg_tests {
         );
 
         let successor_replay = refresh_service()
-            .execute(&mut conn_c, successor, "req-successor")
+            .execute(
+                &mut conn_c,
+                successor,
+                OAuthClientId::WyrdCli,
+                "req-successor",
+            )
             .await;
         assert!(
-            matches!(successor_replay, Err(RefreshError::Reused)),
-            "the successor cannot rotate: {successor_replay:?}"
+            matches!(successor_replay, Err(RefreshError::NotFound)),
+            "the contained successor is an ordinary inactive token: {successor_replay:?}"
         );
     }
 
@@ -1027,6 +1226,7 @@ mod pg_tests {
             .execute(
                 &mut setup,
                 SecretString::from(ancestor.expose_secret().to_owned()),
+                OAuthClientId::WyrdCli,
                 "req-rotate-a",
             )
             .await
@@ -1038,7 +1238,12 @@ mod pg_tests {
         // The legitimate rotation of B, held open with C written.
         let mut rotating = fixture.tenant_conn().await.expect("rotating conn opens");
         let successor = service
-            .execute(&mut rotating, current, "req-rotate-b")
+            .execute(
+                &mut rotating,
+                current,
+                OAuthClientId::WyrdCli,
+                "req-rotate-b",
+            )
             .await
             .expect("B rotates to C")
             .refresh_token
@@ -1050,7 +1255,12 @@ mod pg_tests {
             .await
             .expect("replay pid reads");
         let (replay, ()) = tokio::join!(
-            service.execute(&mut replaying, ancestor, "req-replay-a"),
+            service.execute(
+                &mut replaying,
+                ancestor,
+                OAuthClientId::WyrdCli,
+                "req-replay-a"
+            ),
             async {
                 wait_for_advisory_lock_wait(&fixture, replay_pid).await;
                 rotating.commit().await.expect("rotation commits");
@@ -1087,10 +1297,17 @@ mod pg_tests {
             vec![Some(ancestor_id)],
             "exactly one containment audit names the replayed A"
         );
-        let successor_rotation = service.execute(&mut fresh, successor, "req-rotate-c").await;
+        let successor_rotation = service
+            .execute(
+                &mut fresh,
+                successor,
+                OAuthClientId::WyrdCli,
+                "req-rotate-c",
+            )
+            .await;
         assert!(
-            matches!(successor_rotation, Err(RefreshError::Reused)),
-            "C cannot rotate: {successor_rotation:?}"
+            matches!(successor_rotation, Err(RefreshError::NotFound)),
+            "contained C is an ordinary inactive token: {successor_rotation:?}"
         );
     }
 
@@ -1171,7 +1388,12 @@ mod pg_tests {
         // The legitimate rotation of B, held open with C written.
         let mut rotating = fixture.tenant_conn().await.expect("rotating conn opens");
         let successor = service
-            .execute(&mut rotating, current, "req-rotate-b")
+            .execute(
+                &mut rotating,
+                current,
+                OAuthClientId::WyrdCli,
+                "req-rotate-b",
+            )
             .await
             .expect("B rotates to C")
             .refresh_token
@@ -1192,7 +1414,14 @@ mod pg_tests {
         deactivated.expect("deactivation commits");
 
         let mut fresh = fixture.tenant_conn().await.expect("fresh conn opens");
-        let successor_rotation = service.execute(&mut fresh, successor, "req-rotate-c").await;
+        let successor_rotation = service
+            .execute(
+                &mut fresh,
+                successor,
+                OAuthClientId::WyrdCli,
+                "req-rotate-c",
+            )
+            .await;
         assert!(
             matches!(
                 successor_rotation,
@@ -1235,7 +1464,12 @@ mod pg_tests {
         seed_active_refresh(&mut conn, "service", sa_id, &hash).await;
 
         let result = refresh_service()
-            .execute(&mut conn, refresh_jwt, "req-machine-rotate")
+            .execute(
+                &mut conn,
+                refresh_jwt,
+                OAuthClientId::WyrdCli,
+                "req-machine-rotate",
+            )
             .await;
 
         assert!(

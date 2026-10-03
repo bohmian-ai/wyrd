@@ -730,9 +730,11 @@ export declare function connectVerification(serverUrl?: string | undefined | nul
  * Builds one client without performing IO.
  *
  * Omitted arguments resolve through `client_from_options`: the environment,
- * then the saved user login for this server and `tenant` (a tenant route
- * key), then `~/.config/wyrd/credentials.toml`. Failures are returned as catalog
- * metadata.
+ * then the saved `wyrd auth login` for this server (the one for `tenant`, a
+ * tenant route key, when given, otherwise the newest), then
+ * `~/.config/wyrd/credentials.toml`. Failures are returned as catalog
+ * metadata, including `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when this server
+ * has saved logins but none for `tenant`.
  */
 export declare function connectWyrdClient(serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, tenant?: string | undefined | null): NativeWyrdClientResult
 

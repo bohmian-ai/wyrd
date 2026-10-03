@@ -1079,8 +1079,8 @@ export class WyrdClient {
    * Omitted options resolve from the environment, then the saved
    * `wyrd auth login` for this server (the one for `tenant`, a tenant route
    * key, when given, otherwise the newest), then
-   * `~/.config/wyrd/credentials.toml`. A `tenant` with no saved login for this
-   * server, or a saved login that cannot be used, raises
+   * `~/.config/wyrd/credentials.toml`. A `tenant` that matches none of this
+   * server's saved logins, or a saved login that cannot be used, raises
    * `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE`.
    */
   static connect(

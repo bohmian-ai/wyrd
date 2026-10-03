@@ -9,9 +9,10 @@ from typing import Literal
 class WyrdClient:
     """Authenticated Wyrd client that can act for another principal.
 
-    Construction resolves omitted values from the environment and then
-    ``~/.config/wyrd/credentials.toml``. The client's own credential is the
-    actor in ``on_behalf_of``.
+    Construction resolves omitted values from the environment, then the saved
+    ``wyrd auth login`` for this server (the newest unless ``tenant`` selects
+    one), then ``~/.config/wyrd/credentials.toml``. The client's own
+    credential is the actor in ``on_behalf_of``.
     """
 
     def __init__(
@@ -28,7 +29,9 @@ class WyrdClient:
 
         Raises:
             WyrdError: ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no credential
-                resolves.
+                resolves; ``WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE`` when this
+                server has saved logins but none for ``tenant``, or the saved
+                login can no longer be renewed.
         """
         ...
 

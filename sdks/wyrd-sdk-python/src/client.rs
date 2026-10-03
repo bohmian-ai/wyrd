@@ -42,8 +42,8 @@ impl PyWyrdClient {
     ///
     /// # Errors
     /// Raises `WyrdError` carrying `WYRD_CLIENT_401_NO_CREDENTIALS` when no
-    /// credential resolves, `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when
-    /// `tenant` names no saved login for this server or the saved login
+    /// credential resolves, `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when this
+    /// server has saved logins but none for `tenant`, or the saved login
     /// cannot be used, or a transport error when the client cannot be built.
     #[new]
     #[pyo3(signature = (server_url=None, credential=None, grpc_url=None, tenant=None))]

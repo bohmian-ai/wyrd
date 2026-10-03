@@ -431,7 +431,6 @@ mod pg_tests {
         ]);
         let before_cancel = cluster.metric_totals_labeled(&[family], &labels)?[family];
         handle.cancel(None).await?;
-        cluster.release_execute_pause(paused)?;
         for (index, before) in baseline {
             await_baseline(&cluster, index, before).await?;
         }

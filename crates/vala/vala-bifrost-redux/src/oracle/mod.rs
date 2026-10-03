@@ -4137,17 +4137,17 @@ impl AttemptSettlement {
 /// object error means a data file the pinned cut referenced was already deleted
 /// when the scan reached it; there is no second attempt to move to, so the
 /// attempt is cancelled, its distributed children are joined, and the query
-/// fails. Any other first-batch failure, a missing telemetry guard, or a
-/// schema-frame failure settles the distributed children and releases the
-/// admitted owner before returning, so no child outlives its parent on a
-/// failure path.
+/// fails. A cancellation before the first batch, any other first-batch
+/// failure, a missing telemetry guard, or a schema-frame failure settles the
+/// distributed children and releases the admitted owner before returning, so
+/// no child outlives its parent on a failure path.
 ///
 /// # Errors
 ///
 /// Returns [`BifrostError::QueryTimeout`] when the first batch does not arrive
-/// before the deadline, [`BifrostError::QueryExecutionFailed`] for a stale first
-/// batch or a missing telemetry guard, and the mapped first-batch failure
-/// otherwise.
+/// before the deadline, [`BifrostError::QueryExecutionFailed`] when the query is
+/// cancelled first, for a stale first batch, or for a missing telemetry guard,
+/// and the mapped first-batch failure otherwise.
 async fn settle_attempt_output(
     output: AttemptOutput,
     settle: AttemptSettlement,
@@ -4158,7 +4158,7 @@ async fn settle_attempt_output(
         mut batches,
         scan_stats,
         degraded_sources,
-        mut admitted,
+        admitted,
         running_query,
         query_class,
         reader_protection,
@@ -4167,9 +4167,24 @@ async fn settle_attempt_output(
         deadline,
         deadline_ms,
     } = settle;
-    let Ok(first) =
-        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), batches.next()).await
-    else {
+    // A cancel before the first batch ends the wait, exactly as a cancel of
+    // an open stream ends its next read; the distributed children are then
+    // cancelled and joined like any other first-batch failure.
+    let cancellation = admitted.cancellation.clone();
+    let next = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), batches.next());
+    let Ok(first) = (tokio::select! {
+        first = next => first,
+        () = cancellation.cancelled() => {
+            return settle_distributed_failure(
+                deadline,
+                batches,
+                admitted,
+                BifrostError::QueryExecutionFailed,
+                "first-batch cancellation",
+            )
+            .await;
+        }
+    }) else {
         return settle_distributed_failure(
             deadline,
             batches,
@@ -4186,7 +4201,6 @@ async fn settle_attempt_output(
         admitted.cancellation.cancel();
         drop(batches);
         admitted.distributed_settlement.join().await;
-        admitted.drain_children().await;
         return release_error(
             deadline,
             admitted,
@@ -4375,7 +4389,7 @@ fn release_error<T>(
 async fn settle_distributed_failure<T>(
     deadline: Instant,
     batches: SendableRecordBatchStream,
-    mut admitted: AdmittedQueryGuard,
+    admitted: AdmittedQueryGuard,
     original: BifrostError,
     phase: &'static str,
 ) -> Result<T, BifrostError> {
@@ -4383,7 +4397,6 @@ async fn settle_distributed_failure<T>(
     admitted.request_cancellation.cancel();
     drop(batches);
     admitted.distributed_settlement.join().await;
-    admitted.drain_children().await;
     release_error(deadline, admitted, original, phase)
 }
 

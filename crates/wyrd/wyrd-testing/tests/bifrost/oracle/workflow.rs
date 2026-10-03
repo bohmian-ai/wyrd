@@ -62,8 +62,8 @@ enum TerminalCause {
 /// A forwarded Workflow query settles on its remote Oracle before the run
 /// ends, for cancel, deadline, and pod loss alike.
 ///
-/// Cancel and deadline record a `cancelled` Analytical query, and pod loss
-/// records a `failed` one.
+/// A cancel records a `cancelled` Analytical query; a deadline, which the
+/// leader ends as a query timeout, and a pod loss record a `failed` one.
 ///
 /// # Panics
 ///
@@ -171,16 +171,6 @@ async fn prove_forwarded_query_settles(cause: TerminalCause) -> Result<(), Journ
             None
         }
     };
-    // A registry cancel does not reach the held follower task, so the
-    // leader's cleanup can begin only once that task is released. Releasing
-    // it after the leader recorded the cancellation lets the graph end but
-    // never succeed.
-    if cause == TerminalCause::Cancel {
-        let leader =
-            wyrd_client::Bifrost::query_only(&public_client(cluster.server(LEADER)?, &api_key)?);
-        await_cancellation_requested(&leader).await?;
-        cluster.release_execute_pause(HELD_FOLLOWER)?;
-    }
     cluster.await_cleanup_paused().await?;
 
     // The leader's cleanup still owns the query, so its terminal has not
@@ -243,27 +233,6 @@ async fn prove_forwarded_query_settles(cause: TerminalCause) -> Result<(), Journ
     Ok(())
 }
 
-/// Wait until the one running query `leader` lists has cancellation
-/// requested.
-///
-/// # Errors
-///
-/// Returns the listing failure, or a message when no running query is
-/// marked cancelled within [`PATIENCE`].
-async fn await_cancellation_requested(leader: &wyrd_client::Bifrost) -> Result<(), JourneyError> {
-    let deadline = tokio::time::Instant::now() + PATIENCE;
-    loop {
-        let running = leader.running().await?;
-        if running.iter().any(|query| query.cancellation_requested) {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("the leader never recorded the cancellation: {running:?}").into());
-        }
-        tokio::time::sleep(POLL).await;
-    }
-}
-
 /// Production Oracle query duration family, labelled by class and outcome.
 const DURATION: &str = "oracle_query_duration_seconds";
 
@@ -278,13 +247,14 @@ fn duration_outcome(outcome: &str) -> BTreeMap<String, String> {
 impl TerminalCause {
     /// The [`DURATION`] outcome the held query's end must record.
     ///
-    /// The tool query's deadline is capped at the run's remaining time, so in
-    /// the deadline case the run's cancel and the query's own expiry arrive
-    /// together, and both are a cancellation.
+    /// A cancel reaches the leader as a registry cancel, which is recorded as
+    /// `cancelled` even before the query's stream exists. A deadline ends the
+    /// leader's first-batch wait as a query timeout, and that end before a
+    /// stream exists is recorded as `failed`, as is a lost follower.
     const fn recorded_outcome(self) -> &'static str {
         match self {
-            Self::Cancel | Self::Deadline => "cancelled",
-            Self::PodKill => "failed",
+            Self::Cancel => "cancelled",
+            Self::Deadline | Self::PodKill => "failed",
         }
     }
 }

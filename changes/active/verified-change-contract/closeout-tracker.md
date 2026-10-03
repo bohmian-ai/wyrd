@@ -22,7 +22,7 @@ Rules for every worktree:
 | 1 | Gateway capture refactor | verified-change-contract rev 54 | merged | `de3dfaca6` | **Done** | — |
 | 2 | Benchmark fixes (reviews R1–R5) | verified-change-contract rev 57 | `agent-a82d72f51901e1dc5` / `worktree-agent-a82d72f51901e1dc5` | `1d05642bf` | R5 verdict FIX_REQUIRED: 2 findings, both accepted as valid. FIND-16: replica shutdown must sit on an owner struct. FIND-17: the audit drain must count decisions still held in a replica's memory and committed rows that arrive after the stop. A fresh implementer is fixing them | R6 Codex review after the fixes |
 | 3 | Forge concurrent planning (TASK-001, TASK-002) | forge-concurrent-planning rev 2 | `agent-ac58f45cb5b747685` / `worktree-agent-ac58f45cb5b747685` | `be922f434` | r2 verdict FIX_REQUIRED: 8 findings, all accepted as valid (failover deadline and kill proof, shutdown release error, worker expiry delay, full failed batch, AC-010 compaction proof, raw transaction, task revision, exact commands). The live_rewrite test change was judged sound. A fresh implementer is fixing them | r3 Codex review after the fixes |
-| 4 | Audit outbox (3 tasks) | audit-outbox rev 1 | `agent-aad682fbca5074900` / `worktree-agent-aad682fbca5074900` | `f451d52be` | All 3 tasks implemented (T01 `0fa3d0d6b`, T02 `d2af088b9`, T03 `f451d52be`), all lanes green; r1 Codex review running | Validate r1 findings, then fix or merge |
+| 4 | Audit outbox (3 tasks) | audit-outbox rev 2 (approved) | `agent-aad682fbca5074900` / `worktree-agent-aad682fbca5074900` | `fb1efad77` | r1 verdict SPEC_REVISION_REQUIRED (FIND-1: failed commits were dropped). Rev 2 approved: retry without drop, generic outbox (REQ-008), event-ID dedup (REQ-009). Nine other findings accepted. FIND-5 (capacity) and the `mise run gate` part of FIND-8 are deferred to integration | Remediation implementer, then the r2 review |
 | 5 | Verifier runtime under load (TASK-013, 014, 015) | verified-change-contract rev 59 (`5e5623a2e`) + rev 60 (`82f142580`) | `agent-a0ed64ce133bff9d3` / `worktree-agent-a0ed64ce133bff9d3` | `8b7218a92` | TASK-013 done (results through capture writer, no SYSTEM tokens; net −1,100 lines). TASK-015 paused because its outbox duplicated the audit outbox. Agent now on TASK-014 | TASK-015 after the audit outbox merges (see Shared outbox machinery). Then a Codex review |
 
 ### 2. Benchmark fixes
@@ -77,35 +77,167 @@ Rules for every worktree:
 - Drift runs its SQL and scores what comes back. It has no completeness check.
 - Proof: AC-044, plus the revised AC-014, AC-023, AC-030 and AC-043.
 
-### Shared outbox machinery (TASK-015, after the audit outbox merges)
+### Shared outbox machinery (audit-outbox rev 2 REQ-008/009, then TASK-015)
 
 The first TASK-015 attempt hand-wrote an Eval run-request outbox that copied
-the audit outbox's queue, pending counter, stop signal, writer task, retry
-backoff and per-tenant grouping. That copy is not allowed. TASK-015 instead:
+the audit outbox's queue and writer code. That copy is not allowed. There is
+one generic outbox type with separate instances for audit and Eval. They write
+to different crates' databases, and one slow database must not delay the
+other. Sharing the type costs no throughput, because each instance has its own
+queue and writer. If one writer is ever measured as the limit, write tenants
+concurrently inside the generic type. Never add a second outbox.
 
-- Moves the audit outbox's queue and writer machinery into one generic outbox
-  type in a shared crate. It owns the queue, pending count, idle signal, stop,
-  writer task, per-tenant grouping, retry with backoff, no count limit,
-  never-drop retention, graceful-shutdown flush, and counting and logging of
-  losses.
-- Leaves each use with only what is specific to it: the item type and one
-  "write this tenant's items" call. Audit's call writes to `vala.audit_staging`
-  through Vala's Postgres. Eval's call is the multi-row
-  `enqueue_observation_batch` insert through Wyrd's Postgres.
-- Uses one shared type with **separate instances** for audit and Eval, not one
-  queue. They write to different databases owned by different crates (no
-  cross-crate SQL), and a slow database for one must not hold up the other.
-  Each instance has its own queue and writer, so sharing the type costs no
-  throughput.
-- Each writer writes a tenant's queued items in one multi-row insert. If a
-  single writer per instance is ever measured as the limit, write tenants
-  concurrently inside the shared type. Never add a second outbox.
-- Keeps the work-in-progress parts that are not duplicates: deriving run
-  requests from Eval frames, the multi-row insert SQL, removing the 256 cap,
-  the wiring, and the tests. Deletes the duplicate machinery.
-- Proves both instances with their existing audit and Eval tests. Adds focused
-  tests of the shared type for retry without drop, shutdown flush, and loss
-  counting.
+#### Proposed implementation (approved with audit-outbox spec revision 2)
+
+Both outboxes write through one function that inserts into one table:
+
+| Outbox | Function the sink calls | Table |
+|---|---|---|
+| Audit | `append_audit_events` | `vala.audit_staging` |
+| Eval run requests | `VerifierRunQueue::enqueue_observation_batch` | `verifier_runs` |
+
+The generic outbox owns the queue and the writer. Each use supplies a small
+sink that makes that one call.
+
+**Generic part.** It goes in a shared crate with no SQL dependency (proposed:
+`crates/shared/wyrd-runtime/src/outbox.rs`).
+
+```rust
+/// One destination an outbox writes to. Two real implementations: audit, Eval run requests.
+pub trait OutboxSink: Send + Sync + 'static {
+    /// What gets queued (AuditEvent, ObservationRecord).
+    type Item: Send + 'static;
+    type Error: std::fmt::Display + Send;
+    /// Label for metrics and logs: "audit", "eval_run_requests".
+    const NAME: &'static str;
+
+    /// Write one tenant's items in one transaction, all or nothing.
+    /// A write may be retried, so it must be safe to repeat.
+    fn write(&self, tenant: DataTenantId, items: &[Self::Item])
+        -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+/// The shared outbox. Callers only ever see this.
+pub struct Outbox<S: OutboxSink> {
+    queue: mpsc::UnboundedSender<(DataTenantId, S::Item)>, // no count limit
+    pending: Arc<AtomicUsize>,                             // queued + being written
+    idle: Arc<Notify>,                                     // fires when pending reaches 0
+    stop: CancellationToken,
+    writer: TaskTracker,
+}
+
+impl<S: OutboxSink> Outbox<S> {
+    /// Starts the writer. `concurrency` = most tenants written at once (DB connections it may hold).
+    pub fn new(sink: S, concurrency: usize) -> Arc<Self>;
+    /// Queue one item. Never blocks, never fails a request.
+    pub fn stage(&self, tenant: DataTenantId, item: S::Item);
+    /// Items not yet written; exported as the `outbox_pending{outbox}` gauge (the benchmark reads it).
+    pub fn pending(&self) -> usize;
+    /// Wait until everything queued so far is written (tests).
+    pub async fn settle(&self, deadline: Instant) -> usize;
+    /// Stop taking items, keep writing and retrying until `deadline`, return how many were lost.
+    pub async fn shutdown(&self, deadline: Instant) -> usize;
+}
+
+/// Private background task.
+struct OutboxWriter<S: OutboxSink> {
+    sink: Arc<S>,
+    requests: mpsc::UnboundedReceiver<(DataTenantId, S::Item)>,
+    waiting: HashMap<DataTenantId, Vec<S::Item>>,         // per-tenant queue, in arrival order
+    writing: JoinSet<(DataTenantId, Vec<S::Item>, Result<(), S::Error>)>,
+    in_flight: HashSet<DataTenantId>,                     // at most one write per tenant
+    retry_at: HashMap<DataTenantId, (Instant, Duration)>, // backoff: 50 ms doubling to 5 s
+    concurrency: usize,
+    pending: Arc<AtomicUsize>,
+    idle: Arc<Notify>,
+    stop: CancellationToken,
+}
+```
+
+The writer loop waits on four things at once: new items, finished writes, the
+next retry time, and shutdown.
+
+- **Dispatch.**
+  - Pick each tenant that has items waiting, has no write in flight, and is
+    not backing off.
+  - Stop when `concurrency` writes are running.
+  - Take that tenant's whole list and spawn `sink.write(tenant, &items)`.
+- **Success.**
+  - Subtract the items from `pending` and clear that tenant's backoff.
+  - Fire `idle` when `pending` reaches 0.
+- **Failure.**
+  - Put the items back at the front of that tenant's list, ahead of anything
+    that arrived meanwhile, so order is kept.
+  - Double the backoff, log the error, and increment
+    `outbox_write_failures_total{outbox}`.
+  - Other tenants keep going.
+- **Shutdown.**
+  - Stop taking items and keep running until everything is written or the
+    deadline passes.
+  - Count the remainder in `outbox_events_lost_total{outbox}`.
+
+No memory is preallocated. A sink may split a batch inside its own
+transaction only to fit one statement's parameter limit.
+
+**The two sinks.**
+
+```rust
+// crates/vala/vala-sql/src/audit_outbox.rs
+pub struct AuditSink { vala: ValaPostgres }
+
+impl OutboxSink for AuditSink {
+    type Item = AuditEvent;
+    type Error = sqlx::Error;
+    const NAME: &'static str = "audit";
+    async fn write(&self, tenant: DataTenantId, events: &[AuditEvent]) -> Result<(), sqlx::Error> {
+        let mut conn = self.vala.tenant_conn(tenant).await?;
+        append_audit_events(&mut conn, events).await?; // INSERT INTO vala.audit_staging; skips event IDs already staged
+        conn.commit().await
+    }
+}
+pub type AuditOutbox = Outbox<AuditSink>;              // concurrency = 4
+
+// crates/wyrd/wyrd-server/src/verification/observations.rs
+pub struct ObservationRunSink { postgres: WyrdPostgres, runs: VerifierRunQueue }
+
+impl OutboxSink for ObservationRunSink {
+    type Item = ObservationRecord;
+    type Error = WyrdSqlError;
+    const NAME: &'static str = "eval_run_requests";
+    async fn write(&self, tenant: DataTenantId, records: &[ObservationRecord]) -> Result<(), WyrdSqlError> {
+        let mut conn = self.postgres.tenant_conn(tenant).await?;
+        self.runs.enqueue_observation_batch(&mut conn, records).await?; // INSERT INTO verifier_runs ... ON CONFLICT DO NOTHING
+        conn.commit().await
+    }
+}
+pub type ObservationRunOutbox = Outbox<ObservationRunSink>;
+```
+
+**Safe to retry.**
+
+- Eval is keyed by (tenant, binding, record), so a repeated insert does
+  nothing.
+- Audit (audit-outbox REQ-009) is made safe the same way:
+  - each `AuditEvent` gets an event ID when it is staged;
+  - a migration makes (tenant, event ID) unique on `vala.audit_staging`;
+  - `append_audit_events` skips event IDs already staged, without consuming a
+    `seq` or breaking the hash chain.
+
+**Deleted.**
+
+- The 16,384 queue cap and drop-on-full.
+- `BATCH_EVENTS` preallocation.
+- Drop-on-failure in `commit_tenant` and `record_commit_failure`.
+- `AuditOutboxWriter`, which moves into the generic writer.
+- The hand-written `ObservationRunOutbox` writer from the first TASK-015
+  attempt.
+
+**Who builds what.**
+
+- The audit-outbox r1 remediation builds the generic `Outbox`, the
+  `OutboxSink` trait, `AuditSink`, and the event-ID migration.
+- TASK-015 then adds only `ObservationRunSink` and its wiring, on top of the
+  merged audit outbox.
 
 ## Order of work
 
@@ -113,14 +245,18 @@ backoff and per-tenant grouping. That copy is not allowed. TASK-015 instead:
    R5 fixes then the R6 review (which checks only that the R5 findings are
    closed and nothing regressed); the Forge r2 fixes then the r3 review; and
    verifier runtime TASK-014.
-2. Merge the audit outbox into `TASK-008` first. The benchmark and the
-   verifier runtime both depend on it.
+2. Audit outbox r1 remediation under spec rev 2 (approved). It covers retry
+   without drop, the generic `Outbox`/`OutboxSink`, `AuditSink`, the event-ID
+   migration, and the nine other r1 findings. Then the r2 review until PASS,
+   then merge into `TASK-008` first. The benchmark and the verifier runtime
+   both depend on it.
 3. Merge Forge any time after PASS. It does not overlap with the others.
 4. Merge the benchmark after the audit outbox. While merging, point its
    pending-audit metric at the new audit outbox and rerun its focused tests.
 5. Verifier runtime, last:
    - merge the current `TASK-008` into its worktree;
-   - run TASK-015 (the shared outbox machinery);
+   - run TASK-015 (only `ObservationRunSink` and its wiring over the merged
+     generic outbox, plus deleting the duplicate writer);
    - its own Codex review until PASS;
    - merge.
 6. Closeout steps below, on the fully merged branch.

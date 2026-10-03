@@ -802,7 +802,7 @@ async fn fetches_and_executes_locked_workflow_graph() {
         ),
         (
             card_ref("Agent", "security-reviewer", "1.0.0", None),
-            "WYRD_REGISTRY_400_INVALID_CARD_SPEC",
+            "WYRD_WORKFLOW_400_INVALID_CARD_REF",
         ),
     ];
     for (reference, code) in refusals {

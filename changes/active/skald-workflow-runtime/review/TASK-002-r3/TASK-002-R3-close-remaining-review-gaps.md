@@ -115,3 +115,24 @@ Record each finding's actual source/proof, including what the newer existing fix
 - **Evidence:** the trace shows server start at 23:56:51, the last registration (team-v2) at 23:56:56.306 and shutdown at 23:56:56.78, with no error; the same command with `--testTimeout=60000` passed in 6303ms.
 - **Cause:** no vitest config exists under `sdks/wyrd-sdk-ts`, so this single-`it` journey (which starts its own server) ran under vitest's 5000ms default; the four added `Cards.get` round-trips pushed it past that budget.
 - **Fix site:** the journey's own `it` call, given `60_000` like every other `startTestServer` integration test in the directory (`gateway-admin`, `cards-state`, `verification-run`, `operator-connections`). A read-only diagnostician independently confirmed the cause and fix site; no other file is affected.
+
+### Diagnosis: `fetches_and_executes_locked_workflow_graph`
+
+- **Symptom:** `pg_workflow_registration.rs:813` expected `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an exact Agent ref used as a Workflow selector and got `WYRD_WORKFLOW_400_INVALID_CARD_REF`.
+- **Evidence:** panic message `engineering/Agent/security-reviewer@1.0.0: [WYRD_WORKFLOW_400_INVALID_CARD_REF] registered Workflow loading requires a Workflow selector, not Agent`; `WorkflowCards::load` rustdoc and the catalog entry name the Workflow code for a wrong-kind selector, and the Rust SDK journey asserts it for the same ref.
+- **Cause:** 375d97e67 moved wrong-kind and versionless Workflow selectors to `WorkflowInvalidCardRef` and updated the SDK journeys, but not this server test's refusal table.
+- **Fix site:** the Agent row of that refusal table, plus the stale error-code rows of `tasks/TASK-002-cleanup.md`. A read-only diagnostician confirmed production code is correct and no other test asserts the old code. The `^1.0.0` row is still correct (it reaches the server read).
+
+### Acceptance
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-7: each journey compares exact spec refs and relationship targets for all three Agent/Prompt pairs, keeping exact/UID and after-v2 runs | Rust `workflow_loading.rs::{assert_locked_graph,locked_refs}` via `Cards::get`; Python `test_cards_crud.py::{_envelope,_outbound}` via `GET /v1/cards/by-uid/{kind}/{uid}` with the reader's exchanged access token (HTTP supplies envelope inspection; no Python envelope projection added), plus the loaded Workflow's YAML step targets; TS `workflow-loading.test.ts::{refs,outbound}` via `Cards.get` | the three named journey commands, each 1 passed | PASS |
+| FIND-12: generic Python selector/identity failures emit `WYRD_SPEC_400_VALIDATION` before IO; Data validation and Workflow selectors unchanged | `sdks/wyrd-sdk-python/src/state/mod.rs::invalid_selector` used by `selector_for_kind`, `parse_space`, `parse_name`, `parse_version` | `test_registry_selector_errors_use_request_validation` RED 36 failed (`WYRD_DATA_400_VALIDATION`), GREEN 36 passed; `test_user_metadata_rejects_invalid_reserved_and_secret_values` passed; Python journey Workflow negatives passed | PASS |
+| FIND-13: bundle load and canonicalization run off the polling thread | `wyrd-client/src/workflow.rs::{Workflow::from_path,load_bundle}` via `tokio::task::spawn_blocking`; join failure maps to `WYRD_WORKFLOW_500_INTERNAL`; rustdoc states abandonment behaviour | `workflow::tests::from_path_uses_existing_loader`, `tests::load_explicit_workflow_bundle`, Rust and TS journeys passed | PASS |
+| FIND-14: generated feature union passes | `crates/shared/workspace-hack/Cargo.toml` from `cargo hakari generate` (`manage-deps`: no operations) | `mise run check:workspace-hack` exit 0 | PASS |
+| FIND-15: cumulative whitespace check passes | removed the EOF blank of `review/TASK-002-r2/maintainer-review.md` | `git diff --check 0569b797 HEAD` exit 0 | PASS |
+
+Also run and passing: `pg_workflow_registration` `registers_only_valid_explicit_workflow_graphs`, `refuses_stale_preflight_after_dependency_replacement`, `fetches_and_executes_locked_workflow_graph`; `pg_cards_register` `relationship_recheck_blocks_target_lifecycle_race`; `cargo fmt --check`, `cargo clippy --all-features --all-targets -D warnings` for wyrd-client, wyrd-sdk-rust, wyrd-sdk-python, wyrd-server; ruff format/check on touched Python; `ts:typecheck`. Broad aggregate lanes were not run (the lead limited verification to the write set). Non-goals stayed out of scope: no new registry API, runtime, dependency, or gate.
+
+Open observation, not changed: a Workflow selector with a range version (`^1.0.0`) is refused before IO with `WYRD_WORKFLOW_400_INVALID_CARD_REF` in Python but reaches the server as `WYRD_REGISTRY_400_INVALID_CARD_SPEC` in Rust and TypeScript.

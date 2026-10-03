@@ -301,8 +301,8 @@ Observed codes, consistent across SDKs:
 | Registry ref, no credentials | `WYRD_CLIENT_401_NO_CREDENTIALS` |
 | Principal cannot read Cards | `WYRD_PERMISSION_403_DENIED_RBAC` |
 | Deleted Card / Agent UID used as Workflow UID | `WYRD_REGISTRY_404_CARD_NOT_FOUND` |
-| Exact Agent ref used as Workflow selector | `WYRD_REGISTRY_400_INVALID_CARD_SPEC` |
-| Versionless selector | `WYRD_REGISTRY_400_VERSION_REQUIRED` |
+| Exact Agent ref used as Workflow selector | `WYRD_WORKFLOW_400_INVALID_CARD_REF` |
+| Versionless selector | `WYRD_WORKFLOW_400_INVALID_CARD_REF` |
 | Ref UID naming another Card | `WYRD_REGISTRY_400_CARD_REF_UID_NOT_RESOLVABLE_HERE` |
 | Mixed TS/Python selector | `WYRD_SPEC_400_VALIDATION` |
 | `run()` on the `wyrd_gateway` route | `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` (pre-dispatch) |

@@ -1875,8 +1875,9 @@ mod tests {
     }
 
     /// Scenario 4: step routes resolve with step-over-workflow precedence;
-    /// each gateway call carries its own immutable fallback, deadline-derived
-    /// timeout, and run/step/attempt correlation; native steps never reach the
+    /// each gateway call carries its Prompt's gateway model identity, its own
+    /// immutable fallback, deadline-derived timeout, and run/step/attempt
+    /// correlation; native steps never reach the
     /// gateway; tool declarations survive the route; an OpenAI Responses
     /// Agent keeps its native shape through its tool loop; remote problems keep
     /// only safe metadata; a missing gateway refuses the run before dispatch.
@@ -2022,6 +2023,7 @@ mod tests {
             let routed = by_step("routed");
             assert_eq!(routed.len(), 1);
             assert_eq!(routed[0].fallback.as_ref(), Some(&fallback));
+            assert_eq!(routed[0].model.to_string(), "openai/gpt-test");
             assert!(routed[0].timeout <= Duration::from_secs(30) && !routed[0].timeout.is_zero());
             assert_eq!(routed[0].correlation.run_id, run.run_id);
             assert_eq!(routed[0].correlation.attempt, 1);

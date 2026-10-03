@@ -1093,6 +1093,7 @@ pub enum ExternalEndpointProfile {
 
 pub struct WyrdGatewayCall {
     pub request: ProviderRequest,
+    pub model: ModelRef,
     pub fallback: Option<GatewayFallbackOverride>,
     pub timeout: Duration,
     pub correlation: WorkflowGatewayCorrelation,

@@ -257,10 +257,18 @@ async fn drift_runner_without_local_oracle_reads_through_a_peer() -> Result<(), 
     Ok(())
 }
 
-/// A monthly schedule whose current window opens at the start of the month,
-/// so an observation acknowledged just before a binding is made due always
-/// falls inside the window the run analyzes.
+/// A monthly schedule whose current window opens at the start of the month
+/// and closes at the PostgreSQL time the binding is made due.
 const MONTHLY: &str = "0 0 1 * *";
+
+/// How far before the client's own clock the shared observation is stamped.
+///
+/// The client owns `wyrd_event_time`; the window end is PostgreSQL's
+/// `statement_timestamp()`. The two clocks can differ (a VM-backed Postgres
+/// lags the host), so the observation carries an explicit event time this far
+/// in the past instead of letting Scribe stamp its receipt instant, which
+/// keeps it inside the window regardless of that skew.
+const EVENT_TIME_LEAD: chrono::Duration = chrono::Duration::minutes(1);
 
 /// Two schedule bindings of one subject share one raw client observation and
 /// stay independently filterable through their runs and results.
@@ -444,7 +452,9 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
 }
 
 /// One Drift observation `record` of `card_ref`: a drifting `score` and a
-/// `latency` feature, as the SDK's tall projection writes them.
+/// `latency` feature, as the SDK's tall projection writes them, with a
+/// client-owned `wyrd_event_time` [`EVENT_TIME_LEAD`] before the client's
+/// clock.
 ///
 /// # Errors
 /// Returns an Arrow error when the batch cannot be assembled.
@@ -458,8 +468,10 @@ fn observation_batch(record: &str, card_ref: &str) -> Result<RecordBatch, Server
         Field::new("session_id", DataType::Utf8, true),
         Field::new("created_at", utc(), false),
         Field::new(CARD_REF, DataType::Utf8, true),
+        Field::new(WYRD_EVENT_TIME, utc(), false),
     ]));
     let now = Utc::now().timestamp_micros();
+    let event_time = (Utc::now() - EVENT_TIME_LEAD).timestamp_micros();
     Ok(RecordBatch::try_new(
         schema,
         vec![
@@ -470,6 +482,9 @@ fn observation_batch(record: &str, card_ref: &str) -> Result<RecordBatch, Server
             Arc::new(StringArray::from(vec![None::<&str>, None])),
             Arc::new(TimestampMicrosecondArray::from(vec![now, now]).with_timezone("UTC")),
             Arc::new(StringArray::from(vec![card_ref, card_ref])),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![event_time, event_time]).with_timezone("UTC"),
+            ),
         ],
     )?)
 }

@@ -19,6 +19,11 @@
 //! A decision arriving while the queue is full, or one whose batch fails to
 //! commit, is logged and counted in `oracle_audit_commit_failures_total`; that
 //! decision has no audit row.
+//!
+//! The decisions queued or being written, not yet committed or counted lost,
+//! are exported as the `audit_outbox_pending` gauge, so an operator or the
+//! capacity benchmark can see work the process still owns after its requests
+//! returned.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -44,6 +49,10 @@ const QUEUE_EVENTS: usize = 16_384;
 
 /// Most decisions the writer commits in one tenant transaction.
 const BATCH_EVENTS: usize = 1_024;
+
+/// Gauge mirroring [`OracleQueryAudit`]'s pending count: decisions this
+/// process owns that are neither committed to the outbox nor counted lost.
+const PENDING_GAUGE: &str = "audit_outbox_pending";
 
 /// Owns the non-blocking outbox writes for one server's Oracle decisions.
 pub struct OracleQueryAudit {
@@ -92,11 +101,15 @@ impl OracleQueryAudit {
     /// Queues one decision for `tenant`'s audit outbox without waiting.
     ///
     /// When the queue is full the decision is dropped, counted in
-    /// `oracle_audit_commit_failures_total`, and logged.
+    /// `oracle_audit_commit_failures_total`, and logged. The pending count and
+    /// its gauge rise before the enqueue, so the writer can never release a
+    /// decision that was not yet counted.
     pub(crate) fn stage(&self, tenant: DataTenantId, event: AuditEvent) {
         self.pending.fetch_add(1, Ordering::AcqRel);
+        metrics::gauge!(PENDING_GAUGE).increment(1.0);
         if let Err(error) = self.queue.try_send((tenant, event)) {
             self.pending.fetch_sub(1, Ordering::AcqRel);
+            metrics::gauge!(PENDING_GAUGE).decrement(1.0);
             let (mpsc::error::TrySendError::Full((_, event))
             | mpsc::error::TrySendError::Closed((_, event))) = error;
             record_commit_failure(&event, "Oracle audit queue is full");
@@ -132,8 +145,8 @@ struct OracleAuditWriter {
     vala: ValaPostgres,
     /// Receiving half of the decision queue.
     decisions: mpsc::Receiver<(DataTenantId, AuditEvent)>,
-    /// Count shared with the owner; decremented once a batch is committed or
-    /// counted lost.
+    /// Count shared with the owner; decremented, with its gauge, once a batch
+    /// is committed or counted lost.
     pending: Arc<AtomicUsize>,
     /// Cancelled by the owner's shutdown to close the queue.
     stop: CancellationToken,
@@ -141,7 +154,8 @@ struct OracleAuditWriter {
 
 impl OracleAuditWriter {
     /// The writer loop: takes every waiting decision, up to [`BATCH_EVENTS`],
-    /// and commits it, until stopped and the queue is empty.
+    /// and commits it, until stopped and the queue is empty. Each batch leaves
+    /// the pending count and its gauge only after its commit or counted loss.
     ///
     /// After `stop` the queue refuses new decisions, and the writer keeps
     /// committing what was already queued before it exits.
@@ -161,6 +175,7 @@ impl OracleAuditWriter {
             }
             self.commit_batch(&mut batch).await;
             self.pending.fetch_sub(received, Ordering::AcqRel);
+            metrics::gauge!(PENDING_GAUGE).decrement(received as f64);
         }
     }
 

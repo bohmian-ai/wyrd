@@ -219,3 +219,43 @@ complete `capacity` target, the owning server/audit integration target, the
 focused `release_server` selection, `mise run fmt`, `mise run lints`, and
 `git diff --check`. Do not substitute the deferred full benchmark for the
 focused handoff proof and do not claim empirical AC-040/AC-041 qualification.
+
+## Implementation evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-R4-1 replica shutdown has a concrete owner | Free `stop_replicas` deleted from `capacity/main.rs`; inherent `Deployment::stop_replicas(&mut self, output)` in `capacity/step.rs` keeps `spawn_blocking`, newest-first stop, `server-<ordinal>.log`, join/process error conversion, ordinal order, and cancellation semantics; `Benchmark::clean_up` calls it after client shutdown | `tests::a_slow_replica_stop_leaves_the_runtime_free` now builds a `Deployment` and drives `Benchmark::clean_up`: heartbeat ≥ 10 ticks, `[Ok(≥ 2 s)]`, replica reaped, `server-0.log` kept, no client failure | PASS |
+| AC-R4-2 process-local audit ownership participates in drain | `OracleQueryAudit` mirrors its existing `pending` owner into the `audit_outbox_pending` gauge (raised before enqueue, lowered after commit or counted loss); `Backlog::with_replicas` sums it across replica scrapes into `audit`; `Deployment::drain` scrapes before the durable read so the handoff can over-count but never miss | `evidence::tests::the_audit_backlog_holds_from_a_pending_decision_until_its_publication`: chain head held, two public Oracle reads return, drain read = 2 from pending alone. Red check: dropping the pending term fails `left: 0, right: 2`. `evidence::tests::pending_decisions_add_to_staged_audit_rows` supports the arithmetic | PASS |
+| AC-R4-3 durable audit ownership survives the handoff | `Queue::backlog` counts every staged row above its tenant's `published_seq`; the `created_at <= stopped` cut is removed | Same held-commit test: after release every drain read during the handoff is ≥ 2, a staged row has `created_at > stopped`, the cell stays 2 until hand-driven `AuditPublisher::publish_tenant` reaches `Idle`, then reads 0. Red check: restoring the cut fails `left: 1, right: 2` | PASS |
+| AC-R4-4 adjacent behavior unchanged | No workload, SLO, report column, CLI, timeout, request wait, queue, ledger, or publisher change; one gauge added and named in `architecture/bifrost-design.md` | `step::tests::a_backlog_drains_only_within_the_limit` and `evidence::tests::staged_members_hold_the_scribe_backlog` pass; full `capacity` target 20/20 including deadline and descendant proofs; `test:bifrost:journey:server` (held-chain-head journey); `release_server::tests` 2/2 | PASS |
+
+Commands (all from the worktree root):
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity                      # 15 passed, 5 skipped
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && \
+  mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity --run-ignored=only \
+  -E 'test(=evidence::tests::the_audit_backlog_holds_from_a_pending_decision_until_its_publication)'"  # 1 passed
+mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity \
+  -E 'test(=evidence::tests::pending_decisions_add_to_staged_audit_rows)'                    # 1 passed
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && \
+  mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity --run-ignored=all"  # 20 passed, 0 skipped
+mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(/^release_server::tests::/)'  # 2 passed
+mise run test:bifrost:journey:server
+mise run fmt
+mise run lints
+git diff --check
+```
+
+The slow-replica-stop proof ran in the `--run-ignored=all` capacity run
+above. The default `bench:capacity` run stays deferred to integration
+(FIND-TASK-008-CLOSEOUT-13); no AC-040/AC-041 qualification is claimed.
+
+Non-goals held: no public API, CLI, Card/schema, storage, production timeout,
+request wait, audit queue, ledger, publisher, configuration, workload, SLO, or
+report column changed. Only `query_audit.rs`, the capacity binary, and one
+sentence in `architecture/bifrost-design.md` changed. `Queue::unconnected` is
+`#[cfg(test)]` only, so the cleanup proof can build a `Deployment` with no
+database. Integration note: the bench reads pending audit work only through
+the `audit_outbox_pending` scrape, so the audit-outbox branch only has to move
+that gauge's source onto `AuditOutbox`.

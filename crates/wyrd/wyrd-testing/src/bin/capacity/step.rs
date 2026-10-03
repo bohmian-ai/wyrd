@@ -13,7 +13,7 @@
 //! flush have ended.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,7 +23,7 @@ use tokio::time::Instant;
 use wyrd_testing::release_server::{LocalServer, MemoryPeak};
 
 use crate::Result;
-use crate::evidence::{Backlog, Overhead, Percentiles, Queue, RunTally, Scrapes, scribe_backlog};
+use crate::evidence::{Backlog, Overhead, Percentiles, Queue, RunTally, Scrapes};
 use crate::fixture::{Kind, Tenant};
 use crate::judge::Judge;
 use crate::load::{Lane, MAX_IN_FLIGHT, Op, Tally, TenantClients, Work, mix};
@@ -404,20 +404,53 @@ impl Deployment {
         Vec<wyrd_testing::release_server::Metrics>,
     )> {
         loop {
+            // Scrapes first: a replica's pending audit decision leaves its
+            // gauge only after its row commits, so the later durable read
+            // can over-count that handoff but never miss it.
             let mut scrapes = Vec::new();
             for replica in &self.replicas {
                 scrapes.push(replica.metrics().await?);
             }
-            let backlog = Backlog {
-                scribe: scribe_backlog(&scrapes),
-                ..self.queue.backlog(since, stopped, activations).await?
-            };
+            let backlog = self
+                .queue
+                .backlog(since, stopped, activations)
+                .await?
+                .with_replicas(&scrapes);
             match Drain::judge(stopped_at.elapsed(), backlog.is_empty()) {
                 Drain::Drained(seconds) => return Ok((Some(seconds), backlog, scrapes)),
                 Drain::Expired => return Ok((None, backlog, scrapes)),
                 Drain::Pending => tokio::time::sleep(POLL).await,
             }
         }
+    }
+
+    /// Stops every replica newest first, copying each log into `output` as
+    /// `server-<ordinal>.log`, and returns each stop's seconds or error in
+    /// ordinal order. The deployment is left without replicas.
+    ///
+    /// Each [`LocalServer::stop`] is synchronous and may wait out the whole
+    /// [`STOP_GRACE`](wyrd_testing::release_server::STOP_GRACE) before its
+    /// kill, reap, and log copy, so it runs on Tokio's blocking pool while
+    /// this future awaits it; the async workers stay free for timers and
+    /// other tasks during cleanup. A stop that panics is reported as that
+    /// replica's error.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future abandons the stop in progress, which still
+    /// finishes on the blocking pool; later replicas are killed by their
+    /// `Drop`.
+    pub async fn stop_replicas(&mut self, output: &Path) -> Vec<std::result::Result<f64, String>> {
+        let mut shutdown = Vec::new();
+        for replica in std::mem::take(&mut self.replicas).into_iter().rev() {
+            let log = output.join(format!("server-{}.log", replica.ordinal()));
+            let stopped =
+                tokio::task::spawn_blocking(move || replica.stop(&log).map_err(|e| e.to_string()))
+                    .await;
+            shutdown.push(stopped.unwrap_or_else(|error| Err(error.to_string())));
+        }
+        shutdown.reverse();
+        shutdown
     }
 
     /// Folds every lane's tally, and the queued lanes' durable runs, into

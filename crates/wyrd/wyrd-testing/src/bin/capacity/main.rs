@@ -585,7 +585,7 @@ impl Benchmark {
     ///
     /// # Cancellation
     ///
-    /// Not cancelled by [`Benchmark::run`]; see [`stop_replicas`].
+    /// Not cancelled by [`Benchmark::run`]; see [`Deployment::stop_replicas`].
     async fn clean_up(&mut self) -> (Option<String>, Vec<std::result::Result<f64, String>>) {
         let Some(mut deployment) = self.deployment.take() else {
             return (None, Vec::new());
@@ -600,7 +600,7 @@ impl Benchmark {
                 Ok(())
             })
             .await;
-        let shutdown = stop_replicas(std::mem::take(&mut deployment.replicas), &self.output).await;
+        let shutdown = deployment.stop_replicas(&self.output).await;
         (failure, shutdown)
     }
 
@@ -644,36 +644,6 @@ impl Benchmark {
     fn deployment_mut(&mut self) -> Result<&mut Deployment> {
         Ok(self.deployment.as_mut().ok_or("no deployment yet")?)
     }
-}
-
-/// Stops `replicas` newest first, copying each log into `output` as
-/// `server-<ordinal>.log`, and returns each stop's seconds or error in
-/// ordinal order.
-///
-/// Each [`LocalServer::stop`] is synchronous and may wait out the whole
-/// [`STOP_GRACE`] before its kill, reap, and log copy, so it runs on Tokio's
-/// blocking pool while this future awaits it; the async workers stay free
-/// for timers and other tasks during cleanup. A stop that panics is reported
-/// as that replica's error.
-///
-/// # Cancellation
-///
-/// Dropping the future abandons the stop in progress, which still finishes
-/// on the blocking pool; later replicas are killed by their `Drop`.
-async fn stop_replicas(
-    replicas: Vec<LocalServer>,
-    output: &Path,
-) -> Vec<std::result::Result<f64, String>> {
-    let mut shutdown = Vec::new();
-    for replica in replicas.into_iter().rev() {
-        let log = output.join(format!("server-{}.log", replica.ordinal()));
-        let stopped =
-            tokio::task::spawn_blocking(move || replica.stop(&log).map_err(|e| e.to_string()))
-                .await;
-        shutdown.push(stopped.unwrap_or_else(|error| Err(error.to_string())));
-    }
-    shutdown.reverse();
-    shutdown
 }
 
 /// The identity of the measured `binary`: path, size, and modification
@@ -762,7 +732,7 @@ mod tests {
     use clap::Parser as _;
     use tokio::time::Instant;
 
-    use super::{Benchmark, Cli, Lifetime, LocalServer, stop_replicas};
+    use super::{Benchmark, Cli, Lifetime, LocalServer};
 
     /// A benchmark that cannot finish fails when its measuring share ends,
     /// and a cleanup that cannot finish stops at its own reserve, so both
@@ -935,14 +905,17 @@ esac
     }
 
     /// A replica that takes two seconds to exit after `SIGTERM` stops off
-    /// the test runtime's only worker: a heartbeat task on that worker keeps
-    /// ticking while it stops, and the stop still waits for the clean exit,
-    /// reaps the process, keeps its log, and reports its time.
+    /// the test runtime's only worker through the benchmark's own cleanup:
+    /// [`Benchmark::clean_up`] shuts the (empty) client set down and hands the
+    /// deployment's replicas to [`super::Deployment::stop_replicas`]. A
+    /// heartbeat task on that worker keeps ticking while the replica stops,
+    /// and the stop still waits for the clean exit, reaps the process, keeps
+    /// its log, and reports its time in the replica's ordinal slot.
     ///
     /// # Panics
     ///
-    /// Panics when the heartbeat stalls, the stop fails or is too quick, the
-    /// replica survives, or its log is lost.
+    /// Panics when the heartbeat stalls, the cleanup fails or is too quick,
+    /// the replica survives, or its log is lost.
     #[tokio::test]
     #[ignore = "starts a stand-in server in a systemd user scope on port 8080; needs a delegating systemd user manager and python3"]
     async fn a_slow_replica_stop_leaves_the_runtime_free() {
@@ -953,11 +926,38 @@ esac
         let scratch = tempfile::tempdir().expect("scratch directory");
         let server = scratch.path().join("wyrd-server");
         stand_in(&server, STALLING_SERVER, scratch.path());
+        let cli = Cli::parse_from([
+            "capacity",
+            "--server-binary",
+            &server.display().to_string(),
+            "--storage-url",
+            "file:///unused",
+            "--storage-endpoint-url",
+            "http://127.0.0.1:1",
+        ]);
+        let started = Instant::now();
+        let lifetime = Lifetime::new(
+            started,
+            started + Duration::from_secs(60),
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+        );
+        let mut benchmark = Benchmark::prepare(cli, lifetime).await.expect("prepare");
+        benchmark.output = scratch.path().join("capacity");
+        std::fs::create_dir_all(&benchmark.output).expect("output directory");
         let replica = LocalServer::start(&server, &[], &[])
             .await
             .expect("the stand-in serves");
-        let output = scratch.path().join("capacity");
-        std::fs::create_dir_all(&output).expect("output directory");
+        benchmark.deployment = Some(super::Deployment {
+            replicas: vec![replica],
+            tenants: Vec::new(),
+            clients: Vec::new(),
+            queue: super::Queue::unconnected().expect("lazy pool"),
+            judge: Arc::clone(&benchmark.judge),
+            permits: super::permits(),
+            profiles: None,
+            binary: serde_json::Value::Null,
+        });
 
         let beats = Arc::new(AtomicUsize::new(0));
         let heartbeat = tokio::spawn({
@@ -969,10 +969,11 @@ esac
                 }
             }
         });
-        let shutdown = stop_replicas(vec![replica], &output).await;
+        let (failure, shutdown) = benchmark.clean_up().await;
         let beats = beats.load(Ordering::Relaxed);
         heartbeat.abort();
 
+        assert_eq!(failure, None, "the empty client set shut down");
         assert!(
             beats >= 10,
             "the heartbeat ticked {beats} times during the stop"
@@ -986,7 +987,7 @@ esac
             "the replica was reaped"
         );
         assert!(
-            output.join("server-0.log").is_file(),
+            benchmark.output.join("server-0.log").is_file(),
             "the replica's log is kept"
         );
     }

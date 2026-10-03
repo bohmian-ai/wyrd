@@ -112,17 +112,21 @@ const LOCK_OBSERVATION_BINDING_SQL: &str = r#"
        FOR NO KEY UPDATE
 "#;
 
-/// Lock and list every `observations_ready` binding of a batch's subjects
-/// until commit.
+/// Lock and list, until commit, every `observations_ready` binding whose
+/// subject and exact owner Card match a `(subject, writer)` pair of the batch.
 ///
-/// Rows are locked in `binding_id` order (the lock sits above the sort), so
-/// two transactions that touch overlapping bindings acquire them in the same
-/// order and one simply waits for the other instead of forming a cycle.
+/// `$1` and `$2` are parallel arrays of subject Card UID and the writing
+/// principal's bound Card UID, so a record runs only the bindings its writer
+/// owns (REQ-108); another owner's binding on the same subject is never
+/// selected. Rows are locked in `binding_id` order (the lock sits above the
+/// sort), so two transactions that touch overlapping bindings acquire them in
+/// the same order and one simply waits for the other instead of forming a
+/// cycle.
 const LOCK_OBSERVATION_SUBJECTS_SQL: &str = r#"
-    SELECT binding_id, subject_card_uid
+    SELECT binding_id, subject_card_uid, owner_card_uid
       FROM wyrd.verification_bindings
      WHERE activation = 'observations_ready'
-       AND subject_card_uid = ANY($1)
+       AND (subject_card_uid, owner_card_uid) IN (SELECT * FROM unnest($1::uuid[], $2::uuid[]))
      ORDER BY binding_id
        FOR NO KEY UPDATE
 "#;
@@ -884,6 +888,9 @@ pub enum TraceWaitOutcome {
 pub struct ObservationRecord {
     /// Subject Card the observation was emitted for.
     pub subject: CardUid,
+    /// Card the writing principal is bound to; only `observations_ready`
+    /// bindings whose exact owner is this Card take a run of it.
+    pub writer: CardUid,
     /// Logical input record ID, unique per binding's runs.
     pub record_id: String,
     /// Committed observation's server event time, frozen on the run.
@@ -1637,16 +1644,19 @@ impl VerifierRunQueue {
         )
     }
 
-    /// Enqueue one Eval run per active `observations_ready` binding of each
-    /// subject for every record of a batch, in one insert statement.
+    /// Enqueue one Eval run per `observations_ready` binding the writer owns
+    /// on each record's subject, for every record of a batch, in one insert
+    /// statement.
     ///
     /// Called after the observations are durably committed, never inside
-    /// their ingest transaction. One statement locks and lists every
-    /// `observations_ready` binding of the batch's subjects in binding order,
-    /// so concurrent batches touching the same bindings serialize instead of
-    /// deadlocking. Each binding whose owner is runtime-active and whose
-    /// Verifier, subject, and implementation accept an Eval record
-    /// contributes one row per record of its subject; one
+    /// their ingest transaction. One statement locks and lists, in binding
+    /// order, every `observations_ready` binding whose subject and exact
+    /// owner Card match a record's subject and writer, so concurrent
+    /// batches touching the same bindings serialize instead of deadlocking
+    /// and another owner's binding on the same subject takes no run
+    /// (REQ-108). Each such binding whose Verifier, subject, and
+    /// implementation accept an Eval record contributes one row per matching
+    /// record; one
     /// [`INSERT_OBSERVATION_RUNS_SQL`] then writes them all. A record that
     /// already has a run of a binding inserts nothing, so a repeated batch is
     /// a no-op. Bindings of other tenants are never read: the caller's tenant
@@ -1665,27 +1675,27 @@ impl VerifierRunQueue {
         conn: &mut TenantConn<'_>,
         records: &[ObservationRecord],
     ) -> Result<u64, SqlxError> {
-        let subjects: Vec<Uuid> = records
+        let (subjects, writers): (Vec<Uuid>, Vec<Uuid>) = records
             .iter()
-            .map(|record| record.subject.as_uuid())
-            .collect();
-        let bindings: Vec<(Uuid, Uuid)> = sqlx::query_as(LOCK_OBSERVATION_SUBJECTS_SQL)
+            .map(|record| (record.subject.as_uuid(), record.writer.as_uuid()))
+            .unzip();
+        let bindings: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(LOCK_OBSERVATION_SUBJECTS_SQL)
             .bind(subjects)
+            .bind(writers)
             .fetch_all(&mut **conn.transaction())
             .await?;
         let (mut run_ids, mut binding_ids, mut record_ids, mut event_times) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for (binding, subject) in bindings {
+        for (binding, subject, writer) in bindings {
             if !self
                 .accepts_records(conn, stored(BindingId::new(binding))?)
                 .await?
             {
                 continue;
             }
-            for record in records
-                .iter()
-                .filter(|record| record.subject.as_uuid() == subject)
-            {
+            for record in records.iter().filter(|record| {
+                record.subject.as_uuid() == subject && record.writer.as_uuid() == writer
+            }) {
                 run_ids.push(VerificationRunId::new_v7().as_uuid());
                 binding_ids.push(binding);
                 record_ids.push(record.record_id.as_str());
@@ -1706,9 +1716,11 @@ impl VerifierRunQueue {
         Ok(inserted.rows_affected())
     }
 
-    /// Whether `binding` takes observation runs now: its owner is
-    /// runtime-active and its target accepts an Eval record (Verifier ready,
-    /// subject available, Eval implementation).
+    /// Whether `binding`'s target accepts an Eval record now: Verifier ready,
+    /// subject available, Eval implementation.
+    ///
+    /// No owner activity is read: the record's writer is bound to the
+    /// binding's owner and has just authenticated (REQ-108).
     ///
     /// # Errors
     /// Returns the database error when a read fails, or a decode error when
@@ -1718,12 +1730,6 @@ impl VerifierRunQueue {
         conn: &mut TenantConn<'_>,
         binding: BindingId,
     ) -> Result<bool, SqlxError> {
-        let active = binding_activity(conn, binding, self.inactivity)
-            .await?
-            .is_some_and(|activity| activity.active);
-        if !active {
-            return Ok(false);
-        }
         let resolved: Option<ResolvedTarget> = sqlx::query_as(RESOLVE_BINDING_SQL)
             .bind(binding.as_uuid())
             .fetch_optional(&mut **conn.transaction())

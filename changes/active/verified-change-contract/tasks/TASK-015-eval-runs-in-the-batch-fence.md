@@ -322,3 +322,54 @@ shutdown. REQ-077 covers only a slow or unavailable Postgres.
 
 Non-goals kept: no generic outbox change, no Scribe or `vala-sql` writes to
 `verifier_runs`, and no unrelated files.
+
+## Remediation evidence: TASK-015-r1 (spec revision 61)
+
+Contract: REQ-108 revision 61. An Eval observation runs only the
+`observations_ready` bindings whose exact owner is the writer. FIND-TASK-015-1
+is resolved by revision 61. FIND-TASK-015-2 is closed as written. Following the
+coordinator's correction, the writer is carried as the Card UID the principal
+is bound to, and bindings are matched on `owner_card_uid`. There is no join to
+`auth_service_accounts`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Each run request carries its writer | `ObservationRecord::writer: CardUid` (`wyrd-sql/src/queries/verifier_runs.rs`). It is set in `ObservationEnqueue::acknowledged` from `bound_card(&auth.principal)`, the root member of the signed Card scope, which carries the registry UID (`wyrd-server/src/verification/observations.rs`) | `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=verification::observations::tests::writer_card_is_the_bound_cards_scope_uid)'` | PASS |
+| A writer bound to no Card creates no Eval runs | `acknowledged` stages nothing when `bound_card` is `None` (User, TenantAdmin, Card-free Service, SYSTEM) | same unit test (User and Card-free Service resolve to `None`) | PASS |
+| The lock query selects only bindings where subject = record subject and owner = writer Card | `LOCK_OBSERVATION_SUBJECTS_SQL`: `(subject_card_uid, owner_card_uid) IN (SELECT * FROM unnest($1, $2))`. Lock order and the `FOR NO KEY UPDATE` lock are unchanged | `scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p wyrd-sql --test pg_verifier_runs -E 'test(=observation_runs_follow_the_writer)'` | PASS |
+| A's record runs A's binding and never B's on the same subject, including a retry after B authenticates again | as above | `observation_runs_follow_the_writer` (SQL) and journey `eval_verification::eval_runs_follow_the_writing_owner`: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E "test(=eval_verification::eval_runs_follow_the_writing_owner)"'` | PASS |
+| The Eval path does no per-binding activity read; the Verifier/subject/implementation readiness check stays | `accepts_records` no longer calls `binding_activity` | Scenario 1 test below | PASS |
+| Scheduled and Trigger activity gating unchanged | `schedule_occurrence` and `binding_status` still call `binding_activity` | `mise run test:sql` | PASS |
+| FIND-TASK-015-2: `# Cancellation` on the sink write | `ObservationRunSink::write` rustdoc covers rollback before commit, unknown outcome while commit resolves, deadline-loss count, and safe repeat | `mise run lints` | PASS |
+| Scenario 1 still passes with the writer field | the old inactive-owner case became a "writer does not own the subject's binding" case; counts unchanged | `... --test pg_verifier_runs -E 'test(=observation_batches_insert_once_per_binding_and_record)'` and `-E 'test(=frames_naming_subjects_in_opposite_orders_serialize)'` | PASS |
+| Scenario 2 still passes | writer = owner Card | `scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test pg_verification_runtime -E 'test(=observation_outbox_retains_through_an_outage_and_flushes_at_shutdown)'` | PASS |
+
+The journey has two Services, A and B, that both contain Agent M and bind it
+to the same Eval Verifier. A writes a record: it gets exactly one run, on A's
+binding. B then authenticates, and A's record still has no run on B's binding.
+B writes a record: it gets a run on B's binding only. After each step the
+journey settles the run-request outbox, so the run set it checks is exact.
+
+Lanes:
+
+| Lane | Result |
+|---|---|
+| `mise run test:bifrost:journey:server` | 32/32 passed |
+| `mise run test:sql` | 186 + 6 + 118 + 2 passed |
+| `mise run test:bifrost:integration:server` | 89 passed (plus 1 + 1 focused) |
+| `mise run fmt` | clean |
+| `mise run lints` | clean |
+| `git diff --check` | clean |
+
+Diagnosis (new test only): the first run of `observation_runs_follow_the_writer`
+panicked in its fixture with `identifier must match [a-z][a-z0-9_-]{2,63}`,
+because Service names "a" and "b" are shorter than three characters. Renamed
+them to `writer-a` and `writer-b`. This changes no production code.
+
+Non-goals kept: the generic outbox, Scribe, and schedule/Trigger gating are
+unchanged, and no files outside the write set were touched.
+
+Risk: `bound_card` reads the UID from the signed scope's root member. If a
+token's scope root had no UID, that writer would stage no Eval runs. Gate
+already refuses such a writer's Card-stamped rows (`CardUnresolved`), so no
+observation would be committed for it either.

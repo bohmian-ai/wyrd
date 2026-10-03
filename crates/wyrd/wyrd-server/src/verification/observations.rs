@@ -2,11 +2,13 @@
 //!
 //! Gate hands every Eval observation frame Scribe has durably acknowledged to
 //! [`ObservationEnqueue`], which derives each row's exact `record_id`,
-//! subject, and committed `wyrd_event_time` and stages one run request per
-//! record on the [`ObservationRunOutbox`] without waiting. Gate hands over
-//! only the acknowledgement that first committed a batch, so a suppressed
-//! replay never queues and its later receipt instant can never be frozen as a
-//! run's event time.
+//! subject, and committed `wyrd_event_time`, tags it with the Card the writing
+//! principal is bound to, and stages one run request per record on the
+//! [`ObservationRunOutbox`] without waiting. Only bindings that Card owns take
+//! a run of it, and a writer bound to no Card stages nothing (REQ-108). Gate
+//! hands over only the acknowledgement that first committed a batch, so a
+//! suppressed replay never queues and its later receipt instant can never be
+//! frozen as a run's event time.
 //!
 //! The generic [`Outbox`] owns the unbounded queue, per-tenant batching,
 //! retry with backoff, and shutdown; [`ObservationRunSink`] is its one durable
@@ -20,7 +22,9 @@ use bytes::Bytes;
 use vala_bifrost_redux::gate::{AuthContext, ObservationAck};
 use vala_bifrost_redux::tables::EvalObservationsTable;
 use wyrd_runtime::outbox::{Outbox, OutboxSink};
+use wyrd_runtime::principal::Principal;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::ids::CardUid;
 use wyrd_sql::queries::verifier_runs::{ObservationRecord, VerifierRunQueue};
 use wyrd_sql::{SqlError, WyrdPostgres};
 
@@ -64,8 +68,8 @@ impl OutboxSink for ObservationRunSink {
     type Error = SqlError;
     const NAME: &'static str = "eval_run_requests";
 
-    /// Inserts one run per active `observations_ready` binding of each
-    /// record's subject in the tenant's transaction and commits it.
+    /// Inserts one run per `observations_ready` binding the record's writer
+    /// owns on its subject in the tenant's transaction and commits it.
     ///
     /// Repeating the write is harmless: the insert is keyed by tenant,
     /// binding, and record with `ON CONFLICT DO NOTHING`.
@@ -73,6 +77,15 @@ impl OutboxSink for ObservationRunSink {
     /// # Errors
     /// Returns the connection, insert, or commit failure; the outbox retries
     /// the batch.
+    ///
+    /// # Cancellation
+    /// The outbox's shutdown deadline may drop this future mid-write.
+    /// Cancelled before `commit` is sent, the transaction rolls back and no
+    /// run exists; cancelled while `commit` resolves, the outcome is unknown
+    /// and the runs may already be durable. Either way the outbox counts the
+    /// batch in `outbox_events_lost_total`. A later repeat of the same
+    /// records is safe, because the tenant/binding/record key absorbs any run
+    /// that did commit.
     async fn write(
         &self,
         tenant: DataTenantId,
@@ -104,11 +117,16 @@ impl ObservationEnqueue {
 
 impl ObservationAck for ObservationEnqueue {
     /// Decodes the acknowledged frame's records and stages one run request
-    /// per record without waiting.
+    /// per record, tagged with the Card `auth`'s principal is bound to as its
+    /// writer, without waiting.
     ///
-    /// A frame that does not decode is logged and counted as lost; the
+    /// A writer bound to no Card owns no binding, so nothing is staged. A
+    /// frame that does not decode is logged and counted as lost; the
     /// acknowledged observation is never affected.
     fn acknowledged(&self, auth: &AuthContext, frame: Bytes, receipt_micros: i64) {
+        let Some(writer) = bound_card(&auth.principal) else {
+            return;
+        };
         match EvalObservationsTable::acknowledged(&frame, &auth.principal, receipt_micros) {
             Ok(keys) => {
                 for key in keys {
@@ -116,6 +134,7 @@ impl ObservationAck for ObservationEnqueue {
                         auth.tenant,
                         ObservationRecord {
                             subject: key.card_uid,
+                            writer: writer.clone(),
                             record_id: key.record_id,
                             event_time: key.event_time,
                         },
@@ -133,5 +152,71 @@ impl ObservationAck for ObservationEnqueue {
                     .increment(1);
             }
         }
+    }
+}
+
+/// The UID of the Card `principal` is bound to, read from the matching member
+/// of its signed Card scope, which the token mint resolves with registry UIDs.
+///
+/// Returns `None` for a principal bound to no Card (humans, tenant
+/// administrators, Card-free automation, SYSTEM) or whose root member carries
+/// no UID; such a writer owns no binding.
+fn bound_card(principal: &Principal) -> Option<CardUid> {
+    let card = principal.card_ref()?;
+    principal
+        .card_ref_scope()?
+        .as_slice()
+        .iter()
+        .find(|member| member.same_identity(card))?
+        .uid
+        .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    //! Writer Card resolution for Eval run requests.
+
+    use uuid::Uuid;
+    use wyrd_runtime::PermissionSet;
+    use wyrd_runtime::principal::{PrincipalId, PrincipalKind};
+    use wyrd_spec::reference::{CardRef, CardRefScope};
+
+    use super::*;
+
+    /// A tenant principal of `kind` with no roles or permissions.
+    fn principal(kind: PrincipalKind) -> Principal {
+        Principal::new(
+            PrincipalId::new(Uuid::now_v7()),
+            kind,
+            DataTenantId::new_v7(),
+            Vec::new(),
+            PermissionSet::new(),
+        )
+    }
+
+    /// A Service principal resolves to its root scope member's UID, while a
+    /// User and a Card-free Service resolve to no writer Card, so their
+    /// records create no Eval runs.
+    #[test]
+    fn writer_card_is_the_bound_cards_scope_uid() {
+        let uid = CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid Card UID");
+        let root: CardRef = "prod/Service/writer@1.0.0"
+            .parse()
+            .expect("static Card reference parses");
+        let resolved = CardRef {
+            uid: Some(uid.clone()),
+            ..root.clone()
+        };
+        let bound = principal(PrincipalKind::Service {
+            card_ref: Some(root),
+            card_ref_scope: CardRefScope::own(&resolved),
+        });
+        assert_eq!(bound_card(&bound), Some(uid));
+        assert_eq!(bound_card(&principal(PrincipalKind::User)), None);
+        let card_free = principal(PrincipalKind::Service {
+            card_ref: None,
+            card_ref_scope: CardRefScope::default(),
+        });
+        assert_eq!(bound_card(&card_free), None);
     }
 }

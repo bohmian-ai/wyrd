@@ -1831,10 +1831,12 @@ async fn claim_reports_postgres_measured_queue_wait_and_age() {
     );
 }
 
-/// One committed record of `subject`.
-fn record(subject: &CardUid, record_id: &str) -> ObservationRecord {
+/// One committed record of `subject` written by a principal bound to
+/// `writer`.
+fn record(subject: &CardUid, writer: &CardUid, record_id: &str) -> ObservationRecord {
     ObservationRecord {
         subject: subject.clone(),
+        writer: writer.clone(),
         record_id: record_id.to_owned(),
         event_time: at(22, 11, 59),
     }
@@ -1855,10 +1857,11 @@ async fn ordinals(conn: &mut TenantConn<'_>, binding: BindingId) -> Vec<(String,
     .expect("ordinals read")
 }
 
-/// A batch of records for several subjects inserts one run per (active
-/// `observations_ready` binding, record): two bindings of one subject each
-/// take every record of it, a scheduled binding and an inactive owner's
-/// binding take none, and a record repeated in the batch runs once.
+/// A batch of records for several subjects inserts one run per
+/// (`observations_ready` binding the writer owns, record): two bindings of one
+/// subject each take every record of it, a scheduled binding takes none, a
+/// record whose writer does not own its subject's binding takes none, and a
+/// record repeated in the batch runs once.
 /// Resubmitting the batch inserts nothing and consumes no ordinal, so a later
 /// record numbers straight after the first batch.
 ///
@@ -1903,27 +1906,26 @@ async fn observation_batches_insert_once_per_binding_and_record() {
         Vec::new(),
     )
     .await;
-    let (stale, stale_principal) = register_service(&mut conn, &actor, "stale").await;
+    let (foreign, foreign_principal) = register_service(&mut conn, &actor, "foreign").await;
     bind(
         &mut conn,
-        &stale,
+        &foreign,
         &assertion,
         BindingActivation::ObservationsReady,
         Vec::new(),
     )
     .await;
-    for principal in [live_principal, other_principal, stale_principal] {
+    for principal in [live_principal, other_principal, foreign_principal] {
         record_machine_authentication(&mut conn, principal)
             .await
             .expect("activation records");
     }
-    age_activity(&mut conn, stale_principal, Duration::days(2)).await;
     let batch = [
-        record(&live, "r-1"),
-        record(&other, "o-1"),
-        record(&stale, "s-1"),
-        record(&live, "r-2"),
-        record(&live, "r-1"),
+        record(&live, &live, "r-1"),
+        record(&other, &other, "o-1"),
+        record(&foreign, &live, "s-1"),
+        record(&live, &live, "r-2"),
+        record(&live, &live, "r-1"),
     ];
 
     let inserted = queue
@@ -1942,7 +1944,7 @@ async fn observation_batches_insert_once_per_binding_and_record() {
     assert_eq!(run_count(&mut conn).await, 5);
     assert_eq!(
         queue
-            .enqueue_observation_batch(&mut conn, &[record(&live, "r-3")])
+            .enqueue_observation_batch(&mut conn, &[record(&live, &live, "r-3")])
             .await
             .expect("later record enqueues"),
         2
@@ -2010,7 +2012,7 @@ async fn frames_naming_subjects_in_opposite_orders_serialize() {
 
     let mut first = fixture.tenant_conn().await.expect("first opens");
     let made = queue
-        .enqueue_observation_batch(&mut first, &[record(x, "a-1"), record(y, "a-2")])
+        .enqueue_observation_batch(&mut first, &[record(x, x, "a-1"), record(y, y, "a-2")])
         .await
         .expect("first frame enqueues");
     assert_eq!(made, 2);
@@ -2018,7 +2020,7 @@ async fn frames_naming_subjects_in_opposite_orders_serialize() {
     let mut probe = fixture.tenant_conn().await.expect("probe opens");
     let second_frame = async {
         let made = queue
-            .enqueue_observation_batch(&mut second, &[record(y, "b-1"), record(x, "b-2")])
+            .enqueue_observation_batch(&mut second, &[record(y, y, "b-1"), record(x, x, "b-2")])
             .await
             .expect("second frame enqueues without a deadlock");
         second.commit().await.expect("second commits");
@@ -2042,6 +2044,100 @@ async fn frames_naming_subjects_in_opposite_orders_serialize() {
         .await
         .expect("tenant connection opens");
     assert_eq!(run_count(&mut conn).await, 4);
+}
+
+/// An Eval record runs only the bindings its writer owns (REQ-108).
+///
+/// Services A and B each own an `observations_ready` binding on A's Card. A
+/// record A writes runs A's binding and never B's: not while B is active, and
+/// not when the record is retried after B authenticates again. A record B
+/// writes on the same subject runs B's binding and not A's.
+///
+/// # Panics
+/// Panics when a binding takes a run of a record its owner did not write, or
+/// misses a run of one it did.
+#[tokio::test]
+async fn observation_runs_follow_the_writer() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierRunQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let verifier = register_verifier(&mut conn, &actor, "eval", eval()).await;
+    let (a, _) = register_service(&mut conn, &actor, "writer-a").await;
+    let (b, b_principal) = register_service(&mut conn, &actor, "writer-b").await;
+    let a_binding = bind(
+        &mut conn,
+        &a,
+        &verifier,
+        BindingActivation::ObservationsReady,
+        Vec::new(),
+    )
+    .await;
+    let b_binding = project_bindings(
+        &mut conn,
+        &b,
+        &CardKind::Service,
+        &[NewBinding {
+            subject_occurrence_key: "a".to_owned(),
+            subject_card_uid: a.clone(),
+            verifier_uid: verifier.clone(),
+            trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
+            operators: Vec::new(),
+            activation: BindingActivation::ObservationsReady,
+        }],
+    )
+    .await
+    .expect("B's binding on A projects")[0];
+    record_machine_authentication(&mut conn, b_principal)
+        .await
+        .expect("B authenticates");
+
+    let first = [record(&a, &a, "a-1")];
+    assert_eq!(
+        queue
+            .enqueue_observation_batch(&mut conn, &first)
+            .await
+            .expect("A's record enqueues"),
+        1
+    );
+    record_machine_authentication(&mut conn, b_principal)
+        .await
+        .expect("B authenticates again");
+    let retried = [record(&a, &a, "a-1"), record(&a, &a, "a-2")];
+    assert_eq!(
+        queue
+            .enqueue_observation_batch(&mut conn, &retried)
+            .await
+            .expect("A's retry enqueues"),
+        1,
+        "only A's new record runs, and only on A's binding"
+    );
+    assert_eq!(
+        queue
+            .enqueue_observation_batch(&mut conn, &[record(&a, &b, "b-1")])
+            .await
+            .expect("B's record enqueues"),
+        1
+    );
+
+    let numbered = |records: &[(&str, i64)]| -> Vec<(String, i64)> {
+        records
+            .iter()
+            .map(|(record, ordinal)| ((*record).to_owned(), *ordinal))
+            .collect()
+    };
+    assert_eq!(
+        ordinals(&mut conn, a_binding).await,
+        numbered(&[("a-1", 1), ("a-2", 2)])
+    );
+    assert_eq!(
+        ordinals(&mut conn, b_binding).await,
+        numbered(&[("b-1", 1)]),
+        "B never takes a run of A's record"
+    );
 }
 
 /// Waiting for a trace refunds the attempt and requeues after the poll delay;

@@ -15,7 +15,8 @@
 //! events and links in one stable span order bounded to the record's trace
 //! window, and that a trace over the span ceiling fails before any judge call.
 //! Provider, media-locator, and Postgres failures settle with stable codes and
-//! fixed text that expose none of their dependency detail.
+//! fixed text that expose none of their dependency detail. Two Services that
+//! bind the same Agent prove each Eval record runs only its writer's bindings.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2253,6 +2254,183 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
         .any(|sentinel| persisted.contains(sentinel))
     {
         return Err(format!("a persisted run error leaks dependency detail: {persisted}").into());
+    }
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Write two Services, `eval-owner-a` and `eval-owner-b`, that each contain
+/// the same Agent Card M and bind it to the same assertion-only Eval Verifier
+/// with `observations_ready`. Returns the two Service paths.
+///
+/// # Panics
+/// Panics when a fixture file cannot be written.
+fn write_owner_graph(root: &Path) -> (PathBuf, PathBuf) {
+    let service = |name: &str| {
+        format!(
+            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: {name}\n  version: 1.0.0\n  space: default\nspec:\n  service_type: agent\n  components:\n    - alias: agent\n      ref: ./agent.yaml\n      verified_by:\n        - verifier: ./verifier.yaml\n          runs_on: {{kind: observations_ready}}\n"
+        )
+    };
+    let files = [
+        (
+            "agent-prompt.yaml",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: eval-agent-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-test\n  messages: [answer the question]\n".to_owned(),
+        ),
+        ("agent.yaml", agent("eval-shared-agent")),
+        (
+            "verifier.yaml",
+            verifier(
+                "eval-shared",
+                "      tasks:\n        answer: {kind: assertion, id: answer, context_path: $.answer, operator: equals, expected: \"yes\"}\n",
+            ),
+        ),
+        ("service-a.yaml", service("eval-owner-a")),
+        ("service-b.yaml", service("eval-owner-b")),
+    ];
+    for (name, body) in files {
+        std::fs::write(root.join(name), body).expect("fixture file writes");
+    }
+    (root.join("service-a.yaml"), root.join("service-b.yaml"))
+}
+
+/// Emit one Eval record about `agent` through `client`'s SDK lifetime over
+/// `bundle`, then shut it down so the record is acknowledged.
+///
+/// # Errors
+/// Returns an error when the Agent is not in the bundle or shutdown fails.
+async fn emit_as(
+    client: &WyrdClient,
+    bundle: &Path,
+    marker: &str,
+) -> Result<(), ServerJourneyError> {
+    let state = start_state(bundle, client).await;
+    emit(
+        &state.run().for_card("agent")?,
+        &json!({ "answer": "yes", "marker": marker }),
+        None,
+        None,
+    );
+    state.shutdown().await?;
+    Ok(())
+}
+
+/// Every observation run as `(owner Card name, record ID)`, sorted.
+const OWNED_RUNS_SQL: &str = "SELECT o.name, r.input_record_id FROM wyrd.verifier_runs r \
+    JOIN wyrd.cards o ON o.card_uid = r.owner_card_uid \
+    WHERE r.origin = 'observation' ORDER BY o.name, r.input_record_id";
+
+/// Poll until `count` observation runs exist, wait for the run-request outbox
+/// to hold nothing more, and return every run as `(owner Service name,
+/// record ID)`, sorted.
+///
+/// Settling after the count is reached proves no further run is on its way,
+/// so the returned set is exact.
+///
+/// # Errors
+/// Returns a query error, a timeout, or an error when the outbox does not
+/// settle.
+async fn owned_runs(
+    server: &WyrdTestServer,
+    superuser: &sqlx::PgPool,
+    count: usize,
+) -> Result<Vec<(String, String)>, ServerJourneyError> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let runs: Vec<(String, String)> =
+            sqlx::query_as(OWNED_RUNS_SQL).fetch_all(superuser).await?;
+        if runs.len() >= count {
+            let outbox = server
+                .state()
+                .bifrost
+                .observation_runs()
+                .ok_or("the server owns no run-request outbox")?;
+            let left = outbox.settle(deadline.into_std()).await;
+            if left != 0 {
+                return Err(format!("{left} run requests never settled").into());
+            }
+            return Ok(sqlx::query_as(OWNED_RUNS_SQL).fetch_all(superuser).await?);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "only {} of {count} runs were enqueued: {runs:?}",
+                runs.len()
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// An Eval record runs only the bindings its writer's Card owns (REQ-108).
+///
+/// Services A and B both contain Agent M and bind it to the same Eval
+/// Verifier. A record A writes about M runs A's binding and none of B's, and
+/// still none of B's after B authenticates; a record B writes about M runs
+/// B's binding only.
+///
+/// # Errors
+/// Returns server, registration, query, or SDK errors, or a description of the
+/// first run set that does not follow its writer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn eval_runs_follow_the_writing_owner() -> Result<(), ServerJourneyError> {
+    let root = tempfile::tempdir()?;
+    let (service_a, service_b) = write_owner_graph(root.path());
+    let (bundle_a, bundle_b) = (root.path().join("bundle-a"), root.path().join("bundle-b"));
+    let server = Box::pin(WyrdTestServer::start_bound()).await?;
+    let tenant = server.data_tenant_id();
+    let superuser = server.pg_fixture().superuser_pool().await?;
+    let admin = connect(
+        &server,
+        &api_key(
+            server
+                .bootstrap_service("eval_owner_admin", &["admin"])
+                .await?,
+        ),
+    );
+    let receipt_a = register(&admin, &service_a, &bundle_a).await;
+    let receipt_b = register(&admin, &service_b, &bundle_b).await;
+    let writer_a = connect(
+        &server,
+        &api_key(
+            server
+                .credential_registered_service(&receipt_a.root, &[])
+                .await?,
+        ),
+    );
+
+    emit_as(&writer_a, &bundle_a, "from-a").await?;
+    server.flush_bifrost().await?;
+    let from_a = record_id(&server, tenant, "from-a").await?;
+    let owner_a = "eval-owner-a".to_owned();
+    let expected = vec![(owner_a.clone(), from_a.clone())];
+    let runs = owned_runs(&server, &superuser, 1).await?;
+    if runs != expected {
+        return Err(format!("A's record ran {runs:?}, not only A's binding").into());
+    }
+
+    // B authenticates and is now active; A's record still has no run of B's.
+    let writer_b = connect(
+        &server,
+        &api_key(
+            server
+                .credential_registered_service(&receipt_b.root, &[])
+                .await?,
+        ),
+    );
+    start_state(&bundle_b, &writer_b).await.shutdown().await?;
+    let runs = owned_runs(&server, &superuser, 1).await?;
+    if runs != expected {
+        return Err(format!("B's authentication changed A's runs: {runs:?}").into());
+    }
+
+    emit_as(&writer_b, &bundle_b, "from-b").await?;
+    server.flush_bifrost().await?;
+    let from_b = record_id(&server, tenant, "from-b").await?;
+    let runs = owned_runs(&server, &superuser, 2).await?;
+    let expected = vec![(owner_a, from_a), ("eval-owner-b".to_owned(), from_b)];
+    if runs != expected {
+        return Err(format!("expected one run per writer's own binding, read {runs:?}").into());
     }
     server.shutdown().await?;
     Ok(())

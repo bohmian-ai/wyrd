@@ -2435,6 +2435,7 @@ async fn observation_outbox_retains_through_an_outage_and_flushes_at_shutdown() 
     let tenant = harness.server.pg_fixture().data_tenant_id();
     let record = |record_id: &str| ObservationRecord {
         subject: owner.clone(),
+        writer: owner.clone(),
         record_id: record_id.to_owned(),
         event_time: Utc::now(),
     };

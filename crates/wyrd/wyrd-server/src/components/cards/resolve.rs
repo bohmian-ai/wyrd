@@ -4,14 +4,15 @@ use std::collections::{BTreeSet, HashMap};
 
 use serde_json::json;
 use skald_workflow::{Workflow, card_body_dependencies};
+use wyrd_semver::VersionSpec;
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::data::{ArrowFormat, DataInterface};
 use wyrd_spec::card::drift::DriftSignal;
 use wyrd_spec::card::operator::{OperatorAction, OperatorSpec};
 use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
 use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
-use wyrd_spec::card::workflow::WorkflowCard;
-use wyrd_spec::envelope::{Card, CardKind, Relationships, Spec};
+use wyrd_spec::card::workflow::{WorkflowCard, jcs_len};
+use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::graph::graph_ready_submissions;
 use wyrd_spec::ids::CardUid;
@@ -20,8 +21,9 @@ use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef, Ref};
 use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
 use wyrd_spec::registry::CardSubmission;
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::cards::{get_card_by_uid, select_card_uids_by_ref_batch};
+use wyrd_sql::queries::cards::{get_card_by_ref, get_card_by_uid, select_card_uids_by_ref_batch};
 use wyrd_sql::queries::operator_connections::find_connection;
+use wyrd_sql::row_types::cards::{CardStatus, ParsedCardRow};
 
 use crate::state::registry_db_error;
 use wyrd_sql::queries::verification::BindingSchedule;
@@ -511,6 +513,202 @@ impl EffectiveSpecs {
         let row = get_card_by_uid(conn, &uid).await?;
         self.externals.insert(identity, row.spec.clone());
         Ok(Some(row.spec))
+    }
+}
+
+/// Server Workflow admission bounds on a graph's declared shape and the JCS
+/// bytes of the bodies it executes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GraphBounds {
+    /// Declared steps one Workflow may have.
+    pub(crate) max_steps: usize,
+    /// Declared dependency edges, duplicates included.
+    pub(crate) max_edges: usize,
+    /// JCS bytes of the Workflow spec and every unique pinned Agent and
+    /// Prompt spec.
+    pub(crate) max_bytes: usize,
+}
+
+/// The exact active Workflow graph one accepted server run executes.
+///
+/// [`PinnedWorkflowGraph::pin`] reads the root Workflow and every Agent and
+/// Prompt Card it names at their exact registered identities, refusing any
+/// Card that is not active, so a later re-registration, deprecation, or
+/// deletion cannot change what an accepted run executes. Bodies are keyed by
+/// exact identity and served only to an external reference with that
+/// identity.
+pub(crate) struct PinnedWorkflowGraph {
+    /// The active root Workflow Card.
+    workflow: WorkflowCard,
+    /// Every pinned Agent and Prompt spec the Workflow names, by identity.
+    bodies: HashMap<CardRefIdentity, Spec>,
+}
+
+impl PinnedWorkflowGraph {
+    /// Read and pin the active Workflow at `workflow_ref` and its Agent and
+    /// Prompt closure within `bounds`.
+    ///
+    /// The step and edge counts are checked on the root spec before any
+    /// dependency is read, and every body is charged against the byte budget
+    /// before it is retained, so an oversized graph is refused without being
+    /// held. Each dependency is read once, at its bound UID when the stored
+    /// reference carries one. No Card is written; cancellation may stop
+    /// after completed reads.
+    ///
+    /// # Errors
+    /// Returns `WYRD_WORKFLOW_422_RUN_REQUEST` when `workflow_ref` names no
+    /// space; `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no Workflow exists at
+    /// that identity or UID; `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` when
+    /// the root or a dependency is not active, names a path or sibling, or
+    /// its bound UID names another identity; `WYRD_WORKFLOW_413_GRAPH_TOO_LARGE`
+    /// when a bound is exceeded; the Workflow envelope errors of
+    /// [`WorkflowCard::from_envelope`]; and registry read failures unchanged.
+    pub(crate) async fn pin(
+        conn: &mut TenantConn<'_>,
+        workflow_ref: &CardRef,
+        bounds: GraphBounds,
+    ) -> Result<Self, WyrdError> {
+        if workflow_ref.kind != CardKind::Workflow || workflow_ref.space.is_none() {
+            return Err(WyrdError::WorkflowRunRequest {
+                message: "workflow must be a Workflow CardRef with an explicit space".to_owned(),
+                details: json!({ "field": "workflow" }),
+            });
+        }
+        let root = active_row(conn, workflow_ref).await?;
+        let workflow = WorkflowCard::from_envelope(row_card(root))?;
+        let steps = workflow.spec.steps.len();
+        let edges = workflow.spec.steps.iter().fold(0_usize, |edges, step| {
+            edges.saturating_add(step.depends_on.len())
+        });
+        if steps > bounds.max_steps {
+            return Err(graph_too_large("max_steps_per_run", bounds.max_steps));
+        }
+        if edges > bounds.max_edges {
+            return Err(graph_too_large(
+                "max_dependency_edges_per_run",
+                bounds.max_edges,
+            ));
+        }
+        let mut charged = jcs_len(&workflow.spec);
+        let mut bodies = HashMap::new();
+        let mut pending = card_body_dependencies(&Spec::Workflow(workflow.spec.clone()));
+        while let Some(dependency) = pending.pop() {
+            let Ref::Ref(card_ref) = &dependency else {
+                return Err(WyrdError::RegistryUnresolvedDependency {
+                    message: "a registered Workflow names a dependency outside the registry"
+                        .to_owned(),
+                    details: json!({}),
+                });
+            };
+            let identity = card_ref.identity_key();
+            if bodies.contains_key(&identity) {
+                continue;
+            }
+            let row = active_row(conn, card_ref).await?;
+            charged = charged.saturating_add(jcs_len(&row.spec));
+            if charged > bounds.max_bytes {
+                return Err(graph_too_large(
+                    "max_resolved_graph_bytes",
+                    bounds.max_bytes,
+                ));
+            }
+            pending.extend(card_body_dependencies(&row.spec));
+            bodies.insert(identity, row.spec);
+        }
+        Ok(Self { workflow, bodies })
+    }
+
+    /// The pinned root Workflow Card.
+    pub(crate) fn workflow(&self) -> &WorkflowCard {
+        &self.workflow
+    }
+
+    /// Return the pinned spec an external reference names by its exact
+    /// identity, or `None` for a sibling, a path, or an unpinned identity.
+    pub(crate) fn body(&self, reference: &Ref) -> Option<Spec> {
+        match reference {
+            Ref::Ref(card_ref) => self.bodies.get(&card_ref.identity_key()).cloned(),
+            Ref::Sibling { .. } | Ref::Path(_) => None,
+        }
+    }
+}
+
+/// Read the active Card `card_ref` names: at its bound UID when it carries
+/// one, otherwise at its exact identity.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no Card exists there,
+/// `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` when the bound UID names another
+/// identity or the Card is not active, `WYRD_REGISTRY_400_INVALID_CARD_SPEC`
+/// for a reference without a space, and registry read failures unchanged.
+async fn active_row(
+    conn: &mut TenantConn<'_>,
+    card_ref: &CardRef,
+) -> Result<ParsedCardRow, WyrdError> {
+    let row = match &card_ref.uid {
+        Some(uid) => get_card_by_uid(conn, uid).await?,
+        None => {
+            let space = card_ref.space.as_ref().ok_or_else(|| {
+                WyrdError::registry_invalid_card_spec("CardRef.space is required for a card read")
+            })?;
+            get_card_by_ref(
+                conn,
+                card_ref.kind.clone(),
+                space,
+                &card_ref.name,
+                &card_ref.version,
+            )
+            .await?
+        }
+    };
+    let pinned = CardRef {
+        kind: row.kind.clone(),
+        name: row.name.clone(),
+        version: row.version.clone(),
+        space: Some(row.space.clone()),
+        uid: None,
+    };
+    let unresolved = |reason: &str| WyrdError::RegistryUnresolvedDependency {
+        message: format!("card dependency {} {reason}", display_ref(card_ref)),
+        details: json!({ "card_ref": display_ref(card_ref) }),
+    };
+    if !pinned.same_identity(card_ref) {
+        return Err(unresolved("is bound to another Card's UID"));
+    }
+    if row.status != CardStatus::Active {
+        return Err(unresolved("is not active"));
+    }
+    Ok(row)
+}
+
+/// Build the Card envelope of a registry row for typed decoding.
+fn row_card(row: ParsedCardRow) -> Card {
+    Card {
+        api_version: ApiVersion::v1(),
+        kind: row.kind,
+        metadata: Metadata {
+            name: row.name,
+            version: Some(VersionSpec::Pin(row.version)),
+            bump: None,
+            space: Some(row.space),
+            uid: Some(row.card_uid),
+            labels: row.labels,
+            annotations: row.annotations,
+            spec_hash: None,
+            artifact_hash: None,
+            origin: None,
+        },
+        spec: row.spec,
+        relationships: Relationships::default(),
+        status: None,
+    }
+}
+
+/// The graph-size refusal naming the server bound a graph exceeded.
+fn graph_too_large(bound: &str, max: usize) -> WyrdError {
+    WyrdError::WorkflowGraphTooLarge {
+        message: format!("the Workflow graph exceeds workflow.{bound}"),
+        details: json!({ "bound": bound, "max": max }),
     }
 }
 

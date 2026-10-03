@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 54
+revision: 55
 status: approved
 ---
 
@@ -1755,8 +1755,10 @@ call site when the budget is exhausted.
   idle producer reserves no budget bytes beyond its own bounded bookkeeping.
 - **REQ-174**: A producer MUST seal a batch when either of these occurs:
   - its staged rows reach the configured `max_message_bytes` frame target; or
-  - the configured linger has elapsed since the first staged row. The linger
-    default is 5 ms.
+  - the configured linger has elapsed since the first staged row and one of
+    its `max_in_flight` send slots is free. The linger default is 5 ms. While
+    every slot is busy, staged rows keep accumulating until a slot frees or
+    the frame target is reached, so batches grow under backpressure.
 
   An explicit flush or shutdown seals immediately. Row-count triggers and the
   1-second default interval are removed. Intake MUST continue while sends are
@@ -2370,7 +2372,7 @@ published image pinned by an immutable registry digest before release.
 
 ## Open material decisions
 
-None for revision 54.
+None for revision 55.
 
 Revision 39 records the user's narrow deletion: remove the always-allow
 hook and its fake `invoke` policy attribution without redesigning delegation.
@@ -2405,6 +2407,18 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 - [PagerDuty Global Integrations and Service Routes](https://support.pagerduty.com/main/docs/event-orchestration)
 
 ## Revision history
+
+- **Revision 55 linger sealing under backpressure (2026-10-02, approved):**
+  The AC-041 benchmark showed the producer sealing a ~350-row batch on every
+  5 ms linger even with every send slot busy. Sealed batches never merge, so
+  the batch rate was fixed by the linger, the sink's
+  `max_in_flight / ack latency` capacity capped throughput near 33k rows/s,
+  client bytes grew, and drain took seconds.
+  - **Direction:** the user approved sealing an elapsed linger only when a
+    send slot is free.
+  - **Changes:** REQ-174's linger trigger now requires a free send slot; the
+    frame-target trigger, flush, and shutdown seal as before.
+  - **Proof:** AC-041 is unchanged.
 
 - **Revision 54 gateway capture writer (2026-10-02, approved):** Gateway
   capture minted a tenant token per tenant and wrote through one embedded

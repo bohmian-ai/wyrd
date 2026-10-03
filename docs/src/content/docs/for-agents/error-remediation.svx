@@ -64,8 +64,9 @@ registration spec-drift response looks like this:
 - For `WYRD_CLIENT_401_NO_CREDENTIALS`, the credential chain resolved no
   usable credential. The remediation is a config fix, not a retry path:
   set one of `WYRD_ACCESS_TOKEN`, `WYRD_WORKLOAD_TOKEN`+`WYRD_TENANT`, or
-  `WYRD_API_KEY`; pass `ClientConfig::api_key`; or add `[default].api_key`
-  to `~/.config/wyrd/credentials.toml`.
+  `WYRD_API_KEY`; pass `ClientConfig::credential`; have a person run
+  `wyrd auth login`; or add `[default].api_key` to
+  `~/.config/wyrd/credentials.toml`.
 - For `WYRD_CLIENT_503_TRANSPORT_DOWN`, the `details.transport` names
   the unavailable transport (DNS, TCP, TLS, or connect failure). Retry
   after the underlying network or server health recovers. Apply

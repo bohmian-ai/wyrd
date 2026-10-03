@@ -213,7 +213,6 @@ Beyond boot-time TOML, workload trusted issuers and bindings have admin CRUD rou
 ## Limitations
 
 - `private_key_jwt` client authentication to the IdP token endpoint is not yet implemented. Use `Public` (PKCE) or a client secret.
-- SAML 2.0 and SCIM provisioning are not supported. A SAML-only IdP can be brokered to OIDC through a provider such as Keycloak.
 - Logout does not end the IdP session (no OIDC RP-initiated or back-channel logout).
 
 ## Related

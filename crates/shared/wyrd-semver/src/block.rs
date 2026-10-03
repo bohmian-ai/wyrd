@@ -10,9 +10,6 @@ use crate::bump::VersionBump;
 use crate::error::VersionError;
 
 /// Semver-compatible version string.
-///
-/// Deserialization reads a string and delegates to [`VersionBlock::parse`],
-/// so a range, partial, or empty value can never inhabit this type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct VersionBlock(String);
@@ -154,7 +151,8 @@ impl FromStr for VersionBlock {
 }
 
 impl<'de> Deserialize<'de> for VersionBlock {
-    /// Deserialize a version string through [`VersionBlock::parse`].
+    /// Deserialize a version string through [`VersionBlock::parse`], so a
+    /// range, partial, or empty value can never inhabit this type.
     ///
     /// # Errors
     /// Returns the deserializer's custom error when the input is not a string

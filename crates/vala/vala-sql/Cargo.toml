@@ -40,6 +40,9 @@ name = "pg_audit_staging"
 name = "pg_forge_operations"
 
 [[test]]
+name = "pg_forge_leader"
+
+[[test]]
 name = "pg_forge_tasks"
 
 [[test]]

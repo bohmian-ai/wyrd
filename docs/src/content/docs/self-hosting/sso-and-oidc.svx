@@ -14,13 +14,71 @@ Workload trusted issuers and bindings are configured as TOML arrays in the same 
 
 ## Human single sign-on
 
-A person logs in through the tenant's IdP with the OIDC authorization-code flow, secured by PKCE. Wyrd stores the login state server-side for at most five minutes and verifies the returned ID token, whose audience must be the connection's client id, before issuing its own tokens. The [login flow](/concepts/authentication/#human-oidc-login-flow) in Concepts has the full sequence. OIDC is optional: a server starts, provisions tenants, and serves API keys and workload federation without any connection.
+Wyrd uses standard OpenID Connect and OAuth 2.0 and has no provider-specific code. It is an OpenID Connect relying party of each tenant's IdP ([OIDC Core 1.0](https://openid.net/specs/openid-connect-core-1_0.html) authorization code flow with PKCE, [OIDC Discovery](https://openid.net/specs/openid-connect-discovery-1_0.html), ID-token validation against the provider's JWKS). It is also the OAuth 2.0 authorization server for its own clients: the web app and the CLI. Any provider that completes a standard OIDC login works. The automated journeys run against Keycloak and Dex.
+
+A person logs in through the tenant's IdP with the authorization code flow, secured by PKCE. Wyrd stores the login state server-side for at most five minutes and verifies the returned ID token, whose audience must be the connection's client id, before issuing its own tokens. Provider tokens never leave the server and are never Wyrd authority. The [login flow](/concepts/authentication/#human-oidc-login-flow) in Concepts has the full sequence.
+
+OIDC is optional. A server starts, provisions tenants, and serves API keys, workload federation, and operator sign-in to the web app without any connection, IdP, or OIDC setting.
+
+### Who operates what
+
+| Party | Self-hosted | Hosted (one Wyrd service, many tenants) |
+| --- | --- | --- |
+| Wyrd deployment: public origin, web-app client secret, sealing key, ingress | Your platform team | The service operator |
+| IdP: the Web application registration, users, groups, and the client secret | Your IdP administrators | Each tenant's own IdP administrators |
+| Tenant connection: stage, test, activate, map groups to roles | Your tenant `admin` | Each tenant's `admin` |
+
+Each tenant has at most one active connection. Different tenants of one hosted service can use different providers, for example Okta for one and Keycloak for another, and one tenant's connection, secret, roles, and lifecycle never affect another's, even when two tenants use the same issuer. The deployment-wide platform-administrator connection is separate and never signs in a tenant user.
 
 ### Deployment setup
 
-Set `WYRD_PUBLIC_ORIGIN` to the origin browsers and IdPs reach Wyrd on, for example `https://wyrd.example.com`. The one callback URL every tenant registers at its IdP is `{WYRD_PUBLIC_ORIGIN}/auth/callback`; it is derived from this setting, never from request headers, and is returned read-only as `callback_url`. Without it, connections cannot be staged or tested. A connection client secret needs a [sealing key](/self-hosting/authentication/#sealing-key), which seals it at rest. The web app signs people in as the confidential OAuth client `wyrd-ui`: set `WYRD_UI_CLIENT_SECRET_SHA256` to the lowercase-hex SHA-256 of its client secret (two comma-separated digests during a rotation). Without it, the server accepts no authorization-code grant.
+Set `WYRD_PUBLIC_ORIGIN` on the server to the origin browsers and IdPs reach Wyrd on, for example `https://wyrd.example.com`. The one callback URL every tenant registers at its IdP is `{WYRD_PUBLIC_ORIGIN}/auth/callback`; it is derived from this setting, never from request headers, and is returned read-only as `callback_url`. Without it, connections cannot be staged or tested. The server publishes its OAuth metadata at `{WYRD_PUBLIC_ORIGIN}/.well-known/oauth-authorization-server` ([RFC 8414](https://www.rfc-editor.org/rfc/rfc8414)).
 
-Wyrd does not rate-limit CLI device login. Rate-limit `POST /auth/device`, where a person enters the CLI's user code (RFC 8628 §5.1), per client address at your public ingress.
+The web app signs people in as the confidential OAuth client `wyrd-ui`, using `client_secret_basic`. Generate one random secret and give it to both sides:
+
+| Process | Variable | Value |
+| --- | --- | --- |
+| Server | `WYRD_UI_CLIENT_SECRET_SHA256` | Lowercase-hex SHA-256 of the secret. During a rotation, two comma-separated digests. |
+| Web app | `WYRD_UI_CLIENT_SECRET` | The secret itself. The web app also derives its cookie-encryption key from it. |
+| Web app | `ORIGIN` | The same value as `WYRD_PUBLIC_ORIGIN`. This is the standard SvelteKit Node adapter setting for the public URL. |
+| Web app | `WYRD_SERVER_URL` | The server URL the web app calls. The official image defaults it to the server in the same container. It must be `https` unless it is a loopback address. |
+
+```bash
+SECRET="$(openssl rand -base64 32)"
+printf '%s' "$SECRET" | sha256sum | cut -d' ' -f1   # WYRD_UI_CLIENT_SECRET_SHA256
+```
+
+Without `WYRD_UI_CLIENT_SECRET_SHA256`, the server accepts no authorization-code grant. To rotate the secret, set both digests on the server, roll the web app to the new secret, then remove the old digest. Rotating it also invalidates every web-app session cookie, so people sign in again.
+
+A connection client secret needs a [sealing key](/self-hosting/authentication/#sealing-key), which seals it at rest. A deployment whose connections use `Public` stores no secret and needs no sealing key.
+
+Wyrd does not rate-limit CLI device login. Rate-limit `POST /auth/device`, where a person enters the CLI's user code ([RFC 8628 §5.1](https://www.rfc-editor.org/rfc/rfc8628#section-5.1)), per client address at your public ingress, as you would any public login form. The official image adds no such limit.
+
+### Registering Wyrd at your IdP
+
+Every provider needs the same inputs:
+
+1. Create a **Web** application (an OIDC confidential client) that uses the authorization code grant.
+2. Register exactly the `callback_url` from `GET /v1/identity/oidc/connections` as its redirect URI.
+3. Note the issuer URL, the client ID, and, unless the client is public, the client secret. Wyrd discovers the endpoints and signing keys from `{issuer}/.well-known/openid-configuration`. You never upload a signing certificate. The issuer you enter must equal the discovery document's `issuer` exactly, including any trailing slash.
+4. To map roles, have the provider put the person's groups in a claim of the **ID token**. Wyrd requests the `openid profile email` scopes and reads the claim named by `claim_mapping.groups`, a dot-separated path such as `groups` or `realm_access.roles`.
+5. Choose `SecretBasic` or `SecretPost` to match the client authentication method the application uses, or `Public` for a client without a secret.
+
+Short notes for common providers follow. They describe standard provider settings; check your provider's documentation for the current screens.
+
+| Provider | Application and issuer | Groups in the ID token |
+| --- | --- | --- |
+| Okta | An OIDC **Web Application** with the callback as its sign-in redirect URI. Issuer `https://{your-okta-domain}` (org authorization server) or `https://{your-okta-domain}/oauth2/default`. | Add a `groups` claim to the ID token, for example with a groups claim filter. |
+| Microsoft Entra ID | An app registration with a **Web** platform redirect URI and a client secret. Issuer `https://login.microsoftonline.com/{tenant-id}/v2.0`. | Add a groups claim under **Token configuration**. Entra ID emits group object IDs, so use those IDs as `group_role_map` keys. A user in more groups than the token can hold gets no `groups` claim and therefore no mapped roles. |
+| Google | An OAuth client of type **Web application** with the callback as an authorized redirect URI. Issuer `https://accounts.google.com`. | Google ID tokens carry no groups claim, so leave `groups` unset; people sign in with no mapped roles. To map Google Workspace groups, broker Google through a provider that emits a groups claim, such as Keycloak. |
+| Auth0 | A **Regular Web Application** with the callback in Allowed Callback URLs. Issuer `https://{your-tenant}.auth0.com/`, with the trailing slash. | Add the groups to the ID token with a post-login Action. Wyrd reads the claim by a dot-separated path, so give it a name without dots. |
+| Keycloak | An OpenID Connect client with **Client authentication** on and the standard flow enabled, with the callback as a valid redirect URI. Issuer `https://{host}/realms/{realm}`. | Add a **Group Membership** mapper that adds a `groups` claim to the ID token. |
+
+### Role mapping
+
+A person's tenant roles come only from `group_role_map`, which maps a value of the groups claim to one or more of the tenant's roles, such as `admin`, `writer`, or `reader`. A connection has no default roles: a person whose groups match no entry still signs in and becomes a tenant `User`, but receives no privileged grant. No provider claim names Wyrd permissions directly, and no IdP group can create a platform administrator. Mapping changes, and changes to a person's groups at the IdP, apply at that person's next sign-in or token issuance.
+
+A `User` is identified by the provider's issuer and subject (`sub`), never by email. Email is display data only.
 
 ### Connection lifecycle
 
@@ -68,6 +126,47 @@ For those providers one mix-up path remains: someone who controls another tenant
 
 Every replica reads the Active connection from Postgres on each login, so activation, rotation, and deactivation take effect on all replicas without a restart. Replacing or deactivating a connection stops its users' refresh immediately; access tokens already issued stay valid until they expire, at most five minutes. A user from a replacement provider is a new User even when the email matches, and group-map changes apply at the user's next token issuance.
 
+### Signing in
+
+| Client | How a person signs in | Standard |
+| --- | --- | --- |
+| Web app | Open `{WYRD_PUBLIC_ORIGIN}/t/{tenant}/login` and choose **Sign in with SSO**. | Authorization code with PKCE ([RFC 6749 §4.1](https://www.rfc-editor.org/rfc/rfc6749#section-4.1), [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636)) |
+| CLI | `wyrd auth login --server {WYRD_PUBLIC_ORIGIN} --tenant {tenant}` prints a one-time code and opens the verification page. The person approves the code and signs in at the IdP. | Device authorization ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)) |
+| Rust, Python, and TypeScript SDKs | Use the login `wyrd auth login` saved, with no extra step. See [Client configuration](/get-started/client-configuration/#credentials). | Refresh ([RFC 6749 §6](https://www.rfc-editor.org/rfc/rfc6749#section-6)) |
+
+Neither client needs a second IdP application: the IdP registers only the Wyrd callback. The web app keeps the session in an encrypted HttpOnly cookie, and the browser never receives a Wyrd or provider token. Its refresh token does not rotate and its session ends after 12 hours. The CLI's refresh token rotates on every use. Logging out of either revokes that login's refresh token best-effort ([RFC 7009](https://www.rfc-editor.org/rfc/rfc7009)) and does not end the IdP session. An access token already issued stays valid until it expires, at most five minutes, so Wyrd never promises instant revocation. Deployed Services and Agents keep their own API keys or workload assertions; enabling SSO does not change them.
+
+### OAuth endpoints
+
+| Endpoint | Purpose | Standard |
+| --- | --- | --- |
+| `GET /.well-known/oauth-authorization-server` | Authorization server metadata | [RFC 8414 §3](https://www.rfc-editor.org/rfc/rfc8414#section-3) |
+| `GET /auth/authorize` | Begin a web-app sign-in. `tenant` is the one extension parameter. | RFC 6749 §4.1.1, RFC 7636 |
+| `POST /auth/device_authorization` | Begin a CLI sign-in | RFC 8628 §3.1 |
+| `GET`, `POST /auth/device` | The page where a person approves or denies a user code | RFC 8628 §3.3 |
+| `POST /auth/token` | Every tenant grant: `authorization_code`, `refresh_token`, `urn:ietf:params:oauth:grant-type:device_code`, token exchange ([RFC 8693](https://www.rfc-editor.org/rfc/rfc8693)), and JWT bearer ([RFC 7523](https://www.rfc-editor.org/rfc/rfc7523)) | RFC 6749 §4.1.3, §6 |
+| `POST /auth/platform/token` | Platform-plane token exchange | RFC 8693 |
+| `POST /auth/revoke` | Revoke a refresh token. Unknown tokens also answer `200`. | RFC 7009 §2 |
+| `GET /auth/callback` | The one provider callback every tenant registers | OIDC Core 1.0 §3.1 |
+
+Two clients are registered: `wyrd-ui`, which is confidential and uses `client_secret_basic`, and `wyrd-cli`, which is public and sends `client_id`. The token, platform token, device authorization, and revocation endpoints take `application/x-www-form-urlencoded` bodies. Successes use the [RFC 6749 §5.1](https://www.rfc-editor.org/rfc/rfc6749#section-5.1) JSON body. Refusals use the [§5.2](https://www.rfc-editor.org/rfc/rfc6749#section-5.2) body (`error`, `error_description`) with `400`, or `401` with `WWW-Authenticate` for `invalid_client`. These endpoints are the one exception to Wyrd's `application/problem+json` errors. The server still logs each refusal under its Wyrd error code. An API key is exchanged with RFC 8693 token exchange and `subject_token_type=urn:wyrd:oauth:token-type:api_key`.
+
+### Login failures
+
+| What happens | What the person sees | Fix |
+| --- | --- | --- |
+| The tenant has no Active connection | The web app shows its sign-in problem page with a link to API-key sign-in. The CLI login is refused. | Activate a connection, or sign in with an API key through recovery below. |
+| The IdP or its discovery is unreachable or unsafe | `503` `WYRD_AUTH_503_DISCOVERY_UNAVAILABLE`; the web app shows "Sign-in unavailable" | Restore the provider. Wyrd never tries another tenant's or the platform connection. |
+| The login took longer than five minutes, or the callback was replayed | `400` `WYRD_AUTH_400_INVALID_STATE` | Start a new login. |
+| The ID token fails signature, issuer, audience, or nonce checks, or the connection changed during the login | `401` `WYRD_AUTH_401_INVALID_TOKEN` or `400` `WYRD_AUTH_400_INVALID_NONCE` | Check the issuer, client ID, and client secret. |
+| The provider refused the sign-in | The web app receives `access_denied` | Check the person's assignment to the application at the IdP. |
+| A CLI code was denied, expired, or already used | The CLI stops with `access_denied`, `expired_token`, or `invalid_grant` | Run `wyrd auth login` again. |
+| A saved CLI login cannot renew | `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` | Run `wyrd auth login` again. |
+
+### Operator recovery
+
+SSO never becomes the only way in. Activation already requires a working `recovery_api_key`. An operator with a tenant API key signs in to the web app at `/t/{tenant}/login/api-key`, which is linked from the sign-in page and its problem page, and works with or without SSO. The CLI and SDKs accept the same key through `WYRD_API_KEY`. A lost tenant administrator credential is reissued by the platform plane; see [Administering the deployment](/self-hosting/running-the-server/#administering-the-deployment).
+
 ### Upgrading from Human trusted issuers
 
 The upgrade migration moves each tenant's existing Human trusted issuer into an Active connection, keeping its claim mapping, group map, JWKS URI, and JWKS TTL. A Human issuer that a workload binding references is kept as a Workload issuer so the binding survives. The migration refuses to run, and leaves the database unchanged, if a tenant has more than one Human issuer, a Human issuer with default roles, an audience different from its client id, `private_key_jwt`, or a secret method with no stored secret. The error names the tenant and the repair to make with the previous release.
@@ -102,12 +201,9 @@ The workload then exchanges its platform JWT for a Wyrd access token:
 
 ```bash
 curl -X POST https://<your-server>/auth/token \
-  -H 'content-type: application/json' \
-  -d '{
-    "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-    "assertion": "<platform-issued-jwt>",
-    "tenant": "acme"
-  }'
+  --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer' \
+  --data-urlencode 'assertion=<platform-issued-jwt>' \
+  --data-urlencode 'tenant=acme'
 ```
 
 ## Managing workload issuers at runtime
@@ -117,6 +213,8 @@ Beyond boot-time TOML, workload trusted issuers and bindings have admin CRUD rou
 ## Limitations
 
 - `private_key_jwt` client authentication to the IdP token endpoint is not yet implemented. Use `Public` (PKCE) or a client secret.
+- SAML 2.0 and SCIM provisioning are not supported. A SAML-only IdP can be brokered to OIDC through a provider such as Keycloak.
+- Logout does not end the IdP session (no OIDC RP-initiated or back-channel logout).
 
 ## Related
 

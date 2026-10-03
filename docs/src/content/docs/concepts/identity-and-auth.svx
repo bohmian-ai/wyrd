@@ -11,8 +11,8 @@ order: 6
 Wyrd owns identity and authorization on the server. Every request carries exactly
 one credential: a Wyrd-signed access token in the `X-Wyrd-Access-Token` header.
 The server verifies it, resolves the caller's permissions, and decides what runs.
-There is no session cookie and no ambient identity. A client can hold a token, but
-only the server decides what it means.
+The server keeps no session and no ambient identity. A client can hold a token,
+but only the server decides what it means.
 
 Identity spans two planes. The **platform plane** operates the deployment
 itself — creating tenants, recovering tenant administration — and its principals
@@ -38,11 +38,11 @@ This page is the map. The three pages it links to hold the detail:
     ['Principal', 'The identity a token acts as. One of five kinds: GlobalAdmin, TenantAdmin, User, Service, or Agent.'],
     ['GlobalAdmin', 'Platform-plane administrator. Holds no tenant and operates tenant lifecycle and tenant-administration recovery; never implicitly authorized over a tenant\'s resources.'],
     ['TenantAdmin', 'The tenant\'s headless root of trust, created during provisioning. Carries no card.'],
-    ['User', 'A human, authenticated through OIDC. Identified by email; no card.'],
+    ['User', 'A human, authenticated through the tenant\'s OIDC provider. Identified by the provider\'s issuer and subject, never by email; no card.'],
     ['Service', 'A non-human principal that may be bound to a ServiceCard. Authenticates with an API key or a workload assertion.'],
     ['Agent', 'A non-human principal, always bound to an AgentCard. Same auth paths as a Service.'],
     ['Access token', 'Short-lived EdDSA JWT sent on every request. Carries the principal, tenant, and role claims.'],
-    ['Refresh token', 'Single-use, rotated token that mints a new access token. Issued only for human OIDC login; a machine re-exchanges its durable credential instead.'],
+    ['Refresh token', 'Token that mints a new access token. Issued only for human login: the CLI\'s rotates on every use, the web app\'s does not and ends after 12 hours. A machine re-exchanges its durable credential instead.'],
     ['Delegated token', 'Access token minted on behalf of another Service/Agent, carrying an act chain. No refresh token.'],
     ['act chain', 'RFC 8693 delegation record embedded in a token: the ordered list of principals that delegated down to the callee.'],
     ['Trusted issuer', 'An external OIDC issuer whose JWTs Wyrd will verify, scoped to one tenant.'],
@@ -98,7 +98,7 @@ device code there.
     { label: 'POST /auth/token', sub: 'match TokenRequest' },
     { label: 'authorization_code · device_code', sub: 'human login → access + refresh' },
     { label: 'jwt-bearer', sub: 'workload assertion → access only' },
-    { label: 'refresh_token', sub: 'rotate → access + refresh' },
+    { label: 'refresh_token', sub: 'CLI: rotate · web app: access only' },
     { label: 'token-exchange', sub: 'API key or delegation → access only' }
   ]}
 />
@@ -155,8 +155,10 @@ In **production** (staging or production), boot fails closed without
     ['APP_ENV', 'development | staging | production. Selects the deployment profile; staging and production both harden.'],
     ['WYRD_SIGNING_KEY_FILE', 'Path to the Ed25519 signing-key PEM (preferred; keeps the key out of the process environment). Required in production.'],
     ['WYRD_SIGNING_KEY_PEM', 'Inline Ed25519 signing-key PEM (fallback). Setting both file and inline is a configuration error.'],
-    ['WYRD_SERVER_TENANT_SLUG', 'Implicit tenant slug used to seed trusted issuers/bindings at boot and to resolve the login tenant.'],
-    ['WYRD_SEALING_KEY_FILE', 'AES-256-GCM key file for OIDC client-secret encryption at rest. See Cloud identity.'],
+    ['WYRD_SERVER_TENANT_SLUG', 'Implicit tenant slug used to seed workload trusted issuers and bindings at boot.'],
+    ['WYRD_PUBLIC_ORIGIN', 'Public origin browsers and IdPs reach Wyrd on. Required for human SSO; the provider callback is this origin plus /auth/callback.'],
+    ['WYRD_UI_CLIENT_SECRET_SHA256', 'SHA-256 of the web app\'s wyrd-ui client secret (two comma-separated during rotation). Without it, no authorization-code grant is accepted.'],
+    ['WYRD_SEALING_KEY_FILE', 'AES-256-GCM key file that seals stored IdP client secrets. Needed only when a stored connection or issuer has a secret.'],
     ['WYRD_SEALING_KEY_BASE64', 'Inline base64 sealing key (fallback for the file form).']
   ]}
 />

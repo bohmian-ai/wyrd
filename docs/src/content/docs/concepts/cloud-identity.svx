@@ -116,24 +116,9 @@ with `ServerBootError::IssuerSeal`. Issuers that use `public` (PKCE) or
 `private_key_jwt` client authentication carry no secret and do not require the
 sealing key.
 
-<Aside title="Single-key limitation" type="caution">
-
-The current implementation uses one static process-wide key with no key-id
-column. Live rotation without downtime is not yet supported.
-
-**If the key leaks:**
-
-1. Rotate the client secret at each affected IdP.
-2. Re-register the issuers via `POST /v1/admin/trusted-issuers` with the new
-   secrets (this re-seals them under the current key).
-3. Replace `WYRD_SEALING_KEY_FILE` / `WYRD_SEALING_KEY_BASE64` with a new
-   32-byte key and restart. Existing `client_secret_enc` rows now encrypt the
-   old (already-rotated) secrets and are harmless.
-
-Key-id versioning, keyring support, KMS-backed key-encryption keys, and AAD
-binding remain future work.
-
-</Aside>
+Every sealed value records the key that sealed it, so the server can hold
+retained keys and rotate without downtime. The rotation procedure is in
+[Authentication](/self-hosting/authentication/#rotating-the-sealing-key).
 
 ## Workload identity setup
 
@@ -159,8 +144,8 @@ To authenticate a Kubernetes service account to Wyrd:
 3. Mount the projected service account token into the pod
    (`audience: <your-audience>`).
 4. The workload calls `POST /auth/token` with
-   `grant_type: urn:ietf:params:oauth:grant-type:jwt-bearer` and the projected
-   token as the `assertion`.
+   a form-encoded body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`
+   and the projected token as `assertion` (RFC 7523 §2.1).
 5. Wyrd verifies the token, resolves the binding, loads the principal and its
    roles, and returns an access token. No secret is stored in the pod.
 

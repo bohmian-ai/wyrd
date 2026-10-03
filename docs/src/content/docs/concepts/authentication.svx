@@ -10,8 +10,9 @@ order: 7
 
 Wyrd issues signed EdDSA JWTs. Every authenticated request carries one in the
 `X-Wyrd-Access-Token: Bearer <token>` header. Wyrd mints the token, and it is the
-only credential the server trusts per request. There is no session cookie and no
-ambient identity.
+only credential the server trusts per request. The server keeps no session and
+no ambient identity; the web app's sign-in cookie lives in its own
+backend-for-frontend, which presents a Wyrd token on every call.
 
 For the end-to-end picture (the identity model, the request verification path, and
 grant dispatch), start with [Identity and auth](/concepts/identity-and-auth/). This
@@ -32,7 +33,7 @@ exchange. Five kinds exist, across two planes:
   rows={[
     ['GlobalAdmin', 'Platform', 'Platform credential issued at deployment initialization', 'None'],
     ['TenantAdmin', 'Tenant', 'Credential printed once when the tenant is created', 'None'],
-    ['User', 'Either', 'Human OIDC login via an external IdP', 'None (email-based)'],
+    ['User', 'Either', 'Human OIDC login, identified by the provider\'s issuer and subject (never email)', 'None'],
     ['Service', 'Tenant', 'API key or workload jwt-bearer; optionally bound to a ServiceCard', 'service (optional)'],
     ['Agent', 'Tenant', 'API key or workload jwt-bearer, bound to an AgentCard', 'agent (required)']
   ]}
@@ -43,7 +44,7 @@ administrator operates tenant lifecycle and tenant-administration recovery, and
 is never implicitly authorized over a tenant's resources.
 
 Access tokens are short-lived, and how a caller renews one splits along the same
-line as identity. A **human** OIDC login receives a rotating refresh token. A
+line as identity. A **human** login receives a refresh token. A
 **machine** — API key or workload assertion — receives access only and renews by
 re-exchanging the durable credential it already holds, so that credential is the
 single thing to revoke to end its access.
@@ -159,6 +160,26 @@ login for that server. `wyrd auth logout` deletes the saved login and revokes
 its refresh token through `POST /auth/revoke`, warning if the revocation
 fails.
 
+## Web-app session and logout
+
+The web app is a backend-for-frontend built on `openid-client`. After the code
+exchange it stores the refresh token in one cookie it encrypts with `jose`
+(Secure, HttpOnly, SameSite=Lax). The browser never sees a Wyrd or provider
+token in page data, URLs, or JavaScript. Any web-app replica can read the
+cookie, so no server-side session store exists. Access tokens are cached in the
+web app's memory and renewed with the refresh token when they expire.
+
+Logout clears the cookie and revokes that login's refresh token at
+`POST /auth/revoke` (RFC 7009). Revocation is best-effort: logout completes
+even if the revocation call fails. Logout does not end the session at your IdP,
+and an access token issued before logout stays valid until it expires, at most
+five minutes. The User's other logins keep working.
+
+When a deployment has no SSO, an operator signs in to the web app at
+`/t/{tenant}/login/api-key` with an existing Wyrd API key, which the web app
+exchanges (RFC 8693) and keeps in the same encrypted cookie. That recovery
+page also stays available when SSO is active.
+
 ## API-key principal flow
 
 Service and Agent principals can authenticate with a long-lived API key. The
@@ -213,8 +234,9 @@ carries only the assertion.
 
 1. Workload obtains a signed JWT from its platform (e.g. Kubernetes projected
    volume, GCP metadata server).
-2. Workload sends `POST /auth/token` with `grant_type: urn:ietf:params:oauth:grant-type:jwt-bearer`
-   and the assertion.
+2. Workload sends `POST /auth/token` with the form parameters
+   `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` and `assertion`
+   (RFC 7523 §2.1), plus `tenant` when the request host does not name it.
 3. Server verifies the assertion against the trusted issuer's JWKS (with
    caching and automatic key-rotation recovery).
 4. Server matches the assertion to a Workload trusted issuer. Human trust
@@ -226,12 +248,20 @@ carries only the assertion.
 
 ## Renewing a token
 
-A **human session** rotates. Refresh tokens are single-use and rotated on each
-use: send `grant_type: refresh_token` to `POST /auth/token` with the current
-refresh token, and the server issues a new access + refresh pair and invalidates
-the presented one. Replaying a consumed token revokes the whole family. Only a
-`User` principal may rotate; a refresh row presented for any other kind is
-refused.
+A **human session** renews with the refresh grant (RFC 6749 §6): send
+`grant_type=refresh_token` and the refresh token to `POST /auth/token`. How the
+refresh token behaves depends on the client type, following RFC 9700 §4.14.2:
+
+- The public CLI client `wyrd-cli` gets a new access + refresh pair on every
+  refresh, and the presented token is consumed. Replaying a consumed token
+  revokes that login's whole rotation chain. A CLI refresh token lasts 30 days
+  from its last rotation.
+- The confidential web-app client `wyrd-ui` authenticates every refresh with
+  its client secret, so its refresh token does not rotate: each refresh returns
+  only an access token, until the login's fixed 12-hour lifetime ends.
+
+Only a `User` principal holds a refresh token. A refresh is refused once the
+connection the login used is deactivated, replaced, or removed.
 
 A **machine** re-exchanges. There is no refresh token to rotate, so an API-key or
 workload client repeats its original grant against `POST /auth/token` — the

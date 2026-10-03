@@ -16,17 +16,17 @@ Every token belongs to a principal, and there are five kinds across two planes. 
 
 ## Tokens
 
-Wyrd mints EdDSA (Ed25519) JWTs signed with its own key, presented on every request. Access tokens are short-lived. Only a human OIDC login receives a rotating refresh token; a machine receives access only and renews by re-exchanging the durable credential it already holds, so revoking that credential ends its access. How a token is verified, and what each grant returns, is covered in [Authentication](/concepts/authentication/). What an operator supplies is the key material below.
+Wyrd mints EdDSA (Ed25519) JWTs signed with its own key, presented on every request. Access tokens are short-lived. Only a human OIDC login receives a refresh token: the CLI's rotates on every use, and the web app's does not rotate and ends after 12 hours; a machine receives access only and renews by re-exchanging the durable credential it already holds, so revoking that credential ends its access. How a token is verified, and what each grant returns, is covered in [Authentication](/concepts/authentication/). What an operator supplies is the key material below.
 
 ## Grants
 
-A **grant** is how a caller proves its identity to get a Wyrd access token. Machines use `POST /auth/token`; a person signs in through the login flow instead. Which one you use depends on who is calling.
+A **grant** is how a caller proves its identity to get a Wyrd access token. Every grant ends at `POST /auth/token`; a person starts with the login flow first. Which one you use depends on who is calling.
 
 | Caller | Grant | Set up in |
 | --- | --- | --- |
-| A person logging in through your IdP | OIDC login (`GET /auth/authorize`, PKCE) | [SSO and OIDC](/self-hosting/sso-and-oidc/#human-single-sign-on) |
+| A person logging in through your IdP | Web app: `authorization_code` with PKCE. CLI: device authorization (RFC 8628). | [SSO and OIDC](/self-hosting/sso-and-oidc/#human-single-sign-on) |
 | A machine workload (CI job, Kubernetes pod) | `jwt-bearer` | [SSO and OIDC](/self-hosting/sso-and-oidc/#workload-federation) |
-| A service or script holding an API key | API-key exchange | [Running the server](/self-hosting/running-the-server/#init) |
+| A service or script holding an API key | `token-exchange` with the API key as the subject token | [Running the server](/self-hosting/running-the-server/#init) |
 | A person renewing an expiring session | `refresh_token` | Automatic once a login issues one |
 | A machine renewing an expiring token | The same grant it started with | Nothing — the client re-exchanges its durable credential |
 
@@ -62,7 +62,7 @@ Rotating the signing key invalidates every token signed with the old key. Plan a
 
 ## Sealing key
 
-The sealing key encrypts secrets at rest with AES-256-GCM: IdP client secrets: tenant OIDC connection secrets, workload issuer secrets, and the platform connection secret. You need it for any IdP client that uses `SecretBasic` or `SecretPost`. A deployment whose IdP clients carry no secret does not need one.
+The sealing key encrypts IdP client secrets at rest with AES-256-GCM: tenant OIDC connection secrets, workload issuer secrets, and the platform connection secret. You need it for any IdP client that uses `SecretBasic` or `SecretPost`. A deployment whose IdP clients carry no secret does not need one.
 
 Generate a 32-byte key, base64-encoded, and put it in a file:
 

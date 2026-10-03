@@ -2369,6 +2369,10 @@ const SLOW_ANSWER: &str = "slow";
 /// Judge answer the judge mock refuses with a provider failure.
 const BROKEN_ANSWER: &str = "broken";
 
+/// Judge answer the judge mock grades `{"passed": false}`, so the LLM judge
+/// itself, not an assertion, fails the judgment.
+const REJECTED_ANSWER: &str = "rejected";
+
 /// Write the direct-execution Eval Verifiers next to the Drift fixtures.
 ///
 /// `direct-assert` is assertion-only on `$.answer`, `direct-judge` grades
@@ -2413,7 +2417,8 @@ fn write_direct_evals(root: &Path) {
 /// Start the `OpenAI`-compatible judge mock of the direct journey.
 ///
 /// The judge passes every answer except [`SLOW_ANSWER`], answered after the
-/// server's execution deadline, and [`BROKEN_ANSWER`], refused with a 500.
+/// server's execution deadline, [`BROKEN_ANSWER`], refused with a 500, and
+/// [`REJECTED_ANSWER`], graded failed.
 ///
 /// # Panics
 /// Panics when a mock cannot be mounted.
@@ -2432,6 +2437,20 @@ async fn start_direct_judge() -> wiremock::MockServer {
             graded
                 .clone()
                 .set_delay(wyrd_sdk::verification::EXECUTION_DEADLINE + Duration::from_secs(5)),
+        )
+        .with_priority(1)
+        .mount(&upstream)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::path(JUDGE_PATH))
+        .and(wiremock::matchers::body_string_contains(REJECTED_ANSWER))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl_direct_rejected", "object": "chat.completion",
+                "created": 1_700_000_000, "model": "gpt-test",
+                "choices": [{ "index": 0, "finish_reason": "stop",
+                    "message": { "role": "assistant", "content": "{\"passed\":false}" } }],
+                "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
+            })),
         )
         .with_priority(1)
         .mount(&upstream)
@@ -2560,8 +2579,8 @@ async fn direct_execution_judges_supplied_input_through_the_sdk() {
     journey.assert_judgments().await;
     assert_eq!(
         requests_to(&upstream, JUDGE_PATH).await,
-        1,
-        "one judge call"
+        2,
+        "one judge call per judged answer"
     );
     journey.assert_input_refusals().await;
     journey.assert_callers_refused().await;
@@ -2669,6 +2688,12 @@ impl DirectJourney<'_> {
             (self.assert_eval, record("yes"), "eval_assertion", "passed"),
             (self.assert_eval, record("no"), "eval_assertion", "failed"),
             (self.judge, record("yes"), "eval_llm_judge", "passed"),
+            (
+                self.judge,
+                record(REJECTED_ANSWER),
+                "eval_llm_judge",
+                "failed",
+            ),
         ];
         for (verifier, input, kind, verdict) in judged {
             let response = self

@@ -11,7 +11,9 @@
 //! 3. loads authored Workflows that reference them through the ambient
 //!    environment, in a child process, and checks the refusals for no
 //!    credential, a principal without read access, and a deleted Card;
-//! 4. applies the `mixed` Workflow, then registers a newer security Agent;
+//! 4. applies the `mixed` Workflow, registers a newer security Agent, and
+//!    checks the Workflow and each Agent stay locked to the exact registered
+//!    Agents and Prompts in both spec references and relationships;
 //! 5. loads the applied Workflow through `cards.workflow()` by exact ref and
 //!    by UID, runs it, and checks the newer Agent did not float in;
 //! 6. checks wrong, versionless, mismatched, and unauthorized selectors are
@@ -138,23 +140,112 @@ fn load_in_child(server: &WyrdTestServer, api_key: Option<&str>, relative: &str)
     serde_json::from_str(line).expect("child outcome is JSON")
 }
 
-/// Register the fixture at `relative` and return the UID of every Card it
-/// registered, keyed by Card name.
+/// Register the fixture at `relative` and return the exact reference of every
+/// Card it registered, keyed by Card name.
 ///
 /// # Panics
-/// Panics when registration fails or an outcome has no UID.
-async fn register(cards: &Cards, relative: &str) -> HashMap<String, String> {
+/// Panics when registration fails.
+async fn register(cards: &Cards, relative: &str) -> HashMap<String, CardRef> {
     let receipt = Box::pin(cards.register_from_path(&fixture(relative)))
         .await
         .expect("fixture registers");
     receipt
         .outcomes
         .into_iter()
-        .map(|outcome| {
-            let uid = outcome.card_ref.uid.expect("registered Card has a UID");
-            (outcome.card_ref.name.to_string(), uid.to_string())
-        })
+        .map(|outcome| (outcome.card_ref.name.to_string(), outcome.card_ref))
         .collect()
+}
+
+/// UID of the registered Card `name` in `refs`, as a string.
+///
+/// # Panics
+/// Panics when `name` is absent or its reference has no UID.
+fn uid(refs: &HashMap<String, CardRef>, name: &str) -> String {
+    refs[name]
+        .uid
+        .as_ref()
+        .expect("registered Card has a UID")
+        .to_string()
+}
+
+/// Decode the exact reference at `value`, a locked spec reference.
+///
+/// # Panics
+/// Panics when `value` is not a Card reference.
+fn spec_ref(value: &Value) -> CardRef {
+    serde_json::from_value(value.clone()).expect("locked spec reference decodes")
+}
+
+/// Read the Card at `card_ref` and return its locked spec references, found
+/// under `pointers`, and its server-derived outbound relationship targets.
+///
+/// # Panics
+/// Panics when the Card cannot be read or a pointer is absent.
+async fn locked_refs(
+    cards: &Cards,
+    card_ref: &CardRef,
+    pointers: &[&str],
+) -> (Vec<CardRef>, Vec<CardRef>) {
+    let card = cards
+        .get(CardSelector::exact(card_ref.clone()))
+        .await
+        .expect("registered Card reads");
+    let spec = serde_json::to_value(&card.spec).expect("spec serializes");
+    let spec_refs = pointers
+        .iter()
+        .map(|pointer| spec_ref(spec.pointer(pointer).expect("locked reference present")))
+        .collect();
+    let outbound = card
+        .relationships
+        .outbound_refs
+        .into_iter()
+        .map(|relationship| relationship.card_ref)
+        .collect();
+    (spec_refs, outbound)
+}
+
+/// Check that the applied Workflow and each of its three Agents lock their
+/// dependencies to the exact registered references in `refs`, both in the
+/// stored spec and in the server-derived outbound relationships.
+///
+/// # Panics
+/// Panics when a spec reference or relationship target differs from the
+/// registration receipt.
+async fn assert_locked_graph(cards: &Cards, refs: &HashMap<String, CardRef>) {
+    let agents = [
+        &refs["security-reviewer"],
+        &refs["correctness-reviewer"],
+        &refs["final-reviewer"],
+    ];
+    let (steps, mut outbound) = locked_refs(
+        cards,
+        &refs["code-review"],
+        &[
+            "/steps/0/action/target",
+            "/steps/1/action/target",
+            "/steps/2/action/target",
+        ],
+    )
+    .await;
+    assert_eq!(steps.iter().collect::<Vec<_>>(), agents);
+    outbound.sort_by_key(|target| target.name.to_string());
+    let mut expected: Vec<&CardRef> = agents.to_vec();
+    expected.sort_by_key(|target| target.name.to_string());
+    assert_eq!(outbound.iter().collect::<Vec<_>>(), expected);
+
+    for (agent, prompt) in [
+        ("security-reviewer", "security-review-prompt"),
+        ("correctness-reviewer", "correctness-review-prompt"),
+        ("final-reviewer", "final-review-prompt"),
+    ] {
+        let (spec_prompt, outbound) = locked_refs(cards, &refs[agent], &["/prompt"]).await;
+        assert_eq!(spec_prompt, vec![refs[prompt].clone()], "{agent} spec");
+        assert_eq!(
+            outbound,
+            vec![refs[prompt].clone()],
+            "{agent} relationships"
+        );
+    }
 }
 
 /// Exact reference to a Card in the `workflow-loading` space.
@@ -269,7 +360,10 @@ async fn assert_authored_loads(
     writer
         .delete(CardSelector::uid(
             CardKind::Prompt,
-            serde_json::from_value(json!(retired["retired-prompt"])).expect("UID decodes"),
+            retired["retired-prompt"]
+                .uid
+                .clone()
+                .expect("registered Card has a UID"),
         ))
         .await
         .expect("retired Prompt deletes");
@@ -331,31 +425,21 @@ async fn workflow_loading_journey() {
     let no_roles = cards_with(&server, &no_roles_key);
 
     // 2. The team registers its reviewer Agents.
-    let mut uids = register(&writer, "team/security.yaml").await;
-    uids.extend(register(&writer, "team/correctness.yaml").await);
+    let mut refs = register(&writer, "team/security.yaml").await;
+    refs.extend(register(&writer, "team/correctness.yaml").await);
 
     // 3. Authored files that reference registered Agents load through the
     //    ambient configuration, which must be able to read them.
     assert_authored_loads(&server, &writer, &reader_key, &no_roles_key).await;
 
     // 4. Apply the mixed Workflow; it pins each step to the exact registered
-    //    Agent UID. Then a newer security Agent registers.
-    let workflow_uid = register(&writer, "mixed/workflow.yaml").await["code-review"].clone();
-    let workflow_ref = card_ref("Workflow", "code-review", "1.0.0", Some(&workflow_uid));
-    let stored = writer
-        .get(CardSelector::exact(workflow_ref.clone()))
-        .await
-        .expect("applied Workflow reads");
-    let stored = serde_json::to_value(&stored.spec).expect("Workflow spec serializes");
-    assert_eq!(
-        stored["steps"][0]["action"]["target"]["uid"],
-        json!(uids["security-reviewer"])
-    );
-    assert_eq!(
-        stored["steps"][1]["action"]["target"]["uid"],
-        json!(uids["correctness-reviewer"])
-    );
+    //    Agent, and each Agent to its exact Prompt. A newer security Agent
+    //    registers and changes neither.
+    refs.extend(register(&writer, "mixed/workflow.yaml").await);
+    let workflow_uid = uid(&refs, "code-review");
+    let workflow_ref = refs["code-review"].clone();
     register(&writer, "team-v2/security.yaml").await;
+    assert_locked_graph(&reader, &refs).await;
 
     // 5. Load by exact ref and by UID; both run the pinned 1.0.0 Agents, not
     //    the newer one ("v2 security review of diff").
@@ -387,7 +471,7 @@ async fn workflow_loading_journey() {
         &reader,
         &no_roles,
         workflow_ref,
-        &uids["correctness-reviewer"],
+        &uid(&refs, "correctness-reviewer"),
     )
     .await;
     server.shutdown().await.expect("test server shuts down");

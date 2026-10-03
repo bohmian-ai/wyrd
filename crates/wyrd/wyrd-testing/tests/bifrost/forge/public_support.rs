@@ -111,24 +111,44 @@ pub(crate) async fn register_table(
 ///
 /// Panics when the table cannot be loaded or the property commit fails.
 pub(crate) async fn enable_compaction(server: &WyrdTestServer, binding: &TenantTableBinding) {
+    set_table_properties(
+        server,
+        binding,
+        &[
+            ("wyrd.forge.enable-compaction", "true"),
+            ("wyrd.forge.compaction.trigger-snapshot-count", "1"),
+        ],
+    )
+    .await;
+}
+
+/// Commits Iceberg table properties, such as one table's Forge settings.
+///
+/// The leader reads these settings from the table each promotion commit
+/// notifies it about, so they govern every later commit.
+///
+/// # Panics
+///
+/// Panics when the table cannot be loaded or the property commit fails.
+pub(crate) async fn set_table_properties(
+    server: &WyrdTestServer,
+    binding: &TenantTableBinding,
+    properties: &[(&str, &str)],
+) {
     let catalog = server.bifrost_catalog().iceberg_catalog();
     let table = catalog
         .load_table(&binding.table_ident())
         .await
-        .expect("the compacting table loads");
+        .expect("the configured table loads");
     let tx = Transaction::new(&table);
-    let tx = tx
-        .update_table_properties()
-        .set("wyrd.forge.enable-compaction".to_owned(), "true".to_owned())
-        .set(
-            "wyrd.forge.compaction.trigger-snapshot-count".to_owned(),
-            "1".to_owned(),
-        )
-        .apply(tx)
-        .expect("Forge compaction settings");
+    let mut update = tx.update_table_properties();
+    for (key, value) in properties {
+        update = update.set((*key).to_owned(), (*value).to_owned());
+    }
+    let tx = update.apply(tx).expect("table properties");
     tx.commit_once(catalog.as_ref())
         .await
-        .expect("Forge compaction settings commit");
+        .expect("table properties commit");
 }
 
 /// Builds a unique table name for one journey.

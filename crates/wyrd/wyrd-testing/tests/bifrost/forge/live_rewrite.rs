@@ -13,7 +13,7 @@ use wyrd_testing::bifrost::{WyrdTestCluster, shared_process_telemetry_for_test};
 use crate::public_support::{
     JourneyTable, ManagedRow, append_values, assert_tenant_scoped_not_found, canonical_order,
     enable_compaction, public_rows_returned, read_managed_rows, register_table, rows_digest,
-    tenant_client, unique_table,
+    set_table_properties, tenant_client, unique_table,
 };
 
 /// Longest a journey waits for one production Forge attempt to return.
@@ -37,6 +37,12 @@ const RELEASE_BOUND: Duration = Duration::from_secs(120);
 /// pod holding several tables needs more than one pass to owe nothing; the
 /// budget bounds that without asserting how many passes it actually took.
 const DRAIN_PASS_BUDGET: usize = 24;
+/// Compaction interval, in seconds, of the recovery journey's owner table.
+///
+/// Two and a half days outlasts the journey's two one-day partition closes, so
+/// no promotion makes the table due; the two-day advance after uncertainty is
+/// armed is what crosses it.
+const REWRITE_INTERVAL_SECS: &str = "216000";
 
 /// Reads the durable Forge operation phases for one tenant's live rewrites.
 ///
@@ -1306,8 +1312,18 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     let shared_name = unique_table("rewrite_recovery");
     let shared = register_table(server, owner, &shared_name).await;
     let neighbour_shared = register_table(server, neighbour, &shared_name).await;
-    enable_compaction(server, &shared.binding).await;
-    enable_compaction(server, &neighbour_shared.binding).await;
+    // The owner's table compacts on RisingWave's interval rule alone, so its
+    // promotions accumulate commits and the rewrite becomes due only when this
+    // journey moves the Forge clock past the interval, after arming uncertainty.
+    set_table_properties(
+        server,
+        &shared.binding,
+        &[
+            ("wyrd.forge.enable-compaction", "true"),
+            ("wyrd.forge.compaction-interval-sec", REWRITE_INTERVAL_SECS),
+        ],
+    )
+    .await;
     assert_eq!(
         shared.qualified, neighbour_shared.qualified,
         "both tenants must be registering the identical table name"
@@ -1317,7 +1333,6 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         "one logical name must resolve to two disjoint physical tables"
     );
     let neighbour_only = register_table(server, neighbour, &unique_table("neighbour_only")).await;
-    enable_compaction(server, &neighbour_only.binding).await;
     let owner_client = tenant_client(server, owner).await;
     let neighbour_client = tenant_client(server, neighbour).await;
 
@@ -1456,7 +1471,10 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     uncertainty.fail_after_next_commit();
     let errors_before = observer.returned_errors().len();
     release_retries(&cluster, owner).await;
-    cluster.request_forge_scheduler_pass_for_test();
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(2))
+        .expect("the owner's compaction interval elapses");
     let mut unsettled = Vec::new();
     // Roster discovery can admit legitimate sibling maintenance first, so this
     // waits for *this* owner's unsettled rewrite rather than for any attempt.

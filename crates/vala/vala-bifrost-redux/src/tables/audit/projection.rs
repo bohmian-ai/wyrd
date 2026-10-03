@@ -31,7 +31,7 @@ pub struct AuditProjection {
     /// so every replica and every crash replay of the same frozen range
     /// presents Scribe the same identity and lands on its durable batch fence.
     pub batch_id: Uuid,
-    /// The 14 content fields declared by [`AuditLogTable`], plus the
+    /// The 15 content fields declared by [`AuditLogTable`], plus the
     /// `wyrd_event_time` the decision was stamped with in Postgres.
     pub rows: RecordBatch,
 }
@@ -225,6 +225,10 @@ fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditPr
         .iter()
         .map(|row| row.detail.clone())
         .collect::<Vec<_>>();
+    let event_id_values = rows
+        .iter()
+        .map(|row| row.event_id.to_string())
+        .collect::<Vec<_>>();
     // The decision instant travels as the event time rather than as content, so
     // a retained row partitions by when the boundary decided, not by when the
     // publisher happened to ship it.
@@ -254,6 +258,7 @@ fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditPr
         Arc::new(StringArray::from(outcome_values)),
         Arc::new(StringArray::from(detail_values)),
         Arc::new(StringArray::from(credential_id_values)),
+        Arc::new(StringArray::from(event_id_values)),
         Arc::new(
             TimestampMicrosecondArray::from(event_time_values).with_timezone(Arc::from("UTC")),
         ),
@@ -334,9 +339,11 @@ mod tests {
         DataTenantId::new(Uuid::from_bytes(bytes)).expect("UUIDv7 test tenant")
     }
 
+    /// One valid staged row of `tenant` at `seq`, under a fresh event id.
     fn row(tenant: DataTenantId, seq: i64) -> AuditStagingRow {
         AuditStagingRow {
             data_tenant_id: tenant.as_uuid(),
+            event_id: Uuid::now_v7(),
             seq,
             entry_hash: vec![0xab; 32],
             prev_hash: vec![0xcd; 32],
@@ -358,6 +365,13 @@ mod tests {
         }
     }
 
+    /// A valid range projects every content column in canonical order, the
+    /// credential and event id last before the managed event time, and its
+    /// batch id derives from the tenant and range alone.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the projection is refused or a column is misplaced.
     #[test]
     fn projects_canonical_content_and_derives_missing_batch_id() {
         let authenticated = tenant(1);
@@ -367,16 +381,31 @@ mod tests {
         assert_eq!(projection.tenant, authenticated);
         assert_eq!((projection.seq_lo, projection.seq_hi), (7, 8));
         assert_eq!(projection.batch_id, derive_batch_id(authenticated, 7, 8));
-        assert_eq!(projection.rows.num_columns(), 15);
+        assert_eq!(projection.rows.num_columns(), 16);
         assert_eq!(
-            projection.rows.schema().field(14).name(),
+            projection.rows.schema().field(15).name(),
             WYRD_EVENT_TIME,
             "the decision instant travels as the managed event time"
         );
         assert_eq!(
             projection.rows.schema().field(13).name(),
             crate::tables::audit::CREDENTIAL_ID,
-            "the credential column is the appended content column, ahead of the managed one"
+        );
+        assert_eq!(
+            projection.rows.schema().field(14).name(),
+            crate::tables::audit::EVENT_ID,
+            "the event id is the last content column, ahead of the managed one"
+        );
+        let event_ids = projection
+            .rows
+            .column(14)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string event id column");
+        assert_eq!(
+            event_ids.value(1),
+            rows[1].event_id.to_string(),
+            "each retained row carries its staged event id"
         );
 
         let hashes = projection

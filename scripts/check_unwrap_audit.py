@@ -28,14 +28,31 @@ class Finding:
     text: str
 
 
+# Out-of-line bodies of `#[cfg(test)] mod tests;` declarations, each mapped to
+# the file that declares it. Rust gives the `tests.rs` name no test-only
+# meaning, so a file is skipped only when listed here, and a new entry must
+# point at a `#[cfg(test)]` declaration that includes it.
+CFG_TEST_MODULES = {
+    "crates/wyrd-spec/src/query/tests.rs": "crates/wyrd-spec/src/query/mod.rs",
+    "crates/shared/wyrd-client/src/observe/tests.rs": "crates/shared/wyrd-client/src/observe/mod.rs",
+    "crates/shared/wyrd-client/src/storage/upload/tests.rs": "crates/shared/wyrd-client/src/storage/upload/mod.rs",
+    "crates/wyrd/wyrd-gateway/src/adapter/tests.rs": "crates/wyrd/wyrd-gateway/src/adapter/mod.rs",
+}
+
+
 def is_ignored_path(path: Path) -> bool:
     """Return whether `path` is a Rust test/example path.
 
-    A `tests.rs` file is the out-of-line body of a `#[cfg(test)] mod tests;`
-    declaration, so it is test code wherever it sits.
+    Paths under a `tests` or `examples` directory are test code, as is each
+    out-of-line cfg-test module listed in `CFG_TEST_MODULES`.
     """
-    parts = path.relative_to(ROOT).parts
-    return "tests" in parts or "examples" in parts or path.name == "tests.rs"
+    relative = path.relative_to(ROOT)
+    parts = relative.parts
+    return (
+        "tests" in parts
+        or "examples" in parts
+        or relative.as_posix() in CFG_TEST_MODULES
+    )
 
 
 def read_string_literal(text: str, i: int) -> tuple[int, str] | None:
@@ -224,13 +241,18 @@ def scan_file(path: Path) -> list[Finding]:
     return findings
 
 
-def main() -> int:
-    """Run the unwrap audit."""
+def audit() -> list[Finding]:
+    """Return production unwrap/expect findings from every crate Rust file."""
     findings: list[Finding] = []
     for path in sorted((ROOT / "crates").rglob("*.rs")):
-        if is_ignored_path(path):
-            continue
-        findings.extend(scan_file(path))
+        if not is_ignored_path(path):
+            findings.extend(scan_file(path))
+    return findings
+
+
+def main() -> int:
+    """Run the unwrap audit."""
+    findings = audit()
 
     if findings:
         for finding in findings:

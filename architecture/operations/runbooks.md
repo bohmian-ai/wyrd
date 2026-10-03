@@ -124,7 +124,9 @@ non-tail WAL is a no-go and invokes full restore or incident escalation.
    Postgres or tenant connection capacity; the logged error names the tenant
    and the failure.
 2. Once Postgres recovers, the queued decisions commit exactly once and the
-   pending gauge returns toward zero. A retry never stages a decision twice.
+   pending gauge returns toward zero. A retry skips a decision still staged;
+   one whose staged row was already published is retained once more under the
+   same `event_id`, which audit reads collapse.
 3. Decisions are lost only at abrupt process loss, or when graceful shutdown
    reaches its deadline with them unwritten. Shutdown counts those in
    `outbox_events_lost_total{outbox="audit"}`; record a nonzero count with its

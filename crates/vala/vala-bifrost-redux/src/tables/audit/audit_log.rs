@@ -7,7 +7,7 @@ use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, sort_asc, sort
 use wyrd_spec::vala::api::{PhysicalLayoutWire, TimeGranularityWire};
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
-/// `vala.system.audit_log` — 14 authorization-decision content columns plus the
+/// `vala.system.audit_log` — 15 authorization-decision content columns plus the
 /// managed physical envelope.
 ///
 /// Audit carries its own principal and Card identity, so the table appends no
@@ -18,6 +18,11 @@ use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 ///
 /// The Postgres decision timestamp travels as `wyrd_event_time` rather than a
 /// content column, so a retained row partitions by when the boundary decided.
+///
+/// Delivery into this table is at least once: a decision whose staged row was
+/// published and retired before an unknown-outcome retry reached it is staged
+/// and retained once more. Both rows carry the decision's [`EVENT_ID`], so a
+/// reader that counts or lists decisions collapses rows sharing one.
 pub struct AuditLogTable;
 
 impl AuditLogTable {
@@ -36,6 +41,10 @@ impl AuditLogTable {
 
 /// The content column naming the credential a decision was made against.
 pub const CREDENTIAL_ID: &str = "credential_id";
+
+/// The content column carrying the event id the audit outbox assigned a
+/// decision when it was staged; unique per decision within a tenant.
+pub const EVENT_ID: &str = "event_id";
 
 impl DomainTable for AuditLogTable {
     const NAMESPACE: &'static str = "system";
@@ -60,6 +69,7 @@ impl DomainTable for AuditLogTable {
             utf8("outcome", false),
             utf8("detail", true),
             utf8(CREDENTIAL_ID, true),
+            utf8(EVENT_ID, false),
         ]
     }
 

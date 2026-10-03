@@ -1,8 +1,14 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tokio::sync::Notify;
 use vala_bifrost_redux::oracle::peer::PeerSecurityAudit;
 use vala_sql::TenantConn;
+use vala_sql::audit_outbox::{AuditSink, StagedAuditEvent};
 use vala_sql::queries::audit_staging::{
     AuditPublicationRange, append_audit, freeze_publication_range, list_publication_batch,
 };
+use wyrd_runtime::outbox::{Outbox, OutboxSink};
 use wyrd_server::audit::publication::{AuditPublisher, PublishOutcome};
 use wyrd_server::oracle::PostgresPeerSecurityAudit;
 use wyrd_spec::DataTenantId;
@@ -810,6 +816,242 @@ async fn retained_matching(
     })
     .await?;
     Ok(outcome.rows)
+}
+
+/// Production audit sink whose armed write commits and then reports failure.
+///
+/// That is the unknown commit outcome of a connection that broke after
+/// Postgres committed: the outbox keeps the batch and retries it. The write
+/// after an armed one waits for a single `retry` permit before committing, so
+/// the journey decides what the publisher does to staging before the retry
+/// runs; every later write commits at once.
+struct UnknownOutcomeSink {
+    /// The production audit sink every write commits through.
+    inner: AuditSink,
+    /// Set by the journey to make the next write lose its acknowledgement.
+    lose_next_ack: Arc<AtomicBool>,
+    /// Set by a lost acknowledgement so the retry waits for `retry`.
+    hold_retry: AtomicBool,
+    /// Notified once an armed write has committed.
+    committed: Arc<Notify>,
+    /// Released by the journey to let a held retry commit.
+    retry: Arc<Notify>,
+}
+
+impl OutboxSink for UnknownOutcomeSink {
+    type Item = StagedAuditEvent;
+    type Error = String;
+    const NAME: &'static str = "audit_unknown_outcome";
+
+    /// Commits `events` through the production sink, then either reports the
+    /// armed failure or, for a held retry, first waits for its permit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the production sink's failure, or the injected lost
+    /// acknowledgement after an armed write committed.
+    async fn write(&self, tenant: DataTenantId, events: &[StagedAuditEvent]) -> Result<(), String> {
+        if self.lose_next_ack.swap(false, Ordering::AcqRel) {
+            self.inner
+                .write(tenant, events)
+                .await
+                .map_err(|error| error.to_string())?;
+            self.hold_retry.store(true, Ordering::Release);
+            self.committed.notify_one();
+            return Err("connection lost after the audit commit".to_owned());
+        }
+        if self.hold_retry.swap(false, Ordering::AcqRel) {
+            self.retry.notified().await;
+        }
+        self.inner
+            .write(tenant, events)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Counts this tenant's staged rows carrying `event_id`.
+///
+/// # Errors
+/// Returns the tenant-connection or query failure Postgres raised.
+async fn staged_copies(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    event_id: uuid::Uuid,
+) -> Result<i64, ServerJourneyError> {
+    let mut conn = server.tenant_conn_for(tenant).await?;
+    let copies = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging WHERE event_id = $1")
+        .bind(event_id)
+        .fetch_one(&mut **conn.transaction())
+        .await?;
+    conn.commit().await?;
+    Ok(copies)
+}
+
+/// Reads the staged `seq` of the one row carrying `event_id`.
+///
+/// # Errors
+/// Returns the tenant-connection or query failure, including no such row.
+async fn staged_seq(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    event_id: uuid::Uuid,
+) -> Result<i64, ServerJourneyError> {
+    let mut conn = server.tenant_conn_for(tenant).await?;
+    let seq = sqlx::query_scalar("SELECT seq FROM vala.audit_staging WHERE event_id = $1")
+        .bind(event_id)
+        .fetch_one(&mut **conn.transaction())
+        .await?;
+    conn.commit().await?;
+    Ok(seq)
+}
+
+/// An unknown-outcome audit retry is skipped while its row is staged, and
+/// after retirement adds at most one retained copy that audit reads collapse.
+///
+/// Both halves drive the production audit sink through a generic outbox whose
+/// armed write commits and then reports failure, and both rely on the server's
+/// own publisher. In the first, the committed row is fenced so the publisher
+/// cannot retire it; the retry finds the event id still staged and commits
+/// nothing, so exactly one retained row carries it. In the second, the
+/// publisher retires the committed row before the retry, with a later decision
+/// of the same tenant staged behind it. The retry stages the event once more,
+/// ahead of the later decision, so retained history holds two rows with the
+/// same event id; raw history shows both, while the harness's audit count and
+/// listing return the decision once. The outbox ends with nothing pending.
+///
+/// # Errors
+/// Returns the server, Postgres, publication, or query failure.
+///
+/// # Panics
+/// Panics when the staged retry duplicates, the retired retry adds anything
+/// other than one copy, the copy follows the later decision, an audit read
+/// counts the decision twice, or work stays pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn unknown_outcome_retries_retain_each_decision_at_most_twice_and_read_once()
+-> Result<(), ServerJourneyError> {
+    let server = WyrdTestServer::start_bound().await?;
+    await_server_ready(server.base_url().ok_or("missing HTTP URL")?).await?;
+    let tenant = server.data_tenant_id();
+    let operation = format!(
+        "wyrd.journey.audit_unknown_outcome.{}",
+        uuid::Uuid::now_v7().simple()
+    );
+    let lose_next_ack = Arc::new(AtomicBool::new(false));
+    let committed = Arc::new(Notify::new());
+    let retry = Arc::new(Notify::new());
+    let outbox = Outbox::new(
+        UnknownOutcomeSink {
+            inner: AuditSink::new(server.state().postgres.vala().clone()),
+            lose_next_ack: Arc::clone(&lose_next_ack),
+            hold_retry: AtomicBool::new(false),
+            committed: Arc::clone(&committed),
+            retry: Arc::clone(&retry),
+        },
+        1,
+    );
+    let settle = || std::time::Instant::now() + PUBLICATION_BUDGET;
+
+    // A retry while the committed row is still staged commits nothing.
+    let staged = StagedAuditEvent::from(decision(&operation));
+    lose_next_ack.store(true, Ordering::Release);
+    outbox.stage(tenant, staged.clone());
+    committed.notified().await;
+    let seq = staged_seq(&server, tenant, staged.event_id).await?;
+    let fence = fence_staged_rows(
+        &server,
+        tenant,
+        AuditPublicationRange {
+            seq_lo: seq,
+            seq_hi: seq,
+        },
+    )
+    .await?;
+    retry.notify_one();
+    assert_eq!(outbox.settle(settle()).await, 0, "the staged retry settles");
+    assert_eq!(
+        staged_copies(&server, tenant, staged.event_id).await?,
+        1,
+        "a retry while the row is staged stages nothing more"
+    );
+    release_fence(fence).await?;
+    server.await_audit_published(tenant).await?;
+    await_retained_where(
+        &server,
+        tenant,
+        &format!("event_id = '{}'", staged.event_id),
+        1,
+    )
+    .await?;
+
+    // A retry after the publisher retired the committed row stages it once more.
+    let retired = StagedAuditEvent::from(decision(&operation));
+    let later = StagedAuditEvent::from(decision(&operation));
+    lose_next_ack.store(true, Ordering::Release);
+    outbox.stage(tenant, retired.clone());
+    committed.notified().await;
+    outbox.stage(tenant, later.clone());
+    server.await_audit_published(tenant).await?;
+    assert_eq!(
+        staged_copies(&server, tenant, retired.event_id).await?,
+        0,
+        "the publisher retired the committed row before the retry"
+    );
+    retry.notify_one();
+    assert_eq!(outbox.settle(settle()).await, 0, "the retry drains");
+    assert_eq!(outbox.pending(), 0);
+    server.await_audit_published(tenant).await?;
+
+    let retired_rows = format!("event_id = '{}'", retired.event_id);
+    await_retained_where(&server, tenant, &retired_rows, 2).await?;
+    await_retained_where(
+        &server,
+        tenant,
+        &format!("event_id = '{}'", later.event_id),
+        1,
+    )
+    .await?;
+    let later_seq = server
+        .retained_audit_records(
+            tenant,
+            "arrow_cast(seq, 'Utf8') AS seq_text",
+            &format!("event_id = '{}'", later.event_id),
+        )
+        .await?
+        .first()
+        .and_then(|record| record.first().cloned().flatten())
+        .ok_or("the later decision is retained")?
+        .parse::<i64>()?;
+    await_retained_where(
+        &server,
+        tenant,
+        &format!("{retired_rows} AND seq < {later_seq}"),
+        2,
+    )
+    .await?;
+    server
+        .await_retained_audit_count(tenant, &retired_rows, 1)
+        .await?;
+    assert_eq!(
+        server
+            .retained_audit_records(tenant, "operation", &retired_rows)
+            .await?
+            .len(),
+        1,
+        "an audit listing returns the re-staged decision once"
+    );
+    assert_eq!(
+        server
+            .retained_audit_operation_count(tenant, &operation)
+            .await?,
+        3,
+        "an audit count sees three decisions across four retained rows"
+    );
+
+    assert_eq!(outbox.shutdown(settle()).await, 0, "nothing is lost");
+    server.shutdown().await?;
+    Ok(())
 }
 
 /// Retained history carries both credential shapes in one uninterrupted read.

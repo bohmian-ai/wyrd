@@ -11,8 +11,10 @@
 //!
 //! A batch that fails to commit is retried at the front of its tenant's queue,
 //! never dropped. Each decision carries the event id assigned when it was
-//! staged, and the append skips ids already staged, so a retry after an unknown
-//! commit outcome cannot stage a decision twice.
+//! staged, and the append skips ids still staged, so a retry after an unknown
+//! commit outcome cannot stage a decision twice while its row is staged. If
+//! publication retired the row first, the retry stages it again; both retained
+//! rows carry the event id, and audit reads collapse them.
 
 use std::sync::Arc;
 

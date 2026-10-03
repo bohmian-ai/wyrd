@@ -14,6 +14,7 @@
 use std::collections::HashSet;
 
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 use wyrd_spec::vala::api::{AuditEvent, AuditOutcome, audit_detail_canonical_json};
 use wyrd_sql::TenantConn;
 
@@ -63,9 +64,10 @@ pub async fn append_audit_batch(
 /// once. Concurrent appends for the same tenant therefore still serialize into
 /// a gapless sequence, a batch pays the lock and its round trips once rather
 /// than once per row, and a batch retried after an unknown commit outcome
-/// stages each event exactly once without consuming a `seq`. Runs inside the
-/// caller's transaction so the rows are durable exactly when — and only when —
-/// the caller commits. An empty or fully staged batch changes nothing and
+/// skips each event still staged without consuming a `seq`; an event whose row
+/// publication already retired is staged again under its event id. Runs inside
+/// the caller's transaction so the rows are durable exactly when — and only
+/// when — the caller commits. An empty or fully staged batch changes nothing and
 /// returns the current head.
 ///
 /// Row-level security through the [`TenantConn`] is the tenant boundary: the
@@ -108,8 +110,8 @@ pub(crate) async fn append_audit_events(
         return Ok(seq);
     }
 
-    let event_ids: Vec<uuid::Uuid> = events.iter().map(|staged| staged.event_id).collect();
-    let already_staged: HashSet<uuid::Uuid> = sqlx::query_scalar(
+    let event_ids: Vec<Uuid> = events.iter().map(|staged| staged.event_id).collect();
+    let already_staged: HashSet<Uuid> = sqlx::query_scalar(
         r#"
         SELECT event_id
           FROM vala.audit_staging
@@ -215,7 +217,7 @@ pub(crate) async fn append_audit_events(
 /// the rows bind as `UNNEST` arrays of one statement.
 struct AuditRows<'a> {
     /// Event id the outbox assigned each decision when it was staged.
-    event_id: Vec<uuid::Uuid>,
+    event_id: Vec<Uuid>,
     /// Gapless chain sequence of each row.
     seq: Vec<i64>,
     /// Hash of the row before each row.
@@ -233,11 +235,11 @@ struct AuditRows<'a> {
     /// Canonical writer-identity card, when the principal has one.
     card_ref: Vec<Option<String>>,
     /// Principal that was authorized.
-    principal_id: Vec<uuid::Uuid>,
+    principal_id: Vec<Uuid>,
     /// Durable spelling of the principal's kind.
     principal_kind: Vec<&'a str>,
     /// Credential the principal used, when known.
-    credential_id: Vec<Option<uuid::Uuid>>,
+    credential_id: Vec<Option<Uuid>>,
     /// Permission that was evaluated.
     permission: Vec<&'a str>,
     /// Durable spelling of the decision.
@@ -286,7 +288,7 @@ pub async fn list_audit_events_for_resource(
 ) -> Result<Vec<AuditStagingRow>, SqlError> {
     sqlx::query_as::<_, AuditStagingRow>(
         r#"
-        SELECT data_tenant_id, seq, entry_hash, prev_hash, request_id, trace_id,
+        SELECT data_tenant_id, event_id, seq, entry_hash, prev_hash, request_id, trace_id,
                operation, resource, card_ref, principal_id, principal_kind,
                credential_id, permission, outcome, detail, created_at
           FROM vala.audit_staging
@@ -319,7 +321,7 @@ pub async fn list_publication_batch(
 ) -> Result<Vec<AuditStagingRow>, SqlError> {
     sqlx::query_as::<_, AuditStagingRow>(
         r#"
-        SELECT data_tenant_id, seq, entry_hash, prev_hash, request_id, trace_id,
+        SELECT data_tenant_id, event_id, seq, entry_hash, prev_hash, request_id, trace_id,
                operation, resource, card_ref, principal_id, principal_kind,
                credential_id, permission, outcome, detail, created_at
           FROM vala.audit_staging
@@ -452,7 +454,7 @@ pub async fn list_publication_range(
 ) -> Result<Vec<AuditStagingRow>, SqlError> {
     sqlx::query_as::<_, AuditStagingRow>(
         r#"
-        SELECT data_tenant_id, seq, entry_hash, prev_hash, request_id, trace_id,
+        SELECT data_tenant_id, event_id, seq, entry_hash, prev_hash, request_id, trace_id,
                operation, resource, card_ref, principal_id, principal_kind,
                credential_id, permission, outcome, detail, created_at
           FROM vala.audit_staging

@@ -7,6 +7,10 @@ use sqlx::types::{Uuid, chrono};
 pub struct AuditStagingRow {
     /// Tenant isolation key.
     pub data_tenant_id: Uuid,
+    /// Event id the outbox assigned when the decision was staged; unique per
+    /// tenant in staging and carried into retained history, where a decision
+    /// re-staged after its first row retired shares it.
+    pub event_id: Uuid,
     /// Gapless per-tenant sequence number.
     pub seq: i64,
     /// SHA256 chain entry hash for this row.

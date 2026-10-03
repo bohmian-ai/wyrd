@@ -1666,28 +1666,6 @@ impl WyrdTestServer {
         Ok(residual as u64)
     }
 
-    /// Counts retained audit rows matching one predicate, through the read path.
-    ///
-    /// `vala.audit_staging` is transient: the server's publisher moves a
-    /// tenant's staged rows into retained history every few seconds and deletes
-    /// them, so a test that reads staging to prove a decision *was* recorded
-    /// races that sweep. This reads the durable table instead, fused and strict
-    /// so a row Scribe still holds counts the same as one already in an object.
-    ///
-    /// `predicate` is the `WHERE` fragment naming the exact rows under
-    /// assertion, so one owner serves every shape a journey needs
-    /// (operation/resource/outcome, or a single request's decision). Every
-    /// query additionally excludes [`AUDIT_INSPECTION_PRINCIPAL`], so a count
-    /// of read decisions never counts the inspection reads that produced it.
-    ///
-    /// A tenant that has never published owns no retained table yet, which is an
-    /// honest zero rather than a failure. A public read may also refuse
-    /// with the retryable `QueryVisibilityUnavailable` while publication moves
-    /// the live cut; that yields `None` so a bounded poll retries instead of
-    /// failing early.
-    ///
-    /// # Errors
-    /// Returns the authorization failure or any non-retryable query failure.
     /// Builds the authorized context every retained-audit inspection runs under.
     ///
     /// It is the same context the public query service builds, except that its
@@ -1719,12 +1697,16 @@ impl WyrdTestServer {
         .map_err(|error| WyrdTestServerError::Audit(error.to_string()))
     }
 
-    /// Reads retained audit rows, every selected column projected as text.
+    /// Reads retained audit decisions, every selected column projected as text.
     ///
     /// `projection` is the `SELECT` list and must cast each column to text, so
     /// one decoder serves every assertion shape. Rows come back in the tenant's
     /// own `seq` order — the order the decisions were made — and the inspector's
     /// own reads are excluded by principal exactly as they are for a count.
+    ///
+    /// Retained delivery is at least once, so rows sharing an event id are one
+    /// decision: the query also selects `event_id`, and only the first row of
+    /// each event id, in `seq` order, is returned.
     ///
     /// # Errors
     /// Returns the authorization, query, decode, or stream failure. A tenant
@@ -1752,7 +1734,7 @@ impl WyrdTestServer {
                 context,
                 wyrd_spec::vala::api::BifrostQueryRequest {
                     sql: format!(
-                        "SELECT {projection} FROM {AUDIT_LOG} WHERE ({predicate}) \
+                        "SELECT event_id, {projection} FROM {AUDIT_LOG} WHERE ({predicate}) \
                          AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}' \
                          ORDER BY seq"
                     ),
@@ -1767,6 +1749,7 @@ impl WyrdTestServer {
         };
         let mut decoder = QueryIpcDecoder::new();
         let mut records = Vec::new();
+        let mut decisions = std::collections::HashSet::new();
         while let Some(frame) = stream.frames.next().await {
             match frame.map_err(|error| audit(&error))? {
                 QueryStreamFrame::Schema(schema) => {
@@ -1792,7 +1775,13 @@ impl WyrdTestServer {
                                 })
                         })
                         .collect::<Result<_, _>>()?;
+                    let Some((event_ids, columns)) = columns.split_first() else {
+                        continue;
+                    };
                     for index in 0..batch.num_rows() {
+                        if !decisions.insert(event_ids.value(index).to_owned()) {
+                            continue;
+                        }
                         records.push(
                             columns
                                 .iter()
@@ -1811,6 +1800,31 @@ impl WyrdTestServer {
         Ok(records)
     }
 
+    /// Counts retained audit decisions matching one predicate, through the read
+    /// path.
+    ///
+    /// `vala.audit_staging` is transient: the server's publisher moves a
+    /// tenant's staged rows into retained history every few seconds and deletes
+    /// them, so a test that reads staging to prove a decision *was* recorded
+    /// races that sweep. This reads the durable table instead, fused and strict
+    /// so a row Scribe still holds counts the same as one already in an object.
+    ///
+    /// `predicate` is the `WHERE` fragment naming the exact rows under
+    /// assertion, so one owner serves every shape a journey needs
+    /// (operation/resource/outcome, or a single request's decision). Every
+    /// query additionally excludes [`AUDIT_INSPECTION_PRINCIPAL`], so a count
+    /// of read decisions never counts the inspection reads that produced it.
+    /// Retained delivery is at least once, so rows sharing an event id count as
+    /// one decision.
+    ///
+    /// A tenant that has never published owns no retained table yet, which is an
+    /// honest zero rather than a failure. A public read may also refuse
+    /// with the retryable `QueryVisibilityUnavailable` while publication moves
+    /// the live cut; that yields `None` so a bounded poll retries instead of
+    /// failing early.
+    ///
+    /// # Errors
+    /// Returns the authorization failure or any non-retryable query failure.
     async fn retained_audit_rows(
         &self,
         tenant: DataTenantId,
@@ -1824,7 +1838,7 @@ impl WyrdTestServer {
             ScheduledQueryCaller::new(self.inner.state.clone(), context, CancellationToken::new())
                 .run(wyrd_spec::vala::api::BifrostQueryRequest {
                     sql: format!(
-                        "SELECT seq FROM {AUDIT_LOG} WHERE ({predicate}) \
+                        "SELECT DISTINCT event_id FROM {AUDIT_LOG} WHERE ({predicate}) \
                  AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}'"
                     ),
                     deadline_ms: Some(60_000),

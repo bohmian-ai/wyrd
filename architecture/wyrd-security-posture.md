@@ -364,8 +364,12 @@ stays at the front of that tenant's queue and is retried with backoff while
 other tenants keep committing, each failed attempt logged with its tenant and
 counted in `outbox_write_failures_total{outbox="audit"}`. Each decision carries
 an event id assigned when it is staged, and staging is unique per tenant and
-event id, so a retry after an unknown commit outcome never stages a decision
-twice. A decision is lost only at abrupt process loss, or when graceful
+event id, so a retry after an unknown commit outcome skips a decision that is
+still staged. The event id is carried into every retained
+`vala.system.audit_log` row; if publication retired the staged row before the
+retry reached it, the retry stages it once more, so retained delivery is at
+least once and audit reads that count or list decisions collapse rows sharing
+a tenant and event id. A decision is lost only at abrupt process loss, or when graceful
 shutdown reaches its deadline with it still unwritten; shutdown counts those
 in `outbox_events_lost_total{outbox="audit"}`. Scribe batch commits and Forge
 maintenance transitions evaluate no permission: they are recorded as lineage
@@ -419,7 +423,7 @@ chain.
 
 Security events include credential issuance and revocation, token replay,
 unknown signing keys, policy unavailability, repeated authorization denial,
-peer context refusal, tenant-tripwire failure, Oracle audit commit failure, audit-chain or
+peer context refusal, tenant-tripwire failure, audit outbox write failure, audit-chain or
 publication failure, SSRF rejection, secret-resolution failure, and privileged
 operator use.
 

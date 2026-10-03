@@ -1,4 +1,4 @@
 mod audit_log;
 pub mod projection;
 
-pub use audit_log::{AuditLogTable, CREDENTIAL_ID};
+pub use audit_log::{AuditLogTable, CREDENTIAL_ID, EVENT_ID};

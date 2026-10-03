@@ -12,8 +12,10 @@ Wyrd errors carry structured data. An agent must preserve that structure and act
 
 ## Error shape
 
-All Wyrd errors follow RFC 9457 Problem Details with Wyrd extensions. A
-registration spec-drift response looks like this:
+Wyrd API errors follow RFC 9457 Problem Details with Wyrd extensions, except
+on the four OAuth 2.0 endpoints described in [OAuth endpoint
+errors](#oauth-endpoint-errors). A registration spec-drift response looks like
+this:
 
 ```json
 {
@@ -43,6 +45,29 @@ registration spec-drift response looks like this:
 | `remediation` | Actionable guidance for the caller or agent | Yes |
 | `details` | Structured key/value map with operation-specific fields (card id, run id, policy name, denial reason, etc.) | When applicable |
 | `instance` | Request correlation URN (`urn:wyrd:request:<id>`); the same id is also returned in the `wyrd-request-id` response header | When the server assigns a request id |
+
+### OAuth endpoint errors
+
+`POST /auth/token`, `POST /auth/platform/token`,
+`POST /auth/device_authorization`, and `POST /auth/revoke` follow OAuth 2.0
+instead. A refusal is the [RFC 6749
+§5.2](https://www.rfc-editor.org/rfc/rfc6749#section-5.2) JSON body with
+`error` and an optional `error_description`. It has no `code`, `remediation`,
+or `instance`, so branch on `error`:
+
+| `error` | Agent action |
+| --- | --- |
+| `invalid_request` | Fix the form parameters or the presented credential. Not a retry path. |
+| `invalid_client` | Fix the client identification or client secret. Not a retry path. |
+| `invalid_grant` | The code, refresh token, assertion, or credential is unusable. Obtain a new one; a person runs `wyrd auth login` again. |
+| `unsupported_grant_type` | Check the exact `grant_type` value. |
+| `authorization_pending`, `slow_down` | Keep polling the device code at the advertised interval (RFC 8628 §3.5). |
+| `access_denied`, `expired_token` | Start a new device login. |
+| `temporarily_unavailable` | Back off and retry. |
+| `server_error` | Do not retry blindly; escalate. |
+
+The Rust, Python, and TypeScript SDKs map these refusals onto the nearest
+catalog code, so SDK callers keep branching on `code`.
 
 ## What agents must do
 
@@ -89,7 +114,8 @@ malformed request.
 
 ## Authorization errors
 
-Use the Wyrd `code` value, not HTTP status alone:
+On Problem Details responses, and on SDK errors, use the Wyrd `code` value,
+not HTTP status alone:
 
 | Code | Agent action |
 | --- | --- |
@@ -113,7 +139,7 @@ Retries are only safe for idempotent operations. The `code` field is the signal 
 - For `WYRD_REGISTRY_410_OPERATION_EXPIRED`, start a new registration with a fresh idempotency key.
 - Not retryable: audit failures, authorization errors. These require a corrective action before a retry will succeed.
 
-If the error response does not include a `code`, treat the operation as non-retryable until the cause is identified.
+If a Problem Details response does not include a `code`, treat the operation as non-retryable until the cause is identified. OAuth endpoint refusals are covered by their `error` value above.
 
 ---
 

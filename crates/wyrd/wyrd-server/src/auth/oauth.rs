@@ -3,10 +3,15 @@
 //! `POST /auth/token`, `POST /auth/platform/token`,
 //! `POST /auth/device_authorization`, and `POST /auth/revoke` take
 //! `application/x-www-form-urlencoded` parameters ([`OAuthForm`]), identify
-//! their client through [`OAuthClients`], and answer the RFC 6749 §5.1
-//! success or the §5.2 error ([`OAuthError`]) with `Cache-Control: no-store`.
-//! They are the one exception to the `WyrdError` problem-json surface; a
-//! refusal is still logged under its Wyrd error code.
+//! their client through [`OAuthClients`], and answer with
+//! `Cache-Control: no-store`. Each success keeps its own standard shape: the
+//! token endpoints return the RFC 6749 §5.1 token response, device
+//! authorization the RFC 8628 §3.2 response, and revocation an empty `200`
+//! (RFC 7009 §2.2). Every refusal is the RFC 6749 §5.2 error ([`OAuthError`]).
+//! They are the one exception to the `WyrdError` problem-json surface. Only a
+//! refusal converted from a `WyrdError` is logged under its Wyrd code; the
+//! extractors' own malformed-form and client-identification refusals carry
+//! none.
 
 use axum::body::Bytes;
 use axum::extract::{FromRequest, Request};

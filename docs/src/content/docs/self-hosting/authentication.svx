@@ -8,7 +8,7 @@ order: 7
 
 # Authentication
 
-Wyrd authenticates every request with a signed token. There is no session cookie and no ambient identity: a caller presents a bearer token in the `X-Wyrd-Access-Token: Bearer <token>` header, and that token is the only credential the server trusts per request. This page is the operator view. For the deeper model behind it, read [Authentication](/concepts/authentication/) and [Authorization](/concepts/authorization/) in Concepts.
+Wyrd authenticates every request with a signed token. The Wyrd API server keeps no browser session and no ambient identity: a caller presents a bearer token in the `X-Wyrd-Access-Token: Bearer <token>` header, and that token is the only credential the server trusts per request. The web app is a separate backend-for-frontend (BFF): it keeps a person's refresh token, or an operator's recovery API key, in its own encrypted Secure, HttpOnly, SameSite=Lax cookie and sends the server a Wyrd access token on each call. Rotating the web-app client secret invalidates those cookies. Logout revokes the refresh token best-effort, and an access token already issued stays valid until it expires. This page is the operator view. For the deeper model behind it, read [Authentication](/concepts/authentication/) and [Authorization](/concepts/authorization/) in Concepts.
 
 ## Principals
 
@@ -20,7 +20,7 @@ Wyrd mints EdDSA (Ed25519) JWTs signed with its own key, presented on every requ
 
 ## Grants
 
-A **grant** is how a caller proves its identity to get a Wyrd access token. Every grant ends at `POST /auth/token`; a person starts with the login flow first. Which one you use depends on who is calling.
+A **grant** is how a caller proves its identity to get a Wyrd access token. Every tenant-plane grant below ends at `POST /auth/token`; a person starts with the login flow first. The platform plane is separate: a platform credential is exchanged only at `POST /auth/platform/token` ([RFC 8693](https://www.rfc-editor.org/rfc/rfc8693)), and `/auth/token` refuses it. Which tenant grant you use depends on who is calling.
 
 | Caller | Grant | Set up in |
 | --- | --- | --- |

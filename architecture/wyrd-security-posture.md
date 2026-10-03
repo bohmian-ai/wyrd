@@ -206,10 +206,13 @@ credential.
   principal, tenant, and connection; tokens are minted when the code or
   device code is redeemed, never stored awaiting pickup.
 - The token, platform token, revocation, and device authorization endpoints
-  take form-encoded bodies and answer RFC 6749 §5.1 and §5.2 JSON with
-  `Cache-Control: no-store`. They are the one exception to `WyrdError`
-  problem+json; the server still logs each refusal under its Wyrd error
-  code.
+  take form-encoded bodies and answer with `Cache-Control: no-store`. Token
+  success is the RFC 6749 §5.1 token response, device authorization success
+  is the RFC 8628 §3.2 response, and revocation success is an empty `200`
+  (RFC 7009 §2.2). Every refusal is the RFC 6749 §5.2 error JSON. They are
+  the one exception to `WyrdError` problem+json: a refusal converted from a
+  `WyrdError` is logged under its Wyrd code, while a malformed form or
+  client-identification refusal is answered directly with no Wyrd code.
 - The web app keeps a person's session in one Secure, HttpOnly,
   SameSite=Lax cookie that it encrypts and that holds the refresh token (or,
   for operator recovery sign-in, the API key). No token reaches page data,

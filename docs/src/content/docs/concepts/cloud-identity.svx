@@ -83,12 +83,12 @@ Issuer fields:
     ['client_id', 'Yes', 'Wyrd\'s OAuth2 client id at this IdP.'],
     ['expected_audience', 'Yes', 'Expected aud claim in tokens from this issuer.'],
     ['client_auth', 'Yes', 'How Wyrd authenticates to the IdP token endpoint: "public" (PKCE, no secret), "private_key_jwt", or a secret variant { secret_basic = "…" } / { secret_post = "…" }. Secret variants are encrypted at rest with the sealing key.'],
-    ['principal_kind', 'No', '"workload" or "human". Defaults to "human".'],
+    ['principal_kind', 'Yes', 'Must be "workload". Trusted issuers are workload-only: an omitted value defaults to "human", and boot and the admin API both refuse a human issuer. Human sign-in is configured as a tenant OIDC connection; see SSO and OIDC.'],
     ['claim_mapping.subject', 'No', 'JWT claim path for the subject identity. Defaults to "sub".'],
-    ['claim_mapping.email', 'No', 'JWT claim path for email. Meaningful for human issuers.'],
-    ['claim_mapping.groups', 'No', 'JWT claim path for group membership. Meaningful for human issuers.'],
-    ['group_role_map', 'No', 'Map from IdP group name to a list of Wyrd role names. Meaningful for human issuers.'],
-    ['default_roles', 'No', 'Baseline Wyrd role names granted to every federated user from this issuer.'],
+    ['claim_mapping.email', 'No', 'Not used by workload federation.'],
+    ['claim_mapping.groups', 'No', 'Not used by workload federation.'],
+    ['group_role_map', 'No', 'Not used by workload federation: a workload acts with the authority of the principal its workload binding names.'],
+    ['default_roles', 'No', 'Not used by workload federation.'],
     ['jwks_ttl_secs', 'No', 'JWKS cache TTL in seconds. Omit to use the boot default.']
   ]}
 />

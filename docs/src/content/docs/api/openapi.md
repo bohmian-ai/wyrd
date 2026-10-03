@@ -25,4 +25,8 @@ into Postman or Bruno to explore the API interactively.
 
 Every operation declares its authentication, typed request and response
 bodies, `application/problem+json` error media type, and the stable Wyrd
-error codes it can return.
+error codes it can return. The four OAuth 2.0 endpoints (`/auth/token`,
+`/auth/platform/token`, `/auth/device_authorization`, and `/auth/revoke`)
+are the exception: they take form bodies and refuse with the RFC 6749
+section 5.2 JSON (`error`, optional `error_description`), which carries no
+Wyrd error code.

@@ -59,7 +59,11 @@ def render_openapi() -> str:
         "",
         "Every operation declares its authentication, typed request and response",
         "bodies, `application/problem+json` error media type, and the stable Wyrd",
-        "error codes it can return.",
+        "error codes it can return. The four OAuth 2.0 endpoints (`/auth/token`,",
+        "`/auth/platform/token`, `/auth/device_authorization`, and `/auth/revoke`)",
+        "are the exception: they take form bodies and refuse with the RFC 6749",
+        "section 5.2 JSON (`error`, optional `error_description`), which carries no",
+        "Wyrd error code.",
         "",
     ]
     return "\n".join(lines)
@@ -118,7 +122,7 @@ def render_errors() -> str:
             "",
             "Wyrd returns errors as structured RFC 9457 Problem Details objects (`application/problem+json`). Agents and SDK clients must preserve the full structure and must not collapse errors into prose.",
             "",
-            "The one exception is the OAuth 2.0 endpoints (`/auth/token`, `/auth/platform/token`, `/auth/device_authorization`, and `/auth/revoke`). They return the standard RFC 6749 section 5.2 JSON body (`error`, `error_description`), as OAuth clients expect, and the server logs each refusal under its Wyrd code. See [SSO and OIDC](/self-hosting/sso-and-oidc/#oauth-endpoints).",
+            "The one exception is the OAuth 2.0 endpoints (`/auth/token`, `/auth/platform/token`, `/auth/device_authorization`, and `/auth/revoke`). They refuse with the standard RFC 6749 section 5.2 JSON body (`error`, optional `error_description`), as OAuth clients expect. That body carries no Wyrd `code`, so branch on `error`; the codes below never appear in it. The Rust, Python, and TypeScript SDKs map such a refusal onto the nearest catalog code. See [SSO and OIDC](/self-hosting/sso-and-oidc/#oauth-endpoints).",
             "",
             "This page is the generated error catalog. For how an agent should act on these errors, see [Error remediation](/for-agents/error-remediation/).",
             "",

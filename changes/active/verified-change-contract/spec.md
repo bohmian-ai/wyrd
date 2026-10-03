@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 55
+revision: 56
 status: approved
 ---
 
@@ -1704,15 +1704,33 @@ table on `(data_tenant_id, result_id)`.
 
   No Grafana deliverable is part of this change.
 - **REQ-171**: `mise run bench:verification:capacity` MUST replace the
-  verification journey benchmark. It measures queued, direct, and concurrent
-  queued/direct execution of PSI, SPC, Custom, assertion Eval, and LLM-judge
-  Eval, both solo and mixed, on one and two release replicas.
-  - Defaults: 30-second steps; offered totals of 10, 25, 50, 100, and 200
-    executions per second split evenly across kinds; one noisy, one quiet,
-    and 70 background tenants.
-  - It reports, per path, step, and kind: reconciled work, achieved rate,
-    raw client p50/p95/p99, bucket-estimated server phases, paired engine
-    overhead, task-start delay, backlog, the resource envelope, and a verdict.
+  verification journey benchmark. It follows standard capacity-testing
+  practice: one realistic production workload, a short ramp to find
+  saturation, then a sustained run at load on one and then two release
+  replicas. A default run MUST complete within 30 minutes, including setup.
+  - **Workload.** Every scored step drives the same production mix at once:
+    queued and direct execution of PSI, SPC, Custom, assertion Eval, and
+    LLM-judge Eval. The offered total is split evenly across the two paths
+    and the five kinds and carried by one noisy tenant. One quiet tenant
+    sends low-volume assertion work, and 70 background tenants send queued
+    work throughout. There are no separate solo-kind, queued-only, or
+    direct-only ladders.
+  - **Steps.** The default run has seven steps:
+    1. a 30-second warmup, which is not scored;
+    2. a ramp of 60-second steps at offered totals of 50, 100, 200, and
+       400 executions per second on one replica. The ramp stops at the
+       first step that is not sustainable;
+    3. a 180-second sustained step on one replica at the highest
+       sustainable ramp rate;
+    4. the same 180-second sustained step on two replicas.
+  - **Report.** One summary row per step: offered and achieved rate,
+    reconciled work, errors, raw client p50/p95/p99, backlog, drain, the
+    resource envelope, and a verdict. Each step also has a per-kind,
+    per-path breakdown of the same fields, bucket-estimated server phases,
+    paired engine overhead, and task-start delay. The two-replica step also
+    reports per-replica results, cross-replica claim exclusivity, and
+    reconciliation. Both sustained steps report quiet- and background-tenant
+    progress during noisy traffic.
   - `--profile` captures symbolized per-step, per-replica `perf` profiles of
     a diagnostic build and fails explicitly on missing evidence.
   - Manual activations used for capacity are labelled and never counted as
@@ -2318,13 +2336,14 @@ published image pinned by an immutable registry digest before release.
   | SPC | 4 features × 1,000 samples, subgroup size 5, baseline from 10,000 rows |
   | LLM judge | 1 judge plus 1 assertion against a local TLS mock with a 200 ms delay |
 
-  Sustainable load is the highest offered step whose achieved rate is at
-  least 95% of offered and whose outstanding work drains within one step. At
-  sustainable load, solo and mixed, on one release replica, the four
-  non-judge cases MUST show direct-mode paired per-request engine overhead
-  below 10 ms at p95, from at least 1,000 samples per case per step. Judge
-  cases report overhead and provider waits separately, with no threshold.
-  Mixed slowdown is reported without a contractual bound.
+  A step is sustainable when its achieved rate is at least 95% of offered
+  and its outstanding work drains within one ramp step (60 seconds). In the
+  one-replica sustained step of REQ-171, the four non-judge kinds MUST show
+  direct-mode paired per-request engine overhead below 10 ms at p95, from at
+  least 1,000 samples per kind. A sustained rate too low to yield 1,000
+  samples per kind fails this criterion. Judge cases report overhead and
+  provider waits separately, with no threshold. The two-replica sustained
+  step reports scaling and overhead with no threshold.
 - **AC-041**: A release-build Rust benchmark against a real server, Postgres,
   and the RustFS emulator MUST drive one `WyrdState` emitting 500 Drift
   observations per second × 100 features (50,000 rows/s) for 60 s with
@@ -2372,7 +2391,7 @@ published image pinned by an immutable registry digest before release.
 
 ## Open material decisions
 
-None for revision 55.
+None for revision 56.
 
 Revision 39 records the user's narrow deletion: remove the always-allow
 hook and its fake `invoke` policy attribution without redesigning delegation.
@@ -2407,6 +2426,23 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 - [PagerDuty Global Integrations and Service Routes](https://support.pagerduty.com/main/docs/event-orchestration)
 
 ## Revision history
+
+- **Revision 56 production-shaped capacity benchmark (2026-10-02, approved):**
+  The REQ-171 defaults expanded to 134 steps of 30 seconds: 2 paths × 6
+  cases × 5 rates on each of two replica counts, plus warmup, combined, and
+  fairness steps. A run took over an hour, and no person could diagnose its
+  report. The 10 and 25 per second steps could never yield AC-040's 1,000
+  samples per case.
+  - **Direction:** the user asked for a simple, human-readable benchmark
+    that tests production behavior the way standard capacity tests do, in
+    30 minutes or less.
+  - **Changes:** REQ-171 now runs one production mix through a warmup, a
+    four-rate ramp, and sustained steps on one and two replicas, with a
+    30-minute ceiling. Per-kind and per-path figures become breakdowns of
+    each step. AC-040 measures overhead in the one-replica sustained step
+    instead of solo and mixed ladders.
+  - **Proof:** AC-040 keeps the reference workloads, the 10 ms p95 bound,
+    and the 1,000-sample floor.
 
 - **Revision 55 linger sealing under backpressure (2026-10-02, approved):**
   The AC-041 benchmark showed the producer sealing a ~350-row batch on every

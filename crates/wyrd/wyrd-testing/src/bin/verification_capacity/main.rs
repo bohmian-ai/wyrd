@@ -38,7 +38,7 @@ use std::sync::Arc;
 use clap::Parser;
 use secrecy::ExposeSecret as _;
 use wyrd_testing::bifrost::peer_ca::BifrostPeerCa;
-use wyrd_testing::capacity::{install_tracing, release_binary};
+use wyrd_testing::capacity::{binary_identity, install_tracing, release_binary};
 use wyrd_testing::release_server::{CPUS, LocalServer, MEMORY_BYTES};
 
 use collector::Collector;
@@ -347,21 +347,16 @@ async fn ladders(
     Ok(())
 }
 
-/// The identity of the measured `binary`: path, size, and modification
-/// time, and whether it is the profiling build.
+/// The identity of the measured `binary`, as [`binary_identity`] records it,
+/// and whether it is the profiling build.
 ///
 /// # Errors
 ///
 /// Returns the metadata failure.
 fn identity(binary: &Path, profiled: bool) -> Result<serde_json::Value> {
-    let metadata = std::fs::metadata(binary)?;
-    let modified: chrono::DateTime<chrono::Utc> = metadata.modified()?.into();
-    Ok(serde_json::json!({
-        "path": binary.display().to_string(),
-        "bytes": metadata.len(),
-        "modified": modified,
-        "profiling_build": profiled,
-    }))
+    let mut identity = binary_identity(binary)?;
+    identity["profiling_build"] = serde_json::Value::Bool(profiled);
+    Ok(identity)
 }
 
 /// Runs the benchmark and exits nonzero on any failed check or error.

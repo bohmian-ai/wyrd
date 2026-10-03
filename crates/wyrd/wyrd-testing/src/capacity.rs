@@ -12,7 +12,7 @@
 //! percentiles. Raw percentiles come from per-sample measurements.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -231,6 +231,22 @@ pub fn release_binary() -> Result<PathBuf, Error> {
     } else {
         Err(format!("{} is not built; run through mise", binary.display()).into())
     }
+}
+
+/// The identity of the measured server `binary` a report records: its path,
+/// size, and modification time.
+///
+/// # Errors
+///
+/// Returns the metadata failure.
+pub fn binary_identity(binary: &Path) -> Result<serde_json::Value, Error> {
+    let metadata = std::fs::metadata(binary)?;
+    let modified: chrono::DateTime<chrono::Utc> = metadata.modified()?.into();
+    Ok(serde_json::json!({
+        "path": binary.display().to_string(),
+        "bytes": metadata.len(),
+        "modified": modified,
+    }))
 }
 
 /// Installs a stderr log subscriber when `WYRD_LOG`, else `RUST_LOG`, is set,

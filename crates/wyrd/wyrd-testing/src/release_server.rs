@@ -117,6 +117,19 @@ pub struct LocalServer {
     /// Replica ordinal: 0 for the server [`LocalServer::start`] set up,
     /// which binds the default ports, and its listener offset otherwise.
     ordinal: u16,
+    /// What the process runs, which decides its readiness probe.
+    role: Role,
+}
+
+/// What a [`LocalServer`] process runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// The default target: the public API and every serving subsystem, ready
+    /// once `/readyz` answers.
+    Serving,
+    /// `WYRD_TARGET=forge-worker`: Forge work only, no API and no peer
+    /// listener, ready once its metrics listener answers.
+    ForgeWorker,
 }
 
 impl LocalServer {
@@ -144,12 +157,15 @@ impl LocalServer {
         std::fs::create_dir_all(&storage)?;
         let storage_url = format!("file://{}", storage.display());
         let workdir = root.path().to_path_buf();
-        run(operator(binary, &workdir, &storage_url, 0, env)
-            .arg("migrate")
-            .env("WYRD_DATABASE_URL", owner_url))?;
-        let mut server = Self::serve(binary, root, &storage_url, 0, env).await?;
+        run(
+            operator(binary, &workdir, &storage_url, 0, Role::Serving, env)
+                .arg("migrate")
+                .env("WYRD_DATABASE_URL", owner_url),
+        )?;
+        let mut server = Self::serve(binary, root, &storage_url, 0, Role::Serving, env).await?;
 
-        let operator = |program: &Path| operator(program, &workdir, &storage_url, 0, env);
+        let operator =
+            |program: &Path| operator(program, &workdir, &storage_url, 0, Role::Serving, env);
 
         let mut platform: Option<String> = None;
         for slug in tenants {
@@ -201,11 +217,36 @@ impl LocalServer {
     ) -> Result<Self> {
         let root = tempfile::Builder::new().prefix("wyrd-bench-").tempdir()?;
         let storage_url = format!("file://{}", self.storage_dir().display());
-        Self::serve(binary, root, &storage_url, ordinal, env).await
+        Self::serve(binary, root, &storage_url, ordinal, Role::Serving, env).await
     }
 
-    /// Serves `binary` as replica `ordinal` from `root` in its envelope and
-    /// waits until it is ready.
+    /// Starts a dedicated Forge worker of this deployment as replica
+    /// `ordinal`: `binary` with `WYRD_TARGET=forge-worker`, the same Postgres
+    /// and store, its own working directory and envelope, and its metrics
+    /// listener offset by `ordinal` strides.
+    ///
+    /// A Forge worker serves no API and opens no peer listener, so it is
+    /// ready once `/metrics` answers. It pulls compaction from the elected
+    /// Forge leader over the peer route, which needs `WYRD_PEER_TLS_DIR` in
+    /// `env`; no peer address is derived for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the process exits or never becomes ready, or its
+    /// cgroup does not enforce the envelope.
+    pub async fn start_forge_worker(
+        &self,
+        binary: &Path,
+        ordinal: u16,
+        env: &[(&str, &str)],
+    ) -> Result<Self> {
+        let root = tempfile::Builder::new().prefix("wyrd-bench-").tempdir()?;
+        let storage_url = format!("file://{}", self.storage_dir().display());
+        Self::serve(binary, root, &storage_url, ordinal, Role::ForgeWorker, env).await
+    }
+
+    /// Serves `binary` as replica `ordinal` in `role` from `root` in its
+    /// envelope and waits until it is ready.
     ///
     /// # Errors
     ///
@@ -216,6 +257,7 @@ impl LocalServer {
         root: tempfile::TempDir,
         storage_url: &str,
         ordinal: u16,
+        role: Role,
         env: &[(&str, &str)],
     ) -> Result<Self> {
         let log = File::create(root.path().join("server.log"))?;
@@ -224,6 +266,7 @@ impl LocalServer {
             root.path(),
             storage_url,
             ordinal,
+            role,
             env,
         )
         .args(["--user", "--scope", "--quiet", "--collect"])
@@ -242,6 +285,7 @@ impl LocalServer {
             root,
             tenants: Vec::new(),
             ordinal,
+            role,
         };
         server.await_ready().await?;
         server.cgroup = server.find_cgroup()?;
@@ -377,7 +421,9 @@ impl LocalServer {
         Err(format!("wyrd-server did not exit within {}s", STOP_GRACE.as_secs()).into())
     }
 
-    /// Polls `/readyz` until it answers 200, failing if the process exits.
+    /// Polls the role's readiness endpoint until it answers 200, failing if
+    /// the process exits: `/readyz` for a serving replica and `/metrics` for
+    /// a Forge worker, which serves nothing else.
     ///
     /// # Errors
     ///
@@ -398,7 +444,13 @@ impl LocalServer {
                 )
                 .into());
             }
-            if reqwest::get(format!("{}/readyz", self.url()))
+            let probe = match self.role {
+                Role::Serving => format!("{}/readyz", self.url()),
+                Role::ForgeWorker => {
+                    format!("http://127.0.0.1:{}/metrics", self.port(HTTP_PORT) + 1)
+                }
+            };
+            if reqwest::get(probe)
                 .await
                 .is_ok_and(|response| response.status().is_success())
             {
@@ -551,15 +603,17 @@ fn replica_port(base: u16, ordinal: u16) -> u16 {
     base + ordinal * REPLICA_PORT_STRIDE
 }
 
-/// A command running `program` as replica `ordinal` would: in `workdir`,
-/// publishing to `storage_url`, at the server's default pool size, on the
-/// replica's listeners, with `env` added. Peer mode derives the peer
-/// listener and advertised address when `env` names `WYRD_PEER_TLS_DIR`.
+/// A command running `program` as replica `ordinal` in `role` would: in
+/// `workdir`, publishing to `storage_url`, at the server's default pool size,
+/// on the replica's listeners, with `env` added. Peer mode derives a serving
+/// replica's peer listener and advertised address when `env` names
+/// `WYRD_PEER_TLS_DIR`; a Forge worker only dials, so it gets neither.
 fn operator(
     program: &Path,
     workdir: &Path,
     storage_url: &str,
     ordinal: u16,
+    role: Role,
     env: &[(&str, &str)],
 ) -> Command {
     let mut command = Command::new(program);
@@ -579,7 +633,9 @@ fn operator(
                 format!("127.0.0.1:{}", replica_port(GRPC_PORT, ordinal)),
             );
     }
-    if env.iter().any(|(name, _)| *name == "WYRD_PEER_TLS_DIR") {
+    if role == Role::ForgeWorker {
+        command.env("WYRD_TARGET", "forge-worker");
+    } else if env.iter().any(|(name, _)| *name == "WYRD_PEER_TLS_DIR") {
         let peer = format!("127.0.0.1:{}", replica_port(PEER_PORT, ordinal));
         command
             .env("WYRD_BIFROST_PEER_BIND_ADDR", &peer)
@@ -609,7 +665,50 @@ fn run(command: &mut Command) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::Metrics;
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    use super::{Metrics, Role, operator};
+
+    /// A serving replica in peer mode derives its peer listener and address;
+    /// a Forge worker given the same TLS directory only dials, so it gets
+    /// its target and neither peer setting.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a role's environment is wrong.
+    #[test]
+    fn forge_worker_dials_without_a_peer_listener() {
+        let env = [("WYRD_PEER_TLS_DIR", "/peer")];
+        let read = |role: Role| {
+            let command = operator(
+                Path::new("wyrd-server"),
+                Path::new("/"),
+                "file:///s",
+                2,
+                role,
+                &env,
+            );
+            let value = |name: &str| {
+                command
+                    .get_envs()
+                    .find(|(key, _)| *key == OsStr::new(name))
+                    .and_then(|(_, value)| value)
+                    .map(|value| value.to_string_lossy().into_owned())
+            };
+            (
+                value("WYRD_TARGET"),
+                value("WYRD_PEER_ADDRESS"),
+                value("WYRD_BIFROST_PEER_BIND_ADDR"),
+            )
+        };
+        let peer = Some("127.0.0.1:50072".to_owned());
+        assert_eq!(read(Role::Serving), (None, peer.clone(), peer));
+        assert_eq!(
+            read(Role::ForgeWorker),
+            (Some("forge-worker".to_owned()), None, None)
+        );
+    }
 
     /// Series of one family sum across label sets; other families and
     /// same-prefix families do not leak in.

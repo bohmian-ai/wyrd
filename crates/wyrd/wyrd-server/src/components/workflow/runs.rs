@@ -51,7 +51,7 @@ pub(crate) struct RunKey {
 pub(crate) enum Admission {
     /// The key names an accepted run with the same request; its current
     /// snapshot is the replay answer.
-    Replay(WorkflowRun),
+    Replay(Box<WorkflowRun>),
     /// A preparation of the same request is in flight; its outcome is the
     /// answer.
     Wait(watch::Receiver<Option<PreparationOutcome>>),
@@ -280,7 +280,7 @@ impl WorkflowRuns {
                     .get(run_id)
                     .map(|entry| entry.snapshot.borrow().clone())
                     .ok_or_else(run_not_found)?;
-                return Ok(Admission::Replay(snapshot));
+                return Ok(Admission::Replay(Box::new(snapshot)));
             }
             Some(KeyState::Preparing {
                 hash: preparing,

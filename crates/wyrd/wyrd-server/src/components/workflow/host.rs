@@ -97,7 +97,7 @@ impl WorkflowRunHost {
         };
         let runs = &self.state.workflows;
         let (created, mut outcome) = match runs.admit(key, hash)? {
-            Admission::Replay(run) => return Ok((Created::Replayed, run)),
+            Admission::Replay(run) => return Ok((Created::Replayed, *run)),
             Admission::Wait(outcome) => (Created::Replayed, outcome),
             Admission::Reserved(reservation) => {
                 let outcome = reservation.outcome();

@@ -10,6 +10,7 @@
 //! Oracle controls it calls; each surface keeps only its own argument parsing
 //! and error projection.
 
+#[cfg(feature = "test-support")]
 use std::sync::Arc;
 
 use arrow::json::writer::{EncoderOptions, make_encoder};

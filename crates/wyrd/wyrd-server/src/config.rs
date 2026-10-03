@@ -5986,7 +5986,9 @@ api_key = "plaintext"
     /// Panics when a contradictory configuration validates.
     #[test]
     fn workflow_config_rejects_zero_and_contradictory_bounds() {
-        let refused: [(&str, fn(&mut ServerWorkflowConfig)); 17] = [
+        /// One edit that makes a default Workflow configuration invalid.
+        type Contradiction = fn(&mut ServerWorkflowConfig);
+        let refused: [(&str, Contradiction); 17] = [
             ("default_timeout_seconds", |c| c.default_timeout_seconds = 0),
             ("max_timeout_seconds", |c| c.max_timeout_seconds = 0),
             ("max_concurrency_per_run", |c| c.max_concurrency_per_run = 0),

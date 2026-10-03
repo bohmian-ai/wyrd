@@ -1,7 +1,7 @@
 ---
 id: SPEC-audit-outbox
-revision: 2
-status: approved
+revision: 3
+status: draft
 ---
 
 # One non-blocking audit outbox
@@ -146,12 +146,20 @@ items in one transaction, all or nothing. The generic type owns the following.
 
 No other outbox implementation exists.
 
-### REQ-009 — Retried audit writes do not duplicate
+### REQ-009 — Retried audit writes are detectable, not silently duplicated
 
 Every audit event carries an event ID assigned when it is staged. Staged audit
-is unique per (tenant, event ID). A write retried after an unknown commit
-outcome skips events already staged, without consuming a sequence number or
+is unique per (tenant, event ID): a write retried after an unknown commit
+outcome skips events still staged, without consuming a sequence number or
 breaking the hash chain. This requires a migration on `vala.audit_staging`.
+
+The event ID is also carried into every retained `vala.system.audit_log` row.
+If the publisher retires a staged row before an unknown-outcome retry reaches
+it, the retry can stage that event once more; the retained log then holds two
+rows with the same (tenant, event ID). Delivery is therefore at least once, and
+a duplicate is always identifiable by event ID. Audit reads that count or list
+decisions collapse rows sharing a (tenant, event ID). No second audit table,
+ledger, WAL, or retirement delay is added.
 
 ## Invariants
 
@@ -173,8 +181,10 @@ breaking the hash chain. This requires a migration on `vala.audit_staging`.
   abrupt process loss or an expired shutdown deadline has no audit row. A
   failed commit is retried, never dropped.
 - The generic outbox type and its sink trait in a shared crate (REQ-008).
-- The audit event ID and the (tenant, event ID) uniqueness on
-  `vala.audit_staging` (REQ-009, migration).
+- The audit event ID, the (tenant, event ID) uniqueness on
+  `vala.audit_staging`, and the `event_id` column on the retained
+  `vala.system.audit_log` schema (REQ-009, migration and retained-schema
+  change).
 - Moving publication progress out of `vala.audit_chain_head` (migration).
 - Removal of the "not yet converted" clause from `AGENTS.md` and
   `architecture/wyrd-design.md`.
@@ -211,13 +221,15 @@ breaking the hash chain. This requires a migration on `vala.audit_staging`.
   - There is no count limit.
   - Shutdown flushes until the deadline and counts the remainder as lost.
   - `pending` returns to zero.
-- AC-009 (REQ-009): Retrying a batch after its commit already succeeded
-  produces no duplicate staged rows and a gap-free chain. Postgres
-  integration test.
+- AC-009 (REQ-009): Retrying a batch after its commit already succeeded, while
+  the row is still staged, produces no duplicate staged rows and a gap-free
+  chain. A retry after the publisher has retired the row produces at most one
+  extra retained row, carrying the same event ID, and audit reads collapse it.
+  Postgres integration tests through the production publisher.
 
 ## Open material decisions
 
-None for revision 2.
+None for revision 3.
 
 ## Authority links
 
@@ -242,3 +254,10 @@ outbox-labelled metrics. Adds REQ-009: an audit event ID with (tenant, event
 ID) uniqueness, so a retry after an unknown commit outcome cannot duplicate
 audit. Source: r1 review FIND-AUDIT-OUTBOX-1. Approved by the user on
 2026-10-03.
+- Revision 3 (2026-10-03, draft): r2 review FIND-AUDIT-OUTBOX-11 showed
+  staging-only event-ID uniqueness cannot prevent a duplicate once the
+  publisher retires the staged row before an unknown-outcome retry. Audit
+  delivery is at least once: the event ID is carried into the retained audit
+  log and readers collapse rows sharing it. Rejected: a retirement delay (not
+  guaranteed, grows staging by the delay's volume) and a separate event-ID
+  table (contradicts one audit write path).

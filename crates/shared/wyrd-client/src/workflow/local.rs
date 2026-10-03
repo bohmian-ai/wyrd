@@ -1,34 +1,36 @@
 //! Local execution dependencies for the routes a Workflow selects.
 //!
 //! [`SelectedRoutes`] reads a Workflow's resolved step routes and prepares
-//! only what they need from the shared client configuration: one
-//! [`ExternalGatewayBinding`] per selected `ext_gateway` binding, with its
-//! secret headers resolved at run time. Unselected bindings are never read.
+//! only what they need: a [`PublicWyrdGatewayCaller`] over the Workflow's
+//! client when a step uses `wyrd_gateway`, and, from the shared client
+//! configuration, one [`ExternalGatewayBinding`] per selected `ext_gateway`
+//! binding, with its secret headers resolved at run time. Unselected bindings
+//! are never read.
 //! A selected binding absent from configuration is left out, so Skald refuses
 //! the run before any dispatch.
 
 use std::collections::{BTreeSet, HashMap};
 
 use reqwest::header::HeaderName;
-use secrecy::SecretString;
 use skald_runtime::ProviderRegistry;
 use skald_workflow::{
     ExternalGatewayBinding, ExternalGatewayBindings, WorkflowExecutionDependencies,
+    WyrdGatewayCaller,
 };
-use tokio::io::AsyncReadExt as _;
 use wyrd_spec::card::workflow::{ExternalGatewayBindingConfig, LlmRoute, WorkflowSpec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CredentialBindingName;
-use wyrd_spec::security::SecretRef;
+use wyrd_utils::secret::read_secret_ref;
 
+use super::PublicWyrdGatewayCaller;
+use crate::WyrdClient;
 use crate::global_config::LocalWorkflowConfig;
-
-/// Largest secret file a binding header may read.
-const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
 
 /// The non-native routes a Workflow's steps resolve to.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct SelectedRoutes {
+    /// Whether any step resolves to the `wyrd_gateway` route.
+    wyrd_gateway: bool,
     /// External gateway bindings named by selected `ext_gateway` routes.
     external: BTreeSet<CredentialBindingName>,
 }
@@ -36,6 +38,10 @@ pub(super) struct SelectedRoutes {
 impl SelectedRoutes {
     /// Collect the routes `spec`'s steps resolve to.
     pub(super) fn of(spec: &WorkflowSpec) -> Self {
+        let wyrd_gateway = spec
+            .steps
+            .iter()
+            .any(|step| *spec.resolved_route(step) == LlmRoute::WyrdGateway);
         let external = spec
             .steps
             .iter()
@@ -46,7 +52,15 @@ impl SelectedRoutes {
                 LlmRoute::Native | LlmRoute::WyrdGateway => None,
             })
             .collect();
-        Self { external }
+        Self {
+            wyrd_gateway,
+            external,
+        }
+    }
+
+    /// Whether any selected route needs a Wyrd gateway client.
+    pub(super) fn needs_gateway(&self) -> bool {
+        self.wyrd_gateway
     }
 
     /// Whether any selected route needs shared configuration.
@@ -56,6 +70,8 @@ impl SelectedRoutes {
 
     /// Build execution dependencies over `native` for the selected routes.
     ///
+    /// When a step uses `wyrd_gateway`, `gateway` serves it through the
+    /// public ingress; without one Skald refuses the run before dispatch.
     /// Each selected binding present in `config` has its secret headers
     /// resolved now; bindings no route selects are never read.
     ///
@@ -67,6 +83,7 @@ impl SelectedRoutes {
         &self,
         native: ProviderRegistry,
         config: &LocalWorkflowConfig,
+        gateway: Option<WyrdClient>,
     ) -> Result<WorkflowExecutionDependencies, WyrdError> {
         let mut bindings = ExternalGatewayBindings::new();
         for name in &self.external {
@@ -74,11 +91,21 @@ impl SelectedRoutes {
                 bindings.insert(resolve_binding(name, binding).await?)?;
             }
         }
-        Ok(WorkflowExecutionDependencies::new(native).with_external_gateways(bindings))
+        let dependencies =
+            WorkflowExecutionDependencies::new(native).with_external_gateways(bindings);
+        Ok(match gateway.filter(|_| self.wyrd_gateway) {
+            Some(client) => dependencies
+                .with_wyrd_gateway(std::sync::Arc::new(PublicWyrdGatewayCaller::new(client))
+                    as std::sync::Arc<dyn WyrdGatewayCaller>),
+            None => dependencies,
+        })
     }
 }
 
 /// Resolve one configured binding's secret headers.
+///
+/// Each secret is read by the shared [`read_secret_ref`] on the blocking
+/// pool, under its owner-only, bounded file rule.
 ///
 /// # Errors
 /// Returns `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` for an invalid header name
@@ -92,8 +119,11 @@ async fn resolve_binding(
         let header = HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
             binding_unavailable(name, "secret header names must be valid HTTP field names")
         })?;
-        let value = read_secret(secret)
+        let secret = secret.clone();
+        let value = tokio::task::spawn_blocking(move || read_secret_ref(&secret))
             .await
+            .ok()
+            .and_then(Result::ok)
             .ok_or_else(|| binding_unavailable(name, "a secret header value is unavailable"))?;
         secret_headers.insert(header, value);
     }
@@ -103,46 +133,6 @@ async fn resolve_binding(
         origin: config.origin.clone(),
         secret_headers,
     })
-}
-
-/// Read one secret from an environment variable or an owner-only file.
-///
-/// A file is checked through metadata of the already-open handle: it must be
-/// a regular file, on Unix with no group or other permission bits, and at
-/// most [`MAX_SECRET_FILE_BYTES`]. Other reference kinds are unsupported
-/// locally. Returns `None` for any refusal so no path or value is reported.
-async fn read_secret(secret: &SecretRef) -> Option<SecretString> {
-    let path = match secret {
-        SecretRef::Env { name } => return std::env::var(name).ok().map(SecretString::from),
-        SecretRef::File { path } => path,
-        _ => return None,
-    };
-    let file = tokio::fs::File::open(path).await.ok()?;
-    let metadata = file.metadata().await.ok()?;
-    if !owner_only(&metadata) {
-        return None;
-    }
-    let mut value = String::new();
-    let read = file
-        .take(MAX_SECRET_FILE_BYTES + 1)
-        .read_to_string(&mut value)
-        .await
-        .ok()?;
-    (read as u64 <= MAX_SECRET_FILE_BYTES).then(|| SecretString::from(value))
-}
-
-/// Whether an opened secret file is regular and owner-only.
-#[cfg(unix)]
-fn owner_only(metadata: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    metadata.is_file() && metadata.permissions().mode() & 0o077 == 0
-}
-
-/// Whether an opened secret file is regular; access restriction is a
-/// deployment requirement on platforms without Unix mode bits.
-#[cfg(not(unix))]
-fn owner_only(metadata: &std::fs::Metadata) -> bool {
-    metadata.is_file()
 }
 
 /// A binding-unavailable refusal naming the binding and a fixed reason.

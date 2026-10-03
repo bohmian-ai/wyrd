@@ -347,6 +347,60 @@ impl HttpTransport {
         })
     }
 
+    /// POST one JSON body to a native-protocol route and return its raw answer.
+    ///
+    /// Native gateway ingresses answer refusals in their protocol's own error
+    /// envelope rather than `application/problem+json`, so the status and
+    /// body are returned undecoded for the caller's protocol codec. The
+    /// request carries the Wyrd bearer, a minted request id, and `headers`;
+    /// it is never retried, because a model call is not replay-safe, except
+    /// that one `401` buys exactly one [`AuthMiddleware::force_refresh`] and
+    /// one replay, which is safe because the edge refuses an unusable
+    /// credential before any service acts. No total deadline is applied; the
+    /// caller bounds the call.
+    ///
+    /// # Errors
+    /// Returns the authentication error when no bearer can be produced, or
+    /// [`WyrdError::Internal`] for a transport or body-read failure.
+    pub(crate) async fn post_native(
+        &self,
+        path: &str,
+        body: bytes::Bytes,
+        headers: &[(&str, &str)],
+    ) -> Result<(StatusCode, bytes::Bytes), WyrdError> {
+        let url = self.authenticated_url(path)?;
+        let request_id = self.auth.request_id(None);
+        let mut refreshed = false;
+        loop {
+            let bearer = self.auth.bearer().await.map_err(AuthError::into_wyrd)?;
+            let mut request = self
+                .client
+                .post(&url)
+                .header(
+                    HEADER_WYRD_ACCESS_TOKEN,
+                    format!("Bearer {}", bearer.expose()),
+                )
+                .header(HEADER_REQUEST_ID, &request_id)
+                .header("content-type", "application/json")
+                .body(body.clone());
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            let response = request.send().await.map_err(|err| WyrdError::Internal {
+                message: format!("transport error: {err}"),
+                details: serde_json::json!({"transport": "http"}),
+            })?;
+            let status = response.status();
+            if status == StatusCode::UNAUTHORIZED && !refreshed {
+                refreshed = true;
+                let _ = self.auth.force_refresh().await;
+                continue;
+            }
+            let bytes = response.bytes().await.map_err(body_read_err)?;
+            return Ok((status, bytes));
+        }
+    }
+
     /// Send a request and return raw Arrow IPC bytes plus metadata headers.
     ///
     /// The optional request body is serialized as JSON. On `2xx` the raw

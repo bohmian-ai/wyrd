@@ -37,7 +37,7 @@ pub use operator_connections::OperatorConnections;
 pub use platform::Platform;
 pub use principals::Principals;
 pub use verification::Verification;
-pub use workflow::{Workflow, WorkflowCards, Workflows};
+pub use workflow::{PublicWyrdGatewayCaller, Workflow, WorkflowCards, Workflows};
 
 /// Serializes tests that read or mutate process-global `WYRD_*`/`HOME`
 /// environment variables. `ClientConfig::from_env` and

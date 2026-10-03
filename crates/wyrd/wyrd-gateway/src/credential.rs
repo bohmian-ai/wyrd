@@ -6,26 +6,18 @@
 //! when the attempt finishes.
 
 use std::collections::BTreeMap;
-use std::fs::{File, Metadata};
-use std::io::Read as _;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 use std::sync::Arc;
 
 use secrecy::{ExposeSecret, SecretString};
-use tokio::io::AsyncReadExt;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::gateway::{ProviderCredentialState, ProviderDeployment};
 use wyrd_spec::ids::SecretBackendName;
 use wyrd_spec::security::SecretRef;
+use wyrd_utils::secret::read_secret_ref;
 
 use crate::managed::{ManagedSecretBinding, ManagedSecretKeys};
 use crate::snapshot::{GatewayCredentialSource, GatewayTenantSnapshot};
 use crate::vault::VaultBackend;
-
-/// Largest mounted secret file read, in bytes; longer files fail closed.
-const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
 
 /// Redacted provider credential plaintext held for one upstream attempt.
 #[derive(Debug)]
@@ -168,95 +160,28 @@ impl CredentialResolver {
 
 /// Reads an operator environment or mounted-file secret reference.
 ///
-/// A file is validated through metadata of the already-open handle, so no
-/// path swap can slip between check and read: on Unix it must be a regular
-/// file with no group or other permission bits. Other platforms check only
-/// that it is a regular file and rely on the deployment restricting access.
+/// The shared [`wyrd_utils::secret::read_secret_ref`] owns the open-handle,
+/// regular-file, owner-only, and size rules; it runs on the blocking pool so
+/// the file read never occupies a polling thread.
 ///
 /// # Errors
 ///
 /// Returns `Unavailable` for an unset variable, an unreadable, non-regular,
-/// permissive, or oversized file, non-UTF-8 content, or a reference kind
-/// bindings do not support.
+/// permissive, or oversized file, non-UTF-8 content, a reference kind
+/// bindings do not support, or a blocking read that could not complete.
 pub(crate) async fn read_binding(secret: &SecretRef) -> Result<SecretString, CredentialError> {
-    if let SecretRef::Env { name } = secret {
-        return std::env::var(name)
-            .map(SecretString::from)
-            .map_err(|_| CredentialError::Unavailable);
-    }
-    let SecretRef::File { path } = secret else {
-        return Err(CredentialError::Unavailable);
-    };
-    let file = tokio::fs::File::open(path)
+    let secret = secret.clone();
+    tokio::task::spawn_blocking(move || read_secret_ref(&secret))
         .await
-        .map_err(|_| CredentialError::Unavailable)?;
-    let metadata = file
-        .metadata()
-        .await
-        .map_err(|_| CredentialError::Unavailable)?;
-    if !restrictive(&metadata) {
-        return Err(CredentialError::Unavailable);
-    }
-    let mut value = String::new();
-    let read = file
-        .take(MAX_SECRET_FILE_BYTES + 1)
-        .read_to_string(&mut value)
-        .await
-        .map_err(|_| CredentialError::Unavailable)?;
-    if read as u64 > MAX_SECRET_FILE_BYTES {
-        return Err(CredentialError::Unavailable);
-    }
-    Ok(SecretString::from(value))
-}
-
-/// Reads a mounted secret file synchronously under the same rules as
-/// [`read_binding`].
-///
-/// The boot path that loads tenant wrapping keys has no runtime to await on,
-/// but it holds the same authority a request-path binding does, so it shares
-/// this module's [`restrictive`] rule and byte cap rather than its own. As
-/// there, the check runs against metadata of the already-open handle, so no
-/// path swap can slip between check and read.
-///
-/// # Errors
-///
-/// Returns a short static reason — unopenable, non-regular or permissive, or
-/// oversized — naming no path and no content, so a caller can render it
-/// verbatim in a redacted configuration error.
-pub fn read_secret_file(path: &Path) -> Result<String, &'static str> {
-    let file = File::open(path).map_err(|_| "names an unreadable file")?;
-    let metadata = file.metadata().map_err(|_| "names an unreadable file")?;
-    if !restrictive(&metadata) {
-        return Err("names a file that is not a regular owner-only file");
-    }
-    let mut value = String::new();
-    let read = file
-        .take(MAX_SECRET_FILE_BYTES + 1)
-        .read_to_string(&mut value)
-        .map_err(|_| "names an unreadable file")?;
-    if read as u64 > MAX_SECRET_FILE_BYTES {
-        return Err("names a file larger than one secret");
-    }
-    Ok(value)
-}
-
-/// Whether an opened secret file is regular and, on Unix, readable by its
-/// owner only: the six low group and other mode bits are all clear.
-#[cfg(unix)]
-fn restrictive(metadata: &Metadata) -> bool {
-    metadata.is_file() && metadata.permissions().mode().trailing_zeros() >= 6
-}
-
-/// Whether an opened secret file is regular; access restriction is a
-/// deployment requirement on platforms without Unix mode bits.
-#[cfg(not(unix))]
-fn restrictive(metadata: &Metadata) -> bool {
-    metadata.is_file()
+        .map_err(|_| CredentialError::Unavailable)?
+        .map_err(|_| CredentialError::Unavailable)
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
 
     use serde_json::{Value, json};
     use url::Url;

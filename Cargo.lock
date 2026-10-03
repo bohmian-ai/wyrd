@@ -11428,6 +11428,7 @@ dependencies = [
  "wyrd-crypt",
  "wyrd-spec",
  "wyrd-tls",
+ "wyrd-utils",
  "wyrd-vault",
  "zeroize",
 ]
@@ -11740,6 +11741,7 @@ dependencies = [
  "wyrd-testing",
  "wyrd-tls",
  "wyrd-tonic",
+ "wyrd-utils",
  "wyrd-vault",
  "zeroize",
 ]
@@ -11991,6 +11993,7 @@ version = "0.0.1"
 dependencies = [
  "flate2",
  "pyo3",
+ "secrecy",
  "semver",
  "serde",
  "serde_json",

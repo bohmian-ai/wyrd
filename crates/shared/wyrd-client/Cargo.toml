@@ -38,6 +38,7 @@ serde_jcs = { workspace = true }
 serde_json = { workspace = true }
 serde_urlencoded = { workspace = true }
 serde_yaml = { workspace = true }
+skald-providers = { workspace = true }
 skald-runtime = { workspace = true }
 skald-spec = { workspace = true }
 skald-tool = { workspace = true }
@@ -66,7 +67,6 @@ wyrd-utils = { workspace = true }
 [dev-dependencies]
 workspace-hack.workspace = true
 secrecy = { workspace = true }
-skald-providers = { workspace = true }
 sqlx = { workspace = true, features = ["postgres"] }
 vala-bifrost-redux = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }

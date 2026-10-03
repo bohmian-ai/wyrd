@@ -18,13 +18,16 @@ use skald_workflow::{
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 
+use crate::WyrdClient;
 use crate::cards::{CardGraphHydrator, CardSelector, Cards, WorkflowBodies};
 use crate::global_config::{GlobalConfig, LocalWorkflowConfig};
 use local::SelectedRoutes;
 
+mod gateway;
 mod local;
 mod remote;
 
+pub use gateway::PublicWyrdGatewayCaller;
 pub use remote::Workflows;
 
 /// A loaded, validated Workflow ready to run on the local Skald runtime.
@@ -32,6 +35,9 @@ pub use remote::Workflows;
 pub struct Workflow {
     /// The hydrated Skald Workflow every run delegates to.
     inner: SkaldWorkflow,
+    /// Client that loaded registered Cards, reused for `wyrd_gateway` calls
+    /// so its connection overrides stay in effect.
+    client: Option<WyrdClient>,
 }
 
 impl Workflow {
@@ -75,13 +81,16 @@ impl Workflow {
             })??;
         let (workflow, mut bodies) = WorkflowBodies::authored(&tree, &entry)?;
         let refs = bodies.external_refs(&workflow);
+        let mut client = None;
         if !refs.is_empty() {
             let cards = Cards::new(None, None)?;
             CardGraphHydrator::new(cards.registry_context())
                 .resolve_external(&mut bodies, &refs)
                 .await?;
+            client = Some(cards.engine.client.clone());
         }
-        bodies.hydrate(workflow).map(Self::from)
+        let inner = bodies.hydrate(workflow)?;
+        Ok(Self { inner, client })
     }
 
     /// Run on the process-default native provider registry.
@@ -95,16 +104,20 @@ impl Workflow {
 
     /// Run on `native` with the shared local dependencies its routes select.
     ///
-    /// Only when a step resolves to an `ext_gateway` route is the shared
-    /// client configuration loaded; then each selected binding it configures
-    /// has its secret headers resolved, and no other binding is read. A
-    /// selected binding absent from configuration is refused by Skald before
-    /// any dispatch. Loading a Workflow never performs this preparation.
+    /// A step on the `wyrd_gateway` route calls the public gateway through
+    /// the client that loaded the Workflow's registered Cards, or else a
+    /// client built from the shared configuration. Only when a step resolves
+    /// to an `ext_gateway` route is the shared client configuration loaded;
+    /// then each selected binding it configures has its secret headers
+    /// resolved, and no other binding is read. A selected binding absent from
+    /// configuration is refused by Skald before any dispatch. Loading a
+    /// Workflow never performs this preparation.
     ///
     /// # Errors
     /// Returns the client configuration error when the shared configuration
-    /// cannot be read, `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` when a selected
-    /// binding is absent, invalid, or has an unreadable secret, and the other
+    /// cannot be read, `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` when no gateway
+    /// client can be built for a `wyrd_gateway` step or a selected binding is
+    /// absent, invalid, or has an unreadable secret, and the other
     /// pre-dispatch errors of [`SkaldWorkflow::run_with_options`]; step
     /// failures are reported in the returned run.
     pub async fn run_with(
@@ -118,7 +131,19 @@ impl Workflow {
         } else {
             LocalWorkflowConfig::default()
         };
-        let dependencies = routes.dependencies(native.clone(), &config).await?;
+        let gateway = match (&self.client, routes.needs_gateway()) {
+            (_, false) => None,
+            (Some(client), true) => Some(client.clone()),
+            (None, true) => Some(WyrdClient::from_global().map_err(|error| {
+                WyrdError::WorkflowBindingUnavailable {
+                    message: format!("no Wyrd gateway client is available: {error}"),
+                    details: serde_json::json!({ "route": "wyrd_gateway" }),
+                }
+            })?),
+        };
+        let dependencies = routes
+            .dependencies(native.clone(), &config, gateway)
+            .await?;
         self.inner
             .run_with_options(&dependencies, input, WorkflowRunOptions::default())
             .await
@@ -165,7 +190,10 @@ fn load_bundle(path: &Path) -> Result<(wyrd_loader::LoadedTree, PathBuf), WyrdEr
 impl From<SkaldWorkflow> for Workflow {
     /// Wrap an already hydrated Skald Workflow, such as a native builder's.
     fn from(inner: SkaldWorkflow) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            client: None,
+        }
     }
 }
 
@@ -226,10 +254,13 @@ impl WorkflowCards<'_> {
                 details: serde_json::json!({ "field": "kind" }),
             });
         }
-        CardGraphHydrator::new(self.cards.registry_context())
+        let inner = CardGraphHydrator::new(self.cards.registry_context())
             .load_workflow(selector)
-            .await
-            .map(Workflow::from)
+            .await?;
+        Ok(Workflow {
+            inner,
+            client: Some(self.cards.engine.client.clone()),
+        })
     }
 }
 /// Authored-file loading over the checked-in code-review bundle.
@@ -464,7 +495,7 @@ mod tests {
         config: &LocalWorkflowConfig,
     ) -> WorkflowResult<WorkflowRun> {
         let dependencies = SelectedRoutes::of(workflow.as_skald().spec())
-            .dependencies(skald_runtime::ProviderRegistry::new(), config)
+            .dependencies(skald_runtime::ProviderRegistry::new(), config, None)
             .await?;
         let input = serde_json::Map::from_iter([("code".to_owned(), json!("diff"))]);
         workflow
@@ -478,8 +509,8 @@ mod tests {
     /// binding's secret is read and sent, and an unused binding naming an
     /// unreadable secret is never touched. An absent binding, a binding for
     /// another protocol, and an unreadable selected secret are refused before
-    /// any dispatch. Native-only and `wyrd_gateway` Workflows select no
-    /// configuration.
+    /// any dispatch. A `wyrd_gateway` Workflow selects no configuration and
+    /// calls the public ingress through the client it carries.
     ///
     /// # Panics
     /// Panics when a run, refusal, or upstream request differs from the
@@ -589,9 +620,72 @@ mod tests {
             "refused runs dispatch nothing"
         );
 
-        let gateway = Workflow::from_path(bundle().join("workflow.yaml"))
+        // A wyrd_gateway Workflow calls the public ingress through the client
+        // it carries, with the Prompt's model and no ext_gateway preparation.
+        let wyrd = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::to_value(match chat_text("REVIEWED") {
+                        ProviderResponse::OpenAiChatCompletion(response) => response,
+                        _ => unreachable!("chat_text builds a chat completion"),
+                    })
+                    .expect("completion serializes"),
+                ),
+            )
+            .mount(&wyrd)
+            .await;
+        let loaded = Workflow::from_path(bundle().join("workflow.yaml"))
             .await
             .expect("local bundle loads");
-        assert!(!SelectedRoutes::of(gateway.as_skald().spec()).needs_config());
+        let routes = SelectedRoutes::of(loaded.as_skald().spec());
+        assert!(routes.needs_gateway() && !routes.needs_config());
+        let gateway = Workflow {
+            inner: loaded.into_skald(),
+            client: Some(bearer_client(&wyrd.uri())),
+        };
+        let input = serde_json::Map::from_iter([("code".to_owned(), json!("diff"))]);
+        let run = gateway
+            .run_with(&skald_runtime::ProviderRegistry::new(), input)
+            .await
+            .expect("gateway run starts");
+        assert_eq!(run.status, WorkflowRunStatus::Succeeded);
+        let requests = wyrd.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap_or_default();
+            body["model"] == json!("openai/gpt-5-5")
+                && request
+                    .headers
+                    .get("x-wyrd-access-token")
+                    .map(|value| value.as_bytes())
+                    == Some(b"Bearer test-bearer".as_slice())
+        }));
+    }
+
+    /// A bearer-authenticated client pointed at `base_url`.
+    ///
+    /// # Panics
+    /// Panics when the fixed test client cannot be assembled.
+    fn bearer_client(base_url: &str) -> WyrdClient {
+        let mut config = crate::config::ClientConfig::default();
+        config.http.base_url = base_url.to_owned();
+        let auth = crate::auth::AuthMiddleware::new(
+            &config,
+            crate::transport::credential::ResolvedCredential::BearerToken(
+                secrecy::SecretString::from("test-bearer"),
+            ),
+        )
+        .expect("auth builds");
+        let transport = crate::transport::HttpTransport::new(
+            &crate::transport::config::HttpConfig {
+                base_url: base_url.to_owned(),
+                ..crate::transport::config::HttpConfig::default()
+            },
+            std::sync::Arc::clone(&auth),
+        )
+        .expect("transport builds");
+        WyrdClient::from_parts(auth, transport, config.grpc)
     }
 }

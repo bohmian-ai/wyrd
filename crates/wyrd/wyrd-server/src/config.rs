@@ -21,7 +21,6 @@ use wyrd_auth_oidc::{AddressPolicy, ScreenedHttp};
 use wyrd_crypt::SecretKey;
 use wyrd_gateway::{
     CredentialAssignment, CredentialResolver, ManagedSecretKeys, TenantKeyring, VaultBackend,
-    read_secret_file,
 };
 use wyrd_spec::auth::IssuerTokenPolicy;
 use wyrd_spec::gateway::{ExternalSecretReference, ProviderCredentialSourceView};
@@ -29,6 +28,7 @@ use wyrd_spec::ids::{CredentialBindingName, SecretBackendName};
 use wyrd_spec::security::SecretRef;
 use wyrd_spec::{DataTenantId, TenantSlug};
 use wyrd_telemetry::TelemetryConfig;
+use wyrd_utils::secret::read_secret_ref;
 
 use crate::boot::data_root::DEFAULT_BIFROST_DATA_DIR;
 
@@ -2420,7 +2420,7 @@ impl GatewayConfig {
     /// wrapping key out of per-tenant configuration, so that fails boot.
     ///
     /// A mounted file carries tenant wrapping authority, so it is read through
-    /// [`read_secret_file`] under the same open-handle, regular-file,
+    /// [`read_secret_ref`] under the same open-handle, regular-file,
     /// owner-only, bounded rule the request path applies to an operator
     /// binding: a `0644` mount is refused here rather than accepted.
     ///
@@ -2440,15 +2440,9 @@ impl GatewayConfig {
             };
             let mut versions = BTreeMap::new();
             for (version, secret) in &configured.versions {
-                let encoded = match secret {
-                    SecretRef::Env { name } => env::var(name)
-                        .map_err(|_| invalid(version, "names an unset environment variable"))?,
-                    SecretRef::File { path } => read_secret_file(Path::new(path))
-                        .map_err(|reason| invalid(version, reason))?,
-                    _ => return Err(invalid(version, "must be an env or file secret reference")),
-                };
+                let encoded = read_secret_ref(secret).map_err(|reason| invalid(version, reason))?;
                 let bytes: [u8; 32] = BASE64_STANDARD
-                    .decode(encoded.trim())
+                    .decode(encoded.expose_secret().trim())
                     .ok()
                     .and_then(|bytes| bytes.try_into().ok())
                     .ok_or_else(|| {

@@ -3,8 +3,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use secrecy::SecretString;
 use serde_json::{Value, json};
+use skald_providers::{ProviderError, RemoteProblem};
+use skald_spec::{ProviderRequest, ProviderResponse};
+use skald_workflow::{WorkflowGatewayCorrelation, WyrdGatewayCall, WyrdGatewayCaller};
+use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_client::auth::AuthMiddleware;
@@ -12,8 +18,9 @@ use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
-use wyrd_client::{Workflows, WyrdClient};
+use wyrd_client::{PublicWyrdGatewayCaller, Workflows, WyrdClient};
 use wyrd_spec::card::workflow::{CreateWorkflowRunRequest, WorkflowRunStatus};
+use wyrd_spec::gateway::{GatewayFallbackOverride, ModelRef};
 use wyrd_spec::ids::WorkflowRunId;
 
 /// Fixed run identity used by every scripted response.
@@ -273,4 +280,413 @@ async fn shared_workflow_client_contract() {
             .all(|request| request.method == wiremock::http::Method::GET
                 && request.url.path() == run_path())
     );
+}
+
+/// An OpenAI Chat request whose body names a model the caller must replace.
+fn chat_request() -> ProviderRequest {
+    ProviderRequest::OpenAiChatCompletion(
+        serde_json::from_value(json!({
+            "model": "body-model",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("chat request decodes"),
+    )
+}
+
+/// A completed OpenAI Chat answer.
+fn chat_answer() -> Value {
+    json!({
+        "id": "resp",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "gpt-a",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop"
+        }]
+    })
+}
+
+/// A gateway call for `request` on `model` with `fallback` and `timeout`.
+fn gateway_call(
+    request: ProviderRequest,
+    model: &str,
+    fallback: Option<GatewayFallbackOverride>,
+    timeout: Duration,
+) -> WyrdGatewayCall {
+    WyrdGatewayCall {
+        request,
+        model: ModelRef::from_projection(model).expect("model ref"),
+        fallback,
+        timeout,
+        correlation: WorkflowGatewayCorrelation {
+            run_id: run_id(),
+            step_id: "step".to_owned(),
+            attempt: 1,
+        },
+    }
+}
+
+/// A fallback override naming `candidate`.
+fn fallback(candidate: &str) -> GatewayFallbackOverride {
+    GatewayFallbackOverride {
+        candidates: vec![ModelRef::from_projection(candidate).expect("candidate")],
+    }
+}
+
+/// The remote problem a call returned.
+///
+/// # Panics
+/// Panics when the call did not fail with a remote problem.
+fn problem(outcome: Result<ProviderResponse, ProviderError>) -> RemoteProblem {
+    match outcome {
+        Err(ProviderError::RemoteProblem(problem)) => *problem,
+        other => panic!("expected a remote problem, got {other:?}"),
+    }
+}
+
+/// Concurrent public gateway calls keep their own fallback, deadline, and
+/// model; each dialect reaches its ingress with the call's model; Vertex,
+/// cancellation, and timeouts stop locally; native error envelopes become
+/// redacted problems keeping only status, Wyrd code, message, OpenAI `param`,
+/// and catalog remediation.
+#[tokio::test]
+async fn public_gateway_call_context_and_errors() {
+    // Concurrent calls on one caller carry only their own fallback header.
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "POST",
+        "/v1/chat/completions",
+        ResponseTemplate::new(200).set_body_json(chat_answer()),
+        u64::MAX,
+    )
+    .await;
+    let caller = PublicWyrdGatewayCaller::new(client(&server.uri()));
+    let token = CancellationToken::new();
+    let (first, second, third) = tokio::join!(
+        caller.call(
+            gateway_call(
+                chat_request(),
+                "openai/gpt-a",
+                Some(fallback("openai/gpt-b")),
+                Duration::from_secs(5)
+            ),
+            &token,
+        ),
+        caller.call(
+            gateway_call(
+                chat_request(),
+                "openai/gpt-c",
+                Some(fallback("openai/gpt-d")),
+                Duration::from_secs(9)
+            ),
+            &token,
+        ),
+        caller.call(
+            gateway_call(chat_request(), "openai/gpt-e", None, Duration::from_secs(5)),
+            &token,
+        ),
+    );
+    for outcome in [first, second, third] {
+        assert!(matches!(
+            outcome,
+            Ok(ProviderResponse::OpenAiChatCompletion(_))
+        ));
+    }
+    let requests = received(&server).await;
+    assert_eq!(requests.len(), 3);
+    for request in &requests {
+        let body: Value = serde_json::from_slice(&request.body).expect("JSON body");
+        assert!(request.headers.contains_key("x-wyrd-access-token"));
+        let header = request.headers.get("wyrd-gateway-fallback").map(|value| {
+            let json = URL_SAFE_NO_PAD.decode(value.as_bytes()).expect("base64url");
+            serde_json::from_slice::<GatewayFallbackOverride>(&json).expect("fallback")
+        });
+        let expected = match body["model"].as_str() {
+            Some("openai/gpt-a") => Some(fallback("openai/gpt-b")),
+            Some("openai/gpt-c") => Some(fallback("openai/gpt-d")),
+            Some("openai/gpt-e") => None,
+            other => panic!("unexpected model {other:?}"),
+        };
+        assert_eq!(header, expected);
+    }
+
+    // Every dialect reaches its ingress with the call's model.
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "POST",
+        "/v1/responses",
+        ResponseTemplate::new(200).set_body_json(json!({
+            "id": "resp", "object": "response", "model": "gpt-r", "status": "completed",
+            "created_at": 0, "output": []
+        })),
+        1,
+    )
+    .await;
+    mount(
+        &server,
+        "POST",
+        "/v1/messages",
+        ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg", "type": "message", "role": "assistant", "model": "claude-a",
+            "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn",
+            "stop_sequence": null, "usage": {"input_tokens": 1, "output_tokens": 1}
+        })),
+        1,
+    )
+    .await;
+    mount(
+        &server,
+        "POST",
+        "/v1beta/models/gemini-a:generateContent",
+        ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{"content": {"role": "model", "parts": [{"text": "ok"}]}}]
+        })),
+        1,
+    )
+    .await;
+    let caller = PublicWyrdGatewayCaller::new(client(&server.uri()));
+    let responses = ProviderRequest::OpenAiResponses(
+        serde_json::from_value(json!({"model": "body-model", "input": "hi"})).expect("responses"),
+    );
+    let anthropic = ProviderRequest::AnthropicMessage(
+        serde_json::from_value(json!({
+            "model": "body-model", "max_tokens": 16,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        }))
+        .expect("anthropic"),
+    );
+    let gemini = ProviderRequest::GeminiGenerateContent(
+        serde_json::from_value(json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}))
+            .expect("gemini"),
+    );
+    let deadline = Duration::from_secs(5);
+    assert!(matches!(
+        caller
+            .call(
+                gateway_call(responses, "openai/gpt-r", None, deadline),
+                &token
+            )
+            .await,
+        Ok(ProviderResponse::OpenAiResponses(_))
+    ));
+    assert!(matches!(
+        caller
+            .call(
+                gateway_call(anthropic, "anthropic/claude-a", None, deadline),
+                &token
+            )
+            .await,
+        Ok(ProviderResponse::AnthropicMessage(_))
+    ));
+    assert!(matches!(
+        caller
+            .call(
+                gateway_call(gemini.clone(), "gemini/gemini-a", None, deadline),
+                &token
+            )
+            .await,
+        Ok(ProviderResponse::GeminiGenerateContent(_))
+    ));
+    let models: Vec<Value> = received(&server)
+        .await
+        .iter()
+        .map(|request| {
+            serde_json::from_slice::<Value>(&request.body).expect("JSON body")["model"].clone()
+        })
+        .collect();
+    assert_eq!(
+        models,
+        vec![json!("openai/gpt-r"), json!("claude-a"), Value::Null]
+    );
+
+    // Vertex and a cancelled run stop before any request; a slow answer times
+    // out at the call's own deadline.
+    let vertex = ProviderRequest::Vertex(
+        serde_json::from_value(json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}))
+            .expect("vertex"),
+    );
+    let refused = caller
+        .call(
+            gateway_call(vertex, "vertex/gemini-a", None, deadline),
+            &token,
+        )
+        .await
+        .expect_err("Vertex is refused locally");
+    assert_eq!(refused.code(), "SKALD_PROVIDERS_400_BAD_REQUEST");
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let stopped = caller
+        .call(
+            gateway_call(chat_request(), "openai/gpt-a", None, deadline),
+            &cancelled,
+        )
+        .await
+        .expect_err("a cancelled run stops the call");
+    assert_eq!(stopped.code(), "SKALD_PROVIDERS_408_TIMEOUT");
+    assert_eq!(received(&server).await.len(), 3, "nothing else was sent");
+    let slow = MockServer::start().await;
+    mount(
+        &slow,
+        "POST",
+        "/v1/chat/completions",
+        ResponseTemplate::new(200)
+            .set_body_json(chat_answer())
+            .set_delay(Duration::from_secs(5)),
+        1,
+    )
+    .await;
+    let timed_out = PublicWyrdGatewayCaller::new(client(&slow.uri()))
+        .call(
+            gateway_call(
+                chat_request(),
+                "openai/gpt-a",
+                None,
+                Duration::from_millis(100),
+            ),
+            &token,
+        )
+        .await
+        .expect_err("the call's deadline bounds it");
+    assert_eq!(timed_out.code(), "SKALD_PROVIDERS_408_TIMEOUT");
+
+    // Native error envelopes keep only the safe common fields.
+    let refusal = |status: u16, route: &str, body: Value| {
+        let route = route.to_owned();
+        async move {
+            let server = MockServer::start().await;
+            mount(
+                &server,
+                "POST",
+                &route,
+                ResponseTemplate::new(status).set_body_json(body),
+                1,
+            )
+            .await;
+            server
+        }
+    };
+    let openai = refusal(
+        400,
+        "/v1/chat/completions",
+        json!({"error": {
+            "message": "fallback must be unpadded base64url", "type": "invalid_request_error",
+            "param": "fallback", "code": "WYRD_GATEWAY_400_INVALID_REQUEST"
+        }}),
+    )
+    .await;
+    let refused = problem(
+        PublicWyrdGatewayCaller::new(client(&openai.uri()))
+            .call(
+                gateway_call(chat_request(), "openai/gpt-a", None, deadline),
+                &token,
+            )
+            .await,
+    );
+    let catalog = wyrd_spec::error::WyrdError::GatewayInvalidRequest {
+        message: String::new(),
+        details: json!({}),
+    };
+    assert_eq!(
+        refused,
+        RemoteProblem {
+            code: "WYRD_GATEWAY_400_INVALID_REQUEST".to_owned(),
+            status: 400,
+            message: "fallback must be unpadded base64url".to_owned(),
+            field: Some("fallback".to_owned()),
+            remediation: catalog.remediation().to_owned(),
+        }
+    );
+    let anthropic = refusal(
+        429,
+        "/v1/messages",
+        json!({"type": "error", "error": {
+            "type": "rate_limit_error", "message": "limit exceeded",
+            "code": "WYRD_GATEWAY_429_LIMIT_EXCEEDED"
+        }}),
+    )
+    .await;
+    let anthropic_request = ProviderRequest::AnthropicMessage(
+        serde_json::from_value(json!({
+            "model": "body-model", "max_tokens": 16,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        }))
+        .expect("anthropic"),
+    );
+    let refused = problem(
+        PublicWyrdGatewayCaller::new(client(&anthropic.uri()))
+            .call(
+                gateway_call(anthropic_request, "anthropic/claude-a", None, deadline),
+                &token,
+            )
+            .await,
+    );
+    assert_eq!(
+        (refused.code.as_str(), refused.status),
+        ("WYRD_GATEWAY_429_LIMIT_EXCEEDED", 429)
+    );
+    assert_eq!(refused.message, "limit exceeded");
+    assert_eq!(refused.field, None);
+    let google = refusal(
+        504,
+        "/v1beta/models/gemini-a:generateContent",
+        json!({"error": {
+            "code": 504, "message": "deadline exceeded", "status": "DEADLINE_EXCEEDED",
+            "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": "WYRD_GATEWAY_504_DEADLINE_EXCEEDED", "domain": "wyrd"}]
+        }}),
+    )
+    .await;
+    let refused = problem(
+        PublicWyrdGatewayCaller::new(client(&google.uri()))
+            .call(
+                gateway_call(gemini, "gemini/gemini-a", None, deadline),
+                &token,
+            )
+            .await,
+    );
+    assert_eq!(
+        (
+            refused.code.as_str(),
+            refused.status,
+            refused.message.as_str()
+        ),
+        (
+            "WYRD_GATEWAY_504_DEADLINE_EXCEEDED",
+            504,
+            "deadline exceeded"
+        )
+    );
+
+    // A relayed provider refusal without a Wyrd code keeps no upstream text.
+    for (status, code) in [
+        (429, "SKALD_PROVIDERS_429_RATE_LIMIT"),
+        (503, "SKALD_PROVIDERS_5XX_UPSTREAM"),
+        (408, "SKALD_PROVIDERS_408_TIMEOUT"),
+        (400, "SKALD_PROVIDERS_400_BAD_REQUEST"),
+    ] {
+        let upstream = refusal(
+            status,
+            "/v1/chat/completions",
+            json!({"error": {
+                "message": "echoed prompt sk-canary", "type": "provider_error",
+                "param": null, "code": "provider_specific"
+            }}),
+        )
+        .await;
+        let refused = problem(
+            PublicWyrdGatewayCaller::new(client(&upstream.uri()))
+                .call(
+                    gateway_call(chat_request(), "openai/gpt-a", None, deadline),
+                    &token,
+                )
+                .await,
+        );
+        assert_eq!((refused.code.as_str(), refused.status), (code, status));
+        assert!(!format!("{refused:?}").contains("sk-canary"));
+        assert_eq!(refused.field, None);
+    }
 }

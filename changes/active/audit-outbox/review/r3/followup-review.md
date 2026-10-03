@@ -1,256 +1,322 @@
-# Focused follow-up — audit-outbox r3 conflicts
+# Focused follow-up review
 
-## Immutable subject and purpose
+## Immutable subject and question
 
 - Base: `cf5ee4128ce0b842e00a0eb20770ab5c285dedd8`
-- Candidate: `e54b1244f32950d1ab251dae6530c4e1694c78d5`
-- Reviewed range: `cf5ee4128..e54b1244f`
-- Approved authority: `changes/active/audit-outbox/spec.md`, revision 3
-- Prior closure authority: `review/r2/verdict.md`,
-  `review/r2/findings-validation.md`, and
-  `review/r2/TASK-AUDIT-OUTBOX-R2-bounded-remediation.md`
+- Candidate: `52e1144b5c186ccacd85d9c779a4e60c3cce5ac2`
+- Reviewed range: `cf5ee4128ce0b842e00a0eb20770ab5c285dedd8..52e1144b5c186ccacd85d9c779a4e60c3cce5ac2`
+- Approved authority: `changes/active/audit-outbox/spec.md`, revision 4
+- Closure inputs: the r2 verdict and validation ledger, the bounded-remediation
+  task, and the revision-4 commit-outcome remediation task
 
-This pass resolves three conflicts among the completed r3 discovery reports.
-It is not a vote or a verdict. I read all eight discovery reports in this
-directory, the complete applicable workflow and architecture authority, the
-owners and callers identified below, and the relevant history. The repository
-has no `.codegraph/` directory, so navigation used direct source and history.
-The unanimous shipped-reader-collapse finding is not re-reviewed here.
+This fresh follow-up resolves only the conflicts routed by the orchestrator:
+the remaining panic path, the proof obligation for the untested transaction
+status branches, the range-local standards and documentation proposals, and
+the three implementer-reported risks. It does not vote on the overall verdict
+or reopen earlier passed code. The repository has no `.codegraph/` directory.
+`HEAD` matched the immutable candidate before and after source inspection.
 
-## Uncertainty 1 — retained-schema compatibility
+## Source and authority inspected
 
-### Source paths and history inspected
-
+- `AGENTS.md` sections 2, 4-6, 11-12, 14-16
+- `architecture/agent-rules.md`
 - `architecture/references/languages/spec-driven-development.md`
-- `architecture/operations/deployment-and-release.md:151-218`
-- `architecture/references/domain/iceberg.md:22-29`
-- `changes/active/audit-outbox/spec.md`, revision 3, especially REQ-009,
-  AC-009, expensive-to-reverse decisions, and open material decisions
-- `crates/vala/vala-bifrost-redux/src/tables/audit/audit_log.rs`
-- `crates/vala/vala-bifrost-redux/src/scribe/ingress.rs:183-204`
-- `crates/vala/vala-bifrost-redux/src/catalog/bifrost_catalog.rs:1016-1042,
-  1072-1135,1238-1261`
-- Commit `b7185d0ee0a812949efb74fe232b2b10a94c625d` and the audit-specific
-  compatibility implementation it deleted
-- The current branch/tag history around the immutable base and candidate
+- `architecture/references/languages/maintainer-style.md`
+- `architecture/references/languages/rust-core.md`
+- `architecture/references/languages/testing-workflows.md`
+- `architecture/bifrost-design.md`, especially lines 587-649
+- `architecture/operations/deployment-and-release.md`, especially the migration
+  contract
+- `changes/active/audit-outbox/spec.md`, revision 4, especially REQ-003,
+  REQ-003a, REQ-008, REQ-009, AC-008, and AC-009
+- `changes/active/audit-outbox/review/r2/findings-validation.md`
+- `changes/active/audit-outbox/review/r2/verdict.md`
+- both r2 remediation tasks and their recorded evidence
+- every r3 discovery report supplied to this follow-up
+- `crates/shared/wyrd-runtime/src/outbox.rs`
+- `crates/vala/vala-sql/src/audit_outbox.rs`
+- `crates/wyrd/wyrd-sql/src/error.rs`
+- `crates/vala/vala-sql/src/queries/audit_staging.rs`
+- `crates/vala/vala-sql/tests/pg_audit_outbox.rs`
+- `crates/wyrd/wyrd-testing/tests/bifrost/server/audit_publication.rs`
+- `crates/wyrd/wyrd-server/src/audit/mod.rs`
+- `crates/vala/vala-bifrost-redux/src/tables/audit/projection.rs`
+- the deleted event-ID migration and its history in the immutable range
+- the full committed range diff and file history needed to distinguish changed
+  prose from earlier prose
 
-### Evidence
+## Resolution 1: panic containment and `FIND-AUDIT-OUTBOX-12`
 
-The mechanical risk reported by both sides is real. `ensure_builtin` sends the
-current declaration to `create_table_locked`; an existing control row whose
-fingerprint differs returns `FingerprintMismatch` before the physical table is
-accepted (`bifrost_catalog.rs:1110-1113`), and an exact physical-shape mismatch
-would also fail (`:1238-1261`). Adding required `event_id` therefore cannot
-publish into a table materialized under the preceding declaration. The range
-contains no evolution path.
+### Reachable state trace
 
-That fact is not, by itself, a supported-state regression for this task. The
-authority order in `spec-driven-development.md` places repository architecture
-above the approved spec and both above implementation evidence. The applicable
-release authority expressly states that no Wyrd image has yet been published
-and that the next artifact is the first release
-(`deployment-and-release.md:209-213`). Its expand-and-contract requirement is
-conditioned on an old/new release overlap (`:163-168`), and its compatibility
-interval is established by published release manifests (`:175-218`). There is
-no supported predecessor image or manifest in that interval here. Revision 3
-then expressly approves `event_id` on retained `audit_log` as an
-expensive-to-reverse schema change and records no open material decision.
+`OutboxWriter::dispatch` removes the only owned item vector from `waiting`,
+spawns a child task, and records only `(tenant, count)` in `in_flight`
+(`crates/shared/wyrd-runtime/src/outbox.rs:319-345`). The child catches unwind
+while constructing `sink.write`, and `contain_panic` catches unwind from each
+poll (`outbox.rs:331-337,435-454`). That closes the exact ordinary async-body
+panic exercised by the new test.
 
-Repository history corroborates that interpretation rather than creating it:
-`b7185d0ee` deliberately removed the only audit-specific Iceberg evolution,
-legacy fingerprint, field-ID reconciliation, and upgrade proof because the
-schema had not shipped. The current strict `ensure_builtin` path is the chosen
-pre-release replacement behavior, not an accidentally omitted compatibility
-branch.
+The containment boundary nevertheless ends before all sink-controlled values
+have been normalized and destroyed:
 
-The Iceberg reference still controls released/retained schema evolution: once
-an earlier table shape belongs to a supported release interval, a required
-field change needs explicit compatibility. It does not turn every developer or
-test catalog materialized from an unpublished intermediate commit into a
-supported upgrade state. Under the checked-in deployment authority, an
-existing materialized *pre-release* catalog is disposable integration/developer
-state unless the user separately designates it as data that the first release
-must preserve. No such designation exists in this task. If integration supplies
-that new external fact, the current code will refuse publication and the
-compatibility decision must be reopened before release.
+- On an ordinary sink error, `error.to_string()` executes after
+  `contain_panic` returns (`outbox.rs:338-340`). `OutboxSink::Error` is generic
+  and bounded only by `Display + Send + 'static` (`outbox.rs:55-77`); neither
+  the trait nor Rust makes a `Display` implementation non-panicking. A
+  conforming generic sink can therefore return an error whose `Display`
+  panics. This is a direct child-task panic while the child still owns the sole
+  vector.
+- After a poll panic, the caught `Box<dyn Any + Send>` and the pinned sink
+  future are dropped after the polling catch. A sink can use a panic payload
+  with a panicking destructor, and a sink future can have a panicking
+  destructor. Those drops occur after the narrow polling catch and can unwind
+  the child. The current `finish` rustdoc itself records the panic-payload-drop
+  example (`outbox.rs:368-375`).
 
-### Resolution
+The parent then receives `JoinError`. Because `in_flight` contains no items,
+`finish` can only increment loss, release pending, and return
+(`outbox.rs:382-388`). The writer and process continue, later same-tenant work
+can dispatch, and the accepted decisions are permanently absent. This is not
+an abrupt process stop, shutdown deadline, or revision-4 transaction-status
+`NULL` terminal.
 
-**RESOLVED — no source-local finding.** `STD-R3-001` and `SEC-TEN-R3-002`
-correctly identify what would happen to an old physical table, but they apply a
-released-upgrade obligation to a state the controlling deployment authority
-does not support. The maintainer, system, behavior, invariant, and
-persistent-data dispositions are the authority-consistent result for this
-immutable task. This conclusion is narrow to the first-release boundary and
-must not be reused after a Wyrd artifact is published or if the user explicitly
-requires preservation of a pre-release catalog.
+### Generic versus audit-sink reachability
 
-## Uncertainty 2 — escaped sink panics and `FIND-AUDIT-OUTBOX-12`
-
-### Source paths inspected
-
-- Revision-3 REQ-003, REQ-003a, REQ-008, and AC-008 in
-  `changes/active/audit-outbox/spec.md`
-- `review/r2/findings-validation.md` and `review/r2/verdict.md`, exact
-  `FIND-AUDIT-OUTBOX-12` diagnosis and correction
-- `review/r2/TASK-AUDIT-OUTBOX-R2-bounded-remediation.md`, item 1 and its
-  focused closure proof
-- `crates/shared/wyrd-runtime/src/outbox.rs:50-78,304-453`
-- `crates/vala/vala-sql/src/audit_outbox.rs:90-110`
-- All repository `OutboxSink` implementations and call sites, including the
-  test-only `UnknownOutcomeSink`
-- The current and planned-consumer references found by the discovery reports
-
-### Evidence
-
-The original defect was concrete: the child task owned the only item vector,
-an ordinary panic from `OutboxSink::write` escaped as `JoinError`, and
-`finish` counted that batch lost while the process continued. The independently
-validated correction was specific: contain sink-future construction and
-polling unwind while the task still owns the vector, then use the existing
-front-of-queue retry path. The remediation task repeats exactly that boundary
-and asks for a sink that panics once and then succeeds.
-
-The candidate implements that correction at `outbox.rs:328-342`:
-`sink.write(...)` construction is inside `catch_unwind`, every poll is inside
-`contain_panic`'s `catch_unwind`, and the child returns `(tenant, items,
-result)`. `finish` then treats the contained panic like an ordinary failure and
-prepends the original vector (`:368-423`). The focused proof exercises this
-path. The production `AuditSink` is the only shipped implementation; its
-compiler-generated future awaits tenant acquisition, append, and commit and
-returns `SqlError`. No custom `Drop`, panic payload, or panicking `Display`
-implementation is present in that path. No production Eval sink exists in this
-candidate.
-
-`CONC-R3-001` identifies type-system-possible escapes outside that boundary:
-a deliberately panicking future destructor after a caught poll panic, an error
-whose `Display` panics, or a panic payload whose formatting/destruction panics.
-The public trait bounds do not make those programs ill-typed. They are not,
-however, a reachable behavior of a current production consumer, and they are
-not the construction/poll panic that `FIND-12` and its approved correction
-specified. They require a custom sink type whose teardown or formatting itself
-panics. Treating every user-supplied `Drop`/`Display` implementation as an
-outbox failure mode would extend the task into general adversarial Rust panic
-containment; even `Item::drop` can be made to panic, so the proposed boundary is
-not a complete generic no-unwind guarantee.
-
-The remaining `JoinError` branch is therefore defensive runtime containment,
-not evidence that the reported production/audit path is still wrong. It also
-does not handle deadline cancellation in normal operation: on deadline the
-writer and its `JoinSet` are dropped by the shutdown path, and shutdown owns the
-resulting accepted loss.
+The current production `AuditSink` uses `SqlError`, whose `Display` is derived
+from fixed variants and whose source shows no custom panicking destructor. No
+ordinary audit database error was found that is expected to trigger the
+`Display` path above. That narrows immediate audit likelihood, but does not
+close the finding: `FIND-AUDIT-OUTBOX-12` and REQ-008 govern the reusable
+generic owner, and the trait admits this path without unsafe code, contract
+violation, or test-only access. The r2 correction explicitly required a sink
+task panic to retain the batch while the task owns it, not merely panics from
+one poll site. The current generic module also promises that a write which
+"returns an error or panics" is retried and that live-process loss does not
+occur (`outbox.rs:11-23`).
 
 ### Resolution
 
-**RESOLVED — no source-local finding.** `FIND-AUDIT-OUTBOX-12` is closed at
-the exact approved correction boundary. `CONC-R3-001` is rejected as
-speculative hardening over hypothetical custom malicious/broken
-`Future::drop`, `Display`, or panic-payload behavior, with no current production
-consumer path. A future sink that introduces such behavior must be reviewed at
-that sink; it is not a regression introduced by this range.
+`FIND-AUDIT-OUTBOX-12` remains open. The invariant and system reports identified
+a reachable closure failure, not speculative hardening. Behavior, concurrency,
+persistent-data, and security reviews proved the ordinary async-body panic but
+did not account for the sink-owned normalization and destruction steps after
+the catch.
 
-## Uncertainty 3 — repeated unknown commit outcomes
+## Resolution 2: direct proof for the transaction-status branches
 
-### Source paths inspected
+### Approved proof contract
 
-- Revision-3 REQ-003, REQ-008, REQ-009, and AC-009 in
-  `changes/active/audit-outbox/spec.md`
-- `crates/vala/vala-sql/src/audit_outbox.rs:90-110`
-- `crates/vala/vala-sql/src/queries/audit_staging.rs:57-209,472-522`
-- `crates/shared/wyrd-runtime/src/outbox.rs:368-423`
-- `crates/wyrd/wyrd-server/src/audit/publication.rs:272-348`
-- `crates/wyrd/wyrd-testing/tests/bifrost/server/audit_publication.rs:821-870,
-  909-1054`
-- `architecture/bifrost-design.md` and the revision-3 audit wording in
-  `architecture/wyrd-security-posture.md`
+Revision-4 REQ-009 specifies four outcome classes: committed, aborted,
+in-progress/unreachable, and status `NULL`. AC-009 chooses the required
+Postgres integration proof: a landed commit whose reply is lost is not retried;
+an aborted commit is retried and retained once; and repeated ambiguous commits
+with publisher retirement between them leave exactly one retained row per
+decision and a gap-free chain. The revision-4 remediation task repeats exactly
+those proof scenarios. Neither AC-009 nor that task separately requires a
+forced in-progress/unreachable state or an aged-out `NULL` state.
 
-### Evidence
+The journey at
+`crates/wyrd/wyrd-testing/tests/bifrost/server/audit_publication.rs:976-1054`
+uses the production sink and publisher. Three `AckLost` rounds establish the
+committed/no-resend outcome across retirement; the `CommitLost` round
+establishes aborted/front-of-queue retry; the final retained population equals
+the chain head. That is the direct AC-009 proof selected by the approved spec.
 
-This path is reachable without a malicious type. `AuditSink::write` returns
-the result of `TenantConn::commit` directly. A connection loss after Postgres
-commits is an ordinary ambiguous result: the durable row exists, but the
-outbox receives `Err`. `OutboxWriter::finish` must retry every reported failure
-indefinitely and retains the same event ID at the tenant front. On each retry,
-`append_audit_events` checks only the current `vala.audit_staging` rows
-(`audit_staging.rs:113-130`). `settle_publication` deletes those rows after
-durable publication (`:491-522`). Once deleted, the next attempt allocates a
-new sequence and creates a new range-derived Scribe batch identity. Retained
-`event_id` makes that copy detectable but does not fence another restage.
+### Source closure of the unforced branches
 
-Consequently the following cycle has no guard and can repeat:
+`AuditSink::resolve_commit` keeps ownership inside one sink future
+(`crates/vala/vala-sql/src/audit_outbox.rs:83-125`). `Ok(Some(_))` other than
+the terminal strings and a query `Err` can only log, sleep with capped backoff,
+and loop; there is no append call or return to the generic retry owner in that
+branch (`audit_outbox.rs:112-122`). `Ok(None)` increments the audit loss metric
+by the exact event count and returns success, so the generic owner releases
+pending but cannot resend (`audit_outbox.rs:100-110`; generic release at
+`outbox.rs:391-395`). These transitions contain no intervening stateful helper
+or sibling consumer.
 
-1. commit succeeds and its acknowledgement is lost;
-2. the publisher retains and retires that staged row during retry delay;
-3. retry restages the same event under a new sequence;
-4. that commit also succeeds and loses its acknowledgement;
-5. publication retires the second row before the next retry;
-6. the next retry creates a third retained copy, and later cycles can create
-   more.
-
-The test fixture deliberately excludes this path. `UnknownOutcomeSink` uses
-`lose_next_ack.swap(false, ...)` and makes every later attempt commit normally
-(`audit_publication.rs:821-870`). Its phase-two assertion therefore proves one
-ambiguous outcome plus one successful retry, not the claimed physical bound.
-
-The approved wording is not limited to a single retry. REQ-003 requires a
-failed write to remain queued and retry with backoff, and REQ-008 assigns that
-retry behavior to the generic owner without an attempt limit. REQ-009 describes
-the one-retirement example in the singular, but AC-009 supplies the normative
-bound: a retry after retirement produces **at most one extra retained row**.
-Read together, that is a global per-event physical multiplicity cap, not merely
-a statement about the first retry. If the intended contract were ordinary
-at-least-once delivery with any number of detectable physical copies, AC-009
-would not say “at most one.” Logical read collapse does not repair the retained
-row bound.
-
-No source-local bounded correction is available under revision 3's simultaneous
-constraints. Staging is the sole durable event-ID fence and is deliberately
-deleted after publication; retries are indefinite; and the spec prohibits a
-second ledger/table/WAL and a retirement delay. Preventing a third copy needs a
-durable identity lifetime or coordination decision, or the approved bound must
-change to allow any number of detectable copies. That is a persistent-data and
-delivery-semantics decision, not a local test or consumer guard.
+Repository testing guidance favors edge and stable-failure coverage, but the
+applicable Rust reference says new core logic "should" cover those cases;
+`AGENTS.md` requires directly testable code and the strongest applicable tier,
+not exhaustive branch execution where the approved AC selected narrower proof.
+A real `NULL` integration case would require aging a transaction status out of
+Postgres; deterministic in-progress/unreachable injection would require more
+proxy behavior or a new production seam. `maintainer-style.md` expressly warns
+against building a test harness only to prove one branch. On this immutable
+task, imposing those tests as closure requirements would strengthen approved
+AC-009 after implementation.
 
 ### Resolution
 
-**RESOLVED — proposed new source-local finding `FOLLOWUP-R3-001`.** The
-`INV-R3-001` / `PDATA-R3-002` claim is supported and should enter independent
-validation. The reports that accepted the one-ambiguity journey did not trace
-the indefinite retry loop through a second publication/retirement cycle.
+The absent direct in-progress/unreachable and `NULL` tests are a material
+verification limit to retain in the verdict, not a proposed finding and not a
+reason that `FIND-AUDIT-OUTBOX-11` remains open. `STD-R3-002` is rejected as a
+mandatory-proof claim. This conclusion does not claim those branches have
+runtime proof; it distinguishes source-validated required behavior from the
+three scenarios AC-009 explicitly requires as integration evidence.
 
-#### FOLLOWUP-R3-001 — repeated ambiguous commits exceed AC-009's retained-copy bound
+## Resolution 3: standards, rustdoc, and prose proposals
+
+### Import placement and declaration types
+
+The new journey proxy violates two explicit, unconditional rules in
+`architecture/agent-rules.md`:
+
+- `CommitCutter::addr` uses `std::net::SocketAddr`
+  (`audit_publication.rs:839-846`).
+- `relay` uses `tokio::net::TcpStream` parameters and a
+  `std::io::Result<()>` return (`audit_publication.rs:915-920`).
+- `relay` puts `use tokio::io::{AsyncReadExt, AsyncWriteExt};` inside the
+  function (`audit_publication.rs:921`). Neither allowed function-local import
+  exception applies.
+
+All of these lines were introduced by the immutable range. This is the exact
+mandatory dependency-manifest rule previously tracked by
+`FIND-AUDIT-OUTBOX-7`; fixing its older `MutexGuard` and `Uuid` sites while
+adding fresh instances in the closure journey leaves the cumulative finding
+unclosed and is an in-scope range regression.
+
+### Rustdoc on changed test items
+
+The range materially changes `MemorySink::write` to signal dispatch, optionally
+wait, consume one-shot panic state, and then perform ordinary failure/write
+behavior (`crates/shared/wyrd-runtime/src/outbox.rs:519-543`). It has no item
+rustdoc, including no `# Errors`, `# Panics`, or async wait/cancellation
+description. The range also adds all six methods in `impl Recorder for
+TestMetrics` (`outbox.rs:614-629`) without item rustdoc, including the
+intentional no-op histogram behavior.
+
+`AGENTS.md` section 16 and `architecture/agent-rules.md` make substantive
+rustdoc a hard acceptance criterion for every new or materially modified Rust
+item, explicitly including private test helpers and methods. The behavior of
+the changed sink is central to the `FIND-AUDIT-OUTBOX-12` closure proof, so this
+is not documentation of untouched code or optional polish. It is an in-scope
+range standards regression.
+
+### Revision-4 loss prose
+
+The changed owner-module paragraph at
+`crates/vala/vala-sql/src/audit_outbox.rs:12-16` says a batch that fails to
+commit is retried and "never dropped," but revision-4 REQ-009 and the same
+module's `resolve_commit` documentation say a status Postgres no longer holds
+is counted lost without resend (`audit_outbox.rs:65-78,100-110`). The new
+qualification about consulting Postgres does not state that terminal exception
+and leaves the owner overview making a broader durability promise than its
+implementation. Because the paragraph was materially modified for revision 4
+and describes the exact changed failure contract, the contradiction is an
+in-scope documentation regression.
+
+The similar sentence at `architecture/bifrost-design.md:589-595` says a failed
+commit is retried until it lands. `git blame` and the exact range diff establish
+that lines 593-595 predate the remediation base (`5a5542cbb9`) and were not
+modified by `cf5ee4128..52e1144b5`; the range changes only the later, accurate
+paragraph at lines 639-642. The earlier sentence is stale against revision 4,
+but the user's closure boundary forbids reopening earlier passed prose unless
+it makes audit results wrong. It does not alter the writer, publisher, reader,
+or retained result, so it is recorded as an out-of-scope inconsistency rather
+than folded into the range-local documentation proposal.
+
+## Resolution 4: directed operational risks
+
+### One unresolved batch holds one of four writer slots
+
+Accepted, with a bounded availability cost. `AuditSink::outbox` fixes four
+generic tenant-write slots (`crates/vala/vala-sql/src/audit_outbox.rs:27-32,
+51-63`). `resolve_commit` owns one slot while its transaction outcome remains
+uncertain but holds no checked-out database connection during its backoff
+sleep: each `fetch_one(self.vala.pool())` completes before the branch sleeps
+(`audit_outbox.rs:90-121`). One unresolved tenant therefore leaves three slots
+and cannot be overtaken by later same-tenant work. Four simultaneously
+unresolved transactions can occupy all four slots, but under complete Postgres
+unreachability no released slot could commit another audit batch. Moving the
+wait out of the sink would require a second unresolved-outcome scheduler and a
+new concurrency owner not approved by revision 4. This is not a loss,
+duplication, attribution, tenancy, or closure regression; capacity remains the
+explicitly deferred benchmark obligation.
+
+### Deleted unreleased migration
+
+Accepted. The deleted
+`crates/vala/vala-sql/migrations/20261003000001_audit_staging_event_id.sql` was
+introduced by the superseded event-ID implementation and removed by the
+revision-4 commit. The user stipulates it was unreleased, and revision 4
+explicitly requires no event-ID column on staging or retained audit. Current
+append, row, projection, and reader source consistently omit it. Retaining a
+forward migration would leave a schema the final writer does not populate and
+would contradict the approved contract. This conclusion is specific to the
+stipulated unreleased migration; it does not weaken the repository's immutable
+released-migration rule.
+
+## Proposed findings for independent validation
+
+### FOLLOW-R3-001 — `FIND-AUDIT-OUTBOX-12` remains open after partial containment
 
 - **Classification:** `INCORRECT`
-- **Violated obligation:** revision-3 REQ-003/REQ-008 indefinite retry together
-  with AC-009's “at most one extra retained row” requirement.
-- **Exact location:**
-  `crates/vala/vala-sql/src/audit_outbox.rs:102-109`;
-  `crates/vala/vala-sql/src/queries/audit_staging.rs:113-130,491-522`;
-  `crates/shared/wyrd-runtime/src/outbox.rs:391-423`; insufficient proof at
-  `crates/wyrd/wyrd-testing/tests/bifrost/server/audit_publication.rs:821-870,
-  909-1007`.
-- **Observable consequence:** two successive commit-success/acknowledgement-loss
-  cycles with publication and retirement between them produce three retained,
-  gap-free rows for one authorization decision; the cycle can continue, so
-  physical retained duplication is not bounded at one extra row.
-- **Correction boundary:** this requires specification revision unless the
-  approved constraints permit a durable/reconcilable event-ID lifetime or
-  publication coordination mechanism. A focused proof must inject at least two
-  successive commit-success/unknown-result attempts, publish and retire between
-  them, and establish the newly approved physical bound. Harness or shipped-read
-  deduplication alone is not closure proof for this retained-data obligation.
+- **Violated obligation:** `FIND-AUDIT-OUTBOX-12`, REQ-003, REQ-003a, and
+  REQ-008.
+- **Location:** `crates/shared/wyrd-runtime/src/outbox.rs:328-342,382-388,
+  435-454`.
+- **Reachable consequence:** a generic sink error whose `Display` panics, or
+  sink-controlled future/panic-payload cleanup that panics after polling, turns
+  into `JoinError`; the sole accepted batch is counted lost and released while
+  the process continues.
+- **Minimum correction boundary:** preserve the owned batch while containing
+  the complete sink-controlled result lifecycle needed to classify the write,
+  then route every contained non-deadline panic through the existing failure,
+  front-of-queue retry, and write-failure metric. Do not clone items, add a
+  queue, or abort the process.
+- **Focused proof:** a test sink with a panicking error formatter (and any
+  separately relevant cleanup panic) proves the original batch commits once
+  before later same-tenant work, the writer survives, failure increments, loss
+  remains zero, and pending/gauge settle to zero.
 
-## Follow-up disposition
+### FOLLOW-R3-002 — the closure journey reintroduces `FIND-AUDIT-OUTBOX-7`
 
-All three conflicts are **RESOLVED** from checked-in authority and reachable
-source paths:
+- **Classification:** `REGRESSION / VIOLATION`
+- **Violated obligation:** `architecture/agent-rules.md` top-level-import and
+  bare-declaration-type rules; prior `FIND-AUDIT-OUTBOX-7` closure.
+- **Location:**
+  `crates/wyrd/wyrd-testing/tests/bifrost/server/audit_publication.rs:839-841,
+  915-921`.
+- **Consequence:** the range claims closure while its new proof code repeats
+  the exact mandatory dependency-manifest violation.
+- **Minimum correction boundary:** import the existing standard-library and
+  Tokio types/traits in the module import block and use bare declaration and
+  signature names; no wrapper or refactor is needed.
 
-1. the pre-release schema mismatch is real but not a supported compatibility
-   state in this task;
-2. the construction/poll panic defect from `FIND-12` is closed, while the
-   proposed destructor/formatting cases are hypothetical custom-sink hardening;
-3. repeated real commit ambiguities can exceed AC-009's explicit physical-copy
-   cap and support `FOLLOWUP-R3-001` for independent validation.
+### FOLLOW-R3-003 — changed and new Rust test items lack mandatory rustdoc
 
-No conclusion here changes the separate, unanimous finding that shipped audit
-count/list reads do not collapse retained duplicates.
+- **Classification:** `VIOLATION`
+- **Violated obligation:** `AGENTS.md` section 16 and
+  `architecture/agent-rules.md` Rust documentation rule.
+- **Location:** `crates/shared/wyrd-runtime/src/outbox.rs:519-543,614-629`.
+- **Consequence:** the panic-closure fixture's ordering, errors, panics, wait
+  behavior, and the recorder's deliberate metric model are not documented at
+  the items that own them, despite the hard rule covering test helpers.
+- **Minimum correction boundary:** document only the materially changed sink
+  method and the new recorder methods with the required workflow, error/panic,
+  async, and no-op semantics; do not document unrelated untouched items.
+
+### FOLLOW-R3-004 — changed audit-sink overview overstates retry durability
+
+- **Classification:** `REGRESSION / INCORRECT`
+- **Violated obligation:** revision-4 REQ-009 and the maintainer requirement
+  that durable failure and retry documentation match behavior.
+- **Location:** `crates/vala/vala-sql/src/audit_outbox.rs:12-16`.
+- **Consequence:** the owner overview promises a failed batch is never dropped
+  while the approved and implemented `NULL` terminal counts it lost and sends
+  nothing again, leaving incompatible guidance inside one module.
+- **Minimum correction boundary:** make this changed overview name the same
+  committed/aborted/wait/status-unavailable outcomes already documented by
+  `resolve_commit`; no new check or architectural prose is needed.
+
+`STD-R3-002` (mandatory direct tests for in-progress/unreachable and `NULL`) is
+not retained. The Bifrost read-audit sentence at lines 593-595 is stale but is
+not a proposed finding because it predates the range and does not make audit
+results wrong.
+
+## Status
+
+**RESOLVED.** Source and authority resolve all routed conflicts. Four proposed
+findings remain for the required independent Ponytail validation; the missing
+transaction-status branch tests remain a verification limit, and the writer
+slot and unreleased-migration risks are accepted within the approved boundary.

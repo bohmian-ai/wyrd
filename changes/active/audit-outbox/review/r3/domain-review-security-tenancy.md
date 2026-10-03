@@ -1,202 +1,180 @@
-# Security, tenancy, and audit-integrity domain review
+# Audit outbox r3 security and tenancy domain review
 
-## Immutable subject and scope
+## Result
+
+**PASS**
+
+No material security, RBAC, tenant-isolation, attribution, or audit-integrity
+finding remains in the closure scope. The reviewed range closes
+`FIND-AUDIT-OUTBOX-11`, `-12`, `-13`, `-14`, `-7`, and `-3` for this domain and
+does not introduce a security or tenancy regression.
+
+## Immutable subject
 
 - Base: `cf5ee4128ce0b842e00a0eb20770ab5c285dedd8`
-- Candidate: `e54b1244f32950d1ab251dae6530c4e1694c78d5`
-- Approved authority: `changes/active/audit-outbox/spec.md`, revision 3
-- Prior closure hypotheses: `FIND-AUDIT-OUTBOX-11` and
-  `FIND-AUDIT-OUTBOX-3`
-- Additional scope: security, tenancy, and audit-integrity regressions introduced
-  by the immutable remediation range
-
-`HEAD` matched the candidate before and after this review. The repository has no
-`.codegraph/` directory, so source navigation used repository search and direct
-caller inspection. No production source or test was modified.
+- Candidate: `52e1144b5c186ccacd85d9c779a4e60c3cce5ac2`
+- Range: `cf5ee4128ce0b842e00a0eb20770ab5c285dedd8..52e1144b5c186ccacd85d9c779a4e60c3cce5ac2`
+- Approved authority: `changes/active/audit-outbox/spec.md`, revision 4
+- Prior finding authority: `changes/active/audit-outbox/review/r2/verdict.md`
+  and `findings-validation.md`
+- Remediation authority:
+  `TASK-AUDIT-OUTBOX-R2-bounded-remediation.md` and
+  `TASK-AUDIT-OUTBOX-R3-commit-outcome.md`
+- `HEAD` was the candidate when this report was completed.
+- The repository has no `.codegraph/` directory, so source navigation used
+  repository search and direct caller/source inspection.
 
 ## Reviewed boundary
 
-The review traced the decision identity and tenant binding through:
+This review traced the security- and tenancy-sensitive path end to end:
 
-1. `StagedAuditEvent::from`, the tenant-grouped audit sink, and
-   `append_audit_events`;
-2. the `(data_tenant_id, event_id)` staging uniqueness fence and every changed
-   staging-row read used by publication;
-3. `AuditPublisher::publish_tenant` and `publish_range`;
-4. `project_audit_rows`, the canonical `AuditLogTable` schema, and Scribe's
-   built-in registration/fingerprint checks;
-5. retained-audit reads in `WyrdTestServer`; and
-6. shipped query entry points through HTTP/gRPC service dispatch, MCP, CLI, and
-   the shared Rust client projected into Python and TypeScript. The current UI
-   has no retained authorization-audit reader; its unrelated change-workspace
-   “Audit” page does not query `vala.system.audit_log`.
+1. a typed `DataTenantId` enters the generic outbox alongside one
+   `AuditEvent`;
+2. the writer groups items by that tenant and permits at most one write in
+   flight for that tenant;
+3. `AuditSink::write` opens a `TenantConn` bound to the same tenant, obtains the
+   transaction's own `xid8`, and calls the one canonical staging append;
+4. the append relies on RLS for `vala.audit_chain_head` and
+   `vala.audit_staging`, derives the stored tenant from the bound connection,
+   and preserves the event's principal, credential, permission, resource, and
+   decision fields;
+5. only after an ambiguous `COMMIT` does the sink query `pg_xact_status` on a
+   fresh runtime-pool connection, using the internally produced transaction ID
+   rather than tenant- or caller-controlled input;
+6. committed outcomes settle without resend, aborted outcomes return to the
+   existing same-tenant front-of-queue retry, unresolved outcomes wait without
+   resend, and a discarded status counts and logs the batch as lost without
+   resend; and
+7. the publisher continues to read tenant-bound contiguous staging ranges,
+   rejects foreign-tenant rows at projection, and retains them through the
+   existing tenant-qualified `vala.system.audit_log` chain.
 
-The audit is intentionally limited to whether the range loses, duplicates,
-misattributes, or crosses tenant boundaries for authorization decisions. It
-does not reopen earlier accepted implementation outside those outcomes.
+The transaction-status query does not read tenant data or confer cross-tenant
+authority. It observes only the global commit state of the exact transaction ID
+created inside the preceding tenant-bound append. Its parameter is bound, not
+interpolated. The result cannot change the event tenant, principal, permission,
+resource, outcome, or retained projection.
 
-## Authority coverage
+## Authority and source coverage
 
-| Boundary | Governing authority | Result |
+| Boundary | Authority and source evidence | Result |
 |---|---|---|
-| Event identity and read cardinality | Revision-3 `REQ-009` and `AC-009`; `AGENTS.md` audit-cardinality decision; `architecture/wyrd-security-posture.md` audit integrity | **FAIL** — identity reaches retained rows, but only test-harness readers collapse duplicates |
-| Tenant isolation | `INV-003`; `AGENTS.md` tenant separation; security posture RLS and credential-derived tenancy | **PASS** — staging and publication remain tenant-bound, and projection rejects a foreign row |
-| Retained-schema evolution | Revision-3 approved retained `event_id` schema change; `architecture/references/domain/iceberg.md` explicit compatibility requirement for nullability/required-field changes | **FAIL** — an already registered audit table is refused rather than evolved |
-| Operational ownership wording | `FIND-AUDIT-OUTBOX-3`; one outbox/one publisher authority | **PASS** — the remaining Oracle commit-owner phrase now names the shared audit outbox |
+| Tenant selection and SQL authority | `architecture/wyrd-security-posture.md:339-354`; `architecture/references/doctrine/architecture-constraints.md:69-83`; `crates/shared/wyrd-runtime/src/outbox.rs:148-161,304-352`; `crates/vala/vala-sql/src/audit_outbox.rs:128-158` | PASS — typed grouping is preserved through a tenant-bound `TenantConn`; no caller-controlled tenant or administrative pool is introduced. |
+| Canonical append and attribution | `crates/vala/vala-sql/src/queries/audit_staging.rs:61-174` | PASS — the connection supplies `data_tenant_id`; principal, credential, permission, resource, outcome, request, and trace fields remain attached to the same event. RLS remains the tenant boundary. |
+| Ambiguous commit outcome | `spec.md` REQ-009/AC-009; `crates/vala/vala-sql/src/audit_outbox.rs:65-124,133-157` | PASS — committed is success, aborted is the only resend path, unresolved waits, and `NULL` records accepted loss without resend. No event ID or reader deduplication remains. |
+| PostgreSQL semantics | PostgreSQL system-information-function documentation for `pg_current_xact_id()` and `pg_xact_status(xid8)` | PASS — the documented outcomes are `in progress`, `committed`, `aborted`, and `NULL` when status was discarded; PostgreSQL documents this function for resolving a disconnect during `COMMIT`. The sink does not use prepared transactions, for which `in progress` would have a distinct meaning. |
+| Retained tenant chain | `crates/vala/vala-sql/src/queries/audit_staging.rs:269-483`; `crates/vala/vala-bifrost-redux/src/tables/audit/projection.rs:76-160`; `architecture/bifrost-design.md:613-649` | PASS — publication remains tenant-bound and contiguous, projection rejects a foreign tenant, and Scribe's existing frozen-range identity remains the only publication deduplication mechanism. |
+| Panic and shutdown loss boundaries | `crates/shared/wyrd-runtime/src/outbox.rs:189-226,304-345,368-423`; focused tests at `outbox.rs:732-823` | PASS — a contained sink panic returns its owned batch for ordered retry; shutdown fences later admission and accounts abandoned work exactly once. |
+| Unwrap-audit security control | `scripts/check_unwrap_audit.py:31-55,218-265`; `scripts/test_check_unwrap_audit.py:14-44` | PASS — the basename-wide production bypass is gone; only four explicit cfg-test module paths are excluded, while a production `tests.rs` is rejected. |
+| Security operations and incident ownership | `architecture/wyrd-security-posture.md:356-396,420-433`; `architecture/operations/runbooks.md:116-165` | PASS — live authority now attributes failures to the shared audit outbox, documents transaction-status resolution and accepted loss, and no longer assigns commit ownership to Oracle. |
+| Dependency and migration surface | `crates/vala/vala-sql/Cargo.toml`; deletion of `20261003000001_audit_staging_event_id.sql` | PASS — `tokio` is an existing workspace dependency used only for bounded retry timing. The deleted event-ID migration was unreleased and its schema is absent from the candidate contract, so retaining it would create the obsolete revision-2/3 write requirement. |
 
-## Source coverage and positive controls
+## Prior-finding closure
 
-- `crates/vala/vala-sql/src/queries/audit_staging.rs:113-195` checks existing
-  event IDs under a `TenantConn`, retains the same `event_id` beside the same
-  decision fields, and inserts it under the tenant-bound transaction. The
-  existing database constraint is `(data_tenant_id, event_id)`, so two tenants
-  may legitimately use the same UUID without colliding globally.
-- `crates/vala/vala-sql/src/queries/audit_staging.rs:291-304,324-334,457-469`
-  now selects `event_id` for resource, batch, and frozen-range reads. This
-  prevents the publication projection from inventing or losing identity.
-- `crates/vala/vala-bifrost-redux/src/tables/audit/projection.rs:76-88,108-135`
-  binds the projection to the authenticated tenant and rejects any staged row
-  whose `data_tenant_id` differs. Lines 228-266 project each row's own
-  `event_id` into the matching decision row, without a parallel iterator or
-  positional join that could misassociate identities.
-- `crates/wyrd/wyrd-server/src/audit/publication.rs:272-348` publishes that
-  projection using the same authenticated tenant and the sole
-  `AuditPublisher`/Scribe path. No second writer or cross-tenant identity source
-  entered the range.
-- `crates/wyrd/wyrd-testing/src/server.rs:1737-1795` deduplicates a listing by
-  `event_id`, and lines 1841-1848 count `DISTINCT event_id`. Both helpers first
-  construct one tenant's authorized query context, so their in-memory set is
-  effectively keyed by `(tenant, event_id)`, not globally across tenants.
-- `architecture/wyrd-security-posture.md:423-428` now says “audit outbox write
-  failure”; no Oracle-specific commit owner remains in the live authority.
+| Finding | Security/tenancy judgment |
+|---|---|
+| `FIND-AUDIT-OUTBOX-11` | **Closed under revision 4.** The commit transaction ID is obtained inside the tenant-bound transaction before append. A failed acknowledgement is resolved before any retry, so publisher retirement cannot erase the only duplicate fence: the writer does not resend a committed decision. The production writer/publisher journey exercises three acknowledged commits with lost replies and one commit lost before Postgres receives it, and asserts one retained row per decision plus a gap-free retained prefix. |
+| `FIND-AUDIT-OUTBOX-12` | **Closed.** Sink panics are contained while the task still owns the items and follow the same front-of-tenant retry path. This removes the prior live-process audit-loss path. |
+| `FIND-AUDIT-OUTBOX-13` | **Closed.** Shutdown takes and drops the sender before awaiting, so post-fence decisions cannot enter the queue; pre-fence items drain, and deadline remainder is counted and released from pending state. |
+| `FIND-AUDIT-OUTBOX-14` | **Closed.** A production file can no longer evade the unwrap/expect control solely by being named `tests.rs`. |
+| `FIND-AUDIT-OUTBOX-7` | **Closed with no security regression.** The touched declarations use top-level imports and bare `MutexGuard`/`Uuid` names; no boundary or type semantics changed. |
+| `FIND-AUDIT-OUTBOX-3` | **Closed.** The security posture and runbook name the shared audit outbox as the commit owner and give operators the correct failure, pending, loss, and publication signals. |
 
-These controls close the identity-carrying and tenant-association portions of
-`FIND-AUDIT-OUTBOX-11` and close `FIND-AUDIT-OUTBOX-3`. They do not close the
-two material gaps below.
+## User-directed risk judgments
+
+### In-progress/unreachable wait and `NULL` loss have no direct test
+
+This is a verification limit, not a material finding in this domain.
+
+- The implemented branches directly match revision 4 and PostgreSQL's closed
+  result set: resend occurs only for `aborted`; `in progress`, an unavailable
+  status connection, or any temporarily unresolved response loops without
+  releasing the batch to retry; `NULL` increments
+  `outbox_events_lost_total{outbox="audit"}`, logs tenant/xact/error/count, and
+  settles without resend.
+- The ambiguous-commit journey directly proves the security-critical opposites:
+  a landed commit whose acknowledgement is lost is not resent, and a commit
+  Postgres never receives is retried once. It also retires each landed row
+  before the next ambiguity, closing the prior retirement race.
+- A dedicated `NULL` integration test is difficult because it requires safely
+  advancing PostgreSQL beyond retained transaction status. The lack of that
+  harness does not create a caller-controlled or cross-tenant path, but the
+  branch should remain an explicit verification limit for final integration.
+
+### A waiting batch holds one of four writer slots
+
+Accepted for this closure. One unresolved tenant can occupy only its own one
+in-flight slot, leaving three audit writer slots for other tenants. An external
+tenant cannot choose a transaction ID, trigger prepared-transaction state, or
+control the database connection fault needed to enter this path. Four
+simultaneous unresolved tenants could temporarily consume all four slots, but
+that requires an infrastructure-level ambiguous-commit event across four
+tenants; while Postgres is unreachable no tenant could commit through another
+implementation either, and after reachability returns each status query can
+settle without resend. This is a bounded availability tradeoff of the approved
+"wait and ask again" behavior, not an RBAC bypass, cross-tenant data path, or
+audit misattribution defect.
+
+### Deleted unreleased migration
+
+Accepted. Revision 4 removes the event-ID contract completely; deleting the
+unreleased migration keeps a fresh deployment aligned with the candidate code
+and avoids leaving a `NOT NULL event_id` column that the revision-4 append no
+longer supplies. This judgment depends on the user-supplied fact that the
+migration was never released. Any persistent environment that applied the
+intermediate migration would require an explicit cleanup migration before this
+candidate could serve writes; that rollout condition is not present for the
+reviewed unreleased change.
+
+## Verification
+
+- PASS: `mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E
+  'test(=outbox::tests::a_panicking_write_is_retried_once_in_order_without_loss)
+  or test(=outbox::tests::shutdown_refuses_items_staged_after_it_begins) or
+  test(=outbox::tests::shutdown_counts_items_unwritten_at_the_deadline_as_lost)'`
+  — 3/3 passed.
+- PASS: `mise exec -- python3 scripts/test_check_unwrap_audit.py`.
+- Static PASS: the exact audit-specific search found no remaining event-ID
+  machinery, reader collapse, at-least-once audit wording, or Oracle-owned
+  audit-commit wording in the live source and authority paths.
+- The focused Postgres journey was attempted independently, but the environment
+  denied access to the configured Docker socket before Postgres could start.
+  Therefore this review relies on the task's recorded passing journey,
+  integration, family, formatting, lint, documentation, and boundary evidence
+  for database-backed execution. `FIND-5`, `mise run bench:capacity`, and
+  `mise run gate` remain explicitly deferred to integration by user direction.
 
 ## Security Audit
 
 ### Critical
 
-None.
+- None.
 
 ### High
 
-None.
+- None.
 
 ### Medium
 
-#### SEC-TEN-R3-001 — shipped audit count/list reads do not collapse retained duplicates
-
-- **Classification:** `INCORRECT`; `FIND-AUDIT-OUTBOX-11` remains open.
-- **Violated obligation:** Revision-3 `REQ-009` says audit reads that count or
-  list decisions collapse rows sharing `(tenant, event ID)`; `AC-009` requires
-  that behavior through the production publisher. The security posture assigns
-  cardinality to authorization decisions, not delivery attempts.
-- **Exact location:**
-  `crates/wyrd/wyrd-testing/src/server.rs:1737-1795,1841-1848` implements
-  collapse only in test-support helpers. The shipped path forwards caller SQL
-  unchanged at `crates/wyrd/wyrd-server/src/query/service.rs:200-220`;
-  `crates/wyrd/wyrd-server/src/mcp/bifrost.rs:302-307,386-418`;
-  `crates/wyrd/wyrd-cli/src/query/mod.rs:67-81,100-122`;
-  `crates/shared/wyrd-client/src/bifrost/facade.rs:652-693`;
-  `sdks/wyrd-sdk-python/src/bifrost/mod.rs:456-481`; and
-  `sdks/wyrd-sdk-ts/native/src/lib.rs:731-743`.
-- **Evidence:** `event_id` has no production use outside staging/publication;
-  the repository-wide source trace finds deduplication only in
-  `WyrdTestServer`. An authenticated caller can issue
-  `SELECT count(*) FROM vala.system.audit_log` or list rows through HTTP/gRPC,
-  Rust/Python/TypeScript, CLI, or `bifrost.query`; Oracle evaluates the raw
-  table and returns both rows of the approved unknown-outcome retry. Tenant
-  authorization prevents cross-tenant leakage, but it does not turn two
-  delivery rows into one decision.
-- **Observable consequence:** the shipped audit history can over-count or list
-  one allow/deny decision twice during incident response, compliance export,
-  or authorization-denial analysis. The new journey passes because it calls a
-  harness-only wrapper that ordinary users and agents cannot call.
-- **Required testable correction:** put decision-level deduplication on the
-  shipped server-owned audit read boundary for every supported surface, keyed
-  by tenant plus event ID, and prove the unknown-outcome production-publisher
-  scenario through at least one real public query surface. A correction must
-  not globally deduplicate equal UUIDs across tenant contexts and must not rely
-  on callers knowing to add `DISTINCT`. If revision 3 intentionally leaves raw
-  generic SQL as the only audit reader and expects each caller to rewrite its
-  own SQL, that is contrary to the approved text and requires renewed spec
-  approval rather than being accepted as implementation evidence.
-
-#### SEC-TEN-R3-002 — the retained-schema change strands existing audit tables on the old fingerprint
-
-- **Classification:** `REGRESSION`.
-- **Violated obligation:** the user-directed no-regression boundary; revision-3
-  retained audit correctness; and
-  `architecture/references/domain/iceberg.md`, which requires explicit
-  compatibility for schema nullability and required-field changes.
-- **Exact location:** the range adds a required field at
-  `crates/vala/vala-bifrost-redux/src/tables/audit/audit_log.rs:45-73`.
-  Publication calls Scribe with the new projection at
-  `crates/wyrd/wyrd-server/src/audit/publication.rs:332-348`. Scribe always
-  calls `ensure_builtin` at
-  `crates/vala/vala-bifrost-redux/src/scribe/ingress.rs:183-204`, while
-  `crates/vala/vala-bifrost-redux/src/catalog/bifrost_catalog.rs:1016-1042,1110-1127`
-  rejects an existing registration whose stored fingerprint differs. The
-  remediation range adds no retained-table evolution or deployment migration.
-- **Evidence:** adding non-null UTF-8 `event_id` changes the canonical user
-  fingerprint. For a tenant that already has `vala.system.audit_log`, the next
-  publisher attempt reaches `ensure_builtin`, sees the old catalog fingerprint,
-  and returns `FingerprintMismatch` before Scribe accepts the batch. The claim
-  that no compatibility path is needed because the schema is unshipped is not
-  established by the approved spec or by a source guard that makes an old
-  registration unreachable.
-- **Observable consequence:** after an in-place upgrade, new authorization
-  decisions remain in transient staging and never enter authoritative retained
-  history. Public audit queries therefore omit post-upgrade decisions; a
-  prolonged failure also grows the unbounded staging backlog. Existing rows are
-  not cross-tenant, but the retained audit result is incomplete.
-- **Required testable correction:** provide an explicit additive evolution or
-  upgrade path for an existing tenant audit table and its control-plane
-  fingerprint, preserving every old decision and assigning semantics that do
-  not collapse unrelated legacy rows. Prove upgrade from the old canonical
-  schema, successful publication of a new event-ID row, and a decision-level
-  read spanning old and new files. If support is intentionally limited to
-  deployments where no audit table can preexist, make that deployment boundary
-  explicit in approved authority and prove it from release/upgrade state; an
-  implementer note is not sufficient.
+- None.
 
 ### Low / Defense In Depth
 
-None in the user-directed scope.
+- None. The untested status-wait and `NULL` branches are recorded as proof
+  limits above, not speculative vulnerabilities.
 
 ### Positive Controls
 
-- Event identity stays attached to the correct decision row from staging
-  through retained projection.
-- RLS-backed `TenantConn` and projection-time tenant verification keep
-  publication tenant-scoped.
-- The harness's dedup logic is tenant-local and does not globally collapse an
-  event ID reused by another tenant.
-- Publication still uses one canonical publisher and no alternate audit sink.
-- The operational security authority now attributes write failures to the
-  shared audit outbox rather than Oracle.
-
-## Verification and limits
-
-| Evidence | Result |
-|---|---|
-| `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(/^tables::audit::/)'` | **PASS, 7/7**, including cross-tenant rejection and event-ID projection |
-| Static caller trace of HTTP/gRPC service, MCP, CLI, shared Rust client, Python, and TypeScript | **FAIL for decision collapse**; all expose the generic SQL result, and none adds audit semantics |
-| Static upgrade trace from `AuditPublisher` to `ensure_builtin` and stored fingerprint comparison | **FAIL for compatibility**; old fingerprint is refused before ingest |
-| Implementer-recorded Postgres and server journey evidence | Accepted as evidence that a fresh schema publishes and that harness readers collapse; it does not exercise a public shipped audit reader or an old registered table |
-
-The sandbox rerun did not include the Postgres-backed journey. `FIND-5`,
-`bench:capacity`, and `mise run gate` remain deferred to integration exactly as
-directed and do not affect this domain verdict.
-
-## Overall result
-
-**FAIL**
-
-`FIND-AUDIT-OUTBOX-3` is closed. `FIND-AUDIT-OUTBOX-11` is only partially
-closed: retained rows carry the correct tenant-associated event ID, but shipped
-audit reads do not collapse the permitted duplicate. The range also introduces
-`SEC-TEN-R3-002`, a retained-audit availability/integrity regression for an
-existing registered schema.
+- Tenant audit writes use typed tenant identity, `TenantConn`, transaction-local
+  RLS, and a publisher-side foreign-tenant rejection.
+- The transaction-status lookup uses a bound, internally derived `xid8`; no SQL
+  interpolation or external identifier reaches it.
+- Retry is fail-safe for audit integrity: no resend until an abort is known,
+  and an unresolvable outcome is surfaced as counted loss instead of risking a
+  duplicate or misattributed decision.
+- Logs expose tenant, transaction ID, database error, retry delay, and count,
+  but not audit payloads, credentials, tokens, prompts, or request bodies.
+- The obsolete event-ID/deduplication path is removed from staging, retained
+  projection, readers, docs, and migration state, leaving one audit writer and
+  one publisher.
+- The production unwrap audit no longer has a basename-wide bypass.

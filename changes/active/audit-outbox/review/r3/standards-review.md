@@ -1,187 +1,144 @@
-# Repository standards review
-
-## Review result
-
-**FAIL.** The remediation range closes the repository-rule defects behind
-FIND-AUDIT-OUTBOX-12, -13, -14, -7, and -3, and it carries the durable event
-ID required by revision 3. Two material repository-rule failures remain at the
-new retained-data/read boundary: an already-created retained table has no
-schema-evolution path, and the shipped audit query surfaces still expose
-duplicate physical rows as duplicate decisions.
-
-This is a repository-standards audit only. It does not independently adjudicate
-task acceptance outside the user-directed closure scope.
-
-## Material findings
-
-### STD-R3-001 — the required retained-schema change has no upgrade-compatible path
-
-- **Severity:** important
-- **Classification:** VIOLATION / REGRESSION
-- **Location:**
-  `crates/vala/vala-bifrost-redux/src/tables/audit/audit_log.rs:56-73`;
-  `crates/vala/vala-bifrost-redux/src/catalog/bifrost_catalog.rs:1020-1042,1110-1125`;
-  `crates/vala/vala-bifrost-redux/src/scribe/ingress.rs:183-205`.
-- **Violated authority:** `architecture/references/domain/iceberg.md:22-29`
-  requires explicit compatibility for nullability and required-field changes;
-  `docs/src/content/docs/bifrost/architecture.svx:281-285` states that a
-  registered physical schema is frozen and requires an explicit migration.
-- **Evidence:** the range adds required, non-null `event_id` to
-  `AuditLogTable::arrow_fields`. Scribe calls `ensure_builtin` before accepting
-  the logical frame, and `create_table_locked` rejects any existing catalog row
-  whose stored fingerprint differs from the new declaration. The range has no
-  retained-Iceberg migration, catalog-fingerprint transition, old-row backfill
-  policy, or other compatibility path. The only event-ID migration in the
-  cumulative change is for transient Postgres staging, not retained
-  `vala.system.audit_log`.
-- **Consequence:** a deployment that already materialized
-  `vala.system.audit_log` cannot publish the new projection. Each publisher
-  sweep reaches the schema fingerprint mismatch, leaves staging outstanding,
-  and retries later; retained audit history therefore stops advancing. Old
-  retained rows also have no event ID from which the new decision-cardinality
-  contract can be reconstructed.
-- **Testable correction:** make the persistent-data decision explicit and
-  implement it at the catalog/table owner: preserve field identities and define
-  how the new column and pre-change rows evolve, or approve and implement a
-  deliberate replacement/backfill policy. Add an upgrade journey that creates
-  the old retained table with data, starts the candidate, publishes a new audit
-  decision, and proves both old and new history remain queryable with the chosen
-  event-ID semantics. A fresh-install test is not sufficient.
-
-### STD-R3-002 — shipped audit reads do not collapse retained duplicates by event ID
-
-- **Severity:** important
-- **Classification:** INCORRECT / REGRESSION
-- **Location:**
-  `crates/wyrd/wyrd-testing/src/server.rs:1700-1801,1803-1850` versus
-  `crates/wyrd/wyrd-server/src/query/routes.rs:241-292`,
-  `crates/wyrd/wyrd-server/src/query/service.rs:200-213`,
-  `crates/wyrd/wyrd-server/src/mcp/bifrost.rs:376-420`,
-  `crates/wyrd/wyrd-cli/src/query/mod.rs:94-122,145-201`, and
-  `crates/shared/wyrd-client/src/bifrost/facade.rs:645-693`.
-- **Violated authority:** `architecture/bifrost-design.md:636-645`,
-  `architecture/wyrd-security-posture.md:367-374`, and
-  `docs/src/content/docs/bifrost/architecture.svx:323-330` all require audit
-  reads that count or list decisions to collapse rows sharing tenant and event
-  ID. `AGENTS.md` requires audit to remain foundational across HTTP, MCP, CLI,
-  SDK, UI, server, and Vala surfaces and requires user-observable behavior to be
-  proved at the shipped journey tier.
-- **Evidence:** the only decision-aware readers in the range are
-  `WyrdTestServer` helpers: listings use an in-memory `HashSet<event_id>` and
-  counts issue `SELECT DISTINCT event_id`. The production HTTP `/query` route
-  passes caller SQL unchanged to Oracle; `bifrost.query`, the CLI query command,
-  Rust `Bifrost`, and the Python and TypeScript Bifrost facades project that
-  same raw SQL result. A shipped `SELECT * FROM vala.system.audit_log` listing
-  therefore returns both rows for one decision, and `SELECT count(*)` counts
-  both. The remediation journey proves this exact physical duplicate exists at
-  `crates/wyrd/wyrd-testing/tests/bifrost/server/audit_publication.rs:1006-1049`
-  but proves collapse only through the harness helpers. No dedicated retained
-  audit-log reader exists in HTTP, MCP, CLI, Rust SDK, Python SDK, TypeScript
-  SDK, or the UI; the UI's unrelated change-workspace “Audit” view is not a
-  `vala.system.audit_log` consumer.
-- **Consequence:** the revision-3 at-least-once behavior makes ordinary shipped
-  audit listings and counts report one authorization decision more than once.
-  This is an audit-result error, not merely a presentation difference.
-- **Testable correction:** define one server-owned decision-level audit read
-  contract (for example, a canonical decision view/query owner) that collapses
-  by `(tenant, event_id)`, project it consistently through every shipped audit
-  count/list surface, and retain an explicitly named raw-row path only if the
-  architecture requires forensic physical delivery inspection. Add a real
-  public-surface journey that creates the post-retirement duplicate and proves
-  decision count/list cardinality through the HTTP contract and each exposed
-  MCP/CLI/SDK projection. Do not hide this solely in test helpers or attempt an
-  unsafe rewrite of arbitrary caller SQL.
+# Audit outbox r3 repository-standards review
 
 ## Immutable subject and scope
 
-| Item | Reviewed value |
-|---|---|
-| Base | `cf5ee4128ce0b842e00a0eb20770ab5c285dedd8` |
-| Candidate | `e54b1244f32950d1ab251dae6530c4e1694c78d5` |
-| Range | Base-exclusive remediation range only |
-| Approved authority | `changes/active/audit-outbox/spec.md`, revision 3, approved in `d61114979` |
-| Prior review inputs | r2 `verdict.md`, `findings-validation.md`, and `TASK-AUDIT-OUTBOX-R2-bounded-remediation.md` including implementer evidence |
-| Closure scope | FIND-AUDIT-OUTBOX-11, -12, -13, -14, -7, -3, plus regressions introduced by the range |
-| Explicit deferrals | FIND-5 / `bench:capacity` and `mise run gate` remain integration-owned and were not assessed as failures |
+- Repository: `/home/thorrester/Documents/GitHub/wyrd/.claude/worktrees/agent-aad682fbca5074900`
+- Base: `cf5ee4128ce0b842e00a0eb20770ab5c285dedd8`
+- Candidate: `52e1144b5c186ccacd85d9c779a4e60c3cce5ac2`
+- Approved authority: `changes/active/audit-outbox/spec.md`, revision 4
+- Closure scope: `FIND-AUDIT-OUTBOX-11` under revision 4, `-12`, `-13`,
+  `-14`, `-7`, and `-3`, plus regressions introduced by the immutable range
+- Explicit deferrals: `FIND-AUDIT-OUTBOX-5`, `mise run bench:capacity`, and
+  `mise run gate`
 
-No `.codegraph/` directory exists at the repository root, so the repository's
-CodeGraph-first rule did not apply.
+`HEAD` matched the candidate before and after inspection. The repository has
+no `.codegraph/` directory. This report does not assess general task
+acceptance, reopen earlier passed code, or propose optional improvements.
+
+## Material findings
+
+### STD-R3-001 — the new journey proxy repeats the mandatory import/type-ownership violation
+
+- **Classification:** `REGRESSION / VIOLATION`
+- **Governing rule:** `architecture/agent-rules.md:9-10` requires types in
+  fields and signatures to be imported at module scope and used by bare name,
+  and permits no ordinary function-scoped `use` statements.
+- **Changed location:**
+  `crates/wyrd/wyrd-testing/tests/bifrost/server/audit_publication.rs:839-841,915-921`.
+- **Evidence:** the newly added `CommitCutter::addr` field uses
+  `std::net::SocketAddr`; `relay` names `tokio::net::TcpStream` in two
+  parameters and `std::io::Result` in its return type; and `relay` imports
+  `AsyncReadExt`/`AsyncWriteExt` inside the function. None is one of the two
+  allowed exceptions. This repeats the same mandatory dependency-manifest
+  rule whose earlier violations were tracked as `FIND-AUDIT-OUTBOX-7`.
+- **Consequence:** the r3 closure introduces a fresh instance of the exact
+  repository-rule violation the cumulative candidate claims to close, hiding
+  dependencies from the module-level import manifest.
+- **Testable correction:** import `SocketAddr`, the IO result type,
+  `TcpStream`, `AsyncReadExt`, and `AsyncWriteExt` at the module top and use
+  bare type names in the field and function signature. Prove with `mise run
+  fmt`, `mise run lints`, and a focused diff/search showing no function-scoped
+  imports or fully qualified declaration types remain in the added proxy.
+
+### STD-R3-002 — two required commit-outcome branches have no deterministic proof
+
+- **Classification:** `VIOLATION`
+- **Governing rules:** `AGENTS.md:398-405` assigns edge and negative branches
+  to supporting integration/unit tests; `AGENTS.md:718-733` requires changed
+  code to be directly testable; and
+  `architecture/references/languages/rust-core.md:773-783` requires new core
+  logic to cover success, edge cases, and stable failures. Revision 4
+  `REQ-009` makes the wait/no-resend and unknown/loss outcomes part of the
+  exact-once audit contract.
+- **Changed location:** `crates/vala/vala-sql/src/audit_outbox.rs:90-123`;
+  current journey proof at
+  `crates/wyrd/wyrd-testing/tests/bifrost/server/audit_publication.rs:996-1055`.
+- **Evidence:** the production resolver handles `in progress` or a failed
+  status query by waiting and re-querying without re-sending
+  (`audit_outbox.rs:112-121`), and handles `NULL` by counting the batch lost
+  and returning success so it is never re-sent (`audit_outbox.rs:100-110`).
+  The implementer evidence explicitly records that neither branch has a
+  direct test. The `CommitLost` journey may transiently observe `in progress`,
+  but neither forces nor asserts that state, it never makes the status query
+  unreachable, and it cannot reach `NULL`.
+- **Consequence:** the two branches that prevent an uncertain commit from
+  becoming a duplicate—or turn irrecoverable uncertainty into a counted audit
+  gap—can regress while the reported AC-009 journey remains green. That can
+  make retained audit results duplicated or silently lost, which is inside the
+  user-directed regression boundary.
+- **Testable correction:** add deterministic focused proof through the
+  production audit sink that (1) an in-progress or temporarily unreachable
+  status causes no re-send, continues resolution, and eventually follows the
+  returned committed/aborted outcome, and (2) a `NULL` status increments
+  `outbox_events_lost_total{outbox="audit"}` exactly by the batch size, sends
+  nothing again, and settles pending ownership. Keep the existing real
+  writer/publisher exactly-once journey; do not replace it with only a pure
+  classifier test or sleep-based timing.
 
 ## Authority coverage
 
-| Changed surface / risk | Owning boundary | Authorities and routed references read completely | Source, consumer, and proof inspected | Coverage |
-|---|---|---|---|---|
-| Generic non-blocking outbox, panic retry, shutdown fence, metrics | `crates/shared/wyrd-runtime` | `AGENTS.md`; `architecture/agent-rules.md`; `architecture/wyrd-design.md`; `architecture/references/languages/{rust-core,maintainer-style,implementation-execution,testing-workflows}.md`; `architecture/references/architecture/patterns.md` | `outbox.rs`, its remediation diff and focused tests; `wyrd-runtime/Cargo.toml`; concrete audit sink | Complete |
-| Audit append, staged event identity, RLS, row decoding | `crates/vala/vala-sql` | design/security authorities; `architecture/references/domain/{vala-architecture,olap-serving}.md`; Rust/testing rules | `audit_outbox.rs`; `queries/audit_staging.rs`; `row_types/audit_staging.rs`; SQL test evidence; manifest | Complete |
-| Retained schema, projection, catalog compatibility, Scribe ingress | `crates/vala/vala-bifrost-redux` | `architecture/bifrost-design.md`; `architecture/references/domain/{iceberg,analytical-operations-reliability,olap-serving}.md`; public Bifrost docs | `audit_log.rs`; `projection.rs`; table registry; `ensure_builtin`/fingerprint branch; Scribe ingress; manifest | Complete; **FAIL STD-R3-001** |
-| Audit publisher and at-least-once lifecycle | `crates/wyrd/wyrd-server` | Wyrd design; Bifrost design; security posture; operations runbook | production `AuditPublisher`, frozen range, Scribe append, settlement and retry path | Complete |
-| Audit decision counts/listings and public readers | server query plus first-class clients | headless/client-server doctrine; Bifrost design; security posture; agent-harness/testing references | harness readers and journey; HTTP query route; MCP `bifrost.query`; CLI query; Rust/Python/TypeScript Bifrost clients; UI search | Complete; **FAIL STD-R3-002** |
-| Unwrap/expect production check | repository tooling | `AGENTS.md` completion/check rules; `architecture/agent-rules.md`; implementation/testing references | checker, four cfg-test owner declarations, fixtures, canonical mise task | Complete |
-| Changed architecture and operator prose | repository authorities/docs | `architecture/references/README.md`; Wyrd/Bifrost designs; doctrine; security posture; operations runbook; docs Bifrost architecture | range diff and ownership wording | Complete |
-| Dependency, feature, and verification ownership | workspace/manifests | `AGENTS.md` §§3-11, 15-16; Rust/testing references | `mise.toml`; affected crate manifests; range contains no dependency or feature changes | Complete |
+The reference router selected the complete applicable slices:
+`doctrine/architecture-constraints.md`, `architecture/patterns.md`,
+`languages/spec-driven-development.md`, `languages/maintainer-style.md`,
+`languages/rust-core.md`, `languages/testing-workflows.md`,
+`domain/vala-architecture.md`, `domain/olap-serving.md`, and
+`domain/analytical-operations-reliability.md`. Governing authorities read were
+`AGENTS.md`, `architecture/agent-rules.md`, `architecture/wyrd-design.md`,
+`architecture/wyrd-doctrine.mdx`, `architecture/bifrost-design.md`,
+`architecture/wyrd-security-posture.md`, and
+`architecture/operations/runbooks.md`. The migration assessment also checked
+the migration contract in
+`architecture/v1/00-foundations/sql-foundation.md` and
+`architecture/operations/deployment-and-release.md`.
 
-Also read completely because the router marked them applicable:
-`architecture/wyrd-doctrine.mdx`,
-`architecture/references/languages/spec-driven-development.md`,
-`architecture/references/languages/agent-harness.md`, and
-`architecture/references/doctrine/architecture-constraints.md`.
+| Changed surface | Applicable repository authority and rule | Result | Exact evidence |
+|---|---|---:|---|
+| Generic outbox owner, panic containment, shutdown fence, counters, and tests (`wyrd-runtime/src/outbox.rs`) | `AGENTS.md` §§5-6, 11, 16; `agent-rules.md` async, struct owner, rustdoc, testing, and audit rules; `rust-core.md`; `maintainer-style.md`; `testing-workflows.md` | **PASS** | `Outbox<S>` remains the meaningful state owner; `stage`, `settle`, and `shutdown` are inherent methods; `contain_panic` is a focused future helper. Lines 90-214 close admission under the handle, drain pre-fence work, settle pending/gauge state, and count deadline loss. Lines 296-360 return panicked items to the existing tenant-front retry path. Added focused tests cover sink panic and shutdown admission/loss, and changed declarations carry substantive rustdoc. |
+| Audit sink transaction-ID capture and outcome resolution (`vala-sql/src/audit_outbox.rs`) | `AGENTS.md` §§2, 3, 6, 9, 11, 16; `agent-rules.md` one audit path, `TenantConn`, async IO, and docs; `architecture-constraints.md` Audit Boundaries; `patterns.md` Audit Pattern; `rust-core.md` Postgres/Audit; security posture Audit Integrity | **FAIL — STD-R3-002** | Lines 144-157 obtain `pg_current_xact_id()` in the tenant transaction and route an errored commit to lines 83-125. Committed returns success; aborted returns the original error for the existing outbox retry; unresolved waits without re-send; `NULL` counts loss and returns success. The owner and RLS boundary are correct, but the latter two required branches lack deterministic tests. |
+| Canonical staged append and row arrays (`vala-sql/src/queries/audit_staging.rs`) | `agent-rules.md` `TenantConn`/RLS, caller-owned transaction, bare types, one append path, name-based fields; `AGENTS.md` §§4, 5, 15, 16; `patterns.md` Storage/Audit | **PASS** | `append_audit_events` remains crate-private and has only the production `AuditSink` caller plus feature-gated seeding wrappers. It accepts `&mut TenantConn`, relies on RLS rather than a manual tenant predicate for reads/updates, never commits, imports `Uuid` at module top, and builds named column arrays. Removal of event-ID skip logic restores the revision-4 schema without adding another writer or authority. |
+| `vala-sql` manifest | `AGENTS.md` §§1, 2, 4; `agent-rules.md` Cargo-feature/dependency cost; `rust-core.md` async; ownership boundaries | **PASS** | Adding existing workspace `tokio` with only `time` is earned by the real IO retry wait in `AuditSink::resolve_commit`; no feature, SQL edge into a shared/client crate, cloud SDK, or new dependency family was added. The dependency remains in the narrow SQL owner rather than `wyrd-runtime`. |
+| Removed event-ID migration | SQL migration contract; approved revision-4 spec; spec-driven authority order | **PASS (user-stipulated unreleased migration)** | `20261003000001_audit_staging_event_id.sql` was introduced only for the superseded revision-2/3 event-ID approach and revision 4 explicitly removes that column and migration. The user states it was unreleased; no shipped/applied production checksum therefore exists to preserve. Current source, staging row type, projection, and tests contain no audit `event_id` dependency. A forward migration would retain a prohibited schema field. This exception does not authorize deleting or editing any released migration. |
+| Postgres integration tests (`pg_audit_outbox.rs`) | `AGENTS.md` §11; `agent-rules.md` external Postgres-test placement and exact `mise` execution; `testing-workflows.md` | **PASS for changed coverage; AC-009 gap is recorded on the production resolver** | The external `pg_*` test legitimately drives Postgres. It retains replica chain/order, tenant independence, and shutdown loss coverage; removal of the old event-ID retry test matches revision 4. The missing resolver branches are not excused by this surface and are captured as `STD-R3-002`. |
+| Retained audit projection (`vala-bifrost-redux`) and server/harness readers | `AGENTS.md` §§3, 9-11, 16; `bifrost-design.md` Read Audit; `vala-architecture.md`; `olap-serving.md`; `patterns.md` Audit/Verification | **PASS** | The projection returns to 15 canonical columns and readers no longer collapse by an event ID. `AuditPublisher` remains the sole publisher and the harness reads raw retained decisions. Added rustdoc on materially changed projection test items satisfies the hard documentation rule. |
+| Commit-outcome production journey and proxy (`wyrd-testing/.../audit_publication.rs`) | `AGENTS.md` §§11, 16; `agent-rules.md` import placement, Postgres/live-server test placement, journey proof; `testing-workflows.md`; `maintainer-style.md` | **FAIL — STD-R3-001, STD-R3-002** | The ignored server journey is correctly housed in the real Bifrost journey binary and uses the production `AuditSink`, server publisher, and retained query path. Three acknowledgement-loss rounds retire between commits, and the commit-loss round proves retry after abort. New types/functions/tests are documented. The proxy declarations/imports violate the module import rule, and the proof does not deterministically cover status-unreachable/in-progress or `NULL`. |
+| One-of-four writer-slot occupancy while commit status is unresolved | `REQ-002`, `REQ-008`, `REQ-009`; `analytical-operations-reliability.md` bounded ownership; `audit_outbox.rs` docs | **PASS — accepted bounded behavior, not a regression** | `AuditSink::resolve_commit` deliberately remains the one in-flight tenant write and holds one logical outbox slot while it polls; it does not hold a database connection during backoff. `AUDIT_WRITER_CONNECTIONS` stays fixed at four, leaving three slots for other tenants, and line 77 documents the ownership. Revision 4 requires waiting without re-send; no authority requires uncertain batches to leave the writer concurrency accounting. Four simultaneously unresolved tenants can consume all four slots, but that is bounded dependency unavailability under the approved semantics, not an unbounded queue or a new cross-tenant correctness defect. |
+| Unwrap/expect checker and Python fixtures | `AGENTS.md` §§11-12, 16; `agent-rules.md` no gate circumvention; Python top-level-test rule; `testing-workflows.md` boundary checks | **PASS** | The blanket `tests.rs` exclusion is removed. `CFG_TEST_MODULES` lists four proven cfg-test modules with declaring files, while `is_ignored_path` scans any other production `tests.rs`. `scripts/test_check_unwrap_audit.py` uses top-level `test_*` functions and identical allowlisted/production bodies. `mise exec -- python3 scripts/test_check_unwrap_audit.py` passed; `UV_CACHE_DIR=/tmp/wyrd-review-uv-cache mise run check:unwrap-audit` passed. |
+| Architecture, security posture, runbook, server module docs, and public Bifrost docs | `wyrd-design.md`; `bifrost-design.md`; `wyrd-security-posture.md`; operations runbook; `architecture-constraints.md`; `patterns.md`; `wyrd-doctrine.mdx` | **PASS** | Live authority consistently removes event-ID/dedup reader claims and states `pg_xact_status` resolution: retry only aborted, wait on unresolved, count `NULL` as loss, one retained row per decision. Security operations now names audit outbox write/publication failure rather than “Oracle audit commit failure,” closing FIND-3. No second audit table, publisher, WAL, relay, or public contract was added. |
+| Approved spec and r2 remediation/evidence packets | `spec-driven-development.md`; `AGENTS.md` §14 | **PASS** | Revision 4 is approved, records the superseded revision-2/3 event-ID decisions, and provides stable REQ/AC mapping. The two r2 remediation tasks preserve evidence and explicitly identify the unresolved test limits. Review prose stays inside the active change packet rather than production code. |
 
-## Applicable repository-rule results
+## Prior-finding closure under repository rules
 
-| Rule family | Exact evidence | Result |
-|---|---|---|
-| One audit write path and one publisher | The range adds no writer, table, WAL, relay, or publisher. `AuditSink` remains the canonical staging append caller and the existing `AuditPublisher` remains the only retained-history mover. | PASS |
-| Permission blocks; audit does not | The range leaves surface staging asynchronous and changes only the shared outbox owner, retained projection, harness, checker, and authority prose. No request path begins awaiting an audit commit. | PASS |
-| Failed accepted batches retry; live-process panic is not an allowed loss boundary | `outbox.rs:328-343` catches unwind during sink-future construction and polling while the child still owns `items`; `finish` routes the returned error through the existing front-of-queue/backoff path. The concrete sink error/display path is non-panicking, and the focused panic test reported green. | PASS — FIND-12 closed |
-| Shutdown is a handle-owned one-way fence and terminal gauges settle | `outbox.rs:148-160` sends while holding the read lock; `shutdown` takes/drops the sender under the write lock before awaiting, and `pending.swap(0)` decrements the gauge/counts the deadline remainder once. Focused fence/deadline tests are recorded green. | PASS — FIND-13 closed |
-| Tenant isolation | The event-ID lookup and inserts still run through `TenantConn`; retained projection validates every row tenant before construction; no range change widens query or publication tenant authority. | PASS |
-| Required retained-schema compatibility | Required `event_id` changes the persisted fingerprint; the existing-registration branch returns `FingerprintMismatch`, and no upgrade path is present. | **FAIL — STD-R3-001** |
-| Audit decision reads collapse at-least-once duplicates | Harness-only `HashSet`/`DISTINCT` collapse is correct, but shipped raw HTTP/MCP/CLI/SDK audit queries return physical duplicates. | **FAIL — STD-R3-002** |
-| Struct-centered ownership / async only at IO | `Outbox`/`OutboxWriter`, `AuditSink`, catalog, publisher, and test-server handle remain cohesive dependency-owning structs; pure projection/validation stays synchronous. No zero-sized utility owner or speculative trait was added. | PASS |
-| Crate and dependency boundaries | Runtime remains SQL-free; SQL and DataFusion/Iceberg dependencies stay in Vala/server owners; no manifest, feature, lockfile, client-tier SQL/cloud edge, or PyO3 scope changed. | PASS |
-| Rust import style | `MutexGuard` and `Uuid` are imported at module scope and used bare in the cited declarations. | PASS — FIND-7 closed |
-| Rust documentation | New/materially modified Rust items, fields, helpers, async/durable workflows, fallible functions, and tests have intent/invariant documentation and applicable Errors/Panics/cancellation/retry detail. | PASS |
-| Production unwrap audit cannot be bypassed by basename | `CFG_TEST_MODULES` names four exact files and their declaring modules; `is_ignored_path` no longer exempts arbitrary `tests.rs`; the identical-body production fixture is rejected. | PASS — FIND-14 closed |
-| Live authority names the actual owner | Security posture now uses shared audit-outbox write/publication vocabulary and no longer assigns commit failure to Oracle. | PASS — FIND-3 closed |
-| Test hierarchy and shipped-surface coverage | The Postgres publisher journey exercises the retirement duplicate and harness-level collapse. It does not prove a shipped decision-level read surface, and there is no old-schema upgrade journey. | **FAIL — STD-R3-001, STD-R3-002** |
-| No unrelated churn / minimum cohesive remediation | Production changes stay within the six closure findings and the required authority updates. The checker fixture is narrow; no new abstraction, table, queue, relay, or dependency was added. | PASS |
-| Public/generated contract checks | No wire request/response, proto, OpenAPI registration, Python stub, or TypeScript declaration was changed. `event_id` is a retained internal table field, so no generated public schema was expected from this range. | PASS |
-
-## Closure status under repository rules
-
-| Prior finding | Standards disposition |
+| Prior finding | Standards result |
 |---|---|
-| FIND-AUDIT-OUTBOX-11 | **Not closed overall.** Event identity is correctly retained and the production publisher journey reaches the accepted at-least-once case, but the retained schema is not upgrade-compatible and only harness readers collapse the duplicate. |
-| FIND-AUDIT-OUTBOX-12 | CLOSED |
-| FIND-AUDIT-OUTBOX-13 | CLOSED |
-| FIND-AUDIT-OUTBOX-14 | CLOSED |
-| FIND-AUDIT-OUTBOX-7 | CLOSED |
-| FIND-AUDIT-OUTBOX-3 | CLOSED |
-
-## Open questions
-
-- None that changes this standards result. “The schema was unshipped” is not a
-  committed repository authority or deployment constraint and therefore cannot
-  substitute for the required compatibility decision.
+| `FIND-AUDIT-OUTBOX-11` | Implementation shape and live authorities align with revision 4, but closure proof is incomplete for two required resolver branches (`STD-R3-002`). |
+| `FIND-AUDIT-OUTBOX-12` | Closed: a sink panic is contained while the task owns its items and goes through the existing retry path with direct proof. |
+| `FIND-AUDIT-OUTBOX-13` | Closed: shutdown owns a one-way admission fence, drains pre-fence work, refuses/counts late stages, and clears pending/gauge state after deadline loss. |
+| `FIND-AUDIT-OUTBOX-14` | Closed: no basename-wide exclusion remains and checker fixtures prove the distinction. |
+| `FIND-AUDIT-OUTBOX-7` | Prior cited declarations are fixed, but the r3 journey introduces a fresh violation of the same rule (`STD-R3-001`), so the cumulative repository is not standards-clean. |
+| `FIND-AUDIT-OUTBOX-3` | Closed: live security authority uses shared audit-outbox write/publication terminology. |
 
 ## Verification notes
 
-- Independently ran `mise exec -- python3 scripts/test_check_unwrap_audit.py`:
-  passed.
-- Independently ran `mise run check:unwrap-audit` with a writable temporary uv
-  cache after the default user cache was read-only: passed.
-- Independently ran
-  `git diff --check cf5ee4128ce0b842e00a0eb20770ab5c285dedd8..e54b1244f32950d1ab251dae6530c4e1694c78d5`:
-  passed.
-- The immutable remediation record reports: focused `wyrd-runtime` outbox tests
-  7/7; Redux audit tests 7/7; Postgres Bifrost SQL 119/119; audit publisher
-  journey and server journey 31/31; `test:wyrd` 2329/2329; format, lints,
-  docs, client-tier, and unwrap checks green.
-- I did not rerun Cargo/nextest lanes in parallel with the other independent
-  reviewers; the recorded exact commands and source-local assertions were
-  inspected. No source diagnosis here depends solely on those recorded results.
-- FIND-5 / `mise run bench:capacity` and `mise run gate` remain explicitly
-  deferred to integration and are not residual gaps in this report.
-- Candidate HEAD was `e54b1244f32950d1ab251dae6530c4e1694c78d5`
-  before review actions. The only workspace write by this reviewer is this
-  report; final HEAD verification follows report creation.
+- Reviewed the complete committed diff and every materially changed source,
+  test, manifest, migration, authority, runbook, public-doc, checker, and
+  active-packet surface in the range.
+- Independently passed: `git diff --check
+  cf5ee4128ce0b842e00a0eb20770ab5c285dedd8..52e1144b5c186ccacd85d9c779a4e60c3cce5ac2`;
+  `mise exec -- python3 scripts/test_check_unwrap_audit.py`; and
+  `UV_CACHE_DIR=/tmp/wyrd-review-uv-cache mise run check:unwrap-audit`.
+- Reviewed implementer-recorded green evidence for the exact AC-009 journey,
+  Bifrost SQL integration, Bifrost server journeys, `test:wyrd`, formatting,
+  lints, docs, and unwrap audit. This standards pass did not rerun Cargo lanes.
+- The first `mise run check:unwrap-audit` attempt could not create a temporary
+  cache file in the sandbox's read-only user cache; rerunning the same task
+  with its cache under `/tmp` passed. This is an execution-environment limit,
+  not a source failure.
+- Per user direction, `mise run bench:capacity` and `mise run gate` remain
+  deferred to integration and are not findings here.
+
+## Overall result
+
+**FAIL** — `STD-R3-001` and `STD-R3-002` are material repository-rule
+violations in the remediation range. The deleted unreleased migration and the
+single unresolved tenant's use of one of four writer slots are accepted under
+the approved revision-4 boundary and do not add findings.

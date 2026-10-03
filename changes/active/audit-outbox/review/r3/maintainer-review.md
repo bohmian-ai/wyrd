@@ -1,144 +1,151 @@
-# Maintainer Review
+# Maintainer review
 
-## Immutable subject
+## Subject and result
 
-- Repository: `/home/thorrester/Documents/GitHub/wyrd/.claude/worktrees/agent-aad682fbca5074900`
+- Repository: Wyrd
 - Base: `cf5ee4128ce0b842e00a0eb20770ab5c285dedd8`
-- Candidate: `e54b1244f32950d1ab251dae6530c4e1694c78d5`
-- Reviewed range: `cf5ee4128ce0b842e00a0eb20770ab5c285dedd8..e54b1244f32950d1ab251dae6530c4e1694c78d5`
-- Approved specification: `changes/active/audit-outbox/spec.md`, revision 3
-- Prior review and remediation authority:
-  `changes/active/audit-outbox/review/r2/{verdict.md,findings-validation.md,TASK-AUDIT-OUTBOX-R2-bounded-remediation.md}`
-- User-directed scope: closure of `FIND-AUDIT-OUTBOX-11`, `-12`, `-13`,
-  `-14`, `-7`, and `-3`, plus regressions introduced by the reviewed range.
-  `FIND-AUDIT-OUTBOX-5`, `bench:capacity`, and `mise run gate` remain
-  integration-deferred.
+- Candidate: `52e1144b5c186ccacd85d9c779a4e60c3cce5ac2`
+- Scope: closure of `FIND-AUDIT-OUTBOX-11` under approved specification
+  revision 4 and `FIND-AUDIT-OUTBOX-12`, `-13`, `-14`, `-7`, and `-3`, plus
+  regressions introduced by the immutable range
+- Overall result: **FAIL**
 
-The repository has no `.codegraph/` index, so navigation used the immutable
-diff, direct owner-module reads, and caller/consumer/test searches.
+The changed runtime ownership is findable and cohesive: `Outbox` still owns
+generic queueing and lifecycle, `AuditSink` owns Postgres commit-outcome
+resolution, and the public journey drives the production writer and publisher.
+Three bounded maintainer defects remain: two changed descriptions still state
+the superseded unconditional-retry behavior, one materially changed test sink
+and its new recorder methods lack the repository-required rustdoc, and the new
+journey hides Tokio IO imports inside a function.
 
 ## Changed-surface coverage
 
-| Surface | Material owners and symbols reviewed | Callers, consumers, and proof traced | Result |
+| Changed surface | Owner, callers, and consumers inspected | Relevant proof inspected | Result |
 |---|---|---|---|
-| Generic outbox panic recovery | `OutboxWriter::{dispatch,finish}`, `contain_panic`, `panic_message`, `Written`, and the in-memory `MemorySink`/metrics harness | `AuditSink::write`, retry/front-of-queue state, loss/write-failure/pending metrics, `a_panicking_write_is_retried_once_in_order_without_loss` | PASS for `FIND-AUDIT-OUTBOX-12`: the normal sink-construction and sink-poll panic paths return the owned batch to the existing retry path, preserve ordering, and do not count loss |
-| Generic outbox shutdown | `Outbox::{queue,stage,shutdown}`, `QueueSender`, `OutboxWriter::run`, pending/gauge settlement | Server shutdown ownership, concurrent stage/shutdown behavior, `shutdown_refuses_items_staged_after_it_begins`, `shutdown_counts_items_unwritten_at_the_deadline_as_lost`, existing recovery-before-deadline test | PASS for `FIND-AUDIT-OUTBOX-13`: the handle closes admission before awaiting, pre-fence items drain, deadline remainder is counted once, and terminal pending state is cleared |
-| Staging identity and retained projection | `AuditSink`, `StagedAuditEvent`, `AuditStagingRow`, `append_audit_events`, `AuditRows`, publication-range reads, `AuditLogTable::{EVENT_ID,arrow_fields}`, `project_audit_rows`, `project_record_batch` | `AuditPublisher` input/output shape, staging uniqueness, Scribe publication schema, projection unit tests, unknown-outcome production-publisher journey | PASS for carrying the original `event_id` into every retained row and preserving tenant/sequence projection; **FAIL** for the complete `FIND-AUDIT-OUTBOX-11` read contract (`MAINT-R3-01`) |
-| Audit decision reads and proof | `WyrdTestServer::{retained_audit_records,retained_audit_rows,retained_audit_count,retained_audit_operation_count}` and `unknown_outcome_retries_retain_each_decision_at_most_twice_and_read_once` | Public HTTP and gRPC query services, MCP `bifrost.query`, CLI query, shared Rust `Bifrost::sql`, Python `Bifrost.sql`, TypeScript `Bifrost.sql`; canonical `vala.system` SQL authority | **FAIL**: only the test harness collapses duplicate event IDs; shipped SQL reads return the raw duplicate retained rows (`MAINT-R3-01`) |
-| Unwrap/expect check | `CFG_TEST_MODULES`, `is_ignored_path`, extracted `audit`, fixture script and both fixture tests | All four allowlisted owner declarations, production `tests.rs` fixture, repository scan | PASS for `FIND-AUDIT-OUTBOX-14`: the basename-wide exemption is gone and the explicit entries name their cfg-test owners |
-| Bare type ownership | `MutexGuard` import/use in the outbox test module; `Uuid` import/use in `AuditRows` and staging queries | Changed declarations and their tests | PASS for `FIND-AUDIT-OUTBOX-7`: changed signatures and fields use top-level imports and bare names |
-| Security and operations wording | Bifrost design, security posture, runbook, docs-site architecture | Shared outbox metrics and owner, publisher/retirement behavior, retained-schema/read wording | PASS for `FIND-AUDIT-OUTBOX-3`; **FAIL** only where the revised documents claim read collapsing that production does not implement (`MAINT-R3-01`) |
-| Retained-schema compatibility risk | `AuditLogTable::arrow_fields`, built-in registration fingerprinting, `BifrostCatalog::ensure_builtin/create_table_locked` | Prior removal of the unshipped audit compatibility path, revision-3 expensive-to-reverse decision, current registration behavior | PASS / accepted scope: the fingerprint changes and an older physical registration would fail strict startup validation, but revision 3 explicitly approves the retained-schema change, this schema has no shipped compatibility contract, and the repository deliberately removed the earlier unshipped compatibility mechanism. Adding a path here would reintroduce out-of-scope compatibility machinery |
-| Range-wide regression scan | All 17 changed paths, including the approved spec/task records, authority/docs changes, SQL row/query changes, projection, harness, journey, and checker | Nearest owner modules, public consumers, changed tests, and recorded implementation evidence | No additional material regression found within the user-directed boundary |
+| `wyrd-runtime::outbox`: `Outbox`, `OutboxWriter`, `QueueSender`, `Written`, `contain_panic`, `panic_message`, shutdown/admission state, metrics test recorder | Full owning module; `AuditOutbox` alias; server boot (`AuditSink::outbox`), `AppState` staging and server shutdown; representative auth, Gate, Oracle, gateway, and test-harness users of `stage`, `settle`, and `shutdown` | Seven inline outbox tests, especially panic retry, admission fencing, deadline loss, pending/gauge settlement, tenant independence, and ordered retry | **FAIL** for changed-item documentation only (`MAINT-R3-02`); ownership and test scenarios are otherwise clear |
+| `vala-sql::audit_outbox`: `AuditSink::write` and `resolve_commit` | Full owner; `ValaPostgres::pool`/tenant-connection boundary; canonical `append_audit_events`; `AuditSink::outbox` callers in boot, state construction, auth tests, Oracle tests, and journeys | Exactly-once ambiguous-commit journey; `pg_audit_outbox` integration tests; implementer-reported focused and family results treated as claims, not proof by summary | PASS |
+| Audit staging append and event-ID removal | `append_audit`, `append_audit_batch`, private `append_audit_events`, `AuditRows`; publisher reads through `list_publication_batch`; staging row projection | Existing staging/outbox integration coverage and exactly-once journey; event-ID retry test removal is consistent with revision 4 | PASS |
+| Retained projection, publisher-facing harness reads, and ambiguous-commit journey | `project_audit_rows`; server publisher flow; `WyrdTestServer` retained-count/record helpers; new `CommitCutter`, `relay`, and journey | Projection test and the production writer/publisher journey, including three acknowledgement-loss rounds and one aborted transaction | **FAIL** for the function-scoped import (`MAINT-R3-03`); scenario naming and assertions otherwise make the required outcome legible |
+| Unwrap/expect audit | `CFG_TEST_MODULES`, `is_ignored_path`, `audit`, CLI `main`; all four declaring modules named by the allowlist | Fixture script passed independently; `mise run check:unwrap-audit` passed independently with a writable temporary tool cache | PASS |
+| Architecture, runbook, security posture, server module docs, and public Bifrost docs | Changed passages compared with revision 4 `REQ-009`/`AC-009`, the runtime owner, and nearby audit authority | Static source comparison | **FAIL** because two live descriptions retain superseded unconditional-retry wording (`MAINT-R3-01`) |
+| Deleted `20261003000001_audit_staging_event_id.sql` migration | Migration history, neighboring Vala migrations, migration integration test, revision 4 removal requirement | Git history shows the event-ID migration belonged to the unreleased event-ID implementation; current tree ends at audit publication progress for this change | PASS |
 
 ## Material findings
 
-### MAINT-R3-01 — `FIND-AUDIT-OUTBOX-11` is closed only in the test harness, not in shipped audit reads
+### MAINT-R3-01 — live owner documentation contradicts revision 4's unresolvable-outcome loss
 
-- **Classification:** `INCORRECT`
+- **Changed locations:**
+  - `crates/vala/vala-sql/src/audit_outbox.rs:12-15`
+  - `architecture/bifrost-design.md:589-595`
+- **Governing principle:** `maintainer-style.md` requires documentation to
+  explain durable failure and retry behavior accurately; approved revision 4
+  `REQ-009` says a transaction status that Postgres no longer holds is counted
+  lost and is not re-sent.
+- **Evidence:** the changed `AuditSink` module description says a batch that
+  fails to commit is "retried ... never dropped," and the live Bifrost read
+  contract says a failed commit is "retried until it lands." The same range's
+  `AuditSink::resolve_commit` returns success after counting `Ok(None)` events
+  lost, and the changed runbook and later Bifrost publication section describe
+  that loss correctly.
+- **Maintenance cost:** there are now two incompatible instructions in the
+  owner and design authority for the highest-risk branch. A maintainer changing
+  retry or operating an audit gap cannot tell whether `NULL` is an accepted
+  terminal loss or a retry obligation without rediscovering the revision-4
+  decision from implementation.
+- **Smallest testable correction:** update only these two descriptions to use
+  the already-established wording nearby: a returned commit error is resolved
+  from transaction status; committed succeeds, aborted retries, in-progress or
+  unreachable waits, and unavailable status is counted lost without re-send.
+  A repository text search for unconditional audit "retried until it lands" or
+  "never dropped" wording is sufficient focused proof; no new check is needed.
+- **Nearby pattern:** `architecture/operations/runbooks.md:119-134` and
+  `AuditSink::resolve_commit`'s rustdoc already state the revision-4 behavior
+  precisely.
+
+### MAINT-R3-02 — materially changed test behavior is undocumented
+
+- **Changed locations:**
+  - `crates/shared/wyrd-runtime/src/outbox.rs:524-543`
+  - `crates/shared/wyrd-runtime/src/outbox.rs:614-629`
+- **Governing rule:** `AGENTS.md` section 16 and
+  `architecture/agent-rules.md` require substantive rustdoc on every new or
+  materially modified Rust item, including private test helpers and methods;
+  fallible methods require `# Errors`, and panic/async behavior must be stated
+  where relevant.
+- **Evidence:** `MemorySink::write` was materially changed to signal dispatch,
+  optionally wait, consume a one-shot panic injection, and then apply ordinary
+  failure behavior, but has no item rustdoc. The newly added `Recorder`
+  implementation's six methods also have no item rustdoc.
+- **Maintenance cost:** the panic-closure proof depends on the precise order of
+  notification, hanging, one-shot panic consumption, and ordinary failure. A
+  later test edit can reorder those stages and silently stop proving the
+  ownership invariant. The recorder's name-only aggregation and no-op
+  histogram behavior are likewise hidden in method bodies even though the
+  assertions rely on that deliberately narrow model.
+- **Smallest testable correction:** add substantive rustdoc to the changed sink
+  method describing its injection order, `# Errors`, `# Panics`, and wait/
+  cancellation behavior, and to each new recorder method describing whether it
+  records or intentionally ignores the metric. `mise run fmt` and the focused
+  `wyrd-runtime` outbox tests are sufficient proof.
+- **Nearby pattern:** the new `TestMetrics::{cell,raw,counter,gauge}` methods
+  immediately above already document their test-specific semantics.
+
+### MAINT-R3-03 — the new journey hides a module dependency inside `relay`
+
 - **Changed location:**
-  `crates/wyrd/wyrd-testing/src/server.rs:1700-1800,1803-1856` adds duplicate
-  collapsing only to `WyrdTestServer`: listings fetch raw rows and discard
-  repeated `event_id` values in a local `HashSet`, while counts issue
-  `SELECT DISTINCT event_id`. The changed journey explicitly characterizes the
-  result as "the harness's audit count and listing" at
-  `crates/wyrd/wyrd-testing/tests/bifrost/server/audit_publication.rs:909-929`
-  and exercises those helpers at lines 1033-1049. The production table's new
-  rustdoc promises that a reader collapses duplicates at
-  `crates/vala/vala-bifrost-redux/src/tables/audit/audit_log.rs:22-25`, but no
-  production read owner changed to enforce that promise.
-- **Governing rule / guide principle:** revision-3 REQ-009 and AC-009 require
-  audit reads that count or list decisions to collapse rows sharing
-  `(tenant,event_id)`. `architecture/bifrost-design.md:639-644` repeats that
-  contract, while lines 989-1004 establish ordinary canonical SQL as the only
-  read contract for `vala.system`. `AGENTS.md` requires durable server behavior
-  to live in its Rust server owner and forbids language-specific duplicate
-  implementations. Maintainer Style requires tests to prove the caller-visible
-  outcome rather than replace its implementation with harness behavior.
-- **Caller and reachability evidence:** `POST /v1/query` forwards the supplied
-  `BifrostQueryRequest` to `stream_query`
-  (`crates/wyrd/wyrd-server/src/query/routes.rs:241-295`), and the gRPC method
-  does the same (`crates/wyrd/wyrd-server/src/grpc/query.rs:103-143`). MCP
-  forwards its arbitrary SQL request through that owner
-  (`crates/wyrd/wyrd-server/src/mcp/bifrost.rs:376-427`). The CLI streams the
-  same request unchanged (`crates/wyrd/wyrd-cli/src/query/mod.rs:67-81`), and
-  the shared Rust facade documents and executes SQL over any authorized table
-  (`crates/shared/wyrd-client/src/bifrost/facade.rs:592-625`). Python and
-  TypeScript likewise pass arbitrary SQL through their shared Bifrost clients
-  (`sdks/wyrd-sdk-python/python/wyrd/bifrost/__init__.py:551-572` and
-  `sdks/wyrd-sdk-ts/wyrd/src/index.ts:840-880`). No distinct shipped audit
-  list/count owner or UI audit reader was found; therefore every shipped audit
-  read is the ordinary SQL path, and a `COUNT(*)` or row listing over
-  `vala.system.audit_log` observes both retained copies.
-- **Concrete maintenance cost:** maintainers are given a green AC-009 journey
-  and architecture prose saying one authorization decision is read once, but
-  users of HTTP, gRPC, MCP, CLI, Rust, Python, or TypeScript receive two rows
-  and a count of two after the exact accepted retirement/retry race. The only
-  correct semantics live in a test-only helper that no production caller can
-  reach. This makes audit cardinality wrong at every supported headless surface
-  and invites each client to invent a different downstream guard.
-- **Smallest testable correction:** enforce one logical row per tenant/event ID
-  at the existing server-owned canonical Bifrost read boundary for
-  `vala.system.audit_log`, before arbitrary SQL projection or aggregation, so
-  the shared HTTP/gRPC engine and MCP/CLI/Rust/Python/TypeScript projections all
-  inherit one implementation. Preserve both raw retained rows for publication,
-  recovery, and internal evidence; do not add client-side filters, a second
-  audit table, a second publisher, or another storage authority. Replace the
-  harness-only proof with a production-publisher journey that creates the
-  two-row retained state, then uses an ordinary authenticated `Bifrost` query
-  to prove both `COUNT(*)` and a row listing expose one decision. Because MCP is
-  agent-facing, include its existing `bifrost.query` path in the owning journey
-  coverage or demonstrate that it consumes the exact same corrected query
-  result without a separate implementation.
+  `crates/wyrd/wyrd-testing/tests/bifrost/server/audit_publication.rs:921`
+- **Governing rule:** `architecture/agent-rules.md` requires all `use`
+  statements at module scope so the module's dependency surface is visible;
+  neither allowed exception applies here.
+- **Evidence:** `relay` contains
+  `use tokio::io::{AsyncReadExt, AsyncWriteExt};` inside the function.
+- **Maintenance cost:** the already protocol-heavy journey cannot be audited
+  from its module imports to see that it depends on Tokio's read/write extension
+  traits; that is exactly the dependency-manifest cost the repository rule
+  prevents.
+- **Smallest testable correction:** move both trait imports to the existing
+  module-level import block and keep the relay unchanged. `mise run fmt` and
+  the exact ambiguous-commit journey are sufficient proof.
+- **Nearby pattern:** the same file's new SQLx and standard-library dependencies
+  are declared at the top of the module.
 
-## Calibration notes
+## Directed risk judgments and verification limits
 
-- The retained `audit_log` schema fingerprint does change without an upgrade
-  path. That is a real operational fact, but not a finding in this review:
-  revision 3 explicitly approves the retained-schema addition, the repository's
-  earlier `b7185d0ee` change deliberately deleted compatibility for this
-  unshipped schema, and the approved remediation forbids expanding into a new
-  compatibility mechanism. `BifrostCatalog::create_table_locked` will continue
-  to reject a genuinely older registration rather than silently reinterpret it.
-- `OutboxWriter::finish` retains its defensive `JoinError` loss branch for a
-  panic that escapes construction/poll containment (its comment names a panic
-  while dropping a panic payload). The changed production `AuditSink` supplies
-  no reachable instance of that exotic path, while the in-scope ordinary sink
-  panic now returns the owned items and is directly proved. I therefore did not
-  reopen `FIND-AUDIT-OUTBOX-12` on a hypothetical custom panic payload.
-- The `CFG_TEST_MODULES` values are documentation/evidence, not dynamically
-  validated owner paths. That matches the r2 correction's explicitly allowed
-  narrow allowlist and does not justify adding a Rust parser or a check that
-  verifies another check.
-- No dedicated audit UI surface was found. This does not narrow REQ-009: Wyrd
-  is headless and the shipped SQL surfaces already make the duplicate result
-  reachable.
+- **No direct test for in-progress/unreachable or `NULL`:** accepted as a
+  verification limitation in this maintainer pass, not an additional finding.
+  `resolve_commit` keeps the complete policy in one documented owner, and the
+  journey directly proves the two retry/duplicate decisions required by
+  `AC-009` (committed and aborted). The in-progress/unreachable loop and
+  unavailable-status loss remain source-inspection evidence only. Creating a
+  trait or configurable status provider solely for these branches would add a
+  production abstraction for one test; a future focused Postgres test would be
+  useful if it can drive the real states without that seam.
+- **A waiting batch holds one of four writer slots:** accepted. The behavior is
+  stated in `AuditSink::resolve_commit`, the fixed pool share is named by
+  `AUDIT_WRITER_CONNECTIONS`, and it preserves the required rule that nothing
+  is re-sent while the transaction outcome is unknown. Three other tenants can
+  still progress; no extra queue, task, or connection owner is justified by
+  the approved behavior.
+- **Deleted unreleased migration:** accepted and preferable. Revision 4 removes
+  the event-ID schema entirely, the migration was introduced only for the
+  superseded unpublished approach, and retaining a forward migration for a
+  column absent from the final contract would leave dead schema and misleading
+  upgrade history. Shipped migration immutability remains covered separately
+  by the existing migration test.
+- **Verification evidence:** the implementer reports the focused journey,
+  Bifrost SQL integration, server journey, `test:wyrd`, format, lint, docs, and
+  unwrap-audit lanes as green. This review independently ran the unwrap checker
+  fixtures and `check:unwrap-audit`; both passed. `bench:capacity` and
+  `mise run gate` remain deferred exactly as directed. The three findings are
+  source-static and are not disproved by those green lanes.
 
-## Verification assessment
+## Calibration preferences (non-blocking)
 
-- Independently ran the three exact `wyrd-runtime` closure tests for panic
-  retry, shutdown fencing, and deadline loss: 3/3 passed.
-- Independently ran `vala-bifrost-redux`'s audit projection unit selection:
-  7/7 passed.
-- Independently ran `mise exec -- python3 scripts/test_check_unwrap_audit.py`
-  and the production checker directly through the pinned mise environment;
-  both passed. `mise run check:unwrap-audit` itself could not acquire the
-  sandboxed uv cache lock because that cache is read-only in this review
-  environment; the implementer's recorded owning-lane result is PASS.
-- Independently ran `git diff --check base..candidate`; it passed.
-- The implementer's Postgres journey evidence is credible for event-ID
-  propagation, staging uniqueness, raw retained duplication, and the harness
-  helpers. It is not closure evidence for the shipped read contract because the
-  asserted collapse occurs after the production query returns raw duplicates.
-- The user-deferred capacity benchmark and aggregate gate were not run.
-
-## Overall result
-
-**FAIL**
-
-`FIND-AUDIT-OUTBOX-12`, `-13`, `-14`, `-7`, and `-3` are maintainably closed,
-and the range introduces no other material regression found in this audit.
-`FIND-AUDIT-OUTBOX-11` remains open: revision 3's retained identity is present,
-but the required one-decision read semantics exist only in test-only helpers,
-while every shipped audit read surface still exposes the duplicate retained
-rows through canonical SQL.
+- `CommitCutter` is substantial test-only protocol code, but it earns its place:
+  no existing Postgres commit-acknowledgement injection owner was found, it
+  avoids sleeps, and it proves the production writer/publisher seam required by
+  `AC-009`. Extracting a generic proxy now would add an unsupported second
+  consumer.
+- The allowlist fixture mutates the checker module's `ROOT` for its short-lived
+  test process. Keeping it local rather than adding a reset helper is acceptable
+  while the script remains a standalone fixture runner.

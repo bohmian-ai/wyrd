@@ -1,86 +1,116 @@
-# Persistent-data and durability domain review
+# Persistent-data and transaction domain review
 
 ## Immutable subject
 
 - Repository: `/home/thorrester/Documents/GitHub/wyrd/.claude/worktrees/agent-aad682fbca5074900`
 - Base: `cf5ee4128ce0b842e00a0eb20770ab5c285dedd8`
-- Candidate: `e54b1244f32950d1ab251dae6530c4e1694c78d5`
-- Reviewed range: `cf5ee4128..e54b1244f`
-- Approved authority: `changes/active/audit-outbox/spec.md`, revision 3, especially REQ-009 and AC-009
-- Prior finding under closure: `FIND-AUDIT-OUTBOX-11`
-- User-directed scope: persistent-data closure of FIND-11 and regressions introduced by the reviewed range; FIND-5, `bench:capacity`, and `mise run gate` remain deferred
+- Candidate: `52e1144b5c186ccacd85d9c779a4e60c3cce5ac2`
+- Range: `cf5ee4128ce0b842e00a0eb20770ab5c285dedd8..52e1144b5c186ccacd85d9c779a4e60c3cce5ac2`
+- Approved authority: `changes/active/audit-outbox/spec.md`, revision 4
 
-`HEAD` was `e54b1244f32950d1ab251dae6530c4e1694c78d5` before and after this review. The repository has no `.codegraph/` index.
+`HEAD` remained the candidate while this report was produced. The repository
+has no `.codegraph/` index, so navigation used the source tree and git diff.
+The abandoned earlier contents of `review/r3/` were not used as review
+evidence.
 
 ## Reviewed boundary
 
-The reviewed durability boundary is:
+This review followed audit decisions from the generic process queue through the
+tenant transaction, commit-outcome reconciliation, hash-chain staging,
+publisher range identity, retained history, and staging retirement. It was
+limited to closure of `FIND-AUDIT-OUTBOX-11`, `-12`, `-13`, `-14`, `-7`, and
+`-3`, plus regressions introduced by the immutable range that could lose,
+duplicate, misattribute, or cross tenants for audit decisions.
 
-```text
-StagedAuditEvent.event_id
-  -> TenantConn / AuditSink transaction
-  -> vala.audit_staging uniqueness
-  -> frozen AuditPublisher range
-  -> audit RecordBatch projection
-  -> Scribe retained vala.system.audit_log rows
-  -> staging retirement
-  -> retry after an unknown commit result
-  -> retained audit count/list reads
-```
-
-I traced the persisted event identity, chain sequence, projection schema, built-in table registration, schema fingerprint, Iceberg physical schema, retirement transaction, retry ownership, and the production query surfaces that can count or list retained decisions. I did not reopen earlier accepted implementation except where it directly determines whether retained audit results are duplicated.
-
-## Authority and source coverage
-
-| Boundary | Authority and source inspected | Result |
+| Boundary | Authority and source coverage | Assessment |
 |---|---|---|
-| Revision-3 retained identity | Spec REQ-009 / AC-009; `vala-sql/src/audit_outbox.rs`; `vala-sql/src/queries/audit_staging.rs`; `vala-sql/src/row_types/audit_staging.rs` | The same tenant-scoped event ID survives an ordinary retry and is selected for publication. Staging remains unique per tenant and event ID. |
-| Publication and retirement | `wyrd-server/src/audit/publication.rs`; `audit_staging.rs::freeze_publication_range`, `list_publication_range`, and `settle_publication`; Bifrost audit-publication authority | The frozen range remains range-idempotent. Settlement advances the tenant watermark and deletes staging through it atomically. After deletion, staging no longer fences the event ID. |
-| Retained projection | `vala-bifrost-redux/src/tables/audit/{audit_log.rs,projection.rs,mod.rs}` | Every newly projected retained row carries non-null `event_id`; projection maps it by the canonical declared column order. No second audit store or publisher was introduced. |
-| Retry lifecycle | `wyrd-runtime/src/outbox.rs::finish`; `vala-sql/src/queries/audit_staging.rs::append_audit_events` | A failed/unknown result retries indefinitely at the tenant front. Each attempt only checks current staging, so retirement between repeated unknown outcomes can make the same event fresh repeatedly. |
-| Retained read semantics | `wyrd-testing/src/server.rs::retained_audit_records` and `retained_audit_rows`; HTTP `/v1/query`; gRPC query; MCP `bifrost.query`; CLI query; shared Rust client; Python and TypeScript SDK query methods | Collapse is implemented only in `wyrd-testing`. Every production surface passes caller SQL to the common Oracle query service and exposes the physical retained rows. |
-| Retained schema/catalog compatibility | `AuditLogTable::arrow_fields`; `BifrostCatalog::ensure_builtin` / `create_table_locked`; `validate_physical_table`; schema fingerprint owners; Iceberg schema authority; deployment/release authority | The new required field changes both the catalog fingerprint and physical Iceberg schema. An already-registered old table would fail `FingerprintMismatch` before publication. Current release authority explicitly states that no Wyrd image has yet been published, so there is no supported predecessor deployment or rolling-version interval to migrate in this first release. This is not a finding under current authority. |
-| Tenant isolation | `TenantConn`, per-tenant physical table binding, staging RLS, projection tenant validation, and tenant-scoped query planning | No lost, cross-tenant, or misattributed event-ID path was found in the reviewed range. The harness's set key omits tenant only because each query is already bound to one physical tenant table. |
+| Commit identity and outcome | Revision-4 REQ-009/AC-009; `crates/vala/vala-sql/src/audit_outbox.rs:65-158`; PostgreSQL `pg_current_xact_id` / `pg_xact_status` documented semantics | The transaction ID is obtained inside the same tenant transaction before append. A failed commit is classified on a separately acquired pool connection. `committed` completes without retry, `aborted` returns the original error to the generic front-of-queue retry, `in progress` and query failure wait with capped backoff, and `NULL` counts the batch lost and completes without resend. This is the state transition revision 4 requires. |
+| Tenant and chain transaction | `architecture/agent-rules.md`; `crates/vala/vala-sql/src/queries/audit_staging.rs:50-175`; `TenantConn` lifecycle | The existing RLS-bound `TenantConn` remains the tenant authority. Transaction ID read, chain-head lock, all row inserts, head update, and commit are one transaction. An aborted attempt consumes no sequence; a committed attempt advances the gap-free chain once. |
+| Generic pending/retry ownership | REQ-003/003a/007/008; `crates/shared/wyrd-runtime/src/outbox.rs:143-227,266-433,435-468` | A sink batch remains in the one in-flight task while its outcome is unresolved, so later same-tenant work cannot overtake it. Confirmed abort returns the owned batch to the tenant queue front. Committed and unresolvable outcomes release generic pending exactly once; only the `NULL` branch increments audit loss before returning success, so generic shutdown/retry accounting does not count that loss twice. |
+| Publisher and retirement seam | `architecture/bifrost-design.md:613-645`; `crates/vala/vala-sql/src/queries/audit_staging.rs`; `crates/vala/vala-bifrost-redux/src/tables/audit/projection.rs`; production `AuditPublisher` journey | Publisher identity remains the frozen tenant sequence range. It can retire a committed row while the writer resolves the lost acknowledgement without creating the r2/r3 duplicate: the writer never resends a transaction that Postgres reports committed. Confirmed abort retries before later same-tenant items; `NULL` never resends. Readers contain no event-ID collapse. |
+| Event-ID schema removal | Deleted `20261003000001_audit_staging_event_id.sql`; `AuditStagingRow`; staging queries; `AuditLogTable`; projection and test-harness reads | The final schema and all writer/publisher/read projections consistently omit audit `event_id`; no partial event-ID authority remains in production audit code. Revision 4 explicitly requires this removal. |
+| Migration lifecycle | `architecture/operations/deployment-and-release.md:135-173` and its statement that no Wyrd image has yet been published; range history | The deleted migration was introduced only in the unreleased revision-2/3 candidate and implemented a contract revision 4 explicitly supersedes. No released application/schema compatibility interval can contain it, so removing it is not a shipped migration rewrite. An ephemeral or development database that applied the intermediate candidate must be rebuilt; it is not a supported upgrade source and no accepted production audit evidence is being contracted. |
+| Closure-adjacent loss fixes | `outbox.rs:328-423,435-463,764-823`; unwrap checker and fixtures; security authority wording | The sink future's construction and polling panics retain ownership and re-enter retry (`FIND-12`); shutdown fences admission and settles pending/lost accounting (`FIND-13`); the filename-wide unwrap exemption is replaced by explicit cfg-test entries (`FIND-14`); bare imports close `FIND-7`; and shared outbox ownership wording closes `FIND-3`. No persistent-data regression was found in those changes. |
 
-## Schema-fingerprint compatibility judgment
+PostgreSQL's primary documentation confirms that `pg_xact_status(xid8)`
+returns exactly `in progress`, `committed`, `aborted`, or `NULL` when the
+status has aged out, and specifically identifies disconnected `COMMIT`
+resolution as an intended use:
+<https://www.postgresql.org/docs/16/functions-info.html>.
 
-The implementer's reported risk is technically accurate: adding required `event_id` changes the `vala.system.audit_log` user-schema fingerprint and physical Iceberg schema. `BifrostCatalog::create_table_locked` rejects an existing control row whose fingerprint differs (`bifrost_catalog.rs:1110-1113`), and even a rewritten control row would then encounter the exact physical-schema comparison (`bifrost_catalog.rs:1238-1261`). The candidate contains no catalog or Iceberg evolution path.
+## Prior-finding closure
 
-That is not a closure defect under the current approved and deployment authority. Revision 3 explicitly approves the retained-schema change and leaves no material decision open, while `architecture/operations/deployment-and-release.md:209-213` states that no Wyrd image has been published and defines the next artifact as the first release. Therefore no supported old image, retained production catalog, or rolling old/new replica pair exists in the current compatibility interval. The Iceberg requirement for explicit compatibility becomes controlling once a released schema must remain readable (`architecture/references/domain/iceberg.md:24-29`), and future released schema changes must use the expand-and-contract rules at `deployment-and-release.md:163-168`; it does not require an upgrade shim for this pre-release replacement.
+| Finding | Persistent-data closure result |
+|---|---|
+| `FIND-AUDIT-OUTBOX-11` | **CLOSED under revision 4.** The production sink resolves the exact transaction before returning to the generic writer. The journey at `crates/wyrd/wyrd-testing/tests/bifrost/server/audit_publication.rs:976-1054` cuts three commit acknowledgements, lets the production publisher retire each row between rounds, then cuts a commit before Postgres receives it. It proves one retained row per decision and a retained sequence population equal to the chain head. |
+| `FIND-AUDIT-OUTBOX-12` | **CLOSED.** The write task catches panics while it still owns the item vector and converts them to the ordinary retry path. The focused test proves in-order recovery, one write-failure count, zero lost count, and zero terminal pending. No reachable audit-sink panic path in the reviewed range bypasses this containment. |
+| `FIND-AUDIT-OUTBOX-13` | **CLOSED.** Shutdown takes and drops the only sender before awaiting the writer; late stages are refused/count lost and pre-fence work drains. Deadline abandonment clears both atomic pending and its gauge after the writer has stopped. |
+| `FIND-AUDIT-OUTBOX-14` | **CLOSED.** The production `tests.rs` fixture is scanned while only the four explicitly mapped cfg-test modules are skipped. No persistent-data exception was introduced. |
+| `FIND-AUDIT-OUTBOX-7` | **CLOSED.** The changed declarations use top-level `MutexGuard` and `Uuid` imports and bare names. |
+| `FIND-AUDIT-OUTBOX-3` | **CLOSED.** Live security authority names the shared audit-outbox write failure rather than an Oracle commit owner. |
 
-If integration has an external retained catalog that is intended to survive into the first supported release despite that authority, this judgment must be revisited before merge: the current candidate will refuse publication for that tenant. No such supported deployment is evidenced in the reviewed repository.
+## Implementer-reported risk judgments
 
-## Material findings
+### In-progress/unreachable wait and `NULL` loss lack direct tests
 
-### PDATA-R3-001 — production audit reads do not collapse retained copies by event ID
+Accepted as a verification limit, not a material closure finding. The
+revision-4 production journey directly proves the two commit outcomes that
+decide resend (`committed` and `aborted`) and repeats committed ambiguity across
+publisher retirement. The remaining branches are a literal mapping of the
+native closed status set: the wait branch performs no append and loops, while
+`NULL` increments the audit loss counter and returns success so the generic
+writer cannot resend. Forcing aged-out commit status or a durable in-progress
+commit through the production server would require a new database fault harness
+or production seam not required by AC-009. This remains residual risk because
+the metric/no-resend behavior is source-validated rather than directly
+executed.
 
-- **Classification:** `MISSING`
-- **Violated obligation:** Revision-3 REQ-009 requires audit reads that count or list decisions to collapse rows sharing `(tenant, event_id)`; AC-009 requires the production-publisher proof to show that behavior.
-- **Exact location:** `crates/wyrd/wyrd-testing/src/server.rs:1707-1709,1751-1795,1817-1818,1828-1848`; `crates/wyrd/wyrd-testing/tests/bifrost/server/audit_publication.rs:909-921,1006-1049`; production pass-through surfaces at `crates/wyrd/wyrd-server/src/query/routes.rs:281-296`, `crates/wyrd/wyrd-server/src/grpc/query.rs:120-136`, `crates/wyrd/wyrd-server/src/mcp/bifrost.rs:376-420`, `crates/wyrd/wyrd-cli/src/query/mod.rs:67-81`, `crates/shared/wyrd-client/src/bifrost/facade.rs:652-693`, `sdks/wyrd-sdk-python/src/bifrost/mod.rs:448-481`, and `sdks/wyrd-sdk-ts/wyrd/src/index.ts:840-880`.
-- **Evidence:** The only collapse implementation is the test harness: `retained_audit_records` builds an in-memory `HashSet` of event IDs and `retained_audit_rows` issues `SELECT DISTINCT event_id`. The new journey explicitly proves that ordinary retained SQL sees two rows (`await_retained_where(..., 2)`) and only then calls those harness helpers to obtain one. The production HTTP, gRPC, MCP, CLI, Rust, Python, and TypeScript query paths accept the caller's SELECT and return Oracle's physical result without audit-specific collapse. No production UI audit reader was found, but the absence of a UI surface does not close the first-class query surfaces.
-- **Observable consequence:** An operator or agent issuing `SELECT COUNT(*)` or listing rows from `vala.system.audit_log` through any shipped query surface observes one authorization decision multiple times after the exact unknown-outcome/retirement path revision 3 accepts. Retained audit cardinality is therefore wrong on production surfaces even though the test harness reports the expected logical count.
-- **Required correction:** Put event-ID collapse in the production owner of retained `vala.system.audit_log` reads so the common Oracle path supplies one logical decision to every HTTP, gRPC, MCP, CLI, Rust, Python, and TypeScript caller. Do not duplicate this rule in each client. Preserve the physical at-least-once rows and the one publisher; use a privileged/internal storage assertion, rather than a public audit read, when a test must prove that two physical copies exist. Add a real server-to-client journey showing both `COUNT` and a row listing return one decision after publication, retirement, and retry.
+### A waiting batch holds one of four writer slots
 
-### PDATA-R3-002 — repeated unknown commit outcomes can retain more than one extra copy
+Accepted and consistent with the approved protocol. The slot is the ownership
+fence that prevents the unresolved batch's tenant from being dispatched again.
+One unresolved tenant leaves three bounded slots available. If Postgres is
+unreachable, no audit batch could commit through an otherwise freed slot; on
+recovery the held resolver asks Postgres before any resend. Moving this wait
+outside the write owner would require another unresolved-state scheduler and
+would weaken the simple no-resend invariant. Capacity qualification remains the
+explicitly deferred `bench:capacity` obligation.
 
-- **Classification:** `INCORRECT`
-- **Violated obligation:** AC-009 requires a retry after retirement to produce **at most one** extra retained row for the event ID.
-- **Exact location:** `crates/vala/vala-sql/src/queries/audit_staging.rs:57-71,113-130,166-209,472-522`; `crates/shared/wyrd-runtime/src/outbox.rs:368-423`; insufficient proof at `crates/wyrd/wyrd-testing/tests/bifrost/server/audit_publication.rs:821-870,909-932,988-1007`.
-- **Evidence:** `append_audit_events` rejects an event ID only while it is present in `vala.audit_staging`. `settle_publication` deletes that evidence. The generic outbox retries the same owned batch after every reported failure with no attempt limit, as revision 3 otherwise requires. Therefore this reachable cycle can repeat: commit succeeds but acknowledgement is lost; publisher retains and retires the row; retry sees no staged ID and commits another row; that acknowledgement is also lost; publisher retires it; the next retry commits a third copy, and so on. Each copy receives a fresh sequence and a fresh range-derived Scribe batch identity. The journey's `AtomicBool` injects only one lost acknowledgement and makes the following write return success, so it proves exactly two copies only by excluding the repeated failure path.
-- **Observable consequence:** One decision may occupy an unbounded number of retained chain entries rather than the maximum two approved by AC-009. A production read-collapse fix would hide the cardinality from logical audit results, but it would not satisfy the approved persistent-data bound or prevent unbounded duplicate retention under a recurring connection-loss pattern.
-- **Required correction:** Establish a durable/reconcilable state transition that distinguishes the one permitted post-retirement restage from later ambiguous attempts without dropping an event whose latest attempt may not have committed. Then prove two consecutive commit-after-send acknowledgement losses with publication and retirement between them cannot create a third retained copy. If no correction can satisfy that bound while preserving the approved prohibition on a second identity ledger, retirement delay, or alternate publisher, this finding requires specification revision rather than a downstream guard or a test that injects only one unknown outcome.
+### Deleted unreleased migration
 
-## Regression assessment
+Accepted. The file encoded the superseded event-ID design, entered only the
+unreleased candidate history, and revision 4 requires that audit staging and
+retained history have no event ID. Keeping or replacing it would leave durable
+contract drift. This judgment depends on the repository's explicit no-release
+state; deleting an already shipped migration would fail the migration contract.
 
-Apart from the two REQ-009 closure failures above, the reviewed persistence range introduces no evidenced loss, cross-tenant decision, event-ID misattribution, chain gap, second audit authority, or publication-order regression. The event ID is projected from the tenant-bound staging row into the retained row, and later same-tenant events remain behind the retry in the outbox. The pre-release schema replacement is deliberately not treated as a regression for the authority reasons above.
+## Verification evidence and limits
 
-## Verification limits
+- Reviewed the implementer-recorded green exact journey, SQL integration,
+  Bifrost server journey, Wyrd family, formatting, lint, documentation, unwrap
+  audit, and diff-check results in
+  `review/r2/TASK-AUDIT-OUTBOX-R3-commit-outcome.md`.
+- Source-inspected the journey's commit proxy, all four resolution branches,
+  the generic writer's retry/pending/loss interaction, publisher range identity,
+  staging retirement, final retained projection, migration registry ownership,
+  and the earlier bounded-remediation changes.
+- Independently ran `git diff --check` on the persistent-data source slice; it
+  returned clean.
+- No Cargo-backed lane was rerun by this domain reviewer. The in-progress /
+  temporarily unreachable loop and aged-out `NULL` loss branch have no direct
+  test, as assessed above.
+- `mise run bench:capacity` and `mise run gate` remain deferred to integration
+  by user direction and are not domain-review failures.
 
-- I inspected the complete reviewed diff and the current owners/callers for staging, publication, retained projection, catalog registration, schema identity, retirement, retry, and public query surfaces.
-- The implementer reports passing focused Redux audit tests (7/7), Bifrost SQL integration (119/119), the named unknown-outcome journey, and `test:bifrost:journey:server` (31/31). Those results were not independently rerun in this domain pass; shared-checkout Cargo lanes must run sequentially, and the report's defects are already demonstrated by source and by the journey's own raw-count assertion.
-- The recorded journey proves one unknown outcome before a successful retry. It does not exercise repeated unknown outcomes, and its count/list closure checks call test-only helpers rather than HTTP, gRPC, MCP, CLI, or an SDK.
-- FIND-5 / `bench:capacity` and `mise run gate` are deferred by user direction and are not domain-review gaps.
+## Material proposed findings
+
+None.
+
+No reviewed range path was found that loses an audit decision outside the
+approved and counted boundaries, duplicates it after publisher retirement,
+misattributes it, crosses tenant authority, or allows later same-tenant work to
+overtake an unresolved/aborted batch.
 
 ## Overall result
 
-**FAIL** — `FIND-AUDIT-OUTBOX-11` is not closed under revision 3. The retained event ID is persisted correctly, but production audit reads still expose duplicate decisions, and the persistent path does not enforce AC-009's maximum of one extra retained row.
+**PASS**

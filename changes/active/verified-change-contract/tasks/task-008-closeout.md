@@ -12,6 +12,15 @@ continues: TASK-008
 intended_to_replace: task-008-recovery.md
 ---
 
+## Closeout Tracker (required)
+
+[`../closeout-tracker.md`](../closeout-tracker.md) lists every open
+workstream this closeout depends on: the benchmark fixes, Forge concurrent
+planning, the audit outbox, and the revision-59 Verifier runtime. It also
+lists the integration steps that follow. TASK-008 closeout is not complete
+until every row in that tracker is **Done**. Its status is updated whenever a
+workstream changes state.
+
 ## Outcome and Value
 
 Close all remaining TASK-008 implementation and verification obligations and

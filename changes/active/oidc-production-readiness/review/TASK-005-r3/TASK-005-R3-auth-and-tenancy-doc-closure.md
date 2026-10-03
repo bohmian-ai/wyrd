@@ -195,3 +195,17 @@ Record the corrected locations, the static owner comparison for every finding,
 and the exit result of each required focused command. Route the completed
 remediation directly to `$wyrd-implement`, then reassess the complete original
 base-to-new-candidate range with `$wyrd-task-review`.
+
+## Implementation Evidence
+
+Commit `9224aa768`. Documentation and one module rustdoc only. No runtime change.
+
+| Finding | Corrected locations | Static owner comparison | Result |
+|---|---|---|---|
+| FIND-TASK-005-3 | `auth/oauth.rs` module rustdoc; `sso-and-oidc.svx` OAuth endpoints paragraph | `OAuthClients::identify` returns `None` without a client and is required only for the code, refresh, and device-code grants in `components/auth/routes.rs`; `OAuthClients::require` in `cli_login.rs` (device authorization, revoke); `platform_token` has no client input | PASS |
+| FIND-TASK-005-9 | `self-hosting/authentication.svx` intro and Tokens | Bearer layers cover `/v1` and MCP; `/auth/*`, `/.well-known/*`, platform login and token, health, and OpenAPI are composed outside them | PASS |
+| FIND-TASK-005-10 | `concepts/identity-and-auth.svx` glossary (Tenant, User, Access token, Refresh token) and request-path intro; `self-hosting/authentication.svx` Principals | Platform `User` is a tenantless `PlatformPrincipal`; the platform session carries no tenant or roles, and the platform extractor re-reads grants | PASS |
+| FIND-TASK-005-11 | `self-hosting/configuration.svx` "The implicit tenant" | Protected requests take the tenant from the verified token; `auth/jwt_bearer.rs` uses `tenant_slug_from_host`, else the form `tenant`, as a candidate before verification; boot uses `WYRD_SERVER_TENANT_SLUG` only for seeded issuers and bindings | PASS |
+| Final sweep | Narrowed "every request" claims in identity-and-auth (description, request path), configuration (Authentication intro), and security posture (RBAC) to protected requests | Grepped every file changed since base for every/all/each/any + request/grant/client/user/principal/token/route | PASS |
+
+Verification (all exit 0): `mise run docs:check`, `mise run codegen:check`, `mise run fmt`, `mise run lints`, `git diff --check`. `docs:generate` refreshed `llms.txt` and `llms-full.txt` from the changed page description.

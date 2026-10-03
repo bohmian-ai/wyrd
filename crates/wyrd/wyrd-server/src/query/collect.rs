@@ -215,9 +215,10 @@ impl BoundedQuery {
 
     /// Run `arguments` as `caller` and collect the complete result.
     ///
-    /// Cancelling `cancel` signals the query immediately and then awaits the
-    /// Oracle controls' settlement under the query's original deadline before
-    /// returning, so a returned error never leaves an unsettled query behind.
+    /// Cancelling `cancel` signals the query immediately, while its stream is
+    /// still opening or afterwards, and then awaits the Oracle controls'
+    /// settlement under the query's original deadline before returning, so a
+    /// returned error never leaves an unsettled query behind.
     ///
     /// # Errors
     /// Returns `RunningQueryControlUnavailable` when this process has no query
@@ -236,10 +237,12 @@ impl BoundedQuery {
             .query_controls()
             .ok_or(ValaError::RunningQueryControlUnavailable)?
             .clone();
-        let settlement = Some((controls, caller.data_tenant_id, caller.request_id.clone()));
-        let stream =
-            super::service::stream_query(self.state.clone(), caller, arguments.to_request(), None)
-                .await?;
+        let tenant = caller.data_tenant_id;
+        let request_id = caller.request_id.clone();
+        let open =
+            super::service::stream_query(self.state.clone(), caller, arguments.to_request(), None);
+        let stream = Self::open(open, &controls, tenant, &request_id, cancel).await?;
+        let settlement = Some((controls, tenant, request_id));
         let collector = ResultCollector {
             settlement,
             max_rows: usize::try_from(arguments.max_rows).unwrap_or(usize::MAX),
@@ -249,6 +252,41 @@ impl BoundedQuery {
             stall: self.claim_schema_stall(&stream),
         };
         collector.collect(stream, cancel).await
+    }
+
+    /// Await the query's stream `open`, cancelling the query at its owner if
+    /// `cancel` fires first.
+    ///
+    /// An Analytical leader opens its stream only with its first batch, so a
+    /// cancellation that waited for the open would wait for the query
+    /// itself. The cancellation is therefore routed to the request's
+    /// registered owner, and the open is still awaited rather than dropped,
+    /// so whatever it returns is settled by the caller instead of being
+    /// abandoned mid-flight. A query its owner has not registered yet is
+    /// not found here; the collector cancels it once its stream opens.
+    ///
+    /// # Errors
+    /// Returns every error of [`super::service::stream_query`].
+    async fn open(
+        open: impl Future<Output = Result<OracleQueryStream, WyrdError>>,
+        controls: &crate::oracle::RunningQueryControls,
+        tenant: wyrd_spec::DataTenantId,
+        request_id: &wyrd_spec::request_id::RequestId,
+        cancel: &CancellationToken,
+    ) -> Result<OracleQueryStream, WyrdError> {
+        tokio::pin!(open);
+        tokio::select! {
+            biased;
+            opened = &mut open => return opened,
+            () = cancel.cancelled() => {}
+        }
+        if let Err(error) = controls.cancel(tenant, request_id.clone()).await {
+            tracing::debug!(
+                code = error.code(),
+                "the opening query had no cancellable owner yet"
+            );
+        }
+        open.await
     }
 
     /// Bind the armed test-only schema hold to this stream's resource probe.

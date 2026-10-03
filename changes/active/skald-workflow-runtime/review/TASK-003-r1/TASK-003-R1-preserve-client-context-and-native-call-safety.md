@@ -72,3 +72,52 @@ For broader implementation verification, inspect current canonical tasks and run
 ## Completion and next review
 
 Route this task to `$wyrd-implement`; the private retry wording correction goes through `$wyrd-plan` under the same spec. Do not implement optional alternatives. Record closure by stable finding ID, exact evidence and cumulative candidate. The subsequent `$wyrd-task-review` reassesses the complete original base-to-new-candidate range with the original task, this verdict/ledger and remediation task.
+
+## Implementation Evidence
+
+Candidate commits on `wyrd/skald-workflow-runtime/TASK-003` after `53210efdf`:
+`db6d985a2` (FIND-2, FIND-3), `258755550` (FIND-4, FIND-5 in wyrd-utils and
+wyrd-spec), `7d78d83cc` (FIND-1, FIND-5 in wyrd-client, TASK-003 wording), and
+the commit recording this evidence. Every cargo/mise command ran with
+`CARGO_TARGET_DIR=/home/thorrester/Documents/GitHub/wyrd/target CARGO_BUILD_JOBS=12`.
+
+Reuse map: renewal reuses `AuthMiddleware::force_refresh` and
+`AuthError::into_wyrd` (the auth owner); recognized-code text reuses the
+derive-backed `WyrdError::from_code`/`title`/`remediation`; the Python handoff
+reuses the shared `wyrd_client::Workflow` (only a standard `as_skald_mut`
+accessor beside the existing `as_skald` was added) and the existing
+`gateway_server` fixture, `deploy` helper, and stdlib recording handler pattern.
+
+| Finding / criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-TASK-003-1: registered and authored-ref Python loads keep their client; ambient config pointing to B or absent does not redirect; mutations keep context and refused edits change nothing; a client-less local file still refuses with `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` | `sdks/wyrd-sdk-python/src/workflow.rs` (`PyWorkflow.inner: wyrd_client::Workflow`, edits via `as_skald_mut`, run via `self.inner.run`), `sdks/wyrd-sdk-python/src/state/mod.rs` (`PyWorkflow::from(workflow)`), `crates/shared/wyrd-client/src/workflow/mod.rs` (`Workflow::as_skald_mut`) | New journey `tests/integration/gateway/test_workflow_gateway_context.py::test_loaded_workflow_calls_the_gateway_through_its_loading_client`. RED (Python src stashed, wheel rebuilt): `assert 'failed' == 'succeeded'`, run error `WYRD_CLIENT_503_TRANSPORT_DOWN` from the ambient server B. GREEN: `1 passed` | PASS |
+| FIND-TASK-003-2: uncoded and Wyrd-auth-code-spoofing 401 send one model POST; renewal without resend; next call carries renewed bearer; renewal failure returns the auth error; uncoded is `SKALD_PROVIDERS_401_AUTH` | `crates/shared/wyrd-client/src/transport/http.rs` `HttpTransport::post_native` (single send; `force_refresh` on 401, error propagated; original status/body returned). Sole caller `workflow/gateway.rs` checked | Extended `public_gateway_call_context_and_errors`. RED (http.rs stashed): `left: ("SKALD_PROVIDERS_400_BAD_REQUEST", 404) right: ("SKALD_PROVIDERS_401_AUTH", 401)` — the resend hit an exhausted mock. GREEN: 1 passed | PASS |
+| FIND-TASK-003-3: OpenAI/Anthropic/Google known-code canary text never reaches RemoteProblem; status/code/field/remediation kept; message is catalog title; uncoded path unchanged | `crates/shared/wyrd-client/src/workflow/gateway.rs` `Ingress::problem` (envelope message no longer read; recognized code takes `title()`; a recognized but non-reconstructable code keeps the fixed message and provider remediation) | Same test, all three dialects with `echoed prompt sk-canary` compared to `catalog_problem(...)`. RED (gateway.rs stashed): `message: "echoed prompt sk-canary"` vs `"Invalid gateway request"`. GREEN: 1 passed. Gateway native relay untouched | PASS |
+| FIND-TASK-003-4: only `read_secret_ref -> SecretString` is public | `crates/shared/wyrd-utils/src/secret.rs` (`read_secret_file` private, body unchanged; no other callers in tree) | `wyrd-gateway` `credential_sources_resolve_within_assignments`, `credential_sources_fail_closed` 2/2; `test:shared` 708/708; `lints` 0 | PASS |
+| FIND-TASK-003-5: imports at module tops, cfg kept | `secret.rs` (`#[cfg(unix)] use PermissionsExt` at top), `wyrd-client/src/workflow/mod.rs` tests block, `wyrd-spec/src/gateway/policy.rs` tests block | `fallback_header_round_trips_and_refuses` 1/1; `selected_local_dependencies_use_shared_config` 1/1; `lints` 0 | PASS |
+| TASK-003 retry wording | `tasks/TASK-003-remote-client-and-public-gateway.md` now states send-once, renew via `force_refresh`, propagate renewal failure, return original refusal; recognized-code message is the catalog title. Same-spec (Revision 12) task correction directed by the lead; no spec change | Source | PASS |
+
+Commands and exact results:
+
+| Command | Result |
+|---|---|
+| `mise exec -- cargo nextest run --locked -p wyrd-client --test workflow_transport -E 'test(=public_gateway_call_context_and_errors)'` | 1 passed, 1 skipped (RED runs recorded above) |
+| `mise exec -- cargo nextest run --locked -p wyrd-client --test workflow_transport -E 'test(=shared_workflow_client_contract)'` | 1 passed, 1 skipped |
+| `mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=workflow::tests::selected_local_dependencies_use_shared_config)'` | 1 passed, 221 skipped |
+| `mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=gateway::policy::tests::fallback_header_round_trips_and_refuses)'` | 1 passed, 905 skipped |
+| `mise exec -- cargo nextest run --locked -p wyrd-gateway --lib -E 'test(=credential::tests::credential_sources_resolve_within_assignments) \| test(=credential::tests::credential_sources_fail_closed)'` | 2 passed, 56 skipped |
+| `mise run py:setup` | exit 0 (stubs regenerated, wheel built) |
+| `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cd sdks/wyrd-sdk-python && uv run python -m pytest -q -m integration "tests/integration/gateway/test_workflow_gateway_context.py::test_loaded_workflow_calls_the_gateway_through_its_loading_client"'` | 1 passed |
+| `mise run fmt`; `mise run py:format` | exit 0, no changes |
+| `mise run lints` | exit 0 |
+| `mise run codegen:check` | exit 0 |
+| `mise run check:client-tier`; `mise run check:sdk-client-tier`; `mise run check:pyo3-scope` | exit 0 each |
+| `mise run py:lints`; `mise run py:typecheck` | exit 0 each |
+| `mise run py:test:unit` | 526 passed, 4 deselected |
+| `mise run test:shared` | 708 passed, 15 skipped |
+| `git diff --check` | exit 0 |
+
+Non-goals stayed excluded: no gateway relay, server, transport, header,
+configuration, dependency, or check change; sibling JSON/framed/gRPC 401
+retries untouched. TypeScript and Rust SDK sources were not changed; their
+compile is covered by the workspace `lints` lane.

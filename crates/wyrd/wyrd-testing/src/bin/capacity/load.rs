@@ -161,6 +161,12 @@ impl TenantClients {
     /// # Errors
     ///
     /// Returns a client, token exchange, bundle, or Bifrost start failure.
+    ///
+    /// # Cancellation
+    ///
+    /// Service lifetimes already started are dropped with nothing queued;
+    /// exchanged tokens simply expire. Nothing durable is written, so a
+    /// retry is safe.
     pub async fn connect(tenant: &Tenant, urls: &[String]) -> Result<Self> {
         let mut verification = Vec::new();
         let mut states = Vec::new();
@@ -192,6 +198,11 @@ impl TenantClients {
     /// # Errors
     ///
     /// Returns the first flush failure.
+    ///
+    /// # Cancellation
+    ///
+    /// Batches already handed to the server are durable; the rest stay
+    /// queued in their Service lifetime for a later flush or shutdown.
     pub async fn flush(&self) -> Result<()> {
         for state in &self.states {
             state.flush().await?;
@@ -204,6 +215,11 @@ impl TenantClients {
     /// # Errors
     ///
     /// Returns the first shutdown failure.
+    ///
+    /// # Cancellation
+    ///
+    /// Lifetimes already stopped are drained and durable; observations of
+    /// the rest are lost when the clients drop.
     pub async fn shutdown(&self) -> Result<()> {
         for state in &self.states {
             state.shutdown().await?;
@@ -246,6 +262,14 @@ impl Lane {
     ///
     /// Returns an error when the tenant does not run this lane's workload, a
     /// request task panicked, or the drain flush fails.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping it aborts every in-flight request task and discards the
+    /// tally. Requests that reached a replica keep their effects: enqueued
+    /// runs, admitted observations, and audit rows remain durable, and
+    /// observations admitted to the client queue are flushed by its owner's
+    /// later flush or shutdown. Arrivals are never resent.
     pub async fn drive(
         self,
         tenant: &Tenant,
@@ -344,6 +368,13 @@ impl Lane {
 
 impl Request {
     /// Sends arrival `sequence` to `replica`.
+    ///
+    /// # Cancellation
+    ///
+    /// A request dropped after it reached the replica may still take
+    /// effect there (a judgment, an enqueued run, or audit rows); an
+    /// observation is admitted to the client queue synchronously, so it is
+    /// either admitted or not. The driver never resends an arrival.
     async fn send(&self, clients: &TenantClients, replica: usize, sequence: u64) -> Outcome {
         let failing = sequence % FAIL_EVERY == FAIL_EVERY - 1;
         let accepted = Outcome::Accepted { right: true };

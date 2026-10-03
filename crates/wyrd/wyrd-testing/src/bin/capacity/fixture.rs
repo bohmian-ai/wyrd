@@ -206,6 +206,15 @@ impl Tenant {
     ///
     /// Returns a client, registration, fit, hydration, key, or seeding
     /// failure.
+    ///
+    /// # Cancellation
+    ///
+    /// Each registration, the issued key, and seeded observations are
+    /// durable as soon as their call returns, so a dropped provisioning
+    /// leaves a partial tenant in the database and store, and its files
+    /// under `root`. No [`Tenant`] is returned and nothing measures it;
+    /// registering again is idempotent per Card version, but a retry is only
+    /// meaningful on the fresh database a new benchmark run gets.
     pub async fn provision(setup: &SetupTenant, root: &Path) -> Result<Self> {
         let directory = root.join(&setup.slug);
         std::fs::create_dir_all(&directory)?;
@@ -330,6 +339,10 @@ impl Tenant {
     /// # Errors
     ///
     /// Returns the query failure or an answer without exactly one row.
+    ///
+    /// # Cancellation
+    ///
+    /// Read-only, apart from the audited read decision the server records.
     pub async fn count(&self, sql: &str) -> Result<u64> {
         let rows: Vec<Count> = Bifrost::query_only(&self.admin(SERVER_URL)?)
             .sql_as(sql)
@@ -353,6 +366,12 @@ impl Tenant {
     ///
     /// Returns an emit failure other than `QUEUE_FULL`, a flush, drain, or
     /// query failure, or a window that never settles within [`SETTLE`].
+    ///
+    /// # Cancellation
+    ///
+    /// Observations already flushed stay durable; those still queued in the
+    /// dropped Service lifetime are lost. The window is then incomplete and
+    /// not returned, so no queued Drift step reads it.
     async fn seed(&self) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
         let start = Utc::now();
         let state = WyrdState::from_path(&self.bundle)?;
@@ -400,6 +419,10 @@ impl Tenant {
 /// # Errors
 ///
 /// Returns a read failure, a failed fit, or a fit outlasting [`SETTLE`].
+///
+/// # Cancellation
+///
+/// Read-only: the server keeps fitting after the future drops.
 async fn await_fit(cards: &Cards, kind: Kind, root: CardRef) -> Result<()> {
     let deadline = tokio::time::Instant::now() + SETTLE;
     let selector = CardSelector::exact(root);

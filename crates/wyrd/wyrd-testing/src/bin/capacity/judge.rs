@@ -6,10 +6,14 @@
 //! release server trusts that CA through `SSL_CERT_FILE`, so certificate
 //! validation and the provider's `https`-only base URL stay enforced. The
 //! mock measures Wyrd overhead and concurrency, not real-provider capacity.
+//!
+//! The judge is also the owner of provider-wait evidence (AC-040): it records
+//! how long it held every answered completion, so a step reports that wait
+//! apart from the server's judge engine overhead.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use axum::Router;
@@ -36,8 +40,9 @@ pub struct Judge {
     base_url: String,
     /// PEM file holding the CA the server must trust.
     ca_file: PathBuf,
-    /// Completions answered so far.
-    calls: Arc<AtomicU64>,
+    /// How long each answered completion waited before its answer,
+    /// microseconds, in answer order.
+    waits: Arc<Mutex<Vec<u64>>>,
     /// Stops the listener.
     stop: CancellationToken,
 }
@@ -49,6 +54,11 @@ impl Judge {
     /// # Errors
     ///
     /// Returns a certificate, file, TLS configuration, or bind failure.
+    ///
+    /// # Cancellation
+    ///
+    /// Before it returns nothing is served; the CA file may remain under
+    /// `directory`, which its owner removes.
     pub async fn start(directory: &Path) -> Result<Self> {
         let authority = BifrostPeerCa::generate(HOST)?;
         let leaf = authority.issue_leaf("capacity-judge")?;
@@ -67,15 +77,20 @@ impl Judge {
         )?;
         let tcp = TcpListener::bind("127.0.0.1:0").await?;
         let base_url = format!("https://{HOST}:{}/v1", tcp.local_addr()?.port());
-        let calls = Arc::new(AtomicU64::new(0));
-        let counted = Arc::clone(&calls);
+        let waits = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&waits);
         let router = Router::new().route(
             "/v1/chat/completions",
             post(move || {
-                let calls = Arc::clone(&counted);
+                let waits = Arc::clone(&recorded);
                 async move {
+                    let received = tokio::time::Instant::now();
                     tokio::time::sleep(JUDGE_DELAY).await;
-                    calls.fetch_add(1, Ordering::Relaxed);
+                    let waited = u64::try_from(received.elapsed().as_micros()).unwrap_or(u64::MAX);
+                    waits
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(waited);
                     axum::Json(serde_json::json!({
                         "id": "chatcmpl_capacity", "object": "chat.completion",
                         "created": 1_700_000_000, "model": "gpt-test",
@@ -103,7 +118,7 @@ impl Judge {
         Ok(Self {
             base_url,
             ca_file,
-            calls,
+            waits,
             stop,
         })
     }
@@ -118,9 +133,23 @@ impl Judge {
         &self.ca_file
     }
 
-    /// Completions answered so far.
-    pub fn calls(&self) -> u64 {
-        self.calls.load(Ordering::Relaxed)
+    /// Completions answered so far; a step marks its start with it.
+    pub fn calls(&self) -> usize {
+        self.waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// The provider wait of every completion answered since `mark`, a
+    /// [`Judge::calls`] reading, microseconds.
+    pub fn waits_since(&self, mark: usize) -> Vec<u64> {
+        self.waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(mark..)
+            .map(<[u64]>::to_vec)
+            .unwrap_or_default()
     }
 }
 

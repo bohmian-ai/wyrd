@@ -86,14 +86,18 @@ impl Scrapes {
     }
 }
 
-/// Scribe work still queued on every replica in `scrapes`: generations
-/// waiting for persistence plus immutable generations not yet persisted.
+/// Scribe work still owned on every replica in `scrapes`: generations
+/// waiting for persistence, immutable generations not yet persisted, and
+/// durable staging members, ready or claimed, not yet published. Persistence
+/// hands work to staging, so the first two can read zero while staging
+/// still holds it.
 pub fn scribe_backlog(scrapes: &[Metrics]) -> u64 {
     scrapes
         .iter()
         .map(|metrics| {
             metrics.sum("bifrost_scribe_persistence_queue_depth", &[])
                 + metrics.sum("bifrost_scribe_immutable_generation_count", &[])
+                + metrics.sum("bifrost_scribe_staging_live_members", &[])
         })
         .sum::<f64>()
         .max(0.0) as u64
@@ -158,7 +162,8 @@ pub struct Backlog {
     /// Runs created this step still pending, running, or retrying, plus
     /// accepted queued requests whose run does not exist yet.
     pub runs: u64,
-    /// Scribe generations not yet persisted, every replica together.
+    /// Scribe work not yet published, every replica together: see
+    /// [`scribe_backlog`].
     pub scribe: u64,
     /// Audit decisions staged before load stopped and not yet published.
     pub audit: u64,
@@ -190,6 +195,10 @@ impl Queue {
     /// # Errors
     ///
     /// Returns the missing variable or connection failure.
+    ///
+    /// # Cancellation
+    ///
+    /// Read-only; a dropped connect leaves nothing behind.
     pub async fn connect() -> Result<Self> {
         Ok(Self {
             owner: PgPool::connect(&std::env::var("WYRD_TEST_DATABASE_ADMIN_URL")?).await?,
@@ -201,6 +210,10 @@ impl Queue {
     /// # Errors
     ///
     /// Returns the query failure.
+    ///
+    /// # Cancellation
+    ///
+    /// Read-only.
     pub async fn now(&self) -> Result<DateTime<Utc>> {
         Ok(sqlx::query_scalar("SELECT statement_timestamp()")
             .fetch_one(&self.owner)
@@ -218,6 +231,10 @@ impl Queue {
     /// # Errors
     ///
     /// Returns the query failure.
+    ///
+    /// # Cancellation
+    ///
+    /// Read-only.
     pub async fn backlog(
         &self,
         since: DateTime<Utc>,
@@ -252,6 +269,10 @@ impl Queue {
     /// # Errors
     ///
     /// Returns the query failure.
+    ///
+    /// # Cancellation
+    ///
+    /// Read-only.
     pub async fn runs(&self, since: DateTime<Utc>) -> Result<BTreeMap<String, RunTally>> {
         let rows: Vec<RunRow> = sqlx::query_as(
             "SELECT verifier_uid::text, status, \
@@ -278,7 +299,29 @@ impl Queue {
 
 #[cfg(test)]
 mod tests {
-    use super::{Percentiles, deltas, quantile};
+    use wyrd_testing::release_server::Metrics;
+
+    use super::{Percentiles, deltas, quantile, scribe_backlog};
+
+    /// One staged live member keeps Scribe's backlog nonzero while the
+    /// persistence queue and immutable generations read zero, and the
+    /// backlog clears with it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the backlog is wrong.
+    #[test]
+    fn staged_members_hold_the_scribe_backlog() {
+        let scrape = |staged: u32| {
+            Metrics::parse(&format!(
+                "bifrost_scribe_persistence_queue_depth 0\n\
+                 bifrost_scribe_immutable_generation_count 0\n\
+                 bifrost_scribe_staging_live_members {staged}\n"
+            ))
+        };
+        assert_eq!(scribe_backlog(&[scrape(0), scrape(1)]), 1);
+        assert_eq!(scribe_backlog(&[scrape(0), scrape(0)]), 0);
+    }
 
     /// A quantile is the first cumulative bucket bound covering it among the
     /// observations between two readings, and an empty interval has none.

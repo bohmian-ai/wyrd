@@ -1,16 +1,21 @@
 ---
 id: TASK-008-CLOSEOUT
 kind: implementation
-status: proposed
+status: review
 caller_approval: approved
-planning_result: SPEC_REVISION_REQUIRED
 spec: SPEC-verified-change-contract
-spec_revision: 49
-requirements: [REQ-089, REQ-101, REQ-114, REQ-115, REQ-135, REQ-136, REQ-137, REQ-145, REQ-146, REQ-151, REQ-152, INV-015, AC-017, AC-020, AC-021, AC-022, AC-023, AC-024, AC-030, AC-032, AC-033, REQ-172, REQ-173, REQ-174, REQ-175, REQ-176, REQ-177, INV-019, AC-041, AC-042, REQ-178, REQ-179, REQ-180, INV-020, AC-043]
+spec_revision: 57
+requirements: [REQ-089, REQ-101, REQ-114, REQ-115, REQ-135, REQ-136, REQ-137, REQ-145, REQ-146, REQ-151, REQ-152, INV-015, AC-017, AC-020, AC-021, AC-022, AC-023, AC-024, AC-030, AC-032, AC-033, REQ-172, REQ-173, REQ-174, REQ-175, REQ-176, REQ-177, INV-019, REQ-171, AC-040, AC-041, AC-042, REQ-178, REQ-179, REQ-180, INV-020, AC-043]
 depends_on: [TASK-005, TASK-006, TASK-009, TASK-010, TASK-012]
 continues: TASK-008
 intended_to_replace: task-008-recovery.md
+remediation: review/TASK-008-r1/TASK-008-CLOSEOUT-R1-capacity-closure.md
 ---
+
+> Current contract: spec revision 57, in review. The revision 49 planning
+> notes below, including their `SPEC_REVISION_REQUIRED` result, are history;
+> the revision 57 `bench:capacity` contract is the section
+> `bench:capacity implementation (revision 57)` and its remediation task.
 
 ## Outcome and Value
 

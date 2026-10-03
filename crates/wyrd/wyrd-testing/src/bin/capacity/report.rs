@@ -1,11 +1,12 @@
 //! The capacity report: the REQ-171 golden-signal SLOs judged per step and
-//! rendered as one Markdown table plus JSON.
+//! rendered as one Markdown table plus JSON. Each step's row is followed by
+//! one row per operation under the same columns.
 //!
 //! A step passes only when every judged cell passes:
 //! - traffic: every operation completed at least [`TRAFFIC`] of what it
 //!   offered inside the arrival window;
-//! - errors: none — no refusal, loss, duplicate, wrong judgment, or failed
-//!   run (intentionally failing inputs judged failed are correct);
+//! - errors: none — no refusal, loss, wrong judgment, or failed run
+//!   (intentionally failing inputs judged failed are correct);
 //! - overhead: each non-judge kind's direct paired engine overhead p95
 //!   bucket below 10 ms, from at least [`MIN_SAMPLES`] samples in the
 //!   one-replica sustained step (AC-040);
@@ -14,7 +15,8 @@
 //! - backlogs: run queue, Scribe, audit outbox, and Forge demand empty
 //!   within [`DRAIN_LIMIT`] of load stopping.
 //!
-//! Client latency and replica CPU and memory are reported, never judged.
+//! Client latency, replica CPU and memory, the judge kind's engine overhead,
+//! and the judge provider's wait are reported, never judged.
 //! The run passes when the one-replica sustained step and both two-replica
 //! steps pass. Missing evidence never passes.
 
@@ -25,7 +27,7 @@ use serde::Serialize;
 
 use crate::Result;
 use crate::load::Op;
-use crate::step::{DRAIN_LIMIT, OpRecord, Record};
+use crate::step::{DRAIN_LIMIT, OpRecord, Record, StepKind};
 
 /// Achieved share of offered traffic a step needs (REQ-171).
 const TRAFFIC: f64 = 0.95;
@@ -132,15 +134,21 @@ fn achieved(record: &OpRecord) -> Option<f64> {
     (record.offered > 0).then(|| record.completed as f64 / record.offered as f64)
 }
 
-/// The traffic cell of one operation.
+/// The traffic cell of one operation; arrivals that found no driver permit
+/// are named, since they count against it.
 fn traffic(record: &OpRecord, seconds: f64) -> Cell {
     match achieved(record) {
         Some(share) => Cell::judged(
             share >= TRAFFIC,
             format!(
-                "{:.1}% of {:.0}/s",
+                "{:.1}% of {:.0}/s{}",
                 share * 100.0,
-                record.offered as f64 / seconds
+                record.offered as f64 / seconds,
+                if record.missed > 0 {
+                    format!(" ({} found no driver permit)", record.missed)
+                } else {
+                    String::new()
+                }
             ),
         ),
         None => Cell::judged(false, "nothing offered".to_owned()),
@@ -178,12 +186,13 @@ fn latency(record: &OpRecord) -> Cell {
 
 /// A cell that does not apply to the row.
 fn none() -> Cell {
-    Cell::reported("-".to_owned())
+    Cell::reported("n/a".to_owned())
 }
 
 /// The overhead cell of `record`: every non-judge kind below the bound,
 /// with the sample floor in the one-replica sustained step, where a kind
-/// short of it is marked `< 1,000`; the judge kind is shown for diagnosis.
+/// short of it is marked `< 1,000`; the judge kind's engine overhead and,
+/// separately, the judge provider's wait are shown for diagnosis.
 fn overhead(record: &Record) -> Cell {
     let mut pass = true;
     let mut parts = Vec::new();
@@ -207,7 +216,21 @@ fn overhead(record: &Record) -> Cell {
             if short { " < 1,000" } else { "" }
         ));
     }
+    parts.push(judge_wait(record));
     Cell::judged(pass, parts.join(", "))
+}
+
+/// The judge provider's wait in `record`, milliseconds, or `not measured`
+/// when no judge call was answered during the step.
+fn judge_wait(record: &Record) -> String {
+    let wait = record.judge_wait_ms;
+    match (wait.p50, wait.p95, wait.p99) {
+        (Some(p50), Some(p95), Some(p99)) => format!(
+            "judge provider wait {p50:.1}/{p95:.1}/{p99:.1} ms (n {})",
+            record.judge_calls
+        ),
+        _ => "judge provider wait not measured".to_owned(),
+    }
 }
 
 /// The ingest drain cell of an operation record, when it measured one.
@@ -222,7 +245,10 @@ fn ingest_drain(record: &OpRecord) -> Cell {
 fn backlog(record: &Record) -> Cell {
     let left = record.backlog;
     match record.backlog_drain_seconds {
-        Some(seconds) => Cell::judged(true, format!("{seconds:.1} s")),
+        Some(seconds) => Cell::judged(
+            seconds <= DRAIN_LIMIT.as_secs_f64(),
+            format!("{seconds:.1} s"),
+        ),
         None => Cell::judged(
             false,
             format!(
@@ -316,7 +342,8 @@ pub fn step_row(record: &Record) -> Row {
 }
 
 /// The per-operation row of `op` in `record`, for diagnosis: the same
-/// columns, with those that do not apply to the operation left blank.
+/// columns with the same meanings, `n/a` where one does not apply to the
+/// operation.
 fn op_row(record: &Record, op: Op, evidence: &OpRecord) -> Row {
     Row {
         traffic: traffic(evidence, record.window_seconds),
@@ -337,14 +364,7 @@ fn op_row(record: &Record, op: Op, evidence: &OpRecord) -> Row {
             _ => none(),
         },
         latency: latency(evidence),
-        resources: if evidence.missed > 0 {
-            Cell::reported(format!(
-                "{} arrivals found no driver permit",
-                evidence.missed
-            ))
-        } else {
-            none()
-        },
+        resources: none(),
     }
 }
 
@@ -353,10 +373,14 @@ fn op_row(record: &Record, op: Op, evidence: &OpRecord) -> Row {
 pub struct Report {
     /// Whether this run was profiled, and so is diagnostic only.
     pub profiled: bool,
-    /// Seconds spent starting, provisioning, fitting, and seeding.
-    pub setup_seconds: f64,
+    /// Seconds spent starting, provisioning, fitting, and seeding; `None`
+    /// when setup did not finish.
+    pub setup_seconds: Option<f64>,
     /// Seconds the whole run took.
     pub total_seconds: f64,
+    /// Why the run stopped before finishing its sequence or cleanup: a
+    /// failure or the lifetime limit. Any failure fails the verdict.
+    pub failure: Option<String>,
     /// The deployment and driver settings every step ran under.
     pub envelope: serde_json::Value,
     /// Every step, in order.
@@ -371,24 +395,26 @@ impl Report {
     /// The verdict steps: the one-replica sustained step and both
     /// two-replica steps; missing ones fail.
     fn verdict_steps(&self) -> [(&'static str, Option<&Record>); 3] {
-        let find = |name: &str, replicas: usize| {
+        let find = |name: StepKind, replicas: usize| {
             self.records
                 .iter()
                 .find(|record| record.plan.name == name && record.replicas == replicas)
         };
         [
-            ("sustained on 1 replica", find("sustained", 1)),
-            ("sustained on 2 replicas", find("sustained", 2)),
-            ("scale-out on 2 replicas", find("scale-out", 2)),
+            ("sustained on 1 replica", find(StepKind::Sustained, 1)),
+            ("sustained on 2 replicas", find(StepKind::Sustained, 2)),
+            ("scale-out on 2 replicas", find(StepKind::ScaleOut, 2)),
         ]
     }
 
-    /// Whether the run passed: every verdict step passed and, when
-    /// profiling, every capture is usable evidence.
+    /// Whether the run passed: it finished without a failure, every verdict
+    /// step passed and, when profiling, every capture is usable evidence.
     pub fn passed(&self) -> bool {
-        self.verdict_steps()
-            .iter()
-            .all(|(_, record)| record.is_some_and(|record| step_row(record).passed()))
+        self.failure.is_none()
+            && self
+                .verdict_steps()
+                .iter()
+                .all(|(_, record)| record.is_some_and(|record| step_row(record).passed()))
             && self
                 .records
                 .iter()
@@ -419,7 +445,7 @@ impl Report {
         let mut text = String::new();
         let _ = writeln!(
             text,
-            "# Capacity{}\n\n**Verdict: {}.** Knee K = {}. Setup {:.0} s, total {:.0} s.\n",
+            "# Capacity{}\n\n**Verdict: {}.** Knee K = {}. Setup {}, total {:.0} s.\n",
             if self.profiled {
                 " (profiled: diagnostic, not authoritative)"
             } else {
@@ -428,9 +454,13 @@ impl Report {
             if self.passed() { "PASS" } else { "FAIL" },
             self.knee
                 .map_or("none".to_owned(), |knee| format!("{knee}/s")),
-            self.setup_seconds,
+            self.setup_seconds
+                .map_or("unfinished".to_owned(), |seconds| format!("{seconds:.0} s")),
             self.total_seconds,
         );
+        if let Some(failure) = &self.failure {
+            let _ = writeln!(text, "**Stopped early:** {failure}\n");
+        }
         for (name, record) in self.verdict_steps() {
             let _ = writeln!(
                 text,
@@ -444,37 +474,15 @@ impl Report {
         }
         let _ = writeln!(
             text,
-            "\nL is verification executions per second over four identical tenants; each step offers direct and queued verification at L/2 each, Scribe ingest at 2.5·L Drift observations of 100 features, and Oracle queries at L/2. SLOs: traffic ≥ 95% of offered per operation; 0 errors (refused, lost, duplicate, wrong judgment, failed run; QUEUE_FULL counts); direct overhead p95 < 10 ms for PSI, SPC, Custom and assertion Eval, from ≥ 1,000 samples each in the 1-replica sustained step; client queue drain ≤ 1 s; every backlog (run queue, Scribe, audit outbox, Forge demand) drained within 60 s of load stopping. Latency and CPU/memory are reported, not judged. Overhead figures are bucket upper bounds.\n"
+            "\nL is verification executions per second over four identical tenants; each step offers direct and queued verification at L/2 each, Scribe ingest at 2.5·L Drift observations of 100 features, and Oracle queries at L/2. SLOs: traffic ≥ 95% of offered per operation; 0 errors (refused, lost, wrong judgment, failed run; QUEUE_FULL counts); direct overhead p95 < 10 ms for PSI, SPC, Custom and assertion Eval, from ≥ 1,000 samples each in the 1-replica sustained step; client queue drain ≤ 1 s; every backlog (run queue, Scribe, audit outbox, Forge demand) drained within 60 s of load stopping. Latency, CPU/memory, judge engine overhead, and judge provider wait are reported, not judged. Overhead figures are bucket upper bounds. Each step row (operation `all`) is followed by its operation rows; `n/a` marks a column that does not apply.\n"
         );
-        let header = "| step | replicas | L | traffic | errors | direct overhead p95 | ingest drain | backlogs drained | client latency | CPU / memory | result |\n|---|---|---|---|---|---|---|---|---|---|---|";
-        let _ = writeln!(text, "## Steps\n\n{header}");
+        let _ = writeln!(text, "{HEADER}");
         for record in &self.records {
             let row = step_row(record);
-            let _ = writeln!(
-                text,
-                "| {} | {} | {} | {} | {} |",
-                record.plan.name,
-                record.replicas,
-                record.plan.level,
-                row.render(),
-                result(record, &row)
-            );
-        }
-        let _ = writeln!(
-            text,
-            "\n## Per operation\n\n| step | replicas | L | operation | traffic | errors | direct overhead p95 | ingest drain | backlog left | client p50/p95/p99 | driver |\n|---|---|---|---|---|---|---|---|---|---|---|"
-        );
-        for record in &self.records {
+            let _ = writeln!(text, "{}", table_row(record, "all", &row));
             for (op, evidence) in &record.ops {
-                let _ = writeln!(
-                    text,
-                    "| {} | {} | {} | {} | {} |",
-                    record.plan.name,
-                    record.replicas,
-                    record.plan.level,
-                    op.label(),
-                    op_row(record, *op, evidence).render()
-                );
+                let row = op_row(record, *op, evidence);
+                let _ = writeln!(text, "{}", table_row(record, op.label(), &row));
             }
         }
         let _ = writeln!(
@@ -506,11 +514,13 @@ impl Report {
                     .map(move |profile| match &profile.failure {
                         Some(failure) => format!(
                             "### {} {} r{}\n\n**FAIL** {failure}\n",
-                            record.plan.name, record.replicas, profile.replica
+                            record.plan.name.label(),
+                            record.replicas,
+                            profile.replica
                         ),
                         None => format!(
                             "### {} {} r{}\n\n```text\n{}\n```\n",
-                            record.plan.name,
+                            record.plan.name.label(),
                             record.replicas,
                             profile.replica,
                             profile.hotspots.join("\n")
@@ -525,7 +535,23 @@ impl Report {
     }
 }
 
-/// The step's result cell: `not judged` for the warmup.
+/// The one report table's header: step identity, the operation (`all` for
+/// the step row), the SLI columns of [`Row`], and the result.
+const HEADER: &str = "| step | replicas | L | operation | traffic | errors | direct overhead p95 | ingest drain | backlogs | client latency | CPU / memory | result |\n|---|---|---|---|---|---|---|---|---|---|---|---|";
+
+/// One table line of `record` for `operation` with SLI cells `row`.
+fn table_row(record: &Record, operation: &str, row: &Row) -> String {
+    format!(
+        "| {} | {} | {} | {operation} | {} | {} |",
+        record.plan.name.label(),
+        record.replicas,
+        record.plan.level,
+        row.render(),
+        result(record, row)
+    )
+}
+
+/// A row's result cell: `not judged` for the warmup.
 fn result(record: &Record, row: &Row) -> &'static str {
     if !record.plan.judged {
         "not judged"
@@ -538,15 +564,15 @@ fn result(record: &Record, row: &Row) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{Report, step_row};
-    use crate::evidence::{Backlog, Overhead};
+    use super::{HEADER, Report, step_row};
+    use crate::evidence::{Backlog, Overhead, Percentiles};
     use crate::load::Op;
-    use crate::step::{OpRecord, Plan, Record};
+    use crate::step::{OpRecord, Plan, Record, StepKind};
 
     /// A step whose every operation completed all it offered with no error,
-    /// whose overhead holds with `samples` per kind, and whose backlogs
-    /// drained.
-    fn record(name: &'static str, replicas: usize, samples: f64) -> Record {
+    /// whose overhead holds with `samples` per kind, whose backlogs drained,
+    /// and whose judge provider answered 40 calls in about 200 ms.
+    fn record(name: StepKind, replicas: usize, samples: f64) -> Record {
         let op = OpRecord {
             offered: 100,
             completed: 100,
@@ -556,11 +582,8 @@ mod tests {
         Record {
             replicas,
             plan: Plan {
-                name,
-                level: 50.0,
-                seconds: 10.0,
-                judged: true,
-                sample_floor: name == "sustained" && replicas == 1,
+                sample_floor: name == StepKind::Sustained && replicas == 1,
+                ..Plan::new(name, 50.0, 10.0)
             },
             window_seconds: 10.0,
             ops: Op::ALL.into_iter().map(|op_| (op_, op.clone())).collect(),
@@ -581,8 +604,27 @@ mod tests {
             backlog_drain_seconds: Some(1.0),
             backlog: Backlog::default(),
             resources: Vec::new(),
-            judge_calls: 0,
+            judge_calls: 40,
+            judge_wait_ms: Percentiles {
+                p50: Some(200.4),
+                p95: Some(201.5),
+                p99: Some(203.0),
+            },
             profiles: Vec::new(),
+        }
+    }
+
+    /// A finished report of `records`.
+    fn report(records: Vec<Record>) -> Report {
+        Report {
+            profiled: false,
+            setup_seconds: Some(0.0),
+            total_seconds: 0.0,
+            failure: None,
+            envelope: serde_json::Value::Null,
+            records,
+            knee: Some(50.0),
+            shutdown: Vec::new(),
         }
     }
 
@@ -596,58 +638,175 @@ mod tests {
     /// Panics when a verdict is wrong.
     #[test]
     fn every_slo_failure_fails_the_step() {
-        assert!(step_row(&record("ramp", 1, 10.0)).passed());
-        let mut slow = record("ramp", 1, 10.0);
+        assert!(step_row(&record(StepKind::Ramp, 1, 10.0)).passed());
+        let mut slow = record(StepKind::Ramp, 1, 10.0);
         slow.ops[1].1.completed = 94;
         assert!(!step_row(&slow).passed());
-        let mut refused = record("ramp", 1, 10.0);
-        refused.ops[2]
-            .1
-            .errors
-            .insert("WYRD_CLIENT_429_QUEUE_FULL".to_owned(), 1);
-        assert!(!step_row(&refused).passed());
-        let mut overhead = record("ramp", 1, 10.0);
+        let mut overhead = record(StepKind::Ramp, 1, 10.0);
         overhead.overhead[0].p95 = Some(0.01);
         assert!(!step_row(&overhead).passed());
-        let mut judge = record("ramp", 1, 10.0);
+        let mut judge = record(StepKind::Ramp, 1, 10.0);
         judge.overhead[4].p95 = Some(0.5);
         assert!(step_row(&judge).passed());
-        assert!(!step_row(&record("sustained", 1, 999.0)).passed());
-        assert!(step_row(&record("sustained", 1, 1_000.0)).passed());
-        assert!(step_row(&record("sustained", 2, 10.0)).passed());
-        let mut drain = record("ramp", 1, 10.0);
+        assert!(!step_row(&record(StepKind::Sustained, 1, 999.0)).passed());
+        assert!(step_row(&record(StepKind::Sustained, 1, 1_000.0)).passed());
+        assert!(step_row(&record(StepKind::Sustained, 2, 10.0)).passed());
+        let mut drain = record(StepKind::Ramp, 1, 10.0);
         drain.ops[2].1.drain_seconds = Some(1.5);
         assert!(!step_row(&drain).passed());
-        let mut backlog = record("ramp", 1, 10.0);
+        let mut backlog = record(StepKind::Ramp, 1, 10.0);
         backlog.backlog_drain_seconds = None;
         backlog.backlog.audit = 3;
         assert!(!step_row(&backlog).passed());
     }
 
-    /// The run passes only with all three verdict steps passing; a missing
-    /// one fails it.
+    /// Every REQ-171 error category fails the step: a refusal (including
+    /// `QUEUE_FULL`), a lost request, a wrong judgment, and a failed run.
+    /// Duplicate-run judgment belongs to the exactly-once test, so neither
+    /// the rendered SLOs nor any cell name it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an error category passes or duplication is judged.
+    #[test]
+    fn every_approved_error_category_fails_without_duplicate_judgment() {
+        for (op, cause) in [
+            (2, "WYRD_CLIENT_429_QUEUE_FULL"),
+            (0, "WYRD_VERIFICATION_REFUSED"),
+            (1, "lost"),
+            (0, "wrong judgment"),
+            (1, "run failed"),
+        ] {
+            let mut failed = record(StepKind::Ramp, 1, 10.0);
+            failed.ops[op].1.errors.insert(cause.to_owned(), 1);
+            let row = step_row(&failed);
+            assert!(!row.passed(), "{cause} passed");
+            assert!(row.errors.text.contains(cause));
+        }
+        let rendered = report(vec![record(StepKind::Ramp, 1, 10.0)]).render();
+        assert!(!rendered.contains("duplicate"));
+    }
+
+    /// A backlog drained below or exactly at 60 s passes; one reported as
+    /// drained after it fails, as does one that never drained.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the boundary is judged wrongly.
+    #[test]
+    fn backlog_passes_only_within_sixty_seconds() {
+        let drained = |seconds| {
+            let mut step = record(StepKind::Ramp, 1, 10.0);
+            step.backlog_drain_seconds = seconds;
+            step_row(&step).backlog.pass
+        };
+        assert_eq!(drained(Some(59.9)), Some(true));
+        assert_eq!(drained(Some(60.0)), Some(true));
+        assert_eq!(drained(Some(60.1)), Some(false));
+        assert_eq!(drained(None), Some(false));
+    }
+
+    /// The judge provider's wait appears apart from the judge kind's engine
+    /// overhead in Markdown and JSON, and a step without answered judge
+    /// calls says it was not measured instead of showing a wait.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the wait is missing, merged, or invented.
+    #[test]
+    fn judge_provider_wait_is_reported_apart_from_overhead() {
+        let step = record(StepKind::Ramp, 1, 10.0);
+        let cell = step_row(&step).overhead.text;
+        assert!(cell.contains("eval_llm_judge ≤5 ms (n 10)"));
+        assert!(cell.contains("judge provider wait 200.4/201.5/203.0 ms (n 40)"));
+        let json = serde_json::to_value(&step).unwrap_or_default();
+        assert_eq!(json["judge_wait_ms"]["p95"], 201.5);
+        assert_eq!(json["judge_calls"], 40);
+        assert_eq!(json["overhead"][4]["kind"], "eval_llm_judge");
+        assert!(json["overhead"][4].get("judge_wait_ms").is_none());
+        let mut silent = record(StepKind::Ramp, 1, 10.0);
+        silent.judge_calls = 0;
+        silent.judge_wait_ms = Percentiles::default();
+        assert!(
+            step_row(&silent)
+                .overhead
+                .text
+                .contains("judge provider wait not measured")
+        );
+    }
+
+    /// The Markdown holds one table: one header, every line with the same
+    /// columns, and each step row (operation `all`) immediately followed by
+    /// its four operation rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the table splits or a row is misplaced.
+    #[test]
+    fn report_renders_one_shared_table() {
+        let rendered = report(vec![
+            record(StepKind::Warmup, 1, 10.0),
+            record(StepKind::Ramp, 1, 10.0),
+        ])
+        .render();
+        let lines: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with('|'))
+            .collect();
+        assert_eq!(
+            rendered.matches("| step | replicas |").count(),
+            1,
+            "one header"
+        );
+        assert!(rendered.contains(HEADER));
+        let columns = |line: &str| line.matches('|').count();
+        assert!(lines.iter().all(|line| columns(line) == columns(lines[0])));
+        let operations: Vec<&str> = lines[2..]
+            .iter()
+            .map(|line| line.split(" | ").nth(3).unwrap_or_default())
+            .collect();
+        let step = ["all"]
+            .into_iter()
+            .chain(Op::ALL.map(Op::label))
+            .collect::<Vec<_>>();
+        assert_eq!(operations, [step.clone(), step].concat());
+        assert!(lines[2].starts_with("| warmup | 1 | 50 | all |"));
+        assert!(lines[7].starts_with("| ramp | 1 | 50 | all |"));
+    }
+
+    /// The run passes only with all three verdict steps, chosen by kind and
+    /// replica count, passing and no early stop; a missing one or a failure
+    /// fails it.
     ///
     /// # Panics
     ///
     /// Panics when the verdict is wrong.
     #[test]
     fn verdict_needs_every_verdict_step() {
-        let report = |records| Report {
-            profiled: false,
-            setup_seconds: 0.0,
-            total_seconds: 0.0,
-            envelope: serde_json::Value::Null,
-            records,
-            knee: Some(50.0),
-            shutdown: Vec::new(),
+        let all = || {
+            vec![
+                record(StepKind::Sustained, 1, 1_000.0),
+                record(StepKind::Sustained, 2, 1.0),
+                record(StepKind::ScaleOut, 2, 1.0),
+            ]
         };
-        let all = vec![
-            record("sustained", 1, 1_000.0),
-            record("sustained", 2, 1.0),
-            record("scale-out", 2, 1.0),
-        ];
-        assert!(report(all).passed());
-        assert!(!report(vec![record("sustained", 1, 1_000.0)]).passed());
+        let passing = report(all());
+        assert!(passing.passed());
+        assert!(
+            passing
+                .verdict_steps()
+                .iter()
+                .all(|(_, record)| record.is_some())
+        );
+        assert!(!report(vec![record(StepKind::Sustained, 1, 1_000.0)]).passed());
         assert!(!report(Vec::new()).passed());
+        let stopped = Report {
+            failure: Some("the benchmark passed its 30-minute limit".to_owned()),
+            ..report(all())
+        };
+        assert!(!stopped.passed());
+        assert!(stopped.render().contains("**Stopped early:**"));
+        let json = serde_json::to_value(passing.records[2].plan.clone()).unwrap_or_default();
+        assert_eq!(json["name"], "scale-out");
     }
 }

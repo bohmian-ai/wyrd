@@ -5,7 +5,12 @@
 //! The drain watches every server-owned backlog — the run queue, Scribe,
 //! the audit outbox, and Forge demand — from the moment the arrivals stop,
 //! and gives up at [`DRAIN_LIMIT`], the REQ-171 saturation SLO, so a step
-//! that cannot drain fails instead of stretching the run.
+//! that cannot drain fails instead of stretching the run. A backlog first
+//! seen empty after the limit is a miss, not a late pass.
+//!
+//! Replica CPU and peak memory cover one [`ResourceWindow`]: from just before
+//! the arrivals start until every lane, its request tails, and its client
+//! flush have ended.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -15,7 +20,7 @@ use std::time::Duration;
 use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
-use wyrd_testing::release_server::LocalServer;
+use wyrd_testing::release_server::{LocalServer, MemoryPeak};
 
 use crate::Result;
 use crate::evidence::{Backlog, Overhead, Percentiles, Queue, RunTally, Scrapes, scribe_backlog};
@@ -50,11 +55,48 @@ pub struct Deployment {
     pub binary: serde_json::Value,
 }
 
+/// The closed set of REQ-171 step kinds. The verdict selects its steps by
+/// variant, so a misnamed step cannot compile into missing evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepKind {
+    /// Not judged; warms caches and connections.
+    Warmup,
+    /// One step of the one-replica ramp that finds the knee.
+    Ramp,
+    /// The knee held for the sustained window.
+    Sustained,
+    /// Twice the knee on two replicas.
+    ScaleOut,
+}
+
+impl StepKind {
+    /// The one label of this kind: the report's step column, the JSON
+    /// `name`, and the profile directory prefix.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Warmup => "warmup",
+            Self::Ramp => "ramp",
+            Self::Sustained => "sustained",
+            Self::ScaleOut => "scale-out",
+        }
+    }
+}
+
+impl Serialize for StepKind {
+    /// Serializes as [`StepKind::label`].
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.label())
+    }
+}
+
 /// One step of the REQ-171 sequence.
 #[derive(Debug, Clone, Serialize)]
 pub struct Plan {
-    /// Step name: `warmup`, `ramp`, `sustained`, or `scale-out`.
-    pub name: &'static str,
+    /// Step kind.
+    pub name: StepKind,
     /// Load level `L`: verification executions per second.
     pub level: f64,
     /// Arrival window, seconds.
@@ -64,6 +106,20 @@ pub struct Plan {
     /// Whether the AC-040 sample floor applies: the one-replica sustained
     /// step.
     pub sample_floor: bool,
+}
+
+impl Plan {
+    /// A step of `name` at `level` for `seconds`, judged unless it is the
+    /// warmup, without the sample floor.
+    pub fn new(name: StepKind, level: f64, seconds: f64) -> Self {
+        Self {
+            name,
+            level,
+            seconds,
+            judged: name != StepKind::Warmup,
+            sample_floor: false,
+        }
+    }
 }
 
 /// One operation's evidence over one step, every tenant together.
@@ -76,8 +132,8 @@ pub struct OpRecord {
     /// Requests that completed inside the arrival window: accepted
     /// requests, or settled runs for the queued path.
     pub completed: u64,
-    /// Errors by cause: refusal codes, `lost`, `duplicate run`,
-    /// `wrong judgment`, and `run <status>`.
+    /// Errors by cause: refusal codes, `lost`, `wrong judgment`, and
+    /// `run <status>`.
     pub errors: BTreeMap<String, u64>,
     /// Raw client latency percentiles, milliseconds.
     pub client_ms: Percentiles,
@@ -86,15 +142,123 @@ pub struct OpRecord {
     pub drain_seconds: Option<f64>,
 }
 
-/// One replica's resource use over the arrival window.
+/// One replica's resource use over one step's [`ResourceWindow`].
 #[derive(Debug, Clone, Serialize)]
 pub struct Resources {
     /// Replica ordinal.
     pub replica: u16,
-    /// Mean cores: cgroup CPU seconds over window seconds.
+    /// Measured length of the window, seconds.
+    pub seconds: f64,
+    /// Mean cores: cgroup CPU seconds over [`Resources::seconds`].
     pub cores: f64,
-    /// Peak cgroup memory, bytes.
+    /// Peak cgroup memory over the same window, bytes.
     pub peak_memory: u64,
+}
+
+impl Resources {
+    /// Replica `replica`'s use between two cgroup CPU readings, each an
+    /// instant and `usage_usec`, with the peak memory read at the second.
+    /// Cores divide the CPU delta by the readings' own interval, never by a
+    /// planned window.
+    fn between(
+        replica: u16,
+        opened: (Instant, u64),
+        closed: (Instant, u64),
+        peak_memory: u64,
+    ) -> Self {
+        let seconds = closed.0.saturating_duration_since(opened.0).as_secs_f64();
+        let cpu_seconds = closed.1.saturating_sub(opened.1) as f64 / 1e6;
+        Self {
+            replica,
+            seconds,
+            cores: if seconds > 0.0 {
+                cpu_seconds / seconds
+            } else {
+                0.0
+            },
+            peak_memory,
+        }
+    }
+}
+
+/// The one interval a step's replica CPU and peak memory both cover. It
+/// opens with every replica's CPU reading and a fresh `memory.peak`
+/// descriptor, and closes by reading both again at one instant.
+struct ResourceWindow {
+    /// When the CPU readings were taken.
+    opened: Instant,
+    /// Each replica's `usage_usec` at [`ResourceWindow::opened`].
+    cpu_usec: Vec<u64>,
+    /// Each replica's peak descriptor, reset at [`ResourceWindow::opened`].
+    peaks: Vec<MemoryPeak>,
+}
+
+impl ResourceWindow {
+    /// Opens the window over `replicas`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `memory.peak` open or reset failure.
+    fn open(replicas: &[LocalServer]) -> Result<Self> {
+        let mut peaks = Vec::new();
+        for replica in replicas {
+            peaks.push(replica.memory_peak()?);
+        }
+        Ok(Self {
+            opened: Instant::now(),
+            cpu_usec: replicas.iter().map(cpu_usec).collect(),
+            peaks,
+        })
+    }
+
+    /// Closes the window over the same `replicas`, in the same order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `memory.peak` read failure.
+    fn close(self, replicas: &[LocalServer]) -> Result<Vec<Resources>> {
+        let closed = Instant::now();
+        let mut resources = Vec::new();
+        for ((replica, before), peak) in replicas.iter().zip(self.cpu_usec).zip(self.peaks) {
+            resources.push(Resources::between(
+                replica.ordinal(),
+                (self.opened, before),
+                (closed, cpu_usec(replica)),
+                peak.read()?,
+            ));
+        }
+        Ok(resources)
+    }
+}
+
+/// `replica`'s cgroup CPU time, microseconds.
+fn cpu_usec(replica: &LocalServer) -> u64 {
+    replica.cgroup_stat("cpu.stat", "usage_usec")
+}
+
+/// What one backlog read means for the drain.
+#[derive(Debug, PartialEq)]
+enum Drain {
+    /// Not empty yet, with time left.
+    Pending,
+    /// Empty, seen this many seconds after load stopped, within the limit.
+    Drained(f64),
+    /// The limit passed before an empty read.
+    Expired,
+}
+
+impl Drain {
+    /// Judges a read taken `elapsed` after load stopped: empty at or before
+    /// [`DRAIN_LIMIT`] drains, anything at or after it otherwise expires.
+    fn judge(elapsed: Duration, empty: bool) -> Self {
+        if empty && elapsed <= DRAIN_LIMIT {
+            Self::Drained(elapsed.as_secs_f64())
+        } else if elapsed >= DRAIN_LIMIT {
+            Self::Expired
+        } else {
+            Self::Pending
+        }
+    }
 }
 
 /// Everything one step produced.
@@ -118,7 +282,10 @@ pub struct Record {
     /// Per-replica resources.
     pub resources: Vec<Resources>,
     /// Judge completions during the step.
-    pub judge_calls: u64,
+    pub judge_calls: usize,
+    /// The local judge provider's wait per completion, milliseconds:
+    /// reported apart from judge engine overhead, never judged (AC-040).
+    pub judge_wait_ms: Percentiles,
     /// Profiles, when captured.
     pub profiles: Vec<Profile>,
 }
@@ -139,22 +306,25 @@ impl Deployment {
     /// # Errors
     ///
     /// Returns a driver, scrape, query, flush, or capture failure.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future mid-step aborts every in-flight request task and
+    /// kills any `perf` capture, but requests that already reached a replica
+    /// keep their durable effects: enqueued runs, admitted observations, and
+    /// audit rows stay in the shared database and store, and observations
+    /// still queued in the tenants' clients are flushed or dropped by the
+    /// clients' owner. No partial [`Record`] survives; a retry runs a new
+    /// step whose evidence starts from that residue, so it is not comparable
+    /// with an uncancelled step.
     pub async fn run(&self, plan: Plan) -> Result<Record> {
         let since = self.queue.now().await?;
         let mut before = Vec::new();
         for replica in &self.replicas {
             before.push(replica.metrics().await?);
         }
-        let cpu_before: Vec<u64> = self
-            .replicas
-            .iter()
-            .map(|replica| replica.cgroup_stat("cpu.stat", "usage_usec"))
-            .collect();
-        let mut peaks = Vec::new();
-        for replica in &self.replicas {
-            peaks.push(replica.memory_peak()?);
-        }
         let judge_before = self.judge.calls();
+        let resources = ResourceWindow::open(&self.replicas)?;
         let captures = self.start_captures(&plan)?;
 
         let lanes = mix(plan.level, self.tenants.len());
@@ -171,13 +341,9 @@ impl Deployment {
             ));
         }
         let tallies = futures_util::future::try_join_all(running).await?;
+        let resources = resources.close(&self.replicas)?;
         let stopped = self.queue.now().await?;
         let window_seconds = window.as_secs_f64();
-        let cpu_after: Vec<u64> = self
-            .replicas
-            .iter()
-            .map(|replica| replica.cgroup_stat("cpu.stat", "usage_usec"))
-            .collect();
         let mut profiles = Vec::new();
         let metadata = serde_json::json!({ "step": plan, "binary": self.binary });
         for capture in captures {
@@ -195,15 +361,6 @@ impl Deployment {
             .await?;
         let scrapes = Scrapes { before, after };
         let runs = self.queue.runs(since).await?;
-        let mut resources = Vec::new();
-        for (index, (replica, peak)) in self.replicas.iter().zip(peaks).enumerate() {
-            let cpu_seconds = cpu_after[index].saturating_sub(cpu_before[index]) as f64 / 1e6;
-            resources.push(Resources {
-                replica: replica.ordinal(),
-                cores: cpu_seconds / window_seconds,
-                peak_memory: peak.read()?,
-            });
-        }
         let ops = self.ops(&lanes, &tallies, &runs, window, backlog.runs == 0)?;
         Ok(Record {
             replicas: self.replicas.len(),
@@ -217,19 +374,24 @@ impl Deployment {
             backlog_drain_seconds,
             backlog,
             resources,
-            judge_calls: self.judge.calls() - judge_before,
+            judge_calls: self.judge.calls().saturating_sub(judge_before),
+            judge_wait_ms: Percentiles::raw(&self.judge.waits_since(judge_before), 1e-3),
             profiles,
         })
     }
 
     /// Waits from `stopped_at` until every backlog is empty or
     /// [`DRAIN_LIMIT`] passes, and returns the seconds it took (`None` when
-    /// the limit passed), the last backlog read, and every replica's final
-    /// scrape.
+    /// the limit passed first, including a first empty read after it), the
+    /// last backlog read, and every replica's final scrape.
     ///
     /// # Errors
     ///
     /// Returns a scrape or query failure.
+    ///
+    /// # Cancellation
+    ///
+    /// Read-only: dropping it leaves the backlogs to drain on their own.
     async fn drain(
         &self,
         stopped_at: Instant,
@@ -250,14 +412,11 @@ impl Deployment {
                 scribe: scribe_backlog(&scrapes),
                 ..self.queue.backlog(since, stopped, activations).await?
             };
-            let elapsed = stopped_at.elapsed();
-            if backlog.is_empty() {
-                return Ok((Some(elapsed.as_secs_f64()), backlog, scrapes));
+            match Drain::judge(stopped_at.elapsed(), backlog.is_empty()) {
+                Drain::Drained(seconds) => return Ok((Some(seconds), backlog, scrapes)),
+                Drain::Expired => return Ok((None, backlog, scrapes)),
+                Drain::Pending => tokio::time::sleep(POLL).await,
             }
-            if elapsed >= DRAIN_LIMIT {
-                return Ok((None, backlog, scrapes));
-            }
-            tokio::time::sleep(POLL).await;
         }
     }
 
@@ -307,10 +466,6 @@ impl Deployment {
                 *record.errors.entry("lost".to_owned()).or_default() +=
                     tally.accepted - runs.created;
             }
-            if runs.created > tally.accepted {
-                *record.errors.entry("duplicate run".to_owned()).or_default() +=
-                    runs.created - tally.accepted;
-            }
             for (status, count) in &runs.statuses {
                 if !matches!(
                     status.as_str(),
@@ -344,7 +499,7 @@ impl Deployment {
             let directory = root
                 .join(format!(
                     "{}-{}-replicas-{}",
-                    plan.name,
+                    plan.name.label(),
                     plan.level,
                     self.replicas.len()
                 ))
@@ -367,4 +522,56 @@ fn within(completions: &[Duration], window: Duration) -> u64 {
 /// The shared driver permits.
 pub fn permits() -> Arc<Semaphore> {
     Arc::new(Semaphore::new(MAX_IN_FLIGHT))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    use super::{DRAIN_LIMIT, Drain, Resources};
+
+    /// A backlog seen empty below or exactly at the 60 s limit drains; one
+    /// first seen empty after it expires, as does a non-empty read at it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a read is judged wrongly.
+    #[test]
+    fn a_backlog_drains_only_within_the_limit() {
+        let below = DRAIN_LIMIT - Duration::from_millis(100);
+        assert_eq!(
+            Drain::judge(below, true),
+            Drain::Drained(below.as_secs_f64())
+        );
+        assert_eq!(Drain::judge(below, false), Drain::Pending);
+        assert_eq!(Drain::judge(DRAIN_LIMIT, true), Drain::Drained(60.0));
+        assert_eq!(Drain::judge(DRAIN_LIMIT, false), Drain::Expired);
+        let above = DRAIN_LIMIT + Duration::from_millis(100);
+        assert_eq!(Drain::judge(above, true), Drain::Expired);
+    }
+
+    /// Cores divide the CPU delta by the interval between the two readings
+    /// whose instants bound the memory peak too, not by any planned window.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the arithmetic is wrong.
+    #[test]
+    fn resources_use_the_readings_interval() {
+        let opened = Instant::now();
+        let closed = opened + Duration::from_millis(2_500);
+        let resources = Resources::between(1, (opened, 1_000_000), (closed, 6_000_000), 42);
+        assert_eq!(resources.replica, 1);
+        assert!((resources.seconds - 2.5).abs() < 1e-9);
+        assert!((resources.cores - 2.0).abs() < 1e-9);
+        assert_eq!(resources.peak_memory, 42);
+        assert!(
+            Resources::between(0, (opened, 5), (opened, 9), 0)
+                .cores
+                .abs()
+                < f64::EPSILON
+        );
+    }
 }

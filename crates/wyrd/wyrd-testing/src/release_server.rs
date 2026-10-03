@@ -61,8 +61,9 @@ const READY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long the server may take to exit after `SIGTERM`: the kind pods'
 /// `terminationGracePeriodSeconds`, 10 s beyond the server's default 35 s
-/// shutdown drain budget.
-const STOP_GRACE: Duration = Duration::from_secs(45);
+/// shutdown drain budget. A benchmark that bounds its own lifetime reserves
+/// this much per replica for [`LocalServer::stop`].
+pub const STOP_GRACE: Duration = Duration::from_secs(45);
 
 /// Why starting, observing, or stopping the release server failed.
 #[derive(Debug, thiserror::Error)]
@@ -504,8 +505,10 @@ impl MemoryPeak {
 pub struct Metrics(BTreeMap<String, f64>);
 
 impl Metrics {
-    /// Parses a Prometheus text exposition, skipping comments.
-    fn parse(exposition: &str) -> Self {
+    /// Parses a Prometheus text exposition, skipping comments. Scrapes come
+    /// from [`LocalServer::metrics`]; tests of scrape consumers build one
+    /// from literal text.
+    pub fn parse(exposition: &str) -> Self {
         Self(
             exposition
                 .lines()

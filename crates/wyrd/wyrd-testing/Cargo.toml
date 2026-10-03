@@ -142,14 +142,6 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-client-reqwest",
 ] }
 
-# The opt-in single-pod query capacity benchmark. Run only through
-# `mise run bench:bifrost:query-capacity`; only its unit tests run in a lane,
-# with the crate's other tests.
-[[bin]]
-name = "bifrost_query_capacity"
-path = "src/bin/bifrost_query_capacity/main.rs"
-bench = false
-
 # The opt-in server capacity benchmark (REQ-171). Run only through
 # `mise run bench:capacity`; only its unit tests run in a lane, with the
 # crate's other tests.

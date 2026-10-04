@@ -242,20 +242,38 @@ owners named above. It must use the same Postgres/RustFS wrappers as
 `bench:verification:capacity`, generating real Iceberg commits
 and physical rewrites, not a spin loop or higher test-thread count.
 
-**GREEN.** Measure separate event, selection, RPC/catalog and worker stages.
-Run a fixed 10,000 tracked-table / 1,000 due-table scheduling case with 32
-concurrent pullers: p99 warm commit-state update and p99 in-memory pull
-selection must each stay below 1,000 microseconds on the declared host.
-Then run real worker-bound rewrites over at least 128 independent eligible
-tables with one leader and 1, 2 and 4 identical compactor replicas. Under
-steady backlog, 2-worker and 4-worker completion rates must reach at least
-1.7x and 3.0x the one-worker rate, respectively; leader CPU must stay below
-70%, and workers must be at least 85% occupied. Record object-store and
-Postgres utilization so another saturated dependency cannot be mistaken for
-a leader bottleneck. Selection uses the sorted due index approved in the
-REQ-009 revision of 2026-10-03; a missed latency target is a failed capacity
-gate. Report repeated p50/p99 and throughput
-measurements, not one favorable run.
+**GREEN.** (Revised 2026-10-03 with the human owner; replaces the 32-puller
+hammer and the 85% occupancy gate.) Follow the Bifrost capacity benchmarks'
+structure (`LocalServer`, release cloud build, RustFS and test Postgres, a
+systemd scope per process, reports under `target/`). The declared host has
+16 CPUs; all Wyrd processes together stay within 8 CPU / 16 GiB: the leader
+runs in a 1 CPU / 2 GiB scope and each dedicated compactor in a
+1.5 CPU / 3 GiB scope, so the 4-worker step uses 7 CPU / 14 GiB and every
+step adds identical capacity. Postgres and RustFS run outside the envelope
+and their utilization is recorded. Host load is recorded before each run;
+a run whose host load exceeds the envelope's 8 CPUs is discarded and
+repeated, not reported.
+
+1. *Leader decision latency.* Measured from the leader's own
+   `bifrost_forge_leader_decision_seconds{operation}` and the in-process
+   schedule case with 10,000 tracked / 1,000 due tables. Pulls arrive
+   open-loop at the production rate (each of 32 workers every five seconds)
+   and at 10x, then in increasing steps until the p99 bends; report the knee.
+   p99 commit, pull and report decisions stay below 1,000 microseconds at the
+   production and 10x rates.
+2. *Fleet throughput.* At least 128 independent tables written continuously
+   through Scribe at a production-like rate, with compaction enabled at the
+   default `full` type, the default 1 GiB file target and a realistic commit
+   trigger (not one commit), with one leader and 1, 2 and 4 compactors. No
+   oversized seed is written to lengthen rewrites. 2-worker and 4-worker
+   completion rates reach at least 1.7x and 3.0x one worker; whenever the
+   leader holds due tables, every pull is answered with as many tasks as it
+   requested; leader CPU stays below 70%. The report names the resource that
+   bounds the largest step (compactor CPU, RustFS or Postgres).
+
+Selection uses the sorted due index approved in the REQ-009 revision of
+2026-10-03. Report two qualifying runs' p50/p99 and throughput, not one
+favourable run.
 
 **REFACTOR.** Remove old SQL backlog gauges and full-roster traversal
 metrics whose meanings no longer match the new protocol.

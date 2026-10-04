@@ -272,7 +272,14 @@ unsettled publication and cleanup evidence has a safe owner.
 - AC-007: Superseded concurrent planning code, SQL, metrics, docs and tests
   are removed or rewritten without disabling a failing gate.
 - AC-008: Capacity evidence reports leader decision p50/p99 and worker
-  scale-out, without claiming unmeasured microsecond latency.
+  scale-out, without claiming unmeasured microsecond latency. Revised
+  2026-10-03 with the human owner: Wyrd processes run within 8 CPU / 16 GiB
+  in fixed per-process scopes; leader latency is measured open-loop at
+  production and 10x pull rates from `bifrost_forge_leader_decision_seconds`
+  plus a rate sweep to its knee; fleet throughput uses a production-like
+  Scribe workload at default compaction settings and gates on 1.7x/3.0x
+  scaling, full pull answers under backlog and leader CPU below 70%, naming
+  the bounding resource. The 85% occupancy gate is removed.
 
 ## Deletion and consumer map
 

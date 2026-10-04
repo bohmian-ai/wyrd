@@ -559,7 +559,6 @@ impl ScribeStagingRuntime {
     ///
     /// A publisher that found every claim slot held creates this *before* it
     /// asks for a claim, so a release racing that request still wakes it.
-    #[must_use]
     pub fn claim_released(&self) -> tokio::sync::futures::Notified<'_> {
         self.drivers.released.notified()
     }
@@ -2074,14 +2073,30 @@ mod tests {
                 .expect("claim index")
                 .is_empty()
         );
+        assert_claim_fully_retired(&stage, &hot_sources, &key, &member_ids).await;
+    }
+
+    /// Asserts a restarted stage kept nothing of a retired claim: no staged
+    /// member, no member directory, and no hot-source authority.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stage cannot be rescanned, a member survives the
+    /// rescan or left its directory behind, or an authority is still live.
+    async fn assert_claim_fully_retired(
+        stage: &ScribeHotStage,
+        hot_sources: &crate::scribe::hot_source::ScribeHotSourceRegistry,
+        key: &ScribeAssemblyKey,
+        member_ids: &[StagedMemberId],
+    ) {
         assert!(stage.recover().await.expect("stage rescans").is_empty());
-        for member in &member_ids {
+        for member in member_ids {
             assert!(
-                !stage.member_directory(&key, *member).exists(),
+                !stage.member_directory(key, *member).exists(),
                 "member {member:?} left its directory behind"
             );
         }
-        assert_no_restored_authority_survives(&hot_sources, &key, &member_ids);
+        assert_no_restored_authority_survives(hot_sources, key, member_ids);
     }
 
     /// Removes part of one member directory the way a crash inside its

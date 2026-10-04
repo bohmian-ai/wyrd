@@ -1256,6 +1256,24 @@ impl PersistenceRuntime {
     }
 }
 
+/// Sizes the claim-merge lane from the CPUs the persistence lane leaves free.
+///
+/// Member encoding on the persistence lane and claim merges run at the same
+/// time, so giving merges every effective CPU would oversubscribe the pod by
+/// the persistence lane's width. The lane keeps at least one thread so claims
+/// always progress, and never more than `claim_budget`, since no more merges
+/// can be outstanding at once.
+fn merge_lane_threads(
+    effective_cpu: usize,
+    persistence_threads: usize,
+    claim_budget: usize,
+) -> usize {
+    effective_cpu
+        .saturating_sub(persistence_threads)
+        .max(1)
+        .min(claim_budget.max(1))
+}
+
 /// How a publisher reacts when every claim slot is held and it has no claim
 /// of its own in flight.
 #[derive(Debug, Clone, Copy)]
@@ -1749,8 +1767,8 @@ impl PersistenceWorker {
     /// `staging` pairs the pod's staged lifecycle owner with its claim budget
     /// (the persistence worker count `build_staging` sizes the assembler
     /// with). Also starts the worker's own claim-merge lane: it queues up to
-    /// the budget and runs the budget's merges on at most the pod's effective
-    /// CPUs.
+    /// the budget and runs merges on the effective CPUs the persistence lane
+    /// does not already occupy (see [`merge_lane_threads`]).
     ///
     /// # Panics
     ///
@@ -1766,7 +1784,11 @@ impl PersistenceWorker {
         ),
     ) -> Self {
         let claim_budget = claim_budget.max(1);
-        let merge_threads = claim_budget.min(context.memory.effective_cpu());
+        let merge_threads = merge_lane_threads(
+            context.memory.effective_cpu(),
+            context.persistence_cpu.thread_count(),
+            claim_budget,
+        );
         Self {
             operator_pool,
             failures,
@@ -2532,6 +2554,32 @@ async fn finish_visibility_publication(
 
 #[cfg(test)]
 mod tests {
+    /// The claim-merge lane takes the CPUs the persistence lane leaves free.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the merge lane oversubscribes the pod, drops below one
+    /// thread, or exceeds the claim budget.
+    #[test]
+    fn merge_lane_threads_leave_the_persistence_lane_its_cpus() {
+        assert_eq!(
+            super::merge_lane_threads(8, 2, 4),
+            4,
+            "capped by the budget"
+        );
+        assert_eq!(super::merge_lane_threads(8, 6, 4), 2, "only the free CPUs");
+        assert_eq!(
+            super::merge_lane_threads(2, 2, 4),
+            1,
+            "never below one thread"
+        );
+        assert_eq!(
+            super::merge_lane_threads(4, 0, 0),
+            1,
+            "an empty budget still merges"
+        );
+    }
+
     use super::*;
     use std::future::Future;
     use std::panic::AssertUnwindSafe;

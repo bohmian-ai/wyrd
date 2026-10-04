@@ -29,8 +29,9 @@
 //! the member set, so the retry re-derives the same claim and resumes it. A
 //! back edge would let the same members be published under two identities.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -546,13 +547,22 @@ impl StagedMember {
 pub struct ScribeHotStage {
     /// Root of the governed durable staging namespace.
     root: PathBuf,
+    /// Key directories whose entry in `root` this process has synced.
+    ///
+    /// Key directories are created once and never removed, so one root sync
+    /// per key makes every later record under it reachable after a crash.
+    /// Clones share the set because they share the root.
+    synced_keys: Arc<Mutex<HashSet<[u8; 32]>>>,
 }
 
 impl ScribeHotStage {
     /// Binds the owner to one durable staging root.
     #[must_use]
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            synced_keys: Arc::default(),
+        }
     }
 
     /// Returns the governed root every staged file lives under.
@@ -579,8 +589,11 @@ impl ScribeHotStage {
     /// The runs it names must already be fsynced in the member directory. The
     /// record is written to `.tmp`, fsynced, renamed, and both the member and
     /// key directories are fsynced, so a crash at any point leaves either no
-    /// record or a complete one. This is the write half of the first durable
-    /// boundary: after it returns, the member's rows survive without the WAL.
+    /// record or a complete one. The first record this process publishes under
+    /// a key also fsyncs the staging root, so the key directory's own entry is
+    /// durable before any member in it is reported durable. This is the write
+    /// half of the first durable boundary: after it returns, the member's rows
+    /// survive without the WAL.
     ///
     /// # Errors
     ///
@@ -604,7 +617,38 @@ impl ScribeHotStage {
         if let Some(parent) = directory.parent() {
             fsync_directory(parent).await?;
         }
+        self.sync_key_entry(key).await?;
         Ok(final_path)
+    }
+
+    /// Fsyncs the staging root the first time this process publishes under
+    /// `key`.
+    ///
+    /// The key is marked only after the sync succeeds, so concurrent first
+    /// publications may each sync the root but none returns before one sync
+    /// completed. The set holds plain digests and every critical section is a
+    /// single lookup or insert, so a poisoned lock is recovered rather than
+    /// refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotStageError::Io`] when the root cannot be opened or synced;
+    /// the key stays unmarked so the next publication retries the sync.
+    async fn sync_key_entry(&self, key: &ScribeAssemblyKey) -> Result<(), HotStageError> {
+        let digest = key.digest();
+        let synced = self
+            .synced_keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&digest);
+        if !synced {
+            fsync_directory(&self.root).await?;
+            self.synced_keys
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(digest);
+        }
+        Ok(())
     }
 
     /// Moves one staged member forward to its next lifecycle state.
@@ -1384,6 +1428,63 @@ mod tests {
         assert!(
             matches!(missing, HotStageError::MissingRun { .. }),
             "unexpected refusal: {missing}"
+        );
+    }
+
+    /// The first record published under a key also syncs the staging root.
+    ///
+    /// A member's record is durable only if every directory entry on its path
+    /// is: the record in its member directory, the member directory in its key
+    /// directory, and the key directory in the staging root. Key directories
+    /// are created once and never removed, so the root is synced once per key
+    /// rather than on every publication.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture write or publication is refused, or when a
+    /// publication issues a different number of syncs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_first_record_of_a_key_syncs_the_staging_root_once() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let syncs = || {
+            recorder
+                .snapshot()
+                .counters
+                .get(super::STAGE_FSYNCS_TOTAL)
+                .copied()
+                .unwrap_or(0)
+        };
+        let directory = tempfile::tempdir().expect("staging root");
+        let stage = ScribeHotStage::new(directory.path().join("hot-stage"));
+        let key = fixture_key();
+        let mut costs = Vec::new();
+        for generation in 0..2 {
+            let member = StagedMemberId::new(1, generation);
+            let run = write_run(
+                &stage.member_directory(&key, member),
+                "run-0.parquet",
+                b"member-bytes",
+            )
+            .await;
+            let record = StagedHotSourceRecordV1::ready(
+                &key,
+                member,
+                StagedLsnRange { min: 1, max: 1 },
+                vec![run],
+                ready_at(),
+            );
+            let before = syncs();
+            stage
+                .publish_record(&key, &record)
+                .await
+                .expect("the record publishes");
+            costs.push(syncs() - before);
+        }
+        assert_eq!(
+            costs,
+            vec![4, 3],
+            "the record, member, and key directories sync every time; the root only for a new key"
         );
     }
 

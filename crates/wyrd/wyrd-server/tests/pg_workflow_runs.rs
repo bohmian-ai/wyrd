@@ -46,6 +46,12 @@ const RUNNER_ROLE: &str = "workflow_runner";
 /// Provider key the tenant administrator submits for the gateway deployment.
 const PROVIDER_KEY: &str = "sk-workflow-upstream";
 
+/// Google Cloud project of the Vertex deployment.
+const VERTEX_PROJECT: &str = "acme";
+
+/// Google Cloud region of the Vertex deployment.
+const VERTEX_LOCATION: &str = "us-central1";
+
 /// Header every `/v1` route reads the caller's access token from.
 const ACCESS_TOKEN_HEADER: &str = "x-wyrd-access-token";
 
@@ -127,6 +133,10 @@ impl Upstream {
             .route("/v1/responses", axum::routing::post(respond))
             .route("/v1/messages", axum::routing::post(message))
             .route("/v1beta/models/{call}", axum::routing::post(generate))
+            .route(
+                "/v1/projects/{project}/locations/{location}/publishers/google/models/{call}",
+                axum::routing::post(generate),
+            )
             .with_state(Arc::clone(&script));
         tokio::spawn(async move { axum::serve(listener, app).await });
         Self { url, script }
@@ -292,14 +302,15 @@ async fn message(
     }))
 }
 
-/// Answer one Gemini `generateContent` request with the next scripted text.
+/// Answer one Gemini or Vertex `generateContent` request, recorded under its
+/// own path, with the next scripted text.
 async fn generate(
     State(script): State<Arc<Script>>,
-    axum::extract::Path(call): axum::extract::Path<String>,
+    uri: axum::http::Uri,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Json<Value> {
-    let message = answer(&script, format!("/v1beta/models/{call}"), &headers, body).await;
+    let message = answer(&script, uri.path().to_owned(), &headers, body).await;
     Json(json!({
         "candidates": [{ "content": { "role": "model", "parts": [{ "text": content(&message) }] },
                          "finishReason": "STOP", "index": 0 }],
@@ -486,7 +497,8 @@ impl Fixture {
 
     /// Submit [`PROVIDER_KEY`] as the `{provider}-key` credential and one
     /// built-in `provider` deployment of `model` serving `capabilities`,
-    /// authenticated by `header`, as the administrator.
+    /// authenticated by `header`, as the administrator. A `vertex`
+    /// deployment is placed in [`VERTEX_PROJECT`] at [`VERTEX_LOCATION`].
     ///
     /// # Panics
     /// Panics when either administration request is refused.
@@ -494,6 +506,11 @@ impl Fixture {
         let token = self.token(&self.admin).await;
         let credential = format!("{provider}-key");
         let name = model.replace('.', "-");
+        let adapter = if provider == "vertex" {
+            json!({ "vertex": { "project": VERTEX_PROJECT, "location": VERTEX_LOCATION } })
+        } else {
+            json!(provider)
+        };
         let auth = if header == "authorization" {
             json!({ "bearer": { "credential": credential } })
         } else {
@@ -513,7 +530,7 @@ impl Fixture {
                 json!({
                     "name": name,
                     "model": { "provider": provider, "model": model },
-                    "adapter": provider,
+                    "adapter": adapter,
                     "auth": auth,
                     "capabilities": capabilities,
                     "routing_weight": 1,
@@ -2193,8 +2210,9 @@ async fn declared_tools_use_captured_scopes_and_owned_services() {
 /// its tenant-assigned binding with the binding's secret header and no
 /// gateway key, ledger entry, or decision. A binding assigned to another
 /// tenant is unavailable before any call, and no secret reaches a run.
-/// Anthropic Messages, Gemini `generateContent`, and `OpenAI` Responses
-/// Prompts each reach their own provider path and decode their own answer;
+/// Anthropic Messages, Gemini and Vertex `generateContent`, and `OpenAI`
+/// Responses Prompts each reach their own provider path and decode their own
+/// answer, a stored Vertex Prompt staying Vertex despite its Gemini shape;
 /// a deployment lacking the operation is refused before any provider call;
 /// concurrent steps each keep their own stored fallback order; a call is
 /// bounded by its run's remaining time; and cancelling one run leaves a
@@ -2330,6 +2348,14 @@ async fn server_routes_keep_gateway_and_external_ownership() {
             &["chat_completions", "responses"],
         )
         .await;
+    fixture
+        .deploy_model(
+            "vertex",
+            "authorization",
+            "gemini-2.5-pro",
+            &["chat_completions"],
+        )
+        .await;
     let invoke = |provider: &str| {
         Permission::gateway_invoke(GatewayAccess::Provider {
             provider: provider.parse().expect("provider id"),
@@ -2345,6 +2371,7 @@ async fn server_routes_keep_gateway_and_external_ownership() {
                 invoke("openai"),
                 invoke("anthropic"),
                 invoke("gemini"),
+                invoke("vertex"),
             ],
         )
         .await
@@ -2369,6 +2396,11 @@ async fn server_routes_keep_gateway_and_external_ownership() {
             "responses-review",
             "  provider: openai\n  model: gpt-5-4\n  operation: responses\n",
             "/v1/responses",
+        ),
+        (
+            "vertex-review",
+            "  provider: vertex\n  model: gemini-2.5-pro\n",
+            "/v1/projects/acme/locations/us-central1/publishers/google/models/gemini-2.5-pro:generateContent",
         ),
     ] {
         let bundle = declared_review(

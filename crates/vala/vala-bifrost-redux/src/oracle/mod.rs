@@ -511,6 +511,8 @@ impl OracleTelemetry {
                 "oracle_query_partitions_scanned_total",
                 "oracle_query_row_groups_scanned_total",
                 "oracle_query_row_groups_pruned_total",
+                "oracle_query_row_groups_pruned_bloom_total",
+                "oracle_query_rows_pruned_page_index_total",
             ] {
                 metrics::counter!(family, "class" => class).increment(0);
             }
@@ -746,12 +748,22 @@ impl QueryTelemetryGuard {
             "oracle_query_row_groups_scanned_total",
             "class" => query_class_label(self.query_class)
         )
-        .increment(self.scan_stats.row_groups_scanned);
+        .increment(self.scan_stats.pruning.row_groups_scanned);
         metrics::counter!(
             "oracle_query_row_groups_pruned_total",
             "class" => query_class_label(self.query_class)
         )
-        .increment(self.scan_stats.row_groups_pruned);
+        .increment(self.scan_stats.pruning.row_groups_pruned);
+        metrics::counter!(
+            "oracle_query_row_groups_pruned_bloom_total",
+            "class" => query_class_label(self.query_class)
+        )
+        .increment(self.scan_stats.pruning.row_groups_pruned_bloom);
+        metrics::counter!(
+            "oracle_query_rows_pruned_page_index_total",
+            "class" => query_class_label(self.query_class)
+        )
+        .increment(self.scan_stats.pruning.rows_pruned_page_index);
         if let Some(bytes) = self.scan_stats.physical_bytes_scanned {
             metrics::counter!(
                 "oracle_query_bytes_scanned_total",

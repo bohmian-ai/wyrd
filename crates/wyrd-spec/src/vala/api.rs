@@ -2147,8 +2147,14 @@ pub struct WorkerScanStats {
     pub row_groups_scanned: u64,
     /// Row groups the follower excluded by closed-predicate statistics
     /// pruning, reported alongside `row_groups_scanned` so an operator can see
-    /// how much a pushed-down predicate actually saved.
+    /// how much a pushed-down predicate actually saved. Counts every excluded
+    /// row group, whether statistics or a Bloom filter excluded it.
     pub row_groups_pruned: u64,
+    /// Subset of `row_groups_pruned` that a Bloom filter excluded after
+    /// min/max statistics retained the row group.
+    pub row_groups_pruned_bloom: u64,
+    /// Rows inside retained row groups that page-index row selection skipped.
+    pub rows_pruned_page_index: u64,
 }
 
 /// Verified worker footer for one completed attempt.

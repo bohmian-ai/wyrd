@@ -998,8 +998,10 @@ impl FollowerScanEvidence {
             bytes_scanned: self.0.physical_bytes_scanned,
             files_scanned: self.0.files_scanned,
             partitions_scanned: self.0.partitions_scanned,
-            row_groups_scanned: self.0.row_groups_scanned,
-            row_groups_pruned: self.0.row_groups_pruned,
+            row_groups_scanned: self.0.pruning.row_groups_scanned,
+            row_groups_pruned: self.0.pruning.row_groups_pruned,
+            row_groups_pruned_bloom: self.0.pruning.row_groups_pruned_bloom,
+            rows_pruned_page_index: self.0.pruning.rows_pruned_page_index,
         }
     }
 }

@@ -532,6 +532,7 @@ impl TryFrom<proto::ScanLiteral> for assignment_authority::ScanLiteral {
             Value::F64BitsValue(inner) => Ok(Self::F64Bits(inner)),
             Value::Utf8Value(inner) => Ok(Self::Utf8(inner)),
             Value::TimestampMicrosValue(inner) => Ok(Self::TimestampMicros(inner)),
+            Value::BytesValue(inner) => Ok(Self::Bytes(inner)),
         }
     }
 }
@@ -549,6 +550,7 @@ impl From<assignment_authority::ScanLiteral> for proto::ScanLiteral {
             assignment_authority::ScanLiteral::TimestampMicros(inner) => {
                 Value::TimestampMicrosValue(inner)
             }
+            assignment_authority::ScanLiteral::Bytes(inner) => Value::BytesValue(inner),
         };
         Self { value: Some(value) }
     }
@@ -1060,6 +1062,8 @@ impl From<proto::WorkerScanStats> for domain::WorkerScanStats {
             partitions_scanned: value.partitions_scanned,
             row_groups_scanned: value.row_groups_scanned,
             row_groups_pruned: value.row_groups_pruned,
+            row_groups_pruned_bloom: value.row_groups_pruned_bloom,
+            rows_pruned_page_index: value.rows_pruned_page_index,
         }
     }
 }
@@ -1073,6 +1077,8 @@ impl From<domain::WorkerScanStats> for proto::WorkerScanStats {
             partitions_scanned: value.partitions_scanned,
             row_groups_scanned: value.row_groups_scanned,
             row_groups_pruned: value.row_groups_pruned,
+            row_groups_pruned_bloom: value.row_groups_pruned_bloom,
+            rows_pruned_page_index: value.rows_pruned_page_index,
         }
     }
 }
@@ -1700,6 +1706,8 @@ mod tests {
                 partitions_scanned: 2,
                 row_groups_scanned: 5,
                 row_groups_pruned: 7,
+                row_groups_pruned_bloom: 3,
+                rows_pruned_page_index: 11,
             },
         });
         let actual =
@@ -1737,6 +1745,10 @@ mod tests {
             assignment_authority::ScanPredicate::GtEq(
                 "active".into(),
                 assignment_authority::ScanLiteral::Bool(true),
+            ),
+            assignment_authority::ScanPredicate::Eq(
+                "trace_id".into(),
+                assignment_authority::ScanLiteral::Bytes(vec![0xff, 0x00, 0x7f]),
             ),
             assignment_authority::ScanPredicate::IsNull("optional_field".into()),
             assignment_authority::ScanPredicate::IsNotNull("required_field".into()),

@@ -17,10 +17,12 @@ use sha2::{Digest, Sha256};
 
 /// Closed scalar literal vocabulary for a supported comparison predicate.
 ///
-/// Only these six variants may appear as the literal operand of a supported
+/// Only these seven variants may appear as the literal operand of a supported
 /// leaf predicate. `F64Bits` carries the IEEE-754 bit pattern (via
 /// [`f64::to_bits`]) rather than a raw `f64` so equality, hashing, and the
-/// digest encoding stay exact instead of floating-point-approximate.
+/// digest encoding stay exact instead of floating-point-approximate. `Bytes`
+/// carries a binary or fixed-size binary literal (for example a trace id)
+/// losslessly, so binary identifiers never round-trip through UTF-8.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub enum ScanLiteral {
@@ -36,12 +38,15 @@ pub enum ScanLiteral {
     Utf8(String),
     /// Microsecond-precision UTC timestamp literal.
     TimestampMicros(i64),
+    /// Binary literal compared byte-for-byte against binary and fixed-size
+    /// binary columns.
+    Bytes(Vec<u8>),
 }
 
 impl ScanLiteral {
     /// Returns the digest literal-type tag defined by the assignment-authority
     /// encoding (`Bool` 0, `I64` 1, `U64` 2, `F64Bits` 3, `Utf8` 4,
-    /// `TimestampMicros` 5).
+    /// `TimestampMicros` 5, `Bytes` 6).
     #[must_use]
     pub fn digest_tag(&self) -> u8 {
         match self {
@@ -51,6 +56,7 @@ impl ScanLiteral {
             ScanLiteral::F64Bits(_) => 3,
             ScanLiteral::Utf8(_) => 4,
             ScanLiteral::TimestampMicros(_) => 5,
+            ScanLiteral::Bytes(_) => 6,
         }
     }
 }
@@ -216,10 +222,22 @@ const ASSIGNMENT_AUTHORITY_DOMAIN: &[u8] = b"wyrd.oracle.assignment-authority.v6
 /// Appends a length-prefixed UTF-8 string: a big-endian `u32` byte length
 /// followed by the raw UTF-8 bytes.
 fn push_string(buffer: &mut Vec<u8>, value: &str) -> Result<(), AssignmentDigestError> {
-    let bytes = value.as_bytes();
-    let len = u32::try_from(bytes.len()).map_err(|_| AssignmentDigestError::LengthOverflow {
-        field: "string length",
-    })?;
+    push_bytes(buffer, value.as_bytes(), "string length")
+}
+
+/// Appends a big-endian `u32` byte length followed by the raw bytes.
+///
+/// # Errors
+///
+/// Returns [`AssignmentDigestError::LengthOverflow`] naming `field` when the
+/// slice exceeds the `u32` length domain.
+fn push_bytes(
+    buffer: &mut Vec<u8>,
+    bytes: &[u8],
+    field: &'static str,
+) -> Result<(), AssignmentDigestError> {
+    let len =
+        u32::try_from(bytes.len()).map_err(|_| AssignmentDigestError::LengthOverflow { field })?;
     buffer.extend_from_slice(&len.to_be_bytes());
     buffer.extend_from_slice(bytes);
     Ok(())
@@ -263,6 +281,7 @@ fn push_literal(buffer: &mut Vec<u8>, literal: &ScanLiteral) -> Result<(), Assig
         ScanLiteral::F64Bits(bits) => buffer.extend_from_slice(&bits.to_be_bytes()),
         ScanLiteral::Utf8(value) => push_string(buffer, value)?,
         ScanLiteral::TimestampMicros(value) => buffer.extend_from_slice(&value.to_be_bytes()),
+        ScanLiteral::Bytes(value) => push_bytes(buffer, value, "bytes length")?,
     }
     Ok(())
 }
@@ -1188,6 +1207,18 @@ mod tests {
             ScanLiteral::F64Bits(1.0000001_f64.to_bits()),
         )]);
         assert_ne!(float_baseline, float_mutated);
+
+        // binary literal: distinct from its UTF-8 spelling and from other bytes
+        let bytes_baseline = baseline_digest(&[ScanPredicate::Eq(
+            "service_name".to_string(),
+            ScanLiteral::Bytes(b"api".to_vec()),
+        )]);
+        assert_ne!(baseline, bytes_baseline);
+        let bytes_mutated = baseline_digest(&[ScanPredicate::Eq(
+            "service_name".to_string(),
+            ScanLiteral::Bytes(vec![0xff, 0x00, 0x01]),
+        )]);
+        assert_ne!(bytes_baseline, bytes_mutated);
     }
 
     #[test]

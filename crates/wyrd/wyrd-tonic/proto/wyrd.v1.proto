@@ -210,6 +210,7 @@ message ScanLiteral {
   oneof value {
     bool bool_value = 1; int64 i64_value = 2; uint64 u64_value = 3;
     uint64 f64_bits_value = 4; string utf8_value = 5; int64 timestamp_micros_value = 6;
+    bytes bytes_value = 7;
   }
 }
 message ScanPredicate { ScanPredicateOp op = 1; string column = 2; ScanLiteral literal = 3; }
@@ -250,10 +251,13 @@ message WorkerScanStats {
   // the same as zero, so the leader must not substitute one for the other.
   optional uint64 bytes_scanned = 1;
   uint64 files_scanned = 2; uint64 partitions_scanned = 3;
-  // Row groups retained and excluded by closed-predicate statistics pruning
-  // on the follower. The leader's own plan carries only a remote placeholder,
+  // Row groups retained and excluded by closed-predicate pruning on the
+  // follower; row_groups_pruned_bloom is the Bloom-attributed subset of
+  // row_groups_pruned, and rows_pruned_page_index counts rows page-index
+  // selection skipped inside retained row groups. The leader's own plan carries only a remote placeholder,
   // so these can only be observed where the physical read happened.
   uint64 row_groups_scanned = 4; uint64 row_groups_pruned = 5;
+  uint64 row_groups_pruned_bloom = 6; uint64 rows_pruned_page_index = 7;
 }
 
 message InsertBatchRequest {

@@ -527,9 +527,14 @@ async fn scribe_hot_path_telemetry_reconciles() {
         "the write traces carry each request's batch id"
     );
     print_trace(&written, &writes[0].trace_id, "write_success");
+    // The ambient WYRD_LOG filter decides whether DEBUG spans are captured, so
+    // the level is read from each span rather than inferred from its absence.
+    let wal_appends = spans_named(&written, "bifrost.scribe.wal.append");
     assert!(
-        spans_named(&written, "bifrost.scribe.wal.append").is_empty(),
-        "per-append WAL spans are DEBUG detail, not routine operation traces"
+        wal_appends
+            .iter()
+            .all(|span| attribute(span, "level") == Some("DEBUG")),
+        "per-append WAL spans are DEBUG detail, not routine operation traces: {wal_appends:?}"
     );
     assert_no_routine_info(&written, "a successful write");
 

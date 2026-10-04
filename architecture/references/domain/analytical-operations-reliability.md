@@ -96,7 +96,7 @@ not generate fresh output until prior uncertainty settles.
 - **Manifest rewrite** reorganizes metadata without changing the logical data
   set.
 - **Snapshot expiration** changes retained snapshot reachability under active
-  task and reader watermarks.
+  task watermarks and active Oracle reads.
 - **Expired-file cleanup** deletes objects proven unreachable from retained
   snapshots and advances durable per-object evidence.
 - **Never-published orphan cleanup** handles aged attempt-generation objects
@@ -126,7 +126,7 @@ Measure at minimum:
 - Forge promotion debt, rewrite debt, local FIFO age, estimated and observed
   plan memory, running parallelism, worker loss, attempts, failure class,
   accepted-delete rate, writer estimates and close reasons, commit conflicts,
-  uncertain operations, no-progress refusals, snapshot age, role readiness,
+  uncertain operations, no-progress refusals, active table reads, role readiness,
   and the durable cleanup cursor. Orphan cleanup is measured this way — by its
   own queue age, attempts, failures, and physically deleted objects — and not
   by an orphan-backlog gauge: that number is only knowable by a full storage

@@ -573,11 +573,14 @@ class with no executable capacity on the pod is refused immediately. Public
 HTTP queries bypass the server's global load-shed and request-concurrency
 layers so they reach this queue; gRPC reaches it directly.
 
-Snapshot preparation has no admission gate of its own. Table lookup, reader
-guard, and hot-cut work wait on the bounded runtime PostgreSQL pool; the
-metadata pointer read and revalidation wait on the Iceberg SQL catalog's own
-bounded pool, which pings a reused connection only after it has sat idle. All
-wait within the leader deadline. `oracle_query_phase_seconds` times the
+Snapshot preparation has no admission gate of its own. One tenant-scoped
+statement on the bounded runtime PostgreSQL pool resolves every referenced
+table, registers one active read per table under the table's maintenance
+authority, and returns each catalog metadata pointer with its hot rows. Oracle
+then reads the selected metadata documents directly and concurrently; a
+document missing after a catalog move reacquires the whole cut once, and a
+second `NotFound` is terminal. The active reads live until the leader settles
+every descendant fragment, and all of this waits within the leader deadline. `oracle_query_phase_seconds` times the
 leader's sequential, non-overlapping steps — `snapshot_pin` (covering every
 preparation substep above), `scribe_listing`, `provider_setup`,
 `physical_planning`, and `admission` — so they may be read as additive; total
@@ -858,14 +861,17 @@ or contradictory lineage evidence fails closed.
 Data-file compaction, manifest rewriting, snapshot expiration, expired-object
 cleanup, and never-published orphan cleanup are separate protocols. The leader
 timer orders them per pass as manifest rewrite, snapshot expiry, then cleanup.
-Expiry's age cutoff (24 hours by default) never passes the snapshot an
-in-flight compaction observed, and a table whose in-flight task observed none
-is skipped; snapshot expiration preserves active refs, unresolved attempts, reconciliation evidence,
-and the lineage snapshot referenced by the branch head. Orphan GC deletes only
+Expiry has no age or retain-last window: a replaced snapshot is eligible as
+soon as no active Oracle read, in-flight compaction, unsettled promotion, or
+other authoritative root retains it. A table with an active read is skipped;
+snapshot expiration preserves active refs, unresolved attempts, reconciliation
+evidence, and the lineage snapshot referenced by the branch head. Orphan GC deletes only
 objects proven unreferenced and outside every active or uncertain attempt.
 Committed Scribe hot objects in `file_list` that lack exact promotion evidence,
-and objects retained by a pinned Oracle cut, are hard GC roots even when no
-Iceberg snapshot references them.
+and objects of a table with an active Oracle read, are hard GC roots even
+when no Iceberg snapshot references them. Once the last reader releases,
+expired-object cleanup deletes without an age floor and removes the matching
+terminal `file_list` row in the same completion transaction.
 An open Scribe fragment retains its local Arrow batches and staged resources
 until its stream completes or drops. It names no Forge-collectable object and
 contributes no independent Forge GC root.

@@ -95,15 +95,16 @@ change. Per-table Iceberg properties control the work:
 | --- | --- | --- |
 | `wyrd.forge.enable-compaction` | `true` | Automatic data-file compaction. On for every table, including built-in tables; set `false` to turn it off. |
 | `wyrd.forge.compaction.type` | `small-files` | How the worker selects files: `small-files`, `full`, `files-with-delete`, or `auto`. A `copy-on-write` table always compacts `full`. |
-| `wyrd.forge.enable-snapshot-expiration` | `true` | Expires snapshots older than retention (24 hours by default). |
+| `wyrd.forge.enable-snapshot-expiration` | `true` | Expires replaced snapshots as soon as no active query or other root retains them. |
 | `wyrd.forge.enable-manifest-rewrite` | `false` | Merges small manifests before expiry. Format-v3 tables are skipped. |
 | `commit.manifest.target-size-bytes` | 8 MiB | Manifest-rewrite target size. |
 | `commit.manifest.min-count-to-merge` | 100 | Minimum small manifests that trigger a merge. |
 
 Snapshot expiry never moves past the snapshot an in-flight compaction
 observed, and skips a table whose in-flight task observed none. The worker's
-final check still protects Oracle reader pins, unresolved operations, and the
-current head before anything is deleted.
+final check still protects tables with active Oracle reads, unresolved
+operations, and the current head before anything is deleted. When the last
+query reading a table finishes, its replaced objects become eligible at once.
 
 The lease scope is:
 

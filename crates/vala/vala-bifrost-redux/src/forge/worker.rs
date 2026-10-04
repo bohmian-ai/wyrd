@@ -2070,6 +2070,9 @@ impl ForgeWorker {
     /// itself: a durable healthy-worker registration, and a complete recovery
     /// drain of every `Prepared` attempt and lapsed claim it already owns.
     /// Readiness is published by the caller only when this returns `true`.
+    /// The start is logged with this worker's local admission bounds, which
+    /// the composition derived from the node's effective CPU, so an operator
+    /// can confirm the bounds a cgroup quota produced.
     ///
     /// # Errors
     ///
@@ -2087,7 +2090,12 @@ impl ForgeWorker {
                 detail: "injected Forge worker registration failure".to_owned(),
             }));
         }
-        tracing::info!(worker = %self.owner, "Forge worker started");
+        tracing::info!(
+            worker = %self.owner,
+            max_task_parallelism = self.config.max_task_parallelism,
+            pending_task_parallelism = self.config.pending_task_parallelism,
+            "Forge worker started"
+        );
         // Readiness is recovery-gated. A Prepared attempt or a lapsed claim is
         // durable evidence a reader can already observe, so this worker
         // resolves all of it before advertising itself and taking new work.

@@ -485,73 +485,53 @@ impl ScribeStagingRuntime {
             .resumable_claims())
     }
 
-    /// Drives every outstanding claim no publisher holds and publication can
-    /// still run again.
+    /// Drives every outstanding claim no publisher holds.
     ///
-    /// A refused publication leaves its claim outstanding with members still
-    /// `Claimed` or already `Publishing`. Both re-run the identical claim:
-    /// the claim identity, the publication operation, the uploaded objects, and
-    /// the fenced `file_list` transaction are all derived from the member set,
-    /// so a replay either commits or recognises its own earlier commit. A claim
-    /// whose members recorded the commit (`Published` or later) has nothing
-    /// left to publish and is left to startup reconciliation.
+    /// An outstanding claim that is not driven is one whose publication was
+    /// refused. Its driver resumes it with [`Self::finish_committed`] first:
+    /// a claim refused after its fenced commit has only retirement left, and a
+    /// claim refused before it re-runs the identical publication — the claim
+    /// identity, the publication operation, the uploaded objects, and the
+    /// fenced `file_list` transaction are all derived from the member set, so
+    /// a replay either commits or recognises its own earlier commit.
     ///
-    /// Each claim is marked driven under the ready-index lock before its
-    /// records are read, so a claim another publisher is driving — still in
-    /// flight, not refused — is never returned. Claims that turn out not to be
-    /// retryable are released again.
+    /// Each claim is marked driven under the ready-index lock, so a claim
+    /// another publisher is driving — still in flight, not refused — is never
+    /// returned.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when the ready-index owner is poisoned
-    /// or a claimed member's durable record cannot be read. Every claim driven
-    /// so far is released.
-    pub async fn retryable_claims(&self) -> Result<Vec<DrivenClaim>, ScribeError> {
-        let candidates = {
-            let assembly = self.lock_assembly()?;
-            assembly
-                .resumable_claims()
-                .into_iter()
-                .filter_map(|claim| self.drivers.drive(claim))
-                .collect::<Vec<_>>()
-        };
-        let mut retryable = Vec::with_capacity(candidates.len());
-        for claim in candidates {
-            if self.publication_can_rerun(&claim).await? {
-                retryable.push(claim);
-            }
-        }
-        Ok(retryable)
+    /// Returns [`ScribeError::Internal`] when the ready-index owner is
+    /// poisoned.
+    pub fn retryable_claims(&self) -> Result<Vec<DrivenClaim>, ScribeError> {
+        Ok(self
+            .lock_assembly()?
+            .resumable_claims()
+            .into_iter()
+            .filter_map(|claim| self.drivers.drive(claim))
+            .collect())
     }
 
-    /// Returns whether every member of `claim` is still before its commit.
+    /// Finishes and settles one retried claim whose fenced commit already
+    /// landed, returning `false` when it still has to publish.
+    ///
+    /// The members' durable records decide (see
+    /// [`ClaimPublisher::finish_committed`]); a committed claim's survivors are
+    /// retired and its slot returns to the budget without republishing, so
+    /// publication continues without a restart. Commit counters are not
+    /// incremented here: they count the attempt that observed the commit.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when a member's durable record cannot
-    /// be read.
-    async fn publication_can_rerun(&self, claim: &StagingClaim) -> Result<bool, ScribeError> {
-        for member in claim.members() {
-            let staged = self
-                .stage
-                .member(claim.key(), member.id())
-                .await
-                .map_err(|error| ScribeError::Internal {
-                    detail: format!(
-                        "read staged member {}-{} before resuming its claim: {error}",
-                        member.id().shard(),
-                        member.id().generation()
-                    ),
-                })?;
-            if !matches!(
-                staged.record().state(),
-                crate::scribe::hot_stage::StagedMemberState::Ready
-                    | crate::scribe::hot_stage::StagedMemberState::Claimed { .. }
-                    | crate::scribe::hot_stage::StagedMemberState::Publishing { .. }
-            ) {
-                return Ok(false);
-            }
+    /// Returns [`ScribeError::Internal`] when a record cannot be read, the
+    /// survivors contradict a committed claim, retirement is refused, or the
+    /// ready index cannot settle the claim. The claim stays outstanding and the
+    /// next attempt resumes from what the refusal left durable.
+    pub async fn finish_committed(&self, claim: &DrivenClaim) -> Result<bool, ScribeError> {
+        if !self.publisher.finish_committed(claim).await? {
+            return Ok(false);
         }
+        self.settle(claim.id())?;
         Ok(true)
     }
 
@@ -637,11 +617,16 @@ impl ScribeStagingRuntime {
         let mut restored = 0;
         for (key, members) in recovered {
             self.restore_authorities(&key, &members)?;
+            let records = members
+                .iter()
+                .map(crate::scribe::hot_stage::StagedMember::record)
+                .collect::<Vec<_>>();
             let terminal = self
                 .publisher
-                .recover_terminal_members(&key, &members)
+                .recover_terminal_members(&key, &records)
                 .await?;
             let mut members_to_restore = Vec::with_capacity(members.len());
+            let mut kept = Vec::with_capacity(members.len());
             for member in &members {
                 if member
                     .record()
@@ -658,9 +643,10 @@ impl ScribeStagingRuntime {
                     continue;
                 };
                 members_to_restore.push(recovered);
+                kept.push(member);
             }
             if !members_to_restore.is_empty() {
-                let context = self.restore_context(pool, &key, &members).await?;
+                let context = self.restore_context(pool, &key, &kept).await?;
                 restored += members_to_restore.len();
                 self.lock_assembly()?
                     .restore(&key, members_to_restore)
@@ -751,6 +737,11 @@ impl ScribeStagingRuntime {
 
     /// Reconstructs one recovered key's encoding context, or fails closed.
     ///
+    /// `members` are the members restore keeps. The schema is read from their
+    /// runs only: a key can also hold the leftovers of a claim that already
+    /// committed, and restore has removed those members' runs by the time it
+    /// rebuilds the key.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the key names no run to read the
@@ -761,11 +752,11 @@ impl ScribeStagingRuntime {
         &self,
         pool: &sqlx::PgPool,
         key: &ScribeAssemblyKey,
-        members: &[crate::scribe::hot_stage::StagedMember],
+        members: &[&crate::scribe::hot_stage::StagedMember],
     ) -> Result<ClaimContext, ScribeError> {
         let run = members
             .iter()
-            .flat_map(crate::scribe::hot_stage::StagedMember::run_paths)
+            .flat_map(|member| member.run_paths())
             .next()
             .ok_or_else(|| ScribeError::Internal {
                 detail: "a recovered staged key names no run to read its schema from".to_owned(),
@@ -1581,11 +1572,7 @@ mod tests {
             .expect("the ready key releases a residue claim")
             .expect("a residue claim is due");
         assert!(
-            runtime
-                .retryable_claims()
-                .await
-                .expect("retry sweep")
-                .is_empty(),
+            runtime.retryable_claims().expect("retry sweep").is_empty(),
             "a claim still in flight is never offered for retry"
         );
         assert!(
@@ -1602,7 +1589,7 @@ mod tests {
         drop(claim);
         released.await;
         assert!(runtime.drives_no_claims());
-        let retried = runtime.retryable_claims().await.expect("retry sweep");
+        let retried = runtime.retryable_claims().expect("retry sweep");
         assert_eq!(
             retried.iter().map(|claim| claim.id()).collect::<Vec<_>>(),
             vec![id],
@@ -1611,7 +1598,6 @@ mod tests {
         assert!(
             runtime
                 .retryable_claims()
-                .await
                 .expect("second retry sweep")
                 .is_empty(),
             "a retried claim is driven by its one retrier"
@@ -1941,7 +1927,7 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the stage refuses any member's transition.
-    async fn move_claim(
+    pub(super) async fn move_claim(
         stage: &ScribeHotStage,
         key: &ScribeAssemblyKey,
         member_ids: &[StagedMemberId],
@@ -2164,12 +2150,179 @@ mod tests {
     async fn a_claim_crashed_inside_one_member_removal_retires_on_restart() {
         recovers_claim_interrupted_between_batched_states(true, 1, true).await;
     }
+
+    /// A live claim refused inside its removal is finished by its next driver,
+    /// without a restart and without republishing.
+    ///
+    /// Four members are staged under a pod authority registry. Retried while
+    /// still `Claimed`, the claim is not finished: nothing proves a commit, so
+    /// it must publish again. The members are then moved through the commit to
+    /// `CleanupPending` with their authority on the published object, and the
+    /// removal is interrupted the way a refused attempt leaves it: one member
+    /// removed and released, one removed but still registered, one left
+    /// without its runs, one left whole. The retried claim must finish —
+    /// every survivor retired, every authority released, its slot back in the
+    /// budget — through the lazy, never-connected pool, which proves nothing
+    /// was committed again.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot stage or drive the claim, when the
+    /// pre-commit claim is finished, or when the committed claim is not
+    /// finished, keeps its slot, or leaves a member, directory, or authority.
+    #[tokio::test]
+    async fn a_live_claim_refused_inside_its_removal_finishes_without_republication() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let stage_root = root.path().join("stage");
+        let wal_root = root.path().join("member-wal");
+        for path in [&stage_root, &wal_root] {
+            std::fs::create_dir_all(path).expect("fixture directory");
+        }
+        let node_id = NodeId::new(uuid::Uuid::from_u128(0xf1e));
+        let tenant = DataTenantId::new_v7();
+        let seal_key = frozen_member(tenant, 1, 1).seal_key;
+        let hot_sources = Arc::new(crate::scribe::hot_source::ScribeHotSourceRegistry::new());
+        for shard in 1..=4_u8 {
+            hot_sources
+                .register_memtable(
+                    &seal_key,
+                    crate::scribe::hot_source::GenerationOrdinal::new(
+                        u16::from(shard),
+                        u64::from(shard),
+                    ),
+                )
+                .expect("memtable generation registers");
+        }
+        let stage = Arc::new(ScribeHotStage::new(stage_root));
+        let runtime = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            publisher(Arc::clone(&stage), &wal_root, node_id),
+            StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 1)
+                .expect("assembler controls"),
+        )
+        .with_hot_sources(Arc::clone(&hot_sources));
+        let (key, member_ids) =
+            stage_durable_members(&runtime, tenant, node_id, 1..=4, chrono::Utc::now()).await;
+        drop(
+            runtime
+                .take_residue(&key, ClaimCause::Drain)
+                .expect("residue claim")
+                .expect("four members form one claim"),
+        );
+        let mut retried = runtime.retryable_claims().expect("retry sweep");
+        let claim = retried.pop().expect("the refused claim is retried");
+        assert!(
+            !runtime
+                .finish_committed(&claim)
+                .await
+                .expect("pre-commit claim reads"),
+            "a claim with no recorded commit publishes again"
+        );
+
+        interrupt_committed_removal(&stage, &hot_sources, &key, &member_ids, &claim.id()).await;
+        assert!(
+            runtime
+                .finish_committed(&claim)
+                .await
+                .expect("the committed claim finishes"),
+            "a claim whose members recorded the commit is finished, not republished"
+        );
+        drop(claim);
+        assert!(runtime.resumable_claims().expect("claim index").is_empty());
+        assert_eq!(
+            runtime.backlog().expect("backlog").outstanding_claims,
+            0,
+            "the finished claim returns its slot to the budget"
+        );
+        assert_claim_fully_retired(&stage, &hot_sources, &key, &member_ids).await;
+    }
+
+    /// Leaves a claim the way a publication refused inside its removal does.
+    ///
+    /// Every member is moved through `Publishing`, `Published`, and
+    /// `CleanupPending` with its authority on the committed object, exactly as
+    /// publication orders it. Then only part of the removal happens: the first
+    /// member is removed and released, the second loses its record but keeps
+    /// its runs and authority, the third keeps its record but loses its runs,
+    /// and the fourth is untouched.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stage refuses a transition or removal, or the registry
+    /// refuses an advance or release.
+    async fn interrupt_committed_removal(
+        stage: &ScribeHotStage,
+        hot_sources: &crate::scribe::hot_source::ScribeHotSourceRegistry,
+        key: &ScribeAssemblyKey,
+        member_ids: &[StagedMemberId],
+        claim: &StagingClaimId,
+    ) {
+        use crate::scribe::hot_stage::StagedMemberState;
+        let claim_id = claim.to_string();
+        let objects = vec![format!("objects/{claim_id}/hot-0.parquet")];
+        let seal_key = SealKey::new(key.tenant(), key.table().clone(), key.partition());
+        let ordinal = |member: &StagedMemberId| {
+            crate::scribe::hot_source::GenerationOrdinal::new(member.shard(), member.generation())
+        };
+        move_claim(stage, key, member_ids, |_| StagedMemberState::Publishing {
+            claim_id: claim_id.clone(),
+            operation_id: uuid::Uuid::from_u128(0xf1e),
+        })
+        .await;
+        for member in member_ids {
+            hot_sources
+                .advance(
+                    &seal_key,
+                    ordinal(member),
+                    crate::scribe::hot_source::HotAuthority::Published {
+                        object_keys: objects.clone(),
+                    },
+                )
+                .expect("authority moves to the committed object");
+        }
+        let ranges = |member: &StagedMemberId| {
+            let shard = u64::from(member.shard());
+            vec![StagedLsnRange {
+                min: shard * 10,
+                max: shard * 10 + 9,
+            }]
+        };
+        move_claim(stage, key, member_ids, |member| {
+            StagedMemberState::Published {
+                claim_id: claim_id.clone(),
+                file_list_commit_key: "node:10:49".to_owned(),
+                published_object_identities: objects.clone(),
+                persisted_lsn_ranges: ranges(member),
+            }
+        })
+        .await;
+        move_claim(stage, key, member_ids, |member| {
+            StagedMemberState::CleanupPending {
+                claim_id: claim_id.clone(),
+                file_list_commit_key: "node:10:49".to_owned(),
+                published_object_identities: objects.clone(),
+                persisted_lsn_ranges: ranges(member),
+            }
+        })
+        .await;
+        stage
+            .retire_all(key, &member_ids[..1])
+            .await
+            .expect("the refused attempt removed one member");
+        hot_sources
+            .release(&seal_key, ordinal(&member_ids[0]))
+            .expect("and released its authority");
+        half_remove(&stage.member_directory(key, member_ids[1]), false);
+        half_remove(&stage.member_directory(key, member_ids[2]), true);
+    }
 }
 
 /// Postgres-backed recovery proofs for the staged backlog gauges.
 #[cfg(test)]
 mod pg_tests {
-    use super::tests::{publisher, runtime_layout, runtime_schema, stage_durable_members};
+    use super::tests::{
+        move_claim, publisher, runtime_layout, runtime_schema, stage_durable_members,
+    };
     use super::*;
     use crate::scribe::stream_identity::NodeId;
     use num_traits::ToPrimitive as _;
@@ -2473,5 +2626,91 @@ mod pg_tests {
                 .expect("claim index")
                 .is_empty()
         );
+    }
+
+    /// A key that holds a finished claim's leftovers beside a live member
+    /// restores, and only the live member comes back.
+    ///
+    /// The finished claim crashed after every member recorded the commit, so
+    /// restore retires those members before it rebuilds the key. A live member
+    /// staged afterwards under the same key must still restore: its encoding
+    /// context has to come from runs restore keeps, never from runs it has
+    /// just removed. The leftovers outnumber the live member four to one, so
+    /// the namespace scan usually lists a retired member first.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot stage or drive the claim, when restore
+    /// refuses the key, or when anything but the live member survives it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_key_with_finished_claim_leftovers_and_a_live_member_restores() {
+        let database = wyrd_dev_fixtures::pg::PgFixture::start()
+            .await
+            .expect("Postgres fixture");
+        register_control_row(&database).await;
+        let tenant = database.data_tenant_id();
+        let root = tempfile::tempdir().expect("runtime root");
+        let stage_root = root.path().join("stage");
+        let wal_root = root.path().join("member-wal");
+        for path in [&stage_root, &wal_root] {
+            std::fs::create_dir_all(path).expect("fixture directory");
+        }
+        let node_id = NodeId::new(uuid::Uuid::from_u128(0x1ef7));
+        let stage = Arc::new(ScribeHotStage::new(stage_root));
+        let config =
+            StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
+                .expect("assembler controls");
+        let runtime = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            publisher(Arc::clone(&stage), &wal_root, node_id),
+            config,
+        );
+        let (key, finished) =
+            stage_durable_members(&runtime, tenant, node_id, 1..=4, chrono::Utc::now()).await;
+        let claim = runtime
+            .take_residue(&key, ClaimCause::Drain)
+            .expect("residue claim")
+            .expect("four members form one claim");
+        let claim_id = claim.id().to_string();
+        move_claim(&stage, &key, &finished, |member| {
+            crate::scribe::hot_stage::StagedMemberState::Published {
+                claim_id: claim_id.clone(),
+                file_list_commit_key: "node:10:49".to_owned(),
+                published_object_identities: vec![format!("objects/{claim_id}/hot-0.parquet")],
+                persisted_lsn_ranges: vec![crate::scribe::hot_stage::StagedLsnRange {
+                    min: u64::from(member.shard()) * 10,
+                    max: u64::from(member.shard()) * 10 + 9,
+                }],
+            }
+        })
+        .await;
+        let (live_key, live) =
+            stage_durable_members(&runtime, tenant, node_id, 5..=5, chrono::Utc::now()).await;
+        assert_eq!(
+            live_key, key,
+            "the live member shares the finished claim's key"
+        );
+        drop(claim);
+        drop(runtime);
+
+        let restarted = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            publisher(Arc::clone(&stage), &wal_root, node_id),
+            config,
+        );
+        let restored = restarted
+            .restore(database.operator_pool().pool())
+            .await
+            .expect("a key with finished-claim leftovers beside a live member restores");
+        assert_eq!(restored, 1, "only the live member is restored");
+        let survivors = stage.recover().await.expect("stage rescans");
+        let kept: Vec<_> = survivors
+            .get(&key)
+            .expect("the live member's key survives")
+            .iter()
+            .map(|member| member.record().member())
+            .collect();
+        assert_eq!(kept, live, "the finished claim's members are retired");
+        assert_eq!(restarted.ready_keys().expect("ready index"), vec![key]);
     }
 }

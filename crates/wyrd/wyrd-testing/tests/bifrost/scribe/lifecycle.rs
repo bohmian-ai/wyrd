@@ -334,6 +334,98 @@ async fn scribe_tick_retries_a_failed_due_claim() {
     server.shutdown().await.expect("the server drains cleanly");
 }
 
+/// A claim that fails after its commit landed is finished by the pod's own
+/// tick, frees its claim slot, and lets publication continue.
+///
+/// The claim's fenced commit lands and every member records it as
+/// `Published`, then retirement fails before any member moves to cleanup.
+/// Nothing but the lifecycle tick runs: no flush, drain, or restart. The tick
+/// must finish the claim from its durable state without publishing its rows
+/// again, return its slot, and publish a second table written afterwards.
+///
+/// # Panics
+///
+/// Panics when the server cannot start, when an append or read fails, when
+/// the injected failure is never reached, when either claim does not settle
+/// within [`IDLE_PUBLICATION_DEADLINE`], when a claim stays outstanding or a
+/// staged member survives, or when a row is lost or duplicated.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn scribe_tick_finishes_a_claim_that_failed_after_its_commit() {
+    let geometry = ScribeGeometry::new(
+        DEFAULT_SHARD_COUNT,
+        DEFAULT_WAL_SEGMENT_BYTES,
+        DEFAULT_GENERATION_ROTATION_BYTES,
+        RETENTION,
+        None,
+        None,
+        DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
+    )
+    .expect("default geometry with a short retention is valid");
+    let faults = PersistenceFaults::default();
+    faults.fail_next_claim_retirement();
+    let server = WyrdTestServer::builder()
+        .with_scribe_geometry_for_test(geometry)
+        .with_scribe_persistence_faults_for_test(faults.clone())
+        .without_audit_publication_for_test()
+        .start_bound()
+        .await
+        .expect("the Scribe production harness starts");
+    let tenant = server.data_tenant_id();
+    let client = tenant_client(&server, tenant).await;
+    let expected: Vec<i64> = (0..32).collect();
+
+    let first_name = unique_table("post_commit_failure");
+    let first = register_table(&server, tenant, BifrostNamespace::Datasets, &first_name).await;
+    append_values(&client, &first, Uuid::now_v7(), &expected)
+        .await
+        .expect("the first append is acknowledged");
+    tokio::time::timeout(
+        IDLE_PUBLICATION_DEADLINE,
+        faults.wait_for_published_claims_for_test(1),
+    )
+    .await
+    .expect("the tick finishes the claim whose retirement failed after its commit");
+    assert!(
+        !faults.claim_retirement_failure_armed_for_test(),
+        "the claim failed after its commit before the tick finished it"
+    );
+    assert_eq!(
+        published_rows(&server, tenant, &first_name).await,
+        expected.len() as u64,
+        "the finished claim's rows are published exactly once"
+    );
+    assert_eq!(sorted_values(&client, &first).await, expected);
+    let settled = server
+        .scribe_staging_backlog_for_test()
+        .expect("the staging owner is inspectable");
+    assert_eq!(
+        (settled.outstanding_claims, settled.live_members),
+        (0, 0),
+        "the finished claim returned its slot and retired its members"
+    );
+
+    let second_name = unique_table("after_post_commit_failure");
+    let second = register_table(&server, tenant, BifrostNamespace::Datasets, &second_name).await;
+    append_values(&client, &second, Uuid::now_v7(), &expected)
+        .await
+        .expect("the second append is acknowledged");
+    tokio::time::timeout(
+        IDLE_PUBLICATION_DEADLINE,
+        faults.wait_for_published_claims_for_test(2),
+    )
+    .await
+    .expect("publication continues after the finished claim");
+    assert_eq!(
+        published_rows(&server, tenant, &second_name).await,
+        expected.len() as u64,
+        "the next claim publishes every acknowledged row exactly once"
+    );
+    assert_eq!(sorted_values(&client, &second).await, expected);
+
+    server.shutdown().await.expect("the server drains cleanly");
+}
+
 /// A stopping pod retains its acknowledged rows for the next process.
 ///
 /// Acknowledged rows outlive the process that accepted them. A pod told to

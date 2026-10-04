@@ -468,6 +468,14 @@ impl ClaimPublisher {
             }),
         )
         .await?;
+        #[cfg(any(test, feature = "test-support"))]
+        if self.reconciler.fail_claim_retirement() {
+            return Err(ScribeError::Internal {
+                detail: format!(
+                    "test failure retiring claim {claim_id} after its members recorded the commit"
+                ),
+            });
+        }
         self.move_each(
             key,
             records.iter().map(|record| {
@@ -502,6 +510,142 @@ impl ClaimPublisher {
         Ok(())
     }
 
+    /// Finishes one outstanding claim whose fenced commit already landed.
+    ///
+    /// A publication that fails after its members recorded the commit — a
+    /// refused `CleanupPending` move, a lease drain, a removal, an authority
+    /// release — leaves an outstanding claim with nothing left to publish.
+    /// Publishing it again would re-run a merge over members whose runs may
+    /// already be gone, so the driver of a retried claim calls this first and
+    /// publishes only when it returns `false`.
+    ///
+    /// The members' durable records decide. A member whose record is gone was
+    /// removed by retirement, which starts only once every member is
+    /// `CleanupPending`; a `Published` or `CleanupPending` member names the
+    /// commit itself. Either proves the claim committed, and the survivors are
+    /// then driven through the same terminal cleanup startup uses, in the
+    /// same order: `CleanupPending`, lease drain, removal, authority release.
+    /// Directories a removal left without their record are deleted, and their
+    /// authorities released if the failed attempt had not yet done so. When
+    /// every member is still before its commit, nothing is changed and the
+    /// claim publishes again under its own identity, which a replay-exact
+    /// fenced transaction recognises if the rows landed anyway.
+    ///
+    /// The claim's staged candidates and publication manifest are not removed
+    /// here: they are named by the claim's WAL union, which retired members no
+    /// longer carry. Startup publication recovery replays and removes them, as
+    /// it does after a crash between the commit and that cleanup.
+    ///
+    /// The caller must hold the claim's exclusive drive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when a record cannot be read, when the
+    /// survivors contradict a committed claim (a member before its commit with
+    /// no committed sibling to take facts from, or a member of another claim),
+    /// or for the first transition, lease-drain, removal, or registry refusal.
+    /// The claim stays outstanding and the next attempt resumes from whatever
+    /// the refusal left durable.
+    pub(crate) async fn finish_committed(&self, claim: &StagingClaim) -> Result<bool, ScribeError> {
+        let key = claim.key();
+        let mut surviving = Vec::with_capacity(claim.members().len());
+        let mut retired = Vec::new();
+        for member in claim.members() {
+            let record = self
+                .stage
+                .surviving_record(key, member.id())
+                .await
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!(
+                        "read staged member {}-{} before resuming its claim: {error}",
+                        member.id().shard(),
+                        member.id().generation()
+                    ),
+                })?;
+            match record {
+                Some(record) => surviving.push(record),
+                None => retired.push(member.id()),
+            }
+        }
+        let recorded_commit = surviving.iter().any(|record| {
+            matches!(
+                record.state(),
+                StagedMemberState::Published { .. } | StagedMemberState::CleanupPending { .. }
+            )
+        });
+        if retired.is_empty() && !recorded_commit {
+            return Ok(false);
+        }
+        let claim_id = claim.id().to_string();
+        if let Some(stranded) = surviving.iter().find(|record| {
+            record.state().claim_id() != Some(claim_id.as_str())
+                || match record.state() {
+                    StagedMemberState::Ready | StagedMemberState::Claimed { .. } => true,
+                    StagedMemberState::Publishing { .. } => !recorded_commit,
+                    StagedMemberState::Published { .. }
+                    | StagedMemberState::CleanupPending { .. } => false,
+                }
+        }) {
+            return Err(ScribeError::Internal {
+                detail: format!(
+                    "staged member {}-{} is {} after claim {claim_id} committed",
+                    stranded.member().shard(),
+                    stranded.member().generation(),
+                    stranded.state().label()
+                ),
+            });
+        }
+        let surviving = surviving.iter().collect::<Vec<_>>();
+        self.recover_terminal_members(key, &surviving).await?;
+        self.stage
+            .retire_all(key, &retired)
+            .await
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("retire the removed members of claim {claim_id}: {error}"),
+            })?;
+        for member in retired {
+            self.release_retired_authority(key, member)?;
+        }
+        Ok(true)
+    }
+
+    /// Releases the authority of a member retirement already removed.
+    ///
+    /// The failed attempt removes members before it releases them, so the
+    /// authority may or may not still be registered; an unregistered one was
+    /// released by that attempt and is not a refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the registry refuses the release
+    /// for any other reason, which means nothing durable holds the rows.
+    fn release_retired_authority(
+        &self,
+        key: &crate::scribe::assembly::ScribeAssemblyKey,
+        member: crate::scribe::assembly::StagedMemberId,
+    ) -> Result<(), ScribeError> {
+        let Some(hot_sources) = &self.hot_sources else {
+            return Ok(());
+        };
+        match hot_sources.release(
+            &crate::scribe::seal_key::SealKey::new(
+                key.tenant(),
+                key.table().clone(),
+                key.partition(),
+            ),
+            crate::scribe::hot_source::GenerationOrdinal::new(member.shard(), member.generation()),
+        ) {
+            Ok(_) | Err(crate::scribe::hot_source::HotSourceError::Unregistered { .. }) => Ok(()),
+            Err(error) => Err(ScribeError::Internal {
+                detail: format!(
+                    "release the authority of retired staged member {}-{}: {error}",
+                    member.shard(),
+                    member.generation()
+                ),
+            }),
+        }
+    }
+
     /// Drives recovered published members through terminal cleanup.
     ///
     /// `Published` records first persist the complete `CleanupPending` facts;
@@ -509,21 +653,25 @@ impl ClaimPublisher {
     /// prevents new leases through the restored published authority, drains
     /// existing leases, removes member storage, and releases registry authority.
     ///
+    /// `records` are the durable records of one key's surviving members:
+    /// every member startup recovered, or the survivors of one claim whose
+    /// retirement failed after its commit (see [`Self::finish_committed`]).
+    ///
     /// # Errors
     ///
     /// Returns the first durable transition, lease, filesystem, or registry
-    /// refusal. Unprocessed records remain intact for the next startup.
+    /// refusal. Unprocessed records remain intact for the next attempt.
     pub(crate) async fn recover_terminal_members(
         &self,
         key: &crate::scribe::assembly::ScribeAssemblyKey,
-        members: &[crate::scribe::hot_stage::StagedMember],
+        records: &[&StagedHotSourceRecordV1],
     ) -> Result<RecoveredTerminalCleanup, ScribeError> {
-        let terminal_facts = TerminalPublicationFacts::collect(members);
-        for member in members {
-            let Some(plan) = terminal_facts.plan_for(member) else {
+        let terminal_facts = TerminalPublicationFacts::collect(records);
+        for record in records {
+            let Some(plan) = terminal_facts.plan_for(record) else {
                 continue;
             };
-            self.retire_terminal_member(key, member.record().member(), plan)
+            self.retire_terminal_member(key, record.member(), plan)
                 .await?;
         }
         Ok(RecoveredTerminalCleanup {
@@ -632,10 +780,10 @@ struct TerminalMemberPlan {
 
 impl TerminalPublicationFacts {
     /// Collects the committed facts every terminal claim in the cohort carries.
-    fn collect(members: &[crate::scribe::hot_stage::StagedMember]) -> Self {
-        let facts = members
+    fn collect(records: &[&StagedHotSourceRecordV1]) -> Self {
+        let facts = records
             .iter()
-            .filter_map(|member| match member.record().state() {
+            .filter_map(|record| match record.state() {
                 StagedMemberState::Published {
                     claim_id,
                     file_list_commit_key,
@@ -677,11 +825,8 @@ impl TerminalPublicationFacts {
     /// facts — but only when such a sibling exists, because nothing else proves
     /// its claim committed. A member is never transitioned onto the state it is
     /// already in; the stage refuses that as a lifecycle contradiction.
-    fn plan_for(
-        &self,
-        member: &crate::scribe::hot_stage::StagedMember,
-    ) -> Option<TerminalMemberPlan> {
-        match member.record().state() {
+    fn plan_for(&self, record: &StagedHotSourceRecordV1) -> Option<TerminalMemberPlan> {
+        match record.state() {
             StagedMemberState::Published { claim_id, .. } => {
                 let facts = self.facts_for(claim_id)?;
                 Some(TerminalMemberPlan {
@@ -702,7 +847,7 @@ impl TerminalPublicationFacts {
             }
             StagedMemberState::Publishing { claim_id, .. } => Some(TerminalMemberPlan {
                 facts: self.facts_for(claim_id)?,
-                persisted_lsn_ranges: vec![member.record().wal_range()],
+                persisted_lsn_ranges: vec![record.wal_range()],
                 records_publication: true,
                 needs_cleanup_transition: true,
             }),

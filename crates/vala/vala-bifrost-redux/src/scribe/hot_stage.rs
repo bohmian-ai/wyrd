@@ -792,6 +792,35 @@ impl ScribeHotStage {
         self.validate(&directory, &path).await
     }
 
+    /// Reads one member's durable record, or `None` once retirement removed it.
+    ///
+    /// A claim whose fenced commit landed and whose retirement then failed is
+    /// finished by the publisher driving it, and what that publisher needs is
+    /// each member's lifecycle state, not its runs: retirement deletes those
+    /// runs whatever they contain, and a member still before its commit is
+    /// re-validated byte-for-byte when its claim is gathered again. Retirement
+    /// removes the record first, so an absent record is a member already past
+    /// its commit. The caller must hold the claim's exclusive drive, which is
+    /// what keeps the record from changing between this read and the caller's
+    /// next transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotStageError::Io`] when the record exists but cannot be read
+    /// and [`HotStageError::Malformed`] when it cannot be decoded.
+    pub async fn surviving_record(
+        &self,
+        key: &ScribeAssemblyKey,
+        member: StagedMemberId,
+    ) -> Result<Option<StagedHotSourceRecordV1>, HotStageError> {
+        let path = self.member_directory(key, member).join(RECORD_FILE_NAME);
+        match read_record(&path).await {
+            Ok(record) => Ok(Some(record)),
+            Err(HotStageError::Io { .. }) if !path_exists(&path).await => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Scans and validates the whole staged namespace at startup.
     ///
     /// Every record is decoded, version-checked, rebuilt into its assembly key,

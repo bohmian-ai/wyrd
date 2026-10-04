@@ -18,9 +18,9 @@
 //! does not own that lane, so it cannot silently move encoding onto a runtime
 //! thread that a caller expected to keep responsive.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use arrow::datatypes::SchemaRef;
 use chrono::{DateTime, Utc};
@@ -29,8 +29,8 @@ use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::PhysicalLayout;
 use crate::contracts::ScribeError;
 use crate::scribe::assembly::{
-    ClaimCause, ScribeAssemblyKey, StagingAssembler, StagingAssemblerConfig, StagingBacklog,
-    StagingClaim, StagingClaimId,
+    AssemblyError, ClaimCause, ScribeAssemblyKey, StagingAssembler, StagingAssemblerConfig,
+    StagingBacklog, StagingClaim, StagingClaimId,
 };
 use crate::scribe::claim_assembly::{
     AssembleClaimRequest, AssembledClaim, ClaimAssembler, ClaimRuns,
@@ -69,6 +69,125 @@ pub struct AssembleRequest<'a> {
     pub memory: crate::resources::ScribeResources,
 }
 
+/// Why a claim could not be taken from the ready index.
+///
+/// A full claim budget is backpressure, not a failure: every slot belongs to
+/// an outstanding claim that a publication will settle or retry, so a caller
+/// that meets it either yields until its next pass or waits for
+/// [`ScribeStagingRuntime::claim_released`].
+#[derive(Debug, thiserror::Error)]
+pub enum ClaimTakeError {
+    /// A claim is due but every claim slot is held by an outstanding claim.
+    #[error("Scribe staging cannot take another claim: all {budget} claim slots are outstanding")]
+    BudgetExhausted {
+        /// Configured simultaneous-claim ceiling.
+        budget: usize,
+    },
+    /// The ready index is unavailable or refused the claim for another reason.
+    #[error(transparent)]
+    Failed(#[from] ScribeError),
+}
+
+impl From<ClaimTakeError> for ScribeError {
+    /// Collapses a refused take into the Scribe error a caller that cannot
+    /// wait for a claim slot reports.
+    fn from(error: ClaimTakeError) -> Self {
+        match error {
+            ClaimTakeError::BudgetExhausted { .. } => Self::Internal {
+                detail: error.to_string(),
+            },
+            ClaimTakeError::Failed(error) => error,
+        }
+    }
+}
+
+/// Outstanding claims some caller in this process is currently publishing.
+///
+/// An outstanding claim outlives the publication that took it: a refused
+/// publication leaves the claim, its slot, and its members in place so the
+/// identical claim can run again. This set is what tells such a retry apart
+/// from a claim still in flight, so no claim is ever driven by two
+/// publishers at once. Entries live exactly as long as their [`DrivenClaim`].
+#[derive(Debug, Default)]
+struct ClaimDrivers {
+    /// Identities of the claims currently held by a [`DrivenClaim`].
+    driven: Mutex<HashSet<StagingClaimId>>,
+    /// Wakes every publisher waiting for a claim slot when a drive ends.
+    released: tokio::sync::Notify,
+}
+
+impl ClaimDrivers {
+    /// Takes the exclusive right to publish `claim`, unless another caller
+    /// already holds it.
+    ///
+    /// The set stays consistent across a panic — every critical section is a
+    /// single insert, remove, or read — so a poisoned lock is recovered rather
+    /// than turned into a refusal that would strand the claim.
+    fn drive(self: &Arc<Self>, claim: StagingClaim) -> Option<DrivenClaim> {
+        let inserted = self
+            .driven
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(claim.id());
+        inserted.then(|| DrivenClaim {
+            claim,
+            drivers: Arc::clone(self),
+        })
+    }
+
+    /// Ends one drive and wakes every publisher waiting for a claim slot.
+    ///
+    /// A settled claim has already returned its slot when its drive ends, and a
+    /// refused one has just become retryable, so either way a waiter has new
+    /// work to look for.
+    fn release(&self, claim: StagingClaimId) {
+        self.driven
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&claim);
+        self.released.notify_waiters();
+    }
+
+    /// Returns whether no caller in this process is publishing any claim.
+    fn is_idle(&self) -> bool {
+        self.driven
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+    }
+}
+
+/// An outstanding claim together with the exclusive right to publish it.
+///
+/// Handed out by [`ScribeStagingRuntime::take_claim`],
+/// [`ScribeStagingRuntime::take_residue`], and
+/// [`ScribeStagingRuntime::retryable_claims`]. Dropping it — after the claim
+/// settles, after a refusal, or on cancellation — ends the drive, so a claim
+/// that did not settle becomes retryable again.
+#[derive(Debug)]
+pub struct DrivenClaim {
+    /// The claim this publisher owns.
+    claim: StagingClaim,
+    /// Registry the drive is released back to on drop.
+    drivers: Arc<ClaimDrivers>,
+}
+
+impl std::ops::Deref for DrivenClaim {
+    type Target = StagingClaim;
+
+    /// Exposes the driven claim's identity, key, and members.
+    fn deref(&self) -> &StagingClaim {
+        &self.claim
+    }
+}
+
+impl Drop for DrivenClaim {
+    /// Releases the drive so the claim can be retried or its slot reused.
+    fn drop(&mut self) {
+        self.drivers.release(self.claim.id());
+    }
+}
+
 /// Owner of one pod's staged members, ready index, and claim lifecycle.
 pub struct ScribeStagingRuntime {
     /// Durable staged namespace this pod recovers and serves from.
@@ -81,6 +200,8 @@ pub struct ScribeStagingRuntime {
     publisher: ClaimPublisher,
     /// Tenant-fair ready index deciding which members become one object.
     assembly: Mutex<StagingAssembler>,
+    /// Outstanding claims a publisher in this process is currently driving.
+    drivers: Arc<ClaimDrivers>,
     /// Encoding context recorded for every key that has staged a member.
     contexts: Mutex<HashMap<ScribeAssemblyKey, ClaimContext>>,
     /// Approximate encoded size at which one published object closes.
@@ -130,6 +251,7 @@ impl ScribeStagingRuntime {
             claims: ClaimAssembler::new(stage),
             publisher,
             assembly: Mutex::new(StagingAssembler::new(config)),
+            drivers: Arc::default(),
             contexts: Mutex::new(HashMap::new()),
             target_object_bytes: config.target_file_size_bytes(),
             hot_sources: None,
@@ -302,22 +424,47 @@ impl ScribeStagingRuntime {
 
     /// Takes the next claim any tenant is entitled to, if one is due.
     ///
+    /// The claim is returned already driven by the caller, under the same
+    /// ready-index lock that created it, so no retry can observe it unowned.
+    ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when the ready index is unavailable or
-    /// a key is due while every claim slot is held. A full budget with nothing
+    /// Returns [`ClaimTakeError::BudgetExhausted`] when a key is due while
+    /// every claim slot is held, and [`ClaimTakeError::Failed`] when the ready
+    /// index is unavailable or refuses the claim. A full budget with nothing
     /// due is not an error; it returns `Ok(None)` like any other idle poll.
-    pub fn take_claim(&self, now: DateTime<Utc>) -> Result<Option<StagingClaim>, ScribeError> {
+    pub fn take_claim(&self, now: DateTime<Utc>) -> Result<Option<DrivenClaim>, ClaimTakeError> {
         let mut assembly = self.lock_assembly()?;
         let claim = assembly
             .next_claim(now)
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("take the next due staging claim: {error}"),
-            })?;
-        if claim.is_some() {
-            assembly.backlog().publish();
-        }
-        Ok(claim)
+            .map_err(|error| take_refused("take the next due staging claim", error))?;
+        self.drive_taken(&assembly, claim)
+    }
+
+    /// Drives a claim the ready index just created and republishes the backlog.
+    ///
+    /// Runs under the ready-index guard that created the claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClaimTakeError::Failed`] when the fresh claim is already
+    /// driven, which would mean the ready index handed out one member set
+    /// twice.
+    fn drive_taken(
+        &self,
+        assembly: &StagingAssembler,
+        claim: Option<StagingClaim>,
+    ) -> Result<Option<DrivenClaim>, ClaimTakeError> {
+        let Some(claim) = claim else {
+            return Ok(None);
+        };
+        assembly.backlog().publish();
+        let id = claim.id();
+        self.drivers.drive(claim).map(Some).ok_or_else(|| {
+            ClaimTakeError::Failed(ScribeError::Internal {
+                detail: format!("freshly taken staging claim {id} is already being published"),
+            })
+        })
     }
 
     /// Returns every outstanding claim under its original durable identity.
@@ -338,49 +485,91 @@ impl ScribeStagingRuntime {
             .resumable_claims())
     }
 
-    /// Returns outstanding claims that never attempted a fenced commit.
+    /// Drives every outstanding claim no publisher holds and publication can
+    /// still run again.
     ///
-    /// A publication refused before its transaction leaves every member still
-    /// `Claimed`, so the identical claim can simply be run again in this
-    /// process. A claim whose members reached `Publishing` has an outcome only
-    /// the publication manifest can resolve, and that reconciliation belongs to
-    /// startup recovery, so it is deliberately excluded here rather than
-    /// re-driven against a member the lifecycle will refuse to move.
+    /// A refused publication leaves its claim outstanding with members still
+    /// `Claimed` or already `Publishing`. Both re-run the identical claim:
+    /// the claim identity, the publication operation, the uploaded objects, and
+    /// the fenced `file_list` transaction are all derived from the member set,
+    /// so a replay either commits or recognises its own earlier commit. A claim
+    /// whose members recorded the commit (`Published` or later) has nothing
+    /// left to publish and is left to startup reconciliation.
+    ///
+    /// Each claim is marked driven under the ready-index lock before its
+    /// records are read, so a claim another publisher is driving — still in
+    /// flight, not refused — is never returned. Claims that turn out not to be
+    /// retryable are released again.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the ready-index owner is poisoned
-    /// or a claimed member's durable record cannot be read.
-    pub async fn retryable_claims(&self) -> Result<Vec<StagingClaim>, ScribeError> {
-        let mut retryable = Vec::new();
-        for claim in self.resumable_claims()? {
-            let mut publishing = false;
-            for member in claim.members() {
-                let staged =
-                    self.stage
-                        .member(claim.key(), member.id())
-                        .await
-                        .map_err(|error| ScribeError::Internal {
-                            detail: format!(
-                                "read staged member {}-{} before resuming its claim: {error}",
-                                member.id().shard(),
-                                member.id().generation()
-                            ),
-                        })?;
-                if !matches!(
-                    staged.record().state(),
-                    crate::scribe::hot_stage::StagedMemberState::Ready
-                        | crate::scribe::hot_stage::StagedMemberState::Claimed { .. }
-                ) {
-                    publishing = true;
-                    break;
-                }
-            }
-            if !publishing {
+    /// or a claimed member's durable record cannot be read. Every claim driven
+    /// so far is released.
+    pub async fn retryable_claims(&self) -> Result<Vec<DrivenClaim>, ScribeError> {
+        let candidates = {
+            let assembly = self.lock_assembly()?;
+            assembly
+                .resumable_claims()
+                .into_iter()
+                .filter_map(|claim| self.drivers.drive(claim))
+                .collect::<Vec<_>>()
+        };
+        let mut retryable = Vec::with_capacity(candidates.len());
+        for claim in candidates {
+            if self.publication_can_rerun(&claim).await? {
                 retryable.push(claim);
             }
         }
         Ok(retryable)
+    }
+
+    /// Returns whether every member of `claim` is still before its commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when a member's durable record cannot
+    /// be read.
+    async fn publication_can_rerun(&self, claim: &StagingClaim) -> Result<bool, ScribeError> {
+        for member in claim.members() {
+            let staged = self
+                .stage
+                .member(claim.key(), member.id())
+                .await
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!(
+                        "read staged member {}-{} before resuming its claim: {error}",
+                        member.id().shard(),
+                        member.id().generation()
+                    ),
+                })?;
+            if !matches!(
+                staged.record().state(),
+                crate::scribe::hot_stage::StagedMemberState::Ready
+                    | crate::scribe::hot_stage::StagedMemberState::Claimed { .. }
+                    | crate::scribe::hot_stage::StagedMemberState::Publishing { .. }
+            ) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Returns a future that completes when any claim's drive next ends.
+    ///
+    /// A publisher that found every claim slot held creates this *before* it
+    /// asks for a claim, so a release racing that request still wakes it.
+    pub fn claim_released(&self) -> tokio::sync::futures::Notified<'_> {
+        self.drivers.released.notified()
+    }
+
+    /// Returns whether no publisher in this process is driving any claim.
+    ///
+    /// With the budget exhausted and no drive in progress, no release is
+    /// coming: every slot belongs to a claim no publisher can run again.
+    #[must_use]
+    pub fn drives_no_claims(&self) -> bool {
+        self.drivers.is_idle()
     }
 
     /// Takes every ready member of one key as a residue claim.
@@ -388,25 +577,23 @@ impl ScribeStagingRuntime {
     /// Used when waiting for target can no longer pay for itself: the partition
     /// closed, the pod is draining, or pressure requires the staged bytes back.
     ///
+    /// The claim is returned already driven by the caller.
+    ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when the ready index is unavailable or
-    /// every claim slot is already held.
+    /// Returns [`ClaimTakeError::BudgetExhausted`] when the key holds ready
+    /// members while every claim slot is held, and [`ClaimTakeError::Failed`]
+    /// when the ready index is unavailable or refuses the claim.
     pub fn take_residue(
         &self,
         key: &ScribeAssemblyKey,
         cause: ClaimCause,
-    ) -> Result<Option<StagingClaim>, ScribeError> {
+    ) -> Result<Option<DrivenClaim>, ClaimTakeError> {
         let mut assembly = self.lock_assembly()?;
         let claim = assembly
             .claim_residue(key, cause)
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("take the residue claim for a staged key: {error}"),
-            })?;
-        if claim.is_some() {
-            assembly.backlog().publish();
-        }
-        Ok(claim)
+            .map_err(|error| take_refused("take the residue claim for a staged key", error))?;
+        self.drive_taken(&assembly, claim)
     }
 
     /// Rebuilds the ready and claim indexes from what survived on the volume.
@@ -858,6 +1045,21 @@ fn claim_object_base(
         wal.max,
     )?
     .object_base())
+}
+
+/// Classifies a ready-index refusal to hand out a claim.
+///
+/// An exhausted claim budget stays typed as backpressure; every other refusal
+/// is an internal failure described by `action`.
+fn take_refused(action: &str, error: AssemblyError) -> ClaimTakeError {
+    match error {
+        AssemblyError::ClaimBudgetExhausted { budget } => {
+            ClaimTakeError::BudgetExhausted { budget }
+        }
+        error => ClaimTakeError::Failed(ScribeError::Internal {
+            detail: format!("{action}: {error}"),
+        }),
+    }
 }
 
 /// Builds the failure describing one poisoned staged-lifecycle owner.
@@ -1339,6 +1541,83 @@ mod tests {
         assert_eq!(claim.members().len(), 1);
     }
 
+    /// A claim is retryable only while no publisher drives it.
+    ///
+    /// A take hands its claim out already driven, so a concurrent retry sweep
+    /// never sees a claim still in flight. Once that drive ends without
+    /// settling, waiters for a claim slot are woken and the identical claim is
+    /// offered for retry to exactly one sweep. A full budget meanwhile is
+    /// typed backpressure, not an internal failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics when staging fails, a driven claim is offered for retry, the
+    /// released claim is not offered exactly once, or budget exhaustion is not
+    /// reported as [`ClaimTakeError::BudgetExhausted`].
+    #[tokio::test]
+    async fn a_claim_is_retryable_only_while_no_publisher_drives_it() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let stage_root = root.path().join("stage");
+        let wal_root = root.path().join("member-wal");
+        for path in [&stage_root, &wal_root] {
+            std::fs::create_dir_all(path).expect("fixture directory");
+        }
+        let node_id = NodeId::new(uuid::Uuid::from_u128(0xd21e));
+        let stage = Arc::new(ScribeHotStage::new(stage_root));
+        let runtime = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            publisher(stage, &wal_root, node_id),
+            StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 1)
+                .expect("assembler controls"),
+        );
+        let now = chrono::Utc::now();
+        let (first, _) =
+            stage_durable_members(&runtime, DataTenantId::new_v7(), node_id, 1..=1, now).await;
+        let (second, _) =
+            stage_durable_members(&runtime, DataTenantId::new_v7(), node_id, 1..=1, now).await;
+
+        let claim = runtime
+            .take_residue(&first, ClaimCause::Drain)
+            .expect("the ready key releases a residue claim")
+            .expect("a residue claim is due");
+        assert!(
+            runtime
+                .retryable_claims()
+                .await
+                .expect("retry sweep")
+                .is_empty(),
+            "a claim still in flight is never offered for retry"
+        );
+        assert!(
+            matches!(
+                runtime.take_residue(&second, ClaimCause::Drain),
+                Err(ClaimTakeError::BudgetExhausted { budget: 1 })
+            ),
+            "a full claim budget is typed backpressure"
+        );
+
+        let id = claim.id();
+        let released = runtime.claim_released();
+        assert!(!runtime.drives_no_claims());
+        drop(claim);
+        released.await;
+        assert!(runtime.drives_no_claims());
+        let retried = runtime.retryable_claims().await.expect("retry sweep");
+        assert_eq!(
+            retried.iter().map(|claim| claim.id()).collect::<Vec<_>>(),
+            vec![id],
+            "the unsettled claim is retried under its original identity"
+        );
+        assert!(
+            runtime
+                .retryable_claims()
+                .await
+                .expect("second retry sweep")
+                .is_empty(),
+            "a retried claim is driven by its one retrier"
+        );
+    }
+
     /// Concurrent registration, claim, and settlement leave the published
     /// staged gauges equal to the assembler's final ownership.
     ///
@@ -1684,18 +1963,23 @@ mod tests {
     /// reproduces the durable state at the chosen boundary with the same stage
     /// operations: all members in `Published` (`cleanup_pending == false`) or
     /// all in `CleanupPending`, with the first `retired` members already
-    /// removed by one batched [`ScribeHotStage::retire_all`]. Restart must
+    /// removed by one batched [`ScribeHotStage::retire_all`]. With
+    /// `half_removed`, the next two survivors are left the way a crash inside
+    /// one member's removal leaves it: one keeps its record but has lost its
+    /// runs, the other keeps its runs but has lost its record. Restart must
     /// retire every survivor under the committed facts without republishing,
-    /// leave no claim to resume, no staged bytes, and no authority.
+    /// leave no claim to resume, no staged bytes, no member directory, and no
+    /// authority.
     ///
     /// # Panics
     ///
     /// Panics when the fixture cannot stage or drive the claim, or when
-    /// recovery republishes, leaves a resumable claim, leaks staged bytes, or
-    /// leaves a restored authority alive.
+    /// recovery republishes, leaves a resumable claim, leaks staged bytes,
+    /// leaves a member directory, or leaves a restored authority alive.
     async fn recovers_claim_interrupted_between_batched_states(
         cleanup_pending: bool,
         retired: usize,
+        half_removed: bool,
     ) {
         let root = tempfile::tempdir().expect("runtime root");
         let stage_root = root.path().join("stage");
@@ -1761,6 +2045,13 @@ mod tests {
             .retire_all(&key, &member_ids[..retired])
             .await
             .expect("members retired before the crash");
+        if half_removed {
+            half_remove(&stage.member_directory(&key, member_ids[retired]), true);
+            half_remove(
+                &stage.member_directory(&key, member_ids[retired + 1]),
+                false,
+            );
+        }
         drop(runtime);
 
         let hot_sources = Arc::new(crate::scribe::hot_source::ScribeHotSourceRegistry::new());
@@ -1782,8 +2073,50 @@ mod tests {
                 .expect("claim index")
                 .is_empty()
         );
+        assert_claim_fully_retired(&stage, &hot_sources, &key, &member_ids).await;
+    }
+
+    /// Asserts a restarted stage kept nothing of a retired claim: no staged
+    /// member, no member directory, and no hot-source authority.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stage cannot be rescanned, a member survives the
+    /// rescan or left its directory behind, or an authority is still live.
+    async fn assert_claim_fully_retired(
+        stage: &ScribeHotStage,
+        hot_sources: &crate::scribe::hot_source::ScribeHotSourceRegistry,
+        key: &ScribeAssemblyKey,
+        member_ids: &[StagedMemberId],
+    ) {
         assert!(stage.recover().await.expect("stage rescans").is_empty());
-        assert_no_restored_authority_survives(&hot_sources, &key, &member_ids);
+        for member in member_ids {
+            assert!(
+                !stage.member_directory(key, *member).exists(),
+                "member {member:?} left its directory behind"
+            );
+        }
+        assert_no_restored_authority_survives(hot_sources, key, member_ids);
+    }
+
+    /// Removes part of one member directory the way a crash inside its
+    /// removal can leave it: every run but not the record when `keep_record`,
+    /// otherwise only the record.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the directory cannot be listed or a file cannot be removed.
+    fn half_remove(directory: &Path, keep_record: bool) {
+        for entry in std::fs::read_dir(directory).expect("member directory lists") {
+            let path = entry.expect("member directory entry").path();
+            let is_record = path.file_name()
+                == Some(std::ffi::OsStr::new(
+                    crate::scribe::hot_stage::RECORD_FILE_NAME,
+                ));
+            if is_record != keep_record {
+                std::fs::remove_file(&path).expect("crash removes the file");
+            }
+        }
     }
 
     /// A claim that crashed after every member recorded the commit, before
@@ -1794,7 +2127,7 @@ mod tests {
     /// Panics when recovery leaves the claim, its bytes, or its authority.
     #[tokio::test]
     async fn a_claim_crashed_after_its_published_step_retires_on_restart() {
-        recovers_claim_interrupted_between_batched_states(false, 0).await;
+        recovers_claim_interrupted_between_batched_states(false, 0, false).await;
     }
 
     /// A claim that crashed after every member moved to cleanup, before any
@@ -1805,7 +2138,7 @@ mod tests {
     /// Panics when recovery leaves the claim, its bytes, or its authority.
     #[tokio::test]
     async fn a_claim_crashed_after_its_cleanup_step_retires_on_restart() {
-        recovers_claim_interrupted_between_batched_states(true, 0).await;
+        recovers_claim_interrupted_between_batched_states(true, 0, false).await;
     }
 
     /// A claim that crashed partway through its batched removal retires its
@@ -1816,7 +2149,20 @@ mod tests {
     /// Panics when recovery leaves the claim, its bytes, or its authority.
     #[tokio::test]
     async fn a_claim_crashed_inside_its_batched_removal_retires_on_restart() {
-        recovers_claim_interrupted_between_batched_states(true, 2).await;
+        recovers_claim_interrupted_between_batched_states(true, 2, false).await;
+    }
+
+    /// A claim that crashed inside one member's removal — a member left with
+    /// its record but not its runs, another with its runs but not its record —
+    /// retires every survivor on restart instead of refusing to start.
+    ///
+    /// # Panics
+    ///
+    /// Panics when recovery refuses a half-removed member or leaves the
+    /// claim, its bytes, a member directory, or its authority.
+    #[tokio::test]
+    async fn a_claim_crashed_inside_one_member_removal_retires_on_restart() {
+        recovers_claim_interrupted_between_batched_states(true, 1, true).await;
     }
 }
 
@@ -1962,6 +2308,170 @@ mod pg_tests {
         assert_eq!(
             gauge("bifrost_scribe_staging_outstanding_claims"),
             Some(1.0)
+        );
+    }
+
+    /// Builds a publisher whose fenced transaction runs against `pool`.
+    fn fenced_publisher(
+        stage: Arc<ScribeHotStage>,
+        wal_root: &Path,
+        node: NodeId,
+        pool: vala_sql::OperatorPool,
+    ) -> ClaimPublisher {
+        let operator = opendal::Operator::new(opendal::services::Memory::default())
+            .expect("memory operator")
+            .finish();
+        ClaimPublisher::new(
+            stage,
+            crate::scribe::persistence::ScribeStageMover::new(wal_root, operator),
+            crate::scribe::persistence::ScribePublicationReconciler::new(
+                pool,
+                StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1)),
+                crate::scribe::persistence::PersistenceFaults::default(),
+            ),
+        )
+    }
+
+    /// Gathers, merges, and publishes one claim the way persistence does.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first gather, merge, or publication refusal.
+    async fn publish_claim_once(
+        runtime: &ScribeStagingRuntime,
+        claim: &StagingClaim,
+        scratch: &Path,
+        node: NodeId,
+    ) -> Result<PublishedClaim, ScribeError> {
+        let runs = runtime.gather(claim).await?;
+        std::fs::create_dir_all(scratch).expect("claim scratch");
+        let assembled = runtime.assemble(
+            claim,
+            AssembleRequest {
+                runs: &runs,
+                scratch_dir: scratch,
+                memory: crate::resources::ScribeResources::for_test(),
+            },
+        )?;
+        runtime
+            .publish(
+                claim,
+                &runs,
+                &assembled,
+                StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1)),
+            )
+            .await
+    }
+
+    /// A claim whose members reached `Publishing` and whose commit never
+    /// landed publishes once a restarted runtime resumes it.
+    ///
+    /// The first runtime's node holds no publication fence, so its fenced
+    /// transaction is refused after every member durably entered
+    /// `Publishing` — the state a crash between that step and the commit
+    /// leaves. A restarted runtime over the same namespace, now fenced,
+    /// restores the claim under its original identity and must carry it
+    /// through the commit rather than refusing to move its members.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot stage or claim, when the unfenced attempt
+    /// commits, or when the resumed claim does not publish and retire.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_claim_stranded_in_publishing_publishes_after_restart() {
+        let database = wyrd_dev_fixtures::pg::PgFixture::start()
+            .await
+            .expect("Postgres fixture");
+        register_control_row(&database).await;
+        let tenant = database.data_tenant_id();
+        let root = tempfile::tempdir().expect("runtime root");
+        let stage_root = root.path().join("stage");
+        let wal_root = root.path().join("member-wal");
+        for path in [&stage_root, &wal_root] {
+            std::fs::create_dir_all(path).expect("fixture directory");
+        }
+        let node_id = NodeId::generate();
+        let stage = Arc::new(ScribeHotStage::new(stage_root));
+        let config =
+            StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
+                .expect("assembler controls");
+        let runtime = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            fenced_publisher(
+                Arc::clone(&stage),
+                &wal_root,
+                node_id,
+                database.operator_pool().clone(),
+            ),
+            config,
+        );
+        let (key, member_ids) =
+            stage_durable_members(&runtime, tenant, node_id, 1..=2, chrono::Utc::now()).await;
+        let claim = runtime
+            .take_residue(&key, ClaimCause::Drain)
+            .expect("residue claim")
+            .expect("two ready members form one claim");
+        publish_claim_once(&runtime, &claim, &root.path().join("scratch-0"), node_id)
+            .await
+            .expect_err("an unfenced node cannot commit the claim");
+        for member in &member_ids {
+            assert_eq!(
+                stage
+                    .member(&key, *member)
+                    .await
+                    .expect("member survives the refusal")
+                    .record()
+                    .state()
+                    .label(),
+                "publishing"
+            );
+        }
+        drop(runtime);
+
+        let superuser = database.superuser_pool().await.expect("superuser pool");
+        sqlx::query(
+            "INSERT INTO vala.cluster_nodes (data_tenant_id,node_id,role,advertise_addr,fencing_token,started_at,heartbeat_at) VALUES ($1,$2,'scribe','127.0.0.1:1',$3,now(),now())",
+        )
+        .bind(wyrd_spec::DataTenantId::SYSTEM_OWNER.as_uuid())
+        .bind(node_id.as_uuid())
+        .bind(1_i64)
+        .execute(&superuser)
+        .await
+        .expect("register the restarted node's publication fence");
+        let restarted = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            fenced_publisher(
+                Arc::clone(&stage),
+                &wal_root,
+                node_id,
+                database.operator_pool().clone(),
+            ),
+            config,
+        );
+        restarted
+            .restore(database.operator_pool().pool())
+            .await
+            .expect("the stranded claim restores");
+        let resumed = restarted
+            .resumable_claims()
+            .expect("claim index")
+            .pop()
+            .expect("the stranded claim is outstanding");
+        assert_eq!(resumed.id(), claim.id(), "the claim resumes as itself");
+        publish_claim_once(
+            &restarted,
+            &resumed,
+            &root.path().join("scratch-1"),
+            node_id,
+        )
+        .await
+        .expect("the resumed claim publishes");
+        assert!(stage.recover().await.expect("stage rescans").is_empty());
+        assert!(
+            restarted
+                .resumable_claims()
+                .expect("claim index")
+                .is_empty()
         );
     }
 }

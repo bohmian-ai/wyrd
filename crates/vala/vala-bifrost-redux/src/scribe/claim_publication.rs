@@ -289,7 +289,7 @@ impl ClaimPublisher {
             request.binding,
             request.runs.wal(),
         )?;
-        let operation_id = uuid::Uuid::new_v4();
+        let operation_id = publication_operation_id(request.claim);
         let records = self
             .move_members(
                 request.claim,
@@ -733,6 +733,21 @@ impl std::fmt::Debug for ClaimPublisher {
             .field("stage", &self.stage.root())
             .finish_non_exhaustive()
     }
+}
+
+/// Derives the publication operation identity a claim's members record when
+/// they enter `Publishing`.
+///
+/// It is a function of the claim identity alone, so every attempt at one
+/// claim — a retry in this process or a resume after a restart — writes the
+/// identical `Publishing` state, which the stage accepts as an idempotent
+/// replay instead of refusing it as a backwards move. Nothing else reads the
+/// value; Forge derives its own promotion operation identities from its
+/// tasks.
+fn publication_operation_id(claim: &StagingClaim) -> uuid::Uuid {
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&claim.id().as_bytes()[..16]);
+    uuid::Builder::from_custom_bytes(bytes).into_uuid()
 }
 
 /// Builds the failure describing one member's refused durable transition.

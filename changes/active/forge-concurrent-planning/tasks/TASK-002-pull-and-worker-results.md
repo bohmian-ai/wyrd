@@ -471,6 +471,132 @@ each fail it ("pull diverged from the scan", "index drifted after commit").
   must settle it. All other checks that a 1-worker run can evaluate passed.
   Drain: 0.78 rewrites/s, which is at the pull-cadence ceiling.
 
+- **Publication revision review (findings 1–5 and suggestions).** Every finding was
+  checked against the code before it was fixed, and all five were confirmed
+  real. Each fix began with a test that failed for the stated reason.
+  Commits: 0edbe3f54 (findings 1 and 5), f058e52d4 (findings 2–4), e642d14ed
+  (suggestions).
+  - **1, CRITICAL, a crash mid-removal blocks pod start: CONFIRMED and FIXED.**
+    - Symptom: `remove_dir_all` deletes entries in readdir order. A crash
+      partway through can leave a `CleanupPending` record whose runs are
+      already gone. `validate` then returns `MissingRun`, and `recover()`
+      stops at its first error, so restore fails and the pod cannot start.
+    - Fix (`hot_stage.rs`):
+      - `retire_all` unlinks the record before removing the directory.
+      - `recover` removes a member directory that has no record.
+      - `validate` tolerates `MissingRun` only for a `CleanupPending` member.
+    - Test: `scribe::staging_runtime::tests::a_claim_crashed_inside_one_member_removal_retires_on_restart`.
+      It covers one survivor that kept its record but lost its runs, and one
+      that kept its runs but lost its record.
+    - Diagnostician (read-only): two existing tests encoded the old policy.
+      They were `hot_stage` recovery-temporaries, which kept runs without a
+      record, and `member_stager`, which ran `recover()` while staging.
+      `recover` is a startup-only scan, and the WAL stays authoritative until
+      the record lands. Both tests were updated to that policy. Runs without a
+      record are removed, and they are never a query authority.
+  - **5, Publishing-to-Publishing replay is "Backwards": CONFIRMED and FIXED.**
+    - RED: `scribe::staging_runtime::pg_tests::a_claim_stranded_in_publishing_publishes_after_restart`
+      failed with `move staged member 1-1 to publishing: Scribe staged member
+      cannot move from publishing to publishing`. Each attempt minted a fresh
+      `operation_id`, so the replay was not an identical record.
+    - Fix: `claim_publication.rs` `publication_operation_id` derives the id
+      from the claim id, so a replay rewrites the identical record and is
+      idempotent.
+    - Forge side: `scribe_promotion.rs` derives its own ids
+      (`promotion_generation_operation_id`). Nothing outside tests reads the
+      Publishing `operation_id`.
+  - **3, one claim driven by two publishers: CONFIRMED and FIXED.**
+    - RED: journey `lifecycle::concurrent_flushes_share_the_claim_budget_and_publish_each_claim_once`.
+      The second flush's `retryable_claims` re-drove the 4 claims the first
+      flush still held, so `assemble_claim` ran twice per claim id. The two
+      `Claimed`→`Publishing` record writes then raced on one `.tmp`, and the
+      flush failed with `move staged member 0-7 to publishing: ... failed to
+      rename the staged record into place: No such file or directory`.
+    - Fix (`staging_runtime.rs`): an in-process `ClaimDrivers` set and a
+      `DrivenClaim` guard.
+      - `take_claim` and `take_residue` hand out claims already driven, under
+        the ready-index lock.
+      - `retryable_claims` marks each candidate under that lock before
+        reading its records, and skips claims already driven.
+      - Dropping the guard (settle, refusal, or cancellation) releases the
+        claim and wakes waiting publishers.
+  - **2, REGRESSION from 3ce3a113b, budget exhaustion treated as failure:
+    CONFIRMED and FIXED.**
+    - Found by code reading, and hidden behind finding 3 in the same journey:
+      `take_claim` and `take_residue` flattened
+      `AssemblyError::ClaimBudgetExhausted` into `ScribeError::Internal`.
+    - Fix: they return a typed `ClaimTakeError::BudgetExhausted { budget }`.
+      `PersistenceWorker::publish_claims` treats it as backpressure. It stops
+      taking claims and lets its own in-flight claims settle.
+      - With nothing in flight, the tick (`ClaimSlotWait::Yield`) ends its pass
+        with `Ok`.
+      - A flush (`ClaimSlotWait::Await`) waits on `claim_released()`. It
+        registers the wait before asking for a claim, so it cannot miss a
+        wakeup.
+      - The flush fails only when no publisher in the process drives any
+        claim, because then no slot can be released.
+    - No `ScribeError` variant was added.
+    - Unit test: `scribe::staging_runtime::tests::a_claim_is_retryable_only_while_no_publisher_drives_it`.
+  - **4, a failed due claim is never retried in production: CONFIRMED and
+    FIXED.**
+    - RED: journey `lifecycle::scribe_tick_retries_a_failed_due_claim`. One
+      injected object-write failure produced `WARN Scribe due publication
+      failed; next tick retries`. No further `assemble_claim` ran, and the
+      test hit `Elapsed` after 30 s.
+    - Fix: every `publish_claims` pass first drains `retryable_claims`, so
+      each tick retries refused claims. Members already in `Publishing` are
+      retryable now that finding 5 makes the replay idempotent. Claims whose
+      members recorded the commit (`Published` or later) are left to startup.
+    - `resume_staging_claims` also goes through `retryable_claims`. It still
+      fails if any restored claim cannot run again.
+  - Diagnostician on the two journey failures (read-only; given the command,
+    trace, and diff):
+    - Both tests assert real production behavior.
+    - Test 1 is a real race (tick versus flush, or two flushes), with a
+      hidden second failure: `ClaimBudgetExhausted` flattened to `Internal`.
+    - Test 2 is a real defect: the tick only takes new claims. A refused
+      claim has already left the ready index, so `next_claim` never sees it
+      again.
+    - Fix site: `ScribeStagingRuntime` (drive mark plus typed exhaustion) and
+      `PersistenceWorker::publish_claims` and `publish_due_claims`.
+    - The test-only `note_claim_slot_wait` must be called at the new wait
+      point. Without it the contention probe cannot fire once the double
+      drive is gone. It is now called there.
+  - **Suggestion, merge-lane sizing: DONE.**
+    - `merge_lane_threads` returns `max(1, effective_cpu - persistence lane
+      threads)`, capped by the claim budget.
+    - Test: `scribe::persistence::tests::merge_lane_threads_leave_the_persistence_lane_its_cpus`.
+      Under the old `budget.min(effective_cpu)`, the case (8 CPUs, 6
+      persistence threads, budget 4) gave 4 where 2 is free.
+  - **Suggestion, root fsync for new key directories: DONE.**
+    - The first record this process publishes under a key also fsyncs the
+      staging root. Key directories are never removed.
+    - RED: `scribe::hot_stage::tests::the_first_record_of_a_key_syncs_the_staging_root_once`
+      counted `[3, 3]` syncs. GREEN is `[4, 3]`.
+    - The existing per-state sync count is unchanged.
+  - **Adjacent finding, not fixed (outside these findings):**
+    `ScribeStagingRuntime::restore_context` reads the schema from the first
+    run of any member of a key. That can include terminal members that
+    restore has just retired. A key holding terminal leftovers next to live
+    members may therefore fail restore.
+  - Lane note: `telemetry::scribe_hot_path_telemetry_reconciles` failed once
+    in the journey lane, at telemetry.rs:530 ("per-append WAL spans are
+    DEBUG detail"). The cause was the lane being run with
+    `WYRD_LOG=info,vala_bifrost_redux=debug`, which turns on the DEBUG
+    `bifrost.scribe.wal.append` span that the test asserts is absent from
+    routine traces. With `WYRD_LOG=info` the test passed alone and in the
+    full lane. It is not a code defect, and the test is unchanged.
+  - Verification:
+    - `mise run test:bifrost:integration:redux`: 895/895.
+    - Journeys, run with `WYRD_LOG=info`:
+      - `mise run test:bifrost:journey:scribe`: 24/24.
+      - `mise run test:bifrost:journey:forge`: 21/21.
+      - `mise run test:bifrost:journey:oracle`: 42/42.
+    - `mise run fmt`: clean.
+    - `cargo clippy -p vala-bifrost-redux -p wyrd-testing --all-features
+      --tests -- -D warnings`: clean.
+    - `git diff --check`: clean.
+
 ### Acceptance
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
@@ -481,4 +607,10 @@ each fail it ("pull diverged from the scan", "index drifted after commit").
 | Multi-replica worker progress | forge_peer.rs, leadership.rs | journey lane 19/19; `mise run test:tonic` 39/39 | PASS |
 | No leader-side file inspection | leadership.rs | `leader_decision_has_no_catalog_io` (zero catalog/object IO) | PASS |
 | AC-008 capacity evidence | bench `bench:bifrost:forge-capacity` | pending revised two-run report | OPEN |
-
+| Review 1: crash mid-removal restarts | hot_stage.rs `retire_all`, `recover`, `validate` | `a_claim_crashed_inside_one_member_removal_retires_on_restart` | PASS |
+| Review 2: budget exhaustion is backpressure | staging_runtime.rs `ClaimTakeError`; persistence.rs `publish_claims` | journey `concurrent_flushes_share_the_claim_budget_and_publish_each_claim_once`; `a_claim_is_retryable_only_while_no_publisher_drives_it` | PASS |
+| Review 3: one publisher per claim | staging_runtime.rs `ClaimDrivers`, `DrivenClaim` | same journey (no double assemble, no `.tmp` race) | PASS |
+| Review 4: tick retries a failed due claim | persistence.rs `publish_claims` retry drain | journey `scribe_tick_retries_a_failed_due_claim` | PASS |
+| Review 5: Publishing replay is idempotent | claim_publication.rs `publication_operation_id` | `a_claim_stranded_in_publishing_publishes_after_restart` | PASS |
+| Suggestion: merge lane from free CPUs | persistence.rs `merge_lane_threads` | `merge_lane_threads_leave_the_persistence_lane_its_cpus` | PASS |
+| Suggestion: root fsync for new key | hot_stage.rs `sync_key_entry` | `the_first_record_of_a_key_syncs_the_staging_root_once` | PASS |

@@ -1546,6 +1546,12 @@ impl ScribePersistenceCpuPool {
         })
     }
 
+    /// Returns how many Rayon threads run this lane's work.
+    #[must_use]
+    pub fn thread_count(&self) -> usize {
+        self.pool.current_num_threads()
+    }
+
     /// Acquires one application-level persistence lane permit.
     ///
     /// A saturated lane waits on the bounded semaphore and records one

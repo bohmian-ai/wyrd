@@ -29,8 +29,9 @@
 //! the member set, so the retry re-derives the same claim and resumes it. A
 //! back edge would let the same members be published under two identities.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -546,13 +547,22 @@ impl StagedMember {
 pub struct ScribeHotStage {
     /// Root of the governed durable staging namespace.
     root: PathBuf,
+    /// Key directories whose entry in `root` this process has synced.
+    ///
+    /// Key directories are created once and never removed, so one root sync
+    /// per key makes every later record under it reachable after a crash.
+    /// Clones share the set because they share the root.
+    synced_keys: Arc<Mutex<HashSet<[u8; 32]>>>,
 }
 
 impl ScribeHotStage {
     /// Binds the owner to one durable staging root.
     #[must_use]
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            synced_keys: Arc::default(),
+        }
     }
 
     /// Returns the governed root every staged file lives under.
@@ -579,8 +589,11 @@ impl ScribeHotStage {
     /// The runs it names must already be fsynced in the member directory. The
     /// record is written to `.tmp`, fsynced, renamed, and both the member and
     /// key directories are fsynced, so a crash at any point leaves either no
-    /// record or a complete one. This is the write half of the first durable
-    /// boundary: after it returns, the member's rows survive without the WAL.
+    /// record or a complete one. The first record this process publishes under
+    /// a key also fsyncs the staging root, so the key directory's own entry is
+    /// durable before any member in it is reported durable. This is the write
+    /// half of the first durable boundary: after it returns, the member's rows
+    /// survive without the WAL.
     ///
     /// # Errors
     ///
@@ -604,7 +617,38 @@ impl ScribeHotStage {
         if let Some(parent) = directory.parent() {
             fsync_directory(parent).await?;
         }
+        self.sync_key_entry(key).await?;
         Ok(final_path)
+    }
+
+    /// Fsyncs the staging root the first time this process publishes under
+    /// `key`.
+    ///
+    /// The key is marked only after the sync succeeds, so concurrent first
+    /// publications may each sync the root but none returns before one sync
+    /// completed. The set holds plain digests and every critical section is a
+    /// single lookup or insert, so a poisoned lock is recovered rather than
+    /// refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotStageError::Io`] when the root cannot be opened or synced;
+    /// the key stays unmarked so the next publication retries the sync.
+    async fn sync_key_entry(&self, key: &ScribeAssemblyKey) -> Result<(), HotStageError> {
+        let digest = key.digest();
+        let synced = self
+            .synced_keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&digest);
+        if !synced {
+            fsync_directory(&self.root).await?;
+            self.synced_keys
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(digest);
+        }
+        Ok(())
     }
 
     /// Moves one staged member forward to its next lifecycle state.
@@ -684,17 +728,23 @@ impl ScribeHotStage {
     /// the last one. Members already gone are skipped; when none was removed
     /// nothing is synced.
     ///
+    /// Each member's record is unlinked before the rest of its directory, so
+    /// an interrupted removal normally leaves a record-less directory, which
+    /// [`Self::recover`] deletes. A file system that persists the run unlinks
+    /// before the record unlink can still leave a `CleanupPending` record
+    /// without its runs, and recovery accepts that too (see [`Self::recover`]).
+    ///
     /// # Errors
     ///
-    /// Returns [`HotStageError::Io`] when a directory cannot be removed or the
-    /// key directory cannot be synced.
+    /// Returns [`HotStageError::Io`] when a record or directory cannot be
+    /// removed or the key directory cannot be synced.
     ///
     /// # Cancellation
     ///
     /// Cancellation may leave some members, part of a member directory, or the
     /// removals unsynced. Each removed member was already past its fenced
     /// commit, so recovery retires any survivor again, and repeating the
-    /// removal is safe because each record is deleted with its directory.
+    /// removal is safe because absent records and directories are skipped.
     pub async fn retire_all(
         &self,
         key: &ScribeAssemblyKey,
@@ -702,7 +752,13 @@ impl ScribeHotStage {
     ) -> Result<(), HotStageError> {
         let mut removed = false;
         for member in members {
-            match tokio::fs::remove_dir_all(self.member_directory(key, *member)).await {
+            let directory = self.member_directory(key, *member);
+            match tokio::fs::remove_file(directory.join(RECORD_FILE_NAME)).await {
+                Ok(()) => removed = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(stage_io("retire the member record")(error)),
+            }
+            match tokio::fs::remove_dir_all(&directory).await {
                 Ok(()) => removed = true,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(stage_io("retire the member directory")(error)),
@@ -740,9 +796,17 @@ impl ScribeHotStage {
     ///
     /// Every record is decoded, version-checked, rebuilt into its assembly key,
     /// and validated against the exact bytes of every run it names. Proven
-    /// incomplete temporaries are removed; anything else that fails is returned
+    /// incomplete temporaries are removed, and so is every member directory
+    /// without a record: staging writes the record last and retirement removes
+    /// it first, so such a directory is the leftover of an interrupted staging
+    /// or retirement and nothing names its runs. A `CleanupPending` record
+    /// whose runs are already gone is an interrupted retirement and is
+    /// returned for the caller to finish. Anything else that fails is returned
     /// as an error so the caller keeps the WAL authoritative rather than
     /// serving a member it cannot vouch for.
+    ///
+    /// This is a startup scan: run while a member is being staged, it would
+    /// remove that member's runs before its record lands.
     ///
     /// Members are returned grouped by assembly key so the caller can rebuild
     /// the ready index in one pass.
@@ -787,6 +851,16 @@ impl ScribeHotStage {
                 remove_if_present(&directory.join(TEMPORARY_RECORD_FILE_NAME)).await?;
                 let path = directory.join(RECORD_FILE_NAME);
                 if !path_exists(&path).await {
+                    // Runs without a record are what an interrupted staging or
+                    // retirement leaves: staging writes the record last and
+                    // retirement removes it first, so nothing names these runs.
+                    match tokio::fs::remove_dir_all(&directory).await {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(stage_io("remove a record-less member directory")(error));
+                        }
+                    }
                     continue;
                 }
                 let member = self.validate(&directory, &path).await?;
@@ -828,9 +902,16 @@ impl ScribeHotStage {
         }
         let key = record.assembly_key(&name)?;
         // A member is offered as a query source only after its bytes are proven
-        // to be the bytes the record describes.
+        // to be the bytes the record describes. A `CleanupPending` member is
+        // not one: a published object serves its rows and its runs are being
+        // deleted, so a run already gone is an interrupted retirement that
+        // recovery finishes, not missing evidence.
+        let retiring = matches!(record.state, StagedMemberState::CleanupPending { .. });
         for run in &record.runs {
-            validate_run(&directory.join(&run.file_name), run).await?;
+            match validate_run(&directory.join(&run.file_name), run).await {
+                Err(HotStageError::MissingRun { .. }) if retiring => {}
+                result => result?,
+            }
         }
         record.ready_member(&name)?;
         Ok(StagedMember {
@@ -1204,10 +1285,13 @@ mod tests {
         );
     }
 
-    /// An incomplete record is removed and never counted as a query source.
+    /// An incomplete record and the runs it never named are removed and never
+    /// counted as a query source.
     ///
-    /// A `.tmp` record is the one thing a crash can leave that is provably
-    /// worthless: it was never renamed, so nothing ever depended on it.
+    /// A `.tmp` record was never renamed, so nothing ever depended on it. Runs
+    /// without a record are just as worthless: a member's WAL stays
+    /// authoritative for its rows until its record is published, so replay
+    /// stages those rows again.
     ///
     /// # Panics
     ///
@@ -1234,8 +1318,8 @@ mod tests {
             "a proven incomplete temporary is removed"
         );
         assert!(
-            path_exists(&member_directory.join("run-0.parquet")).await,
-            "recovery never deletes durable run bytes it did not prove worthless"
+            !path_exists(&member_directory).await,
+            "runs no record names are removed with their directory"
         );
     }
 
@@ -1344,6 +1428,63 @@ mod tests {
         assert!(
             matches!(missing, HotStageError::MissingRun { .. }),
             "unexpected refusal: {missing}"
+        );
+    }
+
+    /// The first record published under a key also syncs the staging root.
+    ///
+    /// A member's record is durable only if every directory entry on its path
+    /// is: the record in its member directory, the member directory in its key
+    /// directory, and the key directory in the staging root. Key directories
+    /// are created once and never removed, so the root is synced once per key
+    /// rather than on every publication.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture write or publication is refused, or when a
+    /// publication issues a different number of syncs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_first_record_of_a_key_syncs_the_staging_root_once() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let syncs = || {
+            recorder
+                .snapshot()
+                .counters
+                .get(super::STAGE_FSYNCS_TOTAL)
+                .copied()
+                .unwrap_or(0)
+        };
+        let directory = tempfile::tempdir().expect("staging root");
+        let stage = ScribeHotStage::new(directory.path().join("hot-stage"));
+        let key = fixture_key();
+        let mut costs = Vec::new();
+        for generation in 0..2 {
+            let member = StagedMemberId::new(1, generation);
+            let run = write_run(
+                &stage.member_directory(&key, member),
+                "run-0.parquet",
+                b"member-bytes",
+            )
+            .await;
+            let record = StagedHotSourceRecordV1::ready(
+                &key,
+                member,
+                StagedLsnRange { min: 1, max: 1 },
+                vec![run],
+                ready_at(),
+            );
+            let before = syncs();
+            stage
+                .publish_record(&key, &record)
+                .await
+                .expect("the record publishes");
+            costs.push(syncs() - before);
+        }
+        assert_eq!(
+            costs,
+            vec![4, 3],
+            "the record, member, and key directories sync every time; the root only for a new key"
         );
     }
 

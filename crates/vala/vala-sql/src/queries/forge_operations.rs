@@ -96,7 +96,8 @@ impl<'resource> ForgeOperations<'resource> {
     /// # Errors
     ///
     /// Returns [`SqlError::Conflict`] on invalid transition identity,
-    /// transition collision, or detail mismatch.
+    /// transition collision, detail mismatch, or a new rewrite on a table
+    /// whose Scribe promotion is still Prepared.
     /// Returns [`SqlError::InvariantViolation`] when stored data is malformed.
     /// Returns [`SqlError::Query`] when locking or projection IO fails.
     ///
@@ -129,7 +130,11 @@ impl<'resource> ForgeOperations<'resource> {
 
         match row {
             None => {
-                // Absent row: first Prepared for this operation.
+                // Absent row: first Prepared for this operation. A new rewrite
+                // waits for every promotion on its table to settle.
+                if self.family == ForgeOperationFamily::IcebergRewrite {
+                    self.refuse_unsettled_promotion(conn.transaction()).await?;
+                }
                 self.insert_prepared(conn.transaction(), operation_id, &detail)
                     .await?;
                 Ok(ForgeOperationTransition::Applied)
@@ -453,6 +458,38 @@ impl<'resource> ForgeOperations<'resource> {
 // ---------------------------------------------------------------------------
 
 impl<'resource> ForgeOperations<'resource> {
+    /// Refuses while this table resource has an unsettled Scribe promotion.
+    ///
+    /// A Prepared promotion may already have appended its objects to the
+    /// catalog without settling their `file_list` rows, so a rewrite or
+    /// expiration over that table would act on objects whose ownership is not
+    /// yet agreed. The promotion's own operation row is the barrier: once its
+    /// terminal transition commits the catalog and `file_list` agree and this
+    /// check passes again. Runs inside the caller's tenant transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Conflict`] when a promotion is still Prepared and
+    /// [`SqlError::Query`] when the read fails.
+    async fn refuse_unsettled_promotion(&self, conn: &mut PgConnection) -> Result<(), SqlError> {
+        let open: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM vala.forge_operation_state \
+              WHERE data_tenant_id = wyrd.current_tenant() AND resource = $1 \
+                AND family = $2 AND phase = 'prepared')",
+        )
+        .bind(self.resource)
+        .bind(ForgeOperationFamily::ScribePromotion.as_str())
+        .fetch_one(conn)
+        .await
+        .map_err(SqlError::from)?;
+        if open {
+            return Err(SqlError::Conflict {
+                detail: "a Scribe promotion on this table is not yet settled".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Acquires a transaction-scoped advisory lock on `(resource, family, operation_id)`.
     ///
     /// Every transition path acquires this lock before selecting state or appending
@@ -842,8 +879,8 @@ impl ForgeOperations<'_> {
     /// Returns [`SqlError::Conflict`] when the family is not
     /// `snapshot_expire`, the transition does not name this operation, the
     /// lease fence is lost, the task/attempt/owner/table identity does not
-    /// match, an Oracle query still reads the table, or the operation is
-    /// already resolved.
+    /// match, an Oracle query still reads the table, a Scribe promotion on the
+    /// table is unsettled, or the operation is already resolved.
     /// Returns [`SqlError::InvariantViolation`] when stored state is malformed.
     /// Returns [`SqlError::Query`] for statement failures.
     ///
@@ -881,6 +918,7 @@ impl ForgeOperations<'_> {
         .await?;
         let identity = lock_table_authority(&mut tx, tenant, request.table).await?;
         refuse_active_table_reads(&mut tx, &identity).await?;
+        self.refuse_unsettled_promotion(&mut tx).await?;
 
         self.acquire_operation_lock(&mut tx, operation_id).await?;
         if let Some(sql_row) = self.select_state_for_update(&mut tx, operation_id).await? {

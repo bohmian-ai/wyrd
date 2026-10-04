@@ -744,7 +744,7 @@ impl PersistenceRuntime {
             Arc::clone(&failures),
             context,
             output_scratch,
-            staging,
+            (staging, config.workers),
         ));
         let runtime_state = Arc::new(Self {
             sender: Arc::new(Mutex::new(Some(sender))),
@@ -1183,12 +1183,16 @@ struct PersistenceWorker {
     wal: Arc<WalWriter>,
     /// Bounded CPU lane used for Parquet encoding.
     persistence_cpu: ScribePersistenceCpuPool,
-    /// One-thread lane that runs claim merges.
+    /// Dedicated lane that runs claim merges.
     ///
-    /// A merge can take tens of seconds; on its own thread it never queues
+    /// A merge can take tens of seconds; on its own threads it never queues
     /// generation staging, so ingest and shutdown's final flush do not wait on
-    /// it. Claims publish one at a time, so one thread is the whole demand.
+    /// it. It admits every claim the budget lets publish at once and merges as
+    /// many together as the pod has effective CPUs.
     assembly_cpu: ScribePersistenceCpuPool,
+    /// Claims this worker publishes at once: the assembler's claim budget, so
+    /// every claim slot it hands out has a publication driving it.
+    claim_budget: usize,
     /// Bounded filesystem lane used for manifest advancement.
     wal_io: ScribeWalIoPool,
     /// Scribe memory budget for persistence workspace reservations.
@@ -1641,25 +1645,35 @@ impl PersistenceWorker {
 
     /// Builds a persistence worker from its complete durable dependencies.
     ///
-    /// Also starts the worker's own claim-merge lane.
+    /// `staging` pairs the pod's staged lifecycle owner with its claim budget
+    /// (the persistence worker count `build_staging` sizes the assembler
+    /// with). Also starts the worker's own claim-merge lane: it queues up to
+    /// the budget and runs the budget's merges on at most the pod's effective
+    /// CPUs.
     ///
     /// # Panics
     ///
-    /// Panics if the claim-merge thread cannot be started.
+    /// Panics if the claim-merge threads cannot be started.
     fn new(
         operator_pool: Option<vala_sql::OperatorPool>,
         failures: Arc<Mutex<Vec<String>>>,
         context: PersistenceRuntimeContext,
         output_scratch: Option<Arc<crate::resources::ScratchVolume>>,
-        staging: Option<Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>>,
+        (staging, claim_budget): (
+            Option<Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>>,
+            usize,
+        ),
     ) -> Self {
+        let claim_budget = claim_budget.max(1);
+        let merge_threads = claim_budget.min(context.memory.effective_cpu());
         Self {
             operator_pool,
             failures,
             actor_stream: context.actor_stream,
             wal: context.wal,
             persistence_cpu: context.persistence_cpu,
-            assembly_cpu: ScribePersistenceCpuPool::new_with_capacity(1, 1),
+            assembly_cpu: ScribePersistenceCpuPool::new_with_capacity(merge_threads, claim_budget),
+            claim_budget,
             wal_io: context.wal_io,
             memory: context.memory,
             staging_file_publisher: context.staging_file_publisher,
@@ -1962,8 +1976,9 @@ impl PersistenceWorker {
     ///
     /// Runs from [`PersistenceRuntime::publish_due`] on the server's lifecycle
     /// tick, so a key that reached target publishes within one tick and a key
-    /// whose writes stopped still publishes once its dwell expires. Concurrent
-    /// callers are safe: the assembler hands each due claim to
+    /// whose writes stopped still publishes once its dwell expires. Due claims
+    /// publish together, up to the claim budget (see [`Self::publish_claims`]).
+    /// Concurrent callers are safe: the assembler hands each due claim to
     /// exactly one caller.
     ///
     /// # Errors
@@ -1973,11 +1988,61 @@ impl PersistenceWorker {
     /// durable, so the failure retries rather than losing rows.
     async fn publish_due_claims(&self) -> Result<Vec<FileListCommitKey>, ScribeError> {
         let staging = self.staging()?;
+        self.publish_claims(&staging, || staging.take_claim(chrono::Utc::now()))
+            .await
+    }
+
+    /// Publishes every claim `next` hands out, up to the claim budget at once.
+    ///
+    /// Claims are independent — each has its own key, members, scratch and
+    /// fenced transaction — so they merge, upload and commit together instead
+    /// of each waiting for the one before it. `next` is asked for another
+    /// claim whenever fewer than `claim_budget` are in flight, and again after
+    /// each settles, so work that becomes due meanwhile is picked up;
+    /// publication ends when `next` has nothing and nothing is in flight.
+    /// Commit keys are returned in settlement order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error from `next` or from a claim's publication. No
+    /// further claim is taken after it, but claims already in flight run to
+    /// their own settlement, so none is abandoned between its fenced commit
+    /// and its retirement. A failed claim stays outstanding with durable
+    /// members and retries.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future drops every in-flight publication; each converges
+    /// on retry like a single interrupted claim, and the WAL stays
+    /// authoritative for its rows.
+    async fn publish_claims(
+        &self,
+        staging: &Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>,
+        mut next: impl FnMut() -> Result<Option<crate::scribe::assembly::StagingClaim>, ScribeError>,
+    ) -> Result<Vec<FileListCommitKey>, ScribeError> {
+        use futures_util::StreamExt as _;
+        let mut in_flight = futures_util::stream::FuturesUnordered::new();
         let mut published = Vec::new();
-        while let Some(claim) = staging.take_claim(chrono::Utc::now())? {
-            published.push(self.publish_claim(&staging, &claim).await?);
+        let mut failure = None;
+        loop {
+            while failure.is_none() && in_flight.len() < self.claim_budget {
+                match next() {
+                    Ok(Some(claim)) => {
+                        in_flight.push(async move { self.publish_claim(staging, &claim).await });
+                    }
+                    Ok(None) => break,
+                    Err(error) => failure = Some(error),
+                }
+            }
+            match in_flight.next().await {
+                Some(Ok(key)) => published.push(key),
+                Some(Err(error)) => {
+                    failure.get_or_insert(error);
+                }
+                None => break,
+            }
         }
-        Ok(published)
+        failure.map_or(Ok(published), Err)
     }
 
     /// Publishes every staged member that target and dwell would still hold.
@@ -2005,23 +2070,30 @@ impl PersistenceWorker {
         cause: crate::scribe::assembly::ClaimCause,
     ) -> Result<usize, ScribeError> {
         let staging = self.staging()?;
-        let mut published = 0;
         // A claim whose publication was refused keeps its slot and its members;
         // nothing returns it to the ready index, so the sweep below cannot see
         // it. Driving those claims first is what makes a pre-commit refusal
         // retryable inside one process instead of only after a restart, and it
         // reuses the original claim identity rather than inventing a new one.
-        for claim in staging.retryable_claims().await? {
-            self.publish_claim(&staging, &claim).await?;
-            published += 1;
-        }
-        for key in staging.ready_keys()? {
-            while let Some(claim) = staging.take_residue(&key, cause)? {
-                self.publish_claim(&staging, &claim).await?;
-                published += 1;
-            }
-        }
-        Ok(published)
+        // Claims then publish together, up to the claim budget.
+        let mut retryable = staging.retryable_claims().await?.into_iter();
+        let mut keys = staging.ready_keys()?.into_iter();
+        let mut key = keys.next();
+        let published = self
+            .publish_claims(&staging, || {
+                if let Some(claim) = retryable.next() {
+                    return Ok(Some(claim));
+                }
+                while let Some(current) = &key {
+                    if let Some(claim) = staging.take_residue(current, cause)? {
+                        return Ok(Some(claim));
+                    }
+                    key = keys.next();
+                }
+                Ok(None)
+            })
+            .await?;
+        Ok(published.len())
     }
 
     /// Publishes only the residue of the assembly keys owning one partition.

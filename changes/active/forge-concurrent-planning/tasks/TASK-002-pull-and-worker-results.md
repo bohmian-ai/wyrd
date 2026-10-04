@@ -376,7 +376,7 @@ each fail it ("pull diverged from the scan", "index drifted after commit").
   every track under the schedule lock. Cause: `O(tables)` selection plus
   queueing behind 31 closed-loop pullers. Fix site: `ForgeSchedule` (due
   index); uncontended pull is now 2.2 µs p50 / 3.5 µs p99 in release.
-- **Promotion pacing (OPEN, product defect in Scribe claim publication).**
+- **Promotion pacing (FIXED in 3ce3a113b and 75bfe0224; was a product defect in Scribe claim publication).**
   Symptom: 128 tables written every 1 s with a 10 s seal offer about 12.8
   promotions/s; the leader commits 2.2/s (earlier runs 1.2–1.5/s), and a
   table waits p50 56 s / p90 83 s / max 99 s from seal to Iceberg commit.
@@ -421,6 +421,55 @@ each fail it ("pull diverged from the scan", "index drifted after commit").
   implemented here: it changes durable Scribe publication concurrency outside
   this task's write set, which needs an owner decision. The backlog-drain
   measurement does not depend on it.
+  Fix (owner-approved, full publication revision): 3ce3a113b publishes due
+  and residue claims concurrently up to the assembler's claim budget
+  (`PersistenceWorker::publish_claims`) and sizes the merge lane from that
+  budget, capped by effective CPU. 75bfe0224 moves each claim's members
+  through Publishing, Published and CleanupPending as one concurrent step per
+  state. A state change now syncs only the record and its member directory,
+  because the key-directory entry has been durable since first publish.
+  Members retire together with one key-directory sync, and retirement reads
+  WAL ranges from the Publishing records instead of re-hashing runs. Stage
+  syncs per member fall from about 10 to 6, plus 1 per claim. Every state that
+  recovery reads is durable before the next step starts. Syncs are counted in
+  `bifrost_scribe_stage_fsyncs_total`.
+  Tests:
+  - concurrency bound: journey
+    `lifecycle::scribe_publishes_due_claims_concurrently_within_the_claim_budget`
+    (RED: at most 1 in flight; GREEN: 1 < overlap <= 4);
+  - sync count:
+    `scribe::hot_stage::tests::a_claim_costs_two_syncs_per_member_state_and_one_to_retire`
+    (RED: 12 syncs for 4 members; GREEN: 8, and 1 to retire);
+  - crash at each batched boundary:
+    `scribe::staging_runtime::tests::a_claim_crashed_{after_its_published_step,after_its_cleanup_step,inside_its_batched_removal}_retires_on_restart`.
+    These pin unchanged recovery behavior; their only RED was the missing
+    `retire_all`.
+  Verification: `mise run test:bifrost:integration:redux` 888/888,
+  `mise run test:bifrost:journey:scribe` 22/22, and clippy `-D warnings` on
+  `vala-bifrost-redux` (all features) and `wyrd-testing`.
+  Before/after: the same diagnostic command, 1 worker, leader trace. Before
+  is 88bcabfe1 on a loaded host; after is 75bfe0224 with 27 of 32 CPUs free.
+
+  | Measure | Before | After |
+  |---|---|---|
+  | Promotions/s over the commit window | 2.15 (573 in 267 s) | 5.65 (1165 in 206 s); fill 6.09/s |
+  | Seal to Iceberg commit, oldest pending seal, p50 / p99 / max | 56.3 / 89.7 / 99.1 s | 12.8 / 16.9 / 17.4 s |
+  | Generations per promotion | 5.6 | 1.9 |
+  | Per-claim time, assembly start to promotion task, FIFO-paired, p50 / p90 / p99 | 1.38 / 2.84 / 4.11 s | 0.28 / 1.49 / 2.44 s |
+  | Assembly start to next promotion task, p50 | 0.37 s | 0.02 s |
+  | Gap between consecutive claim publications, p50 | 0.445 s | 0.051 s |
+
+  Promotion now keeps pace with sealing: 5.65/s × 1.9 generations ≈ 10.7 of
+  the 12.8 generations/s offered. Seal-to-commit p50 now sits at the 10 s
+  seal cadence plus dwell instead of growing with backlog. The before-run
+  FIFO per-claim figure includes queueing behind the serial publisher.
+  Open in the after run: the live leader p99 pull at 10× was 1135.7 µs
+  against the 1 ms gate (1× was 171 µs; the 10× client round trip p50 was
+  15.4 ms). The probe runs while the first fill is writing, and the 1-CPU
+  leader now publishes up to 4 claims at once. It is unproven whether this
+  is that added contention or noise from one sample; the qualifying runs
+  must settle it. All other checks that a 1-worker run can evaluate passed.
+  Drain: 0.78 rewrites/s, which is at the pull-cadence ceiling.
 
 ### Acceptance
 

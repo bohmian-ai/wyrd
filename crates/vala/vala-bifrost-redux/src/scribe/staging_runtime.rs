@@ -1655,6 +1655,169 @@ mod tests {
         assert_no_restored_authority_survives(&hot_sources, &key, &member_ids);
         assert_eq!(recovered.restore(&pool).await.expect("cleanup replays"), 0);
     }
+
+    /// Moves every member of one claim to the state `state_for` names for it,
+    /// the way publication moves a claim through one batched step.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stage refuses any member's transition.
+    async fn move_claim(
+        stage: &ScribeHotStage,
+        key: &ScribeAssemblyKey,
+        member_ids: &[StagedMemberId],
+        state_for: impl Fn(&StagedMemberId) -> crate::scribe::hot_stage::StagedMemberState,
+    ) {
+        for member in member_ids {
+            stage
+                .transition(key, *member, state_for(member))
+                .await
+                .expect("member moves to the claim's next state");
+        }
+    }
+
+    /// Crashes a four-member claim at one boundary between the batched steps
+    /// publication moves a claim through, then proves restart retires it.
+    ///
+    /// Publication moves every member durably to `Published`, then every
+    /// member to `CleanupPending`, then removes them together. The fixture
+    /// reproduces the durable state at the chosen boundary with the same stage
+    /// operations: all members in `Published` (`cleanup_pending == false`) or
+    /// all in `CleanupPending`, with the first `retired` members already
+    /// removed by one batched [`ScribeHotStage::retire_all`]. Restart must
+    /// retire every survivor under the committed facts without republishing,
+    /// leave no claim to resume, no staged bytes, and no authority.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot stage or drive the claim, or when
+    /// recovery republishes, leaves a resumable claim, leaks staged bytes, or
+    /// leaves a restored authority alive.
+    async fn recovers_claim_interrupted_between_batched_states(
+        cleanup_pending: bool,
+        retired: usize,
+    ) {
+        let root = tempfile::tempdir().expect("runtime root");
+        let stage_root = root.path().join("stage");
+        let wal_root = root.path().join("member-wal");
+        for path in [&stage_root, &wal_root] {
+            std::fs::create_dir_all(path).expect("fixture directory");
+        }
+        let node_id = NodeId::new(uuid::Uuid::from_u128(0xba7));
+        let stage = Arc::new(ScribeHotStage::new(stage_root.clone()));
+        let config = || {
+            StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
+                .expect("assembler controls")
+        };
+        let runtime = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            publisher(Arc::clone(&stage), &wal_root, node_id),
+            config(),
+        );
+        let tenant = DataTenantId::new_v7();
+        let (key, member_ids) =
+            stage_durable_members(&runtime, tenant, node_id, 1..=4, chrono::Utc::now()).await;
+        let claim = runtime
+            .take_residue(&key, ClaimCause::Drain)
+            .expect("residue claim")
+            .expect("four members form one claim");
+        let claim_id = claim.id().to_string();
+        let objects = vec![format!("objects/{claim_id}/hot-0.parquet")];
+        let ranges = |member: &StagedMemberId| {
+            let shard = u64::from(member.shard());
+            vec![StagedLsnRange {
+                min: shard * 10,
+                max: shard * 10 + 9,
+            }]
+        };
+        move_claim(&stage, &key, &member_ids, |_| {
+            crate::scribe::hot_stage::StagedMemberState::Publishing {
+                claim_id: claim_id.clone(),
+                operation_id: uuid::Uuid::from_u128(0xba7),
+            }
+        })
+        .await;
+        move_claim(&stage, &key, &member_ids, |member| {
+            crate::scribe::hot_stage::StagedMemberState::Published {
+                claim_id: claim_id.clone(),
+                file_list_commit_key: "node:10:49".to_owned(),
+                published_object_identities: objects.clone(),
+                persisted_lsn_ranges: ranges(member),
+            }
+        })
+        .await;
+        if cleanup_pending {
+            move_claim(&stage, &key, &member_ids, |member| {
+                crate::scribe::hot_stage::StagedMemberState::CleanupPending {
+                    claim_id: claim_id.clone(),
+                    file_list_commit_key: "node:10:49".to_owned(),
+                    published_object_identities: objects.clone(),
+                    persisted_lsn_ranges: ranges(member),
+                }
+            })
+            .await;
+        }
+        stage
+            .retire_all(&key, &member_ids[..retired])
+            .await
+            .expect("members retired before the crash");
+        drop(runtime);
+
+        let hot_sources = Arc::new(crate::scribe::hot_source::ScribeHotSourceRegistry::new());
+        let recovered = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            publisher(Arc::clone(&stage), &wal_root, node_id),
+            config(),
+        )
+        .with_hot_sources(Arc::clone(&hot_sources));
+        let pool = sqlx::PgPool::connect_lazy("postgres://unused/unused").expect("lazy pool");
+        assert_eq!(
+            recovered.restore(&pool).await.expect("claim recovers"),
+            0,
+            "a committed claim is retired, never republished"
+        );
+        assert!(
+            recovered
+                .resumable_claims()
+                .expect("claim index")
+                .is_empty()
+        );
+        assert!(stage.recover().await.expect("stage rescans").is_empty());
+        assert_no_restored_authority_survives(&hot_sources, &key, &member_ids);
+    }
+
+    /// A claim that crashed after every member recorded the commit, before
+    /// any moved to cleanup, retires on restart.
+    ///
+    /// # Panics
+    ///
+    /// Panics when recovery leaves the claim, its bytes, or its authority.
+    #[tokio::test]
+    async fn a_claim_crashed_after_its_published_step_retires_on_restart() {
+        recovers_claim_interrupted_between_batched_states(false, 0).await;
+    }
+
+    /// A claim that crashed after every member moved to cleanup, before any
+    /// was removed, retires on restart.
+    ///
+    /// # Panics
+    ///
+    /// Panics when recovery leaves the claim, its bytes, or its authority.
+    #[tokio::test]
+    async fn a_claim_crashed_after_its_cleanup_step_retires_on_restart() {
+        recovers_claim_interrupted_between_batched_states(true, 0).await;
+    }
+
+    /// A claim that crashed partway through its batched removal retires its
+    /// surviving members on restart.
+    ///
+    /// # Panics
+    ///
+    /// Panics when recovery leaves the claim, its bytes, or its authority.
+    #[tokio::test]
+    async fn a_claim_crashed_inside_its_batched_removal_retires_on_restart() {
+        recovers_claim_interrupted_between_batched_states(true, 2).await;
+    }
 }
 
 /// Postgres-backed recovery proofs for the staged backlog gauges.

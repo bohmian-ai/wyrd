@@ -8,6 +8,7 @@ use vala_bifrost_redux::scribe::geometry::{
     DEFAULT_GENERATION_ROTATION_BYTES, DEFAULT_SHARD_COUNT, DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
     DEFAULT_WAL_SEGMENT_BYTES, ScribeGeometry,
 };
+use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 
@@ -96,6 +97,105 @@ async fn scribe_publishes_idle_rows_on_its_own_clock() {
         expected,
         "publication may not change which rows are readable"
     );
+
+    server.shutdown().await.expect("the server drains cleanly");
+}
+
+/// Claims the pod may hold at once: the harness runs the default Scribe
+/// configuration, whose four WAL IO workers size the claim budget.
+const CLAIM_BUDGET: usize = 4;
+
+/// Tables the concurrent-publication case makes due together: twice the
+/// budget, so a publisher that honours the budget must queue half of them.
+const CONCURRENT_TABLES: usize = 2 * CLAIM_BUDGET;
+
+/// How long each claim's publication is held open in the concurrent case, so
+/// claims that run together are observed overlapping.
+const HELD_PUBLICATION: Duration = Duration::from_millis(1_500);
+
+/// Due claims publish together, never more at once than the claim budget.
+///
+/// Every table here is written once and goes quiet, so each becomes one claim
+/// that the pod's own lifecycle tick makes due when its dwell expires — the
+/// production path a busy pod with many tables takes every few seconds. Each
+/// publication is held open at the real object-write seam, so the fault
+/// controls observe how many claims are in flight together: more than one
+/// proves due claims do not wait for each other, and no more than the budget
+/// proves the bound holds. Every acknowledged row must still publish exactly
+/// once.
+///
+/// # Panics
+///
+/// Panics when the server cannot start, when an append or read fails, when
+/// the due claims do not all publish within [`IDLE_PUBLICATION_DEADLINE`],
+/// when no two claims overlap, when more than [`CLAIM_BUDGET`] run at once, or
+/// when a row is lost or duplicated.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn scribe_publishes_due_claims_concurrently_within_the_claim_budget() {
+    let geometry = ScribeGeometry::new(
+        DEFAULT_SHARD_COUNT,
+        DEFAULT_WAL_SEGMENT_BYTES,
+        DEFAULT_GENERATION_ROTATION_BYTES,
+        RETENTION,
+        None,
+        None,
+        DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
+    )
+    .expect("default geometry with a short retention is valid");
+    let faults = PersistenceFaults::default();
+    faults.set_object_write_delay_for_test(HELD_PUBLICATION);
+    let server = WyrdTestServer::builder()
+        .with_scribe_geometry_for_test(geometry)
+        .with_scribe_persistence_faults_for_test(faults.clone())
+        .without_audit_publication_for_test()
+        .start_bound()
+        .await
+        .expect("the Scribe production harness starts");
+    let tenant = server.data_tenant_id();
+    let client = tenant_client(&server, tenant).await;
+    let expected: Vec<i64> = (0..16).collect();
+    let mut tables = Vec::with_capacity(CONCURRENT_TABLES);
+    for index in 0..CONCURRENT_TABLES {
+        let name = unique_table(&format!("concurrent_due_{index}"));
+        let table = register_table(&server, tenant, BifrostNamespace::Datasets, &name).await;
+        append_values(&client, &table, Uuid::now_v7(), &expected)
+            .await
+            .expect("the append is acknowledged");
+        tables.push((name, table));
+    }
+
+    let deadline = tokio::time::Instant::now() + IDLE_PUBLICATION_DEADLINE;
+    for (name, _) in &tables {
+        while published_rows(&server, tenant, name).await < expected.len() as u64 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "due claims were not all published within {IDLE_PUBLICATION_DEADLINE:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    let overlap = faults.max_concurrent_object_writes_for_test();
+    assert!(
+        overlap > 1,
+        "due claims must publish together, but at most {overlap} was in flight at once"
+    );
+    assert!(
+        overlap <= CLAIM_BUDGET,
+        "{overlap} claims were in flight at once; the claim budget is {CLAIM_BUDGET}"
+    );
+    for (name, table) in &tables {
+        assert_eq!(
+            published_rows(&server, tenant, name).await,
+            expected.len() as u64,
+            "concurrent publication must publish every acknowledged row exactly once"
+        );
+        assert_eq!(
+            sorted_values(&client, table).await,
+            expected,
+            "publication may not change which rows are readable"
+        );
+    }
 
     server.shutdown().await.expect("the server drains cleanly");
 }

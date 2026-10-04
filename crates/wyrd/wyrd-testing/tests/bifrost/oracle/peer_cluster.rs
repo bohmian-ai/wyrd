@@ -76,6 +76,12 @@ pub(crate) struct PeerCluster {
     preparation_pauses: BTreeMap<usize, Arc<OraclePreparationPause>>,
     /// Statement a journey started and has not yet joined, per pod.
     active: BTreeMap<usize, QuerySlot>,
+    /// Managed event time, in UTC microseconds, stamped on every fixture row.
+    ///
+    /// Fixed once at launch so every row a journey ingests lands in one
+    /// hourly partition, and therefore behind one live route and one Scribe
+    /// producer, no matter when the journey runs relative to an hour boundary.
+    fixture_event_time_micros: i64,
 }
 
 impl PeerCluster {
@@ -169,6 +175,7 @@ impl PeerCluster {
             execute_pauses: BTreeMap::new(),
             preparation_pauses: BTreeMap::new(),
             active: BTreeMap::new(),
+            fixture_event_time_micros: chrono::Utc::now().timestamp_micros(),
         };
         let booted = peers.len() - usize::from(delay_last);
         for index in 0..booted {
@@ -573,7 +580,7 @@ impl PeerCluster {
                 expected_schema_fingerprint: fingerprint,
                 request_id: RequestId::now_v7(),
                 batch_id: uuid::Uuid::now_v7(),
-                payload: fixture_rows_ipc(start_id, rows, groups)?,
+                payload: fixture_rows_ipc(start_id, rows, groups, self.fixture_event_time_micros)?,
             })
             .await?;
         Ok(())
@@ -1784,30 +1791,50 @@ fn scratch_usage(root: &Path) -> Result<ScratchUsage, JourneyError> {
     Ok(usage)
 }
 
-/// Encodes `rows` deterministic `(id, filter_key)` rows as one Arrow IPC stream.
+/// Encodes `rows` deterministic `(id, filter_key, wyrd_event_time)` rows as one
+/// Arrow IPC stream.
 ///
 /// Ids run `start_id..start_id + rows`, and keys cycle `group_{id % groups}`,
-/// so a grouped aggregate has more than one non-trivial group.
+/// so a grouped aggregate has more than one non-trivial group. Every row
+/// carries `event_time_micros` in the managed event-time column, which Scribe
+/// lifts verbatim, so the caller rather than wall clock picks the partition.
 ///
 /// # Errors
 ///
 /// Returns the batch or IPC encoding failure.
-fn fixture_rows_ipc(start_id: i64, rows: i64, groups: i64) -> Result<bytes::Bytes, JourneyError> {
+fn fixture_rows_ipc(
+    start_id: i64,
+    rows: i64,
+    groups: i64,
+    event_time_micros: i64,
+) -> Result<bytes::Bytes, JourneyError> {
     let groups = groups.max(1);
     let schema = Arc::new(arrow::datatypes::Schema::new(vec![
         arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
         arrow::datatypes::Field::new("filter_key", arrow::datatypes::DataType::Utf8, false),
+        arrow::datatypes::Field::new(
+            wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
+            arrow::datatypes::DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ),
+            false,
+        ),
     ]));
     let ids: Vec<i64> = (start_id..start_id.saturating_add(rows)).collect();
     let keys: Vec<String> = ids
         .iter()
         .map(|id| format!("group_{}", id % groups))
         .collect();
+    let event_times = vec![event_time_micros; ids.len()];
     let batch = arrow::record_batch::RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
             Arc::new(arrow::array::Int64Array::from(ids)),
             Arc::new(arrow::array::StringArray::from(keys)),
+            Arc::new(
+                arrow::array::TimestampMicrosecondArray::from(event_times).with_timezone("UTC"),
+            ),
         ],
     )?;
     let mut ipc = Vec::new();

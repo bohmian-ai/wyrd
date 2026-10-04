@@ -474,3 +474,138 @@ The completion report must include:
 - `architecture/references/languages/spec-driven-development.md`
 - `architecture/references/languages/implementation-execution.md`
 - `architecture/references/languages/testing-workflows.md`
+
+
+## Implementation Evidence
+
+Commits: `41968879e`, `17c864196`, `3f69e10a5`, `fa2ad497b`, `191fd217e`
+(S3), `362d7e758` (S4), `6acd54371` (S8), `62de8d84f` (S7), `7dde4299c` (S5),
+`e4aecabc5` (S2), `3a51a24d5` (S6 and expired-cleanup age fix), `6160a35e9`
+(lint and sync cleanup), `d87086302` (documentation), `a678b5916`
+(fence-liveness definer, removed by revision 11), `05cceaf35` and
+`484c3b4f6` (gate fixes), `0924e52cf` (revision 11: drop release and
+deadline expiry).
+
+Scenario commands use the exact forms listed per scenario above
+(`scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked ... -E "test(=...)"'`).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| One tenant-scoped acquisition statement commits one active row per query/table | `vala-sql` migration `20260910000025_oracle_reader_authority.sql` (`oracle_acquire_table_cut`, SECURITY INVOKER under TenantConn RLS) | S1 `active_table_read_claim_is_atomic_tenant_scoped_and_postgres_expired` (`pg_oracle_membership`); S5 journey | PASS |
+| Acquisition and destructive maintenance serialize through table authority | Acquisition takes the maintenance authority `FOR SHARE`; Forge destruction takes it exclusively and checks `table_is_read` | S3 `forge::reader_expiry_ordering::last_table_reader_controls_destructive_cleanup` | PASS |
+| Cut and ownership are one private value through settlement | `ActiveReadClaim` owned with the materialized cut in `oracle/mod.rs`; released in `settle_and_finish_stream` | S2 `distributed::held_cut_owns_active_reads_until_all_descendants_settle` (active=1 while a follower is held; 0 before the terminal frame) | PASS |
+| Release after success, cancellation, timeout and failure; a dropped owner releases; a crashed owner's rows expire at the query deadline in PostgreSQL time | `planner.rs` `ActiveReadClaim::release` plus `Drop` spawning the same release; `ActiveReadOwner::deadline` bound as `p_deadline_ms`, `abandon_after = statement_timestamp() + p_deadline_ms ms`; `active_table_reads_exist` deletes on `abandon_after <= statement_timestamp()` only | S2 dropped caller and dropped pin both reach 0 rows (RED with drop release disabled: "a dropped caller: 1 active reads remain"); S1 `abandon_after - acquired_at` equals the bound 3600 s, a future row survives, a past row is discarded | PASS |
+| Forge refuses while read; immediate eligibility after last reader; other roots stay | `forge/expire.rs` no age/depth retention; `forge/orphan_gc.rs` age floor only for `AttemptGeneration` | S3; S6 `distributed::held_query_blocks_cleanup_then_releases_replaced_snapshot`; unit `forge_expired_cleanup_eligibility_matrix` | PASS |
+| Iceberg expiration acts only on explicit IDs | Fork pins `iceberg-rust@97c32f63`, `iceberg-compaction-core@ef97aea0` (`17c864196`) | Fork proof in the pinned fork; Tier-2 `forge::snapshot_expiration` suite | PASS |
+| Unsettled promotion blocks rewrite and expiration | Existing operation owner and table authority (`362d7e758`) | S4 `forge::promotion::promotion_barrier::unsettled_promotion_blocks_rewrite_and_expiration` | PASS |
+| RLS plus narrow definer prevent cross-tenant exposure | `oracle_catalog_metadata_location` SECURITY DEFINER pointer lookup; no `wyrd_app` grant on `iceberg_catalog` | S1 cross-tenant cases; S5 cross-tenant lookup; tenant-isolation check in `verify:bifrost` | PASS |
+| One-statement success, one reacquire on `NotFound`, second terminal | Oracle acquisition loop in `catalog/bifrost_catalog.rs` / `oracle/mod.rs` | S5 `distributed::tenant_scoped_active_cut_is_one_statement_and_one_bounded_retry` | PASS |
+| Local and forwarded queries share one boot-resolved default deadline | `62de8d84f` (server state forwarding) | S7 `query::configured_default_deadline_is_shared_by_local_and_forwarded_queries` | PASS |
+| Held-query journey tracks exact hot path through promotion and rewrite | S6 journey in `wyrd-testing/tests/bifrost/oracle/distributed.rs` | S6: originals survive while held with terminal rows; after release only originals deleted, replacement survives, promoted snapshot expired | PASS |
+| Successful cleanup removes the terminal `file_list` row; failures retain it | Cleanup completion transaction (`6acd54371`) | S8 `forge::expired_cleanup::terminal_file_list_row_is_removed_only_after_object_cleanup`; S6 rows `None` after cleanup | PASS |
+| No epoch, frontier, ancestry, IO gate, reader-cut field, cache, retention deadline, cap, preallocation, or alias | Deletions in `41968879e`, `3f69e10a5`, `fa2ad497b` | `git grep -i -E "reader_epoch|ReaderEpoch|ancestry_frontier|reader_cut|IoGate|io_permit|reader_protection"` finds only protobuf `reserved "reader_cut"`; `codegen:check` | PASS |
+| Docs describe exact active readers and immediate eligibility | `architecture/bifrost-design.md`, `references/domain/iceberg.md`, `references/domain/analytical-operations-reliability.md`, `docs/.../bifrost/forge.svx` | `mise run docs:check` | PASS |
+
+### Diagnoses
+
+- **S3 — Symptom:** later passes recorded no expiry after a refusal while a
+  read was held. **Evidence:** the refused attempt remained active in
+  `forge_tasks`. **Cause:** expiry was claimed before the read check, so a
+  refusal left an active attempt. **Fix site:** the leader's `table_is_read`
+  pre-check before claiming destructive work.
+- **S2 — Symptom:** the journey hung. **Evidence:** the trace logs
+  "analytical attempt admitted" but never "Oracle leader opened one query
+  stream". **Cause:** `query_sql` awaits the first batch, which needs the
+  paused follower; awaiting it before the join deadlocked the test. **Fix
+  site:** the test only (run the query inside `try_join!`/`select!`).
+- **S6 — Symptom:** no rewrite replaced the promoted object. **Evidence:**
+  small-files task `progressed=false` with one input. **Cause:** small-files
+  needs at least two inputs. **Fix site:** the test writes two objects.
+- **S6 — Symptom:** expired cleanup refused with `TooYoung`, then "retry
+  failure lost attempt ownership". **Evidence:** "refreshed protection refused
+  a prepared expired-cleanup candidate: TooYoung". **Cause:** shared
+  `orphan_gc.rs::eligibility` applied the orphan TTL to expired-object
+  cleanup. This was hidden because Tier-2 S3 advanced the clock 48h.
+  **Fix site:** `eligibility` applies the age floor only to
+  `MaintenanceScope::AttemptGeneration`. Both callers were checked; Tier-2
+  `expired_cleanup`, `reader_expiry_ordering`, `snapshot_expiration`,
+  `promotion` and `orphan_cleanup` pass (21/21).
+- **S6 — Symptom:** originals not deleted after release. **Cause:** the
+  head's `lineage_snapshot_id` root (a legitimate pre-existing root) retained
+  the rewrite base. **Fix site:** the test only. It appends ordinarily with
+  compaction disabled so the head moves, and production keeps the root.
+
+- **verify:bifrost — Symptom:** `check:tenant-isolation` rejected public
+  `refuse_active_table_reads` and `active_table_reads_exist` (raw
+  `Transaction`). The S1 test was moved to the public owner
+  (`BifrostTableMaintenanceAuthority::has_active_reads` on `TenantConn`,
+  which the Forge leader's `table_is_read` uses), and it then failed at
+  `pg_oracle_membership.rs:1001`: a dead fence alone discarded a read.
+  **Evidence:** `vala.cluster_nodes` RLS is `data_tenant_id =
+  wyrd.current_tenant()` and Oracle fences are SYSTEM_OWNER rows. **Cause:**
+  under a tenant-bound connection the abandonment's `NOT EXISTS (live
+  fence)` saw no row, so a live owner's read past `abandon_after` was
+  discarded. Only the operator-pool path (BYPASS) was correct. **Fix site:**
+  the shared rule `active_table_reads_exist` now calls a narrow SECURITY
+  DEFINER `vala.oracle_fence_is_live(node_id, fencing_token, liveness_secs)`
+  added to unshipped migration 025. Both helpers are `pub(crate)`. Callers
+  checked: `forge_tasks.rs` expiration preparation (operator),
+  `BifrostTableMaintenanceAuthority::has_active_reads` (TenantConn: Forge
+  `gc.rs`/`orphan_gc.rs`). Superseded by revision 11: abandonment no longer
+  reads fence liveness, so the definer was removed (`0924e52cf`).
+- **verify:bifrost — Symptom:** `forge::snapshot_expiration` compared a
+  manual Forge clock with host `Utc::now()`. **Cause:** the test read the
+  wrong clock. **Fix site:** the test reads `forge.clock_for_test()`.
+- **verify:bifrost — Symptom:** `forge::production_routes` failed on a
+  `snapshot_expiry`/`expired_cleanup` sibling route. **Cause:** a stale ban
+  from before immediate eligibility; those routes are now expected. **Fix
+  site:** the ban was removed. Disabling expiration instead stopped orphan
+  scheduling and was reverted.
+- **verify:bifrost — Symptom:** `forge::production_closeout` reader case
+  expected expiration that immediate eligibility now performs only after
+  release. **Fix site:** the test holds the reader through
+  `HELD_READER_PASSES`, asserts the objects survive, then collects them
+  exactly after `wait_for_reader_release`.
+- **verify:bifrost — Symptom:** `server::eval_verification` and
+  `oracle::published` bracketed durable timestamps with host time. **Cause:**
+  PostgreSQL owns those timestamps; host skew put them out of range. **Fix
+  site:** both tests read `clock_timestamp()` from PostgreSQL.
+
+### Non-goals
+
+No metadata cache, query cap, reader-capacity preallocation, retention-derived
+deadline, replacement wire field, compatibility alias, or `iceberg_catalog`
+grant to `wyrd_app` was added. No unrelated files changed.
+
+### Risks
+
+- A crashed Oracle's rows block destructive cleanup on their tables until
+  each query's deadline passes in PostgreSQL time. This is by design. The
+  deadline is computed from host time and bound as a duration, so host/PG skew
+  does not shift it; acquisition latency only lengthens it.
+- A dropped owner's release is spawned, not awaited. Outside a Tokio runtime,
+  or if the release statement fails, the row waits for its deadline.
+- After a refused cleanup candidate, failure settlement can log "retry failure
+  lost attempt ownership". This was not observed once the age floor was
+  fixed, and was not addressed here.
+- S5 counts acquisition calls, not wire statements. Audit staging and the
+  release `DELETE` are separate statements.
+- S5 production code predates its test commit, so it has no recorded RED.
+- In S6, orphan refusal is not discriminating because Scribe objects are
+  outside orphan scope. Tier-2 `orphan_cleanup` covers that refusal.
+
+### Final Verification
+
+- `mise run fmt`, `mise run lints`, `git diff --check`: clean.
+- `mise run verify:bifrost`: exit 0. Every lane passed, including
+  `check:tenant-isolation`, the Bifrost unit and integration suites, and the
+  forge (21), scribe (25), oracle (49), drift and SDK journeys.
+- `mise run test:principals:integration`: exit 0.
+- S1 and S2 were rerun after revision 11 with their exact commands. S2 RED
+  was demonstrated with the drop release disabled.
+- No contract, schema, stub, or docs change was made in revision 11, so
+  `codegen:check` and `docs:check` were not rerun for it.
+
+## Final Status
+
+IMPLEMENTED

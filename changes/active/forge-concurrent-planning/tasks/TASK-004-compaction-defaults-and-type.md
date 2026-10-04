@@ -3,7 +3,7 @@ id: TASK-004
 kind: implementation
 status: proposed
 spec: SPEC-forge-concurrent-planning
-requirements: [REQ-011, REQ-012]
+requirements: [REQ-011, REQ-012, REQ-013]
 depends_on: [TASK-003]
 ---
 
@@ -33,6 +33,24 @@ src). Journeys in Rust, Python and TypeScript register a table with
 `small-files`, read it back from the description, re-register with the same
 value (accepted) and a different value (conflict), and show Forge dispatching
 that type.
+
+## Scenario 3 — Merge staged files once; never revisit finished files (REQ-013)
+
+Default `ForgeTableSettings::compaction_type` becomes `SmallFiles`. Replace
+`ForgeConfig::small_file_threshold_bytes` (fixed 64 MiB,
+`forge/compact.rs`) with a percentage of the resolved file target
+(default 75); `ForgeTablePolicy::extract` (`forge/managed/policy.rs`)
+derives the byte threshold from the table's resolved target. The
+production-closeout geometry profiles already encode this ratio (768 MiB
+of 1 GiB; the fast profile's 4 MiB stage / 8 MiB target scales the same
+way), so they use the default instead of an explicit threshold. RED/GREEN
+with real files at the scaled geometry: two staged-size files merge into
+one target-size output; a target-size output is never selected again by a
+later compaction; a lone staged-size file is left until a partner arrives.
+Unit tests pin 768 MiB at the 1 GiB default and 75% of a declared target.
+Update docs (`forge.svx` property table and compaction prose) and
+`architecture/bifrost-design.md` if it states the old default type or
+threshold.
 
 ## Verification
 

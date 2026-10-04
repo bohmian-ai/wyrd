@@ -61,6 +61,20 @@ impl OraclePlanner {
         }
         parse_select_tables(&request.sql)
     }
+
+    /// Projects one request's `deadline_ms` to the total budget it runs under.
+    ///
+    /// A positive value is honored exactly and uncapped. An omitted, zero, or
+    /// negative value takes this planner's configured default, so every entry
+    /// that owns a planner built from the boot-resolved configuration — local
+    /// Oracle entry and public forwarding alike — resolves the same budget.
+    #[must_use]
+    pub fn request_deadline(&self, requested_ms: Option<i64>) -> Duration {
+        requested_ms
+            .and_then(|deadline_ms| u64::try_from(deadline_ms).ok())
+            .filter(|deadline_ms| *deadline_ms != 0)
+            .map_or(self.config.default_deadline, Duration::from_millis)
+    }
 }
 
 /// One query's committed active table reads.

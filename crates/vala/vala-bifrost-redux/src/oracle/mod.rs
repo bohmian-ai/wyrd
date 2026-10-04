@@ -1720,8 +1720,7 @@ impl Oracle {
     /// # Errors
     /// Returns query timeout if the configured duration cannot form an instant.
     fn capture_query_deadline(&self, request: &BifrostQueryRequest) -> Result<i64, BifrostError> {
-        let duration =
-            projected_request_deadline(request.deadline_ms, self.planner.config.default_deadline);
+        let duration = self.planner.request_deadline(request.deadline_ms);
         let duration =
             chrono::Duration::from_std(duration).map_err(|_| BifrostError::QueryTimeout)?;
         chrono::Utc::now()
@@ -3352,13 +3351,6 @@ pub fn physical_build_observation_for_test() -> (u64, String) {
     (total, latest)
 }
 
-/// Projects omitted, zero, and negative request budgets to the configured immutable default.
-fn projected_request_deadline(requested_ms: Option<i64>, default: Duration) -> Duration {
-    requested_ms
-        .and_then(|deadline_ms| u64::try_from(deadline_ms).ok())
-        .filter(|deadline_ms| *deadline_ms != 0)
-        .map_or(default, Duration::from_millis)
-}
 
 /// Projects one pinned Iceberg manifest entry into the descriptor a follower is
 /// signed to read.
@@ -4419,11 +4411,15 @@ mod tests {
     #[test]
     fn request_deadline_projects_unusable_budgets_to_the_default() {
         let default = Duration::from_secs(30);
-        assert_eq!(projected_request_deadline(None, default), default);
-        assert_eq!(projected_request_deadline(Some(0), default), default);
-        assert_eq!(projected_request_deadline(Some(-5), default), default);
+        let planner = OraclePlanner::new(OracleConfig {
+            default_deadline: default,
+            ..OracleConfig::default()
+        });
+        assert_eq!(planner.request_deadline(None), default);
+        assert_eq!(planner.request_deadline(Some(0)), default);
+        assert_eq!(planner.request_deadline(Some(-5)), default);
         assert_eq!(
-            projected_request_deadline(Some(125), default),
+            planner.request_deadline(Some(125)),
             Duration::from_millis(125)
         );
     }

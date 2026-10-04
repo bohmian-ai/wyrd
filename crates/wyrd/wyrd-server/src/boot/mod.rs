@@ -1092,7 +1092,10 @@ pub async fn compose_bifrost(
                 .map(|runtime| runtime.registered_role().fencing_token),
             tls: peer_tls,
             authority: forwarding_authority,
-            config: OracleConfig::default(),
+            config: OracleConfig {
+                default_deadline: bifrost_config.oracle.default_query_deadline(),
+                ..OracleConfig::default()
+            },
         },
     ));
     let interceptor =
@@ -1680,9 +1683,7 @@ impl<'a> OracleRoleBuilder<'a> {
                 std::time::Duration::from_millis(config.oracle.max_queue_wait_ms),
                 |value| value.max_queue_wait,
             ),
-            default_deadline: std::time::Duration::from_millis(
-                config.oracle.default_query_deadline_ms,
-            ),
+            default_deadline: config.oracle.default_query_deadline(),
             ..OracleConfig::default()
         };
         let capabilities = OracleCapabilitiesV1 {

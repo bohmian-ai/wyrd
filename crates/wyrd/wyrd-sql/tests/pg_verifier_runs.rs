@@ -262,6 +262,11 @@ async fn cursor(conn: &mut TenantConn<'_>, binding: BindingId) -> Option<DateTim
         .expect("cursor reads")
 }
 
+/// REQ-186's fixed wait after a scheduled window ends before its occurrence
+/// may be claimed; a cursor is due only once it is this far behind the
+/// database clock.
+const SCHEDULE_CLAIM_DELAY: Duration = Duration::seconds(30);
+
 /// Read the database's current statement instant, the queue's only clock.
 ///
 /// # Panics
@@ -922,7 +927,9 @@ async fn observation_ordinal_is_fixed_at_serialized_enqueue() {
 /// Two schedulers ticking the same due binding concurrently create exactly one
 /// run: the second skips the locked row. The committed cursor moves to the
 /// next future boundary, a restarted scheduler on fresh handles finds nothing
-/// due, and re-enqueueing the same occurrence returns the existing run.
+/// due, and re-enqueueing the same occurrence returns the existing run. The
+/// cursor sits one claim delay behind the database clock, and the claimed
+/// window still ends at the cursor.
 ///
 /// # Panics
 /// Panics when an occurrence produces zero or two runs, the window or cursor
@@ -944,7 +951,8 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
         .await
         .expect("owner activates");
     assert_next_daily_boundary(cursor(&mut setup, binding).await, armed_after);
-    let due = database_now(&mut setup).await;
+    let now = database_now(&mut setup).await;
+    let due = now - SCHEDULE_CLAIM_DELAY;
     set_cursor(&mut setup, binding, Some(due)).await;
     setup.commit().await.expect("setup commits");
 
@@ -965,7 +973,7 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
     );
     assert_eq!(tick.binding_id, binding);
     assert_eq!(tick.due_at, due);
-    assert_next_daily_boundary(tick.next_run_at, due);
+    assert_next_daily_boundary(tick.next_run_at, now);
     let ScheduleOutcome::Enqueued(run) = tick.outcome else {
         panic!("expected a scheduled run, got {:?}", tick.outcome);
     };
@@ -995,7 +1003,7 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
             .expect("restarted tick runs")
             .is_none()
     );
-    assert_next_daily_boundary(cursor(&mut conn, binding).await, due);
+    assert_next_daily_boundary(cursor(&mut conn, binding).await, now);
     let claimed = claim(&queue, &mut conn).await;
     assert_eq!(claimed.lease.run_id, run);
     assert_eq!(claimed.origin, RunOrigin::Schedule);
@@ -1044,7 +1052,8 @@ async fn scheduler_skips_inactive_unready_and_missed_occurrences() {
         .expect("tenant connection opens");
     let custom = register_verifier(&mut conn, &actor, "custom", custom_drift()).await;
     let psi = register_verifier(&mut conn, &actor, "psi", psi_drift()).await;
-    let due = database_now(&mut conn).await;
+    let now = database_now(&mut conn).await;
+    let due = now - SCHEDULE_CLAIM_DELAY;
 
     let (stale_owner, stale) = register_service(&mut conn, &actor, "stale").await;
     let inactive = bind(&mut conn, &stale_owner, &custom, daily(), Vec::new()).await;
@@ -1065,7 +1074,7 @@ async fn scheduler_skips_inactive_unready_and_missed_occurrences() {
 
     let mut outcomes = Vec::new();
     while let Some(tick) = queue.schedule_next_due(&mut conn).await.expect("tick runs") {
-        assert_next_daily_boundary(tick.next_run_at, due);
+        assert_next_daily_boundary(tick.next_run_at, now);
         outcomes.push((tick.binding_id, tick.outcome));
     }
     outcomes.sort_by_key(|(binding, _)| *binding);
@@ -1082,7 +1091,7 @@ async fn scheduler_skips_inactive_unready_and_missed_occurrences() {
     expected.sort_by_key(|(binding, _)| *binding);
     assert_eq!(outcomes, expected);
     for binding in [inactive, unready, missed] {
-        assert_next_daily_boundary(cursor(&mut conn, binding).await, due);
+        assert_next_daily_boundary(cursor(&mut conn, binding).await, now);
     }
     assert_eq!(run_count(&mut conn).await, 0);
 }
@@ -2374,7 +2383,7 @@ async fn queue_state_is_tenant_isolated() {
         .await
         .expect("tenant connection opens");
     let now = database_now(&mut due_now).await;
-    set_cursor(&mut due_now, binding, Some(now)).await;
+    set_cursor(&mut due_now, binding, Some(now - SCHEDULE_CLAIM_DELAY)).await;
     due_now.commit().await.expect("cursor commits");
     assert_eq!(
         queue
@@ -2495,7 +2504,9 @@ async fn binding_status_reports_activity_readiness_and_latest_run() {
 ///
 /// # Panics
 /// Panics when a stored instant falls outside its database bracket, a backoff
-/// differs from the configured delay, or a future cursor is reported due.
+/// differs from the configured delay, a future cursor or one whose window
+/// ended less than the claim delay ago is reported due, or a due occurrence's
+/// window does not end at its cursor.
 #[tokio::test]
 async fn database_clock_owns_verifier_queue_deadlines() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -2638,13 +2649,29 @@ async fn database_clock_owns_verifier_queue_deadlines() {
             .is_none(),
         "a cursor ahead of the database clock is not due"
     );
-    let due = database_now(&mut conn).await;
+    sqlx::query(
+        "UPDATE wyrd.verification_bindings SET next_run_at = statement_timestamp() \
+          WHERE binding_id = $1",
+    )
+    .bind(binding.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("cursor reaches the database clock");
+    assert!(
+        queue
+            .schedule_next_due(&mut conn)
+            .await
+            .expect("window-end tick runs")
+            .is_none(),
+        "a window that has just ended waits out the claim delay"
+    );
+    let due = database_now(&mut conn).await - SCHEDULE_CLAIM_DELAY;
     set_cursor(&mut conn, binding, Some(due)).await;
     let tick = queue
         .schedule_next_due(&mut conn)
         .await
         .expect("due tick runs")
-        .expect("the cursor is due on the database clock");
+        .expect("a cursor the claim delay behind the database clock is due");
     assert_eq!(tick.due_at, due);
 }
 

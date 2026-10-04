@@ -206,16 +206,28 @@ const BINDING_SUBJECT_SQL: &str = r#"
      WHERE binding_id = $1
 "#;
 
+/// How long after a scheduled window ends its occurrence becomes claimable.
+///
+/// An occurrence whose window ends at `T` is claimed only once PostgreSQL's
+/// statement time reaches `T` plus this delay, so observations stamped just
+/// before `T` that are still being ingested land inside the window they
+/// belong to. The window itself stays `[start, T)`. Bound as milliseconds
+/// into [`DUE_BINDING_SQL`] and [`DUE_TENANTS_SQL`], which derive the cutoff
+/// from `statement_timestamp()`. A fixed value, not configuration.
+const SCHEDULE_CLAIM_DELAY: Duration = Duration::seconds(30);
+
 /// Briefly lock the earliest due scheduled binding no other scheduler holds.
 ///
-/// Dueness is decided against PostgreSQL's statement time, and the same
-/// statement returns that instant so the synchronous cron calculation anchors
-/// on the database clock rather than the scheduler process's.
+/// Dueness is decided against PostgreSQL's statement time: a cursor is due
+/// once it is at least `$1` milliseconds ([`SCHEDULE_CLAIM_DELAY`]) in the
+/// past. The same statement returns that instant so the synchronous cron
+/// calculation anchors on the database clock rather than the scheduler
+/// process's.
 const DUE_BINDING_SQL: &str = r#"
     SELECT binding_id, schedule_cron, schedule_tz, next_run_at, statement_timestamp() AS now
       FROM wyrd.verification_bindings
      WHERE activation = 'schedule'
-       AND next_run_at <= statement_timestamp()
+       AND next_run_at + ($1::bigint * INTERVAL '1 millisecond') <= statement_timestamp()
      ORDER BY next_run_at, binding_id
      LIMIT 1
        FOR UPDATE SKIP LOCKED
@@ -483,11 +495,14 @@ const RUNNABLE_TENANTS_SQL: &str = r#"
 "#;
 
 /// List tenants with due scheduled bindings, most overdue tenant first.
+///
+/// Uses the same dueness rule as [`DUE_BINDING_SQL`]: `$2` is
+/// [`SCHEDULE_CLAIM_DELAY`] in milliseconds.
 const DUE_TENANTS_SQL: &str = r#"
     SELECT data_tenant_id
       FROM wyrd.verification_bindings
      WHERE activation = 'schedule'
-       AND next_run_at <= statement_timestamp()
+       AND next_run_at + ($2::bigint * INTERVAL '1 millisecond') <= statement_timestamp()
      GROUP BY data_tenant_id
      ORDER BY min(next_run_at), data_tenant_id
      LIMIT $1
@@ -1223,8 +1238,8 @@ impl VerifierRunQueue {
 
     /// Process the earliest due scheduled binding of the caller's tenant.
     ///
-    /// Locks one binding whose cursor is at or before PostgreSQL's statement
-    /// time with `FOR UPDATE SKIP LOCKED`, so concurrent schedulers never
+    /// Locks one binding whose cursor is at least [`SCHEDULE_CLAIM_DELAY`]
+    /// before PostgreSQL's statement time with `FOR UPDATE SKIP LOCKED`, so concurrent schedulers never
     /// claim the same occurrence. That same database instant is the anchor for
     /// every decision this tick makes: the occurrence yields one run for its
     /// fixed window only when it was not missed by then, its owner principal
@@ -1245,6 +1260,7 @@ impl VerifierRunQueue {
         conn: &mut TenantConn<'_>,
     ) -> Result<Option<ScheduleTick>, SqlxError> {
         let due: Option<DueBindingRow> = sqlx::query_as(DUE_BINDING_SQL)
+            .bind(SCHEDULE_CLAIM_DELAY.num_milliseconds())
             .fetch_optional(&mut **conn.transaction())
             .await?;
         let Some(due) = due else {
@@ -1885,6 +1901,7 @@ impl VerifierRunQueue {
     ) -> Result<Vec<DataTenantId>, SqlxError> {
         let rows: Vec<Uuid> = sqlx::query_scalar(DUE_TENANTS_SQL)
             .bind(limit)
+            .bind(SCHEDULE_CLAIM_DELAY.num_milliseconds())
             .fetch_all(operator.pool())
             .await?;
         rows.into_iter()

@@ -484,8 +484,11 @@ impl VerificationFixture {
     /// Bring one armed schedule cursor to database statement time.
     ///
     /// Dueness is PostgreSQL's decision, so a scheduling test places the
-    /// cursor where the due predicate fires rather than moving a process
-    /// clock.
+    /// cursor at the database clock rather than moving a process clock. The
+    /// occurrence's window therefore ends now and holds every observation the
+    /// test already wrote; the scheduler claims it once PostgreSQL's clock is
+    /// 30 seconds past the cursor, so callers poll for the run for longer
+    /// than that.
     ///
     /// # Errors
     /// Returns [`VerificationFixtureError`] when the update fails.

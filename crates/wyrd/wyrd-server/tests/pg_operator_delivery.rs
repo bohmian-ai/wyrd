@@ -40,7 +40,10 @@ use wyrd_testing::verification::VerificationFixture;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 /// Upper bound on every wait for the runtime to make progress.
-const WAIT: Duration = Duration::from_secs(30);
+///
+/// A due binding's occurrence is claimed only 30 seconds after its window
+/// ends, so a scheduled-run wait must outlast that claim delay.
+const WAIT: Duration = Duration::from_secs(60);
 /// Slack bot token of the fixture connection.
 const SLACK_TOKEN: &str = "xoxb-delivery-slack-token";
 /// Slack bot token after rotation.

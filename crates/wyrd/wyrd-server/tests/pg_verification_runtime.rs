@@ -49,7 +49,10 @@ use wyrd_testing::logs::LogCapture;
 use wyrd_testing::verification::{RunRow, VerificationFixture};
 
 /// Upper bound on every wait for the runtime to make progress.
-const WAIT: Duration = Duration::from_secs(30);
+///
+/// A due binding's occurrence is claimed only 30 seconds after its window
+/// ends, so a scheduled-run wait must outlast that claim delay.
+const WAIT: Duration = Duration::from_secs(60);
 
 /// Summary table every completed result ends with.
 const RESULTS: &str = "vala.verification.results";

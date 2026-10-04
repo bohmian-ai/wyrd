@@ -531,10 +531,23 @@ async fn pg_bifrost_selective_predicate_spans_hot_and_compacted_reads() {
 /// error when the fixture fails to reach the two-tier state the assertion
 /// requires.
 async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
-    let cluster = WyrdTestCluster::start_spec_with_forge_completion_observer(
+    // The first batch must reach Iceberg and the second must stay hot. Forge
+    // promotes each flushed object as soon as it is published (REQ-002), so
+    // every Forge catalog is wrapped in the production commit seam: inert
+    // while the first batch promotes, then armed to park the first promotion
+    // commit of the second batch. The parked attempt is the table's active
+    // attempt, so every later promotion defers behind it and the second batch
+    // stays hot until shutdown drains the parked commit unsettled.
+    let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
         BifrostClusterSpec::three_mixed(),
+        ForgeConfig::default(),
+        false,
+        true,
     )
     .await?;
+    let promotion = cluster
+        .commit_uncertainty_catalog()
+        .ok_or("the topology wraps its Forge catalog in the commit seam")?;
     let ingest_server = cluster
         .servers()
         .find(|server| server.bifrost_scribe().is_some())
@@ -583,6 +596,7 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
     compact_sealed_batch(&cluster, tenant, &table, COMPACTED_BATCH_ROWS).await?;
     prove_compacted_only_projection(&cluster, tenant, &table, &table_fqn).await?;
 
+    promotion.pause_before_commit();
     for offset in 0..HOT_BATCH_ROWS {
         let id = HOT_BATCH_ID_BASE + offset;
         rows.write(
@@ -593,12 +607,15 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
         .await?;
         ingest_server.flush_bifrost().await?;
     }
+    tokio::time::timeout(Duration::from_secs(30), promotion.wait_for_before_commit())
+        .await
+        .map_err(|_| "the hot batch's first promotion never reached the parked commit")?;
     cluster.refresh_oracle_snapshots().await?;
 
     // Precondition, asserted immediately before the query rather than assumed:
-    // the periodic maintenance ticker could in principle sweep the second batch
-    // too, and a cut with only one physical tier in it would silently prove
-    // half of what this journey claims.
+    // a promotion that escaped the parked commit would move the second batch
+    // into Iceberg too, and a cut with only one physical tier in it would
+    // silently prove half of what this journey claims.
     let (compacted_files, hot_files) = file_tier_counts(&cluster, tenant, &table).await?;
     if compacted_files == 0 || hot_files == 0 {
         return Err(format!(

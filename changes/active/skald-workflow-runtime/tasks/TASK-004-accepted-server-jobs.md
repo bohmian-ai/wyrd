@@ -480,15 +480,21 @@ submitted to the Scribe-only pod. No case uses a synchronization sleep; each use
 the pause controls and polls only observable state:
 
 - **While the follower is held:** a sibling query succeeds.
-- **While the leader's cleanup is paused:** the run is non-terminal, any cancel
-  response is still pending, and the model has seen no tool result.
-- **When the run ends:** it is `cancelled`, `timed_out`, or `succeeded`. On pod
-  loss the model receives a redacted `WYRD_VALA_` tool failure without rows.
-- **Metrics:** Analytical success is unchanged and each case's exact outcome
-  increments.
+- **While the leader's cleanup is paused:** the model has seen no tool result.
+  For cancel and pod loss the run is also non-terminal and any cancel response
+  is still pending. A deadline is the query's own bound, so the run may end at
+  it without waiting on that cleanup (D7).
+- **When the run ends:** it is `cancelled`, `timed_out`, or `succeeded`. A
+  timed-out run ends no earlier than `created_at` + its 20 s deadline and has
+  no outputs. On pod loss the model receives a redacted `WYRD_VALA_` tool
+  failure without rows.
+- **Metrics:** Analytical success is unchanged and each case's exact
+  `oracle_query_duration_seconds` outcome increments by one: `cancelled` for
+  cancel, `failed` for deadline and pod loss.
+- **Afterwards:** every Oracle drains to its baseline ownership and a later
+  query returns its rows.
 
-Status: Cancel and PodKill pass. Deadline is pending the Bifrost decision below
-(B1, B2).
+Status: all three causes pass.
 
 ### Diagnoses
 
@@ -556,7 +562,7 @@ confirmed)
   - `peer_network::analytical::one_attempt_peer_loss_and_cancellation_join_every_pod`.
 
 **B1. Bifrost: a registry cancel before the stream exists is recorded as
-`failed`** (decision pending)
+`failed`** (resolved in 087cc0416)
 - Symptom: the forwarded Cancel case recorded
   `oracle_query_duration_seconds{class=analytical,outcome=failed}`. Root stage 0
   attempt `failed`; follower stages `cancelled`.
@@ -565,12 +571,13 @@ confirmed)
   stream.
 - Cause: a registry cancel that arrives before stream construction never sets the
   marker, so Drop falls through to `failed`.
-- Fix site: the running-query registry cancel in vala-bifrost-redux should set
-  the query's existing `explicit_cancelled` marker. Until then, the Cancel case
-  asserts `bifrost_oracle_analytical_attempts_total{outcome="cancelled"}`.
+- Fix site: the running-query registry cancel (`oracle/running.rs`) sets the
+  telemetry marker `run_sql_attempt` adopts before the stream exists. Unit
+  test: `oracle::tests::oracle_pre_stream_registry_cancel_records_cancelled`.
+  The Cancel case asserts the exact `cancelled` duration outcome.
 
 **B2. Bifrost: a deadline cleanup failure leaves the leader holding its graph**
-(decision pending)
+(resolved in c63e2ff46)
 - Symptom: after a run deadline the leader logs "graph cleanup did not complete".
   It stays at `leader_graphs=1`, `root_query_active=true`, and is not ready
   ("Oracle role unavailable"), even after the follower is released.
@@ -580,7 +587,84 @@ confirmed)
   entering the cleanup pause and without releasing the graph.
 - Cause: the held follower request outlives the deadline (it is the same pause as
   in D5), and Bifrost retains a graph whose drain it could not confirm.
-- Fix site: undecided, either Bifrost's deadline cleanup or the harness pause.
+- Fix site (human decision): delete both graph drain loops (leader
+  `release_graph`, follower `drain`), the supervisor's idle-envelope refusal,
+  `AdmittedQueryGuard::drain_children`, `GRAPH_DRAIN_*`, and
+  `OracleQueryResources::release`'s reserved-bytes poison. A graph releases
+  when it ends. A late child keeps the query memory view alive and returns its
+  bytes through the shared root; `GovernedMemoryView::drop` remains the leak
+  check, and the root's `try_grow` still refuses overcommit. A truly leaked
+  child shows as root memory held rather than as a poison.
+- The verify-first traced run of `analytical_activation`, `peer_network`,
+  `mcp` and the workflow journey found no poison line. Removing only the loops
+  first made `peer_network::join::peer_join_and_remote_query` abort: the
+  supervisor refused a graph 142 µs after a failed grant ("still owns a live
+  envelope child"), the node went NotServing, and shutdown aborted. Dropping
+  the refusal and the release-time poison fixed it.
+- Tests asserting the refusal were deleted
+  (`assert_a_live_envelope_child_fails_settlement`,
+  `follower_retains_a_graph_whose_children_never_drain`). The readiness test
+  now forces cleanup failure with a stray attempt, and
+  `oracle_release_paths_are_exact_and_idempotent` asserts a late child does not
+  poison and returns its bytes.
+
+**D6. A failure before the first batch returned before its graph settled**
+- Symptom: Deadline case, "the run ended before its query settled".
+- Evidence: the leader logged `released after failure phase="first-batch
+  timeout"` while its graph was still at the cleanup pause. Its graph released
+  only after the test let the pause go.
+- Cause: `release_error` (`vala-bifrost-redux/src/oracle/mod.rs`) dropped the
+  Analytical ownership and returned, while the stream path awaits
+  `settle_analytical`. Cancel passed only by winning that race.
+- Fix site: `release_error`, the one release every pre-stream failure path
+  uses, now awaits `query_stream::settle_analytical(.., Failed)` first
+  (caf180a5c). Callers: projection, running-query, source and execution
+  rejection, stale first batch, and `settle_distributed_failure`.
+
+**D7. A run deadline does not wait on the leader's cleanup** (diagnostician
+confirmed; test assertion changed with lead approval)
+- Symptom: after D6, Deadline still saw the run `TimedOut` during the pause.
+- Evidence: the leader's stage 0 settled `failed` at 00:02:45.056 and its graph
+  released at 00:02:45.063, after the pause was released, yet the GET during
+  the pause returned `TimedOut`.
+- Cause: `QueryTool::invoke` (`components/workflow/tools.rs:180-190`) caps the
+  query deadline at the run's remaining time, and `route_remote_once`
+  (`oracle/forwarding.rs:621`) bounds the forwarded open by that deadline. The
+  ingress owner completes with `QueryTimeout`, `tools.drain()`
+  (`host.rs:278`) returns, and `finish` commits `TimedOut`. That is what the
+  spec requires: "retain/drain the response under its original query
+  deadline", "Once the original deadline is exhausted, do not add a fresh
+  cleanup timeout", and Scenario 4 "Repeat with deadline expiry ...: bounded
+  completion reports honest incomplete/unavailable/protocol settlement".
+- Diagnostician report: the same cause chain with the same file lines; the
+  assertion was also racy (the GET could land before `finish`); changing
+  forwarding or the run owner instead would break the deadline bound for every
+  forwarded surface (HTTP, gRPC, MCP, scheduled, Workflow).
+- Fix site: the journey only. Deadline skips the non-terminal-while-held claim
+  and asserts `TimedOut` no earlier than its deadline with no outputs, plus the
+  shared exact-metric, no-tool-result and healthy-follow-up claims (7ad33ac2d).
+
+**D8. A scheduled query cancelled while opening reports the owner's failure**
+(diagnostician confirmed)
+- Symptom: `server::query::generated_grpc_and_scheduled_queries_share_audit_terminal_and_cleanup`
+  expected `WYRD_VALA_502_QUERY_STREAM_INCOMPLETE` and got
+  `WYRD_VALA_500_QUERY_EXECUTION_FAILED`.
+- Evidence: the leader logged `released after failure phase="first-batch
+  cancellation" error=QueryExecutionFailed`, then every attempt and graph
+  settled and released cleanly.
+- Cause: the cancel lands while the follower is held, so the leader is still
+  opening. Since c63e2ff46 the first-batch wait ends on the cancel with the
+  same `QueryExecutionFailed` the open-stream path maps a cancel to
+  (`query_stream.rs`). `ScheduledQueryCaller::run` documents that a cancel
+  during the open still awaits the open and returns its error;
+  `QueryStreamIncomplete` is only for a cancel after the open.
+- Diagnostician report: production matches every documented contract and the
+  assertion encoded the old timing. The test was also racy: releasing the
+  pause right after the cancel could let a batch open the stream first, and
+  the hold already returns on the graph cancel.
+- Fix site: the journey only. It expects the owner's failure and no longer
+  releases the pause manually (5dfee4d3f). `query.rs:482` (pre-cancelled
+  token, no owner registered yet) still passes and was left unchanged.
 
 ### Commands
 
@@ -588,11 +672,24 @@ confirmed)
 - Each scenario's exact `-E "test(=<name>)"` command from the task — exit 0
 - `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=mcp::bifrost::tests::query_schema_is_closed_bounded_and_has_no_path_selector) | test(=query::collect::tests::query_rejects_untrustworthy_terminal_and_settles_stream) | test(=query::collect::tests::query_result_is_positional_and_counts_exact_structured_json_bytes)'` — exit 0
 - MCP query journeys `-p wyrd-mcp --test mcp -P journey --run-ignored=all` under the PG wrapper (4 tests) — exit 0
-- `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E "test(=workflow::workflow_forwarded_query_settles_before_the_run_ends)"'` — Cancel and PodKill pass; Deadline pending B1/B2
+- `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E "test(=workflow::workflow_forwarded_query_settles_before_the_run_ends)"'` — exit 0 (all three causes)
 - `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=oracle::lifecycle_controls::tests::cancel_while_opening_requests_cancellation_and_keeps_the_open)'` — exit 0
 - `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E "test(=analytical_activation::selected_peer_failure_is_terminal) | test(=peer_network::analytical::one_attempt_peer_loss_and_cancellation_join_every_pod)"'` — exit 0
 - `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-cli --test cli -E "test(/^card_lifecycle::/)"'` (18 tests) — exit 0
-- Lanes: pending the Bifrost decision.
+- `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E "test(=query::generated_grpc_and_scheduled_queries_share_audit_terminal_and_cleanup)"'` — exit 0
+- `mise run test:bifrost` — 8/9 lanes passed before D8; `mise run test:bifrost:journey:server` after D8 — exit 0 (27/27)
+- `mise run test:shared` — exit 0
+- `mise run test:wyrd` — exit 0
+- `mise run test:principals:unit` — exit 0
+- `mise run test:principals:integration` — exit 0
+- `mise run test:gateway:journey` — exit 0
+- `mise run codegen:check` — exit 0
+- `mise run check:client-tier` — exit 0
+- `mise run check:tenant-isolation` — exit 0
+- `mise run check:unwrap-audit` — exit 0
+- `mise run fmt` — exit 0
+- `mise run lints` — exit 0
+- `git diff --check` — exit 0
 
 ### Material limits
 

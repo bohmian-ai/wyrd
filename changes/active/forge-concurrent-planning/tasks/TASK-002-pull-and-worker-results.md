@@ -729,6 +729,173 @@ each fail it ("pull diverged from the scan", "index drifted after commit").
       --all-features --tests -- -D warnings`: clean.
     - `git diff --check`: clean.
 
+- **verify:bifrost residuals after 24039433e.**
+  - **5, `two_bindings_share_one_client_observation` returned inconclusive
+    for both bindings: FIXED (179e91bb9).**
+    - Symptom: in `wyrd-testing::server`, both verdicts were inconclusive.
+      It failed in about 1 of 3 full-lane runs and rarely alone.
+    - Evidence (WYRD_LOG
+      `info,vala_bifrost_redux=debug,wyrd_server::verification=debug`):
+      - The observation's `wyrd_event_time` equalled its receipt time,
+        07:12:32.799814Z.
+      - The binding window end, taken from `statement_timestamp()` in
+        `make_binding_due`, was 07:12:32.786634Z.
+      - `ObservationWindow` filters `wyrd_event_time < end`, so the row fell
+        outside the window.
+      - psql against the test Postgres showed its clock running about 24 ms
+        behind the host clock in every sample.
+    - Cause:
+      - The journey let Scribe stamp the default event time from the host
+        `SystemTime`.
+      - It then compared that time with an exclusive window end on the
+        Postgres clock.
+      - A write acknowledged less than about 24 ms before `make_binding_due`
+        therefore landed at or after the window end.
+      - The product is correct: PostgreSQL owns coordination time, and the
+        producer owns event time.
+      - Suspects ruled out: TASK-004 compaction defaults, TASK-001
+        promotion, Scribe claim publication and redux telemetry. None of
+        them is on this path.
+    - Diagnostician (fresh, read-only; given only the command, trace and
+      diff): same cause, fix site in the journey's `observation_batch`. The
+      other `make_binding_due` callers were checked and are unaffected.
+    - Fix: `verification_runtime.rs` `observation_batch` supplies a
+      caller-owned `wyrd_event_time`. `observed_in_current_month` sets it to
+      the later of the month start and now minus 1 minute, which keeps it
+      inside the monthly window.
+    - GREEN: the full server journey binary passed 29/29 in each of 3
+      consecutive runs.
+  - **6, Forge `scribe_promotion` reported "promoted object ... disagrees
+    with its evidence on column sizes" (`internal_invariant`): FIXED
+    (8f31a1188).**
+    - Symptom: in the journey:typescript log, promotion of `traces.spans`,
+      `metrics.points` and `logs.records` objects failed as terminal
+      `internal_invariant`.
+    - Evidence:
+      - `validate_promoted_object` compares the Scribe evidence with the
+        footer metrics. The evidence comes from
+        `parquet_writer.rs::derive_data_file_metrics`, keyed by
+        `iceberg_schema_for(schema)`, which uses the declared
+        `PARQUET:field_id`s, envelope ids 1000–1006 included. The footer
+        metrics come from `PromotedObjectFooter::decode`, keyed by the
+        table's current schema.
+      - A probe comparing the declared ids with the ids after
+        `TableMetadataBuilder::from_table_creation` found 102 differences.
+        All were in spans (41), points (47) and records (14). Every other
+        built-in matched.
+    - Cause:
+      - `BifrostCatalog::create_physical_table` passed the declared-id
+        schema to `SqlCatalog::create_table`.
+      - Iceberg's `reassign_ids` renumbers every field from 1, so the
+        physical table recorded ids that the Parquet objects and the
+        evidence do not use.
+      - `column_sizes` is the first id-keyed map the comparison reaches.
+    - Impact: no data loss.
+      - Unpromoted `file_list` rows are excluded from hot GC and stay
+        hot-readable.
+      - Promotion of these tables was permanently stuck:
+        - the failure is terminal;
+        - the idempotency index defers the same plan;
+        - each new plan includes the same objects;
+        - the hot tier grows without bound.
+      - Relaxing the check would have been wrong. Oracle's Iceberg scan
+        resolves columns by field id, so promoted rows would read as the
+        wrong columns or as nulls.
+    - Diagnostician (fresh, read-only): confirmed the cause and the fix site
+      at table creation.
+    - RED: `catalog::bifrost_catalog::production_pin_tests::builtin_tables_keep_their_declared_field_ids`
+      failed with `traces.spans field ids`.
+    - Fix:
+      - `create_physical_table` builds the creation metadata, then
+        `with_declared_field_ids` rebinds it:
+        - the current schema is replaced by the declared one;
+        - `last-column-id` is set to the declared highest id;
+        - partition and sort `source-id`s are remapped by name;
+        - spec id 0 and sort order id 1, which Scribe stamps on every data
+          file, are kept.
+      - The rebound metadata is written as the first metadata document and
+        registered with `SqlCatalog::register_table`.
+      - The describe-path comment that documented the old divergence is
+        updated.
+    - GREEN: the same test passes for all three signal tables, including
+      re-provisioning.
+    - Material risk: tables created before 8f31a1188 keep their sequential
+      ids, and promotion of their signal tables stays stuck. Recovery needs
+      those tables recreated, or a metadata repair. Registration does not
+      validate ids, so these tables are not refused.
+    - Not changed: `dev.agent_traces` cannot be provisioned through
+      `ensure_builtin`, because its user field `run_id` is a reserved
+      column. The test therefore covers the three id-declaring signal
+      tables.
+  - **7, canonical-signal reads failed with "unsupported
+    'FIXED_LEN_BYTE_ARRAY' index type in column_index" once spans promoted:
+    FIXED (4572ec145).**
+    - Symptom: after 8f31a1188, `verify:bifrost` failed the same read in
+      four journeys:
+      - `pg_bifrost_e2e canonical_signal_arrow_write_and_sql_read_round_trip`
+      - MCP `agent_reads_canonical_trace_genai_logs_and_metrics_through_sql`
+      - Python `test_canonical_signal_arrow_write_and_sql_read_round_trip`
+      - the TypeScript canonical journey
+    - Evidence:
+      - The failing filter is `parent_span_id IS NULL`, on a
+        `FixedSizeBinary(8)` column.
+      - Oracle's `OracleIcebergScanExec::start_stream` enables row selection.
+      - In the fork, the page-index evaluator (`page_index_evaluator.rs`)
+        returns a hard error for FLBA and INT96 column indexes.
+      - It also `unwrap`s a UTF-8 decode of every BYTE_ARRAY bound, so a
+        `Binary` column whose bounds are not UTF-8 panics.
+    - Cause: a latent Oracle and fork defect. Before 8f31a1188, signal
+      tables never promoted. Their predicate ids also pointed at other
+      Parquet leaves, so this path was never reached correctly.
+    - Diagnostician (fresh, read-only):
+      - Root fix site: the fork's evaluator, which should decode by Iceberg
+        type and return `Ok(None)` for anything unsupported.
+      - In-repo alternatives: disable row selection everywhere, or gate it
+        by predicate column type.
+      - Affected filters: any filter on `trace_id`, `span_id` or
+        `wyrd_batch_id` against promoted data.
+    - Fix: we cannot push the fork, so the gate is in Oracle.
+      - `page_index_evaluable` enables row selection only when every column
+        the predicate names is boolean, numeric, temporal or string.
+      - Row-group pruning stays on.
+      - DataFusion still applies the filter, which is reported Inexact.
+    - Test:
+      - Unit test `oracle::exec::tests::page_index_selection_skips_columns_the_evaluator_cannot_decode`.
+      - The SDK journey binary (17/17) and the MCP journey binary (14/14)
+        now pass.
+    - Follow-up (fork): fix the evaluator so that page-level pruning also
+      covers ids and binary columns.
+  - **8, `oracle distributed::live_query_terminal_failure_matrix` poisoned
+    the governor ("Oracle query owner outlived a nested resource child"):
+    FIXED (51c64fb29).**
+    - Symptom: the rejected-Scribe-ticket case terminated the server, and
+      the next request failed with a transport error. It is intermittent:
+      the same lane passed in the earlier run.
+    - Evidence: the poison follows the first-batch rejection by 34 µs, and
+      there was no "did not drain" warning.
+    - Cause:
+      - `drain_children` → `nested_idle` treated zero bytes as idle.
+      - The sibling published-partition `SortExec` had registered its
+        reservation at build time and was still mid-poll when the merge was
+        aborted.
+      - It passed the drain at zero bytes, grew, and then `release` saw
+        reserved != 0.
+    - Diagnostician (fresh, read-only):
+      - Same cause.
+      - Fix site: `GovernedMemoryView` registration accounting.
+      - The diff under test was not involved.
+    - Fix:
+      - The view counts live registrations, shared with
+        `OracleQueryResources`.
+      - `nested_idle` now requires zero bytes and zero registrations.
+      - `release` keeps its bytes-based poison.
+    - RED → GREEN: `resources::tests::a_registered_zero_byte_child_keeps_its_query_busy`.
+  - **"cancelled with unknown acceptance" warnings: benign, no change.**
+    - They are emitted when test-server shutdown cancels `commit_once`
+      during the catalog commit.
+    - The failure class is `TransientCoordination`, and the next owner
+      reconciles the outcome by operation id.
+
 ### AC-008 qualifying runs
 
 Commit 69d2efe8c, two back-to-back runs of `mise run bench:bifrost:forge-capacity` with the
@@ -804,3 +971,32 @@ pull cadence is the measured bound, not compactor CPU, RustFS or Postgres.
 | Follow-up 2: live tick finishes a claim refused after commit | claim_publication.rs `finish_committed`; staging_runtime.rs `finish_committed`, `retryable_claims`; persistence.rs `resume_claim` | journey `scribe_tick_finishes_a_claim_that_failed_after_its_commit`; `a_live_claim_refused_inside_its_removal_finishes_without_republication` | PASS |
 | Follow-up 3: telemetry journey independent of WYRD_LOG | wyrd-telemetry `init_test_capture` `with_level(true)`; telemetry.rs level assertion | `scribe_hot_path_telemetry_reconciles` under default and debug filters | PASS |
 | Follow-up 4: redux integration binary traced | forge/support.rs `ProcessTelemetry` | non-checkpoint Forge test prints DEBUG trace under WYRD_LOG | PASS |
+| Residual 5: shared verification observation lands in the window | verification_runtime.rs `observation_batch`, `observed_in_current_month` | server journey binary 29/29 ×3 | PASS |
+| Residual 6: promoted signal objects agree with their evidence | bifrost_catalog.rs `create_physical_table`, `with_declared_field_ids` | `builtin_tables_keep_their_declared_field_ids` (RED → GREEN); `verify:bifrost` log has 0 `internal_invariant` and 0 `disagrees with its evidence` hits (the 24039433e log had 7) | PASS |
+| Residual 7: promoted canonical signals stay queryable | exec.rs `page_index_evaluable` | `page_index_selection_skips_columns_the_evaluator_cannot_decode`; SDK, MCP, Python and TypeScript canonical journeys | PASS |
+| Residual 8: failed-query drain waits for registered children | resources.rs `GovernedMemoryView` registration count, `nested_idle` | `a_registered_zero_byte_child_keeps_its_query_busy` (RED → GREEN); oracle journey 42/42 | PASS |
+
+`mise run verify:bifrost` at 51c64fb29 exited 0. Lane results:
+
+| Lane | Result |
+|---|---|
+| check:bifrost: fmt, resource governance, object-store pin, tenant isolation | pass |
+| Rust unit | 210/210 |
+| integration redux | 900/900 |
+| integration server | 113/113 |
+| integration SQL | 85/85 |
+| journey SDK | 17/17 |
+| journey observe | 3/3 |
+| journey drift | 4/4 |
+| journey forge | 21/21 |
+| journey scribe | 25/25 (1 skipped by the lane filter) |
+| journey oracle | 42/42 |
+| journey OTLP | 11/11 |
+| journey server | 29/29 |
+| journey MCP | 14/14 |
+| Python unit | 2 passed |
+| journey Python | 47 passed |
+| TypeScript unit | 10/10 |
+| journey TypeScript | 27/27 |
+
+Summary line: "9/9 lanes passed". `mise run lints` and `git diff --check` are clean.

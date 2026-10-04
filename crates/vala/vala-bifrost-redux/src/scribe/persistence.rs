@@ -114,10 +114,92 @@ pub struct PersistenceFaults {
     /// Next real writer-v2 publication paused on both sides of fenced SQL visibility.
     publication_barrier:
         Arc<Mutex<Option<crate::scribe::file_list_writer::PublicationFenceBarrier>>>,
+    /// Claim-publication progress a test can await instead of polling.
+    claim_probe: Arc<tokio::sync::watch::Sender<ClaimPublicationProbe>>,
+}
+
+/// Claim-publication progress observed through [`PersistenceFaults`].
+///
+/// Every field only moves forward except `held`, which counts the claim
+/// publications currently stopped at the object-write hold.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, Default)]
+struct ClaimPublicationProbe {
+    /// Whether claim object writes stop at the hold until released.
+    hold: bool,
+    /// Claim publications currently waiting at the hold.
+    held: usize,
+    /// Times a publisher found every claim slot held by another publication
+    /// and waited for one to be released.
+    claim_slot_waits: usize,
+    /// Claims whose publication committed and settled.
+    published_claims: usize,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl PersistenceFaults {
+    /// Stops every claim publication at its object write until
+    /// [`Self::release_object_writes_for_test`].
+    ///
+    /// A held publication has already taken its claim slot and durably owns
+    /// its members, so a test can arrange real contention for the slots.
+    pub fn hold_object_writes_for_test(&self) {
+        self.claim_probe.send_modify(|probe| probe.hold = true);
+    }
+
+    /// Lets every held claim publication, and every later one, continue.
+    pub fn release_object_writes_for_test(&self) {
+        self.claim_probe.send_modify(|probe| probe.hold = false);
+    }
+
+    /// Waits until at least `count` claim publications are stopped at the hold.
+    pub async fn wait_for_held_object_writes_for_test(&self, count: usize) {
+        let mut probe = self.claim_probe.subscribe();
+        // The sender lives in `self`, so the channel cannot close while waiting.
+        let _ = probe.wait_for(|probe| probe.held >= count).await;
+    }
+
+    /// Waits until a second publisher contends for the claim slots: either
+    /// more than `budget` claim publications are held at once, or one waited
+    /// because every slot was held.
+    pub async fn wait_for_claim_contention_for_test(&self, budget: usize) {
+        let mut probe = self.claim_probe.subscribe();
+        let _ = probe
+            .wait_for(|probe| probe.held > budget || probe.claim_slot_waits > 0)
+            .await;
+    }
+
+    /// Waits until at least `count` claims have committed and settled.
+    pub async fn wait_for_published_claims_for_test(&self, count: usize) {
+        let mut probe = self.claim_probe.subscribe();
+        let _ = probe
+            .wait_for(|probe| probe.published_claims >= count)
+            .await;
+    }
+
+    /// Stops one claim publication at the hold while it is set.
+    async fn pass_object_write_hold(&self) {
+        let mut probe = self.claim_probe.subscribe();
+        if !probe.borrow_and_update().hold {
+            return;
+        }
+        self.claim_probe.send_modify(|probe| probe.held += 1);
+        let _ = probe.wait_for(|probe| !probe.hold).await;
+        self.claim_probe.send_modify(|probe| probe.held -= 1);
+    }
+
+    /// Records that a publisher waited for another publication's claim slot.
+    fn note_claim_slot_wait(&self) {
+        self.claim_probe
+            .send_modify(|probe| probe.claim_slot_waits += 1);
+    }
+
+    /// Records one committed and settled claim publication.
+    fn note_claim_published(&self) {
+        self.claim_probe
+            .send_modify(|probe| probe.published_claims += 1);
+    }
+
     /// Installs a two-phase barrier for the next actual writer-v2 publication.
     ///
     /// The selected publication pauses only after its durable local manifest
@@ -1151,7 +1233,16 @@ impl PersistenceRuntime {
         let Some(staging) = &worker.staging else {
             return Ok(0);
         };
-        let claims = staging.resumable_claims()?;
+        let claims = staging.retryable_claims().await?;
+        let outstanding = staging.resumable_claims()?.len();
+        if claims.len() != outstanding {
+            return Err(ScribeError::Internal {
+                detail: format!(
+                    "{} of {outstanding} restored Scribe claims cannot publish again",
+                    outstanding - claims.len()
+                ),
+            });
+        }
         let mut resumed = 0_usize;
         for claim in claims {
             worker.publish_claim(staging, &claim).await?;
@@ -1163,6 +1254,16 @@ impl PersistenceRuntime {
         }
         Ok(resumed)
     }
+}
+
+/// How a publisher reacts when every claim slot is held and it has no claim
+/// of its own in flight.
+#[derive(Debug, Clone, Copy)]
+enum ClaimSlotWait {
+    /// End the pass; a periodic caller takes the remaining work next time.
+    Yield,
+    /// Wait for another publisher's claim to settle or become retryable.
+    Await,
 }
 
 /// Owns the dependencies and durable workflow for one persistence worker.
@@ -1976,63 +2077,115 @@ impl PersistenceWorker {
     ///
     /// Runs from [`PersistenceRuntime::publish_due`] on the server's lifecycle
     /// tick, so a key that reached target publishes within one tick and a key
-    /// whose writes stopped still publishes once its dwell expires. Due claims
-    /// publish together, up to the claim budget (see [`Self::publish_claims`]).
-    /// Concurrent callers are safe: the assembler hands each due claim to
-    /// exactly one caller.
+    /// whose writes stopped still publishes once its dwell expires. Claims an
+    /// earlier publication was refused on are retried first (see
+    /// [`Self::publish_claims`]), so each tick retries them. Due claims publish
+    /// together, up to the claim budget. Concurrent callers are safe: each
+    /// claim is driven by exactly one caller at a time.
+    ///
+    /// A full claim budget ends the pass without error: the tick yields to the
+    /// publications holding the slots and takes the remaining due claims on a
+    /// later tick.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when a due claim cannot be gathered, admitted,
     /// merged, or published. The claim stays outstanding and its members stay
-    /// durable, so the failure retries rather than losing rows.
+    /// durable, so the next tick retries it rather than losing rows.
     async fn publish_due_claims(&self) -> Result<Vec<FileListCommitKey>, ScribeError> {
         let staging = self.staging()?;
-        self.publish_claims(&staging, || staging.take_claim(chrono::Utc::now()))
-            .await
+        self.publish_claims(&staging, ClaimSlotWait::Yield, || {
+            staging.take_claim(chrono::Utc::now())
+        })
+        .await
     }
 
-    /// Publishes every claim `next` hands out, up to the claim budget at once.
+    /// Publishes every retryable claim and every claim `next` hands out, up to
+    /// the claim budget at once.
     ///
     /// Claims are independent — each has its own key, members, scratch and
     /// fenced transaction — so they merge, upload and commit together instead
-    /// of each waiting for the one before it. `next` is asked for another
-    /// claim whenever fewer than `claim_budget` are in flight, and again after
-    /// each settles, so work that becomes due meanwhile is picked up;
-    /// publication ends when `next` has nothing and nothing is in flight.
-    /// Commit keys are returned in settlement order.
+    /// of each waiting for the one before it. Each pass first drives every
+    /// outstanding claim an earlier publication was refused on, then asks
+    /// `next` for new claims while fewer than `claim_budget` are in flight;
+    /// a pass runs again after each claim settles, so work that becomes due
+    /// meanwhile is picked up. Publication ends when there is nothing to take
+    /// and nothing is in flight. Commit keys are returned in settlement order.
+    ///
+    /// A full claim budget is backpressure, not a failure. This publisher
+    /// stops taking claims and lets its own in-flight claims settle; when it
+    /// has none, `slots` decides whether it ends the pass
+    /// ([`ClaimSlotWait::Yield`]) or waits for another publisher's claim to
+    /// end its drive ([`ClaimSlotWait::Await`]).
     ///
     /// # Errors
     ///
-    /// Returns the first error from `next` or from a claim's publication. No
-    /// further claim is taken after it, but claims already in flight run to
-    /// their own settlement, so none is abandoned between its fenced commit
-    /// and its retirement. A failed claim stays outstanding with durable
-    /// members and retries.
+    /// Returns the first error from `next`, from reading retryable claims, or
+    /// from a claim's publication. No further claim is taken after it, but
+    /// claims already in flight run to their own settlement, so none is
+    /// abandoned between its fenced commit and its retirement. A failed claim
+    /// stays outstanding with durable members and retries. A waiting
+    /// publisher fails when the budget is exhausted and no publisher in this
+    /// process drives a claim, because no slot can then be released.
     ///
     /// # Cancellation
     ///
-    /// Dropping the future drops every in-flight publication; each converges
-    /// on retry like a single interrupted claim, and the WAL stays
-    /// authoritative for its rows.
+    /// Dropping the future drops every in-flight publication and releases its
+    /// drive; each converges on retry like a single interrupted claim, and the
+    /// WAL stays authoritative for its rows.
     async fn publish_claims(
         &self,
         staging: &Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>,
-        mut next: impl FnMut() -> Result<Option<crate::scribe::assembly::StagingClaim>, ScribeError>,
+        slots: ClaimSlotWait,
+        mut next: impl FnMut() -> Result<
+            Option<crate::scribe::staging_runtime::DrivenClaim>,
+            crate::scribe::staging_runtime::ClaimTakeError,
+        >,
     ) -> Result<Vec<FileListCommitKey>, ScribeError> {
+        use crate::scribe::staging_runtime::ClaimTakeError;
+        use futures_util::FutureExt as _;
         use futures_util::StreamExt as _;
+        let drive = |claim: crate::scribe::staging_runtime::DrivenClaim| async move {
+            self.publish_claim(staging, &claim).await
+        };
         let mut in_flight = futures_util::stream::FuturesUnordered::new();
         let mut published = Vec::new();
         let mut failure = None;
         loop {
-            while failure.is_none() && in_flight.len() < self.claim_budget {
-                match next() {
-                    Ok(Some(claim)) => {
-                        in_flight.push(async move { self.publish_claim(staging, &claim).await });
+            // Registered before any claim is asked for, so a drive that ends
+            // while this pass runs still wakes a waiting publisher.
+            let mut released = std::pin::pin!(staging.claim_released());
+            let mut exhausted = None;
+            if failure.is_none() {
+                match staging.retryable_claims().await {
+                    Ok(claims) => {
+                        in_flight.extend(claims.into_iter().map(drive));
                     }
-                    Ok(None) => break,
                     Err(error) => failure = Some(error),
                 }
+            }
+            while failure.is_none() && exhausted.is_none() && in_flight.len() < self.claim_budget {
+                match next() {
+                    Ok(Some(claim)) => in_flight.push(drive(claim)),
+                    Ok(None) => break,
+                    Err(ClaimTakeError::BudgetExhausted { budget }) => exhausted = Some(budget),
+                    Err(ClaimTakeError::Failed(error)) => failure = Some(error),
+                }
+            }
+            if in_flight.is_empty() {
+                let (Some(budget), ClaimSlotWait::Await, None) = (exhausted, slots, &failure)
+                else {
+                    break;
+                };
+                if !staging.drives_no_claims() {
+                    #[cfg(any(test, feature = "test-support"))]
+                    self.faults.note_claim_slot_wait();
+                    released.await;
+                } else if released.as_mut().now_or_never().is_none() {
+                    failure = Some(ClaimTakeError::BudgetExhausted { budget }.into());
+                    break;
+                }
+                continue;
             }
             match in_flight.next().await {
                 Some(Ok(key)) => published.push(key),
@@ -2055,15 +2208,16 @@ impl PersistenceWorker {
     ///
     /// Returns the number of claims published.
     ///
+    /// An outstanding claim whose publication was refused is resumed before
+    /// the ready sweep, because settlement is what returns members to the
+    /// budget and a refused claim never settled. When every claim slot is held
+    /// by another publisher, the flush waits for one rather than failing.
+    ///
     /// # Errors
     ///
-    /// An outstanding claim that was refused before its fenced transaction is
-    /// resumed before the ready sweep, because settlement is what returns
-    /// members to the budget and a refused claim never settled. A claim with an
-    /// unresolved commit outcome is left to startup reconciliation.
-    ///
     /// Returns [`ScribeError`] when the staging capability is absent, when the
-    /// assembler refuses a residue claim, or when a claim fails to publish. The
+    /// assembler refuses a residue claim, when every claim slot is held by a
+    /// claim no publisher can run again, or when a claim fails to publish. The
     /// remaining keys stay staged and the WAL stays authoritative for them.
     async fn publish_residue(
         &self,
@@ -2072,18 +2226,13 @@ impl PersistenceWorker {
         let staging = self.staging()?;
         // A claim whose publication was refused keeps its slot and its members;
         // nothing returns it to the ready index, so the sweep below cannot see
-        // it. Driving those claims first is what makes a pre-commit refusal
-        // retryable inside one process instead of only after a restart, and it
-        // reuses the original claim identity rather than inventing a new one.
-        // Claims then publish together, up to the claim budget.
-        let mut retryable = staging.retryable_claims().await?.into_iter();
+        // it. `publish_claims` drives those claims first, under their original
+        // identity, and the sweep's claims then publish together with them, up
+        // to the claim budget.
         let mut keys = staging.ready_keys()?.into_iter();
         let mut key = keys.next();
         let published = self
-            .publish_claims(&staging, || {
-                if let Some(claim) = retryable.next() {
-                    return Ok(Some(claim));
-                }
+            .publish_claims(&staging, ClaimSlotWait::Await, || {
                 while let Some(current) = &key {
                     if let Some(claim) = staging.take_residue(current, cause)? {
                         return Ok(Some(claim));
@@ -2149,7 +2298,7 @@ impl PersistenceWorker {
     async fn publish_claim(
         &self,
         staging: &Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>,
-        claim: &crate::scribe::assembly::StagingClaim,
+        claim: &crate::scribe::staging_runtime::DrivenClaim,
     ) -> Result<FileListCommitKey, ScribeError> {
         let runs = staging.gather(claim).await?;
         let scratch = self
@@ -2162,6 +2311,8 @@ impl PersistenceWorker {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("Scribe claim scratch creation failed: {error}"),
             })?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.faults.pass_object_write_hold().await;
         #[cfg(any(test, feature = "test-support"))]
         let _object_write_guard = self.faults.begin_object_write().await;
         let mut assembled = match self
@@ -2210,6 +2361,8 @@ impl PersistenceWorker {
         // instead of poisoning volume health through the artifact set's drop.
         assembled.artifacts.cleanup().await?;
         let published = published?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.faults.note_claim_published();
         self.publish_staging_hint(claim.key());
         if let Some(detail) = published.unacknowledged {
             let error = ScribeError::Internal { detail };

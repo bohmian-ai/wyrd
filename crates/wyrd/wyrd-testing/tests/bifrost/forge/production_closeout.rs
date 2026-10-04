@@ -2824,7 +2824,7 @@ async fn compactors_pull_oldest_due_with_capacity() {
     assert_eq!(pulled_keys(&peer), keys[..2], "the two oldest due tables");
     assert!(
         peer.iter()
-            .all(|dispatch| dispatch.compaction_type == ForgeCompactionType::Full),
+            .all(|dispatch| dispatch.compaction_type == ForgeCompactionType::SmallFiles),
         "a dispatch names the table and its task type, never files: {peer:?}"
     );
     let local = forge(leader).pull_compaction(2).await.expect("local pull");

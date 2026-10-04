@@ -505,7 +505,6 @@
           "type": "object",
           "required": [
             "base_metadata_location",
-            "cutoff_ms",
             "group",
             "kind",
             "operation_id",
@@ -524,11 +523,6 @@
                 "integer",
                 "null"
               ],
-              "format": "int64"
-            },
-            "cutoff_ms": {
-              "description": "Strict timestamp cutoff used for selection.",
-              "type": "integer",
               "format": "int64"
             },
             "group": {

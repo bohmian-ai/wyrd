@@ -641,8 +641,6 @@ pub enum AuditDetail {
         current_snapshot_id: Option<i64>,
         /// Snapshot IDs at the heads of retained Iceberg refs.
         retained_ref_heads: Vec<i64>,
-        /// Strict timestamp cutoff used for selection.
-        cutoff_ms: i64,
         /// Exact snapshot IDs selected for expiry, sorted ascending.
         selected_snapshot_ids: Vec<i64>,
     },

@@ -53,6 +53,30 @@ pub enum BifrostCatalogError {
 }
 
 impl BifrostCatalogError {
+    /// Reports whether this failure is an object-store `NotFound`.
+    ///
+    /// Oracle reacquires its active cut once when the exact metadata document
+    /// an acquisition selected has already been removed by a catalog move;
+    /// the storage owner's typed `NotFound` is the only evidence of that, and
+    /// it survives as a source of the Iceberg error.
+    #[must_use]
+    pub fn is_missing_object(&self) -> bool {
+        let Self::Iceberg(error) = self else {
+            return false;
+        };
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        while let Some(current) = source {
+            if matches!(
+                current.downcast_ref::<crate::storage::BifrostStorageError>(),
+                Some(crate::storage::BifrostStorageError::NotFound { .. })
+            ) {
+                return true;
+            }
+            source = current.source();
+        }
+        false
+    }
+
     /// Convert the engine-local error into the stable public Bifrost catalog.
     #[must_use]
     pub fn into_public(self) -> wyrd_spec::vala::BifrostError {

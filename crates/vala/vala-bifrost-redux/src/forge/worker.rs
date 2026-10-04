@@ -6049,13 +6049,8 @@ impl ForgeWorker {
             lease,
             TaskProgressEffect::NoOpAcknowledged {
                 snapshot_id: metadata.current_snapshot_id().unwrap_or(0),
-                commit_count: u64::try_from(
-                    metadata
-                        .snapshots()
-                        .count()
-                        .saturating_sub(self.forge.core.config.retain_last),
-                )
-                .unwrap_or(u64::MAX),
+                commit_count: u64::try_from(metadata.snapshots().count().saturating_sub(1))
+                    .unwrap_or(u64::MAX),
             },
         )
         .await

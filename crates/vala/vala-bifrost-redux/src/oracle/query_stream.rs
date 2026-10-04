@@ -241,50 +241,8 @@ pub(super) struct QueryStreamInput {
     pub(super) gate_lifecycle: Option<Arc<QueryStreamLifecycle>>,
     /// Exactly-once owner-local registry settlement retained through terminal output.
     pub(super) running_query: Option<RunningQueryTerminalOwner>,
-    /// Reader-epoch protection retained until every descendant has joined.
-    pub(super) reader_protection: Option<ReaderProtectedQueryTerminalOwner>,
-}
-
-/// Terminal owner of one query's reader-epoch protection.
-///
-/// The guard and permit are held here, beside the running-query owner and the
-/// distributed settlement, for exactly one reason: release must not happen
-/// while any descendant can still read. Because the frame stream owns this
-/// value, and the frame stream joins its remote settlement before it is
-/// dropped, the narrowing command the guard enqueues on drop cannot be
-/// enqueued while leader-local or remote IO is still reachable.
-pub(super) struct ReaderProtectedQueryTerminalOwner {
-    /// This query's durable claim on every snapshot it planned against.
-    _guard: super::reader_pins::ReaderQueryGuard,
-    /// The permit every read of those snapshots presented.
-    ///
-    /// Retained rather than dropped after provider construction so the permit
-    /// and the protection it depends on end together: a clone handed to a
-    /// provider stays valid for exactly as long as this owner lives.
-    _permit: super::reader_pins::ReaderIoPermit,
-}
-
-impl std::fmt::Debug for ReaderProtectedQueryTerminalOwner {
-    /// Prints the owner without its guard's per-table holdings.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ReaderProtectedQueryTerminalOwner")
-            .finish_non_exhaustive()
-    }
-}
-
-impl ReaderProtectedQueryTerminalOwner {
-    /// Takes ownership of one query's complete protection for its lifetime.
-    #[must_use]
-    pub(super) fn new(
-        guard: super::reader_pins::ReaderQueryGuard,
-        permit: super::reader_pins::ReaderIoPermit,
-    ) -> Self {
-        Self {
-            _guard: guard,
-            _permit: permit,
-        }
-    }
+    /// Active table reads released only after every descendant has joined.
+    pub(super) active_reads: Option<super::planner::ActiveReadClaim>,
 }
 
 /// Exactly-once terminal owner for one inserted running-query entry.
@@ -371,8 +329,8 @@ struct FrameBuildInput {
     stream_telemetry_cancelled: Arc<std::sync::atomic::AtomicBool>,
     /// Exactly-once active-registry terminal owner.
     running_query: Option<RunningQueryTerminalOwner>,
-    /// Reader-epoch protection released only when this stream is finished.
-    reader_protection: Option<ReaderProtectedQueryTerminalOwner>,
+    /// Active table reads released only when this stream is finished.
+    active_reads: Option<super::planner::ActiveReadClaim>,
 }
 
 /// Builds the lazy frame stream that owns terminal cleanup state.
@@ -456,7 +414,7 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
         request_cancellation,
         stream_telemetry_cancelled,
         mut running_query,
-        reader_protection,
+        active_reads,
     } = input;
     let frames = async_stream::stream! {
         let distributed_settlement = Arc::clone(&admitted.distributed_settlement);
@@ -538,7 +496,7 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
             running_query: &mut running_query,
             query_class,
             row_count,
-            reader_protection,
+            active_reads,
         })
         .await;
         yield Ok(QueryStreamFrame::Terminal(terminal));
@@ -621,8 +579,8 @@ struct StreamSettlementInputs<'a> {
     query_class: QueryClass,
     /// Rows emitted before the terminal, reported on every outcome.
     row_count: u64,
-    /// Reader-epoch protection released only once nothing can read again.
-    reader_protection: Option<ReaderProtectedQueryTerminalOwner>,
+    /// Active table reads released only once nothing can read again.
+    active_reads: Option<super::planner::ActiveReadClaim>,
 }
 
 /// Settles every owner the drained stream holds and assembles its terminal.
@@ -648,7 +606,7 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
         running_query,
         query_class,
         row_count,
-        reader_protection,
+        active_reads,
     } = inputs;
     let outcome = candidate.outcome;
     let failed_outcome = settle_failed_cancellation(
@@ -692,9 +650,11 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
         owner.finish(terminal.outcome);
     }
     // Released only here. Every leader-local batch source was dropped by the
-    // caller and the distributed settlement has joined, so no descendant of
-    // this query can read the protected snapshots again.
-    drop(reader_protection);
+    // caller and the distributed and Analytical settlements have joined, so
+    // no descendant of this query can read its cut again.
+    if let Some(claim) = active_reads {
+        claim.release().await;
+    }
     terminal
 }
 
@@ -1509,7 +1469,7 @@ impl OracleQueryStream {
             scan_stats,
             gate_lifecycle: None,
             running_query: None,
-            reader_protection: None,
+            active_reads: None,
         })
     }
 
@@ -1534,7 +1494,7 @@ impl OracleQueryStream {
             scan_stats,
             gate_lifecycle,
             running_query,
-            reader_protection,
+            active_reads,
         } = input;
         #[cfg(feature = "test-support")]
         let mut admitted = admitted;
@@ -1564,7 +1524,7 @@ impl OracleQueryStream {
             request_cancellation,
             stream_telemetry_cancelled,
             running_query,
-            reader_protection,
+            active_reads,
         });
         let frames = polled_in_span(frames, span);
         let stream = Self::assemble(
@@ -2129,7 +2089,7 @@ mod tests {
             scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
             running_query: None,
-            reader_protection: None,
+            active_reads: None,
         });
         let mut terminal_seen = false;
         while let Some(Ok(frame)) = stream.frames.next().await {
@@ -2167,7 +2127,7 @@ mod tests {
             scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
             running_query: None,
-            reader_protection: None,
+            active_reads: None,
         });
         assert!(matches!(
             stream.frames.next().await,
@@ -2204,7 +2164,7 @@ mod tests {
             scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
             running_query: None,
-            reader_protection: None,
+            active_reads: None,
         });
         assert!(matches!(
             stream.frames.next().await,

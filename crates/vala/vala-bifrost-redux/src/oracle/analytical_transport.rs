@@ -2490,7 +2490,6 @@ mod tests {
                 leaf: crate::oracle::codec::AnalyticalLeafBinding::new(
                     wyrd_spec::vala::api::ClusterRole::Oracle,
                     Arc::new(crate::oracle::follower::UnresolvableSource),
-                    None,
                 ),
                 egress: Arc::new(crate::oracle::analytical::AnalyticalStageEgress::new(
                     node_id,

@@ -379,9 +379,8 @@ struct DurableProtectionRoots {
     hot_unpromoted: Vec<String>,
     /// Outputs produced or still producible by a nonterminal attempt.
     open_outputs: Vec<String>,
-    /// Snapshots a pinned Oracle cut still depends on.
-    pinned_snapshot_ids: Vec<i64>,
-    /// Whether any open or unreconciled operation forbids destructive work.
+    /// Whether an open or unreconciled operation, or an active Oracle table
+    /// read, forbids destructive work.
     blocked: bool,
 }
 
@@ -391,8 +390,6 @@ struct CatalogProtection {
     live: ProtectedLiveSet,
     /// Catalog location used to normalize SQL and audit paths.
     table_location: String,
-    /// Snapshot ids the traversal visited, so a reader pin can be corroborated.
-    traversed_snapshot_ids: Vec<i64>,
 }
 
 /// Returns output objects that nonterminal operations must retain.
@@ -1006,7 +1003,6 @@ impl Forge {
         let CatalogProtection {
             live,
             table_location,
-            traversed_snapshot_ids,
         } = self.load_catalog_protection(table_context.binding).await?;
         let durable = self
             .load_durable_protection_roots(&request, &table_location)
@@ -1015,13 +1011,11 @@ impl Forge {
 
         let composed = OrphanProtectionRoots {
             catalog: live,
-            traversed_snapshot_ids,
             hot_unpromoted: durable.hot_unpromoted,
             open_outputs: durable.open_outputs,
-            pinned_snapshot_ids: durable.pinned_snapshot_ids,
             blocked: durable.blocked,
         }
-        .compose()?;
+        .compose();
         let object_age_cutoff = match table_context.age_cutoff_ms {
             Some(cutoff_ms) => {
                 Timestamp::from_millisecond(cutoff_ms).map_err(|_| ForgeError::InvalidConfig {
@@ -1147,11 +1141,11 @@ impl Forge {
                 .open_outputs
                 .push(normalize(prepared.candidate.path.as_str())?);
         }
-        // Every snapshot on every proven ancestry chain, not just the chain
-        // endpoints: this pass protects the objects those snapshots reach, so a
-        // partial chain would leave the middle of a reader's history collectable.
-        roots.pinned_snapshot_ids = super::reader_protection::ReaderProtection::new(&mut conn)
-            .protected_snapshot_ids(key.tenant, &key.table_ref)
+        // An active Oracle table read may still open any object its cut
+        // named, so it blocks the whole pass. The check serializes with cut
+        // acquisition on the table's maintenance authority.
+        roots.blocked |= super::table_authority::TableAuthority::new(&mut conn)
+            .has_active_reads(key.tenant, &key.table_ref)
             .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
         Ok(roots)
@@ -1218,7 +1212,6 @@ impl Forge {
         }
         let mut live = ProtectedLiveSet::default();
         let table_location = table.metadata().location().to_owned();
-        let mut traversed_snapshot_ids = Vec::with_capacity(retained_snapshot_count);
         let mut add = |path: &str| self.add_path(&mut live, binding, &table_location, path);
         add(table
             .metadata_location_result()
@@ -1227,7 +1220,6 @@ impl Forge {
             add(&metadata_log.metadata_file)?;
         }
         for snapshot in table.metadata().snapshots() {
-            traversed_snapshot_ids.push(snapshot.snapshot_id());
             add(snapshot.manifest_list())?;
             let manifest_list = table
                 .manifest_list_reader(snapshot)
@@ -1262,7 +1254,6 @@ impl Forge {
         Ok(CatalogProtection {
             live,
             table_location,
-            traversed_snapshot_ids,
         })
     }
 
@@ -2213,10 +2204,8 @@ mod tests {
                     set.insert(self.catalog_output.clone());
                     set
                 },
-                traversed_snapshot_ids: vec![10, 20],
                 hot_unpromoted: vec![self.hot_scribe.clone()],
                 open_outputs: vec![self.open_output.clone()],
-                pinned_snapshot_ids: vec![20],
                 blocked: false,
             }
         }
@@ -2224,7 +2213,7 @@ mod tests {
 
     /// The fixed age cutoff and evaluation time every matrix case shares.
     fn orphan_matrix_protection(roots: OrphanProtectionRoots) -> MaintenanceProtection {
-        let composed = roots.compose().expect("roots compose");
+        let composed = roots.compose();
         MaintenanceProtection::new(
             composed.live_set,
             composed.blocked,
@@ -2244,16 +2233,13 @@ mod tests {
     /// Each root defends its object differently, so "load-bearing" cannot be a
     /// single assertion: dropping catalog reachability or the open-output root
     /// flips an object to eligible, dropping the `file_list` root removes it
-    /// from the protected union without changing any verdict, and breaking the
-    /// lineage or reader-pin agreement must refuse to compose at all.
+    /// from the protected union without changing any verdict.
     #[derive(Debug, Clone, Copy)]
     enum RootLoss {
         /// The subject becomes deletable, which is the data-loss case.
         SubjectBecomesEligible,
         /// The subject leaves the protected union without a verdict change.
         SubjectLeavesLiveSet,
-        /// The root set no longer composes, so the pass refuses.
-        CompositionFailsClosed,
     }
 
     /// One independent protection root, its subject, and its removal.
@@ -2294,18 +2280,6 @@ mod tests {
                 subject: |paths| &paths.hot_scribe,
                 loss: RootLoss::SubjectLeavesLiveSet,
             },
-            RootCase {
-                authority: "an Oracle reader pin inside the proven lineage",
-                remove: |roots| roots.pinned_snapshot_ids = vec![30],
-                subject: |paths| &paths.orphan,
-                loss: RootLoss::CompositionFailsClosed,
-            },
-            RootCase {
-                authority: "the traversed snapshot lineage",
-                remove: |roots| roots.traversed_snapshot_ids.clear(),
-                subject: |paths| &paths.orphan,
-                loss: RootLoss::CompositionFailsClosed,
-            },
         ]
     }
 
@@ -2313,8 +2287,8 @@ mod tests {
     ///
     /// A root that can be dropped with no observable consequence is a root that
     /// is no longer protecting anything, so each case here must either expose an
-    /// object as unsafely eligible, remove it from the protected union, or fail
-    /// closed. Every case first asserts the complete root set does protect its
+    /// object as unsafely eligible or remove it from the protected union. Every
+    /// case first asserts the complete root set does protect its
     /// subject, so a removal can never pass because the subject was unprotected
     /// to begin with.
     fn assert_each_orphan_root_is_load_bearing(paths: &OrphanMatrixPaths) {
@@ -2337,12 +2311,6 @@ mod tests {
                     complete.live_set.contains(subject),
                     "{authority} names its subject before it is removed"
                 ),
-                RootLoss::CompositionFailsClosed => {
-                    assert!(
-                        paths.roots().compose().is_ok(),
-                        "{authority} composes before it is broken"
-                    );
-                }
             }
 
             let mut mutated = paths.roots();
@@ -2361,16 +2329,13 @@ mod tests {
                     !orphan_matrix_protection(mutated).live_set.contains(subject),
                     "dropping {authority} removes the only authority naming its subject"
                 ),
-                RootLoss::CompositionFailsClosed => assert!(
-                    mutated.compose().is_err(),
-                    "breaking {authority} must refuse to compose rather than proceed"
-                ),
             }
         }
 
         // The destructive-maintenance gate is not a per-object root: lease loss,
-        // fence loss, and any open operation raise one gate over the whole
-        // table, so its subject is the otherwise-eligible orphan.
+        // fence loss, any open operation, and any active Oracle table read raise
+        // one gate over the whole table, so its subject is the otherwise-eligible
+        // orphan.
         let mut blocked = paths.roots();
         blocked.blocked = true;
         assert_eq!(

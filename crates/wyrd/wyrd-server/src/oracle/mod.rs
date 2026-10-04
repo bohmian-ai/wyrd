@@ -1,9 +1,6 @@
 //! Private Oracle peer authority owned by the server boot boundary.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio_util::sync::CancellationToken;
-use vala_bifrost_redux::cluster::{ClusterError, ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::oracle::dispatcher::OraclePeerWorker;
 
 mod forwarding;
@@ -34,30 +31,6 @@ pub use query_audit::OracleQueryAudit;
 pub use tail_discovery::RegistryTailStreamDiscovery;
 #[cfg(feature = "test-support")]
 pub use tail_discovery::{arm_tail_listing_stale_for_test, arm_tail_listing_stall_for_test};
-
-/// Closes the local serving latch once this Oracle's reader epoch is lost.
-///
-/// The latch closes and the shared Oracle cancellation token fires together, so
-/// no request path can select this node after its own epoch selected loss.
-pub(crate) fn close_local_reader_epoch(advertise_ready: &AtomicBool, shutdown: &CancellationToken) {
-    advertise_ready.store(false, Ordering::Release);
-    shutdown.cancel();
-}
-
-/// Removes one retained Oracle fence from durable and local routing discovery.
-///
-/// # Errors
-///
-/// Returns [`ClusterError`] when the exact fenced readiness mutation or the
-/// following immutable snapshot refresh cannot complete.
-pub(crate) async fn deactivate_lost_reader_epoch(
-    cluster: &ClusterRegistry,
-    registered_role: &RegisteredRole,
-) -> Result<(), ClusterError> {
-    cluster.deactivate(registered_role).await?;
-    cluster.refresh_snapshot().await?;
-    Ok(())
-}
 
 /// Oracle-owned private peer service retained by the Oracle runtime.
 #[derive(Clone)]
@@ -113,90 +86,5 @@ impl OraclePeerRuntime {
     #[must_use]
     pub fn lifecycle_transport(&self) -> Arc<OracleLifecycleTransport> {
         Arc::clone(&self.lifecycle_transport)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use wyrd_dev_fixtures::pg::PgFixture;
-    use wyrd_spec::vala::api::{NodeId, OracleCapabilitiesV1, QueryClass, ScribeCapabilitiesV1};
-
-    /// Reader-epoch loss closes readiness and settles cancellation work.
-    ///
-    /// # Panics
-    ///
-    /// Panics when local readiness remains open, the exact durable role row is
-    /// still ready, or an affected task does not observe cancellation and settle.
-    #[tokio::test]
-    async fn reader_epoch_loss_deactivates_exact_oracle_fence_and_settles_queries() {
-        let fixture = PgFixture::start().await.expect("PostgreSQL fixture starts");
-        let node_id = NodeId::new(uuid::Uuid::from_u128(41));
-        let cluster = ClusterRegistry::new(fixture.vala_postgres().clone(), node_id);
-        let oracle = cluster
-            .register_oracle(
-                "http://oracle.test",
-                OracleCapabilitiesV1 {
-                    storage_protocol_version: 1,
-                    cpu_cores: 1.0,
-                    memory_budget_bytes: 1024,
-                    cpu_cores_per_slot: 1.0,
-                    memory_bytes_per_slot: 1024,
-                    raw_slots: 1,
-                    usable_slots: 1,
-                    supported_classes: vec![QueryClass::Interactive],
-                    max_workers_per_query: 1,
-                },
-            )
-            .await
-            .expect("Oracle registers");
-        let scribe = cluster
-            .register_scribe(
-                "http://scribe.test",
-                ScribeCapabilitiesV1 {
-                    tail_protocol_version: 1,
-                },
-            )
-            .await
-            .expect("Scribe registers");
-        cluster.refresh_snapshot().await.expect("ready snapshot");
-        let shutdown = CancellationToken::new();
-        let affected_query = shutdown.child_token();
-        let settled = Arc::new(AtomicBool::new(false));
-        let task_settled = Arc::clone(&settled);
-        let task = tokio::spawn(async move {
-            affected_query.cancelled().await;
-            task_settled.store(true, Ordering::Release);
-        });
-        let ready = AtomicBool::new(true);
-        close_local_reader_epoch(&ready, &shutdown);
-        deactivate_lost_reader_epoch(&cluster, &oracle)
-            .await
-            .expect("reader-epoch loss deactivates exact role");
-        task.await.expect("affected query settles");
-        assert!(!ready.load(Ordering::Acquire));
-        assert!(settled.load(Ordering::Acquire));
-        let snapshot = cluster.snapshot();
-        assert!(
-            snapshot
-                .live_oracle_at_fence(node_id, oracle.fencing_token)
-                .is_none()
-        );
-        assert!(
-            snapshot
-                .live_scribe_at_fence(node_id, scribe.fencing_token)
-                .is_some()
-        );
-        let durable_ready: bool = sqlx::query_scalar(
-            "SELECT ready FROM vala.cluster_nodes WHERE data_tenant_id=$1 \
-             AND node_id=$2 AND role='oracle' AND fencing_token=$3",
-        )
-        .bind(wyrd_spec::DataTenantId::SYSTEM_OWNER.as_uuid())
-        .bind(node_id.as_uuid())
-        .bind(i64::try_from(oracle.fencing_token).expect("test fence fits i64"))
-        .fetch_one(fixture.operator_pool().pool())
-        .await
-        .expect("durable Oracle readiness");
-        assert!(!durable_ready);
     }
 }

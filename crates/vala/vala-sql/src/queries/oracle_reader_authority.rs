@@ -139,6 +139,63 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
         }
         Ok(())
     }
+
+    /// Locks the table's authority row and reports whether an Oracle query is
+    /// still reading the table.
+    ///
+    /// Abandoned reads are discarded first, under the rule
+    /// [`crate::queries::forge_operations::active_table_reads_exist`] owns. The
+    /// lock is held for the rest of the caller's transaction, so no cut
+    /// acquisition can commit a new read between this answer and the caller's
+    /// commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the identity failures of [`Self::lock`] and [`SqlError`] when
+    /// either active-read statement fails.
+    pub async fn has_active_reads(
+        &mut self,
+        identity: &TableAuthorityIdentity,
+    ) -> Result<bool, SqlError> {
+        self.lock(identity).await?;
+        crate::queries::forge_operations::active_table_reads_exist(
+            self.conn.transaction(),
+            identity,
+        )
+        .await
+    }
+
+    /// Returns every snapshot of this table an unresolved Forge expiration has
+    /// already claimed, in ascending order.
+    ///
+    /// A snapshot another prepared expiration owns is removed from a new
+    /// selection rather than prepared twice; preparation re-checks the claim
+    /// index under [`Self::lock`]. The owner never mutates a claim; only the
+    /// fenced Forge lifecycle does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::InvariantViolation`] when the identity is malformed
+    /// and [`SqlError`] when the claim-index read fails.
+    pub async fn claimed_snapshots(
+        &mut self,
+        identity: &TableAuthorityIdentity,
+    ) -> Result<Vec<i64>, SqlError> {
+        identity.validate(BIFROST_CATALOG_NAME)?;
+        sqlx::query_scalar(
+            r"
+            SELECT snapshot_id
+              FROM vala.forge_snapshot_expiration_claims
+             WHERE data_tenant_id = wyrd.current_tenant()
+               AND table_uid = $1
+             ORDER BY snapshot_id
+            ",
+        )
+        .bind(identity.table_uid.as_slice())
+        .fetch_all(&mut **self.conn.transaction())
+        .await
+        .map_err(SqlError::from)
+    }
 }
 
 /// One logical table a query asks to read, as the planner canonicalized it.
@@ -238,16 +295,15 @@ impl<'conn, 'tx> OracleActiveTableReads<'conn, 'tx> {
                 })
                 .collect(),
         );
-        let rows: Vec<AcquiredCutDbRow> = sqlx::query_as(
-            "SELECT * FROM vala.oracle_acquire_table_cut($1, $2, $3, $4::jsonb)",
-        )
-        .bind(owner.query_id)
-        .bind(owner.node_id)
-        .bind(owner.fencing_token)
-        .bind(request)
-        .fetch_all(&mut **self.conn.transaction())
-        .await
-        .map_err(acquisition_error)?;
+        let rows: Vec<AcquiredCutDbRow> =
+            sqlx::query_as("SELECT * FROM vala.oracle_acquire_table_cut($1, $2, $3, $4::jsonb)")
+                .bind(owner.query_id)
+                .bind(owner.node_id)
+                .bind(owner.fencing_token)
+                .bind(request)
+                .fetch_all(&mut **self.conn.transaction())
+                .await
+                .map_err(acquisition_error)?;
         group_acquired_cut(self.conn.data_tenant_id(), tables, rows)
     }
 
@@ -438,7 +494,9 @@ fn group_acquired_cut(
                 || cut.identity.table_name != row.table_name
                 || cut.metadata_location != row.metadata_location
             {
-                return Err(invariant("acquired cut returned conflicting table identity"));
+                return Err(invariant(
+                    "acquired cut returned conflicting table identity",
+                ));
             }
             match hot {
                 Some(hot) if !cut.hot_files.is_empty() => cut.hot_files.push(hot),
@@ -453,7 +511,9 @@ fn group_acquired_cut(
             || requested.namespace_name != row.namespace_name
             || requested.table_name != row.table_name
         {
-            return Err(invariant("acquired cut returned tables out of request order"));
+            return Err(invariant(
+                "acquired cut returned tables out of request order",
+            ));
         }
         let identity = TableAuthorityIdentity {
             tenant,

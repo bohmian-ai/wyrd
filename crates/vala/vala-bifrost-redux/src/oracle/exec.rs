@@ -6811,7 +6811,6 @@ mod tests {
     ) -> wyrd_spec::vala::api::FollowerScanAssignment {
         wyrd_spec::vala::api::FollowerScanAssignment {
             scan_id: key.scan_id.clone(),
-            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
             binding: wyrd_spec::vala::api::TenantTableBinding {
                 tenant_id: key.tenant,
                 namespace: "traces".to_owned(),
@@ -7893,7 +7892,6 @@ mod tests {
                 namespace: "traces".to_owned(),
                 table: "spans".to_owned(),
             },
-            table_uid: uuid::Uuid::nil(),
             routes: vec![crate::oracle::live::LiveScribeRoute {
                 node_id: wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7()),
                 writer_epoch: 1,

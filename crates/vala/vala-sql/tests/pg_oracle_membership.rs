@@ -361,8 +361,8 @@ mod pg_tests {
     use sqlx::{PgPool, Row};
     use uuid::Uuid;
     use vala_sql::queries::cluster_nodes::ClusterNodes;
-    use vala_sql::queries::olap_catalog::upsert_table;
     use vala_sql::queries::forge_operations::refuse_active_table_reads;
+    use vala_sql::queries::olap_catalog::upsert_table;
     use vala_sql::queries::oracle_reader_authority::{
         ActiveReadOwner, ActiveTableRef, OracleActiveTableReads,
     };
@@ -412,11 +412,10 @@ mod pg_tests {
         async fn start() -> Self {
             let fixture = PgFixture::start().await.expect("fixture starts");
             let superuser = fixture.superuser_pool().await.expect("superuser pool");
-            let catalog = PgPool::connect(secrecy::ExposeSecret::expose_secret(
-                fixture.catalog_dsn(),
-            ))
-            .await
-            .expect("catalog pool");
+            let catalog =
+                PgPool::connect(secrecy::ExposeSecret::expose_secret(fixture.catalog_dsn()))
+                    .await
+                    .expect("catalog pool");
             sqlx::query(
                 "CREATE TABLE IF NOT EXISTS iceberg_catalog.iceberg_tables (
                     catalog_name VARCHAR(255) NOT NULL,
@@ -759,12 +758,21 @@ mod pg_tests {
         .expect("function catalog reads");
         assert_eq!(functions.len(), 2);
         let acquire = &functions[0];
-        assert_eq!(acquire.get::<String, _>("proname"), "oracle_acquire_table_cut");
-        assert!(!acquire.get::<bool, _>("prosecdef"), "acquisition runs as the caller");
+        assert_eq!(
+            acquire.get::<String, _>("proname"),
+            "oracle_acquire_table_cut"
+        );
+        assert!(
+            !acquire.get::<bool, _>("prosecdef"),
+            "acquisition runs as the caller"
+        );
         assert_eq!(acquire.get::<String, _>("volatility"), "v");
         assert!(acquire.get::<bool, _>("app_exec"));
         let pointer = &functions[1];
-        assert!(pointer.get::<bool, _>("prosecdef"), "the pointer read is the one definer");
+        assert!(
+            pointer.get::<bool, _>("prosecdef"),
+            "the pointer read is the one definer"
+        );
         assert_eq!(pointer.get::<String, _>("owner"), "wyrd_platform_admin");
         assert_eq!(
             pointer.get::<Option<Vec<String>>, _>("proconfig"),
@@ -780,14 +788,28 @@ mod pg_tests {
 
         let tenant_a = reads.tenant().await;
         let tenant_b = reads.tenant().await;
-        reads.register(tenant_a, "events", Some("s3://a/events/v1.metadata.json")).await;
-        reads.register(tenant_a, "quiet", Some("s3://a/quiet/v1.metadata.json")).await;
+        reads
+            .register(tenant_a, "events", Some("s3://a/events/v1.metadata.json"))
+            .await;
+        reads
+            .register(tenant_a, "quiet", Some("s3://a/quiet/v1.metadata.json"))
+            .await;
         reads.register(tenant_a, "unpublished", None).await;
-        reads.register(tenant_b, "events", Some("s3://b/events/v1.metadata.json")).await;
-        reads.hot_row(tenant_a, "events", "a/hot-1.parquet", false, None).await;
-        reads.hot_row(tenant_a, "events", "a/moving.parquet", true, None).await;
-        reads.hot_row(tenant_a, "events", "a/settled.parquet", true, Some(7)).await;
-        reads.hot_row(tenant_b, "events", "b/hot-1.parquet", false, None).await;
+        reads
+            .register(tenant_b, "events", Some("s3://b/events/v1.metadata.json"))
+            .await;
+        reads
+            .hot_row(tenant_a, "events", "a/hot-1.parquet", false, None)
+            .await;
+        reads
+            .hot_row(tenant_a, "events", "a/moving.parquet", true, None)
+            .await;
+        reads
+            .hot_row(tenant_a, "events", "a/settled.parquet", true, Some(7))
+            .await;
+        reads
+            .hot_row(tenant_b, "events", "b/hot-1.parquet", false, None)
+            .await;
 
         let mut direct = reads.conn(tenant_a).await;
         let denied = sqlx::query("SELECT 1 FROM iceberg_catalog.iceberg_tables")
@@ -801,26 +823,57 @@ mod pg_tests {
         // claims invisible until the caller commits.
         let q1 = Uuid::now_v7();
         let refs = [
-            ActiveTableRef { namespace_name: NAMESPACE, table_name: "events" },
-            ActiveTableRef { namespace_name: NAMESPACE, table_name: "quiet" },
-            ActiveTableRef { namespace_name: NAMESPACE, table_name: "events" },
+            ActiveTableRef {
+                namespace_name: NAMESPACE,
+                table_name: "events",
+            },
+            ActiveTableRef {
+                namespace_name: NAMESPACE,
+                table_name: "quiet",
+            },
+            ActiveTableRef {
+                namespace_name: NAMESPACE,
+                table_name: "events",
+            },
         ];
         let mut conn = reads.conn(tenant_a).await;
         let cuts = OracleActiveTableReads::new(&mut conn)
             .acquire(reads.owner(q1), &refs)
             .await
             .expect("acquisition succeeds");
-        assert_eq!(reads.rows_for(q1).await, 0, "claims are invisible before commit");
+        assert_eq!(
+            reads.rows_for(q1).await,
+            0,
+            "claims are invisible before commit"
+        );
         conn.commit().await.expect("acquisition commits");
         assert_eq!(cuts.len(), 2, "a repeated table is one cut");
         assert_eq!(cuts[0].identity.table_name, "events");
         assert_eq!(cuts[0].metadata_location, "s3://a/events/v1.metadata.json");
-        let mut paths: Vec<&str> = cuts[0].hot_files.iter().map(|row| row.file_path.as_str()).collect();
+        let mut paths: Vec<&str> = cuts[0]
+            .hot_files
+            .iter()
+            .map(|row| row.file_path.as_str())
+            .collect();
         paths.sort_unstable();
         assert_eq!(paths, ["a/hot-1.parquet", "a/moving.parquet"]);
-        assert!(cuts[0].hot_files.iter().all(|row| row.data_tenant_id == tenant_a.as_uuid()));
+        assert!(
+            cuts[0]
+                .hot_files
+                .iter()
+                .all(|row| row.data_tenant_id == tenant_a.as_uuid())
+        );
+        assert!(
+            cuts[0].hot_files.iter().all(|row| row.row_count == 100
+                && row.min_event_time.is_some()
+                && row.max_event_time.is_some()),
+            "hot candidates project the durable row count and event-time bounds"
+        );
         assert_eq!(cuts[1].identity.table_name, "quiet");
-        assert!(cuts[1].hot_files.is_empty(), "an empty hot set is a valid cut");
+        assert!(
+            cuts[1].hot_files.is_empty(),
+            "an empty hot set is a valid cut"
+        );
         assert_eq!(reads.rows_for(q1).await, 2, "one claim per distinct table");
         let lifetime: (bool, f64) = sqlx::query_as(
             "SELECT bool_and(node_id = $2 AND fencing_token = $3), \
@@ -833,20 +886,28 @@ mod pg_tests {
         .fetch_one(pool)
         .await
         .expect("claim fence reads");
-        assert_eq!(lifetime, (true, 6.0 * 3600.0), "exact fence, six-hour Postgres lifetime");
+        assert_eq!(
+            lifetime,
+            (true, 6.0 * 3600.0),
+            "exact fence, six-hour Postgres lifetime"
+        );
 
         // Tenant isolation: the same logical name resolves to tenant B's own
         // pointer and hot rows, and B cannot see A's claims.
         let q2 = Uuid::now_v7();
-        let cut_b = reads.acquire(tenant_b, q2, &["events"]).await.expect("tenant B acquires");
+        let cut_b = reads
+            .acquire(tenant_b, q2, &["events"])
+            .await
+            .expect("tenant B acquires");
         assert_eq!(cut_b[0].metadata_location, "s3://b/events/v1.metadata.json");
         assert_eq!(cut_b[0].hot_files.len(), 1);
         assert_eq!(cut_b[0].hot_files[0].file_path, "b/hot-1.parquet");
         let mut conn = reads.conn(tenant_b).await;
-        let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.oracle_active_table_reads")
-            .fetch_one(&mut **conn.transaction())
-            .await
-            .expect("tenant B reads its claims");
+        let visible: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM vala.oracle_active_table_reads")
+                .fetch_one(&mut **conn.transaction())
+                .await
+                .expect("tenant B reads its claims");
         assert_eq!(visible, 1, "RLS hides tenant A's claims");
         drop(conn);
 
@@ -884,7 +945,10 @@ mod pg_tests {
                 let cut = OracleActiveTableReads::new(&mut conn)
                     .acquire(
                         owner,
-                        &[ActiveTableRef { namespace_name: NAMESPACE, table_name: "events" }],
+                        &[ActiveTableRef {
+                            namespace_name: NAMESPACE,
+                            table_name: "events",
+                        }],
                     )
                     .await?;
                 conn.commit().await?;
@@ -904,9 +968,14 @@ mod pg_tests {
             }
             tokio::task::yield_now().await;
         }
-        reads.move_pointer(tenant_a, "events", "s3://a/events/v2.metadata.json").await;
+        reads
+            .move_pointer(tenant_a, "events", "s3://a/events/v2.metadata.json")
+            .await;
         forge.commit().await.expect("forge commits first");
-        let later = waiting.await.expect("acquisition task joins").expect("acquisition succeeds");
+        let later = waiting
+            .await
+            .expect("acquisition task joins")
+            .expect("acquisition succeeds");
         assert_eq!(later[0].metadata_location, "s3://a/events/v2.metadata.json");
 
         // The other ordering: a committed reader makes Forge refuse.
@@ -919,21 +988,45 @@ mod pg_tests {
         // abandon_after; a live owner's row never expires.
         let mut releaser = reads.conn(tenant_a).await;
         assert_eq!(
-            OracleActiveTableReads::new(&mut releaser).release(q4).await.expect("release"),
+            OracleActiveTableReads::new(&mut releaser)
+                .release(q4)
+                .await
+                .expect("release"),
             1
         );
         releaser.commit().await.expect("release commits");
         reads.set_fence_live(false).await;
         reads.set_abandoned(q1, false).await;
-        assert!(matches!(reads.forge_gate(&events_a).await, Err(SqlError::Conflict { .. })));
-        assert_eq!(reads.rows_for(q1).await, 2, "a dead fence alone does not abandon");
+        assert!(matches!(
+            reads.forge_gate(&events_a).await,
+            Err(SqlError::Conflict { .. })
+        ));
+        assert_eq!(
+            reads.rows_for(q1).await,
+            2,
+            "a dead fence alone does not abandon"
+        );
         reads.set_fence_live(true).await;
         reads.set_abandoned(q1, true).await;
-        assert!(matches!(reads.forge_gate(&events_a).await, Err(SqlError::Conflict { .. })));
-        assert_eq!(reads.rows_for(q1).await, 2, "a live owner's row never expires");
+        assert!(matches!(
+            reads.forge_gate(&events_a).await,
+            Err(SqlError::Conflict { .. })
+        ));
+        assert_eq!(
+            reads.rows_for(q1).await,
+            2,
+            "a live owner's row never expires"
+        );
         reads.set_fence_live(false).await;
-        reads.forge_gate(&events_a).await.expect("an abandoned dead-fence read is discarded");
-        assert_eq!(reads.rows_for(q1).await, 1, "only the gated table's row is discarded");
+        reads
+            .forge_gate(&events_a)
+            .await
+            .expect("an abandoned dead-fence read is discarded");
+        assert_eq!(
+            reads.rows_for(q1).await,
+            1,
+            "only the gated table's row is discarded"
+        );
 
         // Release is idempotent.
         let mut releaser = reads.conn(tenant_a).await;
@@ -942,6 +1035,10 @@ mod pg_tests {
         assert_eq!(owner.release(q1).await.expect("repeat release"), 0);
         releaser.commit().await.expect("release commits");
         assert_eq!(reads.rows_for(q1).await, 0);
-        assert_eq!(reads.rows_for(q2).await, 1, "another tenant's claim is untouched");
+        assert_eq!(
+            reads.rows_for(q2).await,
+            1,
+            "another tenant's claim is untouched"
+        );
     }
 }

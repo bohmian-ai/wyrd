@@ -1518,10 +1518,8 @@ pub(crate) async fn lock_table_authority(
 /// Runs inside a Forge operator transaction that is already tenant-bound and
 /// already holds the table's maintenance-authority row `FOR UPDATE`, so no
 /// acquisition can commit a new read between this decision and the caller's
-/// destructive preparation. A row is abandoned only when PostgreSQL time has
-/// passed its `abandon_after` **and** its exact Oracle `(node_id,
-/// fencing_token)` no longer has a heartbeat within [`ROLE_LIVENESS_CUTOFF`];
-/// a live owner's row never expires.
+/// destructive preparation. Abandonment follows
+/// [`active_table_reads_exist`].
 ///
 /// # Errors
 ///
@@ -1531,6 +1529,32 @@ pub async fn refuse_active_table_reads(
     tx: &mut Transaction<'_, Postgres>,
     identity: &TableAuthorityIdentity,
 ) -> Result<(), SqlError> {
+    if active_table_reads_exist(tx, identity).await? {
+        return Err(SqlError::Conflict {
+            detail: "an Oracle query is still reading this table".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Discards one table's abandoned active reads and reports whether any
+/// active read remains.
+///
+/// The caller's tenant-bound transaction must already hold the table's
+/// maintenance-authority row `FOR UPDATE`, so the answer stays true for the
+/// rest of that transaction. A row is abandoned only when PostgreSQL time has
+/// passed its `abandon_after` **and** its exact Oracle `(node_id,
+/// fencing_token)` no longer has a heartbeat within [`ROLE_LIVENESS_CUTOFF`];
+/// a live owner's row never expires. The abandonment delete commits with the
+/// caller's transaction.
+///
+/// # Errors
+///
+/// Returns [`SqlError`] when either statement fails.
+pub async fn active_table_reads_exist(
+    tx: &mut Transaction<'_, Postgres>,
+    identity: &TableAuthorityIdentity,
+) -> Result<bool, SqlError> {
     sqlx::query(
         r"
         DELETE FROM vala.oracle_active_table_reads r
@@ -1561,14 +1585,8 @@ pub async fn refuse_active_table_reads(
     .fetch_one(&mut **tx)
     .await
     .map_err(SqlError::from)?;
-    if active {
-        return Err(SqlError::Conflict {
-            detail: "an Oracle query is still reading this table".to_owned(),
-        });
-    }
-    Ok(())
+    Ok(active)
 }
-
 
 /// Returns the exact ascending snapshot selection carried by a snapshot-expiry
 /// detail.

@@ -74,10 +74,6 @@ pub struct ForgeConfig {
     pub uncertainty_bound: Duration,
     /// Number of audit rows read per reconciliation page.
     pub audit_page_size: i64,
-    /// Age after which old Iceberg snapshots become eligible for expiry.
-    pub snapshot_retention: Duration,
-    /// Number of snapshots retained along each current/ref ancestry.
-    pub retain_last: usize,
     /// Small-file threshold as a percentage of each table's resolved file
     /// target, in `1..=99`.
     ///
@@ -142,8 +138,6 @@ impl Default for ForgeConfig {
             uncertainty_margin: Duration::from_secs(30),
             uncertainty_bound: Duration::from_mins(2),
             audit_page_size: 256,
-            snapshot_retention: Duration::from_hours(24),
-            retain_last: 1,
             small_file_threshold_percent: DEFAULT_SMALL_FILE_THRESHOLD_PERCENT,
             default_target_file_size_bytes: DEFAULT_TARGET_FILE_SIZE_BYTES,
             orphan_gc_ttl: Duration::from_hours(24),
@@ -167,10 +161,7 @@ impl ForgeConfig {
     ///
     /// Returns [`ForgeError::InvalidConfig`] when a limit is zero, a bin cannot
     /// contain two files, the small-file threshold percentage is not below 100,
-    /// the lease cannot cover the configured commit window, or `retain_last`
-    /// exceeds the retained-snapshot traversal cap
-    /// (`max_retained_snapshots_per_table`), which would make reconciliation
-    /// unable to see every snapshot the expiry policy is asked to retain.
+    /// or the lease cannot cover the configured commit window.
     pub fn validate(&self) -> Result<(), ForgeError> {
         if self.lease_ttl.is_zero()
             || self.iceberg_total_retry_timeout.is_zero()
@@ -178,8 +169,6 @@ impl ForgeConfig {
             || self.uncertainty_margin.is_zero()
             || self.uncertainty_bound.is_zero()
             || self.audit_page_size <= 0
-            || self.snapshot_retention.is_zero()
-            || self.retain_last == 0
             || self.small_file_threshold_percent == 0
             || self.default_target_file_size_bytes == 0
             || self.orphan_gc_ttl.is_zero()
@@ -200,11 +189,6 @@ impl ForgeConfig {
         if self.small_file_threshold_percent >= 100 {
             return Err(ForgeError::InvalidConfig {
                 detail: "small_file_threshold_percent must be below 100".to_owned(),
-            });
-        }
-        if self.retain_last > self.max_retained_snapshots_per_table {
-            return Err(ForgeError::InvalidConfig {
-                detail: "retain_last must not exceed max_retained_snapshots_per_table".to_owned(),
             });
         }
         let required = self
@@ -575,27 +559,6 @@ mod tests {
             ..ForgeConfig::default()
         };
         assert!(zero_budget.validate().is_err());
-    }
-
-    /// `retain_last` may not exceed the retained-snapshot traversal cap.
-    ///
-    /// The default (`retain_last` 1, cap 256) is well within bound, and equal
-    /// values are accepted; only a `retain_last` above the traversal cap fails,
-    /// because reconciliation could then never observe every retained snapshot.
-    #[test]
-    fn forge_config_rejects_retain_last_above_traversal_cap() {
-        let at_bound = ForgeConfig {
-            retain_last: 4,
-            max_retained_snapshots_per_table: 4,
-            ..ForgeConfig::default()
-        };
-        assert!(at_bound.validate().is_ok());
-        let over_bound = ForgeConfig {
-            retain_last: 5,
-            max_retained_snapshots_per_table: 4,
-            ..ForgeConfig::default()
-        };
-        assert!(over_bound.validate().is_err());
     }
 
     /// The small-file threshold percentage defaults to 75 and stays in `1..=99`.

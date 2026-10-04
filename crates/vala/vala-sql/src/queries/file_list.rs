@@ -86,41 +86,22 @@ fn is_unresolved_hot(
     )
 }
 
-impl HotFileCatalog {
-    /// Creates a manifest reader for one logical table identity.
+impl HotFileCut {
+    /// Subtracts one pinned snapshot from a table's unresolved hot candidates.
+    ///
+    /// `rows` are the acquisition's candidates — every `file_list` row with no
+    /// committed snapshot, in durable file-list order. A candidate stays hot
+    /// unless the pinned snapshot already contains its path or, for a
+    /// compacted row, records its Forge publication operation. Compacted
+    /// transition rows stay candidates because their operation may be newer
+    /// than the independently pinned snapshot. A compacted row with neither
+    /// settlement fact nor a represented path is ambiguous publication.
     #[must_use]
-    pub fn new(namespace: &str, table_name: &str) -> Self {
-        Self {
-            namespace: namespace.to_owned(),
-            table_name: table_name.to_owned(),
-        }
-    }
-
-    /// Reads tenant-scoped sealed files for exact pinned-snapshot subtraction.
-    ///
-    /// Only rows without a committed snapshot are read: a committed row is
-    /// never hot, so the read stays bounded by unpublished work rather than by
-    /// every file the table has ever had. Compacted transition rows with no
-    /// committed snapshot remain visible, because their Forge operation may be
-    /// newer than Oracle's independently pinned snapshot.
-    ///
-    /// # Errors
-    /// Returns [`SqlError`] when the RLS-bound transaction or manifest query fails.
-    pub async fn unresolved_for_cut(
-        &self,
-        conn: &mut TenantConn<'_>,
+    pub fn reconcile(
+        rows: Vec<HotFileRow>,
         pinned_paths: &BTreeSet<String>,
         pinned_operation: Option<uuid::Uuid>,
-    ) -> Result<HotFileCut, SqlError> {
-        let rows = sqlx::query_as::<_, HotFileRow>(
-            "SELECT id, data_tenant_id, namespace, table_name, file_path, file_ordinal, file_checksum, file_size, row_count, min_event_time, max_event_time, partition_granularity, partition_start, compacted, committed_snapshot_id, forge_publication_operation_id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, created_at FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 AND committed_snapshot_id IS NULL ORDER BY partition_granularity, partition_start, created_at, file_ordinal, id",
-        )
-        .bind(uuid::Uuid::from(conn.data_tenant_id()))
-        .bind(&self.namespace)
-        .bind(&self.table_name)
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .map_err(SqlError::from)?;
+    ) -> Self {
         let read = rows.len();
         let mut hot_files = Vec::new();
         let mut ambiguous_publication = false;
@@ -131,11 +112,22 @@ impl HotFileCatalog {
                 hot_files.push(row);
             }
         }
-        Ok(HotFileCut {
+        Self {
             represented: read - hot_files.len(),
             hot_files,
             ambiguous_publication,
-        })
+        }
+    }
+}
+
+impl HotFileCatalog {
+    /// Creates a manifest reader for one logical table identity.
+    #[must_use]
+    pub fn new(namespace: &str, table_name: &str) -> Self {
+        Self {
+            namespace: namespace.to_owned(),
+            table_name: table_name.to_owned(),
+        }
     }
 
     /// Reads the exact hot rows this table owes an unchanged Iceberg promotion.
@@ -425,99 +417,12 @@ mod tests {
 
 #[cfg(test)]
 mod pg_tests {
-    //! Database projection proof for the already-durable hot event-time bounds.
-
-    use std::collections::BTreeSet;
+    //! Database proofs for promotion demand and settlement.
 
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_sql::TenantConn;
 
     use super::HotFileCatalog;
-
-    /// The tenant-scoped unresolved-hot read projects the durable
-    /// `min_event_time`/`max_event_time` interval and row count alongside the
-    /// identity columns, so Oracle can exclude a non-overlapping hot file
-    /// before it opens the object's footer. A row already committed to an
-    /// Iceberg snapshot is not read at all.
-    ///
-    /// No migration is involved: both columns already exist on
-    /// `vala.file_list`; only the query projection and row mapping change.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the `PostgreSQL` fixture, insert, or tenant-scoped read fails.
-    #[tokio::test]
-    async fn unresolved_hot_cut_projects_bounds_without_migration() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let pool = fixture.superuser_pool().await.expect("superuser pool");
-        let tenant = fixture.data_tenant_id();
-        let lower = chrono::DateTime::from_timestamp_micros(1_787_493_600_000_000)
-            .expect("fixture lower bound is representable");
-        let upper = chrono::DateTime::from_timestamp_micros(1_787_497_199_000_000)
-            .expect("fixture upper bound is representable");
-        sqlx::query(
-            r#"
-            INSERT INTO vala.file_list (
-                id, data_tenant_id, namespace, table_name, file_path,
-                file_size, row_count, min_event_time, max_event_time,
-                partition_granularity, partition_start, node_id, writer_epoch,
-                wal_lsn_min, wal_lsn_max, promotion_record
-            ) VALUES (
-                $1, $2, 'vala.traces', 'spans', 'spans/a.parquet',
-                4096, 128, $3, $4,
-                'hour', $5,
-                $6, 1, 100, 200, '{"fixture": "hot-bounds"}'::jsonb
-            )
-            "#,
-        )
-        .bind(uuid::Uuid::now_v7())
-        .bind(tenant.as_uuid())
-        .bind(lower)
-        .bind(upper)
-        .bind(lower)
-        .bind(uuid::Uuid::now_v7())
-        .execute(&pool)
-        .await
-        .expect("insert unresolved hot row");
-        sqlx::query(
-            r#"
-            INSERT INTO vala.file_list (
-                id, data_tenant_id, namespace, table_name, file_path,
-                file_size, row_count, min_event_time, max_event_time,
-                partition_granularity, partition_start, compacted,
-                committed_snapshot_id, node_id, writer_epoch,
-                wal_lsn_min, wal_lsn_max, promotion_record
-            ) VALUES (
-                $1, $2, 'vala.traces', 'spans', 'spans/committed.parquet',
-                4096, 64, $3, $3, 'hour', $3, true, 9,
-                $4, 1, 201, 300, '{"fixture": "committed"}'::jsonb
-            )
-            "#,
-        )
-        .bind(uuid::Uuid::now_v7())
-        .bind(tenant.as_uuid())
-        .bind(lower)
-        .bind(uuid::Uuid::now_v7())
-        .execute(&pool)
-        .await
-        .expect("insert committed row");
-
-        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
-            .await
-            .expect("tenant connection");
-        let cut = HotFileCatalog::new("vala.traces", "spans")
-            .unresolved_for_cut(&mut conn, &BTreeSet::new(), None)
-            .await
-            .expect("unresolved hot cut reads");
-
-        assert_eq!(cut.hot_files.len(), 1, "one unresolved hot row is returned");
-        assert_eq!(cut.represented, 0, "the committed row is never read");
-        let row = &cut.hot_files[0];
-        assert_eq!(row.min_event_time, Some(lower));
-        assert_eq!(row.max_event_time, Some(upper));
-        assert_eq!(row.row_count, 128);
-        assert!(row.row_count >= 0, "durable row count is nonnegative");
-    }
 
     /// Promotion demand is exactly the hot rows that carry complete evidence and
     /// have never been published, in deterministic promotion order, and the

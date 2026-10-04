@@ -28,13 +28,8 @@ use wyrd_spec::vala::api::{
 
 use super::codec::{OraclePhysicalExtensionCodec, physical_plan_fingerprint};
 use crate::catalog::layout::TimePartition;
-use crate::catalog::{
-    BIFROST_CATALOG_NAME, BifrostCatalog, TableRef, TenantTableBinding as CatalogTableBinding,
-};
+use crate::catalog::{BifrostCatalog, TableRef, TenantTableBinding as CatalogTableBinding};
 use crate::contracts::ScribeError;
-use crate::oracle::reader_pins::{
-    OracleReaderAuthority, ReaderIoPermit, ReaderQueryGuard, local_cut_from_follower,
-};
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, LiveTailBatches};
 use crate::storage::BifrostStorage;
@@ -153,7 +148,6 @@ impl FollowerSourceResolver for UnresolvableSource {
         _target_role: ClusterRole,
         _assignment: &FollowerScanAssignment,
         _session: &SessionState,
-        _reader_io_permit: Option<&ReaderIoPermit>,
     ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
         Err(FollowerResolutionError::Fault(
             "fixture resolver refuses every assignment".to_owned(),
@@ -181,7 +175,6 @@ pub trait FollowerSourceResolver: Send + Sync {
         target_role: ClusterRole,
         assignment: &FollowerScanAssignment,
         session: &SessionState,
-        reader_io_permit: Option<&ReaderIoPermit>,
     ) -> Result<ResolvedFollowerSource, FollowerResolutionError>;
 }
 
@@ -196,10 +189,9 @@ where
         target_role: ClusterRole,
         assignment: &FollowerScanAssignment,
         session: &SessionState,
-        reader_io_permit: Option<&ReaderIoPermit>,
     ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
         self.as_ref()
-            .resolve(target_role, assignment, session, reader_io_permit)
+            .resolve(target_role, assignment, session)
             .await
     }
 }
@@ -310,7 +302,6 @@ impl OracleCatalogResolver {
         required_schema: SchemaRef,
         full_schema: SchemaRef,
         session: &SessionState,
-        permit: &ReaderIoPermit,
     ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
         let files = assigned_locations
             .iter()
@@ -322,7 +313,7 @@ impl OracleCatalogResolver {
             plan: Arc::new(
                 super::exec::HotParquetExec::new(
                     files,
-                    self.catalog.gated_file_io(permit),
+                    self.catalog.file_io(),
                     Arc::clone(self.catalog.storage()),
                     required_schema,
                     super::exec::HotParquetPlan::Follower {
@@ -435,13 +426,7 @@ impl FollowerSourceResolver for OracleCatalogResolver {
         target_role: ClusterRole,
         assignment: &FollowerScanAssignment,
         session: &SessionState,
-        reader_io_permit: Option<&ReaderIoPermit>,
     ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
-        // Required, not optional: this resolver is the only one that opens
-        // snapshot-dependent objects, so it refuses to build anything without
-        // the permit proving its node's epoch already protects that snapshot.
-        let permit = reader_io_permit
-            .ok_or_else(|| "Oracle resolver has no reader epoch permit".to_owned())?;
         if target_role != ClusterRole::Oracle || assignment.scribe_provider_cut.is_some() {
             return Err(FollowerResolutionError::Fault(
                 "Oracle resolver received a non-Oracle assignment".to_owned(),
@@ -464,12 +449,12 @@ impl FollowerSourceResolver for OracleCatalogResolver {
         let provider = match source {
             super::AssignedPersistedSource::Iceberg { snapshot_id } => {
                 self.catalog
-                    .pinned_provider(&table, assignment.binding.tenant_id, snapshot_id, permit)
+                    .pinned_provider(&table, assignment.binding.tenant_id, snapshot_id)
                     .await
             }
             super::AssignedPersistedSource::Hot | super::AssignedPersistedSource::Empty => {
                 self.catalog
-                    .provider(&table, assignment.binding.tenant_id, permit)
+                    .provider(&table, assignment.binding.tenant_id)
                     .await
             }
         }
@@ -503,7 +488,6 @@ impl FollowerSourceResolver for OracleCatalogResolver {
                 required_schema,
                 full_schema,
                 session,
-                permit,
             );
         }
         // Compacted assignments keep the catalog's own scan. Rebuild the leaf
@@ -865,108 +849,6 @@ pub struct FollowerExecution {
     scan_stats: FollowerScanEvidence,
 }
 
-/// One Analytical leaf's local reader-epoch protection.
-///
-/// The guard keeps this node's epoch protecting the signed snapshots, and the
-/// permit is what every object open in the resolved leaf presents. Dropping
-/// the guard cancels the permit, so the protection cannot outlive or
-/// under-live the reads it exists for.
-pub struct FollowerReaderProtection {
-    /// This node's durable claim on every snapshot the fragment reads.
-    guard: ReaderQueryGuard,
-    /// Permission the resolved plan's source IO presents.
-    permit: ReaderIoPermit,
-}
-
-impl std::fmt::Debug for FollowerReaderProtection {
-    /// Prints the owner without any tenant, table, or snapshot payload.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("FollowerReaderProtection")
-            .finish_non_exhaustive()
-    }
-}
-
-impl FollowerReaderProtection {
-    /// Splits this protection into the durable guard and the clonable permit.
-    ///
-    /// Used only where the two halves need different owners: the Analytical
-    /// follower hands the guard to the graph that must outlive the plan, and
-    /// keeps the permit with the plan that presents it on every read. The
-    /// guard remains strictly stronger — dropping it cancels every permit it
-    /// issued — so the split cannot widen what the permit authorizes.
-    #[must_use]
-    pub(super) fn into_parts(self) -> (ReaderQueryGuard, ReaderIoPermit) {
-        (self.guard, self.permit)
-    }
-}
-
-/// Protects every snapshot a set of signed assignments names, under this epoch.
-///
-/// The Analytical leaf calls it before opening a provider. The leader signed
-/// exactly which snapshot each scan reads, so this re-derives the same cuts and
-/// commits them under `authority`. An installed epoch also supplies the IO
-/// permit for hot-only or empty assignments, without adding snapshot
-/// protection; without an epoch and without snapshots it yields `None`.
-///
-/// # Errors
-///
-/// Returns a redacted description when an assignment names a snapshot while the
-/// node has no reader epoch, when a signed cut targets a different epoch fence
-/// than the node holds, when its binding is not canonical, or when the local
-/// authority refuses the protection.
-pub(super) async fn protect_reader_cuts<'a, I>(
-    authority: Option<&Arc<OracleReaderAuthority>>,
-    assignments: I,
-) -> Result<Option<FollowerReaderProtection>, String>
-where
-    I: IntoIterator<Item = &'a FollowerScanAssignment>,
-{
-    let mut cuts = Vec::new();
-    for assignment in assignments {
-        if !assignment.reader_cut.protects_a_snapshot() {
-            continue;
-        }
-        let Some(authority) = authority else {
-            return Err(
-                "follower has no reader epoch for a snapshot-bearing assignment".to_owned(),
-            );
-        };
-        let local_fence = u64::try_from(authority.fencing_token())
-            .map_err(|_| "local reader epoch fence is not representable".to_owned())?;
-        if assignment.reader_cut.target_epoch_fence != local_fence {
-            return Err("assignment reader cut targets a different Oracle epoch fence".to_owned());
-        }
-        let table = assignment_table(&assignment.binding)?;
-        cuts.push((
-            vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity {
-                tenant: assignment.binding.tenant_id,
-                table_uid: *assignment.reader_cut.table_uid.as_bytes(),
-                catalog_name: BIFROST_CATALOG_NAME.to_owned(),
-                namespace_name: table.namespace.as_str().to_owned(),
-                table_name: table.name.clone(),
-            },
-            assignment.reader_cut.clone(),
-        ));
-    }
-    if cuts.is_empty() && authority.is_none() {
-        return Ok(None);
-    }
-    // Verified before any widening so a tampered ancestry is refused here
-    // rather than turning into a durable protection claim.
-    for (identity, cut) in &cuts {
-        local_cut_from_follower(identity, cut).map_err(|error| error.to_string())?;
-    }
-    let Some(authority) = authority else {
-        return Err("follower has no reader epoch for a snapshot-bearing assignment".to_owned());
-    };
-    let (guard, permit) = authority
-        .acquire_follower_guard(&cuts)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(Some(FollowerReaderProtection { guard, permit }))
-}
-
 impl FollowerExecution {
     /// Splits this execution into its output stream and deferred scan evidence.
     ///
@@ -1031,7 +913,6 @@ where
         target_role: ClusterRole,
         assignment: &FollowerScanAssignment,
         session: &SessionState,
-        _reader_io_permit: Option<&ReaderIoPermit>,
     ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
         if target_role != ClusterRole::Scribe || !assignment.persisted.files.is_empty() {
             return Err(FollowerResolutionError::Fault(
@@ -1334,9 +1215,8 @@ where
     /// progress. Retry restarts preflight and every provider resolution.
     ///
     /// # Errors
-    /// Returns [`PhysicalPlanFollowerError::Preflight`] when preflight fails or
-    /// any assignment names a snapshot, which this epoch-less follower cannot
-    /// protect, and other [`PhysicalPlanFollowerError`] variants for provider
+    /// Returns [`PhysicalPlanFollowerError::Preflight`] when preflight fails,
+    /// and other [`PhysicalPlanFollowerError`] variants for provider
     /// resolution or post-resolution native `DataFusion` decode failure.
     pub async fn decode(
         &self,
@@ -1346,23 +1226,12 @@ where
         context: &TaskContext,
     ) -> Result<Arc<dyn ExecutionPlan>, PhysicalPlanFollowerError> {
         let preflight = self.preflight(request, &authenticated)?;
-        // This follower holds no reader epoch, so a signed snapshot is refused
-        // before any provider, manifest, or object open could read it.
-        if preflight
-            .assignments
-            .values()
-            .any(|assignment| assignment.reader_cut.protects_a_snapshot())
-        {
-            return Err(PhysicalPlanFollowerError::Preflight(
-                "follower has no reader epoch for a snapshot-bearing assignment".to_owned(),
-            ));
-        }
         let mut providers = HashMap::with_capacity(preflight.assignments.len());
         for (scan_id, assignment) in preflight.assignments {
             self.effects.resolver.fetch_add(1, Ordering::SeqCst);
             let resolved = self
                 .resolver
-                .resolve(request.target_fence.role, &assignment, session, None)
+                .resolve(request.target_fence.role, &assignment, session)
                 .await
                 .map_err(PhysicalPlanFollowerError::Resolution)?;
             // Two distinct schemas, checked in order. The fingerprint identifies
@@ -1730,7 +1599,6 @@ pub fn authenticated_preflight(
             _target_role: ClusterRole,
             _assignment: &FollowerScanAssignment,
             _session: &SessionState,
-            _reader_io_permit: Option<&ReaderIoPermit>,
         ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
             Err(FollowerResolutionError::Fault(
                 "preflight resolver must not run".to_owned(),
@@ -1998,7 +1866,6 @@ pub(crate) mod tests {
             _target_role: ClusterRole,
             assignment: &FollowerScanAssignment,
             _session: &SessionState,
-            _reader_io_permit: Option<&ReaderIoPermit>,
         ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let required_schema =
@@ -2071,10 +1938,6 @@ pub(crate) mod tests {
                     schema_fingerprint: fingerprint,
                     required_columns: vec!["value".to_owned()],
                     predicates: Vec::new(),
-                    reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(
-                        uuid::Uuid::nil(),
-                        1,
-                    ),
                 }],
                 plan_fingerprint: physical_plan_fingerprint(&bytes),
             },
@@ -2130,7 +1993,6 @@ pub(crate) mod tests {
             schema_fingerprint: fingerprint.clone(),
             required_columns: vec!["wyrd_event_time".to_owned()],
             predicates: Vec::new(),
-            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
         };
         let session = SessionContext::new().state();
         resolver
@@ -2138,7 +2000,6 @@ pub(crate) mod tests {
                 ClusterRole::Scribe,
                 &assignment(local_scribe_scan_id(&binding, stream)),
                 &session,
-                None,
             )
             .await
             .expect("the exact local identity resolves its hot provider");
@@ -2155,7 +2016,7 @@ pub(crate) mod tests {
             3,
         );
         resolver
-            .resolve(ClusterRole::Scribe, &assignment(sibling), &session, None)
+            .resolve(ClusterRole::Scribe, &assignment(sibling), &session)
             .await
             .expect("a sibling placeholder resolves as an explicit empty provider");
         assert_eq!(
@@ -2211,7 +2072,6 @@ pub(crate) mod tests {
             schema_fingerprint: super::super::assignment_schema_fingerprint(schema.as_ref()),
             required_columns: vec!["wyrd_event_time".to_owned()],
             predicates: Vec::new(),
-            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
         };
         let session = SessionContext::new().state();
 
@@ -2225,7 +2085,7 @@ pub(crate) mod tests {
         );
         for (refused, expected) in [(other_epoch, "source loss"), (other_schema, "fault")] {
             let class = match resolver
-                .resolve(ClusterRole::Scribe, &refused, &session, None)
+                .resolve(ClusterRole::Scribe, &refused, &session)
                 .await
             {
                 Err(FollowerResolutionError::SourceLoss(_)) => "source loss",
@@ -2363,7 +2223,6 @@ pub(crate) mod tests {
             schema_fingerprint: "mixed".to_owned(),
             required_columns: vec!["wyrd_event_time".to_owned()],
             predicates: Vec::new(),
-            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
         };
         let fence: wyrd_spec::vala::api::FencingToken = 1;
         assert!(
@@ -2428,7 +2287,6 @@ pub(crate) mod tests {
             schema_fingerprint: "shape".to_owned(),
             required_columns: vec!["wyrd_event_time".to_owned()],
             predicates: Vec::new(),
-            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
         };
 
         for scannable in [
@@ -2661,13 +2519,8 @@ pub(crate) mod tests {
                     // schema actually carries.
                     required_columns: vec!["wyrd_event_time".to_owned()],
                     predicates: Vec::new(),
-                    reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(
-                        uuid::Uuid::nil(),
-                        1,
-                    ),
                 },
                 &session,
-                None,
             )
             .await
             .expect("snapshot cohort resolves");
@@ -2778,7 +2631,6 @@ pub(crate) mod tests {
                     "STATUS_CODE_ERROR".to_owned(),
                 ),
             )],
-            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
         }
     }
 
@@ -2885,7 +2737,6 @@ pub(crate) mod tests {
                     fingerprint.clone(),
                 ),
                 &session,
-                None,
             )
             .await
             .expect("signed closure resolves");
@@ -2929,7 +2780,6 @@ pub(crate) mod tests {
                     fingerprint.clone(),
                 ),
                 &session,
-                None,
             )
             .await
             .expect("a non-owning assignment resolves to an empty branch");
@@ -2960,7 +2810,7 @@ pub(crate) mod tests {
             fingerprint,
         );
         recording
-            .resolve(ClusterRole::Scribe, &assignment, &session, None)
+            .resolve(ClusterRole::Scribe, &assignment, &session)
             .await
             .expect("the recording source resolves the same signed closure");
         let recorded = requests
@@ -3016,7 +2866,6 @@ pub(crate) mod tests {
                         "sha256:wrong".to_owned(),
                     ),
                     &session,
-                    None,
                 )
                 .await
                 .is_err(),
@@ -3075,10 +2924,9 @@ pub(crate) mod tests {
             schema_fingerprint: super::super::assignment_schema_fingerprint(schema.as_ref()),
             required_columns: vec!["value".to_owned()],
             predicates,
-            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
         };
         resolver
-            .resolve(ClusterRole::Scribe, &assignment, session, None)
+            .resolve(ClusterRole::Scribe, &assignment, session)
             .await
             .expect("the staged assignment resolves")
             .plan
@@ -3240,7 +3088,7 @@ pub(crate) mod tests {
             fingerprint.clone(),
         );
         let plan = resolver
-            .resolve(ClusterRole::Scribe, &assignment, &session, None)
+            .resolve(ClusterRole::Scribe, &assignment, &session)
             .await
             .expect("the one-batch cut resolves")
             .plan;
@@ -3265,7 +3113,7 @@ pub(crate) mod tests {
             test_storage(),
         );
         let plan = empty
-            .resolve(ClusterRole::Scribe, &assignment, &session, None)
+            .resolve(ClusterRole::Scribe, &assignment, &session)
             .await
             .expect("the empty cut resolves")
             .plan;

@@ -427,11 +427,6 @@ fn resolve_forge_config(
 ) -> (ForgeConfig, std::time::Duration) {
     let base = ForgeConfig::default();
     let config = ForgeConfig {
-        snapshot_retention: forge_runtime
-            .snapshot_retention_secs
-            .map(std::time::Duration::from_secs)
-            .unwrap_or(base.snapshot_retention),
-        retain_last: forge_runtime.retain_last.unwrap_or(base.retain_last),
         orphan_gc_ttl: forge_runtime
             .orphan_gc_ttl_secs
             .map(std::time::Duration::from_secs)
@@ -1690,11 +1685,6 @@ impl<'a> OracleRoleBuilder<'a> {
             ),
             ..OracleConfig::default()
         };
-        let operator_pool = postgres.operator_pool().ok_or_else(|| {
-            ServerBootError::OraclePeer(
-                "Oracle reader-epoch authority requires the operator pool".to_owned(),
-            )
-        })?;
         let capabilities = OracleCapabilitiesV1 {
             storage_protocol_version: 1,
             cpu_cores: configured_cpu,
@@ -1798,7 +1788,6 @@ impl<'a> OracleRoleBuilder<'a> {
             shutdown: shutdown.clone(),
             catalog: Arc::clone(&catalog),
             vala: postgres.vala().clone(),
-            operator_pool,
             cluster: Arc::clone(&cluster),
             local_role: role.clone(),
             memory: OracleMemoryResources {
@@ -2486,8 +2475,6 @@ mod tests {
     #[test]
     fn resolve_forge_config_applies_supplied_overrides() {
         let runtime = crate::config::ForgeRuntimeConfig {
-            snapshot_retention_secs: Some(7_200),
-            retain_last: Some(3),
             orphan_gc_ttl_secs: Some(3_600),
             orphan_gc_max_list_pages: Some(64),
             orphan_gc_run_budget_secs: Some(30),
@@ -2497,11 +2484,6 @@ mod tests {
         };
         let (config, maintenance_interval) = resolve_forge_config(&runtime);
         assert_eq!(config.default_target_file_size_bytes, 2_147_483_648);
-        assert_eq!(
-            config.snapshot_retention,
-            std::time::Duration::from_secs(7_200)
-        );
-        assert_eq!(config.retain_last, 3);
         assert_eq!(config.orphan_gc_ttl, std::time::Duration::from_secs(3_600));
         assert_eq!(config.orphan_gc_max_list_pages, 64);
         assert_eq!(
@@ -2521,7 +2503,7 @@ mod tests {
     #[test]
     fn resolve_forge_config_zero_value_is_rejected_by_validate() {
         let runtime = crate::config::ForgeRuntimeConfig {
-            snapshot_retention_secs: Some(0),
+            orphan_gc_ttl_secs: Some(0),
             ..crate::config::ForgeRuntimeConfig::default()
         };
         let (config, _) = resolve_forge_config(&runtime);

@@ -331,12 +331,13 @@ impl Forge {
 
     /// Expires one table's snapshots, then cleans the files that expiry freed.
     ///
-    /// The `RisingWave` pre-checks run on the leader: a processing compaction
-    /// without an observed snapshot skips the table, one with a snapshot
-    /// clamps the age cutoff to it, and nothing older than the cutoff skips the
-    /// table. The recorded expiry attempt then re-derives the cutoff from
-    /// durable roots — running attempts, Oracle pins and unresolved
-    /// operations — before it commits. An unconsumed handoff from an earlier
+    /// The pre-checks run on the leader: a processing compaction without an
+    /// observed snapshot skips the table, one with a snapshot holds the chain
+    /// from the current snapshot down to it, and a table with no other
+    /// replaced snapshot skips. The recorded expiry attempt then re-derives
+    /// its selection from durable roots — running attempts, claims, and
+    /// unresolved operations — and preparation refuses while an Oracle query
+    /// still reads the table. An unconsumed handoff from an earlier
     /// failed cleanup is drained first, so a retry deletes only what is still
     /// proven unreachable.
     ///
@@ -362,7 +363,7 @@ impl Forge {
                 tracing::info!(table = %key.table.table, "Forge expiry skipped: a compaction has no observed snapshot");
                 false
             }
-            watermark => self.expiry_due(&table, watermark.flatten())?,
+            watermark => expiry_due(&table, watermark.flatten()),
         };
         let Some(task) = self
             .expiry_task(key, &table, expiry_due, reconciliation_due)
@@ -374,44 +375,6 @@ impl Forge {
             .execute_accepted(Uuid::now_v7(), &task, stop)
             .await?;
         self.clean_expired(executor, key, stop).await
-    }
-
-    /// Whether some snapshot is strictly older than the clamped expiry cutoff.
-    ///
-    /// The cutoff is now minus the configured retention, lowered to the
-    /// processing compaction's snapshot timestamp when one is held. A held
-    /// snapshot the table no longer retains skips the table. The comparison
-    /// is strict, as the expiry policy's own selection is, so a held snapshot
-    /// that is itself the oldest leaves nothing due and opens no attempt.
-    ///
-    /// # Errors
-    ///
-    /// Returns a clock error.
-    fn expiry_due(
-        &self,
-        table: &iceberg::table::Table,
-        watermark: Option<i64>,
-    ) -> Result<bool, ForgeError> {
-        let retention =
-            i64::try_from(self.core.config.snapshot_retention.as_millis()).unwrap_or(i64::MAX);
-        let mut cutoff_ms = self
-            .core
-            .clock
-            .now()?
-            .timestamp_millis()
-            .saturating_sub(retention);
-        if let Some(snapshot_id) = watermark {
-            let Some(held) = table.metadata().snapshot_by_id(snapshot_id) else {
-                return Ok(false);
-            };
-            cutoff_ms = cutoff_ms.min(held.timestamp_ms());
-        }
-        Ok(table
-            .metadata()
-            .snapshots()
-            .map(|snapshot| snapshot.timestamp_ms())
-            .min()
-            .is_some_and(|oldest| oldest < cutoff_ms))
     }
 
     /// Builds the recorded expiry attempt for one table, when one is due.
@@ -469,7 +432,7 @@ impl Forge {
             parameters: serde_json::json!({
                 "kind": "maintenance",
                 "trigger_commit_count": table.metadata().snapshots().count()
-                    .saturating_sub(self.core.config.retain_last),
+                    .saturating_sub(1),
                 "snapshot_expiry_due": expiry_due,
                 "reconciliation_due": reconciliation_due,
             }),
@@ -583,6 +546,41 @@ impl Forge {
             .await?;
         Ok(())
     }
+}
+
+/// Whether some retained snapshot is replaced and not held by a compaction.
+///
+/// The current snapshot is never due. A held compaction snapshot keeps the
+/// chain from the current snapshot down to and including it, because the
+/// rewrite's commit-time validation walks that chain; a held snapshot the
+/// table no longer retains skips the table. This is only the leader's
+/// pre-check: the recorded attempt re-derives its selection from every
+/// durable root before preparing anything.
+fn expiry_due(table: &iceberg::table::Table, watermark: Option<i64>) -> bool {
+    let metadata = table.metadata();
+    let Some(current) = metadata.current_snapshot_id() else {
+        return false;
+    };
+    let mut held = HashSet::from([current]);
+    if let Some(snapshot_id) = watermark {
+        if metadata.snapshot_by_id(snapshot_id).is_none() {
+            return false;
+        }
+        let mut cursor = metadata
+            .snapshot_by_id(current)
+            .and_then(|snapshot| snapshot.parent_snapshot_id());
+        while let Some(id) = cursor.filter(|_| !held.contains(&snapshot_id)) {
+            if !held.insert(id) {
+                break;
+            }
+            cursor = metadata
+                .snapshot_by_id(id)
+                .and_then(|snapshot| snapshot.parent_snapshot_id());
+        }
+    }
+    metadata
+        .snapshots()
+        .any(|snapshot| !held.contains(&snapshot.snapshot_id()))
 }
 
 /// Builds the orphan-cleanup attempt for one table at one fixed cut.

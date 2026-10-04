@@ -465,10 +465,6 @@ pub struct Oracle {
     snapshot_poller: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// Synchronously aborts the snapshot poller without acquiring its async owner lock.
     snapshot_poller_abort: AbortHandle,
-    /// Retains the delegated-continuity monitor until role shutdown.
-    continuity_monitor: Arc<Mutex<Option<JoinHandle<()>>>>,
-    /// Synchronously aborts the continuity monitor after a shutdown deadline.
-    continuity_monitor_abort: AbortHandle,
     /// Readiness value preserved by heartbeats during transport drain.
     advertise_ready: Arc<AtomicBool>,
     /// Audit outbox writer retained for the complete Oracle lifecycle.
@@ -503,19 +499,17 @@ impl Oracle {
     /// Cancels Oracle work and explicitly aborts retained role tasks without awaiting.
     ///
     /// Used only after the process deadline is exhausted. It closes role
-    /// activity synchronously, aborts the heartbeat, snapshot poller, and
-    /// continuity monitor through handles that do not require their async owner
-    /// locks, starts no registry operation, and leaves incomplete durable cleanup
+    /// activity synchronously, aborts the heartbeat and snapshot poller
+    /// through handles that do not require their async owner locks, starts no registry operation, and leaves incomplete durable cleanup
     /// to existing recovery.
     pub(crate) fn abort_shutdown(&self) {
         self.lifecycle.begin_stopping();
         self.role_shutdown.cancel();
         self.heartbeat_abort.abort();
         self.snapshot_poller_abort.abort();
-        self.continuity_monitor_abort.abort();
         self.engine.begin_shutdown();
     }
-    /// Creates the retained query lifecycle and its reader-epoch loss monitor.
+    /// Creates the retained query lifecycle.
     ///
     /// # Errors
     ///
@@ -544,15 +538,6 @@ impl Oracle {
         let snapshot_poller = Arc::clone(&cluster).start_snapshot_poller(role_shutdown.clone());
         let heartbeat_abort = heartbeat.abort_handle();
         let snapshot_poller_abort = snapshot_poller.abort_handle();
-        let continuity_monitor = tokio::spawn(run_reader_epoch_loss_monitor(
-            Arc::clone(&engine),
-            Arc::clone(&cluster),
-            registered_role.clone(),
-            lifecycle.clone(),
-            Arc::clone(&advertise_ready),
-            role_shutdown.clone(),
-        ));
-        let continuity_monitor_abort = continuity_monitor.abort_handle();
         let running_queries = Arc::clone(engine.running_queries());
         // The engine already owns the distributed dispatcher, so assert the
         // composition invariant here rather than retaining a second handle that
@@ -576,8 +561,6 @@ impl Oracle {
             heartbeat_abort,
             snapshot_poller: Arc::new(Mutex::new(Some(snapshot_poller))),
             snapshot_poller_abort,
-            continuity_monitor: Arc::new(Mutex::new(Some(continuity_monitor))),
-            continuity_monitor_abort,
             lifecycle,
             advertise_ready,
             audit,
@@ -732,12 +715,6 @@ impl Oracle {
         self.role_shutdown.cancel();
         let report = self.engine.shutdown(deadline).await;
         let audit = self.audit.shutdown(deadline).await;
-        await_role_task(
-            &self.continuity_monitor,
-            deadline,
-            "oracle continuity monitor",
-        )
-        .await?;
         await_role_task(&self.heartbeat, deadline, "oracle heartbeat").await?;
         await_role_task(&self.snapshot_poller, deadline, "oracle snapshot poller").await?;
         if report.active_queries != 0
@@ -783,62 +760,6 @@ impl Oracle {
             })
         }
     }
-}
-
-/// Closes this Oracle fence once its reader epoch selects its own loss.
-///
-/// The local readiness bit and engine cancellation close synchronously before
-/// the exact durable role row is marked unready. Refreshing the local immutable
-/// snapshot then prevents both local Gate dispatch and remote forwarding from
-/// selecting the dead owner. Query streams observe engine cancellation and
-/// retain their existing terminal-settlement guards.
-async fn run_reader_epoch_loss_monitor(
-    engine: Arc<OracleEngine>,
-    cluster: Arc<ClusterRegistry>,
-    registered_role: RegisteredRole,
-    lifecycle: RoleLifecycle,
-    advertise_ready: Arc<AtomicBool>,
-    shutdown: CancellationToken,
-) {
-    // The reader epoch's own loss is selected before its audited edge commits,
-    // so this monitor observes the epoch directly rather than waiting for a
-    // report an epoch fencing itself never produces.
-    tokio::select! {
-        () = shutdown.cancelled() => return,
-        () = engine.reader_authority().loss_selected_notify().cancelled() => {}
-    }
-    crate::oracle::close_local_reader_epoch(advertise_ready.as_ref(), &shutdown);
-    lifecycle.begin_draining();
-    metrics::gauge!("bifrost_role_ready", "role" => "oracle").set(0.0);
-    engine.begin_shutdown();
-    let deactivation =
-        crate::oracle::deactivate_lost_reader_epoch(&cluster, &registered_role).await;
-    let report = await_reader_epoch_loss_settlement(
-        deactivation,
-        engine.shutdown(Instant::now() + Duration::from_secs(5)),
-    )
-    .await;
-    if report.active_queries != 0 || report.queued_queries != 0 {
-        tracing::error!(
-            active_queries = report.active_queries,
-            queued_queries = report.queued_queries,
-            "Oracle reader-epoch shutdown retained unsettled query admission"
-        );
-    }
-}
-
-/// Reports durable routing failure without skipping local query settlement.
-async fn await_reader_epoch_loss_settlement<F, T>(
-    deactivation: Result<(), vala_bifrost_redux::cluster::ClusterError>,
-    settlement: F,
-) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    if let Err(error) = deactivation {
-        tracing::error!(%error, "failed to deactivate Oracle after reader-epoch loss");
-    }
-    settlement.await
 }
 
 /// Withdraws this Scribe role once its WAL faults.
@@ -2703,22 +2624,6 @@ mod tests {
             "a process without the Forge worker role has no executor to hand out"
         );
         drop(absent);
-    }
-
-    /// Durable registry failure cannot skip local reader-epoch settlement.
-    #[tokio::test]
-    async fn reader_epoch_loss_registry_failure_still_settles_local_work() {
-        let settled = Arc::new(AtomicBool::new(false));
-        let observed = Arc::clone(&settled);
-        super::await_reader_epoch_loss_settlement(
-            Err(vala_bifrost_redux::cluster::ClusterError::StaleFence),
-            async move {
-                observed.store(true, Ordering::Release);
-            },
-        )
-        .await;
-
-        assert!(settled.load(Ordering::Acquire));
     }
 
     /// Builds one verifier with a real decoding key for shell composition.

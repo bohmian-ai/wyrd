@@ -24,6 +24,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use vala_sql::ValaPostgres;
+use vala_sql::queries::oracle_reader_authority::ActiveReadOwner;
 use wyrd_runtime::{DelegationStep, Permission, PermissionScope, Principal};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
@@ -70,7 +71,6 @@ pub mod peer;
 pub mod planner;
 pub(crate) mod pruning;
 mod query_stream;
-pub mod reader_pins;
 mod running;
 pub(crate) mod spill;
 
@@ -116,9 +116,7 @@ pub use query_stream::QueryStreamLifecycle;
 pub use query_stream::{
     ORACLE_IPC_FRAMING_SCRATCH_BYTES, QueryIpcDecodeError, QueryIpcDecoder, QueryIpcEncoder,
 };
-use query_stream::{
-    QueryStreamInput, ReaderProtectedQueryTerminalOwner, RunningQueryTerminalOwner,
-};
+use query_stream::{QueryStreamInput, RunningQueryTerminalOwner};
 pub use running::{RunningQueryEntry, RunningQueryRegistry, RunningQuerySettlement};
 
 /// Builds one test stream through the production telemetry terminal owner.
@@ -949,8 +947,6 @@ pub struct OracleBuildConfig {
     pub catalog: Arc<BifrostCatalog>,
     /// Tenant-scoped SQL owner.
     pub vala: ValaPostgres,
-    /// Cross-tenant operator pool used by Oracle reader-epoch authority work.
-    pub operator_pool: vala_sql::OperatorPool,
     /// Immutable membership registry.
     pub cluster: Arc<ClusterRegistry>,
     /// Fenced local Oracle role.
@@ -1107,44 +1103,39 @@ struct CutExecution {
     query_class: QueryClass,
 }
 
-/// Pinned tables and class selected during one retry's planning phase.
+/// Pinned tables selected during one attempt's planning phase.
 ///
 /// Pinned once per query and carried straight into the physical build, so the
 /// catalog is read once rather than once to size the query and again to run it.
+/// It is only ever created inside a [`ClaimedSqlCut`], whose claim keeps every
+/// table here protected from destructive maintenance.
 pub struct PlannedSqlCut {
     /// Exact immutable table cuts.
-    pub(crate) cuts: Vec<PinnedSealedTable>,
+    cuts: Vec<PinnedSealedTable>,
     /// Fraction of pinned sealed bytes in the local hot tier.
-    pub(crate) local_ratio: f64,
-    /// This node's claim on the snapshots these cuts named.
-    ///
-    /// Carried by the plan rather than taken and released around execution so
-    /// that the claim's lifetime is the cut's lifetime by construction: a plan
-    /// that is abandoned before execution, or dropped on a retry, releases its
-    /// snapshots without anyone remembering to.
-    pub(crate) reader_pin: reader_pins::ReaderQueryGuard,
-    /// Epoch-gated permission this plan's source IO must present.
-    ///
-    /// Held beside the pin rather than derived at execution so that the permit
-    /// and the protection it depends on have exactly one lifetime: a plan that
-    /// carries a pin always carries the permit proving that pin is still live.
-    pub(crate) reader_io_permit: reader_pins::ReaderIoPermit,
+    local_ratio: f64,
 }
 
-/// One complete set of materialized table cuts and the reader-epoch evidence
-/// that made materializing them legal.
+/// The inseparable cut-and-claim owner one query attempt starts from.
 ///
-/// This is the single value produced by the leader's protect-then-materialize
-/// sequence. It exists so that a caller cannot hold cuts without also holding
-/// the guard that keeps their snapshots alive and the permit their source IO
-/// must present: the three are constructed together and move together.
-pub(crate) struct ProtectedPlannedSqlCut {
-    /// This node's durable claim on every snapshot named below.
-    pub(crate) guard: reader_pins::ReaderQueryGuard,
-    /// Epoch-gated permission every read of these cuts must present.
-    pub(crate) permit: reader_pins::ReaderIoPermit,
-    /// Immutable table cuts materialized under `permit`.
-    pub(crate) cuts: Vec<PinnedSealedTable>,
+/// Its fields are private to Oracle. The pair is split only by
+/// [`Oracle::run_sql_query`], whose frame keeps the claim until the attempt
+/// either hands it to the returned stream or has settled every descendant and
+/// releases it, and by the test-support Analytical lease, which releases it.
+pub struct ClaimedSqlCut {
+    /// The immutable cut every provider is built from.
+    cut: PlannedSqlCut,
+    /// This query's committed active reads on every table of `cut`.
+    claim: planner::ActiveReadClaim,
+}
+
+impl ClaimedSqlCut {
+    /// Releases this attempt's active reads after a refusal before execution.
+    ///
+    /// Only valid while nothing built from the cut exists.
+    async fn release(self) {
+        self.claim.release().await;
+    }
 }
 
 /// Borrowed inputs for staging the read decision and binding its sources.
@@ -1182,6 +1173,9 @@ struct SqlAttemptInput<'a> {
     roster: participant_cut::OracleQueryAttemptRoster,
     /// Catalog snapshot already pinned in this process for this attempt.
     prepared: PlannedSqlCut,
+    /// The attempt's active-read claim, held by the caller's frame until the
+    /// returned stream takes it.
+    active_reads: &'a mut Option<planner::ActiveReadClaim>,
 }
 
 /// Inputs for the pre-admission half of one attempt.
@@ -1217,13 +1211,6 @@ struct ClassifiedAttempt {
 }
 
 /// Retained local query engine owner.
-/// Maximum expired reader epochs one startup sweep reclaims.
-///
-/// Bounded so a cluster that lost many nodes at once still starts promptly; the
-/// epochs a sweep does not reach stay expired and are reclaimed by the next
-/// Oracle to start.
-const EXPIRED_EPOCH_SWEEP_LIMIT: i64 = 64;
-
 pub struct Oracle {
     /// Planner and floor configuration.
     planner: OraclePlanner,
@@ -1237,8 +1224,6 @@ pub struct Oracle {
     reservations: Arc<dispatcher::ReservationRegistry>,
     /// One process-local lifecycle registry shared with private controls.
     running_queries: Arc<RunningQueryRegistry>,
-    /// One process-global epoch owning every durable reader protection.
-    reader_authority: Arc<reader_pins::OracleReaderAuthority>,
     /// Tenant-qualified catalog and SQL owners retained for query execution.
     catalog: Arc<BifrostCatalog>,
     /// Tenant SQL handle retained for the Oracle lifecycle boundary.
@@ -1428,8 +1413,6 @@ struct AnalyticalCompositionInputs {
     fence: u64,
     /// Catalog the follower leaf binding resolves sources through.
     catalog: Arc<BifrostCatalog>,
-    /// This node's reader epoch, which every decoded Analytical leaf protects under.
-    reader_authority: Arc<reader_pins::OracleReaderAuthority>,
     /// Reservation owner this node's Analytical graphs charge against.
     reservations: Arc<dispatcher::ReservationRegistry>,
     /// Directory this leader reserves each graph participant's envelope through.
@@ -1453,7 +1436,6 @@ fn compose_analytical_handle(
         node_id,
         fence,
         catalog,
-        reader_authority,
         reservations,
         peer_transports,
         peer_tls,
@@ -1462,7 +1444,6 @@ fn compose_analytical_handle(
     let leaf = codec::AnalyticalLeafBinding::new(
         wyrd_spec::vala::api::ClusterRole::Oracle,
         Arc::new(follower::OracleCatalogResolver::new(catalog)),
-        Some(reader_authority),
     );
     let egress = Arc::new(analytical::AnalyticalStageEgress::new(
         node_id,
@@ -1563,38 +1544,12 @@ impl Oracle {
             .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
-    /// Acquires this process's one reader epoch for the local Oracle role.
-    ///
-    /// The epoch protects snapshots and joins its readers at loss; it takes no
-    /// part in query capacity, which admission and the pod governor own.
-    ///
-    /// # Errors
-    /// Returns the acquisition, fence, or audit failure from
-    /// [`reader_pins::OracleReaderAuthority::start`].
-    async fn start_reader_authority(
-        vala: &vala_sql::ValaPostgres,
-        operator_pool: &vala_sql::OperatorPool,
-        local_role: &RegisteredRole,
-        shutdown: &CancellationToken,
-    ) -> Result<Arc<reader_pins::OracleReaderAuthority>, BifrostError> {
-        reader_pins::OracleReaderAuthority::start(reader_pins::OracleReaderAuthorityConfig {
-            vala: vala.clone(),
-            operator_pool: operator_pool.clone(),
-            node_id: local_role.key.node_id.as_uuid(),
-            fencing_token: local_role.fencing_token,
-            terminator: Arc::new(reader_pins::AbortingEpochTerminator),
-            shutdown: shutdown.clone(),
-        })
-        .await
-    }
-
     /// Constructs a retained Oracle owner from explicit dependency handles.
     ///
     /// # Errors
     /// Returns [`BifrostError::Internal`] when the configured SQL floor is zero.
     pub async fn new(config: OracleBuildConfig) -> Result<Self, BifrostError> {
         validate_oracle_config(config.config)?;
-        let operator_pool = config.operator_pool;
         let planner = OraclePlanner::new(config.config);
         let telemetry = Arc::new(OracleTelemetry::new());
         telemetry::install_query_span_propagation();
@@ -1611,13 +1566,6 @@ impl Oracle {
         let ready = Arc::new(AtomicBool::new(false));
         let (maintenance, startup_result) =
             OracleAdmission::start_maintenance(shutdown.clone(), Arc::clone(&ready))?;
-        let reader_authority = Self::start_reader_authority(
-            &config.vala,
-            &operator_pool,
-            &admission.local_role,
-            &shutdown,
-        )
-        .await?;
         let fragment_dispatcher = config.peer_transports.as_ref().map(|transports| {
             Arc::new(dispatcher::FragmentDispatcher::new(Arc::clone(transports)))
         });
@@ -1634,7 +1582,6 @@ impl Oracle {
                         node_id: admission.local_role.key.node_id,
                         fence: admission.local_role.fencing_token,
                         catalog: Arc::clone(&config.catalog),
-                        reader_authority: Arc::clone(&reader_authority),
                         reservations: Arc::clone(&config.reservations),
                         peer_transports: config.peer_transports.as_ref().map(Arc::clone),
                     })
@@ -1645,7 +1592,6 @@ impl Oracle {
             cluster,
             reservations: Arc::clone(&config.reservations),
             running_queries,
-            reader_authority,
             catalog: config.catalog,
             vala: config.vala,
             memory: config.memory,
@@ -1835,9 +1781,18 @@ impl Oracle {
         BifrostError,
     > {
         let deadline_ms = self.capture_query_deadline(&request)?;
-        let (roster, prepared) = self
+        let (
+            roster,
+            ClaimedSqlCut {
+                cut: prepared,
+                claim,
+            },
+        ) = self
             .prepare_query_attempt(&context, &request, deadline_ms)
             .await?;
+        // A leased attempt is returned at rest and reads nothing here; the
+        // test that drives it owns whatever it executes afterwards.
+        claim.release().await;
         let deadline = instant_deadline(roster.deadline())?;
         let ClassifiedAttempt {
             planned,
@@ -1925,7 +1880,7 @@ impl Oracle {
         context: &AuthorizedQueryContext,
         request: &BifrostQueryRequest,
         absolute_deadline_ms: i64,
-    ) -> Result<(participant_cut::OracleQueryAttemptRoster, PlannedSqlCut), BifrostError> {
+    ) -> Result<(participant_cut::OracleQueryAttemptRoster, ClaimedSqlCut), BifrostError> {
         let tables = self.validate_query(request)?;
         if !self.is_ready() {
             return Err(BifrostError::OracleRoleUnavailable);
@@ -1942,6 +1897,12 @@ impl Oracle {
         let deadline = Instant::now()
             .checked_add(duration)
             .ok_or(BifrostError::QueryTimeout)?;
+        let attempt_id = QueryId::new(
+            uuid::Uuid::parse_str(context.request_id.as_str())
+                .map_err(|_| BifrostError::QueryExecutionFailed)?,
+        );
+        let fencing_token = i64::try_from(self.admission.local_role.fencing_token)
+            .map_err(|_| BifrostError::OracleRoleUnavailable)?;
         let snapshot = self.cluster.snapshot();
         let pin_started = Instant::now();
         let planned = self
@@ -1951,10 +1912,44 @@ impl Oracle {
                 &tables,
                 deadline,
                 &self.catalog,
-                Some(&self.reader_authority),
+                ActiveReadOwner {
+                    query_id: attempt_id.as_uuid(),
+                    node_id: self.admission.local_role.key.node_id.as_uuid(),
+                    fencing_token,
+                },
             )
             .await?;
         QueryPhase::SnapshotPin.record(pin_started);
+        // Every refusal from here on owns a committed claim no descendant can
+        // read yet, so it releases the claim before it returns.
+        match self
+            .freeze_pinned_attempt(context, &snapshot, attempt_id, deadline, wall_deadline)
+            .await
+        {
+            Ok(roster) => Ok((roster, planned)),
+            Err(error) => {
+                planned.release().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Re-checks the deadline around the test-support preparation pause, then
+    /// freezes the class-neutral roster for an already pinned attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryTimeout`] when either deadline has passed,
+    /// [`BifrostError::Internal`] for a poisoned pause lock, and the roster
+    /// freeze's own refusal.
+    async fn freeze_pinned_attempt(
+        &self,
+        context: &AuthorizedQueryContext,
+        snapshot: &ClusterSnapshot,
+        attempt_id: QueryId,
+        deadline: Instant,
+        wall_deadline: chrono::DateTime<chrono::Utc>,
+    ) -> Result<participant_cut::OracleQueryAttemptRoster, BifrostError> {
         if Instant::now() >= deadline || chrono::Utc::now() >= wall_deadline {
             return Err(BifrostError::QueryTimeout);
         }
@@ -1970,21 +1965,18 @@ impl Oracle {
             if let Some(pause) = pause {
                 tokio::time::timeout_at(
                     tokio::time::Instant::from_std(deadline),
-                    pause.hold(&context.request_id, absolute_deadline_ms),
+                    pause.hold(&context.request_id, wall_deadline.timestamp_millis()),
                 )
                 .await
                 .map_err(|_| BifrostError::QueryTimeout)?;
             }
         }
+        #[cfg(not(feature = "test-support"))]
+        let _ = context;
         if Instant::now() >= deadline || chrono::Utc::now() >= wall_deadline {
             return Err(BifrostError::QueryTimeout);
         }
-        let attempt_id = QueryId::new(
-            uuid::Uuid::parse_str(context.request_id.as_str())
-                .map_err(|_| BifrostError::QueryExecutionFailed)?,
-        );
-        let roster = self.freeze_roster(&snapshot, attempt_id, wall_deadline)?;
-        Ok((roster, planned))
+        self.freeze_roster(snapshot, attempt_id, wall_deadline)
     }
 
     /// Freezes one attempt roster led by this Oracle from a membership snapshot.
@@ -2027,6 +2019,11 @@ impl Oracle {
     /// only submit a new logical query. Gate attaches its own request lifecycle
     /// to the returned stream afterwards rather than through this path.
     ///
+    /// The cut's active-read claim is split off and held in this frame: the
+    /// returned stream takes it and releases it at its terminal, and a failed
+    /// attempt — which settles every descendant before it returns — has it
+    /// released here before the error is returned.
+    ///
     /// # Errors
     /// Returns the same stable query, catalog, admission, visibility, audit,
     /// timeout, or execution errors as [`Self::query_sql`].
@@ -2046,7 +2043,38 @@ impl Oracle {
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
         roster: participant_cut::OracleQueryAttemptRoster,
+        prepared: ClaimedSqlCut,
+    ) -> Result<OracleQueryStream, BifrostError> {
+        let ClaimedSqlCut { cut, claim } = prepared;
+        let mut active_reads = Some(claim);
+        let result = self
+            .run_claimed_query(context, request, roster, cut, &mut active_reads)
+            .await;
+        // A failed attempt has settled every descendant before returning, so
+        // its claim is released here unless the stream already took it.
+        if result.is_err()
+            && let Some(claim) = active_reads
+        {
+            claim.release().await;
+        }
+        result
+    }
+
+    /// Runs the leader's checks and its one attempt while the caller holds the
+    /// attempt's active-read claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::OracleRoleUnavailable`] when this node is not
+    /// ready, [`BifrostError::QueryPeerSecurity`] when the roster does not name
+    /// this node and request, and otherwise the attempt's own terminal error.
+    async fn run_claimed_query(
+        &self,
+        context: AuthorizedQueryContext,
+        request: BifrostQueryRequest,
+        roster: participant_cut::OracleQueryAttemptRoster,
         prepared: PlannedSqlCut,
+        active_reads: &mut Option<planner::ActiveReadClaim>,
     ) -> Result<OracleQueryStream, BifrostError> {
         if !self.is_ready() {
             return Err(BifrostError::OracleRoleUnavailable);
@@ -2072,6 +2100,7 @@ impl Oracle {
                     deadline,
                     roster,
                     prepared,
+                    active_reads,
                 },
                 &mut query_telemetry,
             )
@@ -2276,6 +2305,7 @@ impl Oracle {
             deadline,
             roster,
             prepared,
+            active_reads,
         } = input;
         let ClassifiedAttempt {
             planned,
@@ -2325,11 +2355,6 @@ impl Oracle {
             Ok(bound) => bound,
             Err(error) => return release_error(deadline, admitted, error, "source rejection"),
         };
-        // Protection moves out of the plan here, before execution builds
-        // anything from the cuts, so the guard outlives every provider and
-        // every leaf the retained root opens.
-        let reader_protection =
-            ReaderProtectedQueryTerminalOwner::new(planned.reader_pin, planned.reader_io_permit);
         // Retained here only until execution: an Analytical query moves this
         // owner onto its graph, and what is left is what the stream still owes.
         let mut running_query = Some(running_query);
@@ -2360,8 +2385,8 @@ impl Oracle {
             execution.degraded_sources = Arc::clone(bindings.degraded());
         }
         let settlement = AttemptSettlement::new(deadline, &participant_cut);
-        let output = AttemptOutput::new(execution, admitted, running_query, reader_protection);
-        settle_attempt_output(output, settlement, query_telemetry).await
+        let output = AttemptOutput::new(execution, admitted, running_query);
+        settle_attempt_output(output, settlement, query_telemetry, active_reads).await
     }
 
     /// Executes the one retained root, graphless or on the Analytical graph.
@@ -2564,17 +2589,7 @@ impl Oracle {
                         && cut.binding.table_ref.fqn() == source.table
                 })
                 .ok_or(BifrostError::QueryExecutionFailed)?;
-            // The cut is signed against the frozen destination's own role
-            // fence, not the leader's: a follower that restarted independently
-            // holds a different fence and must refuse a cut naming another
-            // epoch. The destination is fixed when the roster is frozen, so the
-            // targeted fence is part of the occurrence's planned authority.
-            let assignment = follower_scan_assignment(
-                cut,
-                source.tier,
-                &placeholder,
-                source.destination.worker_fence,
-            )?;
+            let assignment = follower_scan_assignment(cut, source.tier, &placeholder)?;
             match follower_assignments.entry(source.clone()) {
                 std::collections::hash_map::Entry::Vacant(slot) => {
                     slot.insert(assignment);
@@ -2726,12 +2741,6 @@ impl Oracle {
         Ok(admitted)
     }
 
-    /// Borrows this node's process-global reader epoch authority.
-    #[must_use]
-    pub fn reader_authority(&self) -> &Arc<reader_pins::OracleReaderAuthority> {
-        &self.reader_authority
-    }
-
     /// Stages the read decision authorizing every pinned source.
     ///
     /// Building the locked detail is the only fallible step; staging never
@@ -2769,7 +2778,6 @@ impl Oracle {
     pub fn is_ready(&self) -> bool {
         self.startup_reconciled()
             && self.admission.is_available()
-            && self.reader_authority.admits()
             && self
                 .analytical
                 .as_ref()
@@ -2815,10 +2823,8 @@ impl Oracle {
     /// Awaits the exact startup result before role activation.
     ///
     /// # Errors
-    /// Returns the startup task's own failure, a duplicate-wait invariant, task
-    /// loss, an expired-epoch sweep that could not enumerate or reclaim, or an
-    /// activation that Postgres refused. Every one of those leaves this Oracle
-    /// unactivated and therefore unready.
+    /// Returns the startup task's own failure, a duplicate-wait invariant, or
+    /// task loss. Every one of those leaves this Oracle unready.
     pub async fn await_startup(&self) -> Result<(), BifrostError> {
         let receiver = self
             .startup_result
@@ -2833,26 +2839,7 @@ impl Oracle {
         receiver.await.map_err(|_| BifrostError::Internal {
             detail: "Oracle startup task ended without a result".to_owned(),
         })??;
-        // Reclaiming crashed epochs precedes activation so this node does not
-        // start serving while dead peers still hold protection. Enumeration or
-        // a per-epoch reclaim that fails therefore fails startup: continuing
-        // would activate this epoch and publish readiness over retention that
-        // was never released, which is the exact condition this step exists to
-        // rule out.
-        let recovery = reader_pins::OracleEpochRecovery::new(
-            self.reader_authority.operator_pool().clone(),
-            self.vala.clone(),
-        );
-        let reclaimed = recovery.reclaim_expired(EXPIRED_EPOCH_SWEEP_LIMIT).await?;
-        if reclaimed > 0 {
-            tracing::info!(
-                reclaimed,
-                "Oracle reclaimed expired reader epochs before activation"
-            );
-        }
-        // Activation is the last startup step, so readiness can never be
-        // published under an epoch Postgres has not yet marked active.
-        self.reader_authority.activate().await
+        Ok(())
     }
 
     /// Borrows the tenant SQL root retained by the Oracle composition boundary.
@@ -2913,16 +2900,6 @@ impl Oracle {
             {
                 maintenance.abort();
             }
-        }
-        // Retirement owns its own ordering end to end: it closes admission,
-        // joins descendants, drains and joins its workers, releases every
-        // table, and only then deletes the epoch row.
-        if let Err(error) = self
-            .reader_authority
-            .retire(tokio::time::Instant::from_std(deadline))
-            .await
-        {
-            tracing::error!(error = %error, "Oracle retained reader protection after retirement failed");
         }
         report
     }
@@ -3260,11 +3237,7 @@ impl Oracle {
                 .collect::<Result<Vec<_>, BifrostError>>()?;
             discovered.tables.insert(
                 cut.binding.table_ref.fqn(),
-                live::LiveTableRoutes {
-                    binding,
-                    table_uid: uuid::Uuid::from_bytes(*cut.table_uid.as_bytes()),
-                    routes,
-                },
+                live::LiveTableRoutes { binding, routes },
             );
         }
         Ok(Some(discovered))
@@ -3518,13 +3491,11 @@ pub(super) fn remote_placeholders(
 ///
 /// Returns [`BifrostError::QueryExecutionFailed`] when a pinned hot row carries
 /// no usable durable identity, which would otherwise mint a valid-looking but
-/// colliding object key, or [`BifrostError::Internal`] when the pinned snapshot
-/// is absent from its own metadata and the reader cut cannot be signed.
+/// colliding object key.
 fn follower_scan_assignment(
     cut: &PinnedSealedTable,
     tier: RemotePersistedTier,
     placeholder: &codec::RemoteSourcePlaceholderExec,
-    planned_under_fence: u64,
 ) -> Result<wyrd_spec::vala::api::FollowerScanAssignment, BifrostError> {
     let files = match tier {
         RemotePersistedTier::Iceberg => cut
@@ -3538,20 +3509,9 @@ fn follower_scan_assignment(
             .map(hot_file_descriptor)
             .collect::<Result<Vec<_>, _>>()?,
     };
-    // Derived from the cut rather than from the occurrence: every scan id one
-    // table contributes names the same protected snapshot, so two assignments
-    // for one follower can never disagree about what it must protect.
-    let reader_cut =
-        reader_pins::follower_reader_cut(cut, planned_under_fence)?.unwrap_or_else(|| {
-            wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(
-                uuid::Uuid::from_bytes(*cut.table_uid.as_bytes()),
-                planned_under_fence,
-            )
-        });
     Ok(wyrd_spec::vala::api::FollowerScanAssignment {
         scan_id: placeholder.scan_id().to_owned(),
         binding: tail_discovery::wire_binding(cut)?,
-        reader_cut,
         persisted: wyrd_spec::vala::api::PersistedFileAssignment { files },
         scribe_provider_cut: None,
         // The planned placeholder already carries the full-schema fingerprint
@@ -3895,8 +3855,8 @@ fn execution_topology(
 /// expansion, or a second spelling of the same table therefore cannot present a
 /// different object to the checker.
 ///
-/// A prepared identity and the sealed cut it later materializes into carry the
-/// same binding and UID, so both authorization stages name the same object.
+/// An acquired identity and the sealed cut it materializes into carry the same
+/// binding and UID, so both authorization stages name the same object.
 pub(super) fn resolved_table_scope(
     binding: &crate::catalog::TenantTableBinding,
     table_uid: &crate::catalog::TableUid,
@@ -3906,15 +3866,13 @@ pub(super) fn resolved_table_scope(
 
 /// Refuses the whole query unless every resolved table is individually granted.
 ///
-/// This runs on the complete *prepared* scan set — direct tables, join inputs,
+/// This runs on the complete acquired scan set — direct tables, join inputs,
 /// and view expansions alike — which is the earliest point at which every
-/// requested table has a tenant-bound canonical binding and a stable UID. It
-/// therefore precedes reader-guard acquisition, catalog revalidation, cut
-/// materialization, provider registration, physical planning, admission,
-/// read-audit acceptance, peer dispatch, and any source IO. One uncovered
-/// table denies the query outright: there is no partial plan, no silently
-/// narrowed result, and no materialization work an out-of-scope caller can
-/// observe.
+/// requested table has a tenant-bound canonical binding and its registered
+/// UID. It therefore precedes every metadata, manifest, and data object read,
+/// provider registration, physical planning, admission, read-audit
+/// acceptance, and peer dispatch. One uncovered table denies the query
+/// outright: there is no partial plan and no silently narrowed result.
 ///
 /// # Errors
 ///
@@ -3922,18 +3880,18 @@ pub(super) fn resolved_table_scope(
 /// principal's effective permissions do not cover.
 pub(super) fn authorize_resolved_tables(
     context: &AuthorizedQueryContext,
-    prepared: &[crate::catalog::PreparedReaderIdentity],
+    resolved: &[(crate::catalog::TenantTableBinding, crate::catalog::TableUid)],
 ) -> Result<(), BifrostError> {
-    for identity in prepared {
+    for (binding, table_uid) in resolved {
         let required = Permission {
             resource: wyrd_runtime::Resource::BifrostQuery,
             action: wyrd_runtime::Action::Read,
-            scope: resolved_table_scope(&identity.binding, &identity.table_uid),
+            scope: resolved_table_scope(binding, table_uid),
         };
         if !context.principal.effective_permissions.contains(&required) {
             tracing::warn!(
                 request_id = %context.request_id,
-                table = %identity.binding.table_ref,
+                table = %binding.table_ref,
                 "Oracle refused a query over a table this principal is not granted"
             );
             return Err(BifrostError::QueryForbidden);
@@ -4076,8 +4034,6 @@ struct AttemptOutput {
     running_query: Option<RunningQueryTerminalOwner>,
     /// Execution path this attempt irreversibly selected before it opened.
     query_class: QueryClass,
-    /// Reader-epoch protection transferred into the returned stream.
-    reader_protection: ReaderProtectedQueryTerminalOwner,
 }
 
 impl AttemptOutput {
@@ -4091,7 +4047,6 @@ impl AttemptOutput {
         execution: CutExecution,
         admitted: AdmittedQueryGuard,
         running_query: Option<RunningQueryTerminalOwner>,
-        reader_protection: ReaderProtectedQueryTerminalOwner,
     ) -> Self {
         let CutExecution {
             schema,
@@ -4108,7 +4063,6 @@ impl AttemptOutput {
             admitted,
             running_query,
             query_class,
-            reader_protection,
         }
     }
 }
@@ -4151,11 +4105,13 @@ impl AttemptSettlement {
 /// Returns [`BifrostError::QueryTimeout`] when the first batch does not arrive
 /// before the deadline, [`BifrostError::QueryExecutionFailed`] for a stale first
 /// batch or a missing telemetry guard, and the mapped first-batch failure
-/// otherwise.
+/// otherwise. Only a returned stream takes `active_reads`; every error leaves
+/// the claim with the caller, which releases it after this settlement.
 async fn settle_attempt_output(
     output: AttemptOutput,
     settle: AttemptSettlement,
     query_telemetry: &mut Option<QueryTelemetryGuard>,
+    active_reads: &mut Option<planner::ActiveReadClaim>,
 ) -> Result<OracleQueryStream, BifrostError> {
     let AttemptOutput {
         schema,
@@ -4165,7 +4121,6 @@ async fn settle_attempt_output(
         mut admitted,
         running_query,
         query_class,
-        reader_protection,
     } = output;
     let AttemptSettlement {
         deadline,
@@ -4242,7 +4197,9 @@ async fn settle_attempt_output(
         // `with_gate_lifecycle`; nothing on the attempt path owns one.
         gate_lifecycle: None,
         running_query,
-        reader_protection: Some(reader_protection),
+        // Taken only here, by the stream that releases it at its terminal;
+        // every failure above leaves it with the caller to release.
+        active_reads: active_reads.take(),
     }))
 }
 

@@ -234,15 +234,6 @@ pub struct ForgeRuntimeConfig {
     /// set. Default 1.
     #[serde(default)]
     pub per_tenant_active_cap: Option<usize>,
-    /// Age (seconds) after which old Iceberg snapshots become eligible for
-    /// expiry. Must be positive when set. Default 86400 (24 hours).
-    #[serde(default)]
-    pub snapshot_retention_secs: Option<u64>,
-    /// Number of snapshots retained along each current/ref ancestry. Must be
-    /// positive and must not exceed the internal retained-snapshot traversal
-    /// cap. Default 1.
-    #[serde(default)]
-    pub retain_last: Option<usize>,
     /// Age (seconds) after which an unreferenced object may be deleted by
     /// orphan GC. Must be positive when set. Default 86400 (24 hours).
     #[serde(default)]
@@ -3732,8 +3723,6 @@ mod tests {
         let config = from_toml_str_with_dev_oracle_opt_in("").expect("empty config parses");
         let forge = &config.forge;
         assert_eq!(forge.per_tenant_active_cap, None);
-        assert_eq!(forge.snapshot_retention_secs, None);
-        assert_eq!(forge.retain_last, None);
         assert_eq!(forge.orphan_gc_ttl_secs, None);
         assert_eq!(forge.orphan_gc_max_list_pages, None);
         assert_eq!(forge.orphan_gc_run_budget_secs, None);
@@ -3747,8 +3736,6 @@ mod tests {
         let toml = r#"
 [forge]
 per_tenant_active_cap = 2
-snapshot_retention_secs = 7200
-retain_last = 3
 orphan_gc_ttl_secs = 3600
 orphan_gc_max_list_pages = 64
 orphan_gc_run_budget_secs = 30
@@ -3757,8 +3744,6 @@ maintenance_interval_secs = 45
         let config = from_toml_str_with_dev_oracle_opt_in(toml).expect("forge section parses");
         let forge = &config.forge;
         assert_eq!(forge.per_tenant_active_cap, Some(2));
-        assert_eq!(forge.snapshot_retention_secs, Some(7200));
-        assert_eq!(forge.retain_last, Some(3));
         assert_eq!(forge.orphan_gc_ttl_secs, Some(3600));
         assert_eq!(forge.orphan_gc_max_list_pages, Some(64));
         assert_eq!(forge.orphan_gc_run_budget_secs, Some(30));

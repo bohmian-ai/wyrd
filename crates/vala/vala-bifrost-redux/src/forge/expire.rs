@@ -1,7 +1,6 @@
 //! Iceberg snapshot expiry for the Forge maintenance loop.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use iceberg::transaction::{
@@ -84,40 +83,22 @@ pub(crate) struct ExpiryTaskAuthority {
     pub(crate) worker: Uuid,
 }
 
-/// Selects only snapshots older than `cutoff_ms` that are not current, ref
-/// heads, or among the retained ancestry of a current/ref head.
+/// Selects every retained snapshot that is neither current nor a ref head.
+///
+/// There is no age or depth retention: a replaced snapshot is eligible as soon
+/// as nothing else roots it. Roots outside Iceberg — open attempts, rewrite
+/// lineage, existing claims — are removed by the expiry policy, and active
+/// Oracle readers refuse the whole operation at preparation.
 #[must_use]
 pub fn select_expirable_snapshots(
     snapshots: &[SnapshotSummary],
     current_snapshot_id: Option<i64>,
     ref_heads: &[i64],
-    cutoff_ms: i64,
-    retain_last: usize,
 ) -> Vec<i64> {
-    let by_id = snapshots
-        .iter()
-        .map(|snapshot| (snapshot.id, *snapshot))
-        .collect::<HashMap<_, _>>();
-    let mut heads = ref_heads.iter().copied().collect::<HashSet<_>>();
-    if let Some(current) = current_snapshot_id {
-        heads.insert(current);
-    }
-    let mut protected = HashSet::new();
-    let retained_count = retain_last.max(1);
-    for head in heads {
-        let mut cursor = Some(head);
-        for _ in 0..retained_count {
-            let Some(id) = cursor else { break };
-            if !protected.insert(id) {
-                break;
-            }
-            cursor = by_id.get(&id).and_then(|snapshot| snapshot.parent_id);
-        }
-    }
     let mut selected = snapshots
         .iter()
-        .filter(|snapshot| snapshot.timestamp_ms < cutoff_ms && !protected.contains(&snapshot.id))
         .map(|snapshot| snapshot.id)
+        .filter(|id| Some(*id) != current_snapshot_id && !ref_heads.contains(id))
         .collect::<Vec<_>>();
     selected.sort_unstable();
     selected
@@ -237,7 +218,6 @@ impl Forge {
         require_running(stop)?;
         lease.require_fence(&self.core.operator_pool).await?;
         let table = self.load_table(&binding.table_ident()).await?;
-        let retention_cutoff_ms = expiry_cutoff_ms(now, self.core.config.snapshot_retention)?;
         let roots = self
             .snapshot_protection_roots(key, &table, outcome.destructive_maintenance)
             .await?;
@@ -247,25 +227,16 @@ impl Forge {
             current_snapshot_id: table.metadata().current_snapshot_id(),
             ref_heads: &ref_heads,
             roots: &roots,
-            retention_cutoff_ms,
-            retain_last: self.core.config.retain_last,
             traversal_limit: self.core.config.max_retained_snapshots_per_table,
         }
         .decide()?;
-        let SnapshotExpiryDecision::Expire {
-            snapshot_ids,
-            cutoff_ms,
-        } = decision
-        else {
+        let SnapshotExpiryDecision::Expire { snapshot_ids } = decision else {
             return Ok(outcome);
         };
-        let doomed: Vec<i64> = snapshot_ids.clone();
-        let detail = expiry_detail(&table, key, cutoff_ms, snapshot_ids, ref_heads)?;
+        let detail = expiry_detail(&table, key, snapshot_ids, ref_heads)?;
         let claim_table = self.expiry_claim_table(key, &table).await?;
         require_running(stop)?;
         lease.require_fence(&self.core.operator_pool).await?;
-        self.revalidate_reader_protection(key, &doomed, cutoff_ms)
-            .await?;
         self.prepare_expiration(lease, key, authority, &claim_table, &detail)
             .await?;
         require_running(stop)?;
@@ -273,12 +244,7 @@ impl Forge {
         // what preparation recorded; anything else is definite pre-call drift
         // that releases the claims without making a single Iceberg mutation.
         let reloaded = self.load_table(&binding.table_ident()).await?;
-        if let Err(drift) = corroborate_expiry(
-            &reloaded,
-            &claim_table,
-            &detail,
-            self.core.config.retain_last,
-        ) {
+        if let Err(drift) = corroborate_expiry(&reloaded, &claim_table, &detail) {
             self.reset_expiration(lease, key, authority, &claim_table, &detail, &drift)
                 .await?;
             outcome.unresolved = outcome.unresolved.saturating_add(1);
@@ -328,58 +294,6 @@ impl Forge {
 }
 
 impl Forge {
-    /// Re-reads reader protection immediately before the destructive commit.
-    ///
-    /// The selection was decided against a read of the reader watermarks taken
-    /// before planning, the prepared audit, and the fence refresh. A query
-    /// admitted in that window publishes its pin durably before it reads, so
-    /// re-reading here is what turns "nobody needed this when we looked" into
-    /// "nobody needs this now". The pass is abandoned rather than narrowed: the
-    /// prepared operation settles on its own reconciliation path, and a
-    /// successor re-decides against the newer reader set.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ForgeError::Sql`] when the watermarks cannot be re-read and
-    /// [`ForgeError::SnapshotExpiry`] when the bounded query overflows or a
-    /// live reader now depends on a snapshot this pass intended to expire.
-    async fn revalidate_reader_protection(
-        &self,
-        key: &ForgeTableKey,
-        doomed: &[i64],
-        cutoff_ms: i64,
-    ) -> Result<(), ForgeError> {
-        let mut conn = self
-            .core
-            .vala
-            .tenant_conn(key.tenant)
-            .await
-            .map_err(ForgeError::Sql)?;
-        let readers = super::reader_protection::ReaderProtection::new(&mut conn)
-            .watermarks(key.tenant, &key.table_ref)
-            .await?;
-        conn.commit().await.map_err(ForgeError::Sql)?;
-        // The cutoff is the minimum of configured retention and every watermark
-        // this pass already saw, so a reader sitting exactly on it is the reader
-        // that lowered it and is protected by construction — selection expires
-        // only snapshots strictly older. Refusing at the cutoff would refuse
-        // every pass that a protected old reader made safe. What is unsafe is a
-        // reader the pass never saw: one on a doomed snapshot, or one that would
-        // have pulled the cutoff further back.
-        for reader in &readers {
-            if doomed.contains(&reader.snapshot_id) || reader.timestamp_ms < cutoff_ms {
-                return Err(ForgeError::SnapshotExpiry {
-                    detail: format!(
-                        "a live reader on snapshot {} at {}ms was admitted after this expiry was \
-                         decided against cutoff {cutoff_ms}ms",
-                        reader.snapshot_id, reader.timestamp_ms
-                    ),
-                });
-            }
-        }
-        Ok(())
-    }
-
     /// Gathers every non-catalog authority that protects a snapshot.
     ///
     /// The three roots are read together, under the fence this pass already
@@ -425,18 +339,11 @@ impl Forge {
                 .await
                 .map_err(ForgeError::Sql)?;
         attempt_watermarks.extend(self.leader_compaction_watermark(key.tenant, identity, table)?);
-        // Reader protection is not bounded by the open-operation cap: a
-        // frontier is one member per incomparable lineage, and truncating it
-        // would silently stop protecting one of them. A frontier that cannot be
-        // read or validated fails the pass instead.
-        let reader_watermarks = super::reader_protection::ReaderProtection::new(&mut conn)
-            .watermarks(key.tenant, &key.table_ref)
-            .await?;
         // Snapshots another prepared expiration already claimed are removed
         // from this pass in the same transaction the other roots are read in.
         // Preparation re-checks the claim index under the table lock; this read
         // only keeps a pass from planning work that is already owned.
-        let claimed_snapshot_ids = super::reader_protection::ReaderProtection::new(&mut conn)
+        let claimed_snapshot_ids = super::table_authority::TableAuthority::new(&mut conn)
             .claimed_snapshot_ids(key.tenant, &key.table_ref)
             .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
@@ -447,7 +354,6 @@ impl Forge {
         }
         Ok(SnapshotProtectionRoots {
             attempt_watermarks,
-            reader_watermarks,
             lineage_snapshot_id: head_lineage_snapshot_id(table),
             claimed_snapshot_ids,
             destructive_maintenance,
@@ -462,13 +368,13 @@ impl Forge {
     /// leader's own clamp would decide only that expiry is due, and the
     /// effect would still expire the selected snapshot. The timestamp comes
     /// from the table the policy decides over, so a held snapshot the table no
-    /// longer retains cannot lower the cutoff silently.
+    /// longer retains cannot silently protect nothing.
     ///
     /// # Errors
     ///
     /// Returns [`ForgeError::SnapshotExpiry`] when the leader holds a
     /// compaction without an observed snapshot, or one whose snapshot the
-    /// table no longer retains: neither leaves a provably safe cutoff.
+    /// table no longer retains: neither leaves a provable protection.
     fn leader_compaction_watermark(
         &self,
         tenant: wyrd_spec::DataTenantId,
@@ -518,10 +424,11 @@ fn head_lineage_snapshot_id(table: &iceberg::table::Table) -> Option<i64> {
         .map(|rewrite| rewrite.base_snapshot_id)
 }
 
-/// Validates watermark identity/timestamp parity and returns a timestamp cutoff.
+/// Validates that every watermark names a retained snapshot on an approved
+/// head's ancestry, with the timestamp Iceberg records for it.
 ///
-/// Snapshot identifiers are used only for ancestry lookup; ordering is based
-/// exclusively on timestamps so non-monotonic Iceberg IDs remain valid.
+/// Snapshot identifiers are used only for ancestry lookup, so non-monotonic
+/// Iceberg IDs remain valid.
 ///
 /// # Errors
 ///
@@ -535,9 +442,8 @@ pub(super) fn validate_watermarks(
     current_snapshot_id: Option<i64>,
     ref_heads: &[i64],
     watermarks: &[SnapshotWatermark],
-    retention_cutoff_ms: i64,
     traversal_limit: usize,
-) -> Result<i64, ForgeError> {
+) -> Result<(), ForgeError> {
     let by_id = snapshots
         .iter()
         .map(|snapshot| (snapshot.id, *snapshot))
@@ -548,17 +454,15 @@ pub(super) fn validate_watermarks(
     }
     let table_is_empty = snapshots.is_empty() && heads.is_empty();
     if table_is_empty {
-        return watermarks
-            .iter()
-            .try_fold(retention_cutoff_ms, |cutoff, watermark| {
-                if watermark.snapshot_id == 0 && watermark.timestamp_ms == 0 {
-                    Ok(cutoff.min(0))
-                } else {
-                    Err(ForgeError::SnapshotExpiry {
-                        detail: "non-sentinel watermark protects an empty Iceberg table".to_owned(),
-                    })
-                }
-            });
+        return watermarks.iter().try_for_each(|watermark| {
+            if watermark.snapshot_id == 0 && watermark.timestamp_ms == 0 {
+                Ok(())
+            } else {
+                Err(ForgeError::SnapshotExpiry {
+                    detail: "non-sentinel watermark protects an empty Iceberg table".to_owned(),
+                })
+            }
+        });
     }
     if watermarks
         .iter()
@@ -586,10 +490,11 @@ pub(super) fn validate_watermarks(
             // A parent an earlier expiration already removed is where the
             // retained ancestry ends, not a malformed graph: Iceberg leaves the
             // surviving snapshot's `parent_snapshot_id` pointing at the deleted
-            // one. Every snapshot a watermark can still protect is newer than
-            // the cutoff that removed these, so the truncated walk still reaches
-            // all of them, and a watermark below the truncation is caught by the
-            // detached-from-heads refusal below.
+            // one. Every snapshot a watermark protects lies on the chain between
+            // it and a head, which expiration never removed while the watermark
+            // was held, so the truncated walk still reaches all of them, and a
+            // watermark below the truncation is caught by the detached-from-heads
+            // refusal below.
             let Some(snapshot) = by_id.get(&id) else {
                 break;
             };
@@ -602,36 +507,34 @@ pub(super) fn validate_watermarks(
             cursor = snapshot.parent_id;
         }
     }
-    watermarks
-        .iter()
-        .try_fold(retention_cutoff_ms, |cutoff, watermark| {
-            let snapshot =
-                by_id
-                    .get(&watermark.snapshot_id)
-                    .ok_or_else(|| ForgeError::SnapshotExpiry {
-                        detail: format!(
-                            "active Forge watermark snapshot {} is not retained",
-                            watermark.snapshot_id
-                        ),
-                    })?;
-            if !reachable.contains(&watermark.snapshot_id) {
-                return Err(ForgeError::SnapshotExpiry {
+    watermarks.iter().try_for_each(|watermark| {
+        let snapshot =
+            by_id
+                .get(&watermark.snapshot_id)
+                .ok_or_else(|| ForgeError::SnapshotExpiry {
                     detail: format!(
-                        "active Forge watermark snapshot {} is detached from approved heads",
+                        "active Forge watermark snapshot {} is not retained",
                         watermark.snapshot_id
                     ),
-                });
-            }
-            if snapshot.timestamp_ms != watermark.timestamp_ms {
-                return Err(ForgeError::SnapshotExpiry {
-                    detail: format!(
-                        "active Forge watermark {} timestamp does not match Iceberg ancestry",
-                        watermark.snapshot_id
-                    ),
-                });
-            }
-            Ok(cutoff.min(watermark.timestamp_ms))
-        })
+                })?;
+        if !reachable.contains(&watermark.snapshot_id) {
+            return Err(ForgeError::SnapshotExpiry {
+                detail: format!(
+                    "active Forge watermark snapshot {} is detached from approved heads",
+                    watermark.snapshot_id
+                ),
+            });
+        }
+        if snapshot.timestamp_ms != watermark.timestamp_ms {
+            return Err(ForgeError::SnapshotExpiry {
+                detail: format!(
+                    "active Forge watermark {} timestamp does not match Iceberg ancestry",
+                    watermark.snapshot_id
+                ),
+            });
+        }
+        Ok(())
+    })
 }
 
 /// Rejects entry into a new expiry effect after operation authority is cancelled.
@@ -645,19 +548,6 @@ fn require_running(stop: &CancellationToken) -> Result<(), ForgeError> {
     } else {
         Ok(())
     }
-}
-
-/// Convert a retention duration into the UTC millisecond cutoff used by Iceberg.
-fn expiry_cutoff_ms(now: DateTime<Utc>, retention: Duration) -> Result<i64, ForgeError> {
-    let retention_ms =
-        i64::try_from(retention.as_millis()).map_err(|_| ForgeError::InvalidConfig {
-            detail: "snapshot_retention exceeds an i64 millisecond timestamp".to_owned(),
-        })?;
-    now.timestamp_millis()
-        .checked_sub(retention_ms)
-        .ok_or_else(|| ForgeError::InvalidConfig {
-            detail: "snapshot retention cutoff overflows UTC milliseconds".to_owned(),
-        })
 }
 
 /// Extract snapshot timestamps, parent links, and every metadata reference head.
@@ -708,7 +598,6 @@ fn snapshot_summaries(
 fn expiry_detail(
     table: &iceberg::table::Table,
     key: &ForgeTableKey,
-    cutoff_ms: i64,
     mut selected_snapshot_ids: Vec<i64>,
     mut retained_ref_heads: Vec<i64>,
 ) -> Result<AuditDetail, ForgeError> {
@@ -723,13 +612,12 @@ fn expiry_detail(
             })
         })?;
     Ok(AuditDetail::ForgeSnapshotExpire {
-        operation_id: expiry_operation_id(key, cutoff_ms, &selected_snapshot_ids),
+        operation_id: expiry_operation_id(key, &base_metadata_location, &selected_snapshot_ids),
         phase: ForgeSnapshotExpirePhase::Prepared,
         group: table_resource_for_key(key),
         base_metadata_location,
         current_snapshot_id: table.metadata().current_snapshot_id(),
         retained_ref_heads,
-        cutoff_ms,
         selected_snapshot_ids,
     })
 }
@@ -744,11 +632,10 @@ fn expiry_detail(
 fn expiry_selection<'detail>(
     detail: &'detail AuditDetail,
     key: &ForgeTableKey,
-) -> Result<(&'detail [i64], i64), ForgeError> {
+) -> Result<&'detail [i64], ForgeError> {
     let AuditDetail::ForgeSnapshotExpire {
         operation_id: _,
         selected_snapshot_ids,
-        cutoff_ms,
         group,
         ..
     } = detail
@@ -767,7 +654,7 @@ fn expiry_selection<'detail>(
             detail: "expiry audit detail is not canonical".to_owned(),
         });
     }
-    Ok((selected_snapshot_ids, *cutoff_ms))
+    Ok(selected_snapshot_ids)
 }
 
 /// Commit an expiry selection after rechecking metadata and the lease fence.
@@ -792,7 +679,7 @@ impl Forge {
         detail: &AuditDetail,
         stop: &CancellationToken,
     ) -> Result<ExpiredFileSet, ForgeError> {
-        let (selected_snapshot_ids, cutoff_ms) = expiry_selection(detail, key)?;
+        let selected_snapshot_ids = expiry_selection(detail, key)?;
         if !lease.renew(&self.core.operator_pool).await? {
             return Err(ForgeError::FenceLost {
                 lease_key: lease.lease_key.clone(),
@@ -954,16 +841,12 @@ pub(super) async fn derive_recovered_files(
 fn selected_ids_are_eligible(
     table: &iceberg::table::Table,
     selected: &[i64],
-    cutoff_ms: i64,
-    retain_last: usize,
 ) -> Result<bool, ForgeError> {
     let (summaries, ref_heads) = snapshot_summaries(table)?;
     let expected = select_expirable_snapshots(
         &summaries,
         table.metadata().current_snapshot_id(),
         &ref_heads,
-        cutoff_ms,
-        retain_last,
     )
     .into_iter()
     .collect::<HashSet<_>>();
@@ -1055,7 +938,6 @@ impl Forge {
         let detail = state.prepared_detail;
         let AuditDetail::ForgeSnapshotExpire {
             selected_snapshot_ids,
-            cutoff_ms,
             ..
         } = &detail
         else {
@@ -1091,12 +973,7 @@ impl Forge {
             outcome.destructive_maintenance =
                 super::live_reconcile::DestructiveMaintenance::Blocked;
             return Ok(outcome);
-        } else if selected_ids_are_eligible(
-            &table,
-            selected_snapshot_ids,
-            *cutoff_ms,
-            self.core.config.retain_last,
-        )? {
+        } else if selected_ids_are_eligible(&table, selected_snapshot_ids)? {
             ForgeExpirationSettlement::Committed
         } else {
             outcome.unresolved = 1;
@@ -1176,7 +1053,7 @@ impl Forge {
             .tenant_conn(key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let identity = super::reader_protection::ReaderProtection::new(&mut conn)
+        let identity = super::table_authority::TableAuthority::new(&mut conn)
             .identity(key.tenant, &key.table_ref)
             .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
@@ -1384,13 +1261,11 @@ fn corroborate_expiry(
     table: &iceberg::table::Table,
     claim_table: &ForgeClaimTable,
     detail: &AuditDetail,
-    retain_last: usize,
 ) -> Result<(), ForgeError> {
     let AuditDetail::ForgeSnapshotExpire {
         base_metadata_location,
         current_snapshot_id,
         retained_ref_heads,
-        cutoff_ms,
         selected_snapshot_ids,
         ..
     } = detail
@@ -1419,7 +1294,7 @@ fn corroborate_expiry(
     if &ref_heads != retained_ref_heads {
         return Err(drift("retained ref heads"));
     }
-    if !selected_ids_are_eligible(table, selected_snapshot_ids, *cutoff_ms, retain_last)? {
+    if !selected_ids_are_eligible(table, selected_snapshot_ids)? {
         return Err(drift("selected snapshots"));
     }
     Ok(())
@@ -1434,7 +1309,6 @@ fn terminal_expiry_detail(detail: &AuditDetail, phase: ForgeSnapshotExpirePhase)
             base_metadata_location,
             current_snapshot_id,
             retained_ref_heads,
-            cutoff_ms,
             selected_snapshot_ids,
             ..
         } => AuditDetail::ForgeSnapshotExpire {
@@ -1444,7 +1318,6 @@ fn terminal_expiry_detail(detail: &AuditDetail, phase: ForgeSnapshotExpirePhase)
             base_metadata_location: base_metadata_location.clone(),
             current_snapshot_id: *current_snapshot_id,
             retained_ref_heads: retained_ref_heads.clone(),
-            cutoff_ms: *cutoff_ms,
             selected_snapshot_ids: selected_snapshot_ids.clone(),
         },
         _ => detail.clone(),
@@ -1500,12 +1373,17 @@ pub(crate) fn table_resource_for_key(key: &ForgeTableKey) -> String {
     )
 }
 
-/// Derive a stable operation ID from the table, cutoff, and sorted snapshot IDs.
-fn expiry_operation_id(key: &ForgeTableKey, cutoff_ms: i64, selected: &[i64]) -> Uuid {
+/// Derive a stable operation ID from the table, the base metadata location the
+/// selection was made against, and the sorted snapshot IDs.
+fn expiry_operation_id(
+    key: &ForgeTableKey,
+    base_metadata_location: &StoragePath,
+    selected: &[i64],
+) -> Uuid {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(table_resource_for_key(key));
-    hasher.update(cutoff_ms.to_be_bytes());
+    hasher.update(base_metadata_location.as_str());
     for id in selected {
         hasher.update(id.to_be_bytes());
     }
@@ -1540,36 +1418,37 @@ mod tests {
                 timestamp_ms: 3,
             },
         ];
-        let selected = select_expirable_snapshots(&snapshots, Some(30), &[], 4, 2);
+        let selected = select_expirable_snapshots(&snapshots, Some(30), &[20]);
         assert_eq!(selected, vec![10]);
     }
 
+    /// Every replaced snapshot is eligible regardless of age or ancestry depth.
     #[test]
-    fn snapshot_selection_uses_timestamp_and_retain_last_not_numeric_id() {
+    fn snapshot_selection_has_no_age_or_depth_retention() {
         let snapshots = vec![
             SnapshotSummary {
                 id: 100,
                 parent_id: None,
-                timestamp_ms: 1,
+                timestamp_ms: i64::MAX - 2,
             },
             SnapshotSummary {
                 id: 2,
                 parent_id: Some(100),
-                timestamp_ms: 2,
+                timestamp_ms: i64::MAX - 1,
             },
             SnapshotSummary {
                 id: 50,
                 parent_id: Some(2),
-                timestamp_ms: 3,
+                timestamp_ms: i64::MAX,
             },
         ];
-        let selected = select_expirable_snapshots(&snapshots, Some(50), &[], 4, 2);
-        assert_eq!(selected, vec![100]);
+        let selected = select_expirable_snapshots(&snapshots, Some(50), &[]);
+        assert_eq!(selected, vec![2, 100]);
     }
 
-    /// Active watermark ordering follows timestamps even when IDs move backward.
+    /// A watermark validates by ancestry even when IDs move backward.
     #[test]
-    fn watermark_cutoff_uses_timestamps_not_snapshot_ids() {
+    fn watermark_validation_uses_ancestry_not_snapshot_ids() {
         let snapshots = vec![
             SnapshotSummary {
                 id: 900,
@@ -1586,9 +1465,8 @@ mod tests {
             snapshot_id: 900,
             timestamp_ms: 10,
         }];
-        let cutoff = validate_watermarks(&snapshots, Some(2), &[], &watermarks, 100, 2)
+        validate_watermarks(&snapshots, Some(2), &[], &watermarks, 2)
             .expect("valid non-monotonic watermark");
-        assert_eq!(cutoff, 10);
     }
 
     /// A persisted timestamp mismatch fails closed before expiry selection.
@@ -1607,23 +1485,25 @@ mod tests {
                 snapshot_id: 7,
                 timestamp_ms: 19,
             }],
-            100,
             1,
         )
         .expect_err("mismatched watermark must fail");
         assert!(error.to_string().contains("does not match"));
     }
 
-    /// Stable expiry identities bind an exact ordered selection and cutoff.
+    /// Stable expiry identities bind an exact base and ordered selection.
     #[test]
     fn maintenance_operation_id_is_stable_for_sorted_targets() {
         let key = ForgeTableKey {
             tenant: DataTenantId::new_v7(),
             table_ref: TableRef::new(BifrostNamespace::Traces, "spans"),
         };
-        let left = expiry_operation_id(&key, 10, &[3, 8]);
-        let right = expiry_operation_id(&key, 10, &[3, 8]);
+        let base = StoragePath::new("s3://bucket/t/metadata/00001.metadata.json".to_owned())
+            .expect("test metadata location");
+        let left = expiry_operation_id(&key, &base, &[3, 8]);
+        let right = expiry_operation_id(&key, &base, &[3, 8]);
         assert_eq!(left, right);
+        assert_ne!(left, expiry_operation_id(&key, &base, &[3]));
     }
 
     /// A timestamp-correct sibling cannot authorize expiry from another branch.
@@ -1654,7 +1534,6 @@ mod tests {
                 snapshot_id: 3,
                 timestamp_ms: 30,
             }],
-            100,
             3,
         )
         .expect_err("detached sibling must fail");
@@ -1674,10 +1553,10 @@ mod tests {
             parent_id: Some(1),
             timestamp_ms: 20,
         }];
-        validate_watermarks(&snapshots, Some(2), &[], &[], 100, 2)
+        validate_watermarks(&snapshots, Some(2), &[], &[], 2)
             .expect("an already-expired parent ends the retained ancestry");
 
-        let error = validate_watermarks(&snapshots, Some(3), &[], &[], 100, 3)
+        let error = validate_watermarks(&snapshots, Some(3), &[], &[], 3)
             .expect_err("an unretained head must fail");
         assert!(error.to_string().contains("missing head snapshot 3"));
     }
@@ -1705,7 +1584,6 @@ mod tests {
                 snapshot_id: 1,
                 timestamp_ms: 10,
             }],
-            100,
             2,
         )
         .expect_err("cycle must fail");
@@ -1728,7 +1606,6 @@ mod tests {
                 snapshot_id: 0,
                 timestamp_ms: 0,
             }],
-            100,
             1,
         )
         .expect_err("sentinel must fail for a non-empty table");
@@ -1750,7 +1627,7 @@ mod tests {
                 timestamp_ms: 20,
             },
         ];
-        let error = validate_watermarks(&snapshots, Some(2), &[], &[], 100, 1)
+        let error = validate_watermarks(&snapshots, Some(2), &[], &[], 1)
             .expect_err("ancestry beyond the bound must fail");
         assert!(error.to_string().contains("traversal bound"));
     }

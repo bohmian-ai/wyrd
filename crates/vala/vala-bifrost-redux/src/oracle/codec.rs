@@ -508,19 +508,6 @@ pub struct AnalyticalLeafBinding {
     role: wyrd_spec::vala::api::ClusterRole,
     /// Process resolver that turns a signed assignment into a local provider.
     resolver: Arc<dyn super::follower::FollowerSourceResolver>,
-    /// This node's reader epoch, which every decoded leaf protects under.
-    ///
-    /// `None` only on a node that runs no Oracle epoch, where a decoded leaf
-    /// carrying a snapshot-bearing cut is refused rather than read unprotected.
-    reader_authority: Option<Arc<super::reader_pins::OracleReaderAuthority>>,
-    /// Graph-scoped owner every decoded leaf hands its reader guard to.
-    ///
-    /// `None` on the node-wide binding the ingress retains, because no single
-    /// graph owns that one. The per-session clone
-    /// [`AnalyticalLeafBinding::for_graph`] builds always carries it, and a leaf
-    /// that acquires protection without one is refused rather than allowed to
-    /// hold a claim the graph's teardown cannot release.
-    guard_sink: Option<Arc<super::analytical_scan::GraphReaderGuardSink>>,
 }
 
 impl AnalyticalLeafBinding {
@@ -529,31 +516,8 @@ impl AnalyticalLeafBinding {
     pub fn new(
         role: wyrd_spec::vala::api::ClusterRole,
         resolver: Arc<dyn super::follower::FollowerSourceResolver>,
-        reader_authority: Option<Arc<super::reader_pins::OracleReaderAuthority>>,
     ) -> Self {
-        Self {
-            role,
-            resolver,
-            reader_authority,
-            guard_sink: None,
-        }
-    }
-
-    /// Binds this node-wide capability to the one graph a session serves.
-    ///
-    /// The session builder resolves the graph before it installs the codec, so
-    /// this is where a leaf's reader guard acquires an owner whose lifetime is
-    /// the graph rather than the upstream task cache.
-    #[must_use]
-    pub(super) fn for_graph(
-        mut self,
-        graph: super::analytical::AnalyticalGraphKey,
-        registry: Arc<super::analytical::AnalyticalRuntimeRegistry>,
-    ) -> Self {
-        self.guard_sink = Some(Arc::new(super::analytical_scan::GraphReaderGuardSink::new(
-            graph, registry,
-        )));
-        self
+        Self { role, resolver }
     }
 }
 
@@ -870,8 +834,6 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
                     assignment,
                     binding.role,
                     Arc::clone(&binding.resolver),
-                    binding.reader_authority.as_ref().map(Arc::clone),
-                    binding.guard_sink.as_ref().map(Arc::clone),
                     schema,
                     partitions,
                 )))

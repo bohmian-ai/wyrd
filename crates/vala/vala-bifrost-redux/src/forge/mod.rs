@@ -32,10 +32,10 @@ mod phase;
 mod planner;
 mod protection_roots;
 pub(crate) mod publication;
-mod reader_protection;
 mod scheduler;
 pub(crate) mod scribe_promotion;
 mod settings;
+mod table_authority;
 mod worker;
 
 pub use clock::ForgeClock;

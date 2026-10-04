@@ -1,6 +1,6 @@
 ---
 id: SPEC-forge-concurrent-planning
-revision: 6
+revision: 8
 status: approved
 ---
 
@@ -274,6 +274,67 @@ are never selected again. Forge's `small-files` plan sets the core's existing gr
 `full`, `auto` and `files-with-delete` keep upstream grouping. `full`, `auto` and
 `files-with-delete` remain available per table through REQ-012.
 
+### REQ-014 — One tenant-scoped Oracle catalog selection
+
+(Added 2026-10-04, approved by the human owner.) Iceberg catalog identity is
+tenant relative. A catalog lookup by an Oracle request can expose only tables
+registered to its authenticated tenant, enforced by tenant-scoped database
+authority rather than an Oracle-side name check alone. Forge retains its
+internal platform credential for Iceberg publication, compaction, and
+maintenance. Oracle uses tenant-scoped database authority for its catalog and
+Scribe cut reads; it does not use a global catalog credential on the request
+path.
+
+One Oracle query acquires its complete set of referenced-table catalog pointers
+and unresolved Scribe hot-file candidates through one SQL `SELECT`, including
+the first read of a table and a cut that needs new reader protection. That
+database operation establishes durable, bounded protection before returning
+the cut. Protection covers both the Iceberg objects and Scribe hot objects
+that the result may read, even across publication, compaction, expiration, and
+cleanup. Forge defers reclamation covered by an active reader. A bounded
+table-wide read pin is acceptable for this purpose; release, cancellation,
+node failure, and stale-owner fencing cannot leave permanent pins. The
+returned catalog pointers and hot candidates represent one consistent
+database view, and Oracle still validates and reconciles them against the
+immutable Iceberg metadata and manifests before scanning. Promotion or catalog
+movement after selection cannot duplicate, omit, or prematurely delete rows.
+
+The one-`SELECT` requirement concerns SQL statements, not object-store reads
+or a claim of one database network round trip. Transaction setup and commit
+remain visible in the step count. The implementation must reduce the serial
+database steps of cut acquisition compared with the current two catalog
+pointer reads plus hot-file read, without using elapsed time as the proof.
+Latency targets and before/after milliseconds belong to the separate
+optimization-and-benchmarks change.
+
+### REQ-015 — Iceberg assigns every table's physical field IDs
+
+(Added 2026-10-04, explicitly approved by the human owner.) Built-in signal
+tables and custom tables do not declare their own numeric field IDs. The
+registered Iceberg table assigns the IDs, including nested and Bifrost-managed
+fields. Scribe writes those IDs into Parquet, Oracle interprets them from the
+registered table, and Forge keeps its exact file-to-table ID validation. The
+canonical signal fingerprint covers the ordered names, physical types,
+nullability, nesting, and semantic sensitivity metadata without treating
+numeric field IDs as canonical identity. Fresh signal-table promotion works
+without editing Iceberg's generated metadata document to restore declared
+IDs. Nothing has shipped, so no legacy-table migration is required.
+
+### REQ-016 — Prove typed pruning on both Oracle tiers
+
+(Added 2026-10-04, directed by the human owner after review.) Oracle's hot
+and Iceberg readers use the Bloom filters declared in each table's physical
+layout, including binary `trace_id` values, while preserving exact results
+and conservative behavior for unsupported or missing index evidence. The
+closed scan-predicate contract carries binary literals losslessly to hot and
+distributed readers. The Iceberg reader also handles binary page bounds
+without disabling page selection for other predicates in the query. Tests
+isolate Bloom exclusion from min/max exclusion rather than inferring Bloom
+use from a file's Bloom metadata. `wyrd_request_id` equality lookups return
+exact rows on hot, promoted, and rewritten cuts and demonstrate row-group
+min/max exclusion where row-group ranges are disjoint; this requirement does
+not add a Bloom filter for that column or promise pruning when ranges overlap.
+
 ## Invariants
 
 - INV-001: One active scheduling leader; compactors on any replica may work.
@@ -288,6 +349,11 @@ are never selected again. Forge's `small-files` plan sets the core's existing gr
   response alone never authorize deletion.
 - INV-007: Physical file selection has one worker-side compaction-library owner.
 - INV-008: Tenant isolation and bounded worker resource admission remain.
+- INV-009: A tenant-scoped Oracle cut never exposes another tenant's catalog
+  pointer, and no object named by an active cut is reclaimed before its
+  protection is released.
+- INV-010: Parquet field IDs match the registered Iceberg table's assigned
+  IDs; built-in declarations and fingerprints do not own numeric IDs.
 
 ## Acceptance criteria
 
@@ -323,6 +389,19 @@ are never selected again. Forge's `small-files` plan sets the core's existing gr
   Scribe with no worker running until each holds compactable staged files,
   then each fleet size drains an equal fresh backlog, so the measurement is
   bounded by compaction and not by the arrival rate of due tables.
+- AC-009: A production-shaped Oracle journey proves one tenant-scoped SQL
+  `SELECT` for all tables in a query, including cold and protected-cut cases,
+  with fewer serial database steps than the current path. Separate evidence
+  proves cross-tenant denial, exact hot/Iceberg results through publication
+  and cleanup races, and safe release on cancellation or failure. Statement
+  and step counts are asserted; no elapsed-time threshold is asserted here.
+- AC-010: Fresh spans, points, records, and custom-table files promote and
+  rewrite with field IDs matching their Iceberg table, with no declared-ID
+  metadata rewrite. Forge still rejects a mismatched file.
+- AC-011: Hot, promoted, and rewritten journeys prove actual Bloom exclusion
+  for declared keys, including binary `trace_id`, and exact
+  `wyrd_request_id` results with row-group min/max exclusion when the fixture
+  has disjoint ranges. Binary page pruning and mixed predicates remain exact.
 
 ## Deletion and consumer map
 
@@ -356,6 +435,14 @@ handling and maintenance behavior follow the pinned RisingWave Iceberg sources.
 
 ## Revision history and authority
 
+- Revision 8 (2026-10-04, explicitly approved by the human owner for removing
+  declared IDs and directed through review comments for pruning coverage):
+  make Iceberg the field-ID owner and prove binary Bloom and request-ID
+  filtering across hot and Iceberg cuts.
+- Revision 7 (2026-10-04, explicitly approved by the human owner): make
+  Iceberg catalog identity tenant relative for Oracle, retain Forge's platform
+  authority, and require one protected SQL selection per Oracle query without
+  moving latency measurement out of the benchmark change.
 - Revision 6 (2026-10-03, directed by the user in this conversation): require
   source comparison of nimtable and Wyrd's fork; preserve central-governor
   charging and spill placement without mandating a dependency choice.

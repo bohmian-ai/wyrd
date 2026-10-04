@@ -61,3 +61,29 @@ def test_table_config_carries_an_optional_compaction_target():
         compaction_target_file_size_bytes=target,
     )
     assert arrow.compaction_target_file_size_bytes == target
+
+
+def test_table_config_carries_an_optional_compaction_type():
+    """The explicit Forge compaction type reaches the native config from both
+    doors in its ``snake_case`` wire spelling; an unknown spelling, including
+    the hyphenated Iceberg property form, is refused at the boundary."""
+
+    import pyarrow
+    from pydantic import BaseModel
+    from wyrd import WyrdError
+    from wyrd.bifrost import TableConfig
+
+    class Row(BaseModel):
+        id: int
+
+    assert TableConfig(Row, "vala.datasets.t").compaction_type is None
+    declared = TableConfig(Row, "vala.datasets.t", compaction_type="small_files")
+    assert declared.compaction_type == "small_files"
+    arrow = TableConfig.from_arrow(
+        pyarrow.schema([("id", pyarrow.int64())]),
+        "vala.datasets.t",
+        compaction_type="files_with_delete",
+    )
+    assert arrow.compaction_type == "files_with_delete"
+    with pytest.raises(WyrdError):
+        TableConfig(Row, "vala.datasets.t", compaction_type="small-files")

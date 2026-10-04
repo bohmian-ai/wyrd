@@ -809,6 +809,21 @@ column to let the server stamp receipt time."
         /// Canonical `<namespace>.<name>` of the conflicting table.
         table: String,
     },
+
+    /// A register retry supplied a compaction type that differs from the
+    /// table's existing explicit type, or supplied one for a table that
+    /// compacts with the default `full` type without declaring it.
+    #[error("compaction type mismatch for table: {table}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH",
+        status = 409,
+        title = "Bifrost compaction type mismatch",
+        remediation = "Retry with the table's registered compaction type, omit it, or register a different table."
+    )]
+    CompactionTypeMismatch {
+        /// Canonical `<namespace>.<name>` of the conflicting table.
+        table: String,
+    },
 }
 
 /// Declaration slot named by [`BifrostError::InvalidPhysicalLayout`].

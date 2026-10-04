@@ -6,6 +6,7 @@ import {
   IncompleteQueryStreamError,
   TableConfig,
   WyrdError,
+  type CompactionType,
   type TableDescription,
 } from "@wyrd/sdk";
 
@@ -186,6 +187,7 @@ describe("bifrost public typing", () => {
         bloom_columns: ["trace_id"],
       },
       compaction_target_file_size_bytes: 1_073_741_824,
+      compaction_type: "small_files",
     };
     const nested = description.user_fields[0].data_type;
     const item = typeof nested === "string" || !("List" in nested) ? undefined : nested.List;
@@ -195,6 +197,7 @@ describe("bifrost public typing", () => {
     expect(description.physical_layout.sort_keys[0].column).toBe("trace_id");
     expect(description.canonical_physical_fingerprint).toBe("canonical-fp");
     expect(description.compaction_target_file_size_bytes).toBe(1_073_741_824);
+    expect(description.compaction_type).toBe("small_files");
   });
 });
 
@@ -216,5 +219,32 @@ describe("TableConfig compaction target", () => {
   it("refuses a target that is not a non-negative integer", () => {
     expect(() => TableConfig.fromJsonSchema("unit.rows", SCHEMA, undefined, 1.5)).toThrow(/compaction target/);
     expect(() => TableConfig.fromJsonSchema("unit.rows", SCHEMA, undefined, -1)).toThrow(/compaction target/);
+  });
+});
+
+describe("TableConfig compaction type", () => {
+  const SCHEMA = {
+    type: "object",
+    properties: { id: { type: "integer" } },
+    required: ["id"],
+  };
+
+  it("defaults to full by declaring nothing and carries an explicit type", () => {
+    expect(TableConfig.fromJsonSchema("unit.rows", SCHEMA).compactionType).toBeUndefined();
+    expect(
+      TableConfig.fromJsonSchema("unit.rows", SCHEMA, undefined, undefined, "small_files").compactionType,
+    ).toBe("small_files");
+  });
+
+  it("refuses a spelling that is not a wire compaction type", () => {
+    expect(() =>
+      TableConfig.fromJsonSchema(
+        "unit.rows",
+        SCHEMA,
+        undefined,
+        undefined,
+        "small-files" as unknown as CompactionType,
+      ),
+    ).toThrow(/compaction type/);
   });
 });

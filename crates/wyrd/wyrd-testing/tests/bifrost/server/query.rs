@@ -1252,6 +1252,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
         }],
         physical_layout: None,
         compaction_target_file_size_bytes: None,
+        compaction_type: None,
     };
     let refused = delegated
         .request_json::<_, serde_json::Value>(

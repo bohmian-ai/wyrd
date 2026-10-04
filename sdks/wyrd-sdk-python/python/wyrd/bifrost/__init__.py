@@ -202,6 +202,7 @@ class TableConfig:
         sort_keys: list[SortKey] | None = None,
         bloom_columns: list[str] | None = None,
         compaction_target_file_size_bytes: int | None = None,
+        compaction_type: str | None = None,
     ) -> None:
         schema = model.model_json_schema()
         self._native = _native.bifrost.TableConfig.from_json_schema(
@@ -209,6 +210,7 @@ class TableConfig:
             json.dumps(schema),
             _layout_json(partition_granularity, sort_keys, bloom_columns),
             compaction_target_file_size_bytes,
+            compaction_type,
         )
 
     @classmethod
@@ -227,6 +229,7 @@ class TableConfig:
         sort_keys: list[SortKey] | None = None,
         bloom_columns: list[str] | None = None,
         compaction_target_file_size_bytes: int | None = None,
+        compaction_type: str | None = None,
     ) -> TableConfig:
         """Build from an explicit ``pyarrow.Schema``.
 
@@ -240,6 +243,7 @@ class TableConfig:
                 schema.serialize().to_pybytes(),
                 _layout_json(partition_granularity, sort_keys, bloom_columns),
                 compaction_target_file_size_bytes,
+                compaction_type,
             )
         )
 
@@ -283,6 +287,15 @@ class TableConfig:
 
         value = self._native.compaction_target_file_size_bytes
         return None if value is None else int(value)
+
+    @property
+    def compaction_type(self) -> str | None:
+        """The explicit Forge compaction type (``auto``, ``full``,
+        ``small_files`` or ``files_with_delete``), or ``None`` for the
+        ``full`` default."""
+
+        value = self._native.compaction_type
+        return None if value is None else str(value)
 
     @property
     def resolved(self) -> ResolvedTable | None:
@@ -779,6 +792,7 @@ class _TableDescriptionOptional(TypedDict, total=False):
 
     canonical_physical_fingerprint: str
     compaction_target_file_size_bytes: int
+    compaction_type: str
 
 
 class TableDescription(_TableDescriptionOptional):

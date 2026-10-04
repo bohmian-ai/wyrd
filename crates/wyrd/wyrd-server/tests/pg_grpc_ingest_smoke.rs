@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tokio_util::sync::CancellationToken;
-use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::catalog::{CompactionRegistration, TableRef};
 use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeIngressFrame};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint as ReduxSchemaFingerprint;
@@ -191,7 +191,7 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
             table.clone(),
             vec![Field::new("value", DataType::Int64, false)],
             None,
-            None,
+            CompactionRegistration::default(),
             None,
         )
         .await
@@ -591,7 +591,7 @@ async fn embedded_ingest_resolves_catalog_and_durably_acknowledges_arrow() {
             TableRef::new(BifrostNamespace::Datasets, TABLE_NAME),
             vec![Field::new("value", DataType::Int64, false)],
             None,
-            None,
+            CompactionRegistration::default(),
             None,
         )
         .await

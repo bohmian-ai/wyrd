@@ -140,6 +140,32 @@ pub struct BifrostTableDescription {
     /// the deployment default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_target_file_size_bytes: Option<u64>,
+    /// The table's explicit Forge compaction type.
+    ///
+    /// Present only when the table stores its own `wyrd.forge.compaction.type`;
+    /// omitted means Forge compacts it `full`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_type: Option<CompactionTypeWire>,
+}
+
+/// Physical compaction strategy a table asks Forge to apply.
+///
+/// Stored as the table's `wyrd.forge.compaction.type` Iceberg property, whose
+/// own spelling is hyphenated (`small-files`); the wire keeps the `snake_case`
+/// convention every other Wyrd enum uses. A copy-on-write table always compacts
+/// `full` whatever it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTypeWire {
+    /// Choose a delete-heavy or small-file plan from table-wide thresholds.
+    Auto,
+    /// Rewrite every live data file; the default when none is declared.
+    Full,
+    /// Rewrite only data files below the small-file threshold.
+    SmallFiles,
+    /// Rewrite only data files with associated delete files.
+    FilesWithDelete,
 }
 
 // ── Arrow-free schema / field wire types ────────────────────────────────────
@@ -382,6 +408,15 @@ pub struct RegisterTableRequest {
     /// is `WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_target_file_size_bytes: Option<u64>,
+    /// Optional physical compaction strategy Forge applies to this table.
+    ///
+    /// Omitted, the table stores no explicit type and Forge compacts it
+    /// `full`. Supplied, it is stored as the table's
+    /// `wyrd.forge.compaction.type` Iceberg property. A re-register may omit
+    /// it or repeat the stored value; a different value is
+    /// `WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_type: Option<CompactionTypeWire>,
 }
 
 /// Whether a register call created a new table or matched an existing one.
@@ -2557,7 +2592,7 @@ mod bifrost_wire_tests {
     use std::collections::BTreeMap;
 
     use crate::vala::api::{
-        BifrostTableDescription, BifrostTableEntry, DataTypeSpec, FieldSpec,
+        BifrostTableDescription, BifrostTableEntry, CompactionTypeWire, DataTypeSpec, FieldSpec,
         INPUT_CLASS_GATE_CORRELATION, INPUT_CLASS_KEY, NullOrderWire, PARQUET_FIELD_ID_KEY,
         PhysicalLayoutWire, RegisterOutcome, RegisterTableRequest, RegisterTableResponse,
         SortDirectionWire, SortKeyWire, TableStatus, TimeGranularityWire, TimeUnit,
@@ -2667,6 +2702,31 @@ mod bifrost_wire_tests {
         assert!(layout.sort_keys.is_empty());
         assert!(layout.bloom_columns.is_empty());
         bifrost_wire_round_trip(&req);
+    }
+
+    /// The register request carries the compaction type in its `snake_case`
+    /// wire spelling and rejects the hyphenated Iceberg property spelling, so
+    /// one table has exactly one way to name its type on the wire.
+    #[test]
+    fn bifrost_wire_register_request_carries_snake_case_compaction_type() {
+        let req: RegisterTableRequest = serde_json::from_str(
+            r#"{"namespace":"vala.datasets","name":"events","fields":[],
+                "compaction_type":"small_files"}"#,
+        )
+        .expect("deserialize");
+        assert_eq!(req.compaction_type, Some(CompactionTypeWire::SmallFiles));
+        bifrost_wire_round_trip(&req);
+        let omitted: RegisterTableRequest =
+            serde_json::from_str(r#"{"namespace":"vala.datasets","name":"events","fields":[]}"#)
+                .expect("deserialize");
+        assert_eq!(omitted.compaction_type, None);
+        assert!(
+            serde_json::from_str::<RegisterTableRequest>(
+                r#"{"namespace":"vala.datasets","name":"events","fields":[],
+                    "compaction_type":"small-files"}"#,
+            )
+            .is_err()
+        );
     }
 
     /// No wire field names a partition column any more, so a declaration that
@@ -2782,6 +2842,7 @@ mod bifrost_wire_tests {
                 bloom_columns: vec!["run_id".to_string()],
             },
             compaction_target_file_size_bytes: Some(1_073_741_824),
+            compaction_type: Some(CompactionTypeWire::SmallFiles),
         };
         bifrost_wire_round_trip(&entry);
         bifrost_wire_round_trip(&desc);

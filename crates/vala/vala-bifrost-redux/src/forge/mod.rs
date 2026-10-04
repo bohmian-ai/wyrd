@@ -61,6 +61,7 @@ pub use metrics::ForgeTelemetry;
 pub use planner::{ForgePlanCandidate, PlannedForgeTask};
 #[cfg(feature = "test-support")]
 pub use scheduler::ForgeSchedulerTrigger;
+pub(crate) use settings::COMPACTION_TYPE_PROPERTY;
 pub use settings::{ForgeCompactionType, ForgeTableSettings};
 #[cfg(feature = "test-support")]
 pub use worker::{ForgeLifecycleEvent, ForgeWorkerCompletionObserver};

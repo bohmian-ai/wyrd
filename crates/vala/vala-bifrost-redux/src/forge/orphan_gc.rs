@@ -2118,8 +2118,7 @@ mod tests {
                 &young_manifest,
                 ObjectEvidence::Present(&young_metadata)
             ),
-            GcEligibility::Eligible,
-            "an unreachable expiry candidate waits on no object age"
+            GcEligibility::Eligible
         );
         assert_eq!(
             protection.expired_cleanup_eligibility(

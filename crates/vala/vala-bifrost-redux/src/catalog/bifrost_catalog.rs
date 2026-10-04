@@ -472,46 +472,17 @@ impl BifrostCatalog {
         let snapshot_id = pinned.snapshot_id;
         let iceberg_file_paths = pinned.file_paths;
         let iceberg_files = pinned.files;
-        let mut estimated_bytes = pinned.estimated_bytes;
         if cut.ambiguous_publication {
             return Err(BifrostCatalogError::AmbiguousPublication);
         }
         let hot_files = cut.hot_files;
-        for row in &hot_files {
-            let valid_identity = row.data_tenant_id == tenant.as_uuid()
-                && row.namespace == binding.logical_namespace
-                && row.table_name == binding.table_name
-                && row.file_size > 0
-                && row.row_count >= 0
-                && row.writer_epoch >= 0
-                && row.wal_lsn_min >= 0
-                && row.wal_lsn_max >= row.wal_lsn_min
-                && binding.validate_object_path(&row.file_path).is_some();
-            if !valid_identity {
-                return Err(BifrostCatalogError::MetadataMismatch(
-                    "sealed manifest row violates its tenant/table binding".to_owned(),
-                ));
-            }
-        }
+        let estimated_bytes = hot_cut_bytes(&binding, &hot_files, pinned.estimated_bytes)?;
         metrics::counter!(
             "bifrost_oracle_files_pruned_total",
             "source" => "hot_sealed",
             "reason" => "snapshot_overlap"
         )
         .increment(cut.represented as u64);
-        for row in &hot_files {
-            estimated_bytes = estimated_bytes
-                .checked_add(u64::try_from(row.file_size).map_err(|_| {
-                    BifrostCatalogError::MetadataMismatch(
-                        "hot manifest file size is invalid".to_owned(),
-                    )
-                })?)
-                .ok_or_else(|| {
-                    BifrostCatalogError::MetadataMismatch(
-                        "sealed byte estimate overflow".to_owned(),
-                    )
-                })?;
-        }
         let snapshot_digest = digest_strings(
             snapshot_id
                 .map(|id| id.to_string())
@@ -1826,6 +1797,48 @@ mod schema_shape_tests {
         assert!(!schema_shape_matches(&declared, &reordered));
         assert!(!schema_shape_matches(&reordered, &declared));
     }
+}
+
+/// Validates every reconciled hot row against its binding and adds its bytes.
+///
+/// A hot row is only readable when it names this tenant and table, carries a
+/// coherent size, row count, epoch, and WAL range, and resolves inside the
+/// binding's object prefix. The returned estimate is `base` plus every row's
+/// file size.
+///
+/// # Errors
+/// Returns [`BifrostCatalogError::MetadataMismatch`] when a row violates its
+/// binding or the byte estimate cannot be represented.
+fn hot_cut_bytes(
+    binding: &TenantTableBinding,
+    hot_files: &[vala_sql::row_types::file_list::HotFileRow],
+    base: u64,
+) -> Result<u64, BifrostCatalogError> {
+    hot_files.iter().try_fold(base, |total, row| {
+        let valid_identity = row.data_tenant_id == binding.tenant.as_uuid()
+            && row.namespace == binding.logical_namespace
+            && row.table_name == binding.table_name
+            && row.file_size > 0
+            && row.row_count >= 0
+            && row.writer_epoch >= 0
+            && row.wal_lsn_min >= 0
+            && row.wal_lsn_max >= row.wal_lsn_min
+            && binding.validate_object_path(&row.file_path).is_some();
+        if !valid_identity {
+            return Err(BifrostCatalogError::MetadataMismatch(
+                "sealed manifest row violates its tenant/table binding".to_owned(),
+            ));
+        }
+        total
+            .checked_add(u64::try_from(row.file_size).map_err(|_| {
+                BifrostCatalogError::MetadataMismatch(
+                    "hot manifest file size is invalid".to_owned(),
+                )
+            })?)
+            .ok_or_else(|| {
+                BifrostCatalogError::MetadataMismatch("sealed byte estimate overflow".to_owned())
+            })
+    })
 }
 
 #[cfg(test)]

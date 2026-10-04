@@ -833,7 +833,7 @@ impl PromotionIntegrationFixture {
     /// Goes through the production catalog acquisition, so the row is the
     /// exact durable state a held query leaves and serializes with Forge on
     /// the same table maintenance authority. The owner fence names no live
-    /// node, which is harmless: abandonment also needs PostgreSQL time past
+    /// node, which is harmless: abandonment also needs Postgres time past
     /// the six-hour expiry, so the row stays protective for the whole test.
     ///
     /// # Panics

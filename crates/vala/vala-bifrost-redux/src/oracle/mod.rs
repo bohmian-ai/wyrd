@@ -1548,7 +1548,7 @@ impl Oracle {
     ///
     /// # Errors
     /// Returns [`BifrostError::Internal`] when the configured SQL floor is zero.
-    pub async fn new(config: OracleBuildConfig) -> Result<Self, BifrostError> {
+    pub fn new(config: OracleBuildConfig) -> Result<Self, BifrostError> {
         validate_oracle_config(config.config)?;
         let planner = OraclePlanner::new(config.config);
         let telemetry = Arc::new(OracleTelemetry::new());
@@ -1921,10 +1921,15 @@ impl Oracle {
         QueryPhase::SnapshotPin.record(pin_started);
         // Every refusal from here on owns a committed claim no descendant can
         // read yet, so it releases the claim before it returns.
-        match self
-            .freeze_pinned_attempt(context, &snapshot, attempt_id, deadline, wall_deadline)
-            .await
-        {
+        #[cfg(feature = "test-support")]
+        let held = self
+            .hold_preparation_pause(context, deadline, wall_deadline)
+            .await;
+        #[cfg(not(feature = "test-support"))]
+        let held = Ok(());
+        match held.and_then(|()| {
+            self.freeze_pinned_attempt(&snapshot, attempt_id, deadline, wall_deadline)
+        }) {
             Ok(roster) => Ok((roster, planned)),
             Err(error) => {
                 planned.release().await;
@@ -1933,45 +1938,55 @@ impl Oracle {
         }
     }
 
-    /// Re-checks the deadline around the test-support preparation pause, then
-    /// freezes the class-neutral roster for an already pinned attempt.
+    /// Holds a pinned attempt at the test-support post-pin preparation pause.
+    ///
+    /// The pause is keyed by request identity and bounded by the attempt's
+    /// own deadline, so a held query observes the same timeout it would
+    /// without the pause. Production builds compile no pause.
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::QueryTimeout`] when either deadline has passed,
-    /// [`BifrostError::Internal`] for a poisoned pause lock, and the roster
-    /// freeze's own refusal.
-    async fn freeze_pinned_attempt(
+    /// Returns [`BifrostError::QueryTimeout`] when the deadline passes while
+    /// held and [`BifrostError::Internal`] for a poisoned pause lock.
+    #[cfg(feature = "test-support")]
+    async fn hold_preparation_pause(
         &self,
         context: &AuthorizedQueryContext,
+        deadline: Instant,
+        wall_deadline: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), BifrostError> {
+        let pause = self
+            .preparation_pause
+            .lock()
+            .map_err(|_| BifrostError::Internal {
+                detail: "Oracle preparation pause lock is poisoned".to_owned(),
+            })?
+            .clone();
+        if let Some(pause) = pause {
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                pause.hold(&context.request_id, wall_deadline.timestamp_millis()),
+            )
+            .await
+            .map_err(|_| BifrostError::QueryTimeout)?;
+        }
+        Ok(())
+    }
+
+    /// Re-checks the deadline, then freezes the class-neutral roster for an
+    /// already pinned attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryTimeout`] when either deadline has passed
+    /// and the roster freeze's own refusal.
+    fn freeze_pinned_attempt(
+        &self,
         snapshot: &ClusterSnapshot,
         attempt_id: QueryId,
         deadline: Instant,
         wall_deadline: chrono::DateTime<chrono::Utc>,
     ) -> Result<participant_cut::OracleQueryAttemptRoster, BifrostError> {
-        if Instant::now() >= deadline || chrono::Utc::now() >= wall_deadline {
-            return Err(BifrostError::QueryTimeout);
-        }
-        #[cfg(feature = "test-support")]
-        {
-            let pause = self
-                .preparation_pause
-                .lock()
-                .map_err(|_| BifrostError::Internal {
-                    detail: "Oracle preparation pause lock is poisoned".to_owned(),
-                })?
-                .clone();
-            if let Some(pause) = pause {
-                tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(deadline),
-                    pause.hold(&context.request_id, wall_deadline.timestamp_millis()),
-                )
-                .await
-                .map_err(|_| BifrostError::QueryTimeout)?;
-            }
-        }
-        #[cfg(not(feature = "test-support"))]
-        let _ = context;
         if Instant::now() >= deadline || chrono::Utc::now() >= wall_deadline {
             return Err(BifrostError::QueryTimeout);
         }

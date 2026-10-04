@@ -1802,9 +1802,7 @@ impl<'a> OracleRoleBuilder<'a> {
             tail_discovery: Some(tail_discovery),
             peer_transports: Some(peer_transports),
             config: oracle_config,
-        })
-        .await
-        {
+        }) {
             Ok(oracle) => Arc::new(oracle),
             Err(error) => {
                 release_failed_oracle_role(&cluster, &role, "construction").await;

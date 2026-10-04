@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use tokio::sync::Mutex;
@@ -305,7 +305,7 @@ pub struct BifrostTestControls {
     /// Optional object-store wrapper used to inject object-store behavior.
     pub forge_object_store: Option<Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>>,
     /// Deterministic delay in the existing Scribe WAL IO lane.
-    pub scribe_wal_sync_delay: Duration,
+    pub scribe_wal_sync_delay: std::time::Duration,
     /// Optional complete override of the production Scribe geometry.
     ///
     /// Scaled production journeys need the assembled-object target and the

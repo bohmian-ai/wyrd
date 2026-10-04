@@ -359,3 +359,89 @@ both with `WYRD_LOG=info,vala_bifrost_redux=debug`; `mise run test:bifrost:journ
 `mise exec -- cargo fmt --all --check`; `mise exec -- cargo clippy --locked -p vala-bifrost-redux -p wyrd-testing --all-features --tests -- -D warnings`;
 `git diff --check`. All green. No product knob or behaviour change; no test
 weakened, skipped or slept.
+
+### Follow-up remediation evidence (red-gate findings)
+
+#### Finding 1 — retry loop after a refused promotion commit (product defect, fixed)
+
+- Symptom: after two definite conflicts reset a promotion operation, the
+  task went `retryable`; every retry failed with
+  `Forge SQL operation failed: sql operation conflict: Reset Forge generation
+  cannot be reopened; retry requires a new operation and output generation`
+  (`crates/vala/vala-sql/src/queries/forge_operations.rs:157-160`) until the
+  attempt bound, while hint and sweep promotions logged "Forge promotion
+  deferred behind the table's active attempt"
+  (`forge/scribe_promotion.rs`, `promote_table`).
+- Evidence (RED, `WYRD_LOG=info,vala_bifrost_redux=debug`, new test
+  `forge::promotion::scribe_promotion_integration_reset_operation_retries_under_fresh_operation`):
+  without the backoff release the test panicked at
+  `tests/integration/forge/support.rs:2016` ("production Forge worker
+  attempt bound: Elapsed") with two "deferred behind the table's active
+  attempt" lines; with it, the retry of the same `task_id` under a new
+  `attempt_id` failed at `support.rs:2017` with the reopen refusal
+  (`failure_class="transient_coordination"`).
+- Cause: `ForgeWorker::promotion_operation_id` returned `claim.task_id`, so
+  the operation identity was fixed per task. `dispatch_scribe_promotion`
+  closes that operation as `Reset` after a surviving definite conflict and
+  returns `ForgeError::Catalog` (`TransientObjectStore`), so the task is
+  retried in place and `ForgeOperations::append_prepared` refuses the same
+  Reset identity on every later attempt. `insert_claimed`'s `NOT EXISTS
+  ready/retryable` guard keeps the hint/sweep path from planning around it,
+  and the all-state `forge_tasks_idempotency` index would refuse a fresh task
+  for the same head and plan. `architecture/bifrost-design.md` ("Scribe hot
+  promotion") requires the later retry to run under a new attempt and
+  operation, so this is not intended behaviour.
+- Diagnostician (fresh, read-only; command, trace and diff only): concurred
+  on the cause; named `worker.rs` dispatch/settlement as the fix site; flagged
+  the idempotency index as blocking a "terminalize and replan" fix and the
+  recovery paths (`settle_promotion_evidence`, `forge.task_id` /
+  `forge.operation_id` snapshot properties, `settle_promoted`) that must keep
+  one identity per attempt.
+- Fix site: `Forge::promotion_operation_id` (`forge/scribe_promotion.rs`)
+  resolves the task's current operation generation from
+  `vala.forge_operation_state`: generation zero is the task id; each `Reset`
+  generation advances to a deterministic successor
+  (`promotion_generation_operation_id`, domain-separated SHA-256 of task id
+  and generation, UUID v8). The walk is bounded by `ATTEMPT_BOUND`. Both
+  callers (`dispatch_scribe_promotion`, `settle_promotion_evidence`) use it,
+  so Prepared resume, committed recovery and settlement keep one identity per
+  attempt. No schema, plan-shape, failure-class or retry-policy change; the
+  in-place retry keeps the production backoff.
+- Harness gap (reported, not changed): the redux `integration` test binary
+  installs no tracing subscriber unless a scenario installs
+  `ForgeTelemetryCheckpoint`; the RED trace used a temporary
+  `wyrd_telemetry::init` inside the new test, removed before commit.
+
+#### Finding 2 — latent `hot > 0` race in `prove_hot_and_compacted_pruning` (fixed)
+
+- Cause: same as the sibling hot-only journey; hint-driven promotion can
+  settle the second batch before the precondition reads it.
+- Fix: the journey starts through
+  `start_spec_with_forge_config_and_completion_observer(.., inject_uncertainty
+  = true)`, lets the first batch promote with the seam inert, then
+  `pause_before_commit()` before writing the hot batch and awaits
+  `wait_for_before_commit()`. Later hot-batch promotions logged "deferred
+  behind the table's active attempt" (1–2 per run); shutdown drains the
+  parked commit unsettled. Pre-fix runs passed 3/3 (latent, not reproduced).
+
+#### Finding 3 — stale `compact_sealed_batch` rustdoc (fixed)
+
+Now states that it waits on promotion settlement (`file_list.compacted`), that
+promotion has no partition/age gate, what the one-day clock advance does
+affect, the 10-second heartbeat sweep versus requested passes, backoff
+release, and that a parked promotion commit must be released first.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| After a refused (reset) commit the next attempt succeeds under a fresh generation, no repeated reopen failures | `forge/scribe_promotion.rs` `promotion_operation_id`, `promotion_generation_operation_id`; `forge/worker.rs` callers | `forge::promotion::scribe_promotion_integration_reset_operation_retries_under_fresh_operation` (phases `reset, committed`; one task `succeeded` at attempt 1; no reopen error); unit `forge::scribe_promotion::tests::promotion_generations_are_deterministic_and_distinct` | PASS |
+| Two-tier journey holds its hot batch | `oracle/distributed.rs` commit-seam hold | `distributed::pg_bifrost_selective_predicate_spans_hot_and_compacted_reads` 5/5 (8.6–11.0 s) | PASS |
+| `compact_sealed_batch` rustdoc describes current behaviour | `oracle/support.rs` | review | PASS |
+| No regression | — | `mise run test:bifrost:journey:oracle` 42/42; redux integration `forge::` 59/59; redux lib `forge::` 91/91; `mise run test:bifrost:journey:forge` 21/21 | PASS |
+
+Commands: `mise exec -- scripts/postgres/with-test-postgres.sh -- <nextest -p vala-bifrost-redux --test integration -P journey --run-ignored=all -E '<expr>'>`
+(and `--lib`), the same for `-p wyrd-testing --test oracle` after
+`mise run db:migrate:inner`; `mise run test:bifrost:journey:oracle`;
+`mise run test:bifrost:journey:forge`; `mise exec -- cargo fmt --all --check`;
+`mise exec -- cargo clippy --locked -p vala-bifrost-redux -p wyrd-testing --all-features --tests -- -D warnings`;
+`git diff --check`. vala-sql was not modified. No test weakened, skipped or
+slept; `clear_task_backoff` is the fixture's existing backoff release.

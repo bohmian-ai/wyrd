@@ -31,7 +31,7 @@ use wyrd_queue::QueueConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::BifrostQueryRequest;
-use wyrd_spec::vala::api::PhysicalLayoutWire;
+use wyrd_spec::vala::api::{CompactionTypeWire, PhysicalLayoutWire};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::RunId;
 
@@ -398,8 +398,9 @@ fn decode_batch_ipc(bytes: &[u8]) -> Result<RecordBatch> {
 ///
 /// Returns a napi error when the table is not `namespace.name`, the document is
 /// not one mappable JSON Schema, a declared column is server-owned, the
-/// layout is not one physical-layout declaration, or the compaction target is
-/// not a non-negative integer.
+/// layout is not one physical-layout declaration, the compaction target is
+/// not a non-negative integer, or the compaction type is not one known
+/// `snake_case` wire spelling.
 // justification: napi boundary; a JavaScript string is primitive and cannot be
 // passed by reference, so the generated binding requires an owned String
 #[allow(clippy::needless_pass_by_value)]
@@ -409,15 +410,14 @@ pub fn table_config_from_json_schema(
     schema_json: String,
     layout_json: Option<String>,
     compaction_target_file_size_bytes: Option<f64>,
+    compaction_type: Option<String>,
 ) -> Result<NativeTableConfig> {
     let schema: Value = serde_json::from_str(&schema_json)
         .map_err(|error| napi::Error::from_reason(format!("invalid JSON schema: {error}")))?;
     let config = TableConfig::from_json_schema(&table, &schema).map_err(napi_error)?;
     let config = apply_layout(config, layout_json.as_deref())?;
-    NativeTableConfig::project(&apply_compaction_target(
-        config,
-        compaction_target_file_size_bytes,
-    )?)
+    let config = apply_compaction_target(config, compaction_target_file_size_bytes)?;
+    NativeTableConfig::project(&apply_compaction_type(config, compaction_type.as_deref())?)
 }
 
 /// Fetches an already-registered table's config by name.
@@ -496,6 +496,27 @@ fn apply_compaction_target(config: TableConfig, bytes: Option<f64>) -> Result<Ta
                 ))
             })?;
             Ok(config.with_compaction_target_file_size_bytes(bytes))
+        }
+    }
+}
+
+/// Applies one optional explicit Forge compaction type to a config.
+///
+/// The spelling is the `snake_case` wire value, parsed by the wire type's own
+/// serde contract so JavaScript accepts exactly what the server accepts.
+///
+/// # Errors
+///
+/// Returns a napi error when the spelling is not one known compaction type.
+fn apply_compaction_type(config: TableConfig, raw: Option<&str>) -> Result<TableConfig> {
+    match raw {
+        None => Ok(config),
+        Some(raw) => {
+            let kind: CompactionTypeWire = serde_json::from_value(Value::String(raw.to_owned()))
+                .map_err(|error| {
+                    napi::Error::from_reason(format!("invalid compaction type: {error}"))
+                })?;
+            Ok(config.with_compaction_type(kind))
         }
     }
 }

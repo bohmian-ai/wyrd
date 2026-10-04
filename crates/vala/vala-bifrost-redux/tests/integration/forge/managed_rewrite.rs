@@ -917,15 +917,58 @@ async fn promote_then_compact(supervisor: &mut SupervisedPromotion) {
     supervisor.run_one_success().await;
 }
 
+/// Declares a file target a quarter above two staged objects and returns its
+/// small-file threshold.
+///
+/// This is the scaled form of production's geometry: the 75% threshold sits
+/// above one staged object and below a merged pair. The quarter of headroom is
+/// needed because the writer rolls on written bytes plus its open row group's
+/// uncompressed estimate, so a target equal to the pair would roll the merge
+/// into two files. The row group keeps production's one-eighth of the target.
+///
+/// # Panics
+///
+/// Panics when a staged object is not below the threshold or the property
+/// commit fails.
+async fn scale_target_to_pair(
+    promoted: &PromotedRewriteFixture,
+    staged: &[iceberg::spec::DataFile],
+) -> u64 {
+    let staged_bytes: u64 = staged
+        .iter()
+        .map(iceberg::spec::DataFile::file_size_in_bytes)
+        .sum();
+    let target = staged_bytes * 5 / 4;
+    let row_group = target / 8;
+    let threshold = target / 100 * 75 + target % 100 * 75 / 100;
+    for file in staged {
+        assert!(
+            file.file_size_in_bytes() < threshold,
+            "a staged object is a small file: {} of {threshold}",
+            file.file_size_in_bytes()
+        );
+    }
+    set_table_properties(
+        &promoted.fixture.catalog,
+        &promoted.fixture.binding,
+        &[
+            ("write.target-file-size-bytes", &target.to_string()),
+            ("write.parquet.row-group-size-bytes", &row_group.to_string()),
+        ],
+    )
+    .await;
+    threshold
+}
+
 /// Staged files merge once, a finished file is never revisited, and a lone
 /// staged file waits for a partner.
 ///
 /// Scaled geometry over real files through the production scheduler and
 /// worker, with the fixture's compaction type removed so the table plans with
-/// the default. The table
-/// target is set a quarter above two staged objects, so its 75% small-file
-/// threshold sits above one staged object and below a merged pair, as 768 MiB
-/// sits between a 512 MiB staged file and a 1 GiB output. Two staged objects
+/// the default. The table target is set a quarter above two staged objects,
+/// so its 75% small-file threshold sits above one staged object and below a
+/// merged pair, as 768 MiB sits between a 512 MiB staged file and a 1 GiB
+/// output. Two staged objects
 /// in one day merge into one output that reaches the threshold, while the
 /// fixture's single-file days stay as they are. A third staged object alone
 /// beside that output is not rewritten. When a fourth arrives, the third and
@@ -965,33 +1008,7 @@ async fn small_files_merges_staged_pairs_once_and_lone_files_wait() {
         2,
         "the fixture keeps one object in each of two days"
     );
-    let staged_bytes: u64 = staged
-        .iter()
-        .map(iceberg::spec::DataFile::file_size_in_bytes)
-        .sum();
-    // A quarter of headroom over the pair: the writer rolls on written bytes
-    // plus its open row group's uncompressed estimate, so a target equal to
-    // the pair would roll the merge into two files. The row group keeps
-    // production's one-eighth of the file target.
-    let target = staged_bytes * 5 / 4;
-    let row_group = target / 8;
-    let threshold = target / 100 * 75 + target % 100 * 75 / 100;
-    for file in &staged {
-        assert!(
-            file.file_size_in_bytes() < threshold,
-            "a staged object is a small file: {} of {threshold}",
-            file.file_size_in_bytes()
-        );
-    }
-    set_table_properties(
-        &promoted.fixture.catalog,
-        &promoted.fixture.binding,
-        &[
-            ("write.target-file-size-bytes", &target.to_string()),
-            ("write.parquet.row-group-size-bytes", &row_group.to_string()),
-        ],
-    )
-    .await;
+    let threshold = scale_target_to_pair(&promoted, &staged).await;
     let staged_values = values(&promoted, &staged).await;
 
     supervisor.restart_worker();

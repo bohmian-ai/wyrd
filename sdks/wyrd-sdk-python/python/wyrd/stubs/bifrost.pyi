@@ -70,6 +70,7 @@ class _TableDescriptionOptional(TypedDict, total=False):
 
     canonical_physical_fingerprint: str
     compaction_target_file_size_bytes: int
+    compaction_type: str
 
 class TableDescription(_TableDescriptionOptional):
     """Server projection of one registered table's stored physical schema."""
@@ -148,6 +149,7 @@ class TableConfig:
         sort_keys: list[SortKey] | None = None,
         bloom_columns: list[str] | None = None,
         compaction_target_file_size_bytes: int | None = None,
+        compaction_type: str | None = None,
     ) -> None: ...
     @staticmethod
     def from_arrow(
@@ -157,6 +159,7 @@ class TableConfig:
         sort_keys: list[SortKey] | None = None,
         bloom_columns: list[str] | None = None,
         compaction_target_file_size_bytes: int | None = None,
+        compaction_type: str | None = None,
     ) -> TableConfig:
         """Build from an explicit Arrow schema, for types JSON Schema cannot express."""
         ...
@@ -180,6 +183,10 @@ class TableConfig:
     @property
     def compaction_target_file_size_bytes(self) -> int | None:
         """The explicit Forge compaction file target, or ``None`` for the deployment default."""
+        ...
+    @property
+    def compaction_type(self) -> str | None:
+        """The explicit Forge compaction type, or ``None`` for the ``small_files`` default."""
         ...
     @property
     def resolved(self) -> ResolvedTable | None:

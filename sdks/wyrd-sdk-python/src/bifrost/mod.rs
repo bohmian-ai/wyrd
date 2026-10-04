@@ -31,7 +31,7 @@ use wyrd_client::bifrost::TableConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{BifrostQueryRequest, PhysicalLayoutWire};
+use wyrd_spec::vala::api::{BifrostQueryRequest, CompactionTypeWire, PhysicalLayoutWire};
 use wyrd_spec::vala::ids::RunId;
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject};
 
@@ -115,29 +115,41 @@ impl PyTableConfig {
     /// public Python wrapper assembles it from its keyword arguments so the
     /// wire contract stays the only layout shape. `compaction_target_file_size_bytes`,
     /// when present, is the explicit Forge file target the register call
-    /// requests; the server validates it.
+    /// requests; the server validates it. `compaction_type`, when present, is
+    /// one `snake_case` wire spelling of the Forge compaction type.
     ///
     /// # Errors
     ///
     /// Raises `WyrdError` when the table is not `namespace.name`, the document
-    /// is not one mappable JSON Schema, a declared column is server-owned, or
-    /// the layout is not one physical-layout declaration.
+    /// is not one mappable JSON Schema, a declared column is server-owned, the
+    /// layout is not one physical-layout declaration, or the compaction type
+    /// is not one known spelling.
     #[staticmethod]
-    #[pyo3(signature = (table, schema_json, layout_json=None, compaction_target_file_size_bytes=None))]
+    #[pyo3(signature = (
+        table,
+        schema_json,
+        layout_json=None,
+        compaction_target_file_size_bytes=None,
+        compaction_type=None,
+    ))]
     fn from_json_schema(
         table: &str,
         schema_json: &str,
         layout_json: Option<&str>,
         compaction_target_file_size_bytes: Option<u64>,
+        compaction_type: Option<&str>,
     ) -> WyrdPyResult<Self> {
         let schema: Value = serde_json::from_str(schema_json)
             .map_err(|error| invalid_argument("schema_json", error))?;
         let config = TableConfig::from_json_schema(table, &schema).map_err(client_error)?;
         Ok(Self {
-            inner: apply_compaction_target(
-                apply_layout(config, layout_json)?,
-                compaction_target_file_size_bytes,
-            ),
+            inner: apply_compaction_type(
+                apply_compaction_target(
+                    apply_layout(config, layout_json)?,
+                    compaction_target_file_size_bytes,
+                ),
+                compaction_type,
+            )?,
         })
     }
 
@@ -152,22 +164,32 @@ impl PyTableConfig {
     /// Raises `WyrdError` when the bytes are not one Arrow IPC schema, the
     /// table is not `namespace.name`, a declared column is server-owned, or the
     /// layout is not one physical-layout declaration. The optional compaction
-    /// target is applied as in [`Self::from_json_schema`].
+    /// target and type are applied as in [`Self::from_json_schema`].
     #[staticmethod]
-    #[pyo3(signature = (table, schema_ipc, layout_json=None, compaction_target_file_size_bytes=None))]
+    #[pyo3(signature = (
+        table,
+        schema_ipc,
+        layout_json=None,
+        compaction_target_file_size_bytes=None,
+        compaction_type=None,
+    ))]
     fn from_arrow_ipc(
         table: &str,
         schema_ipc: &[u8],
         layout_json: Option<&str>,
         compaction_target_file_size_bytes: Option<u64>,
+        compaction_type: Option<&str>,
     ) -> WyrdPyResult<Self> {
         let schema = decode_schema_ipc(schema_ipc)?;
         let config = TableConfig::from_arrow(table, schema).map_err(client_error)?;
         Ok(Self {
-            inner: apply_compaction_target(
-                apply_layout(config, layout_json)?,
-                compaction_target_file_size_bytes,
-            ),
+            inner: apply_compaction_type(
+                apply_compaction_target(
+                    apply_layout(config, layout_json)?,
+                    compaction_target_file_size_bytes,
+                ),
+                compaction_type,
+            )?,
         })
     }
 
@@ -222,6 +244,16 @@ impl PyTableConfig {
     #[getter]
     fn compaction_target_file_size_bytes(&self) -> Option<u64> {
         self.inner.compaction_target_file_size_bytes()
+    }
+
+    /// The explicit Forge compaction type in its `snake_case` wire spelling,
+    /// declared or described; `None` compacts with the `small_files` default.
+    #[getter]
+    fn compaction_type(&self) -> Option<String> {
+        self.inner
+            .compaction_type()
+            .and_then(|kind| serde_json::to_value(kind).ok())
+            .and_then(|value| value.as_str().map(str::to_owned))
     }
 
     /// The server-assigned `(table_uid, fingerprint)`, or `None` while inert.
@@ -588,6 +620,26 @@ fn apply_compaction_target(config: TableConfig, bytes: Option<u64>) -> TableConf
     match bytes {
         None => config,
         Some(bytes) => config.with_compaction_target_file_size_bytes(bytes),
+    }
+}
+
+/// Applies one optional explicit compaction type to a config.
+///
+/// The spelling is the `snake_case` wire value, parsed by the wire type's own
+/// serde contract so Python accepts exactly what the server accepts.
+///
+/// # Errors
+///
+/// Returns the stable Wyrd invalid-argument error when the spelling is not one
+/// known compaction type.
+fn apply_compaction_type(config: TableConfig, raw: Option<&str>) -> WyrdPyResult<TableConfig> {
+    match raw {
+        None => Ok(config),
+        Some(raw) => {
+            let kind: CompactionTypeWire = serde_json::from_value(Value::String(raw.to_owned()))
+                .map_err(|error| invalid_argument("compaction_type", error))?;
+            Ok(config.with_compaction_type(kind))
+        }
     }
 }
 

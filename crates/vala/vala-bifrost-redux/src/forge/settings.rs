@@ -93,6 +93,31 @@ impl ForgeCompactionType {
     }
 }
 
+impl From<wyrd_spec::vala::api::CompactionTypeWire> for ForgeCompactionType {
+    /// Maps a registration's wire type onto the type a worker plans with.
+    fn from(wire: wyrd_spec::vala::api::CompactionTypeWire) -> Self {
+        use wyrd_spec::vala::api::CompactionTypeWire;
+        match wire {
+            CompactionTypeWire::Auto => Self::Auto,
+            CompactionTypeWire::Full => Self::Full,
+            CompactionTypeWire::SmallFiles => Self::SmallFiles,
+            CompactionTypeWire::FilesWithDelete => Self::FilesWithDelete,
+        }
+    }
+}
+
+impl From<ForgeCompactionType> for wyrd_spec::vala::api::CompactionTypeWire {
+    /// Maps a stored type back onto the wire spelling a description reports.
+    fn from(kind: ForgeCompactionType) -> Self {
+        match kind {
+            ForgeCompactionType::Auto => Self::Auto,
+            ForgeCompactionType::Full => Self::Full,
+            ForgeCompactionType::SmallFiles => Self::SmallFiles,
+            ForgeCompactionType::FilesWithDelete => Self::FilesWithDelete,
+        }
+    }
+}
+
 /// The scheduling and maintenance settings one table declares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeTableSettings {

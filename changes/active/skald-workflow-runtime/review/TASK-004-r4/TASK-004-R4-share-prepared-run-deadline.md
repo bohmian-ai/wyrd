@@ -145,3 +145,45 @@ The implementation report must identify the one prepared deadline owner, the
 existing seam that projects it into `RunTools`, the focused assertion that
 would fail with the candidate's two sampling points, and the recorded results
 of these commands.
+
+## Implementation evidence
+
+- **Deadline owner:** `WorkflowExecutor::new` (`crates/skald/skald-workflow/src/workflow.rs`)
+  remains the only sampler; `PreparedWorkflowRun::deadline()`
+  (`workflow_surface.rs`) exposes that exact `tokio::time::Instant`.
+- **Seam:** `Preparation::prepare` (`components/workflow/host.rs`) calls
+  `RunTools::bind_deadline(&prepared)` after Skald preparation returns and
+  before `reservation.accept`. `RunTools.deadline` is an
+  `Arc<OnceLock<Instant>>` shared by every clone already held by hydrated
+  Agents; `RunTools::new` no longer takes or samples a deadline.
+- **Red proof:** with `RunTools::new` restored to sample `Instant::now() + 30s`
+  at tool creation, `tools_use_the_prepared_run_deadline` fails with
+  `left: …194229.76s, right: …194230.76s` (the 1 s advanced between hydration
+  and preparation).
+- **Journey:** the forwarded-Oracle journey was run unchanged. Its deadline
+  branch was not modified because the lead's direction required a
+  diagnostician and lead approval before any existing assertion change; the
+  focused unit test closes the two-sampling-point gap directly.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Every `RunTools` clone consumes the exact prepared-run deadline; no tool-only deadline remains | `tools.rs` `RunTools.deadline: Arc<OnceLock<Instant>>`, `bind_deadline`; `host.rs` bind before accept; `PreparedWorkflowRun::deadline` | `components::workflow::tools::tests::tools_use_the_prepared_run_deadline` asserts a hydrated Agent's clone equals `prepared.deadline()` | PASS |
+| Nonzero hydration/planning time cannot shorten an unqualified query | Clone created before `tokio::time::advance(1s)`; deadline bound from the later prepared run | same test; red with early sampling | PASS |
+| Omitted/longer explicit deadline clipped to the prepared boundary; shorter explicit wins | `QueryTool::invoke` derives `remaining` only from the bound deadline, `min` with requested | `test:wyrd` (wyrd-server) and Oracle journey lanes | PASS |
+| No premature tool timeout before the run boundary; shared-boundary expiry stays `TimedOut` | Tool and executor read one instant | `workflow::workflow_forwarded_query_settles_before_the_run_ends` (Deadline case ends `TimedOut`) | PASS |
+| Cancellation, settlement, pod loss, sibling serviceability, prior closures intact | No change to `BoundedQuery`, trackers, cancellation, Oracle | `test:skald`, `test:wyrd`, `test:bifrost:journey:oracle` | PASS |
+
+| Command | Result |
+|---|---|
+| `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-server --lib -E "test(=components::workflow::tools::tests::tools_use_the_prepared_run_deadline)"'` | 1 passed |
+| `mise run fmt` | exit 0 |
+| `mise run lints` | exit 0 |
+| `git diff --check` | clean |
+| `mise run test:skald` | 338 passed |
+| `WYRD_TEST_PACKAGES="wyrd-server" mise run test:wyrd` | 684 passed, 23 skipped |
+| `mise run test:bifrost:journey:oracle` (includes `workflow::workflow_forwarded_query_settles_before_the_run_ends`) | 43 passed |
+
+Non-goals held: public duration-based run options, MCP and scheduled-query
+deadlines, `BoundedQuery`, Oracle settlement, trackers, and cancellation are
+unchanged; no timer, channel, retry, poll, setting, option, dependency,
+checker, or harness was added.

@@ -25,7 +25,7 @@ use wyrd_runtime::Permission;
 use wyrd_spec::AgentSpec;
 use wyrd_spec::card::workflow::{CreateWorkflowRunRequest, LlmRoute, WorkflowAction, WorkflowRun};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{IdempotencyKey, WorkflowRunId};
+use wyrd_spec::ids::{CredentialBindingName, IdempotencyKey, WorkflowRunId};
 use wyrd_spec::reference::{CardRef, InlineableRef};
 
 use super::runs::{Admission, Reservation, RunKey, run_not_found, run_unavailable};
@@ -406,7 +406,7 @@ impl Preparation {
     /// step that resolves to `native`.
     fn external_bindings(
         graph: &PinnedWorkflowGraph,
-    ) -> Result<BTreeSet<wyrd_spec::ids::CredentialBindingName>, WyrdError> {
+    ) -> Result<BTreeSet<CredentialBindingName>, WyrdError> {
         let spec = &graph.workflow().spec;
         let mut external = BTreeSet::new();
         for step in &spec.steps {

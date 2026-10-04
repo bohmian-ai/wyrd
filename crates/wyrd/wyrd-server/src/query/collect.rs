@@ -13,14 +13,17 @@
 #[cfg(feature = "test-support")]
 use std::sync::Arc;
 
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::json::writer::{EncoderOptions, make_encoder};
 use arrow::record_batch::RecordBatch;
 use futures_util::StreamExt as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::oracle::{OracleQueryStream, QueryIpcDecoder};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError as ValaError;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::api::{
@@ -29,7 +32,10 @@ use wyrd_spec::vala::api::{
 };
 
 use crate::components::auth::Caller;
+use crate::oracle::RunningQueryControls;
 use crate::state::AppState;
+#[cfg(feature = "test-support")]
+use crate::state::{QueryStreamFault, QueryStreamStall};
 
 /// Wire name of the bounded read-only query tool on every agent surface.
 pub(crate) const QUERY: &str = "bifrost.query";
@@ -326,20 +332,17 @@ impl BoundedQuery {
     /// so fast fixture execution cannot make cancellation evidence vacuous. A
     /// probe capture is consumed and changes nothing.
     #[cfg(feature = "test-support")]
-    fn claim_fault(
-        &self,
-        stream: &mut OracleQueryStream,
-    ) -> Option<Arc<crate::state::QueryStreamStall>> {
+    fn claim_fault(&self, stream: &mut OracleQueryStream) -> Option<Arc<QueryStreamStall>> {
         let controller = self.state.query_stream_fault.as_ref()?;
         let kept = match controller.claim()? {
-            crate::state::QueryStreamFault::EofAfterSchema => 1,
-            crate::state::QueryStreamFault::EofAfterBatch => 2,
-            crate::state::QueryStreamFault::StallAfterSchema => {
+            QueryStreamFault::EofAfterSchema => 1,
+            QueryStreamFault::EofAfterBatch => 2,
+            QueryStreamFault::StallAfterSchema => {
                 let stall = controller.claim_stall()?;
                 stall.bind_resource_probe(stream.resource_probe_for_test());
                 return Some(stall);
             }
-            crate::state::QueryStreamFault::CaptureProbe => return None,
+            QueryStreamFault::CaptureProbe => return None,
         };
         let frames = std::mem::replace(&mut stream.frames, Box::pin(futures_util::stream::empty()));
         stream.frames = Box::pin(frames.take(kept));
@@ -355,11 +358,7 @@ impl BoundedQuery {
 /// budget it charges and the shape it produces.
 struct ResultCollector {
     /// Trusted cancellation routing and identity; absent only in pure decoder fixtures.
-    settlement: Option<(
-        crate::oracle::RunningQueryControls,
-        wyrd_spec::DataTenantId,
-        wyrd_spec::request_id::RequestId,
-    )>,
+    settlement: Option<(RunningQueryControls, DataTenantId, RequestId)>,
     /// Row ceiling this caller asked for. Exceeding it fails; nothing truncates.
     max_rows: usize,
     /// Exact compact-JSON byte ceiling for `{columns, rows, terminal}`.
@@ -368,7 +367,7 @@ struct ResultCollector {
     bytes: usize,
     /// Deterministic post-schema hold used only by cancellation journeys.
     #[cfg(feature = "test-support")]
-    stall: Option<Arc<crate::state::QueryStreamStall>>,
+    stall: Option<Arc<QueryStreamStall>>,
 }
 
 impl ResultCollector {
@@ -413,7 +412,7 @@ impl ResultCollector {
     ) -> Result<JsonValue, WyrdError> {
         let mut ipc = QueryIpcDecoder::new();
         let mut columns: Option<Vec<JsonValue>> = None;
-        let mut schema: Option<arrow::datatypes::SchemaRef> = None;
+        let mut schema: Option<SchemaRef> = None;
         let mut rows: Vec<JsonValue> = Vec::new();
         let mut decoded_rows = 0_u64;
         let mut terminal: Option<JsonValue> = None;
@@ -591,7 +590,7 @@ impl ResultCollector {
     ///
     /// Returns [`WyrdError::Internal`] when the value cannot be serialized, and
     /// [`ValaError::QueryResultTooLarge`] when charging it exceeds the ceiling.
-    fn charge<T: serde::Serialize + ?Sized>(&mut self, value: &T) -> Result<(), WyrdError> {
+    fn charge<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), WyrdError> {
         let measured = serde_json::to_vec(value).map_err(|error| WyrdError::Internal {
             message: format!("{QUERY} could not measure its own result: {error}"),
             details: serde_json::json!({ "tool": QUERY }),
@@ -624,7 +623,7 @@ impl ResultCollector {
 /// matter how many batches follow. Duplicate column names are preserved rather
 /// than deduplicated, which is why rows are positional arrays: an object row
 /// model cannot represent a result the engine can legally produce.
-fn project_columns(schema: &arrow::datatypes::Schema) -> Vec<JsonValue> {
+fn project_columns(schema: &Schema) -> Vec<JsonValue> {
     schema
         .fields()
         .iter()

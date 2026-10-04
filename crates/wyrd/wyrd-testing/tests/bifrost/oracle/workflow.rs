@@ -17,8 +17,12 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::extract::State;
+use reqwest::{Client, RequestBuilder, StatusCode};
+use secrecy::SecretString;
 use serde_json::{Value, json};
-use tokio::sync::watch;
+use tempfile::TempDir;
+use tokio::sync::watch::Sender;
+use url::Url;
 use wyrd_client::cards::Cards;
 use wyrd_server::config::BifrostTarget;
 use wyrd_spec::card::workflow::{WorkflowRun, WorkflowRunStatus};
@@ -298,7 +302,7 @@ impl TerminalCause {
 #[derive(Clone)]
 struct Ingress {
     /// Plain HTTP client for the public routes.
-    http: reqwest::Client,
+    http: Client,
     /// Ingress pod base URL.
     base: String,
     /// Access token of the tenant administrator.
@@ -312,13 +316,10 @@ impl Ingress {
     ///
     /// Returns a message when the pod serves no HTTP listener, or the
     /// exchange failure.
-    async fn new(
-        cluster: &PeerCluster,
-        api_key: &secrecy::SecretString,
-    ) -> Result<Self, JourneyError> {
+    async fn new(cluster: &PeerCluster, api_key: &SecretString) -> Result<Self, JourneyError> {
         let server = cluster.server(INGRESS)?;
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: Client::new(),
             base: server
                 .base_url()
                 .ok_or("the ingress pod serves no public HTTP listener")?
@@ -392,7 +393,7 @@ impl Ingress {
             .await?;
         let status = response.status();
         let body = response.text().await?;
-        if status != reqwest::StatusCode::ACCEPTED {
+        if status != StatusCode::ACCEPTED {
             return Err(format!("the run was not accepted: {status} {body}").into());
         }
         let run: WorkflowRun = serde_json::from_str(&body)?;
@@ -448,18 +449,18 @@ impl Ingress {
     /// # Errors
     ///
     /// Returns a message when the route answers anything but `200`.
-    async fn run(&self, request: reqwest::RequestBuilder) -> Result<WorkflowRun, JourneyError> {
+    async fn run(&self, request: RequestBuilder) -> Result<WorkflowRun, JourneyError> {
         let response = self.authorized(request).send().await?;
         let status = response.status();
         let body = response.text().await?;
-        if status != reqwest::StatusCode::OK {
+        if status != StatusCode::OK {
             return Err(format!("the run route refused: {status} {body}").into());
         }
         Ok(serde_json::from_str(&body)?)
     }
 
     /// Attach the administrator's access token.
-    fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn authorized(&self, request: RequestBuilder) -> RequestBuilder {
         request.header(ACCESS_TOKEN_HEADER, format!("Bearer {}", self.token))
     }
 }
@@ -470,8 +471,8 @@ impl Ingress {
 /// # Errors
 ///
 /// Returns the temporary directory or file write failure.
-fn query_workflow() -> Result<tempfile::TempDir, JourneyError> {
-    let bundle = tempfile::TempDir::new()?;
+fn query_workflow() -> Result<TempDir, JourneyError> {
+    let bundle = TempDir::new()?;
     let write = |file: &str, body: &str| std::fs::write(bundle.path().join(file), body);
     write(
         "prompt.yaml",
@@ -493,7 +494,7 @@ struct Script {
     /// Every request body in arrival order.
     calls: Mutex<Vec<Value>>,
     /// Number of requests received so far.
-    arrivals: watch::Sender<usize>,
+    arrivals: Sender<usize>,
     /// Assistant messages answered in order.
     replies: Mutex<VecDeque<Value>>,
 }
@@ -505,7 +506,7 @@ struct Script {
 /// stays in flight until it is cancelled or times out.
 struct Upstream {
     /// Origin every pod's gateway adapters are rooted at.
-    url: url::Url,
+    url: Url,
     /// State shared with the serving task.
     script: Arc<Script>,
 }
@@ -518,10 +519,10 @@ impl Upstream {
     /// Returns the bind failure.
     async fn start() -> Result<Self, JourneyError> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let url = url::Url::parse(&format!("http://{}", listener.local_addr()?))?;
+        let url = Url::parse(&format!("http://{}", listener.local_addr()?))?;
         let script = Arc::new(Script {
             calls: Mutex::default(),
-            arrivals: watch::Sender::new(0),
+            arrivals: Sender::new(0),
             replies: Mutex::default(),
         });
         let app = axum::Router::new()

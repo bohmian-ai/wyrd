@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sha2::{Digest as _, Sha256};
+use url::Url;
 use vala_bifrost_redux::oracle::OraclePreparationPause;
 use vala_bifrost_redux::oracle::analytical::{AnalyticalExecutePause, AnalyticalPhysicalEvidence};
 use wyrd_server::config::BifrostTarget;
@@ -104,7 +105,7 @@ impl PeerCluster {
     /// Returns the same errors as [`Self::start`].
     pub(crate) async fn start_with_gateway_provider_root(
         targets: &[BifrostTarget],
-        root: url::Url,
+        root: Url,
     ) -> Result<Self, JourneyError> {
         let pods: Vec<_> = targets.iter().map(|target| (*target, None)).collect();
         Self::launch(&pods, false, Some(root)).await
@@ -150,7 +151,7 @@ impl PeerCluster {
     async fn launch(
         pods: &[(BifrostTarget, Option<usize>)],
         delay_last: bool,
-        gateway_provider_root: Option<url::Url>,
+        gateway_provider_root: Option<Url>,
     ) -> Result<Self, JourneyError> {
         let targets: Vec<BifrostTarget> = pods.iter().map(|(target, _)| *target).collect();
         let mut spec = BifrostClusterSpec::for_targets(&targets);

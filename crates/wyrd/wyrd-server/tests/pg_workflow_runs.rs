@@ -14,13 +14,13 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, Uri};
 use chrono::Duration as ChronoDuration;
-use reqwest::{RequestBuilder, StatusCode};
+use reqwest::{Client, RequestBuilder, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::sync::watch;
+use tokio::sync::watch::Sender;
 use url::Url;
 use wyrd_auth_verify::WyrdAuthVerifySettings;
 use wyrd_client::WyrdClient;
@@ -92,9 +92,9 @@ struct Script {
     /// Every request in arrival order.
     calls: Mutex<Vec<UpstreamCall>>,
     /// Number of requests received so far.
-    arrivals: watch::Sender<usize>,
+    arrivals: Sender<usize>,
     /// While set, every response after that arrival count waits.
-    held: watch::Sender<Option<usize>>,
+    held: Sender<Option<usize>>,
     /// Assistant messages answered in order; `DONE` text once exhausted.
     replies: Mutex<VecDeque<Value>>,
 }
@@ -124,8 +124,8 @@ impl Upstream {
         .expect("upstream URL parses");
         let script = Arc::new(Script {
             calls: Mutex::default(),
-            arrivals: watch::Sender::new(0),
-            held: watch::Sender::new(None),
+            arrivals: Sender::new(0),
+            held: Sender::new(None),
             replies: Mutex::default(),
         });
         let app = axum::Router::new()
@@ -306,7 +306,7 @@ async fn message(
 /// own path, with the next scripted text.
 async fn generate(
     State(script): State<Arc<Script>>,
-    uri: axum::http::Uri,
+    uri: Uri,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Json<Value> {
@@ -383,7 +383,7 @@ struct Fixture {
     /// Scripted upstream behind the gateway and external bindings.
     upstream: Upstream,
     /// Plain HTTP client for the Workflow-run routes.
-    http: reqwest::Client,
+    http: Client,
     /// Server base URL.
     base: String,
     /// Tenant administrator who configures the gateway and registers Cards.
@@ -432,7 +432,7 @@ impl Fixture {
             base: server.base_url().expect("bound URL").to_owned(),
             server,
             upstream,
-            http: reqwest::Client::new(),
+            http: Client::new(),
             admin,
             runner,
         };

@@ -15,11 +15,17 @@
 //! within the configured retained-run ceilings.
 
 use std::collections::HashMap;
+#[cfg(feature = "test-support")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use tokio::sync::watch;
+use blake3::Hash;
+#[cfg(feature = "test-support")]
+use tokio::sync::Notify;
+use tokio::sync::watch::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
+use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tokio_util::task::task_tracker::TaskTrackerToken;
@@ -57,7 +63,7 @@ pub(crate) enum Admission {
     Replay(Box<WorkflowRun>),
     /// A preparation of the same request is in flight; its outcome is the
     /// answer.
-    Wait(watch::Receiver<Option<PreparationOutcome>>),
+    Wait(Receiver<Option<PreparationOutcome>>),
     /// This create owns a new preparation.
     Reserved(Reservation),
 }
@@ -67,14 +73,14 @@ enum KeyState {
     /// A preparation owns the key and one active slot.
     Preparing {
         /// BLAKE3 hash of the canonical request.
-        hash: blake3::Hash,
+        hash: Hash,
         /// Outcome the preparation publishes.
-        outcome: watch::Receiver<Option<PreparationOutcome>>,
+        outcome: Receiver<Option<PreparationOutcome>>,
     },
     /// The key names an accepted run.
     Accepted {
         /// BLAKE3 hash of the canonical request.
-        hash: blake3::Hash,
+        hash: Hash,
         /// The accepted run.
         run_id: WorkflowRunId,
     },
@@ -85,7 +91,7 @@ struct RunEntry {
     /// The key that created the run; its tenant and principal own the run.
     key: RunKey,
     /// The current complete snapshot, replaced whole on each transition.
-    snapshot: watch::Sender<WorkflowRun>,
+    snapshot: Sender<WorkflowRun>,
     /// Cancels the run's preparation, execution, and tool owners.
     cancel: CancellationToken,
     /// When the terminal snapshot was committed; `None` while active.
@@ -266,11 +272,7 @@ impl WorkflowRuns {
     /// different request, `WYRD_WORKFLOW_503_RUN_UNAVAILABLE` after shutdown
     /// began, and `WYRD_WORKFLOW_429_RUN_CAPACITY` when an active ceiling is
     /// full.
-    pub(crate) fn admit(
-        self: &Arc<Self>,
-        key: RunKey,
-        hash: blake3::Hash,
-    ) -> Result<Admission, WyrdError> {
+    pub(crate) fn admit(self: &Arc<Self>, key: RunKey, hash: Hash) -> Result<Admission, WyrdError> {
         let mut table = self.table();
         table.sweep(
             self.config.max_retained_per_tenant,
@@ -401,7 +403,7 @@ impl WorkflowRuns {
         tenant: DataTenantId,
         principal: PrincipalId,
         run_id: WorkflowRunId,
-    ) -> Result<watch::Receiver<WorkflowRun>, WyrdError> {
+    ) -> Result<Receiver<WorkflowRun>, WyrdError> {
         let mut table = self.table();
         table.sweep(
             self.config.max_retained_per_tenant,
@@ -419,7 +421,7 @@ impl WorkflowRuns {
     /// [`Self::admit`] either already holds its tracker token or refuses.
     /// Returns whether every task finished; the remaining tasks are left to
     /// process exit.
-    pub async fn drain(&self, deadline: tokio::time::Instant) -> bool {
+    pub async fn drain(&self, deadline: TokioInstant) -> bool {
         {
             let _table = self.table();
             self.admission.cancel();
@@ -478,9 +480,7 @@ impl WorkflowRuns {
     /// armed stall stops at whichever pass comes next and is consumed there.
     #[cfg(feature = "test-support")]
     pub fn stall_next_preparation_for_test(&self) {
-        self.preparation_gate
-            .armed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.preparation_gate.armed.store(true, Ordering::SeqCst);
     }
 
     /// Wait until the preparation armed by
@@ -503,7 +503,7 @@ impl WorkflowRuns {
     #[cfg(feature = "test-support")]
     pub(crate) async fn pass_preparation_gate_for_test(&self) {
         let gate = &self.preparation_gate;
-        if gate.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        if gate.armed.swap(false, Ordering::SeqCst) {
             gate.reached.notify_one();
             gate.released.notified().await;
         }
@@ -518,13 +518,13 @@ impl WorkflowRuns {
 #[derive(Default)]
 struct PreparationGate {
     /// Whether the next preparation stops.
-    armed: std::sync::atomic::AtomicBool,
+    armed: AtomicBool,
     /// Notified once a preparation has stopped.
-    reached: tokio::sync::Notify,
+    reached: Notify,
     /// Notified to let the stopped preparation continue.
-    released: tokio::sync::Notify,
+    released: Notify,
     /// Creates that joined an in-flight preparation as waiters so far.
-    joined: watch::Sender<usize>,
+    joined: Sender<usize>,
 }
 
 /// One in-flight preparation's ownership of its key and active slot.
@@ -537,9 +537,9 @@ pub(crate) struct Reservation {
     /// The reserved key.
     key: RunKey,
     /// BLAKE3 hash of the canonical request.
-    hash: blake3::Hash,
+    hash: Hash,
     /// Publishes the preparation outcome.
-    outcome: watch::Sender<Option<PreparationOutcome>>,
+    outcome: Sender<Option<PreparationOutcome>>,
     /// Cancels the preparation and, once accepted, the run.
     cancel: CancellationToken,
     /// Keeps [`WorkflowRuns::drain`] waiting until the reservation settles,
@@ -556,7 +556,7 @@ impl Reservation {
     }
 
     /// A receiver of this preparation's outcome.
-    pub(crate) fn outcome(&self) -> watch::Receiver<Option<PreparationOutcome>> {
+    pub(crate) fn outcome(&self) -> Receiver<Option<PreparationOutcome>> {
         self.outcome.subscribe()
     }
 
@@ -644,7 +644,7 @@ pub(crate) struct AcceptedRun {
     /// The run's tenant, whose active slot it holds.
     tenant: DataTenantId,
     /// The stored snapshot.
-    snapshot: watch::Sender<WorkflowRun>,
+    snapshot: Sender<WorkflowRun>,
 }
 
 impl AcceptedRun {

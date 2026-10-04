@@ -10,6 +10,7 @@ use opendal::Operator;
 use sqlx::Row;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+use url::Url;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::RoleTiming;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
@@ -142,7 +143,7 @@ pub struct BifrostClusterSpec {
     /// Oracle runtime bounds every Oracle node boots with, when not the defaults.
     oracle_runtime: Option<wyrd_server::config::OracleRuntimeConfig>,
     /// Local mock upstream every node's built-in gateway adapters reach.
-    gateway_provider_root: Option<url::Url>,
+    gateway_provider_root: Option<Url>,
 }
 
 impl BifrostClusterSpec {
@@ -214,7 +215,7 @@ impl BifrostClusterSpec {
     /// journey drives governed model calls on a cluster pod without reaching
     /// a real provider.
     #[must_use]
-    pub fn with_gateway_provider_root_for_test(mut self, root: url::Url) -> Self {
+    pub fn with_gateway_provider_root_for_test(mut self, root: Url) -> Self {
         self.gateway_provider_root = Some(root);
         self
     }
@@ -886,7 +887,7 @@ pub struct WyrdTestCluster {
     /// Oracle runtime bounds every node start and restart boots with.
     oracle_runtime: Option<wyrd_server::config::OracleRuntimeConfig>,
     /// Mock upstream root every node start and restart roots its gateway at.
-    gateway_provider_root: Option<url::Url>,
+    gateway_provider_root: Option<Url>,
     /// Scoped transport fault state.
     faults: OracleFaultController,
     /// Read-only process telemetry handle.

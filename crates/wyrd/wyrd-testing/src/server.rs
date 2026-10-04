@@ -68,7 +68,7 @@ use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
 use wyrd_server::config::{
     BifrostRuntimeConfig, BifrostRuntimeRole, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig,
     GatewayConfig, GatewayManagedSecretKeys, IssuerEntry, OperatorKeySource, OperatorKeysConfig,
-    ServeMode, WorkloadBindingEntry,
+    ServeMode, ServerWorkflowConfig, WorkloadBindingEntry,
 };
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
@@ -483,7 +483,7 @@ pub struct WyrdTestServerBuilder {
     /// Optional non-default edge limits applied to the composed `AppState`.
     limits: Option<wyrd_server::state::LimitsConfig>,
     /// Optional non-default Workflow run bounds and bindings.
-    workflow_config: Option<wyrd_server::config::ServerWorkflowConfig>,
+    workflow_config: Option<ServerWorkflowConfig>,
     /// Built-in provider base URLs of an attached HTTP gateway engine; `None`
     /// keeps the default engine that dispatches nothing.
     gateway_endpoints: Option<BuiltinEndpoints>,
@@ -3848,10 +3848,7 @@ impl WyrdTestServerBuilder {
     /// Compose the server with `config` as its Workflow run bounds and
     /// tenant-assigned external gateway bindings instead of the defaults.
     #[must_use]
-    pub fn with_workflow_config_for_test(
-        mut self,
-        config: wyrd_server::config::ServerWorkflowConfig,
-    ) -> Self {
+    pub fn with_workflow_config_for_test(mut self, config: ServerWorkflowConfig) -> Self {
         self.workflow_config = Some(config);
         self
     }

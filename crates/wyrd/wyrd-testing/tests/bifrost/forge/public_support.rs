@@ -100,10 +100,10 @@ pub(crate) async fn register_table(
     }
 }
 
-/// Opts one registered table into Forge compaction, due on every commit.
+/// Makes one registered table's Forge compaction due on every commit.
 ///
-/// Compaction is off by default, as in `RisingWave`; a table opts in through
-/// its own Iceberg properties. A snapshot-count trigger of one makes each
+/// Compaction is on for every table by default; the explicit opt-in only
+/// states the journey's intent. A snapshot-count trigger of one makes each
 /// promotion commit due on the next compactor pull, so a journey never waits
 /// out the hourly interval.
 ///

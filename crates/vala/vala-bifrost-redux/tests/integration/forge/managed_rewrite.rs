@@ -19,7 +19,10 @@ use vala_bifrost_redux::catalog::layout::FORGE_WRITER_RECIPE;
 use vala_bifrost_redux::forge::{ForgeClock, ForgeError, ForgeObjectStore, ForgeUnsettledOutput};
 
 use super::rewrite_support::{AttemptRun, PromotedRewriteFixture, RewriteOutputBreak};
-use super::support::{CountingObjectStore, PromotionCatalogSeam, SupervisedPromotion};
+use super::support::{
+    CountingObjectStore, PromotionCatalogSeam, SupervisedPromotion, remove_table_properties,
+    set_table_properties,
+};
 
 /// Runs one whole attempt over the promoted snapshot with no plan budget.
 ///
@@ -844,5 +847,240 @@ async fn compaction_publishes_replacements_without_deleting_inputs() {
     assert_eq!(
         deletes_before, 0,
         "nothing before the rewrite deleted either"
+    );
+}
+
+/// Rows in every staged object the small-files scenario seals.
+///
+/// Large enough that the incompressible `value` column dominates each object's
+/// size, so two staged objects merged are close to the sum of their sizes.
+const STAGED_ROWS: usize = 8192;
+
+/// Day, counted back from the fixture day, the small-files scenario seals into.
+///
+/// Clear of the fixture's own lone objects at days zero and one.
+const STAGED_DAY: i64 = 5;
+
+/// Returns the live data files whose row count is exactly `rows`.
+///
+/// The scenario's staged objects all carry [`STAGED_ROWS`] rows and a merged
+/// pair carries twice that, while the fixture's own lone objects carry two, so
+/// row count alone identifies each kind of file in the live cut.
+///
+/// # Panics
+///
+/// Panics when the live cut cannot be read.
+async fn live_files_with_rows(
+    promoted: &PromotedRewriteFixture,
+    rows: usize,
+) -> Vec<iceberg::spec::DataFile> {
+    let rows = u64::try_from(rows).expect("fixture row counts fit u64");
+    promoted
+        .live_data_files()
+        .await
+        .into_iter()
+        .filter(|file| file.record_count() == rows)
+        .collect()
+}
+
+/// Returns the object path of every file, in order.
+fn paths(files: &[iceberg::spec::DataFile]) -> BTreeSet<String> {
+    files
+        .iter()
+        .map(|file| file.file_path().to_owned())
+        .collect()
+}
+
+/// Returns the sorted `value` column of every file.
+///
+/// # Panics
+///
+/// Panics when an object cannot be read.
+async fn values(promoted: &PromotedRewriteFixture, files: &[iceberg::spec::DataFile]) -> Vec<i64> {
+    promoted
+        .object_values(&paths(files).into_iter().collect::<Vec<_>>())
+        .await
+}
+
+/// Runs one production promotion and then the compaction it makes due.
+///
+/// The fixture table is due on every commit, so each promotion is followed by
+/// a leader dispatch planned with the table's default compaction type.
+///
+/// # Panics
+///
+/// Panics when either attempt misses its bound or fails.
+async fn promote_then_compact(supervisor: &mut SupervisedPromotion) {
+    supervisor.restart_worker();
+    supervisor.run_one_success().await;
+    supervisor.restart_worker();
+    supervisor.run_one_success().await;
+}
+
+/// Declares a file target a quarter above two staged objects and returns its
+/// small-file threshold.
+///
+/// This is the scaled form of production's geometry: the 75% threshold sits
+/// above one staged object and below a merged pair. The quarter of headroom is
+/// needed because the writer rolls on written bytes plus its open row group's
+/// uncompressed estimate, so a target equal to the pair would roll the merge
+/// into two files. The row group keeps production's one-eighth of the target.
+///
+/// # Panics
+///
+/// Panics when a staged object is not below the threshold or the property
+/// commit fails.
+async fn scale_target_to_pair(
+    promoted: &PromotedRewriteFixture,
+    staged: &[iceberg::spec::DataFile],
+) -> u64 {
+    let staged_bytes: u64 = staged
+        .iter()
+        .map(iceberg::spec::DataFile::file_size_in_bytes)
+        .sum();
+    let target = staged_bytes * 5 / 4;
+    let row_group = target / 8;
+    let threshold = target / 100 * 75 + target % 100 * 75 / 100;
+    for file in staged {
+        assert!(
+            file.file_size_in_bytes() < threshold,
+            "a staged object is a small file: {} of {threshold}",
+            file.file_size_in_bytes()
+        );
+    }
+    set_table_properties(
+        &promoted.fixture.catalog,
+        &promoted.fixture.binding,
+        &[
+            ("write.target-file-size-bytes", &target.to_string()),
+            ("write.parquet.row-group-size-bytes", &row_group.to_string()),
+        ],
+    )
+    .await;
+    threshold
+}
+
+/// Staged files merge once, a finished file is never revisited, and a lone
+/// staged file waits for a partner.
+///
+/// Scaled geometry over real files through the production scheduler and
+/// worker, with the fixture's compaction type removed so the table plans with
+/// the default. The table target is set a quarter above two staged objects,
+/// so its 75% small-file threshold sits above one staged object and below a
+/// merged pair, as 768 MiB sits between a 512 MiB staged file and a 1 GiB
+/// output. Two staged objects
+/// in one day merge into one output that reaches the threshold, while the
+/// fixture's single-file days stay as they are. A third staged object alone
+/// beside that output is not rewritten. When a fourth arrives, the third and
+/// fourth merge and the first output stays live, untouched.
+///
+/// # Panics
+///
+/// Panics when a staged pair is not merged into one threshold-sized output,
+/// when a lone file or a finished output is rewritten, or when rows change.
+#[tokio::test]
+async fn small_files_merges_staged_pairs_once_and_lone_files_wait() {
+    let promoted = PromotedRewriteFixture::start_unpromoted("rewrite_small_files_once").await;
+    remove_table_properties(
+        &promoted.fixture.catalog,
+        &promoted.fixture.binding,
+        &["wyrd.forge.compaction.type"],
+    )
+    .await;
+    promoted
+        .fixture
+        .seal_partition_files(STAGED_DAY, STAGED_ROWS, 2, 0)
+        .await;
+    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let mut supervisor = SupervisedPromotion::start(
+        &promoted.fixture,
+        promoted.fixture.catalog.iceberg_catalog(),
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    supervisor.run_one_success().await;
+
+    let staged = live_files_with_rows(&promoted, STAGED_ROWS).await;
+    assert_eq!(staged.len(), 2, "both staged objects are promoted as-is");
+    let lone = paths(&live_files_with_rows(&promoted, 2).await);
+    assert_eq!(
+        lone.len(),
+        2,
+        "the fixture keeps one object in each of two days"
+    );
+    let threshold = scale_target_to_pair(&promoted, &staged).await;
+    let staged_values = values(&promoted, &staged).await;
+
+    supervisor.restart_worker();
+    supervisor.run_one_success().await;
+    let merged = live_files_with_rows(&promoted, 2 * STAGED_ROWS).await;
+    assert_eq!(merged.len(), 1, "the staged pair merges into one output");
+    let first_output = merged[0].file_path().to_owned();
+    assert!(
+        merged[0].file_size_in_bytes() >= threshold,
+        "the merged output reaches the small-file threshold: {} of {threshold}",
+        merged[0].file_size_in_bytes()
+    );
+    assert!(
+        live_files_with_rows(&promoted, STAGED_ROWS)
+            .await
+            .is_empty(),
+        "both staged inputs left the live cut"
+    );
+    assert_eq!(
+        paths(&live_files_with_rows(&promoted, 2).await),
+        lone,
+        "a file alone in its day is not rewritten"
+    );
+    assert_eq!(
+        values(&promoted, &merged).await,
+        staged_values,
+        "the merge carries every staged row exactly once"
+    );
+
+    let rows = u64::try_from(STAGED_ROWS).expect("fixture row counts fit u64");
+    promoted
+        .fixture
+        .seal_partition_files(STAGED_DAY, STAGED_ROWS, 1, 2 * rows)
+        .await;
+    promote_then_compact(&mut supervisor).await;
+    let waiting = live_files_with_rows(&promoted, STAGED_ROWS).await;
+    assert_eq!(
+        waiting.len(),
+        1,
+        "a staged object alone beside a finished output waits"
+    );
+    assert_eq!(
+        paths(&live_files_with_rows(&promoted, 2 * STAGED_ROWS).await),
+        BTreeSet::from([first_output.clone()]),
+        "a finished output is not rewritten with a lone staged object"
+    );
+
+    promoted
+        .fixture
+        .seal_partition_files(STAGED_DAY, STAGED_ROWS, 1, 3 * rows)
+        .await;
+    promote_then_compact(&mut supervisor).await;
+    supervisor.shutdown().await;
+    let outputs = live_files_with_rows(&promoted, 2 * STAGED_ROWS).await;
+    assert_eq!(
+        outputs.len(),
+        2,
+        "the waiting object merged with its partner"
+    );
+    assert!(
+        paths(&outputs).contains(&first_output),
+        "the first output is never selected again"
+    );
+    assert!(
+        live_files_with_rows(&promoted, STAGED_ROWS)
+            .await
+            .is_empty(),
+        "the waiting object and its partner left the live cut"
+    );
+    assert_eq!(
+        paths(&live_files_with_rows(&promoted, 2).await),
+        lone,
+        "single-file days still wait"
     );
 }

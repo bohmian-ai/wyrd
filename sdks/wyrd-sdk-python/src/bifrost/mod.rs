@@ -247,7 +247,7 @@ impl PyTableConfig {
     }
 
     /// The explicit Forge compaction type in its `snake_case` wire spelling,
-    /// declared or described; `None` compacts with the `full` default.
+    /// declared or described; `None` compacts with the `small_files` default.
     #[getter]
     fn compaction_type(&self) -> Option<String> {
         self.inner

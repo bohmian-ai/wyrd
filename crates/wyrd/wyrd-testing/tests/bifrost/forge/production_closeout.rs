@@ -159,8 +159,6 @@ struct GeometryProfile {
     /// Parquet row-group target, always below the file target so a rolled
     /// output necessarily contains more than one group.
     row_group_bytes: u64,
-    /// Compaction eligibility threshold this journey's Forge config uses.
-    small_file_threshold_bytes: u64,
     /// Whether the qualification sizing of the worker and Oracle pods applies.
     production_resources: bool,
 }
@@ -178,11 +176,6 @@ impl GeometryProfile {
         scribe_target_bytes: 4 * 1024 * 1024,
         iceberg_target_bytes: 8 * 1024 * 1024,
         row_group_bytes: 1024 * 1024,
-        // Just under the file target, as production's is: a packed residue that
-        // has not yet reached the target is still small, so the backlog keeps
-        // rolling instead of stalling on one intermediate output the next pass
-        // may no longer touch.
-        small_file_threshold_bytes: 7 * 1024 * 1024,
         production_resources: false,
     };
 
@@ -193,7 +186,6 @@ impl GeometryProfile {
         scribe_target_bytes: 512 * 1024 * 1024,
         iceberg_target_bytes: 1024 * 1024 * 1024,
         row_group_bytes: 128 * 1024 * 1024,
-        small_file_threshold_bytes: 768 * 1024 * 1024,
         production_resources: true,
     };
 
@@ -231,11 +223,7 @@ impl CloseoutJourney {
     /// # Panics
     /// Panics if the production topology cannot start or lacks its observer.
     async fn start() -> Self {
-        Self::start_with_config(ForgeConfig {
-            small_file_threshold_bytes: GeometryProfile::selected().small_file_threshold_bytes,
-            ..ForgeConfig::default()
-        })
-        .await
+        Self::start_with_config(ForgeConfig::default()).await
     }
 
     /// Starts the same role topology with the journey's maintenance policy.
@@ -2637,12 +2625,19 @@ async fn empty_maintenance_restart_protects_orphans() {
     let (leader, _) = journey.leaders()[0];
     let successor = if leader == first { second } else { first };
 
-    // Snapshot expiration is on by default and compaction off, so the table's
-    // only leader work is maintenance and it never owes a rewrite.
+    // Snapshot expiration is on by default; compaction is opted out, because
+    // the leader skips the orphan sweep for a table that owes a rewrite. The
+    // table's only leader work is maintenance and it never owes a rewrite.
     let table = register_table(
         journey.node(leader),
         journey.tenant,
         &unique_table("cold_restart"),
+    )
+    .await;
+    set_table_properties(
+        journey.node(leader),
+        &table.binding,
+        &[("wyrd.forge.enable-compaction", "false")],
     )
     .await;
     for values in [&[1, 2][..], &[3, 4]] {
@@ -2829,7 +2824,7 @@ async fn compactors_pull_oldest_due_with_capacity() {
     assert_eq!(pulled_keys(&peer), keys[..2], "the two oldest due tables");
     assert!(
         peer.iter()
-            .all(|dispatch| dispatch.compaction_type == ForgeCompactionType::Full),
+            .all(|dispatch| dispatch.compaction_type == ForgeCompactionType::SmallFiles),
         "a dispatch names the table and its task type, never files: {peer:?}"
     );
     let local = forge(leader).pull_compaction(2).await.expect("local pull");

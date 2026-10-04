@@ -518,6 +518,32 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
     let tenant = cluster.data_tenant_id();
     let table = unique_table("oracle_two_tier");
     register_table(ingest_server, tenant, &table).await?;
+    // Compaction is on for every table by default. This journey measures the
+    // promoted files exactly as Scribe sealed them, so a background rewrite
+    // between its baseline and selective queries would change the cut under
+    // measurement; the table opts out.
+    let catalog = ingest_server
+        .state()
+        .bifrost_catalog()
+        .ok_or("Scribe composition retains the shared catalog")?
+        .iceberg_catalog();
+    let binding = vala_bifrost_redux::catalog::TenantTableBinding::resolve((
+        tenant,
+        vala_bifrost_redux::catalog::TableRef::new(
+            vala_bifrost_redux::namespaces::BifrostNamespace::Bifrost,
+            &table,
+        ),
+    ))?;
+    let loaded = catalog.load_table(&binding.table_ident()).await?;
+    let tx = iceberg::transaction::Transaction::new(&loaded);
+    let tx = iceberg::transaction::ApplyTransactionAction::apply(
+        tx.update_table_properties().set(
+            "wyrd.forge.enable-compaction".to_owned(),
+            "false".to_owned(),
+        ),
+        tx,
+    )?;
+    tx.commit_once(catalog.as_ref()).await?;
     let rows = writer(ingest_server, "two-tier-writer").await?;
     let table_fqn = format!("vala.bifrost.{table}");
 

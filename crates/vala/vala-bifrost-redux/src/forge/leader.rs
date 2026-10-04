@@ -780,7 +780,11 @@ mod tests {
             "the configured count dispatches early"
         );
 
-        schedule.request_compaction(&key("manual"), &ForgeTableSettings::default(), start);
+        let opted_out = ForgeTableSettings {
+            compaction_enabled: false,
+            ..ForgeTableSettings::default()
+        };
+        schedule.request_compaction(&key("manual"), &opted_out, start);
         let manual = schedule.pull(4, start);
         assert_eq!(
             manual.len(),
@@ -925,6 +929,7 @@ mod tests {
         let schedule = ForgeSchedule::new(DEFAULT_REPORT_TIMEOUT);
         commit(&schedule, "t", 1, &enabled(10, usize::MAX), start);
         let disabled = ForgeTableSettings {
+            compaction_enabled: false,
             manifest_rewrite_enabled: true,
             ..ForgeTableSettings::default()
         };

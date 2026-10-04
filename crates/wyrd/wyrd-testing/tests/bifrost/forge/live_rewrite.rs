@@ -1316,6 +1316,15 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     let shared_name = unique_table("rewrite_recovery");
     let shared = register_table(server, owner, &shared_name).await;
     let neighbour_shared = register_table(server, neighbour, &shared_name).await;
+    // Compaction is on for every table by default; the neighbour's tables opt
+    // out so the only rewrite in flight is the owner's, which is the one the
+    // injected uncertainty must land on.
+    set_table_properties(
+        server,
+        &neighbour_shared.binding,
+        &[("wyrd.forge.enable-compaction", "false")],
+    )
+    .await;
     // The owner's table compacts on RisingWave's interval rule alone, so its
     // promotions accumulate commits and the rewrite becomes due only when this
     // journey moves the Forge clock past the interval, after arming uncertainty.
@@ -1337,6 +1346,12 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         "one logical name must resolve to two disjoint physical tables"
     );
     let neighbour_only = register_table(server, neighbour, &unique_table("neighbour_only")).await;
+    set_table_properties(
+        server,
+        &neighbour_only.binding,
+        &[("wyrd.forge.enable-compaction", "false")],
+    )
+    .await;
     let owner_client = tenant_client(server, owner).await;
     let neighbour_client = tenant_client(server, neighbour).await;
 
@@ -1346,7 +1361,7 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     let mut owner_expected: Vec<ManagedRow> = Vec::new();
     let owner_values: Vec<i64> = (0..24).collect();
     let neighbour_values: Vec<i64> = (1_000..1_024).collect();
-    // Each neighbour table has one file, so it owes no independent small-file
+    // Each neighbour table has compaction opted out, so it owes no independent
     // rewrite while we assert its exact cut survives the owner's recovery.
     let neighbour_shared_expected = canonical_order(
         append_values(
@@ -2272,6 +2287,109 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
     }
 }
 
+/// A table registered through the public client with no options is compacted.
+///
+/// Compaction is on for every table by default, so the journey registers one
+/// table with nothing but its schema, never touches its Iceberg properties,
+/// and proves the table declares no Forge setting at all. Two flushed public
+/// appends are promoted by the pod's own Forge; the leader then owes the table
+/// nothing until the default one-hour interval has passed since its first
+/// commit, after which it dispatches the rewrite. The committed rewrite
+/// replaces the promoted inputs and the public read returns exactly the
+/// acknowledged rows.
+///
+/// # Panics
+///
+/// Panics when the pod cannot start, a public call fails, the table declares a
+/// Forge property, Forge leaves work owed or commits no rewrite, or the rows
+/// differ.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn property_less_public_table_is_compacted_by_default() {
+    let cluster = WyrdTestCluster::start_with_embedded_forge_observer()
+        .await
+        .expect("one bound embedded Bifrost pod starts");
+    cluster.lead_forge_for_test().await;
+    let observer = cluster
+        .forge_completion_observer()
+        .expect("the journey pod carries a Forge completion observer");
+    let server = cluster.server(0).expect("the embedded pod is running");
+    let tenant = cluster.data_tenant_id();
+    let client = tenant_client(server, tenant).await;
+    let name = unique_table("default_compaction");
+    let table = JourneyTable {
+        qualified: format!("vala.datasets.{name}"),
+        name: name.clone(),
+        binding: TenantTableBinding::resolve((
+            tenant,
+            vala_bifrost_redux::catalog::TableRef::new(
+                vala_bifrost_redux::namespaces::BifrostNamespace::Datasets,
+                &name,
+            ),
+        ))
+        .expect("the journey table resolves to its physical binding"),
+    };
+    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+    ]));
+    let config = wyrd_client::bifrost::TableConfig::from_arrow(&table.qualified, schema)
+        .expect("the journey schema is a table config");
+    assert_eq!(
+        wyrd_client::Bifrost::connect_with_table(&client, config)
+            .await
+            .expect("the public Bifrost client connects")
+            .register()
+            .await
+            .expect("option-less registration"),
+        RegisterOutcome::Created
+    );
+    let properties = server
+        .bifrost_catalog()
+        .iceberg_catalog()
+        .load_table(&table.binding.table_ident())
+        .await
+        .expect("the journey table loads through the production catalog")
+        .metadata()
+        .properties()
+        .clone();
+    assert!(
+        !properties.keys().any(|key| key.starts_with("wyrd.forge.")),
+        "an option-less registration declares no Forge setting: {properties:?}"
+    );
+
+    let mut rows = Vec::new();
+    for half in 0..2_i64 {
+        let values: Vec<i64> = (half * 8..half * 8 + 8).collect();
+        rows.extend(append_values(&client, &table.qualified, Uuid::now_v7(), &values).await);
+        server
+            .flush_bifrost()
+            .await
+            .expect("the pod publishes its staged rows");
+    }
+    let expected = canonical_order(rows);
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1))
+        .expect("the written partition closes");
+    drain_forge_backlog(&cluster, &observer, &[tenant]).await;
+    let promoted = live_cut(&cluster, &table.binding).await;
+    assert!(
+        rewrite_targets(&cluster, &table.binding).await.is_empty(),
+        "no rewrite runs before the default interval"
+    );
+    server
+        .forge_clock()
+        .advance(chrono::Duration::hours(1))
+        .expect("the default compaction interval passes");
+    await_committed_rewrites(&cluster, &observer, &[&table.binding]).await;
+    assert_ne!(
+        live_cut(&cluster, &table.binding).await.data,
+        promoted.data,
+        "the rewrite outputs replaced the promoted inputs"
+    );
+    assert_public_rows(&client, &table, &expected, "after default compaction").await;
+}
+
 /// Reads the compaction type of every leader-dispatched Forge task of one table.
 ///
 /// A leader dispatch writes its table's type into the claimed attempt's plan
@@ -2299,17 +2417,19 @@ async fn dispatched_compaction_types(
 }
 
 /// A caller-declared compaction type is stored, described, fenced, and
-/// dispatched by Forge, while an undeclared table is dispatched `full`.
+/// dispatched by Forge, while an undeclared table is dispatched with the
+/// `small-files` default.
 ///
 /// Both tables are registered through the public client. The declared table
-/// stores `small-files` as its `wyrd.forge.compaction.type` Iceberg property
-/// and describes it back as `small_files`; re-registering it with the same
-/// type or with none is idempotent, and a different type is refused with
+/// declares `full`, the type that differs from the default, stores it as its
+/// `wyrd.forge.compaction.type` Iceberg property and describes it back;
+/// re-registering it with the same type or with none is idempotent, and a
+/// different type is refused with
 /// `WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH` without changing it. The
 /// undeclared table stores no type. Each table then receives two flushed
 /// public appends, and the pod's own Forge promotes and rewrites them: every
-/// dispatched attempt of the declared table names `small-files`, every one of
-/// the undeclared table names `full`, and both read back exactly.
+/// dispatched attempt of the declared table names `full`, every one of the
+/// undeclared table names `small-files`, and both read back exactly.
 ///
 /// # Panics
 ///
@@ -2363,7 +2483,7 @@ async fn compaction_type_registers_describes_and_steers_forge_dispatch() {
         }
     };
     assert_eq!(
-        register(&declared, Some(CompactionTypeWire::SmallFiles))
+        register(&declared, Some(CompactionTypeWire::Full))
             .await
             .expect("declared registration"),
         RegisterOutcome::Created
@@ -2401,14 +2521,11 @@ async fn compaction_type_registers_describes_and_steers_forge_dispatch() {
                 .cloned()
         }
     };
-    assert_eq!(
-        described(&declared).await,
-        Some(CompactionTypeWire::SmallFiles)
-    );
+    assert_eq!(described(&declared).await, Some(CompactionTypeWire::Full));
     assert_eq!(described(&undeclared).await, None);
     assert_eq!(
         stored_type(&declared).await.as_deref(),
-        Some("small-files"),
+        Some("full"),
         "the declared type is stored in Forge's own property spelling"
     );
     assert_eq!(
@@ -2417,7 +2534,7 @@ async fn compaction_type_registers_describes_and_steers_forge_dispatch() {
         "an omitted type writes no Iceberg property"
     );
     assert_eq!(
-        register(&declared, Some(CompactionTypeWire::SmallFiles))
+        register(&declared, Some(CompactionTypeWire::Full))
             .await
             .expect("same-value registration"),
         RegisterOutcome::AlreadyExists
@@ -2428,7 +2545,7 @@ async fn compaction_type_registers_describes_and_steers_forge_dispatch() {
             .expect("omitted-on-existing registration"),
         RegisterOutcome::AlreadyExists
     );
-    let conflict = register(&declared, Some(CompactionTypeWire::Full))
+    let conflict = register(&declared, Some(CompactionTypeWire::SmallFiles))
         .await
         .expect_err("a different type is refused");
     let wyrd_client::bifrost::BifrostClientError::Transport(conflict) = conflict else {
@@ -2439,10 +2556,7 @@ async fn compaction_type_registers_describes_and_steers_forge_dispatch() {
         ("WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH", 409),
         "the conflict is the typed mismatch refusal"
     );
-    assert_eq!(
-        described(&declared).await,
-        Some(CompactionTypeWire::SmallFiles)
-    );
+    assert_eq!(described(&declared).await, Some(CompactionTypeWire::Full));
 
     let mut expected = BTreeMap::new();
     for table in [&declared, &undeclared] {
@@ -2469,7 +2583,7 @@ async fn compaction_type_registers_describes_and_steers_forge_dispatch() {
     )
     .await;
 
-    for (table, dispatched) in [(&declared, "small-files"), (&undeclared, "full")] {
+    for (table, dispatched) in [(&declared, "full"), (&undeclared, "small-files")] {
         let types = dispatched_compaction_types(&cluster, tenant, table).await;
         assert!(
             !types.is_empty() && types.iter().all(|kind| kind == dispatched),

@@ -292,7 +292,7 @@ class TableConfig:
     def compaction_type(self) -> str | None:
         """The explicit Forge compaction type (``auto``, ``full``,
         ``small_files`` or ``files_with_delete``), or ``None`` for the
-        ``full`` default."""
+        ``small_files`` default."""
 
         value = self._native.compaction_type
         return None if value is None else str(value)

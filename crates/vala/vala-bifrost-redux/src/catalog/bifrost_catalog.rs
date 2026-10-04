@@ -1771,7 +1771,7 @@ fn explicit_compaction_target(
 
 /// Reads the explicit compaction type a physical table stores.
 ///
-/// `None` means the table declares none and Forge compacts it `full`.
+/// `None` means the table declares none and Forge plans its `small-files` default.
 ///
 /// # Errors
 /// Returns [`BifrostCatalogError::MetadataMismatch`] when the stored property
@@ -1798,7 +1798,7 @@ fn explicit_compaction_type(
 /// new table's explicit Iceberg property in its create transaction, and on a
 /// re-registration must equal the stored explicit value. An omitted option
 /// stores nothing and never conflicts, so the table follows Forge's default
-/// (the deployment file target, the `full` type). [`Default`] declares
+/// (the deployment file target, the `small-files` type). [`Default`] declares
 /// nothing, which is how built-ins register.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CompactionRegistration {
@@ -1976,7 +1976,7 @@ mod tests {
     /// A declared compaction type is written under Forge's own property in
     /// the hyphenated spelling Forge parses back to the same type, every wire
     /// value round-trips through the Forge type, and an empty declaration
-    /// writes nothing so Forge keeps its `full` default.
+    /// writes nothing so Forge keeps its `small-files` default.
     ///
     /// # Panics
     /// Panics when a written property is missing, misspelled, or does not
@@ -2019,7 +2019,7 @@ mod tests {
             ForgeTableSettings::from_properties(&empty)
                 .expect("defaults parse")
                 .compaction_type,
-            ForgeCompactionType::Full
+            ForgeCompactionType::SmallFiles
         );
     }
 

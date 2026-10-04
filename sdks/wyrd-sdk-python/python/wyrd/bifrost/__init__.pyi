@@ -188,7 +188,7 @@ class TableConfig:
         ...
     @property
     def compaction_type(self) -> str | None:
-        """The explicit Forge compaction type, or ``None`` for the ``full`` default."""
+        """The explicit Forge compaction type, or ``None`` for the ``small_files`` default."""
         ...
     @property
     def resolved(self) -> ResolvedTable | None:

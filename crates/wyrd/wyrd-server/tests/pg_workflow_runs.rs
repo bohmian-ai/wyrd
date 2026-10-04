@@ -7,7 +7,7 @@
 //! each request and can hold every response, so a journey acts while steps are
 //! in flight without sleeping for them.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -386,10 +386,7 @@ impl Fixture {
     /// # Panics
     /// Panics when the exchange fails.
     async fn token(&self, principal: &Principal) -> String {
-        self.server
-            .exchange_api_key(principal.api_key())
-            .await
-            .expect("api key exchanges")
+        self.token_of(&principal.bootstrap).await
     }
 
     /// Submit the provider key and one `openai/gpt-5-5` deployment as the
@@ -443,7 +440,27 @@ impl Fixture {
     /// # Panics
     /// Panics when the client cannot build or registration fails.
     async fn register(&self, workflow: &Path) {
-        let token = self.token(&self.admin).await;
+        self.register_as(&self.token(&self.admin).await, workflow)
+            .await;
+    }
+
+    /// Register the bundle rooted at `workflow` through the shared Rust
+    /// client, in the tenant of the administrator `token` authenticates.
+    ///
+    /// # Panics
+    /// Panics when the client cannot build or registration fails.
+    async fn register_as(&self, token: &str, workflow: &Path) {
+        let cards = Cards::with_client(self.client(token));
+        Box::pin(cards.register_from_path(workflow))
+            .await
+            .unwrap_or_else(|error| panic!("{} registers: {error}", workflow.display()));
+    }
+
+    /// A shared Rust client of this server authenticated by `token`.
+    ///
+    /// # Panics
+    /// Panics when the client cannot build.
+    fn client(&self, token: &str) -> WyrdClient {
         let config = ClientConfig {
             http: HttpConfig {
                 base_url: self.base.clone(),
@@ -453,15 +470,79 @@ impl Fixture {
         };
         let auth = AuthMiddleware::new(
             &config,
-            ResolvedCredential::BearerToken(SecretString::from(token)),
+            ResolvedCredential::BearerToken(SecretString::from(token.to_owned())),
         )
         .expect("client auth builds");
         let transport =
             HttpTransport::new(&config.http, Arc::clone(&auth)).expect("transport builds");
-        Cards::with_client(WyrdClient::from_parts(auth, transport, config.grpc))
-            .register_from_path(workflow)
+        WyrdClient::from_parts(auth, transport, config.grpc)
+    }
+
+    /// Seed another tenant and bootstrap an administrator in it, whose
+    /// token authenticates against that tenant alone.
+    ///
+    /// # Panics
+    /// Panics when the tenant, principal, or exchange cannot be set up.
+    async fn foreign_admin(&self, name: &str) -> Principal {
+        let tenant = self
+            .server
+            .seed_tenant(&format!("{name}-{}", uuid::Uuid::now_v7().simple()))
             .await
-            .unwrap_or_else(|error| panic!("{} registers: {error}", workflow.display()));
+            .expect("second tenant seeds");
+        let bootstrap = self
+            .server
+            .bootstrap_service_in_tenant(tenant, name, &["admin"])
+            .await
+            .expect("foreign administrator bootstraps");
+        let token = self.token_of(&bootstrap).await;
+        Principal { bootstrap, token }
+    }
+
+    /// A foreign administrator whose tenant has the bundle rooted at
+    /// `workflow` registered and no gateway deployment, so its runs are
+    /// accepted and then fail at their first model call.
+    ///
+    /// # Panics
+    /// Panics when the tenant or registration cannot be set up.
+    async fn foreign_runner(&self, name: &str, workflow: &Path) -> Principal {
+        let foreign = self.foreign_admin(name).await;
+        self.register_as(&foreign.token, workflow).await;
+        foreign
+    }
+
+    /// A fresh access token for `bootstrap`'s key.
+    ///
+    /// # Panics
+    /// Panics when the exchange fails.
+    async fn token_of(&self, bootstrap: &Bootstrap) -> String {
+        self.server
+            .exchange_api_key(bootstrap.api_key().expect("service principals carry a key"))
+            .await
+            .expect("api key exchanges")
+    }
+
+    /// Soft-delete `kind` Card `name@1.0.0` in `engineering` as the
+    /// administrator, deactivating it.
+    ///
+    /// # Panics
+    /// Panics when the delete is refused.
+    async fn delete_card(&self, kind: &str, name: &str) {
+        let (status, body) = send(
+            self.http
+                .delete(format!("{}/v1/cards/by-ref", self.base))
+                .query(&[
+                    ("kind", kind),
+                    ("space", "engineering"),
+                    ("name", name),
+                    ("version", "1.0.0"),
+                ])
+                .header(
+                    ACCESS_TOKEN_HEADER,
+                    format!("Bearer {}", self.token(&self.admin).await),
+                ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{kind} {name} deletes: {body}");
     }
 
     /// The create request for `key` and raw `body` as `token`.
@@ -852,15 +933,67 @@ fn step_status(run: &WorkflowRun, step: &str) -> WorkflowStepStatus {
         .status
 }
 
+/// The tool results the model received in `call`, by tool call id, each
+/// decoded from its JSON content.
+fn tool_results(call: &UpstreamCall) -> HashMap<String, Value> {
+    call.body["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|message| message["role"] == "tool")
+        .map(|message| {
+            let content = &message["content"];
+            (
+                message["tool_call_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                content
+                    .as_str()
+                    .and_then(|text| serde_json::from_str(text).ok())
+                    .unwrap_or_else(|| content.clone()),
+            )
+        })
+        .collect()
+}
+
+/// The stable code of the failed tool result `id` in `results`.
+///
+/// # Panics
+/// Panics when `id` has no result or its result carries no code.
+#[track_caller]
+fn tool_code<'a>(results: &'a HashMap<String, Value>, id: &str) -> &'a str {
+    results
+        .get(id)
+        .and_then(|result| result["code"].as_str())
+        .unwrap_or_else(|| panic!("tool call {id} failed with a code: {results:?}"))
+}
+
+/// Assert every step of `run` has left pending and running.
+///
+/// # Panics
+/// Panics when a step is still pending or running.
+#[track_caller]
+fn assert_complete(run: &WorkflowRun) {
+    assert!(
+        run.steps.values().all(|step| !matches!(
+            step.status,
+            WorkflowStepStatus::Pending | WorkflowStepStatus::Running
+        )),
+        "{run:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 /// Every refusal of a create happens before any run exists or any provider
 /// or tool is called. Unauthenticated callers are refused first; principals
 /// without `workflows:run` (reader, runtime_admin) are refused and audited
 /// before any run lookup; request-shape, route-override, and timeout errors
 /// are refused before authorization; an unknown version, a native route,
-/// undeclarable tools, an unbound external route, an oversized input, and a
-/// full tenant are refused after an audited allow; and an unrecordable
-/// decision refuses the create. Writer, agent, and admin principals are
+/// undeclarable tools, an unbound external route, an oversized input, a
+/// deleted root, and a full tenant are refused after an audited allow; an
+/// unrecordable decision refuses the create; and another tenant's
+/// administrator cannot name this tenant's Workflow at all. Writer, agent, and admin principals are
 /// accepted, with live gateway grants still applying to the run.
 ///
 /// # Panics
@@ -877,10 +1010,12 @@ async fn admission_is_audited_and_side_effect_free_on_refusal() {
         ("shell-review", "[shell.exec]", WYRD_GATEWAY),
         ("twice-review", "[cards.get, cards.get]", WYRD_GATEWAY),
         ("external-review", "[]", external.as_str()),
+        ("retired-review", "[]", WYRD_GATEWAY),
     ] {
         let bundle = single_step(name, tools, route, 0);
         fixture.register(&bundle.path().join("workflow.yaml")).await;
     }
+    fixture.delete_card("Workflow", "retired-review").await;
     let reader = fixture.principal("workflow-reader", &["reader"]).await;
     let runtime_admin = fixture
         .principal("workflow-runtime-admin", &["runtime_admin"])
@@ -995,6 +1130,11 @@ async fn admission_is_audited_and_side_effect_free_on_refusal() {
             StatusCode::PAYLOAD_TOO_LARGE,
             "WYRD_WORKFLOW_413_INPUT_TOO_LARGE",
         ),
+        (
+            run_request("retired-review", "x"),
+            StatusCode::NOT_FOUND,
+            "WYRD_REGISTRY_404_CARD_NOT_FOUND",
+        ),
     ];
     let mut runner_allowed = authorized_refusals.len();
     for (body, status, code) in authorized_refusals {
@@ -1017,6 +1157,12 @@ async fn admission_is_audited_and_side_effect_free_on_refusal() {
         fixture.get(runner, &unknown).await,
         StatusCode::NOT_FOUND,
         "WYRD_WORKFLOW_404_RUN_NOT_FOUND",
+    );
+    let foreign = fixture.foreign_admin("workflow-foreign").await;
+    problem(
+        fixture.create(&foreign.token, &new_key(), &request).await,
+        StatusCode::NOT_FOUND,
+        "WYRD_REGISTRY_404_CARD_NOT_FOUND",
     );
     assert_eq!(
         fixture.upstream.arrivals(),
@@ -1089,7 +1235,12 @@ async fn admission_is_audited_and_side_effect_free_on_refusal() {
 /// while another principal's identical key is its own run that the first
 /// principal cannot see. A failed preparation caches nothing and frees its
 /// slot, so the same key later succeeds. A creator that disconnects
-/// mid-preparation strands nothing: a waiter and the run see it through.
+/// mid-preparation strands nothing: a waiter and the run see it through. A
+/// waiter that disconnects leaves the owner and the other waiter answered
+/// with the one run, a create whose acceptance answer was lost recovers its
+/// run by key without a second execution, another tenant's identical key is
+/// a separate invisible run, and shutdown during a preparation answers its
+/// creator and every waiter once with the unavailable error.
 ///
 /// # Panics
 /// Panics when any status, run identity, or upstream call count differs.
@@ -1204,6 +1355,109 @@ async fn tracked_preparation_replay_and_disconnect() {
     let recovered = fixture.terminal(runner, &run_of(recovered)).await;
     assert_eq!(recovered.status, WorkflowRunStatus::Succeeded);
     assert_eq!(fixture.upstream.arrivals(), 10);
+
+    // A waiter that gives up leaves the preparation and its other waiter
+    // alone.
+    let joins = workflows.preparation_joins_for_test();
+    workflows.stall_next_preparation_for_test();
+    let shared_key = new_key();
+    let owner = tokio::spawn(send(fixture.create_request(runner, &shared_key, &request)));
+    tokio::time::timeout(PATIENCE, workflows.wait_preparation_stall_for_test())
+        .await
+        .expect("the owner's preparation stops at the gate");
+    let quitter = tokio::spawn(send(fixture.create_request(runner, &shared_key, &request)));
+    let stayer = tokio::spawn(send(fixture.create_request(runner, &shared_key, &request)));
+    tokio::time::timeout(PATIENCE, workflows.wait_preparation_joins_for_test(joins + 2))
+        .await
+        .expect("both waiters join the preparation");
+    quitter.abort();
+    assert!(quitter.await.is_err(), "the quitting waiter disconnected");
+    workflows.release_preparation_for_test();
+    let (status, owned) = owner.await.expect("the owner answers");
+    assert_eq!(status, StatusCode::ACCEPTED, "{owned}");
+    let (status, stayed) = stayer.await.expect("the remaining waiter answers");
+    assert_eq!(status, StatusCode::OK, "{stayed}");
+    let owned = run_of(owned);
+    assert_eq!(run_of(stayed).run_id, owned.run_id);
+    assert_eq!(
+        fixture.terminal(runner, &owned).await.status,
+        WorkflowRunStatus::Succeeded
+    );
+    assert_eq!(fixture.upstream.arrivals(), 13);
+
+    // A create whose acceptance answer is lost after its run started is
+    // recovered by the same key without a second run.
+    fixture.upstream.hold();
+    let lost_key = new_key();
+    let lost = tokio::spawn(send(fixture.create_request(runner, &lost_key, &request)));
+    fixture.upstream.wait_arrivals(15).await;
+    lost.abort();
+    let _ = lost.await;
+    let (status, found) = fixture.create(runner, &lost_key, &request).await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    let found = run_of(found);
+    fixture.upstream.release();
+    assert_eq!(
+        fixture.terminal(runner, &found).await.status,
+        WorkflowRunStatus::Succeeded
+    );
+    assert_eq!(fixture.upstream.arrivals(), 16, "exactly one run executed");
+
+    // The key is scoped to its tenant: another tenant's identical key is its
+    // own run, invisible across the boundary in both directions.
+    let foreign = fixture
+        .foreign_runner("workflow-replay-foreign", &code_review())
+        .await;
+    let (status, foreign_run) = fixture.create(&foreign.token, &key, &request).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{foreign_run}");
+    let foreign_run = run_of(foreign_run);
+    assert_ne!(foreign_run.run_id, first.run_id);
+    let hidden = "WYRD_WORKFLOW_404_RUN_NOT_FOUND";
+    problem(
+        fixture.get(runner, &foreign_run.run_id.to_string()).await,
+        StatusCode::NOT_FOUND,
+        hidden,
+    );
+    problem(
+        fixture.get(&foreign.token, &first.run_id.to_string()).await,
+        StatusCode::NOT_FOUND,
+        hidden,
+    );
+    assert_eq!(
+        fixture.terminal(&foreign.token, &foreign_run).await.status,
+        WorkflowRunStatus::Failed,
+        "the foreign tenant has no deployment of its own"
+    );
+    assert_eq!(fixture.upstream.arrivals(), 16);
+
+    // Shutdown during a preparation wakes its creator and every waiter
+    // exactly once, each with the unavailable answer, and starts no run.
+    let workflows = Arc::clone(workflows);
+    let joins = workflows.preparation_joins_for_test();
+    workflows.stall_next_preparation_for_test();
+    let doomed_key = new_key();
+    let creator = tokio::spawn(send(fixture.create_request(runner, &doomed_key, &request)));
+    tokio::time::timeout(PATIENCE, workflows.wait_preparation_stall_for_test())
+        .await
+        .expect("the doomed preparation stops at the gate");
+    let waiters: Vec<_> = (0..2)
+        .map(|_| tokio::spawn(send(fixture.create_request(runner, &doomed_key, &request))))
+        .collect();
+    tokio::time::timeout(PATIENCE, workflows.wait_preparation_joins_for_test(joins + 2))
+        .await
+        .expect("both waiters join the doomed preparation");
+    tokio::time::timeout(PATIENCE, fixture.server.shutdown_and_inspect())
+        .await
+        .expect("shutdown finishes")
+        .expect("Workflow runs drained within the shutdown deadline");
+    for answer in std::iter::once(creator).chain(waiters) {
+        problem(
+            answer.await.expect("each create answers once"),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "WYRD_WORKFLOW_503_RUN_UNAVAILABLE",
+        );
+    }
+    assert_eq!(fixture.upstream.arrivals(), 16, "the doomed preparation started nothing");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1213,7 +1467,11 @@ async fn tracked_preparation_replay_and_disconnect() {
 /// needs current authentication and permission — an expired token is
 /// refused, a token minted without the grant is denied for read, cancel,
 /// and replay — and a restored grant reads the run and replays it without
-/// starting another.
+/// starting another. The pinned run finishes although its root Workflow is
+/// deleted mid-run, after which a new create of that root is refused. A
+/// later step still obeys the gateway's current eligibility: once the
+/// deployment's credential is revoked, it fails without reaching the
+/// provider.
 ///
 /// # Panics
 /// Panics when any status, run outcome, upstream call count, or gateway
@@ -1227,6 +1485,10 @@ async fn accepted_authority_outlives_submission_only() {
             })
     })
     .await;
+    let credential = code_review_variant("credential-review", |yaml| yaml);
+    fixture
+        .register(&credential.path().join("workflow.yaml"))
+        .await;
     let request = run_request("code-review", "fn authority() {}");
     let submitted = fixture.token(&fixture.runner).await;
     fixture.upstream.hold();
@@ -1236,6 +1498,7 @@ async fn accepted_authority_outlives_submission_only() {
     let run = run_of(run);
     let run_id = run.run_id.to_string();
     fixture.upstream.wait_arrivals(2).await;
+    fixture.delete_card("Workflow", "code-review").await;
 
     fixture
         .server
@@ -1297,6 +1560,53 @@ async fn accepted_authority_outlives_submission_only() {
         3,
         "each step, including the one after revocation, took its own gateway decision: {invocations:?}"
     );
+    // The two second token lifetime is shorter than this tail, so each
+    // request below carries a freshly minted token.
+    problem(
+        fixture
+            .create(&fixture.token(&fixture.runner).await, &new_key(), &request)
+            .await,
+        StatusCode::NOT_FOUND,
+        "WYRD_REGISTRY_404_CARD_NOT_FOUND",
+    );
+
+    fixture.upstream.hold();
+    let run = fixture
+        .accept(
+            &fixture.token(&fixture.runner).await,
+            &run_request("credential-review", "x"),
+        )
+        .await;
+    fixture.upstream.wait_arrivals(5).await;
+    let (status, revoked) = send(
+        fixture
+            .http
+            .post(format!(
+                "{}/v1/admin/gateway/provider-credentials/openai-key/revoke",
+                fixture.base
+            ))
+            .header(
+                ACCESS_TOKEN_HEADER,
+                format!("Bearer {}", fixture.token(&fixture.admin).await),
+            ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{revoked}");
+    fixture.upstream.release();
+    let run = fixture
+        .terminal(&fixture.token(&fixture.runner).await, &run)
+        .await;
+    assert_eq!(run.status, WorkflowRunStatus::Failed, "{run:?}");
+    assert_eq!(
+        step_status(&run, "final_review"),
+        WorkflowStepStatus::Failed
+    );
+    assert_complete(&run);
+    assert_eq!(
+        fixture.upstream.arrivals(),
+        5,
+        "the step after the credential was revoked never reached the provider"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1305,8 +1615,14 @@ async fn accepted_authority_outlives_submission_only() {
 /// space for the Card read, and the model sees the complete results.
 /// Malformed arguments, non-SELECT SQL, an exceeded result ceiling, and an
 /// unknown Card reach the model only as redacted stable codes; a call to an
-/// undeclared tool fails the run. A caller without Card or query grants is
-/// denied, and grants added after acceptance do not widen the run.
+/// undeclared tool fails the run. Oversized SQL, every out-of-range numeric
+/// bound, a result over its row bound, an unknown table, and a stream that
+/// ends before its terminal each reach the model as one redacted code with
+/// no rows. Each tool's permission is checked independently, a run's
+/// tools cannot read another tenant's Card, that tenant cannot query this
+/// tenant's table, a caller without
+/// Card or query grants is denied, and neither grants added after
+/// acceptance nor a replay under them widen the run.
 /// Cancelling a run while its query is held settles the query's resources
 /// before the cancel answers, and a later query still runs.
 ///
@@ -1403,6 +1719,167 @@ async fn declared_tools_use_captured_scopes_and_owned_services() {
     let run = fixture.terminal(runner, &run).await;
     assert_eq!(run.status, WorkflowRunStatus::Failed, "{run:?}");
 
+    // Every numeric bound and the SQL size are refused as input before any
+    // query runs; a result over its row bound, an unknown table, and a stream
+    // that ends without its terminal each fail with one redacted code.
+    let bounded = |overrides: Value| {
+        let mut arguments = json!({ "sql": select });
+        for (field, value) in overrides.as_object().expect("overrides are an object") {
+            arguments[field] = value.clone();
+        }
+        arguments
+    };
+    let input = "WYRD_TOOL_422_INPUT";
+    let refusals = [
+        (
+            "long-sql",
+            json!({ "sql": format!("SELECT {}", "1".repeat(65_536)) }),
+            input,
+        ),
+        ("zero-rows", bounded(json!({ "max_rows": 0 })), input),
+        ("many-rows", bounded(json!({ "max_rows": 10_001 })), input),
+        ("zero-bytes", bounded(json!({ "max_bytes": 0 })), input),
+        (
+            "huge-bytes",
+            bounded(json!({ "max_bytes": 16 * 1024 * 1024 + 1 })),
+            input,
+        ),
+        ("zero-deadline", bounded(json!({ "deadline_ms": 0 })), input),
+        (
+            "row-ceiling",
+            bounded(json!({ "max_rows": 1 })),
+            "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
+        ),
+        (
+            "missing-table",
+            json!({ "sql": "SELECT id FROM vala.bifrost.workflow_absent_table" }),
+            "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
+        ),
+    ];
+    let before = fixture.upstream.arrivals();
+    fixture.upstream.reply(tool_calls(
+        &refusals
+            .iter()
+            .map(|(id, arguments, _)| (*id, "bifrost.query", arguments.clone()))
+            .collect::<Vec<_>>(),
+    ));
+    fixture.upstream.reply(text("BOUNDED"));
+    let run = fixture.accept(runner, &request).await;
+    let run = fixture.terminal(runner, &run).await;
+    assert_eq!(run.status, WorkflowRunStatus::Succeeded, "{run:?}");
+    let results = tool_results(&fixture.upstream.calls()[before + 1]);
+    for (id, _, code) in &refusals {
+        assert_eq!(tool_code(&results, id), *code, "{id}");
+    }
+    for (fault, id) in [
+        (WyrdTestServer::fail_next_query_after_schema as fn(&WyrdTestServer), "eof-schema"),
+        (WyrdTestServer::fail_next_query_after_batch, "eof-batch"),
+    ] {
+        fault(&fixture.server);
+        let before = fixture.upstream.arrivals();
+        fixture
+            .upstream
+            .reply(tool_calls(&[(id, "bifrost.query", json!({ "sql": select }))]));
+        fixture.upstream.reply(text("TRUNCATED"));
+        let run = fixture.accept(runner, &request).await;
+        let run = fixture.terminal(runner, &run).await;
+        assert_eq!(run.status, WorkflowRunStatus::Succeeded, "{run:?}");
+        let results = tool_results(&fixture.upstream.calls()[before + 1]);
+        assert_eq!(
+            tool_code(&results, id),
+            "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE",
+            "{id}"
+        );
+        assert!(!results[id].to_string().contains("first"), "{results:?}");
+    }
+
+    // Each tool's permission is independent: a caller holding only one of
+    // them gets that tool's data and the other tool's redacted denial.
+    let denial = "WYRD_PERMISSION_403_DENIED_RBAC";
+    for (role, permission) in [
+        ("workflow_cards_only", vec![Permission::card_read()]),
+        (
+            "workflow_query_only",
+            vec![
+                Permission::bifrost_query_read(),
+                Permission::bifrost_table_read(),
+            ],
+        ),
+    ] {
+        let mut permissions = vec![Permission::workflow_run(), openai_invoke()];
+        permissions.extend(permission);
+        fixture
+            .server
+            .seed_role(role, &permissions)
+            .await
+            .expect("single-tool role seeds");
+        let caller = fixture.principal(&role.replace('_', "-"), &[role]).await;
+        let before = fixture.upstream.arrivals();
+        fixture.upstream.reply(tool_calls(&[
+            ("query", "bifrost.query", json!({ "sql": select })),
+            ("card", "cards.get", prompt.clone()),
+        ]));
+        fixture.upstream.reply(text("SINGLE"));
+        let run = fixture.accept(&caller.token, &request).await;
+        let run = fixture.terminal(&caller.token, &run).await;
+        assert_eq!(run.status, WorkflowRunStatus::Succeeded, "{run:?}");
+        let results = tool_results(&fixture.upstream.calls()[before + 1]);
+        let (allowed, denied) = if role == "workflow_cards_only" {
+            ("card", "query")
+        } else {
+            ("query", "card")
+        };
+        assert_eq!(tool_code(&results, denied), denial, "{role}");
+        assert!(results[allowed].get("code").is_none(), "{role}: {results:?}");
+        assert!(
+            !results[denied].to_string().contains("first")
+                && !results[denied].to_string().contains("wyrd/v1"),
+            "{role}: {results:?}"
+        );
+    }
+
+    // Tenancy follows the run's credentials: this tenant's tools cannot
+    // read another tenant's Card, and that tenant cannot query this
+    // tenant's table.
+    let foreign_bundle = single_step("foreign-review", "[]", WYRD_GATEWAY, 0);
+    let foreign = fixture
+        .foreign_runner(
+            "workflow-tools-foreign",
+            &foreign_bundle.path().join("workflow.yaml"),
+        )
+        .await;
+    let before = fixture.upstream.arrivals();
+    fixture.upstream.reply(tool_calls(&[(
+        "card",
+        "cards.get",
+        json!({ "kind": "Prompt", "name": "foreign-review-prompt", "version": "1.0.0" }),
+    )]));
+    fixture.upstream.reply(text("LOCAL"));
+    let local = fixture
+        .principal("workflow-tools-local", &[RUNNER_ROLE])
+        .await;
+    let run = fixture.accept(&local.token, &request).await;
+    let run = fixture.terminal(&local.token, &run).await;
+    assert_eq!(run.status, WorkflowRunStatus::Succeeded, "{run:?}");
+    let results = tool_results(&fixture.upstream.calls()[before + 1]);
+    assert_eq!(
+        tool_code(&results, "card"),
+        "WYRD_REGISTRY_404_CARD_NOT_FOUND"
+    );
+    assert!(!format!("{results:?}").contains("wyrd/v1"), "{results:?}");
+    problem(
+        send(
+            fixture
+                .http
+                .post(format!("{}/v1/query", fixture.base))
+                .header(ACCESS_TOKEN_HEADER, format!("Bearer {}", foreign.token))
+                .json(&json!({ "sql": select })),
+        )
+        .await,
+        StatusCode::NOT_FOUND,
+        "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
+    );
+
     fixture
         .server
         .seed_role(
@@ -1416,7 +1893,10 @@ async fn declared_tools_use_captured_scopes_and_owned_services() {
         .await;
     fixture.upstream.hold();
     let before = fixture.upstream.arrivals();
-    let run = fixture.accept(&limited.token, &request).await;
+    let limited_key = new_key();
+    let (status, run) = fixture.create(&limited.token, &limited_key, &request).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{run}");
+    let run = run_of(run);
     fixture.upstream.wait_arrivals(before + 1).await;
     fixture
         .server
@@ -1440,6 +1920,15 @@ async fn declared_tools_use_captured_scopes_and_owned_services() {
         !results.contains("first") && !results.contains("wyrd/v1"),
         "{results}"
     );
+    let widened = fixture.token(&limited).await;
+    let (status, replay) = fixture.create(&widened, &limited_key, &request).await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(
+        run_of(replay),
+        run,
+        "a replay under widened grants returns the accepted run unchanged"
+    );
+    assert_eq!(fixture.upstream.arrivals(), before + 2);
 
     fixture.server.stall_next_query_after_schema();
     fixture.upstream.reply(tool_calls(&[(
@@ -1605,11 +2094,15 @@ async fn server_routes_keep_gateway_and_external_ownership() {
 /// Cancelling a running run commits one whole terminal snapshot — no step
 /// left pending or running — that later upstream answers cannot change, and
 /// frees its slot. A run deadline times the run out the same way. A cancel
-/// racing completion returns exactly the snapshot that won. Retention evicts
-/// the oldest terminal run and its key, expires runs after 24 hours, and an
-/// evicted, expired, foreign, unknown, or malformed id is the same 404. A
-/// restart loses every run without resuming its calls, and shutdown cancels
-/// a mid-preparation create and a running run within the shared deadline.
+/// racing completion returns exactly the snapshot that won, and completion
+/// racing a deadline leaves every concurrent read a whole snapshot.
+/// Retention evicts the oldest terminal run and its key per tenant and
+/// globally across tenants and principals, expires runs after 24 hours, and
+/// an evicted, expired, foreign-principal, foreign-tenant, unknown, or
+/// malformed id is the same 404. A restart loses every run without resuming
+/// its calls, and shutdown cancels a mid-preparation create, a queued run,
+/// and a running run within the shared deadline, leaving complete cancelled
+/// snapshots.
 ///
 /// # Panics
 /// Panics when a snapshot, status, refusal, upstream count, or shutdown
@@ -1692,6 +2185,51 @@ async fn lifecycle_races_retention_and_shutdown() {
         "the cancel answers the snapshot that won"
     );
 
+    // Completion races a one second deadline while every read sees one
+    // whole snapshot: all steps present, status never moving backwards, and
+    // no step left pending or running once the run is terminal.
+    let mut racing = request.clone();
+    racing["timeout_seconds"] = json!(1);
+    let racing = fixture.accept(&runner, &racing).await;
+    let racing_id = racing.run_id.to_string();
+    let mut observed = Vec::new();
+    let won = tokio::time::timeout(PATIENCE, async {
+        loop {
+            let (status, body) = fixture.get(&runner, &racing_id).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let run = run_of(body);
+            observed.push(run.clone());
+            if run.status.is_terminal() {
+                return run;
+            }
+        }
+    })
+    .await
+    .expect("the racing run terminates");
+    assert!(
+        matches!(
+            won.status,
+            WorkflowRunStatus::Succeeded | WorkflowRunStatus::TimedOut
+        ),
+        "{won:?}"
+    );
+    let rank = |status: WorkflowRunStatus| match status {
+        WorkflowRunStatus::Queued => 0,
+        WorkflowRunStatus::Running => 1,
+        _ => 2,
+    };
+    for pair in observed.windows(2) {
+        assert!(rank(pair[0].status) <= rank(pair[1].status), "{pair:?}");
+    }
+    for snapshot in &observed {
+        assert_eq!(snapshot.steps.len(), 3, "{snapshot:?}");
+        if snapshot.status.is_terminal() {
+            assert_complete(snapshot);
+        }
+    }
+    let (_, read) = fixture.get(&runner, &racing_id).await;
+    assert_eq!(run_of(read), won, "the winning snapshot is final");
+
     let not_found = |answer: (StatusCode, Value)| {
         let body = problem(
             answer,
@@ -1704,7 +2242,12 @@ async fn lifecycle_races_retention_and_shutdown() {
     let other = fixture
         .principal("workflow-runner-two", &[RUNNER_ROLE])
         .await;
+    let foreign = fixture.foreign_admin("workflow-lifecycle-foreign").await;
     for answer in [
+        fixture.get(&foreign.token, &timed.run_id.to_string()).await,
+        fixture
+            .cancel(&foreign.token, &timed.run_id.to_string())
+            .await,
         fixture
             .get(&runner, &uuid::Uuid::now_v7().to_string())
             .await,
@@ -1767,14 +2310,69 @@ async fn lifecycle_races_retention_and_shutdown() {
         "the lost run never resumed"
     );
 
+    // Retention is also global: with two tenants each at their own bound,
+    // a terminal run in a third tenant evicts the oldest terminal run of any
+    // tenant or principal, and nothing newer.
+    let retained = single_step("retained-review", "[]", WYRD_GATEWAY, 0);
+    let retained_path = retained.path().join("workflow.yaml");
+    fixture.register(&retained_path).await;
+    let second = fixture
+        .foreign_runner("workflow-retained-second", &retained_path)
+        .await;
+    let third = fixture
+        .foreign_runner("workflow-retained-third", &retained_path)
+        .await;
+    let peer = fixture
+        .principal("workflow-runner-four", &[RUNNER_ROLE])
+        .await;
+    let retained_request = run_request("retained-review", "x");
+    let mut kept = Vec::new();
+    for token in [&peer.token, &second.token, &second.token, &third.token] {
+        let run = fixture.accept(token, &retained_request).await;
+        kept.push((token, fixture.terminal(token, &run).await));
+    }
+    assert_eq!(
+        not_found(fixture.get(&runner, &fresh.run_id.to_string()).await),
+        evicted,
+        "the globally oldest terminal run is evicted"
+    );
+    for (token, run) in &kept {
+        let (status, read) = fixture.get(token, &run.run_id.to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{read}");
+        assert_eq!(&run_of(read), run);
+    }
+
+    let before = fixture.upstream.arrivals();
     fixture.upstream.hold();
     let running = fixture.accept(&runner, &request).await;
     assert_eq!(running.status, WorkflowRunStatus::Queued);
-    fixture.upstream.wait_arrivals(after_restart + 5).await;
+    fixture.upstream.wait_arrivals(before + 2).await;
     let other = fixture
         .principal("workflow-runner-three", &[RUNNER_ROLE])
         .await;
-    let workflows = &fixture.server.state().workflows;
+    let workflows = Arc::clone(&fixture.server.state().workflows);
+
+    // An accepted run held before it starts executing stays queued.
+    workflows.stall_next_preparation_for_test();
+    let queued = tokio::spawn(send(fixture.create_request(
+        &second.token,
+        &new_key(),
+        &retained_request,
+    )));
+    tokio::time::timeout(PATIENCE, workflows.wait_preparation_stall_for_test())
+        .await
+        .expect("the queued run's preparation stops at the gate");
+    workflows.stall_next_preparation_for_test();
+    workflows.release_preparation_for_test();
+    let (status, queued) = queued.await.expect("the queued create answers");
+    assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
+    let queued = run_of(queued);
+    tokio::time::timeout(PATIENCE, workflows.wait_preparation_stall_for_test())
+        .await
+        .expect("the accepted run stops before it executes");
+    let (_, read) = fixture.get(&second.token, &queued.run_id.to_string()).await;
+    assert_eq!(run_of(read).status, WorkflowRunStatus::Queued);
+
     workflows.stall_next_preparation_for_test();
     let preparing = tokio::spawn(send(fixture.create_request(
         &other.token,
@@ -1793,6 +2391,13 @@ async fn lifecycle_races_retention_and_shutdown() {
         StatusCode::SERVICE_UNAVAILABLE,
         "WYRD_WORKFLOW_503_RUN_UNAVAILABLE",
     );
+    for run in [&running, &queued] {
+        let stopped = workflows
+            .snapshot_for_test(run.run_id)
+            .expect("shutdown keeps the terminal snapshot");
+        assert_eq!(stopped.status, WorkflowRunStatus::Cancelled, "{stopped:?}");
+        assert_complete(&stopped);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

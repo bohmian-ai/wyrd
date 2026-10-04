@@ -249,7 +249,9 @@ impl Preparation {
     /// releases it the same way. After acceptance the Skald run executes
     /// under the reservation's token, each non-terminal transition replaces
     /// the stored snapshot, and the terminal snapshot is committed only after
-    /// every query owner of the run has settled.
+    /// every query owner of the run has settled. With `test-support`, an
+    /// armed preparation gate can hold the accepted run queued before it
+    /// executes; cancellation releases it into the same terminalization.
     async fn run(self) {
         let Self {
             state,
@@ -274,6 +276,12 @@ impl Preparation {
         let Ok(accepted) = reservation.accept(prepared.snapshot().clone()) else {
             return;
         };
+        #[cfg(feature = "test-support")]
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {}
+            () = state.workflows.pass_preparation_gate_for_test() => {}
+        }
         let terminal = prepared.execute(|run| accepted.observe(run)).await;
         tools.drain().await;
         accepted.finish(terminal);

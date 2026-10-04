@@ -303,6 +303,8 @@ impl BoundedQuery {
                 cancel,
             )
             .await?;
+        #[cfg(feature = "test-support")]
+        let mut stream = stream;
         let settlement = Some((controls, tenant, request_id));
         let collector = ResultCollector {
             settlement,
@@ -310,30 +312,41 @@ impl BoundedQuery {
             max_bytes: arguments.max_bytes,
             bytes: STRUCTURED_OVERHEAD_BYTES,
             #[cfg(feature = "test-support")]
-            stall: self.claim_schema_stall(&stream),
+            stall: self.claim_fault(&mut stream),
         };
         collector.collect(stream, cancel).await
     }
 
-    /// Bind the armed test-only schema hold to this stream's resource probe.
+    /// Apply the armed test-only stream fault to this stream.
     ///
-    /// The cancellation journey waits for this hold before cancelling, so fast
-    /// fixture execution cannot make cancellation evidence vacuous.
+    /// An end-of-stream fault truncates the frames after the schema or the
+    /// first batch, so the collector meets the same early EOF a broken owner
+    /// stream produces. A schema hold is bound to this stream's resource probe
+    /// and returned; the cancellation journey waits for it before cancelling,
+    /// so fast fixture execution cannot make cancellation evidence vacuous. A
+    /// probe capture is consumed and changes nothing.
     #[cfg(feature = "test-support")]
-    fn claim_schema_stall(
+    fn claim_fault(
         &self,
-        stream: &OracleQueryStream,
+        stream: &mut OracleQueryStream,
     ) -> Option<Arc<crate::state::QueryStreamStall>> {
         let controller = self.state.query_stream_fault.as_ref()?;
-        if !matches!(
-            controller.claim(),
-            Some(crate::state::QueryStreamFault::StallAfterSchema)
-        ) {
-            return None;
-        }
-        let stall = controller.claim_stall()?;
-        stall.bind_resource_probe(stream.resource_probe_for_test());
-        Some(stall)
+        let kept = match controller.claim()? {
+            crate::state::QueryStreamFault::EofAfterSchema => 1,
+            crate::state::QueryStreamFault::EofAfterBatch => 2,
+            crate::state::QueryStreamFault::StallAfterSchema => {
+                let stall = controller.claim_stall()?;
+                stall.bind_resource_probe(stream.resource_probe_for_test());
+                return Some(stall);
+            }
+            crate::state::QueryStreamFault::CaptureProbe => return None,
+        };
+        let frames = std::mem::replace(
+            &mut stream.frames,
+            Box::pin(futures_util::stream::empty()),
+        );
+        stream.frames = Box::pin(frames.take(kept));
+        None
     }
 }
 

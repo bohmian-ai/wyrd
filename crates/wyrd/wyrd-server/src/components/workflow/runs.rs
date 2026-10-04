@@ -217,7 +217,7 @@ pub struct WorkflowRuns {
     tasks: TaskTracker,
     /// The run table.
     table: Mutex<RunTable>,
-    /// Holds an armed preparation before it reads its graph.
+    /// Holds an armed preparation at its next gate pass.
     #[cfg(feature = "test-support")]
     preparation_gate: PreparationGate,
 }
@@ -291,7 +291,13 @@ impl WorkflowRuns {
             Some(KeyState::Preparing {
                 hash: preparing,
                 outcome,
-            }) if *preparing == hash => return Ok(Admission::Wait(outcome.clone())),
+            }) if *preparing == hash => {
+                #[cfg(feature = "test-support")]
+                self.preparation_gate
+                    .joined
+                    .send_modify(|joined| *joined += 1);
+                return Ok(Admission::Wait(outcome.clone()));
+            }
             Some(_) => return Err(idempotency_conflict()),
             None => {}
         }
@@ -430,8 +436,46 @@ impl WorkflowRuns {
         self.table().clock_offset += offset;
     }
 
-    /// Stop the next preparation before it reads its graph, until
+    /// The stored snapshot of `run_id`, whoever owns it; `None` once the run
+    /// is evicted or expired.
+    ///
+    /// Readable after shutdown, since the table outlives its admission.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn snapshot_for_test(&self, run_id: WorkflowRunId) -> Option<WorkflowRun> {
+        self.table()
+            .runs
+            .get(&run_id)
+            .map(|entry| entry.snapshot.borrow().clone())
+    }
+
+    /// How many creates have joined an in-flight preparation as waiters
+    /// since this owner was built.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn preparation_joins_for_test(&self) -> usize {
+        *self.preparation_gate.joined.borrow()
+    }
+
+    /// Wait until `count` creates in total have joined an in-flight
+    /// preparation as waiters, as [`Self::preparation_joins_for_test`]
+    /// counts them.
+    #[cfg(feature = "test-support")]
+    pub async fn wait_preparation_joins_for_test(&self, count: usize) {
+        let _ = self
+            .preparation_gate
+            .joined
+            .subscribe()
+            .wait_for(|joined| *joined >= count)
+            .await;
+    }
+
+    /// Stop at the next preparation gate, until
     /// [`Self::release_preparation_for_test`].
+    ///
+    /// A preparation passes the gate twice: before it reads its graph, and
+    /// after its run is accepted but before the run starts executing. Each
+    /// armed stall stops at whichever pass comes next and is consumed there.
     #[cfg(feature = "test-support")]
     pub fn stall_next_preparation_for_test(&self) {
         self.preparation_gate
@@ -479,6 +523,8 @@ struct PreparationGate {
     reached: tokio::sync::Notify,
     /// Notified to let the stopped preparation continue.
     released: tokio::sync::Notify,
+    /// Creates that joined an in-flight preparation as waiters so far.
+    joined: watch::Sender<usize>,
 }
 
 /// One in-flight preparation's ownership of its key and active slot.

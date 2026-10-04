@@ -7,9 +7,12 @@
 //! follower is held at a real execute boundary. An explicit cancel and the
 //! loss of the held follower pod must leave the leader's graph cleanup in
 //! charge of the result: the run stays non-terminal and the model sees nothing
-//! while that cleanup is paused. The run deadline is the query's own bound, so
-//! the run times out at it without waiting on that cleanup, never earlier, and
-//! the model still sees no result.
+//! while that cleanup is paused. The run deadline bounds the query whether
+//! the model omits `deadline_ms` or asks for a longer one, so the run times out
+//! at it without waiting on that cleanup, never earlier, and the model still
+//! sees no result. A shorter requested deadline stays the query's own: the
+//! query times out first and the model answers its failure while the run is
+//! still live.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -44,9 +47,21 @@ const INGRESS: usize = 3;
 /// Header every `/v1` route reads the caller's access token from.
 const ACCESS_TOKEN_HEADER: &str = "x-wyrd-access-token";
 
-/// Run deadline of the deadline case, long enough to arm the cleanup pause
+/// Run deadline of the deadline cases, long enough to arm the cleanup pause
 /// after the sibling query and before the deadline cancels the tool query.
 const RUN_TIMEOUT_SECONDS: u64 = 20;
+
+/// Requested query deadline beyond the run's remaining time, which the run
+/// deadline must clip.
+const LONGER_DEADLINE_MS: u32 = 120_000;
+
+/// Requested query deadline well inside the run's, long enough to arm the
+/// cleanup pause after the sibling query and short enough to leave the run
+/// time to answer the timed-out query.
+const SHORTER_DEADLINE_MS: u32 = 10_000;
+
+/// Stable code the model sees for a query that reached its own deadline.
+const QUERY_TIMEOUT_CODE: &str = "WYRD_VALA_504_QUERY_TIMEOUT";
 
 /// Bound for every wait on a run, a pause, or the upstream.
 const PATIENCE: Duration = Duration::from_secs(60);
@@ -59,15 +74,21 @@ const POLL: Duration = Duration::from_millis(100);
 enum TerminalCause {
     /// The run's owner cancels it.
     Cancel,
-    /// The run's total deadline expires.
+    /// The run's total deadline expires; the tool call omits `deadline_ms`.
     Deadline,
+    /// The run's total deadline expires before a longer requested
+    /// `deadline_ms`.
+    LongerDeadline,
+    /// A shorter requested `deadline_ms` expires while the run is live.
+    ShorterDeadline,
     /// The held follower's pod disappears mid-graph.
     PodKill,
 }
 
 /// A forwarded Workflow query settles on its remote Oracle before the run
-/// ends on a cancel or a pod loss, and a deadline ends the run exactly at the
-/// query's own bound.
+/// ends on a cancel or a pod loss, a run deadline ends the run exactly at the
+/// query's bound whether `deadline_ms` is omitted or longer, and a shorter
+/// `deadline_ms` times the query out first while the run goes on to succeed.
 ///
 /// A cancel records a `cancelled` Analytical query; a deadline, which the
 /// leader ends as a query timeout, and a pod loss record a `failed` one.
@@ -81,6 +102,8 @@ async fn workflow_forwarded_query_settles_before_the_run_ends() {
     for cause in [
         TerminalCause::Cancel,
         TerminalCause::Deadline,
+        TerminalCause::LongerDeadline,
+        TerminalCause::ShorterDeadline,
         TerminalCause::PodKill,
     ] {
         prove_forwarded_query_settles(cause)
@@ -131,18 +154,22 @@ async fn prove_forwarded_query_settles(cause: TerminalCause) -> Result<(), Journ
         .register_from_path(&bundle.path().join("workflow.yaml"))
         .await?;
 
+    let mut arguments = json!({ "sql": sql });
+    if let Some(deadline_ms) = cause.requested_deadline_ms() {
+        arguments["deadline_ms"] = json!(deadline_ms);
+    }
     upstream.reply(json!({
         "role": "assistant",
         "content": null,
         "tool_calls": [{
             "id": "forwarded",
             "type": "function",
-            "function": { "name": "bifrost.query", "arguments": json!({ "sql": sql }).to_string() }
+            "function": { "name": "bifrost.query", "arguments": arguments.to_string() }
         }]
     }));
     // A deadline run also answers the post-tool continuation, so a tool query
     // that timed out before the run's own deadline would let the run succeed
-    // instead of timing out.
+    // instead of timing out, and a shorter query deadline must let it succeed.
     if cause != TerminalCause::Cancel {
         upstream.reply(json!({ "role": "assistant", "content": "DONE" }));
     }
@@ -152,7 +179,7 @@ async fn prove_forwarded_query_settles(cause: TerminalCause) -> Result<(), Journ
         baseline.push((index, cluster.ownership_snapshot(index)?));
     }
     cluster.arm_execute_pause(HELD_FOLLOWER)?;
-    let timeout = (cause == TerminalCause::Deadline).then_some(RUN_TIMEOUT_SECONDS);
+    let timeout = cause.run_timeout_seconds();
     let run = ingress.create(timeout).await?;
     cluster.await_execute_paused(HELD_FOLLOWER).await?;
 
@@ -175,7 +202,9 @@ async fn prove_forwarded_query_settles(cause: TerminalCause) -> Result<(), Journ
             let run_id = run.clone();
             Some(tokio::spawn(async move { ingress.cancel(&run_id).await }))
         }
-        TerminalCause::Deadline => None,
+        TerminalCause::Deadline
+        | TerminalCause::LongerDeadline
+        | TerminalCause::ShorterDeadline => None,
         TerminalCause::PodKill => {
             cluster.kill(HELD_FOLLOWER).await?;
             None
@@ -193,7 +222,7 @@ async fn prove_forwarded_query_settles(cause: TerminalCause) -> Result<(), Journ
         .is_some_and(tokio::task::JoinHandle::is_finished);
     let arrivals = upstream.arrivals();
     cluster.release_cleanup_pause();
-    if cause != TerminalCause::Deadline && (held.status.is_terminal() || cancel_finished) {
+    if !cause.ends_at_run_deadline() && (held.status.is_terminal() || cancel_finished) {
         return Err(format!("the run ended before its query settled: {held:?}").into());
     }
     if arrivals != 1 {
@@ -206,20 +235,38 @@ async fn prove_forwarded_query_settles(cause: TerminalCause) -> Result<(), Journ
     };
     let expected = match cause {
         TerminalCause::Cancel => WorkflowRunStatus::Cancelled,
-        TerminalCause::Deadline => WorkflowRunStatus::TimedOut,
-        TerminalCause::PodKill => WorkflowRunStatus::Succeeded,
+        TerminalCause::Deadline | TerminalCause::LongerDeadline => WorkflowRunStatus::TimedOut,
+        TerminalCause::ShorterDeadline | TerminalCause::PodKill => WorkflowRunStatus::Succeeded,
     };
     if terminal.status != expected {
         return Err(format!("expected a {expected:?} run, saw {terminal:?}").into());
     }
     // The tool query's deadline is the run's remaining time, so a run that
     // timed out earlier than its own deadline would have cut its query short.
-    if cause == TerminalCause::Deadline {
-        let bound = terminal.created_at
-            + chrono::Duration::from_std(Duration::from_secs(RUN_TIMEOUT_SECONDS))?;
-        if terminal.ended_at.is_none_or(|ended| ended < bound) || !terminal.outputs.is_empty() {
+    let bound =
+        terminal.created_at + chrono::Duration::from_std(Duration::from_secs(RUN_TIMEOUT_SECONDS))?;
+    if cause.ends_at_run_deadline()
+        && (terminal.ended_at.is_none_or(|ended| ended < bound) || !terminal.outputs.is_empty())
+    {
+        return Err(
+            format!("the run must time out at its deadline with no result: {terminal:?}").into(),
+        );
+    }
+    // A shorter query deadline stays the query's own: the model answers its
+    // timeout and the run ends before its own deadline would have.
+    if cause == TerminalCause::ShorterDeadline {
+        let results = upstream.calls()[1]["messages"].to_string();
+        if !results.contains(QUERY_TIMEOUT_CODE) || results.contains("columns") {
             return Err(format!(
-                "the run must time out at its deadline with no result: {terminal:?}"
+                "the shorter query must fail as {QUERY_TIMEOUT_CODE} without rows: {results}"
+            )
+            .into());
+        }
+        if terminal.ended_at.is_none_or(|ended| ended >= bound)
+            || terminal.outputs.get("answer") != Some(&json!("DONE"))
+        {
+            return Err(format!(
+                "the run must answer the timed-out query before its deadline: {terminal:?}"
             )
             .into());
         }
@@ -287,16 +334,44 @@ fn duration_outcome(outcome: &str) -> BTreeMap<String, String> {
 }
 
 impl TerminalCause {
+    /// The `deadline_ms` the model's tool call requests, if any.
+    const fn requested_deadline_ms(self) -> Option<u32> {
+        match self {
+            Self::LongerDeadline => Some(LONGER_DEADLINE_MS),
+            Self::ShorterDeadline => Some(SHORTER_DEADLINE_MS),
+            Self::Cancel | Self::Deadline | Self::PodKill => None,
+        }
+    }
+
+    /// The run's total timeout: [`RUN_TIMEOUT_SECONDS`] for every deadline
+    /// case, none otherwise.
+    const fn run_timeout_seconds(self) -> Option<u64> {
+        match self {
+            Self::Deadline | Self::LongerDeadline | Self::ShorterDeadline => {
+                Some(RUN_TIMEOUT_SECONDS)
+            }
+            Self::Cancel | Self::PodKill => None,
+        }
+    }
+
+    /// Whether the run's own deadline ends the held query and the run.
+    const fn ends_at_run_deadline(self) -> bool {
+        matches!(self, Self::Deadline | Self::LongerDeadline)
+    }
+
     /// The [`DURATION`] outcome the held query's end must record.
     ///
     /// A cancel reaches the leader as a registry cancel, which is recorded as
     /// `cancelled` even before the query's stream exists. A deadline ends the
     /// leader's first-batch wait as a query timeout, and that end before a
-    /// stream exists is recorded as `failed`, as is a lost follower.
+    /// stream exists is recorded as `failed`, whether the run's deadline or a
+    /// shorter requested one bounded it, as is a lost follower.
     const fn recorded_outcome(self) -> &'static str {
         match self {
             Self::Cancel => "cancelled",
-            Self::Deadline | Self::PodKill => "failed",
+            Self::Deadline | Self::LongerDeadline | Self::ShorterDeadline | Self::PodKill => {
+                "failed"
+            }
         }
     }
 }

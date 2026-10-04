@@ -107,7 +107,7 @@ pub fn validate_index_range(start: i64, stop: i64) -> Result<(), WyrdError> {
 ///
 /// # Errors
 /// Returns `WYRD_DATA_400_INVALID_SPLIT_RULE` when the split is empty or any
-/// index is negative. Duplicate values are preserved for `DataSpec` validation.
+/// index is negative or duplicated.
 pub fn validate_indices(values: &[i64]) -> Result<(), WyrdError> {
     let mut seen = std::collections::HashSet::new();
     if values.is_empty() {
@@ -131,6 +131,14 @@ pub fn validate_indices(values: &[i64]) -> Result<(), WyrdError> {
 #[cfg(feature = "python")]
 #[pymethods]
 impl PySplit {
+    /// Select rows whose column `col` satisfies `op` against `value`.
+    ///
+    /// `op` is one of `==`, `!=`, `<`, `<=`, `>`, `>=`, or `in`; `value` is a
+    /// `bool`, `int`, `float`, `str`, `datetime`, or a list of those.
+    ///
+    /// # Errors
+    /// Returns `WYRD_DATA_400_INVALID_SPLIT_RULE` for an invalid column name,
+    /// unknown operator, or unsupported value type.
     #[staticmethod]
     fn column(col: &str, op: &str, value: &Bound<'_, PyAny>) -> WyrdPyResult<Self> {
         let name = ColumnName::new(col).map_err(|error| {
@@ -150,6 +158,11 @@ impl PySplit {
         }))
     }
 
+    /// Use rows already materialized in the Artifact card `card_ref` names.
+    ///
+    /// # Errors
+    /// Returns `WYRD_DATA_400_INVALID_SPLIT_RULE` when `card_ref` is not a
+    /// valid `CardRef` or does not target an Artifact card.
     #[staticmethod]
     fn materialized(card_ref: &Bound<'_, PyAny>) -> WyrdPyResult<Self> {
         Ok(Self::from_inner(SplitStrategy::Materialized(
@@ -157,23 +170,41 @@ impl PySplit {
         )))
     }
 
+    /// Select the half-open row index range `[start, stop)`.
+    ///
+    /// # Errors
+    /// Returns `WYRD_DATA_400_INVALID_SPLIT_RULE` when a bound is negative or
+    /// `start > stop`.
     #[staticmethod]
     fn index_range(start: i64, stop: i64) -> WyrdPyResult<Self> {
         validate_index_range(start, stop)?;
         Ok(Self::from_inner(SplitStrategy::IndexRange { start, stop }))
     }
 
+    /// Select explicit row indices.
+    ///
+    /// # Errors
+    /// Returns `WYRD_DATA_400_INVALID_SPLIT_RULE` when `values` is empty or
+    /// contains a negative or duplicate index.
     #[staticmethod]
     fn indices(values: Vec<i64>) -> WyrdPyResult<Self> {
         validate_indices(&values)?;
         Ok(Self::from_inner(SplitStrategy::Indices(values)))
     }
 
+    /// Serialized split strategy; the same value `to_dict` returns.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when JSON conversion fails.
     #[getter]
     fn strategy(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(py, &serde_json::to_value(&self.inner)?)?)
     }
 
+    /// Return this split strategy as a JSON-compatible dictionary.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when JSON conversion fails.
     fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(py, &serde_json::to_value(&self.inner)?)?)
     }

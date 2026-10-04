@@ -57,6 +57,65 @@ print(run.steps["planner"]["structured_output"])
 
 Mapping input supplies declared inputs by name; undeclared keys and values of the wrong declared type are rejected. A string is shorthand for the declared string input named `input`. Validation, input, and route errors raise `WyrdError` before any step runs. Once the run starts, step failures are recorded in `run.steps` and `run.error` instead of being raised.
 
+## Run From The CLI
+
+`wyrd workflow run` takes exactly one source: `--file <path>`, `--uid <uid>`,
+or `--space <space> --name <name> --version <version>`. Input is a JSON object
+from `--input '<json>'` or `--input-file <path>`. Runs execute in the CLI
+process by default; `--execution server` runs a registered Workflow on the
+server. `--server <url>` only selects the Wyrd endpoint.
+
+```bash
+wyrd workflow run --file examples/workflows/code-review/workflow.yaml \
+  --input-file examples/workflows/code-review/input.json
+wyrd apply examples/workflows/code-review
+wyrd workflow run --space engineering --name code-review --version 1.0.0 \
+  --input-file examples/workflows/code-review/input.json --execution server
+```
+
+`--format json` prints the `WorkflowRun` snapshot; text output prints the
+status and named outputs, and `--steps` adds every step's result. The command
+exits `0` when the run succeeded and `2` when it ended in any other status.
+
+A server run prints `accepted workflow run <id>` to stderr, then waits for the
+run to finish. `--detach` returns as soon as the run is accepted. Interrupting
+the wait exits `130` and leaves the run running on the server; it is never
+cancelled or resubmitted. Use the ID afterwards:
+
+```bash
+wyrd workflow status <run-id> --steps
+wyrd workflow cancel <run-id>
+```
+
+Server runs live in the server process that accepted them. A restart loses
+them, and a multi-replica deployment must route one run's requests to the
+same replica.
+
+## Route Model Calls
+
+`llm_route` on the Workflow, or on one step to override it, selects where each
+Agent's model calls go:
+
+- `native` (default) calls the provider from the CLI or SDK process. Server
+  runs refuse it.
+- `wyrd_gateway` calls the governed Wyrd gateway with your identity. A step
+  `fallback` travels with each call. Local runs reach the public Chat
+  Completions, Responses, Anthropic Messages, and Gemini endpoints; a Vertex
+  Prompt runs only on the server.
+- `ext_gateway` sends the native request straight to an external gateway
+  binding. Local runs read the binding from the client `config.toml`:
+
+```toml
+[workflow.external_gateway_bindings.review-gateway]
+protocol = "openai_chat"
+origin = "https://gateway.example.com"
+secret_headers = { x-gateway-key = { source = "file", path = "/run/secrets/gateway-key" } }
+```
+
+The secret is read when a run that selects the binding starts, never while
+loading or registering, and never appears in run output. Server runs use the
+bindings the server operator assigns to your tenant.
+
 ## Save And Load
 
 ```python

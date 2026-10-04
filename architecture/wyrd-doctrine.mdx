@@ -250,6 +250,17 @@ transport to call `wyrd-server`.
 Scribe, Oracle, and Forge remain server-owned subsystems; Gate is their server
 dispatcher, not a role or client type.
 
+Workflow surfaces are scoped by capability rather than mirrored everywhere.
+Rust, Python, and TypeScript load and run authored and registered Workflows
+locally through the one Skald runtime. Accepted server runs are submitted,
+read, and cancelled only through the Rust `wyrd_client::Workflows` handle, the
+`/v1/workflow-runs` HTTP resource, and `wyrd workflow`; MCP has no Workflow
+surface. Every surface returns the same `WorkflowRun` snapshot. A model-call
+route is owned by the process executing the step: `native` uses that
+process's providers, `wyrd_gateway` the governed gateway under the caller's
+identity, and `ext_gateway` that process's configured external binding.
+Server runs accept only the two gateway routes.
+
 The public protocol remains open to every language. A client needs only the
 HTTP and MCP contracts, generated schemas, machine-readable documentation, and
 stable errors. What a user declares in Rust, Python, or TypeScript remains

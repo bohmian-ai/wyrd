@@ -30,7 +30,8 @@ use super::snapshot_expiration::object_exists;
 use super::snapshot_expiration::{ExpirableTable, expirable_table, head_watermark, maintain_once};
 use super::support::{
     CountingObjectStore, ForgeTelemetryCheckpoint, PromotionCatalogSeam,
-    PromotionIntegrationFixture, SupervisedPromotion, manual_clock, set_table_properties,
+    PromotionIntegrationFixture, SupervisedPromotion, manual_clock, remove_table_properties,
+    set_table_properties,
 };
 
 /// Maximum diagnostic wait for a claimed ownership episode.
@@ -1621,9 +1622,10 @@ async fn planned_paths(
 /// A dispatched worker plans from the table's current Iceberg head.
 ///
 /// The leader names a table and a task type, never files, so every file
-/// decision is the worker's, made against the head it loads. Full, the
-/// default, consumes every live file at that head; `SmallFiles` consumes the
-/// small ones, which here is all of them; Auto keeps upstream's five-small-file
+/// decision is the worker's, made against the head it loads. Full consumes
+/// every live file at that head; `SmallFiles`, the default, consumes small
+/// files in groups of two or more, which here is all of them because every
+/// day holds a pair; Auto keeps upstream's five-small-file
 /// floor; `FilesWithDelete` finds nothing on a table without deletes; and a
 /// copy-on-write table plans one table-wide Full group whatever type it names.
 /// Through the production worker, a type that finds nothing still reports
@@ -1643,7 +1645,24 @@ async fn planned_paths(
 #[ignore = "requires Postgres, Iceberg, and object storage"]
 async fn worker_selects_current_iceberg_files() {
     let _telemetry = ForgeTelemetryCheckpoint::install();
-    let promoted = PromotedRewriteFixture::start("worker_selects").await;
+    // Each fixture object is alone in its day; a same-day partner for each
+    // makes every live file a member of a small-files group.
+    let promoted = PromotedRewriteFixture::start_unpromoted("worker_selects").await;
+    for day in 0..2 {
+        promoted
+            .fixture
+            .seal_partition_files(day, 2, 1, 1_000 * day.unsigned_abs())
+            .await;
+    }
+    let mut promotion = SupervisedPromotion::start(
+        &promoted.fixture,
+        promoted.fixture.catalog.iceberg_catalog(),
+        CountingObjectStore::new(Arc::clone(&promoted.fixture.staging))
+            as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    promotion.run_one_success().await;
+    promotion.shutdown().await;
     let store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
     let forge = promoted.forge(
         promoted.fixture.catalog.iceberg_catalog(),
@@ -2188,7 +2207,7 @@ async fn leader_decision_has_no_catalog_io() {
 
 /// A table that declares no Forge property is compacted on the default interval.
 ///
-/// The fixture's compaction opt-in and count trigger are removed before the
+/// The fixture's compaction opt-in, count trigger, and type are removed before the
 /// first promotion, so the table carries exactly the properties registration
 /// writes. Its first commit must open a compaction track, the track must stay
 /// idle for the whole default one-hour interval, and the leader must dispatch
@@ -2202,22 +2221,16 @@ async fn leader_decision_has_no_catalog_io() {
 #[ignore = "requires Postgres, Iceberg, and object storage"]
 async fn property_less_table_is_compacted_after_the_default_interval() {
     let fixture = PromotionIntegrationFixture::start("default_compaction").await;
-    let iceberg = fixture.catalog.iceberg_catalog();
-    let loaded = iceberg
-        .load_table(&fixture.binding.table_ident())
-        .await
-        .expect("fixture table load");
-    let tx = Transaction::new(&loaded);
-    let tx = tx
-        .update_table_properties()
-        .remove("wyrd.forge.enable-compaction".to_owned())
-        .remove("wyrd.forge.compaction.trigger-snapshot-count".to_owned())
-        .apply(tx)
-        .expect("property removal applies");
-    let cleared = tx
-        .commit(iceberg.as_ref())
-        .await
-        .expect("property removal commits");
+    let cleared = remove_table_properties(
+        &fixture.catalog,
+        &fixture.binding,
+        &[
+            "wyrd.forge.enable-compaction",
+            "wyrd.forge.compaction.trigger-snapshot-count",
+            "wyrd.forge.compaction.type",
+        ],
+    )
+    .await;
     assert!(
         !cleared
             .metadata()

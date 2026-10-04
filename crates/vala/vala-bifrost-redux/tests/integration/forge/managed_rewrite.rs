@@ -20,7 +20,8 @@ use vala_bifrost_redux::forge::{ForgeClock, ForgeError, ForgeObjectStore, ForgeU
 
 use super::rewrite_support::{AttemptRun, PromotedRewriteFixture, RewriteOutputBreak};
 use super::support::{
-    CountingObjectStore, PromotionCatalogSeam, SupervisedPromotion, set_table_properties,
+    CountingObjectStore, PromotionCatalogSeam, SupervisedPromotion, remove_table_properties,
+    set_table_properties,
 };
 
 /// Runs one whole attempt over the promoted snapshot with no plan budget.
@@ -920,7 +921,8 @@ async fn promote_then_compact(supervisor: &mut SupervisedPromotion) {
 /// staged file waits for a partner.
 ///
 /// Scaled geometry over real files through the production scheduler and
-/// worker, with the table's compaction type left at its default. The table
+/// worker, with the fixture's compaction type removed so the table plans with
+/// the default. The table
 /// target is set a quarter above two staged objects, so its 75% small-file
 /// threshold sits above one staged object and below a merged pair, as 768 MiB
 /// sits between a 512 MiB staged file and a 1 GiB output. Two staged objects
@@ -936,6 +938,12 @@ async fn promote_then_compact(supervisor: &mut SupervisedPromotion) {
 #[tokio::test]
 async fn small_files_merges_staged_pairs_once_and_lone_files_wait() {
     let promoted = PromotedRewriteFixture::start_unpromoted("rewrite_small_files_once").await;
+    remove_table_properties(
+        &promoted.fixture.catalog,
+        &promoted.fixture.binding,
+        &["wyrd.forge.compaction.type"],
+    )
+    .await;
     promoted
         .fixture
         .seal_partition_files(STAGED_DAY, STAGED_ROWS, 2, 0)

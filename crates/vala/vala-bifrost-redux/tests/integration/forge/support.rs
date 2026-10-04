@@ -2670,11 +2670,16 @@ async fn create_table(
     binding
 }
 
-/// Declares the fixture table compaction-enabled and due on every commit.
+/// Declares the fixture table compaction-enabled, due on every commit, and
+/// compacted `full`.
 ///
 /// Rewrites are dispatched by the leader from table properties, as in
 /// `RisingWave`; a snapshot-count trigger of one makes each promotion commit
 /// due on the next worker pull, so a scenario never waits out the interval.
+/// The fixture seals one object per day, which the default `small-files`
+/// type leaves waiting for a partner; `full` rewrites each of them, which is
+/// what the publication, recovery, admission, and cleanup scenarios built on
+/// this fixture need. Small-files scenarios remove the type or seal partners.
 ///
 /// # Panics
 /// Panics when the table cannot be loaded or the property commit fails.
@@ -2685,9 +2690,38 @@ async fn enable_compaction(catalog: &BifrostCatalog, binding: &TenantTableBindin
         &[
             ("wyrd.forge.enable-compaction", "true"),
             ("wyrd.forge.compaction.trigger-snapshot-count", "1"),
+            ("wyrd.forge.compaction.type", "full"),
         ],
     )
     .await;
+}
+
+/// Removes Iceberg table properties and returns the committed table.
+///
+/// A scenario about a default removes the fixture's declaration of it, so the
+/// table carries what registration alone writes.
+///
+/// # Panics
+/// Panics when the table cannot be loaded or the property commit fails.
+pub(crate) async fn remove_table_properties(
+    catalog: &BifrostCatalog,
+    binding: &TenantTableBinding,
+    keys: &[&str],
+) -> Table {
+    let iceberg = catalog.iceberg_catalog();
+    let table = iceberg
+        .load_table(&binding.table_ident())
+        .await
+        .expect("fixture table load");
+    let tx = Transaction::new(&table);
+    let mut update = tx.update_table_properties();
+    for key in keys {
+        update = update.remove((*key).to_owned());
+    }
+    let tx = update.apply(tx).expect("fixture property removal");
+    tx.commit(iceberg.as_ref())
+        .await
+        .expect("fixture property removal commit")
 }
 
 /// Commits Iceberg table properties, such as the fixture table's Forge settings.

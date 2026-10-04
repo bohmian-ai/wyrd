@@ -1684,18 +1684,23 @@ mod tests {
     /// reproduces the durable state at the chosen boundary with the same stage
     /// operations: all members in `Published` (`cleanup_pending == false`) or
     /// all in `CleanupPending`, with the first `retired` members already
-    /// removed by one batched [`ScribeHotStage::retire_all`]. Restart must
+    /// removed by one batched [`ScribeHotStage::retire_all`]. With
+    /// `half_removed`, the next two survivors are left the way a crash inside
+    /// one member's removal leaves it: one keeps its record but has lost its
+    /// runs, the other keeps its runs but has lost its record. Restart must
     /// retire every survivor under the committed facts without republishing,
-    /// leave no claim to resume, no staged bytes, and no authority.
+    /// leave no claim to resume, no staged bytes, no member directory, and no
+    /// authority.
     ///
     /// # Panics
     ///
     /// Panics when the fixture cannot stage or drive the claim, or when
-    /// recovery republishes, leaves a resumable claim, leaks staged bytes, or
-    /// leaves a restored authority alive.
+    /// recovery republishes, leaves a resumable claim, leaks staged bytes,
+    /// leaves a member directory, or leaves a restored authority alive.
     async fn recovers_claim_interrupted_between_batched_states(
         cleanup_pending: bool,
         retired: usize,
+        half_removed: bool,
     ) {
         let root = tempfile::tempdir().expect("runtime root");
         let stage_root = root.path().join("stage");
@@ -1761,6 +1766,13 @@ mod tests {
             .retire_all(&key, &member_ids[..retired])
             .await
             .expect("members retired before the crash");
+        if half_removed {
+            half_remove(&stage.member_directory(&key, member_ids[retired]), true);
+            half_remove(
+                &stage.member_directory(&key, member_ids[retired + 1]),
+                false,
+            );
+        }
         drop(runtime);
 
         let hot_sources = Arc::new(crate::scribe::hot_source::ScribeHotSourceRegistry::new());
@@ -1783,7 +1795,33 @@ mod tests {
                 .is_empty()
         );
         assert!(stage.recover().await.expect("stage rescans").is_empty());
+        for member in &member_ids {
+            assert!(
+                !stage.member_directory(&key, *member).exists(),
+                "member {member:?} left its directory behind"
+            );
+        }
         assert_no_restored_authority_survives(&hot_sources, &key, &member_ids);
+    }
+
+    /// Removes part of one member directory the way a crash inside its
+    /// removal can leave it: every run but not the record when `keep_record`,
+    /// otherwise only the record.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the directory cannot be listed or a file cannot be removed.
+    fn half_remove(directory: &Path, keep_record: bool) {
+        for entry in std::fs::read_dir(directory).expect("member directory lists") {
+            let path = entry.expect("member directory entry").path();
+            let is_record = path.file_name()
+                == Some(std::ffi::OsStr::new(
+                    crate::scribe::hot_stage::RECORD_FILE_NAME,
+                ));
+            if is_record != keep_record {
+                std::fs::remove_file(&path).expect("crash removes the file");
+            }
+        }
     }
 
     /// A claim that crashed after every member recorded the commit, before
@@ -1794,7 +1832,7 @@ mod tests {
     /// Panics when recovery leaves the claim, its bytes, or its authority.
     #[tokio::test]
     async fn a_claim_crashed_after_its_published_step_retires_on_restart() {
-        recovers_claim_interrupted_between_batched_states(false, 0).await;
+        recovers_claim_interrupted_between_batched_states(false, 0, false).await;
     }
 
     /// A claim that crashed after every member moved to cleanup, before any
@@ -1805,7 +1843,7 @@ mod tests {
     /// Panics when recovery leaves the claim, its bytes, or its authority.
     #[tokio::test]
     async fn a_claim_crashed_after_its_cleanup_step_retires_on_restart() {
-        recovers_claim_interrupted_between_batched_states(true, 0).await;
+        recovers_claim_interrupted_between_batched_states(true, 0, false).await;
     }
 
     /// A claim that crashed partway through its batched removal retires its
@@ -1816,7 +1854,20 @@ mod tests {
     /// Panics when recovery leaves the claim, its bytes, or its authority.
     #[tokio::test]
     async fn a_claim_crashed_inside_its_batched_removal_retires_on_restart() {
-        recovers_claim_interrupted_between_batched_states(true, 2).await;
+        recovers_claim_interrupted_between_batched_states(true, 2, false).await;
+    }
+
+    /// A claim that crashed inside one member's removal — a member left with
+    /// its record but not its runs, another with its runs but not its record —
+    /// retires every survivor on restart instead of refusing to start.
+    ///
+    /// # Panics
+    ///
+    /// Panics when recovery refuses a half-removed member or leaves the
+    /// claim, its bytes, a member directory, or its authority.
+    #[tokio::test]
+    async fn a_claim_crashed_inside_one_member_removal_retires_on_restart() {
+        recovers_claim_interrupted_between_batched_states(true, 1, true).await;
     }
 }
 
@@ -1962,6 +2013,170 @@ mod pg_tests {
         assert_eq!(
             gauge("bifrost_scribe_staging_outstanding_claims"),
             Some(1.0)
+        );
+    }
+
+    /// Builds a publisher whose fenced transaction runs against `pool`.
+    fn fenced_publisher(
+        stage: Arc<ScribeHotStage>,
+        wal_root: &Path,
+        node: NodeId,
+        pool: vala_sql::OperatorPool,
+    ) -> ClaimPublisher {
+        let operator = opendal::Operator::new(opendal::services::Memory::default())
+            .expect("memory operator")
+            .finish();
+        ClaimPublisher::new(
+            stage,
+            crate::scribe::persistence::ScribeStageMover::new(wal_root, operator),
+            crate::scribe::persistence::ScribePublicationReconciler::new(
+                pool,
+                StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1)),
+                crate::scribe::persistence::PersistenceFaults::default(),
+            ),
+        )
+    }
+
+    /// Gathers, merges, and publishes one claim the way persistence does.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first gather, merge, or publication refusal.
+    async fn publish_claim_once(
+        runtime: &ScribeStagingRuntime,
+        claim: &StagingClaim,
+        scratch: &Path,
+        node: NodeId,
+    ) -> Result<PublishedClaim, ScribeError> {
+        let runs = runtime.gather(claim).await?;
+        std::fs::create_dir_all(scratch).expect("claim scratch");
+        let assembled = runtime.assemble(
+            claim,
+            AssembleRequest {
+                runs: &runs,
+                scratch_dir: scratch,
+                memory: crate::resources::ScribeResources::for_test(),
+            },
+        )?;
+        runtime
+            .publish(
+                claim,
+                &runs,
+                &assembled,
+                StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1)),
+            )
+            .await
+    }
+
+    /// A claim whose members reached `Publishing` and whose commit never
+    /// landed publishes once a restarted runtime resumes it.
+    ///
+    /// The first runtime's node holds no publication fence, so its fenced
+    /// transaction is refused after every member durably entered
+    /// `Publishing` — the state a crash between that step and the commit
+    /// leaves. A restarted runtime over the same namespace, now fenced,
+    /// restores the claim under its original identity and must carry it
+    /// through the commit rather than refusing to move its members.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot stage or claim, when the unfenced attempt
+    /// commits, or when the resumed claim does not publish and retire.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_claim_stranded_in_publishing_publishes_after_restart() {
+        let database = wyrd_dev_fixtures::pg::PgFixture::start()
+            .await
+            .expect("Postgres fixture");
+        register_control_row(&database).await;
+        let tenant = database.data_tenant_id();
+        let root = tempfile::tempdir().expect("runtime root");
+        let stage_root = root.path().join("stage");
+        let wal_root = root.path().join("member-wal");
+        for path in [&stage_root, &wal_root] {
+            std::fs::create_dir_all(path).expect("fixture directory");
+        }
+        let node_id = NodeId::generate();
+        let stage = Arc::new(ScribeHotStage::new(stage_root));
+        let config =
+            StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
+                .expect("assembler controls");
+        let runtime = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            fenced_publisher(
+                Arc::clone(&stage),
+                &wal_root,
+                node_id,
+                database.operator_pool().clone(),
+            ),
+            config,
+        );
+        let (key, member_ids) =
+            stage_durable_members(&runtime, tenant, node_id, 1..=2, chrono::Utc::now()).await;
+        let claim = runtime
+            .take_residue(&key, ClaimCause::Drain)
+            .expect("residue claim")
+            .expect("two ready members form one claim");
+        publish_claim_once(&runtime, &claim, &root.path().join("scratch-0"), node_id)
+            .await
+            .expect_err("an unfenced node cannot commit the claim");
+        for member in &member_ids {
+            assert_eq!(
+                stage
+                    .member(&key, *member)
+                    .await
+                    .expect("member survives the refusal")
+                    .record()
+                    .state()
+                    .label(),
+                "publishing"
+            );
+        }
+        drop(runtime);
+
+        let superuser = database.superuser_pool().await.expect("superuser pool");
+        sqlx::query(
+            "INSERT INTO vala.cluster_nodes (data_tenant_id,node_id,role,advertise_addr,fencing_token,started_at,heartbeat_at) VALUES ($1,$2,'scribe','127.0.0.1:1',$3,now(),now())",
+        )
+        .bind(wyrd_spec::DataTenantId::SYSTEM_OWNER.as_uuid())
+        .bind(node_id.as_uuid())
+        .bind(1_i64)
+        .execute(&superuser)
+        .await
+        .expect("register the restarted node's publication fence");
+        let restarted = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            fenced_publisher(
+                Arc::clone(&stage),
+                &wal_root,
+                node_id,
+                database.operator_pool().clone(),
+            ),
+            config,
+        );
+        restarted
+            .restore(database.operator_pool().pool())
+            .await
+            .expect("the stranded claim restores");
+        let resumed = restarted
+            .resumable_claims()
+            .expect("claim index")
+            .pop()
+            .expect("the stranded claim is outstanding");
+        assert_eq!(resumed.id(), claim.id(), "the claim resumes as itself");
+        publish_claim_once(
+            &restarted,
+            &resumed,
+            &root.path().join("scratch-1"),
+            node_id,
+        )
+        .await
+        .expect("the resumed claim publishes");
+        assert!(stage.recover().await.expect("stage rescans").is_empty());
+        assert!(
+            restarted
+                .resumable_claims()
+                .expect("claim index")
+                .is_empty()
         );
     }
 }

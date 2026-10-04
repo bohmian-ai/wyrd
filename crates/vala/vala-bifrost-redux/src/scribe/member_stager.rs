@@ -484,9 +484,8 @@ mod tests {
         assert_eq!(member.member(), StagedMemberId::new(5, 9));
         assert_eq!(member.runs().len(), 1);
 
-        let recovered_before = stage.recover().await.expect("scan before publication");
         assert!(
-            recovered_before.is_empty(),
+            stage.member(member.key(), member.member()).await.is_err(),
             "runs without a record are never a query authority"
         );
 

@@ -1119,9 +1119,16 @@ async fn sealed_replay_on_a_later_day_activates_once() -> Result<(), ServerJourn
         .execute(&mut *lock)
         .await?;
 
-    let before = chrono::Utc::now();
+    // Scribe stamps receipts from PostgreSQL time, so the window is read from
+    // that same clock rather than the host's.
+    let postgres_now = "SELECT clock_timestamp()";
+    let before: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(postgres_now)
+        .fetch_one(&superuser)
+        .await?;
     ingest.insert(OBSERVATIONS, batch, frame.clone()).await?;
-    let after = chrono::Utc::now();
+    let after: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(postgres_now)
+        .fetch_one(&superuser)
+        .await?;
     blocked_activations(&superuser, 1).await?;
     scribe.shift_receipt_clock_for_test(Duration::from_secs(86_400));
     let (first, second) = tokio::join!(

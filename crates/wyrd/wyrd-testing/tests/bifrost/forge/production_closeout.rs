@@ -110,6 +110,9 @@ impl Drop for OracleReadBarriers {
 const PASS_BOUND: Duration = Duration::from_secs(15);
 /// Production-sized rewrites may spend several minutes encoding physical bytes.
 const REWRITE_BOUND: Duration = Duration::from_secs(600);
+/// Maintenance passes driven while a reader is held; each must defer every
+/// destructive route, so several passes prove the deferral is not one-shot.
+const HELD_READER_PASSES: usize = 3;
 /// Environment flag selecting the standard production geometry profile.
 ///
 /// Journey-only: it changes nothing but the sizes this test's own setup
@@ -1411,7 +1414,7 @@ struct ReaderCleanupJourney {
     old_snapshot: i64,
     /// Exact data files the paused query must retain.
     old_files: BTreeMap<String, DataFile>,
-    /// Earlier replaced data object eligible for deletion while the query lives.
+    /// Earlier replaced data object collected only after the reader releases.
     earlier_object: String,
 }
 
@@ -1515,11 +1518,17 @@ impl ReaderCleanupJourney {
         .expect("terminal query releases its active table read");
     }
 
-    /// Holds a public reader while earlier objects are deleted, then releases it.
+    /// Holds a public reader across a rewrite and destructive passes, then
+    /// collects the earlier replaced object once the reader releases.
+    ///
+    /// While the query owns its active table read, another pod still rewrites
+    /// the table, but every maintenance pass defers expiry and cleanup, so the
+    /// earlier object, the reader's files, and its snapshot all survive.
     ///
     /// # Panics
-    /// Panics if the query was not protected, cleanup touches its inputs, or its
-    /// terminal rows change after another process publishes and expires snapshots.
+    /// Panics if the query was not protected, a held pass deletes anything, its
+    /// terminal rows change, or the earlier object is not collected after
+    /// release.
     async fn protect_during_cleanup(&mut self) {
         let expected = canonical_order(self.workload.expected.clone());
         let barriers = OracleReadBarriers::arm(&self.roles.cluster);
@@ -1548,10 +1557,15 @@ impl ReaderCleanupJourney {
                 .expect("new rows flush");
             let (current, _) = self.roles.compact_small_table(&self.table.binding).await;
             assert_ne!(current, self.old_snapshot);
-            self.roles.advance_maintenance(chrono::Duration::days(2));
-            self.roles
-                .collect_exact(&self.table.binding, &self.earlier_object, &self.old_files)
-                .await;
+            for _ in 0..HELD_READER_PASSES {
+                self.roles.maintenance_pass().await;
+                self.roles.drain_tasks().await;
+            }
+            assert!(
+                !self.roles.object_missing(&self.earlier_object).await,
+                "an active table read defers every destructive pass"
+            );
+            self.roles.assert_objects(&self.old_files).await;
             let metadata = self
                 .roles
                 .coordinator()
@@ -1574,6 +1588,12 @@ impl ReaderCleanupJourney {
             "old reader returns exactly its protected cut"
         );
         self.wait_for_reader_release().await;
+        // With the last reader gone the earlier object is collected without an
+        // age wait; the reader's own files stay live through the head's
+        // rewrite lineage until `finish` moves the head on.
+        self.roles
+            .collect_exact(&self.table.binding, &self.earlier_object, &self.old_files)
+            .await;
     }
 
     /// Moves the rewrite head onward and observes exact old-object deletion.
@@ -1619,7 +1639,7 @@ impl ReaderCleanupJourney {
     }
 }
 
-/// An old public reader survives real cross-pod expiration and physical cleanup.
+/// An old public reader defers cross-pod expiration and physical cleanup.
 ///
 /// # Panics
 /// Panics when durable protection, exact deletion ownership, or tenant rows fail.

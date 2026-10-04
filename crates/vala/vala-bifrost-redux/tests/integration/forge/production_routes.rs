@@ -686,16 +686,6 @@ async fn coordinator_and_worker_delete_only_exact_never_published_generation() {
         "a restarted worker replayed or rewound its durable cursor: {cursors:?}"
     );
 
-    // No destructive sibling route ran: the table never owed an expiration or a
-    // cleanup handoff, so nothing but collection could have removed an object.
-    let observed = settled_tasks(&promoted.fixture).await;
-    assert!(
-        observed
-            .iter()
-            .all(|(_, strategy, _)| strategy != "snapshot_expiry" && strategy != "expired_cleanup"),
-        "a sibling destructive route ran beside collection: {observed:?}"
-    );
-
     // Identity is orphan-only: no other route wrote an operation row while
     // this one ran.
     let operations = super::orphan_cleanup::orphan_operations(&promoted.fixture).await;

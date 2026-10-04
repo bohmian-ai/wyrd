@@ -1293,7 +1293,7 @@ async fn assert_compaction_watermark_blocks_expiry(table: &ExpirableTable) {
             compaction_enabled: false,
             ..ForgeTableSettings::default()
         },
-        chrono::Utc::now(),
+        forge.clock_for_test().now().expect("Forge clock reads"),
     );
     let manual = forge.pull_compaction(4).await.expect("leader pull");
     assert_eq!(manual.len(), 1, "the manual run is due: {manual:?}");

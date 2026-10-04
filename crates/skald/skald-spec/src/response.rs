@@ -25,12 +25,10 @@ pub enum ProviderResponse {
     OpenAiEmbeddings(OpenAiEmbeddingsResponse),
     /// Anthropic Messages response.
     AnthropicMessage(AnthropicMessagesResponse),
-    /// Google Gemini GenerateContent response.
+    /// Google GenerateContent response, from Gemini or Vertex.
     GeminiGenerateContent(GoogleGenerateContentResponse),
     /// Google Gemini BatchEmbedContents response.
     GoogleBatchEmbed(GoogleBatchEmbedResponse),
-    /// Vertex GenerateContent response.
-    VertexGenerateContent(GoogleGenerateContentResponse),
     /// Vertex Predict response.
     VertexPredict(VertexPredictResponse),
     /// Raw provider response body that no typed variant claimed.
@@ -87,9 +85,6 @@ impl PartialEq for ProviderResponse {
                 left == right
             }
             (Self::GoogleBatchEmbed(left), Self::GoogleBatchEmbed(right)) => left == right,
-            (Self::VertexGenerateContent(left), Self::VertexGenerateContent(right)) => {
-                left == right
-            }
             (Self::VertexPredict(left), Self::VertexPredict(right)) => left == right,
             (Self::RawV1(left), Self::RawV1(right)) => left.get() == right.get(),
             _ => false,
@@ -111,7 +106,7 @@ impl ProviderResponse {
             | Self::OpenAiEmbeddings(_) => ProviderName::OpenAi,
             Self::AnthropicMessage(_) => ProviderName::Anthropic,
             Self::GeminiGenerateContent(_) | Self::GoogleBatchEmbed(_) => ProviderName::Google,
-            Self::VertexGenerateContent(_) | Self::VertexPredict(_) => ProviderName::Vertex,
+            Self::VertexPredict(_) => ProviderName::Vertex,
             Self::RawV1(_) => ProviderName::Custom("raw".to_owned()),
         }
     }

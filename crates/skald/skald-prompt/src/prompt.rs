@@ -108,12 +108,6 @@ impl Prompt {
                     parts: vec![google_text_part(text)],
                 });
             }
-            ProviderRequest::Vertex(request) => {
-                request.0.system_instruction = Some(GoogleContent {
-                    role: "user".to_owned(),
-                    parts: vec![google_text_part(text)],
-                });
-            }
             other => return unsupported_role(other, "system"),
         }
         prompt.inner.normalize_media_placeholders_mut()?;
@@ -166,12 +160,6 @@ impl Prompt {
                     .contents
                     .push(google_tool_result(tool_use_id, &content));
             }
-            ProviderRequest::Vertex(request) => {
-                request
-                    .0
-                    .contents
-                    .push(google_tool_result(tool_use_id, &content));
-            }
             other => return unsupported_role(other, "tool_result"),
         }
         prompt.inner.normalize_media_placeholders_mut()?;
@@ -207,9 +195,6 @@ impl Prompt {
             }
             ProviderRequest::GeminiGenerateContent(request) => {
                 request.contents.push(google_content(role, text));
-            }
-            ProviderRequest::Vertex(request) => {
-                request.0.contents.push(google_content(role, text));
             }
             other => return unsupported_role(other, role),
         }
@@ -1143,9 +1128,6 @@ impl PyProviderRequest {
     /// Raises `WyrdError` when the provider is not vertex.
     pub fn vertex(&self) -> WyrdPyResult<python::PyVertexRequest> {
         match self.inner.as_ref() {
-            skald_spec::ProviderRequest::Vertex(_) => {
-                Ok(python::PyVertexRequest::new(Arc::clone(&self.inner)))
-            }
             other => Err(wrong_provider("vertex", other.provider()).into()),
         }
     }
@@ -1312,7 +1294,6 @@ fn request_messages_value(request: &ProviderRequest) -> serde_json::Value {
         ProviderRequest::OpenAiResponses(request) => serde_json::to_value(request.input.items()),
         ProviderRequest::AnthropicMessage(request) => serde_json::to_value(&request.messages),
         ProviderRequest::GeminiGenerateContent(request) => serde_json::to_value(&request.contents),
-        ProviderRequest::Vertex(request) => serde_json::to_value(&request.0.contents),
         _ => Ok(serde_json::Value::Array(Vec::new())),
     }
     .unwrap_or(serde_json::Value::Null)
@@ -1333,7 +1314,6 @@ fn request_system_value(request: &ProviderRequest) -> serde_json::Value {
         ProviderRequest::GeminiGenerateContent(request) => {
             serde_json::to_value(&request.system_instruction)
         }
-        ProviderRequest::Vertex(request) => serde_json::to_value(&request.0.system_instruction),
         _ => Ok(serde_json::Value::Null),
     }
     .unwrap_or(serde_json::Value::Null)
@@ -1629,16 +1609,6 @@ fn append_native_json_content(
         }
         ProviderRequest::GeminiGenerateContent(request) => {
             request.contents.push(GoogleContent {
-                role: if role == "assistant" {
-                    "model".to_owned()
-                } else {
-                    "user".to_owned()
-                },
-                parts: json_parts::<GooglePart>(value)?,
-            });
-        }
-        ProviderRequest::Vertex(request) => {
-            request.0.contents.push(GoogleContent {
                 role: if role == "assistant" {
                     "model".to_owned()
                 } else {

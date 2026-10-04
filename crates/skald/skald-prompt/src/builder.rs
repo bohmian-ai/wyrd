@@ -13,7 +13,6 @@ use skald_spec::wire::openai_responses::{
     OpenAiResponseContentPart, OpenAiResponseItem, OpenAiResponsesRequest, OpenAiResponsesSettings,
     OpenAiResponsesText, OpenAiTextResponseFormat,
 };
-use skald_spec::wire::vertex_generate::VertexGenerateContentRequest;
 use skald_spec::{ProviderName, ProviderRequest, ResponseType};
 
 use crate::coerce::{checked_model, schema_object};
@@ -298,28 +297,26 @@ fn google_prompt(
         settings,
     };
     finalize_prompt(skald_spec::Prompt {
-        request: if vertex_target {
-            ProviderRequest::Vertex(VertexGenerateContentRequest(request))
-        } else {
-            ProviderRequest::GeminiGenerateContent(request)
-        },
+        request: ProviderRequest::GeminiGenerateContent(request),
         model,
         version: options.version,
         variables: options.variables,
         media_variables: Vec::new(),
         response_type,
-        provider: None,
+        provider: vertex_target.then_some(ProviderName::Vertex),
     })
 }
 
 fn finalize_prompt(mut prompt: skald_spec::Prompt) -> PromptBuilderResult<Prompt> {
     if prompt.variables.is_empty() {
+        let provider = prompt.provider;
         prompt = skald_spec::Prompt::new(
             prompt.request,
             prompt.model,
             prompt.version,
             prompt.response_type,
         )?;
+        prompt.provider = provider;
     } else {
         prompt.normalize_media_placeholders_mut()?;
     }
@@ -618,8 +615,9 @@ mod builder_tests {
         .unwrap();
         assert!(matches!(
             vertex_prompt.native().request,
-            ProviderRequest::Vertex(_)
+            ProviderRequest::GeminiGenerateContent(_)
         ));
+        assert_eq!(vertex_prompt.native().provider(), ProviderName::Vertex);
     }
 
     #[test]

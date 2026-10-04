@@ -78,9 +78,6 @@ impl PyProviderResponse {
 
     pub fn vertex(&self) -> WyrdPyResult<PyVertexResponse> {
         match self.inner.as_ref() {
-            ProviderResponse::VertexGenerateContent(_) => {
-                Ok(PyVertexResponse::new(Arc::clone(&self.inner)))
-            }
             other => Err(wrong_provider("vertex", other.provider()).into()),
         }
     }

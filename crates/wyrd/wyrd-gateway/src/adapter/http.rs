@@ -14,7 +14,6 @@ use skald_providers::{
     AnthropicClient, GoogleClient, HttpTransport, MediaAnswer, OpenAiClient, OpenAiMediaRoute,
     OpenAiRoute, ProviderByteStream, ProviderError, ProviderResult, RetryPolicy, VertexClient,
 };
-use skald_spec::wire::vertex_generate::VertexGenerateContentRequest;
 use skald_spec::{ProviderRequest, ProviderResponse};
 use url::Url;
 use wyrd_spec::gateway::{GatewayOperation, ProviderAdapter, ProviderAuth, ProviderDeployment};
@@ -347,9 +346,7 @@ impl Client {
             }
             (Self::Vertex(client), Prepared::Google(request)) => {
                 client
-                    .send_native(ProviderRequest::Vertex(VertexGenerateContentRequest(
-                        *request,
-                    )))
+                    .send_native(ProviderRequest::GeminiGenerateContent(*request))
                     .await?
             }
             (_, _) => return Err(mismatch()),

@@ -295,13 +295,12 @@ impl WorkflowExecutionDependencies {
                             message: format!("{field}: no Wyrd gateway is available"),
                             details: serde_json::json!({ "field": field }),
                         })?;
-                let model =
-                    gateway_model(&prompt.request.provider(), &prompt.model).ok_or_else(|| {
-                        route_unsupported(
-                            field,
-                            "Prompt provider and model are not a gateway model identity",
-                        )
-                    })?;
+                let model = gateway_model(&prompt.provider(), &prompt.model).ok_or_else(|| {
+                    route_unsupported(
+                        field,
+                        "Prompt provider and model are not a gateway model identity",
+                    )
+                })?;
                 Ok(StepRoute::WyrdGateway {
                     caller: Arc::clone(caller),
                     fallback: fallback.cloned(),
@@ -428,6 +427,8 @@ impl StepRoute {
 }
 
 /// Return true when `request`'s native dialect is the one `protocol` accepts.
+///
+/// Gemini and Vertex gateways both accept a Google GenerateContent body.
 pub(crate) fn protocol_matches(
     protocol: ExternalGatewayProtocol,
     request: &ProviderRequest,
@@ -448,7 +449,7 @@ pub(crate) fn protocol_matches(
             ProviderRequest::GeminiGenerateContent(_)
         ) | (
             ExternalGatewayProtocol::VertexGenerateContent,
-            ProviderRequest::Vertex(_)
+            ProviderRequest::GeminiGenerateContent(_)
         )
     )
 }

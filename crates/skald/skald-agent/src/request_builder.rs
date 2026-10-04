@@ -20,10 +20,8 @@ pub enum PromptLoopSupport {
     OpenAiResponses,
     /// `ProviderRequest::AnthropicMessage`.
     Anthropic,
-    /// `ProviderRequest::GeminiGenerateContent`.
+    /// `ProviderRequest::GeminiGenerateContent`, for Gemini or Vertex.
     Gemini,
-    /// `ProviderRequest::Vertex`.
-    Vertex,
 }
 
 /// Decide whether a rendered provider request can drive the agent tool loop.
@@ -45,7 +43,6 @@ pub fn validate_prompt_loop_request(
         ProviderRequest::OpenAiChatCompletion(_) => Ok(PromptLoopSupport::OpenAiChat),
         ProviderRequest::AnthropicMessage(_) => Ok(PromptLoopSupport::Anthropic),
         ProviderRequest::GeminiGenerateContent(_) => Ok(PromptLoopSupport::Gemini),
-        ProviderRequest::Vertex(_) => Ok(PromptLoopSupport::Vertex),
         ProviderRequest::OpenAiResponses(_) => Ok(PromptLoopSupport::OpenAiResponses),
         ProviderRequest::OpenAiEmbeddings(_) | ProviderRequest::GoogleBatchEmbed(_) => {
             Err(AgentError::Prompt {
@@ -99,13 +96,6 @@ pub fn extract_messages(agent: &str, request: &ProviderRequest) -> AgentResult<V
             .map(MessageNum::Anthropic)
             .collect()),
         (PromptLoopSupport::Gemini, ProviderRequest::GeminiGenerateContent(req)) => Ok(req
-            .contents
-            .iter()
-            .cloned()
-            .map(MessageNum::Gemini)
-            .collect()),
-        (PromptLoopSupport::Vertex, ProviderRequest::Vertex(req)) => Ok(req
-            .0
             .contents
             .iter()
             .cloned()
@@ -173,8 +163,7 @@ pub fn assistant_message(agent: &str, response: &ProviderResponse) -> AgentResul
                 content: response.content.clone(),
             }))
         }
-        ProviderResponse::GeminiGenerateContent(response)
-        | ProviderResponse::VertexGenerateContent(response) => {
+        ProviderResponse::GeminiGenerateContent(response) => {
             let candidate =
                 response
                     .candidates
@@ -256,18 +245,6 @@ pub fn rebuild_request_messages(
                 }
             }
         }
-        ProviderRequest::Vertex(req) => {
-            req.0.contents.clear();
-            for msg in new_messages {
-                match msg {
-                    MessageNum::Gemini(message) if message.role != "system" => {
-                        req.0.contents.push(message.clone());
-                    }
-                    MessageNum::Gemini(_) => {}
-                    _ => return Err(mismatch(ProviderName::Vertex)),
-                }
-            }
-        }
         ProviderRequest::OpenAiResponses(req) => {
             let mut items = Vec::new();
             for msg in new_messages {
@@ -342,7 +319,6 @@ fn validate_message_provider(
             )
             | (PromptLoopSupport::Anthropic, MessageNum::Anthropic(_))
             | (PromptLoopSupport::Gemini, MessageNum::Gemini(_))
-            | (PromptLoopSupport::Vertex, MessageNum::Gemini(_))
     );
     if valid {
         return Ok(());
@@ -354,7 +330,6 @@ fn validate_message_provider(
             }
             PromptLoopSupport::Anthropic => skald_spec::ProviderName::Anthropic,
             PromptLoopSupport::Gemini => skald_spec::ProviderName::Google,
-            PromptLoopSupport::Vertex => skald_spec::ProviderName::Vertex,
         },
         detail: format!("agent '{agent}' conversation contains a mismatched assistant message"),
     })
@@ -374,14 +349,12 @@ fn system_message(provider: PromptLoopSupport, content: &str) -> MessageNum {
                 citations: None,
             }],
         }),
-        PromptLoopSupport::Gemini | PromptLoopSupport::Vertex => {
-            MessageNum::Gemini(GoogleContent {
-                role: "system".to_owned(),
-                parts: vec![GooglePart::Text {
-                    text: content.to_owned(),
-                }],
-            })
-        }
+        PromptLoopSupport::Gemini => MessageNum::Gemini(GoogleContent {
+            role: "system".to_owned(),
+            parts: vec![GooglePart::Text {
+                text: content.to_owned(),
+            }],
+        }),
     }
 }
 
@@ -399,14 +372,12 @@ fn user_message(provider: PromptLoopSupport, content: &str) -> MessageNum {
                 citations: None,
             }],
         }),
-        PromptLoopSupport::Gemini | PromptLoopSupport::Vertex => {
-            MessageNum::Gemini(GoogleContent {
-                role: "user".to_owned(),
-                parts: vec![GooglePart::Text {
-                    text: content.to_owned(),
-                }],
-            })
-        }
+        PromptLoopSupport::Gemini => MessageNum::Gemini(GoogleContent {
+            role: "user".to_owned(),
+            parts: vec![GooglePart::Text {
+                text: content.to_owned(),
+            }],
+        }),
     }
 }
 
@@ -438,17 +409,15 @@ fn tool_result_message(
                 cache_control: None,
             }],
         }),
-        PromptLoopSupport::Gemini | PromptLoopSupport::Vertex => {
-            MessageNum::Gemini(GoogleContent {
-                role: "function".to_owned(),
-                parts: vec![GooglePart::FunctionResponse {
-                    function_response: GoogleFunctionResponse {
-                        name: call_id.to_owned(),
-                        response: serde_json::json!({ "content": content }),
-                    },
-                }],
-            })
-        }
+        PromptLoopSupport::Gemini => MessageNum::Gemini(GoogleContent {
+            role: "function".to_owned(),
+            parts: vec![GooglePart::FunctionResponse {
+                function_response: GoogleFunctionResponse {
+                    name: call_id.to_owned(),
+                    response: serde_json::json!({ "content": content }),
+                },
+            }],
+        }),
     }
 }
 
@@ -480,7 +449,6 @@ mod tests {
         GoogleContent, GoogleGenerateContentRequest, GoogleGenerateSettings, GooglePart,
     };
     use skald_spec::wire::openai_chat::{OpenAiChatMessage, OpenAiMessageContent};
-    use skald_spec::wire::vertex_generate::VertexGenerateContentRequest;
     use skald_spec::{MessageNum, ProviderRequest};
 
     use super::{extract_messages, rebuild_request_messages};
@@ -523,10 +491,6 @@ mod tests {
         ProviderRequest::GeminiGenerateContent(google_request(contents))
     }
 
-    fn vertex_request(contents: Vec<GoogleContent>) -> ProviderRequest {
-        ProviderRequest::Vertex(VertexGenerateContentRequest(google_request(contents)))
-    }
-
     fn google_message(role: &str, text: &str) -> GoogleContent {
         GoogleContent {
             role: role.to_owned(),
@@ -557,23 +521,6 @@ mod tests {
         ]);
 
         let messages = extract_messages("agent", &request).expect("Gemini messages must extract");
-
-        assert_eq!(messages.len(), 2);
-        assert!(
-            messages
-                .iter()
-                .all(|message| matches!(message, MessageNum::Gemini(_)))
-        );
-    }
-
-    #[test]
-    fn extract_messages_vertex_returns_gemini_variants() {
-        let request = vertex_request(vec![
-            google_message("user", "hello"),
-            google_message("model", "hi"),
-        ]);
-
-        let messages = extract_messages("agent", &request).expect("Vertex messages must extract");
 
         assert_eq!(messages.len(), 2);
         assert!(

@@ -92,7 +92,6 @@ fn request_model(request: &ProviderRequest) -> Option<&str> {
         ProviderRequest::AnthropicMessage(request) => Some(&request.model),
         ProviderRequest::GeminiGenerateContent(_)
         | ProviderRequest::GoogleBatchEmbed(_)
-        | ProviderRequest::Vertex(_)
         | ProviderRequest::VertexPredict(_)
         | ProviderRequest::RawV1 { .. } => None,
         // ProviderRequest is #[non_exhaustive]. Any new variant that carries a

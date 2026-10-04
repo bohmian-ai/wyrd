@@ -12,15 +12,14 @@ use crate::wire::openai_chat::{OpenAiFunction, OpenAiTool};
 use crate::wire::openai_embeddings::OpenAiEmbeddingsRequest;
 use crate::wire::openai_responses::OpenAiResponsesRequest;
 use crate::wire::openai_responses::OpenAiResponsesTool;
-use crate::wire::vertex_generate::VertexGenerateContentRequest;
 use crate::wire::vertex_predict::VertexPredictRequest;
 
 /// One native LLM request, tagged with the provider dialect its body speaks.
 ///
 /// Serialized as `{"provider": "<variant>", "body": <native provider JSON>}`.
-/// The tag selects the variant, so bodies that share a wire shape (Gemini and
-/// Vertex GenerateContent) still read back as the provider that saved them, and
-/// a body that does not match its named provider fails to deserialize.
+/// The tag selects the variant, so a body that does not match its named
+/// dialect fails to deserialize. The tag names a wire schema, not a
+/// destination: one schema served by several providers is one variant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(tag = "provider", content = "body", rename_all = "snake_case")]
@@ -36,12 +35,11 @@ pub enum ProviderRequest {
     OpenAiEmbeddings(OpenAiEmbeddingsRequest),
     /// Anthropic Messages request.
     AnthropicMessage(AnthropicMessagesRequest),
-    /// Google Gemini GenerateContent request.
+    /// Google GenerateContent request, sent to Gemini or, when
+    /// [`Prompt::provider`](crate::Prompt::provider) is Vertex, to Vertex.
     GeminiGenerateContent(GoogleGenerateContentRequest),
     /// Google Gemini BatchEmbedContents request.
     GoogleBatchEmbed(GoogleBatchEmbedRequest),
-    /// Vertex GenerateContent request.
-    Vertex(VertexGenerateContentRequest),
     /// Vertex Predict request.
     VertexPredict(VertexPredictRequest),
     /// Raw provider request body that no typed variant models.
@@ -94,7 +92,7 @@ impl ProviderRequest {
             | Self::OpenAiEmbeddings(_) => ProviderName::OpenAi,
             Self::AnthropicMessage(_) => ProviderName::Anthropic,
             Self::GeminiGenerateContent(_) | Self::GoogleBatchEmbed(_) => ProviderName::Google,
-            Self::Vertex(_) | Self::VertexPredict(_) => ProviderName::Vertex,
+            Self::VertexPredict(_) => ProviderName::Vertex,
             Self::RawV1 { provider, .. } => provider.clone(),
         }
     }
@@ -117,9 +115,6 @@ impl ProviderRequest {
             }
             Self::GeminiGenerateContent(request) => {
                 request.tools = Some(vec![google_tool(&tools)]);
-            }
-            Self::Vertex(request) => {
-                request.0.tools = Some(vec![google_tool(&tools)]);
             }
             Self::OpenAiEmbeddings(_)
             | Self::GoogleBatchEmbed(_)
@@ -247,7 +242,6 @@ mod round_trip {
         round_trip(&common::google_response(
             crate::wire::google_generate::GoogleFinishReason::Stop,
         ));
-        round_trip(&common::vertex_generate_request());
         round_trip(&common::vertex_predict_request());
         round_trip(&common::vertex_predict_response());
     }
@@ -267,18 +261,6 @@ mod round_trip {
             assert_eq!(reparsed, request);
             assert_eq!(reparsed.provider(), provider);
         }
-    }
-
-    /// A Vertex body has the Gemini wire shape; the provider tag alone keeps it
-    /// Vertex across a save and load.
-    #[test]
-    fn vertex_request_reads_back_as_vertex() {
-        let request = ProviderRequest::Vertex(common::vertex_generate_request());
-        let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["provider"], "vertex");
-        let reparsed: ProviderRequest = serde_json::from_value(json).unwrap();
-        assert!(matches!(reparsed, ProviderRequest::Vertex(_)));
-        assert_eq!(reparsed, request);
     }
 
     /// Stores such as Postgres `jsonb` reorder keys, so the body may precede

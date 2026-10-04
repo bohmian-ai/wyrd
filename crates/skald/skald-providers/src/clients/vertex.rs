@@ -102,10 +102,11 @@ impl VertexClient {
         .await
     }
 
-    /// Sends a native Vertex request.
+    /// Sends a native Vertex request: a Google GenerateContent body to the
+    /// project/location `generateContent` endpoint, or a Predict body.
     pub async fn send_native(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
         match request {
-            ProviderRequest::Vertex(request) => {
+            ProviderRequest::GeminiGenerateContent(request) => {
                 let url = self.auth.model_url(&self.model, "generateContent");
                 let response = super::send_json_with_retry(
                     &self.transport,
@@ -116,7 +117,7 @@ impl VertexClient {
                     &self.retry,
                 )
                 .await?;
-                Ok(ProviderResponse::VertexGenerateContent(response))
+                Ok(ProviderResponse::GeminiGenerateContent(response))
             }
             ProviderRequest::VertexPredict(request) => {
                 let url = self.auth.model_url(&self.model, "predict");
@@ -162,7 +163,7 @@ impl ProviderClient for VertexClient {
 
     async fn stream(&self, request: ProviderRequest) -> ProviderResult<ProviderStream> {
         match request {
-            ProviderRequest::Vertex(request) => {
+            ProviderRequest::GeminiGenerateContent(request) => {
                 let url = self.auth.model_url(&self.model, "streamGenerateContent");
                 let body = serde_json::to_vec(&request)
                     .map_err(|error| ProviderError::decode("vertex", error))?;
@@ -222,7 +223,7 @@ mod vertex_embed {
 mod vertex_generate {
     use crate::ProviderClient;
     use crate::common;
-    use skald_spec::{ProviderRequest, ProviderResponse, VertexGenerateContentRequest};
+    use skald_spec::{GoogleGenerateContentRequest, ProviderRequest, ProviderResponse};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -237,16 +238,16 @@ mod vertex_generate {
             .mount(&server)
             .await;
 
-        let request: VertexGenerateContentRequest =
+        let request: GoogleGenerateContentRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         let response = common::vertex_client(&server.uri(), "gemini-2.5-flash")
-            .send(ProviderRequest::Vertex(request))
+            .send(ProviderRequest::GeminiGenerateContent(request))
             .await
             .expect("request succeeds");
 
         assert!(matches!(
             response,
-            ProviderResponse::VertexGenerateContent(_)
+            ProviderResponse::GeminiGenerateContent(_)
         ));
         common::assert_received_body(&server, &request_body).await;
     }

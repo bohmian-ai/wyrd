@@ -80,9 +80,9 @@ impl CacheKey {
                 }))
             }
             ProviderRequest::RawV1 { .. } => Err(SkaldCacheError::OpaqueRequest),
-            ProviderRequest::OpenAiResponses(_)
-            | ProviderRequest::GeminiGenerateContent(_)
-            | ProviderRequest::Vertex(_) => Ok(None),
+            ProviderRequest::OpenAiResponses(_) | ProviderRequest::GeminiGenerateContent(_) => {
+                Ok(None)
+            }
             _ => Ok(None),
         }
     }

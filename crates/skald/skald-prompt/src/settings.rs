@@ -381,9 +381,6 @@ pub fn apply_model_settings(
         ProviderRequest::GeminiGenerateContent(request) => {
             request.settings = resolve_google_settings(Some(value))?;
         }
-        ProviderRequest::Vertex(request) => {
-            request.0.settings = resolve_google_settings(Some(value))?;
-        }
         _ => {
             return Err(settings_decode(
                 prompt.request.provider(),

@@ -7,6 +7,9 @@ use skald_agent::{
 };
 use skald_prompt::Prompt;
 use skald_runtime::{MockProvider, ProviderRegistry};
+use skald_spec::wire::google_generate::{
+    GoogleContent, GoogleGenerateContentRequest, GoogleGenerateSettings, GooglePart,
+};
 use skald_spec::wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse, OpenAiChatSettings,
     OpenAiMessageContent,
@@ -102,6 +105,56 @@ async fn custom_provider_prompt_round_trips_and_dispatches_to_its_client() {
         .expect("the local client answers");
 
     assert_eq!(run.output, "local answer");
+}
+
+/// A Vertex Prompt is a Google GenerateContent body naming the Vertex
+/// provider; it keeps that provider across a JSON round trip, and the Agent
+/// loop dispatches it to the Vertex client rather than to Google AI Studio.
+#[tokio::test]
+async fn vertex_prompt_round_trips_and_dispatches_to_the_vertex_client() {
+    let mut native = skald_spec::Prompt::new(
+        ProviderRequest::GeminiGenerateContent(GoogleGenerateContentRequest {
+            contents: vec![GoogleContent {
+                role: "user".to_owned(),
+                parts: vec![GooglePart::Text {
+                    text: "hello".to_owned(),
+                }],
+            }],
+            system_instruction: None,
+            tools: None,
+            tool_config: None,
+            settings: GoogleGenerateSettings::default(),
+        }),
+        "gemini-2.5-pro",
+        None,
+        ResponseType::Text,
+    )
+    .expect("static prompt is valid");
+    native.provider = Some(ProviderName::Vertex);
+    let json = serde_json::to_value(&native).expect("prompt serializes");
+    assert_eq!(json["provider"], "vertex");
+    assert_eq!(json["request"]["provider"], "gemini_generate_content");
+    let reparsed: skald_spec::Prompt = serde_json::from_value(json).expect("prompt reads back");
+    assert_eq!(reparsed, native);
+
+    let vertex = MockProvider::new(ProviderName::Vertex);
+    vertex.push_response(ProviderResponse::GeminiGenerateContent(
+        serde_json::from_value(serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "vertex answer"}]},
+                "finishReason": "STOP"
+            }]
+        }))
+        .expect("static Google answer decodes"),
+    ));
+    let mut providers = ProviderRegistry::new();
+    providers.register(Arc::new(vertex));
+    let run = Agent::new(Prompt::from_native(reparsed))
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("the Vertex client answers");
+
+    assert_eq!(run.output, "vertex answer");
 }
 
 fn temp_path(name: &str) -> std::path::PathBuf {

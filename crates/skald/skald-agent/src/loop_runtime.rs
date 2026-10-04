@@ -914,7 +914,6 @@ fn request_model(request: &ProviderRequest) -> Option<&str> {
         ProviderRequest::AnthropicMessage(request) => Some(&request.model),
         ProviderRequest::GeminiGenerateContent(_)
         | ProviderRequest::GoogleBatchEmbed(_)
-        | ProviderRequest::Vertex(_)
         | ProviderRequest::VertexPredict(_)
         | ProviderRequest::RawV1 { .. } => None,
         _ => None,
@@ -957,8 +956,7 @@ fn response_finish_reason(response: &ProviderResponse) -> String {
             .as_ref()
             .map(|reason| format!("{reason:?}").to_lowercase())
             .unwrap_or_else(|| "other".to_owned()),
-        ProviderResponse::GeminiGenerateContent(response)
-        | ProviderResponse::VertexGenerateContent(response) => response
+        ProviderResponse::GeminiGenerateContent(response) => response
             .candidates
             .first()
             .and_then(|candidate| candidate.finish_reason.as_ref())

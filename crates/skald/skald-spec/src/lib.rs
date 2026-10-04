@@ -49,7 +49,6 @@ pub use wire::openai_responses::{
     OpenAiResponseItem, OpenAiResponsesInput, OpenAiResponsesRequest, OpenAiResponsesResponse,
     OpenAiResponsesSettings, OpenAiResponsesStreamEvent,
 };
-pub use wire::vertex_generate::VertexGenerateContentRequest;
 pub use wire::vertex_predict::{VertexPredictRequest, VertexPredictResponse, VertexPrediction};
 
 #[cfg(test)]
@@ -63,7 +62,6 @@ pub(crate) mod common {
     use crate::wire::google_generate::*;
     use crate::wire::openai_chat::*;
     use crate::wire::openai_responses::*;
-    use crate::wire::vertex_generate::VertexGenerateContentRequest;
     use crate::wire::vertex_predict::*;
     use crate::{MessageNum, ProviderName, ProviderRequest, ProviderResponse};
 
@@ -297,10 +295,6 @@ pub(crate) mod common {
             response_id: None,
             create_time: None,
         }
-    }
-
-    pub(crate) fn vertex_generate_request() -> VertexGenerateContentRequest {
-        VertexGenerateContentRequest(google_request())
     }
 
     pub(crate) fn vertex_predict_request() -> VertexPredictRequest {

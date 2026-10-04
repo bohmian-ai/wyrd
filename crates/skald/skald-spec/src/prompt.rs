@@ -187,9 +187,6 @@ impl Prompt {
             ProviderRequest::GeminiGenerateContent(request) => {
                 Some(ProviderSettingsRef::Google(&request.settings))
             }
-            ProviderRequest::Vertex(request) => {
-                Some(ProviderSettingsRef::Google(&request.0.settings))
-            }
             ProviderRequest::OpenAiEmbeddings(_)
             | ProviderRequest::GoogleBatchEmbed(_)
             | ProviderRequest::VertexPredict(_)
@@ -258,9 +255,6 @@ impl Prompt {
             }
             ProviderRequest::GeminiGenerateContent(request) => {
                 bind_media_google(request, name, media, ProviderName::Google)?;
-            }
-            ProviderRequest::Vertex(request) => {
-                bind_media_google(&mut request.0, name, media, ProviderName::Vertex)?;
             }
             ProviderRequest::OpenAiEmbeddings(_)
             | ProviderRequest::GoogleBatchEmbed(_)
@@ -379,9 +373,6 @@ fn scan_system_for_media(request: &ProviderRequest) -> SkaldResult<()> {
         ProviderRequest::GeminiGenerateContent(request) => {
             scan_google_system(request.system_instruction.as_ref())?;
         }
-        ProviderRequest::Vertex(request) => {
-            scan_google_system(request.0.system_instruction.as_ref())?;
-        }
         ProviderRequest::OpenAiEmbeddings(_)
         | ProviderRequest::GoogleBatchEmbed(_)
         | ProviderRequest::VertexPredict(_)
@@ -434,7 +425,6 @@ fn split_request_text_parts(request: &mut ProviderRequest) -> Vec<String> {
         ProviderRequest::OpenAiResponses(request) => split_openai_responses(request, &mut names),
         ProviderRequest::AnthropicMessage(request) => split_anthropic(request, &mut names),
         ProviderRequest::GeminiGenerateContent(request) => split_google(request, &mut names),
-        ProviderRequest::Vertex(request) => split_google(&mut request.0, &mut names),
         ProviderRequest::OpenAiEmbeddings(_)
         | ProviderRequest::GoogleBatchEmbed(_)
         | ProviderRequest::VertexPredict(_)

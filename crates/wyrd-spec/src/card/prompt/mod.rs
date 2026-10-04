@@ -38,7 +38,6 @@ pub(crate) mod prompt_support {
     };
     use skald_spec::wire::openai_chat::OpenAiMessageContent;
     use skald_spec::wire::openai_responses::{OpenAiResponseContentPart, OpenAiResponseItem};
-    use skald_spec::wire::vertex_generate::VertexGenerateContentRequest;
     use skald_spec::{
         AnthropicContentBlock, AnthropicMessage, AnthropicMessagesRequest,
         AnthropicMessagesSettings, GoogleContent, GoogleGenerateContentRequest,
@@ -212,14 +211,6 @@ pub(crate) mod prompt_support {
         })
     }
 
-    pub fn vertex_request(text: &str) -> ProviderRequest {
-        let google = match google_request(text) {
-            ProviderRequest::GeminiGenerateContent(request) => request,
-            _ => unreachable!("helper returns Google"),
-        };
-        ProviderRequest::Vertex(VertexGenerateContentRequest(google))
-    }
-
     pub fn raw_request(provider: ProviderName) -> ProviderRequest {
         ProviderRequest::RawV1 {
             provider,
@@ -336,7 +327,7 @@ mod prompt_codec_tests {
 mod prompt_construct_tests {
     use super::prompt_support::{
         anthropic_request, google_request, openai_chat_request, openai_responses_request,
-        prompt_spec, raw_request, vertex_request,
+        prompt_spec, raw_request,
     };
     use skald_spec::ProviderName;
 
@@ -347,7 +338,6 @@ mod prompt_construct_tests {
             openai_responses_request("hello"),
             anthropic_request("hello"),
             google_request("hello"),
-            vertex_request("hello"),
         ] {
             let spec = prompt_spec(request, Vec::new());
             assert!(spec.parameters().is_empty());

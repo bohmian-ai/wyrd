@@ -140,10 +140,8 @@ enum Answer {
     OpenAiResponses,
     /// Anthropic Messages.
     AnthropicMessages,
-    /// Gemini `GenerateContent`.
+    /// Google `GenerateContent`, from Gemini or Vertex.
     GeminiGenerateContent,
-    /// Vertex `GenerateContent`.
-    VertexGenerateContent,
 }
 
 impl Answer {
@@ -159,9 +157,6 @@ impl Answer {
             Self::AnthropicMessages => decode(body).map(ProviderResponse::AnthropicMessage),
             Self::GeminiGenerateContent => {
                 decode(body).map(ProviderResponse::GeminiGenerateContent)
-            }
-            Self::VertexGenerateContent => {
-                decode(body).map(ProviderResponse::VertexGenerateContent)
             }
         }
     }
@@ -185,7 +180,9 @@ impl NativeCall {
     /// The model always comes from `model`, never from the request body:
     /// `OpenAI` bodies carry its `<provider>/<model>` projection, Anthropic
     /// bodies its provider-native model, and Google bodies none, since the
-    /// gateway routes them by `model` alone.
+    /// gateway routes them by `model` alone. A Google GenerateContent body
+    /// enters as Vertex when `model` names the `vertex` provider, which the
+    /// Workflow derives from a Prompt whose provider is Vertex.
     ///
     /// # Errors
     /// Returns [`ProviderError::BadRequest`] for a request dialect the
@@ -221,15 +218,13 @@ impl NativeCall {
             }
             ProviderRequest::GeminiGenerateContent(body) => (
                 GatewayOperation::ChatCompletions,
-                IngressDialect::GeminiGenerateContent,
+                if model.provider.as_str() == "vertex" {
+                    IngressDialect::VertexGenerateContent
+                } else {
+                    IngressDialect::GeminiGenerateContent
+                },
                 Answer::GeminiGenerateContent,
                 encode(&body)?,
-            ),
-            ProviderRequest::Vertex(body) => (
-                GatewayOperation::ChatCompletions,
-                IngressDialect::VertexGenerateContent,
-                Answer::VertexGenerateContent,
-                encode(&body.0)?,
             ),
             _ => {
                 return Err(ProviderError::bad_request(

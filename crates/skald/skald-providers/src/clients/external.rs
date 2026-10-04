@@ -95,14 +95,15 @@ impl ExternalGatewayClient {
     /// Posts `request` to the dialect path below the base URL and decodes the
     /// native response of the same dialect.
     ///
-    /// `model` names the model for the Google dialects, whose model lives in
-    /// the request path rather than the body. Provider-internal retries apply
+    /// `model` names the model for Google GenerateContent, served by Gemini
+    /// and Vertex gateways alike, whose model lives in the request path rather
+    /// than the body. Provider-internal retries apply
     /// within this call.
     ///
     /// # Errors
     ///
     /// Returns [`ProviderError::VariantMismatch`] for a request that is not
-    /// one of the five supported generation dialects, the transport or status
+    /// one of the four supported generation dialects, the transport or status
     /// error of the exchange, or a decode error when the answer is not the
     /// dialect's native response.
     pub async fn send(
@@ -127,10 +128,6 @@ impl ExternalGatewayClient {
                 .post(&self.url(&format!("models/{model}:generateContent")), &body)
                 .await
                 .map(ProviderResponse::GeminiGenerateContent),
-            ProviderRequest::Vertex(body) => self
-                .post(&self.url(&format!("models/{model}:generateContent")), &body)
-                .await
-                .map(ProviderResponse::VertexGenerateContent),
             other => Err(ProviderError::variant_mismatch(
                 PROVIDER,
                 super::request_variant_label(&other),

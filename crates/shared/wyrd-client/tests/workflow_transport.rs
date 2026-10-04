@@ -724,7 +724,7 @@ async fn public_gateway_call_context_and_errors() {
 
     // Vertex and an already cancelled run stop before any request; a slow
     // answer times out at the call's own deadline.
-    let vertex = ProviderRequest::Vertex(
+    let vertex = ProviderRequest::GeminiGenerateContent(
         serde_json::from_value(json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}))
             .expect("vertex"),
     );

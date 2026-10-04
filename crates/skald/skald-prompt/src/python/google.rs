@@ -27,16 +27,13 @@ use crate::prompt::wrong_variant;
 fn google_request(arc: &Arc<ProviderRequest>) -> &GoogleGenerateContentRequest {
     match arc.as_ref() {
         ProviderRequest::GeminiGenerateContent(r) => r,
-        ProviderRequest::Vertex(r) => &r.0,
         _ => unreachable!(),
     }
 }
 
 fn google_response(arc: &Arc<ProviderResponse>) -> &GoogleGenerateContentResponse {
     match arc.as_ref() {
-        ProviderResponse::GeminiGenerateContent(r) | ProviderResponse::VertexGenerateContent(r) => {
-            r
-        }
+        ProviderResponse::GeminiGenerateContent(r) => r,
         _ => unreachable!(),
     }
 }

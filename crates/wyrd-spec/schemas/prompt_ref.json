@@ -4040,7 +4040,7 @@
       ]
     },
     "ProviderRequest": {
-      "description": "One native LLM request, tagged with the provider dialect its body speaks.\n\nSerialized as `{\"provider\": \"<variant>\", \"body\": <native provider JSON>}`. The tag selects the variant, so bodies that share a wire shape (Gemini and Vertex GenerateContent) still read back as the provider that saved them, and a body that does not match its named provider fails to deserialize.",
+      "description": "One native LLM request, tagged with the provider dialect its body speaks.\n\nSerialized as `{\"provider\": \"<variant>\", \"body\": <native provider JSON>}`. The tag selects the variant, so a body that does not match its named dialect fails to deserialize. The tag names a wire schema, not a destination: one schema served by several providers is one variant.",
       "oneOf": [
         {
           "description": "OpenAI Chat Completions request, whether it is sent to OpenAI, a gateway, or a custom OpenAI-compatible endpoint named by [`Prompt::provider`](crate::Prompt::provider).",
@@ -4119,7 +4119,7 @@
           }
         },
         {
-          "description": "Google Gemini GenerateContent request.",
+          "description": "Google GenerateContent request, sent to Gemini or, when [`Prompt::provider`](crate::Prompt::provider) is Vertex, to Vertex.",
           "type": "object",
           "required": [
             "body",
@@ -4152,25 +4152,6 @@
               "type": "string",
               "enum": [
                 "google_batch_embed"
-              ]
-            }
-          }
-        },
-        {
-          "description": "Vertex GenerateContent request.",
-          "type": "object",
-          "required": [
-            "body",
-            "provider"
-          ],
-          "properties": {
-            "body": {
-              "$ref": "#/definitions/GoogleGenerateContentRequest"
-            },
-            "provider": {
-              "type": "string",
-              "enum": [
-                "vertex"
               ]
             }
           }

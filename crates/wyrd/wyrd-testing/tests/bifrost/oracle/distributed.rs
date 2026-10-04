@@ -2401,7 +2401,107 @@ async fn hot_filtering_mechanisms_cover_all_table_kinds() -> Result<(), JourneyE
     let fixture = FilteringFixture::write(scribe).await?;
     cluster.refresh_oracle_snapshots().await?;
     let reader = client(oracle, "filtering-reader").await?;
-    fixture.prove_hot_cut(&cluster, scribe, &reader).await?;
+    fixture
+        .prove_cut(&cluster, scribe, &reader, FilterCut::Hot)
+        .await?;
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Encoded row-group target the rewrite journey declares on its custom table.
+///
+/// Small enough that Forge's rewrite of the three 45,000-row slices closes
+/// several row groups, each still spanning more than one 20,000-row page, so
+/// one sorted output file exposes row-group and page pruning together.
+const REWRITE_ROW_GROUP_BYTES: u64 = 512 * 1024;
+
+/// After an actual Forge promotion, and again after an actual Forge rewrite,
+/// the caller-registered custom dataset and the built-in spans, records, and
+/// points tables return exactly the rows the hot-only cut returned, and every
+/// physical mechanism is proven again on the Iceberg reader Oracle executes:
+///
+/// - **tier** — the durable file list shows every Scribe file promoted, and
+///   the table's current snapshot plans the Scribe objects themselves after
+///   promotion and only Forge outputs after the rewrite;
+/// - **sort order and Bloom layout** — every promoted and rewritten object is
+///   read back from storage in its resolved layout's order with Bloom filters
+///   on exactly the declared columns, so a rewrite that dropped either fails;
+/// - **file-level min/max** — on the promoted cut, Iceberg manifest bounds plan
+///   one file for a custom key, an event-time slice, a request id, or an
+///   absent trace id;
+/// - **row-group min/max** — the rewritten custom file holds several row
+///   groups, and the key, slice, and request-id lookups exclude the groups
+///   whose disjoint ranges cannot match;
+/// - **Bloom** — the absent `trace_id` and custom label, re-verified
+///   Bloom-negative against each cut's own filters and inside its bounds, are
+///   excluded by the Bloom filter after statistics kept the group;
+/// - **page index** — the custom key lookup skips rows of its retained
+///   multi-page row group in both Iceberg cuts.
+///
+/// The topology is one Scribe node, one Oracle node, one Forge worker, and a
+/// delayed Server node carrying the only Forge coordinator. The hot cut is
+/// proven before the coordinator exists. Its boot pass then promotes the
+/// owed Scribe debt; compaction becomes due only after the table interval, so
+/// the promoted cut is proven before any rewrite can run. Advancing the
+/// deterministic Forge clock past that interval then lets the worker pull a
+/// small-file rewrite of each table.
+///
+/// # Errors
+///
+/// Returns cluster, registration, write, catalog, storage, Forge, telemetry,
+/// or query errors, or a description of the first expectation that does not
+/// hold.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn iceberg_filtering_mechanisms_cover_all_table_kinds() -> Result<(), JourneyError> {
+    let spec = BifrostClusterSpec::for_targets(&[
+        BifrostTarget::Scribe,
+        BifrostTarget::Oracle,
+        BifrostTarget::ForgeWorker,
+        BifrostTarget::Server,
+    ]);
+    let coordinator = spec
+        .nodes
+        .last()
+        .ok_or("the topology names its delayed coordinator")?
+        .node_id;
+    let mut cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
+        spec,
+        ForgeConfig::default(),
+        true,
+        true,
+    )
+    .await?;
+    let fixture = {
+        let scribe = cluster.server(0).ok_or("missing Scribe node")?;
+        let fixture = FilteringFixture::write(scribe).await?;
+        fixture.declare_rewrite_row_groups(scribe).await?;
+        fixture
+    };
+    cluster.refresh_oracle_snapshots().await?;
+    let reader = client(
+        cluster.server(1).ok_or("missing Oracle node")?,
+        "filtering-reader",
+    )
+    .await?;
+    let scribe = cluster.server(0).ok_or("missing Scribe node")?;
+    fixture
+        .prove_cut(&cluster, scribe, &reader, FilterCut::Hot)
+        .await?;
+
+    cluster.restart_node(coordinator).await?;
+    fixture.await_promotion(&cluster, coordinator).await?;
+    cluster.refresh_oracle_snapshots().await?;
+    let scribe = cluster.server(0).ok_or("missing Scribe node")?;
+    fixture
+        .prove_cut(&cluster, scribe, &reader, FilterCut::Promoted)
+        .await?;
+
+    fixture.await_rewrite(&cluster, scribe).await?;
+    cluster.refresh_oracle_snapshots().await?;
+    fixture
+        .prove_cut(&cluster, scribe, &reader, FilterCut::Rewritten)
+        .await?;
     cluster.shutdown().await?;
     Ok(())
 }
@@ -2433,7 +2533,7 @@ struct FilterCase {
 /// Physical scan evidence one query's Oracle telemetry delta records.
 #[derive(Debug, Clone, Copy)]
 struct ScanEvidence {
-    /// Hot files opened.
+    /// Hot files opened, or Iceberg data files the manifest pruning kept.
     files: f64,
     /// Row groups excluded by statistics or Bloom filters.
     row_groups_pruned: f64,
@@ -2778,73 +2878,239 @@ impl FilteringFixture {
         )
     }
 
-    /// Proves the hot-only cut, the physical layout of every sealed file, and
-    /// the per-mechanism query matrix.
+    /// The four tables the fixture writes, as `(namespace, table)`.
+    fn tables(&self) -> [(vala_bifrost_redux::namespaces::BifrostNamespace, &str); 4] {
+        use vala_bifrost_redux::namespaces::BifrostNamespace;
+
+        [
+            (BifrostNamespace::Datasets, self.custom.as_str()),
+            (BifrostNamespace::Traces, "spans"),
+            (BifrostNamespace::Logs, "records"),
+            (BifrostNamespace::Metrics, "points"),
+        ]
+    }
+
+    /// Declares [`REWRITE_ROW_GROUP_BYTES`] as the custom table's Forge
+    /// row-group target.
+    ///
+    /// A test-scoped Iceberg table property: Scribe's sealed files ignore it,
+    /// and Forge reads it when it plans the rewrite.
     ///
     /// # Errors
     ///
-    /// Returns storage, telemetry, or query errors, and a description of the
-    /// first physical or result expectation that does not hold.
-    async fn prove_hot_cut(
+    /// Returns catalog, binding, or commit errors.
+    async fn declare_rewrite_row_groups(
+        &self,
+        server: &WyrdTestServer,
+    ) -> Result<(), JourneyError> {
+        use vala_bifrost_redux::namespaces::BifrostNamespace;
+
+        let catalog = server
+            .state()
+            .bifrost_catalog()
+            .ok_or("Scribe composition retains the shared catalog")?
+            .iceberg_catalog();
+        let binding = vala_bifrost_redux::catalog::TenantTableBinding::resolve((
+            server.data_tenant_id(),
+            vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Datasets, &self.custom),
+        ))?;
+        let loaded = catalog.load_table(&binding.table_ident()).await?;
+        let tx = iceberg::transaction::Transaction::new(&loaded);
+        let tx = iceberg::transaction::ApplyTransactionAction::apply(
+            tx.update_table_properties().set(
+                iceberg::spec::TableProperties::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES.to_owned(),
+                REWRITE_ROW_GROUP_BYTES.to_string(),
+            ),
+            tx,
+        )?;
+        tx.commit_once(catalog.as_ref()).await?;
+        Ok(())
+    }
+
+    /// Waits, bounded, until the freshly started coordinator has promoted every
+    /// table's sealed files.
+    ///
+    /// The coordinator's boot pass promotes owed Scribe debt; further passes
+    /// are requested without touching the Forge clock, so no table's
+    /// compaction interval elapses and nothing is rewritten. The exit
+    /// condition is the durable `compacted` flag of every file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the coordinator is absent, its boot pass does not
+    /// complete, a Postgres probe fails, or any table still holds hot files
+    /// when the budget elapses.
+    async fn await_promotion(
+        &self,
+        cluster: &WyrdTestCluster,
+        coordinator: wyrd_spec::vala::api::NodeId,
+    ) -> Result<(), JourneyError> {
+        let server = cluster
+            .server_by_node(coordinator)
+            .ok_or("the delayed coordinator is running")?;
+        tokio::time::timeout(
+            FORGE_PASS_WAIT,
+            server.wait_for_forge_scheduler_passes_for_test(1),
+        )
+        .await
+        .map_err(|_| "the coordinator never completed its boot pass")?;
+        let tenant = cluster.data_tenant_id();
+        let deadline = std::time::Instant::now() + FORGE_PHASE_BUDGET;
+        loop {
+            let mut hot_tables = Vec::new();
+            for (_, table) in self.tables() {
+                let (compacted, hot) = file_tier_counts(cluster, tenant, table).await?;
+                if compacted != FILTER_FILES || hot != 0 {
+                    hot_tables.push(format!("{table}: compacted={compacted} hot={hot}"));
+                }
+            }
+            if hot_tables.is_empty() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("promotion did not finish: {hot_tables:?}").into());
+            }
+            let before = server.completed_forge_scheduler_passes_for_test();
+            server.request_forge_scheduler_pass_for_test();
+            tokio::time::timeout(
+                FORGE_PASS_WAIT,
+                server.wait_for_forge_scheduler_passes_for_test(before + 1),
+            )
+            .await
+            .map_err(|_| "a requested scheduler pass did not complete")?;
+        }
+    }
+
+    /// Advances every Forge clock past the compaction interval and waits,
+    /// bounded, until each table's current snapshot plans only Forge outputs.
+    ///
+    /// Each iteration releases retry backoff, requests a scheduler pass, and
+    /// waits for a worker completion; the exit condition is the planned data
+    /// files themselves, never a pass or completion count.
+    ///
+    /// # Errors
+    ///
+    /// Returns clock, catalog, scan-planning, or Postgres errors, or an error
+    /// naming the tables still planning Scribe objects when the budget
+    /// elapses.
+    async fn await_rewrite(
+        &self,
+        cluster: &WyrdTestCluster,
+        server: &WyrdTestServer,
+    ) -> Result<(), JourneyError> {
+        let observer = cluster
+            .forge_completion_observer()
+            .ok_or("cluster was started without a Forge completion observer")?;
+        for node in cluster.servers() {
+            node.forge_clock()
+                .advance(chrono::Duration::days(1))
+                .map_err(|error| format!("elapse the compaction interval: {error}"))?;
+        }
+        let tenant = cluster.data_tenant_id();
+        let deadline = std::time::Instant::now() + FORGE_PHASE_BUDGET;
+        loop {
+            let mut pending = Vec::new();
+            for (namespace, table) in self.tables() {
+                let paths = planned_paths(server, tenant, namespace, table).await?;
+                if paths.is_empty() || !paths.iter().all(|path| path.contains(FORGE_DATA_SEGMENT)) {
+                    pending.push(format!("{table}: {paths:?}"));
+                }
+            }
+            if pending.is_empty() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("the rewrite did not publish: {pending:?}").into());
+            }
+            for (_, table) in self.tables() {
+                release_forge_retries(cluster, tenant, table).await?;
+            }
+            let target = observer.completed().saturating_add(1);
+            cluster.request_forge_scheduler_pass_for_test();
+            // A lapsed wait is not a verdict: the planned files checked at the
+            // top of the next iteration are.
+            let _ = tokio::time::timeout(FORGE_PASS_WAIT, observer.wait_for_at_least(target)).await;
+        }
+    }
+
+    /// Proves `cut` is the one serving every table, the physical layout of its
+    /// objects, and the per-mechanism query matrix against it.
+    ///
+    /// The durable file list names the tier: a hot cut has every Scribe file
+    /// unpromoted, and an Iceberg cut has every one promoted. The Iceberg
+    /// snapshot then names its generation: a promoted cut plans the Scribe
+    /// objects themselves, and a rewritten cut plans only Forge outputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage, catalog, telemetry, or query errors, and a description
+    /// of the first tier, physical, or result expectation that does not hold.
+    async fn prove_cut(
         &self,
         cluster: &WyrdTestCluster,
         server: &WyrdTestServer,
         reader: &WyrdClient,
+        cut: FilterCut,
     ) -> Result<(), JourneyError> {
-        use vala_bifrost_redux::namespaces::BifrostNamespace;
-
         let tenant = cluster.data_tenant_id();
-        for table in [self.custom.as_str(), "spans", "records", "points"] {
+        let mut tables = Vec::with_capacity(4);
+        for (namespace, table) in self.tables() {
             let (compacted, hot) = file_tier_counts(cluster, tenant, table).await?;
-            if compacted != 0 || hot != FILTER_FILES {
+            let expected = match cut {
+                FilterCut::Hot => (0, FILTER_FILES),
+                FilterCut::Promoted | FilterCut::Rewritten => (FILTER_FILES, 0),
+            };
+            if (compacted, hot) != expected {
                 return Err(format!(
-                    "{table}: the proof needs a hot-only cut of {FILTER_FILES} files: \
-                     hot={hot} compacted={compacted}"
+                    "{table}: the {cut:?} proof needs (compacted, hot) = {expected:?}, \
+                     saw ({compacted}, {hot})"
                 )
                 .into());
             }
+            let objects =
+                SealedObject::read_tier(cluster, server, tenant, namespace, table, cut.tier())
+                    .await?;
+            let forge_outputs = objects
+                .iter()
+                .filter(|object| object.path.contains(FORGE_DATA_SEGMENT))
+                .count();
+            let expected_outputs = match cut {
+                FilterCut::Hot | FilterCut::Promoted => 0,
+                FilterCut::Rewritten => objects.len(),
+            };
+            if objects.len() != cut.objects() || forge_outputs != expected_outputs {
+                return Err(format!(
+                    "{table}: the {cut:?} cut must plan {} objects of which \
+                     {expected_outputs} are Forge outputs, saw {:?}",
+                    cut.objects(),
+                    objects
+                        .iter()
+                        .map(|object| &object.path)
+                        .collect::<Vec<_>>()
+                )
+                .into());
+            }
+            tables.push(objects);
         }
-
-        let custom = SealedObject::read_tier(
-            cluster,
-            server,
-            tenant,
-            BifrostNamespace::Datasets,
-            &self.custom,
-            PhysicalTier::Hot,
-        )
-        .await?;
-        let spans = SealedObject::read_tier(
-            cluster,
-            server,
-            tenant,
-            BifrostNamespace::Traces,
-            "spans",
-            PhysicalTier::Hot,
-        )
-        .await?;
-        let records = SealedObject::read_tier(
-            cluster,
-            server,
-            tenant,
-            BifrostNamespace::Logs,
-            "records",
-            PhysicalTier::Hot,
-        )
-        .await?;
-        let points = SealedObject::read_tier(
-            cluster,
-            server,
-            tenant,
-            BifrostNamespace::Metrics,
-            "points",
-            PhysicalTier::Hot,
-        )
-        .await?;
+        let [custom, spans, records, points] = tables.as_slice() else {
+            return Err("four tables were read".into());
+        };
+        eprintln!(
+            "filtering {cut:?} cut: custom row-group rows {:?}, paths {:?}",
+            custom
+                .iter()
+                .flat_map(|object| object
+                    .metadata
+                    .row_groups()
+                    .iter()
+                    .map(|group| group.num_rows()))
+                .collect::<Vec<_>>(),
+            custom.iter().map(|object| &object.path).collect::<Vec<_>>()
+        );
         let probes = self
-            .expect_physical_layout(&custom, &spans, &records, &points)
+            .expect_physical_layout(custom, spans, records, points)
             .await?;
-        self.run_matrix(cluster, reader, &probes).await
+        self.run_matrix(cluster, reader, &probes, cut).await
     }
 
     /// Asserts each table's sealed files follow its resolved layout and draws
@@ -2873,34 +3139,35 @@ impl FilteringFixture {
                 .describe(&fqn)
                 .await?
                 .physical_layout;
-            if objects.len() != usize::try_from(FILTER_FILES)? {
-                return Err(format!("{fqn}: expected {FILTER_FILES} sealed files").into());
-            }
             for object in objects {
                 object.expect_sorted(&fqn, &layout.sort_keys)?;
                 object.expect_bloom_columns(&fqn, &layout.bloom_columns, undeclared)?;
             }
         }
-        for object in custom {
-            let pages = object.page_count("key_id")?;
-            if pages < 2 {
-                return Err(format!(
-                    "{}: a custom file must carry several key pages, saw {pages}",
-                    object.path
-                )
-                .into());
-            }
+        let probe_pages = custom
+            .iter()
+            .find_map(|object| object.key_pages_at(CUSTOM_PROBE_KEY).transpose())
+            .ok_or_else(|| format!("no custom object holds key {CUSTOM_PROBE_KEY}"))??;
+        if probe_pages < 2 {
+            return Err(format!(
+                "the row group holding key {CUSTOM_PROBE_KEY} must carry several key pages, \
+                 saw {probe_pages}"
+            )
+            .into());
         }
 
         // Odd ordinals strictly between file 1's smallest and largest written
-        // trace are unwritten yet inside its statistics bounds.
+        // trace are unwritten yet inside the statistics bounds of whichever
+        // row group holds file 1's spans.
         let span_probe = (1..2 * (SIGNAL_ROWS_PER_FILE - 1))
             .step_by(2)
             .map(|ordinal| fixture_trace_id(1, ordinal))
             .find(|candidate| {
-                spans[1]
-                    .may_contain("trace_id", candidate)
-                    .is_ok_and(|hit| !hit)
+                spans.iter().all(|object| {
+                    object
+                        .may_contain("trace_id", candidate)
+                        .is_ok_and(|hit| !hit)
+                })
             })
             .ok_or("no unwritten trace id inside file 1's bounds is Bloom-negative")?;
         // Odd labels lie between every file's `label-00` and `label-14`.
@@ -2914,18 +3181,33 @@ impl FilteringFixture {
                 })
             })
             .ok_or("no unwritten label inside every file's bounds is Bloom-negative")?;
-        let request_ids = custom
-            .iter()
-            .map(SealedObject::request_id)
+        let request_ids = (0..FILTER_FILES)
+            .map(|file| {
+                let key = custom_keys(file).start;
+                custom
+                    .iter()
+                    .find_map(|object| object.request_id_of_key(key).transpose())
+                    .ok_or_else(|| format!("no custom object holds key {key}"))?
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(FilterProbes {
             span_probe,
             label_probe,
             request_ids,
+            custom_groups: custom.iter().map(SealedObject::row_groups).sum(),
         })
     }
 
     /// Runs every table's query matrix and asserts each mechanism's evidence.
+    ///
+    /// Every case expects the same rows in every cut; only the level at which
+    /// each mechanism acts moves. A hot read opens every file the durable
+    /// event-time bounds keep and prunes their single row groups by footer
+    /// statistics. A promoted read prunes the same disjoint ranges one level
+    /// earlier, from Iceberg's per-file manifest bounds, so fewer files are
+    /// planned. A rewritten read plans one sorted file and prunes its several
+    /// row groups. Bloom exclusion always lands on row groups whose statistics
+    /// cover the probe, so no other mechanism can account for it.
     ///
     /// # Errors
     ///
@@ -2936,7 +3218,10 @@ impl FilteringFixture {
         cluster: &WyrdTestCluster,
         reader: &WyrdClient,
         probes: &FilterProbes,
+        cut: FilterCut,
     ) -> Result<(), JourneyError> {
+        let objects = f64::from(u32::try_from(cut.objects())?);
+        let groups = f64::from(u32::try_from(probes.custom_groups)?);
         let custom = self.custom_fqn();
         let all_custom: Vec<i64> = (0..FILTER_FILES).flat_map(custom_keys).collect();
         let custom_where = |keep: &dyn Fn(i64) -> bool| -> Vec<i64> {
@@ -2957,7 +3242,7 @@ impl FilteringFixture {
             },
         )
         .await?;
-        expect_measure("custom unfiltered", "files", baseline.files, 3.0)?;
+        expect_measure("custom unfiltered", "files", baseline.files, objects)?;
         expect_measure(
             "custom unfiltered",
             "pruned",
@@ -2991,13 +3276,13 @@ impl FilteringFixture {
             },
         )
         .await?;
-        expect_measure("custom Bloom absent", "files", bloom.files, 3.0)?;
-        expect_measure("custom Bloom absent", "bloom", bloom.bloom_pruned, 3.0)?;
+        expect_measure("custom Bloom absent", "files", bloom.files, objects)?;
+        expect_measure("custom Bloom absent", "bloom", bloom.bloom_pruned, groups)?;
         expect_measure(
             "custom Bloom absent",
             "pruned",
             bloom.row_groups_pruned,
-            3.0,
+            groups,
         )?;
 
         let point = run_case(
@@ -3012,8 +3297,16 @@ impl FilteringFixture {
             },
         )
         .await?;
-        expect_measure("custom key", "files", point.files, 3.0)?;
-        expect_measure("custom key", "pruned", point.row_groups_pruned, 2.0)?;
+        // Hot: every file opens and footer statistics drop the other two
+        // groups. Promoted: manifest bounds plan only the key's file.
+        // Rewritten: the one file's other row groups are dropped.
+        let (files, pruned) = match cut {
+            FilterCut::Hot => (3.0, 2.0),
+            FilterCut::Promoted => (1.0, 0.0),
+            FilterCut::Rewritten => (1.0, groups - 1.0),
+        };
+        expect_measure("custom key", "files", point.files, files)?;
+        expect_measure("custom key", "pruned", point.row_groups_pruned, pruned)?;
         expect_measure("custom key", "bloom", point.bloom_pruned, 0.0)?;
         if point.page_rows_pruned <= 0.0 {
             return Err(format!(
@@ -3036,6 +3329,12 @@ impl FilteringFixture {
         )
         .await?;
         expect_measure("custom slice", "files", slice.files, 1.0)?;
+        if cut == FilterCut::Rewritten && slice.row_groups_pruned <= 0.0 {
+            return Err(format!(
+                "custom slice: the rewritten file's out-of-range row groups were read: {slice:?}"
+            )
+            .into());
+        }
 
         for (name, filter, expected) in [
             (
@@ -3084,12 +3383,39 @@ impl FilteringFixture {
                 },
             )
             .await?;
-            expect_measure(
-                "request id present",
-                "pruned",
-                present.row_groups_pruned,
-                2.0,
-            )?;
+            // Each request id spans one disjoint key range: two other footers
+            // (hot), two other manifest entries (promoted), or the rewritten
+            // file's groups holding only other ranges.
+            match cut {
+                FilterCut::Hot => {
+                    expect_measure("request id present", "files", present.files, 3.0)?;
+                    expect_measure(
+                        "request id present",
+                        "pruned",
+                        present.row_groups_pruned,
+                        2.0,
+                    )?;
+                }
+                FilterCut::Promoted => {
+                    expect_measure("request id present", "files", present.files, 1.0)?;
+                    expect_measure(
+                        "request id present",
+                        "pruned",
+                        present.row_groups_pruned,
+                        0.0,
+                    )?;
+                }
+                FilterCut::Rewritten => {
+                    expect_measure("request id present", "files", present.files, 1.0)?;
+                    if present.row_groups_pruned <= 0.0 {
+                        return Err(format!(
+                            "request id of file {file}: no disjoint row group was \
+                             excluded: {present:?}"
+                        )
+                        .into());
+                    }
+                }
+            }
             expect_measure("request id present", "bloom", present.bloom_pruned, 0.0)?;
         }
         let absent = run_case(
@@ -3105,10 +3431,22 @@ impl FilteringFixture {
             },
         )
         .await?;
-        expect_measure("request id absent", "pruned", absent.row_groups_pruned, 3.0)?;
+        // A fresh request id sorts above every written one: hot footers drop
+        // each file's group, and Iceberg's manifest bounds plan no file.
+        let (files, pruned) = match cut {
+            FilterCut::Hot => (3.0, 3.0),
+            FilterCut::Promoted | FilterCut::Rewritten => (0.0, 0.0),
+        };
+        expect_measure("request id absent", "files", absent.files, files)?;
+        expect_measure(
+            "request id absent",
+            "pruned",
+            absent.row_groups_pruned,
+            pruned,
+        )?;
         expect_measure("request id absent", "bloom", absent.bloom_pruned, 0.0)?;
 
-        self.run_signal_matrix(cluster, reader, probes).await
+        self.run_signal_matrix(cluster, reader, probes, cut).await
     }
 
     /// Runs the spans, records, and points matrices.
@@ -3122,7 +3460,9 @@ impl FilteringFixture {
         cluster: &WyrdTestCluster,
         reader: &WyrdClient,
         probes: &FilterProbes,
+        cut: FilterCut,
     ) -> Result<(), JourneyError> {
+        let objects = f64::from(u32::try_from(cut.objects())?);
         let signals = |keep: &dyn Fn(i64, i64) -> bool| -> Vec<i64> {
             (0..FILTER_FILES)
                 .flat_map(|file| (0..SIGNAL_ROWS_PER_FILE).map(move |row| (file, row)))
@@ -3147,7 +3487,7 @@ impl FilteringFixture {
                 },
             )
             .await?;
-            expect_measure(table, "files", baseline.files, 3.0)?;
+            expect_measure(table, "files", baseline.files, objects)?;
             let slice = run_case(
                 cluster,
                 reader,
@@ -3178,12 +3518,20 @@ impl FilteringFixture {
             },
         )
         .await?;
-        expect_measure("spans absent trace", "files", absent.files, 3.0)?;
+        // The probe lies inside file 1's trace bounds only. Hot reads open
+        // every file and drop files 0 and 2 by footer statistics; Iceberg
+        // reads plan only the object holding file 1's spans. Either way the
+        // one row group whose bounds cover the probe falls to its Bloom filter.
+        let (files, pruned) = match cut {
+            FilterCut::Hot => (3.0, 3.0),
+            FilterCut::Promoted | FilterCut::Rewritten => (1.0, 1.0),
+        };
+        expect_measure("spans absent trace", "files", absent.files, files)?;
         expect_measure(
             "spans absent trace",
             "pruned",
             absent.row_groups_pruned,
-            3.0,
+            pruned,
         )?;
         expect_measure("spans absent trace", "bloom", absent.bloom_pruned, 1.0)?;
 
@@ -3304,8 +3652,44 @@ struct FilterProbes {
     /// An unwritten label inside every custom file's bounds whose Bloom
     /// filters all answer absent.
     label_probe: String,
-    /// The one `wyrd_request_id` each custom file carries, in file order.
+    /// The `wyrd_request_id` each written custom slice carries, in slice
+    /// order.
     request_ids: Vec<String>,
+    /// Row groups across every custom object of the cut.
+    custom_groups: usize,
+}
+
+/// Path segment every Forge rewrite output carries beneath its table root.
+const FORGE_DATA_SEGMENT: &str = "/data/forge/";
+
+/// The physical cut one filtering phase proves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterCut {
+    /// Scribe hot objects alone; no Forge coordinator has run.
+    Hot,
+    /// Forge promoted every hot object into Iceberg unchanged.
+    Promoted,
+    /// A Forge rewrite replaced each table's promoted objects with one output.
+    Rewritten,
+}
+
+impl FilterCut {
+    /// The tier this cut's objects are read from.
+    fn tier(self) -> PhysicalTier {
+        match self {
+            Self::Hot => PhysicalTier::Hot,
+            Self::Promoted | Self::Rewritten => PhysicalTier::Iceberg,
+        }
+    }
+
+    /// Objects each table holds in this cut: one per written slice until a
+    /// rewrite merges them.
+    fn objects(self) -> usize {
+        match self {
+            Self::Hot | Self::Promoted => 3,
+            Self::Rewritten => 1,
+        }
+    }
 }
 
 /// The physical tier a [`SealedObject`] read draws its objects from.
@@ -3315,6 +3699,44 @@ enum PhysicalTier {
     Hot,
     /// Data files of the table's current Iceberg snapshot.
     Iceberg,
+}
+
+/// Bound on one requested Forge scheduler pass or worker completion.
+const FORGE_PASS_WAIT: Duration = Duration::from_secs(30);
+
+/// Bound on one whole Forge phase of the filtering journey.
+const FORGE_PHASE_BUDGET: Duration = Duration::from_secs(180);
+
+/// The data-file paths one table's current Iceberg snapshot plans.
+///
+/// # Errors
+///
+/// Returns catalog, binding, or scan-planning errors.
+async fn planned_paths(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    namespace: vala_bifrost_redux::namespaces::BifrostNamespace,
+    table: &str,
+) -> Result<Vec<String>, JourneyError> {
+    let catalog = server
+        .state()
+        .bifrost_catalog()
+        .ok_or("Scribe composition retains the shared catalog")?
+        .iceberg_catalog();
+    let binding = vala_bifrost_redux::catalog::TenantTableBinding::resolve((
+        tenant,
+        vala_bifrost_redux::catalog::TableRef::new(namespace, table),
+    ))?;
+    let loaded = catalog.load_table(&binding.table_ident()).await?;
+    if loaded.metadata().current_snapshot().is_none() {
+        return Ok(Vec::new());
+    }
+    let mut tasks = loaded.scan().select_all().build()?.plan_files().await?;
+    let mut paths = Vec::new();
+    while let Some(task) = futures_util::TryStreamExt::try_next(&mut tasks).await? {
+        paths.push(task.data_file_path);
+    }
+    Ok(paths)
 }
 
 /// One sealed object read back from storage, with its decoded rows and its
@@ -3369,14 +3791,7 @@ impl SealedObject {
                 .fetch_all(cluster.pg_fixture().operator_pool().pool())
                 .await?
             }
-            PhysicalTier::Iceberg => {
-                let mut tasks = loaded.scan().select_all().build()?.plan_files().await?;
-                let mut paths = Vec::new();
-                while let Some(task) = futures_util::TryStreamExt::try_next(&mut tasks).await? {
-                    paths.push(task.data_file_path);
-                }
-                paths
-            }
+            PhysicalTier::Iceberg => planned_paths(server, tenant, namespace, table).await?,
         };
         let mut objects = Vec::with_capacity(paths.len());
         for path in paths {
@@ -3469,7 +3884,7 @@ impl SealedObject {
     }
 
     /// Requires a Bloom filter on every declared column and none on
-    /// `undeclared`.
+    /// `undeclared`, in every row group.
     ///
     /// # Errors
     ///
@@ -3480,31 +3895,38 @@ impl SealedObject {
         declared: &[String],
         undeclared: &str,
     ) -> Result<(), JourneyError> {
-        let group = self.metadata.row_group(0);
-        for column in declared {
-            let Ok(index) = self.column_index(column) else {
-                continue;
-            };
-            if group.column(index).bloom_filter_offset().is_none() {
+        let undeclared_index = self.column_index(undeclared)?;
+        for group in self.metadata.row_groups() {
+            for column in declared {
+                let Ok(index) = self.column_index(column) else {
+                    continue;
+                };
+                if group.column(index).bloom_filter_offset().is_none() {
+                    return Err(format!(
+                        "{table}: {} has no Bloom filter on declared {column}",
+                        self.path
+                    )
+                    .into());
+                }
+            }
+            if group
+                .column(undeclared_index)
+                .bloom_filter_offset()
+                .is_some()
+            {
                 return Err(format!(
-                    "{table}: {} has no Bloom filter on declared {column}",
+                    "{table}: {} carries a Bloom filter on undeclared {undeclared}",
                     self.path
                 )
                 .into());
             }
         }
-        if group
-            .column(self.column_index(undeclared)?)
-            .bloom_filter_offset()
-            .is_some()
-        {
-            return Err(format!(
-                "{table}: {} carries a Bloom filter on undeclared {undeclared}",
-                self.path
-            )
-            .into());
-        }
         Ok(())
+    }
+
+    /// The number of row groups the footer declares.
+    fn row_groups(&self) -> usize {
+        self.metadata.num_row_groups()
     }
 
     /// The leaf index of top-level column `name`.
@@ -3522,12 +3944,12 @@ impl SealedObject {
             .ok_or_else(|| format!("{}: no column {name}", self.path).into())
     }
 
-    /// Whether row group 0's Bloom filter on `column` may contain `value`.
+    /// Whether any row group's Bloom filter on `column` may contain `value`.
     ///
     /// # Errors
     ///
-    /// Returns an error when the object does not decode or carries no filter
-    /// on the column.
+    /// Returns an error when the object does not decode or a row group
+    /// carries no filter on the column.
     fn may_contain(&self, column: &str, value: &[u8]) -> Result<bool, JourneyError> {
         use parquet::file::reader::FileReader;
 
@@ -3541,53 +3963,112 @@ impl SealedObject {
                 )
                 .build(),
         )?;
-        let group = reader.get_row_group(0)?;
-        let filter = group
-            .get_column_bloom_filter(self.column_index(column)?)
-            .ok_or_else(|| format!("{}: no Bloom filter on {column}", self.path))?;
-        Ok(filter.check(value))
+        let index = self.column_index(column)?;
+        for group in 0..reader.num_row_groups() {
+            let group = reader.get_row_group(group)?;
+            let filter = group
+                .get_column_bloom_filter(index)
+                .ok_or_else(|| format!("{}: no Bloom filter on {column}", self.path))?;
+            if filter.check(value) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
-    /// The number of pages row group 0 stores for `column`.
+    /// The fewest pages any row group stores for `column`.
     ///
     /// # Errors
     ///
     /// Returns an error when the object carries no offset index.
     fn page_count(&self, column: &str) -> Result<usize, JourneyError> {
         let index = self.column_index(column)?;
-        Ok(self
-            .metadata
+        self.metadata
             .offset_index()
-            .and_then(|groups| groups.first())
-            .and_then(|columns| columns.get(index))
             .ok_or_else(|| format!("{}: no offset index", self.path))?
-            .page_locations()
-            .len())
+            .iter()
+            .map(|columns| {
+                columns
+                    .get(index)
+                    .map(|column| column.page_locations().len())
+                    .ok_or_else(|| format!("{}: no offset index for {column}", self.path))
+            })
+            .try_fold(usize::MAX, |fewest, pages| Ok(fewest.min(pages?)))
+            .map_err(|error: String| error.into())
     }
 
-    /// The single `wyrd_request_id` every row of this object carries.
+    /// The number of `key_id` pages in the row group holding custom `key`, or
+    /// `None` when this object does not hold that key.
+    ///
+    /// Rows are decoded in physical order, so the key's row position locates
+    /// its row group through the groups' cumulative row counts.
     ///
     /// # Errors
     ///
-    /// Returns an error when the column is missing or holds several values.
-    fn request_id(&self) -> Result<String, JourneyError> {
-        let column = self
+    /// Returns an error when the key column is missing or mistyped, or the
+    /// object carries no offset index for it.
+    fn key_pages_at(&self, key: i64) -> Result<Option<usize>, JourneyError> {
+        let keys = self
+            .rows
+            .column_by_name("key_id")
+            .ok_or_else(|| format!("{}: no key column", self.path))?
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .ok_or_else(|| format!("{}: key_id is not Int64", self.path))?;
+        let Some(row) = keys.iter().position(|candidate| candidate == Some(key)) else {
+            return Ok(None);
+        };
+        let mut end = 0_usize;
+        let group = self
+            .metadata
+            .row_groups()
+            .iter()
+            .position(|group| {
+                end = end.saturating_add(usize::try_from(group.num_rows()).unwrap_or(usize::MAX));
+                row < end
+            })
+            .ok_or_else(|| format!("{}: row {row} lies past every row group", self.path))?;
+        let index = self.column_index("key_id")?;
+        let pages = self
+            .metadata
+            .offset_index()
+            .and_then(|groups| groups.get(group))
+            .and_then(|columns| columns.get(index))
+            .ok_or_else(|| format!("{}: no key offset index", self.path))?
+            .page_locations()
+            .len();
+        Ok(Some(pages))
+    }
+
+    /// The `wyrd_request_id` of the custom row whose `key_id` is `key`, or
+    /// `None` when this object does not hold that key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either column is missing or mistyped, or the
+    /// row's request id is null.
+    fn request_id_of_key(&self, key: i64) -> Result<Option<String>, JourneyError> {
+        let keys = self
+            .rows
+            .column_by_name("key_id")
+            .ok_or_else(|| format!("{}: no key column", self.path))?
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .ok_or_else(|| format!("{}: key_id is not Int64", self.path))?;
+        let request_ids = self
             .rows
             .column_by_name("wyrd_request_id")
             .ok_or_else(|| format!("{}: no request id column", self.path))?
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
             .ok_or_else(|| format!("{}: request id is not UTF-8", self.path))?;
-        let distinct = column
-            .iter()
-            .flatten()
-            .collect::<std::collections::BTreeSet<_>>();
-        match distinct.into_iter().collect::<Vec<_>>().as_slice() {
-            [only] => Ok((*only).to_owned()),
-            many => {
-                Err(format!("{}: expected one request id, saw {}", self.path, many.len()).into())
-            }
+        let Some(row) = keys.iter().position(|candidate| candidate == Some(key)) else {
+            return Ok(None);
+        };
+        if request_ids.is_null(row) {
+            return Err(format!("{}: key {key} has no request id", self.path).into());
         }
+        Ok(Some(request_ids.value(row).to_owned()))
     }
 }
 

@@ -2285,9 +2285,12 @@ mod tests {
         };
         let forge_runtime = crate::config::ForgeRuntimeConfig::default();
         let worker = super::forge_compaction_worker_config(&plan, &forge_runtime);
-        assert_eq!(worker.max_task_parallelism, 18, "three per effective CPU");
         assert_eq!(
-            worker.pending_task_parallelism, 72,
+            worker.max_task_parallelism, 72,
+            "twelve per effective CPU, the Iceberg compactor multiplier"
+        );
+        assert_eq!(
+            worker.pending_task_parallelism, 288,
             "four times running parallelism may wait"
         );
         assert_eq!(worker.per_tenant_active_cap, 1);

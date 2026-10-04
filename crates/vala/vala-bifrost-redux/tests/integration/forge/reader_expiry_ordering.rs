@@ -68,7 +68,10 @@ async fn last_table_reader_controls_destructive_cleanup() {
             .run_orphan_gc_report_for_test(&fixture.binding)
             .await
             .expect("orphan cleanup runs and refuses");
-        assert_eq!(report.deleted, 0, "orphan cleanup deletes nothing while {why} is held");
+        assert_eq!(
+            report.deleted, 0,
+            "orphan cleanup deletes nothing while {why} is held"
+        );
         assert!(
             object_exists(fixture, &orphan).await,
             "the orphan survives while {why} is held"
@@ -102,7 +105,10 @@ async fn last_table_reader_controls_destructive_cleanup() {
         .run_orphan_gc_report_for_test(&fixture.binding)
         .await
         .expect("orphan cleanup runs");
-    assert_eq!(report.deleted, 1, "orphan cleanup deletes exactly the orphan");
+    assert_eq!(
+        report.deleted, 1,
+        "orphan cleanup deletes exactly the orphan"
+    );
     assert!(
         !object_exists(fixture, &orphan).await,
         "the orphan is gone after the last reader"

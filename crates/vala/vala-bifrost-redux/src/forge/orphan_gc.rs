@@ -195,8 +195,10 @@ impl MaintenanceProtection {
     /// draining that set may be running long afterwards, so every proof is
     /// re-taken here against refreshed catalog, SQL, and object evidence: the
     /// candidate must still be inside this tenant's table binding, destructive
-    /// maintenance must still be permitted, no retained head may reach it
-    /// again, and it must still clear the object age floor.
+    /// maintenance must still be permitted, and no retained head may reach it
+    /// again. It waits on no object age: a committed snapshot once referenced
+    /// it, so no in-flight writer can own it, and the active table read is
+    /// what protects readers.
     ///
     /// Unlike [`Self::gc_eligibility`] this admits any object the binding
     /// accepts, because expiry legitimately strands manifests, manifest lists,
@@ -211,12 +213,14 @@ impl MaintenanceProtection {
         self.eligibility(binding, path, evidence, MaintenanceScope::ExpiredCandidate)
     }
 
-    /// Decides one object under the scope-specific path rule.
+    /// Decides one object under the scope-specific path and age rules.
     ///
-    /// Scope changes only which paths are addressable at all. Every safety
-    /// proof after that — binding, destructive gate, live-set containment,
-    /// existence, object kind, and age — is shared, so the two destructive
-    /// protocols cannot diverge on what protects an object.
+    /// Scope changes which paths are addressable and whether object age
+    /// matters. Every other safety proof — binding, destructive gate, live-set
+    /// containment, existence, and object kind — is shared, so the two
+    /// destructive protocols cannot diverge on what protects an object. Only
+    /// never-published generations wait for the age floor, because only they
+    /// can belong to a writer still in flight.
     fn eligibility(
         &self,
         binding: &TenantTableBinding,
@@ -241,9 +245,10 @@ impl MaintenanceProtection {
         if metadata.mode() != EntryMode::FILE {
             return GcEligibility::NotFile;
         }
-        if metadata
-            .last_modified()
-            .is_none_or(|modified| modified > self.object_age_cutoff)
+        if scope == MaintenanceScope::AttemptGeneration
+            && metadata
+                .last_modified()
+                .is_none_or(|modified| modified > self.object_age_cutoff)
         {
             return GcEligibility::TooYoung;
         }
@@ -2113,7 +2118,8 @@ mod tests {
                 &young_manifest,
                 ObjectEvidence::Present(&young_metadata)
             ),
-            GcEligibility::TooYoung
+            GcEligibility::Eligible,
+            "an unreachable expiry candidate waits on no object age"
         );
         assert_eq!(
             protection.expired_cleanup_eligibility(

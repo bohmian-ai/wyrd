@@ -604,8 +604,7 @@ mod promotion_barrier {
     use vala_sql::SqlError;
     use vala_sql::queries::forge_operations::ForgeOperations;
     use vala_sql::row_types::forge_operations::{
-        ForgeClaimTable, ForgeExpirationAuthority, ForgeExpirationPreparation,
-        ForgeOperationFamily,
+        ForgeClaimTable, ForgeExpirationAuthority, ForgeExpirationPreparation, ForgeOperationFamily,
     };
     use vala_sql::row_types::forge_tasks::ForgeTaskEvidence;
     use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
@@ -670,12 +669,18 @@ mod promotion_barrier {
             .await
             .expect("tenant connection");
         if operation.ends_with(".prepared") {
-            operations.append_prepared(&mut conn, operation, detail).await
+            operations
+                .append_prepared(&mut conn, operation, detail)
+                .await
         } else {
-            operations.append_terminal(&mut conn, operation, detail).await
+            operations
+                .append_terminal(&mut conn, operation, detail)
+                .await
         }
         .expect("the promotion transition appends");
-        conn.commit().await.expect("the promotion transition commits");
+        conn.commit()
+            .await
+            .expect("the promotion transition commits");
     }
 
     /// Prepares one new rewrite operation through the operation owner.
@@ -714,7 +719,9 @@ mod promotion_barrier {
             .expect("valid Forge resource")
             .append_prepared(&mut conn, "forge.iceberg_rewrite.prepared", &detail)
             .await?;
-        conn.commit().await.expect("the rewrite preparation commits");
+        conn.commit()
+            .await
+            .expect("the rewrite preparation commits");
         Ok(())
     }
 
@@ -831,7 +838,12 @@ mod promotion_barrier {
         append_promotion(
             &fixture,
             &resource,
-            &promotion_detail(&resource, promotion, ForgeScribePromotionPhase::Prepared, None),
+            &promotion_detail(
+                &resource,
+                promotion,
+                ForgeScribePromotionPhase::Prepared,
+                None,
+            ),
             "forge.scribe_promotion.prepared",
         )
         .await;

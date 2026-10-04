@@ -1106,7 +1106,10 @@ fn leader_term(table: &ExpirableTable) -> Arc<ForgeHeldTerm> {
 /// # Panics
 ///
 /// Panics when the table, the snapshot, or its manifest list cannot be read.
-pub(super) async fn snapshot_files(fixture: &PromotionIntegrationFixture, snapshot_id: i64) -> Vec<String> {
+pub(super) async fn snapshot_files(
+    fixture: &PromotionIntegrationFixture,
+    snapshot_id: i64,
+) -> Vec<String> {
     let table = fixture
         .catalog
         .iceberg_catalog()
@@ -1137,7 +1140,11 @@ pub(super) async fn snapshot_files(fixture: &PromotionIntegrationFixture, snapsh
 /// # Panics
 ///
 /// Panics when a file is missing or its existence cannot be read.
-pub(super) async fn assert_files_exist(fixture: &PromotionIntegrationFixture, files: &[String], why: &str) {
+pub(super) async fn assert_files_exist(
+    fixture: &PromotionIntegrationFixture,
+    files: &[String],
+    why: &str,
+) {
     let table = fixture
         .catalog
         .iceberg_catalog()

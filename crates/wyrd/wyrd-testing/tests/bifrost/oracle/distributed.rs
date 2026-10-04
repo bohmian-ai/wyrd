@@ -4,6 +4,7 @@
 //! Module of the `oracle` binary; see `main.rs` for the capability it proves
 //! and `support.rs` for the fixtures it shares.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -4609,9 +4610,6 @@ const HELD_CUT_FOLLOWER: usize = 1;
 /// Scribe pod that ingests the held-cut journey's rows.
 const HELD_CUT_SCRIBE: usize = 3;
 
-/// Bound on waiting for a query's active reads to reach an expected count.
-const ACTIVE_READ_POLL_BOUND: Duration = Duration::from_secs(15);
-
 /// Counts the active table reads one table holds on the shared database.
 ///
 /// # Errors
@@ -4624,28 +4622,6 @@ async fn active_reads(
         .server(HELD_CUT_LEADER)?
         .oracle_active_table_reads_for_test(binding)
         .await?)
-}
-
-/// Waits until the table's active reads reach `expected`.
-///
-/// # Errors
-/// Returns an error when the count does not reach `expected` within
-/// [`ACTIVE_READ_POLL_BOUND`] or a read fails.
-async fn await_active_reads(
-    cluster: &PeerCluster,
-    binding: &vala_bifrost_redux::catalog::TenantTableBinding,
-    expected: i64,
-) -> Result<(), JourneyError> {
-    tokio::time::timeout(ACTIVE_READ_POLL_BOUND, async {
-        loop {
-            if active_reads(cluster, binding).await? == expected {
-                return Ok::<(), JourneyError>(());
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .map_err(|_| format!("active reads never reached {expected}"))?
 }
 
 /// Proves one inseparable cut-and-claim owner holds active reads to the end.
@@ -4788,4 +4764,442 @@ async fn held_cut_owns_active_reads_until_all_descendants_settle() -> Result<(),
         "a dropped pin leaves its committed row beside the dropped caller's"
     );
     cluster.shutdown().await
+}
+
+/// Rows the held-query journey writes into each of its two hot objects.
+const HELD_QUERY_ROWS: i64 = 2;
+
+/// Hot objects the held query pins; a small-files rewrite needs at least two.
+const HELD_QUERY_OBJECTS: i64 = 2;
+
+/// Bound on any one Forge transition the held-query journey waits for.
+const HELD_QUERY_TRANSITION_BOUND: Duration = Duration::from_secs(120);
+
+/// Reads the current snapshot, every retained snapshot, and the current live
+/// data-file paths, trimmed to the table's object prefix so they compare with
+/// `file_list` and storage paths. A table with no snapshot yet has none.
+///
+/// # Errors
+/// Returns a catalog, manifest, or path error.
+async fn held_query_live_files(
+    catalog: &dyn iceberg::Catalog,
+    binding: &vala_bifrost_redux::catalog::TenantTableBinding,
+) -> Result<(Option<i64>, BTreeSet<i64>, BTreeSet<String>), JourneyError> {
+    let table = catalog.load_table(&binding.table_ident()).await?;
+    let snapshots = table
+        .metadata()
+        .snapshots()
+        .map(|snapshot| snapshot.snapshot_id())
+        .collect();
+    let mut files = BTreeSet::new();
+    let Some(current) = table.metadata().current_snapshot() else {
+        return Ok((None, snapshots, files));
+    };
+    for manifest in table.manifest_list_reader(current).load().await?.entries() {
+        let manifest = manifest.load_manifest(table.file_io()).await?;
+        for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+            let path = entry.data_file().file_path();
+            let start = path
+                .find(binding.object_prefix.as_str())
+                .ok_or_else(|| format!("{path} is outside the table prefix"))?;
+            files.insert(path[start..].to_owned());
+        }
+    }
+    Ok((Some(current.snapshot_id()), snapshots, files))
+}
+
+/// Commits one table property through the shared catalog, outside Forge.
+///
+/// # Errors
+/// Returns the catalog load, transaction, or commit error.
+async fn held_query_set_property(
+    catalog: &std::sync::Arc<dyn iceberg::Catalog>,
+    binding: &vala_bifrost_redux::catalog::TenantTableBinding,
+    key: &str,
+    value: &str,
+) -> Result<(), JourneyError> {
+    let loaded = catalog.load_table(&binding.table_ident()).await?;
+    let tx = iceberg::transaction::Transaction::new(&loaded);
+    let tx = iceberg::transaction::ApplyTransactionAction::apply(
+        tx.update_table_properties()
+            .set(key.to_owned(), value.to_owned()),
+        tx,
+    )?;
+    tx.commit_once(catalog.as_ref()).await?;
+    Ok(())
+}
+
+/// Reads one `file_list` row's `(compacted, committed)` state, if it exists.
+///
+/// # Errors
+/// Returns the SQL error when the operator read fails.
+async fn held_query_file_row(
+    cluster: &WyrdTestCluster,
+    tenant: DataTenantId,
+    table: &str,
+    path: &str,
+) -> Result<Option<(bool, bool)>, JourneyError> {
+    Ok(sqlx::query_as(
+        "SELECT compacted, committed_snapshot_id IS NOT NULL FROM vala.file_list \
+         WHERE data_tenant_id = $1 AND table_name = $2 AND file_path = $3",
+    )
+    .bind(tenant.as_uuid())
+    .bind(table)
+    .bind(path)
+    .fetch_optional(cluster.pg_fixture().operator_pool().pool())
+    .await?)
+}
+
+/// Runs one leader maintenance pass and waits for it to complete.
+///
+/// # Errors
+/// Returns an error when the pass does not complete within the bound.
+async fn held_query_maintenance_pass(server: &WyrdTestServer) -> Result<(), JourneyError> {
+    let before = server.completed_forge_scheduler_passes_for_test();
+    server.request_forge_maintenance_pass_for_test();
+    tokio::time::timeout(
+        HELD_QUERY_TRANSITION_BOUND,
+        server.wait_for_forge_scheduler_passes_for_test(before + 1),
+    )
+    .await
+    .map_err(|_| "the leader maintenance pass did not complete")?;
+    Ok(())
+}
+
+/// Drains one held query's stream and returns its ids behind a success terminal.
+///
+/// # Errors
+/// Returns a query, decode, or terminal error, or an error when the terminal
+/// is not a success.
+async fn held_query_ids(
+    engine: &vala_bifrost_redux::oracle::Oracle,
+    context: vala_bifrost_redux::oracle::AuthorizedQueryContext,
+    sql: String,
+) -> Result<Vec<i64>, JourneyError> {
+    let mut stream = engine
+        .query_sql(
+            context,
+            BifrostQueryRequest {
+                sql,
+                deadline_ms: None,
+            },
+        )
+        .await?;
+    let mut decoder = vala_bifrost_redux::oracle::QueryIpcDecoder::new();
+    let mut ids = Vec::new();
+    let mut outcome = None;
+    while let Some(frame) = futures_util::StreamExt::next(&mut stream.frames).await {
+        match frame? {
+            wyrd_spec::vala::api::QueryStreamFrame::Schema(schema) => {
+                decoder.accept_schema(&schema.arrow_ipc_schema)?;
+            }
+            wyrd_spec::vala::api::QueryStreamFrame::Batch(batch) => {
+                let decoded = decoder.accept_batch(&batch.arrow_ipc_batch)?;
+                let column = decoded
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or("the id column is not Int64")?;
+                ids.extend(column.iter().flatten());
+            }
+            wyrd_spec::vala::api::QueryStreamFrame::Terminal(terminal) => {
+                outcome = Some(terminal.outcome);
+            }
+        }
+    }
+    if outcome != Some(QueryTerminalOutcome::Success) {
+        return Err(format!("the held query ended {outcome:?}").into());
+    }
+    Ok(ids)
+}
+
+/// Proves a held query owns its exact hot objects through promotion and rewrite.
+///
+/// The query pins a cut of two Scribe hot files, then is held at its post-pin
+/// boundary with its active table read committed. While held, those same
+/// objects are promoted unchanged and their `file_list` rows become terminal,
+/// a small-files rewrite publishes one distinct replacement object and
+/// snapshot, and a leader maintenance pass — expiration, expired cleanup, and
+/// orphan cleanup — destroys nothing. Released, the query returns
+/// every row exactly once and the original paths still exist. Once its read is
+/// gone and an ordinary append moves the head off the rewrite (whose lineage
+/// root names the replaced snapshot), the next maintenance passes expire the
+/// replaced snapshot and delete exactly the original objects and their
+/// terminal `file_list` rows, while the replacement survives. No Forge clock
+/// is advanced.
+///
+/// # Errors
+/// Returns cluster, ingest, catalog, query, or SQL errors.
+///
+/// # Panics
+/// Panics when any destructive step runs while the read is held, the query
+/// returns other than each row once, or cleanup deletes anything but the
+/// original objects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
+        BifrostClusterSpec::one_mixed(),
+        ForgeConfig::default(),
+        false,
+        true,
+    )
+    .await?;
+    let server = cluster.servers().next().ok_or("missing mixed node")?;
+    let promotion = cluster
+        .commit_uncertainty_catalog()
+        .ok_or("the topology wraps its Forge catalog in the commit seam")?;
+    let tenant = cluster.data_tenant_id();
+    let table = unique_table("held_replaced");
+    register_table(server, tenant, &table).await?;
+    let binding = vala_bifrost_redux::catalog::TenantTableBinding::resolve((
+        tenant,
+        vala_bifrost_redux::catalog::TableRef::new(
+            vala_bifrost_redux::namespaces::BifrostNamespace::Bifrost,
+            &table,
+        ),
+    ))?;
+    let catalog = server
+        .state()
+        .bifrost_catalog()
+        .ok_or("the mixed node retains the shared catalog")?
+        .iceberg_catalog();
+    // One promotion commit makes the table due, so the rewrite needs no
+    // elapsed interval and no clock advance.
+    held_query_set_property(
+        &catalog,
+        &binding,
+        "wyrd.forge.compaction.trigger-snapshot-count",
+        "1",
+    )
+    .await?;
+
+    // The object stays hot: its promotion is parked at the commit seam.
+    promotion.pause_before_commit();
+    let rows = writer(server, "held-replaced-writer").await?;
+    for object in 0..HELD_QUERY_OBJECTS {
+        for id in 1..=HELD_QUERY_ROWS {
+            rows.write(
+                &format!("vala.bifrost.{table}"),
+                &journey_schema(),
+                [journey_row(object * HELD_QUERY_ROWS + id, "held")],
+            )
+            .await?;
+        }
+        server.flush_bifrost().await?;
+    }
+    tokio::time::timeout(
+        HELD_QUERY_TRANSITION_BOUND,
+        promotion.wait_for_before_commit(),
+    )
+    .await
+    .map_err(|_| "the promotion never reached the parked commit")?;
+    let originals: BTreeSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT file_path FROM vala.file_list \
+         WHERE data_tenant_id = $1 AND table_name = $2 AND NOT compacted",
+    )
+    .bind(tenant.as_uuid())
+    .bind(&table)
+    .fetch_all(cluster.pg_fixture().operator_pool().pool())
+    .await?
+    .into_iter()
+    .collect();
+    assert_eq!(
+        originals.len(),
+        usize::try_from(HELD_QUERY_OBJECTS)?,
+        "each flush published one hot object: {originals:?}"
+    );
+
+    let engine = server
+        .state()
+        .bifrost_query()
+        .map(|query| std::sync::Arc::clone(query.engine()))
+        .ok_or("the mixed node composes no Oracle")?;
+    let context = query_context(tenant)?;
+    let pause = std::sync::Arc::new(vala_bifrost_redux::oracle::OraclePreparationPause::new(
+        context.request_id.clone(),
+    ));
+    engine.bind_preparation_pause_for_test(Some(std::sync::Arc::clone(&pause)))?;
+    let observer = cluster
+        .forge_completion_observer()
+        .ok_or("cluster was started without a Forge completion observer")?;
+    let storage = cluster.storage_operator();
+
+    let query = held_query_ids(
+        &engine,
+        context,
+        format!("SELECT id FROM vala.bifrost.{table} ORDER BY id"),
+    );
+    let maintain = async {
+        tokio::time::timeout(HELD_QUERY_TRANSITION_BOUND, async {
+            while pause.observed_deadline_ms().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "the query never reached its post-pin hold")?;
+        assert_eq!(
+            server.oracle_active_table_reads_for_test(&binding).await?,
+            1,
+            "the held query owns one active table read over the hot cut"
+        );
+
+        // Promotion appends the same objects unchanged and settles their rows.
+        promotion.release_paused_before_commit();
+        let promoted = tokio::time::timeout(HELD_QUERY_TRANSITION_BOUND, async {
+            loop {
+                let live = held_query_live_files(catalog.as_ref(), &binding).await?;
+                if live.2 == originals {
+                    return Ok::<_, JourneyError>(live);
+                }
+                let next = observer.completed().saturating_add(1);
+                cluster.request_forge_scheduler_pass_for_test();
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(5), observer.wait_for_at_least(next))
+                        .await;
+            }
+        })
+        .await
+        .map_err(|_| "the parked promotion never published the hot objects")??;
+        for original in &originals {
+            assert_eq!(
+                held_query_file_row(&cluster, tenant, &table, original).await?,
+                Some((true, true)),
+                "promotion settled {original}'s file_list row terminal"
+            );
+        }
+        let promoted_snapshot = promoted.0.ok_or("promotion published no snapshot")?;
+
+        // Rewrite replaces it with a distinct Forge object and snapshot.
+        let rewritten = tokio::time::timeout(HELD_QUERY_TRANSITION_BOUND, async {
+            loop {
+                let live = held_query_live_files(catalog.as_ref(), &binding).await?;
+                if live.0 != Some(promoted_snapshot) && live.2.is_disjoint(&originals) {
+                    return Ok::<_, JourneyError>(live);
+                }
+                let next = observer.completed().saturating_add(1);
+                cluster.request_forge_scheduler_pass_for_test();
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(5), observer.wait_for_at_least(next))
+                        .await;
+            }
+        })
+        .await
+        .map_err(|_| "no rewrite replaced the promoted object")??;
+        let [replacement] =
+            <[String; 1]>::try_from(rewritten.2.iter().cloned().collect::<Vec<_>>())
+                .map_err(|files| format!("expected one replacement object, saw {files:?}"))?;
+        assert!(
+            replacement.contains("/data/forge/"),
+            "the rewrite published a distinct Forge object: {replacement}"
+        );
+
+        // Every destructive path refuses while the read is held.
+        held_query_maintenance_pass(server).await?;
+        let held = held_query_live_files(catalog.as_ref(), &binding).await?;
+        assert!(
+            held.1.contains(&promoted_snapshot),
+            "snapshot expiration keeps the replaced snapshot while the read is held"
+        );
+        for original in &originals {
+            assert!(
+                storage.exists(original).await?,
+                "the held pass's expired and orphan cleanup leave {original}"
+            );
+            assert_eq!(
+                held_query_file_row(&cluster, tenant, &table, original).await?,
+                Some((true, true)),
+                "{original}'s terminal file_list row survives while the read is held"
+            );
+        }
+        pause.release();
+        Ok::<_, JourneyError>((promoted_snapshot, replacement))
+    };
+    let (ids, (promoted_snapshot, replacement)) = tokio::try_join!(query, maintain)?;
+    engine.bind_preparation_pause_for_test(None)?;
+    assert_eq!(
+        ids,
+        (1..=HELD_QUERY_OBJECTS * HELD_QUERY_ROWS).collect::<Vec<_>>(),
+        "the held query returns every row exactly once"
+    );
+    assert_eq!(
+        server.oracle_active_table_reads_for_test(&binding).await?,
+        0,
+        "the settled query released its active table read"
+    );
+
+    // The rewrite head still names its base snapshot as lineage, which keeps
+    // the originals reachable until an ordinary append moves the head. With
+    // compaction off, a third object promotes without rewriting the
+    // replacement, so the replacement stays live in the new head.
+    held_query_set_property(&catalog, &binding, "wyrd.forge.enable-compaction", "false").await?;
+    rows.write(
+        &format!("vala.bifrost.{table}"),
+        &journey_schema(),
+        [journey_row(0, "later")],
+    )
+    .await?;
+    server.flush_bifrost().await?;
+    tokio::time::timeout(HELD_QUERY_TRANSITION_BOUND, async {
+        loop {
+            let live = held_query_live_files(catalog.as_ref(), &binding).await?;
+            if live.2.len() == 2 && live.2.contains(&replacement) {
+                return Ok::<(), JourneyError>(());
+            }
+            let next = observer.completed().saturating_add(1);
+            cluster.request_forge_scheduler_pass_for_test();
+            let _ = tokio::time::timeout(Duration::from_secs(5), observer.wait_for_at_least(next))
+                .await;
+        }
+    })
+    .await
+    .map_err(|_| "the later object never promoted beside the replacement")??;
+
+    // After the last reader, ordinary maintenance destroys only the originals.
+    let deleted = tokio::time::timeout(HELD_QUERY_TRANSITION_BOUND, async {
+        for original in &originals {
+            while storage.exists(original).await? {
+                held_query_maintenance_pass(server).await?;
+            }
+        }
+        Ok::<_, JourneyError>(())
+    })
+    .await;
+    if let Ok(result) = deleted {
+        result?;
+    } else {
+        // The journey's evidence for a stuck cleanup is the table's own
+        // durable Forge history and catalog state.
+        let tasks: Vec<(String, String, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT strategy, state, evidence FROM vala.forge_tasks \
+             WHERE table_name = $1 ORDER BY created_at",
+        )
+        .bind(&table)
+        .fetch_all(cluster.pg_fixture().operator_pool().pool())
+        .await?;
+        let live = held_query_live_files(catalog.as_ref(), &binding).await?;
+        return Err(format!(
+            "an original object was never deleted after release: originals={originals:?} \
+             live={live:?} tasks={tasks:?}"
+        )
+        .into());
+    }
+    let after = held_query_live_files(catalog.as_ref(), &binding).await?;
+    assert!(
+        !after.1.contains(&promoted_snapshot),
+        "the replaced snapshot expired after the last reader"
+    );
+    assert!(
+        storage.exists(&replacement).await?,
+        "the replacement object survives cleanup"
+    );
+    for original in &originals {
+        assert_eq!(
+            held_query_file_row(&cluster, tenant, &table, original).await?,
+            None,
+            "physical cleanup removed {original}'s terminal file_list row"
+        );
+    }
+    cluster.shutdown().await?;
+    Ok(())
 }

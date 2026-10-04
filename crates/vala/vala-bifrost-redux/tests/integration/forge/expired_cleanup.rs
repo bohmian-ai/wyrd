@@ -1224,7 +1224,10 @@ async fn terminal_file_list_row_is_removed_only_after_object_cleanup() {
     let seeded = seed_extra_candidates(
         &table,
         &payload,
-        &["wyrd-terminal-present.parquet", "wyrd-terminal-absent.parquet"],
+        &[
+            "wyrd-terminal-present.parquet",
+            "wyrd-terminal-absent.parquet",
+        ],
     )
     .await;
     let present = seeded[0].path.as_str().to_owned();

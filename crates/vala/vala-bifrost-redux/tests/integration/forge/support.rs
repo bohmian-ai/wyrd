@@ -53,8 +53,8 @@ use vala_bifrost_redux::scribe::{
 };
 use vala_sql::queries::forge_tasks::ForgeTasks;
 use vala_sql::queries::oracle_reader_authority::ActiveReadOwner;
-use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
 use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
+use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
 use wyrd_spec::DataTenantId;
 
 /// Bounded wait every fixture handshake uses instead of a sleep.

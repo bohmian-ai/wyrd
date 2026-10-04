@@ -3351,7 +3351,6 @@ pub fn physical_build_observation_for_test() -> (u64, String) {
     (total, latest)
 }
 
-
 /// Projects one pinned Iceberg manifest entry into the descriptor a follower is
 /// signed to read.
 ///

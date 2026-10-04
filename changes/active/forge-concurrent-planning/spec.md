@@ -256,10 +256,22 @@ Table registration accepts an optional `compaction_type` (`auto`, `full`,
 `compaction_target_file_size_bytes` contract end to end: wyrd-spec request
 and description, Rust, Python and TypeScript SDKs, server validation, and the
 catalog writing `wyrd.forge.compaction.type` in the create transaction.
-Omitted means `full`. A re-register may omit it or repeat the stored value; a
+Omitted stores no property, so the table uses the REQ-013 default. A re-register may omit it or repeat the stored value; a
 different value is a stable conflict error, as for the file target. The
 table description reports the stored type. Copy-on-write tables still
 compact `full`.
+
+### REQ-013 — Default compaction merges staged files once and never revisits finished files
+
+(Added 2026-10-03, approved by the human owner.) Scribe stages toward 512 MiB
+and Forge compacts toward 1 GiB; neither changes. A table that names no
+compaction type compacts `small-files`. The small-file threshold is no longer
+a fixed 64 MiB: it is 75% of the table's resolved file target (768 MiB at the
+1 GiB default, following a table's own `write.target-file-size-bytes`).
+Files below it are merge candidates; files at or above it are finished and
+are never selected again. The core's existing per-partition minimum keeps a
+lone staged file waiting for a partner. `full`, `auto` and
+`files-with-delete` remain available per table through REQ-012.
 
 ## Invariants
 

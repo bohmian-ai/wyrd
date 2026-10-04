@@ -1,6 +1,6 @@
 ---
 id: SPEC-skald-workflow-runtime
-revision: 12
+revision: 13
 status: approved
 ---
 
@@ -17,6 +17,29 @@ for single-agent and multi-agent DAGs. A user can test a code-review workflow
 locally, register the same card and its referenced Agents and Prompts, then
 choose local execution or tenant-bound server execution without rewriting the
 workflow.
+
+## Revision 13 provider-tagged requests
+
+Approved by the user on 2026-10-03. A saved Prompt must name its provider
+instead of the server inferring it from the body shape: Gemini and Vertex
+GenerateContent bodies are identical, so an untagged Vertex Prompt reads back
+as Gemini and is sent to the wrong endpoint with the wrong credentials.
+
+- `skald_spec::ProviderRequest` uses serde adjacent tagging,
+  `#[serde(tag = "provider", content = "body", rename_all = "snake_case")]`,
+  with derived `Deserialize`. The hand-written shape-ordered deserializer and
+  its helper wire structs are deleted. `body` stays the native provider JSON.
+  Variants that already carry a `ProviderName` (`OpenAiChatCompatible`,
+  `RawV1`) keep it inside their body.
+- A body that does not match its named provider is a deserialization error,
+  never a fallthrough to another variant.
+- Nothing has shipped: there is no migration, compatibility reader, or alias
+  for the untagged form. Every fixture, example, SDK authoring path (Rust,
+  Python, TypeScript), generated schema, and stub moves to the tagged form, and
+  Prompt content hashes change accordingly.
+- A registered Vertex Prompt round-trips as `ProviderRequest::Vertex` and
+  reaches the in-process Vertex gateway projection. TASK-004 carries this
+  change and its server-internal Vertex success proof.
 
 ## Revision 12 client loading and reuse contract
 
@@ -2407,7 +2430,8 @@ retried after restart.
     server calls set `GatewayCallRequest.fallback` and remaining timeout,
     passing cancellation separately. Workflow correlation is trace-only, and
     errors normalize to the smallest protocol-common safe shape. Shared
-    mutable adapter context and changes to `ProviderRequest` are prohibited.
+    mutable adapter context is prohibited. `ProviderRequest` changes only as
+    fixed by the Revision 13 provider-tagging contract.
 21. Workflow retry repeats a whole Agent step attempt, uses the exact typed
     eligibility and deterministic exponential schedule above, and composes
     per-attempt step timeout, Agent timeout, provider-internal retry, and total
@@ -2655,7 +2679,8 @@ retried after restart.
 
 ## Open material decisions
 
-None in approved Revision 12. The user approved the complete remediation
+None in approved Revision 13. Revision 13 changes only `ProviderRequest`
+serialization; everything else stands as approved in Revision 12. The user approved the complete remediation
 recommendation and explicitly requested skill, spec, task and review updates
 on 2026-10-02. Production implementation is not part of that request.
 Historical approval context: Revisions 10 and 11 (see Revision history) were approved by the user on 2026-10-02. The user approved all seven readiness-review
@@ -2688,6 +2713,12 @@ or asynchronous server lifecycle requires another material spec revision
 before implementation planning.
 
 ## Revision history
+
+- **Revision 13 — approved (2026-10-03):** User-approved provider-tagged
+  `ProviderRequest` serialization (serde adjacent tagging, derived
+  deserializer, custom shape-ordered deserializer deleted, no migration) so
+  Vertex Prompts round-trip and reach the in-process Vertex gateway path.
+  Carried by TASK-004.
 
 - **Revision 12 — approved (2026-10-02):** User-approved automatic client loading
   APIs for Rust/Python/TypeScript, registered Agent/Prompt reuse, existing-owner

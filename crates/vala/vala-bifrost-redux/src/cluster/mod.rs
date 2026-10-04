@@ -22,8 +22,7 @@ use wyrd_spec::vala::api::{
 
 /// Production heartbeat period for independently fenced runtime roles.
 pub const ROLE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-/// Maximum age of a heartbeat included in a live cluster snapshot.
-pub const ROLE_LIVENESS_CUTOFF: Duration = Duration::from_secs(15);
+pub use vala_sql::queries::cluster_nodes::ROLE_LIVENESS_CUTOFF;
 
 /// Test-support cadence for independently fenced role heartbeats and snapshots.
 ///

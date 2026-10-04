@@ -14,6 +14,13 @@ use wyrd_spec::vala::api::{
 use crate::row_types::cluster_nodes::{RegisteredRoleRow, RoleMutation, RoleRegistration};
 use crate::{SqlError, TenantConn, ValaPostgres};
 
+/// Maximum age of a heartbeat included in a live cluster snapshot.
+///
+/// Owned here rather than by the runtime registry because durable decisions
+/// also consume it: Forge treats an Oracle fence whose heartbeat is older than
+/// this as no longer live when it evaluates an abandoned active table read.
+pub const ROLE_LIVENESS_CUTOFF: Duration = Duration::from_secs(15);
+
 /// SQL owner for role-fenced cluster membership.
 pub struct ClusterNodes {
     /// Vala runtime handle from which callers open tenant transactions.

@@ -27,9 +27,8 @@ use wyrd_spec::vala::api::{
     ForgeSnapshotExpirePhase, audit_detail_canonical_json,
 };
 
-use crate::queries::oracle_reader_authority::{
-    BIFROST_CATALOG_NAME, invariant, read_protection_record,
-};
+use crate::queries::cluster_nodes::ROLE_LIVENESS_CUTOFF;
+use crate::queries::oracle_reader_authority::BIFROST_CATALOG_NAME;
 use crate::row_types::forge_operations::{
     ForgeClaimTable, ForgeExpirationAuthority, ForgeExpirationPreparation,
     ForgeExpirationResetOutcome, ForgeExpirationResetRequest, ForgeExpirationSettlementRequest,
@@ -38,7 +37,7 @@ use crate::row_types::forge_operations::{
     OpenForgeOperationPage,
 };
 use crate::row_types::forge_tasks::{ForgeTaskEvidence, evidence_to_value};
-use crate::row_types::oracle_reader_authority::{ProtectionRecord, TableAuthorityIdentity};
+use crate::row_types::oracle_reader_authority::TableAuthorityIdentity;
 use crate::{OperatorPool, SqlError, TenantConn};
 
 /// Scoped Forge operation state handle for one `(resource, family)`.
@@ -830,8 +829,8 @@ impl ForgeOperations<'_> {
     ///
     /// In one operator transaction this asserts the caller's live lease fence,
     /// pins the exact running attempt, takes the table's maintenance-authority
-    /// row, refuses when any surviving reader protection frontier still covers
-    /// a selected snapshot, inserts the Prepared operation state, claims every
+    /// row, discards provably abandoned active table reads and refuses while
+    /// any other active read remains, inserts the Prepared operation state, claims every
     /// selected snapshot, and moves the task to Prepared with its evidence.
     ///
     /// Replaying the identical preparation writes nothing. An identical
@@ -843,8 +842,8 @@ impl ForgeOperations<'_> {
     /// Returns [`SqlError::Conflict`] when the family is not
     /// `snapshot_expire`, the transition does not name this operation, the
     /// lease fence is lost, the task/attempt/owner/table identity does not
-    /// match, a surviving protection frontier covers a selected snapshot, or
-    /// the operation is already resolved.
+    /// match, an Oracle query still reads the table, or the operation is
+    /// already resolved.
     /// Returns [`SqlError::InvariantViolation`] when stored state is malformed.
     /// Returns [`SqlError::Query`] for statement failures.
     ///
@@ -881,7 +880,7 @@ impl ForgeOperations<'_> {
         )
         .await?;
         let identity = lock_table_authority(&mut tx, tenant, request.table).await?;
-        refuse_protected_snapshots(&mut tx, &identity, &selected).await?;
+        refuse_active_table_reads(&mut tx, &identity).await?;
 
         self.acquire_operation_lock(&mut tx, operation_id).await?;
         if let Some(sql_row) = self.select_state_for_update(&mut tx, operation_id).await? {
@@ -1019,7 +1018,7 @@ impl ForgeOperations<'_> {
     /// `current_detail` and records the release only through the `reset` column
     /// phase. The same transaction deletes every claim, cancels the task, and
     /// advances the table's planning demand so the selection can be recomputed
-    /// against fresh reader protection.
+    /// against fresh table state.
     ///
     /// # Errors
     ///
@@ -1513,88 +1512,63 @@ pub(crate) async fn lock_table_authority(
     Ok(identity)
 }
 
-/// Refuses the whole preparation when any surviving reader protection frontier
-/// still covers a selected snapshot.
+/// Discards one table's abandoned active reads, then refuses destructive work
+/// while any active read remains.
 ///
-/// The refusal is deliberate: `operation_id` is derived from the exact
-/// selection and the Prepared audit detail is immutable, so silently narrowing
-/// the selection here would invalidate the identity the caller committed to.
-/// Coverage is proven ancestry-path membership — Iceberg remains the only
-/// ancestry authority, so this never re-derives lineage in SQL.
+/// Runs inside a Forge operator transaction that is already tenant-bound and
+/// already holds the table's maintenance-authority row `FOR UPDATE`, so no
+/// acquisition can commit a new read between this decision and the caller's
+/// destructive preparation. A row is abandoned only when PostgreSQL time has
+/// passed its `abandon_after` **and** its exact Oracle `(node_id,
+/// fencing_token)` no longer has a heartbeat within [`ROLE_LIVENESS_CUTOFF`];
+/// a live owner's row never expires.
 ///
 /// # Errors
-/// Returns [`SqlError::Conflict`] when a frontier covers a selected snapshot,
-/// and [`SqlError::InvariantViolation`] when a stored protection fails
-/// validation.
-async fn refuse_protected_snapshots(
+///
+/// Returns [`SqlError::Conflict`] when an active read remains and
+/// [`SqlError`] when either statement fails.
+pub async fn refuse_active_table_reads(
     tx: &mut Transaction<'_, Postgres>,
     identity: &TableAuthorityIdentity,
-    selected: &[i64],
 ) -> Result<(), SqlError> {
-    let records = list_table_protection_in_operator_tx(tx, identity).await?;
-    for record in &records {
-        if let Some(covered) = selected
-            .iter()
-            .copied()
-            .find(|snapshot| record.frontier.covers(*snapshot))
-        {
-            return Err(SqlError::Conflict {
-                detail: format!(
-                    "snapshot {covered} is still covered by a surviving reader protection frontier"
-                ),
-            });
-        }
+    sqlx::query(
+        r"
+        DELETE FROM vala.oracle_active_table_reads r
+         WHERE r.data_tenant_id = wyrd.current_tenant()
+           AND r.table_uid = $1
+           AND r.abandon_after <= statement_timestamp()
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM vala.cluster_nodes n
+                WHERE n.data_tenant_id = $2
+                  AND n.node_id = r.node_id
+                  AND n.role = 'oracle'
+                  AND n.fencing_token = r.fencing_token
+                  AND n.heartbeat_at >= statement_timestamp() - ($3 * interval '1 second'))
+        ",
+    )
+    .bind(identity.table_uid.as_slice())
+    .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
+    .bind(ROLE_LIVENESS_CUTOFF.as_secs_f64())
+    .execute(&mut **tx)
+    .await
+    .map_err(SqlError::from)?;
+    let active: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM vala.oracle_active_table_reads \
+         WHERE data_tenant_id = wyrd.current_tenant() AND table_uid = $1)",
+    )
+    .bind(identity.table_uid.as_slice())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(SqlError::from)?;
+    if active {
+        return Err(SqlError::Conflict {
+            detail: "an Oracle query is still reading this table".to_owned(),
+        });
     }
     Ok(())
 }
 
-/// Reads and validates every epoch's complete protection record for one table
-/// inside the preparation's own operator transaction.
-///
-/// Preparation already holds the table's `bifrost_table_maintenance_authority`
-/// row lock on an operator transaction whose `wyrd.current_tenant()` binding is
-/// established, and the frontier must be read under that same lock: a
-/// protection published between an earlier read and the lock would otherwise be
-/// invisible. Each epoch's record is read by the same
-/// [`read_protection_record`] statement the Oracle owner uses, so the tenant
-/// predicate, member ordering, header-identity check, digest check, and domain
-/// validation are one implementation rather than two that must be kept
-/// identical.
-///
-/// # Errors
-/// Returns [`SqlError::InvariantViolation`] when a stored header names another
-/// table, when a header or member fails validation, or when a header disappears
-/// inside this transaction, and [`SqlError`] when a statement fails.
-pub(crate) async fn list_table_protection_in_operator_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    identity: &TableAuthorityIdentity,
-) -> Result<Vec<ProtectionRecord>, SqlError> {
-    identity.validate(BIFROST_CATALOG_NAME)?;
-    let epochs: Vec<(uuid::Uuid, i64)> = sqlx::query_as(
-        r"
-        SELECT node_id, fencing_token
-          FROM vala.oracle_table_protections
-         WHERE data_tenant_id = wyrd.current_tenant()
-           AND table_uid = $1
-         ORDER BY node_id, fencing_token
-        ",
-    )
-    .bind(identity.table_uid.as_slice())
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(SqlError::from)?;
-
-    let mut records = Vec::with_capacity(epochs.len());
-    for (node_id, fencing_token) in epochs {
-        let record = read_protection_record(tx, identity, node_id, fencing_token)
-            .await?
-            .ok_or_else(|| {
-                invariant("reader protection header disappeared inside one transaction")
-            })?;
-        records.push(record);
-    }
-    Ok(records)
-}
 
 /// Returns the exact ascending snapshot selection carried by a snapshot-expiry
 /// detail.

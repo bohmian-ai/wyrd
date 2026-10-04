@@ -54,6 +54,8 @@ VALA_OPERATOR_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/maintenance_leases.rs",
     # Cross-tenant active Bifrost roster used only by the Forge scheduler.
     "crates/vala/vala-sql/src/queries/forge_catalog_operator.rs",
+    # Singleton Forge leader term in `vala.forge_scheduler_state` (no tenant column).
+    "crates/vala/vala-sql/src/queries/forge_leader.rs",
 }
 
 # Cohesive owners that intentionally expose both cross-tenant OperatorPool
@@ -289,10 +291,18 @@ def check_vala_query_modules(failures: list[str]) -> None:
             continue
 
         if relative in VALA_OPERATOR_ALLOWLIST:
-            if has_public_async_fn(code) and not has_platform_executor(code):
-                failures.append(
-                    f"{relative}: operator public async fn must take PgPool or OperatorPool"
-                )
+            # A struct-centred owner holds its OperatorPool as a field, so its
+            # methods take `&self` instead of a pool parameter.
+            owns_operator_pool = re.search(
+                r"struct\s+\w+\s*\{[^}]*\bOperatorPool\b", code, re.DOTALL
+            ) is not None
+            for fn_name, params in public_async_fns(code):
+                if not has_platform_executor(params) and not (
+                    owns_operator_pool and "&self" in params
+                ):
+                    failures.append(
+                        f"{relative}: operator public async fn {fn_name} must take PgPool or OperatorPool, or be a method of an OperatorPool-owning struct"
+                    )
             continue
 
         if relative in VALA_MIXED_EXECUTOR_ALLOWLIST:

@@ -239,6 +239,28 @@ Drop the branch-only concurrent-planning migration with its commits. Retire
 older planning-demand schema only after its consumers are removed and
 unsettled publication and cleanup evidence has a safe owner.
 
+### REQ-011 — Compaction is on for every table
+
+(Added 2026-10-03, approved by the human owner.) Bifrost owns its Iceberg
+tables, so automatic compaction is enabled for every table by default,
+including built-in tables. `wyrd.forge.enable-compaction` remains readable;
+an absent property means enabled. This intentionally departs from
+RisingWave's sink default (`false`). The staged-file target (512 MiB) and
+the compaction file target (1 GiB) do not change.
+
+### REQ-012 — Tables choose their compaction type
+
+(Added 2026-10-03, approved by the human owner as a public contract change.)
+Table registration accepts an optional `compaction_type` (`auto`, `full`,
+`small-files`, `files-with-delete`), following the existing
+`compaction_target_file_size_bytes` contract end to end: wyrd-spec request
+and description, Rust, Python and TypeScript SDKs, server validation, and the
+catalog writing `wyrd.forge.compaction.type` in the create transaction.
+Omitted means `full`. A re-register may omit it or repeat the stored value; a
+different value is a stable conflict error, as for the file target. The
+table description reports the stored type. Copy-on-write tables still
+compact `full`.
+
 ## Invariants
 
 - INV-001: One active scheduling leader; compactors on any replica may work.

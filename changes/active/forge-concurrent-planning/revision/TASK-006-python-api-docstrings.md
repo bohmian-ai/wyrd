@@ -171,7 +171,7 @@ or test change; TASK-005 untouched.
 
 Before: the constructor showed `Initialize self.  See help(type(self)) for
 accurate signature.` with no argument documentation; the generated stub's
-`__init__` was `...` only. After (runtime and generated stub agree):
+`__init__` was `...` only. After (condensed; runtime help and generated stub carry the same full text):
 
 ```text
  |  __init__(self, model, table, partition_granularity=None, sort_keys=None,

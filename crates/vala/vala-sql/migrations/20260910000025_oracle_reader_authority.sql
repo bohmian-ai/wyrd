@@ -112,6 +112,9 @@ GRANT SELECT, DELETE ON vala.oracle_active_table_reads TO wyrd_platform_admin;
 -- grant is wider than the behavior: Forge only ever reads and locks this row,
 -- and registration remains the sole writer.
 GRANT SELECT, UPDATE ON vala.bifrost_table_maintenance_authority TO wyrd_platform_admin;
+-- Expired-object cleanup retires a promoted object's terminal file_list row in
+-- the same operator transaction that records the object's proven deletion.
+GRANT DELETE ON vala.file_list TO wyrd_platform_admin;
 
 -- ---------------------------------------------------------------------------
 -- Tenant-derived catalog pointer

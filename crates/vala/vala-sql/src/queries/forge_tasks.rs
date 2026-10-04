@@ -1256,7 +1256,14 @@ impl ForgeTasks {
     ///
     /// A proven outcome ([`ExpiredCleanupOutcome::Deleted`] or
     /// [`ExpiredCleanupOutcome::Missing`]) clears the prepared index and
-    /// advances the cursor by exactly one. A refusal or an uncertain acceptance
+    /// advances the cursor by exactly one. In the same transaction it removes
+    /// the table's terminal `vala.file_list` row at the candidate path: the
+    /// eligibility proof that authorized the object's deletion also retires its
+    /// metadata, so the row outlives every refusal and uncertain outcome and
+    /// disappears exactly when the object is proven gone. Nonterminal rows are
+    /// kept; a promotion settles its rows in the same transaction as its
+    /// terminal transition, so no terminal row belongs to an open promotion.
+    /// A refusal or an uncertain acceptance
     /// changes no durable state and leaves the prepared candidate intact, so
     /// the same identity replays it and no blind second delete can precede a
     /// fresh stat and safety proof. A stale owner cannot settle at all.
@@ -1322,6 +1329,13 @@ impl ForgeTasks {
                 .map_err(SqlError::from)?
                 .rows_affected();
             exact_one(changed, "expired cleanup candidate settlement")?;
+            sqlx::query("DELETE FROM vala.file_list WHERE data_tenant_id=wyrd.current_tenant() AND namespace=$1 AND table_name=$2 AND file_path=$3 AND compacted AND committed_snapshot_id IS NOT NULL")
+                .bind(&request.table.namespace_name)
+                .bind(&request.table.table_name)
+                .bind(request.candidate.path.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(SqlError::from)?;
         } else {
             tracing::warn!(
                 task_id = %request.authority.task_id,

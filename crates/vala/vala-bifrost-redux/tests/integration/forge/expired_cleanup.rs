@@ -1162,3 +1162,121 @@ async fn cursor_replays_exact_prepared_candidate_after_refusal_uncertainty_and_t
     let _ = Arc::strong_count(&table.store);
     table.supervised.shutdown().await;
 }
+
+/// Copies one promoted `file_list` row under a new identity, path, and table.
+///
+/// The copy keeps the source row's settlement columns, so a copy of a
+/// terminal row is terminal. A fresh writer node keeps the stream-range
+/// uniqueness index satisfied.
+///
+/// # Panics
+///
+/// Panics when no promoted row exists or the insert fails.
+async fn copy_terminal_row(fixture: &PromotionIntegrationFixture, path: &str, table_name: &str) {
+    let copied = sqlx::query("INSERT INTO vala.file_list (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,compacted,committed_snapshot_id,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,promotion_record,file_ordinal,file_checksum,forge_publication_operation_id) SELECT $1,data_tenant_id,namespace,$3,$2,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,compacted,committed_snapshot_id,$1,writer_epoch,wal_lsn_min,wal_lsn_max,promotion_record,file_ordinal,file_checksum,forge_publication_operation_id FROM vala.file_list WHERE data_tenant_id=$4 AND compacted AND committed_snapshot_id IS NOT NULL LIMIT 1")
+        .bind(Uuid::now_v7())
+        .bind(path)
+        .bind(table_name)
+        .bind(fixture.tenant.as_uuid())
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("the terminal row copies")
+        .rows_affected();
+    assert_eq!(copied, 1, "a promoted terminal row exists to copy");
+}
+
+/// Lists the tenant's `file_list` rows as `(table, path)` pairs.
+///
+/// # Panics
+///
+/// Panics when the read fails.
+async fn file_list_paths(fixture: &PromotionIntegrationFixture) -> Vec<(String, String)> {
+    sqlx::query_as("SELECT table_name, file_path FROM vala.file_list WHERE data_tenant_id=$1 ORDER BY table_name, file_path")
+        .bind(fixture.tenant.as_uuid())
+        .fetch_all(fixture.operator_pool.pool())
+        .await
+        .expect("file_list rows read")
+}
+
+/// Proves cleanup retires a terminal `file_list` row only with its object.
+///
+/// Two extra candidates carry terminal rows: one object is present, the other
+/// is already absent, as after a delete that landed before its SQL settlement.
+/// A terminal row at a non-candidate path and a same-path row of another table
+/// are bystanders. A failed delete leaves every row in place; the drain that
+/// follows removes exactly the candidates' rows, by deletion and by observed
+/// absence, and keeps both bystanders.
+///
+/// # Panics
+///
+/// Panics when a row is removed before its object, a candidate row survives
+/// the completed drain, or a bystander row is removed.
+#[tokio::test]
+async fn terminal_file_list_row_is_removed_only_after_object_cleanup() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let DrainedExpiration {
+        table,
+        worker,
+        cleanup_id,
+        mut payload,
+    } = Box::pin(drained_expiration("cleanup_file_list")).await;
+    let fixture = &table.fixture;
+    let seeded = seed_extra_candidates(
+        &table,
+        &payload,
+        &["wyrd-terminal-present.parquet", "wyrd-terminal-absent.parquet"],
+    )
+    .await;
+    let present = seeded[0].path.as_str().to_owned();
+    let absent = seeded[1].path.as_str().to_owned();
+    let bystander = sibling_path(&seeded[0], "wyrd-terminal-bystander.parquet");
+    payload.cleanup_candidates.extend(seeded);
+    payload.cleanup_candidates.sort();
+    persist_cleanup_plan(fixture, cleanup_id, &payload).await;
+    fixture
+        .staging
+        .delete(&absent)
+        .await
+        .expect("the absent candidate's object is removed up front");
+    let own = fixture.binding.table_ref.name.clone();
+    for path in [&present, &absent, &bystander] {
+        copy_terminal_row(fixture, path, &own).await;
+    }
+    copy_terminal_row(fixture, &present, "other_table").await;
+    let rows_before = file_list_paths(fixture).await;
+
+    table.store.fail_next_deletes(1);
+    worker
+        .execute_one_for_test(&CancellationToken::new())
+        .await
+        .expect_err("a failed delete does not complete the drain");
+    assert_eq!(
+        file_list_paths(fixture).await,
+        rows_before,
+        "a failed delete removes no file_list row"
+    );
+
+    // The lapsed claim is recovered by a takeover worker through the
+    // production prepared-claim route, which replays the retained candidate.
+    expire_claim(fixture.operator_pool.pool(), cleanup_id).await;
+    let taker = ForgeWorker::new(
+        table.supervised.forge(),
+        ForgeWorkerConfig::default(),
+        Uuid::now_v7(),
+    )
+    .expect("takeover worker");
+    taker
+        .execute_one_for_test(&CancellationToken::new())
+        .await
+        .expect("the takeover drains every candidate");
+    assert_eq!(cursor(fixture, cleanup_id).await.0, "succeeded");
+    let expected: Vec<(String, String)> = rows_before
+        .into_iter()
+        .filter(|(table_name, path)| !(table_name == &own && (path == &present || path == &absent)))
+        .collect();
+    assert_eq!(
+        file_list_paths(fixture).await,
+        expected,
+        "exactly the cleaned candidates' terminal rows are removed"
+    );
+}

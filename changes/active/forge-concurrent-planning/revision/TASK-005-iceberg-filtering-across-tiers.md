@@ -378,3 +378,55 @@ Promoted cuts exclude disjoint `wyrd_request_id` ranges one level earlier
 than row groups: Iceberg's manifest bounds plan only the matching file (each
 promoted Scribe file is one row group). The rewritten cut, one sorted file
 with several groups, carries the row-group min/max proof.
+
+### Scenario 4 — SPEC_REVISION_REQUIRED
+
+Status: stopped under the third Material Stop Condition; not implemented.
+Revalidation, protection, and cleanup are unchanged.
+
+- **Tenant authority cannot read the pointer.**
+  `20260619000000_iceberg_catalog.sql` revokes `USAGE` on `iceberg_catalog`
+  from `wyrd_app`. iceberg-catalog-sql creates `iceberg_tables` at runtime
+  under `wyrd_platform_admin`. The supporting test in
+  `catalog/bifrost_catalog.rs` (`SELECT metadata_location FROM
+  iceberg_catalog.iceberg_tables` on a tenant connection → `permission
+  denied`) passes today. A tenant-scoped `SELECT` can return pointers only
+  through new DDL, such as a platform-owned `SECURITY DEFINER` function that
+  joins `vala.bifrost_tables` to `iceberg_tables` under the bound tenant, or
+  a grant on a tenant-filtered view.
+- **A `SELECT` cannot establish durable protection without new DDL.**
+  Protection today is DML inside a tenant transaction (`reader_pins.rs`
+  `protect`: maintenance-authority `FOR UPDATE`, header upsert, member
+  delete and insert). Folding that into one `SELECT` needs a new `VOLATILE`
+  function, because data-modifying CTEs are `WITH ... INSERT` statements,
+  not a `SELECT`. REQ-014's bounded table-wide pin still has to be written
+  by that function.
+- **Hot objects have no reader protection.** Orphan GC and post-promotion
+  cleanup consult `file_list` state, not `oracle_table_protection_members`.
+  Covering hot objects means extending the protection schema or cleanup
+  predicates.
+- **Conflict.** The task forbids any migration. REQ-014, INV-009, and AC-009
+  require one tenant-scoped `SELECT` that both returns the platform-owned
+  pointer and writes protection covering Iceberg and hot objects. Both need
+  persisted schema changes: a function plus a protection-scope change. Under
+  `$wyrd-implement` that is an expensive-to-reverse persisted contract
+  decision.
+- **Decision needed.** Authorize a forward migration that adds a
+  tenant-scoped `SECURITY DEFINER VOLATILE` cut-acquisition function owned by
+  `wyrd_platform_admin`, executable by `wyrd_app`, and bound to
+  `app.data_tenant_id`. It would return pointers plus unresolved `file_list`
+  candidates and upsert a bounded table-wide pin. Alternatively, amend
+  REQ-014 to keep the current pointer, recheck, and hot-list path. A
+  statement-counting harness (none exists today; the
+  `vala_postgres_pool_acquire_total` metric is only a proxy) belongs to the
+  approved option.
+
+### Final Verification
+
+| Check | Result |
+|---|---|
+| fork `cargo test -p iceberg --lib arrow::` | 212 passed |
+| fork `cargo test -p iceberg-datafusion --lib expr_to_predicate` | 39 passed |
+| `mise run fmt`, `mise run lints` | green (`980da2b41` clears the lint gate) |
+| `vala-bifrost-redux --lib` | 833/833 |
+| Scenario 0–3 journeys | pass together |

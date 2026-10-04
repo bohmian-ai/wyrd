@@ -22,7 +22,7 @@ use super::shared::ChatMessageSource;
 // OpenAI Chat — response side
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Read-only view of an OpenAI Chat Completions response.
+/// Read-only view of an `OpenAI` Chat Completions response.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiChatResponse")]
 pub struct PyOpenAiChatResponse {
     inner: Arc<ProviderResponse>,
@@ -45,7 +45,7 @@ impl PyOpenAiChatResponse {
     fn id(&self) -> &str {
         &self.resp().id
     }
-    /// The `object` type, `"chat.completion"` from OpenAI.
+    /// The `object` type, `"chat.completion"` from `OpenAI`.
     #[getter]
     fn object(&self) -> &str {
         &self.resp().object
@@ -96,7 +96,7 @@ impl PyOpenAiChatResponse {
     }
 }
 
-/// One entry of an OpenAI Chat response's `choices`.
+/// One entry of an `OpenAI` Chat response's `choices`.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiChatChoice")]
 pub struct PyOpenAiChatChoice {
     inner: Arc<ProviderResponse>,
@@ -149,7 +149,7 @@ impl PyOpenAiChatChoice {
     }
 }
 
-/// The `logprobs` of an OpenAI Chat choice.
+/// The `logprobs` of an `OpenAI` Chat choice.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiChatLogprobs")]
 pub struct PyOpenAiChatLogprobs {
     inner: Arc<ProviderResponse>,
@@ -191,7 +191,7 @@ impl PyOpenAiChatLogprobs {
     }
 }
 
-/// The `usage` object of an OpenAI Chat response.
+/// The `usage` object of an `OpenAI` Chat response.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiUsage")]
 pub struct PyOpenAiUsage {
     inner: Arc<ProviderResponse>,
@@ -251,7 +251,7 @@ impl PyOpenAiUsage {
     }
 }
 
-/// The `prompt_tokens_details` of an OpenAI Chat usage object.
+/// The `prompt_tokens_details` of an `OpenAI` Chat usage object.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiPromptTokensDetails")]
 pub struct PyOpenAiPromptTokensDetails {
     inner: Arc<ProviderResponse>,
@@ -287,7 +287,7 @@ impl PyOpenAiPromptTokensDetails {
     }
 }
 
-/// The `completion_tokens_details` of an OpenAI Chat usage object.
+/// The `completion_tokens_details` of an `OpenAI` Chat usage object.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiCompletionTokensDetails")]
 pub struct PyOpenAiCompletionTokensDetails {
     inner: Arc<ProviderResponse>,

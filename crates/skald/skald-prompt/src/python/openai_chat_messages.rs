@@ -22,7 +22,7 @@ use crate::prompt::wrong_variant;
 // OpenAI Chat — shared message types (Rule 5)
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// One OpenAI Chat message, from a request's `messages` or a response choice.
+/// One `OpenAI` Chat message, from a request's `messages` or a response choice.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiChatMessage")]
 pub struct PyOpenAiChatMessage {
     pub(crate) src: ChatMessageSource,
@@ -95,7 +95,7 @@ impl PyOpenAiChatMessage {
     }
 }
 
-/// OpenAI Chat message content: either a string or a list of parts.
+/// `OpenAI` Chat message content: either a string or a list of parts.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiMessageContent")]
 pub struct PyOpenAiMessageContent {
     src: ChatMessageSource,
@@ -145,7 +145,7 @@ impl PyOpenAiMessageContent {
     }
 }
 
-/// One part of OpenAI Chat message content.
+/// One part of `OpenAI` Chat message content.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiContentPart")]
 pub struct PyOpenAiContentPart {
     src: ChatMessageSource,
@@ -225,7 +225,7 @@ impl PyOpenAiContentPart {
     }
 }
 
-/// The `image_url` object of an OpenAI Chat image part.
+/// The `image_url` object of an `OpenAI` Chat image part.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiImageUrl")]
 pub struct PyOpenAiImageUrl {
     src: ChatMessageSource,
@@ -259,7 +259,7 @@ impl PyOpenAiImageUrl {
     }
 }
 
-/// The `input_audio` object of an OpenAI Chat audio part.
+/// The `input_audio` object of an `OpenAI` Chat audio part.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiInputAudio")]
 pub struct PyOpenAiInputAudio {
     src: ChatMessageSource,
@@ -293,7 +293,7 @@ impl PyOpenAiInputAudio {
     }
 }
 
-/// The `file` object of an OpenAI Chat file part.
+/// The `file` object of an `OpenAI` Chat file part.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiFilePart")]
 pub struct PyOpenAiFilePart {
     src: ChatMessageSource,
@@ -332,7 +332,7 @@ impl PyOpenAiFilePart {
     }
 }
 
-/// One entry of an OpenAI Chat assistant message's `tool_calls`.
+/// One entry of an `OpenAI` Chat assistant message's `tool_calls`.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiToolCall")]
 pub struct PyOpenAiToolCall {
     src: ChatMessageSource,
@@ -368,7 +368,7 @@ impl PyOpenAiToolCall {
     }
 }
 
-/// The `function` object of an OpenAI Chat tool call.
+/// The `function` object of an `OpenAI` Chat tool call.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiToolFunctionCall")]
 pub struct PyOpenAiToolFunctionCall {
     src: ChatMessageSource,
@@ -396,7 +396,7 @@ impl PyOpenAiToolFunctionCall {
     }
 }
 
-/// One entry of an OpenAI Chat message's `annotations`.
+/// One entry of an `OpenAI` Chat message's `annotations`.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiMessageAnnotation")]
 pub struct PyOpenAiMessageAnnotation {
     src: ChatMessageSource,
@@ -427,7 +427,7 @@ impl PyOpenAiMessageAnnotation {
     }
 }
 
-/// A web citation inside an OpenAI Chat message.
+/// A web citation inside an `OpenAI` Chat message.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiUrlCitation")]
 pub struct PyOpenAiUrlCitation {
     src: ChatMessageSource,
@@ -465,7 +465,7 @@ impl PyOpenAiUrlCitation {
     }
 }
 
-/// The `audio` output of an OpenAI Chat assistant message.
+/// The `audio` output of an `OpenAI` Chat assistant message.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiMessageAudio")]
 pub struct PyOpenAiMessageAudio {
     src: ChatMessageSource,

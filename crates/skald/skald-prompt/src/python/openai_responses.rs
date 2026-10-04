@@ -31,7 +31,7 @@ use crate::prompt::wrong_variant;
 // OpenAI Responses — request + response
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Read-only view of an OpenAI Responses request.
+/// Read-only view of an `OpenAI` Responses request.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponsesRequest")]
 pub struct PyOpenAiResponsesRequest {
     pub(crate) inner: Arc<ProviderRequest>,
@@ -707,7 +707,7 @@ impl PyOpenAiResponsesGrammar {
 
 // OpenAI Responses response
 
-/// Read-only view of an OpenAI Responses response.
+/// Read-only view of an `OpenAI` Responses response.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponsesResponse")]
 pub struct PyOpenAiResponsesResponse {
     inner: Arc<ProviderResponse>,
@@ -768,7 +768,7 @@ impl PyOpenAiResponsesResponse {
     }
 }
 
-/// The `usage` object of an OpenAI Responses response.
+/// The `usage` object of an `OpenAI` Responses response.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponsesUsage")]
 pub struct PyOpenAiResponsesUsage {
     inner: Arc<ProviderResponse>,

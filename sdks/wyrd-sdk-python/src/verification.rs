@@ -51,7 +51,7 @@ impl Verification {
     /// Read one binding's identities, activity, readiness, and cursor as a dict.
     ///
     /// # Errors
-    /// Raises `WyrdError` when `binding_id` is not a UUIDv7, the caller lacks
+    /// Raises `WyrdError` when `binding_id` is not a `UUIDv7`, the caller lacks
     /// `cards:read`, the binding is unknown in the caller's tenant, or the
     /// request fails.
     fn get_binding(&self, py: Python<'_>, binding_id: &str) -> WyrdPyResult<Py<PyAny>> {
@@ -104,7 +104,7 @@ impl Verification {
     /// Read one run's status, requester, result pointer, and dispatches as a dict.
     ///
     /// # Errors
-    /// Raises `WyrdError` when `run_id` is not a UUIDv7, the caller lacks
+    /// Raises `WyrdError` when `run_id` is not a `UUIDv7`, the caller lacks
     /// `cards:read`, the run is unknown in the caller's tenant, or the request
     /// fails.
     fn get_run(&self, py: Python<'_>, run_id: &str) -> WyrdPyResult<Py<PyAny>> {

@@ -41,7 +41,7 @@ fn google_response(arc: &Arc<ProviderResponse>) -> &GoogleGenerateContentRespons
     }
 }
 
-/// Read-only view of a Gemini GenerateContent request.
+/// Read-only view of a Gemini `GenerateContent` request.
 #[pyclass(module = "wyrd.prompt", name = "GeminiRequest")]
 pub struct PyGeminiRequest {
     pub(crate) inner: Arc<ProviderRequest>,
@@ -85,7 +85,7 @@ impl PyGeminiRequest {
     }
 }
 
-/// Read-only view of a Vertex GenerateContent request.
+/// Read-only view of a Vertex `GenerateContent` request.
 #[pyclass(module = "wyrd.prompt", name = "VertexRequest")]
 pub struct PyVertexRequest {
     pub(crate) inner: Arc<ProviderRequest>,
@@ -677,7 +677,7 @@ impl PyGoogleFunctionCallingConfig {
 
 // Google response
 
-/// Read-only view of a Gemini GenerateContent response.
+/// Read-only view of a Gemini `GenerateContent` response.
 #[pyclass(module = "wyrd.prompt", name = "GeminiResponse")]
 pub struct PyGeminiResponse {
     inner: Arc<ProviderResponse>,
@@ -719,7 +719,7 @@ impl PyGeminiResponse {
     }
 }
 
-/// Read-only view of a Vertex GenerateContent response.
+/// Read-only view of a Vertex `GenerateContent` response.
 #[pyclass(module = "wyrd.prompt", name = "VertexResponse")]
 pub struct PyVertexResponse {
     inner: Arc<ProviderResponse>,

@@ -44,7 +44,7 @@ impl PyProviderResponse {
         provider_name_to_string(&self.inner.provider())
     }
 
-    /// Return the typed OpenAI Chat Completions view, sharing this response.
+    /// Return the typed `OpenAI` Chat Completions view, sharing this response.
     ///
     /// # Errors
     /// Returns `WYRD_PROMPT_400_PROVIDER_MISMATCH` when the response is from another API.
@@ -57,7 +57,7 @@ impl PyProviderResponse {
         }
     }
 
-    /// Return the typed OpenAI Responses view, sharing this response.
+    /// Return the typed `OpenAI` Responses view, sharing this response.
     ///
     /// # Errors
     /// Returns `WYRD_PROMPT_400_PROVIDER_MISMATCH` when the response is from another API.
@@ -83,7 +83,7 @@ impl PyProviderResponse {
         }
     }
 
-    /// Return the typed Gemini GenerateContent view, sharing this response.
+    /// Return the typed Gemini `GenerateContent` view, sharing this response.
     ///
     /// # Errors
     /// Returns `WYRD_PROMPT_400_PROVIDER_MISMATCH` when the response is from another API.
@@ -96,7 +96,7 @@ impl PyProviderResponse {
         }
     }
 
-    /// Return the typed Vertex GenerateContent view, sharing this response.
+    /// Return the typed Vertex `GenerateContent` view, sharing this response.
     ///
     /// # Errors
     /// Returns `WYRD_PROMPT_400_PROVIDER_MISMATCH` when the response is from another API.

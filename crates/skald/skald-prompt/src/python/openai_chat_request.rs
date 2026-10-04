@@ -33,7 +33,7 @@ use crate::prompt::wrong_variant;
 // OpenAI Chat — request side
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Read-only view of an OpenAI Chat Completions request.
+/// Read-only view of an `OpenAI` Chat Completions request.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiChatRequest")]
 pub struct PyOpenAiChatRequest {
     pub(crate) inner: Arc<ProviderRequest>,

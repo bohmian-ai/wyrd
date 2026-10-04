@@ -31,6 +31,10 @@ const PROMOTION: &str = "task_type=\"scribe_promotion\"";
 /// A succeeded attempt's result label.
 const SUCCEEDED: &str = "result=\"succeeded\"";
 
+/// The leader's schedule-decision family, timed around each schedule call
+/// including the wait for its lock.
+const LEADER_DECISION: &str = "bifrost_forge_leader_decision_seconds";
+
 /// How often a window samples worker occupancy and Postgres activity.
 const SAMPLE_EVERY: Duration = Duration::from_millis(250);
 
@@ -58,6 +62,53 @@ pub struct WorkerWindow {
     pub mean_active_tasks: f64,
 }
 
+/// One leader schedule operation's live latency over a window.
+///
+/// The leader exports the family without explicit buckets, so the Prometheus
+/// recorder renders it as a summary whose quantiles cover the recorder's
+/// rolling window (three 20 s buckets): read at the end of a 60 s window they
+/// describe that window's operations.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct LeaderDecision {
+    /// Operations per second over the window.
+    pub per_second: f64,
+    /// Latency, microseconds; absent when no operation ran in the window.
+    pub us: Percentiles,
+}
+
+/// The leader's live schedule decisions over a window.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct LeaderDecisions {
+    /// Commit notices applied to the schedule.
+    pub commit: LeaderDecision,
+    /// Compactor pulls served.
+    pub pull: LeaderDecision,
+    /// Compactor reports settled.
+    pub report: LeaderDecision,
+}
+
+impl LeaderDecision {
+    /// Reads `operation` from the leader scrapes that open and close a
+    /// window `seconds` long.
+    fn read(before: &Metrics, after: &Metrics, operation: &str, seconds: f64) -> Self {
+        let label = format!("operation=\"{operation}\"");
+        let count_family = format!("{LEADER_DECISION}_count");
+        let ran = after.sum(&count_family, &[&label]) - before.sum(&count_family, &[&label]);
+        let quantile = |q: &str| {
+            (ran > 0.0)
+                .then(|| after.sum(LEADER_DECISION, &[&label, &format!("quantile=\"{q}\"")]) * 1e6)
+        };
+        Self {
+            per_second: ran / seconds,
+            us: Percentiles {
+                p50: quantile("0.5"),
+                p95: quantile("0.95"),
+                p99: quantile("0.99"),
+            },
+        }
+    }
+}
+
 /// Everything one measurement window produced.
 #[derive(Debug, Clone, Serialize)]
 pub struct WindowRecord {
@@ -83,6 +134,8 @@ pub struct WindowRecord {
     /// Succeeded promotion duration on the leader, bucket estimates in
     /// seconds.
     pub promotion_seconds: Percentiles,
+    /// The leader's live commit, pull, and report decisions.
+    pub leader_decisions: LeaderDecisions,
     /// The most rewrites per second the workers' pull cadence can dispatch:
     /// each worker pulls at most [`PULL_LIMIT`] tasks per pull interval.
     pub pull_ceiling_per_second: f64,
@@ -256,6 +309,11 @@ impl Deployment {
                     &[PROMOTION, SUCCEEDED],
                 ),
             ),
+            leader_decisions: LeaderDecisions {
+                commit: LeaderDecision::read(&leader[0], &leader_after[0], "commit", elapsed),
+                pull: LeaderDecision::read(&leader[0], &leader_after[0], "pull", elapsed),
+                report: LeaderDecision::read(&leader[0], &leader_after[0], "report", elapsed),
+            },
             pull_ceiling_per_second: self.workers.len() as f64 * PULL_LIMIT as f64
                 / ForgeWorkerConfig::default().pull_interval.as_secs_f64(),
             writes_per_second: (acked_after - acked_before) as f64 / elapsed,

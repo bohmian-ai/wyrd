@@ -2515,7 +2515,8 @@ impl ForgeWorker {
     /// [`ForgeWorkerConfig::pull_interval`]: `min(max_task_parallelism -
     /// running parallelism, 4)` table-level tasks, as `RisingWave`'s compactor
     /// requests. The pull budget is recomputed after every admitted task, so a
-    /// task that filled the queue ends the turn.
+    /// task that filled the queue ends the turn. Each leader pull logs, at
+    /// debug, how many tasks it requested and how many the leader returned.
     ///
     /// Returns the number of tasks started, or `None` when a stop signal or a
     /// test-support abandonment ended this worker's loop.
@@ -2569,6 +2570,12 @@ impl ForgeWorker {
                 Vec::new()
             }
         };
+        tracing::debug!(
+            worker = %self.owner,
+            requested = pending_pull_task_count,
+            returned = dispatches.len(),
+            "Forge compaction pull"
+        );
         let mut dispatches = dispatches.into_iter();
         while let Some(dispatch) = dispatches.next() {
             match self

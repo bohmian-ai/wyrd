@@ -389,6 +389,17 @@ impl Report {
                 window.writes_per_second,
                 window.refused_writes
             );
+            let decisions = &window.leader_decisions;
+            let _ = writeln!(
+                out,
+                "    leader decisions p50/p99 µs: commit {} ({:.1}/s) | pull {} ({:.2}/s) | report {} ({:.2}/s)",
+                pair(decisions.commit.us, 1.0),
+                decisions.commit.per_second,
+                pair(decisions.pull.us, 1.0),
+                decisions.pull.per_second,
+                pair(decisions.report.us, 1.0),
+                decisions.report.per_second
+            );
             let workers: Vec<String> = window
                 .per_worker
                 .iter()

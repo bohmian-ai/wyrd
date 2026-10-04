@@ -80,7 +80,9 @@ The leader's schedule lives in memory and starts empty on every new term:
    RisingWave's sink, because Bifrost owns its tables. A table becomes due when
    its commit count or compaction interval (one hour by default) is reached. Compactors on any replica pull due table
    identities up to their free capacity; the worker loads the current Iceberg
-   files and plans the rewrite itself, then reports the result.
+   files and plans the rewrite itself, then reports the result. Tables compact
+   `small-files` by default, where RisingWave defaults to `full`, so a file
+   that already reached its target is not rewritten again.
 3. **Maintenance.** An hourly leader timer (`maintenance_interval_secs`) rewrites
    small manifests for tables that opt in, then expires snapshots, then cleans
    up the files that expiry left unreferenced and never-published orphans. An
@@ -92,6 +94,7 @@ change. Per-table Iceberg properties control the work:
 | Property | Default | Effect |
 | --- | --- | --- |
 | `wyrd.forge.enable-compaction` | `true` | Automatic data-file compaction. On for every table, including built-in tables; set `false` to turn it off. |
+| `wyrd.forge.compaction.type` | `small-files` | How the worker selects files: `small-files`, `full`, `files-with-delete`, or `auto`. A `copy-on-write` table always compacts `full`. |
 | `wyrd.forge.enable-snapshot-expiration` | `true` | Expires snapshots older than retention (24 hours by default). |
 | `wyrd.forge.enable-manifest-rewrite` | `false` | Merges small manifests before expiry. Format-v3 tables are skipped. |
 | `commit.manifest.target-size-bytes` | 8 MiB | Manifest-rewrite target size. |
@@ -126,10 +129,13 @@ maintenance race. Candidates are grouped by their exact time partition
 (`partition_granularity`, `partition_start`) and passed to a
 deterministic bin-packer.
 
-The bin-packer sorts by event-time bounds and file ID, then applies the target
-byte size and maximum file-count limits. It drops singleton bins. Rewriting one
-file does not improve the staged file layout, so Forge only emits a bin with at
-least two inputs.
+A `small-files` compaction selects live data files smaller than 75% of the
+table's file target (`write.target-file-size-bytes`, 1 GiB unless the table
+declares one), so at the defaults the threshold is 768 MiB. Two 512 MiB staged
+files merge into one output near the target, and that output is never
+selected again. Selected files are grouped per partition, and a group needs at
+least two files: rewriting one file only copies it, so a lone staged file
+waits until a partner arrives in its partition.
 
 ### Input validation and output
 

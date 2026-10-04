@@ -4427,3 +4427,171 @@ fn variable_binary_key(row: i64) -> Vec<u8> {
     key.extend_from_slice(&row.to_be_bytes());
     key
 }
+
+/// Runs one in-process query to its terminal and returns the outcome.
+///
+/// # Errors
+/// Returns the pre-stream query error, or a frame error from the stream.
+async fn settle_query(
+    server: &WyrdTestServer,
+    context: vala_bifrost_redux::oracle::AuthorizedQueryContext,
+    sql: &str,
+) -> Result<(), BifrostError> {
+    let mut stream = server
+        .state()
+        .bifrost
+        .query_sql(
+            context,
+            BifrostQueryRequest {
+                sql: sql.to_owned(),
+                deadline_ms: None,
+            },
+        )
+        .await?;
+    while let Some(frame) = futures_util::StreamExt::next(&mut stream.frames).await {
+        frame?;
+    }
+    Ok(())
+}
+
+/// Proves the active cut is one tenant-scoped statement with one bounded retry.
+///
+/// Cold and warm queries over one table and over a two-table join each acquire
+/// their whole cut in exactly one statement. One injected metadata `NotFound`
+/// after acquisition costs exactly one reacquisition and the query succeeds; a
+/// second consecutive `NotFound` is terminal and releases the query's active
+/// reads. A caller not granted the table is refused before any metadata read,
+/// so an armed fault stays unconsumed. Another tenant's lookup of the same name
+/// fails exactly as a never-registered name does, exposing no identity.
+///
+/// # Errors
+/// Returns server, catalog, or harness errors.
+///
+/// # Panics
+/// Panics when a statement count, outcome, retained read, or error differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn tenant_scoped_active_cut_is_one_statement_and_one_bounded_retry()
+-> Result<(), JourneyError> {
+    use vala_bifrost_redux::catalog::{
+        TableRef, TableUid, TenantTableBinding, inject_metadata_not_found_for_test,
+        reset_active_cut_acquisitions_for_test,
+    };
+    use vala_bifrost_redux::namespaces::BifrostNamespace;
+    use wyrd_runtime::permission::PermissionSet;
+    use wyrd_runtime::{Permission, Principal, PrincipalKind};
+    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::request_id::RequestId;
+    use wyrd_spec::vala::api::AuthMethod;
+
+    let server = WyrdTestServer::start_bound().await?;
+    let tenant = server.data_tenant_id();
+    let left = unique_table("cut_left");
+    let right = unique_table("cut_right");
+    register_table(&server, tenant, &left).await?;
+    register_table(&server, tenant, &right).await?;
+    let one = format!("SELECT id FROM vala.bifrost.{left}");
+    let join = format!(
+        "SELECT l.id FROM vala.bifrost.{left} l JOIN vala.bifrost.{right} r ON l.id = r.id"
+    );
+
+    reset_active_cut_acquisitions_for_test();
+    for (case, sql) in [
+        ("cold one-table", &one),
+        ("warm one-table", &one),
+        ("cold join", &join),
+        ("warm join", &join),
+    ] {
+        settle_query(&server, query_context(tenant)?, sql).await?;
+        assert_eq!(
+            reset_active_cut_acquisitions_for_test(),
+            1,
+            "{case} acquires its whole cut in one statement"
+        );
+    }
+
+    inject_metadata_not_found_for_test(1);
+    settle_query(&server, query_context(tenant)?, &join).await?;
+    assert_eq!(
+        reset_active_cut_acquisitions_for_test(),
+        2,
+        "one missing metadata document costs exactly one reacquisition"
+    );
+
+    inject_metadata_not_found_for_test(2);
+    let terminal = settle_query(&server, query_context(tenant)?, &one).await;
+    assert!(terminal.is_err(), "a second NotFound is terminal");
+    assert_eq!(
+        reset_active_cut_acquisitions_for_test(),
+        2,
+        "the terminal NotFound is not retried again"
+    );
+    let binding = TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Bifrost, &left)))?;
+    assert_eq!(
+        server.oracle_active_table_reads_for_test(&binding).await?,
+        0,
+        "the failed query released its active reads"
+    );
+
+    // A grant for some other table identity does not cover this one; the
+    // armed fault surviving the refusal proves no metadata was read.
+    inject_metadata_not_found_for_test(1);
+    let foreign_scope = TableRef::new(BifrostNamespace::Bifrost, &left)
+        .permission_scope(&TableUid::from_bytes(uuid::Uuid::now_v7().into_bytes()));
+    let scoped = Permission {
+        resource: wyrd_runtime::Resource::BifrostQuery,
+        action: wyrd_runtime::Action::Read,
+        scope: foreign_scope,
+    };
+    let principal = Principal::new(
+        PrincipalId::new(uuid::Uuid::now_v7()),
+        PrincipalKind::User,
+        tenant,
+        Vec::new(),
+        PermissionSet::from_iter([scoped]),
+    );
+    // The action permission is tenant-wide, exactly as the public query
+    // service builds it; table coverage comes only from the effective grants.
+    let denied = vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(
+        principal,
+        tenant,
+        RequestId::now_v7(),
+        None,
+        AuthMethod::Internal,
+        Permission::bifrost_query_read(),
+    )?;
+    let refused = settle_query(&server, denied, &one).await;
+    assert!(
+        matches!(refused, Err(BifrostError::QueryForbidden)),
+        "an ungranted table is refused: {refused:?}"
+    );
+    settle_query(&server, query_context(tenant)?, &one).await?;
+    assert_eq!(
+        reset_active_cut_acquisitions_for_test(),
+        3,
+        "the refused query read no metadata, so the armed fault fell to the next query"
+    );
+
+    let neighbour = server.seed_tenant(&unique_table("cut_neighbour")).await?;
+    let foreign = settle_query(&server, query_context(neighbour)?, &one)
+        .await
+        .expect_err("another tenant cannot resolve this table");
+    let unknown = settle_query(
+        &server,
+        query_context(neighbour)?,
+        &format!("SELECT id FROM vala.bifrost.{}", unique_table("never_registered")),
+    )
+    .await
+    .expect_err("a never-registered table is not found");
+    assert_eq!(
+        std::mem::discriminant(&foreign),
+        std::mem::discriminant(&unknown),
+        "a foreign table fails exactly as a missing one"
+    );
+    assert!(
+        !foreign.to_string().contains(&tenant.to_string()),
+        "the refusal exposes no foreign tenant identity: {foreign}"
+    );
+    server.shutdown().await?;
+    Ok(())
+}

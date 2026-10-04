@@ -143,3 +143,24 @@ shared Workflow snapshot contract consumed by the server, also run the
 existing Wyrd server Workflow journey lane that covers cancellation, deadline,
 and terminal snapshots. Use the repository's existing tasks and harnesses only;
 do not add a test binary, fixture system, scanner, or check.
+
+## Implementation evidence
+
+Implementation commit: `ca9c7a906`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-004-19`: every published `Running` step has `attempts >= 1` | `RunLedger::step_started` (`crates/skald/skald-workflow/src/run.rs`) records attempt one; `WorkflowExecutor::drive` (`workflow.rs`) stores 1 into the shared counter before `step_started` and publication; `StepTask::run` keeps `store(attempt)` so the first attempt stays one | `prepared_run_keeps_its_id` asserts every observed `Running` step has `attempts == 1` | PASS |
+| `FIND-TASK-004-19`: pre-poll cancel/deadline/abort is `Cancelled`, attempt one, timestamps retained | `WorkflowExecutor::settle` drops both `attempts > 0` guards; `RunLedger::finish` rewrites only `Pending` to `Unstarted` | `bounded_attempt_lifecycle` pre-poll branch asserts `(Cancelled, 1)` with `started_at` and `ended_at` set | PASS |
+| `FIND-TASK-004-19`: ordinary success remains attempt one; retry exhaustion stays `max_retries + 1` | Retry loop unchanged | Existing retry assertions in `bounded_attempt_lifecycle` (`flaky` = 3, `denied` = 1); `mise run test:skald` | PASS |
+| `FIND-TASK-004-20`: module-scope imports and bare interface types | `prompt/mod.rs` `raw_body -> Option<&Value>`; `lifecycle_controls.rs` imports `tokio::time::Instant` in the module and in its test module; `peer_cluster.rs` imports `bytes::Bytes`; `pg_workflow_runs.rs` has a module-scope `#[cfg(unix)] use std::os::unix::fs::PermissionsExt as _;`. No aliases, no checks added | Source inspection; `mise run lints`; `WYRD_TEST_PACKAGES="wyrd-server wyrd-spec" mise run test:wyrd`; `mise run test:bifrost:journey:oracle` | PASS |
+
+Commands (all exit 0):
+
+- `mise exec -- cargo nextest run --locked -p skald-workflow --lib -E 'test(=workflow::tests::prepared_run_keeps_its_id) | test(=workflow::tests::bounded_attempt_lifecycle)'`: 2 passed
+- `mise run fmt`, `mise run lints`, `git diff --check`
+- `mise run test:skald`
+- `WYRD_TEST_PACKAGES="wyrd-server wyrd-spec" mise run test:wyrd`: 1591 passed, including every `pg_workflow_runs` journey
+- `mise run test:bifrost:journey:oracle`: 43 passed, covering `peer_cluster.rs`
+
+Non-goals still excluded: no new owner, handshake, setting, check, or dependency. Only the two approved test assertions changed. `AnalyticalSupervisor::draining_graphs` is untouched.

@@ -376,11 +376,13 @@ impl Forge {
         self.clean_expired(executor, key, stop).await
     }
 
-    /// Whether some snapshot is older than the clamped expiry cutoff.
+    /// Whether some snapshot is strictly older than the clamped expiry cutoff.
     ///
     /// The cutoff is now minus the configured retention, lowered to the
     /// processing compaction's snapshot timestamp when one is held. A held
-    /// snapshot the table no longer retains skips the table.
+    /// snapshot the table no longer retains skips the table. The comparison
+    /// is strict, as the expiry policy's own selection is, so a held snapshot
+    /// that is itself the oldest leaves nothing due and opens no attempt.
     ///
     /// # Errors
     ///
@@ -409,7 +411,7 @@ impl Forge {
             .snapshots()
             .map(|snapshot| snapshot.timestamp_ms())
             .min()
-            .is_some_and(|oldest| oldest <= cutoff_ms))
+            .is_some_and(|oldest| oldest < cutoff_ms))
     }
 
     /// Builds the recorded expiry attempt for one table, when one is due.

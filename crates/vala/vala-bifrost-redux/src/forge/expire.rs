@@ -386,13 +386,16 @@ impl Forge {
     /// holds, because a decision made from two of them is not a smaller
     /// decision — it is an unsafe one. Watermarks are returned unvalidated;
     /// corroborating them against Iceberg belongs to the policy, which is the
-    /// owner that also knows the ancestry they must be reachable from.
+    /// owner that also knows the ancestry they must be reachable from. On the
+    /// leader, a compaction it selected but no worker has started yet joins
+    /// the attempt watermarks.
     ///
     /// # Errors
     ///
     /// Returns SQL or identity failures from the durable watermark reads, and
     /// [`ForgeError::SnapshotExpiry`] when either bounded query overflowed,
-    /// which means the protected set is not provably complete.
+    /// which means the protected set is not provably complete, or when the
+    /// leader's selected compaction holds no retained snapshot.
     async fn snapshot_protection_roots(
         &self,
         key: &ForgeTableKey,
@@ -416,11 +419,12 @@ impl Forge {
             .tenant_conn(key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let (attempt_watermarks, attempts_overflowed) =
+        let (mut attempt_watermarks, attempts_overflowed) =
             ForgeTasks::new(self.core.operator_pool.clone())
                 .watermarks(&mut conn, &identity, cap)
                 .await
                 .map_err(ForgeError::Sql)?;
+        attempt_watermarks.extend(self.leader_compaction_watermark(key.tenant, identity, table)?);
         // Reader protection is not bounded by the open-operation cap: a
         // frontier is one member per incomparable lineage, and truncating it
         // would silently stop protecting one of them. A frontier that cannot be
@@ -448,6 +452,49 @@ impl Forge {
             claimed_snapshot_ids,
             destructive_maintenance,
         })
+    }
+
+    /// Returns the snapshot a compaction the leader selected still holds.
+    ///
+    /// A pulled compaction writes its durable watermark only when a worker
+    /// starts it, so until then the leader's in-memory track is the one
+    /// record of the snapshot it was selected against. Without this root the
+    /// leader's own clamp would decide only that expiry is due, and the
+    /// effect would still expire the selected snapshot. The timestamp comes
+    /// from the table the policy decides over, so a held snapshot the table no
+    /// longer retains cannot lower the cutoff silently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::SnapshotExpiry`] when the leader holds a
+    /// compaction without an observed snapshot, or one whose snapshot the
+    /// table no longer retains: neither leaves a provably safe cutoff.
+    fn leader_compaction_watermark(
+        &self,
+        tenant: wyrd_spec::DataTenantId,
+        table: ForgeTaskTableIdentity,
+        iceberg_table: &iceberg::table::Table,
+    ) -> Result<Option<SnapshotWatermark>, ForgeError> {
+        // ponytail: only the leader's memory holds a pulled-not-started
+        // watermark, so an expiry a non-leader worker runs sees the durable
+        // roots alone; route such effects through the leader if they ever
+        // run outside its maintenance pass.
+        let Some(term) = self.leadership.held() else {
+            return Ok(None);
+        };
+        let key = super::leader::ForgeTableKey { tenant, table };
+        let Some(held) = term.schedule().processing_watermark(&key) else {
+            return Ok(None);
+        };
+        let snapshot = held
+            .and_then(|snapshot_id| iceberg_table.metadata().snapshot_by_id(snapshot_id))
+            .ok_or_else(|| ForgeError::SnapshotExpiry {
+                detail: "a selected compaction holds no retained snapshot".to_owned(),
+            })?;
+        Ok(Some(SnapshotWatermark {
+            snapshot_id: snapshot.snapshot_id(),
+            timestamp_ms: snapshot.timestamp_ms(),
+        }))
     }
 }
 

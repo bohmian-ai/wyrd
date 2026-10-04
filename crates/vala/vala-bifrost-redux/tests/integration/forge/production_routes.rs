@@ -5,7 +5,7 @@
 //! manifest rewrite, snapshot expiry, and cleanup on its maintenance timer.
 
 use chrono::Duration as ChronoDuration;
-use iceberg::spec::{FormatVersion, ManifestContentType, Operation};
+use iceberg::spec::{FormatVersion, Operation};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
@@ -27,7 +27,7 @@ use wyrd_bench::BenchmarkMetricSnapshot;
 
 use super::rewrite_support::PromotedRewriteFixture;
 use super::snapshot_expiration::object_exists;
-use super::snapshot_expiration::{ExpirableTable, expirable_table, head_watermark};
+use super::snapshot_expiration::{ExpirableTable, expirable_table, head_watermark, maintain_once};
 use super::support::{
     CountingObjectStore, ForgeTelemetryCheckpoint, PromotionCatalogSeam,
     PromotionIntegrationFixture, SupervisedPromotion, manual_clock, set_table_properties,
@@ -78,67 +78,6 @@ async fn fragmented_table(name: &str, properties: &[(&str, &str)]) -> ExpirableT
         control,
         watermark,
     }
-}
-
-/// Head-snapshot shape the maintenance assertions compare across one pass.
-#[derive(Debug)]
-struct HeadShape {
-    /// Current snapshot id.
-    snapshot_id: i64,
-    /// Current snapshot operation.
-    operation: Operation,
-    /// Data manifests the current snapshot's manifest list names.
-    data_manifests: usize,
-    /// Every snapshot the table metadata retains.
-    snapshots: BTreeSet<i64>,
-}
-
-/// Reads the fixture table's head shape from the catalog.
-///
-/// # Panics
-///
-/// Panics when the table, its head, or its manifest list cannot be read.
-async fn head_shape(fixture: &PromotionIntegrationFixture) -> HeadShape {
-    let table = fixture
-        .catalog
-        .iceberg_catalog()
-        .load_table(&fixture.binding.table_ident())
-        .await
-        .expect("fixture table loads");
-    let snapshot = table
-        .metadata()
-        .current_snapshot()
-        .expect("a promotion left a head");
-    let manifests = table
-        .manifest_list_reader(snapshot)
-        .load()
-        .await
-        .expect("the head manifest list loads");
-    HeadShape {
-        snapshot_id: snapshot.snapshot_id(),
-        operation: snapshot.summary().operation.clone(),
-        data_manifests: manifests
-            .entries()
-            .iter()
-            .filter(|manifest| manifest.content == ManifestContentType::Data)
-            .count(),
-        snapshots: table
-            .metadata()
-            .snapshots()
-            .map(|snapshot| snapshot.snapshot_id())
-            .collect(),
-    }
-}
-
-/// Runs one leader maintenance pass and returns the head before and after.
-///
-/// # Panics
-///
-/// Panics when the pass misses its bound or the head cannot be read.
-async fn maintain_once(table: &ExpirableTable) -> (HeadShape, HeadShape) {
-    let before = head_shape(&table.fixture).await;
-    table.supervised.maintain_only().await;
-    (before, head_shape(&table.fixture).await)
 }
 
 /// The leader timer merges fragmented manifests, then expires the old head.

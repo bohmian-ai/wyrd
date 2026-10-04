@@ -198,7 +198,7 @@ async fn release_cleanup_claim(fixture: &PromotionIntegrationFixture, task_id: U
 /// # Panics
 ///
 /// Panics when the role, epoch, or activation cannot be established.
-async fn reader_authority(
+pub(super) async fn reader_authority(
     fixture: &PromotionIntegrationFixture,
     shutdown: &CancellationToken,
 ) -> (Arc<OracleReaderAuthority>, TableAuthorityIdentity) {
@@ -781,7 +781,7 @@ async fn seed_extra_candidates(
 /// # Panics
 ///
 /// Panics when the update fails.
-async fn expire_claim(pool: &sqlx::PgPool, task_id: Uuid) {
+pub(super) async fn expire_claim(pool: &sqlx::PgPool, task_id: Uuid) {
     sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 hour' WHERE task_id=$1")
         .bind(task_id)
         .execute(pool)

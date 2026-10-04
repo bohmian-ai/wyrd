@@ -2150,11 +2150,11 @@ impl Oracle {
         // exact child split of that same envelope. Deriving them afterwards
         // would ask the guard for resources it no longer holds.
         if let Err(error) = admitted.retain_physical_projections(&planned.cuts) {
-            return release_error(deadline, admitted, error, "projection rejection");
+            return release_error(deadline, admitted, error, "projection rejection").await;
         }
         match self.register_running_query(context, query_class, &admitted, participant_cut) {
             Ok(running_query) => Ok((admitted, running_query)),
-            Err(error) => release_error(deadline, admitted, error, "running-query rejection"),
+            Err(error) => release_error(deadline, admitted, error, "running-query rejection").await,
         }
     }
 
@@ -2319,7 +2319,9 @@ impl Oracle {
             &mut phases,
         ) {
             Ok(bound) => bound,
-            Err(error) => return release_error(deadline, admitted, error, "source rejection"),
+            Err(error) => {
+                return release_error(deadline, admitted, error, "source rejection").await;
+            }
         };
         // Protection moves out of the plan here, before execution builds
         // anything from the cuts, so the guard outlives every provider and
@@ -2348,7 +2350,7 @@ impl Oracle {
                 execution
             }
             Err(error) => {
-                return release_error(deadline, admitted, error, "execution rejection");
+                return release_error(deadline, admitted, error, "execution rejection").await;
             }
         };
         // The terminal reads the one accumulator listing and live leaves record on.
@@ -4139,8 +4141,8 @@ impl AttemptSettlement {
 /// attempt is cancelled, its distributed children are joined, and the query
 /// fails. A cancellation before the first batch, any other first-batch
 /// failure, a missing telemetry guard, or a schema-frame failure settles the
-/// distributed children and releases the admitted owner before returning, so
-/// no child outlives its parent on a failure path.
+/// distributed children and the Analytical graph and releases the admitted
+/// owner before returning, so no child outlives its parent on a failure path.
 ///
 /// # Errors
 ///
@@ -4206,7 +4208,8 @@ async fn settle_attempt_output(
             admitted,
             BifrostError::QueryExecutionFailed,
             "stale first batch",
-        );
+        )
+        .await;
     }
     if let Some(error) = map_first_batch_failure(first.as_ref()) {
         return settle_distributed_failure(
@@ -4371,17 +4374,30 @@ pub fn is_tenant_invariant_error(error: &datafusion::error::DataFusionError) -> 
 
 /// Release an admitted query after an attempt-local terminal error.
 ///
+/// A selected Analytical attempt settles as failed first, through the same
+/// [`settle_analytical`](query_stream::settle_analytical) an ending stream
+/// uses, so the error is not returned before the graph's cleanup has joined.
+/// Whatever admission the graph did not take is released afterwards.
+///
 /// # Errors
 ///
 /// Always returns the caller-supplied original error after the cleanup attempt.
-fn release_error<T>(
+async fn release_error<T>(
     _deadline: Instant,
     admitted: AdmittedQueryGuard,
     original: BifrostError,
     phase: &'static str,
 ) -> Result<T, BifrostError> {
     tracing::error!(phase, error = ?original, "Oracle query released after failure");
-    admitted.release();
+    let mut admitted = Some(admitted);
+    query_stream::settle_analytical(
+        &mut admitted,
+        wyrd_spec::vala::api::QueryTerminalOutcome::Failed,
+    )
+    .await;
+    if let Some(admitted) = admitted {
+        admitted.release();
+    }
     Err(original)
 }
 
@@ -4397,7 +4413,7 @@ async fn settle_distributed_failure<T>(
     admitted.request_cancellation.cancel();
     drop(batches);
     admitted.distributed_settlement.join().await;
-    release_error(deadline, admitted, original, phase)
+    release_error(deadline, admitted, original, phase).await
 }
 
 /// Awaits the actual first physical batch while retaining admission ownership.

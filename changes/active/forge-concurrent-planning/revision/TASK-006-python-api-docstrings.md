@@ -112,3 +112,119 @@ needed.
   this task changes documentation only.
 - [AGENTS.md](../../../../AGENTS.md) §8 and
   [agent rules](../../../../architecture/agent-rules.md).
+
+## Implementation Evidence
+
+Base `798e5fe7a`. Commits `5a99f506e` (bifrost), `407167771` (gateway,
+operators, state, testing, verification), `688449b9f` (root, cards, config,
+client, errors), `ac9241536` (agent, observer, observe, eval, otel),
+`6d74cf8a3` (data, model), `de25d36d4` (prompt), `e3d15c250` (generated
+stubs via `mise run codegen:stubs`), `2ed6cd036` (rustdoc backticks).
+
+### Inventory
+
+Public items audited (classes, functions, methods, properties; typed
+structures counted as classes) and gaps closed, per module. Counts come from
+an AST scan of runtime modules and hand-authored stub sources.
+
+| Module | Audited (runtime / stub source) | Gaps closed |
+|---|---|---|
+| `wyrd.bifrost` | 67 / 62 | `TableConfig` seven constructor args, `from_arrow`, `describe` args and errors; every `Bifrost`/`AsyncBifrost` method's args, `deadline_ms` range and server default, errors; stub methods had no docs; layout/description TypedDict fields; wrong `describe_table(...).arrow_schema` reference fixed |
+| `wyrd.gateway` | 24 / 40 | `__init__` and `name` args, field rules and defaults on 22 TypedDicts; "delete succeeds when absent" corrected (policy deletes reset) |
+| `wyrd.operators` | re-export / 21 | `__init__`, `connection_id` args, missing error codes; "UUID" corrected to UUIDv7 |
+| `wyrd.state` | re-export / 33 | `start_bifrost` five args; `from_path` trust rule names actual model types |
+| `wyrd.testing` | re-export / 19 | six `WyrdTestServer` flags and every helper method; duplicated per-flag class prose removed |
+| `wyrd.verification` | re-export / 6 | `__init__`, `binding_id`, `run_id`, `idempotency_key` omission |
+| `wyrd` root, `wyrd.cards`, `config`, `client`, `errors`, `cli` | 5 / 76 | `CardKind.name`, `VersionBump.*`, Save/Load Args, `RegistrationReceipt`, `Cards.__init__`, `list` bounds/syntax, `WyrdClient.__init__`, `apply_defaults`; invalid `space="ml"` examples and garbled `VersionBump` prose fixed; subclass attribute docs deduplicated |
+| `wyrd.agent`, `observer`, `observe`, `eval`, `otel` | 33 / 93 | session memory, `tool()`, `local_registry`, `RunConfig` defaults, callbacks, every `Observer`/`OtelObserver` hook argument, `observe.record`, `MediaRef`; `tokens_in/out`, `FinishReason`, `synthetic` semantics corrected |
+| `wyrd.data`, `wyrd.model` | re-export / 120 | interface defaults, accepted values, file layouts, `FieldSpec`/`Split`/signature errors; 23 undocumented native pymethods; "signature inferred" and duplicate-index claims corrected; joblib interface repeats replaced by references |
+| `wyrd.prompt` | re-export / 240 | ~150 provider accessor classes/properties, `from_dict` `value`, `PromptReference` args, `Prompt` factory args; `MediaRef` provider matrix and `PromptCard` validation timing corrected; 140 native help blocks added |
+
+Remaining scanner hits are deliberate cross-references ("As ``X()``.") and
+internal constructors that take native handles.
+
+### Acceptance Criteria
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Every public callable's args, including the seven `TableConfig` args, documented at runtime and typing surfaces; omission behavior stated | `python/wyrd/bifrost/__init__.py`, `python/wyrd/stubs/*.pyi`, regenerated `python/wyrd/**/__init__.pyi`; native help in `sdks/wyrd-sdk-python/src`, `crates/skald/skald-prompt/src/python`, `crates/wyrd/wyrd-interfaces/src/data` | before/after `help(wyrd.bifrost.TableConfig)` below; generated `bifrost/__init__.pyi` carries the same `Args:` block | PASS |
+| Typed structures describe non-evident fields; no docstring conflicts with signature, server defaults, or contract | TypedDict and accessor docs; defaults traced to Rust (`catalog/layout.rs` `MAX_SORT_KEYS`/`MANAGED_BLOOM_FLOOR`, `forge/compact.rs` 1 GiB, `forge/settings.rs` `SmallFiles`, `RegisterTableRequest` 128 MiB floor, Oracle default deadline) | review; disagreements listed below rather than resolved in prose | PASS |
+| Repeated paragraphs removed; generated stubs produced only by codegen | sibling methods reference their counterpart; generated stubs only from `mise run codegen:stubs` | `mise run codegen:check` | PASS |
+| Named commands pass; no hidden behavior or signature change | docstrings and `///` lines only | docstring-stripped AST comparison of all 51 changed `.py`/`.pyi` files against `798e5fe7a`: identical; Rust diff contains only `///` lines | PASS |
+
+Non-goals held: no signature, default, validation, wire, generator, linter,
+or test change; TASK-005 untouched.
+
+### Commands
+
+| Command | Result |
+|---|---|
+| `mise run codegen:check` | pass |
+| `mise run py:format:check` | pass (156 files) |
+| `mise run py:lints` | pass |
+| `mise run py:typecheck` | pass |
+| `git diff --check 798e5fe7a` | clean |
+| `mise exec -- cargo clippy --locked -p skald-prompt -p wyrd-interfaces -p wyrd-sdk-python --all-features --lib -- -D warnings` | pass (first run flagged 34 `doc_markdown` items in new rustdoc; fixed in `2ed6cd036`) |
+| `mise exec -- cargo fmt -p skald-prompt -p wyrd-interfaces -p wyrd-sdk-python -- --check` | pass |
+
+### `help(wyrd.bifrost.TableConfig)`
+
+Before: the constructor showed `Initialize self.  See help(type(self)) for
+accurate signature.` with no argument documentation; the generated stub's
+`__init__` was `...` only. After (runtime and generated stub agree):
+
+```text
+ |  __init__(self, model, table, partition_granularity=None, sort_keys=None,
+ |      bloom_columns=None, compaction_target_file_size_bytes=None,
+ |      compaction_type=None)
+ |      Declare a table from a Pydantic model class.
+ |      ...omitting all layout arguments lets the server choose: hourly
+ |      partitions, wyrd_event_time descending nulls last, managed Blooms only.
+ |      Args:
+ |          model, table, partition_granularity ("hour"|"day"), sort_keys (<=4,
+ |          asc|desc, first|last), bloom_columns (managed run_id/card_uid/
+ |          principal_id first), compaction_target_file_size_bytes (>= 128 MiB;
+ |          default 1 GiB), compaction_type (auto|full|small_files|
+ |          files_with_delete; default small_files; copy-on-write -> full)
+ |      Raises:
+ |          WyrdError: SCHEMA_PARSE / BIFROST_RESERVED_COLUMN / SPEC_400_VALIDATION
+```
+
+### Contract Disagreements Found (reported, not resolved)
+
+1. Omitted `compaction_type` default: Forge (`forge/settings.rs`
+   `ForgeTableSettings::default`) and approved REQ-013 use `small-files`;
+   `wyrd-spec` `RegisterTableRequest`, `BifrostTableDescription`,
+   `CompactionTypeWire::Full` rustdoc (and the generated JSON schemas under
+   `crates/wyrd-spec/{schemas,tests/schemas}`), and `wyrd-client`
+   `TableConfig` rustdoc say `full`. Python docs follow the implementation.
+2. `stubs/error.pyi` declares `WyrdError(code, message, *, details,
+   remediation)` (and subclasses); runtime is a plain exception that takes no
+   keywords and sets no `.code`.
+3. `stubs/agent.pyi` `SessionTurn` differs from runtime (keyword-only,
+   `call_id` vs `tool_call_id`, `role` type, methods); `Role` lacks `System`;
+   `Agent` stub lacks `add_tool`, `set_tools`, `with_*`, `add_*` callback
+   methods.
+4. Raising in `after_agent`/`after_model`/`after_tool` callbacks reaches
+   `unreachable!` in `skald` `loop_runtime.rs` (panic, not `CallbackAborted`);
+   returning an `AgentRun` from `after_agent` fails the same way. Rust doc
+   claims "raise to abort" for those callbacks.
+5. Observer `on_agent_error` gets `SKALD_*` codes while Python raises
+   `WYRD_*`; `on_agent_finish` gets `modelstopped` vs `FinishReason`
+   `model_stopped`; `on_tool_result(ok=True)` for a skipped tool.
+6. `AnthropicSettings.max_tokens` documented default 4096 has no serde
+   default; `AnthropicSettings()` would fail to decode.
+7. Stub/runtime surface drift: `testing.pyi` lacks 11 runtime methods;
+   `state.pyi` `from_path` defaults `...` vs runtime `None`;
+   `ModelCardMetadata` stub positional vs runtime keyword-only and declares
+   getters runtime lacks; `HuggingfaceInterface` `hf_task` stub default vs
+   required; `DataCardMetadata.to_dict` missing in stub; `PromptCardMetadata.prompt`
+   absent at runtime; several `Prompt` static helpers and accessor getters
+   missing from the stub; `AgentCard.kind` and `run_wyrd_cli` undeclared;
+   several `Mapping`/`Sequence` annotations narrower or wider than runtime.
+8. `WYRD_GATEWAY_409_RESOURCE_CONFLICT` remediation says pricing versions are
+   immutable; the server returns `WYRD_GATEWAY_400_INVALID_CONFIGURATION`.
+9. `Cards()` reads `[client] http_url` from `config.toml`; `WyrdClient`/
+   `Bifrost` ignore it.
+10. `wyrd-cards` `card_ref.rs` says External kinds are not constructable from
+    Python; they are.

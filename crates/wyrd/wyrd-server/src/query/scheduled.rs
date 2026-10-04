@@ -142,11 +142,13 @@ impl ScheduledQueryCaller {
             .bifrost
             .query_controls()
             .ok_or(BifrostError::RunningQueryControlUnavailable)?;
+        let requested_deadline_ms = request.deadline_ms;
         let mut stream = controls
             .open_cancellable(
                 self.dispatch(request),
                 self.context.data_tenant_id,
                 &self.context.request_id,
+                requested_deadline_ms,
                 &self.cancellation,
             )
             .await?;

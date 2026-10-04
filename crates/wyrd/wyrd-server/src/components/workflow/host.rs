@@ -285,8 +285,9 @@ impl Preparation {
     /// `native` routes and any tool other than the built-ins, declared once
     /// per Agent; resolves only the external gateway bindings the graph
     /// selects that are assigned to the caller's tenant; and then hydrates
-    /// and prepares the Skald run on the blocking pool. No provider or tool
-    /// is called.
+    /// and prepares the Skald run on the Workflow tracker's blocking pool, so
+    /// shutdown waits for that work even when this future is cancelled. No
+    /// provider or tool is called.
     ///
     /// # Errors
     /// Returns the registry and graph-bound errors of
@@ -370,7 +371,7 @@ impl Preparation {
         );
         let agent_tools = tools.clone();
         let input = WorkflowInput::Vars(request.input.into_iter().collect());
-        let prepared = tokio::task::spawn_blocking(move || {
+        let prepared = state.workflows.spawn_blocking(move || {
             let workflow = SkaldWorkflow::from_card_bodies(
                 graph.workflow().clone(),
                 &|agent| agent_tools.for_agent(agent),

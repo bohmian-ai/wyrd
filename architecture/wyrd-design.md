@@ -442,6 +442,18 @@ consumes the header without forwarding it to a provider. Without the header,
 tenant fallback policy applies unchanged, so unmodified clients behave as
 before.
 
+A server-hosted Workflow run is an accepted job. The authenticated,
+`workflows:run`-authorized, audited submission pins the exact active graph and
+captures token-free execution authority: the caller's principal attribution
+and scopes, bounded to that run's pinned graph and total deadline. Neither a
+bearer token nor a secret is retained. Token expiry and later grant or
+credential changes neither cancel nor widen an accepted run. Later HTTP
+create/replay, get, and cancel requests authenticate and authorize afresh,
+and replay never replaces run authority. Within the run, Cards reads, Bifrost
+queries, and gateway calls still make and audit their own live per-call
+decisions under the captured authority and current owner admission rules.
+Runs are process-local; restart loses them.
+
 ### Mcp
 MCP server registration. The server enumerates its own tools at runtime; we do
 not shadow them as cards.

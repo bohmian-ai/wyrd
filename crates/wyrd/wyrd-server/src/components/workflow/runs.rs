@@ -4,7 +4,9 @@
 //! short-held lock guards the run table; nothing under it awaits or performs
 //! IO. A create first [`WorkflowRuns::admit`]s its scoped idempotency key,
 //! which either replays an accepted run, joins a matching preparation, or
-//! installs a [`Reservation`] holding one tenant and one global active slot.
+//! installs a [`Reservation`] holding one tenant and one global active slot
+//! and a token of the tracker shutdown drains, so no reservation is ever
+//! visible without tracked ownership.
 //! The reservation's tracked preparation then either
 //! [`Reservation::accept`]s the run, transferring that slot to the queued run
 //! and its key, or releases both exactly once by failing or being dropped.
@@ -20,6 +22,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use tokio_util::task::task_tracker::TaskTrackerToken;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::card::workflow::WorkflowRun;
@@ -251,8 +254,11 @@ impl WorkflowRuns {
     /// Under the lock: expire retained runs; replay an accepted run with the
     /// same hash; join a preparation with the same hash; otherwise, while
     /// admission is open and the global and tenant active ceilings have room,
-    /// install a reservation owning one slot of each. The returned
-    /// reservation's token is a child of admission, so shutdown cancels the
+    /// install a reservation owning one slot of each and a token of the task
+    /// tracker. [`Self::drain`] closes admission under the same lock, so either
+    /// the reservation's token keeps the drain waiting or the create sees
+    /// admission closed and installs nothing. The returned reservation's
+    /// cancellation token is a child of admission, so shutdown cancels the
     /// preparation.
     ///
     /// # Errors
@@ -324,6 +330,7 @@ impl WorkflowRuns {
             hash,
             outcome,
             cancel: self.admission.child_token(),
+            _tracked: self.tasks.token(),
             settled: false,
         }))
     }
@@ -335,6 +342,20 @@ impl WorkflowRuns {
         F::Output: Send + 'static,
     {
         self.tasks.spawn(task)
+    }
+
+    /// Run the CPU-bound `work` on the blocking pool, tracked by the same
+    /// tracker shutdown drains.
+    ///
+    /// Dropping the returned handle detaches nothing: the closure stays
+    /// counted until it returns, so a clean drain waits for it even after its
+    /// caller was cancelled.
+    pub(crate) fn spawn_blocking<F, T>(&self, work: F) -> JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.tasks.spawn_blocking(work)
     }
 
     /// The current snapshot of a run `tenant` and `principal` own.
@@ -386,12 +407,17 @@ impl WorkflowRuns {
     }
 
     /// Close admission, signal every preparation and run, and wait for their
-    /// tracked tasks until `deadline`.
+    /// tracked tasks and reservations until `deadline`.
     ///
+    /// Admission closes under the run-table lock, so a concurrent
+    /// [`Self::admit`] either already holds its tracker token or refuses.
     /// Returns whether every task finished; the remaining tasks are left to
     /// process exit.
     pub async fn drain(&self, deadline: tokio::time::Instant) -> bool {
-        self.admission.cancel();
+        {
+            let _table = self.table();
+            self.admission.cancel();
+        }
         self.tasks.close();
         tokio::time::timeout_at(deadline, self.tasks.wait())
             .await
@@ -470,6 +496,9 @@ pub(crate) struct Reservation {
     outcome: watch::Sender<Option<PreparationOutcome>>,
     /// Cancels the preparation and, once accepted, the run.
     cancel: CancellationToken,
+    /// Keeps [`WorkflowRuns::drain`] waiting until the reservation settles,
+    /// covering the interval before its preparation task is spawned.
+    _tracked: TaskTrackerToken,
     /// Whether a settling path already ran.
     settled: bool,
 }
@@ -634,5 +663,118 @@ fn idempotency_conflict() -> WyrdError {
     WyrdError::WorkflowIdempotencyConflict {
         message: "the Idempotency-Key was already used with a different request".to_owned(),
         details: serde_json::json!({}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio_util::sync::CancellationToken;
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::ids::IdempotencyKey;
+
+    use super::{Admission, RunKey, WorkflowRuns, run_unavailable};
+    use crate::config::ServerWorkflowConfig;
+
+    /// A fresh run owner whose admission closes with its own shutdown token.
+    fn runs() -> Arc<WorkflowRuns> {
+        Arc::new(WorkflowRuns::new(
+            ServerWorkflowConfig::default(),
+            &CancellationToken::new(),
+        ))
+    }
+
+    /// A fresh key of one fresh tenant and principal.
+    fn key() -> RunKey {
+        RunKey {
+            tenant: DataTenantId::new_v7(),
+            principal: PrincipalId::new(uuid::Uuid::now_v7()),
+            key: IdempotencyKey::new(uuid::Uuid::now_v7().to_string())
+                .expect("a UUID is an opaque key"),
+        }
+    }
+
+    /// A reservation whose preparation task was not spawned yet keeps drain
+    /// waiting; once drain began, admission installs nothing; and dropping
+    /// the reservation releases its slot, wakes its waiter with the
+    /// unavailable answer exactly once, and lets drain finish.
+    ///
+    /// # Panics
+    /// Panics if drain completes while the reservation is outstanding, a
+    /// shutdown-losing create installs a key, or the release is not observed.
+    #[tokio::test(start_paused = true)]
+    async fn drain_waits_for_a_reservation_before_its_task_exists() {
+        let runs = runs();
+        let hash = blake3::hash(b"request");
+        let Ok(Admission::Reserved(reservation)) = runs.admit(key(), hash) else {
+            panic!("an open owner reserves a new key");
+        };
+        let mut outcome = reservation.outcome();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        assert!(!runs.drain(deadline).await, "drain waits for the reservation");
+
+        let refused = runs
+            .admit(key(), hash)
+            .err()
+            .expect("admission is closed once drain began");
+        assert_eq!(refused.code(), run_unavailable().code());
+        assert_eq!(runs.table().keys.len(), 1);
+
+        drop(reservation);
+        let published = outcome
+            .wait_for(Option::is_some)
+            .await
+            .expect("the reservation publishes before it closes")
+            .clone()
+            .expect("a published outcome is present");
+        assert_eq!(
+            published.expect_err("a released reservation is unavailable").code(),
+            run_unavailable().code()
+        );
+        {
+            let table = runs.table();
+            assert!(table.keys.is_empty());
+            assert_eq!(table.active, 0);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        assert!(runs.drain(deadline).await, "drain finishes once released");
+    }
+
+    /// Blocking preparation work stays counted after the task awaiting it is
+    /// cancelled, so a clean drain waits until the closure returns.
+    ///
+    /// # Panics
+    /// Panics if drain finishes while the blocking closure still runs, or does
+    /// not finish once it returned.
+    #[tokio::test]
+    async fn drain_waits_for_blocking_work_its_caller_abandoned() {
+        let runs = runs();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (started, running) = tokio::sync::oneshot::channel::<()>();
+        let cancel = runs.admission.child_token();
+        let owner = Arc::clone(&runs);
+        runs.spawn(async move {
+            let work = owner.spawn_blocking(move || {
+                started.send(()).expect("the test awaits the start");
+                held.recv().expect("the test releases the work");
+            });
+            tokio::select! {
+                () = cancel.cancelled() => {}
+                _ = work => {}
+            }
+        });
+        running.await.expect("the blocking work starts");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        assert!(
+            !runs.drain(deadline).await,
+            "drain waits for the abandoned blocking work"
+        );
+        release.send(()).expect("the blocking work still waits");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        assert!(runs.drain(deadline).await, "drain finishes once it returns");
     }
 }

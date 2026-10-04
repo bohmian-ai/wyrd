@@ -20,7 +20,7 @@ use skald_tool::{AgentTool, StructuredInvocationError, ToolError, ToolResolver};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use wyrd_semver::VersionBlock;
-use wyrd_spec::envelope::CardKind;
+use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
@@ -144,20 +144,28 @@ struct QueryTool {
 
 #[async_trait]
 impl AgentTool for QueryTool {
+    /// The stable wire name `bifrost.query`, the same name MCP serves and
+    /// Agent Cards declare.
     fn name(&self) -> &str {
         QUERY
     }
 
+    /// The provider-visible description: one read-only SELECT over the
+    /// caller's tenant, returning a complete, never truncated result.
     fn description(&self) -> &str {
         "Run one read-only SELECT over this tenant's Bifrost tables and return the complete result as {columns, rows, terminal}."
     }
 
+    /// The closed argument schema MCP also advertises; [`QueryArguments`]
+    /// enforces the same bounds when the call arrives.
     fn input_schema(&self) -> Value {
         crate::query::collect::input_schema()
     }
 
+    /// The closed `{columns, rows, terminal}` result schema of
+    /// [`BoundedQuery::run`], the only success value this tool returns.
     fn output_schema(&self) -> Value {
-        serde_json::json!({ "type": "object" })
+        crate::query::collect::output_schema()
     }
 
     /// Run the query on a tracked owner and wait for its complete result.
@@ -235,14 +243,19 @@ struct CardsTool {
 
 #[async_trait]
 impl AgentTool for CardsTool {
+    /// The stable wire name `cards.get` Agent Cards declare.
     fn name(&self) -> &str {
         CARDS_GET
     }
 
+    /// The provider-visible description: one exact Card read whose space
+    /// defaults to the executing Agent's space.
     fn description(&self) -> &str {
         "Read one registered Card by its exact kind, name, and version; space defaults to this Agent's space."
     }
 
+    /// The closed schema of [`CardsGetArguments`]: one exact Card reference
+    /// whose optional space and UID narrow it, with no other field accepted.
     fn input_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -258,8 +271,13 @@ impl AgentTool for CardsTool {
         })
     }
 
+    /// The schema derived from the canonical [`Card`] envelope, which is
+    /// exactly what a successful read serializes.
+    ///
+    /// # Panics
+    /// Never in practice: a derived schema always serializes to JSON.
     fn output_schema(&self) -> Value {
-        serde_json::json!({ "type": "object" })
+        serde_json::to_value(schemars::schema_for!(Card)).expect("a derived schema is JSON")
     }
 
     /// Read the Card through the authorized, audited Cards read.

@@ -118,6 +118,10 @@ struct Cli {
     /// 60 s rolling window, so its quantiles describe only that step.
     #[arg(long, default_value_t = 60.0)]
     probe_seconds: f64,
+    /// `WYRD_LOG` every server process runs with; it must keep the Forge
+    /// leader's and worker's debug pull lines.
+    #[arg(long, default_value = SERVER_LOG)]
+    server_log: String,
     /// The `wyrd-server` binary; defaults to the one built beside this one.
     #[arg(long)]
     server_binary: Option<PathBuf>,
@@ -208,7 +212,7 @@ async fn benchmark(cli: Cli) -> Result<Outcome> {
                 "WYRD_PEER_TLS_DIR",
                 peer_dirs[usize::from(ordinal)].as_str(),
             ),
-            ("WYRD_LOG", SERVER_LOG),
+            ("WYRD_LOG", cli.server_log.as_str()),
         ]
     };
     let mut leader_env = shared(0);

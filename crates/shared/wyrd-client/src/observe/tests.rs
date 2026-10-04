@@ -1041,3 +1041,115 @@ async fn record_refuses_an_unknown_dataset_table() {
         .expect_err("an unregistered table must refuse");
     assert_eq!(error.status(), 404);
 }
+
+// ── Scenario 5: the client owns observation event time ──────────────────────
+
+/// Every `wyrd_event_time` in the batches `sink` settled for `table`, decoded
+/// from the sent IPC as the exact `Timestamp(Microsecond, "UTC")` wire column.
+///
+/// # Panics
+/// Panics when a batch is not valid IPC or does not carry that column.
+fn sent_event_times(sink: &MockSink, table: &str) -> Vec<i64> {
+    use arrow::array::{Array, TimestampMicrosecondArray};
+    let mut times = Vec::new();
+    for receipt in sink.received().iter().filter(|r| r.table == table) {
+        let reader = arrow::ipc::reader::StreamReader::try_new(receipt.bytes.as_slice(), None)
+            .expect("the settled frame is IPC");
+        for batch in reader {
+            let batch = batch.expect("the settled frame decodes");
+            let column = batch
+                .column_by_name(wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME)
+                .expect("every emitted row carries wyrd_event_time");
+            assert_eq!(
+                column.data_type(),
+                &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+                "the wire column is the managed candidate type"
+            );
+            assert_eq!(column.null_count(), 0, "event time is never null");
+            let column = column
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .expect("timestamp column");
+            times.extend(column.values().iter().copied());
+        }
+    }
+    times
+}
+
+/// Drift, Eval, and record rows carry the client clock reading of their emit
+/// call, not of the later flush; a caller's own `wyrd_event_time` is kept.
+///
+/// The queue lingers for a minute, so nothing seals until `shutdown`; every
+/// stamp must still lie between clock readings taken around the emits and
+/// before that shutdown.
+#[tokio::test]
+async fn emits_stamp_their_own_event_time_and_keep_a_callers() {
+    let server = DescribeServer::start(fixed_table_bodies());
+    let table = "vala.datasets.app_events";
+    server.publish(
+        table,
+        &description(table, vec![Field::new("event", DataType::Utf8, false)]),
+    );
+    let (_bundle, state) = state_fixture();
+    let sink = Arc::new(MockSink::new());
+    state
+        .adopt_started_bifrost_for_test(bifrost_over(
+            &server,
+            Arc::clone(&sink),
+            QueueConfig {
+                linger_ms: 60_000,
+                ..QueueConfig::default()
+            },
+        ))
+        .await
+        .expect("startup");
+    let run = state.run();
+    let observe = run.observe();
+    let supplied = "2026-01-02T03:04:05.678901Z";
+
+    let before = chrono::Utc::now().timestamp_micros();
+    observe
+        .drift(&json!({ "age": 42, "tier": "gold" }), None)
+        .expect("drift enqueues");
+    observe
+        .eval(
+            &json!({ "answer": "yes" }),
+            EvalObservationOptions::default(),
+        )
+        .expect("eval enqueues");
+    observe
+        .record(table, &json!({ "event": "stamped" }))
+        .await
+        .expect("record enqueues");
+    let after = chrono::Utc::now().timestamp_micros();
+    observe
+        .record(
+            table,
+            &json!({ "event": "supplied", "wyrd_event_time": supplied }),
+        )
+        .await
+        .expect("a caller event time is admitted");
+    state.shutdown().await.expect("shutdown drains");
+
+    let drift = sent_event_times(&sink, DRIFT_OBSERVATIONS_TABLE);
+    let eval = sent_event_times(&sink, EVAL_OBSERVATIONS_TABLE);
+    let records = sent_event_times(&sink, table);
+    assert_eq!((drift.len(), eval.len(), records.len()), (2, 1, 2));
+    assert_eq!(
+        drift[0], drift[1],
+        "one Drift record is stamped once for all its rows"
+    );
+    for time in [drift[0], eval[0], records[0]] {
+        assert!(
+            (before..=after).contains(&time),
+            "{time} is the emit-time reading in [{before}, {after}]"
+        );
+    }
+    assert_eq!(
+        records[1],
+        chrono::DateTime::parse_from_rfc3339(supplied)
+            .expect("fixture timestamp")
+            .timestamp_micros(),
+        "the caller's wyrd_event_time is kept, not overwritten"
+    );
+}

@@ -41,6 +41,12 @@ pub struct Row {
     pub card_ref: Option<CardRef>,
     /// The optional per-row run correlation field.
     pub run_id: Option<RunId>,
+    /// The writer's `wyrd_event_time` stamp, in microseconds since the Unix
+    /// epoch (UTC), taken when the row was emitted.
+    ///
+    /// Sealing, retry, and flush never change it. A `wyrd_event_time` in the
+    /// row's own JSON is kept instead of this stamp.
+    pub event_time_micros: i64,
     /// The one handle-wide byte reservation held while the row is buffered.
     pub(crate) _guard: ClientByteGuard,
 }
@@ -407,7 +413,12 @@ impl RecordQueue {
             let json = std::str::from_utf8(&row.json).map_err(|error| {
                 WyrdQueueError::SchemaParse(format!("row is not UTF-8: {error}"))
             })?;
-            builder.append_json_row(json, row.card_ref.as_ref(), row.run_id.as_ref())?;
+            builder.append_json_row(
+                json,
+                row.card_ref.as_ref(),
+                row.run_id.as_ref(),
+                row.event_time_micros,
+            )?;
         }
         encode_ipc(&builder.finish()?, self.config.max_message_bytes)
     }
@@ -678,6 +689,7 @@ mod tests {
             json,
             card_ref: Some("prod/Service/queue@1.0.0".parse().expect("valid test card")),
             run_id: None,
+            event_time_micros: 0,
         }
     }
 

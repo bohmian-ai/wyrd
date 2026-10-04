@@ -6,18 +6,19 @@ from __future__ import annotations
 class Observer:
     """Base class for Wyrd run observers.
 
-    Subclass this to receive lifecycle events from agent and workflow runs.
-    All methods have default no-op implementations - override only what you need.
+    Subclass this and pass instances as ``Workflow(observers=[...])`` to
+    receive lifecycle events from that workflow's runs and the Agent runs of
+    its steps. Every hook is a no-op by default, so override only what you
+    need.
 
-    Observer methods are called concurrently when a workflow runs agents in
-    parallel. Each concurrent agent run has a unique run_id, so calls for
-    different runs never share the same key. If your observer maintains any
-    mutable shared state (span stores, counters, buffers), protect it with
-    threading.Lock or a thread-safe data structure.
+    Hooks run on a worker thread, and the run waits for each hook to return,
+    so keep them fast. An exception raised by a hook is ignored. Hooks for
+    parallel steps run concurrently; each Agent run has its own ``run_id``, but
+    protect any state shared across runs with ``threading.Lock``.
 
-    Duration values passed to on_agent_finish and on_workflow_finish are
-    integer milliseconds (converted from Rust Duration before crossing the
-    PyO3 boundary).
+    ``run_id`` values are UUIDv7 strings; ``agent_id`` is the ``Agent.id``;
+    ``iteration`` is the zero-based loop iteration; ``duration_ms`` is integer
+    wall-clock milliseconds.
     """
 
     def on_agent_start(
@@ -28,20 +29,27 @@ class Observer:
         input: str,
         session_id: str | None,
     ) -> None:
-        """Agent run started.
+        """Called when an Agent run starts, before its first iteration.
 
-        Use this hook to open an agent-level span or run record before any
-        iteration, model call, or tool call is observed. When parent_run_id is
-        present, use it to attach this agent run to the workflow run that
-        scheduled it.
+        Each step attempt of a workflow is a separate Agent run.
+
+        Args:
+            run_id: this Agent run's id.
+            parent_run_id: the ``run_id`` of the workflow run that scheduled
+                this Agent run, or ``None`` when there is none.
+            agent_id: the Agent's runtime id.
+            input: the user input text; ``""`` for workflow steps, which run
+                their rendered Prompt instead.
+            session_id: the run's session id; ``None`` for workflow steps.
         """
 
     def on_iteration(self, run_id: str, agent_id: str, index: int) -> None:
-        """Agent loop iteration started.
+        """Called at the start of each loop iteration, before its model call.
 
-        Use this hook for per-iteration counters, budget tracking, and loop
-        diagnostics. It fires before the model call for the iteration, so it is
-        the earliest hook that can distinguish individual agent turns.
+        Args:
+            run_id: the Agent run's id.
+            agent_id: the Agent's runtime id.
+            index: the zero-based iteration index.
         """
 
     def on_model_call(
@@ -53,10 +61,19 @@ class Observer:
         model: str,
         request: object,
     ) -> None:
-        """Provider model call started.
+        """Called immediately before a model call.
 
-        Use this hook to open a provider/model span or count outbound model
-        requests. It receives a typed ProviderRequest wrapper.
+        When a ``before_model`` callback aborts the run, this hook and
+        ``on_model_result`` still fire although no request is sent.
+
+        Args:
+            run_id: the Agent run's id.
+            agent_id: the Agent's runtime id.
+            iteration: the zero-based iteration index.
+            provider: ``"openai"``, ``"anthropic"``, ``"google"``,
+                ``"vertex"``, or a custom provider's name.
+            model: the requested model name.
+            request: the outbound request, after ``before_model`` callbacks.
         """
 
     def on_model_result(
@@ -68,10 +85,19 @@ class Observer:
         synthetic: bool,
         response: object,
     ) -> None:
-        """Provider model call completed.
+        """Called when a model call completes or fails.
 
-        Use this hook to close the model span opened by on_model_call or record
-        the provider finish reason. It receives a typed ProviderResponse wrapper.
+        Args:
+            run_id: the Agent run's id.
+            agent_id: the Agent's runtime id.
+            iteration: the zero-based iteration index.
+            finish_reason: the provider's finish reason (``"other"`` when it
+                gave none); ``"callback_aborted"`` when ``before_model``
+                aborted; ``"provider_error:<message>"`` when the call failed.
+            synthetic: ``True`` when no provider response exists, that is for
+                the callback-aborted and provider-error cases.
+            response: the provider response; an empty placeholder when
+                ``synthetic`` is ``True``.
         """
 
     def on_tool_call(
@@ -82,11 +108,15 @@ class Observer:
         call_id: str,
         tool_name: str,
     ) -> None:
-        """Tool invocation started.
+        """Called before a tool runs; the tool's arguments are not exposed.
 
-        Use this hook to open a tool span, count tool usage, or correlate a
-        provider tool call with the later on_tool_result event using call_id.
-        Tool arguments are intentionally not exposed through this hook.
+        Args:
+            run_id: the Agent run's id.
+            agent_id: the Agent's runtime id.
+            iteration: the zero-based iteration index.
+            call_id: the provider-assigned tool call id, matching the later
+                ``on_tool_result``.
+            tool_name: the name of the tool being called.
         """
 
     def on_tool_result(
@@ -97,11 +127,16 @@ class Observer:
         call_id: str,
         ok: bool,
     ) -> None:
-        """Tool invocation completed.
+        """Called after a tool call finishes; the result payload is not exposed.
 
-        Use this hook to close the tool span opened by on_tool_call and record
-        whether the invocation succeeded. Tool result payloads are intentionally
-        not exposed through this hook.
+        Args:
+            run_id: the Agent run's id.
+            agent_id: the Agent's runtime id.
+            iteration: the zero-based iteration index.
+            call_id: the provider-assigned tool call id from ``on_tool_call``.
+            ok: ``False`` when the tool call failed, for example by raising,
+                and no ``after_tool`` callback replaced the result. A call
+                skipped by a raising ``before_tool`` callback reports ``True``.
         """
 
     def on_agent_finish(
@@ -112,10 +147,14 @@ class Observer:
         iterations: int,
         duration_ms: int,
     ) -> None:
-        """Agent run finished successfully.
+        """Called when an Agent run returns a result; failed runs call ``on_agent_error``.
 
-        Use this hook to close an agent-level span or finalize a successful run
-        record. Failed runs use on_agent_error instead.
+        Args:
+            run_id: the Agent run's id.
+            agent_id: the Agent's runtime id.
+            finish_reason: ``"modelstopped"`` or ``"callbackaborted"``.
+            iterations: the number of iterations the run used.
+            duration_ms: the run's wall-clock duration.
         """
 
     def on_agent_error(
@@ -125,11 +164,15 @@ class Observer:
         code: str,
         message: str,
     ) -> None:
-        """Agent run failed.
+        """Called when an Agent run fails, for example by timeout or provider error.
 
-        Use this hook to close a failed agent span, increment error metrics, or
-        record the stable Wyrd error code. The message is diagnostic text and
-        should not be used as a durable classifier.
+        Args:
+            run_id: the Agent run's id.
+            agent_id: the Agent's runtime id.
+            code: the stable Skald agent error code, such as
+                ``"SKALD_AGENT_504_TIMEOUT"``; use it, not ``message``, to
+                classify failures.
+            message: human-readable diagnostic text.
         """
 
     def on_workflow_start(
@@ -138,11 +181,13 @@ class Observer:
         workflow_id: str,
         step_count: int,
     ) -> None:
-        """Workflow run started.
+        """Called when a workflow run starts, before any step is scheduled.
 
-        Use this hook to open a workflow-level span or job record before DAG
-        steps are scheduled. Child agent runs can reference this run_id through
-        their parent_run_id when the runtime supplies one.
+        Args:
+            run_id: this workflow run's id; its step runs receive it as
+                ``parent_run_id``.
+            workflow_id: the workflow's name.
+            step_count: the number of steps in the DAG.
         """
 
     def on_workflow_finish(
@@ -151,8 +196,13 @@ class Observer:
         workflow_id: str,
         duration_ms: int,
     ) -> None:
-        """Workflow run finished successfully.
+        """Called when every step of a workflow run has completed.
 
-        Use this hook to close the workflow-level span or finalize a successful
-        workflow record after all DAG steps complete.
+        A failed workflow run raises from ``Workflow.run()`` without calling
+        this hook.
+
+        Args:
+            run_id: the workflow run's id.
+            workflow_id: the workflow's name.
+            duration_ms: the workflow run's wall-clock duration.
         """

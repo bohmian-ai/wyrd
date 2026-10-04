@@ -47,7 +47,12 @@ from .state import CardEnvelope, HydratedArtifact, WyrdState
 
 
 class Card(Protocol):
-    """Shared authoring capability implemented by native Card holders."""
+    """Shared authoring capability implemented by native card holders.
+
+    ``DataCard``, ``ModelCard``, and ``PromptCard`` are the registerable
+    implementations; pass one to ``Cards.register``. Do not construct
+    ``Card`` directly.
+    """
 
     space: str
     name: str

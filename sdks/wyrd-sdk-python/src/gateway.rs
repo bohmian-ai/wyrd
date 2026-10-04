@@ -195,8 +195,8 @@ impl PyGateway {
     ///
     /// # Errors
     ///
-    /// Raises `WyrdError` for an invalid name or the server's permission,
-    /// conflict, or availability error.
+    /// Raises `WyrdError` for an invalid name or the server's permission or
+    /// availability error.
     fn delete_deployment(&self, py: Python<'_>, name: &str) -> WyrdPyResult<Py<PyAny>> {
         let name = Self::deployment_name(name)?;
         Self::run(py, self.inner.delete_deployment(&name))
@@ -240,7 +240,8 @@ impl PyGateway {
     /// # Errors
     ///
     /// Raises `WyrdError` for an invalid body or the server's permission,
-    /// invalid-configuration, conflict, or availability error.
+    /// invalid-configuration, or availability error. A changed stored pricing
+    /// version is an invalid-configuration error.
     fn put_governance_policy(
         &self,
         py: Python<'_>,

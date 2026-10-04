@@ -22,6 +22,7 @@ use crate::prompt::wrong_variant;
 // OpenAI Chat — shared message types (Rule 5)
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// One `OpenAI` Chat message, from a request's `messages` or a response choice.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiChatMessage")]
 pub struct PyOpenAiChatMessage {
     pub(crate) src: ChatMessageSource,
@@ -33,20 +34,24 @@ impl PyOpenAiChatMessage {
 }
 #[pymethods]
 impl PyOpenAiChatMessage {
+    /// The `role`: `"system"`, `"user"`, `"assistant"`, `"tool"`, or another.
     #[getter]
     fn role(&self) -> &str {
         &self.m().role
     }
+    /// The `content`, or `None` when absent.
     #[getter]
     fn content(&self) -> Option<PyOpenAiMessageContent> {
         self.m().content.as_ref().map(|_| PyOpenAiMessageContent {
             src: self.src.clone(),
         })
     }
+    /// The participant `name`.
     #[getter]
     fn name(&self) -> Option<&str> {
         self.m().name.as_deref()
     }
+    /// The assistant `tool_calls`, or `None` when absent.
     #[getter]
     fn tool_calls(&self) -> Option<Vec<PyOpenAiToolCall>> {
         self.m().tool_calls.as_ref().map(|tc| {
@@ -58,14 +63,17 @@ impl PyOpenAiChatMessage {
                 .collect()
         })
     }
+    /// The `tool_call_id` a `tool` message answers.
     #[getter]
     fn tool_call_id(&self) -> Option<&str> {
         self.m().tool_call_id.as_deref()
     }
+    /// The assistant `refusal` text.
     #[getter]
     fn refusal(&self) -> Option<&str> {
         self.m().refusal.as_deref()
     }
+    /// The `annotations` list, empty when absent.
     #[getter]
     fn annotations(&self) -> Vec<PyOpenAiMessageAnnotation> {
         (0..self.m().annotations.len())
@@ -75,6 +83,7 @@ impl PyOpenAiChatMessage {
             })
             .collect()
     }
+    /// The assistant `audio` output, or `None` when absent.
     #[getter]
     fn audio(&self) -> Option<PyOpenAiMessageAudio> {
         self.m().audio.as_ref().map(|_| PyOpenAiMessageAudio {
@@ -86,6 +95,7 @@ impl PyOpenAiChatMessage {
     }
 }
 
+/// `OpenAI` Chat message content: either a string or a list of parts.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiMessageContent")]
 pub struct PyOpenAiMessageContent {
     src: ChatMessageSource,
@@ -97,6 +107,7 @@ impl PyOpenAiMessageContent {
 }
 #[pymethods]
 impl PyOpenAiMessageContent {
+    /// `"text"` or `"parts"`.
     #[getter]
     fn kind(&self) -> &'static str {
         match self.c() {
@@ -104,12 +115,20 @@ impl PyOpenAiMessageContent {
             OpenAiMessageContent::Parts(_) => "parts",
         }
     }
+    /// Return the string content.
+    ///
+    /// # Errors
+    /// Returns `WYRD_PROMPT_400_PROVIDER_MISMATCH` when this value is another variant.
     fn as_text(&self) -> WyrdPyResult<String> {
         match self.c() {
             OpenAiMessageContent::Text(s) => Ok(s.clone()),
             OpenAiMessageContent::Parts(_) => Err(wrong_variant("text", self.kind()).into()),
         }
     }
+    /// Return the content parts when `kind` is `"parts"`.
+    ///
+    /// # Errors
+    /// Returns `WYRD_PROMPT_400_PROVIDER_MISMATCH` when this value is another variant.
     fn as_parts(&self) -> WyrdPyResult<Vec<PyOpenAiContentPart>> {
         match self.c() {
             OpenAiMessageContent::Parts(ps) => Ok((0..ps.len())
@@ -126,6 +145,7 @@ impl PyOpenAiMessageContent {
     }
 }
 
+/// One part of `OpenAI` Chat message content.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiContentPart")]
 pub struct PyOpenAiContentPart {
     src: ChatMessageSource,
@@ -141,6 +161,7 @@ impl PyOpenAiContentPart {
 }
 #[pymethods]
 impl PyOpenAiContentPart {
+    /// `"text"`, `"image_url"`, `"input_audio"`, or `"file"`.
     #[getter]
     fn kind(&self) -> &'static str {
         match self.p() {
@@ -150,12 +171,20 @@ impl PyOpenAiContentPart {
             OpenAiContentPart::File { .. } => "file",
         }
     }
+    /// Return the `text` of a `"text"` part.
+    ///
+    /// # Errors
+    /// Returns `WYRD_PROMPT_400_PROVIDER_MISMATCH` when this value is another variant.
     fn as_text(&self) -> WyrdPyResult<String> {
         match self.p() {
             OpenAiContentPart::Text { text } => Ok(text.clone()),
             _ => Err(wrong_variant("text", self.kind()).into()),
         }
     }
+    /// Return the `image_url` of an `"image_url"` part.
+    ///
+    /// # Errors
+    /// Returns `WYRD_PROMPT_400_PROVIDER_MISMATCH` when this value is another variant.
     fn as_image_url(&self) -> WyrdPyResult<PyOpenAiImageUrl> {
         match self.p() {
             OpenAiContentPart::ImageUrl { .. } => Ok(PyOpenAiImageUrl {
@@ -165,6 +194,10 @@ impl PyOpenAiContentPart {
             _ => Err(wrong_variant("image_url", self.kind()).into()),
         }
     }
+    /// Return the `input_audio` of an `"input_audio"` part.
+    ///
+    /// # Errors
+    /// Returns `WYRD_PROMPT_400_PROVIDER_MISMATCH` when this value is another variant.
     fn as_input_audio(&self) -> WyrdPyResult<PyOpenAiInputAudio> {
         match self.p() {
             OpenAiContentPart::InputAudio { .. } => Ok(PyOpenAiInputAudio {
@@ -174,6 +207,10 @@ impl PyOpenAiContentPart {
             _ => Err(wrong_variant("input_audio", self.kind()).into()),
         }
     }
+    /// Return the `file` of a `"file"` part.
+    ///
+    /// # Errors
+    /// Returns `WYRD_PROMPT_400_PROVIDER_MISMATCH` when this value is another variant.
     fn as_file(&self) -> WyrdPyResult<PyOpenAiFilePart> {
         match self.p() {
             OpenAiContentPart::File { .. } => Ok(PyOpenAiFilePart {
@@ -188,6 +225,7 @@ impl PyOpenAiContentPart {
     }
 }
 
+/// The `image_url` object of an `OpenAI` Chat image part.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiImageUrl")]
 pub struct PyOpenAiImageUrl {
     src: ChatMessageSource,
@@ -206,10 +244,12 @@ impl PyOpenAiImageUrl {
 }
 #[pymethods]
 impl PyOpenAiImageUrl {
+    /// The image `url`, possibly a `data:` URL.
     #[getter]
     fn url(&self) -> &str {
         &self.i().url
     }
+    /// The `detail` level, such as `"low"`, `"high"`, or `"auto"`.
     #[getter]
     fn detail(&self) -> Option<&str> {
         self.i().detail.as_deref()
@@ -219,6 +259,7 @@ impl PyOpenAiImageUrl {
     }
 }
 
+/// The `input_audio` object of an `OpenAI` Chat audio part.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiInputAudio")]
 pub struct PyOpenAiInputAudio {
     src: ChatMessageSource,
@@ -237,10 +278,12 @@ impl PyOpenAiInputAudio {
 }
 #[pymethods]
 impl PyOpenAiInputAudio {
+    /// The base64 audio `data`.
     #[getter]
     fn data(&self) -> &str {
         &self.a().data
     }
+    /// The audio `format`, such as `"wav"` or `"mp3"`.
     #[getter]
     fn format(&self) -> &str {
         &self.a().format
@@ -250,6 +293,7 @@ impl PyOpenAiInputAudio {
     }
 }
 
+/// The `file` object of an `OpenAI` Chat file part.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiFilePart")]
 pub struct PyOpenAiFilePart {
     src: ChatMessageSource,
@@ -268,14 +312,17 @@ impl PyOpenAiFilePart {
 }
 #[pymethods]
 impl PyOpenAiFilePart {
+    /// The uploaded `file_id`.
     #[getter]
     fn file_id(&self) -> Option<&str> {
         self.f().file_id.as_deref()
     }
+    /// The inline `file_data`, a base64 `data:` URL.
     #[getter]
     fn file_data(&self) -> Option<&str> {
         self.f().file_data.as_deref()
     }
+    /// The `filename`.
     #[getter]
     fn filename(&self) -> Option<&str> {
         self.f().filename.as_deref()
@@ -285,6 +332,7 @@ impl PyOpenAiFilePart {
     }
 }
 
+/// One entry of an `OpenAI` Chat assistant message's `tool_calls`.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiToolCall")]
 pub struct PyOpenAiToolCall {
     src: ChatMessageSource,
@@ -297,14 +345,17 @@ impl PyOpenAiToolCall {
 }
 #[pymethods]
 impl PyOpenAiToolCall {
+    /// The tool call `id`; a `tool` message answers it by this id.
     #[getter]
     fn id(&self) -> &str {
         &self.c().id
     }
+    /// The call `type`, such as `"function"`.
     #[getter]
     fn kind(&self) -> &str {
         &self.c().kind
     }
+    /// The called `function`.
     #[getter]
     fn function(&self) -> PyOpenAiToolFunctionCall {
         PyOpenAiToolFunctionCall {
@@ -317,6 +368,7 @@ impl PyOpenAiToolCall {
     }
 }
 
+/// The `function` object of an `OpenAI` Chat tool call.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiToolFunctionCall")]
 pub struct PyOpenAiToolFunctionCall {
     src: ChatMessageSource,
@@ -329,10 +381,12 @@ impl PyOpenAiToolFunctionCall {
 }
 #[pymethods]
 impl PyOpenAiToolFunctionCall {
+    /// The function `name`.
     #[getter]
     fn name(&self) -> &str {
         &self.f().name
     }
+    /// The `arguments` as the model's JSON string, not parsed.
     #[getter]
     fn arguments(&self) -> &str {
         &self.f().arguments
@@ -342,6 +396,7 @@ impl PyOpenAiToolFunctionCall {
     }
 }
 
+/// One entry of an `OpenAI` Chat message's `annotations`.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiMessageAnnotation")]
 pub struct PyOpenAiMessageAnnotation {
     src: ChatMessageSource,
@@ -354,10 +409,12 @@ impl PyOpenAiMessageAnnotation {
 }
 #[pymethods]
 impl PyOpenAiMessageAnnotation {
+    /// The annotation `type`, such as `"url_citation"`.
     #[getter]
     fn kind(&self) -> &str {
         &self.a().kind
     }
+    /// The `url_citation` object.
     #[getter]
     fn url_citation(&self) -> PyOpenAiUrlCitation {
         PyOpenAiUrlCitation {
@@ -370,6 +427,7 @@ impl PyOpenAiMessageAnnotation {
     }
 }
 
+/// A web citation inside an `OpenAI` Chat message.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiUrlCitation")]
 pub struct PyOpenAiUrlCitation {
     src: ChatMessageSource,
@@ -382,18 +440,22 @@ impl PyOpenAiUrlCitation {
 }
 #[pymethods]
 impl PyOpenAiUrlCitation {
+    /// The cited `url`.
     #[getter]
     fn url(&self) -> &str {
         &self.u().url
     }
+    /// The cited page `title`.
     #[getter]
     fn title(&self) -> &str {
         &self.u().title
     }
+    /// The `start_index` of the cited span in the message content.
     #[getter]
     fn start_index(&self) -> u32 {
         self.u().start_index
     }
+    /// The `end_index` of the cited span in the message content.
     #[getter]
     fn end_index(&self) -> u32 {
         self.u().end_index
@@ -403,6 +465,7 @@ impl PyOpenAiUrlCitation {
     }
 }
 
+/// The `audio` output of an `OpenAI` Chat assistant message.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiMessageAudio")]
 pub struct PyOpenAiMessageAudio {
     src: ChatMessageSource,
@@ -414,18 +477,22 @@ impl PyOpenAiMessageAudio {
 }
 #[pymethods]
 impl PyOpenAiMessageAudio {
+    /// The audio response `id`.
     #[getter]
     fn id(&self) -> &str {
         &self.a().id
     }
+    /// The `expires_at` Unix timestamp after which the audio is unavailable.
     #[getter]
     fn expires_at(&self) -> u64 {
         self.a().expires_at
     }
+    /// The base64 audio `data`.
     #[getter]
     fn data(&self) -> &str {
         &self.a().data
     }
+    /// The audio `transcript`.
     #[getter]
     fn transcript(&self) -> &str {
         &self.a().transcript

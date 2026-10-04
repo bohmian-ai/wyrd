@@ -129,15 +129,18 @@ class WyrdState:
     ) -> WyrdState:
         """Load, validate, and eagerly hydrate a complete local bundle.
 
+        This method performs no network access.
+
         Args:
             path: Directory produced by complete ``wyrd get`` hydration.
             interfaces: Custom Model/Data interface classes or instances keyed
                 by friendly alias.
             load_kwargs: Model/Data loader arguments keyed by friendly alias.
             trusted_artifact_hashes: Externally verified canonical artifact
-                manifest hashes keyed by Model/Data alias. Joblib-backed built-in
-                Models require an exact hash for their persisted CardRef before
-                local deserialization can run.
+                manifest hashes keyed by Model/Data alias. Built-in sklearn,
+                XGBoost, LightGBM, and CatBoost Models require an exact hash for
+                their persisted CardRef before local deserialization can run;
+                without one, construction fails.
 
         Returns:
             A fully hydrated offline runtime state.
@@ -146,7 +149,6 @@ class WyrdState:
             WyrdError: With a stable ``WYRD_SDK_*`` code for invalid bundles,
                 aliases, kinds, conflicting configuration, or holder hydration.
 
-        This method performs no network access.
         """
         ...
 
@@ -160,22 +162,33 @@ class WyrdState:
     ) -> None:
         """Connect this state's one Bifrost writer and describe the fixed tables.
 
-        The transport arguments are ``Bifrost(...)``'s and pass straight through,
-        including its environment and default resolution.
-        ``client_byte_limit_bytes`` overrides the handle-wide ingestion byte
-        budget (256 MiB by default). Startup describes
-        ``vala.drift.observations`` and ``vala.eval.observations`` before
-        succeeding, so a run can never enqueue against a missing, unauthorized,
-        or incompatible system table. ``table`` keeps its existing Bifrost
-        meaning and does not choose a run's destination.
+        Startup describes ``vala.drift.observations`` and
+        ``vala.eval.observations`` before succeeding, so a run can never
+        enqueue against a missing, unauthorized, or incompatible system table.
+
+        Args:
+            table: the writer's active write binding, as for ``Bifrost()``.
+                It does not choose a run's destination or replace a fixed
+                system table. Omitted, no write table is bound.
+            server_url: the Bifrost server URL. Resolved from
+                ``WYRD_SERVER_URL`` and then ``http://localhost:8080`` if
+                omitted.
+            credential: the API key or bearer token, resolved as for
+                ``Bifrost()`` if omitted.
+            grpc_url: the ingest endpoint. Resolved from ``WYRD_GRPC_URL`` and
+                then derived from the server URL if omitted.
+            client_byte_limit_bytes: the handle-wide ingestion byte budget.
+                256 MiB if omitted.
 
         Raises:
             WyrdError: ``WYRD_SDK_409_BIFROST_ALREADY_STARTED`` when this state
                 already started Bifrost, ``WYRD_SDK_409_BIFROST_CLOSED`` after a
                 successful shutdown, ``WYRD_CLIENT_400_CONFIG_INVALID`` for a
-                byte budget too small to seal one message, or the catalog code
-                for a missing credential, an undialable ingest channel, or a
-                fixed table that is absent, unauthorized, or incompatible.
+                byte budget too small to seal one message,
+                ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no credential resolves,
+                or the catalog code for an undialable ingest channel or a fixed
+                table that is absent, unauthorized, or incompatible.
+
         """
         ...
 

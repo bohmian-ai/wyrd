@@ -61,6 +61,17 @@ impl From<PyFieldSpec> for FieldSpec {
 #[cfg(feature = "python")]
 #[pymethods]
 impl PyFieldSpec {
+    /// Declare a field; only `name` is validated here.
+    ///
+    /// `dtype` is stored as given; `ModelSignature` validation rejects
+    /// non-canonical Arrow dtype names. `shape` accepts serialized `Dim`
+    /// values or plain integers (each a fixed dimension); omitted means no
+    /// shape. Omitted `extra` is empty.
+    ///
+    /// # Errors
+    /// Returns `WYRD_DATA_400_VALIDATION` when `name` is not a valid column
+    /// name (1 to 64 characters, a lowercase letter then lowercase letters,
+    /// digits, `_`, or `-`), or a Wyrd error when `shape` cannot be parsed.
     #[new]
     #[pyo3(signature = (name, dtype, shape=None, nullable=false, extra=None))]
     fn __new__(
@@ -89,16 +100,22 @@ impl PyFieldSpec {
         }))
     }
 
+    /// Field name.
     #[getter]
     fn name(&self) -> String {
         self.inner.name.as_str().to_string()
     }
 
+    /// Declared Arrow logical dtype name.
     #[getter]
     fn dtype(&self) -> String {
         self.inner.dtype.clone()
     }
 
+    /// Serialized dimensions, each `{"kind": "Fixed" | "Dynamic", "value": ...}`.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when JSON conversion fails.
     #[getter]
     fn shape(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(
@@ -107,6 +124,10 @@ impl PyFieldSpec {
         )?)
     }
 
+    /// Alias of `shape`.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when JSON conversion fails.
     #[getter]
     fn dims(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(
@@ -115,16 +136,22 @@ impl PyFieldSpec {
         )?)
     }
 
+    /// Whether the field may hold nulls.
     #[getter]
     fn nullable(&self) -> bool {
         self.inner.nullable
     }
 
+    /// String metadata stored with the field.
     #[getter]
     fn extra(&self) -> BTreeMap<String, String> {
         self.inner.extra.clone()
     }
 
+    /// Return this field as a JSON-compatible spec dictionary.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when JSON conversion fails.
     fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(py, &serde_json::to_value(&self.inner)?)?)
     }
@@ -175,12 +202,18 @@ impl From<PyDataSchema> for DataSchema {
 #[cfg(feature = "python")]
 #[pymethods]
 impl PyDataSchema {
+    /// Create a schema from ordered `FieldSpec` objects or serialized field
+    /// dictionaries; omitted means an empty schema.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when a serialized field cannot be parsed.
     #[new]
     #[pyo3(signature = (columns=None))]
     fn __new__(columns: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<Self> {
         Ok(Self::from_inner(DataSchema::new(parse_columns(columns)?)))
     }
 
+    /// Fields in schema order.
     #[getter]
     fn columns(&self) -> Vec<PyFieldSpec> {
         self.inner
@@ -191,25 +224,38 @@ impl PyDataSchema {
             .collect()
     }
 
+    /// Alias of `columns`.
     #[getter]
     fn fields(&self) -> Vec<PyFieldSpec> {
         self.columns()
     }
 
+    /// Return `true` when the schema has no fields.
     fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
 
+    /// Return whether a field named `name` exists.
+    ///
+    /// # Errors
+    /// Returns `WYRD_DATA_400_VALIDATION` when `name` is not a valid column
+    /// name.
     fn contains_column(&self, name: &str) -> WyrdPyResult<bool> {
         let name = column_name(name)?;
         Ok(self.inner.contains_column(&name))
     }
 
+    /// Return the field named `name`, or `None` when it is absent.
+    ///
+    /// # Errors
+    /// Returns `WYRD_DATA_400_VALIDATION` when `name` is not a valid column
+    /// name.
     fn column(&self, name: &str) -> WyrdPyResult<Option<PyFieldSpec>> {
         let name = column_name(name)?;
         Ok(self.inner.column(&name).cloned().map(PyFieldSpec::from))
     }
 
+    /// Return field names in schema order.
     fn column_names(&self) -> Vec<String> {
         self.inner
             .column_names()
@@ -217,6 +263,10 @@ impl PyDataSchema {
             .collect()
     }
 
+    /// Return this schema as a JSON-compatible spec dictionary.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when JSON conversion fails.
     fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(py, &serde_json::to_value(&self.inner)?)?)
     }

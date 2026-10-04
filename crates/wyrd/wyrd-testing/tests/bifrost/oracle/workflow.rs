@@ -140,7 +140,10 @@ async fn prove_forwarded_query_settles(cause: TerminalCause) -> Result<(), Journ
             "function": { "name": "bifrost.query", "arguments": json!({ "sql": sql }).to_string() }
         }]
     }));
-    if cause == TerminalCause::PodKill {
+    // A deadline run also answers the post-tool continuation, so a tool query
+    // that timed out before the run's own deadline would let the run succeed
+    // instead of timing out.
+    if cause != TerminalCause::Cancel {
         upstream.reply(json!({ "role": "assistant", "content": "DONE" }));
     }
 

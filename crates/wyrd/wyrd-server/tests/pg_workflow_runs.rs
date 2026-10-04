@@ -68,9 +68,11 @@ const RELEASED: BifrostQueryResourceSnapshot = BifrostQueryResourceSnapshot {
     peer_slots: 0,
 };
 
-/// One chat completion request as the upstream received it.
+/// One provider request as the upstream received it.
 #[derive(Debug, Clone)]
 struct UpstreamCall {
+    /// Request path, naming the provider dialect.
+    path: String,
     /// `authorization` header, as the gateway sends its provider key.
     authorization: Option<String>,
     /// [`SECRET_HEADER`], as an external binding sends its secret.
@@ -91,7 +93,8 @@ struct Script {
     replies: Mutex<VecDeque<Value>>,
 }
 
-/// Local OpenAI-compatible upstream serving `POST /v1/chat/completions`.
+/// Local provider upstream serving `OpenAI` Chat Completions and Responses,
+/// Anthropic Messages, and Gemini `generateContent`.
 struct Upstream {
     /// Origin the gateway and external bindings reach it at.
     url: Url,
@@ -121,6 +124,9 @@ impl Upstream {
         });
         let app = axum::Router::new()
             .route("/v1/chat/completions", axum::routing::post(complete))
+            .route("/v1/responses", axum::routing::post(respond))
+            .route("/v1/messages", axum::routing::post(message))
+            .route("/v1beta/models/{call}", axum::routing::post(generate))
             .with_state(Arc::clone(&script));
         tokio::spawn(async move { axum::serve(listener, app).await });
         Self { url, script }
@@ -178,16 +184,12 @@ impl Upstream {
     }
 }
 
-/// Record one completion request, wait while held, and answer the next
-/// scripted message with usage.
+/// Record one request to `path`, wait while held, and return the next
+/// scripted message.
 ///
 /// # Panics
 /// Panics if the hold sender is gone, which the script owns for its life.
-async fn complete(
-    State(script): State<Arc<Script>>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> Json<Value> {
+async fn answer(script: &Script, path: String, headers: &HeaderMap, body: Value) -> Value {
     let header = |name: &str| {
         headers
             .get(name)
@@ -199,6 +201,7 @@ async fn complete(
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .push(UpstreamCall {
+            path,
             authorization: header("authorization"),
             secret: header(SECRET_HEADER),
             body,
@@ -214,12 +217,27 @@ async fn complete(
         .wait_for(|held| held.is_none_or(|through| arrival <= through))
         .await
         .expect("the hold sender lives with the script");
-    let message = script
+    script
         .replies
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .pop_front()
-        .unwrap_or_else(|| text("DONE"));
+        .unwrap_or_else(|| text("DONE"))
+}
+
+/// Text content of a scripted text message.
+fn content(message: &Value) -> &str {
+    message["content"].as_str().unwrap_or_default()
+}
+
+/// Answer one Chat Completions request with the next scripted message and
+/// usage.
+async fn complete(
+    State(script): State<Arc<Script>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let message = answer(&script, "/v1/chat/completions".to_owned(), &headers, body).await;
     let finish_reason = if message.get("tool_calls").is_some() {
         "tool_calls"
     } else {
@@ -232,6 +250,62 @@ async fn complete(
         "model": "gpt-5-5",
         "choices": [{ "index": 0, "message": message, "finish_reason": finish_reason }],
         "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 }
+    }))
+}
+
+/// Answer one Responses request with the next scripted text.
+async fn respond(
+    State(script): State<Arc<Script>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let message = answer(&script, "/v1/responses".to_owned(), &headers, body).await;
+    Json(json!({
+        "id": "resp_workflow",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "model": "gpt-5-5",
+        "output": [{ "type": "message", "id": "msg_workflow", "status": "completed", "role": "assistant",
+                     "content": [{ "type": "output_text", "text": content(&message), "annotations": [] }] }],
+        "usage": { "input_tokens": 5, "output_tokens": 2, "total_tokens": 7 }
+    }))
+}
+
+/// Answer one Anthropic Messages request with the next scripted text.
+async fn message(
+    State(script): State<Arc<Script>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let message = answer(&script, "/v1/messages".to_owned(), &headers, body).await;
+    Json(json!({
+        "id": "msg_workflow",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-5",
+        "content": [{ "type": "text", "text": content(&message) }],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": { "input_tokens": 5, "output_tokens": 2 },
+        "container": null
+    }))
+}
+
+/// Answer one Gemini `generateContent` request with the next scripted text.
+async fn generate(
+    State(script): State<Arc<Script>>,
+    axum::extract::Path(call): axum::extract::Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let message = answer(&script, format!("/v1beta/models/{call}"), &headers, body).await;
+    Json(json!({
+        "candidates": [{ "content": { "role": "model", "parts": [{ "text": content(&message) }] },
+                         "finishReason": "STOP", "index": 0 }],
+        "usageMetadata": { "promptTokenCount": 5, "candidatesTokenCount": 2, "totalTokenCount": 7 },
+        "modelVersion": "gemini-2.5-flash",
+        "responseId": "resp_workflow"
     }))
 }
 
@@ -406,24 +480,42 @@ impl Fixture {
     /// # Panics
     /// Panics when either administration request is refused.
     async fn deploy(&self) {
+        self.deploy_model("openai", "authorization", "gpt-5-5", &["chat_completions"])
+            .await;
+    }
+
+    /// Submit [`PROVIDER_KEY`] as the `{provider}-key` credential and one
+    /// built-in `provider` deployment of `model` serving `capabilities`,
+    /// authenticated by `header`, as the administrator.
+    ///
+    /// # Panics
+    /// Panics when either administration request is refused.
+    async fn deploy_model(&self, provider: &str, header: &str, model: &str, capabilities: &[&str]) {
         let token = self.token(&self.admin).await;
+        let credential = format!("{provider}-key");
+        let name = model.replace('.', "-");
+        let auth = if header == "authorization" {
+            json!({ "bearer": { "credential": credential } })
+        } else {
+            json!({ "api_key_header": { "header": header, "credential": credential } })
+        };
         for (route, body) in [
             (
-                "provider-credentials/openai-key",
+                format!("provider-credentials/{credential}"),
                 json!({
-                    "name": "openai-key",
-                    "provider": "openai",
+                    "name": credential,
+                    "provider": provider,
                     "source": { "managed_secret": { "secret": PROVIDER_KEY } },
                 }),
             ),
             (
-                "provider-deployments/gpt-5-5",
+                format!("provider-deployments/{name}"),
                 json!({
-                    "name": "gpt-5-5",
-                    "model": { "provider": "openai", "model": "gpt-5-5" },
-                    "adapter": "openai",
-                    "auth": { "bearer": { "credential": "openai-key" } },
-                    "capabilities": ["chat_completions"],
+                    "name": name,
+                    "model": { "provider": provider, "model": model },
+                    "adapter": provider,
+                    "auth": auth,
+                    "capabilities": capabilities,
                     "routing_weight": 1,
                 }),
             ),
@@ -1016,6 +1108,45 @@ async fn query_rows(fixture: &Fixture, token: &str, sql: &str) -> usize {
         rows += batch.num_rows();
     }
     rows
+}
+
+/// A gateway Workflow `name` whose Agent's Prompt has the declarative
+/// `prompt` spec lines and whose `steps` all target that Agent.
+///
+/// # Panics
+/// Panics when a bundle file cannot be written.
+fn declared_review(name: &str, prompt: &str, steps: &str) -> TempDir {
+    let temp = TempDir::new().expect("bundle directory creates");
+    let write = |file: &str, body: String| {
+        std::fs::write(temp.path().join(file), body).expect("bundle file writes");
+    };
+    write(
+        "prompt.yaml",
+        format!(
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  space: engineering\n  name: {name}-prompt\n  version: \"1.0.0\"\nspec:\n{prompt}  messages:\n    - \"Answer about {{{{code}}}}\"\n"
+        ),
+    );
+    write(
+        "agent.yaml",
+        format!(
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  space: engineering\n  name: {name}-agent\n  version: \"1.0.0\"\nspec:\n  prompt: ./prompt.yaml\n  tool_names: []\n  run_config:\n    max_iterations: 4\n"
+        ),
+    );
+    write(
+        "workflow.yaml",
+        format!(
+            "apiVersion: wyrd/v1\nkind: Workflow\nmetadata:\n  space: engineering\n  name: {name}\n  version: \"1.0.0\"\nspec:\n  llm_route:\n{WYRD_GATEWAY}\n  inputs:\n    code:\n      type: str\n      value: \"\"\n  steps:\n{steps}"
+        ),
+    );
+    temp
+}
+
+/// One step `id` of a [`declared_review`] Workflow, with optional extra
+/// step lines.
+fn declared_step(id: &str, extra: &str) -> String {
+    format!(
+        "    - id: {id}\n      action:\n        type: agent\n        target: ./agent.yaml\n      inputs:\n        code: input.code\n{extra}"
+    )
 }
 
 /// A Workflow chaining `depth` steps of the registered `security-reviewer`
@@ -2041,10 +2172,16 @@ async fn declared_tools_use_captured_scopes_and_owned_services() {
 /// its tenant-assigned binding with the binding's secret header and no
 /// gateway key, ledger entry, or decision. A binding assigned to another
 /// tenant is unavailable before any call, and no secret reaches a run.
+/// Anthropic Messages, Gemini `generateContent`, and `OpenAI` Responses
+/// Prompts each reach their own provider path and decode their own answer;
+/// a deployment lacking the operation is refused before any provider call;
+/// concurrent steps each keep their own stored fallback order; a call is
+/// bounded by its run's remaining time; and cancelling one run leaves a
+/// concurrent run's call alone.
 ///
 /// # Panics
-/// Panics when an upstream header, ledger count, decision count, run
-/// outcome, or refusal differs.
+/// Panics when an upstream header, path, model, ledger count, decision
+/// count, run outcome, or refusal differs.
 async fn server_routes_keep_gateway_and_external_ownership() {
     let fixture = Fixture::start(ServerWorkflowConfig::default()).await;
     let secrets = TempDir::new().expect("secret directory creates");
@@ -2145,6 +2282,163 @@ async fn server_routes_keep_gateway_and_external_ownership() {
     let invocations = fixture.decisions("gateway.invoke").await;
     let invocations = made_for(&invocations, &fixture.runner, "allowed");
     assert_eq!(invocations.len(), 1, "{invocations:?}");
+
+    // Each native dialect a stored Prompt selects reaches its own provider
+    // path through the in-process gateway and decodes its own answer.
+    fixture
+        .deploy_model("anthropic", "x-api-key", "claude-sonnet-5", &["chat_completions"])
+        .await;
+    fixture
+        .deploy_model("gemini", "x-goog-api-key", "gemini-2.5-flash", &["chat_completions"])
+        .await;
+    fixture
+        .deploy_model("openai", "authorization", "gpt-5-4", &["chat_completions", "responses"])
+        .await;
+    let invoke = |provider: &str| {
+        Permission::gateway_invoke(GatewayAccess::Provider {
+            provider: provider.parse().expect("provider id"),
+        })
+    };
+    fixture
+        .server
+        .seed_role(
+            "workflow_dialects",
+            &[
+                Permission::workflow_run(),
+                Permission::card_read(),
+                invoke("openai"),
+                invoke("anthropic"),
+                invoke("gemini"),
+            ],
+        )
+        .await
+        .expect("dialect role seeds");
+    let caller = fixture
+        .principal("workflow-dialects", &["workflow_dialects"])
+        .await;
+    let caller = &caller.token;
+    let answer = declared_step("answer", "");
+    for (name, prompt, path) in [
+        (
+            "anthropic-review",
+            "  provider: anthropic\n  model: claude-sonnet-5\n",
+            "/v1/messages",
+        ),
+        (
+            "gemini-review",
+            "  provider: gemini\n  model: gemini-2.5-flash\n",
+            "/v1beta/models/gemini-2.5-flash:generateContent",
+        ),
+        (
+            "responses-review",
+            "  provider: openai\n  model: gpt-5-4\n  operation: responses\n",
+            "/v1/responses",
+        ),
+    ] {
+        let bundle = declared_review(
+            name,
+            prompt,
+            &format!("{answer}  outputs:\n    answer: steps.answer.output.text\n"),
+        );
+        fixture.register(&bundle.path().join("workflow.yaml")).await;
+        let before = fixture.upstream.arrivals();
+        fixture.upstream.reply(text(name));
+        let run = fixture.accept(caller, &run_request(name, "x")).await;
+        let run = fixture.terminal(caller, &run).await;
+        assert_eq!(run.status, WorkflowRunStatus::Succeeded, "{name}: {run:?}");
+        assert_eq!(run.outputs["answer"], json!(name));
+        let calls = fixture.upstream.calls();
+        assert_eq!(calls.len(), before + 1, "{name}");
+        assert_eq!(calls[before].path, path);
+    }
+
+    // A deployment lacking the operation is refused before any provider
+    // call.
+    let bundle = declared_review(
+        "chat-only-review",
+        "  provider: openai\n  model: gpt-5-5\n  operation: responses\n",
+        &format!("{answer}  outputs:\n    answer: steps.answer.output.text\n"),
+    );
+    fixture.register(&bundle.path().join("workflow.yaml")).await;
+    let before = fixture.upstream.arrivals();
+    let run = fixture
+        .accept(caller, &run_request("chat-only-review", "x"))
+        .await;
+    let run = fixture.terminal(caller, &run).await;
+    assert_eq!(run.status, WorkflowRunStatus::Failed, "{run:?}");
+    assert_eq!(
+        run.steps["answer"].error.as_ref().map(|error| error.code.as_str()),
+        Some("WYRD_GATEWAY_404_MODEL_UNAVAILABLE"),
+        "{run:?}"
+    );
+    assert_eq!(fixture.upstream.arrivals(), before);
+
+    // Concurrent steps keep their own stored fallback: the first deployed
+    // candidate in each step's order serves it.
+    let fallback = |models: &[&str]| {
+        let candidates: String = models
+            .iter()
+            .map(|model| format!("          - provider: openai\n            model: {model}\n"))
+            .collect();
+        format!("      fallback:\n        candidates:\n{candidates}")
+    };
+    let steps = format!(
+        "{}{}  outputs:\n    left: steps.left.output.text\n    right: steps.right.output.text\n",
+        declared_step("left", &fallback(&["gpt-5-5-missing", "gpt-5-4", "gpt-5-5"])),
+        declared_step("right", &fallback(&["gpt-5-5"])),
+    );
+    let bundle = declared_review(
+        "fallback-review",
+        "  provider: openai\n  model: gpt-5-5-undeployed\n",
+        &steps,
+    );
+    fixture.register(&bundle.path().join("workflow.yaml")).await;
+    fixture.upstream.hold();
+    let before = fixture.upstream.arrivals();
+    let run = fixture
+        .accept(caller, &run_request("fallback-review", "x"))
+        .await;
+    fixture.upstream.wait_arrivals(before + 2).await;
+    fixture.upstream.release();
+    let run = fixture.terminal(caller, &run).await;
+    assert_eq!(run.status, WorkflowRunStatus::Succeeded, "{run:?}");
+    let mut models: Vec<String> = fixture.upstream.calls()[before..]
+        .iter()
+        .map(|call| call.body["model"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    models.sort();
+    assert_eq!(models, ["gpt-5-4", "gpt-5-5"]);
+
+    // A call is bounded by its run's remaining time, and cancelling one run
+    // leaves a concurrent run's call alone.
+    fixture.upstream.hold();
+    let mut short = run_request("gateway-review", "x");
+    short["timeout_seconds"] = json!(1);
+    let timed = fixture.accept(caller, &short).await;
+    let timed = fixture.terminal(caller, &timed).await;
+    assert_eq!(timed.status, WorkflowRunStatus::TimedOut, "{timed:?}");
+    assert_complete(&timed);
+    let before = fixture.upstream.arrivals();
+    let cancelled = fixture
+        .accept(caller, &run_request("gateway-review", "x"))
+        .await;
+    let survivor = fixture
+        .accept(caller, &run_request("gateway-review", "x"))
+        .await;
+    fixture.upstream.wait_arrivals(before + 2).await;
+    let (status, body) = fixture
+        .cancel(caller, &cancelled.run_id.to_string())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    fixture.upstream.release();
+    assert_eq!(
+        fixture.terminal(caller, &cancelled).await.status,
+        WorkflowRunStatus::Cancelled
+    );
+    assert_eq!(
+        fixture.terminal(caller, &survivor).await.status,
+        WorkflowRunStatus::Succeeded
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

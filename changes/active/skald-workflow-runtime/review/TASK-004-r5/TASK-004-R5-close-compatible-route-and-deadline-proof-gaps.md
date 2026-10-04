@@ -165,3 +165,46 @@ The implementation report must identify the two corrected existing dispatch
 owners, show the actual omitted/longer/shorter query outcomes, record the exact
 focused commands and broader lane results, and confirm that no prohibited
 mechanism or unrelated behavior entered the diff.
+
+## Revision 14 evidence
+
+Commits b86872c29 (one OpenAI Chat variant with an optional Prompt
+provider), 56600aa58 (Vertex GenerateContent folded into the Google schema),
+fbab9c978 (Python Vertex accessors removed), plus the evidence commit.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `ProviderRequest::OpenAiChatCompatible` and every arm/wrapper/builder path for it deleted | `skald-spec/src/request.rs`, `skald-agent/src/request_builder.rs`, `skald-providers/src/clients/external.rs`, `skald-cache/src/key.rs`, `skald-prompt/src/python/{openai_chat_request,shared}.rs`, `wyrd-server/src/components/gateway/workflow.rs`, `wyrd-client/src/workflow/gateway.rs`; no remaining sites | `mise run lints`, `test:skald` | PASS |
+| `Prompt.provider: Option<ProviderName>` with serde default/skip; dispatch uses it, else the request dialect default | `skald-spec/src/prompt.rs` (`Prompt::provider`); `skald-runtime/src/dispatch.rs`, `skald-agent/src/loop_runtime.rs`, `skald-workflow/src/{route,workflow}.rs`; PromptSpec hash projection carries it in `wyrd-spec/src/card/prompt/hash.rs` | `custom_provider_prompt_round_trips_and_dispatches_to_its_client` | PASS |
+| Gateway routes ignore `Prompt.provider` for upstream selection; `wyrd_gateway` model identity is `<provider>/<model>` from `Prompt::provider()` | `skald-workflow/src/route.rs` (`gateway_model`, `protocol_matches`) | `test:gateway:journey`, `test:wyrd` | PASS |
+| Python custom-provider builder yields a plain `OpenAiChatCompletion` with `provider: Custom(name)`; RawV1 keeps its `ProviderName` | `skald-prompt/src/prompt.rs` | `py:test:unit`, `py:test:integration` | PASS |
+| `ProviderRequest::Vertex`, `VertexGenerateContentRequest`, `ProviderResponse::VertexGenerateContent` deleted; `VertexPredict` kept | `skald-spec/src/{request,response}.rs`, `wire/vertex_generate.rs` and its snapshot removed | `test:skald`, `codegen:check` | PASS |
+| A Vertex Prompt is a `GeminiGenerateContent` body with `provider = Some(Vertex)`; native dispatch reaches VertexClient | `skald-spec/src/authoring.rs`, `skald-prompt/src/builder.rs`, `skald-providers/src/clients/vertex.rs` | `vertex_prompt_round_trips_and_dispatches_to_the_vertex_client`, `agent_timeout` Google/Vertex case | PASS |
+| Wyrd gateway projection picks `IngressDialect::VertexGenerateContent` for a GenerateContent body on a vertex model; Revision 13 Vertex success proof kept | `wyrd-server/src/components/gateway/workflow.rs` | `WYRD_TEST_PACKAGES=wyrd-server mise run test:wyrd`, `test:gateway:journey` | PASS |
+| `ext_gateway` `vertex_generate_content` protocol accepts a GenerateContent body | `skald-workflow/src/route.rs` (`protocol_matches`) | `test:skald` | PASS |
+| wyrd-client local gateway behavior for a vertex model unchanged | `wyrd-client/src/workflow/gateway.rs` refuses a GenerateContent body for a vertex model; before Revision 14 it had no Vertex arm and `workflow_transport` asserted "Vertex is refused locally", so the refusal is preserved, now expressed against the Gemini body | `test:shared` (`workflow_transport`) | PASS |
+| Python `ProviderRequest.vertex()`, `ProviderResponse.vertex()`, `VertexRequest`, `VertexResponse` deleted; `Prompt.vertex(...)` kept; `.provider` getters document the dialect default and that `Prompt.provider` is the destination | `skald-prompt/src/prompt.rs`, `skald-prompt/src/python/{google,response,mod}.rs`, `stubs/prompt.pyi` (generated `__init__.pyi` via `mise run codegen:regen`) | `codegen:check`, `py:typecheck`, `check:pyo3-scope` | PASS |
+| No migration, alias, or compatibility reader; fixtures migrated mechanically; FIND-23 journey kept | `tests/fixtures/workflow-loading/**/prompts/*.yaml`, `wyrd-server/tests/pg_workflow_runs.rs` inline YAML | `server_routes_keep_gateway_and_external_ownership` (focused command above) | PASS |
+| Schemas and stubs regenerated, not hand-edited | `mise run codegen:regen` | `mise run codegen:check` | PASS |
+
+Focused unit commands:
+
+```bash
+mise exec -- cargo nextest run --locked -p skald-agent --test agent_journey -E 'test(=custom_provider_prompt_round_trips_and_dispatches_to_its_client) | test(=vertex_prompt_round_trips_and_dispatches_to_the_vertex_client)'
+mise exec -- uv run --project sdks/wyrd-sdk-python pytest sdks/wyrd-sdk-python/tests/unit/cards/prompt/test_prompt_render.py::test_render_preserves_provider_request_variant
+```
+
+Diagnosis, `py:test:unit`:
+
+- **Symptom:** `test_prompt_render.py::test_render_preserves_provider_request_variant[prompt4]` (Vertex) failed `'google' == 'vertex'`.
+- **Evidence:** the test asserted `rendered.provider == prompt.provider`. `rendered` is a `ProviderRequest`, whose `.provider` reports the dialect default. `Prompt.provider` reports the dispatch destination.
+- **Cause:** Revision 14 makes a Vertex Prompt a Google GenerateContent body with `provider: vertex`, so the two values legitimately differ. The assertion compared destination to dialect.
+- **Fix site:** the lead approved changing the assertion to the test's intent, that rendering preserves the request variant: `rendered.provider == prompt.request.provider`, with no Vertex special case. No production change.
+
+Broader lanes, run once on the final tree: fmt, lints, `git diff --check`,
+codegen:check, check:client-tier, check:pyo3-scope, test:skald, test:shared,
+`WYRD_TEST_PACKAGES=wyrd-server mise run test:wyrd`, test:gateway:journey,
+py:format, py:lints, py:test:unit, py:typecheck, py:test:integration,
+ts:test:unit, ts:test:integration, test:bifrost:journey:oracle: all exit 0.
+Non-goals stayed excluded: no compatibility route, alias, migration, or new
+mechanism was added.

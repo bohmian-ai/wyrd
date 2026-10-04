@@ -146,7 +146,11 @@ fn rewrite_operation(phase: ForgeIcebergRewritePhase) -> String {
 }
 
 /// Maximum number of attempt-consuming failures before audited terminalization.
-const ATTEMPT_BOUND: u32 = 5;
+///
+/// Promotion also bounds its operation-generation walk by it: each reset
+/// generation ends one attempt, so a task never resets more generations than
+/// it can attempt.
+pub(super) const ATTEMPT_BOUND: u32 = 5;
 
 /// Returns whether the next classified failure must terminalize at the worker boundary.
 #[must_use]
@@ -5245,6 +5249,10 @@ impl ForgeWorker {
             return Ok(());
         }
         let plan = Self::promotion_plan(claim)?;
+        let operation_id = self
+            .forge
+            .promotion_operation_id(binding, claim.task_id)
+            .await?;
         self.forge
             .settle_promotion(
                 lease,
@@ -5261,7 +5269,7 @@ impl ForgeWorker {
                             ForgeScribePromotionPhase::Committed
                         }
                     },
-                    operation_id: Self::promotion_operation_id(claim),
+                    operation_id,
                     base_snapshot_id: claim.base_snapshot_id,
                     committed_snapshot_id: evidence.committed_snapshot_id,
                 },
@@ -7237,7 +7245,10 @@ impl ForgeWorker {
         stop: &CancellationToken,
     ) -> Result<ForgeDispatchResult, ForgeError> {
         let plan = Self::promotion_plan(claim)?;
-        let operation_id = Self::promotion_operation_id(claim);
+        let operation_id = self
+            .forge
+            .promotion_operation_id(binding, claim.task_id)
+            .await?;
         self.forge
             .settle_promotion(
                 lease,
@@ -7345,7 +7356,9 @@ impl ForgeWorker {
     /// been read back without this operation's effect, so the commit certainly
     /// did not land. Closing here is what keeps a successor from reconciling a
     /// commit that never happened; `committed_snapshot_id` stays `None`
-    /// because no snapshot was settled.
+    /// because no snapshot was settled. A reset operation is never reopened:
+    /// the task's next attempt resolves the next operation generation through
+    /// [`Forge::promotion_operation_id`] and prepares that one instead.
     ///
     /// # Errors
     ///
@@ -7390,17 +7403,6 @@ impl ForgeWorker {
                     detail: "Forge task parameters must be an object".to_owned(),
                 })?;
         ScribePromotionPlan::from_parameters(parameters)
-    }
-
-    /// Returns the stable operation identity for one promotion task.
-    ///
-    /// The durable task identity *is* the operation identity. A task is
-    /// enqueued once per exact file set and is retried in place rather than
-    /// re-planned, so binding the operation to it makes the identity survive
-    /// every retry, restart, and takeover without a second durable column to
-    /// keep consistent.
-    const fn promotion_operation_id(claim: &ForgeTaskClaim) -> Uuid {
-        claim.task_id
     }
 
     /// Marks one claimed task running and extends its claim lease once.

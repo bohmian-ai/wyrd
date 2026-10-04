@@ -153,6 +153,73 @@ async fn scribe_promotion_integration_conflict_revalidates_before_retry() {
     );
 }
 
+/// A promotion whose operation was reset is retried under a fresh operation.
+///
+/// Two definite conflicts exhaust the single revalidated retry, so the attempt
+/// closes its operation as `Reset` and the task waits as `retryable`. A Reset
+/// operation can never be reopened, so the task's next attempt must prepare
+/// and commit the next operation generation. Reusing the reset identity would
+/// instead fail every remaining attempt on the reopen refusal while the
+/// retryable task holds the table's promotion behind it. The production retry
+/// backoff is brought forward rather than slept through.
+#[tokio::test]
+async fn scribe_promotion_integration_reset_operation_retries_under_fresh_operation() {
+    let fixture = PromotionIntegrationFixture::start("promotion_reset_retry").await;
+    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let catalog = PromotionCatalogSeam::new(
+        fixture.catalog.iceberg_catalog(),
+        object_store.read_counter(),
+    );
+    catalog.reject_next_commits(2);
+
+    let forge = SupervisedPromotion::start(
+        &fixture,
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    let mut forge = forge.run_one_failure_while(async {}).await;
+    assert_eq!(
+        fixture.promotion_phases().await,
+        vec!["reset".to_owned()],
+        "a conflict that survives the retry resets the operation"
+    );
+
+    fixture.clear_task_backoff().await;
+    forge.restart_worker();
+    forge.run_one_success().await;
+    let errors = forge.returned_errors();
+    forge.shutdown().await;
+
+    assert!(
+        !errors
+            .iter()
+            .any(|error| error.contains("cannot be reopened")),
+        "no attempt tried to reopen the reset operation: {errors:?}"
+    );
+    assert_eq!(
+        fixture.promotion_phases().await,
+        vec!["reset".to_owned(), "committed".to_owned()],
+        "the retry commits a second operation generation and leaves the reset one closed"
+    );
+    let settled = fixture.file_rows().await;
+    assert!(
+        settled
+            .iter()
+            .all(|row| row.compacted && row.committed_snapshot_id.is_some()),
+        "the fresh operation promoted every row: {settled:?}"
+    );
+    let tasks = fixture.forge_tasks().await;
+    assert_eq!(
+        tasks
+            .iter()
+            .map(|task| (task.state.as_str(), task.attempt_count))
+            .collect::<Vec<_>>(),
+        vec![("succeeded", 1)],
+        "the one task succeeded on its first retry: {tasks:?}"
+    );
+}
+
 /// The operation deadline bounds the conflict retry to zero second attempts.
 ///
 /// The commit is parked at the real catalog seam, the Forge clock is moved past

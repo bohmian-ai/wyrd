@@ -145,8 +145,11 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
     //    concurrent identical query provably arrives while that load is still
     //    in flight rather than after it. The event-time floor excludes the
     //    phase-1 object before its footer, so the stalled range belongs to the
-    //    identity under test and to nothing else.
-    let since_phase_one = Utc::now();
+    //    identity under test and to nothing else. Scribe stamps event time
+    //    from PostgreSQL, so the floor is read from that same clock.
+    let since_phase_one: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&cluster.pg_fixture().superuser_pool().await?)
+        .await?;
     owner
         .write(&fqn, &journey_schema(), [journey_row(3, "row-3")])
         .await?;

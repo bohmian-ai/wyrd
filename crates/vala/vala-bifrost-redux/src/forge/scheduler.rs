@@ -178,10 +178,20 @@ impl Forge {
         shutdown: &CancellationToken,
         readiness: &super::ForgeRoleReadiness,
     ) {
-        // The first heartbeat waits one period, so a test that owns the
-        // trigger arranges its scenario before any unsolicited pass.
+        // Production elects at once on boot. A test that owns the trigger
+        // arranges its scenario first, so its first heartbeat waits a period.
+        #[cfg(feature = "test-support")]
+        let quiet = self
+            .core
+            .scheduler_trigger
+            .as_ref()
+            .and_then(ForgeSchedulerTrigger::owner_for_test)
+            .is_some();
+        #[cfg(not(feature = "test-support"))]
+        let quiet = false;
+        let now = tokio::time::Instant::now();
         let mut heartbeat = tokio::time::interval_at(
-            tokio::time::Instant::now() + LEADER_HEARTBEAT,
+            if quiet { now + LEADER_HEARTBEAT } else { now },
             LEADER_HEARTBEAT,
         );
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

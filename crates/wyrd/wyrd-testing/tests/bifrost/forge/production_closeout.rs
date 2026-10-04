@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::public_support::{
     JourneyTable, ManagedRow, append_values, canonical_order, enable_compaction, read_managed_rows,
-    register_table, tenant_client, unique_table,
+    register_table, set_table_properties, tenant_client, unique_table,
 };
 use arrow::array::{BinaryBuilder, Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -385,29 +385,29 @@ impl CloseoutJourney {
 
     /// Observes an exact production expired-cleanup delete with protection held.
     ///
-    /// The post-delete pause permits inspection of its still-prepared durable
-    /// claim before settlement; no SQL transaction spans the storage effect.
+    /// The elected leader's maintenance pass executes expired cleanup on its
+    /// own executor, so the delete is paused on the leader node's real object
+    /// store. The post-delete pause permits inspection of its still-prepared
+    /// durable claim before settlement; no SQL transaction spans the storage
+    /// effect.
     ///
     /// # Panics
-    /// Panics if deletion stalls, has the wrong owner/route, loses a protected
-    /// object, or lacks its terminal settlement.
+    /// Panics if no node holds the leader term, deletion stalls, has the wrong
+    /// route, loses a protected object, or lacks its terminal settlement.
     async fn collect_exact(
         &self,
         binding: &TenantTableBinding,
         path: &str,
         protected: &BTreeMap<String, DataFile>,
     ) {
-        let worker = self
-            .cluster
-            .server_by_node(self.worker_node)
-            .expect("worker node");
-        let control = worker
+        let leader = self.leader();
+        let control = leader
             .forge_object_store_control_for_test()
             .expect("real storage control");
         control.pause_after_delete_for_path(path);
         let drive = async {
             for _ in 0..12 {
-                self.scheduler_pass().await;
+                self.maintenance_pass().await;
                 self.drain_tasks().await;
                 if self.object_missing(path).await {
                     return;
@@ -426,8 +426,8 @@ impl CloseoutJourney {
                 .tenant_conn_for(binding.tenant)
                 .await
                 .expect("tenant inspection");
-            let rows: Vec<(Uuid, Uuid, serde_json::Value)> = sqlx::query_as(
-                "SELECT t.task_id, t.claimed_by, t.evidence FROM vala.forge_tasks t \
+            let rows: Vec<(Uuid, serde_json::Value)> = sqlx::query_as(
+                "SELECT t.task_id, t.evidence FROM vala.forge_tasks t \
                  JOIN vala.forge_tasks s ON s.task_id=(t.plan->'parameters'->>'source_task_id')::uuid \
                  WHERE t.strategy='expired_cleanup' AND t.state='prepared' \
                  AND s.strategy='snapshot_expiry' AND s.state='succeeded'",
@@ -435,12 +435,11 @@ impl CloseoutJourney {
             conn.commit().await.expect("inspection releases SQL");
             let matching: Vec<_> = rows
                 .into_iter()
-                .filter_map(|(task, owner, raw)| {
+                .filter_map(|(task, raw)| {
                     let evidence = evidence_from_json(raw).expect("validated cleanup evidence");
                     let index = usize::try_from(evidence.prepared_candidate_index?)
                         .expect("candidate index");
-                    (evidence.cleanup_candidates[index].path.as_str() == path)
-                        .then_some((task, owner))
+                    (evidence.cleanup_candidates[index].path.as_str() == path).then_some(task)
                 })
                 .collect();
             assert_eq!(
@@ -448,9 +447,8 @@ impl CloseoutJourney {
                 1,
                 "exact expired-cleanup candidate owns the delete"
             );
-            assert_eq!(matching[0].1, self.worker_node.as_uuid());
             control.release_completed_delete();
-            matching[0].0
+            matching[0]
         };
         let ((), task) = tokio::join!(drive, inspect);
         let mut conn = self
@@ -473,8 +471,8 @@ impl CloseoutJourney {
             .expect("lineage inspection releases SQL");
         assert!(deleted > 0);
         eprintln!(
-            "expired cleanup task={task}, worker={}, physically deleted={path}",
-            self.worker_node.as_uuid()
+            "expired cleanup task={task}, leader={}, physically deleted={path}",
+            leader.node_id().as_uuid()
         );
     }
 
@@ -797,15 +795,18 @@ impl CloseoutJourney {
         .expect("the leader's retry settles the refused table's debt");
     }
 
-    /// Settles the planning pass the coordinator runs as soon as it starts.
+    /// Settles the coordinator's boot maintenance pass, then runs its first
+    /// leader heartbeat.
     ///
-    /// A coordinator plans immediately on start, so a fixture that drives its
-    /// own passes must settle that boot pass before arranging the world.
-    /// Otherwise the boot pass plans concurrently with the first driven pass
-    /// and the run observes tasks neither pass alone accounts for.
+    /// The maintenance timer ticks immediately on start, so a fixture that
+    /// drives its own passes must settle that boot pass before arranging the
+    /// world; otherwise it runs concurrently with the first driven pass. The
+    /// first heartbeat waits a full period, so one driven heartbeat then takes
+    /// the leader term and promotes owed Scribe debt before the journey reads
+    /// the table's published snapshot.
     ///
     /// # Panics
-    /// Panics if the boot pass does not complete in 15 seconds.
+    /// Panics if either pass does not complete within its bound.
     async fn await_boot_pass(&self) {
         tokio::time::timeout(
             PASS_BOUND,
@@ -813,7 +814,57 @@ impl CloseoutJourney {
                 .wait_for_forge_scheduler_passes_for_test(1),
         )
         .await
-        .expect("a freshly started coordinator completes its boot planning pass");
+        .expect("a freshly started coordinator completes its boot maintenance pass");
+        self.scheduler_pass().await;
+    }
+
+    /// Returns the running node whose Forge coordinator holds the leader term.
+    ///
+    /// # Panics
+    /// Panics unless exactly one running node holds a term.
+    fn leader(&self) -> &WyrdTestServer {
+        let mut leaders = self.cluster.servers().filter(|server| {
+            server
+                .state()
+                .forge_coordinator()
+                .and_then(|forge| forge.held_leader_term())
+                .is_some()
+        });
+        let leader = leaders
+            .next()
+            .expect("one node holds the Forge leader term");
+        assert!(leaders.next().is_none(), "exactly one Forge leader");
+        leader
+    }
+
+    /// Requests and observes one leader maintenance pass on every coordinator.
+    ///
+    /// Only the term holder runs manifest rewrite, expiry, and cleanup; every
+    /// other coordinator skips the tick but still reports it, so waiting on
+    /// each proves the leader's pass returned without guessing which leads.
+    /// Nodes without a Forge coordinator run no maintenance loop.
+    ///
+    /// # Panics
+    /// Panics if any node does not complete the requested pass in time.
+    async fn maintenance_pass(&self) {
+        let pending: Vec<_> = self
+            .cluster
+            .servers()
+            .filter(|server| server.state().forge_coordinator().is_some())
+            .map(|server| {
+                let before = server.completed_forge_scheduler_passes_for_test();
+                server.request_forge_maintenance_pass_for_test();
+                (server, before)
+            })
+            .collect();
+        for (server, before) in pending {
+            tokio::time::timeout(
+                PASS_BOUND,
+                server.wait_for_forge_scheduler_passes_for_test(before + 1),
+            )
+            .await
+            .expect("production maintenance responds to its trigger");
+        }
     }
 
     /// Requests and observes one real scheduler pass before inspecting SQL.
@@ -1433,11 +1484,7 @@ impl ReaderCleanupJourney {
     /// # Panics
     /// Panics if public setup, promotion, or compaction fails.
     async fn start() -> Self {
-        let mut roles = CloseoutJourney::start_with_config(ForgeConfig {
-            snapshot_expiry_enabled: true,
-            ..ForgeConfig::default()
-        })
-        .await;
+        let mut roles = CloseoutJourney::start_with_config(ForgeConfig::default()).await;
         let tenant = roles.cluster.data_tenant_id();
         let neighbour = roles
             .cluster
@@ -1705,15 +1752,14 @@ impl OrphanJourney {
     /// Panics if public setup, promotion, or the refused publication does not
     /// leave at least one closed output that no snapshot names.
     async fn start() -> Self {
-        // The production collection route ages objects against the wall clock
-        // its planning demand is stamped with, not the manual maintenance
-        // clock, so the terminal floor has to be a real interval this journey
-        // can outlive. Two seconds is long enough that the object is provably
+        // The leader's collection pass ages objects against the Forge clock it
+        // reads when the pass runs, and this journey never advances that clock,
+        // so the terminal floor has to be a real interval this journey can
+        // outlive. Two seconds is long enough that the object is provably
         // young while its own rewrite is still open and short enough that the
         // bounded collection loop below crosses it.
         let mut roles = CloseoutJourney::start_with_config(ForgeConfig {
             orphan_gc_ttl: std::time::Duration::from_secs(2),
-            maintenance_trigger_interval: std::time::Duration::from_millis(1),
             ..ForgeConfig::default()
         })
         .await;
@@ -1730,6 +1776,20 @@ impl OrphanJourney {
         let table = roles
             .register_payload_table(tenant, unique_table("never_published"))
             .await;
+        // Collection must be proved by difference: it removes the tracked
+        // generation and nothing else. Snapshot expiry would legitimately
+        // delete replaced outputs once the clock advances, so this table opts
+        // out of it and keeps leader-maintenance membership through manifest
+        // rewrite, which deletes no data object.
+        set_table_properties(
+            roles.scribe(),
+            &table.binding,
+            &[
+                ("wyrd.forge.enable-snapshot-expiration", "false"),
+                ("wyrd.forge.enable-manifest-rewrite", "true"),
+            ],
+        )
+        .await;
         let neighbour_table = register_table(roles.scribe(), neighbour, &table.name).await;
         enable_compaction(roles.scribe(), &neighbour_table.binding).await;
         let writer = tenant_client(roles.scribe(), tenant).await;
@@ -1764,10 +1824,9 @@ impl OrphanJourney {
             .expect("coordinator starts");
         roles.await_boot_pass().await;
         // No maintenance-clock advance here. This journey's terminal age floor
-        // is a real interval measured by the production planning demand, so a
+        // is a real interval measured by the leader's collection pass, so a
         // manual clock running ahead of storage would report every object as
         // already old and erase the young window the scenario has to observe.
-        // The table owes maintenance on its own trigger interval instead.
         roles.compact_small_table(&table.binding).await;
 
         // One more acknowledged flush, promoted on its own pass. Promotion is a
@@ -2026,7 +2085,7 @@ impl OrphanJourney {
             .coordinator()
             .completed_forge_scheduler_passes_for_test();
         for _ in 0..12 {
-            self.roles.scheduler_pass().await;
+            self.roles.maintenance_pass().await;
             self.roles.drain_tasks_allowing_injected_refusal().await;
             let mut remaining = false;
             for path in &self.orphans {
@@ -2047,7 +2106,7 @@ impl OrphanJourney {
                 .coordinator()
                 .completed_forge_scheduler_passes_for_test()
                 > before,
-            "collection ran through the existing scheduler trigger"
+            "collection ran through the leader maintenance trigger"
         );
         // Ownership is proved by difference, not by membership: every object
         // this table owned before the pass must survive it except the tracked

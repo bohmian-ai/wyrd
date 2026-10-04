@@ -1565,6 +1565,36 @@ impl WyrdTestCluster {
         }
     }
 
+    /// Runs one leader heartbeat on every Forge coordinator and waits for it.
+    ///
+    /// The first production heartbeat waits a full period, and a promotion
+    /// commit notice reaching no leader is dropped, so a journey that counts
+    /// commits toward compaction must elect its leader before writing. Each
+    /// coordinator first settles its immediate boot maintenance pass, which
+    /// counts on the same trigger, so the awaited pass is the heartbeat.
+    ///
+    /// # Panics
+    /// Panics when a coordinator does not complete either pass in 30 seconds.
+    pub async fn lead_forge_for_test(&self) {
+        const BOUND: Duration = Duration::from_secs(30);
+        for server in self
+            .servers()
+            .filter(|server| server.state().forge_coordinator().is_some())
+        {
+            tokio::time::timeout(BOUND, server.wait_for_forge_scheduler_passes_for_test(1))
+                .await
+                .expect("the coordinator completes its boot maintenance pass");
+            let before = server.completed_forge_scheduler_passes_for_test();
+            server.request_forge_scheduler_pass_for_test();
+            tokio::time::timeout(
+                BOUND,
+                server.wait_for_forge_scheduler_passes_for_test(before + 1),
+            )
+            .await
+            .expect("the coordinator completes the requested heartbeat");
+        }
+    }
+
     /// Return the uncertainty catalog control, when configured.
     #[must_use]
     pub fn commit_uncertainty_catalog(&self) -> Option<Arc<CommitUncertaintyCatalog>> {

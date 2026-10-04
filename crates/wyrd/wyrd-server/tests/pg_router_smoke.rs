@@ -1238,8 +1238,48 @@ const SNAPSHOT_PUBLICATION_CEILING: std::time::Duration = std::time::Duration::f
 /// is wedged rather than merely unready.
 #[cfg(feature = "test-support")]
 async fn drive_scheduler_pass(server: &WyrdTestServer, label: &str) {
+    drive_forge_pass(
+        server,
+        label,
+        WyrdTestServer::request_forge_scheduler_pass_for_test,
+    )
+    .await;
+}
+
+/// Requests one leader maintenance pass and waits until the timer loop returns.
+///
+/// Maintenance runs manifest rewrite, expiry, and cleanup apart from the
+/// heartbeat, so it publishes no readiness of its own; the caller drives a
+/// heartbeat pass afterwards to observe the coordinator bit.
+///
+/// # Panics
+///
+/// Panics when the requested pass does not complete within
+/// [`FORGE_READINESS_CEILING`].
+#[cfg(feature = "test-support")]
+async fn drive_maintenance_pass(server: &WyrdTestServer, label: &str) {
+    drive_forge_pass(
+        server,
+        label,
+        WyrdTestServer::request_forge_maintenance_pass_for_test,
+    )
+    .await;
+}
+
+/// Issues one test-trigger request and waits for the pass counter to advance.
+///
+/// Both the heartbeat and maintenance loops count a returned pass on the same
+/// trigger, so one bounded wait serves either request.
+///
+/// # Panics
+///
+/// Panics when the requested pass does not complete within
+/// [`FORGE_READINESS_CEILING`], which means the loop is not running or is
+/// wedged rather than merely unready.
+#[cfg(feature = "test-support")]
+async fn drive_forge_pass(server: &WyrdTestServer, label: &str, request: fn(&WyrdTestServer)) {
     let before = server.completed_forge_scheduler_passes_for_test();
-    server.request_forge_scheduler_pass_for_test();
+    request(server);
     tokio::time::timeout(
         FORGE_READINESS_CEILING,
         server.wait_for_forge_scheduler_passes_for_test(before + 1),
@@ -1253,12 +1293,12 @@ async fn drive_scheduler_pass(server: &WyrdTestServer, label: &str) {
     });
 }
 
-/// Waits for the planning pass the coordinator runs as soon as it starts.
+/// Waits for the maintenance pass the coordinator runs as soon as it starts.
 ///
-/// The scheduler's first tick is immediate, so a test that drives its own
-/// passes must observe the boot pass first; otherwise the next pass it drives
-/// is the boot pass still in flight, and its assertions describe a pass that
-/// ran before the test finished arranging the world.
+/// The leader maintenance timer's first tick is immediate, so a test that
+/// drives its own passes must observe the boot pass first; otherwise the next
+/// pass it drives is the boot pass still in flight, and its assertions describe
+/// a pass that ran before the test finished arranging the world.
 ///
 /// # Panics
 ///
@@ -1551,6 +1591,9 @@ async fn forge_coordinator_readiness_follows_a_completed_pass() {
         .expect("the default target selects a coordinator");
     let handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(scheduler));
 
+    // The boot maintenance pass counts on the same trigger, so settle it
+    // first; the driven pass is then the first heartbeat pass.
+    await_boot_scheduler_pass(&server, "boot maintenance pass").await;
     drive_scheduler_pass(&server, "first coordinator pass").await;
     assert!(
         forge.is_ready(),
@@ -1635,97 +1678,6 @@ async fn coordinator_standby_pass_is_ready() {
     assert!(
         readiness.is_ready(),
         "the first pass to reclaim the fence completed and is ready"
-    );
-
-    stop.cancel();
-    join_forge_loop(&server, handle)
-        .await
-        .expect("pass loop ok");
-    server.shutdown().await.expect("test server shuts down");
-}
-
-/// An overflowed partial planning pass leaves the coordinator unready until the
-/// next pass drains the remaining demand.
-///
-/// The per-wake hint budget bounds one pass, not the queue. A replica that
-/// stopped at its budget has left demand unacknowledged, so it has not yet
-/// proved it can plan what it was asked to plan.
-///
-/// # Panics
-///
-/// Panics when a partial or completed pass publishes the wrong bit.
-#[cfg(feature = "test-support")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn coordinator_partial_pass_is_not_ready() {
-    let server = WyrdTestServer::builder()
-        .with_forge_config_for_test(vala_bifrost_redux::forge::ForgeConfig {
-            max_hints_per_wake: 1,
-            ..vala_bifrost_redux::forge::ForgeConfig::default()
-        })
-        .start_in_process()
-        .await
-        .expect("test server starts");
-    let readiness = server
-        .state()
-        .forge()
-        .expect("the default target selects Forge")
-        .coordinator_readiness();
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .await
-        .expect("superuser pool");
-
-    for table in ["partial_one", "partial_two"] {
-        register_forge_table(&server, table).await;
-    }
-    let tenant = uuid::Uuid::from(server.data_tenant_id());
-
-    let stop = server.state().shutdown_token.child_token();
-    let scheduler = wyrd_server::boot::spawn_maintenance_scheduler(server.state(), stop.clone())
-        .expect("the scheduler composes")
-        .expect("the default target selects a coordinator");
-    let handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(scheduler));
-
-    await_boot_scheduler_pass(&server, "overflowed partial pass").await;
-    assert!(
-        !readiness.is_ready(),
-        "a pass that stopped at its hint budget left demand unplanned"
-    );
-
-    let first = (
-        table_task_count(&pool, tenant, "partial_one").await,
-        table_task_count(&pool, tenant, "partial_two").await,
-        outstanding_demands(&pool, tenant, "partial_one").await,
-        outstanding_demands(&pool, tenant, "partial_two").await,
-    );
-    assert!(
-        matches!(first, (1, 0, 0, 1) | (0, 1, 1, 0)),
-        "first pass must plan one real table and retain only its sibling demand: {first:?}"
-    );
-    eprintln!(
-        "partial pass: tasks/demands={first:?}, ready={}",
-        readiness.is_ready()
-    );
-    drive_scheduler_pass(&server, "pass draining the remaining real demand").await;
-    let second = (
-        table_task_count(&pool, tenant, "partial_one").await,
-        table_task_count(&pool, tenant, "partial_two").await,
-        outstanding_demands(&pool, tenant, "partial_one").await,
-        outstanding_demands(&pool, tenant, "partial_two").await,
-    );
-    assert_eq!(
-        second,
-        (1, 1, 0, 0),
-        "second pass must acknowledge the remaining table"
-    );
-    assert!(
-        readiness.is_ready(),
-        "the complete second pass restores readiness"
-    );
-    eprintln!(
-        "complete pass: tasks/demands={second:?}, ready={}",
-        readiness.is_ready()
     );
 
     stop.cancel();
@@ -1869,95 +1821,11 @@ async fn await_forge_role_while_running(server: &WyrdTestServer, label: &str) {
         .expect("worker loop ok");
 }
 
-/// Installs the shared planning-failure function and one trigger that raises on
-/// the named durable step.
-///
-/// The function is the same one the SQL-tier planning tests use, so a router
-/// test fails exactly the step a real coordinator commits rather than a stub.
-///
-/// # Panics
-///
-/// Panics when the fault DDL cannot be installed.
-#[cfg(feature = "test-support")]
-async fn install_planning_failure(pool: &sqlx::PgPool, create_trigger: &'static str) {
-    sqlx::query(
-        "CREATE FUNCTION vala.fail_forge_planning_step() RETURNS trigger LANGUAGE plpgsql \
-         AS $$ BEGIN RAISE EXCEPTION 'injected Forge planning failure'; END $$",
-    )
-    .execute(pool)
-    .await
-    .expect("the planning failure function installs");
-    sqlx::query(create_trigger)
-        .execute(pool)
-        .await
-        .expect("the planning failure trigger installs");
-}
-
-/// Removes the planning-failure trigger from `table` and its shared function.
-///
-/// # Panics
-///
-/// Panics when the fault DDL cannot be removed, which would leak into the next
-/// boundary this test drives.
-#[cfg(feature = "test-support")]
-async fn remove_planning_failure(pool: &sqlx::PgPool, table: &str) {
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "DROP TRIGGER forge_fail_step ON vala.{table}"
-    )))
-    .execute(pool)
-    .await
-    .expect("the planning failure trigger is removable");
-    sqlx::query("DROP FUNCTION vala.fail_forge_planning_step()")
-        .execute(pool)
-        .await
-        .expect("the planning failure function is removable");
-}
-
-/// Counts one registered table's outstanding planning demand.
-///
-/// The count is table-scoped because roster repair re-upserts periodic demand
-/// for every registered table on every pass, so a tenant-wide count cannot tell
-/// a retained rollback apart from an unrelated table's fresh demand.
-///
-/// # Panics
-///
-/// Panics when the demand table cannot be read.
-#[cfg(feature = "test-support")]
-async fn outstanding_demands(pool: &sqlx::PgPool, tenant: uuid::Uuid, table: &str) -> i64 {
-    sqlx::query_scalar(
-        "SELECT count(*) FROM vala.forge_planning_demands \
-         WHERE data_tenant_id=$1 AND table_name=$2",
-    )
-    .bind(tenant)
-    .bind(table)
-    .fetch_one(pool)
-    .await
-    .expect("outstanding planning demand is readable")
-}
-
-/// Counts the Forge tasks one registered table currently owns.
-///
-/// # Panics
-///
-/// Panics when the task table cannot be read.
-#[cfg(feature = "test-support")]
-async fn table_task_count(pool: &sqlx::PgPool, tenant: uuid::Uuid, table: &str) -> i64 {
-    sqlx::query_scalar(
-        "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2",
-    )
-    .bind(tenant)
-    .bind(table)
-    .fetch_one(pool)
-    .await
-    .expect("the Forge task table is readable")
-}
-
 /// Registers one real Bifrost table through the retained production catalog.
 ///
-/// Planning discovers a table's snapshot before it reaches any durable write,
-/// so a demand naming a table the catalog does not hold fails in discovery and
-/// never exercises the enqueue transaction. Every coordinator fault this matrix
-/// injects therefore has to be raised against a table that really exists.
+/// Forge loads a table's snapshot before it reaches any durable write, so a
+/// fault this matrix injects has to be raised against a table that really
+/// exists rather than a name the catalog does not hold.
 ///
 /// # Panics
 ///
@@ -2030,98 +1898,6 @@ async fn join_forge_loop(
     outcome
         .expect("bounded Forge join")
         .expect("Forge task joins")
-}
-
-/// A coordinator whose durable task insert fails advances its pass counter,
-/// clears readiness, keeps the demand, and recovers on the next complete pass.
-///
-/// The insert commits inside the planning transaction, so a failure must roll
-/// the whole pass back rather than acknowledge demand it never planned.
-/// Readiness is the externally visible consequence: a replica whose planning
-/// writes are failing must not be routed maintenance.
-///
-/// The faulted table is registered only after the unfaulted pass, so the failing
-/// pass is the first one to plan it. A table already carrying its planned task
-/// would insert nothing on a replan and never reach the fault.
-///
-/// # Panics
-///
-/// Panics when a failed pass publishes ready, silently drops demand, or the
-/// healthy pass that follows does not restore readiness.
-#[cfg(feature = "test-support")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn coordinator_task_insert_failure_clears_readiness() {
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("test server starts");
-    let readiness = server
-        .state()
-        .forge()
-        .expect("the default target selects Forge")
-        .coordinator_readiness();
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .await
-        .expect("superuser pool");
-    let tenant = uuid::Uuid::from(server.data_tenant_id());
-
-    let stop = server.state().shutdown_token.child_token();
-    let handle = spawn_coordinator(&server, &stop);
-    drive_scheduler_pass(&server, "healthy pass before fault injection").await;
-    assert!(
-        readiness.is_ready(),
-        "the unfaulted pass this case builds on did not complete"
-    );
-
-    // An idle registered table still projects one orphan-cleanup task, so a
-    // real table is all the demand needed to reach the durable insert.
-    register_forge_table(&server, "coordinator_sql").await;
-    install_planning_failure(
-        &pool,
-        "CREATE TRIGGER forge_fail_step BEFORE INSERT ON vala.forge_tasks \
-         FOR EACH ROW EXECUTE FUNCTION vala.fail_forge_planning_step()",
-    )
-    .await;
-
-    drive_scheduler_pass(&server, "faulted planning pass").await;
-    assert!(
-        !readiness.is_ready(),
-        "a coordinator whose forge_tasks write failed advertised ready"
-    );
-    assert_eq!(
-        table_task_count(&pool, tenant, "coordinator_sql").await,
-        0,
-        "a rolled-back pass left a task behind"
-    );
-    assert_eq!(
-        outstanding_demands(&pool, tenant, "coordinator_sql").await,
-        1,
-        "a rolled-back pass acknowledged demand it never planned"
-    );
-
-    remove_planning_failure(&pool, "forge_tasks").await;
-    drive_scheduler_pass(&server, "restoration pass").await;
-    assert!(
-        readiness.is_ready(),
-        "the pass after the forge_tasks fault was removed stayed unready"
-    );
-    assert_eq!(
-        table_task_count(&pool, tenant, "coordinator_sql").await,
-        1,
-        "the recovered pass did not enqueue the task the failed pass rolled back"
-    );
-    assert_eq!(
-        outstanding_demands(&pool, tenant, "coordinator_sql").await,
-        0,
-        "the recovered pass left demand unacknowledged"
-    );
-
-    stop.cancel();
-    join_forge_loop(&server, handle)
-        .await
-        .expect("pass loop ok");
-    server.shutdown().await.expect("test server shuts down");
 }
 
 /// Publication evidence naming a snapshot the table never retained.
@@ -2565,22 +2341,22 @@ fn forge_table_ident(server: &WyrdTestServer, table: &str) -> iceberg::TableIden
     .table_ident()
 }
 
-/// A planning pass whose object store cannot serve the current snapshot's
-/// manifest list leaves demand unacknowledged, inserts no task, and clears
-/// coordinator readiness until the object returns.
+/// A maintenance pass whose object store cannot serve one table's manifest
+/// list completes and keeps coordinator readiness.
 ///
-/// Planning discovers a snapshot before it writes anything durable, so an
-/// unreadable manifest list must fail the whole pass rather than produce a
-/// partially-planned table. The coordinator answers whether this replica can
-/// plan; while it cannot read the table it must not advertise that it can.
+/// The leader's maintenance timer isolates per-table failures: an unreadable
+/// table is logged and skipped while the pass continues, exactly as the
+/// RisingWave Iceberg GC loop treats one table's error. Coordinator readiness
+/// answers whether this replica holds or can contest leadership and read
+/// promotion debt, so one table's missing object must not drain the replica.
 ///
 /// # Panics
 ///
-/// Panics when the faulted pass acknowledges demand, inserts a task, or keeps
-/// readiness, or when restoring the exact bytes does not restore planning.
+/// Panics when the faulted pass does not complete or clears readiness, or when
+/// the pass after restoring the exact bytes is not ready.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn coordinator_object_store_failure_clears_readiness() {
+async fn coordinator_object_store_failure_keeps_readiness() {
     let server = WyrdTestServer::builder()
         .start_bound()
         .await
@@ -2595,12 +2371,6 @@ async fn coordinator_object_store_failure_clears_readiness() {
     // test drives below can be that boot pass still in flight — one that ran
     // before the table held any rows — and the promotion loop would count it.
     await_boot_scheduler_pass(&server, "boot pass before object-store fault").await;
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .await
-        .expect("superuser pool");
-    let tenant = uuid::Uuid::from(server.data_tenant_id());
     let table = "coordinator_object_store";
 
     register_forge_table(&server, table).await;
@@ -2616,7 +2386,7 @@ async fn coordinator_object_store_failure_clears_readiness() {
         .expect("the seeded rows publish as hot files");
     // The coordinator promotes inline, so a driven pass returns only after the
     // promoting attempt settled: a visible snapshot already proves ownership
-    // finished and the demand generation is stable.
+    // finished.
     let catalog = server.bifrost_catalog();
     let ident = forge_table_ident(&server, table);
     let mut completed = server.completed_forge_scheduler_passes_for_test();
@@ -2643,11 +2413,6 @@ async fn coordinator_object_store_failure_clears_readiness() {
     });
     drive_scheduler_pass(&server, "healthy pass after promotion ownership completes").await;
     assert!(readiness.is_ready(), "the healthy pass did not complete");
-    assert_eq!(
-        outstanding_demands(&pool, tenant, table).await,
-        0,
-        "the healthy pass left demand unacknowledged"
-    );
 
     // Retain the exact manifest-list bytes, then remove that exact object. The
     // table is otherwise untouched, so restoring the bytes restores the table.
@@ -2663,21 +2428,11 @@ async fn coordinator_object_store_failure_clears_readiness() {
         .await
         .expect("the manifest list is removable");
 
-    let tasks_before = table_task_count(&pool, tenant, table).await;
-    drive_scheduler_pass(&server, "object-store faulted pass").await;
+    drive_maintenance_pass(&server, "object-store faulted maintenance pass").await;
+    drive_scheduler_pass(&server, "heartbeat after the faulted maintenance").await;
     assert!(
-        !readiness.is_ready(),
-        "a coordinator that cannot read its table advertised ready"
-    );
-    assert_eq!(
-        table_task_count(&pool, tenant, table).await,
-        tasks_before,
-        "a pass that could not discover a snapshot still inserted a task"
-    );
-    assert_eq!(
-        outstanding_demands(&pool, tenant, table).await,
-        1,
-        "the failed pass acknowledged demand it never planned"
+        readiness.is_ready(),
+        "one table's unreadable manifest list drained the coordinator"
     );
 
     file_io
@@ -2689,12 +2444,7 @@ async fn coordinator_object_store_failure_clears_readiness() {
     drive_scheduler_pass(&server, "restoration pass").await;
     assert!(
         readiness.is_ready(),
-        "restoring the manifest list did not restore planning"
-    );
-    assert_eq!(
-        outstanding_demands(&pool, tenant, table).await,
-        0,
-        "the restored pass left demand unacknowledged"
+        "the pass after restoring the manifest list was not ready"
     );
 
     server.state().shutdown_token.cancel();
@@ -3041,16 +2791,21 @@ async fn release_failure_clears_readiness() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Preseeded demand cannot authorize readiness when the independent roster read
-/// is unavailable. Restoring discovery permits a fresh complete cycle.
+/// An unavailable promotion-debt read clears coordinator readiness until the
+/// read returns.
+///
+/// Scribe's `file_list` is the one durable read the leader makes on every
+/// heartbeat, so a leader that cannot read it cannot recover stranded
+/// promotions and must not advertise that it coordinates. Restoring the read
+/// lets the next pass restore readiness.
 ///
 /// # Panics
-/// Panics if demand alone raises readiness or discovery restoration cannot recover.
+/// Panics if the pass without the debt read reports ready or the restored pass
+/// does not.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn coordinator_preseeded_demand_requires_roster_discovery() {
+async fn coordinator_promotion_debt_read_failure_clears_readiness() {
     let server = WyrdTestServer::start_in_process().await.expect("server");
-    register_forge_table(&server, "roster_required").await;
     let readiness = server
         .state()
         .forge()
@@ -3061,50 +2816,26 @@ async fn coordinator_preseeded_demand_requires_roster_discovery() {
         .superuser_pool()
         .await
         .expect("superuser pool");
-    let tenant = uuid::Uuid::from(server.data_tenant_id());
-    sqlx::query("INSERT INTO vala.forge_planning_demands(data_tenant_id,catalog_name,namespace_name,table_name,last_source) VALUES ($1,'wyrd-redux','vala.bifrost','roster_required','periodic') ON CONFLICT DO NOTHING")
-        .bind(tenant).execute(&pool).await.expect("preseed real demand");
-    sqlx::query("ALTER TABLE vala.bifrost_tables RENAME TO unavailable_forge_roster")
+    sqlx::query("ALTER TABLE vala.file_list RENAME TO unavailable_promotion_debt")
         .execute(&pool)
         .await
-        .expect("fail roster read");
+        .expect("fail promotion-debt read");
     let stop = server.state().shutdown_token.child_token();
     let handle = spawn_coordinator(&server, &stop);
-    await_boot_scheduler_pass(&server, "boot pass with unavailable roster").await;
-    drive_scheduler_pass(&server, "preseeded demand with unavailable roster").await;
+    await_boot_scheduler_pass(&server, "boot pass with unavailable debt read").await;
+    drive_scheduler_pass(&server, "pass with unavailable debt read").await;
     assert!(
         !readiness.is_ready(),
-        "demand does not prove complete discovery"
+        "a leader that cannot read promotion debt advertised ready"
     );
-    assert_eq!(
-        table_task_count(&pool, tenant, "roster_required").await,
-        1,
-        "the demand planned successfully despite the unavailable independent roster"
-    );
-    assert_eq!(
-        outstanding_demands(&pool, tenant, "roster_required").await,
-        0
-    );
-    sqlx::query("ALTER TABLE vala.unavailable_forge_roster RENAME TO bifrost_tables")
+    sqlx::query("ALTER TABLE vala.unavailable_promotion_debt RENAME TO file_list")
         .execute(&pool)
         .await
-        .expect("restore roster read");
-    drive_scheduler_pass(&server, "restored authoritative roster").await;
+        .expect("restore promotion-debt read");
+    drive_scheduler_pass(&server, "restored promotion-debt read").await;
     assert!(
         readiness.is_ready(),
-        "complete fresh cycle restores readiness"
-    );
-    assert_eq!(
-        outstanding_demands(&pool, tenant, "roster_required").await,
-        0
-    );
-    assert_eq!(
-        table_task_count(&pool, tenant, "roster_required").await,
-        1,
-        "the new cycle's fresh orphan cutoff coalesces onto the still-pending orphan task"
-    );
-    eprintln!(
-        "roster unavailable: task=1/demand=0/ready=false; restored: tasks=1/demand=0/ready=true"
+        "the pass after restoring the debt read stayed unready"
     );
     stop.cancel();
     join_forge_loop(&server, handle)

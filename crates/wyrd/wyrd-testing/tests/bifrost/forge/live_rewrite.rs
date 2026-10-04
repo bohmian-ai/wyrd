@@ -819,9 +819,7 @@ async fn assert_public_rows(
 }
 
 /// Forge families the journey and recovery windows print as evidence.
-const FORGE_FAMILIES: [&str; 12] = [
-    "bifrost_forge_pending_tasks",
-    "bifrost_forge_oldest_pending_task_timestamp_seconds",
+const FORGE_FAMILIES: [&str; 10] = [
     "bifrost_forge_active_tasks",
     "bifrost_forge_tasks_created_total",
     "bifrost_forge_task_attempts_total",
@@ -1234,11 +1232,7 @@ fn assert_recovery_telemetry(
 /// family reintroduced outside the catalog fails here rather than reaching an
 /// operator dashboard.
 const APPROVED_FORGE_FAMILIES: &[&str] = &[
-    "bifrost_forge_planning_demands",
-    "bifrost_forge_oldest_planning_demand_timestamp_seconds",
     "bifrost_forge_tasks_created_total",
-    "bifrost_forge_pending_tasks",
-    "bifrost_forge_oldest_pending_task_timestamp_seconds",
     "bifrost_forge_active_tasks",
     "bifrost_forge_task_attempts_total",
     "bifrost_forge_task_duration_seconds",
@@ -1301,6 +1295,7 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         WyrdTestCluster::start_embedded_forge_uncertainty_for_test(Duration::from_secs(30))
             .await
             .expect("one bound embedded Bifrost pod starts");
+    cluster.lead_forge_for_test().await;
     let observer = cluster
         .forge_completion_observer()
         .expect("the journey pod carries a Forge completion observer");
@@ -2115,6 +2110,7 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
     let cluster = WyrdTestCluster::start_with_embedded_forge_observer()
         .await
         .expect("one bound embedded Bifrost pod starts");
+    cluster.lead_forge_for_test().await;
     let observer = cluster
         .forge_completion_observer()
         .expect("the journey pod carries a Forge completion observer");
@@ -2300,6 +2296,7 @@ async fn failed_memory_attempt_retries_without_partial_publication() {
     let cluster = WyrdTestCluster::start_with_embedded_forge_observer()
         .await
         .expect("one bound embedded Bifrost pod starts");
+    cluster.lead_forge_for_test().await;
     let observer = cluster
         .forge_completion_observer()
         .expect("the journey pod carries a Forge completion observer");

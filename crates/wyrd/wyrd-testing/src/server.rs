@@ -362,8 +362,6 @@ pub struct PublishedHotFileInspection {
 /// Durable pre-snapshot Forge workflow state for one tenant table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeWorkflowInspection {
-    /// Whether a coalesced planning demand remains.
-    pub has_demand: bool,
     /// Durable strategy/state pairs in creation order.
     pub tasks: Vec<(String, String)>,
     /// Tasks retaining active claims.
@@ -1496,6 +1494,15 @@ impl WyrdTestServer {
         self.inner.forge_scheduler_trigger.request_pass();
     }
 
+    /// Wake the already-running leader maintenance timer for one test pass.
+    ///
+    /// The pass runs manifest rewrite, snapshot expiry, and expired and orphan
+    /// cleanup exactly as one production timer tick does, and counts as one
+    /// completed scheduler pass. A replica without the leader term skips it.
+    pub fn request_forge_maintenance_pass_for_test(&self) {
+        self.inner.forge_scheduler_trigger.request_maintenance();
+    }
+
     /// Return completed production scheduler passes observed by the test trigger.
     #[must_use]
     pub fn completed_forge_scheduler_passes_for_test(&self) -> usize {
@@ -2507,7 +2514,7 @@ impl WyrdTestServer {
         self.inner.forge_publisher.clone()
     }
 
-    /// Inspect durable Forge demand and task state without requiring an Iceberg snapshot.
+    /// Inspect durable Forge task state without requiring an Iceberg snapshot.
     ///
     /// # Errors
     ///
@@ -2524,7 +2531,7 @@ impl WyrdTestServer {
         .await
     }
 
-    /// Inspect durable Forge demand and task state for one namespace-qualified
+    /// Inspect durable Forge task state for one namespace-qualified
     /// table without requiring an Iceberg snapshot.
     ///
     /// This is the authoritative body; the `&str` form above is the
@@ -2541,15 +2548,6 @@ impl WyrdTestServer {
         let namespace = table.namespace.as_str();
         let table = table.name.as_str();
         let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
-        let has_demand = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name=$2 AND table_name=$3)",
-        )
-        .bind(tenant.as_uuid())
-        .bind(namespace)
-        .bind(table)
-        .fetch_one(&pool)
-        .await
-        .map_err(sql)?;
         let tasks = sqlx::query_as::<_, (String, String)>(
             "SELECT strategy,state FROM vala.forge_tasks WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name=$2 AND table_name=$3 ORDER BY created_at,task_id",
         )
@@ -2578,7 +2576,6 @@ impl WyrdTestServer {
         .await
         .map_err(sql)?;
         Ok(ForgeWorkflowInspection {
-            has_demand,
             tasks,
             active_claims: u64::try_from(active_claims).map_err(|_| {
                 WyrdTestServerError::Start("negative Forge active claim count".to_owned())

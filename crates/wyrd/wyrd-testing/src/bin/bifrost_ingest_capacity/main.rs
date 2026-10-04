@@ -33,7 +33,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use wyrd_client::QueueConfig;
-use wyrd_testing::release_server::{CPUS, LocalServer, MEMORY_BYTES};
+use wyrd_testing::capacity::{install_tracing, release_binary};
+use wyrd_testing::release_server::{CPUS, Envelope, LocalServer, MEMORY_BYTES};
 
 use fixture::Tenant;
 use step::{Bench, Plan, Record};
@@ -96,7 +97,7 @@ async fn benchmark(cli: Cli) -> Result<bool> {
             cli.storage_endpoint_url.as_str(),
         ),
     ];
-    let server = LocalServer::start(&binary, &["m0"], &env).await?;
+    let server = LocalServer::start(&binary, &["m0"], &env, Envelope::POD).await?;
     let setup = server
         .tenants()
         .first()
@@ -250,34 +251,6 @@ fn render(records: &[Record], smallest_passing: Option<usize>, passed: bool) -> 
         if passed { "PASS" } else { "FAIL" }
     ));
     rendered
-}
-
-/// The release `wyrd-server` built beside this binary.
-///
-/// # Errors
-///
-/// Returns an error when it has not been built.
-fn release_binary() -> Result<PathBuf> {
-    let binary = std::env::current_exe()?.with_file_name("wyrd-server");
-    if binary.is_file() {
-        Ok(binary)
-    } else {
-        Err(format!("{} is not built; run through mise", binary.display()).into())
-    }
-}
-
-/// Installs a stderr log subscriber when `WYRD_LOG`, else `RUST_LOG`, is set,
-/// so client-side failures read alongside the server log.
-fn install_tracing() {
-    let Ok(filter) = std::env::var("WYRD_LOG").or_else(|_| std::env::var("RUST_LOG")) else {
-        return;
-    };
-    let _ = tracing::subscriber::set_global_default(
-        tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-            .with_writer(std::io::stderr)
-            .finish(),
-    );
 }
 
 /// Runs the benchmark and exits nonzero on any failed gating check or error.

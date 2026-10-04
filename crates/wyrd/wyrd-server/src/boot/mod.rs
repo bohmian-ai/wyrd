@@ -962,6 +962,9 @@ pub async fn compose_bifrost(
         })?;
         // A peer-mode coordinator publishes its private listener with every
         // leader term, so commit notices from other replicas reach the leader.
+        // A dedicated Forge worker holds dial-only credentials: it never
+        // contends for a term, so its local advertise marker is never
+        // published, and the same route carries its pulls and reports.
         let coordinator = Arc::new(match &peer_tls {
             Some(tls) => coordinator
                 .with_leader_peer(ForgeLeaderPeer::new(advertise_addr.clone(), tls.clone())),

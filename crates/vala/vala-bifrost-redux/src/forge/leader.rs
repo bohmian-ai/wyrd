@@ -548,7 +548,9 @@ impl ForgeSchedule {
     /// Timed-out tasks first return to Idle, due immediately, exactly as
     /// `RisingWave` reconsiders them on the next pull. The oldest due tables are
     /// then read from the front of the [`DueIndex`] in `RisingWave`'s order,
-    /// without visiting tables that are not due.
+    /// without visiting tables that are not due. Each pull logs, at debug, the
+    /// tasks requested and returned and whether a due table remains, so a
+    /// short answer while tables are still due is visible to an operator.
     #[must_use]
     pub fn pull(&self, limit: usize, now: DateTime<Utc>) -> Vec<ForgeCompactionDispatch> {
         let mut inner = self.lock();
@@ -566,7 +568,7 @@ impl ForgeSchedule {
                 inner.remove_track(&key);
             }
         }
-        inner
+        let dispatches = inner
             .due
             .oldest_due(limit, now)
             .into_iter()
@@ -585,7 +587,17 @@ impl ForgeSchedule {
                     compaction_type,
                 })
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let still_due = !inner.due.oldest_due(1, now).is_empty();
+            tracing::debug!(
+                requested = limit,
+                returned = dispatches.len(),
+                still_due,
+                "Forge compaction pull served"
+            );
+        }
+        dispatches
     }
 
     /// Applies one worker report; a report for any other task is ignored.

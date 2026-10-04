@@ -28,7 +28,8 @@ use wyrd_client::{GlobalConfig, WyrdClient};
 use report::Report;
 use run::Bench;
 use workload::{Case, Fixture, TABLE};
-use wyrd_testing::release_server::{LocalServer, SERVER_URL};
+use wyrd_testing::capacity::{install_tracing, release_binary};
+use wyrd_testing::release_server::{Envelope, LocalServer, SERVER_URL};
 
 /// Error type of every benchmark step: the binary only reports it.
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -73,7 +74,7 @@ async fn benchmark(heavy: bool) -> Result<bool> {
     }
     std::fs::create_dir_all(&output)?;
 
-    let server = LocalServer::start(&release_binary()?, &["bench"], &[]).await?;
+    let server = LocalServer::start(&release_binary()?, &["bench"], &[], Envelope::POD).await?;
     let client = WyrdClient::with_config(ClientConfig {
         credential: Some(server.api_key().clone()),
         ..ClientConfig::from_global_with_overrides(&GlobalConfig::default(), Some(SERVER_URL), None)
@@ -122,20 +123,6 @@ async fn benchmark(heavy: bool) -> Result<bool> {
     Ok(report.passed())
 }
 
-/// The release `wyrd-server` built beside this binary.
-///
-/// # Errors
-///
-/// Returns an error when it has not been built.
-fn release_binary() -> Result<PathBuf> {
-    let binary = std::env::current_exe()?.with_file_name("wyrd-server");
-    if binary.is_file() {
-        Ok(binary)
-    } else {
-        Err(format!("{} is not built; run through mise", binary.display()).into())
-    }
-}
-
 /// Counts the Parquet objects and bytes under the `file://` store.
 fn parquet_files(root: &Path) -> (u64, u64) {
     let (mut files, mut bytes) = (0, 0);
@@ -159,20 +146,6 @@ fn parquet_files(root: &Path) -> (u64, u64) {
         }
     }
     (files, bytes)
-}
-
-/// Installs a stderr log subscriber when `WYRD_LOG`, else `RUST_LOG`, is set,
-/// so client-side failures read alongside the server log.
-fn install_tracing() {
-    let Ok(filter) = std::env::var("WYRD_LOG").or_else(|_| std::env::var("RUST_LOG")) else {
-        return;
-    };
-    let _ = tracing::subscriber::set_global_default(
-        tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-            .with_writer(std::io::stderr)
-            .finish(),
-    );
 }
 
 /// Runs the benchmark and exits nonzero on any failed row or error.

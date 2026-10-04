@@ -376,6 +376,51 @@ each fail it ("pull diverged from the scan", "index drifted after commit").
   every track under the schedule lock. Cause: `O(tables)` selection plus
   queueing behind 31 closed-loop pullers. Fix site: `ForgeSchedule` (due
   index); uncontended pull is now 2.2 µs p50 / 3.5 µs p99 in release.
+- **Promotion pacing (OPEN, product defect in Scribe claim publication).**
+  Symptom: 128 tables written every 1 s with a 10 s seal offer about 12.8
+  promotions/s; the leader commits 2.2/s (earlier runs 1.2–1.5/s), and a
+  table waits p50 56 s / p90 83 s / max 99 s from seal to Iceberg commit.
+  Evidence (run `mise run bench:bifrost:forge-capacity -- --workers 1
+  --server-log "info,vala_bifrost_redux=debug"` at 88bcabfe1; leader trace
+  read by an independent read-only diagnostician): seals keep pace (~128
+  `persisting immutable Scribe generation` per 10 s); 573 promotion commits in
+  267 s against 581 `assemble_claim` stage starts, one promotion per published
+  claim; the Forge `scribe_promotion` task takes p50 43 ms from creation to
+  settle, never more than one runs at a time, and Forge is idle ~91% of the
+  window (560 hinted, 13 from the debt sweep). The pace is a single unbroken
+  chain: claim assembly start → promotion task p50 365 ms, commit → next
+  claim assembly 60 ms, consecutive commits p50 443 ms. Claim time grows with
+  members (2.8 members 0.29 s; 8.5 members 0.79 s), so the backlog feeds
+  itself. Leader CPU stays low (IO/fsync-bound). The host was loaded during
+  this run, which inflates fsync latency but not the serialization.
+  Cause: Scribe publishes due claims one at a time on the leader.
+  `scribe/persistence.rs` `PersistenceWorker::publish_due_claims` is
+  `while let Some(claim) = take_claim(..) { publish_claim(claim).await? }`
+  from one lifecycle task on a 1 s tick (`publish_residue` has the same
+  shape); the claim-merge lane is `ScribePersistenceCpuPool::new_with_capacity(1, 1)`
+  in `PersistenceWorker::new`; and `build_staging` sizes the assembler's claim
+  budget to `workers` on the stated assumption that each worker drives one
+  claim, but only the one publisher task ever takes claims. Per member,
+  `claim_publication.rs` moves, uploads, persists, commits and retires
+  sequentially through `hot_stage.rs` transitions of three fsyncs each
+  (about ten per member). The Forge hint is sent only after all of it, so
+  promotion can only follow publication. None of these files changed on this
+  branch; Forge promotion is not the bound.
+  Fix site: `scribe/persistence.rs` `PersistenceWorker::publish_due_claims`
+  and `publish_residue` (publish up to the claim budget concurrently, treating
+  budget exhaustion as "await one in-flight claim, then refill"), the
+  `assembly_cpu` capacity in `PersistenceWorker::new` (match the claim budget,
+  bounded by effective CPU), and secondarily `claim_publication.rs`
+  `move_members`/`retire_members` with `hot_stage.rs` transitions (advance a
+  claim's members through each state together, or fsync the shared parent once
+  per claim). Next limit after that: `forge/scheduler.rs` awaits
+  `promote_hinted` inline (~55% busy at 12.8/s). The diagnostician found no
+  approved-contract change in this fix (REQ-002 and bifrost-design
+  "Assembly and publication" set membership, a bounded upload lane and one
+  fenced commit per claim, not publication order or concurrency). It is not
+  implemented here: it changes durable Scribe publication concurrency outside
+  this task's write set, which needs an owner decision. The backlog-drain
+  measurement does not depend on it.
 
 ### Acceptance
 

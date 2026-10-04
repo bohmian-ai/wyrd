@@ -21,6 +21,7 @@ use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalOutcome};
 
 use crate::Result;
 use crate::workload::{self, Case, Fixture, Rows};
+use wyrd_testing::capacity::driver_cpu_seconds;
 use wyrd_testing::release_server::{LocalServer, MemoryPeak};
 
 /// Untimed load before each window, so connection setup is not measured.
@@ -594,22 +595,6 @@ async fn join(mut tasks: JoinSet<Measured>) -> Measured {
 /// Microseconds since `sent`.
 fn micros(sent: Instant) -> u64 {
     u64::try_from(sent.elapsed().as_micros()).unwrap_or(u64::MAX)
-}
-
-/// CPU seconds this process has used (user plus system), from
-/// `/proc/self/stat`; zero when unreadable.
-fn driver_cpu_seconds() -> f64 {
-    // ponytail: assumes USER_HZ = 100, true on every mainstream Linux build.
-    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
-    let fields: Vec<&str> = stat
-        .rsplit_once(')')
-        .map_or(Vec::new(), |(_, rest)| rest.split_whitespace().collect());
-    let ticks = |index: usize| {
-        fields
-            .get(index)
-            .and_then(|value| value.parse::<f64>().ok())
-    };
-    (ticks(11).unwrap_or(0.0) + ticks(12).unwrap_or(0.0)) / 100.0
 }
 
 #[cfg(test)]

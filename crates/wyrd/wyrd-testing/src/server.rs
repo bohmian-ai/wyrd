@@ -5291,15 +5291,16 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 /// Builds a control-plane storage owner over one already-built backend handle.
 ///
 /// Used by cluster and Forge harnesses that need a catalog handle before any
-/// node has composed its resources. It allocates no metadata cache, because a
-/// control-plane catalog reads no hot Parquet footer; each simulated node still
-/// constructs its own Oracle-funded owner when it starts.
+/// node has composed its resources, and by the Forge capacity benchmark,
+/// which commits table properties as an operator. It allocates no metadata
+/// cache, because a control-plane catalog reads no hot Parquet footer; each
+/// simulated node still constructs its own Oracle-funded owner when it starts.
 ///
 /// # Panics
 /// Panics when the default storage policy does not resolve, which would mean
 /// the shipped defaults are themselves invalid.
 #[must_use]
-pub(crate) fn test_storage_owner(
+pub fn test_storage_owner(
     storage: &Arc<wyrd_storage::StorageHandle>,
 ) -> Arc<vala_bifrost_redux::storage::BifrostStorage> {
     Arc::new(vala_bifrost_redux::storage::BifrostStorage::new(

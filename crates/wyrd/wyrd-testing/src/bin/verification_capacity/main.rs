@@ -38,7 +38,8 @@ use std::sync::Arc;
 use clap::Parser;
 use secrecy::ExposeSecret as _;
 use wyrd_testing::bifrost::peer_ca::BifrostPeerCa;
-use wyrd_testing::release_server::{CPUS, LocalServer, MEMORY_BYTES};
+use wyrd_testing::capacity::{binary_identity, install_tracing, release_binary};
+use wyrd_testing::release_server::{CPUS, Envelope, LocalServer, MEMORY_BYTES};
 
 use collector::Collector;
 use evidence::Queue;
@@ -155,7 +156,7 @@ async fn benchmark(cli: Cli) -> Result<bool> {
         .chain((0..cli.background).map(|index| format!("bg{index}")))
         .collect();
     let slug_refs: Vec<&str> = slugs.iter().map(String::as_str).collect();
-    let first = LocalServer::start(&binary, &slug_refs, &env(0)).await?;
+    let first = LocalServer::start(&binary, &slug_refs, &env(0), Envelope::POD).await?;
     let mut tenants = Vec::new();
     for (index, setup) in first.tenants().iter().enumerate() {
         tenants.push(Tenant::provision(setup, &work.path().join("tenants"), index < 2).await?);
@@ -346,49 +347,16 @@ async fn ladders(
     Ok(())
 }
 
-/// The identity of the measured `binary`: path, size, and modification
-/// time, and whether it is the profiling build.
+/// The identity of the measured `binary`, as [`binary_identity`] records it,
+/// and whether it is the profiling build.
 ///
 /// # Errors
 ///
 /// Returns the metadata failure.
 fn identity(binary: &Path, profiled: bool) -> Result<serde_json::Value> {
-    let metadata = std::fs::metadata(binary)?;
-    let modified: chrono::DateTime<chrono::Utc> = metadata.modified()?.into();
-    Ok(serde_json::json!({
-        "path": binary.display().to_string(),
-        "bytes": metadata.len(),
-        "modified": modified,
-        "profiling_build": profiled,
-    }))
-}
-
-/// The release `wyrd-server` built beside this binary.
-///
-/// # Errors
-///
-/// Returns an error when it has not been built.
-fn release_binary() -> Result<PathBuf> {
-    let binary = std::env::current_exe()?.with_file_name("wyrd-server");
-    if binary.is_file() {
-        Ok(binary)
-    } else {
-        Err(format!("{} is not built; run through mise", binary.display()).into())
-    }
-}
-
-/// Installs a stderr log subscriber when `WYRD_LOG`, else `RUST_LOG`, is set,
-/// so client-side failures read alongside the server logs.
-fn install_tracing() {
-    let Ok(filter) = std::env::var("WYRD_LOG").or_else(|_| std::env::var("RUST_LOG")) else {
-        return;
-    };
-    let _ = tracing::subscriber::set_global_default(
-        tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-            .with_writer(std::io::stderr)
-            .finish(),
-    );
+    let mut identity = binary_identity(binary)?;
+    identity["profiling_build"] = serde_json::Value::Bool(profiled);
+    Ok(identity)
 }
 
 /// Runs the benchmark and exits nonzero on any failed check or error.

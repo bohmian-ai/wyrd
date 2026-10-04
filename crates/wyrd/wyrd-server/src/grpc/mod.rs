@@ -395,8 +395,8 @@ where
 /// plan decode or storage IO.
 ///
 /// Returns `Ok(None)` when this target selects no private service, which is the
-/// Forge-worker case: it keeps using its durable assignment path and opens no
-/// peer socket.
+/// Forge-worker case: it only dials the elected Forge leader's peer route and
+/// opens no peer socket.
 ///
 /// # Errors
 /// Returns [`GrpcError::Transport`] when tonic rejects the peer TLS material.

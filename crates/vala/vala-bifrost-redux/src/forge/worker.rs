@@ -2070,6 +2070,9 @@ impl ForgeWorker {
     /// itself: a durable healthy-worker registration, and a complete recovery
     /// drain of every `Prepared` attempt and lapsed claim it already owns.
     /// Readiness is published by the caller only when this returns `true`.
+    /// The start is logged with this worker's local admission bounds, which
+    /// the composition derived from the node's effective CPU, so an operator
+    /// can confirm the bounds a cgroup quota produced.
     ///
     /// # Errors
     ///
@@ -2087,7 +2090,12 @@ impl ForgeWorker {
                 detail: "injected Forge worker registration failure".to_owned(),
             }));
         }
-        tracing::info!(worker = %self.owner, "Forge worker started");
+        tracing::info!(
+            worker = %self.owner,
+            max_task_parallelism = self.config.max_task_parallelism,
+            pending_task_parallelism = self.config.pending_task_parallelism,
+            "Forge worker started"
+        );
         // Readiness is recovery-gated. A Prepared attempt or a lapsed claim is
         // durable evidence a reader can already observe, so this worker
         // resolves all of it before advertising itself and taking new work.
@@ -2515,7 +2523,8 @@ impl ForgeWorker {
     /// [`ForgeWorkerConfig::pull_interval`]: `min(max_task_parallelism -
     /// running parallelism, 4)` table-level tasks, as `RisingWave`'s compactor
     /// requests. The pull budget is recomputed after every admitted task, so a
-    /// task that filled the queue ends the turn.
+    /// task that filled the queue ends the turn. Each leader pull logs, at
+    /// debug, how many tasks it requested and how many the leader returned.
     ///
     /// Returns the number of tasks started, or `None` when a stop signal or a
     /// test-support abandonment ended this worker's loop.
@@ -2569,6 +2578,12 @@ impl ForgeWorker {
                 Vec::new()
             }
         };
+        tracing::debug!(
+            worker = %self.owner,
+            requested = pending_pull_task_count,
+            returned = dispatches.len(),
+            "Forge compaction pull"
+        );
         let mut dispatches = dispatches.into_iter();
         while let Some(dispatch) = dispatches.next() {
             match self

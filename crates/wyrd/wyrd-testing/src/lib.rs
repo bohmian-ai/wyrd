@@ -1,6 +1,7 @@
 //! Shared Wyrd integration-test harness.
 
 pub mod bifrost;
+pub mod capacity;
 pub mod interleaving;
 pub mod keys;
 pub mod load;

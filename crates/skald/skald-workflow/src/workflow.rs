@@ -272,6 +272,7 @@ impl WorkflowExecutor {
             {
                 match self.bind(index) {
                     Ok(pairs) => {
+                        self.attempts[index].store(1, Ordering::Release);
                         self.ledger.step_started(index);
                         on_transition(self.ledger.snapshot());
                         let task = StepTask {
@@ -337,9 +338,9 @@ impl WorkflowExecutor {
     ///
     /// Success releases dependents unless its payload overflows the run
     /// budget; failure and panic stop scheduling. An interrupted or aborted
-    /// task is `cancelled` only once an attempt began; a task stopped before
-    /// its first attempt stays active so [`RunLedger::finish`] records it as
-    /// `unstarted` with no attempts or timestamps.
+    /// task is `cancelled` with its recorded attempts, which are at least one
+    /// because scheduling reserves the first attempt before publishing the
+    /// step as `running`.
     fn settle(&mut self, index: usize, report: Result<StepReport, JoinError>) -> bool {
         let attempts = self.attempts[index].load(Ordering::Acquire);
         match report {
@@ -356,15 +357,11 @@ impl WorkflowExecutor {
                 true
             }
             Ok(StepReport::Interrupted) => {
-                if attempts > 0 {
-                    self.ledger.step_cancelled(index, attempts);
-                }
+                self.ledger.step_cancelled(index, attempts);
                 false
             }
             Err(error) if error.is_cancelled() => {
-                if attempts > 0 {
-                    self.ledger.step_cancelled(index, attempts);
-                }
+                self.ledger.step_cancelled(index, attempts);
                 false
             }
             Err(_panic) => {
@@ -801,6 +798,11 @@ mod tests {
             .map(|snapshot| {
                 assert_eq!(snapshot.run_id, queued.run_id);
                 assert_eq!(snapshot.status, WorkflowRunStatus::Running);
+                for step in snapshot.steps.values() {
+                    if step.status == WorkflowStepStatus::Running {
+                        assert_eq!(step.attempts, 1, "a published running step has begun");
+                    }
+                }
                 (
                     snapshot.steps["first"].status,
                     snapshot.steps["second"].status,
@@ -1454,9 +1456,9 @@ mod tests {
         }
         assert_eq!((provider.in_flight(), provider.abandoned()), (0, 1));
 
-        // A step task aborted before its first poll never began: it is
-        // unstarted with no attempts or timestamps, while a task aborted after
-        // its attempt began is cancelled with that attempt.
+        // A published running step task aborted before its first poll is
+        // cancelled with its reserved first attempt and both timestamps, the
+        // same as a task aborted after its attempt began.
         let workflow = independent("prepoll", &[("begun", "begun call"), ("idle", "idle call")]);
         let provider = ScriptedProvider::new();
         let dependencies = WorkflowExecutionDependencies::new(provider.registry());
@@ -1490,15 +1492,16 @@ mod tests {
         executor.ledger.step_started(begun);
         executor.ledger.step_started(idle);
         executor.attempts[begun].store(1, Ordering::Release);
+        executor.attempts[idle].store(1, Ordering::Release);
         assert!(!executor.settle(idle, aborted.pop().expect("aborted idle")));
         assert!(!executor.settle(begun, aborted.pop().expect("aborted begun")));
         let run = executor.ledger.finish(RunEnding::Cancelled, &executor.plan);
         let idle = &run.steps["idle"];
         assert_eq!(
             (idle.status, idle.attempts),
-            (WorkflowStepStatus::Unstarted, 0)
+            (WorkflowStepStatus::Cancelled, 1)
         );
-        assert!(idle.started_at.is_none() && idle.ended_at.is_none());
+        assert!(idle.started_at.is_some() && idle.ended_at.is_some());
         let begun = &run.steps["begun"];
         assert_eq!(
             (begun.status, begun.attempts),

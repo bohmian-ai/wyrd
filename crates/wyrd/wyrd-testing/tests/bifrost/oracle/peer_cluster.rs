@@ -19,6 +19,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
 use url::Url;
 use vala_bifrost_redux::oracle::OraclePreparationPause;
@@ -1808,7 +1809,7 @@ fn fixture_rows_ipc(
     rows: i64,
     groups: i64,
     event_time_micros: i64,
-) -> Result<bytes::Bytes, JourneyError> {
+) -> Result<Bytes, JourneyError> {
     let groups = groups.max(1);
     let schema = Arc::new(arrow::datatypes::Schema::new(vec![
         arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
@@ -1844,7 +1845,7 @@ fn fixture_rows_ipc(
         writer.write(&batch)?;
         writer.finish()?;
     }
-    Ok(bytes::Bytes::from(ipc))
+    Ok(Bytes::from(ipc))
 }
 
 /// Admits settled physical evidence only when the settlement counter advanced.

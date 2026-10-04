@@ -261,7 +261,7 @@ pub(crate) mod prompt_support {
     }
 
     /// Returns the raw provider body of a `RawV1` request, or `None` for a typed request.
-    pub fn raw_body(request: &ProviderRequest) -> Option<&serde_json::Value> {
+    pub fn raw_body(request: &ProviderRequest) -> Option<&Value> {
         match request {
             ProviderRequest::RawV1 { body, .. } => Some(body),
             _ => None,

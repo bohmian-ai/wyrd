@@ -122,11 +122,17 @@ impl RunLedger {
         self.run.started_at = Some(Utc::now());
     }
 
-    /// Mark the step at plan index `index` running.
+    /// Mark the step at plan index `index` running with its first attempt
+    /// begun.
+    ///
+    /// A published `running` step always represents a begun attempt, so the
+    /// snapshot records attempt one here; later retries overwrite the count
+    /// when the step settles.
     pub(crate) fn step_started(&mut self, index: usize) {
         if let Some(step) = self.step_mut(index) {
             step.status = WorkflowStepStatus::Running;
             step.started_at = Some(Utc::now());
+            step.attempts = 1;
         }
     }
 
@@ -214,20 +220,17 @@ impl RunLedger {
 
     /// Terminalize the snapshot.
     ///
-    /// Pending steps become `unstarted`. Cancellation and the total deadline
+    /// Pending steps become `unstarted`; every started step was already
+    /// settled because each step task is joined before the run finishes.
+    /// Cancellation and the total deadline
     /// decide the status first, then an aggregate-size failure, then the
     /// failed step earliest in plan order (stage, then step ID). Otherwise
     /// every declared output is projected with its JSON type; a missing
     /// output field or an over-budget projection fails the run.
     pub(crate) fn finish(mut self, ending: RunEnding, plan: &ExecutionPlan) -> WorkflowRun {
         for step in self.run.steps.values_mut() {
-            if matches!(
-                step.status,
-                WorkflowStepStatus::Pending | WorkflowStepStatus::Running
-            ) {
+            if step.status == WorkflowStepStatus::Pending {
                 step.status = WorkflowStepStatus::Unstarted;
-                step.started_at = None;
-                step.attempts = 0;
             }
         }
         self.run.ended_at = Some(Utc::now());

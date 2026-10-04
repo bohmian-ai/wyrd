@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use futures_util::StreamExt as _;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::oracle::{DEFAULT_QUERY_DEADLINE, OracleQueryStream, RunningQueryRegistry};
 use wyrd_spec::DataTenantId;
@@ -59,7 +60,7 @@ impl RunningQueryControls {
                 .saturating_sub(chrono::Utc::now().timestamp_millis()),
         )
         .unwrap_or(0);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(remaining);
+        let deadline = Instant::now() + std::time::Duration::from_millis(remaining);
         tokio::time::timeout_at(deadline, async {
             if let Some(observed) = &terminal {
                 observed
@@ -150,7 +151,7 @@ impl RunningQueryControls {
             .and_then(|deadline_ms| u64::try_from(deadline_ms).ok())
             .filter(|deadline_ms| *deadline_ms != 0)
             .map_or(DEFAULT_QUERY_DEADLINE, std::time::Duration::from_millis);
-        let deadline = tokio::time::Instant::now() + duration;
+        let deadline = Instant::now() + duration;
         cancel_while_opening(
             open,
             self.cancel(tenant_id, request_id.clone()),
@@ -311,7 +312,7 @@ async fn cancel_while_opening<T, C>(
     open: impl Future<Output = Result<T, WyrdError>>,
     cancel_owner: impl Future<Output = Result<C, WyrdError>>,
     cancel: &CancellationToken,
-    deadline: tokio::time::Instant,
+    deadline: Instant,
 ) -> Result<T, WyrdError> {
     tokio::pin!(open);
     tokio::select! {
@@ -337,6 +338,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use tokio::time::Instant;
     use tokio_util::sync::CancellationToken;
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::vala::BifrostError;
@@ -391,8 +393,8 @@ mod tests {
     }
 
     /// A deadline far enough away that no test reaches it.
-    fn later() -> tokio::time::Instant {
-        tokio::time::Instant::now() + Duration::from_secs(3_600)
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(3_600)
     }
 
     /// A cancellation owner slower than the query's remaining deadline is
@@ -412,7 +414,7 @@ mod tests {
         };
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         let deadline = started + Duration::from_millis(500);
         let error = cancel_while_opening(
             std::future::pending::<Result<u32, WyrdError>>(),
@@ -426,7 +428,7 @@ mod tests {
             error.code(),
             WyrdError::from(BifrostError::QueryStreamIncomplete).code()
         );
-        assert_eq!(tokio::time::Instant::now(), deadline);
+        assert_eq!(Instant::now(), deadline);
         assert_eq!(asked.load(Ordering::Acquire), 1);
     }
 }

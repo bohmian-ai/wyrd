@@ -8,6 +8,8 @@
 //! in flight without sleeping for them.
 
 use std::collections::{HashMap, VecDeque};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -2227,11 +2229,8 @@ async fn server_routes_keep_gateway_and_external_ownership() {
     let secret = secrets.path().join("review-secret");
     std::fs::write(&secret, EXTERNAL_SECRET).expect("secret writes");
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600))
-            .expect("secret restricts");
-    }
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600))
+        .expect("secret restricts");
     let origin = fixture
         .upstream
         .url

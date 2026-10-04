@@ -1,8 +1,8 @@
 //! Public Forge production telemetry.
 //!
-//! Forge exposes exactly the fifteen Prometheus families operators need to
-//! read demand, queue depth and age, active ownership, durable results,
-//! latency, failure class, and physical data flow. Lease,
+//! Forge exposes exactly the twelve Prometheus families operators need to
+//! read active ownership, durable results, latency, failure class, physical
+//! data flow, and the elected leader's in-memory decision time. Lease,
 //! fence, catalog, reconciliation, cursor, scheduler, and resource protocol
 //! detail belongs to structured traces and durable audit/task evidence, and
 //! unresolved authority belongs to role readiness — none of it is duplicated
@@ -29,7 +29,7 @@ pub(super) const TASK_TYPES: [ForgeTaskStrategy; 5] = [
 
 /// The exact public Forge family inventory, used by documentation coverage.
 #[cfg(test)]
-pub(super) const FORGE_METRIC_FAMILIES: [&str; 11] = [
+pub(super) const FORGE_METRIC_FAMILIES: [&str; 12] = [
     "bifrost_forge_tasks_created_total",
     "bifrost_forge_active_tasks",
     "bifrost_forge_task_attempts_total",
@@ -41,7 +41,30 @@ pub(super) const FORGE_METRIC_FAMILIES: [&str; 11] = [
     "bifrost_forge_output_bytes_total",
     "bifrost_forge_deleted_objects_total",
     "bifrost_forge_snapshots_expired_total",
+    "bifrost_forge_leader_decision_seconds",
 ];
+
+/// One leader schedule operation, the closed `operation` label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForgeLeaderDecision {
+    /// A commit notice updated one table's track.
+    Commit,
+    /// A compactor pull selected and dispatched due tables.
+    Pull,
+    /// A compactor report settled one dispatched task.
+    Report,
+}
+
+impl ForgeLeaderDecision {
+    /// Returns the stable `operation` label for this decision.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::Pull => "pull",
+            Self::Report => "report",
+        }
+    }
+}
 
 /// Closed durable result of one completed Forge ownership episode.
 ///
@@ -191,6 +214,18 @@ impl ForgeTelemetry {
         metrics::counter!("bifrost_forge_snapshots_expired_total").increment(snapshots);
     }
 
+    /// Records how long one leader schedule operation held the caller.
+    ///
+    /// The time includes waiting for the schedule lock, so contention between
+    /// concurrent pullers shows here, and excludes RPC and worker time.
+    pub(super) fn record_leader_decision(operation: ForgeLeaderDecision, elapsed: Duration) {
+        metrics::histogram!(
+            "bifrost_forge_leader_decision_seconds",
+            "operation" => operation.as_str()
+        )
+        .record(elapsed.as_secs_f64());
+    }
+
     /// Opens one balanced active-task guard for the duration of an attempt.
     ///
     /// The gauge is incremented here and decremented exactly once when the
@@ -270,6 +305,13 @@ mod tests {
         ForgeTaskResult::Uncertain,
     ];
 
+    /// Every `operation` value Forge may publish.
+    const LEADER_DECISIONS: [ForgeLeaderDecision; 3] = [
+        ForgeLeaderDecision::Commit,
+        ForgeLeaderDecision::Pull,
+        ForgeLeaderDecision::Report,
+    ];
+
     /// Split one recorded series key into its family and its label pairs.
     fn parse_series(series: &str) -> (String, Vec<(String, String)>) {
         let Some((family, tail)) = series.split_once('{') else {
@@ -308,6 +350,10 @@ mod tests {
             .iter()
             .map(|reason| reason.as_str())
             .collect::<BTreeSet<_>>();
+        let operations = LEADER_DECISIONS
+            .iter()
+            .map(|operation| operation.as_str())
+            .collect::<BTreeSet<_>>();
         for series in snapshot
             .counters
             .keys()
@@ -319,6 +365,7 @@ mod tests {
                     "task_type" => &task_types,
                     "result" => &results,
                     "reason" => &reasons,
+                    "operation" => &operations,
                     other => panic!("{series} carries the unapproved label key {other}"),
                 };
                 assert!(
@@ -374,6 +421,9 @@ mod tests {
                 ForgeTelemetry::record_task_failure(ForgeTaskStrategy::SmallFiles, reason);
             }
             ForgeTelemetry::record_snapshots_expired(3);
+            for operation in LEADER_DECISIONS {
+                ForgeTelemetry::record_leader_decision(operation, Duration::from_micros(2));
+            }
 
             drop(telemetry.active_task(ForgeTaskStrategy::SmallFiles));
             let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

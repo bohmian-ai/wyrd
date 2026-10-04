@@ -1288,7 +1288,7 @@ async fn assert_compaction_watermark_blocks_expiry(table: &ExpirableTable) -> i6
         "a disabled table's idle track is dropped"
     );
     leader_term(table).schedule().request_compaction(
-        key.clone(),
+        &key,
         &ForgeTableSettings::default(),
         chrono::Utc::now(),
     );

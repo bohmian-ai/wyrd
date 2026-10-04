@@ -253,7 +253,7 @@ transition after a replacement worker has taken over.
 ## Telemetry
 
 `forge/metrics.rs` is the only Forge metric owner, and it publishes exactly the
-eleven Prometheus families below. They answer the operational questions
+twelve Prometheus families below. They answer the operational questions
 Forge is accountable for: how much work is created, how much this process is
 doing right now, how attempts ended, how
 long they took, why they failed, and how much physical data moved.
@@ -300,7 +300,7 @@ failure:
 | `capacity_refused` | The compaction queue refused every plan for waiting-parallelism capacity or per-plan size. |
 | `internal_invariant` | An internal invariant failed; this is a defect, not a condition. |
 
-### The eleven families
+### The twelve families
 
 Every family is process-local: it is produced by whichever replica did the work
 and sums across replicas.
@@ -318,6 +318,7 @@ and sums across replicas.
 | `bifrost_forge_output_bytes_total` | counter | `task_type` | After a committed or recovered effect | Absent until an effect publishes bytes | Process-local |
 | `bifrost_forge_deleted_objects_total` | counter | `task_type` | At the delete boundary itself, once per accepted delete of a freshly proven-present, eligible object | Pre-delete-missing, refused, and already-absent recovery paths count nothing | Process-local |
 | `bifrost_forge_snapshots_expired_total` | counter | — | After committed or recovered expiration settlement | Counts individual snapshots, not tasks | Process-local |
+| `bifrost_forge_leader_decision_seconds` | histogram | `operation` (`commit`, `pull`, `report`) | Around each leader schedule operation, including the wait for the schedule lock | Absent on a replica that never held the leader term; excludes RPC and worker time | Process-local (leader) |
 
 ### Dashboard examples
 

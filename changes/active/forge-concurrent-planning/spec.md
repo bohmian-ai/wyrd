@@ -217,8 +217,15 @@ and worker time under the existing capacity workload, recording table count,
 commit-event rate, worker count and contention. Microsecond leader decisions
 are a measured target, not an asserted RisingWave guarantee: RisingWave scans
 all tracked tables and sorts eligible ones under a write lock
-(schedule.rs:942-963). Use that exact selection shape and report the measured
-result. A faster due index is outside this approved change.
+(schedule.rs:942-963). Keep RisingWave's due rule, timeout handling and
+oldest-due order exactly, but select from a sorted due index maintained as
+tracks change, so a pull costs O(limit · log tables) rather than O(tables)
+under the lock. A randomized test proves the index selects exactly what the
+RisingWave scan selects. The leader records each commit, pull and report
+decision in `bifrost_forge_leader_decision_seconds{operation}`.
+(Revision 2026-10-03, approved by the human owner after the capacity bench
+measured the full scan at about 100 µs per pull and a 28–34 ms p99 under 32
+pullers.)
 
 ### REQ-010 — Delete superseded machinery
 

@@ -9,6 +9,11 @@
 //! here is durable: a new leader starts with an empty schedule and empty
 //! maintenance sets, and every decision is made under one lock without SQL,
 //! catalog or object IO.
+//!
+//! Selection keeps `RisingWave`'s rule and order (oldest due time first, ties
+//! by table) but not its full scan: [`DueIndex`] keeps due candidates and
+//! report deadlines sorted as tracks change, so a pull costs
+//! `O(limit · log tables)` instead of `O(tables)` under the lock.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -143,6 +148,10 @@ impl CompactionTrack {
     }
 
     /// `RisingWave`'s due rule: count threshold, or elapsed interval with a commit.
+    ///
+    /// Production selection reads [`Self::slot`]; this literal port is the
+    /// reference the index is tested against.
+    #[cfg(test)]
     fn should_trigger(&self, now: DateTime<Utc>) -> bool {
         let TrackState::Idle { next_compaction_at } = self.state else {
             return false;
@@ -238,21 +247,169 @@ impl CompactionTrack {
         matches!(self.state, TrackState::InFlight { task_id: current, .. } if current == task_id)
     }
 
-    /// Whether the in-flight task's deadline has passed.
+    /// Whether the in-flight task's deadline has passed; the reference for
+    /// [`DueIndex::timed_out`].
+    #[cfg(test)]
     fn is_timed_out(&self, now: DateTime<Utc>) -> bool {
         matches!(self.state, TrackState::InFlight { report_deadline, .. } if now >= report_deadline)
+    }
+
+    /// Where this track belongs in the [`DueIndex`], derived from its state.
+    ///
+    /// An Idle track at or over its commit count is due whatever the time; an
+    /// Idle track with fewer commits is due once its interval elapses; an
+    /// Idle track with no commit, and a track mid-selection, are not indexed.
+    fn slot(&self) -> Option<DueSlot> {
+        match self.state {
+            TrackState::Idle { next_compaction_at }
+                if self.pending_commits >= self.trigger_snapshot_count =>
+            {
+                Some(DueSlot::Ready(next_compaction_at))
+            }
+            TrackState::Idle { next_compaction_at } if self.pending_commits > 0 => {
+                Some(DueSlot::Waiting(next_compaction_at))
+            }
+            TrackState::Idle { .. } | TrackState::PendingDispatch { .. } => None,
+            TrackState::InFlight {
+                report_deadline, ..
+            } => Some(DueSlot::Deadline(report_deadline)),
+        }
+    }
+}
+
+/// One track's position in the [`DueIndex`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DueSlot {
+    /// Due now by commit count, ordered by its next compaction time.
+    Ready(DateTime<Utc>),
+    /// Due once its next compaction time passes.
+    Waiting(DateTime<Utc>),
+    /// In flight until its report deadline.
+    Deadline(DateTime<Utc>),
+}
+
+/// Sorted secondary index over the tracks, kept in step by [`ScheduleInner::edit`].
+///
+/// Each set orders `(time, table)`, which is exactly the order `RisingWave`'s
+/// stable sort over table-ordered tracks produces, so a pull reads the oldest
+/// candidates from the front of two sets instead of scanning every track.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DueIndex {
+    /// Idle tracks due by commit count.
+    ready: BTreeSet<(DateTime<Utc>, ForgeTableKey)>,
+    /// Idle tracks with commits, due when their time passes.
+    waiting: BTreeSet<(DateTime<Utc>, ForgeTableKey)>,
+    /// In-flight tracks by report deadline, so a pull finds timeouts directly.
+    deadlines: BTreeSet<(DateTime<Utc>, ForgeTableKey)>,
+}
+
+impl DueIndex {
+    /// Returns the set a slot lives in and its sort time.
+    fn set(
+        &mut self,
+        slot: DueSlot,
+    ) -> (&mut BTreeSet<(DateTime<Utc>, ForgeTableKey)>, DateTime<Utc>) {
+        match slot {
+            DueSlot::Ready(at) => (&mut self.ready, at),
+            DueSlot::Waiting(at) => (&mut self.waiting, at),
+            DueSlot::Deadline(at) => (&mut self.deadlines, at),
+        }
+    }
+
+    /// Indexes one table at `slot`; `None` indexes nothing.
+    fn insert(&mut self, key: &ForgeTableKey, slot: Option<DueSlot>) {
+        if let Some(slot) = slot {
+            let (set, at) = self.set(slot);
+            set.insert((at, key.clone()));
+        }
+    }
+
+    /// Removes one table's entry at `slot`; `None` removes nothing.
+    fn remove(&mut self, key: &ForgeTableKey, slot: Option<DueSlot>) {
+        if let Some(slot) = slot {
+            let (set, at) = self.set(slot);
+            set.remove(&(at, key.clone()));
+        }
+    }
+
+    /// Returns the tables whose report deadline is at or before `now`.
+    fn timed_out(&self, now: DateTime<Utc>) -> Vec<ForgeTableKey> {
+        self.deadlines
+            .iter()
+            .take_while(|(deadline, _)| *deadline <= now)
+            .map(|(_, key)| key.clone())
+            .collect()
+    }
+
+    /// Returns up to `limit` due tables, oldest due time first.
+    ///
+    /// The oldest `limit` of the whole due set are among the first `limit`
+    /// of each set, so only those are merged and sorted.
+    fn oldest_due(&self, limit: usize, now: DateTime<Utc>) -> Vec<ForgeTableKey> {
+        let mut due: Vec<&(DateTime<Utc>, ForgeTableKey)> = self
+            .ready
+            .iter()
+            .take(limit)
+            .chain(
+                self.waiting
+                    .iter()
+                    .take_while(|(at, _)| *at <= now)
+                    .take(limit),
+            )
+            .collect();
+        due.sort_unstable();
+        due.into_iter()
+            .take(limit)
+            .map(|(_, key)| key.clone())
+            .collect()
     }
 }
 
 /// Lock-protected schedule and maintenance membership.
 #[derive(Debug, Default)]
 struct ScheduleInner {
-    /// Compaction tracks by table.
+    /// Compaction tracks by table. Mutate only through [`Self::edit`] and
+    /// [`Self::remove_track`], which keep [`Self::due`] in step.
     tracks: BTreeMap<ForgeTableKey, CompactionTrack>,
+    /// Sorted due candidates and deadlines derived from `tracks`.
+    due: DueIndex,
     /// Tables the leader timer expires.
     snapshot_expiration: BTreeSet<ForgeTableKey>,
     /// Tables the leader timer rewrites manifests for.
     manifest_rewrite: BTreeSet<ForgeTableKey>,
+}
+
+impl ScheduleInner {
+    /// Applies `change` to one track and re-indexes it.
+    ///
+    /// A missing track is created by `create`; when `create` returns `None`
+    /// nothing changes and `None` is returned. The track's old index entry is
+    /// removed before `change` runs and its new one inserted after, so the
+    /// index always matches the track's state.
+    fn edit<R>(
+        &mut self,
+        key: &ForgeTableKey,
+        create: impl FnOnce() -> Option<CompactionTrack>,
+        change: impl FnOnce(&mut CompactionTrack) -> R,
+    ) -> Option<R> {
+        let track = match self.tracks.get_mut(key) {
+            Some(track) => {
+                self.due.remove(key, track.slot());
+                track
+            }
+            None => self.tracks.entry(key.clone()).or_insert(create()?),
+        };
+        let result = change(track);
+        self.due.insert(key, track.slot());
+        Some(result)
+    }
+
+    /// Removes one track and its index entry.
+    fn remove_track(&mut self, key: &ForgeTableKey) {
+        if let Some(track) = self.tracks.remove(key) {
+            self.due.remove(key, track.slot());
+        }
+    }
 }
 
 /// Test-visible projection of one track.
@@ -310,19 +467,21 @@ impl ForgeSchedule {
                 .get(&key)
                 .is_some_and(|track| !track.is_processing() && !track.remove_after_finish)
             {
-                inner.tracks.remove(&key);
+                inner.remove_track(&key);
             }
             return;
         }
         tracing::debug!(table = %key.table.table, snapshot_id, "Forge commit notice recorded");
-        let track = inner
-            .tracks
-            .entry(key)
-            .or_insert_with(|| CompactionTrack::new(&settings, now));
-        track.remove_after_finish = false;
-        track.refresh(&settings, now);
-        track.pending_commits = track.pending_commits.saturating_add(1);
-        track.latest_snapshot = Some(snapshot_id);
+        inner.edit(
+            &key,
+            || Some(CompactionTrack::new(&settings, now)),
+            |track| {
+                track.remove_after_finish = false;
+                track.refresh(&settings, now);
+                track.pending_commits = track.pending_commits.saturating_add(1);
+                track.latest_snapshot = Some(snapshot_id);
+            },
+        );
     }
 
     /// Forces one table due now, even when its automatic compaction is disabled.
@@ -331,19 +490,24 @@ impl ForgeSchedule {
     /// removed after its task finishes.
     pub fn request_compaction(
         &self,
-        key: ForgeTableKey,
+        key: &ForgeTableKey,
         settings: &ForgeTableSettings,
         now: DateTime<Utc>,
     ) {
         let mut inner = self.lock();
-        Self::apply_membership(&mut inner, &key, settings);
-        let track = inner.tracks.entry(key).or_insert_with(|| {
-            let mut track = CompactionTrack::new(settings, now);
-            track.remove_after_finish = !settings.compaction_enabled;
-            track
-        });
-        track.refresh(settings, now);
-        track.force(now);
+        Self::apply_membership(&mut inner, key, settings);
+        inner.edit(
+            key,
+            || {
+                let mut track = CompactionTrack::new(settings, now);
+                track.remove_after_finish = !settings.compaction_enabled;
+                Some(track)
+            },
+            |track| {
+                track.refresh(settings, now);
+                track.force(now);
+            },
+        );
     }
 
     /// Updates both maintenance sets from one table's settings.
@@ -382,43 +546,38 @@ impl ForgeSchedule {
     /// Selects up to `limit` oldest due tables and dispatches them.
     ///
     /// Timed-out tasks first return to Idle, due immediately, exactly as
-    /// `RisingWave` reconsiders them on the next pull. Every `Idle` track is then
-    /// scanned and the due ones sorted by their next compaction time.
+    /// `RisingWave` reconsiders them on the next pull. The oldest due tables are
+    /// then read from the front of the [`DueIndex`] in `RisingWave`'s order,
+    /// without visiting tables that are not due.
     #[must_use]
     pub fn pull(&self, limit: usize, now: DateTime<Utc>) -> Vec<ForgeCompactionDispatch> {
         let mut inner = self.lock();
-        let mut removed = Vec::new();
-        for (key, track) in &mut inner.tracks {
-            if track.is_timed_out(now) {
-                tracing::warn!(tenant = %key.tenant, table = %key.table.table, "Forge compaction report timed out");
-                track.finish_failed(now);
-                if track.remove_after_finish {
-                    removed.push(key.clone());
-                }
+        for key in inner.due.timed_out(now) {
+            tracing::warn!(tenant = %key.tenant, table = %key.table.table, "Forge compaction report timed out");
+            let remove = inner.edit(
+                &key,
+                || None,
+                |track| {
+                    track.finish_failed(now);
+                    track.remove_after_finish
+                },
+            );
+            if remove == Some(true) {
+                inner.remove_track(&key);
             }
         }
-        for key in removed {
-            inner.tracks.remove(&key);
-        }
-        let mut due: Vec<(DateTime<Utc>, ForgeTableKey)> = inner
-            .tracks
-            .iter()
-            .filter(|(_, track)| track.should_trigger(now))
-            .filter_map(|(key, track)| match track.state {
-                TrackState::Idle { next_compaction_at } => Some((next_compaction_at, key.clone())),
-                _ => None,
-            })
-            .collect();
-        due.sort_by_key(|entry| entry.0);
-        due.into_iter()
-            .take(limit)
-            .filter_map(|(_, key)| {
-                let track = inner.tracks.get_mut(&key)?;
-                track.start_processing();
+        inner
+            .due
+            .oldest_due(limit, now)
+            .into_iter()
+            .filter_map(|key| {
                 let task_id = Uuid::now_v7();
-                let compaction_type = track.compaction_type;
-                track.mark_dispatched(task_id, now, self.report_timeout);
-                tracing::debug!(table = %key.table.table, %task_id, pending_commits = track.pending_commits, "Forge compaction dispatched");
+                let (compaction_type, pending_commits) = inner.edit(&key, || None, |track| {
+                    track.start_processing();
+                    track.mark_dispatched(task_id, now, self.report_timeout);
+                    (track.compaction_type, track.pending_commits)
+                })?;
+                tracing::debug!(table = %key.table.table, %task_id, pending_commits, "Forge compaction dispatched");
                 Some(ForgeCompactionDispatch {
                     task_id,
                     key,
@@ -443,7 +602,7 @@ impl ForgeSchedule {
         now: DateTime<Utc>,
     ) -> bool {
         let mut inner = self.lock();
-        let Some(track) = inner.tracks.get_mut(key) else {
+        let Some(track) = inner.tracks.get(key) else {
             tracing::warn!(%task_id, "Forge compaction report for an unknown table ignored");
             return false;
         };
@@ -452,16 +611,26 @@ impl ForgeSchedule {
             return false;
         }
         tracing::debug!(table = %key.table.table, %task_id, ?outcome, "Forge compaction report applied");
-        match outcome {
-            ForgeCompactionOutcome::Succeeded => track.finish_success(now),
-            ForgeCompactionOutcome::Failed => track.finish_failed(now),
-            ForgeCompactionOutcome::NotStarted => {
-                track.revert_pre_dispatch(now);
-                return true;
-            }
-        }
-        if track.remove_after_finish {
-            inner.tracks.remove(key);
+        let remove = inner.edit(
+            key,
+            || None,
+            |track| match outcome {
+                ForgeCompactionOutcome::Succeeded => {
+                    track.finish_success(now);
+                    track.remove_after_finish
+                }
+                ForgeCompactionOutcome::Failed => {
+                    track.finish_failed(now);
+                    track.remove_after_finish
+                }
+                ForgeCompactionOutcome::NotStarted => {
+                    track.revert_pre_dispatch(now);
+                    false
+                }
+            },
+        );
+        if remove == Some(true) {
+            inner.remove_track(key);
         }
         true
     }
@@ -611,7 +780,7 @@ mod tests {
             "the configured count dispatches early"
         );
 
-        schedule.request_compaction(key("manual"), &ForgeTableSettings::default(), start);
+        schedule.request_compaction(&key("manual"), &ForgeTableSettings::default(), start);
         let manual = schedule.pull(4, start);
         assert_eq!(
             manual.len(),
@@ -765,6 +934,126 @@ mod tests {
             schedule
                 .pull(4, start + chrono::Duration::days(1))
                 .is_empty()
+        );
+    }
+
+    /// `RisingWave`'s full scan over a copy of the tracks: expire timeouts,
+    /// then sort every due Idle track by next compaction time.
+    ///
+    /// # Panics
+    /// Never; selection is pure.
+    fn scan_selection(
+        tracks: &BTreeMap<ForgeTableKey, CompactionTrack>,
+        limit: usize,
+        now: DateTime<Utc>,
+    ) -> Vec<ForgeTableKey> {
+        let mut tracks = tracks.clone();
+        tracks.retain(|_, track| !(track.is_timed_out(now) && track.remove_after_finish));
+        for track in tracks.values_mut() {
+            if track.is_timed_out(now) {
+                track.finish_failed(now);
+            }
+        }
+        let mut due: Vec<(DateTime<Utc>, ForgeTableKey)> = tracks
+            .iter()
+            .filter(|(_, track)| track.should_trigger(now))
+            .filter_map(|(key, track)| match track.state {
+                TrackState::Idle { next_compaction_at } => Some((next_compaction_at, key.clone())),
+                _ => None,
+            })
+            .collect();
+        due.sort_by_key(|entry| entry.0);
+        due.into_iter().take(limit).map(|(_, key)| key).collect()
+    }
+
+    /// Rebuilds the index from the tracks alone and compares it with the live one.
+    ///
+    /// # Panics
+    /// Panics when the live index drifted from the tracks it is derived from.
+    fn assert_index_matches_tracks(schedule: &ForgeSchedule, step: &str) {
+        let inner = schedule.lock();
+        let mut rebuilt = DueIndex::default();
+        for (key, track) in &inner.tracks {
+            rebuilt.insert(key, track.slot());
+        }
+        assert_eq!(inner.due, rebuilt, "index drifted after {step}");
+    }
+
+    /// The due index selects exactly what `RisingWave`'s full scan selects.
+    ///
+    /// Random commits, manual requests, setting changes, pulls, reports
+    /// (including stale and not-started ones), timeouts and clock advances run
+    /// against one schedule. Before every pull the reference scan predicts the
+    /// selection from a copy of the tracks; after every operation the index is
+    /// rebuilt from the tracks and compared.
+    ///
+    /// # Panics
+    /// Panics when a pull selects different tables or order than the scan, or
+    /// the index drifts from the tracks.
+    #[test]
+    fn due_index_selects_exactly_what_the_scan_selects() {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        let tables: Vec<String> = (0..12).map(|n| format!("t{n:02}")).collect();
+        let mut pulls = 0_usize;
+        let mut dispatched = 0_usize;
+        for seed in 0..200_u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let schedule = ForgeSchedule::new(Duration::from_secs(5));
+            let mut now = DateTime::<Utc>::UNIX_EPOCH;
+            let mut in_flight: Vec<ForgeCompactionDispatch> = Vec::new();
+            for op in 0..300_i64 {
+                let table = &tables[rng.gen_range(0..tables.len())];
+                let step = match rng.gen_range(0..10) {
+                    0..=3 => {
+                        let mut settings = enabled(rng.gen_range(0..4), rng.gen_range(0..4));
+                        settings.compaction_enabled = rng.gen_bool(0.9);
+                        commit(&schedule, table, op, &settings, now);
+                        "commit"
+                    }
+                    4 => {
+                        let mut settings = enabled(rng.gen_range(0..4), rng.gen_range(1..4));
+                        settings.compaction_enabled = rng.gen_bool(0.5);
+                        schedule.request_compaction(&key(table), &settings, now);
+                        "manual request"
+                    }
+                    5 | 6 => {
+                        let limit = rng.gen_range(0..5);
+                        let expected = {
+                            let inner = schedule.lock();
+                            scan_selection(&inner.tracks, limit, now)
+                        };
+                        let selected = schedule.pull(limit, now);
+                        let keys: Vec<_> = selected.iter().map(|d| d.key.clone()).collect();
+                        assert_eq!(
+                            keys, expected,
+                            "seed {seed} op {op}: pull diverged from the scan"
+                        );
+                        pulls += 1;
+                        dispatched += selected.len();
+                        in_flight.extend(selected);
+                        "pull"
+                    }
+                    7 | 8 if !in_flight.is_empty() => {
+                        let dispatch = in_flight.swap_remove(rng.gen_range(0..in_flight.len()));
+                        let outcome = [
+                            ForgeCompactionOutcome::Succeeded,
+                            ForgeCompactionOutcome::Failed,
+                            ForgeCompactionOutcome::NotStarted,
+                        ][rng.gen_range(0..3)];
+                        let _ = schedule.report(&dispatch.key, dispatch.task_id, outcome, now);
+                        "report"
+                    }
+                    _ => {
+                        now += chrono::Duration::milliseconds(rng.gen_range(0..3_000));
+                        "clock advance"
+                    }
+                };
+                assert_index_matches_tracks(&schedule, step);
+            }
+        }
+        assert!(
+            pulls > 10_000 && dispatched > 5_000,
+            "the run exercised selection: {pulls} pulls, {dispatched} dispatches"
         );
     }
 }

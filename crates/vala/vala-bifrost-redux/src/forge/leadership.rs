@@ -14,7 +14,7 @@
 //! pulls and reports follow the same rule and enter the same handlers.
 
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -31,6 +31,7 @@ use super::leader::{
     DEFAULT_REPORT_TIMEOUT, ForgeCommitNotice, ForgeCompactionDispatch, ForgeCompactionOutcome,
     ForgeSchedule, ForgeTableKey,
 };
+use super::metrics::{ForgeLeaderDecision, ForgeTelemetry};
 use super::settings::ForgeCompactionType;
 use crate::oracle::dispatcher::BifrostPeerTls;
 
@@ -237,9 +238,10 @@ impl ForgeLeadership {
         notice: ForgeCommitNotice,
         now: DateTime<Utc>,
     ) -> Result<(), ForgeError> {
-        self.term(fencing_token)?
-            .schedule
-            .notify_commit(notice, now);
+        let term = self.term(fencing_token)?;
+        let started = Instant::now();
+        term.schedule.notify_commit(notice, now);
+        ForgeTelemetry::record_leader_decision(ForgeLeaderDecision::Commit, started.elapsed());
         Ok(())
     }
 
@@ -311,7 +313,11 @@ impl ForgeLeadership {
         limit: usize,
         now: DateTime<Utc>,
     ) -> Result<Vec<ForgeCompactionDispatch>, ForgeError> {
-        Ok(self.term(fencing_token)?.schedule.pull(limit, now))
+        let term = self.term(fencing_token)?;
+        let started = Instant::now();
+        let dispatches = term.schedule.pull(limit, now);
+        ForgeTelemetry::record_leader_decision(ForgeLeaderDecision::Pull, started.elapsed());
+        Ok(dispatches)
     }
 
     /// Applies one compactor report to the held term's schedule.
@@ -330,10 +336,11 @@ impl ForgeLeadership {
         outcome: ForgeCompactionOutcome,
         now: DateTime<Utc>,
     ) -> Result<bool, ForgeError> {
-        Ok(self
-            .term(fencing_token)?
-            .schedule
-            .report(key, task_id, outcome, now))
+        let term = self.term(fencing_token)?;
+        let started = Instant::now();
+        let matched = term.schedule.report(key, task_id, outcome, now);
+        ForgeTelemetry::record_leader_decision(ForgeLeaderDecision::Report, started.elapsed());
+        Ok(matched)
     }
 
     /// Resolves the remote leader's term, URI and a client for it.

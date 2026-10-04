@@ -11600,6 +11600,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "wiremock",
  "workspace-hack",
  "wyrd-client",
  "wyrd-testing",

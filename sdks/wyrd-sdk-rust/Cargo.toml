@@ -29,6 +29,7 @@ skald-workflow = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 uuid = { workspace = true, features = ["v7"] }
+wiremock = { workspace = true }
 wyrd-testing = { workspace = true }
 
 [lints]

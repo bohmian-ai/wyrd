@@ -2637,12 +2637,19 @@ async fn empty_maintenance_restart_protects_orphans() {
     let (leader, _) = journey.leaders()[0];
     let successor = if leader == first { second } else { first };
 
-    // Snapshot expiration is on by default and compaction off, so the table's
-    // only leader work is maintenance and it never owes a rewrite.
+    // Snapshot expiration is on by default; compaction is opted out, because
+    // the leader skips the orphan sweep for a table that owes a rewrite. The
+    // table's only leader work is maintenance and it never owes a rewrite.
     let table = register_table(
         journey.node(leader),
         journey.tenant,
         &unique_table("cold_restart"),
+    )
+    .await;
+    set_table_properties(
+        journey.node(leader),
+        &table.binding,
+        &[("wyrd.forge.enable-compaction", "false")],
     )
     .await;
     for values in [&[1, 2][..], &[3, 4]] {

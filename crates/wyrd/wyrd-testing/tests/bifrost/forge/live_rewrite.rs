@@ -1316,6 +1316,15 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     let shared_name = unique_table("rewrite_recovery");
     let shared = register_table(server, owner, &shared_name).await;
     let neighbour_shared = register_table(server, neighbour, &shared_name).await;
+    // Compaction is on for every table by default; the neighbour's tables opt
+    // out so the only rewrite in flight is the owner's, which is the one the
+    // injected uncertainty must land on.
+    set_table_properties(
+        server,
+        &neighbour_shared.binding,
+        &[("wyrd.forge.enable-compaction", "false")],
+    )
+    .await;
     // The owner's table compacts on RisingWave's interval rule alone, so its
     // promotions accumulate commits and the rewrite becomes due only when this
     // journey moves the Forge clock past the interval, after arming uncertainty.
@@ -1337,6 +1346,12 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         "one logical name must resolve to two disjoint physical tables"
     );
     let neighbour_only = register_table(server, neighbour, &unique_table("neighbour_only")).await;
+    set_table_properties(
+        server,
+        &neighbour_only.binding,
+        &[("wyrd.forge.enable-compaction", "false")],
+    )
+    .await;
     let owner_client = tenant_client(server, owner).await;
     let neighbour_client = tenant_client(server, neighbour).await;
 
@@ -1346,7 +1361,7 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     let mut owner_expected: Vec<ManagedRow> = Vec::new();
     let owner_values: Vec<i64> = (0..24).collect();
     let neighbour_values: Vec<i64> = (1_000..1_024).collect();
-    // Each neighbour table has one file, so it owes no independent small-file
+    // Each neighbour table has compaction opted out, so it owes no independent
     // rewrite while we assert its exact cut survives the owner's recovery.
     let neighbour_shared_expected = canonical_order(
         append_values(

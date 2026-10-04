@@ -1171,6 +1171,78 @@ impl PromotionIntegrationFixture {
         );
     }
 
+    /// Seals `count` hot objects of `rows` rows each into one closed day.
+    ///
+    /// [`Self::seal_more`] puts every object in its own day, which is right for
+    /// multi-plan scenarios but never gives a partition two small files. This
+    /// seals into the single day `days_before` the fixture day, so the objects
+    /// share a partition and the small-files planner can group them. Values
+    /// are a fixed pseudo-random sequence: they do not compress, so an
+    /// object's size grows with its row count and a scenario can size its
+    /// table target from the sealed objects. `first_value` keeps sequences
+    /// from different calls disjoint.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a seal publishes no new `vala.file_list` row.
+    pub(crate) async fn seal_partition_files(
+        &self,
+        days_before: i64,
+        rows: usize,
+        count: usize,
+        first_value: u64,
+    ) {
+        let before = self.file_rows().await.len();
+        let seeded_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT now()")
+            .fetch_one(self.operator_pool.pool())
+            .await
+            .expect("fixture seed marker");
+        let schema = ingress_schema();
+        let noon = (fixture_day() - chrono::Duration::days(days_before))
+            .and_hms_opt(12, 0, 0)
+            .expect("fixture timestamp")
+            .and_utc()
+            .timestamp_micros();
+        let rows_u64 = u64::try_from(rows).expect("fixture row counts fit u64");
+        for file in 0..u64::try_from(count).expect("fixture seal counts fit u64") {
+            let start = first_value + file * rows_u64;
+            let values: Vec<i64> = (start..start + rows_u64)
+                .map(|index| {
+                    // SplitMix64: a bijective scramble, so values stay distinct.
+                    let mut mixed = index.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                    i64::from_ne_bytes((mixed ^ (mixed >> 31)).to_ne_bytes())
+                })
+                .collect();
+            let times: Vec<i64> = (0..rows)
+                .map(|row| noon + i64::try_from(row).expect("fixture row offsets fit i64"))
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(values)),
+                    Arc::new(TimestampMicrosecondArray::from(times).with_timezone("UTC")),
+                ],
+            )
+            .expect("fixture partition batch");
+            append_and_seal(
+                &self.scribe,
+                &self.catalog,
+                self.tenant,
+                &self.binding,
+                &batch,
+            )
+            .await;
+        }
+        age_files(&self.operator_pool, self.tenant, &self.binding, seeded_at).await;
+        assert_eq!(
+            self.file_rows().await.len(),
+            before + count,
+            "a real Scribe seal publishes one row per batch"
+        );
+    }
+
     /// Seeds one more active tenant and returns its isolation key.
     ///
     /// The Forge claim, admission, and settlement paths are all tenant

@@ -1,11 +1,13 @@
 //! Per-table Forge maintenance settings read from Iceberg table properties.
 //!
 //! The settings mirror `RisingWave`'s Iceberg sink options and defaults
-//! (`connector/src/sink/iceberg/config.rs` at e23ddf95) with one deliberate
-//! departure: Bifrost owns its tables, so compaction is on unless a table
-//! disables it, where `RisingWave`'s sink defaults it off. The interval is one
-//! hour, the snapshot-count trigger is disabled, the physical type is `full`,
-//! snapshot expiration is on and manifest rewriting is off. They are read by
+//! (`connector/src/sink/iceberg/config.rs` at e23ddf95) with two deliberate
+//! departures, both because Bifrost owns its tables: compaction is on unless a
+//! table disables it, where `RisingWave`'s sink defaults it off, and the
+//! physical type is `small-files`, where `RisingWave` defaults to `full`, so a
+//! finished file is not rewritten again. The interval is one hour, the
+//! snapshot-count trigger is disabled, snapshot expiration is on and manifest
+//! rewriting is off. They are read by
 //! whoever already holds the loaded table, never by the leader while it
 //! decides.
 
@@ -45,15 +47,17 @@ pub fn is_copy_on_write(properties: &HashMap<String, String>) -> bool {
 
 /// Physical selection a worker applies to one dispatched compaction task.
 ///
-/// The four values are `RisingWave`'s `CompactionType`; `Full` is its default.
+/// The four values are `RisingWave`'s `CompactionType`. `RisingWave` defaults
+/// to `Full`; Forge defaults to `SmallFiles`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ForgeCompactionType {
     /// Choose a delete-heavy or small-file plan from table-wide thresholds.
     Auto,
     /// Rewrite every live data file.
-    #[default]
     Full,
-    /// Rewrite only data files below the small-file threshold.
+    /// Rewrite only data files below the small-file threshold, in groups of at
+    /// least two files per partition.
+    #[default]
     SmallFiles,
     /// Rewrite only data files with associated delete files.
     FilesWithDelete,
@@ -98,7 +102,7 @@ pub struct ForgeTableSettings {
     pub compaction_interval: Duration,
     /// Pending commit count that triggers compaction early.
     pub trigger_snapshot_count: usize,
-    /// Physical selection the worker applies.
+    /// Physical selection the worker applies; `SmallFiles` by default.
     pub compaction_type: ForgeCompactionType,
     /// Whether the leader timer expires this table's snapshots.
     pub snapshot_expiration_enabled: bool,
@@ -108,13 +112,13 @@ pub struct ForgeTableSettings {
 
 impl Default for ForgeTableSettings {
     /// Returns `RisingWave`'s Iceberg sink defaults, except that compaction is
-    /// enabled because Bifrost owns every table it writes.
+    /// enabled and plans small files because Bifrost owns every table it writes.
     fn default() -> Self {
         Self {
             compaction_enabled: true,
             compaction_interval: Duration::from_hours(1),
             trigger_snapshot_count: usize::MAX,
-            compaction_type: ForgeCompactionType::Full,
+            compaction_type: ForgeCompactionType::SmallFiles,
             snapshot_expiration_enabled: true,
             manifest_rewrite_enabled: false,
         }
@@ -232,7 +236,8 @@ where
 mod tests {
     use super::*;
 
-    /// Absent properties are `RisingWave`'s defaults with compaction on;
+    /// Absent properties are `RisingWave`'s defaults with compaction on and
+    /// small-files selection;
     /// present ones override them.
     ///
     /// # Panics
@@ -245,7 +250,7 @@ mod tests {
         assert!(!defaults.manifest_rewrite_enabled);
         assert_eq!(defaults.compaction_interval, Duration::from_hours(1));
         assert_eq!(defaults.trigger_snapshot_count, usize::MAX);
-        assert_eq!(defaults.compaction_type, ForgeCompactionType::Full);
+        assert_eq!(defaults.compaction_type, ForgeCompactionType::SmallFiles);
         let disabled = HashMap::from([(ENABLE_COMPACTION_PROPERTY.to_owned(), "false".to_owned())]);
         assert!(
             !ForgeTableSettings::from_properties(&disabled)
@@ -260,7 +265,7 @@ mod tests {
             (TRIGGER_SNAPSHOT_COUNT_PROPERTY.to_owned(), "3".to_owned()),
             (
                 COMPACTION_TYPE_PROPERTY.to_owned(),
-                "small-files".to_owned(),
+                "files-with-delete".to_owned(),
             ),
             (
                 ENABLE_SNAPSHOT_EXPIRATION_PROPERTY.to_owned(),
@@ -276,7 +281,10 @@ mod tests {
         assert!(!settings.snapshot_expiration_enabled);
         assert_eq!(settings.compaction_interval, Duration::from_mins(1));
         assert_eq!(settings.trigger_snapshot_count, 3);
-        assert_eq!(settings.compaction_type, ForgeCompactionType::SmallFiles);
+        assert_eq!(
+            settings.compaction_type,
+            ForgeCompactionType::FilesWithDelete
+        );
         assert_eq!(
             ForgeTableSettings::from_properties(&settings.to_properties()).expect("round trip"),
             settings

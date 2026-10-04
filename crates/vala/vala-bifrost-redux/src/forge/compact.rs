@@ -21,8 +21,11 @@ use super::error::ForgeError;
 const DEFAULT_MAX_CONCURRENT_READS: usize = 4;
 const DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE: usize = 256;
 const DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE: usize = 256;
-/// Small-file candidacy threshold.
-pub(crate) const DEFAULT_SMALL_FILE_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+/// Default small-file threshold as a percentage of a table's file target.
+///
+/// At the 1 GiB default target this is 768 MiB: a 512 MiB staged file is
+/// selected, while a merged output that reached the target is not.
+const DEFAULT_SMALL_FILE_THRESHOLD_PERCENT: u8 = 75;
 /// Deployment-wide rewrite file target for tables that declare none: 1 GiB.
 ///
 /// Replaces Iceberg's 512 MiB writer default so every Bifrost table, built-in
@@ -75,8 +78,14 @@ pub struct ForgeConfig {
     pub snapshot_retention: Duration,
     /// Number of snapshots retained along each current/ref ancestry.
     pub retain_last: usize,
-    /// Independent small-file candidacy threshold used by live planning.
-    pub small_file_threshold_bytes: u64,
+    /// Small-file threshold as a percentage of each table's resolved file
+    /// target, in `1..=99`.
+    ///
+    /// A live file below this share of its table's target is a small-file
+    /// candidate. Expressing it as a share rather than a byte count keeps the
+    /// threshold below every table's own target, so an output that reached
+    /// the target is never selected again.
+    pub small_file_threshold_percent: u8,
     /// Soft rewrite file target for a table without its own
     /// `write.target-file-size-bytes` property.
     ///
@@ -135,7 +144,7 @@ impl Default for ForgeConfig {
             audit_page_size: 256,
             snapshot_retention: Duration::from_hours(24),
             retain_last: 1,
-            small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
+            small_file_threshold_percent: DEFAULT_SMALL_FILE_THRESHOLD_PERCENT,
             default_target_file_size_bytes: DEFAULT_TARGET_FILE_SIZE_BYTES,
             orphan_gc_ttl: Duration::from_hours(24),
             max_gc_candidates_per_batch: 256,
@@ -157,8 +166,9 @@ impl ForgeConfig {
     /// # Errors
     ///
     /// Returns [`ForgeError::InvalidConfig`] when a limit is zero, a bin cannot
-    /// contain two files, the lease cannot cover the configured commit window,
-    /// or `retain_last` exceeds the retained-snapshot traversal cap
+    /// contain two files, the small-file threshold percentage is not below 100,
+    /// the lease cannot cover the configured commit window, or `retain_last`
+    /// exceeds the retained-snapshot traversal cap
     /// (`max_retained_snapshots_per_table`), which would make reconciliation
     /// unable to see every snapshot the expiry policy is asked to retain.
     pub fn validate(&self) -> Result<(), ForgeError> {
@@ -170,7 +180,7 @@ impl ForgeConfig {
             || self.audit_page_size <= 0
             || self.snapshot_retention.is_zero()
             || self.retain_last == 0
-            || self.small_file_threshold_bytes == 0
+            || self.small_file_threshold_percent == 0
             || self.default_target_file_size_bytes == 0
             || self.orphan_gc_ttl.is_zero()
             || self.max_gc_candidates_per_batch == 0
@@ -185,6 +195,11 @@ impl ForgeConfig {
         {
             return Err(ForgeError::InvalidConfig {
                 detail: "Forge limits must be positive".to_owned(),
+            });
+        }
+        if self.small_file_threshold_percent >= 100 {
+            return Err(ForgeError::InvalidConfig {
+                detail: "small_file_threshold_percent must be below 100".to_owned(),
             });
         }
         if self.retain_last > self.max_retained_snapshots_per_table {
@@ -581,6 +596,25 @@ mod tests {
             ..ForgeConfig::default()
         };
         assert!(over_bound.validate().is_err());
+    }
+
+    /// The small-file threshold percentage defaults to 75 and stays in `1..=99`.
+    ///
+    /// Zero would select nothing and 100 or more would select a file that
+    /// already reached its table's target, so both bounds are refused.
+    ///
+    /// # Panics
+    /// Panics when the default or a boundary percentage is classified wrongly.
+    #[test]
+    fn forge_config_bounds_the_small_file_threshold_percent() {
+        assert_eq!(ForgeConfig::default().small_file_threshold_percent, 75);
+        for (percent, valid) in [(0, false), (1, true), (99, true), (100, false)] {
+            let config = ForgeConfig {
+                small_file_threshold_percent: percent,
+                ..ForgeConfig::default()
+            };
+            assert_eq!(config.validate().is_ok(), valid, "percent {percent}");
+        }
     }
 
     /// The history readers may continue to call the audit query module until

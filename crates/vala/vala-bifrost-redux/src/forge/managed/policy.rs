@@ -17,7 +17,7 @@ use iceberg_compaction_core::compaction::{CompactionPlan, CompactionPlanner};
 use iceberg_compaction_core::config::{
     CompactionConfig, CompactionExecutionConfig, CompactionExecutionConfigBuilder,
     CompactionPlanningConfig, FileGroupScope, FilesWithDeletesConfig, FullCompactionConfig,
-    GroupingStrategy, SmallFilesConfig,
+    GroupFilters, GroupingStrategy, SmallFilesConfig,
 };
 use iceberg_compaction_core::file_selection::{FileSelector, PlanStrategy};
 use iceberg_compaction_core::managed::{SelectedFile, SelectionReport, SelectionStrategyKind};
@@ -39,6 +39,12 @@ const RUNNER_MAX_FILE_COUNT_PER_PARTITION: usize = 32;
 
 /// `RisingWave`'s Iceberg sink `delete_files_count_threshold` default.
 const DELETE_FILES_COUNT_THRESHOLD: usize = 256;
+
+/// Minimum files in one explicit `SmallFiles` group.
+///
+/// Two, so a lone small file in its partition waits for a partner rather than
+/// being rewritten alone, which would only copy it.
+const SMALL_FILES_MIN_GROUP_FILE_COUNT: usize = 2;
 
 /// Upstream Auto's minimum small-file count for a small-file plan.
 const AUTO_MIN_SMALL_FILES: usize = 5;
@@ -76,9 +82,10 @@ const OVERSIZED_CEILING_PERCENT: u64 = 180;
 /// Registration cannot see a worker's operator limits, so it checks only what
 /// holds under every deployment: the target is representable on this platform,
 /// its oversized ceiling does not overflow, and it is at least the default
-/// row-group target a newly registered table writes with, which also places it
-/// above the default small-file threshold. [`ForgeTablePolicy::extract`] re-checks the
-/// full table and worker combination at planning.
+/// row-group target a newly registered table writes with. The small-file
+/// threshold is a share of the target, so it sits below any admitted target.
+/// [`ForgeTablePolicy::extract`] re-checks the full table and worker
+/// combination at planning.
 #[must_use]
 pub(crate) fn registrable_target_file_size_bytes(bytes: u64) -> bool {
     bytes >= ROW_GROUP_TARGET_DEFAULT
@@ -90,7 +97,8 @@ pub(crate) fn registrable_target_file_size_bytes(bytes: u64) -> bool {
 ///
 /// Every field is derived, never defaulted at the point of use: the identity
 /// triple and both size targets come from the table, the small-file threshold
-/// and plan budget come from validated operator limits, and the data location
+/// is the operator's percentage of the table's resolved file target, and the
+/// data location
 /// and writer recipe come from the registered Forge path layout. Construction
 /// is the only place these can disagree, so construction is where they are
 /// checked.
@@ -100,7 +108,8 @@ pub struct ForgeTablePolicy {
     pub(crate) target_file_size_bytes: u64,
     /// Independent encoded row-group target applied to the Parquet writer.
     pub(crate) row_group_target_bytes: u64,
-    /// Size at or below which a live file is small enough to be reselected.
+    /// Size below which a live file is a small-file candidate: the operator's
+    /// percentage of [`Self::target_file_size_bytes`], rounded down.
     pub(crate) small_file_threshold_bytes: u64,
     /// Current schema a produced file must carry to be considered settled.
     pub(crate) schema_id: i32,
@@ -121,6 +130,9 @@ impl ForgeTablePolicy {
     /// when declared, otherwise the deployment default in
     /// [`ForgeConfig::default_target_file_size_bytes`]. It is resolved here
     /// once; execution, publication, and audit all read this policy's value.
+    /// The small-file threshold is
+    /// [`ForgeConfig::small_file_threshold_percent`] of that resolved target,
+    /// so it moves with a declared target.
     ///
     /// There is no admitted-memory term. Execution charges the shared Bifrost
     /// memory root as it grows, so a row-group target is never checked
@@ -165,7 +177,10 @@ impl ForgeTablePolicy {
         let policy = Self {
             target_file_size_bytes,
             row_group_target_bytes,
-            small_file_threshold_bytes: config.small_file_threshold_bytes,
+            small_file_threshold_bytes: percent_of(
+                target_file_size_bytes,
+                config.small_file_threshold_percent,
+            ),
             schema_id: metadata.current_schema_id(),
             partition_spec_id: metadata.default_partition_spec_id(),
             sort_order_id: i32::try_from(metadata.default_sort_order().order_id).map_err(|_| {
@@ -243,6 +258,12 @@ impl ForgeTablePolicy {
     /// delete-file threshold of 256. The file target and small-file threshold
     /// are this policy's. Copy-on-write plans `Full` over the whole table, as
     /// `RisingWave` does for a copy-on-write sink.
+    ///
+    /// Forge departs from the runner in one place: an explicit `SmallFiles`
+    /// task keeps only groups of at least [`SMALL_FILES_MIN_GROUP_FILE_COUNT`]
+    /// files, so a lone staged file waits for a partner instead of being
+    /// rewritten into a copy of itself. `Auto`'s small-file candidate keeps the
+    /// upstream configuration.
     #[must_use]
     pub(crate) fn planning(
         &self,
@@ -273,7 +294,13 @@ impl ForgeTablePolicy {
                 }))
             }
             ForgeCompactionType::SmallFiles => ForgeTaskPlanning::Explicit(
-                CompactionPlanningConfig::SmallFiles(self.small_files()),
+                CompactionPlanningConfig::SmallFiles(SmallFilesConfig {
+                    group_filters: Some(GroupFilters {
+                        min_group_file_count: Some(SMALL_FILES_MIN_GROUP_FILE_COUNT),
+                        ..GroupFilters::default()
+                    }),
+                    ..self.small_files()
+                }),
             ),
             ForgeCompactionType::FilesWithDelete => ForgeTaskPlanning::Explicit(
                 CompactionPlanningConfig::FilesWithDeletes(self.files_with_deletes()),
@@ -497,6 +524,15 @@ fn selection_report(
     })
 }
 
+/// Returns `percent` percent of `bytes`, rounded down, without overflow.
+///
+/// Splitting `bytes` into its hundreds and remainder keeps every intermediate
+/// product within `u64` for any target and any percentage below 256.
+fn percent_of(bytes: u64, percent: u8) -> u64 {
+    let percent = u64::from(percent);
+    bytes / 100 * percent + bytes % 100 * percent / 100
+}
+
 /// Reads one declared byte-valued table property, or its documented default.
 ///
 /// # Errors
@@ -569,12 +605,9 @@ mod tests {
         .metadata
     }
 
-    /// A validated Forge owner configuration with a usable small-file floor.
+    /// A validated Forge owner configuration with the default threshold share.
     fn limits() -> ForgeConfig {
-        ForgeConfig {
-            small_file_threshold_bytes: 32 * 1024 * 1024,
-            ..ForgeConfig::default()
-        }
+        ForgeConfig::default()
     }
 
     /// The declared file target survives every hop, and stays its own term.
@@ -735,7 +768,7 @@ mod tests {
     /// Every impossible geometry is refused before any planning happens.
     ///
     /// One case per way the geometry can be impossible: a zero target, a
-    /// non-numeric target, a threshold that is not below the target, a row-group
+    /// non-numeric target, a target whose threshold share rounds to zero, a row-group
     /// target above the file target, a target whose oversized ceiling overflows,
     /// and a data location that is not the registered recipe location. Each is
     /// a condition under which an admitted attempt could only produce wrong or
@@ -756,12 +789,15 @@ mod tests {
         assert!(
             matches!(
                 ForgeTablePolicy::extract(
-                    &metadata_with(vec![(FILE_TARGET_PROPERTY, "1024")]),
+                    &metadata_with(vec![
+                        (FILE_TARGET_PROPERTY, "1"),
+                        (ROW_GROUP_TARGET_PROPERTY, "1"),
+                    ]),
                     &limits(),
                 ),
-                Err(ForgeError::InvalidConfig { .. })
+                Err(ForgeError::InvalidConfig { detail }) if detail.contains("small-file threshold")
             ),
-            "a threshold at or above the target selects every file forever"
+            "a target too small to leave a positive threshold share selects nothing"
         );
         assert!(
             matches!(
@@ -799,5 +835,86 @@ mod tests {
             ),
             "outputs written outside the recipe location can never settle"
         );
+    }
+
+    /// The small-file threshold is 75% of the table's resolved file target.
+    ///
+    /// At the 1 GiB deployment default that is 768 MiB, which selects a
+    /// 512 MiB staged file and never a merged output that reached the target.
+    /// A declared target moves the threshold with it.
+    ///
+    /// # Panics
+    /// Panics when a default or declared target derives the wrong threshold.
+    #[test]
+    fn small_file_threshold_is_three_quarters_of_the_resolved_target() {
+        let defaulted =
+            ForgeTablePolicy::extract(&metadata_with(Vec::new()), &ForgeConfig::default())
+                .expect("default geometry is admissible");
+        assert_eq!(defaulted.target_file_size_bytes, 1024 * 1024 * 1024);
+        assert_eq!(defaulted.small_file_threshold_bytes, 768 * 1024 * 1024);
+
+        let declared = ForgeTablePolicy::extract(
+            &metadata_with(vec![(FILE_TARGET_PROPERTY, "268435456")]),
+            &ForgeConfig::default(),
+        )
+        .expect("declared geometry is admissible");
+        assert_eq!(declared.small_file_threshold_bytes, 201_326_592);
+
+        let odd = ForgeTablePolicy::extract(
+            &metadata_with(vec![(FILE_TARGET_PROPERTY, "134217731")]),
+            &ForgeConfig::default(),
+        )
+        .expect("an odd declared target is admissible");
+        assert_eq!(
+            odd.small_file_threshold_bytes, 100_663_298,
+            "the threshold is the floor of 75% of the declared target"
+        );
+    }
+
+    /// Only `SmallFiles` keeps a lone small file waiting for a partner.
+    ///
+    /// The group filter requires two files per group, so a single staged
+    /// file in a partition is not rewritten into an identical copy of
+    /// itself. `Full`, `FilesWithDelete`, and both of `Auto`'s strategies keep
+    /// the upstream configuration with no group filter.
+    ///
+    /// # Panics
+    /// Panics when a task type carries the wrong group filter.
+    #[test]
+    fn only_small_files_requires_a_partner_file() {
+        let policy = ForgeTablePolicy::extract(&metadata_with(Vec::new()), &ForgeConfig::default())
+            .expect("default geometry is admissible");
+        let ForgeTaskPlanning::Explicit(CompactionPlanningConfig::SmallFiles(small)) =
+            policy.planning(ForgeCompactionType::SmallFiles, false)
+        else {
+            panic!("small-files planning is explicit");
+        };
+        assert_eq!(
+            small.group_filters,
+            Some(GroupFilters {
+                min_group_file_count: Some(2),
+                ..GroupFilters::default()
+            })
+        );
+        let ForgeTaskPlanning::Explicit(CompactionPlanningConfig::Full(_)) =
+            policy.planning(ForgeCompactionType::Full, false)
+        else {
+            panic!("full planning is explicit and has no group filter term");
+        };
+        let ForgeTaskPlanning::Explicit(CompactionPlanningConfig::FilesWithDeletes(deletes)) =
+            policy.planning(ForgeCompactionType::FilesWithDelete, false)
+        else {
+            panic!("files-with-delete planning is explicit");
+        };
+        assert_eq!(deletes.group_filters, None);
+        let ForgeTaskPlanning::Auto {
+            files_with_deletes,
+            small_files,
+        } = policy.planning(ForgeCompactionType::Auto, false)
+        else {
+            panic!("auto planning chooses between upstream strategies");
+        };
+        assert_eq!(files_with_deletes.group_filters, None);
+        assert_eq!(small_files.group_filters, None);
     }
 }

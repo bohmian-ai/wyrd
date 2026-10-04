@@ -2274,5 +2274,5 @@ async fn property_less_table_is_compacted_after_the_default_interval() {
         .expect("manual clock advance");
     let due = forge.pull_compaction(4).await.expect("leader pull");
     assert_eq!(due.len(), 1, "the interval boundary dispatches: {due:?}");
-    assert_eq!(due[0].compaction_type, ForgeCompactionType::Full);
+    assert_eq!(due[0].compaction_type, ForgeCompactionType::SmallFiles);
 }

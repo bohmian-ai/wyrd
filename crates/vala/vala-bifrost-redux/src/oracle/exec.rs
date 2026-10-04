@@ -1537,18 +1537,15 @@ impl OracleIcebergScanExec {
         let tasks = futures_util::stream::iter(tasks);
         // Row selection turns each task predicate into a page-index selection,
         // so a point lookup decodes the matching pages instead of every page
-        // of each surviving row group. The reader defaults it off, and it is
-        // enabled only when the page-index evaluator can read every column
-        // the predicate names.
-        let row_selection = self.predicates.as_ref().is_none_or(|predicate| {
-            page_index_evaluable(predicate, self.table.metadata().current_schema())
-        });
+        // of each surviving row group. The reader defaults it off. The pinned
+        // evaluator decodes every physical type it can bound exactly and keeps
+        // pages for any other, so it is enabled for every predicate.
         let reader = self
             .reader
             .get_or_init(|| async {
                 self.table
                     .reader_builder()
-                    .with_row_selection_enabled(row_selection)
+                    .with_row_selection_enabled(true)
                     .with_parquet_metadata_loader(footers)
                     .build()
             })
@@ -3300,56 +3297,6 @@ fn hot_projection_mask(
     parquet::arrow::ProjectionMask::roots(parquet_schema, indices)
 }
 
-/// Reports whether Iceberg's page-index evaluator can prune by `predicate`.
-///
-/// The evaluator decodes each page's column-index bounds into an Iceberg
-/// literal before it can prune. It refuses fixed-length byte arrays and
-/// INT96 with a hard error, decodes every other byte array as UTF-8 with an
-/// `unwrap` that panics on binary bounds, and decodes integer-backed
-/// decimals as plain integers. A scan therefore enables row selection only
-/// when every column the predicate names resolves in `schema` to a type the
-/// evaluator decodes correctly: booleans, integers, floating point, dates,
-/// times, timestamps, and strings. Any other or unresolvable column returns
-/// `false`; the reader then still prunes row groups by their statistics, and
-/// `DataFusion` still applies the filter to every row because Oracle reports
-/// pushdown as inexact.
-fn page_index_evaluable(predicate: &Predicate, schema: &iceberg::spec::Schema) -> bool {
-    let column_evaluable = |name: &str| {
-        schema
-            .field_by_name(name)
-            .and_then(|field| field.field_type.as_primitive_type())
-            .is_some_and(|primitive| {
-                use iceberg::spec::PrimitiveType as Type;
-                matches!(
-                    primitive,
-                    Type::Boolean
-                        | Type::Int
-                        | Type::Long
-                        | Type::Float
-                        | Type::Double
-                        | Type::Date
-                        | Type::Time
-                        | Type::Timestamp
-                        | Type::Timestamptz
-                        | Type::TimestampNs
-                        | Type::TimestamptzNs
-                        | Type::String
-                )
-            })
-    };
-    match predicate {
-        Predicate::AlwaysTrue | Predicate::AlwaysFalse => true,
-        Predicate::And(expression) | Predicate::Or(expression) => expression
-            .inputs()
-            .into_iter()
-            .all(|input| page_index_evaluable(input, schema)),
-        Predicate::Not(expression) => page_index_evaluable(expression.inputs()[0], schema),
-        Predicate::Unary(expression) => column_evaluable(expression.term().name()),
-        Predicate::Binary(expression) => column_evaluable(expression.term().name()),
-        Predicate::Set(expression) => column_evaluable(expression.term().name()),
-    }
-}
-
 /// Result of classifying one `DataFusion` filter expression against the
 /// closed predicate pushdown vocabulary.
 enum FilterClassification {
@@ -4542,49 +4489,6 @@ mod tests {
         assert_eq!(snapshot.oracle_memory_used_bytes, 0);
         assert_eq!(snapshot.governed_memory_used_bytes, 0);
         assert_eq!(query_pool.reserved(), 0);
-    }
-
-    /// Page-index row selection is enabled only for columns it can decode.
-    ///
-    /// Against the canonical span table, a string predicate keeps row
-    /// selection. A predicate naming a fixed-length span id or a binary
-    /// attribute column disables it, and so does any conjunction,
-    /// disjunction, or negation that contains one, as does a column the
-    /// schema lacks.
-    ///
-    /// # Panics
-    /// Panics when the span schema cannot be converted or a predicate is
-    /// classified differently.
-    #[test]
-    fn page_index_selection_skips_columns_the_evaluator_cannot_decode() {
-        use iceberg::expr::Reference;
-        use iceberg::spec::Datum;
-
-        let definition =
-            crate::tables::builtin_table("traces", "spans").expect("span table is built in");
-        let schema = crate::tables::iceberg_schema_for(&(definition.schema)())
-            .expect("span schema converts");
-        let scope = Reference::new("scope_name").equal_to(Datum::string("scope"));
-        let parent = Reference::new("parent_span_id").is_null();
-        let attributes = Reference::new("attributes").is_not_null();
-
-        assert!(page_index_evaluable(&scope, &schema));
-        assert!(page_index_evaluable(&Predicate::AlwaysTrue, &schema));
-        assert!(!page_index_evaluable(&parent, &schema));
-        assert!(!page_index_evaluable(&attributes, &schema));
-        assert!(!page_index_evaluable(
-            &scope.clone().and(parent.clone()),
-            &schema
-        ));
-        assert!(!page_index_evaluable(
-            &scope.clone().or(attributes),
-            &schema
-        ));
-        assert!(!page_index_evaluable(&!parent, &schema));
-        assert!(!page_index_evaluable(
-            &Reference::new("absent").is_null(),
-            &schema
-        ));
     }
 
     /// In-memory sources remain unavailable while hot reads aggregate actual bytes.

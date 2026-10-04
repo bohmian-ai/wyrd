@@ -2811,7 +2811,7 @@ impl FilteringFixture {
             tenant,
             BifrostNamespace::Datasets,
             &self.custom,
-            false,
+            PhysicalTier::Hot,
         )
         .await?;
         let spans = SealedObject::read_tier(
@@ -2820,7 +2820,7 @@ impl FilteringFixture {
             tenant,
             BifrostNamespace::Traces,
             "spans",
-            false,
+            PhysicalTier::Hot,
         )
         .await?;
         let records = SealedObject::read_tier(
@@ -2829,7 +2829,7 @@ impl FilteringFixture {
             tenant,
             BifrostNamespace::Logs,
             "records",
-            false,
+            PhysicalTier::Hot,
         )
         .await?;
         let points = SealedObject::read_tier(
@@ -2838,7 +2838,7 @@ impl FilteringFixture {
             tenant,
             BifrostNamespace::Metrics,
             "points",
-            false,
+            PhysicalTier::Hot,
         )
         .await?;
         let probes = self
@@ -3308,6 +3308,15 @@ struct FilterProbes {
     request_ids: Vec<String>,
 }
 
+/// The physical tier a [`SealedObject`] read draws its objects from.
+#[derive(Debug, Clone, Copy)]
+enum PhysicalTier {
+    /// Scribe hot objects not yet promoted into Iceberg.
+    Hot,
+    /// Data files of the table's current Iceberg snapshot.
+    Iceberg,
+}
+
 /// One sealed object read back from storage, with its decoded rows and its
 /// footer's column and offset indexes.
 struct SealedObject {
@@ -3322,19 +3331,22 @@ struct SealedObject {
 }
 
 impl SealedObject {
-    /// Reads every hot (`compacted = false`) or Forge (`compacted = true`)
-    /// object of one table, ordered by its first event time.
+    /// Reads every object of one table in `tier`, ordered by its first event
+    /// time.
+    ///
+    /// Hot objects are the table's unpromoted `vala.file_list` rows; Iceberg
+    /// objects are the data files the table's current snapshot plans.
     ///
     /// # Errors
     ///
-    /// Returns SQL, catalog, storage, or Parquet errors.
+    /// Returns SQL, catalog, scan-planning, storage, or Parquet errors.
     async fn read_tier(
         cluster: &WyrdTestCluster,
         server: &WyrdTestServer,
         tenant: DataTenantId,
         namespace: vala_bifrost_redux::namespaces::BifrostNamespace,
         table: &str,
-        compacted: bool,
+        tier: PhysicalTier,
     ) -> Result<Vec<Self>, JourneyError> {
         let catalog = server
             .state()
@@ -3346,15 +3358,26 @@ impl SealedObject {
             vala_bifrost_redux::catalog::TableRef::new(namespace, table),
         ))?;
         let loaded = catalog.load_table(&binding.table_ident()).await?;
-        let paths: Vec<String> = sqlx::query_scalar(
-            "SELECT file_path FROM vala.file_list \
-             WHERE data_tenant_id = $1 AND table_name = $2 AND compacted = $3",
-        )
-        .bind(tenant.as_uuid())
-        .bind(table)
-        .bind(compacted)
-        .fetch_all(cluster.pg_fixture().operator_pool().pool())
-        .await?;
+        let paths: Vec<String> = match tier {
+            PhysicalTier::Hot => {
+                sqlx::query_scalar(
+                    "SELECT file_path FROM vala.file_list \
+                     WHERE data_tenant_id = $1 AND table_name = $2 AND NOT compacted",
+                )
+                .bind(tenant.as_uuid())
+                .bind(table)
+                .fetch_all(cluster.pg_fixture().operator_pool().pool())
+                .await?
+            }
+            PhysicalTier::Iceberg => {
+                let mut tasks = loaded.scan().select_all().build()?.plan_files().await?;
+                let mut paths = Vec::new();
+                while let Some(task) = futures_util::TryStreamExt::try_next(&mut tasks).await? {
+                    paths.push(task.data_file_path);
+                }
+                paths
+            }
+        };
         let mut objects = Vec::with_capacity(paths.len());
         for path in paths {
             let bytes = loaded.file_io().new_input(&path)?.read().await?;
@@ -3727,4 +3750,199 @@ fn with_event_time(
         std::sync::Arc::new(arrow::datatypes::Schema::new(fields)),
         columns,
     )?)
+}
+
+/// Rows the binary-key dataset seals: above the 20,000-row page limit, so
+/// its one row group spans several pages of the binary sort key.
+const BINARY_KEY_ROWS: i64 = 45_000;
+
+/// The binary-key row the page probes look up.
+const BINARY_PROBE_ROW: i64 = 30_000;
+
+/// A custom dataset sorted by a fixed-size binary key keeps exact results
+/// and selects pages from both binary key columns once Forge promotes it.
+///
+/// Every key is non-UTF-8 (its leading bytes are `0xff`/`0xfd`), so a reader
+/// that decoded binary page bounds as text would fail or guess. The promoted
+/// file's one row group spans several pages of the sorted key, so the
+/// Iceberg reader's page index is the only mechanism that can skip rows of a
+/// point lookup: row-group statistics keep the group, and there is no other
+/// file. Equality on the fixed-size key, on the variable-length key, and the
+/// fixed-size key combined with a selective event-time bound each return the
+/// one written row while skipping rows by the page index; an absent key
+/// returns nothing.
+///
+/// # Errors
+///
+/// Returns cluster, registration, write, promotion, storage, telemetry, or
+/// query errors, or a description of the first expectation that does not
+/// hold.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn binary_sort_key_page_pruning() -> Result<(), JourneyError> {
+    use vala_bifrost_redux::namespaces::BifrostNamespace;
+    use wyrd_spec::vala::api::{
+        NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
+    };
+
+    let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
+        BifrostClusterSpec::one_mixed(),
+        ForgeConfig::default(),
+        false,
+        false,
+    )
+    .await?;
+    let server = cluster.server(0).ok_or("missing node")?;
+    let tenant = cluster.data_tenant_id();
+    let table = unique_table("oracle_binary_key");
+    let fqn = format!("vala.datasets.{table}");
+    let rows = writer(server, "binary-key-writer").await?;
+    let sort_keys = vec![SortKeyWire {
+        column: "fixed_key".to_owned(),
+        direction: SortDirectionWire::Asc,
+        null_order: NullOrderWire::Last,
+    }];
+    let config = wyrd_client::bifrost::TableConfig::from_arrow(&fqn, binary_key_schema())?
+        .with_layout(PhysicalLayoutWire {
+            partition_granularity: TimeGranularityWire::Hour,
+            sort_keys: sort_keys.clone(),
+            bloom_columns: Vec::new(),
+        });
+    wyrd_client::Bifrost::connect_with_table(rows.client(), config)
+        .await?
+        .register()
+        .await?;
+
+    let hour =
+        (chrono::Utc::now().timestamp_micros() / FILTER_HOUR_MICROS - 2) * FILTER_HOUR_MICROS;
+    let event_time = |row: i64| hour + row * 10_000;
+    let written: Vec<i64> = (0..BINARY_KEY_ROWS).rev().collect();
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        binary_key_schema(),
+        vec![
+            std::sync::Arc::new(arrow::array::Int64Array::from(written.clone())),
+            std::sync::Arc::new(arrow::array::FixedSizeBinaryArray::try_from_iter(
+                written.iter().map(|row| fixed_binary_key(*row)),
+            )?),
+            std::sync::Arc::new(arrow::array::BinaryArray::from_iter_values(
+                written.iter().map(|row| variable_binary_key(*row)),
+            )),
+        ],
+    )?;
+    rows.write_batch(
+        &fqn,
+        &with_event_time(&batch, written.iter().map(|row| event_time(*row)).collect())?,
+    )
+    .await?;
+    server.flush_bifrost().await?;
+    compact_sealed_batch(&cluster, tenant, &table, 1).await?;
+    cluster.refresh_oracle_snapshots().await?;
+
+    let promoted = SealedObject::read_tier(
+        &cluster,
+        server,
+        tenant,
+        BifrostNamespace::Datasets,
+        &table,
+        PhysicalTier::Iceberg,
+    )
+    .await?;
+    let [object] = promoted.as_slice() else {
+        return Err(format!(
+            "the promoted snapshot must hold exactly one data file, saw {}",
+            promoted.len()
+        )
+        .into());
+    };
+    object.expect_sorted(&fqn, &sort_keys)?;
+    for column in ["fixed_key", "variable_key"] {
+        let pages = object.page_count(column)?;
+        if pages < 2 {
+            return Err(format!(
+                "{column}: the promoted file must carry several pages, saw {pages}"
+            )
+            .into());
+        }
+    }
+    if object.metadata.num_row_groups() != 1 {
+        return Err("the promoted file must hold one row group".into());
+    }
+
+    let reader = client(server, "binary-key-reader").await?;
+    let probe_fixed = hex::encode(fixed_binary_key(BINARY_PROBE_ROW));
+    let probe_variable = hex::encode(variable_binary_key(BINARY_PROBE_ROW));
+    for (name, filter) in [
+        ("fixed-size key", format!("fixed_key = X'{probe_fixed}'")),
+        (
+            "variable-length key",
+            format!("variable_key = X'{probe_variable}'"),
+        ),
+        (
+            "fixed-size key and time",
+            format!(
+                "fixed_key = X'{probe_fixed}' AND wyrd_event_time >= TIMESTAMP '{}'",
+                sql_timestamp(event_time(BINARY_PROBE_ROW))?
+            ),
+        ),
+    ] {
+        let evidence = run_case(
+            &cluster,
+            &reader,
+            FilterCase {
+                name: format!("promoted {name}"),
+                sql: format!("SELECT row_id AS id FROM {fqn} WHERE {filter} ORDER BY id"),
+                expected: vec![BINARY_PROBE_ROW],
+            },
+        )
+        .await?;
+        if evidence.page_rows_pruned <= 0.0 {
+            return Err(format!(
+                "promoted {name}: the Iceberg page index skipped no rows: {evidence:?}"
+            )
+            .into());
+        }
+    }
+    run_case(
+        &cluster,
+        &reader,
+        FilterCase {
+            name: "promoted absent binary key".to_owned(),
+            sql: format!(
+                "SELECT row_id AS id FROM {fqn} WHERE fixed_key = X'{}' ORDER BY id",
+                hex::encode(fixed_binary_key(BINARY_KEY_ROWS + 1))
+            ),
+            expected: Vec::new(),
+        },
+    )
+    .await?;
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// The binary-key dataset's user schema: a row identity, a fixed-size binary
+/// sort key, and a variable-length binary key ordered the same way.
+fn binary_key_schema() -> arrow::datatypes::SchemaRef {
+    std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("row_id", arrow::datatypes::DataType::Int64, false),
+        arrow::datatypes::Field::new(
+            "fixed_key",
+            arrow::datatypes::DataType::FixedSizeBinary(16),
+            false,
+        ),
+        arrow::datatypes::Field::new("variable_key", arrow::datatypes::DataType::Binary, false),
+    ]))
+}
+
+/// The non-UTF-8 fixed-size key of `row`, ascending with `row`.
+fn fixed_binary_key(row: i64) -> [u8; 16] {
+    let mut key = [0xff; 16];
+    key[8..].copy_from_slice(&row.to_be_bytes());
+    key
+}
+
+/// The non-UTF-8 variable-length key of `row`, ascending with `row`.
+fn variable_binary_key(row: i64) -> Vec<u8> {
+    let mut key = vec![0xfd];
+    key.extend_from_slice(&row.to_be_bytes());
+    key
 }

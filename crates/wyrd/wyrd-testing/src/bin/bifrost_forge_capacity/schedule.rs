@@ -44,7 +44,9 @@ pub const DECISION_P99_US: f64 = 1_000.0;
 const ACHIEVED_SHARE: f64 = 0.95;
 
 /// Rate multiples of the production pull rate, in sweep order.
-const MULTIPLIERS: [f64; 8] = [1.0, 10.0, 30.0, 100.0, 300.0, 1_000.0, 3_000.0, 10_000.0];
+const MULTIPLIERS: [f64; 10] = [
+    1.0, 10.0, 30.0, 100.0, 300.0, 1_000.0, 3_000.0, 10_000.0, 30_000.0, 100_000.0,
+];
 
 /// The production pull rate: every compactor pulls once per pull interval.
 pub fn production_pulls_per_second() -> f64 {

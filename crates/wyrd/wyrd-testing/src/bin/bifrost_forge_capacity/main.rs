@@ -60,17 +60,11 @@ const PEER_NAME: &str = "wyrd-peer";
 /// Report directory, relative to the workspace root mise runs from.
 const OUTPUT: &str = "target/bifrost-forge-capacity";
 
-/// The leader's scope.
-const LEADER_ENVELOPE: Envelope = Envelope {
-    cpu_percent: 100,
-    memory_bytes: 2 << 30,
-};
+/// The leader's CPU quota, percent of one CPU.
+const LEADER_CPU_PERCENT: u64 = 100;
 
-/// Each dedicated compactor's scope.
-const WORKER_ENVELOPE: Envelope = Envelope {
-    cpu_percent: 150,
-    memory_bytes: 3 << 30,
-};
+/// Each dedicated compactor's CPU quota, percent of one CPU.
+const WORKER_CPU_PERCENT: u64 = 150;
 
 /// Server log filter: info, plus the Forge leader's per-pull and the
 /// worker's per-pull debug lines the full-answer gate reads.
@@ -114,6 +108,12 @@ struct Cli {
     /// Rows per write.
     #[arg(long, default_value_t = 64)]
     rows_per_write: usize,
+    /// The leader scope's memory, GiB.
+    #[arg(long, default_value_t = 2)]
+    leader_memory_gib: u64,
+    /// Each compactor scope's memory, GiB.
+    #[arg(long, default_value_t = 3)]
+    worker_memory_gib: u64,
     /// Seconds each live probe step runs; at least the leader summary's
     /// 60 s rolling window, so its quantiles describe only that step.
     #[arg(long, default_value_t = 60.0)]
@@ -159,6 +159,14 @@ async fn benchmark(cli: Cli) -> Result<Outcome> {
         eprint!("{note}");
         return Ok(Outcome::Discarded);
     }
+    let leader_envelope = Envelope {
+        cpu_percent: LEADER_CPU_PERCENT,
+        memory_bytes: cli.leader_memory_gib << 30,
+    };
+    let worker_envelope = Envelope {
+        cpu_percent: WORKER_CPU_PERCENT,
+        memory_bytes: cli.worker_memory_gib << 30,
+    };
     let binary = match &cli.server_binary {
         Some(binary) => std::fs::canonicalize(binary)?,
         None => release_binary()?,
@@ -208,7 +216,7 @@ async fn benchmark(cli: Cli) -> Result<Outcome> {
         ("WYRD_TARGET", "server"),
         ("WYRD_MAX_FILE_RETENTION_TIME", seal.as_str()),
     ]);
-    let leader = LocalServer::start(&binary, &["forge"], &leader_env, LEADER_ENVELOPE).await?;
+    let leader = LocalServer::start(&binary, &["forge"], &leader_env, leader_envelope).await?;
     let fleet = Fleet::provision(&leader, cli.tables, cli.trigger_snapshot_count).await?;
     let dependencies = Dependencies::connect().await?;
     let probe = LeaderProbe::new(dependencies.owner(), &probe_identity)?;
@@ -253,7 +261,7 @@ async fn benchmark(cli: Cli) -> Result<Outcome> {
             break;
         }
         if let Err(error) = deployment
-            .grow_to(&binary, count, WORKER_ENVELOPE, shared)
+            .grow_to(&binary, count, worker_envelope, shared)
             .await
         {
             failure = Some(error);
@@ -301,8 +309,8 @@ async fn benchmark(cli: Cli) -> Result<Outcome> {
                 write_interval_ms: cli.write_interval_ms,
                 rows_per_write: cli.rows_per_write,
                 trigger_snapshot_count: cli.trigger_snapshot_count,
-                leader_envelope: (LEADER_ENVELOPE.cpu_percent, LEADER_ENVELOPE.memory_bytes),
-                worker_envelope: (WORKER_ENVELOPE.cpu_percent, WORKER_ENVELOPE.memory_bytes),
+                leader_envelope: (leader_envelope.cpu_percent, leader_envelope.memory_bytes),
+                worker_envelope: (worker_envelope.cpu_percent, worker_envelope.memory_bytes),
                 warmup_seconds: cli.warmup_seconds,
                 window_seconds: cli.window_seconds,
                 windows: cli.windows,

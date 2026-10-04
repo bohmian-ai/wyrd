@@ -2176,14 +2176,18 @@ struct LeaderJourney {
 impl LeaderJourney {
     /// Starts `spec` with the default Forge policy and a completion observer.
     ///
+    /// `inject_uncertainty` routes every node's Forge catalog through the
+    /// cluster's shared [`CommitUncertaintyCatalog`], which passes commits
+    /// through unchanged until a scenario arms one of its holds.
+    ///
     /// # Panics
     /// Panics if the cluster cannot start or composes no observer.
-    async fn start(spec: BifrostClusterSpec) -> Self {
+    async fn start(spec: BifrostClusterSpec, inject_uncertainty: bool) -> Self {
         let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
             spec,
             ForgeConfig::default(),
             false,
-            false,
+            inject_uncertainty,
         )
         .await
         .expect("leader journey cluster starts");
@@ -2220,6 +2224,95 @@ impl LeaderJourney {
         )
         .await
         .expect("the production loop completes the requested pass");
+    }
+
+    /// Runs one leader maintenance tick on `node` and waits for it.
+    ///
+    /// The tick is the production timer's own pass; a node without the
+    /// leader term returns from it without touching any table.
+    ///
+    /// # Panics
+    /// Panics if the pass does not complete within the diagnostic bound.
+    async fn maintain(&self, node: NodeId) {
+        let server = self.node(node);
+        let before = server.completed_forge_scheduler_passes_for_test();
+        server.request_forge_maintenance_pass_for_test();
+        tokio::time::timeout(
+            PASS_BOUND,
+            server.wait_for_forge_scheduler_passes_for_test(before + 1),
+        )
+        .await
+        .expect("the production maintenance loop completes the requested tick");
+    }
+
+    /// Advances every running node's Forge clock by `duration`.
+    ///
+    /// # Panics
+    /// Panics if the requested test time is unrepresentable.
+    fn advance(&self, duration: chrono::Duration) {
+        for server in self.cluster.servers() {
+            server
+                .forge_clock()
+                .advance(duration)
+                .expect("maintenance time advances");
+        }
+    }
+
+    /// Returns the snapshot ids `table` currently retains.
+    ///
+    /// # Panics
+    /// Panics if the catalog cannot load the table.
+    async fn snapshots(&self, via: NodeId, table: &JourneyTable) -> BTreeSet<i64> {
+        self.node(via)
+            .bifrost_catalog()
+            .iceberg_catalog()
+            .load_table(&table.binding.table_ident())
+            .await
+            .expect("journey table")
+            .metadata()
+            .snapshots()
+            .map(|snapshot| snapshot.snapshot_id())
+            .collect()
+    }
+
+    /// Counts `table`'s durable expiry, expired-cleanup and orphan attempts.
+    ///
+    /// # Panics
+    /// Panics when the read-only inspection fails.
+    async fn maintenance_rows(&self, table: &JourneyTable) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id = $1 \
+             AND table_name = $2 AND strategy IN \
+             ('snapshot_expiry', 'expired_cleanup', 'orphan_cleanup')",
+        )
+        .bind(self.tenant.as_uuid())
+        .bind(&table.name)
+        .fetch_one(self.cluster.pg_fixture().operator_pool().pool())
+        .await
+        .expect("forge_tasks inspection")
+    }
+
+    /// Whether `path` still exists in shared storage.
+    ///
+    /// # Panics
+    /// Panics on a storage error other than absence.
+    async fn exists(&self, path: &str) -> bool {
+        match self.cluster.storage_operator().stat(path).await {
+            Ok(_) => true,
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => false,
+            Err(error) => panic!("object inspection failed: {error}"),
+        }
+    }
+
+    /// Classifies `path` with `via`'s production orphan predicate.
+    ///
+    /// # Panics
+    /// Panics when the production classifier fails.
+    async fn eligibility(&self, via: NodeId, table: &JourneyTable, path: &str) -> String {
+        self.node(via)
+            .forge_gc_eligibility_for_test(&table.binding, path)
+            .await
+            .expect("production eligibility classification")
     }
 
     /// Returns the leader term `node` holds, if any.
@@ -2364,7 +2457,7 @@ impl LeaderJourney {
 async fn one_leader_failover_volatile_state() {
     let spec = BifrostClusterSpec::two_mixed();
     let (first, second) = (spec.nodes[0].node_id, spec.nodes[1].node_id);
-    let mut journey = LeaderJourney::start(spec).await;
+    let mut journey = LeaderJourney::start(spec, false).await;
     journey.pass(first).await;
     journey.pass(second).await;
     let leaders = journey.leaders();
@@ -2448,7 +2541,7 @@ async fn restart_recovers_hot_promotion_with_empty_schedule() {
     let mut spec = BifrostClusterSpec::two_mixed();
     spec.nodes[1].roles = [BifrostRuntimeRole::Scribe].into_iter().collect();
     let (leader, scribe) = (spec.nodes[0].node_id, spec.nodes[1].node_id);
-    let mut journey = LeaderJourney::start(spec).await;
+    let mut journey = LeaderJourney::start(spec, false).await;
     journey.pass(leader).await;
     let first_token = journey
         .held(leader)
@@ -2516,6 +2609,167 @@ async fn restart_recovers_hot_promotion_with_empty_schedule() {
     journey.cluster.shutdown().await.expect("cluster drains");
 }
 
+/// A new leader maintains nothing until a commit, then cleans only safe orphans.
+///
+/// Mirrors `RisingWave`'s Iceberg GC loop at e23ddf95: the elected node's
+/// maintenance sets are volatile, so after failover a cold table is not
+/// expired, rewritten or swept until its next commit notice makes it a member
+/// again. Wyrd's never-published orphan sweep has no `RisingWave` equivalent;
+/// it reuses the protected deletion boundary, so an unresolved expiry
+/// operation on the table protects even an aged rowless output.
+///
+/// # Panics
+/// Panics if the successor or the standby maintains a cold table, the rejoined
+/// table is not expired and swept, the unresolved operation leaves the orphan
+/// collectable, or a repeated sweep over the deleted object fails.
+#[tokio::test]
+#[ignore = "requires Postgres and two replicas"]
+async fn empty_maintenance_restart_protects_orphans() {
+    let spec = BifrostClusterSpec::two_mixed();
+    let (first, second) = (spec.nodes[0].node_id, spec.nodes[1].node_id);
+    let mut journey = LeaderJourney::start(spec, true).await;
+    let catalog = journey
+        .cluster
+        .commit_uncertainty_catalog()
+        .expect("the topology wraps the real Forge catalog");
+    journey.pass(first).await;
+    journey.pass(second).await;
+    let (leader, _) = journey.leaders()[0];
+    let successor = if leader == first { second } else { first };
+
+    // Snapshot expiration is on by default and compaction off, so the table's
+    // only leader work is maintenance and it never owes a rewrite.
+    let table = register_table(
+        journey.node(leader),
+        journey.tenant,
+        &unique_table("cold_restart"),
+    )
+    .await;
+    for values in [&[1, 2][..], &[3, 4]] {
+        journey.write_hot(leader, &table, values).await;
+        journey.await_promoted(&table).await;
+    }
+    let key = journey.key(&table);
+    assert!(
+        journey
+            .held(leader)
+            .expect("leader term")
+            .schedule()
+            .maintenance_tables()
+            .1
+            .contains(&key),
+        "the first term counts the table for snapshot expiration"
+    );
+    // A rowless output in the writer's canonical grammar: what a rewrite that
+    // died before preparing leaves behind, and what only the sweep can reach.
+    let orphan = format!(
+        "{}/data/forge/v2/{}-00000-{}.parquet",
+        table.binding.object_prefix.trim_end_matches('/'),
+        Uuid::now_v7(),
+        Uuid::now_v7()
+    );
+    journey
+        .cluster
+        .storage_operator()
+        .write(&orphan, b"never published".to_vec())
+        .await
+        .expect("rowless output");
+
+    journey
+        .cluster
+        .stop_node(leader)
+        .await
+        .expect("leader stops");
+    journey.pass(successor).await;
+    journey.cluster.restart_node(leader).await.expect("restart");
+    journey.pass(leader).await;
+    assert_eq!(journey.leaders().len(), 1);
+    let term = journey.held(successor).expect("the successor leads");
+    assert_eq!(
+        term.schedule().sizes_for_test(),
+        (0, 0, 0),
+        "the successor starts with empty maintenance membership"
+    );
+
+    // Past retention and the orphan floor, both replicas tick and nothing runs.
+    journey.advance(chrono::Duration::days(2));
+    let retained = journey.snapshots(successor, &table).await;
+    let rows = journey.maintenance_rows(&table).await;
+    assert!(retained.len() > 1, "expiry is due: {retained:?}");
+    assert_eq!(
+        journey.eligibility(successor, &table, &orphan).await,
+        "Eligible",
+        "the orphan is collectable, so only membership withholds the sweep"
+    );
+    journey.maintain(successor).await;
+    journey.maintain(leader).await;
+    assert_eq!(journey.snapshots(successor, &table).await, retained);
+    assert_eq!(journey.maintenance_rows(&table).await, rows);
+    assert!(journey.exists(&orphan).await, "a cold table is not swept");
+
+    // A new commit rejoins the table; the standby still maintains nothing.
+    journey.write_hot(successor, &table, &[5]).await;
+    journey.await_promoted(&table).await;
+    let rejoined = journey.snapshots(successor, &table).await;
+    let rows = journey.maintenance_rows(&table).await;
+    journey.maintain(leader).await;
+    assert_eq!(journey.held(leader).map(|term| term.fencing_token()), None);
+    assert_eq!(journey.snapshots(successor, &table).await, rejoined);
+    assert_eq!(journey.maintenance_rows(&table).await, rows);
+    assert!(journey.exists(&orphan).await, "a standby sweeps nothing");
+
+    // The leader's expiry is held after the catalog accepted it: that
+    // unresolved operation protects the aged orphan until it settles.
+    catalog.pause_after_snapshot_removal();
+    let drive = journey.maintain(successor);
+    let inspect = async {
+        tokio::time::timeout(PASS_BOUND, catalog.wait_for_commit())
+            .await
+            .expect("the rejoined table's expiry reaches the catalog");
+        assert_eq!(
+            journey.eligibility(successor, &table, &orphan).await,
+            "Protected",
+            "an unresolved expiry protects every object of its table"
+        );
+        assert!(journey.exists(&orphan).await);
+        catalog.release_paused_commit();
+    };
+    tokio::join!(drive, inspect);
+    let expired = journey.snapshots(successor, &table).await;
+    assert_eq!(expired.len(), 1, "retain-last keeps only the head");
+    assert!(expired.is_subset(&rejoined));
+    assert!(
+        !journey.exists(&orphan).await,
+        "the settled pass swept the rowless output"
+    );
+
+    // A later sweep, at a new cut, settles idempotently without the object.
+    let swept = journey.maintenance_rows(&table).await;
+    journey.advance(chrono::Duration::minutes(1));
+    journey.maintain(successor).await;
+    assert!(!journey.exists(&orphan).await);
+    assert!(
+        journey.maintenance_rows(&table).await > swept,
+        "the repeated pass ran its own recorded sweep"
+    );
+    let unsettled: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id = $1 \
+         AND table_name = $2 AND state NOT IN ('succeeded', 'failed', 'cancelled')",
+    )
+    .bind(journey.tenant.as_uuid())
+    .bind(&table.name)
+    .fetch_one(journey.cluster.pg_fixture().operator_pool().pool())
+    .await
+    .expect("forge_tasks inspection");
+    assert_eq!(unsettled, 0, "every maintenance attempt settled");
+    assert!(
+        journey.observer.returned_errors().is_empty(),
+        "{:?}",
+        journey.observer.returned_errors()
+    );
+    journey.cluster.shutdown().await.expect("cluster drains");
+}
+
 /// Compactors pull the oldest due tables on either route and both replicas work.
 ///
 /// Mirrors RisingWave's compactor pull (`compactor/mod.rs:1606-1640`) and
@@ -2538,7 +2792,7 @@ async fn compactors_pull_oldest_due_with_capacity() {
         node.roles.remove(&BifrostRuntimeRole::ForgeWorker);
     }
     let (first, second) = (spec.nodes[0].node_id, spec.nodes[1].node_id);
-    let journey = LeaderJourney::start(spec).await;
+    let journey = LeaderJourney::start(spec, false).await;
     journey.pass(first).await;
     journey.pass(second).await;
     let (leader, _) = journey.leaders()[0];
@@ -2624,7 +2878,7 @@ async fn compactors_pull_oldest_due_with_capacity() {
     journey.cluster.shutdown().await.expect("cluster drains");
 
     // Both replicas' workers pull from the one leader and execute the backlog.
-    let journey = LeaderJourney::start(BifrostClusterSpec::two_mixed()).await;
+    let journey = LeaderJourney::start(BifrostClusterSpec::two_mixed(), false).await;
     let nodes = journey
         .cluster
         .servers()

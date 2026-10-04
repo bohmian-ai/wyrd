@@ -11,7 +11,7 @@ import { z } from "zod";
 import { startTestServer } from "@wyrd/testing";
 import { describe, expect, it } from "vitest";
 
-import { Bifrost, TableConfig, WyrdClient, WyrdError } from "@wyrd/sdk";
+import { Bifrost, TableConfig, WyrdClient, WyrdError, type CompactionType } from "@wyrd/sdk";
 
 const SCHEMA = {
   type: "object",
@@ -255,6 +255,45 @@ describe("Bifrost write journey", () => {
       expect(mismatch.code).toBe("WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH");
       expect(mismatch.status).toBe(409);
       expect(await describeTarget()).toBe(target);
+    } finally {
+      server.shutdown();
+    }
+  }, 30_000);
+
+  it("registers a compaction type, describes it back, and refuses a different one", async () => {
+    const server = startTestServer();
+    try {
+      const fqn = `vala.datasets.kind_${Date.now().toString(36)}`;
+      const register = async (compactionType?: CompactionType) => {
+        const bifrost = await connect(
+          server,
+          TableConfig.fromJsonSchema(fqn, SCHEMA, undefined, undefined, compactionType),
+        );
+        try {
+          return await bifrost.register();
+        } finally {
+          await bifrost.shutdown();
+        }
+      };
+      const describeType = async () =>
+        (
+          await TableConfig.describe(fqn, {
+            serverUrl: server.baseUrl,
+            credential: server.apiKey,
+            grpcUrl: server.grpcUrl,
+          })
+        ).compactionType;
+
+      expect(await register("small_files")).toBe("created");
+      expect(await describeType()).toBe("small_files");
+      expect(await register("small_files")).toBe("already_exists");
+      // Omitting the type defers to what the table already recorded.
+      expect(await register()).toBe("already_exists");
+
+      const mismatch = await rejection(register("full"));
+      expect(mismatch.code).toBe("WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH");
+      expect(mismatch.status).toBe(409);
+      expect(await describeType()).toBe("small_files");
     } finally {
       server.shutdown();
     }

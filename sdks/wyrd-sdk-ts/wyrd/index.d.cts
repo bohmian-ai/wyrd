@@ -933,7 +933,8 @@ export declare function openWyrdState(path: string): NativeWyrdState
  *
  * Returns a napi error when the table is not `namespace.name`, the document is
  * not one mappable JSON Schema, a declared column is server-owned, the
- * layout is not one physical-layout declaration, or the compaction target is
- * not a non-negative integer.
+ * layout is not one physical-layout declaration, the compaction target is
+ * not a non-negative integer, or the compaction type is not one known
+ * `snake_case` wire spelling.
  */
-export declare function tableConfigFromJsonSchema(table: string, schemaJson: string, layoutJson?: string | undefined | null, compactionTargetFileSizeBytes?: number | undefined | null): NativeTableConfig
+export declare function tableConfigFromJsonSchema(table: string, schemaJson: string, layoutJson?: string | undefined | null, compactionTargetFileSizeBytes?: number | undefined | null, compactionType?: string | undefined | null): NativeTableConfig

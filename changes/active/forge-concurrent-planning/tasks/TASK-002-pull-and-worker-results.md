@@ -333,3 +333,58 @@ whole old queue to solve that narrower problem.
 Approved ../spec.md revision 6; AGENTS.md §§5,9,11;
 architecture/bifrost-design.md §§Managed compaction and publication;
 RisingWave e23ddf95 source locations in Approach and scenarios.
+
+## Implementation Evidence
+
+Status: IMPLEMENTED for Scenarios 1–3. Scenario 4 (AC-008) is OPEN until the
+revised capacity bench (GREEN above, revised 2026-10-03) reports two
+qualifying runs; results are appended below when they exist.
+
+Commits: ac84c791a, e04cef237, 179c54c72, 12bef6736, be5e7bfa6, c9cebf6da,
+dc3483751, 000fb21ba, 1463740d3, 0a6fb59c3, 9b8b8ca78, c50708084, ae4e0745b,
+ea99b55c9, 48c6b425d, 1c939eec0, 76a3e5fd3, 4202f3561, e7fa15477,
+6531e5bea (due index and leader telemetry), 5a0f70b72 (revised gate).
+
+### RisingWave comparison (pinned e23ddf95)
+
+| RisingWave behavior | Forge source | Test |
+|---|---|---|
+| Compactor pull `min(max_task_parallelism − running, 4)`, five-second cadence, acknowledgement before the next pull | `forge/worker.rs` `pull_claimed_tasks`, `free_pull_room`, `DEFAULT_PULL_INTERVAL` | `production_closeout::compactors_pull_oldest_due_with_capacity` |
+| Iceberg multiplier 12 × executor workers | `wyrd-server/src/boot/mod.rs` `forge_compaction_worker_config` | `boot::tests::forge_runtime_is_role_scoped_and_cpu_sized` (72/288 at 6 CPUs) |
+| Pull expires timed-out tasks, then oldest-due selection | `forge/leader.rs` `ForgeSchedule::pull`, `DueIndex` | `forge::leader::tests::due_index_selects_exactly_what_the_scan_selects`, `reports_preserve_later_commits_and_ignore_stale_tasks` |
+| Selection captures pending count and watermark; failed send restores Idle | `CompactionTrack::start_processing`, `revert_pre_dispatch` | `forge::production_routes::report_preserves_later_commits_and_ignores_stale` |
+| Worker loads the current head and plans by task type; no-op is success | `forge/worker.rs`, `managed/policy.rs` `planning` | `forge::production_routes::worker_selects_current_iceberg_files` |
+| Local vs peer route converge on one handler | `forge/leadership.rs` `serve_pull`/`serve_report`, `forge_peer.rs` | journey lane, `mise run test:tonic` |
+
+Deviation (approved REQ-009 revision, 2026-10-03): selection reads a sorted
+due index instead of scanning every track. The rule, timeout handling and
+`(due time, table)` order are unchanged; the randomized equivalence test
+compares the index against a literal port of the scan before every pull (200
+seeds × 300 operations) and rebuilds the index after every operation.
+Mutations — waiting entries ignoring due time; removal leaving a stale entry —
+each fail it ("pull diverged from the scan", "index drifted after commit").
+
+### Diagnoses
+
+- **Stale boot sizing test.** Symptom: `forge_runtime_is_role_scoped_and_cpu_sized`
+  asserted 18 at 6 CPUs. Evidence: `boot/mod.rs:1157` multiplies by 12 since
+  e04cef237. Cause: the assertion kept the pre-spec 3× value. Fix site: the
+  test (independent diagnostician confirmed production matches REQ-004; no
+  other caller asserts the values). e7fa15477.
+- **Leader pull latency.** Symptom: bench p99 pull 28–34 ms (10k tables, 32
+  pullers). Evidence: about 100 µs per uncontended pull, all spent walking
+  every track under the schedule lock. Cause: `O(tables)` selection plus
+  queueing behind 31 closed-loop pullers. Fix site: `ForgeSchedule` (due
+  index); uncontended pull is now 2.2 µs p50 / 3.5 µs p99 in release.
+
+### Acceptance
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-003 capacity-bounded pull | worker.rs `free_pull_room` | journey `compactors_pull_oldest_due_with_capacity`; `mise run test:bifrost:journey:forge` 19/19 | PASS |
+| AC-004 oldest due selection, one task per table | leader.rs `DueIndex` | leader lib tests 5/5 incl. equivalence | PASS |
+| AC-005 current-head planning, no-op success, later-commit preservation, late-report ignorance | worker.rs, leader.rs `report` | redux `--test integration -E 'test(/^forge::/)'` 56/56 | PASS |
+| Multi-replica worker progress | forge_peer.rs, leadership.rs | journey lane 19/19; `mise run test:tonic` 39/39 | PASS |
+| No leader-side file inspection | leadership.rs | `leader_decision_has_no_catalog_io` (zero catalog/object IO) | PASS |
+| AC-008 capacity evidence | bench `bench:bifrost:forge-capacity` | pending revised two-run report | OPEN |
+

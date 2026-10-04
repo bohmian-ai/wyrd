@@ -189,11 +189,10 @@ RisingWave e23ddf95 sources listed in Approach and scenarios.
 
 ## Implementation Evidence
 
-Status: IMPLEMENTED except the Scenario 3 REFACTOR. Recurring catalog-wide
-planning, demand rows and the old \`schedule_once\` still run on leader
-planning passes. Their removal is open and lands with TASK-002/TASK-003, so
-this task is not complete until then. Commits 431eccbfc, 89f2441cc, fa560aa14, 85f7f2b24,
-a367d9f0c, fce4cfd7c.
+Status: IMPLEMENTED. The Scenario 3 REFACTOR (removing catalog-wide
+planning, demand rows and `schedule_once`) landed with TASK-003 in 37a526d61.
+Commits 431eccbfc, 89f2441cc, fa560aa14, 85f7f2b24, a367d9f0c, fce4cfd7c,
+and the boot-election fix c6ceefb0a.
 
 ### RisingWave comparison (pinned e23ddf95)
 

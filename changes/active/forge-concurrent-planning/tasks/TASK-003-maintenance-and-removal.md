@@ -205,3 +205,103 @@ consumer rather than reinstating the old planner.
 Approved ../spec.md revision 6; AGENTS.md §§2,11,12;
 architecture/bifrost-design.md §§Maintenance, Convergence and cleanup;
 RisingWave e23ddf95 gc.rs references in Approach and scenarios.
+
+## Implementation Evidence
+
+Status: IMPLEMENTED for Scenarios 1–3 and the removal. `verify:bifrost` runs
+once on the integrated candidate after TASK-004 merges; its result is
+appended here.
+
+Commits: 37a526d61 (leader timer, planner removal), fe0a3d39c (design doc),
+c6ceefb0a (immediate boot election, server journey port), bcf803523
+(Scenario 2 and two expiry defects), b57a35eb1 (Scenario 3).
+
+### RisingWave comparison (pinned e23ddf95)
+
+| RisingWave behavior | Forge source | Test |
+|---|---|---|
+| One GC loop on the leader: manifest rewrite, then expiry, then orphan cleanup; per-table errors logged, pass continues | `forge/gc.rs` `run_maintenance`, `forge/scheduler.rs` `maintain` | `forge::production_routes::leader_timer_rewrites_manifests_before_expiry` |
+| Manifest rewrite opt-in, skipped on format v3; target-size and min-count-to-merge properties | `gc.rs` (`wyrd.forge.enable-manifest-rewrite`, `commit.manifest.*`) | `leader_timer_skips_manifest_rewrite_when_disabled`, `leader_timer_skips_manifest_rewrite_on_format_v3` |
+| Snapshot expiration on by default; cutoff clamped to a running compaction's watermark | `gc.rs` `expiry_due`, `expire.rs` `snapshot_protection_roots` | `forge::snapshot_expiration::active_watermark_and_oracle_pin_block_expiry` |
+| Membership in memory, filled by commits; a new leader starts empty | `leader.rs` `apply_membership`, `refresh_membership` | `production_closeout::empty_maintenance_restart_protects_orphans` |
+
+Wyrd additions beyond RisingWave (required by Wyrd's Oracle and durable
+cleanup): Oracle reader pins protect snapshots; expired-file and orphan
+deletes go through the durable cleanup handoff and exactly-once delete
+accounting.
+
+### Removed
+
+- `forge/planning_scheduler.rs` (1,331 lines): catalog-wide planning,
+  demand cursor, `schedule_once`.
+- `vala.forge_planning_demands` and `forge_scheduler_state.last_tenant_id`,
+  dropped by forward migration `20261003000100`; the applied creation
+  migration and its history entry (`vala-sql/src/lib.rs:205`) stay as
+  history.
+- vala-sql demand types and queries: `ForgePlanningDemandSource`,
+  `ForgePlanningDemand`, `ForgeDemandStatus`, `ForgePendingTaskStatus`,
+  `advance_planning_demand`.
+- `ForgeDemandGenerationChanged` (wyrd-sql error and its storage mapping).
+- Four planning/pending gauges and their docs; worker `request_replan`;
+  the planner's server config fields.
+- Tests that only proved the removed planner:
+  `planning_demand_is_fenced_bounded_and_operational_only`,
+  `enqueue_failure_after_each_atomic_step_rolls_back_everything`,
+  `planning_demand_page_reaches_every_table_of_one_tenant`,
+  `planning_demand_cursor_bounds_hot_tenant_across_takeover`,
+  `forge_telemetry_snapshot_reports_exact_demand_and_pending_work`,
+  `orphan_cleanup_is_last_and_uses_one_demand_cutoff`,
+  `scheduler_discovers_roster_despite_failed_demand`,
+  `coordinator_partial_pass_is_not_ready`,
+  `coordinator_task_insert_failure_clears_readiness`.
+
+Kept on purpose: the worker's `claim_fair` and `forge_fair_claim.sql`. They
+serve durable retryable rows (maintenance and retries), which the leader's
+volatile schedule does not own.
+
+Reused owners: `ForgeSchedule` (membership), `ForgeTasks::enqueue` (now
+admits the cleanup handoff), `ForgeSchedulerTrigger` (gained
+`request_maintenance`), `WyrdTestCluster`/`LeaderJourney`,
+`ForgeWorkerCompletionObserver`, `CountingObjectStore`.
+
+### Mutation evidence
+
+| Mutation | Failing assertion |
+|---|---|
+| Expiry before manifest rewrite | Scenario 1: "retired the pre-pass head" |
+| Return on the first table error | Scenario 1: expected `Replace` head |
+| Remove the `expiry_due` watermark clamp | Scenario 2: "a clamped cutoff with nothing older opens no expiry attempt" (2 vs 1) |
+| Remove the leader-watermark protection root | Scenario 2 phase (a): retained {head} only |
+| Ignore the orphan "blocked" gate | Scenario 3: `Eligible` where `Protected` expected |
+| Keep the old leader's maintenance sets | Scenario 3: expiry removed a snapshot after failover |
+
+### Diagnoses
+
+- **Double worker attempt.** Symptom: `run_one_success` saw 2 completions.
+  Evidence (independent diagnostician): the test trigger ran `lead()` and
+  maintenance together, and the shared observer counted the orphan cleanup's
+  attempt; the first heartbeat had also lost its quiet start. Fix site:
+  `ForgeSchedulerTrigger` split into `request_pass` / `request_maintenance`.
+- **Boot election delay.** Symptom: production promoted nothing for one
+  heartbeat (10 s) after boot. Cause: the quiet first heartbeat applied
+  outside tests. Fix site: `scheduler.rs` heartbeat, quiet only with a test
+  owner (c6ceefb0a); journeys 18/18 and router smoke 34/34 re-run.
+- **Watermark only gated "due".** Symptom: S2 and S3 expired while a pulled
+  compaction held S2. Cause: the expiry cutoff read only durable task
+  watermarks; a pulled task has none until the worker starts it. Fix site:
+  `expire.rs` `leader_compaction_watermark` in the protection roots.
+- **Due check used ≤.** Symptom: a no-op expiry attempt on every pass while
+  the held snapshot was the oldest. Cause: `expiry_due` used `<=` where the
+  policy selects strictly older snapshots. Fix site: `gc.rs`, `<`.
+
+### Acceptance
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-006 maintenance order, opt-in rewrite, default expiry, per-table isolation | gc.rs `run_maintenance` | Scenario 1 tests 3/3; redux forge 56/56 | PASS |
+| AC-007 expiry protects running compaction and Oracle readers; cleanup retry | expire.rs, gc.rs | `active_watermark_and_oracle_pin_block_expiry` | PASS |
+| INV empty leader restart; orphan protection; standby runs nothing | leader.rs, scheduler.rs | `empty_maintenance_restart_protects_orphans`; journey 19/19 | PASS |
+| REQ-010 superseded machinery removed | see Removed | static inventory above; vala-sql `pg_forge_tasks` 33/33 | PASS |
+| Docs | forge.svx, bifrost-design.md | `mise run docs:check` pass | PASS |
+| Integrated `verify:bifrost` | — | pending, after TASK-004 merge | OPEN |
+

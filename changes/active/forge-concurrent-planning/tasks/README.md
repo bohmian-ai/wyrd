@@ -1,10 +1,11 @@
 # Forge implementation tasks
 
-The approved revision 6 spec has three implementation tasks, in order:
+The approved revision 6 spec has four implementation tasks, in order:
 
 1. TASK-001-leader-and-promotion.md — one leader and exact Iceberg commit tracking.
 2. TASK-002-pull-and-worker-results.md — compactor pull, worker planning and reports.
 3. TASK-003-maintenance-and-removal.md — timer maintenance, safe cleanup and removal.
+4. TASK-004-compaction-defaults-and-type.md — compaction on by default; per-table compaction type (REQ-011, REQ-012, added 2026-10-03).
 
 Only this revision-6 spec and these three tasks direct implementation.
 

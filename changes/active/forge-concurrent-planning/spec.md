@@ -239,6 +239,41 @@ Drop the branch-only concurrent-planning migration with its commits. Retire
 older planning-demand schema only after its consumers are removed and
 unsettled publication and cleanup evidence has a safe owner.
 
+### REQ-011 — Compaction is on for every table
+
+(Added 2026-10-03, approved by the human owner.) Bifrost owns its Iceberg
+tables, so automatic compaction is enabled for every table by default,
+including built-in tables. `wyrd.forge.enable-compaction` remains readable;
+an absent property means enabled. This intentionally departs from
+RisingWave's sink default (`false`). The staged-file target (512 MiB) and
+the compaction file target (1 GiB) do not change.
+
+### REQ-012 — Tables choose their compaction type
+
+(Added 2026-10-03, approved by the human owner as a public contract change.)
+Table registration accepts an optional `compaction_type` (`auto`, `full`,
+`small-files`, `files-with-delete`), following the existing
+`compaction_target_file_size_bytes` contract end to end: wyrd-spec request
+and description, Rust, Python and TypeScript SDKs, server validation, and the
+catalog writing `wyrd.forge.compaction.type` in the create transaction.
+Omitted stores no property, so the table uses the REQ-013 default. A re-register may omit it or repeat the stored value; a
+different value is a stable conflict error, as for the file target. The
+table description reports the stored type. Copy-on-write tables still
+compact `full`.
+
+### REQ-013 — Default compaction merges staged files once and never revisits finished files
+
+(Added 2026-10-03, approved by the human owner.) Scribe stages toward 512 MiB
+and Forge compacts toward 1 GiB; neither changes. A table that names no
+compaction type compacts `small-files`. The small-file threshold is no longer
+a fixed 64 MiB: it is 75% of the table's resolved file target (768 MiB at the
+1 GiB default, following a table's own `write.target-file-size-bytes`).
+Files below it are merge candidates; files at or above it are finished and
+are never selected again. Forge's `small-files` plan sets the core's existing group filter
+(`min_group_file_count = 2`), so a lone staged file waits for a partner;
+`full`, `auto` and `files-with-delete` keep upstream grouping. `full`, `auto` and
+`files-with-delete` remain available per table through REQ-012.
+
 ## Invariants
 
 - INV-001: One active scheduling leader; compactors on any replica may work.
@@ -279,7 +314,15 @@ unsettled publication and cleanup evidence has a safe owner.
   plus a rate sweep to its knee; fleet throughput uses a production-like
   Scribe workload at default compaction settings and gates on 1.7x/3.0x
   scaling, full pull answers under backlog and leader CPU below 70%, naming
-  the bounding resource. The 85% occupancy gate is removed.
+  the bounding resource. The 85% occupancy gate is removed. Amended
+  2026-10-03: every Wyrd process keeps its 4 GiB boot floor
+  (`MIN_POD_MEMORY_BYTES`), so the 16 GiB envelope holds one leader
+  (1 CPU / 4 GiB) and at most three workers (7/3 CPU / 4 GiB each); the
+  scaling gates are 2 workers >= 1.7x and 3 workers >= 2.5x of 1 worker.
+  Worker throughput is measured as backlog drain: tables are written through
+  Scribe with no worker running until each holds compactable staged files,
+  then each fleet size drains an equal fresh backlog, so the measurement is
+  bounded by compaction and not by the arrival rate of due tables.
 
 ## Deletion and consumer map
 

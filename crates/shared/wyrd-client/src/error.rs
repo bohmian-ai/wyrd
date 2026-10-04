@@ -247,6 +247,9 @@ fn bifrost_error_from_code(
                 table: table_from_message("compaction target mismatch for table: "),
             }
         }
+        "WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH" => BifrostError::CompactionTypeMismatch {
+            table: table_from_message("compaction type mismatch for table: "),
+        },
         "WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET" => {
             let (bytes, table) = message
                 .strip_prefix("invalid compaction target file size ")
@@ -450,6 +453,21 @@ mod tests {
         assert_eq!(
             target_conflict.code(),
             "WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH"
+        );
+
+        let type_conflict = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH",
+            "detail": "compaction type mismatch for table: vala.datasets.events",
+            "details": {},
+        }));
+        assert_eq!(type_conflict.status(), 409);
+        assert_eq!(
+            type_conflict.code(),
+            "WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH"
+        );
+        assert_eq!(
+            type_conflict.to_string(),
+            "compaction type mismatch for table: vala.datasets.events"
         );
 
         let schema = from_problem_json(&serde_json::json!({

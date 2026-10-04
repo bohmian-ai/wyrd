@@ -1,15 +1,17 @@
 //! The live deployment — one Forge leader and its dedicated workers — and the
-//! measurement of one window over it.
+//! measurement of one fleet size draining a backlog.
 //!
 //! The leader runs `WYRD_TARGET=server`: it serves ingest, promotes sealed
 //! Scribe objects into Iceberg, and schedules compaction, but executes none.
 //! Every rewrite therefore runs on a `WYRD_TARGET=forge-worker` replica that
-//! pulls it from the leader over the peer route. A window records, between two
-//! scrapes, each worker's succeeded compaction attempts and their duration
-//! histogram, the published input and output files, the leader's promotion
-//! commits and live decisions, every process's cgroup CPU, the shared
-//! dependencies' utilization, and — from the leader's debug log — every pull
-//! it served, how many tasks it returned, and whether a due table remained.
+//! pulls it from the leader over the peer route. A drain starts a fresh fleet
+//! against a backlog of due tables and runs until every table was rewritten or
+//! a time limit passed. It records each worker's succeeded compaction attempts
+//! and their duration histogram, the published input and output files, the
+//! leader's promotion commits and live decisions, every process's cgroup CPU,
+//! the shared dependencies' utilization, and — from the leader's debug log —
+//! every pull it served, how many tasks it returned, and whether a due table
+//! remained.
 
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -22,7 +24,6 @@ use wyrd_testing::release_server::{Envelope, LocalServer, Metrics};
 
 use crate::Result;
 use crate::dependencies::{Dependencies, DependencyUsage};
-use crate::fleet::Writers;
 use crate::schedule::PULL_LIMIT;
 
 /// Compaction's task-type metric label. Forge labels a compaction attempt
@@ -42,7 +43,7 @@ const LEADER_DECISION: &str = "bifrost_forge_leader_decision_seconds";
 /// The leader's debug line for one served pull.
 const PULL_SERVED: &str = "Forge compaction pull served";
 
-/// How often a window samples Postgres activity.
+/// How often a drain samples worker progress and Postgres activity.
 const SAMPLE_EVERY: Duration = Duration::from_millis(250);
 
 /// One leader, its workers, and the dependencies they share.
@@ -53,7 +54,7 @@ pub struct Deployment {
     pub workers: Vec<LocalServer>,
     /// Postgres and the object store.
     pub dependencies: Dependencies,
-    /// Read position in the leader's log, so each window parses only the
+    /// Read position in the leader's log, so each drain parses only the
     /// pulls served during it.
     pub leader_log: LogCursor,
 }
@@ -233,13 +234,20 @@ impl PullEvidence {
     }
 }
 
-/// Everything one measurement window produced.
+/// Everything one drain produced.
 #[derive(Debug, Clone, Serialize)]
-pub struct WindowRecord {
+pub struct DrainRecord {
     /// Workers serving.
     pub workers: usize,
-    /// Window length, seconds.
+    /// Tables due when the drain started.
+    pub backlog_tables: u64,
+    /// Seconds from starting the first worker until the last table was
+    /// rewritten or the limit passed.
     pub seconds: f64,
+    /// Whether every backlog table was rewritten within the limit.
+    pub drained: bool,
+    /// Succeeded compaction attempts.
+    pub rewrites: f64,
     /// Succeeded compaction attempts per second, summed across workers.
     pub rewrites_per_second: f64,
     /// Compaction attempts that did not succeed.
@@ -252,12 +260,8 @@ pub struct WindowRecord {
     pub input_bytes_per_second: f64,
     /// Succeeded compaction duration, bucket estimates in seconds.
     pub rewrite_seconds: Percentiles,
-    /// Succeeded promotion commits per second on the leader: the Iceberg
-    /// commit rate that makes tables due.
+    /// Succeeded promotion commits per second on the leader.
     pub promotion_commits_per_second: f64,
-    /// Succeeded promotion duration on the leader, bucket estimates in
-    /// seconds.
-    pub promotion_seconds: Percentiles,
     /// The leader's live commit, pull, and report decisions.
     pub leader_decisions: LeaderDecisions,
     /// Every pull the leader served.
@@ -265,172 +269,141 @@ pub struct WindowRecord {
     /// The most rewrites per second the workers' pull cadence can dispatch:
     /// each worker pulls at most [`PULL_LIMIT`] tasks per pull interval.
     pub pull_ceiling_per_second: f64,
-    /// Client batches acknowledged per second.
-    pub writes_per_second: f64,
-    /// Client batches refused during the window.
-    pub refused_writes: u64,
     /// Leader CPU as a share of its envelope.
     pub leader_cpu_share: f64,
     /// Per-worker evidence.
     pub per_worker: Vec<WorkerWindow>,
-    /// Leader then worker resources.
+    /// Leader then worker resources, from once every worker was ready.
     pub resources: Vec<Resources>,
     /// Postgres and object-store utilization.
     pub dependencies: DependencyUsage,
 }
 
 impl Deployment {
-    /// Starts dedicated workers in `envelope` until `count` serve, giving
-    /// each the environment `env` returns for its ordinal.
+    /// Starts `count` fresh dedicated workers in `envelope`, giving each the
+    /// environment `env` returns for its ordinal, and measures them draining
+    /// a backlog of `backlog` due tables: until their succeeded rewrites
+    /// reach `backlog` or `max_seconds` pass. The workers keep running; stop
+    /// them with [`Self::stop_workers`] before the next backlog is written.
+    ///
+    /// The drain clock starts before the first worker starts, so boot counts
+    /// against the fleet; worker counters start from zero in a fresh process.
     ///
     /// # Errors
     ///
-    /// Returns a worker that never becomes ready.
-    pub async fn grow_to<'a>(
+    /// Returns a worker that never becomes ready, or a scrape, log, cgroup,
+    /// or dependency-statistics failure.
+    pub async fn drain<'a>(
         &mut self,
         binary: &Path,
         count: usize,
         envelope: Envelope,
         env: impl Fn(u16) -> Vec<(&'a str, &'a str)>,
-    ) -> Result<()> {
-        while self.workers.len() < count {
-            let ordinal = u16::try_from(self.workers.len() + 1)?;
+        backlog: u64,
+        max_seconds: f64,
+    ) -> Result<DrainRecord> {
+        let leader_before = self.leader.metrics().await?;
+        let dependencies_before = self.dependencies.read().await?;
+        self.leader_log.read_new()?;
+        let started = Instant::now();
+        for ordinal in 1..=count {
+            let ordinal = u16::try_from(ordinal)?;
             let worker = self
                 .leader
                 .start_forge_worker(binary, ordinal, &env(ordinal), envelope)
                 .await?;
             self.workers.push(worker);
         }
-        Ok(())
-    }
-
-    /// Measures one window of `seconds` while `writers` keep committing.
-    ///
-    /// # Errors
-    ///
-    /// Returns a scrape, log, cgroup, or dependency-statistics failure.
-    pub async fn measure(&mut self, writers: &Writers, seconds: f64) -> Result<WindowRecord> {
-        let leader_before = self.leader.metrics().await?;
-        let mut workers_before = Vec::new();
-        for worker in &self.workers {
-            workers_before.push(worker.metrics().await?);
-        }
-        let dependencies_before = self.dependencies.read().await?;
-        let (acked_before, refused_before) = writers.counts();
-        self.leader_log.read_new()?;
         let processes = || std::iter::once(&self.leader).chain(&self.workers);
         let mut resources = ResourceWindow::open(processes())?;
-        let started = Instant::now();
-        let window = Duration::from_secs_f64(seconds);
+        let resources_opened = Instant::now();
+        let limit = Duration::from_secs_f64(max_seconds);
+        let succeeded = [COMPACTION, SUCCEEDED];
 
         let mut backends = Vec::new();
-        let mut next = started;
-        while started.elapsed() < window {
+        let mut next = Instant::now();
+        let drained = loop {
+            let mut rewrites = 0.0;
+            for worker in &self.workers {
+                rewrites += worker
+                    .metrics()
+                    .await?
+                    .sum("bifrost_forge_task_attempts_total", &succeeded);
+            }
+            if rewrites >= backlog as f64 {
+                break true;
+            }
+            if started.elapsed() >= limit {
+                break false;
+            }
             backends.push(self.dependencies.active_backends().await?);
             next += SAMPLE_EVERY;
             tokio::time::sleep_until(next.into()).await;
-        }
+        };
 
         let elapsed = started.elapsed().as_secs_f64();
         resources.freeze(processes());
-        let (acked_after, refused_after) = writers.counts();
         let dependencies_after = self.dependencies.read().await?;
         let leader_after = self.leader.metrics().await?;
         let mut workers_after = Vec::new();
         for worker in &self.workers {
             workers_after.push(worker.metrics().await?);
         }
-        let resources = resources.finish(processes(), elapsed)?;
+        let resources = resources.finish(processes(), resources_opened.elapsed().as_secs_f64())?;
         let pulls = PullEvidence::parse(&self.leader_log.read_new()?);
 
-        let delta = |before: &[Metrics], after: &[Metrics], family: &str, labels: &[&str]| {
-            before
+        let total = |family: &str, labels: &[&str]| {
+            workers_after
                 .iter()
-                .zip(after)
-                .map(|(before, after)| after.sum(family, labels) - before.sum(family, labels))
+                .map(|after| after.sum(family, labels))
                 .sum::<f64>()
         };
-        let succeeded = [COMPACTION, SUCCEEDED];
         let per_worker = self
             .workers
             .iter()
-            .zip(workers_before.iter().zip(&workers_after))
+            .zip(&workers_after)
             .zip(resources.iter().skip(1))
-            .map(|((worker, (before, after)), resource)| {
-                let one = |family: &str| {
-                    delta(
-                        std::slice::from_ref(before),
-                        std::slice::from_ref(after),
-                        family,
-                        &succeeded,
-                    )
-                };
-                WorkerWindow {
-                    replica: worker.ordinal(),
-                    rewrites_per_second: one("bifrost_forge_task_attempts_total") / elapsed,
-                    mean_active_tasks: one("bifrost_forge_task_duration_seconds_sum") / elapsed,
-                    cpu_share: resource.cores / worker.envelope().cpus(),
-                }
+            .map(|((worker, after), resource)| WorkerWindow {
+                replica: worker.ordinal(),
+                rewrites_per_second: after.sum("bifrost_forge_task_attempts_total", &succeeded)
+                    / elapsed,
+                mean_active_tasks: after.sum("bifrost_forge_task_duration_seconds_sum", &succeeded)
+                    / elapsed,
+                cpu_share: resource.cores / worker.envelope().cpus(),
             })
             .collect::<Vec<_>>();
-        let workers_rate = |family: &str, labels: &[&str]| {
-            delta(&workers_before, &workers_after, family, labels) / elapsed
-        };
-        let leader = [leader_before];
-        let leader_after = [leader_after];
-        let leader_rate =
-            |family: &str, labels: &[&str]| delta(&leader, &leader_after, family, labels) / elapsed;
-        Ok(WindowRecord {
+        let rewrites = total("bifrost_forge_task_attempts_total", &succeeded);
+        let promotions = leader_after
+            .sum("bifrost_forge_task_attempts_total", &[PROMOTION, SUCCEEDED])
+            - leader_before.sum("bifrost_forge_task_attempts_total", &[PROMOTION, SUCCEEDED]);
+        Ok(DrainRecord {
             workers: self.workers.len(),
+            backlog_tables: backlog,
             seconds: elapsed,
-            rewrites_per_second: per_worker.iter().map(|w| w.rewrites_per_second).sum(),
-            unsuccessful_attempts: (workers_rate(
-                "bifrost_forge_task_attempts_total",
-                &[COMPACTION],
-            ) - workers_rate(
-                "bifrost_forge_task_attempts_total",
-                &succeeded,
-            )) * elapsed,
-            input_files_per_second: workers_rate("bifrost_forge_input_files_total", &[COMPACTION]),
-            output_files_per_second: workers_rate(
-                "bifrost_forge_output_files_total",
-                &[COMPACTION],
-            ),
-            input_bytes_per_second: workers_rate("bifrost_forge_input_bytes_total", &[COMPACTION]),
+            drained,
+            rewrites,
+            rewrites_per_second: rewrites / elapsed,
+            unsuccessful_attempts: total("bifrost_forge_task_attempts_total", &[COMPACTION])
+                - rewrites,
+            input_files_per_second: total("bifrost_forge_input_files_total", &[COMPACTION])
+                / elapsed,
+            output_files_per_second: total("bifrost_forge_output_files_total", &[COMPACTION])
+                / elapsed,
+            input_bytes_per_second: total("bifrost_forge_input_bytes_total", &[COMPACTION])
+                / elapsed,
             rewrite_seconds: Percentiles::buckets(
-                &merged(
-                    &workers_before,
-                    "bifrost_forge_task_duration_seconds",
-                    &succeeded,
-                ),
+                &[],
                 &merged(
                     &workers_after,
                     "bifrost_forge_task_duration_seconds",
                     &succeeded,
                 ),
             ),
-            promotion_commits_per_second: leader_rate(
-                "bifrost_forge_task_attempts_total",
-                &[PROMOTION, SUCCEEDED],
-            ),
-            promotion_seconds: Percentiles::buckets(
-                &merged(
-                    &leader,
-                    "bifrost_forge_task_duration_seconds",
-                    &[PROMOTION, SUCCEEDED],
-                ),
-                &merged(
-                    &leader_after,
-                    "bifrost_forge_task_duration_seconds",
-                    &[PROMOTION, SUCCEEDED],
-                ),
-            ),
-            leader_decisions: LeaderDecisions::read(&leader[0], &leader_after[0], elapsed),
+            promotion_commits_per_second: promotions / elapsed,
+            leader_decisions: LeaderDecisions::read(&leader_before, &leader_after, elapsed),
             pulls,
             pull_ceiling_per_second: self.workers.len() as f64 * PULL_LIMIT as f64
                 / ForgeWorkerConfig::default().pull_interval.as_secs_f64(),
-            writes_per_second: (acked_after - acked_before) as f64 / elapsed,
-            refused_writes: refused_after - refused_before,
             leader_cpu_share: resources
                 .first()
                 .map_or(0.0, |leader| leader.cores / self.leader.envelope().cpus()),
@@ -443,6 +416,27 @@ impl Deployment {
                 elapsed,
             ),
         })
+    }
+
+    /// Stops every worker cleanly and keeps its log in `output` as
+    /// `worker-<step>-<ordinal>.log`, ANSI styling removed; a stop failure is
+    /// printed, not fatal, so the evidence still lands.
+    pub fn stop_workers(&mut self, output: &Path, step: usize) {
+        for worker in self.workers.drain(..) {
+            let name = format!("worker-{step}-{}.log", worker.ordinal());
+            keep_log(worker, &output.join(name));
+        }
+    }
+}
+
+/// Stops `server` cleanly, copies its log to `log`, and strips the log's ANSI
+/// styling; a stop failure is printed, not fatal.
+pub fn keep_log(server: LocalServer, log: &Path) {
+    if let Err(error) = server.stop(log) {
+        eprintln!("{} did not stop cleanly: {error}", log.display());
+    }
+    if let Ok(plain) = LogCursor::at_start(log).read_new() {
+        let _ = std::fs::write(log, plain);
     }
 }
 

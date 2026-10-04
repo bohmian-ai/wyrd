@@ -1,6 +1,6 @@
 //! The benchmark's report: host and its load, settings, the resource plans
 //! the processes resolved, the in-process rate sweep, the live leader probe,
-//! every measured window, per-step summaries, the bounding resource, and the
+//! every backlog fill and drain, per-step summaries, the bounding resource, and the
 //! gating checks.
 //!
 //! A check fails the run when its measurement misses the threshold or was not
@@ -14,15 +14,15 @@ use serde::Serialize;
 use wyrd_testing::capacity::Percentiles;
 
 use crate::Result;
-use crate::deployment::{PullEvidence, WindowRecord};
+use crate::deployment::{DrainRecord, PullEvidence};
 use crate::host::{Host, HostLoad};
 use crate::probe::ProbeStep;
 use crate::schedule::{DECISION_P99_US, SweepStep};
 
 /// Required 2-worker over 1-worker completion-rate ratio.
 const TWO_WORKER_SCALING: f64 = 1.7;
-/// Required 4-worker over 1-worker completion-rate ratio.
-const FOUR_WORKER_SCALING: f64 = 3.0;
+/// Required 3-worker over 1-worker completion-rate ratio.
+const THREE_WORKER_SCALING: f64 = 2.5;
 /// Leader CPU share of its envelope that must not be reached.
 const LEADER_CPU_SHARE: f64 = 0.70;
 /// Multiples of the production rate whose p99 decisions are gated.
@@ -47,12 +47,29 @@ pub struct Settings {
     pub leader_envelope: (u64, u64),
     /// Each worker's scope: CPU percent and memory bytes.
     pub worker_envelope: (u64, u64),
-    /// Warmup before a step's first window, seconds.
-    pub warmup_seconds: f64,
-    /// Measured window length, seconds.
-    pub window_seconds: f64,
-    /// Windows measured per step.
-    pub windows: usize,
+    /// Snapshots every table must hold before its fleet starts draining.
+    pub backlog_snapshots: usize,
+    /// Longest a drain may run, seconds.
+    pub drain_limit_seconds: f64,
+}
+
+/// One table set's backlog fill: writes with no worker running until every
+/// table held the backlog's snapshots.
+#[derive(Debug, Clone, Serialize)]
+pub struct BacklogFill {
+    /// The fleet size this backlog was filled for.
+    pub workers: usize,
+    /// Seconds from the first write until every table held its snapshots.
+    pub seconds: f64,
+    /// Client batches acknowledged per second.
+    pub writes_per_second: f64,
+    /// Client batches refused.
+    pub refused_writes: u64,
+    /// Succeeded promotion commits per second on the leader.
+    pub promotion_commits_per_second: f64,
+    /// Succeeded promotion duration on the leader, bucket estimates in
+    /// seconds.
+    pub promotion_seconds: Percentiles,
 }
 
 /// What each process resolved from its scope, read from its start log.
@@ -79,18 +96,18 @@ impl ResourcePlans {
     }
 }
 
-/// One worker count's windows, summarized.
+/// One worker count's drain, summarized.
 #[derive(Debug, Clone, Serialize)]
 pub struct StepSummary {
     /// Workers serving.
     pub workers: usize,
-    /// Median window completion rate, rewrites per second.
+    /// Median drain completion rate, rewrites per second.
     pub rewrites_per_second: f64,
-    /// Lowest and highest window completion rates.
+    /// Lowest and highest drain completion rates.
     pub rewrites_per_second_range: (f64, f64),
-    /// Median window promotion commit rate.
+    /// Median drain promotion commit rate.
     pub promotion_commits_per_second: f64,
-    /// Highest window leader CPU share.
+    /// Highest drain leader CPU share.
     pub leader_cpu_share: f64,
     /// Mean worker CPU share of its envelope.
     pub worker_cpu_share: f64,
@@ -100,19 +117,19 @@ pub struct StepSummary {
     pub rustfs_cores: f64,
     /// Mean Postgres cores.
     pub postgres_cores: f64,
-    /// Every pull the leader served in the step's windows.
+    /// Every pull the leader served in the step's drains.
     pub pulls: PullEvidence,
 }
 
 impl StepSummary {
-    /// Summarizes the windows measured with `workers` workers; `None` when
+    /// Summarizes the drains measured with `workers` workers; `None` when
     /// none were.
-    fn of(windows: &[WindowRecord], workers: usize) -> Option<Self> {
-        let step: Vec<&WindowRecord> = windows.iter().filter(|w| w.workers == workers).collect();
+    fn of(windows: &[DrainRecord], workers: usize) -> Option<Self> {
+        let step: Vec<&DrainRecord> = windows.iter().filter(|w| w.workers == workers).collect();
         if step.is_empty() {
             return None;
         }
-        let median = |pick: fn(&WindowRecord) -> f64| {
+        let median = |pick: fn(&DrainRecord) -> f64| {
             let mut values: Vec<f64> = step.iter().map(|w| pick(w)).collect();
             values.sort_by(f64::total_cmp);
             values[(values.len() - 1) / 2]
@@ -226,8 +243,10 @@ pub struct Report {
     pub knee_pulls_per_second: Option<f64>,
     /// The live leader under open-loop peer pulls.
     pub probe: Vec<ProbeStep>,
-    /// Every measured window, in order.
-    pub windows: Vec<WindowRecord>,
+    /// Every backlog fill, in order.
+    pub fills: Vec<BacklogFill>,
+    /// Every drain, in order.
+    pub drains: Vec<DrainRecord>,
     /// One summary per worker count.
     pub steps: Vec<StepSummary>,
     /// The largest step's candidate bounds, highest utilization first.
@@ -254,8 +273,10 @@ pub struct Evidence {
     pub sweep: Vec<SweepStep>,
     /// The live probe.
     pub probe: Vec<ProbeStep>,
-    /// Every window.
-    pub windows: Vec<WindowRecord>,
+    /// Every backlog fill.
+    pub fills: Vec<BacklogFill>,
+    /// Every drain.
+    pub drains: Vec<DrainRecord>,
 }
 
 impl Report {
@@ -271,11 +292,12 @@ impl Report {
             resource_plans,
             sweep,
             probe,
-            windows,
+            fills,
+            drains,
         } = evidence;
         let steps: Vec<StepSummary> = ladder
             .iter()
-            .filter_map(|workers| StepSummary::of(&windows, *workers))
+            .filter_map(|workers| StepSummary::of(&drains, *workers))
             .collect();
         let knee_pulls_per_second = sweep
             .iter()
@@ -301,7 +323,8 @@ impl Report {
             sweep,
             knee_pulls_per_second,
             probe,
-            windows,
+            fills,
+            drains,
             steps,
             bounds,
             checks,
@@ -359,17 +382,17 @@ impl Report {
             |ratio| ratio >= TWO_WORKER_SCALING,
         ));
         checks.push(Check::new(
-            "4-worker / 1-worker completion rate",
-            ratio(4),
-            ">= 3.0",
-            |ratio| ratio >= FOUR_WORKER_SCALING,
+            "3-worker / 1-worker completion rate",
+            ratio(3),
+            ">= 2.5",
+            |ratio| ratio >= THREE_WORKER_SCALING,
         ));
         let mut pulls = PullEvidence::default();
         for step in steps {
             pulls.add(step.pulls);
         }
         checks.push(Check::new(
-            "pulls answered short while a table stayed due",
+            "pulls answered short under backlog (a table stayed due)",
             (pulls.pulls_with_due > 0).then_some(pulls.short_while_due as f64),
             "= 0 over at least one pull that found due tables",
             |short| short == 0.0,
@@ -429,7 +452,7 @@ impl Report {
             "workload: {} tables, {} tenant, seal {} s, one {}-row write per table every {} ms, \
              compaction on at the default type and target, due every {} promotion commits; \
              leader {:.1} CPU / {:.0} GiB, each worker {:.1} CPU / {:.0} GiB; \
-             warmup {} s, {} windows of {} s per step",
+             each fleet drains its own {} fresh due tables, each holding at least {} snapshots, within {} s",
             settings.tables,
             settings.tenants,
             settings.seal_seconds,
@@ -440,9 +463,9 @@ impl Report {
             gib(settings.leader_envelope.1),
             settings.worker_envelope.0 as f64 / 100.0,
             gib(settings.worker_envelope.1),
-            settings.warmup_seconds,
-            settings.windows,
-            settings.window_seconds
+            settings.tables,
+            settings.backlog_snapshots,
+            settings.drain_limit_seconds
         );
         let plans = &self.resource_plans;
         let _ = writeln!(
@@ -497,16 +520,33 @@ impl Report {
             );
         }
 
-        let _ = writeln!(out, "\nwindows:");
-        for window in &self.windows {
+        let _ = writeln!(out, "\nbacklog fills (no worker running):");
+        for fill in &self.fills {
+            let _ = writeln!(
+                out,
+                "  for {} worker(s): {:.0} s, writes {:.0}/s ({} refused), promotions {:.2}/s p50/p99 {} s",
+                fill.workers,
+                fill.seconds,
+                fill.writes_per_second,
+                fill.refused_writes,
+                fill.promotion_commits_per_second,
+                pair(fill.promotion_seconds)
+            );
+        }
+
+        let _ = writeln!(out, "\ndrains:");
+        for window in &self.drains {
             let deps = &window.dependencies;
             let pulls = &window.pulls;
             let _ = writeln!(
                 out,
-                "  {} worker(s), {:.0} s: {:.2} rewrites/s (in {:.1} files/s, {:.0} KiB/s; out {:.1} files/s; {} unsuccessful) \
-                 rewrite p50/p99 {} s | promotions {:.2}/s p50/p99 {} s | pull ceiling {:.2}/s | writes {:.0}/s ({} refused)",
+                "  {} worker(s): {} of {} tables rewritten in {:.0} s ({}): {:.2} rewrites/s (in {:.1} files/s, {:.0} KiB/s; out {:.1} files/s; {} unsuccessful) \
+                 rewrite p50/p99 {} s | promotions {:.2}/s | pull ceiling {:.2}/s",
                 window.workers,
+                window.rewrites,
+                window.backlog_tables,
                 window.seconds,
+                if window.drained { "drained" } else { "LIMIT" },
                 window.rewrites_per_second,
                 window.input_files_per_second,
                 window.input_bytes_per_second / 1024.0,
@@ -514,10 +554,7 @@ impl Report {
                 window.unsuccessful_attempts,
                 pair(window.rewrite_seconds),
                 window.promotion_commits_per_second,
-                pair(window.promotion_seconds),
-                window.pull_ceiling_per_second,
-                window.writes_per_second,
-                window.refused_writes
+                window.pull_ceiling_per_second
             );
             let decisions = &window.leader_decisions;
             let _ = writeln!(

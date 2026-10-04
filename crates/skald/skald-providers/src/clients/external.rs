@@ -95,8 +95,10 @@ impl ExternalGatewayClient {
     /// Posts `request` to the dialect path below the base URL and decodes the
     /// native response of the same dialect.
     ///
-    /// `model` names the model for the Google dialects, whose model lives in
-    /// the request path rather than the body. Provider-internal retries apply
+    /// A custom OpenAI-compatible request posts its inner OpenAI Chat body to
+    /// the same `chat/completions` path; its provider name only selected the
+    /// registry adapter. `model` names the model for the Google dialects, whose
+    /// model lives in the request path rather than the body. Provider-internal retries apply
     /// within this call.
     ///
     /// # Errors
@@ -111,7 +113,8 @@ impl ExternalGatewayClient {
         request: ProviderRequest,
     ) -> ProviderResult<ProviderResponse> {
         match request {
-            ProviderRequest::OpenAiChatCompletion(body) => self
+            ProviderRequest::OpenAiChatCompletion(body)
+            | ProviderRequest::OpenAiChatCompatible { request: body, .. } => self
                 .post(&self.url("chat/completions"), &body)
                 .await
                 .map(ProviderResponse::OpenAiChatCompletion),

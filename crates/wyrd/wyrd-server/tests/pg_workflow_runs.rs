@@ -2210,7 +2210,9 @@ async fn declared_tools_use_captured_scopes_and_owned_services() {
 /// gateway — with the deployment's provider key, a ledger entry, and an
 /// audited invoke decision — while an `ext_gateway` step goes straight to
 /// its tenant-assigned binding with the binding's secret header and no
-/// gateway key, ledger entry, or decision. A binding assigned to another
+/// gateway key, ledger entry, or decision; a custom OpenAI-compatible Prompt
+/// takes that same direct `openai_chat` path with its native Chat body. A
+/// binding assigned to another
 /// tenant is unavailable before any call, and no secret reaches a run.
 /// Anthropic Messages, Gemini and Vertex `generateContent`, and `OpenAI`
 /// Responses Prompts each reach their own provider path and decode their own
@@ -2320,6 +2322,58 @@ async fn server_routes_keep_gateway_and_external_ownership() {
     let invocations = fixture.decisions("gateway.invoke").await;
     let invocations = made_for(&invocations, &fixture.runner, "allowed");
     assert_eq!(invocations.len(), 1, "{invocations:?}");
+
+    // A registered custom OpenAI-compatible Prompt speaks the OpenAI Chat
+    // dialect, so its stored `openai_chat` route posts the Prompt's native
+    // body straight to the binding and decodes the ordinary Chat answer.
+    let compatible = single_step(
+        "compatible-review",
+        "[]",
+        &external_route(&fixture.upstream, "review-gateway"),
+        0,
+    );
+    std::fs::write(
+        compatible.path().join("prompt.yaml"),
+        "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  space: engineering\n  name: compatible-review-prompt\n  version: \"1.0.0\"\nspec:\n  model: gpt-5-5\n  request:\n    provider: open_ai_chat_compatible\n    body:\n      provider:\n        custom: review-compatible\n      request:\n        model: gpt-5-5\n        messages:\n          - role: user\n            content: \"Answer about {{code}}\"\n  variables: [code]\n  response_type: text\n",
+    )
+    .expect("compatible prompt writes");
+    fixture
+        .register(&compatible.path().join("workflow.yaml"))
+        .await;
+    fixture.upstream.reply(text("COMPATIBLE"));
+    let run = fixture
+        .accept(runner, &run_request("compatible-review", "x"))
+        .await;
+    let run = fixture.terminal(runner, &run).await;
+    assert_eq!(run.status, WorkflowRunStatus::Succeeded, "{run:?}");
+    assert_eq!(run.outputs["answer"], json!("COMPATIBLE"));
+    let calls = fixture.upstream.calls();
+    assert_eq!(calls.len(), 3, "exactly one direct compatible request");
+    assert_eq!(calls[2].path, "/v1/chat/completions");
+    assert_eq!(calls[2].secret.as_deref(), Some(EXTERNAL_SECRET));
+    assert!(
+        !calls[2]
+            .authorization
+            .as_deref()
+            .unwrap_or_default()
+            .contains(PROVIDER_KEY)
+    );
+    assert_eq!(calls[2].body["model"], json!("gpt-5-5"));
+    assert_eq!(
+        calls[2].body["messages"][0]["content"],
+        json!("Answer about x"),
+        "the native Chat body, not the tagged Prompt wrapper: {}",
+        calls[2].body
+    );
+    assert!(calls[2].body.get("provider").is_none(), "{}", calls[2].body);
+    assert_eq!(
+        fixture.accounted_calls().await,
+        accounted + 1,
+        "no gateway ledger entry for the compatible route"
+    );
+    let invocations = fixture.decisions("gateway.invoke").await;
+    let invocations = made_for(&invocations, &fixture.runner, "allowed");
+    assert_eq!(invocations.len(), 1, "no gateway ingress: {invocations:?}");
 
     // Each native dialect a stored Prompt selects reaches its own provider
     // path through the in-process gateway and decodes its own answer.

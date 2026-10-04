@@ -428,6 +428,9 @@ impl StepRoute {
 }
 
 /// Return true when `request`'s native dialect is the one `protocol` accepts.
+///
+/// A custom OpenAI-compatible request speaks the OpenAI Chat dialect, so it
+/// matches [`ExternalGatewayProtocol::OpenAiChat`] like the built-in variant.
 pub(crate) fn protocol_matches(
     protocol: ExternalGatewayProtocol,
     request: &ProviderRequest,
@@ -436,7 +439,7 @@ pub(crate) fn protocol_matches(
         (protocol, request),
         (
             ExternalGatewayProtocol::OpenAiChat,
-            ProviderRequest::OpenAiChatCompletion(_)
+            ProviderRequest::OpenAiChatCompletion(_) | ProviderRequest::OpenAiChatCompatible { .. }
         ) | (
             ExternalGatewayProtocol::OpenAiResponses,
             ProviderRequest::OpenAiResponses(_)

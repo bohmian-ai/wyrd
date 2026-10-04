@@ -10,13 +10,14 @@
 //! commits its terminal snapshot only after every owner finished. Failures
 //! reach the model as the owner's stable code and title alone.
 
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 use skald_tool::{AgentTool, StructuredInvocationError, ToolError, ToolResolver};
+use skald_workflow::PreparedWorkflowRun;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use wyrd_semver::VersionBlock;
@@ -41,8 +42,8 @@ pub(crate) fn is_builtin(name: &str) -> bool {
 
 /// One accepted run's built-in tools.
 ///
-/// Cloning is cheap; every clone shares the run's tool-owner tracker and
-/// cancellation.
+/// Cloning is cheap; every clone shares the run's tool-owner tracker,
+/// cancellation, and deadline.
 #[derive(Clone)]
 pub(crate) struct RunTools {
     /// Server state whose query and Cards services serve every call.
@@ -55,18 +56,23 @@ pub(crate) struct RunTools {
     owners: TaskTracker,
     /// Largest serialized result one call may return.
     max_result_bytes: usize,
-    /// When the run's total deadline expires.
-    deadline: Instant,
+    /// The prepared run's absolute total deadline, bound once by
+    /// [`Self::bind_deadline`] after the Agents holding these clones were
+    /// hydrated and before any tool can be called.
+    deadline: Arc<OnceLock<Instant>>,
 }
 
 impl RunTools {
     /// Bind the built-in tools to one run.
+    ///
+    /// The run's deadline is not known yet: Skald fixes it only once the
+    /// Agents holding these tools are hydrated and the run is prepared, and
+    /// [`Self::bind_deadline`] then hands it to every clone.
     pub(crate) fn new(
         state: AppState,
         caller: Caller,
         cancel: CancellationToken,
         max_result_bytes: usize,
-        deadline: Instant,
     ) -> Self {
         Self {
             state,
@@ -74,7 +80,18 @@ impl RunTools {
             cancel,
             owners: TaskTracker::new(),
             max_result_bytes,
-            deadline,
+            deadline: Arc::default(),
+        }
+    }
+
+    /// Bind every clone to the absolute total deadline `prepared` fixed.
+    ///
+    /// Called once, after preparation and before the run is accepted, so a
+    /// query is clipped to exactly the instant at which the run times out. A
+    /// run without a deadline binds nothing, and a second binding is ignored.
+    pub(crate) fn bind_deadline(&self, prepared: &PreparedWorkflowRun) {
+        if let Some(deadline) = prepared.deadline() {
+            self.deadline.get_or_init(|| deadline);
         }
     }
 
@@ -172,7 +189,7 @@ impl AgentTool for QueryTool {
     ///
     /// The result ceiling is the smaller of the requested `max_bytes` and the
     /// run's step-result bound, and the deadline the smaller of the requested
-    /// one and the run's remaining time. Dropping this future cancels the
+    /// one and the time remaining until the prepared run's deadline. Dropping this future cancels the
     /// owner's token; the owner keeps the response and settles it.
     ///
     /// # Errors
@@ -184,17 +201,17 @@ impl AgentTool for QueryTool {
             serde_json::from_value(args).map_err(|_| invalid_input(QUERY))?;
         arguments.validate().map_err(|_| invalid_input(QUERY))?;
         arguments.max_bytes = arguments.max_bytes.min(self.tools.max_result_bytes);
-        let remaining = self
-            .tools
-            .deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis();
-        let remaining = u32::try_from(remaining).unwrap_or(u32::MAX).max(1);
-        arguments.deadline_ms = Some(
-            arguments
-                .deadline_ms
-                .map_or(remaining, |requested| requested.min(remaining)),
-        );
+        if let Some(deadline) = self.tools.deadline.get() {
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis();
+            let remaining = u32::try_from(remaining).unwrap_or(u32::MAX).max(1);
+            arguments.deadline_ms = Some(
+                arguments
+                    .deadline_ms
+                    .map_or(remaining, |requested| requested.min(remaining)),
+            );
+        }
         let cancel = self.tools.cancel.child_token();
         let waiter = cancel.clone().drop_guard();
         let query = BoundedQuery::new(self.tools.state.clone());
@@ -330,4 +347,126 @@ fn failure(error: &WyrdError) -> ToolError {
         remediation: error.remediation().to_owned(),
         safe_details: None,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use serde_json::json;
+    use skald_runtime::ProviderRegistry;
+    use skald_workflow::{
+        Workflow, WorkflowExecutionDependencies, WorkflowExecutionLimits, WorkflowInput,
+        WorkflowRunOptions,
+    };
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use tokio_util::sync::CancellationToken;
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::card::workflow::WorkflowCard;
+    use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+
+    use super::RunTools;
+    use crate::components::cards::service::reconciliation_caller;
+    use crate::postgres::ServerPostgres;
+    use crate::state::AppState;
+
+    /// A well-formed server state whose pool connects lazily, enough to
+    /// construct run tools that are never called.
+    async fn state() -> AppState {
+        let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        let postgres = Arc::new(ServerPostgres::from_parts(
+            wyrd_sql::WyrdPostgres::from_pools(pool.clone(), None),
+            vala_sql::ValaPostgres::from_pool(pool),
+        ));
+        let root = tempfile::tempdir().expect("temp dir");
+        let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
+        crate::test_support::test_app_state(
+            postgres,
+            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            crate::test_support::test_catalog().await,
+        )
+    }
+
+    /// One inline Agent step that declares `bifrost.query`.
+    fn card() -> WorkflowCard {
+        serde_json::from_value(json!({
+            "apiVersion": "wyrd/v1",
+            "kind": "Workflow",
+            "metadata": { "space": "engineering", "name": "deadline", "version": "1.0.0" },
+            "spec": {
+                "steps": [{
+                    "id": "count",
+                    "action": {
+                        "type": "agent",
+                        "target": {
+                            "prompt": {
+                                "model": "gpt-5-5",
+                                "request": {
+                                    "provider": "open_ai_chat_completion",
+                                    "body": {
+                                        "model": "gpt-5-5",
+                                        "messages": [{ "role": "user", "content": "Count them." }]
+                                    }
+                                },
+                                "response_type": "text"
+                            },
+                            "tool_names": ["bifrost.query"]
+                        }
+                    }
+                }],
+                "outputs": { "answer": "steps.count.output.text" }
+            }
+        }))
+        .expect("fixture Workflow Card parses")
+    }
+
+    /// Tools created before hydration and planning carry exactly the deadline
+    /// the prepared run fixes afterwards, not one sampled when they were
+    /// created.
+    ///
+    /// # Panics
+    /// Panics if the fixture does not prepare or the tools hold any other
+    /// deadline.
+    #[tokio::test(start_paused = true)]
+    async fn tools_use_the_prepared_run_deadline() {
+        let tools = RunTools::new(
+            state().await,
+            reconciliation_caller(DataTenantId::new_v7()),
+            CancellationToken::new(),
+            1024,
+        );
+        let agent_tools = tools.clone();
+        let workflow =
+            Workflow::from_card_bodies(card(), &|agent| agent_tools.for_agent(agent), &|_| None)
+                .expect("fixture Workflow hydrates");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let options = WorkflowRunOptions {
+            limits: WorkflowExecutionLimits {
+                max_concurrency: NonZeroUsize::MIN,
+                deadline: Some(Duration::from_secs(30)),
+                max_input_bytes: None,
+                max_step_result_bytes: None,
+                max_run_bytes: None,
+            },
+            cancellation: CancellationToken::new(),
+        };
+        let prepared = workflow
+            .prepare(
+                &WorkflowExecutionDependencies::new(ProviderRegistry::default()),
+                WorkflowInput::Vars(serde_json::Map::new()),
+                options,
+            )
+            .expect("fixture Workflow prepares");
+
+        tools.bind_deadline(&prepared);
+
+        assert!(prepared.deadline().is_some(), "the run has a deadline");
+        assert_eq!(
+            agent_tools.deadline.get().copied(),
+            prepared.deadline(),
+            "every clone holds the prepared run's deadline"
+        );
+    }
 }

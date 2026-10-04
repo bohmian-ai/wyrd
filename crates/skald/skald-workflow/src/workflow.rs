@@ -202,6 +202,12 @@ impl WorkflowExecutor {
         self.ledger.snapshot()
     }
 
+    /// The absolute total run deadline fixed by [`Self::new`], if the run has
+    /// one.
+    pub(crate) const fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
     /// Execute the run to a terminal snapshot inside its `workflow.run` span.
     ///
     /// Never fails after preparation: step, cancellation, deadline, and size

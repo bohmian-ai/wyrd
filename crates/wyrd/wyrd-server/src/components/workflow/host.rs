@@ -12,7 +12,7 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use skald_runtime::ProviderRegistry;
 use skald_workflow::{
@@ -294,8 +294,9 @@ impl Preparation {
     /// per Agent; resolves only the external gateway bindings the graph
     /// selects that are assigned to the caller's tenant; and then hydrates
     /// and prepares the Skald run on the Workflow tracker's blocking pool, so
-    /// shutdown waits for that work even when this future is cancelled. No
-    /// provider or tool is called.
+    /// shutdown waits for that work even when this future is cancelled. The
+    /// run's tools are then bound to the total deadline the prepared run
+    /// fixed. No provider or tool is called.
     ///
     /// # Errors
     /// Returns the registry and graph-bound errors of
@@ -375,7 +376,6 @@ impl Preparation {
             caller,
             cancel.clone(),
             config.max_step_result_bytes,
-            Instant::now() + timeout,
         );
         let agent_tools = tools.clone();
         let input = WorkflowInput::Vars(request.input.into_iter().collect());
@@ -396,6 +396,7 @@ impl Preparation {
                 message: "Workflow preparation stopped before it finished".to_owned(),
                 details: serde_json::json!({ "boundary": "preparation" }),
             })??;
+        tools.bind_deadline(&prepared);
         Ok((prepared, tools))
     }
 

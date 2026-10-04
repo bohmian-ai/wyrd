@@ -11,6 +11,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use serde_json::{Map, Value};
 use skald_agent::Agent;
+use tokio::time::Instant;
 use wyrd_spec::card::common::ParameterValue;
 use wyrd_spec::card::prompt::is_valid_parameter_name;
 use wyrd_spec::card::workflow::{
@@ -683,6 +684,17 @@ impl PreparedWorkflowRun {
     #[must_use]
     pub fn snapshot(&self) -> &WorkflowRun {
         self.executor.snapshot()
+    }
+
+    /// The absolute total deadline fixed when the run was prepared, or `None`
+    /// when its options set no deadline.
+    ///
+    /// Execution times the run out at exactly this instant, so anything
+    /// bounded by the run, such as a tool call, reads it here instead of
+    /// sampling its own.
+    #[must_use]
+    pub const fn deadline(&self) -> Option<Instant> {
+        self.executor.deadline()
     }
 
     /// Execute the run to its terminal snapshot.

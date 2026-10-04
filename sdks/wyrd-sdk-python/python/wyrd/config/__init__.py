@@ -1,4 +1,4 @@
-"""Wyrd workspace configuration (wyrd.toml) loader."""
+"""Workspace defaults from ``wyrd.toml``, applied on request with ``apply_defaults``."""
 
 from .._wyrd.config import WyrdConfig
 

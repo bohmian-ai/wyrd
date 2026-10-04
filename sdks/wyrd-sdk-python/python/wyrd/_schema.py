@@ -24,7 +24,12 @@ def _wyrd_error(code: str, detail: str) -> WyrdError:
 
 
 def annotation_to_schema(annotation: Any) -> dict:
-    """Convert a Python type annotation to a JSON Schema dict."""
+    """Convert a Python type annotation to a JSON Schema dict.
+
+    ``Optional[T]`` maps to ``T``'s schema; other unions become ``anyOf``.
+    Types without a primitive or container mapping go through pydantic's
+    ``TypeAdapter``; an unknown or unsupported annotation yields ``{}``.
+    """
     if annotation is None or annotation is type(None):
         return {"type": "null"}
 
@@ -82,7 +87,24 @@ def annotation_to_schema(annotation: Any) -> dict:
 def output_to_json_schema(
     output: Any, *, default_name: str = "structured_output"
 ) -> tuple[str, dict]:
-    """Coerce a Prompt output declaration to a JSON Schema object."""
+    """Coerce a Prompt output declaration to a named JSON Schema object.
+
+    Args:
+        output: a raw JSON Schema dict (one with a string ``"type"``), a
+            ``dict[str, type]`` whose keys all become required properties, or
+            a ``pydantic.BaseModel`` subclass.
+        default_name: the schema name returned for a dict declaration; a
+            model class is named after the class.
+
+    Returns:
+        The schema name and the JSON Schema object.
+
+    Raises:
+        WyrdError: ``WYRD_PROMPT_422_INVALID_OUTPUT_SCHEMA`` for any other
+            declaration or a non-string key; ``WYRD_PROMPT_422_PYDANTIC_REQUIRED``
+            for a class when pydantic is not installed.
+
+    """
     if isinstance(output, dict):
         if "type" in output and isinstance(output["type"], str):
             return default_name, output

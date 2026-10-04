@@ -1579,7 +1579,7 @@ impl PyRegistrationReceipt {
 ///
 /// ```python
 /// cards = Cards()
-/// reference = cards.model.resolve_latest(space="ml", name="fraud-model")
+/// reference = cards.model.resolve_latest(space="risk", name="fraud-model")
 /// model = cards.model.get(uid=reference.uid, eager_load=True)
 /// ```
 ///

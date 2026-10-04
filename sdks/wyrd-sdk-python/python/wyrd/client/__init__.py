@@ -1,4 +1,4 @@
-"""The shared Wyrd client and its RFC 8693 delegation helper."""
+"""The shared authenticated Wyrd client, including ``on_behalf_of`` delegation."""
 
 from .._wyrd.client import WyrdClient
 

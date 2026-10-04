@@ -25,9 +25,5 @@ class CardRefLike(Protocol):
     """
 
     def to_dict(self) -> JsonDict:
-        """Return a JSON-compatible card reference dictionary.
-
-        Returns:
-            JsonDict: Serialized card reference.
-        """
+        """Return the reference as a JSON-compatible ``CardRef`` mapping."""
         ...

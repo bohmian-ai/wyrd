@@ -35,8 +35,10 @@ impl PyWyrdClient {
 impl PyWyrdClient {
     /// Build a client from optionally overridden transport values.
     ///
-    /// Omitted values resolve through `client_from_options`: the environment,
-    /// then `~/.config/wyrd/credentials.toml`.
+    /// Omitted values resolve through `client_from_options`: `server_url` from
+    /// `WYRD_SERVER_URL`, then `http://localhost:8080`; `grpc_url` from
+    /// `WYRD_GRPC_URL`, then the server URL's host on port `50051`; and the
+    /// credential from the environment, then `~/.config/wyrd/credentials.toml`.
     ///
     /// # Errors
     /// Raises `WyrdError` carrying `WYRD_CLIENT_401_NO_CREDENTIALS` when no
@@ -60,7 +62,8 @@ impl PyWyrdClient {
     }
 
     /// The effective gRPC endpoint: the explicit `grpc_url` when one was given,
-    /// else the server URL's scheme and host on the public gRPC port `50051`.
+    /// else `WYRD_GRPC_URL`, else the server URL's scheme and host on the
+    /// public gRPC port `50051`.
     #[getter]
     fn grpc_url(&self) -> &str {
         self.inner.grpc_url()

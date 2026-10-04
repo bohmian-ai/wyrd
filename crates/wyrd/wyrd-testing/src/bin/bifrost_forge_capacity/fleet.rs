@@ -5,11 +5,13 @@
 //! would. Compaction is off by default and no public route sets Iceberg table
 //! properties, so the benchmark commits each table's Forge properties as an
 //! operator would: through the Iceberg catalog over the serving Postgres
-//! login and object store the Postgres wrapper and mise task export. A
-//! snapshot-count trigger of one makes every promotion commit due on the next
-//! compactor pull. The writers then send one small batch to every table each
-//! write interval, so Scribe seals each table at the configured age and the
-//! leader promotes, notifies, and dispatches it continuously.
+//! login and object store the Postgres wrapper and mise task export. Only
+//! the opt-in and the snapshot-count trigger are set: the compaction type
+//! stays the default `full` and the file target the default 1 GiB. The
+//! writers then send one small batch to every table each write interval, so
+//! Scribe seals each table at the configured age, the leader promotes and
+//! notifies every seal, and a table becomes due once the trigger's count of
+//! promotion commits has accumulated since its last compaction.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,12 +33,11 @@ use wyrd_testing::release_server::LocalServer;
 
 use crate::Result;
 
-/// Iceberg properties that opt one table into compaction, due on every
-/// commit.
-const FORGE_PROPERTIES: [(&str, &str); 2] = [
-    ("wyrd.forge.enable-compaction", "true"),
-    ("wyrd.forge.compaction.trigger-snapshot-count", "1"),
-];
+/// Iceberg property that opts one table into compaction.
+const ENABLE_COMPACTION: &str = "wyrd.forge.enable-compaction";
+
+/// Iceberg property naming the promotion commits that make a table due.
+const TRIGGER_SNAPSHOT_COUNT: &str = "wyrd.forge.compaction.trigger-snapshot-count";
 
 /// Public table name prefix; the index follows, zero-padded.
 const TABLE_PREFIX: &str = "forge_capacity_";
@@ -63,12 +64,13 @@ pub struct Writers {
 
 impl Fleet {
     /// Registers `count` tables for the leader's first tenant through the
-    /// public client and commits each one's Forge properties.
+    /// public client and commits each one's Forge properties: compaction on,
+    /// due after `trigger` promotion commits.
     ///
     /// # Errors
     ///
     /// Returns a client, registration, catalog, or property-commit failure.
-    pub async fn provision(leader: &LocalServer, count: usize) -> Result<Self> {
+    pub async fn provision(leader: &LocalServer, count: usize, trigger: usize) -> Result<Self> {
         let client = WyrdClient::with_config(ClientConfig {
             credential: Some(leader.api_key().clone()),
             ..ClientConfig::from_global_with_overrides(
@@ -94,7 +96,7 @@ impl Fleet {
                 tenant,
                 TableRef::new(BifrostNamespace::Datasets, &name),
             ))?;
-            enable_compaction(&catalog, &binding).await?;
+            enable_compaction(&catalog, &binding, trigger).await?;
             tables.push(qualified);
         }
         Ok(Self {
@@ -192,20 +194,26 @@ async fn operator_catalog() -> Result<BifrostCatalog> {
     .await?)
 }
 
-/// Commits [`FORGE_PROPERTIES`] onto one registered table.
+/// Commits [`ENABLE_COMPACTION`] and a [`TRIGGER_SNAPSHOT_COUNT`] of
+/// `trigger` onto one registered table.
 ///
 /// # Errors
 ///
 /// Returns a load, transaction, or commit failure.
-async fn enable_compaction(catalog: &BifrostCatalog, binding: &TenantTableBinding) -> Result<()> {
+async fn enable_compaction(
+    catalog: &BifrostCatalog,
+    binding: &TenantTableBinding,
+    trigger: usize,
+) -> Result<()> {
     let iceberg = catalog.iceberg_catalog();
     let table = iceberg.load_table(&binding.table_ident()).await?;
     let tx = Transaction::new(&table);
-    let mut update = tx.update_table_properties();
-    for (key, value) in FORGE_PROPERTIES {
-        update = update.set(key.to_owned(), value.to_owned());
-    }
-    update.apply(tx)?.commit_once(iceberg.as_ref()).await?;
+    tx.update_table_properties()
+        .set(ENABLE_COMPACTION.to_owned(), "true".to_owned())
+        .set(TRIGGER_SNAPSHOT_COUNT.to_owned(), trigger.to_string())
+        .apply(tx)?
+        .commit_once(iceberg.as_ref())
+        .await?;
     Ok(())
 }
 

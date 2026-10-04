@@ -90,6 +90,11 @@ impl Dependencies {
         })
     }
 
+    /// The owner pool, for a probe that reads the Forge leader term.
+    pub fn owner(&self) -> PgPool {
+        self.owner.clone()
+    }
+
     /// Reads every cumulative counter now.
     ///
     /// # Errors

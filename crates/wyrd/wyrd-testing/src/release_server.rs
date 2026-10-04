@@ -9,8 +9,9 @@
 //! The benchmarks add only what the guide leaves to the operator:
 //! `WYRD_STORAGE_URL`, which has no default, pointing at a `file://`
 //! directory; a working directory so the server's `.wyrd/` state lands in a
-//! temporary root; a systemd scope that gives the process the
-//! 8-CPU/16-GiB pod envelope; and any extra environment a benchmark names.
+//! temporary root; a systemd scope that gives the process its resource
+//! [`Envelope`], the 8-CPU/16-GiB pod envelope unless the benchmark names a
+//! smaller one; and any extra environment a benchmark names.
 //! A further replica joins the same Postgres and store on its own ports, as
 //! the configuration guide's peer mode describes.
 //! The wrapper's test-fixture `WYRD_DB_MAX_CONNECTIONS` cap is removed, so
@@ -48,6 +49,34 @@ pub const CPUS: u64 = 8;
 
 /// Memory limit of the pod envelope, with no swap.
 pub const MEMORY_BYTES: u64 = 16 << 30;
+
+/// The CPU quota and memory limit one process's systemd scope enforces.
+///
+/// The server sizes itself from its cgroup — the CPU quota rounded down to
+/// whole CPUs, at least one, and `memory.max` — so a benchmark that gives a
+/// process a smaller envelope measures it as a pod of that size would run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Envelope {
+    /// CPU quota in percent of one CPU, as systemd's `CPUQuota` takes it:
+    /// 150 is one and a half CPUs.
+    pub cpu_percent: u64,
+    /// Memory limit in bytes, with no swap.
+    pub memory_bytes: u64,
+}
+
+impl Envelope {
+    /// The pod envelope every benchmark runs in unless it names another:
+    /// [`CPUS`] CPUs and [`MEMORY_BYTES`].
+    pub const POD: Self = Self {
+        cpu_percent: CPUS * 100,
+        memory_bytes: MEMORY_BYTES,
+    };
+
+    /// The CPU quota in CPUs, possibly fractional.
+    pub fn cpus(self) -> f64 {
+        self.cpu_percent as f64 / 100.0
+    }
+}
 
 /// How long the server may take to report ready on `/readyz`.
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -119,6 +148,8 @@ pub struct LocalServer {
     ordinal: u16,
     /// What the process runs, which decides its readiness probe.
     role: Role,
+    /// The CPU and memory limits its scope enforces.
+    envelope: Envelope,
 }
 
 /// What a [`LocalServer`] process runs.
@@ -133,10 +164,10 @@ enum Role {
 }
 
 impl LocalServer {
-    /// Migrates and serves `binary` with `env` added, then runs `setup` once
-    /// per slug in `tenants`, returning once `/readyz` answers 200, the
-    /// cgroup enforces the envelope, and every tenant's credential was
-    /// printed.
+    /// Migrates and serves `binary` with `env` added in `envelope`, then runs
+    /// `setup` once per slug in `tenants`, returning once `/readyz` answers
+    /// 200, the cgroup enforces the envelope, and every tenant's credential
+    /// was printed.
     ///
     /// The first `setup` initializes the platform root and discloses its
     /// credential; later runs present it as `WYRD_PLATFORM_CREDENTIAL`, as
@@ -147,9 +178,13 @@ impl LocalServer {
     /// Returns an error when `WYRD_TEST_DATABASE_ADMIN_URL` is unset (the
     /// benchmark is not running under the Postgres wrapper), `migrate` or a
     /// `setup` fails or prints no credential, the server exits or never
-    /// becomes ready, or its cgroup does not enforce the
-    /// [`CPUS`]/[`MEMORY_BYTES`] envelope.
-    pub async fn start(binary: &Path, tenants: &[&str], env: &[(&str, &str)]) -> Result<Self> {
+    /// becomes ready, or its cgroup does not enforce `envelope`.
+    pub async fn start(
+        binary: &Path,
+        tenants: &[&str],
+        env: &[(&str, &str)],
+        envelope: Envelope,
+    ) -> Result<Self> {
         let owner_url = std::env::var("WYRD_TEST_DATABASE_ADMIN_URL")
             .map_err(|_| "WYRD_TEST_DATABASE_ADMIN_URL is unset; run through mise")?;
         let root = tempfile::Builder::new().prefix("wyrd-bench-").tempdir()?;
@@ -162,7 +197,8 @@ impl LocalServer {
                 .arg("migrate")
                 .env("WYRD_DATABASE_URL", owner_url),
         )?;
-        let mut server = Self::serve(binary, root, &storage_url, 0, Role::Serving, env).await?;
+        let mut server =
+            Self::serve(binary, root, &storage_url, 0, Role::Serving, env, envelope).await?;
 
         let operator =
             |program: &Path| operator(program, &workdir, &storage_url, 0, Role::Serving, env);
@@ -198,8 +234,8 @@ impl LocalServer {
     }
 
     /// Starts replica `ordinal` of this deployment: `binary` serving the same
-    /// Postgres and store from its own working directory and envelope, with
-    /// every listener offset by `ordinal` strides. Nothing is migrated or set
+    /// Postgres and store from its own working directory and a scope of this
+    /// server's envelope, with every listener offset by `ordinal` strides. Nothing is migrated or set
     /// up; the replica serves the tenants this server provisioned.
     ///
     /// Several replicas need peer mode: give every replica, including this
@@ -217,13 +253,22 @@ impl LocalServer {
     ) -> Result<Self> {
         let root = tempfile::Builder::new().prefix("wyrd-bench-").tempdir()?;
         let storage_url = format!("file://{}", self.storage_dir().display());
-        Self::serve(binary, root, &storage_url, ordinal, Role::Serving, env).await
+        Self::serve(
+            binary,
+            root,
+            &storage_url,
+            ordinal,
+            Role::Serving,
+            env,
+            self.envelope,
+        )
+        .await
     }
 
     /// Starts a dedicated Forge worker of this deployment as replica
     /// `ordinal`: `binary` with `WYRD_TARGET=forge-worker`, the same Postgres
-    /// and store, its own working directory and envelope, and its metrics
-    /// listener offset by `ordinal` strides.
+    /// and store, its own working directory, a scope of `envelope`, and its
+    /// metrics listener offset by `ordinal` strides.
     ///
     /// A Forge worker serves no API and opens no peer listener, so it is
     /// ready once `/metrics` answers. It pulls compaction from the elected
@@ -239,14 +284,24 @@ impl LocalServer {
         binary: &Path,
         ordinal: u16,
         env: &[(&str, &str)],
+        envelope: Envelope,
     ) -> Result<Self> {
         let root = tempfile::Builder::new().prefix("wyrd-bench-").tempdir()?;
         let storage_url = format!("file://{}", self.storage_dir().display());
-        Self::serve(binary, root, &storage_url, ordinal, Role::ForgeWorker, env).await
+        Self::serve(
+            binary,
+            root,
+            &storage_url,
+            ordinal,
+            Role::ForgeWorker,
+            env,
+            envelope,
+        )
+        .await
     }
 
-    /// Serves `binary` as replica `ordinal` in `role` from `root` in its
-    /// envelope and waits until it is ready.
+    /// Serves `binary` as replica `ordinal` in `role` from `root` in a scope
+    /// of `envelope` and waits until it is ready.
     ///
     /// # Errors
     ///
@@ -259,6 +314,7 @@ impl LocalServer {
         ordinal: u16,
         role: Role,
         env: &[(&str, &str)],
+        envelope: Envelope,
     ) -> Result<Self> {
         let log = File::create(root.path().join("server.log"))?;
         let child = operator(
@@ -270,8 +326,8 @@ impl LocalServer {
             env,
         )
         .args(["--user", "--scope", "--quiet", "--collect"])
-        .arg(format!("--property=CPUQuota={}%", CPUS * 100))
-        .arg(format!("--property=MemoryMax={MEMORY_BYTES}"))
+        .arg(format!("--property=CPUQuota={}%", envelope.cpu_percent))
+        .arg(format!("--property=MemoryMax={}", envelope.memory_bytes))
         .arg("--property=MemorySwapMax=0")
         .arg("--")
         .arg(binary)
@@ -286,6 +342,7 @@ impl LocalServer {
             tenants: Vec::new(),
             ordinal,
             role,
+            envelope,
         };
         server.await_ready().await?;
         server.cgroup = server.find_cgroup()?;
@@ -301,6 +358,17 @@ impl LocalServer {
     /// This replica's ordinal.
     pub fn ordinal(&self) -> u16 {
         self.ordinal
+    }
+
+    /// The CPU and memory limits this process's scope enforces.
+    pub fn envelope(&self) -> Envelope {
+        self.envelope
+    }
+
+    /// The process's log, which [`LocalServer::stop`] later copies out; it
+    /// grows while the process runs.
+    pub fn log_path(&self) -> PathBuf {
+        self.root.path().join("server.log")
     }
 
     /// PID of the process `systemd-run --scope` executes in place, so the
@@ -476,8 +544,8 @@ impl LocalServer {
         Ok(Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/')))
     }
 
-    /// Confirms `cpu.max` allows exactly the envelope's CPUs and `memory.max`
-    /// equals its bytes.
+    /// Confirms `cpu.max` allows exactly the envelope's CPU percent and
+    /// `memory.max` equals its bytes.
     ///
     /// # Errors
     ///
@@ -489,15 +557,19 @@ impl LocalServer {
         let mut fields = cpu
             .split_whitespace()
             .map(|field| field.parse::<u64>().ok());
-        let cpus = match (fields.next().flatten(), fields.next().flatten()) {
-            (Some(quota), Some(period)) if period > 0 => quota / period,
+        let cpu_percent = match (fields.next().flatten(), fields.next().flatten()) {
+            (Some(quota), Some(period)) if period > 0 => quota * 100 / period,
             _ => 0,
         };
-        if cpus == CPUS && memory.trim() == MEMORY_BYTES.to_string() {
+        let Envelope {
+            cpu_percent: expected_cpu,
+            memory_bytes,
+        } = self.envelope;
+        if cpu_percent == expected_cpu && memory.trim() == memory_bytes.to_string() {
             return Ok(());
         }
         Err(format!(
-            "cgroup {} enforces cpu.max `{}` memory.max `{}`, not {CPUS} CPUs and {MEMORY_BYTES} bytes",
+            "cgroup {} enforces cpu.max `{}` memory.max `{}`, not {expected_cpu}% CPU and {memory_bytes} bytes",
             self.cgroup.display(),
             cpu.trim(),
             memory.trim()

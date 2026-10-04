@@ -34,7 +34,7 @@ use std::time::Duration;
 use clap::Parser;
 use wyrd_client::QueueConfig;
 use wyrd_testing::capacity::{install_tracing, release_binary};
-use wyrd_testing::release_server::{CPUS, LocalServer, MEMORY_BYTES};
+use wyrd_testing::release_server::{CPUS, Envelope, LocalServer, MEMORY_BYTES};
 
 use fixture::Tenant;
 use step::{Bench, Plan, Record};
@@ -97,7 +97,7 @@ async fn benchmark(cli: Cli) -> Result<bool> {
             cli.storage_endpoint_url.as_str(),
         ),
     ];
-    let server = LocalServer::start(&binary, &["m0"], &env).await?;
+    let server = LocalServer::start(&binary, &["m0"], &env, Envelope::POD).await?;
     let setup = server
         .tenants()
         .first()

@@ -29,7 +29,7 @@ use report::Report;
 use run::Bench;
 use workload::{Case, Fixture, TABLE};
 use wyrd_testing::capacity::{install_tracing, release_binary};
-use wyrd_testing::release_server::{LocalServer, SERVER_URL};
+use wyrd_testing::release_server::{Envelope, LocalServer, SERVER_URL};
 
 /// Error type of every benchmark step: the binary only reports it.
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -74,7 +74,7 @@ async fn benchmark(heavy: bool) -> Result<bool> {
     }
     std::fs::create_dir_all(&output)?;
 
-    let server = LocalServer::start(&release_binary()?, &["bench"], &[]).await?;
+    let server = LocalServer::start(&release_binary()?, &["bench"], &[], Envelope::POD).await?;
     let client = WyrdClient::with_config(ClientConfig {
         credential: Some(server.api_key().clone()),
         ..ClientConfig::from_global_with_overrides(&GlobalConfig::default(), Some(SERVER_URL), None)

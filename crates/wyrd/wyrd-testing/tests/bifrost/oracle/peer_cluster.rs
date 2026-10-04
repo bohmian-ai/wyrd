@@ -33,6 +33,10 @@ use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 use crate::support::JourneyError;
 
+/// Longest a membership change may take to become observable through
+/// [`PeerCluster::await_membership`].
+const MEMBERSHIP_DEADLINE: Duration = Duration::from_secs(45);
+
 /// How long one pod may take to report every readiness probe passing.
 const READY_DEADLINE: Duration = Duration::from_secs(60);
 
@@ -377,6 +381,40 @@ impl PeerCluster {
         };
         registry.refresh_snapshot().await?;
         Ok(MembershipEntry::project(&registry.snapshot()))
+    }
+
+    /// Polls pod `observer`'s live membership cut until `observed` holds.
+    ///
+    /// Membership is heartbeat-driven: a join appears within one heartbeat,
+    /// and a stopped member leaves once its last heartbeat ages past the
+    /// fifteen-second liveness cutoff. [`MEMBERSHIP_DEADLINE`] turns a member
+    /// that never appears or never leaves into a diagnosable failure; elapsed
+    /// time is never itself evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure naming `change` and the last cut seen when the
+    /// deadline passes, or the membership refresh failure unchanged.
+    pub(crate) async fn await_membership(
+        &self,
+        observer: usize,
+        change: &str,
+        observed: impl Fn(&[MembershipEntry]) -> bool,
+    ) -> Result<(), JourneyError> {
+        let deadline = std::time::Instant::now() + MEMBERSHIP_DEADLINE;
+        loop {
+            let membership = self.membership(observer).await?;
+            if observed(&membership) {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "pod {observer} never observed {change}; last membership {membership:?}"
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 
     /// Returns the private address pod `index` published into membership.

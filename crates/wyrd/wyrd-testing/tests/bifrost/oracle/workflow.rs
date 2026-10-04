@@ -219,8 +219,11 @@ async fn prove_forwarded_query_settles(cause: TerminalCause) -> Result<(), Journ
     }
     if cause == TerminalCause::PodKill {
         let results = upstream.calls()[1]["messages"].to_string();
-        if !results.contains("WYRD_VALA_") || results.contains("columns") {
-            return Err(format!("the lost query must fail without rows: {results}").into());
+        if !results.contains(POD_LOSS_CODE) || results.contains("columns") {
+            return Err(format!(
+                "the lost query must fail as {POD_LOSS_CODE} without rows: {results}"
+            )
+            .into());
         }
     }
 
@@ -233,21 +236,37 @@ async fn prove_forwarded_query_settles(cause: TerminalCause) -> Result<(), Journ
         return Err(format!("the held query must record exactly one {expected_outcome:?}").into());
     }
 
-    // Once the query has settled, every Oracle drains back to its baseline
-    // ownership and the topology answers again; the killed pod no longer
-    // serves the graph's follower stages.
-    if cause != TerminalCause::PodKill {
-        for (index, before) in baseline {
-            await_baseline(&cluster, index, before).await?;
+    // Once the query has settled, every surviving Oracle drains back to its
+    // baseline ownership and the topology answers again; the killed pod no
+    // longer serves the graph's follower stages.
+    for (index, before) in baseline {
+        if cause == TerminalCause::PodKill && index == HELD_FOLLOWER {
+            continue;
         }
-        let later = cluster.execute_sql(LEADER, &sql).await?;
-        if later != 3 {
-            return Err(format!("the later query returned {later} rows, expected 3").into());
-        }
+        await_baseline(&cluster, index, before).await?;
+    }
+    // The killed pod's lease outlives it, so the leader still plans onto it
+    // until membership drops it; the later query waits for that cut.
+    if cause == TerminalCause::PodKill {
+        let killed = cluster.node_id(HELD_FOLLOWER).as_uuid();
+        cluster
+            .await_membership(LEADER, "the killed follower's departure", |membership| {
+                membership.iter().all(|entry| entry.node_id != killed)
+            })
+            .await?;
+        cluster.refresh_snapshot(LEADER).await?;
+    }
+    let later = cluster.execute_sql(LEADER, &sql).await?;
+    if later != 3 {
+        return Err(format!("the later query returned {later} rows, expected 3").into());
     }
     cluster.shutdown().await?;
     Ok(())
 }
+
+/// Stable code the model sees for a forwarded query whose follower pod was
+/// lost mid-graph: the leader settles it as a failed execution.
+const POD_LOSS_CODE: &str = "WYRD_VALA_500_QUERY_EXECUTION_FAILED";
 
 /// Production Oracle query duration family, labelled by class and outcome.
 const DURATION: &str = "oracle_query_duration_seconds";

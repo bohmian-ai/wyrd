@@ -806,9 +806,8 @@ impl Forge {
         let tx = Transaction::new(&table);
         let action = tx
             .expire_snapshots()
-            .expire_snapshot_ids(selected_snapshot_ids.iter().copied())
-            .expire_older_than_ms(cutoff_ms)
-            .retain_last(self.core.config.retain_last.max(1));
+            .explicit_ids_only(true)
+            .expire_snapshot_ids(selected_snapshot_ids.iter().copied());
         let transaction = ApplyTransactionAction::apply(action, tx).map_err(ForgeError::Catalog)?;
         lease.require_fence(&self.core.operator_pool).await?;
         if !lease.commit_window_fits(self.core.config.commit_window()) {

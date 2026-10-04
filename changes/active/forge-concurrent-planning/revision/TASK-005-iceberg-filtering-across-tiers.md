@@ -1,7 +1,7 @@
 ---
 id: TASK-005
 kind: implementation
-status: ready
+status: in_progress
 spec: SPEC-forge-concurrent-planning
 spec_revision: 8
 requirements: [REQ-002, REQ-014, REQ-015, REQ-016, INV-005, INV-008, INV-009, INV-010, AC-002, AC-006, AC-009, AC-010, AC-011]
@@ -383,6 +383,11 @@ with several groups, carries the row-group min/max proof.
 
 Status: stopped under the third Material Stop Condition; not implemented.
 Revalidation, protection, and cleanup are unchanged.
+
+Resolution: [TASK-005-R1](../tasks/TASK-005-R1-active-table-reader-cut.md)
+supersedes this stopped scenario under approved spec revision 10. TASK-005 is
+complete only when that revision task passes; Scenarios 0–3 and their evidence
+remain complete.
 
 - **Tenant authority cannot read the pointer.**
   `20260619000000_iceberg_catalog.sql` revokes `USAGE` on `iceberg_catalog`

@@ -1,6 +1,6 @@
 ---
 id: SPEC-forge-concurrent-planning
-revision: 8
+revision: 10
 status: approved
 ---
 
@@ -18,7 +18,7 @@ select files, rewrite data, or list objects to decide whether a table is due.
 Revision 6 supersedes revision 5 and the revision-2 concurrent-planning task
 packet. The
 implementation removes machinery earned only by leaderless durable planning.
-Scribe hot visibility, Oracle pinned cuts, tenant isolation, exact Iceberg
+Scribe hot visibility, Oracle active table reads, tenant isolation, exact Iceberg
 publication, and safe deletion remain required outcomes. No new generic work
 framework, second file selector, or durable scheduling state is authorized.
 
@@ -176,23 +176,37 @@ scheduling counters, not replayed planning claims.
 The leader's default hourly timer first considers enabled manifest rewriting,
 then enabled snapshot expiration. Manifest rewriting groups eligible small
 data manifests by partition spec; unsupported Iceberg v3 tables are skipped.
-Manifest rewrite remains disabled by default. Snapshot expiration becomes
-enabled by default, matching RisingWave, with the 24-hour age fallback and
-unset retain-last default. Iceberg's current snapshot remains protected by
-its own expiry semantics. Remove the current
-32-commit per-table maintenance trigger: timer work is independent of
-ordinary compaction commit counts.
-Expiration uses configured age and retained refs; an active compaction's
-observed snapshot clamps its cutoff, and no safe watermark means skip. It
-commits expiration before cleanup of files used only by expired snapshots.
-A per-table error is reported and does not stop subsequent tables.
+Manifest rewrite remains disabled by default. Snapshot expiration is enabled
+by default. Remove the current 32-commit per-table maintenance trigger: timer
+work is independent of ordinary compaction commit counts.
 
-Wyrd also protects Oracle pinned cuts, unresolved publications, and Scribe
-hot objects without exact promotion evidence. Never-published orphan cleanup
-is separate because RisingWave's Iceberg GC loop does not implement it.
-Destructive cleanup freshly validates catalog reachability, tenant/table
-identity and these protection roots. Honor an explicit per-table retain-last
-setting; unset does not mean retain zero snapshots.
+Once a catalog commit replaces the current snapshot, the replaced snapshot is
+eligible at the next maintenance opportunity as soon as the table has no
+active Oracle read and no other authoritative root retains it. Snapshot age,
+a configured retention duration, and retain-last preallocation do not delay
+that decision. This intentionally departs from RisingWave's age fallback in
+favor of exact active ownership. The current snapshot, explicit Iceberg refs,
+an active compaction's observed snapshot, unresolved publication evidence, and
+open promotion state remain protection roots. Expiration commits before
+cleanup of files used only by expired snapshots. A per-table error is reported
+and does not stop subsequent tables.
+
+Never-published orphan cleanup remains separate because RisingWave's Iceberg
+GC loop does not implement it. Destructive expiration and cleanup take the
+same per-table maintenance authority as Oracle read acquisition, refuse while
+an active table read exists, and freshly validate catalog reachability and
+tenant/table identity. Rewrite and expiration also refuse while a promotion is
+unsettled. No snapshot age or process clock substitutes for active ownership.
+
+Physical deletion eligibility is also the sole authorization to delete the
+matching terminal `vala.file_list` row. After expired-object cleanup deletes
+the object or confirms it is already absent, the existing PostgreSQL cleanup
+completion transaction both deletes that terminal row and records the cleanup
+candidate complete. If the transaction fails after object deletion, the
+ordinary retry observes the object absent and completes both database changes.
+Nonterminal rows and rows needed by an unsettled promotion are never removed.
+No separate metadata eligibility check, retention policy, or row sweeper is
+introduced.
 
 ### REQ-008 — Empty leader restart and hot promotion recovery
 
@@ -286,20 +300,47 @@ Scribe cut reads; it does not use a global catalog credential on the request
 path.
 
 One Oracle query acquires its complete set of referenced-table catalog pointers
-and unresolved Scribe hot-file candidates through one SQL `SELECT`, including
-the first read of a table and a cut that needs new reader protection. That
-database operation establishes durable, bounded protection before returning
-the cut. Protection covers both the Iceberg objects and Scribe hot objects
-that the result may read, even across publication, compaction, expiration, and
-cleanup. Forge defers reclamation covered by an active reader. A bounded
-table-wide read pin is acceptable for this purpose; release, cancellation,
-node failure, and stale-owner fencing cannot leave permanent pins. The
-returned catalog pointers and hot candidates represent one consistent
+and unresolved Scribe hot-file candidates through one tenant-scoped SQL
+statement. Under the existing per-table maintenance authority, that statement
+also records one active read for each query/table pair, owned by the exact
+Oracle node fence, before returning the cut. A cut cannot be constructed
+without its committed active-read ownership, and the ownership cannot be
+detached from the query object that carries the cut through planning, local or
+distributed execution, streaming, and terminal settlement.
+
+An active table read blocks destructive snapshot expiration and object cleanup
+for that table, covering both the Iceberg and Scribe hot objects selected by
+the cut. Promotion and non-destructive catalog movement may continue. Forge
+may expire every replaced, otherwise-unreferenced snapshot at the next
+maintenance opportunity after the final active table read is released. Normal
+terminal settlement releases the rows only after every local and analytical
+descendant has stopped. An abandoned row remains protective until the query's
+already-existing total expiration. Because Oracle derives the execution class
+after acquiring the cut, PostgreSQL uses the existing six-hour analytical
+total expiration as the conservative abandonment lifetime for either possible
+class and evaluates it from `statement_timestamp()`. Forge may discard an
+abandoned row only after its exact Oracle node fence is no longer live and that
+expiration has passed. A row owned by a live Oracle never expires underneath
+its query. This stale-row cleanup does not change either class's runtime. It
+adds no retention-derived query limit, query-capacity preallocation, reader
+epoch, ancestry frontier, or IO gate.
+
+The configured default query deadline has one runtime source: the resolved
+Oracle configuration composed at server boot. Local Oracle entry and the
+public forwarder use that same resolved value whenever a request omits an
+explicit deadline. Neither path reconstructs `OracleConfig::default()` or
+maintains a second default. An explicit request deadline remains the request's
+deadline, and this change introduces no maximum deadline.
+
+The returned catalog pointers and hot candidates represent one consistent
 database view, and Oracle still validates and reconciles them against the
 immutable Iceberg metadata and manifests before scanning. Promotion or catalog
 movement after selection cannot duplicate, omit, or prematurely delete rows.
+If the selected immutable metadata document is missing after a concurrent
+catalog move, Oracle may reacquire the complete cut once; every ordinary
+successful query uses one acquisition statement and no unbounded retry exists.
 
-The one-`SELECT` requirement concerns SQL statements, not object-store reads
+The one-statement requirement concerns SQL, not object-store reads
 or a claim of one database network round trip. Transaction setup and commit
 remain visible in the step count. The implementation must reduce the serial
 database steps of cut acquisition compared with the current two catalog
@@ -343,15 +384,19 @@ not add a Bloom filter for that column or promise pruning when ranges overlap.
 - INV-003: At most one current task per tenant-qualified physical table;
   expired workers may still be physically running.
 - INV-004: A new commit during a task survives that task's success.
-- INV-005: Hot Scribe objects and Oracle pinned cuts stay queryable until
-  their exact authoritative replacement or retention release.
-- INV-006: Age, path shape, stale candidate evidence or an ambiguous catalog
-  response alone never authorize deletion.
+- INV-005: Every Oracle cut owns an active table-read claim until all local and
+  analytical readers of that cut have stopped; the claim protects every
+  Iceberg and Scribe object selected by the cut.
+- INV-006: A replaced snapshot becomes destructively eligible only when no
+  active table read or other authoritative root retains it. Age, path shape,
+  stale candidate evidence, or an ambiguous catalog response never authorize
+  deletion. Successful physical deletion or confirmed absence removes the
+  matching terminal `file_list` row in the cleanup completion transaction.
 - INV-007: Physical file selection has one worker-side compaction-library owner.
 - INV-008: Tenant isolation and bounded worker resource admission remain.
 - INV-009: A tenant-scoped Oracle cut never exposes another tenant's catalog
-  pointer, and no object named by an active cut is reclaimed before its
-  protection is released.
+  pointer. The cut and its active-read ownership are one lifetime-bound value,
+  so no object named by the cut is reclaimed while any reader can use it.
 - INV-010: Parquet field IDs match the registered Iceberg table's assigned
   IDs; built-in declarations and fingerprints do not own numeric IDs.
 
@@ -367,9 +412,13 @@ not add a Bloom filter for that column or promise pruning when ranges overlap.
   table-level tasks with no file scan or SQL demand claim.
 - AC-005: Failed send, failure, timeout, stale report and failover preserve
   correct scheduling and publication outcomes.
-- AC-006: Manifest rewrite precedes expiry; post-expiry cleanup respects
-  reader pins, active watermarks, hot objects and unresolved outputs;
-  maintenance membership after failover follows RisingWave's empty restart.
+- AC-006: Manifest rewrite precedes expiry; destructive expiration and cleanup
+  refuse an active table read or unsettled promotion, then expire replaced
+  snapshots without an age wait after the final reader releases; active
+  watermarks, hot objects, unresolved outputs, and explicit refs remain roots;
+  terminal `file_list` rows disappear as part of physical cleanup while
+  nonterminal and unsettled rows remain; maintenance membership after failover
+  follows RisingWave's empty restart.
 - AC-007: Superseded concurrent planning code, SQL, metrics, docs and tests
   are removed or rewritten without disabling a failing gate.
 - AC-008: Capacity evidence reports leader decision p50/p99 and worker
@@ -390,11 +439,16 @@ not add a Bloom filter for that column or promise pruning when ranges overlap.
   then each fleet size drains an equal fresh backlog, so the measurement is
   bounded by compaction and not by the arrival rate of due tables.
 - AC-009: A production-shaped Oracle journey proves one tenant-scoped SQL
-  `SELECT` for all tables in a query, including cold and protected-cut cases,
+  statement acquires all table pointers and hot candidates and commits their
+  active table reads before exposing the cut, including cold and warm cases,
   with fewer serial database steps than the current path. Separate evidence
-  proves cross-tenant denial, exact hot/Iceberg results through publication
-  and cleanup races, and safe release on cancellation or failure. Statement
-  and step counts are asserted; no elapsed-time threshold is asserted here.
+  proves cross-tenant denial, exact hot/Iceberg results while publication and
+  rewrite continue, refusal of destructive cleanup while held, immediate
+  eligibility after terminal release, and safe abandoned-row expiry after the
+  query's existing total expiration. Statement and step counts are asserted;
+  no elapsed-time threshold is asserted here. A non-default configured query
+  deadline is also observed identically through local and forwarded entry when
+  the request omits an explicit deadline, without imposing a maximum.
 - AC-010: Fresh spans, points, records, and custom-table files promote and
   rewrite with field IDs matching their Iceberg table, with no declared-ID
   metadata rewrite. Forge still rejects a mismatched file.
@@ -435,6 +489,19 @@ handling and maintenance behavior follow the pinned RisingWave Iceberg sources.
 
 ## Revision history and authority
 
+- Revision 10 (2026-10-04, explicitly approved by the human owner): make the
+  resolved Oracle runtime configuration the single default-deadline source for
+  local and forwarded entry; require the held-query proof to track the exact
+  hot object through promotion and rewrite; and delete a terminal `file_list`
+  row in the existing cleanup-completion transaction after physical deletion
+  succeeds or confirms the object already absent.
+- Revision 9 (2026-10-04, explicitly approved by the human owner): replace
+  reader epochs, ancestry frontiers, IO gates, and retention-derived query
+  limits with one active query/table read recorded atomically with the Oracle
+  cut. The cut and claim form one lifetime-owned value. Forge expires replaced
+  snapshots after the last reader releases, subject only to real roots, and
+  PostgreSQL evaluates abandoned claims against the query's existing total
+  expiration.
 - Revision 8 (2026-10-04, explicitly approved by the human owner for removing
   declared IDs and directed through review comments for pruning coverage):
   make Iceberg the field-ID owner and prove binary Bloom and request-ID

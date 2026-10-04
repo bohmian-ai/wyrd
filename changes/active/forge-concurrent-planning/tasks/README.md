@@ -1,13 +1,17 @@
 # Forge implementation tasks
 
-The approved revision 6 spec has four implementation tasks, in order:
+The approved revision 10 spec has six behavioral implementation steps, in order:
 
 1. TASK-001-leader-and-promotion.md — one leader and exact Iceberg commit tracking.
 2. TASK-002-pull-and-worker-results.md — compactor pull, worker planning and reports.
 3. TASK-003-maintenance-and-removal.md — timer maintenance, safe cleanup and removal.
 4. TASK-004-compaction-defaults-and-type.md — compaction on by default; per-table compaction type (REQ-011, REQ-012, added 2026-10-03).
+5. `../revision/TASK-005-iceberg-filtering-across-tiers.md` scenarios 0–3 — field IDs and pruning across hot, promoted, and rewritten cuts.
+6. TASK-005-R1-active-table-reader-cut.md — replace TASK-005 Scenario 4 with
+   one tenant-scoped active cut, reader-controlled destructive cleanup, and
+   terminal hot-file metadata retirement; passing it completes TASK-005.
 
-Only this revision-6 spec and these three tasks direct implementation.
+Only the approved revision-10 spec and these tasks direct Forge and Oracle cut implementation. The separate Python docstring task remains an owner-directed documentation task.
 
 Start by dropping the nine Forge concurrent-planning/review commits after
 `ce5c09ef3b559c35e65d6a3e73beebe0a69ae5bd`; keep the unrelated

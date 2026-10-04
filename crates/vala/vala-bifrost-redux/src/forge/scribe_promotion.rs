@@ -16,12 +16,15 @@
 use std::collections::BTreeSet;
 
 use serde_json::{Map, Value};
+use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use uuid::Uuid;
 use vala_sql::queries::file_list::HotFileCatalog;
 use vala_sql::queries::forge_operations::ForgeOperations;
-use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
+use vala_sql::row_types::forge_operations::{
+    ForgeOperationFamily, ForgeOperationPhase, ForgeOperationTransition,
+};
 use wyrd_spec::vala::api::{
     AuditDetail, ForgePromotedFile, ForgePromotedFileSetDigest, ForgeScribePromotionPhase,
     StoragePath,
@@ -37,6 +40,7 @@ use super::leader::{ForgeCommitNotice, ForgeTableKey};
 use super::lease::ForgeLease;
 use super::planner::{ForgePlanCandidate, ForgeTableSnapshot, plan_table};
 use super::settings::ForgeTableSettings;
+use super::worker::ATTEMPT_BOUND;
 use super::{Forge, ForgeWorker};
 use crate::catalog::TenantTableBinding;
 use crate::scribe::promotion::ScribePublishedHotFileV1;
@@ -1067,6 +1071,63 @@ impl Forge {
         outcome
     }
 
+    /// Resolves the operation identity one promotion task's next transition uses.
+    ///
+    /// A promotion task is retried in place, so its operation identity must be
+    /// recoverable from durable state alone: a successor that finds a Prepared
+    /// operation resumes it, and one that finds a committed snapshot settles it
+    /// under the identity that snapshot carries. Generation zero is the task
+    /// identity itself. A generation that closed as `Reset` proved certain
+    /// non-acceptance and can never be reopened, so the task's next attempt
+    /// moves to the next generation, whose identity
+    /// [`promotion_generation_operation_id`] derives from the task and the
+    /// generation number. The first generation that is not `Reset` — absent,
+    /// Prepared, Committed, or Recovered — is the task's current operation, so
+    /// every transition of one attempt, and every successor attempt, resolves
+    /// the same identity.
+    ///
+    /// The walk is bounded: each reset ends an attempt, and a task is
+    /// terminalized after [`ATTEMPT_BOUND`] attempts, so no task can reset more
+    /// generations than that.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the tenant read fails or a stored
+    /// operation row is malformed, and [`ForgeError::Invariant`] when every
+    /// generation an attempt-bounded task could have used is already reset.
+    pub(super) async fn promotion_operation_id(
+        &self,
+        binding: &TenantTableBinding,
+        task_id: Uuid,
+    ) -> Result<Uuid, ForgeError> {
+        let resource = ForgeGroupKey::table_audit_resource(binding.tenant, &binding.table_ref);
+        let operations = ForgeOperations::new(&resource, ForgeOperationFamily::ScribePromotion)
+            .map_err(ForgeError::Sql)?;
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(binding.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        for generation in 0..=ATTEMPT_BOUND {
+            let operation_id = promotion_generation_operation_id(task_id, generation);
+            let reset = operations
+                .operation(&mut conn, operation_id)
+                .await
+                .map_err(ForgeError::Sql)?
+                .is_some_and(|row| row.phase == ForgeOperationPhase::Reset);
+            if !reset {
+                conn.commit().await.map_err(ForgeError::Sql)?;
+                return Ok(operation_id);
+            }
+        }
+        Err(ForgeError::Invariant {
+            detail: format!(
+                "promotion task {task_id} reset more operation generations than it can attempt"
+            ),
+        })
+    }
+
     /// Settles one promotion's audit transition and hot-row publication together.
     ///
     /// Audit evidence and the `file_list` publication columns become durable in
@@ -1170,9 +1231,65 @@ const fn phase_suffix(phase: ForgeScribePromotionPhase) -> &'static str {
     }
 }
 
+/// Derives the operation identity of one promotion task's `generation`.
+///
+/// Generation zero is the task identity, so a task that never resets keeps the
+/// one identity its snapshot properties and `file_list` settlement already
+/// carry. Every later generation is a domain-separated SHA-256 of the task
+/// identity and the generation number, encoded as a custom (version 8) UUID:
+/// deterministic, so every attempt and successor derives the same value from
+/// durable state, and distinct from the task identity and from every other
+/// generation of the same task.
+fn promotion_generation_operation_id(task_id: Uuid, generation: u32) -> Uuid {
+    if generation == 0 {
+        return task_id;
+    }
+    let digest = Sha256::new()
+        .chain_update(b"wyrd.forge.scribe_promotion.operation_generation")
+        .chain_update(task_id.as_bytes())
+        .chain_update(generation.to_be_bytes())
+        .finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_custom_bytes(bytes).into_uuid()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Generation zero is the task identity; later generations are stable and distinct.
+    ///
+    /// Recovery re-derives the identity from durable state, so the derivation
+    /// must be deterministic, and a reset generation can never be reopened, so
+    /// no two generations of one task may collide.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a generation is not deterministic or collides with another.
+    #[test]
+    fn promotion_generations_are_deterministic_and_distinct() {
+        let task = Uuid::from_u128(7);
+        assert_eq!(promotion_generation_operation_id(task, 0), task);
+        let generations = (0..=ATTEMPT_BOUND)
+            .map(|generation| promotion_generation_operation_id(task, generation))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            generations.len(),
+            usize::try_from(ATTEMPT_BOUND).expect("small bound") + 1,
+            "every generation of one task is a distinct operation"
+        );
+        assert_eq!(
+            promotion_generation_operation_id(task, 1),
+            promotion_generation_operation_id(task, 1),
+            "a generation re-derives the same identity"
+        );
+        assert_ne!(
+            promotion_generation_operation_id(task, 1),
+            promotion_generation_operation_id(Uuid::from_u128(8), 1),
+            "generations of different tasks do not collide"
+        );
+    }
 
     /// Builds one deterministic promoted file for parameter round-trip proofs.
     fn file(seed: u128, name: &str) -> ForgePromotedFile {

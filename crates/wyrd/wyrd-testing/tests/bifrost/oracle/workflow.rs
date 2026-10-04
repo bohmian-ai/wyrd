@@ -4,10 +4,12 @@
 //! The Workflow is submitted to the Scribe-only pod, which owns no Oracle, so
 //! its built-in query tool reaches the elected Oracle leader through ordinary
 //! authenticated forwarding, and the leader runs a distributed graph whose
-//! follower is held at a real execute boundary. Each terminal cause — an
-//! explicit cancel, the run deadline, and the loss of the held follower pod —
-//! must leave the leader's graph cleanup in charge of the result: the run
-//! stays non-terminal and the model sees nothing while that cleanup is paused.
+//! follower is held at a real execute boundary. An explicit cancel and the
+//! loss of the held follower pod must leave the leader's graph cleanup in
+//! charge of the result: the run stays non-terminal and the model sees nothing
+//! while that cleanup is paused. The run deadline is the query's own bound, so
+//! the run times out at it without waiting on that cleanup, never earlier, and
+//! the model still sees no result.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -60,7 +62,8 @@ enum TerminalCause {
 }
 
 /// A forwarded Workflow query settles on its remote Oracle before the run
-/// ends, for cancel, deadline, and pod loss alike.
+/// ends on a cancel or a pod loss, and a deadline ends the run exactly at the
+/// query's own bound.
 ///
 /// A cancel records a `cancelled` Analytical query; a deadline, which the
 /// leader ends as a query timeout, and a pod loss record a `failed` one.
@@ -174,15 +177,16 @@ async fn prove_forwarded_query_settles(cause: TerminalCause) -> Result<(), Journ
     cluster.await_cleanup_paused().await?;
 
     // The leader's cleanup still owns the query, so its terminal has not
-    // reached the forwarding ingress: the run cannot have ended and the model
-    // cannot have seen a tool result.
+    // reached the forwarding ingress: the model cannot have seen a tool
+    // result, and unless the query's own deadline has passed, the run cannot
+    // have ended.
     let held = ingress.get(&run).await?;
     let cancel_finished = cancel
         .as_ref()
         .is_some_and(tokio::task::JoinHandle::is_finished);
     let arrivals = upstream.arrivals();
     cluster.release_cleanup_pause();
-    if held.status.is_terminal() || cancel_finished {
+    if cause != TerminalCause::Deadline && (held.status.is_terminal() || cancel_finished) {
         return Err(format!("the run ended before its query settled: {held:?}").into());
     }
     if arrivals != 1 {
@@ -200,6 +204,18 @@ async fn prove_forwarded_query_settles(cause: TerminalCause) -> Result<(), Journ
     };
     if terminal.status != expected {
         return Err(format!("expected a {expected:?} run, saw {terminal:?}").into());
+    }
+    // The tool query's deadline is the run's remaining time, so a run that
+    // timed out earlier than its own deadline would have cut its query short.
+    if cause == TerminalCause::Deadline {
+        let bound = terminal.created_at
+            + chrono::Duration::from_std(Duration::from_secs(RUN_TIMEOUT_SECONDS))?;
+        if terminal.ended_at.is_none_or(|ended| ended < bound) || !terminal.outputs.is_empty() {
+            return Err(format!(
+                "the run must time out at its deadline with no result: {terminal:?}"
+            )
+            .into());
+        }
     }
     if cause == TerminalCause::PodKill {
         let results = upstream.calls()[1]["messages"].to_string();

@@ -6,10 +6,8 @@ use std::sync::Arc;
 use arrow::datatypes::{Field, Schema};
 use iceberg::io::object_cache::ObjectCache;
 use iceberg::io::{FileIO, FileIOBuilder};
-use iceberg::spec::{
-    FormatVersion, TableMetadata, TableMetadataBuilder, TableProperties, Transform,
-};
-use iceberg::{Catalog as _, Error as IcebergError, MetadataLocation, TableCreation};
+use iceberg::spec::{FormatVersion, TableMetadata, TableProperties, Transform};
+use iceberg::{Catalog as _, Error as IcebergError, TableCreation};
 use iceberg_catalog_sql::SqlCatalog;
 use sha2::{Digest as _, Sha256};
 use vala_sql::queries::file_list::HotFileCatalog;
@@ -318,6 +316,15 @@ pub struct BifrostCatalog {
     /// seen on its first lookup. Grows with registered tables, never with
     /// queries.
     table_uids: Arc<std::sync::RwLock<HashMap<(DataTenantId, String), TableUid>>>,
+    /// Registered Iceberg schemas this node has already loaded, by tenant and
+    /// table name.
+    ///
+    /// The schema is the field-id authority Scribe stamps into every Parquet
+    /// object. A registered table's schema never evolves and its registration
+    /// is never dropped, so a loaded schema stays authoritative for the life
+    /// of the node. Grows with registered tables, never with writes.
+    registered_schemas:
+        Arc<std::sync::RwLock<HashMap<(DataTenantId, String), Arc<iceberg::spec::Schema>>>>,
 }
 
 /// Estimated-weight eviction limit of the node-wide decoded manifest cache.
@@ -929,6 +936,7 @@ impl BifrostCatalog {
             storage_properties,
             manifest_cache: Arc::new(std::sync::OnceLock::new()),
             table_uids: Arc::default(),
+            registered_schemas: Arc::default(),
         })
     }
 
@@ -1174,22 +1182,11 @@ impl BifrostCatalog {
     /// an omitted option writes nothing, so Forge resolves its default at
     /// planning time.
     ///
-    /// Iceberg's table-creation builder renumbers every field from 1, but
-    /// Scribe stamps the schema's own ids into each Parquet object and its
-    /// evidence, and Forge and Oracle resolve columns by the table's ids. The
-    /// builder's metadata is therefore rebound to the schema's ids by
-    /// [`with_declared_field_ids`], written as the table's first metadata
-    /// document, and registered under the tenant identifier, so the physical
-    /// table records exactly the ids its writers use. A failure after the
-    /// document is written but before registration leaves an unreferenced
-    /// metadata file and no table; a retry writes a fresh document.
-    ///
     /// # Errors
     ///
     /// Returns a metadata mismatch when the layout cannot produce a partition
-    /// spec or sort order or the metadata cannot be rebound to the declared
-    /// ids, and an Iceberg error when schema conversion, metadata
-    /// construction, the metadata write, or catalog registration fails.
+    /// spec or sort order, and an Iceberg error when schema conversion or the
+    /// catalog create fails.
     async fn create_physical_table(
         &self,
         binding: &TenantTableBinding,
@@ -1224,20 +1221,14 @@ impl BifrostCatalog {
         let creation = TableCreation::builder()
             .name(binding.table_name.clone())
             .location(location)
-            .schema(iceberg_schema.clone())
+            .schema(iceberg_schema)
             .format_version(FormatVersion::V2)
             .partition_spec(partition_spec)
             .sort_order(sort_order)
             .properties(properties)
             .build();
-        let assigned = TableMetadataBuilder::from_table_creation(creation)?
-            .build()?
-            .metadata;
-        let metadata = with_declared_field_ids(&assigned, &iceberg_schema)?;
-        let metadata_location = MetadataLocation::try_new_with_metadata(&metadata)?;
-        metadata.write_to(&self.file_io, &metadata_location).await?;
         self.catalog
-            .register_table(&binding.table_ident(), metadata_location.to_string())
+            .create_table(binding.physical_namespace(), creation)
             .await?;
         Ok(())
     }
@@ -1408,6 +1399,48 @@ impl BifrostCatalog {
         Ok(table_uid)
     }
 
+    /// Return the registered Iceberg schema of one tenant/logical table.
+    ///
+    /// The registered table, not any declaration, assigns every physical field
+    /// id, nested and managed fields included; Scribe stamps exactly these ids
+    /// into the objects it writes so Forge and Oracle resolve its columns by
+    /// the table's own numbering. Answers from the node's cache when this
+    /// table was loaded before, and otherwise loads the tenant-bound Iceberg
+    /// table once and caches its current schema.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::InvalidBinding`] when the tenant-qualified
+    /// binding cannot be resolved, and the Iceberg error when the physical
+    /// table cannot be loaded.
+    ///
+    /// # Panics
+    /// Panics only if a thread panicked while holding the cache lock.
+    pub async fn registered_schema(
+        &self,
+        table: &TableRef,
+        tenant: DataTenantId,
+    ) -> Result<Arc<iceberg::spec::Schema>, BifrostCatalogError> {
+        let key = (tenant, table.fqn());
+        let cached = self
+            .registered_schemas
+            .read()
+            .expect("the registered schema cache lock is never poisoned")
+            .get(&key)
+            .map(Arc::clone);
+        if let Some(schema) = cached {
+            return Ok(schema);
+        }
+        let binding = TenantTableBinding::resolve((tenant, table.clone()))
+            .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
+        let loaded = self.catalog.load_table(&binding.table_ident()).await?;
+        let schema = Arc::clone(loaded.metadata().current_schema());
+        self.registered_schemas
+            .write()
+            .expect("the registered schema cache lock is never poisoned")
+            .insert(key, Arc::clone(&schema));
+        Ok(schema)
+    }
+
     /// Return the registered user-schema fingerprint for one tenant/logical table.
     ///
     /// # Errors
@@ -1509,11 +1542,11 @@ impl BifrostCatalog {
             .await?
             .ok_or_else(|| BifrostCatalogError::TableNotFound(fqn))?;
         // A canonical built-in is described from its own declaration, not from
-        // the Iceberg round trip. It is the ledger's ids that Scribe enforces
-        // on every stamped canonical batch; table creation now records those
-        // ids, but a table created before it did carries sequential ids, and
-        // describing those would hand a writer a schema its own batches fail
-        // against.
+        // the Iceberg round trip: the stored schema drops the ledger's
+        // sensitivity markers and renames nested list elements, and it is the
+        // ledger's shape that Scribe enforces on every canonical batch. The
+        // registered field ids are the table's and Scribe stamps them itself,
+        // so the description carries none.
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
@@ -1642,73 +1675,6 @@ impl BifrostCatalog {
         conn.commit().await?;
         Ok(row)
     }
-}
-
-/// Rebinds builder-created table metadata to the field ids `declared` carries.
-///
-/// Iceberg's table-creation builder always renumbers fields from 1 and
-/// rebinds the partition spec and sort order by column name. Its public API
-/// has no id-preserving constructor, so this conversion edits the metadata's
-/// serialized document: the current schema is replaced by `declared` under
-/// the same schema id, `last-column-id` becomes the declared highest id, and
-/// every partition and sort `source-id` is mapped from the renumbered field to
-/// the declared field of the same name. Spec ids, sort-order ids, partition
-/// field ids, location, properties, and the table UUID are kept unchanged, and
-/// deserializing the edited document re-runs Iceberg's own metadata
-/// validation. `declared` must be the schema the builder was given, so both
-/// schemas name the same fields.
-///
-/// # Errors
-///
-/// Returns [`BifrostCatalogError::MetadataMismatch`] when the metadata cannot
-/// be encoded or decoded, carries more than its one creation schema, or names
-/// a source field that `declared` lacks.
-fn with_declared_field_ids(
-    assigned: &TableMetadata,
-    declared: &iceberg::spec::Schema,
-) -> Result<TableMetadata, BifrostCatalogError> {
-    let mismatch = |detail: String| {
-        BifrostCatalogError::MetadataMismatch(format!(
-            "table metadata cannot adopt declared field ids: {detail}"
-        ))
-    };
-    let renumbered = assigned.current_schema();
-    let mut document =
-        serde_json::to_value(assigned).map_err(|error| mismatch(error.to_string()))?;
-    let mut schema = serde_json::to_value(declared).map_err(|error| mismatch(error.to_string()))?;
-    schema["schema-id"] = serde_json::Value::from(renumbered.schema_id());
-    let schemas = document
-        .get_mut("schemas")
-        .and_then(serde_json::Value::as_array_mut)
-        .filter(|schemas| schemas.len() == 1)
-        .ok_or_else(|| mismatch("expected exactly one creation schema".to_owned()))?;
-    schemas[0] = schema;
-    document["last-column-id"] = serde_json::Value::from(declared.highest_field_id());
-    for recipes in ["partition-specs", "sort-orders"] {
-        let recipe_fields = document
-            .get_mut(recipes)
-            .and_then(serde_json::Value::as_array_mut)
-            .into_iter()
-            .flatten()
-            .filter_map(|recipe| recipe.get_mut("fields"))
-            .filter_map(serde_json::Value::as_array_mut)
-            .flatten();
-        for field in recipe_fields {
-            let source = field["source-id"]
-                .as_i64()
-                .and_then(|id| i32::try_from(id).ok())
-                .ok_or_else(|| mismatch(format!("{recipes} field lacks a source id")))?;
-            let declared_id = renumbered
-                .name_by_field_id(source)
-                .and_then(|name| declared.field_by_name(name))
-                .map(|declared_field| declared_field.id)
-                .ok_or_else(|| {
-                    mismatch(format!("{recipes} source {source} has no declared field"))
-                })?;
-            field["source-id"] = serde_json::Value::from(declared_id);
-        }
-    }
-    serde_json::from_value(document).map_err(|error| mismatch(error.to_string()))
 }
 
 /// Compares physical schema shapes across Arrow and Iceberg representations.
@@ -2863,153 +2829,5 @@ mod production_pin_tests {
                 );
             }
         });
-    }
-
-    /// Each canonical signal table keeps the field ids its schema declares.
-    ///
-    /// The span, point, and record tables are the built-ins that pin a stable
-    /// `PARQUET:field_id` on every field, including envelope ids above 1000
-    /// that positional numbering never reproduces. Scribe writes each declared `PARQUET:field_id` into its Parquet objects
-    /// and keys file-list evidence by those ids, while Forge decodes a
-    /// promoted object's footer and Oracle's Iceberg scan resolves columns by
-    /// the ids the physical table records. Provisioning a built-in must
-    /// therefore carry the declared ids, nested fields included, into Iceberg
-    /// metadata, with the partition and sort recipes bound to those ids under
-    /// the spec and sort-order ids Scribe stamps on every data file. A second
-    /// provisioning must accept the table the first one created.
-    ///
-    /// # Panics
-    /// Panics when the fixture or catalog fails to start, when a built-in
-    /// cannot be provisioned, re-provisioned, or loaded, when any physical
-    /// field id differs from its declared id, or when the partition or sort
-    /// recipe is bound to another field or recorded under another id.
-    #[test]
-    fn builtin_tables_keep_their_declared_field_ids() {
-        wyrd_runtime::runtime().block_on(async {
-            let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
-                .await
-                .expect("postgres fixture starts");
-            let warehouse = tempfile::tempdir().expect("warehouse directory");
-            let catalog = BifrostCatalog::new(
-                fixture.catalog_dsn().expose_secret(),
-                local_storage_owner(warehouse.path()),
-                fixture.vala_postgres().clone(),
-            )
-            .await
-            .expect("redux catalog builds over the fixture");
-            let tenant = fixture.data_tenant_id();
-            for (namespace, name) in [
-                ("traces", "spans"),
-                ("metrics", "points"),
-                ("logs", "records"),
-            ] {
-                let definition = crate::tables::builtin_table(namespace, name)
-                    .expect("canonical signal table is built in");
-                let fqn = format!("{namespace}.{name}");
-                catalog
-                    .ensure_builtin(tenant, definition)
-                    .await
-                    .unwrap_or_else(|error| panic!("{fqn} provisions: {error}"));
-                catalog
-                    .ensure_builtin(tenant, definition)
-                    .await
-                    .unwrap_or_else(|error| panic!("{fqn} provisions again: {error}"));
-                let namespace = BifrostNamespace::from_domain_namespace(definition.namespace)
-                    .expect("built-in namespace is known");
-                let binding = crate::catalog::TenantTableBinding::resolve((
-                    tenant,
-                    TableRef::new(namespace, definition.name),
-                ))
-                .expect("binding resolves");
-                let physical = catalog
-                    .iceberg_catalog()
-                    .load_table(&binding.table_ident())
-                    .await
-                    .unwrap_or_else(|error| panic!("{fqn} loads: {error}"));
-                assert_declared_field_ids(&fqn, definition, physical.metadata());
-            }
-        });
-    }
-
-    /// Asserts that one physical table records its built-in's declared ids.
-    ///
-    /// Compares every field id by column path, the last column id, and the
-    /// partition and sort source ids against the ids the built-in's canonical
-    /// schema declares, and checks that the recipes sit under the spec and
-    /// sort-order ids Scribe stamps on each data file.
-    ///
-    /// # Panics
-    /// Panics when the built-in's schema or layout cannot be resolved, or when
-    /// any recorded id differs from its declared counterpart.
-    fn assert_declared_field_ids(
-        fqn: &str,
-        definition: &crate::tables::BuiltinTableDefinition,
-        metadata: &iceberg::spec::TableMetadata,
-    ) {
-        let ids_by_name = |schema: &iceberg::spec::Schema| {
-            schema
-                .field_id_to_name_map()
-                .iter()
-                .map(|(id, name)| (name.clone(), *id))
-                .collect::<std::collections::BTreeMap<_, _>>()
-        };
-        let declared = crate::tables::iceberg_schema_for(&(definition.schema)())
-            .expect("canonical schema converts");
-        let declared_id = |column: &str| {
-            declared
-                .field_by_name(column)
-                .unwrap_or_else(|| panic!("{fqn} declares {column}"))
-                .id
-        };
-        assert_eq!(
-            ids_by_name(metadata.current_schema()),
-            ids_by_name(&declared),
-            "{fqn} field ids"
-        );
-        assert_eq!(
-            metadata.last_column_id(),
-            declared.highest_field_id(),
-            "{fqn} last column id"
-        );
-
-        let spec = metadata.default_partition_spec();
-        assert_eq!(
-            spec.spec_id(),
-            crate::catalog::layout::BIFROST_PARTITION_SPEC_ID,
-            "{fqn} partition spec id"
-        );
-        assert!(
-            spec.fields()
-                .iter()
-                .all(|field| field.source_id == declared_id(WYRD_EVENT_TIME)),
-            "{fqn} partitions by the declared event-time id"
-        );
-
-        let (_, layout) = super::resolve_registration_layout(
-            fqn,
-            &(definition.arrow_fields)(),
-            Some(&(definition.physical_layout)()),
-            Some(&(definition.schema)()),
-        )
-        .expect("built-in layout resolves");
-        let order = metadata.default_sort_order();
-        assert_eq!(
-            order.order_id,
-            i64::from(crate::catalog::layout::BIFROST_SORT_ORDER_ID),
-            "{fqn} sort order id"
-        );
-        assert_eq!(
-            order
-                .fields
-                .iter()
-                .map(|field| field.source_id)
-                .collect::<Vec<_>>(),
-            layout
-                .sort_keys()
-                .iter()
-                .map(|key| declared_id(&key.column))
-                .collect::<Vec<_>>(),
-            "{fqn} sort source ids"
-        );
     }
 }

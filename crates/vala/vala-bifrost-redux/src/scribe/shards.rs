@@ -7059,8 +7059,8 @@ mod tests {
         sqlx::query(
             "INSERT INTO vala.scribe_batch_commits (data_tenant_id, logical_table_fqn, batch_id, \
              slice_set_digest, slice_count, wal_node_id, wal_writer_epoch, wal_shard_id, \
-             wal_segment_sequence, wal_lsn_min, wal_lsn_max, request_id) \
-             VALUES ($1, $2, $3, $4, 1, $5, 1, 0, 0, 0, 0, $6)",
+             wal_segment_sequence, wal_lsn_min, wal_lsn_max, request_id, ingested_at) \
+             VALUES ($1, $2, $3, $4, 1, $5, 1, 0, 0, 0, 0, $6, statement_timestamp())",
         )
         .bind(key.tenant.as_uuid())
         .bind(key.table.fqn())

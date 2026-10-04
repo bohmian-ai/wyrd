@@ -264,7 +264,7 @@ const MANAGED_COLUMNS: &[&str] = &[
 /// Assert every stored managed column is the table's own `Field` and value.
 ///
 /// The canonical path constructs only the managed arrays and clones every
-/// managed `Field` — stable id, sensitivity metadata, type, and nullability —
+/// managed `Field` — sensitivity metadata, type, and nullability —
 /// from `(definition.schema)()`, so a locally reconstructed envelope would
 /// differ here even when the values happen to agree.
 ///

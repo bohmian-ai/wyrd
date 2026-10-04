@@ -222,6 +222,7 @@ impl ScribeIngressCpuPool {
             receipt_micros,
             window,
             definition,
+            registered_schema,
         } = inputs;
         let Ok(permit) = self.permits.clone().try_acquire_owned() else {
             self.saturation_events.fetch_add(1, Ordering::Relaxed);
@@ -246,12 +247,15 @@ impl ScribeIngressCpuPool {
             let result = catch_unwind(AssertUnwindSafe(|| {
                 decode(
                     payload,
-                    &principal,
-                    expected_schema_fingerprint,
-                    &request_id,
-                    receipt_micros,
-                    window,
-                    definition,
+                    &DecodeContext {
+                        principal: &principal,
+                        expected_schema_fingerprint,
+                        request_id: &request_id,
+                        window,
+                        receipt_micros,
+                        definition,
+                        registered_schema: registered_schema.as_deref(),
+                    },
                 )
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
@@ -410,12 +414,7 @@ impl ScribeIngressCpuPool {
 /// table contract.
 fn decode(
     payload: IngressPayload,
-    principal: &Principal,
-    expected_schema_fingerprint: SchemaFingerprint,
-    request_id: &RequestId,
-    receipt_micros: i64,
-    window: EventTimeWindow,
-    definition: Option<&'static crate::tables::BuiltinTableDefinition>,
+    context: &DecodeContext<'_>,
 ) -> Result<RecordBatch, ScribeError> {
     let batches = match payload {
         IngressPayload::ArrowIpc(bytes) => {
@@ -439,17 +438,7 @@ fn decode(
     } else {
         arrow::compute::concat_batches(&schema, &batches).map_err(|_| ScribeError::InvalidFrame)?
     };
-    decode_rows(
-        &rows,
-        &DecodeContext {
-            principal,
-            expected_schema_fingerprint,
-            request_id,
-            window,
-            receipt_micros,
-            definition,
-        },
-    )
+    decode_rows(&rows, context)
 }
 
 /// Validates and stamps one current native record batch.
@@ -486,6 +475,11 @@ pub(crate) struct IngressDecodeInputs {
     pub(crate) window: EventTimeWindow,
     /// Canonical built-in whose physical identity the decode must preserve.
     pub(crate) definition: Option<&'static crate::tables::BuiltinTableDefinition>,
+    /// Registered Iceberg schema whose field ids every stamped batch carries.
+    ///
+    /// `None` only for the embedded engine seam, which has no catalog owner
+    /// and writes objects that no registered table promotes.
+    pub(crate) registered_schema: Option<Arc<iceberg::spec::Schema>>,
 }
 
 /// Immutable validation and stamping context for one decoded batch.
@@ -513,15 +507,25 @@ pub(crate) struct DecodeContext<'a> {
     /// table leaves this `None` and keeps the existing catalog-fingerprint and
     /// managed-field policy.
     pub(crate) definition: Option<&'static crate::tables::BuiltinTableDefinition>,
+    /// Registered Iceberg schema whose field ids every stamped batch carries.
+    ///
+    /// `None` only for the embedded engine seam, which has no catalog owner
+    /// and writes objects that no registered table promotes.
+    pub(crate) registered_schema: Option<&'a iceberg::spec::Schema>,
 }
 
 /// Applies source-contract validation and server-managed stamping to one batch.
+///
+/// The final step stamps the registered Iceberg table's field ids onto every
+/// field when the context carries that schema, so the WAL, staged runs, and
+/// sealed objects all number their columns exactly as the table does.
 ///
 /// # Errors
 ///
 /// Returns a stable Scribe refusal for a duplicated column name, reserved
 /// columns, fingerprint mismatch, card-scope failure, invalid event
-/// time, or managed column construction failure.
+/// time, or managed column construction failure, and a fingerprint mismatch
+/// when a stamped field has no registered counterpart.
 fn decode_rows(
     rows: &RecordBatch,
     context: &DecodeContext<'_>,
@@ -561,7 +565,14 @@ fn decode_rows(
         enforce_canonical_source_contract(rows, definition)?;
     }
     validate_card_scope(rows, context.principal)?;
-    stamp_correlation_columns(rows, context)
+    let stamped = stamp_correlation_columns(rows, context)?;
+    match context.registered_schema {
+        Some(registered) => crate::tables::stamp_registered_field_ids(&stamped, registered)
+            .map_err(|_| ScribeError::FingerprintMismatch {
+                table: "resolved ingress table".to_owned(),
+            }),
+        None => Ok(stamped),
+    }
 }
 
 /// Enforces one canonical built-in's exact user contract before stamping.
@@ -573,8 +584,9 @@ fn decode_rows(
 /// the remaining user block, and then requires that block to match
 /// `(definition.arrow_fields)()` in order, name, nullability, and type shape,
 /// so no structurally different Arrow spelling reaches the physical schema.
-/// Field metadata is not compared: the stable id and sensitivity tag are the
-/// server's own physical identity, stamped downstream from the definition, so
+/// Field metadata is not compared: the field id and sensitivity tag are the
+/// server's own physical identity, stamped downstream from the registered
+/// table and the definition, so
 /// a writer building from the published description neither supplies them nor
 /// can be wrong about them.
 ///
@@ -636,7 +648,7 @@ fn enforce_canonical_source_contract(
 /// Confirms a stamped canonical batch still carries its table-owned identity.
 ///
 /// The stamped batch is built from `(definition.schema)()`, so its correlation
-/// and managed `Field`s — stable ids, sensitivity metadata, nullability — are
+/// and managed `Field`s — sensitivity metadata, nullability — are
 /// the table's own rather than locally reconstructed. This re-derives the
 /// canonical physical fingerprint from the stamped schema and compares it with
 /// the definition's resolved identity, so any future divergence between the
@@ -900,7 +912,7 @@ fn stamp_correlation_columns(
         policy,
     )?);
     // A canonical built-in constructs only the arrays here: every correlation
-    // and managed `Field` — with its stable id and sensitivity metadata — is
+    // and managed `Field` — with its sensitivity metadata — is
     // cloned from the table's own physical schema, and the locally assembled
     // field list is compared against it first so a drifting stamping order is
     // refused rather than silently relabelled.
@@ -926,8 +938,8 @@ fn stamp_correlation_columns(
     }
     // The arrays are the writer's; the identity on them is the table's. Every
     // column is re-typed onto the physical field it fills, so the stamped
-    // batch carries the table layer's stable ids and sensitivity tags whether
-    // or not the writer echoed them.
+    // batch carries the table layer's sensitivity tags whether or not the
+    // writer echoed them.
     let columns = physical
         .fields()
         .iter()
@@ -2160,7 +2172,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        ReplayRetirementSettlement, ScribeIngressCpuPool, ScribePersistenceCpuOp,
+        DecodeContext, ReplayRetirementSettlement, ScribeIngressCpuPool, ScribePersistenceCpuOp,
         ScribePersistenceCpuPool, ScribeWalIoPool, decode, record_lane_saturation,
         source_schema_fingerprint, stamp_correlation_columns, wait_lane_drained,
     };
@@ -2200,6 +2212,7 @@ mod tests {
             request_id,
             window: EventTimeWindow::default(),
             receipt_micros: receipt_now(),
+            registered_schema: None,
         }
     }
 
@@ -2654,12 +2667,15 @@ mod tests {
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
             ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            receipt_now(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("projected run_id is correlation data");
         let run_id = error
@@ -2696,12 +2712,15 @@ mod tests {
     ) -> Result<RecordBatch, ScribeError> {
         decode(
             payload,
-            principal,
-            source_schema_fingerprint(schema),
-            &RequestId::now_v7(),
-            receipt_now(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal,
+                expected_schema_fingerprint: source_schema_fingerprint(schema),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
     }
 
@@ -2814,12 +2833,15 @@ mod tests {
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
             ])),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            receipt_now(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect_err("card outside scope");
         assert!(matches!(
@@ -2852,12 +2874,15 @@ mod tests {
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
             ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            receipt_now(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect_err("a duplicated column name fails closed before WAL");
         assert!(matches!(error, ScribeError::InvalidFrame));
@@ -2879,12 +2904,15 @@ mod tests {
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
             ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            receipt_now(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("schema is valid");
         assert_eq!(decoded.schema().field(0).name(), "second");
@@ -2919,12 +2947,15 @@ mod tests {
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
             ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            receipt_now(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("schema is valid");
         assert!(decoded.schema().index_of("data_tenant_id").is_err());
@@ -3024,12 +3055,15 @@ mod tests {
         );
         let decoded = decode(
             ipc_payload(&rows),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            receipt_now(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("native caller event time is accepted");
         assert_eq!(
@@ -3057,12 +3091,15 @@ mod tests {
         );
         let decoded = decode(
             ipc_payload(&rows),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            receipt_now(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("native ingest without event time is server-stamped");
         assert_eq!(
@@ -3094,12 +3131,15 @@ mod tests {
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
             ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            receipt_now(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("projected preserved event time is accepted");
         assert_eq!(
@@ -3134,12 +3174,15 @@ mod tests {
         );
         let decoded = decode(
             ipc_payload(&rows),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            receipt_now(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("native caller event time is accepted");
         let event = decoded
@@ -3206,12 +3249,15 @@ mod tests {
 
         let decoded = decode(
             ipc_payload(&rows_with),
-            &principal,
-            source_schema_fingerprint(rows_with.schema().as_ref()),
-            &RequestId::now_v7(),
-            receipt_now(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows_with.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("native caller event time is accepted");
         assert_eq!(
@@ -3251,12 +3297,15 @@ mod tests {
         );
         let decoded = decode(
             ipc_payload(&rows),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            receipt_now(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("native ingest without event time is server-stamped");
         let event_field = decoded
@@ -3350,12 +3399,15 @@ mod tests {
         ] {
             let error = decode(
                 ipc_payload(&rows),
-                &principal,
-                source_schema_fingerprint(rows.schema().as_ref()),
-                &RequestId::now_v7(),
-                receipt_now(),
-                EventTimeWindow::default(),
-                None,
+                &DecodeContext {
+                    principal: &principal,
+                    expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                    request_id: &RequestId::now_v7(),
+                    window: EventTimeWindow::default(),
+                    receipt_micros: receipt_now(),
+                    definition: None,
+                    registered_schema: None,
+                },
             )
             .expect_err("invalid native event time fails closed");
             assert!(matches!(error, ScribeError::InvalidFrame), "{error:?}");
@@ -3407,12 +3459,15 @@ mod tests {
         );
         let decoded = decode(
             ipc_payload(&rows),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            receipt_now(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("in-window native event time is accepted");
         let arr = decoded
@@ -3447,12 +3502,15 @@ mod tests {
         );
         decode(
             ipc_payload(&rows),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            receipt_now(),
-            window,
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: window,
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("past-edge value is accepted (inclusive bound)");
     }
@@ -3479,12 +3537,15 @@ mod tests {
         );
         decode(
             ipc_payload(&rows),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            receipt_now(),
-            window,
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: window,
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("future-edge value is accepted (inclusive bound)");
     }
@@ -3511,12 +3572,15 @@ mod tests {
         );
         let err = decode(
             ipc_payload(&rows),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            receipt_now(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect_err("31-day-old value must be rejected");
         assert!(
@@ -3553,12 +3617,15 @@ mod tests {
         );
         let err = decode(
             ipc_payload(&rows),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            receipt_now(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect_err("25-hour-future value must be rejected");
         assert!(
@@ -3586,12 +3653,15 @@ mod tests {
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
             ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            receipt_now(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("projected in-window event time is accepted");
         let arr = decoded
@@ -3617,12 +3687,15 @@ mod tests {
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
             ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            receipt_now(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect_err("projected out-of-range event time must be rejected");
         assert!(
@@ -3654,12 +3727,15 @@ mod tests {
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
             ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            receipt_now(),
-            tight_window,
-            None,
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: tight_window,
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("absent event time is server-stamped without window check");
         assert!(
@@ -3726,12 +3802,15 @@ mod tests {
             );
             let error = decode(
                 ipc_payload(&rows),
-                &principal,
-                source_schema_fingerprint(rows.schema().as_ref()),
-                &RequestId::now_v7(),
-                receipt_now(),
-                EventTimeWindow::default(),
-                None,
+                &DecodeContext {
+                    principal: &principal,
+                    expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                    request_id: &RequestId::now_v7(),
+                    window: EventTimeWindow::default(),
+                    receipt_micros: receipt_now(),
+                    definition: None,
+                    registered_schema: None,
+                },
             )
             .expect_err("server-owned managed columns are reserved");
             assert!(matches!(error, ScribeError::InvalidFrame), "{reserved}");

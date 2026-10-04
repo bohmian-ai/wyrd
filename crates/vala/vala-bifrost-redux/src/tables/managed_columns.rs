@@ -1,7 +1,7 @@
 //! The one declaration of every server-managed column Bifrost appends.
 //!
 //! [`MANAGED_COLUMNS`] is the only place a managed column's name, physical
-//! type, nullability, stable id, and physical order are declared. Every
+//! type, nullability, and physical order are declared. Every
 //! physical schema — dynamic tables, pre-declared domain tables, and the
 //! canonical signal tables — and every reserved-name check derives from it, so
 //! adding, retyping, or retiring a managed column is one edit here.
@@ -30,7 +30,7 @@ pub enum ManagedScope {
 /// One server-managed column: its physical declaration and where it applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ManagedColumn {
-    /// Name, physical type, nullability, and stable id of the column.
+    /// Name, physical type, and nullability of the column.
     pub field: CanonicalField,
     /// Which tables append the column.
     pub scope: ManagedScope,
@@ -38,18 +38,17 @@ pub struct ManagedColumn {
 
 impl ManagedColumn {
     /// Declare one UTF-8 identity column in `scope`.
-    const fn identity(id: i32, name: &'static str, nullable: bool, scope: ManagedScope) -> Self {
+    const fn identity(name: &'static str, nullable: bool, scope: ManagedScope) -> Self {
         Self {
-            field: CanonicalField::meta(id, name, CanonicalType::Utf8, nullable),
+            field: CanonicalField::meta(name, CanonicalType::Utf8, nullable),
             scope,
         }
     }
 
     /// Declare one non-null UTC microsecond time column every table appends.
-    const fn time(id: i32, name: &'static str) -> Self {
+    const fn time(name: &'static str) -> Self {
         Self {
             field: CanonicalField::meta(
-                id,
                 name,
                 CanonicalType::Timestamp(TimeUnit::Microsecond, Some("UTC")),
                 false,
@@ -60,8 +59,8 @@ impl ManagedColumn {
 
     /// Project this column into an Arrow field without field metadata.
     ///
-    /// Dynamic and pre-declared tables carry no stable ids, so their managed
-    /// fields carry none either and keep automatic Iceberg id assignment.
+    /// Dynamic and pre-declared tables carry no sensitivity ledger, so their
+    /// managed fields carry no metadata either.
     fn untagged_arrow(&self) -> Field {
         Field::new(
             self.field.name,
@@ -84,17 +83,15 @@ impl ManagedColumn {
 ///   `PostgreSQL` and never caller-supplied.
 ///
 /// Tenant ownership is not a column: every Parquet file proves it in footer
-/// metadata. The stable ids sit far above any signal ledger so a canonical
-/// table can add fields without colliding with them. Ids 1006, 1007, and 1008
-/// are retired — the removed per-row batch id, batch-local row ordinal, and
-/// tenant column — and an id is never reused for a different column.
+/// metadata. Field ids are assigned by each registered Iceberg table, never
+/// declared here.
 pub static MANAGED_COLUMNS: &[ManagedColumn] = &[
-    ManagedColumn::identity(1000, RUN_ID, true, ManagedScope::Correlation),
-    ManagedColumn::identity(1001, CARD_UID, true, ManagedScope::Correlation),
-    ManagedColumn::identity(1002, PRINCIPAL_ID, false, ManagedScope::Correlation),
-    ManagedColumn::identity(1003, WYRD_REQUEST_ID, false, ManagedScope::Request),
-    ManagedColumn::time(1004, WYRD_EVENT_TIME),
-    ManagedColumn::time(1005, WYRD_INGESTED_AT),
+    ManagedColumn::identity(RUN_ID, true, ManagedScope::Correlation),
+    ManagedColumn::identity(CARD_UID, true, ManagedScope::Correlation),
+    ManagedColumn::identity(PRINCIPAL_ID, false, ManagedScope::Correlation),
+    ManagedColumn::identity(WYRD_REQUEST_ID, false, ManagedScope::Request),
+    ManagedColumn::time(WYRD_EVENT_TIME),
+    ManagedColumn::time(WYRD_INGESTED_AT),
 ];
 
 impl CorrelationPolicy {
@@ -163,8 +160,8 @@ pub fn ensure_managed_columns(
 ///
 /// The declared signal ledger comes first in declaration order, then the
 /// `Observation` managed columns. Every field — ledger and managed, at every
-/// nesting depth — carries its stable id and sensitivity metadata, which is
-/// what lets the canonical physical fingerprint cover the whole schema.
+/// nesting depth — carries its sensitivity metadata, which is what lets the
+/// canonical physical fingerprint cover the whole schema.
 #[must_use]
 pub fn canonical_physical_fields(declared: &[CanonicalField]) -> Vec<Field> {
     let mut physical = canonical_arrow_fields(declared);
@@ -266,33 +263,32 @@ mod tests {
         assert!(!is_correlation_column(WYRD_INGESTED_AT));
     }
 
-    /// Canonical tables tag the managed columns with their stable ids.
+    /// Canonical tables tag the managed columns with sensitivity and no id.
     ///
     /// # Panics
     ///
-    /// Panics when a canonical managed field's id differs from its declaration.
+    /// Panics when a canonical managed field declares a field id or loses its
+    /// sensitivity marker.
     #[test]
-    fn canonical_physical_fields_tag_managed_columns_with_stable_ids() {
-        let physical = canonical_physical_fields(&[]);
-        let ids = physical
-            .iter()
-            .map(|field| {
+    fn canonical_physical_fields_declare_no_managed_field_ids() {
+        for field in canonical_physical_fields(&[]) {
+            assert_eq!(
                 field
                     .metadata()
-                    .get(crate::tables::fields::PARQUET_FIELD_ID)
-                    .map(String::as_str)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            ids,
-            vec![
-                Some("1000"),
-                Some("1001"),
-                Some("1002"),
-                Some("1003"),
-                Some("1004"),
-                Some("1005"),
-            ]
-        );
+                    .get(crate::tables::fields::PARQUET_FIELD_ID),
+                None,
+                "{}",
+                field.name()
+            );
+            assert_eq!(
+                field
+                    .metadata()
+                    .get(crate::tables::fields::WYRD_SENSITIVE)
+                    .map(String::as_str),
+                Some("false"),
+                "{}",
+                field.name()
+            );
+        }
     }
 }

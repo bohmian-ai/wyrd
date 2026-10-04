@@ -179,7 +179,7 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics when any canonical value, order, presence distinction, stable id,
+    /// Panics when any canonical value, order, presence distinction, declared field id,
     /// sensitivity marker, or name-bound validation result differs.
     #[test]
     fn maximal_span_projection_is_lossless_and_identity_mapped() {
@@ -257,8 +257,8 @@ mod tests {
                 .clone();
             assert_eq!(
                 field.metadata().get(PARQUET_FIELD_ID),
-                Some(&declared.id.to_string()),
-                "{} carries its stable id",
+                None,
+                "{} declares no id; the registered table assigns it",
                 declared.name
             );
             assert_eq!(

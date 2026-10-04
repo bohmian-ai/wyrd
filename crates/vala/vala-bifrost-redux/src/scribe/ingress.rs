@@ -117,6 +117,11 @@ struct AdmittedRowContext {
     ///
     /// `None` for a dynamic table, which keeps the default envelope.
     definition: Option<&'static crate::tables::BuiltinTableDefinition>,
+    /// Registered Iceberg schema whose field ids every stamped batch carries.
+    ///
+    /// `None` only for the embedded engine seam, which has no catalog owner
+    /// and writes objects that no registered table promotes.
+    registered_schema: Option<std::sync::Arc<iceberg::spec::Schema>>,
 }
 
 /// The registered contract Scribe resolves for one logical frame before it
@@ -129,6 +134,11 @@ struct LogicalFrameContract {
     expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
     /// Registered partition granularity every slice of this frame is bucketed to.
     partition_granularity: crate::catalog::TimeGranularity,
+    /// Registered Iceberg schema whose field ids every stamped batch carries.
+    ///
+    /// `None` only for the embedded engine seam, which has no catalog owner
+    /// and writes objects that no registered table promotes.
+    registered_schema: Option<std::sync::Arc<iceberg::spec::Schema>>,
 }
 
 /// Root admission state established before any scalable materialization.
@@ -137,6 +147,11 @@ struct RootAdmission {
     expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
     /// Registered partition granularity applied to every prepared slice.
     partition_granularity: crate::catalog::TimeGranularity,
+    /// Registered Iceberg schema whose field ids every stamped batch carries.
+    ///
+    /// `None` only for the embedded engine seam, which has no catalog owner
+    /// and writes objects that no registered table promotes.
+    registered_schema: Option<std::sync::Arc<iceberg::spec::Schema>>,
     /// One authoritative receipt time shared by planning and projection.
     receipt_micros: i64,
     /// Complete immutable source-derived material plan.
@@ -178,6 +193,7 @@ impl ScribeImpl {
             return Ok(LogicalFrameContract {
                 expected_schema_fingerprint,
                 partition_granularity: crate::catalog::TimeGranularity::Hour,
+                registered_schema: None,
             });
         };
         if let Some(definition) = crate::tables::builtin_table(
@@ -198,6 +214,10 @@ impl ScribeImpl {
             .table_registration(&frame.table, frame.authenticated_tenant)
             .await
             .map_err(scribe_catalog_error)?;
+        let registered_schema = catalog
+            .registered_schema(&frame.table, frame.authenticated_tenant)
+            .await
+            .map_err(scribe_catalog_error)?;
         Ok(LogicalFrameContract {
             expected_schema_fingerprint: frame
                 .expected_schema_fingerprint
@@ -205,6 +225,7 @@ impl ScribeImpl {
             partition_granularity: crate::catalog::TimeGranularity::from_wire(
                 layout.partition_granularity,
             ),
+            registered_schema: Some(registered_schema),
         })
     }
 
@@ -320,6 +341,7 @@ impl ScribeImpl {
             native_sources,
             native_source_count,
             definition,
+            registered_schema,
         } = context;
         match payload {
             IngressPayload::ArrowIpc(bytes) => {
@@ -336,6 +358,7 @@ impl ScribeImpl {
                     sources: native_sources,
                     source_count: native_source_count,
                     definition,
+                    registered_schema,
                     expanded_limit_bytes: self.ingest_limits.expanded_bytes(),
                 })))
             }
@@ -351,6 +374,7 @@ impl ScribeImpl {
                             receipt_micros,
                             window: event_time_window,
                             definition,
+                            registered_schema,
                         },
                     )
                     .await?;
@@ -387,6 +411,7 @@ impl ScribeImpl {
         let LogicalFrameContract {
             expected_schema_fingerprint,
             partition_granularity,
+            registered_schema,
         } = self.resolve_logical_frame(frame).await?;
         let receipt_micros = self.admission_instant(frame.principal.tenant_id).await?;
         let binding_facts =
@@ -413,6 +438,7 @@ impl ScribeImpl {
         Ok(RootAdmission {
             expected_schema_fingerprint,
             partition_granularity,
+            registered_schema,
             receipt_micros,
             material_plan,
             memory,
@@ -527,6 +553,7 @@ impl ScribeImpl {
         let RootAdmission {
             expected_schema_fingerprint,
             partition_granularity,
+            registered_schema,
             receipt_micros,
             material_plan,
             mut memory,
@@ -556,6 +583,7 @@ impl ScribeImpl {
                     native_sources: material_plan.sources,
                     native_source_count: material_plan.source_count,
                     definition: builtin_definition,
+                    registered_schema,
                 },
             )
             .await?;

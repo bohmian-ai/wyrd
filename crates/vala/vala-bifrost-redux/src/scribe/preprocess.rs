@@ -99,6 +99,11 @@ pub(crate) struct NativeAdmittedRows {
     pub(crate) source_count: usize,
     /// Canonical built-in whose physical identity every source must preserve.
     pub(crate) definition: Option<&'static crate::tables::BuiltinTableDefinition>,
+    /// Registered Iceberg schema whose field ids every stamped batch carries.
+    ///
+    /// `None` only for the embedded engine seam, which has no catalog owner
+    /// and writes objects that no registered table promotes.
+    pub(crate) registered_schema: Option<std::sync::Arc<iceberg::spec::Schema>>,
     /// Expanded-data ceiling the decoded, stamped output must fit before WAL.
     pub(crate) expanded_limit_bytes: usize,
 }
@@ -391,6 +396,7 @@ fn stamp_native_source(
             window: source.event_time_window,
             receipt_micros: source.receipt_micros,
             definition: source.definition,
+            registered_schema: source.registered_schema.as_deref(),
         },
     )
 }
@@ -962,6 +968,7 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         NativeAdmittedRows {
             definition: None,
+            registered_schema: None,
             expanded_limit_bytes: crate::gate::limits::IngestLimits::default().expanded_bytes(),
             bytes,
             principal: Principal {

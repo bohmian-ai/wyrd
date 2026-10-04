@@ -17,7 +17,7 @@ use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 /// Element declaration of the ordered resource entity-reference collection.
-pub static LOG_ENTITY_REF_ELEMENT: F = F::sensitive(17, "entity_ref", T::Binary, false);
+pub static LOG_ENTITY_REF_ELEMENT: F = F::sensitive("entity_ref", T::Binary, false);
 
 /// The canonical `vala.logs.records` ledger.
 ///
@@ -27,33 +27,32 @@ pub static LOG_ENTITY_REF_ELEMENT: F = F::sensitive(17, "entity_ref", T::Binary,
 /// the pinned protocol carries no presence bit for it, so an empty wire value
 /// and an absent one are the same fact and both project to null.
 pub static LOG_FIELDS: &[CanonicalField] = &[
-    F::meta(1, "time_unix_nano", T::Int64, false),
-    F::meta(2, "observed_time_unix_nano", T::Int64, false),
-    F::meta(3, "severity_number", T::Int32, false),
-    F::meta(4, "severity_text", T::Utf8, false),
-    F::meta(5, "event_name", T::Utf8, true),
-    F::sensitive(6, "body", T::Binary, true),
-    F::meta(7, "trace_id", T::FixedSizeBinary(16), true),
-    F::meta(8, "span_id", T::FixedSizeBinary(8), true),
-    F::meta(9, "flags", T::Int64, false),
-    F::sensitive(10, "attributes", T::Binary, false),
-    F::meta(11, "dropped_attributes_count", T::Int64, false),
-    F::meta(12, "resource_present", T::Bool, false),
-    F::sensitive(13, "resource_attributes", T::Binary, false),
-    F::meta(14, "resource_dropped_attributes_count", T::Int64, false),
-    F::meta(15, "resource_schema_url", T::Utf8, false),
+    F::meta("time_unix_nano", T::Int64, false),
+    F::meta("observed_time_unix_nano", T::Int64, false),
+    F::meta("severity_number", T::Int32, false),
+    F::meta("severity_text", T::Utf8, false),
+    F::meta("event_name", T::Utf8, true),
+    F::sensitive("body", T::Binary, true),
+    F::meta("trace_id", T::FixedSizeBinary(16), true),
+    F::meta("span_id", T::FixedSizeBinary(8), true),
+    F::meta("flags", T::Int64, false),
+    F::sensitive("attributes", T::Binary, false),
+    F::meta("dropped_attributes_count", T::Int64, false),
+    F::meta("resource_present", T::Bool, false),
+    F::sensitive("resource_attributes", T::Binary, false),
+    F::meta("resource_dropped_attributes_count", T::Int64, false),
+    F::meta("resource_schema_url", T::Utf8, false),
     F::sensitive(
-        16,
         "resource_entity_refs",
         T::List(&LOG_ENTITY_REF_ELEMENT),
         false,
     ),
-    F::meta(18, "scope_present", T::Bool, false),
-    F::meta(19, "scope_name", T::Utf8, false),
-    F::meta(20, "scope_version", T::Utf8, false),
-    F::sensitive(21, "scope_attributes", T::Binary, false),
-    F::meta(22, "scope_dropped_attributes_count", T::Int64, false),
-    F::meta(23, "scope_schema_url", T::Utf8, false),
+    F::meta("scope_present", T::Bool, false),
+    F::meta("scope_name", T::Utf8, false),
+    F::meta("scope_version", T::Utf8, false),
+    F::sensitive("scope_attributes", T::Binary, false),
+    F::meta("scope_dropped_attributes_count", T::Int64, false),
+    F::meta("scope_schema_url", T::Utf8, false),
 ];
 
 /// The canonical durable table for the `OTLP` log signal.

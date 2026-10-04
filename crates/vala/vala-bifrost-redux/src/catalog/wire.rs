@@ -84,8 +84,8 @@ pub struct DescribedFields {
 /// input class and carries no field id. It is nullable because Card correlation
 /// is optional: a row without one is accepted and stored with an authenticated
 /// `principal_id` and a null `card_uid`. Every other declaration is taken from
-/// the stored schema, so its type, nullability, and stable field id are the
-/// table's actual ones rather than a restatement.
+/// the stored schema, so its type, nullability, and registered field id are
+/// the table's actual ones rather than a restatement.
 ///
 /// # Errors
 ///

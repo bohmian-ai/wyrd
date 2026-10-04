@@ -285,7 +285,7 @@ const LIST_ELEMENT: &str = "element";
 ///
 /// - nested field metadata is dropped, because a nested type's `Debug` includes
 ///   its children's metadata map, whose `HashMap` iteration order is not stable;
-///   the stable ids and sensitivity markers it carries are committed by the
+///   the sensitivity markers it carries are committed by the
 ///   canonical physical fingerprint instead;
 /// - the large and small variable-width types collapse together, because
 ///   Iceberg has one binary and one string type and a schema read back from it

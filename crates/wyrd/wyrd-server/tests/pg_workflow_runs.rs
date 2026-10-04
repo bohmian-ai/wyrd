@@ -35,6 +35,7 @@ use wyrd_server::config::ServerWorkflowConfig;
 use wyrd_spec::auth::GatewayAccess;
 use wyrd_spec::card::workflow::{WorkflowRun, WorkflowRunStatus, WorkflowStepStatus};
 use wyrd_spec::storage::IDEMPOTENCY_KEY_HEADER;
+use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::seed_query_fixture;
 use wyrd_testing::server::{BifrostQueryResourceSnapshot, WyrdTestServer, WyrdTestServerBuilder};
@@ -84,8 +85,8 @@ struct Script {
     calls: Mutex<Vec<UpstreamCall>>,
     /// Number of requests received so far.
     arrivals: watch::Sender<usize>,
-    /// While true, every response waits.
-    held: watch::Sender<bool>,
+    /// While set, every response after that arrival count waits.
+    held: watch::Sender<Option<usize>>,
     /// Assistant messages answered in order; `DONE` text once exhausted.
     replies: Mutex<VecDeque<Value>>,
 }
@@ -115,7 +116,7 @@ impl Upstream {
         let script = Arc::new(Script {
             calls: Mutex::default(),
             arrivals: watch::Sender::new(0),
-            held: watch::Sender::new(false),
+            held: watch::Sender::new(None),
             replies: Mutex::default(),
         });
         let app = axum::Router::new()
@@ -127,12 +128,18 @@ impl Upstream {
 
     /// Make every response wait until [`Self::release`].
     fn hold(&self) {
-        self.script.held.send_replace(true);
+        self.hold_after(0);
+    }
+
+    /// Let the first `count` requests ever received answer and make every
+    /// later response wait until [`Self::release`].
+    fn hold_after(&self, count: usize) {
+        self.script.held.send_replace(Some(count));
     }
 
     /// Let every waiting and later response proceed.
     fn release(&self) {
-        self.script.held.send_replace(false);
+        self.script.held.send_replace(None);
     }
 
     /// Queue one assistant message as the next answer.
@@ -196,11 +203,15 @@ async fn complete(
             secret: header(SECRET_HEADER),
             body,
         });
-    script.arrivals.send_modify(|arrived| *arrived += 1);
+    let mut arrival = 0;
+    script.arrivals.send_modify(|arrived| {
+        *arrived += 1;
+        arrival = *arrived;
+    });
     script
         .held
         .subscribe()
-        .wait_for(|held| !*held)
+        .wait_for(|held| held.is_none_or(|through| arrival <= through))
         .await
         .expect("the hold sender lives with the script");
     let message = script
@@ -982,6 +993,52 @@ fn assert_complete(run: &WorkflowRun) {
         )),
         "{run:?}"
     );
+}
+
+/// Rows `sql` returns through the shared Rust Bifrost client as `token`.
+///
+/// # Panics
+/// Panics when the query does not reach a successful terminal.
+async fn query_rows(fixture: &Fixture, token: &str, sql: &str) -> usize {
+    let mut stream = wyrd_client::Bifrost::query_only(&fixture.client(token))
+        .query(&BifrostQueryRequest {
+            sql: sql.to_owned(),
+            deadline_ms: Some(30_000),
+        })
+        .await
+        .expect("the query starts");
+    let mut rows = 0;
+    while let Some(batch) = stream
+        .next_batch()
+        .await
+        .expect("the query reaches its successful terminal")
+    {
+        rows += batch.num_rows();
+    }
+    rows
+}
+
+/// A Workflow chaining `depth` steps of the registered `security-reviewer`
+/// Agent, each depending on the one before.
+///
+/// # Panics
+/// Panics when the Workflow file cannot be written.
+fn chain(name: &str, depth: usize) -> TempDir {
+    let temp = TempDir::new().expect("bundle directory creates");
+    let mut yaml = format!(
+        "apiVersion: wyrd/v1\nkind: Workflow\nmetadata:\n  space: engineering\n  name: {name}\n  version: \"1.0.0\"\nspec:\n  llm_route:\n{WYRD_GATEWAY}\n  inputs:\n    code:\n      type: str\n      value: \"\"\n  steps:\n"
+    );
+    for step in 0..depth {
+        yaml.push_str(&format!(
+            "    - id: s{step}\n      action:\n        type: agent\n        target:\n          kind: Agent\n          name: security-reviewer\n          version: \"1.0.0\"\n      inputs:\n        code: input.code\n"
+        ));
+        if step > 0 {
+            yaml.push_str(&format!("      depends_on: [s{}]\n", step - 1));
+        }
+    }
+    yaml.push_str(&format!("  outputs:\n    review: steps.s{}.output.text\n", depth - 1));
+    std::fs::write(temp.path().join("workflow.yaml"), yaml).expect("bundle file writes");
+    temp
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2406,8 +2463,13 @@ async fn lifecycle_races_retention_and_shutdown() {
 /// oversized input, all before any provider call and without leaking the
 /// only active slot. A step result over its bound fails the run with a
 /// complete bounded snapshot that carries none of the oversized output.
-/// While a preparation is held, Card reads and direct gateway calls stay
-/// serviceable.
+/// While a preparation is held, Card reads, direct gateway calls, and
+/// Bifrost queries stay serviceable. Two results each under their step
+/// bound that together overflow the run fail it with the aggregate error,
+/// retaining only the first, and a run holding a near-ceiling result stays
+/// complete and within the ceiling when cancelled or timed out. The deepest admissible chain is accepted and
+/// cancelled whole, freeing its slot, with Cards and Bifrost still
+/// answering.
 ///
 /// # Panics
 /// Panics when a refusal, run outcome, snapshot size, or sibling request
@@ -2424,6 +2486,10 @@ async fn graph_and_snapshot_limits_preserve_sibling_services() {
     }));
     let max_run_bytes = bounds.max_run_bytes;
     let fixture = Fixture::start(bounds).await;
+    let seeded = seed_query_fixture(&fixture.server, "workflow-limits")
+        .await
+        .expect("query fixture seeds");
+    let select = format!("SELECT id, value FROM {} ORDER BY id", seeded.table);
     let runner = &fixture.runner.token;
     let extra_step = |id: &str| {
         format!(
@@ -2525,6 +2591,7 @@ async fn graph_and_snapshot_limits_preserve_sibling_services() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{completion}");
+    assert_eq!(query_rows(&fixture, runner, &select).await, 2);
     workflows.release_preparation_for_test();
     let (status, run) = creator.await.expect("creator answers");
     assert_eq!(
@@ -2536,4 +2603,122 @@ async fn graph_and_snapshot_limits_preserve_sibling_services() {
         fixture.terminal(runner, &run_of(run)).await.status,
         WorkflowRunStatus::Succeeded
     );
+
+    // Near the run ceiling: two results each under their step bound
+    // together overflow the run, failing it with the aggregate error and
+    // discarding the second, while a run already holding such a result
+    // still terminalizes within the ceiling when cancelled or timed out.
+    let ceiling = 16_384;
+    let fixture = fixture
+        .restart(config(json!({
+            "max_active_per_tenant": 1,
+            "max_step_result_bytes": 8192,
+            "max_run_bytes": ceiling,
+        })))
+        .await;
+    let runner = &fixture.runner.token;
+    let (first, second) = ("p".repeat(7000), "q".repeat(7000));
+    fixture.upstream.reply(text(&first));
+    fixture.upstream.reply(text(&second));
+    let run = fixture
+        .accept(runner, &run_request("code-review", "x"))
+        .await;
+    let run = fixture.terminal(runner, &run).await;
+    assert_eq!(run.status, WorkflowRunStatus::Failed, "{run:?}");
+    assert_eq!(
+        run.error.as_ref().map(|error| error.code.as_str()),
+        Some("WYRD_WORKFLOW_413_RUN_TOO_LARGE")
+    );
+    let parallel = (
+        step_status(&run, "security"),
+        step_status(&run, "correctness"),
+    );
+    assert!(
+        matches!(
+            parallel,
+            (WorkflowStepStatus::Succeeded, WorkflowStepStatus::Failed)
+                | (WorkflowStepStatus::Failed, WorkflowStepStatus::Succeeded)
+        ),
+        "{parallel:?}"
+    );
+    let snapshot = serde_json::to_string(&run).expect("run serializes");
+    assert!(
+        snapshot.contains(&first) != snapshot.contains(&second),
+        "exactly one result is retained"
+    );
+    assert!(run.canonical_len() <= ceiling);
+    assert_complete(&run);
+
+    let pair = chain("pair-review", 2);
+    fixture.register(&pair.path().join("workflow.yaml")).await;
+    let mut pair_request = run_request("pair-review", "x");
+    for timeout in [None, Some(1)] {
+        let before = fixture.upstream.arrivals();
+        fixture.upstream.hold_after(before + 1);
+        fixture.upstream.reply(text(&first));
+        if let Some(seconds) = timeout {
+            pair_request["timeout_seconds"] = json!(seconds);
+        }
+        let run = fixture.accept(runner, &pair_request).await;
+        fixture.upstream.wait_arrivals(before + 2).await;
+        let ended = if timeout.is_some() {
+            fixture.terminal(runner, &run).await
+        } else {
+            let (status, body) = fixture.cancel(runner, &run.run_id.to_string()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            fixture.terminal(runner, &run).await
+        };
+        fixture.upstream.release();
+        let expected = if timeout.is_some() {
+            WorkflowRunStatus::TimedOut
+        } else {
+            WorkflowRunStatus::Cancelled
+        };
+        assert_eq!(ended.status, expected, "{ended:?}");
+        assert_eq!(ended.steps["s0"].text.as_deref(), Some(first.as_str()));
+        assert!(ended.canonical_len() <= ceiling);
+        assert_complete(&ended);
+    }
+
+    // The deepest admissible chain is accepted and cancelled whole, its slot
+    // freed, and every sibling service still answers.
+    let fixture = fixture
+        .restart(config(json!({ "max_active_per_tenant": 1 })))
+        .await;
+    let runner = &fixture.runner.token;
+    let deep = chain("deep-review", 1024);
+    fixture.register(&deep.path().join("workflow.yaml")).await;
+    fixture.upstream.hold();
+    let before = fixture.upstream.arrivals();
+    let run = fixture
+        .accept(runner, &run_request("deep-review", "x"))
+        .await;
+    fixture.upstream.wait_arrivals(before + 1).await;
+    let (status, cancelled) = fixture.cancel(runner, &run.run_id.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{cancelled}");
+    let cancelled = fixture.terminal(runner, &run).await;
+    fixture.upstream.release();
+    assert_eq!(cancelled.status, WorkflowRunStatus::Cancelled);
+    assert_eq!(cancelled.steps.len(), 1024);
+    assert_complete(&cancelled);
+    let fresh = fixture
+        .accept(runner, &run_request("bulky-review", "x"))
+        .await;
+    assert_eq!(
+        fixture.terminal(runner, &fresh).await.status,
+        WorkflowRunStatus::Succeeded,
+        "the deep run released its slot"
+    );
+    let (status, card) = send(
+        fixture
+            .http
+            .get(format!(
+                "{}/v1/cards/Workflow/engineering/deep-review/latest",
+                fixture.base
+            ))
+            .header(ACCESS_TOKEN_HEADER, format!("Bearer {runner}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{card}");
+    assert_eq!(query_rows(&fixture, runner, &select).await, 2);
 }

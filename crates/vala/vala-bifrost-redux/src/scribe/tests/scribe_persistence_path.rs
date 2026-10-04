@@ -179,7 +179,7 @@ fn ipc_stream(batches: &[RecordBatch]) -> Vec<u8> {
     bytes
 }
 
-/// Read every stamped row of one frame, keyed by its batch id.
+/// Read every stamped row of one frame, keyed by its request id.
 ///
 /// Rows are returned as `(metric_name, rendered quantile_values)` sorted by
 /// value: the layout sort interleaves the two frames' rows, and a stored row
@@ -190,16 +190,16 @@ fn ipc_stream(batches: &[RecordBatch]) -> Vec<u8> {
 ///
 /// Panics when a managed column is absent, carries the wrong Arrow type, or a
 /// quantile value cannot be rendered.
-fn stamped_rows(batches: &[RecordBatch], batch_id: Uuid) -> Vec<(String, String)> {
-    use arrow::array::{Array, FixedSizeBinaryArray, StringArray};
+fn stamped_rows(batches: &[RecordBatch], request_id: &RequestId) -> Vec<(String, String)> {
+    use arrow::array::{Array, StringArray};
     use arrow::util::display::array_value_to_string;
 
     let mut rows = Vec::new();
     for batch in batches {
         let ids = batch
-            .column_by_name("wyrd_batch_id")
-            .and_then(|column| column.as_any().downcast_ref::<FixedSizeBinaryArray>())
-            .expect("wyrd_batch_id is FixedSizeBinary(16)");
+            .column_by_name("wyrd_request_id")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .expect("wyrd_request_id is Utf8");
         let names = batch
             .column_by_name("metric_name")
             .and_then(|column| column.as_any().downcast_ref::<StringArray>())
@@ -208,7 +208,7 @@ fn stamped_rows(batches: &[RecordBatch], batch_id: Uuid) -> Vec<(String, String)
             .column_by_name("quantile_values")
             .expect("the nested canonical column survives the managed WAL path");
         for row in 0..ids.len() {
-            if ids.value(row) != batch_id.as_bytes() {
+            if ids.value(row) != request_id.as_str() {
                 continue;
             }
             rows.push((
@@ -229,12 +229,12 @@ fn stamped_rows(batches: &[RecordBatch], batch_id: Uuid) -> Vec<(String, String)
 /// the two frames do not read back identical user columns.
 fn assert_payload_modes_agree(
     stored: &[RecordBatch],
-    canonical_batch_id: Uuid,
-    arrow_batch_id: Uuid,
+    canonical_request_id: &RequestId,
+    arrow_request_id: &RequestId,
     total_rows: usize,
 ) {
-    let canonical_rows = stamped_rows(stored, canonical_batch_id);
-    let arrow_rows = stamped_rows(stored, arrow_batch_id);
+    let canonical_rows = stamped_rows(stored, canonical_request_id);
+    let arrow_rows = stamped_rows(stored, arrow_request_id);
     assert_eq!(
         canonical_rows.len(),
         total_rows,
@@ -259,7 +259,6 @@ const MANAGED_COLUMNS: &[&str] = &[
     "wyrd_request_id",
     "wyrd_event_time",
     "wyrd_ingested_at",
-    "wyrd_batch_id",
 ];
 
 /// Assert every stored managed column is the table's own `Field` and value.
@@ -325,8 +324,8 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
     let day = fixture_event_day(1);
     let rows = projected_metric_batch(day);
     let total_rows = rows.num_rows();
-    let canonical_batch_id = Uuid::now_v7();
-    let arrow_batch_id = Uuid::now_v7();
+    let canonical_request_id = RequestId::now_v7();
+    let arrow_request_id = RequestId::now_v7();
     let temp_dir = TempDir::new().expect("WAL temp dir");
     let operator = Arc::new(
         opendal::Operator::new(opendal::services::Memory::default())
@@ -345,16 +344,15 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
     let scribe = ScribeImpl::new_for_embedded_with_deps(operator, wal, &Uuid::nil().to_string(), 1);
 
     let fingerprint = projected_source_schema_fingerprint(rows.schema().as_ref());
-    let frame = |batch_id: Uuid, payload: IngressPayload| {
+    let frame = |request_id: &RequestId, payload: IngressPayload| {
         let principal = principal(tenant);
-        let request_id = RequestId::now_v7();
         ScribeIngressFrame {
             authenticated_tenant: tenant,
             principal,
             table: table.clone(),
             expected_schema_fingerprint: Some(fingerprint),
-            request_id,
-            batch_id,
+            request_id: request_id.clone(),
+            batch_id: Uuid::now_v7(),
             measured_wire_bytes: 0,
             payload,
         }
@@ -363,7 +361,7 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
     let canonical = Scribe::ingest_frame(
         &scribe,
         frame(
-            canonical_batch_id,
+            &canonical_request_id,
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
             ])),
@@ -381,7 +379,7 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
     let arrow = Scribe::ingest_frame(
         &scribe,
         frame(
-            arrow_batch_id,
+            &arrow_request_id,
             IngressPayload::ArrowIpc(bytes::Bytes::from(ipc_stream(&split))),
         ),
     )
@@ -409,7 +407,12 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
         "hot snapshot",
     );
 
-    assert_payload_modes_agree(&stored, canonical_batch_id, arrow_batch_id, total_rows);
+    assert_payload_modes_agree(
+        &stored,
+        &canonical_request_id,
+        &arrow_request_id,
+        total_rows,
+    );
     assert_managed_columns_are_table_owned(&stored);
 
     scribe

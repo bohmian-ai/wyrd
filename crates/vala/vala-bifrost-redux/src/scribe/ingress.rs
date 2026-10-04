@@ -348,7 +348,7 @@ impl ScribeImpl {
                             principal,
                             expected_schema_fingerprint,
                             request_id,
-                            batch_id,
+                            receipt_micros,
                             window: event_time_window,
                             definition,
                         },
@@ -388,15 +388,7 @@ impl ScribeImpl {
             expected_schema_fingerprint,
             partition_granularity,
         } = self.resolve_logical_frame(frame).await?;
-        // The one receipt instant this frame is admitted under. Production
-        // reads the system clock; a test-support owner adds the offset
-        // installed by `shift_receipt_clock_for_test`.
-        let receipt_micros = crate::scribe::execution_lanes::current_receipt_micros()?;
-        #[cfg(any(test, feature = "test-support"))]
-        let receipt_micros = receipt_micros.saturating_add(
-            self.receipt_offset_micros_for_test
-                .load(std::sync::atomic::Ordering::Acquire),
-        );
+        let receipt_micros = self.admission_instant(frame.principal.tenant_id).await?;
         let binding_facts =
             crate::catalog::TenantTableBinding::facts(&frame.authenticated_tenant, &frame.table)
                 .map_err(|_| ScribeError::InvalidFrame)?;
@@ -427,6 +419,38 @@ impl ScribeImpl {
             binding,
             reservation,
         })
+    }
+
+    /// Reads the one ingestion instant a transport frame is admitted under.
+    ///
+    /// `PostgreSQL` is the clock of record: the instant is read once per batch,
+    /// stamped on every row as `wyrd_ingested_at`, used as `wyrd_event_time`
+    /// for rows that supply none, anchors the event-time window, and is stored
+    /// on the batch-commit fence. An engine without control `PostgreSQL` has no
+    /// durable state to agree with and reads the system clock. A test-support
+    /// owner adds the offset installed by `shift_receipt_clock_for_test`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `PostgreSQL` acquisition or read error, or an internal error
+    /// when the system clock is unreadable.
+    async fn admission_instant(&self, tenant: wyrd_spec::DataTenantId) -> Result<i64, ScribeError> {
+        let micros = match &self.control_postgres {
+            Some(postgres) => {
+                let mut conn = postgres.tenant_conn(tenant).await?;
+                let instant =
+                    vala_sql::queries::scribe_batch_commits::ingest_instant(&mut conn).await?;
+                conn.commit().await?;
+                instant.timestamp_micros()
+            }
+            None => crate::scribe::execution_lanes::current_receipt_micros()?,
+        };
+        #[cfg(any(test, feature = "test-support"))]
+        let micros = micros.saturating_add(
+            self.receipt_offset_micros_for_test
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
+        Ok(micros)
     }
 
     /// Transfers an admitted memory lease through decode into prepared ownership.
@@ -541,6 +565,7 @@ impl ScribeImpl {
         let admitted = AdmittedAppend {
             batch_id: frame.batch_id,
             request_id,
+            ingested_at_micros: receipt_micros,
             rows,
             measured_wire_bytes: frame.measured_wire_bytes,
             reservation,

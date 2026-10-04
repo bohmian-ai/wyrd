@@ -7,9 +7,7 @@ use thiserror::Error;
 use wyrd_spec::vala::api::{
     NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
 };
-use wyrd_spec::vala::managed_columns::{
-    WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, is_reserved_managed_column,
-};
+use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 pub mod audit;
 pub mod dev;
@@ -63,22 +61,6 @@ pub enum CorrelationPolicy {
     CodeAxis,
     /// Audit content has its own identity columns.
     None,
-}
-
-impl CorrelationPolicy {
-    /// Return the universal correlation columns appended by this policy.
-    #[must_use]
-    pub const fn appended_correlation_columns(self) -> &'static [&'static str] {
-        match self {
-            Self::Observation => &[
-                wyrd_spec::vala::RUN_ID,
-                wyrd_spec::vala::CARD_UID,
-                wyrd_spec::vala::PRINCIPAL_ID,
-            ],
-            Self::CodeAxis => &[wyrd_spec::vala::CARD_UID, wyrd_spec::vala::PRINCIPAL_ID],
-            Self::None => &[],
-        }
-    }
 }
 
 /// Payload handling classification for a built-in table.
@@ -296,23 +278,6 @@ pub trait DomainTable: Send + Sync + 'static {
     fn physical_layout() -> PhysicalLayoutWire {
         hourly_layout(vec![sort_desc(WYRD_EVENT_TIME)], &[])
     }
-}
-
-/// Validate user fields against all server-owned columns for a policy.
-pub fn reject_reserved_domain_fields(
-    user_fields: &[&str],
-    policy: CorrelationPolicy,
-) -> Result<(), TableError> {
-    let appended = policy.appended_correlation_columns();
-    for name in user_fields {
-        if is_reserved_managed_column(name)
-            || [WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_BATCH_ID].contains(name)
-            || appended.contains(name)
-        {
-            return Err(TableError::Internal(format!("reserved column: {name}")));
-        }
-    }
-    Ok(())
 }
 
 /// Versioned recursive fingerprint over one complete canonical physical schema.
@@ -802,7 +767,7 @@ mod tests {
 
     use super::*;
     use fields::{boolean, float64, int32, int64, ts_us_utc, utf8};
-    use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID};
+    use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT};
 
     /// The registry owns three `OTel` signal tables and no removed physical name.
     ///
@@ -1024,8 +989,8 @@ mod tests {
     ///
     /// This is the `CorrelationPolicy::Observation` envelope the Bifrost design
     /// fixes for every table: nullable `run_id` and `card_uid`, the required
-    /// publisher `principal_id`, and the required request, event-time,
-    /// ingestion-time, and batch identity columns. The tenant is a property of
+    /// publisher `principal_id`, and the required request, event-time, and
+    /// ingestion-time columns. The tenant is a property of
     /// the physical table and of each Parquet footer, never a row column, and
     /// Bifrost stamps no per-row position.
     fn verification_managed_envelope() -> Vec<Field> {
@@ -1036,7 +1001,6 @@ mod tests {
             utf8(wyrd_spec::vala::WYRD_REQUEST_ID, false),
             ts_us_utc(WYRD_EVENT_TIME, false),
             ts_us_utc(WYRD_INGESTED_AT, false),
-            Field::new(WYRD_BATCH_ID, DataType::FixedSizeBinary(16), false),
         ]
     }
 
@@ -1424,30 +1388,6 @@ mod tests {
                 "{label} must fail as an invalid physical layout, got {error:?}"
             );
         }
-    }
-
-    #[test]
-    fn correlation_policies_are_explicit() {
-        assert!(
-            !CorrelationPolicy::None
-                .appended_correlation_columns()
-                .contains(&CARD_UID)
-        );
-        assert!(
-            CorrelationPolicy::Observation
-                .appended_correlation_columns()
-                .contains(&RUN_ID)
-        );
-        assert!(
-            !CorrelationPolicy::CodeAxis
-                .appended_correlation_columns()
-                .contains(&RUN_ID)
-        );
-        assert!(
-            CorrelationPolicy::Observation
-                .appended_correlation_columns()
-                .contains(&PRINCIPAL_ID)
-        );
     }
 
     /// One attribute entry used by the round-trip fixtures.
@@ -2062,7 +2002,7 @@ mod tests {
         let reserved = physical
             .fields()
             .iter()
-            .find(|field| field.name() == WYRD_BATCH_ID)
+            .find(|field| field.name() == WYRD_INGESTED_AT)
             .expect("the physical schema carries the reserved envelope")
             .clone();
         duplicated.push(reserved);

@@ -175,6 +175,7 @@ pub(super) async fn append_batch(
         .expect("public ingest transport connects")
         .insert(table, batch_id, encode_ipc(batch))
         .await
+        .map(|_request_id| ())
 }
 
 /// Appends one batch whose rows all carry the caller's chosen event time.

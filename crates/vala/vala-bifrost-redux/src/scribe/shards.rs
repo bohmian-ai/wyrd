@@ -3621,7 +3621,14 @@ impl ShardOwner {
                 })?,
                 request_id: first.request_id,
             };
-            if self.commit_batch_control_fence(&postgres, &commit).await? {
+            let ingested_at = chrono::DateTime::from_timestamp_micros(append.ingested_at_micros)
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "Scribe admission instant exceeds the PostgreSQL range".to_owned(),
+                })?;
+            if self
+                .commit_batch_control_fence(&postgres, &commit, ingested_at)
+                .await?
+            {
                 tracing::debug!(
                     tenant = %append.tenant,
                     table = %append.table.fqn(),
@@ -3635,6 +3642,9 @@ impl ShardOwner {
     }
 
     /// Commits or durably reconciles one exact WAL batch-control fence.
+    ///
+    /// `ingested_at` is the batch's admission instant, the value stamped on
+    /// its rows as `wyrd_ingested_at`; the fence stores it unchanged.
     ///
     /// A `PostgreSQL` COMMIT error is always ambiguous. The method opens a fresh
     /// tenant transaction and compares every durable identity field. An exact
@@ -3651,11 +3661,13 @@ impl ShardOwner {
         &self,
         postgres: &vala_sql::ValaPostgres,
         commit: &vala_sql::queries::scribe_batch_commits::ScribeBatchCommit,
+        ingested_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, ScribeError> {
         loop {
             let mut conn = postgres.tenant_conn(commit.tenant).await?;
             let recorded =
-                vala_sql::queries::scribe_batch_commits::record(&mut conn, commit).await?;
+                vala_sql::queries::scribe_batch_commits::record(&mut conn, commit, ingested_at)
+                    .await?;
             if conn.commit().await.is_ok() {
                 return Ok(matches!(
                     recorded,
@@ -6439,6 +6451,7 @@ mod tests {
             crate::scribe::preprocess::prepare_append(crate::scribe::preprocess::AdmittedAppend {
                 batch_id,
                 request_id: uuid::Uuid::now_v7(),
+                ingested_at_micros: 0,
                 rows: crate::scribe::preprocess::AdmittedRows::Projected(owner_prepared_batch()),
                 measured_wire_bytes: initial_bytes,
                 reservation,

@@ -13,7 +13,9 @@ CREATE TABLE vala.scribe_batch_commits (
     wal_lsn_min bigint NOT NULL CHECK (wal_lsn_min >= 0),
     wal_lsn_max bigint NOT NULL CHECK (wal_lsn_max >= wal_lsn_min),
     request_id uuid NOT NULL,
-    committed_at timestamptz NOT NULL DEFAULT now(),
+    -- PostgreSQL admission instant, read once per batch and stamped on every
+    -- row as wyrd_ingested_at. Written by Scribe; no default.
+    ingested_at timestamptz NOT NULL,
     PRIMARY KEY (data_tenant_id, logical_table_fqn, batch_id)
 );
 

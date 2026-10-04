@@ -36,13 +36,14 @@ User-defined datasets for high-volume custom observability writes. Each tenant g
 
 | Column | Physical type | Description |
 |---|---|---|
-| `wyrd_event_time` | `Timestamp(µs, UTC)` | Canonical event time for partitioning and windowing |
-| `wyrd_ingested_at` | `Timestamp(µs, UTC)` | Server-side flush wall clock |
-| `wyrd_batch_id` | `FixedSizeBinary(16)` | Batch deduplication key |
-| `wyrd_request_id` | `Utf8` | Admitting request identity |
 | `run_id` | `Utf8` (nullable) | Correlation: job/experiment run |
 | `card_uid` | `Utf8` (nullable) | Correlation: owning Card |
-| `principal_id` | `Utf8` (nullable) | Correlation: emitting principal |
+| `principal_id` | `Utf8` | Correlation: emitting principal |
+| `wyrd_request_id` | `Utf8` | Admitting request identity |
+| `wyrd_event_time` | `Timestamp(µs, UTC)` | When the observed thing happened: the caller's value, or `wyrd_ingested_at` when absent; partitions and windows the table |
+| `wyrd_ingested_at` | `Timestamp(µs, UTC)` | When Wyrd accepted the batch: one PostgreSQL timestamp per batch, read at admission; never caller-supplied |
+
+Tables registered with `CorrelationPolicy::None` (for example `vala.system.audit_log`) carry only `wyrd_event_time` and `wyrd_ingested_at`; `CorrelationPolicy::CodeAxis` tables declare their own `run_id`.
 
 ## vala.traces.spans
 
@@ -255,7 +256,7 @@ Source type: `AgentTraceRecord`.
 
 | Arrow physical type | API wire type | Notes |
 |---|---|---|
-| `FixedSizeBinary(16)` | `String` (lowercase hex) | trace_id, batch_id |
+| `FixedSizeBinary(16)` | `String` (lowercase hex) | trace_id |
 | `FixedSizeBinary(8)` | `String` (lowercase hex) | span_id |
 | `Timestamp(µs, UTC)` | `DateTime<Utc>` (RFC3339) | All timestamps |
 | `Utf8` | `String` or `serde_json::Value` | Attributes are JSON-parsed |

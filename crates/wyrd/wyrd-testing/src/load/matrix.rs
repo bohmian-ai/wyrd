@@ -1769,7 +1769,7 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
                     )
                     .await
                 {
-                    Ok(()) => {
+                    Ok(_request_id) => {
                         result.acknowledged_batches += 1;
                         result.acknowledged_rows += u64::from(profile.rows_per_batch);
                         result.acknowledged_bytes += payload.len() as u64;

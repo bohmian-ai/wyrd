@@ -41,10 +41,22 @@ durable Wyrd state independently.
 Every Bifrost table has one server-owned managed envelope with these required,
 non-null columns:
 
-- `wyrd_event_time`: validated caller event time or server receipt time;
-- `wyrd_ingested_at`: server-stamped ingestion time;
-- `wyrd_batch_id`: immutable UUIDv7 identity of one accepted logical batch;
-- `wyrd_request_id`: server-minted or validated request correlation.
+- `wyrd_request_id`: server-minted or validated request correlation, the
+  join key to audit and to the batch-commit fence;
+- `wyrd_event_time`: when the observed thing happened — the caller's value,
+  validated against the acceptance window, or `wyrd_ingested_at` when the
+  caller supplies none;
+- `wyrd_ingested_at`: when Wyrd accepted the batch. Scribe reads it once per
+  batch from PostgreSQL (`statement_timestamp()`) at admission, stamps the same
+  value on every row, and stores it on the batch's
+  `vala.scribe_batch_commits` fence. A caller can never supply it.
+
+The column names, types, stable ids, and order are declared once, in
+`vala_bifrost_redux::tables::managed_columns::MANAGED_COLUMNS`; every physical
+schema and every reserved-name check derives from that declaration.
+`wyrd_ingested_at` comes from the database clock, so it is comparable across
+replicas, but it is the admission instant, not a commit order, and is not an
+incremental-read checkpoint.
 
 The tenant is not a row column. It is a property of the physical table, of
 each Parquet file, and of each in-memory Scribe bucket, all bound from the
@@ -60,8 +72,9 @@ attributes losslessly. The values use the existing `CardRef` and `RunId` text
 grammars. Any client Card UID is ignored; Scribe stamps only the UID from the
 verified principal scope.
 
-Identity is batch-level. Within a tenant-qualified physical table, one
-accepted logical batch is:
+Identity is batch-level. The batch identity is the client-generated UUIDv7
+`wyrd_batch_id` request field; it is not stored on rows. Within a
+tenant-qualified physical table, one accepted logical batch is:
 
 ```text
 wyrd_batch_id
@@ -242,9 +255,10 @@ validate and split by canonical physical partition
 ```
 
 Caller-supplied `wyrd_event_time` is accepted only within the server window,
-defaulting to 30 days before through 24 hours after receipt. An out-of-window
-value fails with `WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE`; Scribe never clamps or
-normalizes it. When the column is absent, the server stamps receipt time.
+defaulting to 30 days before through 24 hours after the batch's
+`wyrd_ingested_at`. An out-of-window value fails with
+`WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE`; Scribe never clamps or normalizes it.
+When the column is absent, the server stamps `wyrd_ingested_at` into it.
 
 Each shard projects WAL bytes, Arrow and metadata ownership, age, and resource
 pressure before append. Rotation closes the shard generation when any validated
@@ -287,9 +301,9 @@ node. Membership is deterministic and durable before merge; one member cannot
 be split across claims and a later member cannot join an existing claim.
 
 `ParquetBatchEncoder` performs a bounded external merge in canonical
-`PhysicalLayout` order with `wyrd_batch_id` as the stable tie-breaker; rows
-that still tie keep claim-member order, then their position within the staged
-run, so the merged order is deterministic without a per-row column. It writes Parquet row groups toward a soft 128 MiB target and
+`PhysicalLayout` order; rows that tie on every layout key keep claim-member
+order, then their position within the staged run, so the merged order is
+deterministic without a per-row tie-breaker column. It writes Parquet row groups toward a soft 128 MiB target and
 closes immutable hot objects around the 512 MiB whole-file target. A completed row group is
 indivisible, and a smaller object is valid for dwell, partition close,
 pressure, drain, or final residue. The 512 MiB target is independent of WAL,

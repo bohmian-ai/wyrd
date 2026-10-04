@@ -1090,8 +1090,7 @@ mod pg_tests {
             // Server-resolved columns are not a writer's to supply, so they are
             // deliberately absent from every description; `wyrd_event_time` and
             // `run_id` are the two the writer may still send.
-            if (wyrd_spec::vala::is_reserved_managed_column(name)
-                || wyrd_spec::vala::is_reserved_correlation_column(name))
+            if vala_bifrost_redux::tables::managed_columns::is_managed_column(name)
                 && name != "wyrd_event_time"
                 && name != "run_id"
             {

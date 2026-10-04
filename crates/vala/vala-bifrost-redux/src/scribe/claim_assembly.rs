@@ -296,7 +296,7 @@ impl ClaimAssembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{FixedSizeBinaryArray, RecordBatch, TimestampMicrosecondArray};
+    use arrow::array::{RecordBatch, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
     use crate::catalog::{TableRef, TenantTableBinding};
@@ -313,14 +313,11 @@ mod tests {
 
     /// Physical schema the fixtures stage, merge, and assemble under.
     fn assembly_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new(
-                "wyrd_event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                false,
-            ),
-            Field::new("wyrd_batch_id", DataType::FixedSizeBinary(16), false),
-        ]))
+        Arc::new(Schema::new(vec![Field::new(
+            "wyrd_event_time",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]))
     }
 
     /// Freezes one member whose rows interleave with the other member's rows.
@@ -332,13 +329,8 @@ mod tests {
         let schema = assembly_schema();
         let times =
             TimestampMicrosecondArray::from_iter_values((0..rows).map(|row| row * 2 + offset));
-        let batch_ids = FixedSizeBinaryArray::try_from_iter((0..rows).map(|_| [batch; 16]))
-            .expect("fixture batch identity");
-        let record = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(times), Arc::new(batch_ids)],
-        )
-        .expect("fixture member batch");
+        let record = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(times)])
+            .expect("fixture member batch");
         FrozenMemtable {
             seal_id: u64::from(batch),
             seal_key: SealKey::new(
@@ -494,7 +486,10 @@ mod tests {
                 layout: &layout,
                 scratch_dir: &rolled_scratch,
                 object_base: "claims/rolled",
-                target_object_bytes: 4 * 1024,
+                // The fixture's sequential timestamps encode to a few hundred
+                // bytes, so only a one-byte target guarantees every merged
+                // batch closes its own object.
+                target_object_bytes: 1,
                 memory: crate::resources::ScribeResources::for_test(),
                 tenant,
             })

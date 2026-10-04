@@ -6,9 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use arrow::array::{
-    Array, ArrayRef, FixedSizeBinaryBuilder, StringArray, TimestampMicrosecondArray,
-};
+use arrow::array::{Array, ArrayRef, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
@@ -31,9 +29,11 @@ use wyrd_runtime::Principal;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::managed_columns::{
-    CARD_REF, CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
-    WYRD_REQUEST_ID,
+    CARD_REF, CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };
+
+use crate::tables::CorrelationPolicy;
+use crate::tables::managed_columns::{ensure_managed_columns, is_managed_column};
 
 #[cfg(test)]
 const INGRESS_QUEUE_ITEMS: usize = 256;
@@ -219,7 +219,7 @@ impl ScribeIngressCpuPool {
             principal,
             expected_schema_fingerprint,
             request_id,
-            batch_id,
+            receipt_micros,
             window,
             definition,
         } = inputs;
@@ -249,7 +249,7 @@ impl ScribeIngressCpuPool {
                     &principal,
                     expected_schema_fingerprint,
                     &request_id,
-                    batch_id,
+                    receipt_micros,
                     window,
                     definition,
                 )
@@ -395,8 +395,8 @@ impl ScribeIngressCpuPool {
 /// columns, so accepting a caller event-time column never perturbs a
 /// registered-schema fingerprint.
 ///
-/// All other managed columns (`wyrd_ingested_at`, `wyrd_batch_id`,
-/// `wyrd_request_id`, principal, and card columns) remain
+/// All other managed columns (`wyrd_ingested_at`, `wyrd_request_id`,
+/// principal, and card columns) remain
 /// unconditionally server-owned and are rejected when supplied.
 ///
 /// # Errors
@@ -413,7 +413,7 @@ fn decode(
     principal: &Principal,
     expected_schema_fingerprint: SchemaFingerprint,
     request_id: &RequestId,
-    batch_id: uuid::Uuid,
+    receipt_micros: i64,
     window: EventTimeWindow,
     definition: Option<&'static crate::tables::BuiltinTableDefinition>,
 ) -> Result<RecordBatch, ScribeError> {
@@ -445,9 +445,8 @@ fn decode(
             principal,
             expected_schema_fingerprint,
             request_id,
-            batch_id,
             window,
-            receipt_micros: None,
+            receipt_micros,
             definition,
         },
     )
@@ -480,8 +479,9 @@ pub(crate) struct IngressDecodeInputs {
     pub(crate) expected_schema_fingerprint: SchemaFingerprint,
     /// Stable request identity stamped into every accepted row.
     pub(crate) request_id: RequestId,
-    /// Stable batch identity stamped into every accepted row.
-    pub(crate) batch_id: uuid::Uuid,
+    /// Admission instant stamped as `wyrd_ingested_at` and anchoring the
+    /// event-time window.
+    pub(crate) receipt_micros: i64,
     /// Accepted caller event-time window.
     pub(crate) window: EventTimeWindow,
     /// Canonical built-in whose physical identity the decode must preserve.
@@ -491,8 +491,8 @@ pub(crate) struct IngressDecodeInputs {
 /// Immutable validation and stamping context for one decoded batch.
 ///
 /// Native persistence preprocessing builds one of these per record batch of a
-/// request; every batch of one request stamps the same batch and request
-/// identity.
+/// request; every batch of one request stamps the same request identity and
+/// admission instant.
 pub(crate) struct DecodeContext<'a> {
     /// Authenticated principal used for scope checks and managed columns.
     pub(crate) principal: &'a Principal,
@@ -500,12 +500,13 @@ pub(crate) struct DecodeContext<'a> {
     pub(crate) expected_schema_fingerprint: SchemaFingerprint,
     /// Stable request identity stamped into every accepted row.
     pub(crate) request_id: &'a RequestId,
-    /// Stable batch identity stamped into every accepted row.
-    pub(crate) batch_id: uuid::Uuid,
     /// Accepted caller event-time window.
     pub(crate) window: EventTimeWindow,
-    /// Fixed receipt time retained by current-only native production.
-    pub(crate) receipt_micros: Option<i64>,
+    /// Admission instant in epoch microseconds, read once per batch.
+    ///
+    /// Stamped as `wyrd_ingested_at`, used as `wyrd_event_time` when the caller
+    /// supplies none, and the anchor of the event-time acceptance window.
+    pub(crate) receipt_micros: i64,
     /// Canonical built-in whose physical identity this decode must preserve.
     ///
     /// `Some` only for a canonical signal table. A dynamic or pre-declared
@@ -536,17 +537,14 @@ fn decode_rows(
         if !seen.insert(field.name().as_str()) {
             return Err(ScribeError::InvalidFrame);
         }
-        // `wyrd_event_time` is intentionally absent from this reserved set: a
-        // caller MAY supply it as the authoritative event time, and it is then
-        // validated and preserved in `stamp_correlation_columns`. `run_id` is
-        // likewise absent: it is caller correlation that this function
-        // relinquishes and restamps exactly once in its canonical slot. Every
+        // A caller MAY supply `wyrd_event_time` as the authoritative event
+        // time; it is then validated and preserved in
+        // `stamp_correlation_columns`. `run_id` is caller correlation that this
+        // function relinquishes and restamps exactly once in its slot. Every
         // other managed column is unconditionally server-owned, so supplying
         // one is a refusal rather than an override.
-        if matches!(
-            field.name().as_str(),
-            CARD_UID | PRINCIPAL_ID | WYRD_BATCH_ID | WYRD_INGESTED_AT | WYRD_REQUEST_ID
-        ) {
+        let name = field.name().as_str();
+        if is_managed_column(name) && name != WYRD_EVENT_TIME && name != RUN_ID {
             return Err(ScribeError::InvalidFrame);
         }
     }
@@ -823,17 +821,16 @@ fn caller_run_id_column(rows: &RecordBatch) -> Result<Option<ArrayRef>, ScribeEr
 /// column is removed from the user projection and its array is reinserted
 /// verbatim (never re-stamped) in the canonical managed slot by
 /// [`append_managed_columns`]; when the column is absent the server stamps
-/// `wyrd_event_time` with the ingest receipt time in that same slot. Either way
-/// `wyrd_event_time` is written exactly once and lands between `wyrd_request_id`
-/// and `wyrd_ingested_at`, so the stamped batch's full field order equals
-/// [`with_managed_columns`](crate::schema::with_managed_columns) in every payload
-/// mode (D88). `wyrd_ingested_at` is always the server receipt time regardless of
-/// caller event time. Projected payloads retain their remaining correlation
-/// values unchanged.
+/// `wyrd_event_time` with the admission instant in that same slot. Either way
+/// `wyrd_event_time` is written exactly once in its declared slot, so the
+/// stamped batch's managed field order is the
+/// [`MANAGED_COLUMNS`](crate::tables::managed_columns::MANAGED_COLUMNS) order in
+/// every payload mode (D88). `wyrd_ingested_at` is always the admission instant
+/// regardless of caller event time. Projected payloads retain their remaining
+/// correlation values unchanged.
 ///
-/// The `window` check uses a single `receipt_micros` computed once at the
-/// entry of this function so an in-flight clock tick cannot split a batch
-/// verdict.
+/// The `window` check and both time columns use the one admission instant in
+/// `context`, read once per batch at admission.
 ///
 /// # Errors
 /// Returns [`ScribeError::InvalidFrame`] when a native payload supplies a
@@ -856,10 +853,6 @@ fn stamp_correlation_columns(
     } = context;
     let (principal, request_id, window) = (*principal, *request_id, *window);
     let receipt_micros = *receipt_micros;
-    let row_count = rows.num_rows();
-    // Compute one receipt instant for the whole batch so clock ticks mid-batch
-    // cannot split the verdict.
-    let receipt_micros = receipt_micros.map_or_else(current_receipt_micros, Ok)?;
     // Type/null/duplicate checks come first (T38). A malformed column stays
     // `InvalidFrame` regardless of window membership.
     validate_native_event_time(rows)?;
@@ -872,49 +865,40 @@ fn stamp_correlation_columns(
     }
     // A present `wyrd_event_time` (validated above for native payloads and
     // window-checked above for both modes) is always lifted out of the user
-    // projection here and reinserted verbatim in the canonical managed slot by
-    // `append_managed_columns`, never re-stamped. When absent, the server stamps
-    // the receipt time into that slot instead. Decoupling "exclude from the user
-    // block" from "stamp the receipt value" keeps the stamped field order equal
-    // to `with_managed_columns` in every payload mode (D88).
+    // projection here and reinserted verbatim in its managed slot by
+    // `managed_arrays`, never re-stamped. When absent, the server stamps the
+    // admission instant into that slot instead. Decoupling "exclude from the
+    // user block" from "stamp the admission value" keeps the stamped field
+    // order equal to the managed-column declaration in every payload mode (D88).
     let caller_event_time = rows
         .schema()
         .index_of(WYRD_EVENT_TIME)
         .ok()
         .map(|index| Arc::clone(rows.column(index)));
     let caller_run_id = caller_run_id_column(rows)?;
-    let server_owned = server_owned_columns();
-    let mut fields = user_fields(rows, &server_owned);
-    let mut columns = user_columns(rows, &server_owned);
+    let mut fields = user_fields(rows);
+    let mut columns = user_columns(rows);
     // A table whose rows carry their own identity declares
     // `CorrelationPolicy::None`, and its registered physical schema has no
-    // envelope slots at all. Stamping one anyway would seal an object with more
-    // columns than the table it is promoted into.
-    let appends_envelope = correlation_envelope_applies(context);
-    if appends_envelope {
-        let card_uids = resolve_card_uids(rows, principal, row_count)?;
-        fields.push(Field::new(RUN_ID, DataType::Utf8, true));
-        columns.push(caller_run_id.unwrap_or_else(|| {
-            Arc::new(StringArray::from(vec![None::<&str>; row_count])) as ArrayRef
-        }));
-        columns.push(Arc::new(StringArray::from(card_uids)) as ArrayRef);
-        columns.push(Arc::new(StringArray::from(vec![
-            principal.id.to_string();
-            row_count
-        ])));
-        columns.push(Arc::new(StringArray::from(vec![
-            request_id.as_str();
-            row_count
-        ])));
-    }
-    append_managed_columns(
-        &mut fields,
-        &mut columns,
-        context,
-        row_count,
-        caller_event_time,
-        receipt_micros,
-    )?;
+    // correlation or request slots. Stamping them anyway would seal an object
+    // with more columns than the table it is promoted into.
+    let policy = if correlation_envelope_applies(context) {
+        CorrelationPolicy::Observation
+    } else {
+        CorrelationPolicy::None
+    };
+    fields.extend(ensure_managed_columns(Vec::new(), policy));
+    columns.extend(managed_arrays(
+        rows,
+        &ManagedValues {
+            principal,
+            request_id,
+            receipt_micros,
+            caller_run_id,
+            caller_event_time,
+        },
+        policy,
+    )?);
     // A canonical built-in constructs only the arrays here: every correlation
     // and managed `Field` — with its stable id and sensitivity metadata — is
     // cloned from the table's own physical schema, and the locally assembled
@@ -1076,68 +1060,39 @@ fn enforce_event_time_window(
     Ok(())
 }
 
-/// Return physical columns excluded from user projection for one payload mode.
+/// Reports whether `name` is excluded from the user projection.
 ///
-/// Every managed column is unconditionally excluded from the user projection and
-/// materialized in its canonical slot by [`append_managed_columns`], regardless
-/// of whether the caller supplied it. In particular `wyrd_event_time` is always
-/// excluded: when the caller supplied a valid value it is reinserted verbatim in
-/// the canonical slot, and when it is absent the server stamps the receipt time
-/// there. Decoupling exclusion from the value source keeps the stamped field
-/// order equal to [`with_managed_columns`](crate::schema::with_managed_columns)
-/// in every payload mode (D88). `run_id` is listed here for the same reason:
-/// the caller relinquishes it from the user projection so the canonical
-/// nullable physical column can be stamped exactly once.
-fn server_owned_columns() -> Vec<&'static str> {
-    vec![
-        CARD_REF,
-        CARD_UID,
-        PRINCIPAL_ID,
-        WYRD_REQUEST_ID,
-        WYRD_EVENT_TIME,
-        WYRD_INGESTED_AT,
-        WYRD_BATCH_ID,
-        RUN_ID,
-    ]
+/// Every managed column is unconditionally excluded from the user projection
+/// and materialized in its declared slot by [`managed_arrays`], regardless of
+/// whether the caller supplied it. In particular `wyrd_event_time` is always
+/// excluded: when the caller supplied a valid value it is reinserted verbatim
+/// in its slot, and when it is absent the server stamps the admission instant
+/// there. `run_id` is excluded for the same reason, so the canonical nullable
+/// physical column is stamped exactly once. `card_ref` is a Gate input that
+/// resolves to `card_uid` and is never stored.
+fn is_server_owned(name: &str) -> bool {
+    name == CARD_REF || is_managed_column(name)
 }
 
-fn user_fields(rows: &RecordBatch, server_owned: &[&str]) -> Vec<Field> {
-    let schema = rows.schema();
-    let capacity = schema
+/// Returns the caller's user fields, in order, without server-owned columns.
+fn user_fields(rows: &RecordBatch) -> Vec<Field> {
+    rows.schema()
         .fields()
         .iter()
-        .filter(|field| !server_owned.contains(&field.name().as_str()))
-        .count();
-    let mut fields = Vec::with_capacity(capacity);
-    fields.extend(
-        schema
-            .fields()
-            .iter()
-            .filter(|field| !server_owned.contains(&field.name().as_str()))
-            .map(|field| field.as_ref().clone()),
-    );
-    debug_assert_eq!(fields.capacity(), capacity);
-    fields
+        .filter(|field| !is_server_owned(field.name()))
+        .map(|field| field.as_ref().clone())
+        .collect()
 }
 
-fn user_columns(rows: &RecordBatch, server_owned: &[&str]) -> Vec<ArrayRef> {
-    let schema = rows.schema();
-    let capacity = schema
+/// Returns the caller's user columns, in order, without server-owned columns.
+fn user_columns(rows: &RecordBatch) -> Vec<ArrayRef> {
+    rows.schema()
         .fields()
         .iter()
-        .filter(|field| !server_owned.contains(&field.name().as_str()))
-        .count();
-    let mut columns = Vec::with_capacity(capacity);
-    columns.extend(
-        schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| !server_owned.contains(&field.name().as_str()))
-            .map(|(index, _)| Arc::clone(rows.column(index))),
-    );
-    debug_assert_eq!(columns.capacity(), capacity);
-    columns
+        .zip(rows.columns())
+        .filter(|(field, _)| !is_server_owned(field.name()))
+        .map(|(_, column)| Arc::clone(column))
+        .collect()
 }
 
 /// Resolves row card references against the principal's signed Card scope.
@@ -1221,76 +1176,77 @@ fn correlation_envelope_applies(context: &DecodeContext<'_>) -> bool {
     })
 }
 
-/// Appends the server-owned managed columns to a partially-stamped batch.
+/// The per-batch values the managed columns are stamped from.
+struct ManagedValues<'a> {
+    /// Authenticated writer stamped as `principal_id` and used to resolve Cards.
+    principal: &'a Principal,
+    /// Request identity stamped as `wyrd_request_id`.
+    request_id: &'a RequestId,
+    /// Admission instant stamped as `wyrd_ingested_at`.
+    receipt_micros: i64,
+    /// Caller `run_id` column lifted out of the user projection, if supplied.
+    caller_run_id: Option<ArrayRef>,
+    /// Validated caller `wyrd_event_time` column, if supplied.
+    caller_event_time: Option<ArrayRef>,
+}
+
+/// Builds one array per managed column `policy` appends, in declared order.
 ///
-/// The event time, receipt timestamp, batch id, and tenant are
-/// appended unconditionally, values and all. The correlation envelope —
-/// `card_uid`, `wyrd_principal_id`, and `wyrd_request_id` — is conditional: its
-/// fields are declared here only when
-/// [`correlation_envelope_applies`] holds for this table, and their arrays were
-/// already pushed onto `columns` by the caller that decoded them, which is what
-/// makes the batch "partially stamped" on entry. A table whose correlation
-/// policy is `None` carries no such column at all.
-/// `wyrd_ingested_at` is always the server receipt time. `wyrd_event_time` is
-/// always materialized in the canonical slot (between `wyrd_request_id` and
-/// `wyrd_ingested_at`), so the stamped field order equals
-/// [`with_managed_columns`](crate::schema::with_managed_columns) in every payload
-/// mode (D88). Only the event-time *value* varies: `caller_event_time` carries a
-/// valid caller-supplied array (already validated and window-checked, lifted out
-/// of the user projection) that is written verbatim exactly once and never
-/// re-stamped; when it is `None` the server stamps the receipt time into the same
-/// slot.
+/// The layout — which columns, in which order, with which type — comes from
+/// [`MANAGED_COLUMNS`](crate::tables::managed_columns::MANAGED_COLUMNS); this
+/// function supplies only each column's values. `wyrd_event_time` is the
+/// caller's validated array verbatim when supplied, otherwise the admission
+/// instant, and `wyrd_ingested_at` is always the admission instant.
 ///
 /// # Errors
-/// Returns [`ScribeError::Internal`] when the system clock precedes the UNIX
-/// epoch, the receipt timestamp exceeds Arrow's range, or batch-id stamping
-/// fails.
-fn append_managed_columns(
-    fields: &mut Vec<Field>,
-    columns: &mut Vec<ArrayRef>,
-    context: &DecodeContext<'_>,
-    row_count: usize,
-    caller_event_time: Option<ArrayRef>,
-    receipt_micros: i64,
-) -> Result<(), ScribeError> {
-    let batch_id = context.batch_id;
-    if correlation_envelope_applies(context) {
-        fields.extend([
-            Field::new(CARD_UID, DataType::Utf8, true),
-            Field::new(PRINCIPAL_ID, DataType::Utf8, false),
-            Field::new(WYRD_REQUEST_ID, DataType::Utf8, false),
-        ]);
-    }
-    fields.extend([
-        Field::new(
-            WYRD_EVENT_TIME,
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        ),
-        Field::new(
-            WYRD_INGESTED_AT,
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        ),
-        Field::new(WYRD_BATCH_ID, DataType::FixedSizeBinary(16), false),
-    ]);
-    let timestamp_array = Arc::new(
-        TimestampMicrosecondArray::from(vec![receipt_micros; row_count]).with_timezone("UTC"),
+///
+/// Returns [`ScribeError::CardUnresolved`] when a `card_ref` cannot be resolved
+/// against the principal's signed scope, and [`ScribeError::Internal`] when a
+/// declared managed column has no stamping rule here.
+fn managed_arrays(
+    rows: &RecordBatch,
+    values: &ManagedValues<'_>,
+    policy: CorrelationPolicy,
+) -> Result<Vec<ArrayRef>, ScribeError> {
+    let row_count = rows.num_rows();
+    let admitted_at = Arc::new(
+        TimestampMicrosecondArray::from(vec![values.receipt_micros; row_count])
+            .with_timezone("UTC"),
     ) as ArrayRef;
-    // Event time lands in the canonical slot exactly once: the caller's array
-    // verbatim when supplied, otherwise the server receipt instant.
-    columns.push(caller_event_time.unwrap_or_else(|| Arc::clone(&timestamp_array)));
-    columns.push(timestamp_array);
-    let mut batch_id_builder = FixedSizeBinaryBuilder::with_capacity(row_count, 16);
-    for _ in 0..row_count {
-        batch_id_builder
-            .append_value(batch_id.as_bytes())
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("batch id stamping failed: {error}"),
-            })?;
-    }
-    columns.push(Arc::new(batch_id_builder.finish()));
-    Ok(())
+    policy
+        .managed_columns()
+        .map(|column| {
+            Ok(match column.field.name {
+                RUN_ID => values.caller_run_id.as_ref().map_or_else(
+                    || Arc::new(StringArray::from(vec![None::<&str>; row_count])) as ArrayRef,
+                    Arc::clone,
+                ),
+                CARD_UID => Arc::new(StringArray::from(resolve_card_uids(
+                    rows,
+                    values.principal,
+                    row_count,
+                )?)),
+                PRINCIPAL_ID => Arc::new(StringArray::from(vec![
+                    values.principal.id.to_string();
+                    row_count
+                ])),
+                WYRD_REQUEST_ID => Arc::new(StringArray::from(vec![
+                    values.request_id.as_str();
+                    row_count
+                ])),
+                WYRD_EVENT_TIME => values
+                    .caller_event_time
+                    .as_ref()
+                    .map_or_else(|| Arc::clone(&admitted_at), Arc::clone),
+                WYRD_INGESTED_AT => Arc::clone(&admitted_at),
+                other => {
+                    return Err(ScribeError::Internal {
+                        detail: format!("managed column {other} has no stamping rule"),
+                    });
+                }
+            })
+        })
+        .collect()
 }
 
 /// Closed set of CPU work permitted after admission has returned.
@@ -2198,8 +2154,7 @@ mod tests {
     use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::managed_columns::{
-        CARD_REF, CARD_UID, PRINCIPAL_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
-        WYRD_REQUEST_ID,
+        CARD_REF, CARD_UID, PRINCIPAL_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
     };
 
     use bytes::Bytes;
@@ -2216,6 +2171,7 @@ mod tests {
     use crate::scribe::replay::ReplayedSealKey;
     use crate::scribe::seal_key::SealKey;
     use crate::scribe::stream_identity::StreamIdentity;
+    use crate::tables::CorrelationPolicy;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
 
@@ -2242,10 +2198,15 @@ mod tests {
             principal,
             expected_schema_fingerprint: SchemaFingerprint([0_u8; 32]),
             request_id,
-            batch_id: Uuid::now_v7(),
             window: EventTimeWindow::default(),
-            receipt_micros: None,
+            receipt_micros: receipt_now(),
         }
+    }
+
+    /// The current admission instant, for fixtures whose event times are
+    /// derived from the same clock.
+    fn receipt_now() -> i64 {
+        super::current_receipt_micros().expect("the receipt clock is readable")
     }
 
     fn batch(fields: Vec<Field>, columns: Vec<ArrayRef>) -> RecordBatch {
@@ -2281,14 +2242,50 @@ mod tests {
         let run_id = stamped.schema().index_of("run_id").expect("run_id field");
         assert!(stamped.schema().field(run_id).is_nullable());
         assert_eq!(stamped.column(run_id).null_count(), stamped.num_rows());
-        let expected = Schema::new(crate::schema::with_managed_columns(vec![Field::new(
-            "value",
-            DataType::Int64,
-            false,
-        )]));
+        let expected = Schema::new(crate::tables::managed_columns::ensure_managed_columns(
+            vec![Field::new("value", DataType::Int64, false)],
+            CorrelationPolicy::Observation,
+        ));
         assert_eq!(
             SchemaFingerprint::from_arrow_schema(stamped.schema().as_ref()),
             SchemaFingerprint::from_arrow_schema(&expected),
+        );
+    }
+
+    /// Stamping writes the one admission instant as `wyrd_ingested_at` on every
+    /// row and writes no per-row batch column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stamped batch carries `wyrd_batch_id`, or when any row's
+    /// ingestion time differs from the admission instant in the context.
+    #[test]
+    fn stamping_writes_the_admission_instant_and_no_batch_column() {
+        const ADMITTED_AT: i64 = 1_700_000_000_123_456;
+        let rows = batch(
+            vec![Field::new("value", DataType::Int64, false)],
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2_i64]))],
+        );
+        let principal = principal();
+        let request_id = RequestId::now_v7();
+        let mut context = stamping_context(&principal, &request_id);
+        context.receipt_micros = ADMITTED_AT;
+
+        let stamped = stamp_correlation_columns(&rows, &context).expect("stamp");
+
+        assert!(
+            stamped.schema().index_of("wyrd_batch_id").is_err(),
+            "rows carry no per-row batch identity"
+        );
+        let ingested = stamped
+            .column_by_name(WYRD_INGESTED_AT)
+            .expect("ingestion time is stamped")
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("ingestion time is a microsecond timestamp");
+        assert!(
+            ingested.iter().all(|value| value == Some(ADMITTED_AT)),
+            "every row carries the admission instant"
         );
     }
 
@@ -2660,7 +2657,7 @@ mod tests {
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
-            Uuid::now_v7(),
+            receipt_now(),
             EventTimeWindow::default(),
             None,
         )
@@ -2702,7 +2699,7 @@ mod tests {
             principal,
             source_schema_fingerprint(schema),
             &RequestId::now_v7(),
-            Uuid::now_v7(),
+            receipt_now(),
             EventTimeWindow::default(),
             None,
         )
@@ -2820,7 +2817,7 @@ mod tests {
             &principal,
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
-            Uuid::now_v7(),
+            receipt_now(),
             EventTimeWindow::default(),
             None,
         )
@@ -2858,7 +2855,7 @@ mod tests {
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
-            Uuid::now_v7(),
+            receipt_now(),
             EventTimeWindow::default(),
             None,
         )
@@ -2885,7 +2882,7 @@ mod tests {
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
-            Uuid::now_v7(),
+            receipt_now(),
             EventTimeWindow::default(),
             None,
         )
@@ -2918,7 +2915,6 @@ mod tests {
             vec![Field::new("value", DataType::Int64, false)],
             vec![Arc::new(Int64Array::from(vec![1_i64]))],
         );
-        let batch_id = Uuid::now_v7();
         let decoded = decode(
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
@@ -2926,14 +2922,14 @@ mod tests {
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
-            batch_id,
+            receipt_now(),
             EventTimeWindow::default(),
             None,
         )
         .expect("schema is valid");
         assert!(decoded.schema().index_of("data_tenant_id").is_err());
         assert!(decoded.schema().index_of(PRINCIPAL_ID).is_ok());
-        assert!(decoded.schema().index_of(WYRD_BATCH_ID).is_ok());
+        assert!(decoded.schema().index_of("wyrd_batch_id").is_err());
         assert!(decoded.schema().index_of(WYRD_EVENT_TIME).is_ok());
         assert!(decoded.schema().index_of(WYRD_INGESTED_AT).is_ok());
         assert!(decoded.schema().index_of(WYRD_REQUEST_ID).is_ok());
@@ -2993,11 +2989,10 @@ mod tests {
 
     /// The canonical managed field-name order for a single `value` user column.
     fn canonical_managed_order() -> Vec<String> {
-        Schema::new(crate::schema::with_managed_columns(vec![Field::new(
-            "value",
-            DataType::Int64,
-            false,
-        )]))
+        Schema::new(crate::tables::managed_columns::ensure_managed_columns(
+            vec![Field::new("value", DataType::Int64, false)],
+            CorrelationPolicy::Observation,
+        ))
         .fields()
         .iter()
         .map(|field| field.name().clone())
@@ -3009,7 +3004,7 @@ mod tests {
     /// the user block into the managed slot (between `wyrd_request_id` and
     /// `wyrd_ingested_at`) — the order the Oracle's pinned sealed-fragment
     /// fingerprint requires. Before D88 the caller column stayed in the user block
-    /// and diverged from [`with_managed_columns`], breaking every sealed read.
+    /// and diverged from [`ensure_managed_columns`], breaking every sealed read.
     #[test]
     fn native_caller_event_time_lands_in_canonical_managed_slot() {
         let (principal, card) = scoped_service_principal();
@@ -3032,7 +3027,7 @@ mod tests {
             &principal,
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
-            Uuid::now_v7(),
+            receipt_now(),
             EventTimeWindow::default(),
             None,
         )
@@ -3065,7 +3060,7 @@ mod tests {
             &principal,
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
-            Uuid::now_v7(),
+            receipt_now(),
             EventTimeWindow::default(),
             None,
         )
@@ -3102,7 +3097,7 @@ mod tests {
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
-            Uuid::now_v7(),
+            receipt_now(),
             EventTimeWindow::default(),
             None,
         )
@@ -3142,7 +3137,7 @@ mod tests {
             &principal,
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
-            Uuid::now_v7(),
+            receipt_now(),
             EventTimeWindow::default(),
             None,
         )
@@ -3214,7 +3209,7 @@ mod tests {
             &principal,
             source_schema_fingerprint(rows_with.schema().as_ref()),
             &RequestId::now_v7(),
-            Uuid::now_v7(),
+            receipt_now(),
             EventTimeWindow::default(),
             None,
         )
@@ -3259,7 +3254,7 @@ mod tests {
             &principal,
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
-            Uuid::now_v7(),
+            receipt_now(),
             EventTimeWindow::default(),
             None,
         )
@@ -3358,7 +3353,7 @@ mod tests {
                 &principal,
                 source_schema_fingerprint(rows.schema().as_ref()),
                 &RequestId::now_v7(),
-                Uuid::now_v7(),
+                receipt_now(),
                 EventTimeWindow::default(),
                 None,
             )
@@ -3415,7 +3410,7 @@ mod tests {
             &principal,
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
-            Uuid::now_v7(),
+            receipt_now(),
             EventTimeWindow::default(),
             None,
         )
@@ -3455,7 +3450,7 @@ mod tests {
             &principal,
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
-            Uuid::now_v7(),
+            receipt_now(),
             window,
             None,
         )
@@ -3487,7 +3482,7 @@ mod tests {
             &principal,
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
-            Uuid::now_v7(),
+            receipt_now(),
             window,
             None,
         )
@@ -3519,7 +3514,7 @@ mod tests {
             &principal,
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
-            Uuid::now_v7(),
+            receipt_now(),
             EventTimeWindow::default(),
             None,
         )
@@ -3561,7 +3556,7 @@ mod tests {
             &principal,
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
-            Uuid::now_v7(),
+            receipt_now(),
             EventTimeWindow::default(),
             None,
         )
@@ -3594,7 +3589,7 @@ mod tests {
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
-            Uuid::now_v7(),
+            receipt_now(),
             EventTimeWindow::default(),
             None,
         )
@@ -3625,7 +3620,7 @@ mod tests {
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
-            Uuid::now_v7(),
+            receipt_now(),
             EventTimeWindow::default(),
             None,
         )
@@ -3662,7 +3657,7 @@ mod tests {
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
-            Uuid::now_v7(),
+            receipt_now(),
             tight_window,
             None,
         )
@@ -3718,7 +3713,7 @@ mod tests {
     #[test]
     fn native_other_reserved_columns_still_rejected() {
         let (principal, card) = scoped_service_principal();
-        for reserved in [WYRD_INGESTED_AT, WYRD_BATCH_ID, WYRD_REQUEST_ID] {
+        for reserved in [WYRD_INGESTED_AT, WYRD_REQUEST_ID, PRINCIPAL_ID] {
             let rows = batch(
                 vec![
                     Field::new(reserved, DataType::Utf8, false),
@@ -3734,7 +3729,7 @@ mod tests {
                 &principal,
                 source_schema_fingerprint(rows.schema().as_ref()),
                 &RequestId::now_v7(),
-                Uuid::now_v7(),
+                receipt_now(),
                 EventTimeWindow::default(),
                 None,
             )

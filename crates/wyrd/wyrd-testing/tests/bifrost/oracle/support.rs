@@ -5,9 +5,7 @@
 //! reading a journey does not mean reading this file first. Contains no
 //! tests.
 
-use arrow::array::{
-    ArrayRef, FixedSizeBinaryBuilder, Int64Array, StringArray, TimestampMicrosecondArray,
-};
+use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use chrono::Utc;
@@ -21,7 +19,8 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::analytical::AnalyticalLiveInspection;
 use vala_bifrost_redux::parquet::footer::tenant_key_value;
 use vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties_with_metadata;
-use vala_bifrost_redux::schema::with_managed_columns;
+use vala_bifrost_redux::tables::CorrelationPolicy;
+use vala_bifrost_redux::tables::managed_columns::ensure_managed_columns;
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
@@ -307,13 +306,14 @@ pub(crate) async fn seed_foreign_hot_row(
 ) -> Result<(), JourneyError> {
     let table_ref = TableRef::new(BifrostNamespace::Bifrost, table);
     let binding = TenantTableBinding::resolve((owner, table_ref))?;
-    let schema = Arc::new(Schema::new(with_managed_columns(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("filter_key", DataType::Utf8, false),
-        Field::new("unused_payload", DataType::Utf8, false),
-    ])));
-    let mut batch_ids = FixedSizeBinaryBuilder::with_capacity(1, 16);
-    batch_ids.append_value(uuid::Uuid::now_v7().as_bytes())?;
+    let schema = Arc::new(Schema::new(ensure_managed_columns(
+        vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("filter_key", DataType::Utf8, false),
+            Field::new("unused_payload", DataType::Utf8, false),
+        ],
+        CorrelationPolicy::Observation,
+    )));
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
@@ -326,7 +326,6 @@ pub(crate) async fn seed_foreign_hot_row(
             Arc::new(StringArray::from(vec![RequestId::now_v7().to_string()])),
             Arc::new(TimestampMicrosecondArray::from(vec![1_000_000_i64]).with_timezone("UTC")),
             Arc::new(TimestampMicrosecondArray::from(vec![1_000_001_i64]).with_timezone("UTC")),
-            Arc::new(batch_ids.finish()),
         ],
     )?;
     let mut parquet = Vec::new();

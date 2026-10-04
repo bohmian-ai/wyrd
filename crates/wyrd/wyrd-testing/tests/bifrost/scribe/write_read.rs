@@ -1085,6 +1085,7 @@ async fn append_correlated(
         .expect("public ingest transport")
         .insert(table, uuid::Uuid::now_v7(), ipc)
         .await
+        .map(|_request_id| ())
 }
 
 /// Read every row's value, stamped Card UID, and publishing principal.

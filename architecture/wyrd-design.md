@@ -665,12 +665,14 @@ Consequences, stated so they stop drifting:
   never splits a batch by card or run. The server therefore authorizes every
   present `card_ref` **per row** (every distinct asserted Card in the batch must
   be in the principal's scope),
-  validates the client-generated UUIDv7 `wyrd_batch_id`, stamps
-  request-scoped `data_tenant_id`, `wyrd_request_id`, and
-  `wyrd_ingested_at`, validates caller-supplied `wyrd_event_time` against a
-  bounded acceptance window and rejects out-of-range values (never clamps or
-  normalizes them). Row identity is batch-level; no per-row position is
-  stamped.
+  validates the client-generated UUIDv7 `wyrd_batch_id` request field (the
+  idempotency key; it is not a row column), stamps request-scoped
+  `wyrd_request_id` and `wyrd_ingested_at` — the PostgreSQL admission instant,
+  read once per batch and never caller-supplied — and validates
+  caller-supplied `wyrd_event_time` against a bounded acceptance window around
+  that instant, rejecting out-of-range values (never clamping or normalizing
+  them). A row without `wyrd_event_time` takes `wyrd_ingested_at`. Row
+  identity is batch-level; no per-row position is stamped.
 
 - **`card_ref` is optional and authorized, not trusted.** Its absence is valid
   generic telemetry and produces null `card_uid`; the authenticated publisher

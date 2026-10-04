@@ -307,6 +307,11 @@ pub struct ScribeImpl {
     recovery_cancelled: Arc<AtomicBool>,
     /// Optional server-provisioned immutable persistence runtime.
     persistence: Option<Arc<persistence::PersistenceRuntime>>,
+    /// Control-plane `PostgreSQL`, the clock of record for `wyrd_ingested_at`.
+    ///
+    /// `None` only for an engine built without persistence, which has no
+    /// durable control state and stamps admission from the system clock.
+    control_postgres: Option<Arc<vala_sql::ValaPostgres>>,
     #[cfg(any(test, feature = "test-support"))]
     ingest_stall: Arc<std::sync::Mutex<Option<Arc<IngestStall>>>>,
     /// Optional decoded-request ceiling used only by bounded regression tests;
@@ -1165,7 +1170,7 @@ impl ScribeImpl {
                 persistence_cpu: persistence_cpu.clone(),
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
-                control_postgres,
+                control_postgres: control_postgres.clone(),
                 stream,
                 memory_ownership,
                 hot_sources: Arc::clone(&hot_sources),
@@ -1198,6 +1203,7 @@ impl ScribeImpl {
             recovery_ready: AtomicBool::new(true),
             recovery_cancelled: Arc::new(AtomicBool::new(false)),
             persistence,
+            control_postgres,
             #[cfg(any(test, feature = "test-support"))]
             ingest_stall: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]

@@ -1139,13 +1139,13 @@ impl GeometryWorkload {
             writer.write(&batch).expect("IPC batch");
             writer.finish().expect("IPC terminal");
         }
-        let batch_id = Uuid::now_v7();
-        transport
-            .insert(table, batch_id, ipc)
+        let request_id = transport
+            .insert(table, Uuid::now_v7(), ipc)
             .await
             .expect("public append acknowledged");
+        let request_id = Uuid::parse_str(request_id.as_str()).expect("request identity is a UUID");
         self.expected.extend(values.iter().map(|value| ManagedRow {
-            batch_id,
+            request_id,
             value: *value,
         }));
     }

@@ -558,14 +558,28 @@ mod pg_tests {
             let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
                 .await
                 .expect("tenant connection");
+            let ingested_at = vala_sql::queries::scribe_batch_commits::ingest_instant(&mut conn)
+                .await
+                .expect("admission instant");
             assert_eq!(
-                vala_sql::queries::scribe_batch_commits::record(&mut conn, &canonical)
+                vala_sql::queries::scribe_batch_commits::record(&mut conn, &canonical, ingested_at)
                     .await
                     .expect("canonical fence"),
                 vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::Committed,
                 "a first observation of a batch identity commits it"
             );
             conn.commit().await.expect("commit canonical fence");
+            let stored: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+                "SELECT ingested_at FROM vala.scribe_batch_commits WHERE batch_id = $1",
+            )
+            .bind(batch_id)
+            .fetch_one(&superuser)
+            .await
+            .expect("stored ingestion instant");
+            assert_eq!(
+                stored, ingested_at,
+                "the fence stores the admission instant Scribe stamps on the rows"
+            );
 
             let retry = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
                 wal_writer_epoch: 2,
@@ -591,7 +605,7 @@ mod pg_tests {
                 ..retry.clone()
             };
             assert_eq!(
-                vala_sql::queries::scribe_batch_commits::record(&mut conn, &resend)
+                vala_sql::queries::scribe_batch_commits::record(&mut conn, &resend, chrono::Utc::now())
                     .await
                     .expect("re-sent identical batch resolves"),
                 vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::AlreadyCommitted,

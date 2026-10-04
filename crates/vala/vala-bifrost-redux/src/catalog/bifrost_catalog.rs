@@ -35,7 +35,7 @@ use crate::catalog::wire::{
 use crate::catalog::{TableRef, TenantTableBinding};
 use crate::forge::{COMPACTION_TYPE_PROPERTY, ForgeCompactionType};
 use crate::namespaces::BifrostNamespace;
-use crate::schema::{SchemaFingerprint, with_managed_columns};
+use crate::schema::SchemaFingerprint;
 use crate::storage::BifrostStorage;
 use crate::tables::{BuiltinTableDefinition, builtin_table};
 use iceberg_datafusion::IcebergStaticTableProvider;
@@ -1762,7 +1762,12 @@ fn resolve_registration_layout(
     canonical_schema: Option<&Schema>,
 ) -> Result<(Schema, PhysicalLayout), BifrostCatalogError> {
     let arrow_schema = canonical_schema.map_or_else(
-        || Schema::new(with_managed_columns(user_fields.to_vec())),
+        || {
+            Schema::new(crate::tables::managed_columns::ensure_managed_columns(
+                user_fields.to_vec(),
+                crate::tables::CorrelationPolicy::Observation,
+            ))
+        },
         Clone::clone,
     );
     let schema_refusal = |detail: String| {

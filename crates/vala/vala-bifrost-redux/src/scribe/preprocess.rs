@@ -10,7 +10,6 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 use wyrd_runtime::Principal;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::managed_columns::{WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID};
 
 use crate::catalog::TableRef;
 use crate::catalog::TimeGranularity;
@@ -47,6 +46,8 @@ pub(crate) struct AdmittedAppend {
     pub batch_id: Uuid,
     /// Request correlation retained for the durable batch-commit fence.
     pub request_id: Uuid,
+    /// Admission instant stamped as `wyrd_ingested_at` and stored on the fence.
+    pub ingested_at_micros: i64,
     pub rows: AdmittedRows,
     pub measured_wire_bytes: usize,
     pub reservation: InflightFrameReservation,
@@ -81,7 +82,7 @@ pub(crate) struct NativeAdmittedRows {
     pub(crate) expected_schema_fingerprint: SchemaFingerprint,
     /// Request identity stamped into every source batch.
     pub(crate) request_id: RequestId,
-    /// Stable batch identity stamped into every source batch.
+    /// Stable batch identity keying every produced slice.
     pub(crate) batch_id: Uuid,
     /// Immutable event-time acceptance window.
     pub(crate) event_time_window: EventTimeWindow,
@@ -106,6 +107,8 @@ pub(crate) struct NativeAdmittedRows {
 #[derive(Debug)]
 pub(crate) struct PreparedAppend {
     pub batch_id: Uuid,
+    /// Admission instant stamped as `wyrd_ingested_at` and stored on the fence.
+    pub ingested_at_micros: i64,
     pub tenant: DataTenantId,
     pub table: TableRef,
     pub prepared_bytes: usize,
@@ -385,9 +388,8 @@ fn stamp_native_source(
             principal: &source.principal,
             expected_schema_fingerprint: source.expected_schema_fingerprint,
             request_id: &source.request_id,
-            batch_id: source.batch_id,
             window: source.event_time_window,
-            receipt_micros: Some(source.receipt_micros),
+            receipt_micros: source.receipt_micros,
             definition: source.definition,
         },
     )
@@ -468,7 +470,7 @@ pub(crate) fn correlation_data_identity(rows: &RecordBatch) -> Result<[u8; 32], 
     digest.update(b"wyrd.correlation-identity.v1");
     let mut bytes = 0_usize;
     for (field, column) in rows.schema().fields().iter().zip(rows.columns()) {
-        if !wyrd_spec::vala::managed_columns::is_reserved_correlation_column(field.name()) {
+        if !crate::tables::managed_columns::is_correlation_column(field.name()) {
             continue;
         }
         digest.update(field.name().as_bytes());
@@ -491,18 +493,14 @@ pub(crate) fn logical_data_identity(rows: &RecordBatch) -> Result<([u8; 32], u32
     let mut digest = Sha256::new();
     let mut bytes = 0_usize;
     for (field, column) in rows.schema().fields().iter().zip(rows.columns()) {
-        // Request-scoped columns are stamped fresh on every attempt, so they
-        // describe *which* request carried the rows, not what the rows are.
-        // Binding any of them would make an honest client retry of the same
-        // batch look like a different batch. The correlation set is taken from
-        // the spec predicate rather than restated here so a newly reserved
-        // correlation column cannot silently re-enter this identity.
-        if wyrd_spec::vala::managed_columns::is_reserved_correlation_column(field.name())
-            || matches!(
-                field.name().as_str(),
-                WYRD_REQUEST_ID | WYRD_EVENT_TIME | WYRD_INGESTED_AT
-            )
-        {
+        // Managed columns describe *which* request carried the rows and whose
+        // attribution they bear, not what the rows are: the request and time
+        // columns are stamped fresh on every attempt, and correlation is bound
+        // separately by `correlation_data_identity`. Binding any of them here
+        // would make an honest client retry of the same batch look like a
+        // different batch. The set is the managed-column declaration itself,
+        // so a newly managed column cannot silently enter this identity.
+        if crate::tables::managed_columns::is_managed_column(field.name()) {
             continue;
         }
         digest.update(field.name().as_bytes());
@@ -655,6 +653,7 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
     let AdmittedAppend {
         batch_id,
         request_id,
+        ingested_at_micros,
         rows,
         measured_wire_bytes: _measured_wire_bytes,
         reservation,
@@ -694,6 +693,7 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
 
     Ok(PreparedAppend {
         batch_id,
+        ingested_at_micros,
         tenant,
         table,
         prepared_bytes,

@@ -240,7 +240,7 @@ pub enum BifrostError {
         code = "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
         status = 400,
         title = "Reserved system column name",
-        remediation = "Rename the column — wyrd_event_time, wyrd_ingested_at, wyrd_batch_id, and data_tenant_id are reserved."
+        remediation = "Rename the column — run_id, card_uid, principal_id, wyrd_request_id, wyrd_event_time, and wyrd_ingested_at are reserved."
     )]
     ReservedColumn {
         /// The reserved column name that was supplied.

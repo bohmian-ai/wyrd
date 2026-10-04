@@ -46,7 +46,9 @@ of 1 GiB; the fast profile's 4 MiB stage / 8 MiB target scales the same
 way), so they use the default instead of an explicit threshold. RED/GREEN
 with real files at the scaled geometry: two staged-size files merge into
 one target-size output; a target-size output is never selected again by a
-later compaction; a lone staged-size file is left until a partner arrives.
+later compaction; a lone staged-size file is left until a partner arrives (core group filter
+`min_group_file_count = 2` on the SmallFiles config only; the core's
+`min_size_per_partition` only sizes parallelism).
 Unit tests pin 768 MiB at the 1 GiB default and 75% of a declared target.
 Update docs (`forge.svx` property table and compaction prose) and
 `architecture/bifrost-design.md` if it states the old default type or

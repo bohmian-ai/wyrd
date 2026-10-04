@@ -269,8 +269,9 @@ compaction type compacts `small-files`. The small-file threshold is no longer
 a fixed 64 MiB: it is 75% of the table's resolved file target (768 MiB at the
 1 GiB default, following a table's own `write.target-file-size-bytes`).
 Files below it are merge candidates; files at or above it are finished and
-are never selected again. The core's existing per-partition minimum keeps a
-lone staged file waiting for a partner. `full`, `auto` and
+are never selected again. Forge's `small-files` plan sets the core's existing group filter
+(`min_group_file_count = 2`), so a lone staged file waits for a partner;
+`full`, `auto` and `files-with-delete` keep upstream grouping. `full`, `auto` and
 `files-with-delete` remain available per table through REQ-012.
 
 ## Invariants

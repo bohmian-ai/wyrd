@@ -2568,7 +2568,6 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{AppState, LimitsConfig};
 

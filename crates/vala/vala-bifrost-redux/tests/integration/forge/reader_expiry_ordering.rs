@@ -1,215 +1,111 @@
-//! Tier-2 coverage for the one table-local winner between reader widening and
-//! prepared snapshot expiration.
+//! Tier-2 coverage for the ordering between Oracle active table reads and
+//! Forge destructive maintenance.
 //!
-//! Both owners take the same `vala.bifrost_table_maintenance_authority` row.
-//! Whichever takes it first wins for the snapshots it names: a prepared claim
-//! makes the reader re-resolve before any source IO, and a surviving protection
-//! header makes preparation refuse. Neither owner may widen the boundary to the
-//! whole table, so an unrelated table and an unrelated cut still progress.
+//! Cut acquisition and every destructive preparation take the same
+//! `vala.bifrost_table_maintenance_authority` row, so an active read is
+//! observed by snapshot expiration, expired-object cleanup, and orphan
+//! cleanup alike. Nothing waits for snapshot age: the first maintenance pass
+//! after the table's last reader releases may destroy what it replaced.
 
-use uuid::Uuid;
-use vala_sql::queries::forge_operations::ForgeOperations;
-use vala_sql::row_types::forge_operations::{
-    ForgeClaimTable, ForgeExpirationAuthority, ForgeExpirationPreparation, ForgeOperationFamily,
+use std::collections::BTreeSet;
+
+use chrono::Duration as ChronoDuration;
+
+use super::snapshot_expiration::{
+    assert_files_exist, commit_snapshot, latest_cleanup_task, leader_only_table, maintain_once,
+    object_exists, seed_never_published_object, snapshot_files,
 };
-use vala_sql::row_types::forge_tasks::ForgeTaskEvidence;
-use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
-use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{AuditDetail, ForgeSnapshotExpirePhase, StoragePath};
+use super::support::ForgeTelemetryCheckpoint;
 
-use crate::oracle::reader_authority::{AuthorityFixture, cut};
-
-/// Canonical Forge resource string for one registered table.
-fn resource_for(identity: &TableAuthorityIdentity) -> String {
-    format!(
-        "bifrost://{}/{}/{}",
-        identity.tenant, identity.namespace_name, identity.table_name
-    )
-}
-
-/// Seeds one live Forge lease and one running snapshot-expiry task.
+/// Proves the table's last active reader, not snapshot age, gates destruction.
+///
+/// Two queries hold active reads while two commits replace every older
+/// snapshot and an aged never-published object waits for orphan cleanup.
+/// While either read is held, the leader's maintenance pass expires nothing
+/// and orphan cleanup deletes nothing. Releasing the first reader changes
+/// nothing; releasing the last lets the very next pass expire every replaced
+/// snapshot without any clock advance, drain the expired-object cleanup it
+/// handed off, and keep the head's files. Orphan cleanup then deletes the
+/// orphan.
 ///
 /// # Panics
 ///
-/// Panics when either seeding statement fails.
-async fn seed_running_expiry_task(
-    fixture: &AuthorityFixture,
-    tenant: DataTenantId,
-    identity: &TableAuthorityIdentity,
-    base_snapshot_id: i64,
-    plan_hash_byte: &str,
-) -> ForgeExpirationAuthority {
-    let authority = ForgeExpirationAuthority {
-        task_id: Uuid::now_v7(),
-        attempt_id: Uuid::now_v7(),
-        worker_id: Uuid::now_v7(),
-        lease_key: format!("forge:{}:{}", identity.table_name, base_snapshot_id),
-        lease_fencing_token: base_snapshot_id,
-    };
-    let pool = fixture.database.operator_pool().pool();
-    sqlx::query("INSERT INTO vala.maintenance_leases (lease_key,owner,fencing_token,expires_at,heartbeat_at) VALUES ($1,$2,$3,now()+interval '10 minutes',now())")
-        .bind(&authority.lease_key)
-        .bind(authority.worker_id)
-        .bind(authority.lease_fencing_token)
-        .execute(pool)
-        .await
-        .expect("lease seeds");
-    sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,ready_at) VALUES ($1,$2,$3,$4,$5,'snapshot_expiry',$8,'{}'::jsonb,decode(repeat($9,32),'hex'),1,1,'running',$6,$7,now()+interval '10 minutes',$8,1,now())")
-        .bind(authority.task_id)
-        .bind(tenant.as_uuid())
-        .bind(&identity.catalog_name)
-        .bind(&identity.namespace_name)
-        .bind(&identity.table_name)
-        .bind(authority.attempt_id)
-        .bind(authority.worker_id)
-        .bind(base_snapshot_id)
-        .bind(plan_hash_byte)
-        .execute(pool)
-        .await
-        .expect("running task seeds");
-    authority
-}
+/// Panics when anything is destroyed while a read is held, a replaced
+/// snapshot or the orphan survives after release, or the head loses a file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn last_table_reader_controls_destructive_cleanup() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let table = leader_only_table("last_table_reader").await;
+    let fixture = &table.fixture;
+    let readers = [
+        fixture.hold_active_read().await,
+        fixture.hold_active_read().await,
+    ];
+    let replaced = table.watermark.0;
+    let replaced_files = snapshot_files(fixture, replaced).await;
+    commit_snapshot(&table).await;
+    let head = commit_snapshot(&table).await;
+    // Only orphan collection has an age rule (its object TTL), so only the
+    // orphan needs the Forge clock moved; snapshot expiry never reads it.
+    let orphan = seed_never_published_object(fixture).await;
+    table
+        .control
+        .advance(ChronoDuration::hours(48))
+        .expect("manual clock advance");
+    let forge = table.supervised.forge();
+    let deletes_before = table.store.deletes();
 
-/// Prepares one snapshot expiration for the exact selection.
-///
-/// # Errors
-///
-/// Returns the SQL owner's refusal when a surviving protection frontier covers
-/// a selected snapshot or the claim collides with another operation.
-///
-/// # Panics
-///
-/// Panics when the fixed resource cannot construct the owner.
-async fn prepare_expiration(
-    fixture: &AuthorityFixture,
-    identity: &TableAuthorityIdentity,
-    authority: &ForgeExpirationAuthority,
-    selected: &[i64],
-) -> Result<(), vala_sql::SqlError> {
-    let resource = resource_for(identity);
-    let detail = AuditDetail::ForgeSnapshotExpire {
-        operation_id: Uuid::now_v7(),
-        phase: ForgeSnapshotExpirePhase::Prepared,
-        group: resource.clone(),
-        base_metadata_location: StoragePath::new("table/iceberg/metadata/00001-base.json")
-            .expect("valid path"),
-        current_snapshot_id: Some(90),
-        retained_ref_heads: vec![90],
-        cutoff_ms: 1_700_000_000_000,
-        selected_snapshot_ids: selected.to_vec(),
-    };
-    let table = ForgeClaimTable {
-        table_uid: identity.table_uid,
-        catalog_name: identity.catalog_name.clone(),
-        namespace_name: identity.namespace_name.clone(),
-        table_name: identity.table_name.clone(),
-        table_uuid: Uuid::now_v7(),
-    };
-    let evidence = ForgeTaskEvidence {
-        prepared_candidate_index: None,
-        version: 1,
-        committed_snapshot_id: None,
-        committed_metadata_location: None,
-        committed_metadata_digest: None,
-        cleanup_candidates: Vec::new(),
-        deleted_candidate_count: 0,
-    };
-    ForgeOperations::new(&resource, ForgeOperationFamily::SnapshotExpire)
-        .expect("valid Forge resource")
-        .prepare_snapshot_expiration(
-            fixture.database.operator_pool(),
-            identity.tenant,
-            &ForgeExpirationPreparation {
-                authority,
-                table: &table,
-                evidence: &evidence,
-                operation: "forge.snapshot_expire.prepared",
-                detail: &detail,
-            },
-        )
-        .await
-        .map(|_| ())
-}
-
-/// Proves both lock winners, per-snapshot rather than per-table exclusion, and
-/// that a surviving header protects even after its epoch lost its lease.
-///
-/// # Panics
-///
-/// Panics on any admission, refusal, or durable-state mismatch.
-#[tokio::test]
-async fn reader_and_expiration_claim_have_one_table_local_winner() {
-    let fixture = AuthorityFixture::start().await;
-    let (authority, _terminator) = fixture.authority().await;
-    let tenant = fixture.tenant().await;
-    let events = fixture.table(tenant, "events").await;
-    let orders = fixture.table(tenant, "orders").await;
-
-    // --- Forge takes the table row first --------------------------------
-    let expiring = seed_running_expiry_task(&fixture, tenant, &events, 20, "00").await;
-    prepare_expiration(&fixture, &events, &expiring, &[30])
-        .await
-        .expect("first preparation claims snapshot 30");
-
-    // A cut whose frontier protects the claimed snapshot loses, and it loses
-    // before any source IO.
-    let refused = authority
-        .acquire_guard_for_cuts(vec![(events.clone(), cut(30, 300, &[30, 20, 10]))])
-        .await;
-    assert!(
-        refused.is_err(),
-        "a claimed snapshot refuses reader widening"
-    );
-    assert!(
-        fixture.header(&events).await.is_none(),
-        "the refused admission published no protection header"
-    );
-
-    // The boundary is per protected snapshot, not per table: a newer cut whose
-    // frontier does not protect the claimed snapshot, and an unrelated table,
-    // both still progress.
-    let _clear_cut = authority
-        .acquire_guard_for_cuts(vec![(events.clone(), cut(40, 400, &[40, 30]))])
-        .await
-        .expect("a cut that avoids the claim still admits");
-    let _other_table = authority
-        .acquire_guard_for_cuts(vec![(orders.clone(), cut(70, 700, &[70, 60]))])
-        .await
-        .expect("an unrelated table still admits");
-    assert!(
-        fixture.header(&events).await.is_some(),
-        "the admitted cut published its protection header"
-    );
-
-    // --- the reader takes the table row first ---------------------------
-    // `orders` widened first, so its surviving header refuses a preparation
-    // over the exact snapshot it protects.
-    let contested = seed_running_expiry_task(&fixture, tenant, &orders, 21, "11").await;
-    let lost = prepare_expiration(&fixture, &orders, &contested, &[70]).await;
-    assert!(
-        lost.is_err(),
-        "a surviving protection frontier refuses preparation over its snapshot"
-    );
-
-    // A header remains a root regardless of its epoch's liveness: only its
-    // durable removal makes it absent.
-    // The collapse only changes the supervisor's next deadline read, so wait
-    // for it to actually fence the epoch; within one renewal interval it does.
-    authority.collapse_lease_for_test();
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        while authority.admits() {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    for (released, why) in [(None, "two reads"), (Some(readers[0]), "the last read")] {
+        if let Some(query_id) = released {
+            fixture.release_active_read(query_id).await;
         }
-    })
-    .await
-    .expect("the collapsed epoch loses its lease and closes admission");
-    let still_lost = prepare_expiration(&fixture, &orders, &contested, &[70]).await;
-    assert!(
-        still_lost.is_err(),
-        "an epoch that lost its lease still protects through its surviving header"
+        let (before, after) = maintain_once(&table).await;
+        assert_eq!(
+            after.snapshots, before.snapshots,
+            "no snapshot expires while {why} is held"
+        );
+        let report = forge
+            .run_orphan_gc_report_for_test(&fixture.binding)
+            .await
+            .expect("orphan cleanup runs and refuses");
+        assert_eq!(report.deleted, 0, "orphan cleanup deletes nothing while {why} is held");
+        assert!(
+            object_exists(fixture, &orphan).await,
+            "the orphan survives while {why} is held"
+        );
+        assert_eq!(
+            table.store.deletes(),
+            deletes_before,
+            "no object is deleted while {why} is held"
+        );
+        assert_files_exist(fixture, &replaced_files, "a replaced snapshot under read").await;
+    }
+
+    fixture.release_active_read(readers[1]).await;
+    let head_files = snapshot_files(fixture, head).await;
+    let (_, after) = maintain_once(&table).await;
+    assert_eq!(
+        after.snapshots,
+        BTreeSet::from([head]),
+        "the first pass after the last reader expires every replaced snapshot"
     );
+    let cleanup = latest_cleanup_task(fixture).await;
+    assert_eq!(cleanup.state, "succeeded", "the handed-off cleanup drained");
+    for path in &cleanup.paths {
+        assert!(
+            !object_exists(fixture, path).await,
+            "the drained cleanup deleted {path}"
+        );
+    }
+    assert_files_exist(fixture, &head_files, "the retained head").await;
+    let report = forge
+        .run_orphan_gc_report_for_test(&fixture.binding)
+        .await
+        .expect("orphan cleanup runs");
+    assert_eq!(report.deleted, 1, "orphan cleanup deletes exactly the orphan");
     assert!(
-        fixture.header(&orders).await.is_some(),
-        "the surviving header was never removed"
+        !object_exists(fixture, &orphan).await,
+        "the orphan is gone after the last reader"
     );
+    table.supervised.shutdown().await;
 }

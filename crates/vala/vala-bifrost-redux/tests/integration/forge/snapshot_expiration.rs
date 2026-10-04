@@ -22,7 +22,7 @@ use vala_bifrost_redux::forge::{
 use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
 use wyrd_spec::DataTenantId;
 
-use super::expired_cleanup::{expire_claim, reader_authority};
+use super::expired_cleanup::expire_claim;
 use super::support::{
     CountingObjectStore, ForgeTelemetryCheckpoint, PromotionCatalogSeam,
     PromotionIntegrationFixture, SupervisedPromotion, manual_clock, set_table_properties,
@@ -353,7 +353,7 @@ pub(super) async fn head_watermark(fixture: &PromotionIntegrationFixture) -> (i6
         .expect("a promotion left a current snapshot")
 }
 
-/// Promotes twice and ages the clock so the older snapshot is expirable.
+/// Promotes twice so the older snapshot is replaced and expirable.
 ///
 /// # Panics
 ///
@@ -369,15 +369,15 @@ pub(super) async fn expirable_table(name: &str) -> ExpirableTable {
         Arc::clone(&store) as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>,
         clock,
     );
-    // Two real promotion commits leave two snapshots, so the retained head
-    // still leaves an expirable ancestor under `retain_last = 1`.
+    // Two real promotion commits leave two snapshots, so the replaced first
+    // one is expirable as soon as nothing reads the table.
     supervised.run_one_success().await;
     fixture.seal_more(2).await;
     supervised.restart_worker();
     supervised.run_one_success().await;
-    // Every existing snapshot is now older than the retention cutoff. Each
-    // later advance moves the cutoff, so every pass derives its own
-    // deterministic operation identity instead of replaying the previous one.
+    // Snapshot expiry has no age rule; this advance only puts the Forge clock
+    // past the orphan TTL, so a never-published object seeded afterwards is
+    // old enough for orphan collection.
     control
         .advance(ChronoDuration::hours(48))
         .expect("manual clock advance");
@@ -810,7 +810,7 @@ async fn settled_expiration_outranks(event: ConcurrentSettlementEvent) {
 /// # Panics
 ///
 /// Panics when the staging operator rejects the write.
-async fn seed_never_published_object(fixture: &PromotionIntegrationFixture) -> String {
+pub(super) async fn seed_never_published_object(fixture: &PromotionIntegrationFixture) -> String {
     let path = format!(
         "{}/data/forge/{FORGE_WRITER_RECIPE}/{}-00001-{}.parquet",
         fixture.binding.object_prefix,
@@ -1033,7 +1033,7 @@ pub(super) async fn maintain_once(table: &ExpirableTable) -> (HeadShape, HeadSha
 ///
 /// Panics when a fixture dependency fails or the first promotion commits no
 /// snapshot.
-async fn leader_only_table(name: &str) -> ExpirableTable {
+pub(super) async fn leader_only_table(name: &str) -> ExpirableTable {
     let fixture = PromotionIntegrationFixture::start(name).await;
     let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
     let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
@@ -1062,7 +1062,7 @@ async fn leader_only_table(name: &str) -> ExpirableTable {
 /// # Panics
 ///
 /// Panics when the seal or the pass fails, or the head does not move.
-async fn commit_snapshot(table: &ExpirableTable) -> i64 {
+pub(super) async fn commit_snapshot(table: &ExpirableTable) -> i64 {
     let (before, _) = head_watermark(&table.fixture).await;
     table.fixture.seal_more(1).await;
     table.supervised.schedule_only().await;
@@ -1106,7 +1106,7 @@ fn leader_term(table: &ExpirableTable) -> Arc<ForgeHeldTerm> {
 /// # Panics
 ///
 /// Panics when the table, the snapshot, or its manifest list cannot be read.
-async fn snapshot_files(fixture: &PromotionIntegrationFixture, snapshot_id: i64) -> Vec<String> {
+pub(super) async fn snapshot_files(fixture: &PromotionIntegrationFixture, snapshot_id: i64) -> Vec<String> {
     let table = fixture
         .catalog
         .iceberg_catalog()
@@ -1137,7 +1137,7 @@ async fn snapshot_files(fixture: &PromotionIntegrationFixture, snapshot_id: i64)
 /// # Panics
 ///
 /// Panics when a file is missing or its existence cannot be read.
-async fn assert_files_exist(fixture: &PromotionIntegrationFixture, files: &[String], why: &str) {
+pub(super) async fn assert_files_exist(fixture: &PromotionIntegrationFixture, files: &[String], why: &str) {
     let table = fixture
         .catalog
         .iceberg_catalog()
@@ -1157,13 +1157,13 @@ async fn assert_files_exist(fixture: &PromotionIntegrationFixture, files: &[Stri
 }
 
 /// The one expired-cleanup task a committed expiration's handoff became.
-struct CleanupTask {
+pub(super) struct CleanupTask {
     /// Durable task identity.
-    task_id: Uuid,
+    pub(super) task_id: Uuid,
     /// Current `vala.forge_tasks.state`.
-    state: String,
+    pub(super) state: String,
     /// Exact candidate paths the task's immutable plan copied from the handoff.
-    paths: Vec<String>,
+    pub(super) paths: Vec<String>,
 }
 
 /// Reads the fixture tenant's newest expired-cleanup task and its candidates.
@@ -1171,7 +1171,7 @@ struct CleanupTask {
 /// # Panics
 ///
 /// Panics when no cleanup task exists or its plan cannot be read.
-async fn latest_cleanup_task(fixture: &PromotionIntegrationFixture) -> CleanupTask {
+pub(super) async fn latest_cleanup_task(fixture: &PromotionIntegrationFixture) -> CleanupTask {
     let pool = fixture.operator_pool.pool();
     let (task_id, state): (Uuid, String) = sqlx::query_as(
         "SELECT task_id, state FROM vala.forge_tasks \
@@ -1219,10 +1219,10 @@ async fn expiry_attempts(fixture: &PromotionIntegrationFixture) -> i64 {
 ///
 /// Phase one pulls a compaction through the production pull route after two
 /// commits, so the leader holds its watermark in memory only, then commits
-/// twice more and ages every snapshot past retention. The maintenance pass
-/// must expire the one snapshot older than the watermark and keep the
-/// watermark and everything after it; a further pass, with nothing older
-/// than the watermark left, must not open an expiry attempt. Phase two runs a manual compaction on a
+/// twice more. The maintenance pass must expire the one snapshot older than
+/// the watermark and keep the watermark and everything after it; a further
+/// pass, with nothing outside the held chain left, must not open an expiry
+/// attempt. Phase two runs a manual compaction on a
 /// table the leader has observed no commit for, so the dispatch carries no
 /// watermark at all, and the pass must expire nothing.
 ///
@@ -1230,7 +1230,7 @@ async fn expiry_attempts(fixture: &PromotionIntegrationFixture) -> i64 {
 ///
 /// Panics when a protected snapshot is expired, an unprotected one survives,
 /// or the leader routes misbehave.
-async fn assert_compaction_watermark_blocks_expiry(table: &ExpirableTable) -> i64 {
+async fn assert_compaction_watermark_blocks_expiry(table: &ExpirableTable) {
     let forge = table.supervised.forge();
     let key = table_key(&table.fixture);
     let first = table.watermark.0;
@@ -1244,10 +1244,6 @@ async fn assert_compaction_watermark_blocks_expiry(table: &ExpirableTable) -> i6
     );
     let later = [commit_snapshot(table).await, commit_snapshot(table).await];
     let held_files = snapshot_files(&table.fixture, held).await;
-    table
-        .control
-        .advance(ChronoDuration::hours(48))
-        .expect("manual clock advance");
     let (_, after) = maintain_once(table).await;
     assert_eq!(
         after.snapshots,
@@ -1255,19 +1251,15 @@ async fn assert_compaction_watermark_blocks_expiry(table: &ExpirableTable) -> i6
         "expiry removes only what precedes the in-flight watermark {held} (first was {first})"
     );
     assert_files_exist(&table.fixture, &held_files, "the watermark snapshot").await;
-    // With the watermark now the oldest snapshot, the clamped cutoff leaves
-    // nothing expirable, so the leader records no expiry attempt at all.
+    // With the watermark now the oldest snapshot, the held chain covers every
+    // snapshot, so the leader records no expiry attempt at all.
     let attempts = expiry_attempts(&table.fixture).await;
-    table
-        .control
-        .advance(ChronoDuration::hours(48))
-        .expect("manual clock advance");
     let (before, after) = maintain_once(table).await;
     assert_eq!(after.snapshots, before.snapshots);
     assert_eq!(
         expiry_attempts(&table.fixture).await,
         attempts,
-        "a clamped cutoff with nothing older opens no expiry attempt"
+        "a held chain covering every snapshot opens no expiry attempt"
     );
     forge
         .report_compaction(&dispatch[0], ForgeCompactionOutcome::Succeeded)
@@ -1283,7 +1275,7 @@ async fn assert_compaction_watermark_blocks_expiry(table: &ExpirableTable) -> i6
         &[("wyrd.forge.enable-compaction", "false")],
     )
     .await;
-    let unobserved = commit_snapshot(table).await;
+    commit_snapshot(table).await;
     assert!(
         leader_term(table).schedule().track_for_test(&key).is_none(),
         "a disabled table's idle track is dropped"
@@ -1303,10 +1295,6 @@ async fn assert_compaction_watermark_blocks_expiry(table: &ExpirableTable) -> i6
         Some(None),
         "a manual run on an unobserved table holds no watermark"
     );
-    table
-        .control
-        .advance(ChronoDuration::hours(48))
-        .expect("manual clock advance");
     let (before, after) = maintain_once(table).await;
     assert_eq!(
         after.snapshots, before.snapshots,
@@ -1320,53 +1308,6 @@ async fn assert_compaction_watermark_blocks_expiry(table: &ExpirableTable) -> i6
         leader_term(table).schedule().track_for_test(&key).is_none(),
         "the manual run's temporary track is removed after its report"
     );
-    unobserved
-}
-
-/// A pinned Oracle reader cut keeps its snapshot and that snapshot's files.
-///
-/// The reader resolves and protects the current head through the production
-/// identity and guard routes, two more commits make it an ancestor, and every
-/// snapshot ages past retention. The maintenance pass must expire the older
-/// ancestors only. The pin is then released and its epoch retired, so the
-/// following scenario sees no reader protection.
-///
-/// # Panics
-///
-/// Panics when the pinned snapshot or any of its files is removed, an
-/// unprotected snapshot survives, or the reader authority misbehaves.
-async fn assert_oracle_pin_blocks_expiry(table: &ExpirableTable, pinned: i64) {
-    let epoch_shutdown = CancellationToken::new();
-    let (oracle, _) = reader_authority(&table.fixture, &epoch_shutdown).await;
-    let prepared = table
-        .fixture
-        .catalog
-        .prepare_reader_identity(&table.fixture.binding.table_ref, table.fixture.tenant)
-        .await
-        .expect("the registered table resolves");
-    let (guard, permit) = oracle
-        .acquire_guard(std::slice::from_ref(&prepared))
-        .await
-        .expect("the reader protects its cut");
-    let later = [commit_snapshot(table).await, commit_snapshot(table).await];
-    let pinned_files = snapshot_files(&table.fixture, pinned).await;
-    table
-        .control
-        .advance(ChronoDuration::hours(48))
-        .expect("manual clock advance");
-    let (_, after) = maintain_once(table).await;
-    assert_eq!(
-        after.snapshots,
-        BTreeSet::from([pinned, later[0], later[1]]),
-        "expiry removes only what precedes the pinned reader cut {pinned}"
-    );
-    assert_files_exist(&table.fixture, &pinned_files, "the pinned reader cut").await;
-    drop(permit);
-    drop(guard);
-    oracle
-        .retire(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
-        .await
-        .expect("the reader epoch retires");
 }
 
 /// A cleanup that fails after expiry commits is retried for exactly its files.
@@ -1386,10 +1327,6 @@ async fn assert_oracle_pin_blocks_expiry(table: &ExpirableTable, pinned: i64) {
 async fn assert_failed_cleanup_retries_exactly(table: &mut ExpirableTable) {
     let head = commit_snapshot(table).await;
     let head_files = snapshot_files(&table.fixture, head).await;
-    table
-        .control
-        .advance(ChronoDuration::hours(48))
-        .expect("manual clock advance");
     table.store.fail_next_deletes(1);
     let deletes_before = table.store.deletes();
     let (_, after) = maintain_once(table).await;
@@ -1449,12 +1386,12 @@ async fn assert_failed_cleanup_retries_exactly(table: &mut ExpirableTable) {
     assert_files_exist(&table.fixture, &head_files, "the retained head").await;
 }
 
-/// Leader maintenance never expires what an active watermark or pin protects.
+/// Leader maintenance never expires what an active watermark protects.
 ///
 /// Drives the production leader maintenance pass, never a seeded task, over
-/// one table: an in-flight compaction's watermark clamps the cutoff and a
-/// watermark-less one skips expiry; a pinned Oracle reader cut keeps its
-/// snapshot's files; and a cleanup that fails after its expiry committed is
+/// one table: an in-flight compaction's watermark holds its chain and a
+/// watermark-less one skips expiry; and a cleanup that fails after its expiry
+/// committed is
 /// retried, once its claim lapses, for exactly the handed-off files.
 ///
 /// # Panics
@@ -1462,11 +1399,10 @@ async fn assert_failed_cleanup_retries_exactly(table: &mut ExpirableTable) {
 /// Panics when any phase's retained snapshots, files, or deletes differ.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Postgres, Iceberg, and object storage"]
-async fn active_watermark_and_oracle_pin_block_expiry() {
+async fn active_watermark_blocks_expiry_and_failed_cleanup_retries_exactly() {
     let _telemetry = ForgeTelemetryCheckpoint::install();
     let mut table = leader_only_table("expiry_protection").await;
-    let pinned = assert_compaction_watermark_blocks_expiry(&table).await;
-    assert_oracle_pin_blocks_expiry(&table, pinned).await;
+    assert_compaction_watermark_blocks_expiry(&table).await;
     assert_failed_cleanup_retries_exactly(&mut table).await;
     table.supervised.shutdown().await;
 }

@@ -97,13 +97,13 @@ deletion. Successful expiry precedes deletion of its uniquely expired files
 (REQ-007, INV-005/006).
 
 **RED.** Add
-forge::snapshot_expiration::active_watermark_and_oracle_pin_block_expiry
+forge::snapshot_expiration::active_watermark_blocks_expiry_and_failed_cleanup_retries_exactly
 to the existing redux integration target with an active compaction and
 pinned Oracle cut. Include catalog-success/file-cleanup-failure followed by
 safe retry using the existing expired-cleanup fault seam. A timer-only
 rewrite that omits protection must fail.
 Run exactly:
-scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p vala-bifrost-redux --test integration -P journey --run-ignored=all -E "test(=forge::snapshot_expiration::active_watermark_and_oracle_pin_block_expiry)"'
+scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p vala-bifrost-redux --test integration -P journey --run-ignored=all -E "test(=forge::snapshot_expiration::active_watermark_blocks_expiry_and_failed_cleanup_retries_exactly)"'
 
 **GREEN.** Apply RisingWave's watermark rule from gc.rs:219-262 and its
 expiry-then-cleanup sequence from gc.rs:264-316. Reuse Wyrd's
@@ -222,7 +222,7 @@ c6ceefb0a (immediate boot election, server journey port), bcf803523
 |---|---|---|
 | One GC loop on the leader: manifest rewrite, then expiry, then orphan cleanup; per-table errors logged, pass continues | `forge/gc.rs` `run_maintenance`, `forge/scheduler.rs` `maintain` | `forge::production_routes::leader_timer_rewrites_manifests_before_expiry` |
 | Manifest rewrite opt-in, skipped on format v3; target-size and min-count-to-merge properties | `gc.rs` (`wyrd.forge.enable-manifest-rewrite`, `commit.manifest.*`) | `leader_timer_skips_manifest_rewrite_when_disabled`, `leader_timer_skips_manifest_rewrite_on_format_v3` |
-| Snapshot expiration on by default; cutoff clamped to a running compaction's watermark | `gc.rs` `expiry_due`, `expire.rs` `snapshot_protection_roots` | `forge::snapshot_expiration::active_watermark_and_oracle_pin_block_expiry` |
+| Snapshot expiration on by default; cutoff clamped to a running compaction's watermark | `gc.rs` `expiry_due`, `expire.rs` `snapshot_protection_roots` | `forge::snapshot_expiration::active_watermark_blocks_expiry_and_failed_cleanup_retries_exactly` |
 | Membership in memory, filled by commits; a new leader starts empty | `leader.rs` `apply_membership`, `refresh_membership` | `production_closeout::empty_maintenance_restart_protects_orphans` |
 
 Wyrd additions beyond RisingWave (required by Wyrd's Oracle and durable
@@ -299,7 +299,7 @@ admits the cleanup handoff), `ForgeSchedulerTrigger` (gained
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
 | AC-006 maintenance order, opt-in rewrite, default expiry, per-table isolation | gc.rs `run_maintenance` | Scenario 1 tests 3/3; redux forge 56/56 | PASS |
-| AC-007 expiry protects running compaction and Oracle readers; cleanup retry | expire.rs, gc.rs | `active_watermark_and_oracle_pin_block_expiry` | PASS |
+| AC-007 expiry protects running compaction and Oracle readers; cleanup retry | expire.rs, gc.rs | `active_watermark_blocks_expiry_and_failed_cleanup_retries_exactly` | PASS |
 | INV empty leader restart; orphan protection; standby runs nothing | leader.rs, scheduler.rs | `empty_maintenance_restart_protects_orphans`; journey 19/19 | PASS |
 | REQ-010 superseded machinery removed | see Removed | static inventory above; vala-sql `pg_forge_tasks` 33/33 | PASS |
 | Docs | forge.svx, bifrost-design.md | `mise run docs:check` pass | PASS |

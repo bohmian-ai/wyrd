@@ -407,15 +407,29 @@ async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
         sealed: &BTreeSet<String>,
         label: &str,
     ) {
-        let permit = vala_bifrost_redux::oracle::reader_pins::ReaderIoPermit::unfenced_for_test();
-        let prepared = catalog
-            .prepare_reader_identity(table, tenant)
+        let query_id = uuid::Uuid::now_v7();
+        let acquired = catalog
+            .acquire_active_cut(
+                tenant,
+                vala_sql::queries::oracle_reader_authority::ActiveReadOwner {
+                    query_id,
+                    node_id: uuid::Uuid::now_v7(),
+                    fencing_token: 1,
+                },
+                std::slice::from_ref(table),
+            )
             .await
-            .expect("the registered table prepares its reader identity");
+            .expect("the registered table acquires its active cut")
+            .pop()
+            .expect("one acquired table");
         let pinned = catalog
-            .materialize_reader_cut(prepared, &permit)
+            .materialize_acquired_cut(tenant, table, acquired)
             .await
             .unwrap_or_else(|error| panic!("{label} cut: {error}"));
+        catalog
+            .release_active_reads(tenant, query_id)
+            .await
+            .expect("the inspection cut releases its active read");
         let hot = pinned
             .hot_files
             .iter()

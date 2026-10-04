@@ -334,7 +334,8 @@ impl Forge {
     /// The pre-checks run on the leader: a processing compaction without an
     /// observed snapshot skips the table, one with a snapshot holds the chain
     /// from the current snapshot down to it, and a table with no other
-    /// replaced snapshot skips. The recorded expiry attempt then re-derives
+    /// replaced snapshot skips, as does a table an Oracle query is reading.
+    /// The recorded expiry attempt then re-derives
     /// its selection from durable roots — running attempts, claims, and
     /// unresolved operations — and preparation refuses while an Oracle query
     /// still reads the table. An unconsumed handoff from an earlier
@@ -363,7 +364,10 @@ impl Forge {
                 tracing::info!(table = %key.table.table, "Forge expiry skipped: a compaction has no observed snapshot");
                 false
             }
-            watermark => expiry_due(&table, watermark.flatten()),
+            watermark => {
+                expiry_due(&table, watermark.flatten())
+                    && !self.table_is_read(key.tenant, &binding.table_ref).await?
+            }
         };
         let Some(task) = self
             .expiry_task(key, &table, expiry_due, reconciliation_due)
@@ -375,6 +379,40 @@ impl Forge {
             .execute_accepted(Uuid::now_v7(), &task, stop)
             .await?;
         self.clean_expired(executor, key, stop).await
+    }
+
+    /// Reports whether an Oracle query is reading one table, so the leader
+    /// records no expiry attempt that preparation would only refuse.
+    ///
+    /// Advisory only: a refused attempt would stay the table's active attempt
+    /// until its retry, delaying the first pass after the last reader. The
+    /// authoritative check is preparation's own refusal under the table's
+    /// maintenance authority. Commits so abandoned reads it discards stay
+    /// discarded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the transaction or statements fail and
+    /// [`ForgeError::Invariant`] when the table is unregistered.
+    async fn table_is_read(
+        &self,
+        tenant: wyrd_spec::DataTenantId,
+        table_ref: &crate::catalog::TableRef,
+    ) -> Result<bool, ForgeError> {
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let active = super::table_authority::TableAuthority::new(&mut conn)
+            .has_active_reads(tenant, table_ref)
+            .await?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        if active {
+            tracing::info!(table = %table_ref.fqn(), "Forge expiry deferred: an Oracle query is reading the table");
+        }
+        Ok(active)
     }
 
     /// Builds the recorded expiry attempt for one table, when one is due.

@@ -2060,6 +2060,47 @@ mod pg_tests {
             .await
             .expect("claim cleanup task");
 
+        // An active Oracle read on the table refuses candidate preparation
+        // under the table's maintenance authority until the read releases.
+        let reader = Uuid::now_v7();
+        sqlx::query("INSERT INTO vala.oracle_active_table_reads (data_tenant_id,query_id,table_uid,catalog_name,namespace_name,table_name,node_id,fencing_token,acquired_at,abandon_after) VALUES ($1,$2,$3,$4,$5,$6,$7,1,now(),now()+interval '6 hours')")
+            .bind(tenant.as_uuid())
+            .bind(reader)
+            .bind(table.table_uid.as_slice())
+            .bind(&table.catalog_name)
+            .bind(&table.namespace_name)
+            .bind(&table.table_name)
+            .bind(Uuid::now_v7())
+            .execute(&admin)
+            .await
+            .expect("seed an active table read");
+        assert!(
+            matches!(
+                tasks
+                    .prepare_expired_cleanup_candidate(
+                        tenant,
+                        ExpiredCleanupCandidateRequest {
+                            authority: &authority,
+                            table: &table,
+                            index: 0,
+                            candidate: &candidates[0]
+                        },
+                    )
+                    .await,
+                Err(vala_sql::SqlError::Conflict { .. })
+            ),
+            "an active table read refuses cleanup preparation"
+        );
+        assert!(
+            evidence_of(&admin, cleanup_id).await.is_none(),
+            "the refused preparation wrote no evidence"
+        );
+        sqlx::query("DELETE FROM vala.oracle_active_table_reads WHERE query_id=$1")
+            .bind(reader)
+            .execute(&admin)
+            .await
+            .expect("release the active table read");
+
         let index = 0_u32;
         assert_eq!(
             tasks

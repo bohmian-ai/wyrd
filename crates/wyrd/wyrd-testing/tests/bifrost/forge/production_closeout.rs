@@ -33,35 +33,12 @@ use wyrd_testing::bifrost::{
     BifrostClusterSpec, CommitUncertaintyCatalog, TestOracleResources, WyrdTestCluster,
 };
 
-/// Reads one node's live Oracle reader-authority fence.
-///
-/// Durable protection rows are keyed by node and epoch, so an inspection has to
-/// name the exact fence the reading node currently holds rather than any value
-/// carried on the wire.
-///
-/// # Panics
-/// Panics if the node is absent, composes no Oracle, or reports a negative fence.
-fn oracle_fence(cluster: &WyrdTestCluster, node: NodeId) -> u64 {
-    let authority = cluster
-        .server_by_node(node)
-        .expect("the inspected node is composed")
-        .state()
-        .bifrost
-        .oracle()
-        .expect("the inspected node composes an Oracle")
-        .engine()
-        .reader_authority()
-        .fencing_token();
-    u64::try_from(authority).expect("positive Oracle fence")
-}
-
 /// Every Oracle-serving node's ranged-read pause, armed before a lazy public read.
 ///
-/// The destination Oracle answers a delegated cut on its analytical follower,
-/// which acquires that node's durable reader protection *before* it opens any
-/// object. Stalling the production storage owner at its first ranged read
-/// therefore holds the query at a point where the protection it committed is
-/// already durable and observable, without adding any production seam.
+/// The query's leader commits its active table read before any object IO, so
+/// stalling the production storage owner at the first ranged read holds the
+/// query at a point where that read is already durable and observable,
+/// without adding any production seam.
 struct OracleReadBarriers {
     /// One barrier per Oracle-serving node, paired with that node's identity.
     entries: Vec<(NodeId, Arc<StorageOperationBarrier>)>,
@@ -1053,18 +1030,8 @@ impl CloseoutJourney {
                 "{family}"
             );
         }
-        let authority = self
-            .oracle()
-            .state()
-            .bifrost
-            .oracle()
-            .expect("Oracle role")
-            .engine()
-            .reader_authority();
         eprintln!(
-            "Oracle epoch node={} fence={}; worker identities={:?}",
-            authority.node_id(),
-            authority.fencing_token(),
+            "worker identities={:?}",
             self.observer.completed_workers()
         );
         operations
@@ -1347,38 +1314,23 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     assert_output_geometry(&outputs, workload.expected.len(), target);
     journey.assert_objects(&inputs).await;
     journey.assert_objects(&outputs).await;
-    // A public read that returns the right rows can still be reading a stale
-    // cut. Pause the follower at its first-batch gate and require its durable
-    // protection to name the replacement snapshot: that is what proves the
-    // post-compaction read pinned the new cut rather than the promoted one.
+    // Pause the follower at its first ranged read: the query's active table
+    // read must already be durable there, because acquisition commits it
+    // before any object IO.
     let barriers = OracleReadBarriers::arm(&journey.cluster);
     let paused_read = read_managed_rows(&reader, &table.qualified);
     let inspect_protection = async {
         let reader_node = tokio::time::timeout(PASS_BOUND, barriers.first_reached())
             .await
             .expect("lazy query reaches its first ranged read");
-        let record = journey
+        let active = journey
             .cluster
             .server_by_node(reader_node)
             .expect("the stalled reader is a composed node")
-            .oracle_table_protection_for_test(
-                &table.binding,
-                reader_node,
-                oracle_fence(&journey.cluster, reader_node),
-            )
+            .oracle_active_table_reads_for_test(&table.binding)
             .await
-            .expect("protection read")
-            .expect("durable protection before the first ranged read");
-        assert!(
-            record
-                .frontier
-                .members
-                .iter()
-                .any(|member| member.protected_snapshot_id == replacement_snapshot),
-            "the post-compaction read pins the replacement snapshot \
-             {replacement_snapshot}: {:?}",
-            record.frontier.members
-        );
+            .expect("active read inspection");
+        assert_eq!(active, 1, "the held query owns one active table read");
         barriers.release();
     };
     let (actual, ()) = tokio::join!(paused_read, inspect_protection);
@@ -1543,43 +1495,27 @@ impl ReaderCleanupJourney {
         }
     }
 
-    /// Waits for every Oracle epoch to narrow its durable frontier after terminal.
+    /// Waits for the terminal query to release its active table read.
     ///
     /// # Panics
-    /// Panics if an epoch retains the completed old query or inspection fails.
+    /// Panics if the read survives the pass bound or inspection fails.
     async fn wait_for_reader_release(&self) {
         tokio::time::timeout(PASS_BOUND, async {
             loop {
-                let mut retained = false;
-                for server in self.roles.cluster.servers() {
-                    if let Some(oracle) = server.state().bifrost.oracle() {
-                        let authority = oracle.engine().reader_authority();
-                        let record = server
-                            .oracle_table_protection_for_test(
-                                &self.table.binding,
-                                server.node_id(),
-                                u64::try_from(authority.fencing_token())
-                                    .expect("positive Oracle fence"),
-                            )
-                            .await
-                            .expect("durable frontier inspection");
-                        retained |= record.is_some_and(|record| {
-                            record
-                                .frontier
-                                .members
-                                .iter()
-                                .any(|member| member.ancestry_path.contains(&self.old_snapshot))
-                        });
-                    }
-                }
-                if !retained {
+                let active = self
+                    .roles
+                    .coordinator()
+                    .oracle_active_table_reads_for_test(&self.table.binding)
+                    .await
+                    .expect("active read inspection");
+                if active == 0 {
                     return;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("terminal query releases durable protection");
+        .expect("terminal query releases its active table read");
     }
 
     /// Holds a public reader while earlier objects are deleted, then releases it.
@@ -1596,26 +1532,15 @@ impl ReaderCleanupJourney {
                 .await
                 .expect("lazy query reaches its first ranged read");
             assert_ne!(reader_node, self.roles.worker_node);
-            let record = self
+            let active = self
                 .roles
                 .cluster
                 .server_by_node(reader_node)
                 .expect("the stalled reader is a composed node")
-                .oracle_table_protection_for_test(
-                    &self.table.binding,
-                    reader_node,
-                    oracle_fence(&self.roles.cluster, reader_node),
-                )
+                .oracle_active_table_reads_for_test(&self.table.binding)
                 .await
-                .expect("protection read")
-                .expect("durable protection before the first ranged read");
-            assert!(
-                record
-                    .frontier
-                    .members
-                    .iter()
-                    .any(|member| member.protected_snapshot_id == self.old_snapshot)
-            );
+                .expect("active read inspection");
+            assert_eq!(active, 1, "the held query owns one active table read");
             self.workload
                 .append_batch(&self.transport, &self.table.qualified, &[5, 6])
                 .await;

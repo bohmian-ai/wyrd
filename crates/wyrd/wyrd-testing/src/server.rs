@@ -3406,6 +3406,7 @@ impl WyrdTestServer {
         conn.commit().await.map_err(sql)?;
         Ok(count)
     }
+
     /// Return the durable Scribe WAL root this fixture composed the server with.
     ///
     /// Durability assertions replay the WAL directly rather than trusting an

@@ -918,7 +918,6 @@ fn expire_detail(fixture: &PromotionIntegrationFixture, operation_id: Uuid) -> s
         )),
         current_snapshot_id: Some(1),
         retained_ref_heads: vec![1],
-        cutoff_ms: 0,
         selected_snapshot_ids: Vec::new(),
     })
 }

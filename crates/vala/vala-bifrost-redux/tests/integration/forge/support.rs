@@ -52,6 +52,8 @@ use vala_bifrost_redux::scribe::{
     ScribeWalIoPool,
 };
 use vala_sql::queries::forge_tasks::ForgeTasks;
+use vala_sql::queries::oracle_reader_authority::ActiveReadOwner;
+use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
 use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
 use wyrd_spec::DataTenantId;
 
@@ -826,6 +828,66 @@ pub(crate) struct PromotionIntegrationFixture {
 }
 
 impl PromotionIntegrationFixture {
+    /// Records one live Oracle query's active read on the fixture table.
+    ///
+    /// Goes through the production catalog acquisition, so the row is the
+    /// exact durable state a held query leaves and serializes with Forge on
+    /// the same table maintenance authority. The owner fence names no live
+    /// node, which is harmless: abandonment also needs PostgreSQL time past
+    /// the six-hour expiry, so the row stays protective for the whole test.
+    ///
+    /// # Panics
+    /// Panics when the acquisition fails.
+    pub(crate) async fn hold_active_read(&self) -> Uuid {
+        let query_id = Uuid::now_v7();
+        self.catalog
+            .acquire_active_cut(
+                self.tenant,
+                ActiveReadOwner {
+                    query_id,
+                    node_id: Uuid::now_v7(),
+                    fencing_token: 1,
+                },
+                std::slice::from_ref(&self.binding.table_ref),
+            )
+            .await
+            .expect("the registered table's active read commits");
+        query_id
+    }
+
+    /// Releases one query's active reads through the production statement.
+    ///
+    /// # Panics
+    /// Panics when the release fails or removes no row.
+    pub(crate) async fn release_active_read(&self, query_id: Uuid) {
+        let released = self
+            .catalog
+            .release_active_reads(self.tenant, query_id)
+            .await
+            .expect("the active read releases");
+        assert_eq!(released, 1, "the query held exactly one table read");
+    }
+
+    /// Reads the fixture table's maintenance-authority identity.
+    ///
+    /// # Panics
+    /// Panics when the table is unregistered or its UID is malformed.
+    pub(crate) async fn table_identity(&self) -> TableAuthorityIdentity {
+        let table_uid: Vec<u8> =
+            sqlx::query_scalar("SELECT table_uid FROM vala.bifrost_tables WHERE data_tenant_id=$1")
+                .bind(self.tenant.as_uuid())
+                .fetch_one(self.operator_pool.pool())
+                .await
+                .expect("the fixture table is registered");
+        TableAuthorityIdentity {
+            tenant: self.tenant,
+            table_uid: table_uid.try_into().expect("table uid is 16 bytes"),
+            catalog_name: vala_bifrost_redux::catalog::BIFROST_CATALOG_NAME.to_owned(),
+            namespace_name: self.binding.table_ref.namespace.as_str().to_owned(),
+            table_name: self.binding.table_ref.name.clone(),
+        }
+    }
+
     /// Enqueues the fixture's owed promotion and returns its production worker
     /// with the requested existing observer gates, without starting it yet.
     ///

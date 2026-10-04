@@ -10,7 +10,9 @@ use chrono::{DateTime, Utc};
 use sqlx::{AssertSqlSafe, types::Uuid};
 use wyrd_spec::DataTenantId;
 
-use crate::queries::forge_operations::{assert_lease_fence, bind_tenant, lock_table_authority};
+use crate::queries::forge_operations::{
+    assert_lease_fence, bind_tenant, lock_table_authority, refuse_active_table_reads,
+};
 use crate::row_types::forge_operations::{ForgeClaimTable, ForgeExpirationAuthority};
 use crate::row_types::forge_tasks::{
     ExpiredCleanupCandidateRequest, ExpiredCleanupOutcome, ExpiredCleanupPayload,
@@ -1163,17 +1165,14 @@ impl ForgeTasks {
     /// only the nullable prepared index. Replaying the exact already-prepared
     /// tuple is read-only and emits no audit; every mismatch refuses.
     ///
-    /// Reader safety is deliberately not decided here. A snapshot a live reader
-    /// still covers was already refused at the source expiration's own
-    /// preparation, and whether this candidate's object is still reachable from
-    /// a pinned snapshot is re-proven per candidate against the live catalog
-    /// immediately before the delete. A reader that is merely behind the
-    /// committed head is not evidence against this deletion: that reader's own
-    /// snapshot was retained precisely because it lowered the expiry cutoff.
+    /// Every candidate preparation, including an exact replay, refuses while
+    /// any Oracle query still holds an active read on the table, so no
+    /// physical delete is prepared from a previously observed absence.
     ///
     /// # Errors
     ///
-    /// Returns [`SqlError::Conflict`] when the lease fence is lost, the task,
+    /// Returns [`SqlError::Conflict`] when an Oracle query still reads the
+    /// table, the lease fence is lost, the task,
     /// attempt, owner, table, or claim does not match exactly, the plan and
     /// evidence disagree, the cursor is not `request.index`, a candidate is
     /// already prepared, or the named candidate is not the plan's candidate at
@@ -1198,13 +1197,11 @@ impl ForgeTasks {
         bind_tenant(&mut tx, tenant).await?;
         assert_lease_fence(&mut tx, request.authority).await?;
         let locked = lock_cleanup_task(&mut tx, request.authority, request.table).await?;
-        // The table-authority row lock is the point of this call: it serializes
-        // preparation against Oracle reader-protection expansion, which refuses
-        // to widen while an unresolved preparation names an object. The identity
-        // it returns is not needed here, because whether a live reader still
-        // needs this candidate is proven per candidate against live catalog
-        // reachability immediately before the delete, not from SQL alone.
-        let _locked_authority = lock_table_authority(&mut tx, tenant, request.table).await?;
+        // The table-authority row lock serializes this preparation with Oracle
+        // cut acquisition, so the active-read refusal below stays true until
+        // this transaction commits the prepared candidate.
+        let identity = lock_table_authority(&mut tx, tenant, request.table).await?;
+        refuse_active_table_reads(&mut tx, &identity).await?;
         let payload = locked.payload()?;
         require_named_candidate(&payload, request.index, request.candidate)?;
 

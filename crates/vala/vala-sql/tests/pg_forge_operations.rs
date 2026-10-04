@@ -666,7 +666,6 @@ mod pg_tests {
                     .expect("valid path"),
                 current_snapshot_id: Some(42),
                 retained_ref_heads: vec![42, 43],
-                cutoff_ms: 1_700_000_000_000i64,
                 selected_snapshot_ids: vec![1, 2, 3],
             };
             let prepared_event = event("forge.snapshot_expire.prepared", resource(), Some(detail));
@@ -685,7 +684,6 @@ mod pg_tests {
                     base_metadata_location,
                     current_snapshot_id,
                     retained_ref_heads,
-                    cutoff_ms,
                     selected_snapshot_ids,
                     ..
                 } => AuditDetail::ForgeSnapshotExpire {
@@ -695,7 +693,6 @@ mod pg_tests {
                     base_metadata_location: base_metadata_location.clone(),
                     current_snapshot_id: *current_snapshot_id,
                     retained_ref_heads: retained_ref_heads.clone(),
-                    cutoff_ms: *cutoff_ms,
                     selected_snapshot_ids: selected_snapshot_ids.clone(),
                 },
                 _ => panic!("expected snapshot-expiry detail"),
@@ -861,7 +858,6 @@ mod pg_tests {
                         .expect("valid path"),
                         current_snapshot_id: Some(42),
                         retained_ref_heads: vec![42],
-                        cutoff_ms: 1_700_000_000_000,
                         selected_snapshot_ids: vec![1],
                     },
                     "Reset transition is not valid for family snapshot_expire",
@@ -1397,7 +1393,6 @@ mod pg_tests {
                 .expect("valid path"),
                 current_snapshot_id: Some(77),
                 retained_ref_heads: vec![77],
-                cutoff_ms: 1_700_000_000_000,
                 selected_snapshot_ids: vec![11, 12],
             }
         }

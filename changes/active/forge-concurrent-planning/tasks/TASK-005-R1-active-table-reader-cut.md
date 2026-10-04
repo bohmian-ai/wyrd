@@ -30,6 +30,10 @@ TASK-005 Scenarios 0–3 are already implemented and evidenced. This task is the
 complete replacement for its stopped Scenario 4; TASK-005 closes only after
 this task passes.
 
+The normative cross-owner implementation decisions are restored in
+[`TASK-005-R1-implementation-reference.md`](../revision/TASK-005-R1-implementation-reference.md).
+Implementation must satisfy that reference; it is not optional guidance.
+
 ## Owners, Scope, Consumers, and Prohibited Changes
 
 - `vala-sql` owns the tenant-scoped active table-read rows and the atomic cut
@@ -362,7 +366,9 @@ Add no TTL, archive, periodic scan, or second garbage collector.
 - Forge refuses expiration and object cleanup while a table has an active
   reader, then treats replaced snapshots as eligible without an age wait after
   the final reader releases. Every other real protection root remains.
-- The Iceberg expiration commit acts only on explicit Forge-selected IDs.
+- The Iceberg expiration commit acts only on explicit Forge-selected IDs. The
+  fork performs no independent snapshot aging, reference aging, or retain-last
+  selection, and every unlisted snapshot and ref remains unchanged.
 - An unsettled promotion blocks rewrite and expiration using existing
   operation state and authority.
 - RLS and the narrow catalog definer prevent cross-tenant identity, pointer,
@@ -393,6 +399,9 @@ Add no TTL, archive, periodic scan, or second garbage collector.
   analytical and follower consumers, direct metadata materialization, Forge
   selection and cleanup, promotion reconciliation, storage wrappers, and
   Redux integration tests.
+- `bohmian-ai/iceberg-rust`, `bohmian-ai/iceberg-compaction`, workspace
+  `Cargo.toml`, and `Cargo.lock`: explicit-ID-only expiration, focused fork
+  proof, and immutable pins that keep one Iceberg dependency universe.
 - `crates/wyrd/wyrd-server` and `crates/wyrd/wyrd-testing`: Oracle composition,
   forwarding from the single configured default, state inspection, exact-path
   held-query journeys, and removed epoch setup.
@@ -462,6 +471,7 @@ The completion report must include:
 ## Authority Links
 
 - `changes/active/forge-concurrent-planning/spec.md` revision 10
+- `changes/active/forge-concurrent-planning/revision/TASK-005-R1-implementation-reference.md`
 - `AGENTS.md`
 - `architecture/agent-rules.md`
 - `architecture/wyrd-design.md`

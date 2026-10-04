@@ -786,8 +786,9 @@ async fn settle_distributed(
 /// explicit settlement cancels the attempt's cancellation child and joins the
 /// driver futures started beneath it. Doing that here — after the distributed
 /// join and before admission release — is what makes a leader stream's end,
-/// however it ended, the point at which follower work stops rather than the
-/// point at which it is merely no longer awaited.
+/// however it ended, the point at which the leader's own work stops rather than
+/// the point at which it is merely no longer awaited. Followers stop when the
+/// settlement closes their grant streams and free their own graphs afterwards.
 ///
 /// Signalling and awaiting is the whole of this stream's part in settlement:
 /// the graph's lifecycle task owns the cleanup order, and reproducing any of it

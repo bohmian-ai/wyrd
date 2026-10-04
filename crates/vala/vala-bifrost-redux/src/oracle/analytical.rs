@@ -2692,7 +2692,9 @@ impl AnalyticalGraphLifecycle {
     /// the graph out of `Active` so nothing new is admitted, cancel unless the
     /// graph succeeded, join the attempt and every descendant it retained,
     /// drop every participant grant, release the graph, and only then release
-    /// the admission owner. Cleanup that cannot be confirmed leaves every
+    /// the admission owner. Dropping a grant closes its stream, which is the
+    /// release each follower acts on asynchronously when it frees its own
+    /// graph; nothing here waits for that. Cleanup that cannot be confirmed leaves every
     /// unresolved owner in the `Draining` entry and publishes a failure, so a
     /// success terminal is unreachable and readiness stays false.
     async fn settle(
@@ -2750,8 +2752,8 @@ impl AnalyticalGraphLifecycle {
                 Err(error) => failure = Some(error.to_string()),
             }
         }
-        // Retired only here, after every attempt, exchange, participant,
-        // runtime, and admission owner joined: the public entry
+        // Retired only here, after every attempt, exchange, runtime, and
+        // admission owner joined and every participant grant closed: the public entry
         // describes the graph, so it outlives the stream that signalled it.
         if let Some(mut owner) = running_query {
             owner.finish(if outcome == AnalyticalAttemptOutcome::Success {
@@ -7776,9 +7778,12 @@ impl AnalyticalAttemptOwnership {
     ///
     /// Dropping this value also releases both, but only settling joins the
     /// attempt's retained drivers first. A leader stream that ended — for any
-    /// reason — calls this so follower work is cancelled and joined before the
-    /// query envelope is returned, rather than leaving an abandoned attempt to
-    /// be swept by a drop.
+    /// reason — calls this so the leader's own drivers are cancelled and joined
+    /// before the query envelope is returned, rather than leaving an abandoned
+    /// attempt to be swept by a drop. Followers are not joined: settlement
+    /// closes each participant's grant stream, and that close is the release a
+    /// follower acts on when it frees its own graph, possibly after this
+    /// returns.
     ///
     /// # Errors
     ///

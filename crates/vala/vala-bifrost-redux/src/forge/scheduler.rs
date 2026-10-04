@@ -308,7 +308,8 @@ impl Forge {
             result = tracing::field::Empty,
             role = "server",
         );
-        let result = tracing::Instrument::instrument(self.lead(executor, stop, sweep), span.clone()).await;
+        let result =
+            tracing::Instrument::instrument(self.lead(executor, stop, sweep), span.clone()).await;
         match result {
             Ok(leader) => {
                 span.record("result", if leader { "succeeded" } else { "standby" });

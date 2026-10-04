@@ -250,12 +250,12 @@ mod tests {
         let shifted = iceberg::spec::Schema::builder()
             .with_fields(registered.as_struct().fields().iter().map(|field| {
                 let mut field = field.as_ref().clone();
-                if field.name == "events" {
-                    if let iceberg::spec::Type::List(list) = field.field_type.as_mut() {
-                        let mut element = list.element_field.as_ref().clone();
-                        element.id += 10_000;
-                        list.element_field = Arc::new(element);
-                    }
+                if field.name == "events"
+                    && let iceberg::spec::Type::List(list) = field.field_type.as_mut()
+                {
+                    let mut element = list.element_field.as_ref().clone();
+                    element.id += 10_000;
+                    list.element_field = Arc::new(element);
                 }
                 Arc::new(field)
             }))

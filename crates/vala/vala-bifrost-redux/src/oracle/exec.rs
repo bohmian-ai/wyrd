@@ -2945,6 +2945,47 @@ impl ExecutionPlan for HotParquetExec {
     }
 }
 
+/// Opens governed readers for the hot objects of one partition stream.
+///
+/// Owns the dependencies every reader of the stream shares, so each piece
+/// builds its reader from a location and size alone. Cloned into each
+/// piece's reader closure, which the metadata owner may call again on retry.
+#[derive(Clone)]
+struct HotReaderFactory {
+    /// File reader inherited from the pinned Iceberg table.
+    file_io: FileIO,
+    /// Closed governance mode every reader's range reservations use.
+    governance: HotParquetGovernance,
+    /// Shared physical scan counters retained to terminal query emission.
+    metrics: Arc<OracleScanMetricsHandle>,
+    /// Deterministic range reader injected only by focused tests.
+    #[cfg(test)]
+    reader_override: Option<HotReadOverride>,
+}
+
+impl HotReaderFactory {
+    /// Creates an unopened reader for the object at `location` of `size`
+    /// bytes; the object is opened on the reader's first range request.
+    fn reader(&self, location: &str, size: u64) -> IcebergParquetReader {
+        let reader = IcebergParquetReader::new(
+            HotObjectSource::Pending {
+                file_io: self.file_io.clone(),
+                location: location.to_owned(),
+            },
+            size,
+            self.governance.clone(),
+            Arc::clone(&self.metrics),
+        );
+        #[cfg(test)]
+        let reader = if let Some(override_reader) = self.reader_override.as_ref() {
+            reader.with_test_reader(location.to_owned(), Arc::clone(override_reader))
+        } else {
+            reader
+        };
+        reader
+    }
+}
+
 /// Builds one partition's hot-file stream after partition validation.
 ///
 /// The partition's byte ranges are read sequentially. The piece holding a
@@ -2963,14 +3004,18 @@ fn hot_stream(
     governance: HotParquetGovernance,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + Send + 'static {
     let pieces = exec.partition_pieces(partition);
-    let file_io = exec.file_io.clone();
+    let readers = HotReaderFactory {
+        file_io: exec.file_io.clone(),
+        governance,
+        metrics: Arc::clone(&exec.metrics),
+        #[cfg(test)]
+        reader_override: exec.reader_override.clone(),
+    };
     let storage = Arc::clone(&exec.storage);
     let schema = Arc::clone(&exec.schema);
     let metrics = Arc::clone(&exec.metrics);
     let predicates = exec.predicates.clone();
     let staged_lease = exec.staged_lease.clone();
-    #[cfg(test)]
-    let reader_override = exec.reader_override.clone();
     // Cancelling the query drops this stream, which drops the guard and
     // cancels any metadata decode this stream still has outstanding. Owner
     // shutdown cancels the same work through the owner's own token.
@@ -2984,30 +3029,9 @@ fn hot_stream(
                 DataFusionError::Execution("hot object size exceeds u64".to_owned())
             })?;
             let build_reader = {
-                let file_io = file_io.clone();
+                let readers = readers.clone();
                 let location = file.location.clone();
-                let governance = governance.clone();
-                let metrics = Arc::clone(&metrics);
-                #[cfg(test)]
-                let reader_override = reader_override.clone();
-                move || {
-                    let reader = IcebergParquetReader::new(
-                        HotObjectSource::Pending {
-                            file_io: file_io.clone(),
-                            location: location.clone(),
-                        },
-                        size,
-                        governance.clone(),
-                        Arc::clone(&metrics),
-                    );
-                    #[cfg(test)]
-                    let reader = if let Some(override_reader) = reader_override.as_ref() {
-                        reader.with_test_reader(location.clone(), Arc::clone(override_reader))
-                    } else {
-                        reader
-                    };
-                    reader
-                }
+                move || readers.reader(&location, size)
             };
             // Recorded before the footer is read so a file observation exists
             // for every attempt on this file, including one whose reader fails
@@ -3079,7 +3103,7 @@ fn hot_stream(
                     .map_err(|error| DataFusionError::External(Box::new(error)))?;
                 let batch = project_batch(&batch, Arc::clone(&schema))?;
                 let decoded_reservation =
-                    governance.reserve_decoded(batch.get_array_memory_size())?;
+                    readers.governance.reserve_decoded(batch.get_array_memory_size())?;
                 yield batch;
                 drop(decoded_reservation);
             }
@@ -3789,7 +3813,7 @@ fn binary_scalar_for(
     use datafusion::scalar::ScalarValue;
     match schema
         .field_with_name(column)
-        .map(|field| field.data_type())
+        .map(arrow::datatypes::Field::data_type)
     {
         Ok(DataType::FixedSizeBinary(width))
             if usize::try_from(*width).is_ok_and(|width| width == value.len()) =>
@@ -5094,7 +5118,7 @@ mod tests {
             .into_optimized_plan()
             .expect("optimized plan");
         let predicate = filter_of(&plan).expect("filter retained above the memory table");
-        let expected = vec![0xff_u8, 0x00].repeat(8);
+        let expected = [0xff_u8, 0x00].repeat(8);
         match classify_filter_for_schema(&schema, &predicate) {
             FilterClassification::Supported(leaves) => assert_eq!(
                 leaves,
@@ -5107,7 +5131,7 @@ mod tests {
         }
         assert_eq!(
             scan_literal_scalar(&schema, "trace_id", &ScanLiteral::Bytes(expected)),
-            datafusion::scalar::ScalarValue::FixedSizeBinary(16, Some(vec![0xff, 0x00].repeat(8)))
+            datafusion::scalar::ScalarValue::FixedSizeBinary(16, Some([0xff, 0x00].repeat(8)))
         );
 
         let short = context

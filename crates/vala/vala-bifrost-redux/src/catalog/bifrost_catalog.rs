@@ -323,9 +323,12 @@ pub struct BifrostCatalog {
     /// object. A registered table's schema never evolves and its registration
     /// is never dropped, so a loaded schema stays authoritative for the life
     /// of the node. Grows with registered tables, never with writes.
-    registered_schemas:
-        Arc<std::sync::RwLock<HashMap<(DataTenantId, String), Arc<iceberg::spec::Schema>>>>,
+    registered_schemas: Arc<std::sync::RwLock<RegisteredSchemas>>,
 }
+
+/// Registered Iceberg schemas a node has loaded, keyed by tenant and table
+/// name; the field-id authority behind [`BifrostCatalog`]'s schema cache.
+type RegisteredSchemas = HashMap<(DataTenantId, String), Arc<iceberg::spec::Schema>>;
 
 /// Estimated-weight eviction limit of the node-wide decoded manifest cache.
 ///

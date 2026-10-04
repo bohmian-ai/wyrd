@@ -104,7 +104,8 @@ export interface PhysicalLayout {
  * A writer declares `user_fields`, supplies `correlation_fields`, and may
  * supply `managed_candidates`. `canonical_physical_fingerprint` is present only
  * for a canonical signal table; `compaction_target_file_size_bytes` only when
- * the table declared an explicit Forge compaction file target.
+ * the table declared an explicit Forge compaction file target, and
+ * `compaction_type` only when it declared an explicit compaction type.
  */
 export interface TableDescription {
   readonly entry: TableEntry;
@@ -114,7 +115,15 @@ export interface TableDescription {
   readonly canonical_physical_fingerprint?: string;
   readonly physical_layout: PhysicalLayout;
   readonly compaction_target_file_size_bytes?: number;
+  readonly compaction_type?: CompactionType;
 }
+
+/**
+ * The physical compaction strategy a table asks Forge to apply, in its wire
+ * spelling. Omitted, Forge compacts the table `full`; a copy-on-write table
+ * compacts `full` whatever it declares.
+ */
+export type CompactionType = "auto" | "full" | "small_files" | "files_with_delete";
 
 export interface RunningQueryProgress {
   readonly completedParticipants: number;
@@ -508,15 +517,21 @@ export class TableConfig {
    * Registration records it once, and a later registration naming a different
    * target is refused rather than silently changing it.
    *
+   * `compactionType` chooses the table's Forge compaction type; omitted, Forge
+   * compacts it `full`. Like the target, it is recorded once and a later
+   * registration naming a different type is refused with
+   * `WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH`.
+   *
    * @throws when the resulting document does not map to an Arrow schema,
-   * declares a column the write path already owns, or the compaction target is
-   * not a non-negative integer.
+   * declares a column the write path already owns, the compaction target is
+   * not a non-negative integer, or the compaction type is not a known spelling.
    */
   static fromJsonSchema(
     table: string,
     schema: Readonly<Record<string, unknown>> | JsonSchemaSource,
     layout?: TableLayout,
     compactionTargetFileSizeBytes?: number,
+    compactionType?: CompactionType,
   ): TableConfig {
     const document =
       typeof (schema as JsonSchemaSource).toJSONSchema === "function"
@@ -528,6 +543,7 @@ export class TableConfig {
         JSON.stringify(document),
         layoutJson(layout),
         compactionTargetFileSizeBytes,
+        compactionType,
       ),
     );
   }
@@ -577,6 +593,17 @@ export class TableConfig {
       compaction_target_file_size_bytes?: number;
     };
     return wire.compaction_target_file_size_bytes;
+  }
+
+  /**
+   * The explicit Forge compaction type, declared or described, or undefined
+   * when the table compacts with the `full` default.
+   */
+  get compactionType(): CompactionType | undefined {
+    const wire = JSON.parse(this.#native.configJson) as {
+      compaction_type?: CompactionType;
+    };
+    return wire.compaction_type;
   }
 
   /** The server-assigned identity, or undefined while unregistered. */

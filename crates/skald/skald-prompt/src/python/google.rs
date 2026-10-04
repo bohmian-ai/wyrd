@@ -80,38 +80,6 @@ impl PyGeminiRequest {
     }
 }
 
-#[pyclass(module = "wyrd.prompt", name = "VertexRequest")]
-pub struct PyVertexRequest {
-    pub(crate) inner: Arc<ProviderRequest>,
-}
-impl PyVertexRequest {
-    pub fn new(inner: Arc<ProviderRequest>) -> Self {
-        Self { inner }
-    }
-}
-#[pymethods]
-impl PyVertexRequest {
-    #[getter]
-    fn contents(&self) -> Vec<PyGoogleContent> {
-        let n = google_request(&self.inner).contents.len();
-        (0..n)
-            .map(|i| PyGoogleContent {
-                inner: Arc::clone(&self.inner),
-                index: i,
-            })
-            .collect()
-    }
-    #[getter]
-    fn settings(&self) -> PyGoogleGenerationConfig {
-        PyGoogleGenerationConfig {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-    fn __repr__(&self) -> String {
-        "VertexRequest".to_owned()
-    }
-}
-
 #[pyclass(module = "wyrd.prompt", name = "GoogleContent")]
 pub struct PyGoogleContent {
     inner: Arc<ProviderRequest>,
@@ -697,41 +665,6 @@ impl PyGeminiResponse {
     }
 }
 
-#[pyclass(module = "wyrd.prompt", name = "VertexResponse")]
-pub struct PyVertexResponse {
-    inner: Arc<ProviderResponse>,
-}
-impl PyVertexResponse {
-    pub fn new(inner: Arc<ProviderResponse>) -> Self {
-        Self { inner }
-    }
-}
-#[pymethods]
-impl PyVertexResponse {
-    #[getter]
-    fn candidates(&self) -> Vec<PyGoogleCandidate> {
-        let n = google_response(&self.inner).candidates.len();
-        (0..n)
-            .map(|i| PyGoogleCandidate {
-                inner: Arc::clone(&self.inner),
-                index: i,
-            })
-            .collect()
-    }
-    #[getter]
-    fn usage_metadata(&self) -> Option<PyGoogleUsageMetadata> {
-        google_response(&self.inner)
-            .usage_metadata
-            .as_ref()
-            .map(|_| PyGoogleUsageMetadata {
-                inner: Arc::clone(&self.inner),
-            })
-    }
-    fn __repr__(&self) -> String {
-        "VertexResponse".to_owned()
-    }
-}
-
 #[pyclass(module = "wyrd.prompt", name = "GoogleCandidate")]
 pub struct PyGoogleCandidate {
     inner: Arc<ProviderResponse>,
@@ -876,7 +809,5 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyGoogleCandidate>()?;
     module.add_class::<PyGoogleUsageMetadata>()?;
     module.add_class::<PyGoogleSafetyRating>()?;
-    module.add_class::<PyVertexRequest>()?;
-    module.add_class::<PyVertexResponse>()?;
     Ok(())
 }

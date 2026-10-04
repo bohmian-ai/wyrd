@@ -9,7 +9,7 @@ use skald_spec::ProviderResponse;
 use wyrd_utils::py::WyrdPyResult;
 
 use super::anthropic::PyAnthropicMessagesResponse;
-use super::google::{PyGeminiResponse, PyVertexResponse};
+use super::google::PyGeminiResponse;
 use super::openai_chat_response::PyOpenAiChatResponse;
 use super::openai_responses::PyOpenAiResponsesResponse;
 use crate::prompt::{provider_name_to_string, wrong_provider};
@@ -35,6 +35,8 @@ impl PyProviderResponse {
 
 #[pymethods]
 impl PyProviderResponse {
+    /// Return the response dialect's default provider, such as "google" for a Vertex body.
+    /// `Prompt.provider` names the dispatch destination.
     #[getter]
     pub fn provider(&self) -> String {
         provider_name_to_string(&self.inner.provider())
@@ -73,12 +75,6 @@ impl PyProviderResponse {
                 Ok(PyGeminiResponse::new(Arc::clone(&self.inner)))
             }
             other => Err(wrong_provider("gemini", other.provider()).into()),
-        }
-    }
-
-    pub fn vertex(&self) -> WyrdPyResult<PyVertexResponse> {
-        match self.inner.as_ref() {
-            other => Err(wrong_provider("vertex", other.provider()).into()),
         }
     }
 

@@ -1074,7 +1074,8 @@ impl PyProviderRequest {
         Ok(serde_json::to_string(self.inner.as_ref())?)
     }
 
-    /// Return the provider name for the rendered request.
+    /// Return the request dialect's default provider, such as "google" for a Vertex body.
+    /// `Prompt.provider` names the dispatch destination.
     #[getter]
     pub fn provider(&self) -> String {
         provider_name_to_string(&self.inner.provider())
@@ -1121,14 +1122,6 @@ impl PyProviderRequest {
                 Ok(python::PyGeminiRequest::new(Arc::clone(&self.inner)))
             }
             other => Err(wrong_provider("gemini", other.provider()).into()),
-        }
-    }
-
-    /// Return a typed Vertex AI request accessor.
-    /// Raises `WyrdError` when the provider is not vertex.
-    pub fn vertex(&self) -> WyrdPyResult<python::PyVertexRequest> {
-        match self.inner.as_ref() {
-            other => Err(wrong_provider("vertex", other.provider()).into()),
         }
     }
 

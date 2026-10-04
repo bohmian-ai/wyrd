@@ -220,11 +220,13 @@ const SCHEDULE_CLAIM_DELAY: Duration = Duration::seconds(30);
 ///
 /// Dueness is decided against PostgreSQL's statement time: a cursor is due
 /// once it is at least `$1` milliseconds ([`SCHEDULE_CLAIM_DELAY`]) in the
-/// past. The same statement returns that instant so the synchronous cron
-/// calculation anchors on the database clock rather than the scheduler
-/// process's.
+/// past. The same statement returns statement time minus that delay as the
+/// schedule clock, so the synchronous cron calculation anchors on the database
+/// clock rather than the scheduler process's, and judges missed occurrences
+/// and the next cursor on the same delayed clock that decides dueness.
 const DUE_BINDING_SQL: &str = r#"
-    SELECT binding_id, schedule_cron, schedule_tz, next_run_at, statement_timestamp() AS now
+    SELECT binding_id, schedule_cron, schedule_tz, next_run_at,
+           statement_timestamp() - ($1::bigint * INTERVAL '1 millisecond') AS schedule_clock
       FROM wyrd.verification_bindings
      WHERE activation = 'schedule'
        AND next_run_at + ($1::bigint * INTERVAL '1 millisecond') <= statement_timestamp()
@@ -1239,13 +1241,14 @@ impl VerifierRunQueue {
     /// Process the earliest due scheduled binding of the caller's tenant.
     ///
     /// Locks one binding whose cursor is at least [`SCHEDULE_CLAIM_DELAY`]
-    /// before PostgreSQL's statement time with `FOR UPDATE SKIP LOCKED`, so concurrent schedulers never
-    /// claim the same occurrence. That same database instant is the anchor for
-    /// every decision this tick makes: the occurrence yields one run for its
-    /// fixed window only when it was not missed by then, its owner principal
-    /// is runtime-active, and the shared enqueue path accepts it (which
-    /// enforces Verifier readiness). In every case the cursor moves to the
-    /// first boundary strictly after that anchor in the same transaction, so
+    /// before PostgreSQL's statement time with `FOR UPDATE SKIP LOCKED`, so
+    /// concurrent schedulers never claim the same occurrence. Statement time
+    /// minus that delay is the schedule clock for this tick: the occurrence
+    /// yields one run for its fixed window only when no later boundary had
+    /// reached it, its owner principal is runtime-active, and the shared
+    /// enqueue path accepts it (which enforces Verifier readiness). In every
+    /// case the cursor moves to the first boundary strictly after the schedule
+    /// clock in the same transaction, so
     /// inactive, unready, and missed occurrences are skipped without
     /// backfill. Returns `None` when nothing is due. The
     /// caller commits, releasing the lock before any analysis runs, and calls
@@ -1272,7 +1275,7 @@ impl VerifierRunQueue {
             &due.schedule_cron,
             due.schedule_tz.as_deref(),
         )
-        .and_then(|schedule| schedule.occurrence(due_at, due.now))
+        .and_then(|schedule| schedule.occurrence(due_at, due.schedule_clock))
         {
             Ok(occurrence) => occurrence,
             Err(error) => {
@@ -2179,8 +2182,11 @@ struct DueBindingRow {
     schedule_tz: Option<String>,
     /// Cursor the occurrence is due at.
     next_run_at: DateTime<Utc>,
-    /// PostgreSQL's statement instant for this tick.
-    now: DateTime<Utc>,
+    /// PostgreSQL's statement instant for this tick minus
+    /// [`SCHEDULE_CLAIM_DELAY`]: the instant every schedule decision of the
+    /// tick is made at, so a boundary counts as passed only once its own
+    /// occurrence would be claimable.
+    schedule_clock: DateTime<Utc>,
 }
 
 /// A run status row from [`RUN_STATUS_SQL`].

@@ -973,7 +973,7 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
     );
     assert_eq!(tick.binding_id, binding);
     assert_eq!(tick.due_at, due);
-    assert_next_daily_boundary(tick.next_run_at, now);
+    assert_next_daily_boundary(tick.next_run_at, due);
     let ScheduleOutcome::Enqueued(run) = tick.outcome else {
         panic!("expected a scheduled run, got {:?}", tick.outcome);
     };
@@ -1003,7 +1003,7 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
             .expect("restarted tick runs")
             .is_none()
     );
-    assert_next_daily_boundary(cursor(&mut conn, binding).await, now);
+    assert_next_daily_boundary(cursor(&mut conn, binding).await, due);
     let claimed = claim(&queue, &mut conn).await;
     assert_eq!(claimed.lease.run_id, run);
     assert_eq!(claimed.origin, RunOrigin::Schedule);
@@ -1036,7 +1036,7 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
 
 /// Inactive owners, unready PSI Verifiers, and missed occurrences create no
 /// run, and every cursor still advances to the first boundary after the
-/// database instant without backfill.
+/// schedule clock (database time minus the claim delay) without backfill.
 ///
 /// # Panics
 /// Panics when a skipped occurrence creates a run, reports the wrong reason,
@@ -1074,7 +1074,7 @@ async fn scheduler_skips_inactive_unready_and_missed_occurrences() {
 
     let mut outcomes = Vec::new();
     while let Some(tick) = queue.schedule_next_due(&mut conn).await.expect("tick runs") {
-        assert_next_daily_boundary(tick.next_run_at, now);
+        assert_next_daily_boundary(tick.next_run_at, due);
         outcomes.push((tick.binding_id, tick.outcome));
     }
     outcomes.sort_by_key(|(binding, _)| *binding);
@@ -1091,7 +1091,7 @@ async fn scheduler_skips_inactive_unready_and_missed_occurrences() {
     expected.sort_by_key(|(binding, _)| *binding);
     assert_eq!(outcomes, expected);
     for binding in [inactive, unready, missed] {
-        assert_next_daily_boundary(cursor(&mut conn, binding).await, now);
+        assert_next_daily_boundary(cursor(&mut conn, binding).await, due);
     }
     assert_eq!(run_count(&mut conn).await, 0);
 }

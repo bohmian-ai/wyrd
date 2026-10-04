@@ -36,6 +36,16 @@ never a destination. OpenAI Chat has one schema, so it has one variant.
   to the client registered under that name.
 - Gateway routes (`wyrd_gateway`, `ext_gateway`) ignore `prompt.provider`; they
   select the upstream themselves and accept any `OpenAiChatCompletion` body.
+- Vertex GenerateContent is the Google GenerateContent schema sent to a
+  different provider (Google Cloud OAuth, project/location endpoint), so
+  `ProviderRequest::Vertex` and the `VertexGenerateContentRequest` wrapper are
+  deleted, as is `ProviderResponse::VertexGenerateContent` (it reuses the
+  Google response schema). A Vertex Prompt is a `GeminiGenerateContent` body
+  with `provider: vertex`. `VertexPredict` stays: it is a distinct schema.
+- The Wyrd gateway projection selects its Vertex GenerateContent ingress from
+  `prompt.provider == vertex` on a GenerateContent body; the Revision 13 Vertex
+  success proof still holds. `ext_gateway` keeps its `vertex_generate_content`
+  protocol (an endpoint-path difference), which accepts a GenerateContent body.
 - `RawV1` keeps its `ProviderName`: it has no schema and is the explicit raw
   escape hatch.
 - Nothing has shipped: no migration, alias, or compatibility reader. Rust,
@@ -2748,8 +2758,9 @@ before implementation planning.
 ## Revision history
 
 - **Revision 14 — approved (2026-10-04):** User-approved deletion of
-  `ProviderRequest::OpenAiChatCompatible`: one OpenAI Chat variant, with a
-  custom dispatch target carried by optional `Prompt.provider`. No migration.
+  `ProviderRequest::OpenAiChatCompatible` and the Vertex GenerateContent
+  request/response wrappers: one variant per wire schema, with the dispatch
+  target carried by optional `Prompt.provider`. No migration.
   Carried by TASK-004.
 
 - **Revision 13 — approved (2026-10-03):** User-approved provider-tagged

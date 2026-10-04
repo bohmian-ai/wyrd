@@ -76,8 +76,9 @@ The leader's schedule lives in memory and starts empty on every new term:
    into Iceberg. A promotion lost with a dead leader is therefore recovered by
    its successor.
 2. **Compaction.** Each successful Iceberg commit notifies the leader, which
-   counts pending commits per table. A table becomes due when its commit count
-   or compaction interval is reached. Compactors on any replica pull due table
+   counts pending commits per table. Every table compacts by default, unlike
+   RisingWave's sink, because Bifrost owns its tables. A table becomes due when
+   its commit count or compaction interval (one hour by default) is reached. Compactors on any replica pull due table
    identities up to their free capacity; the worker loads the current Iceberg
    files and plans the rewrite itself, then reports the result.
 3. **Maintenance.** An hourly leader timer (`maintenance_interval_secs`) rewrites
@@ -90,7 +91,7 @@ change. Per-table Iceberg properties control the work:
 
 | Property | Default | Effect |
 | --- | --- | --- |
-| `wyrd.forge.enable-compaction` | `false` | Enables automatic data-file compaction. |
+| `wyrd.forge.enable-compaction` | `true` | Automatic data-file compaction. On for every table, including built-in tables; set `false` to turn it off. |
 | `wyrd.forge.enable-snapshot-expiration` | `true` | Expires snapshots older than retention (24 hours by default). |
 | `wyrd.forge.enable-manifest-rewrite` | `false` | Merges small manifests before expiry. Format-v3 tables are skipped. |
 | `commit.manifest.target-size-bytes` | 8 MiB | Manifest-rewrite target size. |

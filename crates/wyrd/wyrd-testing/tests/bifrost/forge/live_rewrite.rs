@@ -2272,6 +2272,109 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
     }
 }
 
+/// A table registered through the public client with no options is compacted.
+///
+/// Compaction is on for every table by default, so the journey registers one
+/// table with nothing but its schema, never touches its Iceberg properties,
+/// and proves the table declares no Forge setting at all. Two flushed public
+/// appends are promoted by the pod's own Forge; the leader then owes the table
+/// nothing until the default one-hour interval has passed since its first
+/// commit, after which it dispatches the rewrite. The committed rewrite
+/// replaces the promoted inputs and the public read returns exactly the
+/// acknowledged rows.
+///
+/// # Panics
+///
+/// Panics when the pod cannot start, a public call fails, the table declares a
+/// Forge property, Forge leaves work owed or commits no rewrite, or the rows
+/// differ.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn property_less_public_table_is_compacted_by_default() {
+    let cluster = WyrdTestCluster::start_with_embedded_forge_observer()
+        .await
+        .expect("one bound embedded Bifrost pod starts");
+    cluster.lead_forge_for_test().await;
+    let observer = cluster
+        .forge_completion_observer()
+        .expect("the journey pod carries a Forge completion observer");
+    let server = cluster.server(0).expect("the embedded pod is running");
+    let tenant = cluster.data_tenant_id();
+    let client = tenant_client(server, tenant).await;
+    let name = unique_table("default_compaction");
+    let table = JourneyTable {
+        qualified: format!("vala.datasets.{name}"),
+        name: name.clone(),
+        binding: TenantTableBinding::resolve((
+            tenant,
+            vala_bifrost_redux::catalog::TableRef::new(
+                vala_bifrost_redux::namespaces::BifrostNamespace::Datasets,
+                &name,
+            ),
+        ))
+        .expect("the journey table resolves to its physical binding"),
+    };
+    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+    ]));
+    let config = wyrd_client::bifrost::TableConfig::from_arrow(&table.qualified, schema)
+        .expect("the journey schema is a table config");
+    assert_eq!(
+        wyrd_client::Bifrost::connect_with_table(&client, config)
+            .await
+            .expect("the public Bifrost client connects")
+            .register()
+            .await
+            .expect("option-less registration"),
+        RegisterOutcome::Created
+    );
+    let properties = server
+        .bifrost_catalog()
+        .iceberg_catalog()
+        .load_table(&table.binding.table_ident())
+        .await
+        .expect("the journey table loads through the production catalog")
+        .metadata()
+        .properties()
+        .clone();
+    assert!(
+        !properties.keys().any(|key| key.starts_with("wyrd.forge.")),
+        "an option-less registration declares no Forge setting: {properties:?}"
+    );
+
+    let mut rows = Vec::new();
+    for half in 0..2_i64 {
+        let values: Vec<i64> = (half * 8..half * 8 + 8).collect();
+        rows.extend(append_values(&client, &table.qualified, Uuid::now_v7(), &values).await);
+        server
+            .flush_bifrost()
+            .await
+            .expect("the pod publishes its staged rows");
+    }
+    let expected = canonical_order(rows);
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1))
+        .expect("the written partition closes");
+    drain_forge_backlog(&cluster, &observer, &[tenant]).await;
+    let promoted = live_cut(&cluster, &table.binding).await;
+    assert!(
+        rewrite_targets(&cluster, &table.binding).await.is_empty(),
+        "no rewrite runs before the default interval"
+    );
+    server
+        .forge_clock()
+        .advance(chrono::Duration::hours(1))
+        .expect("the default compaction interval passes");
+    await_committed_rewrites(&cluster, &observer, &[&table.binding]).await;
+    assert_ne!(
+        live_cut(&cluster, &table.binding).await.data,
+        promoted.data,
+        "the rewrite outputs replaced the promoted inputs"
+    );
+    assert_public_rows(&client, &table, &expected, "after default compaction").await;
+}
+
 /// A Forge rewrite attempt refused by a full shared memory root fails only that
 /// attempt, and the durable task retries once memory returns and publishes one
 /// complete rewrite snapshot, never a partial one.

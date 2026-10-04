@@ -4526,7 +4526,8 @@ async fn tenant_scoped_active_cut_is_one_statement_and_one_bounded_retry()
         2,
         "the terminal NotFound is not retried again"
     );
-    let binding = TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Bifrost, &left)))?;
+    let binding =
+        TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Bifrost, &left)))?;
     assert_eq!(
         server.oracle_active_table_reads_for_test(&binding).await?,
         0,
@@ -4579,7 +4580,10 @@ async fn tenant_scoped_active_cut_is_one_statement_and_one_bounded_retry()
     let unknown = settle_query(
         &server,
         query_context(neighbour)?,
-        &format!("SELECT id FROM vala.bifrost.{}", unique_table("never_registered")),
+        &format!(
+            "SELECT id FROM vala.bifrost.{}",
+            unique_table("never_registered")
+        ),
     )
     .await
     .expect_err("a never-registered table is not found");
@@ -4594,4 +4598,194 @@ async fn tenant_scoped_active_cut_is_one_statement_and_one_bounded_retry()
     );
     server.shutdown().await?;
     Ok(())
+}
+
+/// Leader pod of the held-cut journey's Analytical graph.
+const HELD_CUT_LEADER: usize = 0;
+
+/// Follower pod whose `ExecuteTask` the held-cut journey holds.
+const HELD_CUT_FOLLOWER: usize = 1;
+
+/// Scribe pod that ingests the held-cut journey's rows.
+const HELD_CUT_SCRIBE: usize = 3;
+
+/// Bound on waiting for a query's active reads to reach an expected count.
+const ACTIVE_READ_POLL_BOUND: Duration = Duration::from_secs(15);
+
+/// Counts the active table reads one table holds on the shared database.
+///
+/// # Errors
+/// Returns a harness error when the pod is not running or the read fails.
+async fn active_reads(
+    cluster: &PeerCluster,
+    binding: &vala_bifrost_redux::catalog::TenantTableBinding,
+) -> Result<i64, JourneyError> {
+    Ok(cluster
+        .server(HELD_CUT_LEADER)?
+        .oracle_active_table_reads_for_test(binding)
+        .await?)
+}
+
+/// Waits until the table's active reads reach `expected`.
+///
+/// # Errors
+/// Returns an error when the count does not reach `expected` within
+/// [`ACTIVE_READ_POLL_BOUND`] or a read fails.
+async fn await_active_reads(
+    cluster: &PeerCluster,
+    binding: &vala_bifrost_redux::catalog::TenantTableBinding,
+    expected: i64,
+) -> Result<(), JourneyError> {
+    tokio::time::timeout(ACTIVE_READ_POLL_BOUND, async {
+        loop {
+            if active_reads(cluster, binding).await? == expected {
+                return Ok::<(), JourneyError>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| format!("active reads never reached {expected}"))?
+}
+
+/// Proves one inseparable cut-and-claim owner holds active reads to the end.
+///
+/// An Analytical graph whose follower task is held keeps its single active
+/// read; releasing the follower lets the query finish, and the read is already
+/// gone when the caller receives the terminal frame. A caller that drops the
+/// query while that follower is still held performs no release: the read
+/// survives the held descendant and the settled graph, left for
+/// PostgreSQL-time abandonment. A query dropped at its post-pin boundary —
+/// after the claim committed but before any owner received it — likewise
+/// leaves its row instead of releasing it.
+///
+/// # Errors
+/// Returns cluster, ingest, or query errors.
+///
+/// # Panics
+/// Panics when an active read is released before its last descendant settles,
+/// survives a completed terminal, or a dropped owner or pin releases its row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn held_cut_owns_active_reads_until_all_descendants_settle() -> Result<(), JourneyError> {
+    let mut cluster = PeerCluster::start_with_slots(&[
+        (BifrostTarget::Oracle, Some(2)),
+        (BifrostTarget::Oracle, Some(2)),
+        (BifrostTarget::Oracle, Some(2)),
+        (BifrostTarget::Scribe, None),
+    ])
+    .await?;
+    let tenant = cluster.tenant();
+    let table = unique_table("held_cut");
+    cluster.register_table(HELD_CUT_SCRIBE, &table).await?;
+    // Two published objects give the grouped statement remote work.
+    cluster
+        .ingest_rows(HELD_CUT_SCRIBE, &table, 0, 12, 3)
+        .await?;
+    cluster
+        .ingest_rows(HELD_CUT_SCRIBE, &table, 0, 12, 3)
+        .await?;
+    cluster.refresh_snapshots().await?;
+    let binding = vala_bifrost_redux::catalog::TenantTableBinding::resolve((
+        tenant,
+        vala_bifrost_redux::catalog::TableRef::new(
+            vala_bifrost_redux::namespaces::BifrostNamespace::Bifrost,
+            &table,
+        ),
+    ))?;
+    let engine = cluster
+        .server(HELD_CUT_LEADER)?
+        .state()
+        .bifrost_query()
+        .map(|query| std::sync::Arc::clone(query.engine()))
+        .ok_or("the leader pod composes no Oracle")?;
+    let request = BifrostQueryRequest {
+        sql: format!(
+            "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
+             GROUP BY filter_key ORDER BY filter_key"
+        ),
+        deadline_ms: None,
+    };
+
+    // Success: the follower is held, so the graph cannot produce its first
+    // batch; once it is let go, the terminal arrives only after the read was
+    // released. The query runs inside the join because its first batch waits
+    // on the held follower.
+    cluster.arm_execute_pause(HELD_CUT_FOLLOWER)?;
+    let drain = async {
+        let mut stream = engine
+            .query_sql(query_context(tenant)?, request.clone())
+            .await?;
+        let mut class = None;
+        while let Some(frame) = futures_util::StreamExt::next(&mut stream.frames).await {
+            if let wyrd_spec::vala::api::QueryStreamFrame::Terminal(terminal) = frame? {
+                assert_eq!(terminal.outcome, QueryTerminalOutcome::Success);
+                assert_eq!(
+                    active_reads(&cluster, &binding).await?,
+                    0,
+                    "the read is released before the terminal frame is emitted"
+                );
+                class = Some(terminal.query_class);
+            }
+        }
+        Ok::<_, JourneyError>(class)
+    };
+    let hold = async {
+        cluster.await_execute_paused(HELD_CUT_FOLLOWER).await?;
+        assert_eq!(
+            active_reads(&cluster, &binding).await?,
+            1,
+            "a graph with a held follower keeps its one active read"
+        );
+        cluster.release_execute_pause(HELD_CUT_FOLLOWER)?;
+        Ok::<(), JourneyError>(())
+    };
+    let (class, ()) = tokio::try_join!(drain, hold)?;
+    assert_eq!(class, Some(QueryClass::Analytical));
+
+    // Caller drop: dropping the query while its follower still reads performs
+    // no release. The row outlives the caller and the settled graph, and is
+    // left for PostgreSQL-time abandonment.
+    let leader_baseline = cluster.ownership_snapshot(HELD_CUT_LEADER)?;
+    cluster.arm_execute_pause(HELD_CUT_FOLLOWER)?;
+    tokio::select! {
+        result = engine.query_sql(query_context(tenant)?, request.clone()) => {
+            return Err(format!("the held graph returned early: {:?}", result.map(|_| ())).into());
+        }
+        paused = cluster.await_execute_paused(HELD_CUT_FOLLOWER) => paused?,
+    }
+    assert_eq!(
+        active_reads(&cluster, &binding).await?,
+        1,
+        "a dropped caller does not release while a descendant still reads"
+    );
+    cluster.release_execute_pause(HELD_CUT_FOLLOWER)?;
+    await_baseline(&cluster, HELD_CUT_LEADER, leader_baseline).await?;
+    assert_eq!(
+        active_reads(&cluster, &binding).await?,
+        1,
+        "a dropped owner leaves its row for PostgreSQL-time abandonment"
+    );
+
+    // Unexpected drop at the post-pin boundary: the claim committed but no
+    // owner received it, so nothing may release it early.
+    let context = query_context(tenant)?;
+    cluster.arm_preparation_pause(HELD_CUT_LEADER, &context.request_id)?;
+    tokio::select! {
+        result = engine.query_sql(context, request) => {
+            return Err(format!("the paused query returned: {:?}", result.map(|_| ())).into());
+        }
+        () = async {
+            while cluster.preparation_pause_deadline(HELD_CUT_LEADER).is_none() {
+                tokio::task::yield_now().await;
+            }
+        } => {}
+    }
+    cluster.release_preparation_pause(HELD_CUT_LEADER)?;
+    assert_eq!(
+        active_reads(&cluster, &binding).await?,
+        2,
+        "a dropped pin leaves its committed row beside the dropped caller's"
+    );
+    cluster.shutdown().await
 }

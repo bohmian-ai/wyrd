@@ -21,6 +21,69 @@ where it needs compaction off. RED: a redux test that a property-less table
 is dispatched after the interval. Journey: a table registered through the
 public client with no options is compacted.
 
+### Scenario 1 evidence
+
+| Criterion | Implementation | Verification | Result |
+|---|---|---|---|
+| Absent `wyrd.forge.enable-compaction` means enabled; explicit `false` still disables | `ForgeTableSettings::default` (`forge/settings.rs`) `compaction_enabled: true`; module/constant/field rustdoc | lib `forge::settings::tests::settings_default_to_risingwave_and_parse_overrides` (pins defaults incl. 1 h interval, explicit `false`) | PASS |
+| Property-less table gets a track on first commit and is dispatched at the 1 h boundary, not before | — | RED then GREEN: integration `forge::production_routes::property_less_table_is_compacted_after_the_default_interval` (RED failed at "the first commit opens a compaction track by default") | PASS |
+| Public-client table with no options is compacted | — | journey `live_rewrite::property_less_public_table_is_compacted_by_default` (asserts no `wyrd.forge.*` property, no rewrite before the interval, committed rewrite after +1 h, exact public rows) | PASS |
+| 512 MiB staging / 1 GiB compaction targets unchanged | not touched | diff audit | PASS |
+| Docs state the default | `docs/src/content/docs/bifrost/forge.svx` property row `true` + compaction prose; `architecture/bifrost-design.md` states no compaction default (unchanged) | `mise run docs:check` | see final verification |
+
+Suites: redux lib `forge::` 87/87; redux integration `-E 'test(/^forge::/)'` 57/57;
+wyrd-testing `forge` journeys 20/20; wyrd-testing `oracle` journeys 40/42 (two
+failures below, outside this task's cause); clippy `--all-features --tests -D
+warnings` on `vala-bifrost-redux` and `wyrd-testing` clean.
+
+Tests whose expectations or setup changed:
+
+- `forge::leader::tests::due_rule_boundaries_match_risingwave` and
+  `disabled_compaction_keeps_maintenance_membership` (lib): they model a
+  *disabled* table, so they now state `compaction_enabled: false` instead of
+  inheriting it from `default()`. Assertions unchanged.
+- `forge::snapshot_expiration` manual-run step: the table has just been set
+  `enable-compaction=false`; the manual request now carries those real
+  settings, so its track is still temporary. Assertions unchanged.
+- `live_rewrite::compaction_target_registers…` / `public_support::enable_compaction`:
+  rustdoc only (compaction is no longer off by default; the helper still sets
+  the count trigger so journeys do not wait out the hour).
+
+Diagnoses (traced with `WYRD_LOG=info,vala_bifrost_redux::forge=debug`;
+confirmed by an independent read-only diagnostician):
+
+- `production_closeout::empty_maintenance_restart_protects_orphans` — Symptom:
+  panic "the settled pass swept the rowless output". Evidence: commit notices
+  recorded for `cold_restart_*`; final pass runs expiry + expired cleanup but
+  no orphan sweep. Cause: the table now owes compaction after its rejoin
+  commit and `run_maintenance` deliberately skips the orphan sweep for tables
+  that owe compaction (`gc.rs` `owes_compaction`). Fix site: test setup — the
+  scenario is about a cold, maintenance-only table, so it sets
+  `enable-compaction=false`. Production unchanged.
+- `live_rewrite::forge_promoted_files_rewrite_and_remain_exact_across_recovery`
+  — Symptom: "an uncertain rewrite claims no outcome: []". Evidence: three
+  compactions dispatched together (both neighbour tables and the owner); the
+  one-shot `fail_after_next_commit` landed on the neighbour's rewrite. Cause:
+  the neighbour tables now compact by default, contradicting the test's
+  premise that the neighbour is never rewritten. Fix site: test setup — both
+  neighbour tables set `enable-compaction=false`.
+- `oracle distributed::pg_bifrost_selective_predicate_spans_hot_and_compacted_reads`
+  — Symptom: selective scan bytes ≥ unfiltered. Evidence: one
+  `Forge compaction dispatched table=oracle_two_tier_* pending_commits=20`
+  during the measurement. Cause: the measured table now compacts after the
+  journey closes its partition (+1 day), changing the cut between baseline and
+  selective query. Fix site: test setup — the table opts out. Re-run: PASS, 0
+  dispatches.
+
+Blocker (not caused by this scenario; outside this task's write set):
+`oracle distributed::pg_bifrost_selective_predicate_and_projection_prune_distributed_reads`
+("hot-only projection proof requires a hot-only cut: hot=0 compacted=3") and
+`oracle published::published_cache_pruning_and_shutdown_are_production_governed`
+("decoded exactly once", 2 vs 1). Trace shows no compaction dispatch; each
+flush is promoted to Iceberg by the leader's inline `scribe_promotion` within
+~1 s, so these journeys' premise of a still-hot sealed object no longer holds
+under the TASK-001 promotion route. Owner: the promotion/Oracle journey owner.
+
 ## Scenario 2 — Registration chooses the compaction type (REQ-012)
 
 Follow every file on the `compaction_target_file_size_bytes` path

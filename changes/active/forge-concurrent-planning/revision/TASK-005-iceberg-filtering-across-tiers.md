@@ -353,3 +353,28 @@ regression consumers, not duplicate filtering implementations.
   [agent rules](../../../../architecture/agent-rules.md),
   [Bifrost design](../../../../architecture/bifrost-design.md), and
   [Iceberg reference](../../../../architecture/references/domain/iceberg.md).
+
+## Implementation Evidence
+
+Pins: fork `bohmian-ai/iceberg-rust` branch `wyrd/task-005-pruning`
+`0f47bc302` (Bloom row-group pruning and attribution, binary page bounds)
+then `1ccadbf5e` (fixed-size binary literals pushed down as fixed datums);
+`bohmian-ai/iceberg-compaction` `01a190b7` repins the core to the same
+iceberg revision, so the graph keeps one iceberg universe. Wyrd pins both in
+`Cargo.toml` (`64e1de5af`).
+
+| Scenario | Implementation | RED | GREEN | Result |
+|---|---|---|---|---|
+| 0 field IDs | `a1267618c`, `e84f87e85` | at `798e5fe7a` declared IDs ≥1000 failed the Iceberg dense-assignment ownership check | `distributed::iceberg_assigned_field_ids_promote_fresh_signal_tables` passes | PASS |
+| 1 hot | `da30db90d`, `ffbbdfc02` | the hot reader had no bytes `ScanLiteral` or Bloom counter, so the Bloom assertion could not hold (run log not retained) | `distributed::hot_filtering_mechanisms_cover_all_table_kinds`: absent label bloom 3/3, absent trace bloom 1 within bounds, key pruned 2 + 24,520 page rows, slice files 1, request id pruned 2 / 3 | PASS |
+| 2 binary pages | fork `36e37623c`, `1ccadbf5e`; `64e1de5af` removes `page_index_evaluable` | `promoted fixed-size key: the Iceberg page index skipped no rows` (gate removed, fixed-size literal still dropped by the fork converter) | `distributed::binary_sort_key_page_pruning`: fixed 24,520, variable 24,205, fixed+time 24,520 page rows, absent key files 0; fork `binary_bounds_preserve_mixed_pruning` passes | PASS |
+| 3 Iceberg | `21e4f71d6` | the promoted/rewritten matrix is new; the rewrite run first failed at a 1 MiB row-group target (one group, no row-group proof) | `distributed::iceberg_filtering_mechanisms_cover_all_table_kinds`: promoted key files 1 + 24,520 page rows, absent trace files 1 bloom 1, request id files 1/0; rewritten custom 6 groups, Bloom 6/6, key pruned 5 + 20,756 page rows, slice pruned 3, request id pruned 3–4, absent trace bloom 1 | PASS |
+
+Commands: each journey runs through
+`mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E "test(=distributed::<name>)"'`;
+`vala-bifrost-redux --lib` passes 833/833 under the same wrapper.
+
+Promoted cuts exclude disjoint `wyrd_request_id` ranges one level earlier
+than row groups: Iceberg's manifest bounds plan only the matching file (each
+promoted Scribe file is one row group). The rewritten cut, one sorted file
+with several groups, carries the row-group min/max proof.

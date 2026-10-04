@@ -45,6 +45,12 @@ pub struct Prompt {
     /// Expected response shape for runtime validation.
     #[serde(default)]
     pub response_type: ResponseType,
+    /// Native dispatch target, such as a custom OpenAI-compatible endpoint.
+    ///
+    /// When absent, native dispatch uses the request dialect's default
+    /// provider. Gateway routes select their own upstream and ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderName>,
 }
 
 /// Borrowed view of native generation settings for the active provider.
@@ -149,17 +155,27 @@ impl Prompt {
             variables: Vec::new(),
             media_variables: Vec::new(),
             response_type,
+            provider: None,
         };
         prompt.normalize_media_placeholders_mut()?;
         prompt.variables = extract_text_variables(&prompt.request)?;
         Ok(prompt)
     }
 
+    /// Return the provider native dispatch sends this Prompt to.
+    ///
+    /// This is [`Prompt::provider`](Self::provider) when set, otherwise the
+    /// request dialect's default from [`ProviderRequest::provider`].
+    pub fn provider(&self) -> ProviderName {
+        self.provider
+            .clone()
+            .unwrap_or_else(|| self.request.provider())
+    }
+
     /// Borrow native generation settings for the request's active provider.
     pub fn settings_ref(&self) -> Option<ProviderSettingsRef<'_>> {
         match &self.request {
-            ProviderRequest::OpenAiChatCompletion(request)
-            | ProviderRequest::OpenAiChatCompatible { request, .. } => {
+            ProviderRequest::OpenAiChatCompletion(request) => {
                 Some(ProviderSettingsRef::OpenAiChat(&request.settings))
             }
             ProviderRequest::OpenAiResponses(request) => {
@@ -231,8 +247,7 @@ impl Prompt {
     pub fn bind_media_mut(&mut self, name: &str, media: &MediaRef) -> SkaldResult<()> {
         self.normalize_media_placeholders_mut()?;
         match &mut self.request {
-            ProviderRequest::OpenAiChatCompletion(request)
-            | ProviderRequest::OpenAiChatCompatible { request, .. } => {
+            ProviderRequest::OpenAiChatCompletion(request) => {
                 bind_media_openai_chat(request, name, media)?;
             }
             ProviderRequest::OpenAiResponses(request) => {
@@ -336,8 +351,7 @@ fn placeholder_token(name: &str) -> String {
 
 fn scan_system_for_media(request: &ProviderRequest) -> SkaldResult<()> {
     match request {
-        ProviderRequest::OpenAiChatCompletion(request)
-        | ProviderRequest::OpenAiChatCompatible { request, .. } => {
+        ProviderRequest::OpenAiChatCompletion(request) => {
             for message in &request.messages {
                 if message.role == "system" {
                     scan_openai_chat_content(message.content.as_ref())?;
@@ -414,8 +428,7 @@ fn scan_text_for_system_media(text: &str) -> SkaldResult<()> {
 fn split_request_text_parts(request: &mut ProviderRequest) -> Vec<String> {
     let mut names = Vec::new();
     match request {
-        ProviderRequest::OpenAiChatCompletion(request)
-        | ProviderRequest::OpenAiChatCompatible { request, .. } => {
+        ProviderRequest::OpenAiChatCompletion(request) => {
             split_openai_chat(request, &mut names);
         }
         ProviderRequest::OpenAiResponses(request) => split_openai_responses(request, &mut names),
@@ -1383,6 +1396,7 @@ mod prompt_render {
             variables: variables.into_iter().map(str::to_string).collect(),
             media_variables: Vec::new(),
             response_type: ResponseType::Text,
+            provider: None,
         }
     }
 

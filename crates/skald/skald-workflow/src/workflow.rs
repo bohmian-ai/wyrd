@@ -559,7 +559,7 @@ impl StepTask {
             .min();
         let prompt = step.agent.prompt.native();
         let context = AttemptRouteContext {
-            provider: prompt.request.provider(),
+            provider: prompt.provider(),
             model: prompt.model.clone(),
             deadline,
             cancellation: self.cancellation.clone(),

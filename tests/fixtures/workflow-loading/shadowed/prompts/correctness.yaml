@@ -6,19 +6,18 @@ metadata:
   version: "1.0.0"
 spec:
   model: gpt-5-5
+  provider:
+    custom: mock
   request:
-    provider: open_ai_chat_compatible
+    provider: open_ai_chat_completion
     body:
-      provider:
-        custom: mock
-      request:
-        model: gpt-5-5
-        messages:
-          - role: system
-            content: |
-              You are a correctness reviewer. Find reachable bugs, data loss, races,
-              and contract violations. Ignore style-only concerns.
-          - role: user
-            content: "local correctness review of {{code}}"
+      model: gpt-5-5
+      messages:
+        - role: system
+          content: |
+            You are a correctness reviewer. Find reachable bugs, data loss, races,
+            and contract violations. Ignore style-only concerns.
+        - role: user
+          content: "local correctness review of {{code}}"
   variables: [code]
   response_type: text

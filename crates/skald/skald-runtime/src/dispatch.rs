@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use skald_providers::ProviderStream;
-use skald_spec::{ProviderRequest, ProviderResponse};
+use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
 use tracing::{Span, instrument};
 
 use crate::error::{SkaldRuntimeError, SkaldRuntimeResult};
@@ -11,7 +11,16 @@ use crate::provider::ProviderRegistry;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-/// Routes a native request to its registered provider and returns a native response.
+/// Routes a native request to the client registered under `provider` and
+/// returns a native response.
+///
+/// `provider` is the dispatch target, normally `Prompt::provider`; it may name
+/// a custom OpenAI-compatible client for an OpenAI Chat request.
+///
+/// # Errors
+///
+/// Returns [`SkaldRuntimeError::ProviderNotRegistered`] when no client is
+/// registered under `provider`, or the client's provider failure.
 #[instrument(skip_all, fields(
     provider = tracing::field::Empty,
     model = tracing::field::Empty,
@@ -21,9 +30,9 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 ))]
 pub async fn dispatch(
     providers: &ProviderRegistry,
+    provider: ProviderName,
     request: ProviderRequest,
 ) -> SkaldRuntimeResult<ProviderResponse> {
-    let provider = request.provider();
     let request_id = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     Span::current().record("provider", tracing::field::debug(&provider));
     if let Some(model) = request_model(&request) {
@@ -44,7 +53,12 @@ pub async fn dispatch(
     Ok(response)
 }
 
-/// Routes a native streaming request to its registered provider.
+/// Routes a native streaming request to the client registered under `provider`.
+///
+/// # Errors
+///
+/// Returns [`SkaldRuntimeError::ProviderNotRegistered`] when no client is
+/// registered under `provider`, or the client's provider failure.
 #[instrument(skip_all, fields(
     provider = tracing::field::Empty,
     model = tracing::field::Empty,
@@ -52,9 +66,9 @@ pub async fn dispatch(
 ))]
 pub async fn dispatch_stream(
     providers: &ProviderRegistry,
+    provider: ProviderName,
     request: ProviderRequest,
 ) -> SkaldRuntimeResult<ProviderStream> {
-    let provider = request.provider();
     let request_id = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     Span::current().record("provider", tracing::field::debug(&provider));
     if let Some(model) = request_model(&request) {
@@ -72,8 +86,7 @@ pub async fn dispatch_stream(
 
 fn request_model(request: &ProviderRequest) -> Option<&str> {
     match request {
-        ProviderRequest::OpenAiChatCompletion(request)
-        | ProviderRequest::OpenAiChatCompatible { request, .. } => Some(&request.model),
+        ProviderRequest::OpenAiChatCompletion(request) => Some(&request.model),
         ProviderRequest::OpenAiResponses(request) => Some(&request.model),
         ProviderRequest::OpenAiEmbeddings(request) => Some(&request.model),
         ProviderRequest::AnthropicMessage(request) => Some(&request.model),

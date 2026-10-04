@@ -62,9 +62,6 @@ impl CacheKey {
             ProviderRequest::OpenAiChatCompletion(request) => {
                 openai_cache_key(ProviderName::OpenAi, request)
             }
-            ProviderRequest::OpenAiChatCompatible { provider, request } => {
-                openai_cache_key(provider.clone(), request)
-            }
             ProviderRequest::AnthropicMessage(request) => {
                 if !anthropic_has_cache_control(request) {
                     return Ok(None);

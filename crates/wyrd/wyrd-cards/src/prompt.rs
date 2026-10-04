@@ -750,7 +750,7 @@ impl PromptCard {
             "PromptCard(name={:?}, version={:?}, provider={:?}, model={:?})",
             self.name,
             self.version,
-            self.metadata.prompt.request.provider(),
+            self.metadata.prompt.provider(),
             self.metadata.prompt.model
         )
     }

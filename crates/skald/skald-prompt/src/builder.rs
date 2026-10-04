@@ -144,6 +144,7 @@ pub fn openai_chat(
         variables: options.variables,
         media_variables: Vec::new(),
         response_type,
+        provider: None,
     })
 }
 
@@ -182,6 +183,7 @@ pub fn openai_responses(
         variables: options.variables,
         media_variables: Vec::new(),
         response_type,
+        provider: None,
     })
 }
 
@@ -225,6 +227,7 @@ pub fn anthropic(
         variables: options.variables,
         media_variables: Vec::new(),
         response_type,
+        provider: None,
     })
 }
 
@@ -264,6 +267,7 @@ pub fn raw(
         variables: Vec::new(),
         media_variables: Vec::new(),
         response_type: ResponseType::Text,
+        provider: None,
     })
 }
 
@@ -304,6 +308,7 @@ fn google_prompt(
         variables: options.variables,
         media_variables: Vec::new(),
         response_type,
+        provider: None,
     })
 }
 

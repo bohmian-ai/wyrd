@@ -2323,9 +2323,10 @@ async fn server_routes_keep_gateway_and_external_ownership() {
     let invocations = made_for(&invocations, &fixture.runner, "allowed");
     assert_eq!(invocations.len(), 1, "{invocations:?}");
 
-    // A registered custom OpenAI-compatible Prompt speaks the OpenAI Chat
-    // dialect, so its stored `openai_chat` route posts the Prompt's native
-    // body straight to the binding and decodes the ordinary Chat answer.
+    // A registered OpenAI Chat Prompt naming a custom provider keeps the
+    // OpenAI Chat schema; its stored `openai_chat` route ignores that
+    // provider, posts the native body straight to the binding, and decodes
+    // the ordinary Chat answer.
     let compatible = single_step(
         "compatible-review",
         "[]",
@@ -2334,7 +2335,7 @@ async fn server_routes_keep_gateway_and_external_ownership() {
     );
     std::fs::write(
         compatible.path().join("prompt.yaml"),
-        "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  space: engineering\n  name: compatible-review-prompt\n  version: \"1.0.0\"\nspec:\n  model: gpt-5-5\n  request:\n    provider: open_ai_chat_compatible\n    body:\n      provider:\n        custom: review-compatible\n      request:\n        model: gpt-5-5\n        messages:\n          - role: user\n            content: \"Answer about {{code}}\"\n  variables: [code]\n  response_type: text\n",
+        "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  space: engineering\n  name: compatible-review-prompt\n  version: \"1.0.0\"\nspec:\n  model: gpt-5-5\n  provider:\n    custom: review-compatible\n  request:\n    provider: open_ai_chat_completion\n    body:\n      model: gpt-5-5\n      messages:\n        - role: user\n          content: \"Answer about {{code}}\"\n  variables: [code]\n  response_type: text\n",
     )
     .expect("compatible prompt writes");
     fixture

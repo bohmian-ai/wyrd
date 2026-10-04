@@ -42,9 +42,7 @@ pub fn validate_prompt_loop_request(
     request: &ProviderRequest,
 ) -> AgentResult<PromptLoopSupport> {
     match request {
-        ProviderRequest::OpenAiChatCompletion(_) | ProviderRequest::OpenAiChatCompatible { .. } => {
-            Ok(PromptLoopSupport::OpenAiChat)
-        }
+        ProviderRequest::OpenAiChatCompletion(_) => Ok(PromptLoopSupport::OpenAiChat),
         ProviderRequest::AnthropicMessage(_) => Ok(PromptLoopSupport::Anthropic),
         ProviderRequest::GeminiGenerateContent(_) => Ok(PromptLoopSupport::Gemini),
         ProviderRequest::Vertex(_) => Ok(PromptLoopSupport::Vertex),
@@ -88,11 +86,7 @@ pub fn extract_messages(agent: &str, request: &ProviderRequest) -> AgentResult<V
             .cloned()
             .map(|item| MessageNum::OpenAiResponses(vec![item]))
             .collect()),
-        (PromptLoopSupport::OpenAiChat, ProviderRequest::OpenAiChatCompletion(req))
-        | (
-            PromptLoopSupport::OpenAiChat,
-            ProviderRequest::OpenAiChatCompatible { request: req, .. },
-        ) => Ok(req
+        (PromptLoopSupport::OpenAiChat, ProviderRequest::OpenAiChatCompletion(req)) => Ok(req
             .messages
             .iter()
             .cloned()
@@ -229,8 +223,7 @@ pub fn rebuild_request_messages(
     };
 
     match &mut template {
-        ProviderRequest::OpenAiChatCompletion(req)
-        | ProviderRequest::OpenAiChatCompatible { request: req, .. } => {
+        ProviderRequest::OpenAiChatCompletion(req) => {
             req.messages.clear();
             for msg in new_messages {
                 match msg {

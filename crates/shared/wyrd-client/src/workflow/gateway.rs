@@ -236,10 +236,7 @@ impl NativeCall {
     /// does not serve, including Vertex, or a body that does not serialize.
     fn project(request: ProviderRequest, model: &ModelRef) -> Result<Self, ProviderError> {
         let (ingress, path, body) = match request {
-            ProviderRequest::OpenAiChatCompletion(mut body)
-            | ProviderRequest::OpenAiChatCompatible {
-                request: mut body, ..
-            } => {
+            ProviderRequest::OpenAiChatCompletion(mut body) => {
                 body.model = model.to_string();
                 (
                     Ingress::OpenAiChat,

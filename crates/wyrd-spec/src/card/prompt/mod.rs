@@ -60,6 +60,7 @@ pub(crate) mod prompt_support {
             variables: variables.into_iter().map(ToOwned::to_owned).collect(),
             media_variables: Vec::new(),
             response_type: ResponseType::Text,
+            provider: None,
         }
     }
 

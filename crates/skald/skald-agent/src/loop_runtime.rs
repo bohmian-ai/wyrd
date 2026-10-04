@@ -208,8 +208,8 @@ impl Agent {
                         agent: self.id.clone(),
                         detail: err.to_string(),
                     })?;
-                let request_provider = rendered.provider();
-                let agent_provider = self.prompt.native().request.provider();
+                let request_provider = prompt.native().provider();
+                let agent_provider = self.prompt.native().provider();
                 if request_provider != agent_provider {
                     return Err(AgentError::ProviderMismatch {
                         agent: self.id.clone(),
@@ -329,8 +329,11 @@ impl Agent {
             };
 
             self.append_model_journal_call(iteration, &request).await?;
-            let chat = chat_span(&request, model);
-            let response = dispatch(providers, request).instrument(chat.clone()).await;
+            let provider = self.prompt.native().provider();
+            let chat = chat_span(&provider, &request, model);
+            let response = dispatch(providers, provider, request)
+                .instrument(chat.clone())
+                .await;
             match &response {
                 Ok(response) => {
                     let finish_reason = response_finish_reason(response);
@@ -663,7 +666,7 @@ impl Agent {
             "invoke_agent",
             gen_ai.operation.name = "invoke_agent",
             gen_ai.agent.id = %self.id,
-            gen_ai.provider.name = genai_provider_name(&prompt.request.provider()),
+            gen_ai.provider.name = genai_provider_name(&prompt.provider()),
             gen_ai.request.model = prompt.model.as_str(),
             error.r#type = field::Empty,
             otel.status_code = field::Empty,
@@ -704,7 +707,7 @@ impl Agent {
         self.journal
             .append(JournalEvent::ModelCall {
                 iteration,
-                provider: provider_label(&request.provider()),
+                provider: provider_label(&self.prompt.native().provider()),
                 model: request_model(request).unwrap_or_default().to_owned(),
             })
             .await
@@ -815,20 +818,20 @@ struct RunLoopInputs<'a> {
     model: &'a str,
 }
 
-/// Open the `chat` span for one provider dispatch of the effective `request`.
+/// Open the `chat` span for one dispatch of the effective `request` to `provider`.
 ///
-/// Records the semantic provider name of the typed request and the model the
+/// Records the semantic name of the Prompt's dispatch target and the model the
 /// request is actually made to: the request's own model, which reflects any
 /// `before_model` replacement, or the Prompt's resolved `fallback_model` for
 /// wire shapes that omit it (Gemini, Vertex). The caller records the stable
 /// provider error code on failure. The optional
 /// `string[]` finish-reasons attribute is omitted because `tracing` fields are
 /// scalar; finish reasons stay in the journal.
-fn chat_span(request: &ProviderRequest, fallback_model: &str) -> Span {
+fn chat_span(provider: &ProviderName, request: &ProviderRequest, fallback_model: &str) -> Span {
     info_span!(
         "chat",
         gen_ai.operation.name = "chat",
-        gen_ai.provider.name = genai_provider_name(&request.provider()),
+        gen_ai.provider.name = genai_provider_name(provider),
         gen_ai.request.model = request_model(request).unwrap_or(fallback_model),
         error.r#type = field::Empty,
         otel.status_code = field::Empty,
@@ -905,8 +908,7 @@ fn replace_seed_user_turn(conversation: &mut Conversation, input: String) {
 
 fn request_model(request: &ProviderRequest) -> Option<&str> {
     match request {
-        ProviderRequest::OpenAiChatCompletion(request)
-        | ProviderRequest::OpenAiChatCompatible { request, .. } => Some(&request.model),
+        ProviderRequest::OpenAiChatCompletion(request) => Some(&request.model),
         ProviderRequest::OpenAiResponses(request) => Some(&request.model),
         ProviderRequest::OpenAiEmbeddings(request) => Some(&request.model),
         ProviderRequest::AnthropicMessage(request) => Some(&request.model),

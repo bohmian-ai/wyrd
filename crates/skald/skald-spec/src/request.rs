@@ -26,15 +26,10 @@ use crate::wire::vertex_predict::VertexPredictRequest;
 #[serde(tag = "provider", content = "body", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ProviderRequest {
-    /// OpenAI Chat Completions request.
+    /// OpenAI Chat Completions request, whether it is sent to OpenAI, a
+    /// gateway, or a custom OpenAI-compatible endpoint named by
+    /// [`Prompt::provider`](crate::Prompt::provider).
     OpenAiChatCompletion(OpenAiChatRequest),
-    /// Custom provider that accepts OpenAI Chat Completions request semantics.
-    OpenAiChatCompatible {
-        /// Provider dispatch target.
-        provider: ProviderName,
-        /// OpenAI Chat-shaped request body.
-        request: OpenAiChatRequest,
-    },
     /// OpenAI Responses API request.
     OpenAiResponses(OpenAiResponsesRequest),
     /// OpenAI Embeddings request.
@@ -88,13 +83,15 @@ pub struct ToolDescriptor {
 }
 
 impl ProviderRequest {
-    /// Returns the durable provider dispatch target for every request variant.
+    /// Returns the default provider for the request's dialect.
+    ///
+    /// OpenAI dialects default to OpenAI and `RawV1` returns its embedded
+    /// provider. A Prompt can override this target with its own `provider`.
     pub fn provider(&self) -> ProviderName {
         match self {
             Self::OpenAiChatCompletion(_)
             | Self::OpenAiResponses(_)
             | Self::OpenAiEmbeddings(_) => ProviderName::OpenAi,
-            Self::OpenAiChatCompatible { provider, .. } => provider.clone(),
             Self::AnthropicMessage(_) => ProviderName::Anthropic,
             Self::GeminiGenerateContent(_) | Self::GoogleBatchEmbed(_) => ProviderName::Google,
             Self::Vertex(_) | Self::VertexPredict(_) => ProviderName::Vertex,
@@ -110,9 +107,6 @@ impl ProviderRequest {
 
         match &mut self {
             Self::OpenAiChatCompletion(request) => {
-                request.tools = Some(tools.iter().map(openai_chat_tool).collect());
-            }
-            Self::OpenAiChatCompatible { request, .. } => {
                 request.tools = Some(tools.iter().map(openai_chat_tool).collect());
             }
             Self::OpenAiResponses(request) => {

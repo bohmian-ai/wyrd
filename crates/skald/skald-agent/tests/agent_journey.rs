@@ -79,6 +79,31 @@ async fn journey_try_from_ref_resolves_card_prompt() {
     clear_prompt_card_registry();
 }
 
+/// An OpenAI Chat Prompt naming a custom provider keeps that provider across
+/// a JSON round trip, and the Agent loop dispatches it to the client
+/// registered under that name rather than to OpenAI.
+#[tokio::test]
+async fn custom_provider_prompt_round_trips_and_dispatches_to_its_client() {
+    let mut native = test_prompt().into_native();
+    native.provider = Some(ProviderName::Custom("local".to_owned()));
+    let json = serde_json::to_value(&native).expect("prompt serializes");
+    assert_eq!(json["provider"], serde_json::json!({"custom": "local"}));
+    assert_eq!(json["request"]["provider"], "open_ai_chat_completion");
+    let reparsed: skald_spec::Prompt = serde_json::from_value(json).expect("prompt reads back");
+    assert_eq!(reparsed, native);
+
+    let local = MockProvider::new(ProviderName::Custom("local".to_owned()));
+    local.push_response(openai_text_response("local answer"));
+    let mut providers = ProviderRegistry::new();
+    providers.register(Arc::new(local));
+    let run = Agent::new(Prompt::from_native(reparsed))
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("the local client answers");
+
+    assert_eq!(run.output, "local answer");
+}
+
 fn temp_path(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "wyrd_agent_journey_{}_{}.yaml",

@@ -5712,6 +5712,17 @@
           "description": "Model identifier used for indexing and selection.",
           "type": "string"
         },
+        "provider": {
+          "description": "Native dispatch target, such as a custom OpenAI-compatible endpoint.\n\nWhen absent, native dispatch uses the request dialect's default provider. Gateway routes select their own upstream and ignore it.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ProviderName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "request": {
           "description": "Native provider-shaped request authored with `${variable}` or `{{variable}}` placeholders.",
           "allOf": [
@@ -5796,7 +5807,7 @@
       "description": "One native LLM request, tagged with the provider dialect its body speaks.\n\nSerialized as `{\"provider\": \"<variant>\", \"body\": <native provider JSON>}`. The tag selects the variant, so bodies that share a wire shape (Gemini and Vertex GenerateContent) still read back as the provider that saved them, and a body that does not match its named provider fails to deserialize.",
       "oneOf": [
         {
-          "description": "OpenAI Chat Completions request.",
+          "description": "OpenAI Chat Completions request, whether it is sent to OpenAI, a gateway, or a custom OpenAI-compatible endpoint named by [`Prompt::provider`](crate::Prompt::provider).",
           "type": "object",
           "required": [
             "body",
@@ -5810,47 +5821,6 @@
               "type": "string",
               "enum": [
                 "open_ai_chat_completion"
-              ]
-            }
-          }
-        },
-        {
-          "description": "Custom provider that accepts OpenAI Chat Completions request semantics.",
-          "type": "object",
-          "required": [
-            "body",
-            "provider"
-          ],
-          "properties": {
-            "body": {
-              "type": "object",
-              "required": [
-                "provider",
-                "request"
-              ],
-              "properties": {
-                "provider": {
-                  "description": "Provider dispatch target.",
-                  "allOf": [
-                    {
-                      "$ref": "#/definitions/ProviderName"
-                    }
-                  ]
-                },
-                "request": {
-                  "description": "OpenAI Chat-shaped request body.",
-                  "allOf": [
-                    {
-                      "$ref": "#/definitions/OpenAiChatRequest"
-                    }
-                  ]
-                }
-              }
-            },
-            "provider": {
-              "type": "string",
-              "enum": [
-                "open_ai_chat_compatible"
               ]
             }
           }

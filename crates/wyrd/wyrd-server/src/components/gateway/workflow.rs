@@ -192,10 +192,7 @@ impl NativeCall {
     /// gateway does not serve or a body that does not serialize.
     fn project(request: ProviderRequest, model: &ModelRef) -> Result<Self, ProviderError> {
         let (operation, ingress, answer, body) = match request {
-            ProviderRequest::OpenAiChatCompletion(mut body)
-            | ProviderRequest::OpenAiChatCompatible {
-                request: mut body, ..
-            } => {
+            ProviderRequest::OpenAiChatCompletion(mut body) => {
                 body.model = model.to_string();
                 (
                     GatewayOperation::ChatCompletions,

@@ -379,21 +379,23 @@ impl Preparation {
         );
         let agent_tools = tools.clone();
         let input = WorkflowInput::Vars(request.input.into_iter().collect());
-        let prepared = state.workflows.spawn_blocking(move || {
-            let workflow = SkaldWorkflow::from_card_bodies(
-                graph.workflow().clone(),
-                &|agent| agent_tools.for_agent(agent),
-                &|dependency| graph.body(dependency),
-            )?;
-            workflow
-                .prepare(&dependencies, input, options)
-                .map_err(WyrdError::from)
-        })
-        .await
-        .map_err(|_| WyrdError::WorkflowInternal {
-            message: "Workflow preparation stopped before it finished".to_owned(),
-            details: serde_json::json!({ "boundary": "preparation" }),
-        })??;
+        let prepared = state
+            .workflows
+            .spawn_blocking(move || {
+                let workflow = SkaldWorkflow::from_card_bodies(
+                    graph.workflow().clone(),
+                    &|agent| agent_tools.for_agent(agent),
+                    &|dependency| graph.body(dependency),
+                )?;
+                workflow
+                    .prepare(&dependencies, input, options)
+                    .map_err(WyrdError::from)
+            })
+            .await
+            .map_err(|_| WyrdError::WorkflowInternal {
+                message: "Workflow preparation stopped before it finished".to_owned(),
+                details: serde_json::json!({ "boundary": "preparation" }),
+            })??;
         Ok((prepared, tools))
     }
 

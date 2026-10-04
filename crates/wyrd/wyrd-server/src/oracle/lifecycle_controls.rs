@@ -357,9 +357,10 @@ mod tests {
             requested.store(true, Ordering::Release);
             Ok::<(), WyrdError>(())
         };
-        let opened = cancel_while_opening(async { Ok(7) }, owner(), &CancellationToken::new(), later())
-            .await
-            .expect("an uncancelled open returns its stream");
+        let opened =
+            cancel_while_opening(async { Ok(7) }, owner(), &CancellationToken::new(), later())
+                .await
+                .expect("an uncancelled open returns its stream");
         assert_eq!(opened, 7);
         assert!(!requested.load(Ordering::Acquire));
 
@@ -378,7 +379,8 @@ mod tests {
             request.await.expect("cancellation reaches the owner");
             opening.send(9).expect("the open is still awaited");
         };
-        let (opened, ()) = tokio::join!(cancel_while_opening(open, owner, &cancel, later()), signal);
+        let (opened, ()) =
+            tokio::join!(cancel_while_opening(open, owner, &cancel, later()), signal);
         assert_eq!(opened.expect("a cancelled open still returns"), 9);
 
         let refused = async { Err::<(), WyrdError>(BifrostError::RunningQueryNotFound.into()) };

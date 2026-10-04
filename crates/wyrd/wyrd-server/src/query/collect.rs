@@ -341,10 +341,7 @@ impl BoundedQuery {
             }
             crate::state::QueryStreamFault::CaptureProbe => return None,
         };
-        let frames = std::mem::replace(
-            &mut stream.frames,
-            Box::pin(futures_util::stream::empty()),
-        );
+        let frames = std::mem::replace(&mut stream.frames, Box::pin(futures_util::stream::empty()));
         stream.frames = Box::pin(frames.take(kept));
         None
     }

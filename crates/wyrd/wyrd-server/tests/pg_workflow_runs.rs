@@ -1167,7 +1167,10 @@ fn chain(name: &str, depth: usize) -> TempDir {
             yaml.push_str(&format!("      depends_on: [s{}]\n", step - 1));
         }
     }
-    yaml.push_str(&format!("  outputs:\n    review: steps.s{}.output.text\n", depth - 1));
+    yaml.push_str(&format!(
+        "  outputs:\n    review: steps.s{}.output.text\n",
+        depth - 1
+    ));
     std::fs::write(temp.path().join("workflow.yaml"), yaml).expect("bundle file writes");
     temp
 }
@@ -1555,9 +1558,12 @@ async fn tracked_preparation_replay_and_disconnect() {
         .expect("the owner's preparation stops at the gate");
     let quitter = tokio::spawn(send(fixture.create_request(runner, &shared_key, &request)));
     let stayer = tokio::spawn(send(fixture.create_request(runner, &shared_key, &request)));
-    tokio::time::timeout(PATIENCE, workflows.wait_preparation_joins_for_test(joins + 2))
-        .await
-        .expect("both waiters join the preparation");
+    tokio::time::timeout(
+        PATIENCE,
+        workflows.wait_preparation_joins_for_test(joins + 2),
+    )
+    .await
+    .expect("both waiters join the preparation");
     quitter.abort();
     assert!(quitter.await.is_err(), "the quitting waiter disconnected");
     workflows.release_preparation_for_test();
@@ -1631,9 +1637,12 @@ async fn tracked_preparation_replay_and_disconnect() {
     let waiters: Vec<_> = (0..2)
         .map(|_| tokio::spawn(send(fixture.create_request(runner, &doomed_key, &request))))
         .collect();
-    tokio::time::timeout(PATIENCE, workflows.wait_preparation_joins_for_test(joins + 2))
-        .await
-        .expect("both waiters join the doomed preparation");
+    tokio::time::timeout(
+        PATIENCE,
+        workflows.wait_preparation_joins_for_test(joins + 2),
+    )
+    .await
+    .expect("both waiters join the doomed preparation");
     tokio::time::timeout(PATIENCE, fixture.server.shutdown_and_inspect())
         .await
         .expect("shutdown finishes")
@@ -1645,7 +1654,11 @@ async fn tracked_preparation_replay_and_disconnect() {
             "WYRD_WORKFLOW_503_RUN_UNAVAILABLE",
         );
     }
-    assert_eq!(fixture.upstream.arrivals(), 16, "the doomed preparation started nothing");
+    assert_eq!(
+        fixture.upstream.arrivals(),
+        16,
+        "the doomed preparation started nothing"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1960,14 +1973,19 @@ async fn declared_tools_use_captured_scopes_and_owned_services() {
         assert_eq!(tool_code(&results, id), *code, "{id}");
     }
     for (fault, id) in [
-        (WyrdTestServer::fail_next_query_after_schema as fn(&WyrdTestServer), "eof-schema"),
+        (
+            WyrdTestServer::fail_next_query_after_schema as fn(&WyrdTestServer),
+            "eof-schema",
+        ),
         (WyrdTestServer::fail_next_query_after_batch, "eof-batch"),
     ] {
         fault(&fixture.server);
         let before = fixture.upstream.arrivals();
-        fixture
-            .upstream
-            .reply(tool_calls(&[(id, "bifrost.query", json!({ "sql": select }))]));
+        fixture.upstream.reply(tool_calls(&[(
+            id,
+            "bifrost.query",
+            json!({ "sql": select }),
+        )]));
         fixture.upstream.reply(text("TRUNCATED"));
         let run = fixture.accept(runner, &request).await;
         let run = fixture.terminal(runner, &run).await;
@@ -2018,7 +2036,10 @@ async fn declared_tools_use_captured_scopes_and_owned_services() {
             ("query", "card")
         };
         assert_eq!(tool_code(&results, denied), denial, "{role}");
-        assert!(results[allowed].get("code").is_none(), "{role}: {results:?}");
+        assert!(
+            results[allowed].get("code").is_none(),
+            "{role}: {results:?}"
+        );
         assert!(
             !results[denied].to_string().contains("first")
                 && !results[denied].to_string().contains("wyrd/v1"),
@@ -2286,13 +2307,28 @@ async fn server_routes_keep_gateway_and_external_ownership() {
     // Each native dialect a stored Prompt selects reaches its own provider
     // path through the in-process gateway and decodes its own answer.
     fixture
-        .deploy_model("anthropic", "x-api-key", "claude-sonnet-5", &["chat_completions"])
+        .deploy_model(
+            "anthropic",
+            "x-api-key",
+            "claude-sonnet-5",
+            &["chat_completions"],
+        )
         .await;
     fixture
-        .deploy_model("gemini", "x-goog-api-key", "gemini-2.5-flash", &["chat_completions"])
+        .deploy_model(
+            "gemini",
+            "x-goog-api-key",
+            "gemini-2.5-flash",
+            &["chat_completions"],
+        )
         .await;
     fixture
-        .deploy_model("openai", "authorization", "gpt-5-4", &["chat_completions", "responses"])
+        .deploy_model(
+            "openai",
+            "authorization",
+            "gpt-5-4",
+            &["chat_completions", "responses"],
+        )
         .await;
     let invoke = |provider: &str| {
         Permission::gateway_invoke(GatewayAccess::Provider {
@@ -2367,7 +2403,10 @@ async fn server_routes_keep_gateway_and_external_ownership() {
     let run = fixture.terminal(caller, &run).await;
     assert_eq!(run.status, WorkflowRunStatus::Failed, "{run:?}");
     assert_eq!(
-        run.steps["answer"].error.as_ref().map(|error| error.code.as_str()),
+        run.steps["answer"]
+            .error
+            .as_ref()
+            .map(|error| error.code.as_str()),
         Some("WYRD_GATEWAY_404_MODEL_UNAVAILABLE"),
         "{run:?}"
     );
@@ -2384,7 +2423,10 @@ async fn server_routes_keep_gateway_and_external_ownership() {
     };
     let steps = format!(
         "{}{}  outputs:\n    left: steps.left.output.text\n    right: steps.right.output.text\n",
-        declared_step("left", &fallback(&["gpt-5-5-missing", "gpt-5-4", "gpt-5-5"])),
+        declared_step(
+            "left",
+            &fallback(&["gpt-5-5-missing", "gpt-5-4", "gpt-5-5"])
+        ),
         declared_step("right", &fallback(&["gpt-5-5"])),
     );
     let bundle = declared_review(
@@ -2426,9 +2468,7 @@ async fn server_routes_keep_gateway_and_external_ownership() {
         .accept(caller, &run_request("gateway-review", "x"))
         .await;
     fixture.upstream.wait_arrivals(before + 2).await;
-    let (status, body) = fixture
-        .cancel(caller, &cancelled.run_id.to_string())
-        .await;
+    let (status, body) = fixture.cancel(caller, &cancelled.run_id.to_string()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     fixture.upstream.release();
     assert_eq!(

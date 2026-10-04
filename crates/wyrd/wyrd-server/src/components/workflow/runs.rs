@@ -760,7 +760,10 @@ mod tests {
         };
         let mut outcome = reservation.outcome();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
-        assert!(!runs.drain(deadline).await, "drain waits for the reservation");
+        assert!(
+            !runs.drain(deadline).await,
+            "drain waits for the reservation"
+        );
 
         let refused = runs
             .admit(key(), hash)
@@ -777,7 +780,9 @@ mod tests {
             .clone()
             .expect("a published outcome is present");
         assert_eq!(
-            published.expect_err("a released reservation is unavailable").code(),
+            published
+                .expect_err("a released reservation is unavailable")
+                .code(),
             run_unavailable().code()
         );
         {

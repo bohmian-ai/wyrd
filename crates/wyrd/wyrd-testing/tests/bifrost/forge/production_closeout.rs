@@ -159,8 +159,6 @@ struct GeometryProfile {
     /// Parquet row-group target, always below the file target so a rolled
     /// output necessarily contains more than one group.
     row_group_bytes: u64,
-    /// Compaction eligibility threshold this journey's Forge config uses.
-    small_file_threshold_bytes: u64,
     /// Whether the qualification sizing of the worker and Oracle pods applies.
     production_resources: bool,
 }
@@ -178,11 +176,6 @@ impl GeometryProfile {
         scribe_target_bytes: 4 * 1024 * 1024,
         iceberg_target_bytes: 8 * 1024 * 1024,
         row_group_bytes: 1024 * 1024,
-        // Just under the file target, as production's is: a packed residue that
-        // has not yet reached the target is still small, so the backlog keeps
-        // rolling instead of stalling on one intermediate output the next pass
-        // may no longer touch.
-        small_file_threshold_bytes: 7 * 1024 * 1024,
         production_resources: false,
     };
 
@@ -193,7 +186,6 @@ impl GeometryProfile {
         scribe_target_bytes: 512 * 1024 * 1024,
         iceberg_target_bytes: 1024 * 1024 * 1024,
         row_group_bytes: 128 * 1024 * 1024,
-        small_file_threshold_bytes: 768 * 1024 * 1024,
         production_resources: true,
     };
 
@@ -231,11 +223,7 @@ impl CloseoutJourney {
     /// # Panics
     /// Panics if the production topology cannot start or lacks its observer.
     async fn start() -> Self {
-        Self::start_with_config(ForgeConfig {
-            small_file_threshold_bytes: GeometryProfile::selected().small_file_threshold_bytes,
-            ..ForgeConfig::default()
-        })
-        .await
+        Self::start_with_config(ForgeConfig::default()).await
     }
 
     /// Starts the same role topology with the journey's maintenance policy.

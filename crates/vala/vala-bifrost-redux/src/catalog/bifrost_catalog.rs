@@ -15,7 +15,7 @@ use vala_sql::{TenantConn, ValaPostgres};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::WYRD_EVENT_TIME;
 use wyrd_spec::vala::api::{
-    AuditEvent, BifrostTableDescription, BifrostTableEntry, PhysicalLayoutWire,
+    AuditEvent, BifrostTableDescription, BifrostTableEntry, CompactionTypeWire, PhysicalLayoutWire,
 };
 
 use crate::catalog::error::BifrostCatalogError;
@@ -31,6 +31,7 @@ use crate::catalog::wire::{
     reject_reserved_field_names,
 };
 use crate::catalog::{TableRef, TenantTableBinding};
+use crate::forge::{COMPACTION_TYPE_PROPERTY, ForgeCompactionType};
 use crate::namespaces::BifrostNamespace;
 use crate::schema::{SchemaFingerprint, with_managed_columns};
 use crate::storage::BifrostStorage;
@@ -978,26 +979,28 @@ impl BifrostCatalog {
                 "built-in tables must be provisioned with ensure_builtin".to_owned(),
             ));
         }
-        self.create_table_locked(request, None, None).await
+        self.create_table_locked(request, None, CompactionRegistration::default())
+            .await
     }
 
     /// Register a caller-owned dataset in the tenant-qualified dataset namespace.
     ///
-    /// `compaction_target_file_size_bytes`, when supplied, becomes the new
-    /// table's explicit `write.target-file-size-bytes` property; omitted, the
-    /// table follows Forge's deployment default. On an existing table it must
-    /// match the stored explicit target or be omitted.
+    /// Each option `compaction` declares becomes the new table's explicit
+    /// Iceberg property — the file target as `write.target-file-size-bytes`,
+    /// the type as `wyrd.forge.compaction.type`; an omitted option stores
+    /// nothing and the table follows Forge's default. On an existing table each
+    /// declared option must match the stored explicit value or be omitted.
     ///
     /// # Errors
     /// Returns a typed catalog error when the dataset name, schema, physical table,
-    /// compaction target, control row, or audit event is invalid.
+    /// compaction target or type, control row, or audit event is invalid.
     pub async fn register_dataset(
         &self,
         tenant: DataTenantId,
         table: TableRef,
         user_fields: Vec<Field>,
         physical_layout: Option<PhysicalLayoutWire>,
-        compaction_target_file_size_bytes: Option<u64>,
+        compaction: CompactionRegistration,
         audit: Option<AuditEvent>,
     ) -> Result<TableUid, BifrostCatalogError> {
         if table.namespace != BifrostNamespace::Datasets {
@@ -1014,7 +1017,7 @@ impl BifrostCatalog {
                 audit,
             },
             None,
-            compaction_target_file_size_bytes,
+            compaction,
         )
         .await
     }
@@ -1044,7 +1047,7 @@ impl BifrostCatalog {
                 audit: None,
             },
             Some((definition.schema)()),
-            None,
+            CompactionRegistration::default(),
         )
         .await
     }
@@ -1066,21 +1069,21 @@ impl BifrostCatalog {
     /// fields. It selects no resolver: every declaration, built-in or caller,
     /// resolves through the one [`PhysicalLayout::resolve`] entry point.
     ///
-    /// `compaction_target_file_size_bytes` is checked for intrinsic shape
-    /// before the transaction, compared under the advisory lock against an
-    /// existing physical table's explicit target, and otherwise written as the
-    /// new table's `write.target-file-size-bytes` in its create transaction.
+    /// `compaction` is checked for intrinsic shape before the transaction,
+    /// compared under the advisory lock against an existing physical table's
+    /// explicit target and type, and otherwise written as the new table's
+    /// properties in its create transaction.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::Registration`] for an invalid or
-    /// conflicting layout or compaction target,
+    /// conflicting layout, compaction target, or compaction type,
     /// [`BifrostCatalogError::FingerprintMismatch`] for a schema conflict, and
     /// metadata, Iceberg, SQL, or audit errors otherwise.
     async fn create_table_locked(
         &self,
         request: CreateTableRequest,
         canonical_schema: Option<arrow::datatypes::SchemaRef>,
-        compaction_target_file_size_bytes: Option<u64>,
+        compaction: CompactionRegistration,
     ) -> Result<TableUid, BifrostCatalogError> {
         reject_reserved_field_names(&request.user_fields)?;
         let binding = TenantTableBinding::resolve((request.tenant, request.table))
@@ -1094,13 +1097,7 @@ impl BifrostCatalog {
             request.physical_layout.as_ref(),
             canonical_schema.as_deref(),
         )?;
-        if let Some(bytes) = compaction_target_file_size_bytes
-            && !crate::forge::managed::policy::registrable_target_file_size_bytes(bytes)
-        {
-            return Err(BifrostCatalogError::Registration(
-                wyrd_spec::vala::BifrostError::InvalidCompactionTarget { table: fqn, bytes },
-            ));
-        }
+        compaction.validate(&fqn)?;
         let layout_wire = layout.to_wire();
         let layout_json = serde_json::to_value(&layout_wire).map_err(|error| {
             BifrostCatalogError::MetadataMismatch(format!(
@@ -1130,7 +1127,7 @@ impl BifrostCatalog {
             }
             let physical = self.catalog.load_table(&table_ident).await?;
             self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
-            assert_compaction_target(physical.metadata(), compaction_target_file_size_bytes, &fqn)?;
+            compaction.assert_matches(physical.metadata(), &fqn)?;
             // A concurrent winner already created the row; this request's
             // verdict still commits once, in the transaction that observed it.
             append_registration_audit(&mut conn, request.audit.as_ref(), &fqn).await?;
@@ -1142,15 +1139,10 @@ impl BifrostCatalog {
         if physical_exists {
             let physical = self.catalog.load_table(&table_ident).await?;
             self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
-            assert_compaction_target(physical.metadata(), compaction_target_file_size_bytes, &fqn)?;
+            compaction.assert_matches(physical.metadata(), &fqn)?;
         } else {
-            self.create_physical_table(
-                &binding,
-                &arrow_schema,
-                &layout,
-                compaction_target_file_size_bytes,
-            )
-            .await?;
+            self.create_physical_table(&binding, &arrow_schema, &layout, compaction)
+                .await?;
         }
 
         let table_uid = TableUid::new_v7();
@@ -1175,10 +1167,10 @@ impl BifrostCatalog {
     /// derived from `layout` and `binding`, so the canonical layout stays the
     /// single authority for the table's shape. The Forge data path is written
     /// as `write.data.path` so the managed rewrite core roots its outputs under
-    /// the recipe segment instead of the default data root. A supplied
-    /// `compaction_target_file_size_bytes` is written as the table's explicit
-    /// `write.target-file-size-bytes`; omitted, no target property is written
-    /// so Forge resolves its deployment default at planning time.
+    /// the recipe segment instead of the default data root. Each option
+    /// `compaction` declares is written as the table's explicit property;
+    /// an omitted option writes nothing, so Forge resolves its default at
+    /// planning time.
     ///
     /// # Errors
     ///
@@ -1190,7 +1182,7 @@ impl BifrostCatalog {
         binding: &TenantTableBinding,
         arrow_schema: &Schema,
         layout: &PhysicalLayout,
-        compaction_target_file_size_bytes: Option<u64>,
+        compaction: CompactionRegistration,
     ) -> Result<(), BifrostCatalogError> {
         let iceberg_schema = crate::tables::iceberg_schema_for(arrow_schema)?;
         let partition_spec = layout
@@ -1215,9 +1207,7 @@ impl BifrostCatalog {
                 forge_data_location,
             ),
         ]);
-        if let Some(bytes) = compaction_target_file_size_bytes {
-            properties.insert(TARGET_FILE_SIZE_PROPERTY.to_owned(), bytes.to_string());
-        }
+        compaction.write_properties(&mut properties);
         let creation = TableCreation::builder()
             .name(binding.table_name.clone())
             .location(location)
@@ -1528,6 +1518,8 @@ impl BifrostCatalog {
             compaction_target_file_size_bytes: explicit_compaction_target(
                 iceberg_table.metadata(),
             )?,
+            compaction_type: explicit_compaction_type(iceberg_table.metadata())?
+                .map(CompactionTypeWire::from),
         })
     }
 
@@ -1777,30 +1769,123 @@ fn explicit_compaction_target(
         .transpose()
 }
 
-/// Checks a re-registration's compaction target against the stored one.
+/// Reads the explicit compaction type a physical table stores.
 ///
-/// Omission always matches and leaves the stored property untouched; a
-/// supplied value must equal the table's explicit target.
+/// `None` means the table declares none and Forge compacts it `full`.
 ///
 /// # Errors
-/// Returns [`BifrostCatalogError::Registration`] carrying
-/// `CompactionTargetMismatch` when a supplied target differs from the stored
-/// explicit target (including when none is stored), and a metadata mismatch
-/// when the stored property is malformed.
-fn assert_compaction_target(
+/// Returns [`BifrostCatalogError::MetadataMismatch`] when the stored property
+/// is not a known compaction type spelling.
+fn explicit_compaction_type(
     metadata: &TableMetadata,
-    supplied: Option<u64>,
-    fqn: &str,
-) -> Result<(), BifrostCatalogError> {
-    match supplied {
-        Some(bytes) if explicit_compaction_target(metadata)? != Some(bytes) => {
-            Err(BifrostCatalogError::Registration(
+) -> Result<Option<ForgeCompactionType>, BifrostCatalogError> {
+    metadata
+        .properties()
+        .get(COMPACTION_TYPE_PROPERTY)
+        .map(|raw| {
+            ForgeCompactionType::parse(raw).map_err(|error| {
+                BifrostCatalogError::MetadataMismatch(format!(
+                    "stored {COMPACTION_TYPE_PROPERTY}={raw:?} is invalid: {error}"
+                ))
+            })
+        })
+        .transpose()
+}
+
+/// The Forge compaction options one dataset registration declares.
+///
+/// Every option is optional and independent: a declared option becomes the
+/// new table's explicit Iceberg property in its create transaction, and on a
+/// re-registration must equal the stored explicit value. An omitted option
+/// stores nothing and never conflicts, so the table follows Forge's default
+/// (the deployment file target, the `full` type). [`Default`] declares
+/// nothing, which is how built-ins register.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompactionRegistration {
+    /// Soft file target Forge compacts toward, stored as
+    /// `write.target-file-size-bytes`.
+    pub target_file_size_bytes: Option<u64>,
+    /// Physical compaction type a worker plans with, stored as
+    /// `wyrd.forge.compaction.type`.
+    pub compaction_type: Option<ForgeCompactionType>,
+}
+
+impl CompactionRegistration {
+    /// Rejects a declaration Forge could never honor, before any durable write.
+    ///
+    /// Only the file target has intrinsic shape: it must be registrable under
+    /// Forge's file-size policy. Every compaction type is valid on its own.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::Registration`] carrying
+    /// `InvalidCompactionTarget` when the declared target is not registrable.
+    fn validate(&self, fqn: &str) -> Result<(), BifrostCatalogError> {
+        match self.target_file_size_bytes {
+            Some(bytes)
+                if !crate::forge::managed::policy::registrable_target_file_size_bytes(bytes) =>
+            {
+                Err(BifrostCatalogError::Registration(
+                    wyrd_spec::vala::BifrostError::InvalidCompactionTarget {
+                        table: fqn.to_owned(),
+                        bytes,
+                    },
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Checks a re-registration's declared options against the stored table.
+    ///
+    /// Omission always matches and leaves the stored property untouched; a
+    /// declared option must equal the table's explicit value, so declaring
+    /// one for a table that stores none is a conflict. The target is checked
+    /// before the type.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::Registration`] carrying
+    /// `CompactionTargetMismatch` or `CompactionTypeMismatch` for a differing
+    /// declaration, and a metadata mismatch when a stored property is
+    /// malformed.
+    fn assert_matches(
+        &self,
+        metadata: &TableMetadata,
+        fqn: &str,
+    ) -> Result<(), BifrostCatalogError> {
+        if let Some(bytes) = self.target_file_size_bytes
+            && explicit_compaction_target(metadata)? != Some(bytes)
+        {
+            return Err(BifrostCatalogError::Registration(
                 wyrd_spec::vala::BifrostError::CompactionTargetMismatch {
                     table: fqn.to_owned(),
                 },
-            ))
+            ));
         }
-        _ => Ok(()),
+        if let Some(kind) = self.compaction_type
+            && explicit_compaction_type(metadata)? != Some(kind)
+        {
+            return Err(BifrostCatalogError::Registration(
+                wyrd_spec::vala::BifrostError::CompactionTypeMismatch {
+                    table: fqn.to_owned(),
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Adds each declared option to a new table's creation properties.
+    ///
+    /// Writes nothing for an omitted option.
+    fn write_properties(&self, properties: &mut HashMap<String, String>) {
+        if let Some(bytes) = self.target_file_size_bytes {
+            properties.insert(TARGET_FILE_SIZE_PROPERTY.to_owned(), bytes.to_string());
+        }
+        if let Some(kind) = self.compaction_type {
+            properties.insert(
+                COMPACTION_TYPE_PROPERTY.to_owned(),
+                kind.as_str().to_owned(),
+            );
+        }
     }
 }
 
@@ -1880,8 +1965,63 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field};
 
-    use super::{MAX_PHYSICAL_LEAF_COLUMNS, PinnedIcebergFile, resolve_registration_layout};
+    use super::{
+        CompactionRegistration, MAX_PHYSICAL_LEAF_COLUMNS, PinnedIcebergFile,
+        resolve_registration_layout,
+    };
     use crate::catalog::event_time::{EventTimeBoundsDefect, EventTimeStatistics};
+    use crate::forge::{COMPACTION_TYPE_PROPERTY, ForgeCompactionType, ForgeTableSettings};
+    use wyrd_spec::vala::api::CompactionTypeWire;
+
+    /// A declared compaction type is written under Forge's own property in
+    /// the hyphenated spelling Forge parses back to the same type, every wire
+    /// value round-trips through the Forge type, and an empty declaration
+    /// writes nothing so Forge keeps its `full` default.
+    ///
+    /// # Panics
+    /// Panics when a written property is missing, misspelled, or does not
+    /// parse back into the declared type.
+    #[test]
+    fn compaction_registration_writes_the_forge_type_property() {
+        for wire in [
+            CompactionTypeWire::Auto,
+            CompactionTypeWire::Full,
+            CompactionTypeWire::SmallFiles,
+            CompactionTypeWire::FilesWithDelete,
+        ] {
+            let kind = ForgeCompactionType::from(wire);
+            assert_eq!(CompactionTypeWire::from(kind), wire);
+            let mut properties = HashMap::new();
+            CompactionRegistration {
+                target_file_size_bytes: None,
+                compaction_type: Some(kind),
+            }
+            .write_properties(&mut properties);
+            assert_eq!(properties.len(), 1);
+            let settings =
+                ForgeTableSettings::from_properties(&properties).expect("settings parse");
+            assert_eq!(settings.compaction_type, kind);
+        }
+        let mut properties = HashMap::new();
+        CompactionRegistration {
+            target_file_size_bytes: None,
+            compaction_type: Some(ForgeCompactionType::SmallFiles),
+        }
+        .write_properties(&mut properties);
+        assert_eq!(
+            properties.get(COMPACTION_TYPE_PROPERTY).map(String::as_str),
+            Some("small-files")
+        );
+        let mut empty = HashMap::new();
+        CompactionRegistration::default().write_properties(&mut empty);
+        assert!(empty.is_empty());
+        assert_eq!(
+            ForgeTableSettings::from_properties(&empty)
+                .expect("defaults parse")
+                .compaction_type,
+            ForgeCompactionType::Full
+        );
+    }
 
     /// Builds one Forge-style rewrite output's manifest `DataFile` with typed
     /// `wyrd_event_time` bounds under the given field id.
@@ -2069,7 +2209,7 @@ mod production_pin_tests {
 
     use std::sync::Arc;
 
-    use super::BifrostCatalog;
+    use super::{BifrostCatalog, CompactionRegistration};
     use crate::catalog::TableRef;
     use crate::catalog::event_time::{EventTimeBoundsDefect, EventTimeStatistics};
     use crate::namespaces::BifrostNamespace;
@@ -2245,7 +2385,7 @@ mod production_pin_tests {
                         true,
                     )],
                     None,
-                    None,
+                    CompactionRegistration::default(),
                     None,
                 )
                 .await
@@ -2321,7 +2461,7 @@ mod production_pin_tests {
                         true,
                     )],
                     None,
-                    None,
+                    CompactionRegistration::default(),
                     None,
                 )
                 .await
@@ -2445,7 +2585,7 @@ mod production_pin_tests {
                         true,
                     )],
                     None,
-                    None,
+                    CompactionRegistration::default(),
                     None,
                 )
                 .await
@@ -2569,7 +2709,7 @@ mod production_pin_tests {
                         true,
                     )],
                     None,
-                    None,
+                    CompactionRegistration::default(),
                     None,
                 )
                 .await

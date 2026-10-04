@@ -23,13 +23,26 @@ except ImportError:  # optional: run correlation becomes a no-op
 
 
 class OtelObserver(Observer):
-    """OTel observer attached through `Workflow(observers=[...])`.
+    """Observer that turns Wyrd lifecycle events into OpenTelemetry spans.
 
-    Add `OtelObserver()` to a workflow's observer list to emit spans into the
-    Python OpenTelemetry tracer provider configured by the host application.
+    Add ``OtelObserver()`` to ``Workflow(observers=[...])`` to emit a
+    ``wyrd.workflow.run`` span per workflow run, a child ``wyrd.agent.run`` span
+    per Agent run, and ``wyrd.model.call`` and ``wyrd.tool.call`` spans under
+    it. Safe for concurrent workflow steps.
     """
 
     def __init__(self, tracer=None) -> None:
+        """Create an OtelObserver.
+
+        Args:
+            tracer: an OpenTelemetry ``Tracer`` to create spans with. Omitted,
+                ``opentelemetry.trace.get_tracer("wyrd")`` is used, and a
+                warning is emitted if no tracer provider is configured yet,
+                because those spans would be discarded.
+
+        Raises:
+            ImportError: when ``opentelemetry-api`` is not installed.
+        """
         try:
             from opentelemetry import trace
             from opentelemetry.trace import ProxyTracerProvider
@@ -68,6 +81,12 @@ class OtelObserver(Observer):
             return self._spans.pop(key, None)
 
     def on_agent_start(self, run_id, parent_run_id, agent_id, input, session_id) -> None:
+        """As ``Observer.on_agent_start``; starts a ``wyrd.agent.run/<agent_id>`` span.
+
+        The span is a child of the workflow span named by ``parent_run_id`` and
+        carries ``wyrd.run_id`` and ``wyrd.agent.id``.
+        """
+
         from opentelemetry import trace
         from opentelemetry.trace import SpanKind
 
@@ -86,6 +105,13 @@ class OtelObserver(Observer):
         self._set_span(run_id, span)
 
     def on_model_call(self, run_id, agent_id, iteration, provider, model, request) -> None:
+        """As ``Observer.on_model_call``; starts a ``wyrd.model.call/<provider>`` span.
+
+        A ``CLIENT`` span under the agent span carrying ``wyrd.run_id``,
+        ``wyrd.agent.id``, ``wyrd.iteration``, ``gen_ai.system``, and
+        ``gen_ai.request.model``.
+        """
+
         from opentelemetry import trace
         from opentelemetry.trace import SpanKind
 
@@ -115,12 +141,23 @@ class OtelObserver(Observer):
         synthetic,
         response,
     ) -> None:
+        """As ``Observer.on_model_result``; ends the model span.
+
+        Sets ``gen_ai.response.finish_reason`` first.
+        """
         span = self._pop_span(f"{run_id}.model.{iteration}")
         if span is not None:
             span.set_attribute("gen_ai.response.finish_reason", finish_reason)
             span.end()
 
     def on_tool_call(self, run_id, agent_id, iteration, call_id, tool_name) -> None:
+        """As ``Observer.on_tool_call``; starts a ``wyrd.tool.call/<tool_name>`` span.
+
+        The span sits under the agent span and carries ``wyrd.run_id``,
+        ``wyrd.agent.id``, ``wyrd.iteration``, ``wyrd.call_id``, and
+        ``tool.name``.
+        """
+
         from opentelemetry import trace
         from opentelemetry.trace import SpanKind
 
@@ -142,6 +179,8 @@ class OtelObserver(Observer):
         self._set_span(f"{run_id}.tool.{call_id}", span)
 
     def on_tool_result(self, run_id, agent_id, iteration, call_id, ok) -> None:
+        """As ``Observer.on_tool_result``; ends the tool span, as ``ERROR`` unless ``ok``."""
+
         from opentelemetry.trace import StatusCode
 
         span = self._pop_span(f"{run_id}.tool.{call_id}")
@@ -151,6 +190,12 @@ class OtelObserver(Observer):
             span.end()
 
     def on_agent_finish(self, run_id, agent_id, finish_reason, iterations, duration_ms) -> None:
+        """As ``Observer.on_agent_finish``; ends the agent span.
+
+        Sets ``wyrd.finish_reason``, ``wyrd.iterations``, and
+        ``wyrd.duration_ms`` first.
+        """
+
         span = self._pop_span(run_id)
         if span is not None:
             span.set_attribute("wyrd.finish_reason", finish_reason)
@@ -159,6 +204,11 @@ class OtelObserver(Observer):
             span.end()
 
     def on_agent_error(self, run_id, agent_id, code, message) -> None:
+        """As ``Observer.on_agent_error``; ends the agent span with ``ERROR`` status.
+
+        The status description is ``message`` and ``error.code`` is ``code``.
+        """
+
         from opentelemetry.trace import StatusCode
 
         span = self._pop_span(run_id)
@@ -168,6 +218,12 @@ class OtelObserver(Observer):
             span.end()
 
     def on_workflow_start(self, run_id, workflow_id, step_count) -> None:
+        """As ``Observer.on_workflow_start``; starts the workflow span.
+
+        A root span named ``wyrd.workflow.run/<workflow_id>`` carrying
+        ``wyrd.run_id``, ``wyrd.workflow.id``, and ``wyrd.workflow.step_count``.
+        """
+
         from opentelemetry.trace import SpanKind
 
         span = self._tracer.start_span(
@@ -182,6 +238,10 @@ class OtelObserver(Observer):
         self._set_span(f"wf.{run_id}", span)
 
     def on_workflow_finish(self, run_id, workflow_id, duration_ms) -> None:
+        """As ``Observer.on_workflow_finish``; ends the workflow span.
+
+        Sets ``wyrd.duration_ms`` first.
+        """
         span = self._pop_span(f"wf.{run_id}")
         if span is not None:
             span.set_attribute("wyrd.duration_ms", duration_ms)

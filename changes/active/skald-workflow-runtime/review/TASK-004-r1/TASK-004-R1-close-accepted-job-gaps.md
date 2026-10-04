@@ -3,7 +3,7 @@ id: TASK-004-R1
 kind: remediation
 status: ready
 spec: SPEC-skald-workflow-runtime
-spec_revision: 12
+spec_revision: 13
 parent_task: TASK-004
 remediates: [FIND-TASK-004-1, FIND-TASK-004-2, FIND-TASK-004-3, FIND-TASK-004-4, FIND-TASK-004-5, FIND-TASK-004-6, FIND-TASK-004-7, FIND-TASK-004-8, FIND-TASK-004-9, FIND-TASK-004-10, FIND-TASK-004-11, FIND-TASK-004-12, FIND-TASK-004-13, FIND-TASK-004-14]
 ---
@@ -19,6 +19,8 @@ Implementation skill: `$wyrd-implement`.
 - Reviewed base: `b90335e0991438e8c28b65ed9c0c4cd80f9b0d56`
 - Reviewed candidate: `96e993a16706d2fb759e4cdb7371ff490b198a35`
 - Validated diagnosis: `changes/active/skald-workflow-runtime/review/TASK-004-r1/findings-validation.md`
+
+Revision 12 is the authority the r1 review assessed. Approved Revision 13 extended this remediation after that review with provider-tagged `ProviderRequest` and the internal Vertex proof, and is its current authority.
 
 ## Outcome
 

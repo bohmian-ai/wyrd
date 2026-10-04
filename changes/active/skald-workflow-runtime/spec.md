@@ -517,7 +517,8 @@ spec:
 ```
 
 The three paths above target versioned Prompt Card files under `prompts/`.
-Their native bodies are unchanged:
+Their provider-native request bodies are unchanged inside the tagged
+`request.provider`/`request.body` envelope:
 
 ```yaml
 apiVersion: wyrd/v1
@@ -529,16 +530,18 @@ metadata:
 spec:
   model: gpt-5-5
   request:
-    model: gpt-5-5
-    messages:
-      - role: system
-        content: |
-          You are a security reviewer. Report only exploitable security findings.
-          For every finding, identify the affected code and a concrete failure path.
-      - role: user
-        content: |
-          Review this change:
-          {{code}}
+    provider: open_ai_chat_completion
+    body:
+      model: gpt-5-5
+      messages:
+        - role: system
+          content: |
+            You are a security reviewer. Report only exploitable security findings.
+            For every finding, identify the affected code and a concrete failure path.
+        - role: user
+          content: |
+            Review this change:
+            {{code}}
   variables: [code]
   response_type: text
 ```
@@ -553,16 +556,18 @@ metadata:
 spec:
   model: gpt-5-5
   request:
-    model: gpt-5-5
-    messages:
-      - role: system
-        content: |
-          You are a correctness reviewer. Find reachable bugs, data loss, races,
-          and contract violations. Ignore style-only concerns.
-      - role: user
-        content: |
-          Review this change:
-          {{code}}
+    provider: open_ai_chat_completion
+    body:
+      model: gpt-5-5
+      messages:
+        - role: system
+          content: |
+            You are a correctness reviewer. Find reachable bugs, data loss, races,
+            and contract violations. Ignore style-only concerns.
+        - role: user
+          content: |
+            Review this change:
+            {{code}}
   variables: [code]
   response_type: text
 ```
@@ -577,23 +582,25 @@ metadata:
 spec:
   model: gpt-5-5
   request:
-    model: gpt-5-5
-    messages:
-      - role: system
-        content: |
-          You are the final reviewer. Validate each proposed finding against the
-          supplied code, remove duplicates and unsupported claims, and return one
-          prioritized review.
-      - role: user
-        content: |
-          Code:
-          {{code}}
+    provider: open_ai_chat_completion
+    body:
+      model: gpt-5-5
+      messages:
+        - role: system
+          content: |
+            You are the final reviewer. Validate each proposed finding against the
+            supplied code, remove duplicates and unsupported claims, and return one
+            prioritized review.
+        - role: user
+          content: |
+            Code:
+            {{code}}
 
-          Security review:
-          {{security_review}}
+            Security review:
+            {{security_review}}
 
-          Correctness review:
-          {{correctness_review}}
+            Correctness review:
+            {{correctness_review}}
   variables: [code, security_review, correctness_review]
   response_type: text
 ```

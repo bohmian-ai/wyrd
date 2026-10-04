@@ -174,6 +174,36 @@ ALTER FUNCTION vala.oracle_catalog_metadata_location(text, text) OWNER TO wyrd_p
 REVOKE ALL ON FUNCTION vala.oracle_catalog_metadata_location(text, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION vala.oracle_catalog_metadata_location(text, text) TO wyrd_app;
 
+-- Oracle fences are system-owner cluster_nodes rows, invisible to a tenant-bound
+-- request role. An active read is abandoned only when its exact owner fence is
+-- no longer live, so this definer answers that one question for any role: it
+-- returns whether the exact Oracle (node_id, fencing_token) heartbeated within
+-- the caller-bound liveness window, and exposes no other node state.
+CREATE FUNCTION vala.oracle_fence_is_live(
+    p_node_id uuid,
+    p_fencing_token bigint,
+    p_liveness_secs double precision
+) RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+          FROM vala.cluster_nodes n
+         WHERE n.data_tenant_id = '00000000-0000-7000-8000-000000000000'::uuid
+           AND n.node_id = p_node_id
+           AND n.role = 'oracle'
+           AND n.fencing_token = p_fencing_token
+           AND n.heartbeat_at >= pg_catalog.statement_timestamp()
+                                 - (p_liveness_secs * interval '1 second'))
+$$;
+
+ALTER FUNCTION vala.oracle_fence_is_live(uuid, bigint, double precision) OWNER TO wyrd_platform_admin;
+REVOKE ALL ON FUNCTION vala.oracle_fence_is_live(uuid, bigint, double precision) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION vala.oracle_fence_is_live(uuid, bigint, double precision) TO wyrd_app;
+
 -- ---------------------------------------------------------------------------
 -- One-statement cut acquisition
 -- ---------------------------------------------------------------------------

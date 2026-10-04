@@ -1563,7 +1563,7 @@ pub(crate) async fn lock_table_authority(
 ///
 /// Returns [`SqlError::Conflict`] when an active read remains and
 /// [`SqlError`] when either statement fails.
-pub async fn refuse_active_table_reads(
+pub(crate) async fn refuse_active_table_reads(
     tx: &mut Transaction<'_, Postgres>,
     identity: &TableAuthorityIdentity,
 ) -> Result<(), SqlError> {
@@ -1583,13 +1583,15 @@ pub async fn refuse_active_table_reads(
 /// rest of that transaction. A row is abandoned only when PostgreSQL time has
 /// passed its `abandon_after` **and** its exact Oracle `(node_id,
 /// fencing_token)` no longer has a heartbeat within [`ROLE_LIVENESS_CUTOFF`];
-/// a live owner's row never expires. The abandonment delete commits with the
-/// caller's transaction.
+/// a live owner's row never expires. Liveness is read through the
+/// `vala.oracle_fence_is_live` definer because Oracle fences are system-owner
+/// rows a tenant-bound request role cannot see. The abandonment delete commits
+/// with the caller's transaction.
 ///
 /// # Errors
 ///
 /// Returns [`SqlError`] when either statement fails.
-pub async fn active_table_reads_exist(
+pub(crate) async fn active_table_reads_exist(
     tx: &mut Transaction<'_, Postgres>,
     identity: &TableAuthorityIdentity,
 ) -> Result<bool, SqlError> {
@@ -1599,18 +1601,10 @@ pub async fn active_table_reads_exist(
          WHERE r.data_tenant_id = wyrd.current_tenant()
            AND r.table_uid = $1
            AND r.abandon_after <= statement_timestamp()
-           AND NOT EXISTS (
-               SELECT 1
-                 FROM vala.cluster_nodes n
-                WHERE n.data_tenant_id = $2
-                  AND n.node_id = r.node_id
-                  AND n.role = 'oracle'
-                  AND n.fencing_token = r.fencing_token
-                  AND n.heartbeat_at >= statement_timestamp() - ($3 * interval '1 second'))
+           AND NOT vala.oracle_fence_is_live(r.node_id, r.fencing_token, $2)
         ",
     )
     .bind(identity.table_uid.as_slice())
-    .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
     .bind(ROLE_LIVENESS_CUTOFF.as_secs_f64())
     .execute(&mut **tx)
     .await

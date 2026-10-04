@@ -361,10 +361,9 @@ mod pg_tests {
     use sqlx::{PgPool, Row};
     use uuid::Uuid;
     use vala_sql::queries::cluster_nodes::ClusterNodes;
-    use vala_sql::queries::forge_operations::refuse_active_table_reads;
     use vala_sql::queries::olap_catalog::upsert_table;
     use vala_sql::queries::oracle_reader_authority::{
-        ActiveReadOwner, ActiveTableRef, OracleActiveTableReads,
+        ActiveReadOwner, ActiveTableRef, BifrostTableMaintenanceAuthority, OracleActiveTableReads,
     };
     use vala_sql::row_types::cluster_nodes::RoleRegistration;
     use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
@@ -634,36 +633,27 @@ mod pg_tests {
             .expect("active reads count")
         }
 
-        /// Runs Forge's destructive gate for one acquired table the way
-        /// preparation does: operator transaction, tenant bound, authority row
-        /// locked `FOR UPDATE`, then the gate; committed so any discard sticks.
+        /// Runs Forge's destructive gate for one acquired table the way the
+        /// leader does: a tenant transaction locks the table's maintenance
+        /// authority, discards abandoned reads, and reports whether any read
+        /// remains; committed so any discard sticks.
         ///
         /// # Errors
         ///
-        /// Returns the gate's refusal or SQL failure.
+        /// Returns [`SqlError::Conflict`] while an active read remains, or the
+        /// SQL failure.
         async fn forge_gate(&self, identity: &TableAuthorityIdentity) -> Result<(), SqlError> {
-            let mut tx = self
-                .fixture
-                .operator_pool()
-                .pool()
-                .begin()
-                .await
-                .map_err(SqlError::from)?;
-            sqlx::query(wyrd_sql::tenant_conn::BIND_CURRENT_TENANT_SQL)
-                .bind(identity.tenant.to_string())
-                .execute(&mut *tx)
-                .await
-                .map_err(SqlError::from)?;
-            sqlx::query(
-                "SELECT 1 FROM vala.bifrost_table_maintenance_authority \
-                  WHERE data_tenant_id = wyrd.current_tenant() AND table_uid = $1 FOR UPDATE",
-            )
-            .bind(identity.table_uid.as_slice())
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(SqlError::from)?;
-            refuse_active_table_reads(&mut tx, identity).await?;
-            tx.commit().await.map_err(SqlError::from)
+            let mut conn = TenantConn::acquire(self.fixture.app_pool(), identity.tenant).await?;
+            let active = BifrostTableMaintenanceAuthority::new(&mut conn)
+                .has_active_reads(identity)
+                .await?;
+            conn.commit().await?;
+            if active {
+                return Err(SqlError::Conflict {
+                    detail: "an Oracle query is still reading this table".to_owned(),
+                });
+            }
+            Ok(())
         }
 
         /// Moves the Oracle fence's heartbeat outside or back inside liveness.

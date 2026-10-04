@@ -642,6 +642,7 @@ impl ScribeStagingRuntime {
                 .recover_terminal_members(&key, &members)
                 .await?;
             let mut members_to_restore = Vec::with_capacity(members.len());
+            let mut kept = Vec::with_capacity(members.len());
             for member in &members {
                 if member
                     .record()
@@ -658,9 +659,10 @@ impl ScribeStagingRuntime {
                     continue;
                 };
                 members_to_restore.push(recovered);
+                kept.push(member);
             }
             if !members_to_restore.is_empty() {
-                let context = self.restore_context(pool, &key, &members).await?;
+                let context = self.restore_context(pool, &key, &kept).await?;
                 restored += members_to_restore.len();
                 self.lock_assembly()?
                     .restore(&key, members_to_restore)
@@ -751,6 +753,11 @@ impl ScribeStagingRuntime {
 
     /// Reconstructs one recovered key's encoding context, or fails closed.
     ///
+    /// `members` are the members restore keeps. The schema is read from their
+    /// runs only: a key can also hold the leftovers of a claim that already
+    /// committed, and restore has removed those members' runs by the time it
+    /// rebuilds the key.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the key names no run to read the
@@ -761,11 +768,11 @@ impl ScribeStagingRuntime {
         &self,
         pool: &sqlx::PgPool,
         key: &ScribeAssemblyKey,
-        members: &[crate::scribe::hot_stage::StagedMember],
+        members: &[&crate::scribe::hot_stage::StagedMember],
     ) -> Result<ClaimContext, ScribeError> {
         let run = members
             .iter()
-            .flat_map(crate::scribe::hot_stage::StagedMember::run_paths)
+            .flat_map(|member| member.run_paths())
             .next()
             .ok_or_else(|| ScribeError::Internal {
                 detail: "a recovered staged key names no run to read its schema from".to_owned(),
@@ -1941,7 +1948,7 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the stage refuses any member's transition.
-    async fn move_claim(
+    pub(super) async fn move_claim(
         stage: &ScribeHotStage,
         key: &ScribeAssemblyKey,
         member_ids: &[StagedMemberId],
@@ -2169,7 +2176,9 @@ mod tests {
 /// Postgres-backed recovery proofs for the staged backlog gauges.
 #[cfg(test)]
 mod pg_tests {
-    use super::tests::{publisher, runtime_layout, runtime_schema, stage_durable_members};
+    use super::tests::{
+        move_claim, publisher, runtime_layout, runtime_schema, stage_durable_members,
+    };
     use super::*;
     use crate::scribe::stream_identity::NodeId;
     use num_traits::ToPrimitive as _;
@@ -2473,5 +2482,91 @@ mod pg_tests {
                 .expect("claim index")
                 .is_empty()
         );
+    }
+
+    /// A key that holds a finished claim's leftovers beside a live member
+    /// restores, and only the live member comes back.
+    ///
+    /// The finished claim crashed after every member recorded the commit, so
+    /// restore retires those members before it rebuilds the key. A live member
+    /// staged afterwards under the same key must still restore: its encoding
+    /// context has to come from runs restore keeps, never from runs it has
+    /// just removed. The leftovers outnumber the live member four to one, so
+    /// the namespace scan usually lists a retired member first.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot stage or drive the claim, when restore
+    /// refuses the key, or when anything but the live member survives it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_key_with_finished_claim_leftovers_and_a_live_member_restores() {
+        let database = wyrd_dev_fixtures::pg::PgFixture::start()
+            .await
+            .expect("Postgres fixture");
+        register_control_row(&database).await;
+        let tenant = database.data_tenant_id();
+        let root = tempfile::tempdir().expect("runtime root");
+        let stage_root = root.path().join("stage");
+        let wal_root = root.path().join("member-wal");
+        for path in [&stage_root, &wal_root] {
+            std::fs::create_dir_all(path).expect("fixture directory");
+        }
+        let node_id = NodeId::new(uuid::Uuid::from_u128(0x1ef7));
+        let stage = Arc::new(ScribeHotStage::new(stage_root));
+        let config =
+            StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
+                .expect("assembler controls");
+        let runtime = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            publisher(Arc::clone(&stage), &wal_root, node_id),
+            config,
+        );
+        let (key, finished) =
+            stage_durable_members(&runtime, tenant, node_id, 1..=4, chrono::Utc::now()).await;
+        let claim = runtime
+            .take_residue(&key, ClaimCause::Drain)
+            .expect("residue claim")
+            .expect("four members form one claim");
+        let claim_id = claim.id().to_string();
+        move_claim(&stage, &key, &finished, |member| {
+            crate::scribe::hot_stage::StagedMemberState::Published {
+                claim_id: claim_id.clone(),
+                file_list_commit_key: "node:10:49".to_owned(),
+                published_object_identities: vec![format!("objects/{claim_id}/hot-0.parquet")],
+                persisted_lsn_ranges: vec![crate::scribe::hot_stage::StagedLsnRange {
+                    min: u64::from(member.shard()) * 10,
+                    max: u64::from(member.shard()) * 10 + 9,
+                }],
+            }
+        })
+        .await;
+        let (live_key, live) =
+            stage_durable_members(&runtime, tenant, node_id, 5..=5, chrono::Utc::now()).await;
+        assert_eq!(
+            live_key, key,
+            "the live member shares the finished claim's key"
+        );
+        drop(claim);
+        drop(runtime);
+
+        let restarted = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            publisher(Arc::clone(&stage), &wal_root, node_id),
+            config,
+        );
+        let restored = restarted
+            .restore(database.operator_pool().pool())
+            .await
+            .expect("a key with finished-claim leftovers beside a live member restores");
+        assert_eq!(restored, 1, "only the live member is restored");
+        let survivors = stage.recover().await.expect("stage rescans");
+        let kept: Vec<_> = survivors
+            .get(&key)
+            .expect("the live member's key survives")
+            .iter()
+            .map(|member| member.record().member())
+            .collect();
+        assert_eq!(kept, live, "the finished claim's members are retired");
+        assert_eq!(restarted.ready_keys().expect("ready index"), vec![key]);
     }
 }

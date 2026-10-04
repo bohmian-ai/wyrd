@@ -2491,17 +2491,18 @@ impl Drop for AnalyticalGraphSignals {
 
 /// The task-side half of one graph's lifecycle, owning every reservation it takes.
 ///
-/// Reservation is graph-wide and bulk, and it outlives the attempt that asked
-/// for it: a release whose acknowledgement never arrived has to be retried
-/// after the query has already failed. Keeping that follow-up on this one task
-/// is what avoids a detached timer, a second reservation registry, or a status
-/// RPC.
+/// Reservation is graph-wide and bulk: [`Self::reserve`] admits every remote
+/// participant and returns their grant streams as
+/// [`AnalyticalParticipantGrants`], which this task holds until
+/// [`Self::settle`]. Dropping those grants there is the leader-side release;
+/// each follower observes its stream close and settles its own graph
+/// asynchronously, and the leader never waits for that.
 pub(super) struct AnalyticalGraphLifecycle {
-    /// The graph every reservation and retained release belongs to.
+    /// The graph every reservation belongs to.
     graph: AnalyticalGraphKey,
     /// Supervisor the retained-cleanup state is made visible through.
     supervisor: Arc<AnalyticalSupervisor>,
-    /// Directory every reserve and release is issued through.
+    /// Directory participant reservation and admission are issued through.
     transports: Option<Arc<super::dispatcher::OraclePeerTransportDirectory>>,
     /// Frozen remote participants, already excluding this coordinator.
     remote: Vec<(Url, super::dispatcher::DispatchCandidate)>,

@@ -23,6 +23,7 @@ mod principal;
 pub mod python;
 pub mod query;
 pub mod registration;
+mod workflow;
 
 use clap::{Parser, error::ErrorKind};
 
@@ -79,6 +80,8 @@ fn code_to_u8(code: std::process::ExitCode) -> u8 {
         2
     } else if code == std::process::ExitCode::from(64) {
         64
+    } else if code == std::process::ExitCode::from(workflow::INTERRUPTED) {
+        workflow::INTERRUPTED
     } else {
         1
     }
@@ -96,6 +99,7 @@ mod tests {
         assert_eq!(code_to_u8(std::process::ExitCode::FAILURE), 1);
         assert_eq!(code_to_u8(std::process::ExitCode::from(2)), 2);
         assert_eq!(code_to_u8(std::process::ExitCode::from(64)), 64);
+        assert_eq!(code_to_u8(std::process::ExitCode::from(130)), 130);
     }
 
     /// Treat Clap's non-executing help path as success.

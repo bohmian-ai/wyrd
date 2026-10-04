@@ -18,3 +18,5 @@ mod principal_journey;
 mod query_server_journey;
 #[path = "secret_sources.rs"]
 mod secret_sources;
+#[path = "workflow_journey.rs"]
+mod workflow_journey;

@@ -593,7 +593,12 @@ fn parse_status(value: &str) -> Result<CardLifecycleStatus, WyrdCliError> {
     }
 }
 
-fn parse_id<T>(field: &str, value: &str, expected: &str) -> Result<T, WyrdCliError>
+/// Parse one typed identifier argument.
+///
+/// # Errors
+/// Returns `WYRD_CLI_400_INVALID_ARGUMENT` naming `field`, `value`, and the
+/// `expected` shape with the parser's reason.
+pub(crate) fn parse_id<T>(field: &str, value: &str, expected: &str) -> Result<T, WyrdCliError>
 where
     T: FromStr,
     T::Err: Display,
@@ -603,7 +608,8 @@ where
         .map_err(|error: T::Err| invalid_argument(field, value, &format!("{expected}: {error}")))
 }
 
-fn invalid_argument(field: &str, value: &str, expected: &str) -> WyrdCliError {
+/// The `WYRD_CLI_400_INVALID_ARGUMENT` error for one argument.
+pub(crate) fn invalid_argument(field: &str, value: &str, expected: &str) -> WyrdCliError {
     WyrdCliError::InvalidArgument {
         field: field.to_owned(),
         value: value.to_owned(),
@@ -620,7 +626,7 @@ fn invalid_argument(field: &str, value: &str, expected: &str) -> WyrdCliError {
 /// # Errors
 /// Returns [`WyrdCliError::Server`] when the response carries no resolved
 /// version, which means the server did not answer with an exact card.
-fn exact_card_ref(card: &Card) -> Result<CardRef, WyrdCliError> {
+pub(crate) fn exact_card_ref(card: &Card) -> Result<CardRef, WyrdCliError> {
     let version = card
         .metadata
         .resolved_pin()

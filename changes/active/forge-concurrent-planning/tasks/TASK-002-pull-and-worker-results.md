@@ -247,9 +247,11 @@ hammer and the 85% occupancy gate.) Follow the Bifrost capacity benchmarks'
 structure (`LocalServer`, release cloud build, RustFS and test Postgres, a
 systemd scope per process, reports under `target/`). The declared host has
 16 CPUs; all Wyrd processes together stay within 8 CPU / 16 GiB: the leader
-runs in a 1 CPU / 2 GiB scope and each dedicated compactor in a
-1.5 CPU / 3 GiB scope, so the 4-worker step uses 7 CPU / 14 GiB and every
-step adds identical capacity. Postgres and RustFS run outside the envelope
+runs in a 1 CPU / 4 GiB scope and each dedicated compactor in a
+7/3 CPU / 4 GiB scope, so the 3-worker step uses 8 CPU / 16 GiB and every
+step adds identical capacity. (Amended by the implementing agent, spec
+277c408e3: every Wyrd process keeps its 4 GiB boot floor, so the earlier
+2 GiB leader and 4-worker step could not fit; not a human-owner decision.) Postgres and RustFS run outside the envelope
 and their utilization is recorded. Host load is recorded before each run;
 a run whose host load exceeds the envelope's 8 CPUs is discarded and
 repeated, not reported.
@@ -261,15 +263,16 @@ repeated, not reported.
    and at 10x, then in increasing steps until the p99 bends; report the knee.
    p99 commit, pull and report decisions stay below 1,000 microseconds at the
    production and 10x rates.
-2. *Fleet throughput.* At least 128 independent tables written continuously
-   through Scribe at a production-like rate, with compaction enabled at the
-   default `full` type, the default 1 GiB file target and a realistic commit
-   trigger (not one commit), with one leader and 1, 2 and 4 compactors. No
-   oversized seed is written to lengthen rewrites. 2-worker and 4-worker
-   completion rates reach at least 1.7x and 3.0x one worker; whenever the
+2. *Fleet throughput (backlog drain).* For each fleet size, at least 128
+   fresh tables are written through Scribe with no worker running until each
+   holds compactable staged files, at default compaction settings (no type
+   pin) and a realistic commit trigger (not one commit); then one leader and
+   1, 2 or 3 compactors drain that backlog. No oversized seed is written to
+   lengthen rewrites. 2-worker and 3-worker completion rates reach at least
+   1.7x and 2.5x one worker; whenever the
    leader holds due tables, every pull is answered with as many tasks as it
    requested; leader CPU stays below 70%. The report names the resource that
-   bounds the largest step (compactor CPU, RustFS or Postgres).
+   bounds the largest step, as measured.
 
 Selection uses the sorted due index approved in the REQ-009 revision of
 2026-10-03. Report two qualifying runs' p50/p99 and throughput, not one
@@ -312,7 +315,7 @@ implementation reuses their deployment and measurement code and adds only
 the Forge workload/verdict. Run `mise run bench:bifrost:forge-capacity`
 before AC-008 can close. Its report
 includes hardware, table/tenant counts, commit rate, worker occupancy,
-leader CPU, p50/p99 by stage, completed work per second at 1/2/4 workers,
+leader CPU, p50/p99 by stage, completed work per second at 1/2/3 workers,
 and storage/SQL utilization. Any
 specifically named new test must include and run its exact focused
 mise exec -- cargo nextest selector through the correct setup wrapper.

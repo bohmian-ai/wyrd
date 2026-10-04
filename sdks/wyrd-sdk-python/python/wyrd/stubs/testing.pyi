@@ -2,33 +2,11 @@ class WyrdTestServer:
     """Wyrd in-process test server context manager (testing feature only).
 
     Starts a real Wyrd server bound to a loopback TCP socket backed by an
-    embedded Postgres fixture. Use as a context manager; ``bootstrap_service``
-    is only valid inside the ``with`` block.
-
-    When ``mutate_env=True`` (default), the context manager sets
-    ``WYRD_SERVER_URL``, ``WYRD_GRPC_URL``, and ``WYRD_API_KEY`` in the process
-    environment for the duration of the block and restores original values (or
-    removes them) on exit. Use ``mutate_env=False`` when running parallel test
-    suites that manage these vars externally.
-
-    ``cleanup`` is reserved for a future teardown-skip feature; currently ignored
-    (the server and embedded Postgres are always cleaned up on exit).
-
-    ``audit_publication=False`` keeps the server's audit publisher from retiring
-    staged audit rows, for a journey that counts staged decisions.
-
-    ``verification_runtime=True`` composes the verification runtime, so Drift
-    baselines fit and verification runs execute in the background.
-    ``provider_base_url``, when set, makes the gateway dispatch over HTTP with
-    every built-in adapter pointed at that local mock upstream (``OpenAI`` under
-    ``/v1``); operator credential bindings read ``WYRD_TEST_GATEWAY_PROVIDER_KEY``.
-    The same ``/v1`` upstream also serves the verification runtime's ``OpenAI``
-    LLM judge, so a continuous Eval journey's judge calls
-    ``<root>/v1/chat/completions``.
-
-    ``live_providers`` instead points every built-in adapter at its real
-    provider endpoint, which only the opt-in live smoke lane asks for. It
-    cannot be combined with ``provider_base_url``.
+    embedded Postgres fixture and bootstraps an ``admin`` service key for it.
+    Every method and property is valid only inside the ``with`` block; outside
+    it they raise ``WyrdError`` ``WYRD_TESTING_500_HARNESS_START``. Exiting
+    restores published environment variables, shuts the server down, and never
+    suppresses an exception raised inside the block.
     """
 
     def __init__(
@@ -39,9 +17,46 @@ class WyrdTestServer:
         verification_runtime: bool = False,
         provider_base_url: str | None = None,
         live_providers: bool = False,
-    ) -> None: ...
+    ) -> None:
+        """Create an unstarted server; entering the ``with`` block boots it.
+
+        Args:
+            cleanup: reserved for a future teardown-skip feature and currently
+                ignored; the server and embedded Postgres are always cleaned up.
+            mutate_env: when true, entering sets ``WYRD_SERVER_URL``,
+                ``WYRD_GRPC_URL``, and ``WYRD_API_KEY`` for the block and
+                exiting restores the original values (or removes them). Pass
+                false for parallel suites that manage these variables.
+            audit_publication: false keeps the audit publisher from retiring
+                staged audit rows, for a journey that counts staged decisions
+                such as ``table_describe_count()``.
+            verification_runtime: true composes the verification runtime, so
+                Drift baselines fit and verification runs execute in the
+                background.
+            provider_base_url: an absolute URL that every built-in gateway
+                adapter targets as a local mock upstream (``OpenAI`` under
+                ``/v1``); operator credential bindings read
+                ``WYRD_TEST_GATEWAY_PROVIDER_KEY``. The same ``/v1`` upstream
+                serves the verification runtime's ``OpenAI`` LLM judge at
+                ``<root>/v1/chat/completions``. Omitted, the gateway reaches no
+                provider unless ``live_providers`` is set.
+            live_providers: true points every built-in adapter at its real
+                provider endpoint, for the opt-in live smoke lane only.
+
+        Raises:
+            WyrdError: ``WYRD_TESTING_500_HARNESS_START`` when
+                ``provider_base_url`` is not an absolute URL or is combined
+                with ``live_providers``.
+
+        """
+        ...
+
     def access_token(self) -> str:
-        """Exchange the harness API key for a Wyrd access token."""
+        """Exchange the harness API key for a Wyrd access token.
+
+        Lets a test hand an unmodified OTLP exporter or provider SDK the token
+        it needs.
+        """
         ...
 
     def flush_bifrost(self) -> None:
@@ -60,7 +75,7 @@ class WyrdTestServer:
 
     @property
     def api_key(self) -> str:
-        """Bootstrap API key seeded at startup."""
+        """The ``admin`` service API key bootstrapped on entry."""
         ...
 
     @property
@@ -69,50 +84,165 @@ class WyrdTestServer:
         ...
 
     def bootstrap_service(self, roles: list[str], name: str = "svc") -> str:
-        """Mint a service principal with ``roles`` and return its API key.
+        """Mint a fixture-tenant service principal and return its API key.
 
-        ``roles``: Wyrd built-in role names (e.g. ``"bifrost_write"``).
-        An empty list creates a principal with no grants (useful for negative RBAC
-        journeys). Must be called inside the context manager.
+        Args:
+            roles: Wyrd built-in role names (e.g. ``"bifrost_write"``). An
+                empty list creates a principal with no grants, for negative
+                RBAC journeys.
+            name: the service principal's name.
+
         """
         ...
 
     def credential_registered_service(self, card_ref: str, roles: list[str]) -> str:
         """Issue an API key for the principal a registered Service Card projects.
 
-        ``card_ref`` is the canonical ``space/Kind/name@version`` identity of an
-        already-registered Service. The key carries that Service's real card-ref
-        scope, so a run may observe the component Cards its spec references.
+        Nothing is minted: registering the Service already created its
+        principal, so the key carries that Service's real card-ref scope and a
+        run may observe the component Cards its spec references.
+
+        Args:
+            card_ref: the canonical ``space/Kind/name@version`` identity of a
+                Service already registered in the fixture tenant.
+            roles: built-in role names granted to that principal in addition
+                to any it already holds.
+
+        Raises:
+            WyrdError: ``WYRD_TESTING_500_HARNESS_START`` for an unparsable
+                ``card_ref``; ``WYRD_TESTING_500_HARNESS_BOOTSTRAP`` when the
+                Card has no projected principal.
+
         """
         ...
 
-    def make_binding_due(self, binding_id: str) -> None: ...
-    def verification_runs(self) -> list[str]: ...
-    def retire_fitted_format(self, verifier_uid: str) -> None: ...
-    def table_describe_count(self, fqn: str) -> int: ...
-    def fail_table_describe(self, fqn: str) -> None: ...
-    def restore_table_describe(self) -> None: ...
+    def make_binding_due(self, binding_id: str) -> None:
+        """Set a verification binding's next run time to database time.
+
+        The scheduler then finds the binding due without moving a clock.
+
+        Args:
+            binding_id: the binding's UUIDv7.
+
+        Raises:
+            WyrdError: ``WYRD_TESTING_500_HARNESS_START`` for an invalid ID or
+                a failed update.
+
+        """
+        ...
+
+    def verification_runs(self) -> list[str]:
+        """Return every verification run ID of the fixture tenant, oldest first."""
+        ...
+
+    def retire_fitted_format(self, verifier_uid: str) -> None:
+        """Strip ``format`` from a Drift Verifier's ready fitted profile.
+
+        Simulates a profile fitted under earlier semantics, which the engine
+        must refuse rather than rescore.
+
+        Args:
+            verifier_uid: the Verifier Card's UID.
+
+        Raises:
+            WyrdError: ``WYRD_TESTING_500_HARNESS_START`` for an invalid UID or
+                when the Verifier has no ready fitted profile.
+
+        """
+        ...
+
+    def table_describe_count(self, fqn: str) -> int:
+        """Count the server's staged, allowed describes of table ``fqn``.
+
+        Proves a writer reused its cached schema. Start the server with
+        ``audit_publication=False``, or the publisher retires staged rows and
+        shrinks the count.
+
+        Args:
+            fqn: the ``"<namespace>.<name>"`` table name.
+
+        """
+        ...
+
+    def fail_table_describe(self, fqn: str) -> None:
+        """Make every fixture-tenant describe of ``fqn`` fail until restored.
+
+        The server then fails closed with ``WYRD_VALA_500_AUDIT_UNAVAILABLE``
+        for that one table. Calling again replaces the previous fault.
+
+        Args:
+            fqn: the ``"<namespace>.<name>"`` table name.
+
+        Raises:
+            WyrdError: ``WYRD_TESTING_500_HARNESS_START`` when ``fqn`` holds
+                anything but ASCII alphanumerics, ``_``, and ``.``.
+
+        """
+        ...
+
+    def restore_table_describe(self) -> None:
+        """Remove the ``fail_table_describe()`` fault, if any."""
+        ...
+
     def scoped_api_key(self, role: str, permissions: list[str | dict[str, object]]) -> str:
         """Seed ``role`` with exactly ``permissions`` and return a service API key.
 
-        Each permission is a ``"resource:action"`` string or a typed permission
-        dict (``resource``, ``action``, ``scope``) naming objects such as one
-        gateway model.
+        Args:
+            role: the role to seed; the service is also named ``role``.
+            permissions: each a ``"resource:action"`` string granting every
+                object of that operation, or a typed permission dict
+                (``resource``, ``action``, ``scope``) naming objects such as one
+                gateway model.
+
+        Raises:
+            WyrdError: ``WYRD_TESTING_500_HARNESS_START`` for an unparsable
+                permission.
+
         """
         ...
 
     def revoke_scoped_role(self, role: str) -> None:
-        """Revoke ``role`` from the service ``scoped_api_key`` minted for it."""
+        """Revoke ``role`` from the service ``scoped_api_key`` minted for it.
+
+        Access tokens exchanged afterwards resolve the revoked grant set.
+
+        Raises:
+            WyrdError: ``WYRD_TESTING_500_HARNESS_START`` when
+                ``scoped_api_key`` never seeded ``role``.
+
+        """
         ...
 
     def seed_tenant(self, slug: str) -> str:
-        """Provision a second tenant for isolation journeys."""
+        """Provision a second tenant for isolation journeys.
+
+        The tenant is seeded with its built-in roles.
+
+        Args:
+            slug: the new tenant's slug.
+
+        Returns:
+            The new tenant's UUID string, for ``bootstrap_service_in_tenant()``.
+
+        """
         ...
 
     def bootstrap_service_in_tenant(
         self, tenant_id: str, roles: list[str], name: str = "svc"
     ) -> str:
-        """Mint a service principal under an explicit tenant."""
+        """Mint a service principal under an explicit tenant; return its API key.
+
+        Args:
+            tenant_id: a tenant UUID string, such as one ``seed_tenant()``
+                returned.
+            roles: built-in role names, as for ``bootstrap_service()``.
+            name: the service principal's name.
+
+        Raises:
+            WyrdError: ``WYRD_TESTING_500_HARNESS_START`` when ``tenant_id``
+                does not parse.
+
+        """
         ...
 
 __all__ = ["WyrdTestServer"]

@@ -99,7 +99,7 @@ impl OperatorConnections {
     /// Read one connection's redacted view.
     ///
     /// # Errors
-    /// Raises `WyrdError` when `connection_id` is not a UUID, the caller
+    /// Raises `WyrdError` when `connection_id` is not a UUIDv7, the caller
     /// lacks `operators:read`, the connection is unknown in the caller's
     /// tenant, or the request fails.
     fn get(&self, py: Python<'_>, connection_id: &str) -> WyrdPyResult<Py<PyAny>> {
@@ -131,7 +131,7 @@ impl OperatorConnections {
     /// Disable one connection; Operators naming it fail closed until re-enabled.
     ///
     /// # Errors
-    /// Raises `WyrdError` when `connection_id` is not a UUID, the caller
+    /// Raises `WyrdError` when `connection_id` is not a UUIDv7, the caller
     /// lacks `operators:write`, the connection is unknown, or the request
     /// fails.
     fn disable(&self, py: Python<'_>, connection_id: &str) -> WyrdPyResult<Py<PyAny>> {

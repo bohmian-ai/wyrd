@@ -59,6 +59,7 @@ impl AuthorityFixture {
     ///
     /// Panics when the fixture or the membership registration fails.
     pub(crate) async fn start() -> Self {
+        forge_support::ProcessTelemetry::shared();
         let database = PgFixture::start().await.expect("Postgres fixture");
         let node_id = Uuid::now_v7();
         let nodes = ClusterNodes::new(database.vala_postgres().clone());

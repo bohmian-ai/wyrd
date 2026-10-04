@@ -919,6 +919,7 @@ impl PromotionIntegrationFixture {
     /// be registered, or when a real Scribe seal publishes fewer than the two
     /// `vala.file_list` rows a promotion group needs.
     pub(crate) async fn start(table_name: &str) -> Self {
+        ProcessTelemetry::shared();
         let database = wyrd_dev_fixtures::pg::PgFixture::start()
             .await
             .expect("Postgres fixture");
@@ -2853,57 +2854,94 @@ pub(crate) fn manual_clock() -> (ForgeClock, ForgeClockControl) {
     ForgeClock::manual(chrono::Utc::now())
 }
 
-/// The one Tier-2 telemetry observer every Forge integration test installs.
+/// The integration binary's one production-shaped telemetry installation.
 ///
-/// A Forge integration test that only proves durable state cannot distinguish
-/// "the route ran" from "the route ran and reported what it did", and the
-/// production route is the *only* thing allowed to report. This owner installs
-/// the real metrics recorder and the production-shaped OpenTelemetry pipeline
-/// once per test process, then exposes deltas relative to the moment it was
-/// installed, so a test asserts on production emission rather than on a
-/// test-only signal. It exists here, centrally, so no test grows a private
-/// telemetry path of its own.
-///
-/// Installation is process-wide and happens exactly once. Nextest runs every
-/// test in its own process, so a checkpoint per test is a checkpoint per
-/// process; a second installation in one process is a fixture defect and
-/// panics rather than silently observing nothing.
-pub(crate) struct ForgeTelemetryCheckpoint {
+/// The metrics recorder and the tracing subscriber are process-global and can
+/// be set only once, so this binary has exactly one owner for both. Every
+/// fixture entry point initialises it, which is what makes `WYRD_LOG` (else
+/// `RUST_LOG`) trace any test that starts a fixture, and
+/// [`ForgeTelemetryCheckpoint`] reads from it instead of installing its own.
+/// The subscriber is the production pipeline with an in-memory exporter, so
+/// what a checkpoint asserts on is production emission.
+pub(crate) struct ProcessTelemetry {
     /// Process-wide metrics recorder every production counter writes into.
     recorder: Arc<wyrd_bench::BenchmarkRecorder>,
     /// Handle over spans exported by the production tracing pipeline.
     capture: wyrd_telemetry::TestTraceCapture,
-    /// Number of spans finished before the workload started.
-    span_checkpoint: usize,
-    /// Keeps the installed provider alive for the lifetime of the test.
-    _telemetry: wyrd_telemetry::TelemetryGuard,
+    /// Keeps the installed provider alive for the life of the process.
+    _guard: wyrd_telemetry::TelemetryGuard,
 }
 
-impl ForgeTelemetryCheckpoint {
-    /// Installs the production telemetry pipeline and marks a starting point.
+/// The one [`ProcessTelemetry`] of this test process.
+static PROCESS_TELEMETRY: std::sync::OnceLock<ProcessTelemetry> = std::sync::OnceLock::new();
+
+impl ProcessTelemetry {
+    /// Returns the process telemetry, installing it on first use.
+    ///
+    /// The filter is `WYRD_LOG`, else `RUST_LOG`, else `info`. Concurrent
+    /// first callers block until the one installation finishes.
     ///
     /// # Panics
     ///
-    /// Panics when a global metrics recorder or tracing subscriber is already
-    /// installed in this process, which means two fixtures are competing for
-    /// one process-wide seam and no delta would be trustworthy.
+    /// Panics when another owner already installed a global metrics recorder
+    /// or tracing subscriber in this process, because no assertion over this
+    /// owner's recorder or capture could then be trusted.
+    pub(crate) fn shared() -> &'static Self {
+        PROCESS_TELEMETRY.get_or_init(|| {
+            let recorder = wyrd_bench::BenchmarkRecorder::new()
+                .install()
+                .expect("no other global metrics recorder is installed in this test process");
+            let (guard, capture) =
+                wyrd_telemetry::init_test_capture(wyrd_telemetry::TelemetryConfig {
+                    filter: "info".to_owned(),
+                    service_name: Some("forge-integration".to_owned()),
+                    sample_ratio: Some(1.0),
+                    ..wyrd_telemetry::TelemetryConfig::default()
+                })
+                .expect("no other global tracing subscriber is installed in this test process");
+            Self {
+                recorder,
+                capture,
+                _guard: guard,
+            }
+        })
+    }
+}
+
+/// The one Tier-2 telemetry observer every Forge integration test installs.
+///
+/// A Forge integration test that only proves durable state cannot distinguish
+/// "the route ran" from "the route ran and reported what it did", and the
+/// production route is the *only* thing allowed to report. This observer reads
+/// the process's [`ProcessTelemetry`] — the real metrics recorder and the
+/// production-shaped OpenTelemetry pipeline — so a test asserts on production
+/// emission rather than on a test-only signal. It exists here, centrally, so
+/// no test grows a private telemetry path of its own.
+///
+/// Spans are counted from this checkpoint's own mark. Metric snapshots are
+/// the recorder's absolute values; nextest runs each test in its own process,
+/// and every caller creates its checkpoint before starting a fixture, so those
+/// values are the test's own emission.
+pub(crate) struct ForgeTelemetryCheckpoint {
+    /// Process telemetry this checkpoint observes.
+    telemetry: &'static ProcessTelemetry,
+    /// Number of spans finished before the workload started.
+    span_checkpoint: usize,
+}
+
+impl ForgeTelemetryCheckpoint {
+    /// Marks a starting point in the process telemetry, installing it first
+    /// when no fixture has yet.
+    ///
+    /// # Panics
+    ///
+    /// Panics when another owner already installed a global metrics recorder
+    /// or tracing subscriber in this process (see [`ProcessTelemetry::shared`]).
     pub(crate) fn install() -> Self {
-        let recorder = wyrd_bench::BenchmarkRecorder::new()
-            .install()
-            .expect("no other global metrics recorder is installed in this test process");
-        let (telemetry, capture) =
-            wyrd_telemetry::init_test_capture(wyrd_telemetry::TelemetryConfig {
-                filter: "info".to_owned(),
-                service_name: Some("forge-integration".to_owned()),
-                sample_ratio: Some(1.0),
-                ..wyrd_telemetry::TelemetryConfig::default()
-            })
-            .expect("no other global tracing subscriber is installed in this test process");
+        let telemetry = ProcessTelemetry::shared();
         Self {
-            span_checkpoint: capture.checkpoint(),
-            recorder,
-            capture,
-            _telemetry: telemetry,
+            span_checkpoint: telemetry.capture.checkpoint(),
+            telemetry,
         }
     }
 
@@ -2920,7 +2958,7 @@ impl ForgeTelemetryCheckpoint {
     /// commit an earlier phase legitimately made. Pass the returned mark to
     /// [`Self::spans_named_since`].
     pub(crate) fn mark(&self) -> usize {
-        self.capture.checkpoint()
+        self.telemetry.capture.checkpoint()
     }
 
     /// Returns the production spans finished since `mark`, by name.
@@ -2929,7 +2967,8 @@ impl ForgeTelemetryCheckpoint {
         mark: usize,
         name: &str,
     ) -> Vec<wyrd_telemetry::CapturedSpan> {
-        self.capture
+        self.telemetry
+            .capture
             .finished_since(mark)
             .into_iter()
             .filter(|span| span.name == name)
@@ -2942,7 +2981,7 @@ impl ForgeTelemetryCheckpoint {
     /// leaked one, so a scenario that must prove exact label sets or a return
     /// to zero reads the raw series instead.
     pub(crate) fn snapshot(&self) -> wyrd_bench::BenchmarkMetricSnapshot {
-        self.recorder.snapshot()
+        self.telemetry.recorder.snapshot()
     }
 
     /// Asserts every named production metric family was registered and used.
@@ -2951,7 +2990,8 @@ impl ForgeTelemetryCheckpoint {
     ///
     /// Panics naming the missing families when the route did not emit them.
     pub(crate) fn require_metrics(&self, families: &[&str]) {
-        self.recorder
+        self.telemetry
+            .recorder
             .require_metrics(families)
             .expect("the production route emits its declared metric families");
     }

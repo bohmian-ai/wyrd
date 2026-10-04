@@ -445,3 +445,11 @@ Commands: `mise exec -- scripts/postgres/with-test-postgres.sh -- <nextest -p va
 `mise exec -- cargo clippy --locked -p vala-bifrost-redux -p wyrd-testing --all-features --tests -- -D warnings`;
 `git diff --check`. vala-sql was not modified. No test weakened, skipped or
 slept; `clear_task_backoff` is the fixture's existing backoff release.
+
+## Status
+
+Status: IMPLEMENTED for Scenarios 1–3 and the red-gate fixes recorded above.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Integrated `verify:bifrost` | integration branch 51c64fb29 (tree merged unchanged) | `mise run verify:bifrost` exit 0, 9/9 lanes (TASK-002 evidence) | PASS |

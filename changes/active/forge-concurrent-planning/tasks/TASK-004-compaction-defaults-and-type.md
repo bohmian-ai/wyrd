@@ -271,3 +271,91 @@ Focused exact tests for each scenario, `mise run codegen:check`,
 `mise run py:test:unit`, `mise run py:typecheck`, the TypeScript unit and
 integration tasks, `mise run test:bifrost:journey:forge`, fmt, lints and
 `git diff --check`.
+
+### Red-gate remediation evidence
+
+#### Failure 1 — `crates/vala/vala-bifrost-redux/tests/integration/forge/compaction_admission.rs::multi_plan_success_counts_all_committed_volume_once`
+
+- Symptom: the intermittent line 735 (stalled-commit counter equals
+  `consumed`) or line 654 ("durable Scribe promotion demand diverged from the
+  prepared plan") failure recorded in the blocker above.
+- Evidence: the traced runs and independent diagnostician report above; a
+  scheduler heartbeat (`bifrost.forge.scheduler.pass`) creates a promotion
+  task while `seal_more` / `age_files` is still running. Not reproduced
+  locally in 11 traced pre-fix runs plus a 58/58 pre-fix `forge::` suite.
+- Cause: `Forge::supervise` delayed only the first heartbeat under a
+  test-owned trigger; every later tick ran `lead()` →
+  `sweep_promotion_debt()`, an unrequested promotion pass the fixture does
+  not own.
+- Fix site: `forge/scheduler.rs` — `run_pass`/`lead` take `sweep`; the
+  heartbeat arm passes `!quiet`, so under a test-owned trigger the heartbeat
+  renews the leader term only and the sweep runs on requested passes.
+  Production never sets `quiet` (only `ForgeSchedulerTrigger::with_owner_for_test`
+  does), so the production heartbeat still renews and sweeps every tick.
+  Callers checked: every `with_owner_for_test` fixture (redux `support.rs`,
+  `rewrite_support.rs`, wyrd-testing Forge `support.rs`) drives promotion
+  through requested passes or Scribe hints.
+
+#### Failure 2 — Oracle hot-tier journeys
+
+Traced RED (`WYRD_LOG=info,vala_bifrost_redux=debug`):
+
+- `crates/wyrd/wyrd-testing/tests/bifrost/oracle/distributed.rs::pg_bifrost_selective_predicate_and_projection_prune_distributed_reads`
+  panicked at `distributed.rs:87` with
+  `local pruning journey: "hot-only projection proof requires a hot-only cut: hot=0 compacted=3"`.
+- `crates/wyrd/wyrd-testing/tests/bifrost/oracle/published.rs::published_cache_pruning_and_shutdown_are_production_governed`
+  panicked at `published.rs:177`:
+  `assertion left == right failed: one immutable identity is decoded exactly once, however many callers ask; left: 2.0 right: 1.0`.
+
+- Symptom: the hot-tier proofs observe Iceberg-pinned files.
+- Evidence: `file_list.compacted = true` is written only by
+  `FileList::settle_promoted` (`vala-sql` `queries/file_list.rs`), i.e.
+  promotion settlement; no `small_files` rewrite ran in either trace. Every
+  `scribe_promotion` execution (18/18 in the distributed trace) came from the
+  supervisor's hint arm, none from a `bifrost.forge.scheduler.pass`. In the
+  published trace query 1 pinned `hot_files=1` at 13.979 s, the promotion
+  committed 13.988–14.006 s, and query 2 pinned `hot_files=0
+  iceberg_files=2` at 14.016 s; the Oracle cache keys `ObjectPin::Hot` and
+  `ObjectPin::Published` differently, so the same object decoded twice.
+- Cause: hint-driven promotion (REQ-002) promotes each flushed object within
+  ~20–150 ms, which is correct product behaviour; the fixtures assumed the
+  object stays hot. The test-owned trigger does not gate the hint arm, and no
+  `WyrdTestCluster` option supplies one, so it cannot hold promotion.
+- Fix site: the two journey fixtures. Both start through the existing
+  `start_spec_with_forge_config_and_completion_observer(.., inject_uncertainty
+  = true)` commit seam and park the first promotion commit before writing;
+  the parked attempt is the table's active attempt, so every other promotion
+  defers behind it. Flushes stay: every distributed proof and published
+  phases 2, 3, 5 and 6 need sealed hot Parquet (row groups, footers,
+  `HotParquetExec` projection mask, footer tenant proof); the live tail has
+  none. `published.rs` releases the parked commit for phase 4 and parks again
+  for phase 5. `CommitUncertaintyCatalog::release_paused_before_commit` was
+  added to the harness so phase 4 commits instead of refusing; no product
+  knob was added and product behaviour is unchanged. The diagnostician
+  concurred on cause and fix site.
+
+Findings reported, not fixed (outside this write set):
+
+- Refusing a parked promotion (`reject_paused_before_commit`) left the task
+  retrying about every 30 s with "Reset Forge generation cannot be reopened;
+  retry requires a new operation and output generation"
+  (`vala-sql` `queries/forge_operations.rs`) for about 100 s, until a new
+  task id. That looks like a promotion-retry defect after a definite refusal.
+- `distributed.rs::prove_hot_and_compacted_pruning` carries the same latent
+  `hot > 0` race.
+- A promoted object is decoded once per pin kind (Hot, then Published): a
+  cache-efficiency note.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Heartbeat under a test-owned trigger renews the term only; production unchanged | `forge/scheduler.rs` (`supervise`, `run_pass`, `lead`) | `multi_plan_success_counts_all_committed_volume_once` 5/5 (35.6–37.9 s); redux integration `forge::` 58/58 | PASS |
+| Distributed hot-tier proof reads a hot cut | `oracle/distributed.rs` commit-seam hold | `distributed::pg_bifrost_selective_predicate_and_projection_prune_distributed_reads` 5/5 (6.2–7.6 s) | PASS |
+| Published governance journey observes hot, then promoted, then hot | `oracle/published.rs`; `forge_harness.rs` `release_paused_before_commit` | `published::published_cache_pruning_and_shutdown_are_production_governed` 5/5 (19.8–22.1 s) | PASS |
+| No regression in the Oracle lane | — | `mise run test:bifrost:journey:oracle` 42/42 | PASS |
+
+Commands: `mise exec -- scripts/postgres/with-test-postgres.sh -- <nextest -p vala-bifrost-redux --test integration -P journey --run-ignored=all -E '<expr>'>`
+and the same for `-p wyrd-testing --test oracle` after `mise run db:migrate:inner`,
+both with `WYRD_LOG=info,vala_bifrost_redux=debug`; `mise run test:bifrost:journey:oracle`;
+`mise exec -- cargo fmt --all --check`; `mise exec -- cargo clippy --locked -p vala-bifrost-redux -p wyrd-testing --all-features --tests -- -D warnings`;
+`git diff --check`. All green. No product knob or behaviour change; no test
+weakened, skipped or slept.

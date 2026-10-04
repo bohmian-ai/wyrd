@@ -45,6 +45,9 @@ impl ForgeSchedulerTrigger {
     ///
     /// This preserves production scheduling and supervision while allowing a
     /// restart fixture to reconstruct its Forge graph before the prior lease TTL.
+    /// The scenario then owns every promotion sweep: the supervisor's
+    /// heartbeats only renew the leader term, and debt is swept only on the
+    /// passes [`Self::request_pass`] asks for.
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn with_owner_for_test(owner: Uuid) -> Self {
@@ -134,7 +137,8 @@ impl Forge {
     /// Every coordinator contends for the one leader term on a heartbeat and
     /// promotes the Scribe hot objects its own hints name, through a private
     /// attempt executor. The term holder sweeps `file_list` promotion debt on
-    /// every heartbeat. A separate timer runs the leader's Iceberg maintenance
+    /// every heartbeat; under a test-owned trigger it sweeps only on the
+    /// passes that trigger requests. A separate timer runs the leader's Iceberg maintenance
     /// pass, so a long pass never delays term renewal. The term is resigned on
     /// stop, so a standby takes over at once.
     ///
@@ -178,8 +182,11 @@ impl Forge {
         shutdown: &CancellationToken,
         readiness: &super::ForgeRoleReadiness,
     ) {
-        // Production elects at once on boot. A test that owns the trigger
-        // arranges its scenario first, so its first heartbeat waits a period.
+        // Production elects at once on boot and sweeps promotion debt on
+        // every heartbeat. A test that owns the trigger arranges its scenario
+        // first and owns every sweep: its first heartbeat waits a period, and
+        // its heartbeats only renew the term, so no unrequested sweep races
+        // the world the scenario is building.
         #[cfg(feature = "test-support")]
         let quiet = self
             .core
@@ -208,9 +215,9 @@ impl Forge {
                         None => hints_open = false,
                     }
                 }
-                _ = heartbeat.tick() => self.run_pass(executor, shutdown, readiness).await,
+                _ = heartbeat.tick() => self.run_pass(executor, shutdown, readiness, !quiet).await,
                 () = self.await_triggered_pass() => {
-                    self.run_pass(executor, shutdown, readiness).await;
+                    self.run_pass(executor, shutdown, readiness, true).await;
                     #[cfg(feature = "test-support")]
                     self.record_completed_pass();
                 }
@@ -286,20 +293,23 @@ impl Forge {
     /// Runs one heartbeat pass and publishes readiness.
     ///
     /// Every pass renews or contends for the leader term. A replica that
-    /// finds another live leader is a healthy standby; the term holder then
-    /// sweeps promotion debt.
+    /// finds another live leader is a healthy standby; when `sweep` is set,
+    /// the term holder then sweeps promotion debt. Only a heartbeat under a
+    /// test-owned trigger clears `sweep`.
     async fn run_pass(
         &self,
         executor: &ForgeWorker,
         stop: &CancellationToken,
         readiness: &super::ForgeRoleReadiness,
+        sweep: bool,
     ) {
         let span = tracing::info_span!(
             "bifrost.forge.scheduler.pass",
             result = tracing::field::Empty,
             role = "server",
         );
-        let result = tracing::Instrument::instrument(self.lead(executor, stop), span.clone()).await;
+        let result =
+            tracing::Instrument::instrument(self.lead(executor, stop, sweep), span.clone()).await;
         match result {
             Ok(leader) => {
                 span.record("result", if leader { "succeeded" } else { "standby" });
@@ -315,9 +325,11 @@ impl Forge {
         }
     }
 
-    /// Holds the leader term for one heartbeat and sweeps promotion debt.
+    /// Holds the leader term for one heartbeat and, when `sweep` is set,
+    /// sweeps promotion debt.
     ///
-    /// Returns whether this replica holds the term after the pass.
+    /// Returns whether this replica holds the term after the pass. A pass
+    /// without `sweep` only renews or contends for the term.
     ///
     /// # Errors
     ///
@@ -326,10 +338,11 @@ impl Forge {
         &self,
         executor: &ForgeWorker,
         stop: &CancellationToken,
+        sweep: bool,
     ) -> Result<bool, ForgeError> {
         self.leadership.heartbeat().await?;
-        if self.leadership.held().is_none() {
-            return Ok(false);
+        if !sweep || self.leadership.held().is_none() {
+            return Ok(self.leadership.held().is_some());
         }
         // ponytail: one indexed debt read per heartbeat; gate it on
         // acquisition plus a slower tick if the read ever shows up.

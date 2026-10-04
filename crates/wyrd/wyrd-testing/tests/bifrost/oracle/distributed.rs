@@ -12,6 +12,7 @@ use parquet::arrow::ARROW_SCHEMA_META_KEY;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::metadata::KeyValue;
+use vala_bifrost_redux::forge::ForgeConfig;
 use vala_bifrost_redux::oracle::iceberg_projection_probe;
 use vala_bifrost_redux::parquet::footer::tenant_key_value;
 use vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties_with_metadata;
@@ -108,7 +109,27 @@ async fn prove_selective_predicate_pruning(
     query_index: usize,
     expectation: PruningExpectation,
 ) -> Result<(), JourneyError> {
-    let cluster = WyrdTestCluster::start_spec(spec).await?;
+    // Every proof below reads sealed hot Parquet: files and row groups
+    // scanned, footer statistics, `HotParquetExec`'s projection mask and the
+    // footer tenant proof. Scribe's unsealed live tail has none of those, so
+    // the fixture flushes. Forge promotes each flushed object to Iceberg as
+    // soon as it is published (REQ-002), which would move the measurement
+    // onto the Iceberg leaf, so every Forge catalog is wrapped in the
+    // production commit seam and the first promotion commit is parked before
+    // any write. The parked attempt is the table's active attempt, so every
+    // later promotion on any replica defers behind it and the cut stays hot
+    // until shutdown drains the parked commit unsettled.
+    let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
+        spec,
+        ForgeConfig::default(),
+        false,
+        true,
+    )
+    .await?;
+    let promotion = cluster
+        .commit_uncertainty_catalog()
+        .ok_or("the topology wraps its Forge catalog in the commit seam")?;
+    promotion.pause_before_commit();
     let ingest_server = cluster
         .servers()
         .find(|server| server.bifrost_scribe().is_some())
@@ -126,6 +147,9 @@ async fn prove_selective_predicate_pruning(
         .await?;
         ingest_server.flush_bifrost().await?;
     }
+    tokio::time::timeout(Duration::from_secs(30), promotion.wait_for_before_commit())
+        .await
+        .map_err(|_| "the first promotion never reached the parked commit")?;
     cluster.refresh_oracle_snapshots().await?;
 
     let query_server = cluster.server(query_index).ok_or("missing query node")?;

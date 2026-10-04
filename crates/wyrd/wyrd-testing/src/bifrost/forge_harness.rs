@@ -508,6 +508,20 @@ impl CommitUncertaintyCatalog {
             .store(true, Ordering::Release);
         self.controls.before_commit_release.notify_waiters();
     }
+
+    /// Resume the paused commit unchanged, so it delegates to the real catalog.
+    ///
+    /// A journey that parks a commit only to hold the table's state still
+    /// needs that commit to land when it lets go; refusing it instead would
+    /// prove the refusal path, not the held state. Like the other releases,
+    /// this wakes only a caller already parked, so the journey awaits
+    /// [`Self::wait_for_before_commit`] first.
+    pub fn release_paused_before_commit(&self) {
+        self.controls
+            .reject_before_commit
+            .store(false, Ordering::Release);
+        self.controls.before_commit_release.notify_waiters();
+    }
 }
 
 #[async_trait]

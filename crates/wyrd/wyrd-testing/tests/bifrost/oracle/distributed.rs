@@ -2328,3 +2328,1403 @@ fn renumbered_first_field(
         )
         .build()?)
 }
+
+/// Microseconds in one hour, the fixture's single event-time partition.
+const FILTER_HOUR_MICROS: i64 = 3_600_000_000;
+
+/// Width of each sealed file's disjoint event-time slice inside the hour.
+const FILTER_SLICE_MICROS: i64 = 15 * 60 * 1_000_000;
+
+/// Hot files every filtering table seals, one per flush.
+const FILTER_FILES: i64 = 3;
+
+/// Custom rows per sealed file.
+///
+/// Above the writer's 20,000-row page limit, so each custom file carries
+/// several pages and a point lookup can skip pages inside its one row group.
+const CUSTOM_ROWS_PER_FILE: i64 = 45_000;
+
+/// Rows each canonical signal table seals per file.
+const SIGNAL_ROWS_PER_FILE: i64 = 4;
+
+/// The custom key the row-group and page probes look up; it lies in file 1.
+const CUSTOM_PROBE_KEY: i64 = CUSTOM_ROWS_PER_FILE + 5_000;
+
+/// The caller-declared custom Bloom column.
+const CUSTOM_BLOOM_COLUMN: &str = "label";
+
+/// On a proven hot-only cut, the caller-registered custom dataset and the
+/// built-in spans, records, and points tables return exact matches and
+/// nonmatches for Bloom-key equality, event-time ranges, mixed key/time
+/// predicates, and null filters. Each physical mechanism is proven
+/// separately, with a fixture that no other mechanism can satisfy:
+///
+/// - **sort order** — every sealed file is read back from storage and is in
+///   its resolved layout's order even though rows were written out of order;
+/// - **file-level min/max** — an event-time slice opens one file of three,
+///   because the durable file-list bounds exclude the others before any
+///   footer is read;
+/// - **row-group min/max** — a custom key and a `wyrd_request_id` lookup open
+///   every file but exclude the other files' only row groups by footer
+///   statistics, with no Bloom exclusion;
+/// - **Bloom** — an absent `trace_id`, verified Bloom-negative and inside its
+///   file's min/max, and an absent custom label inside every file's bounds,
+///   are excluded by the Bloom filter after statistics kept the group;
+/// - **page index** — the custom key lookup skips rows of its retained
+///   multi-page row group.
+///
+/// Rows are written through a Scribe-only node and read through an
+/// Oracle-only node. Promotion is impossible during the proof: the only Forge
+/// coordinator is the delayed third node, so no hot object can move into
+/// Iceberg.
+///
+/// # Errors
+///
+/// Returns cluster, registration, write, storage, telemetry, or query errors,
+/// or a description of the first expectation that does not hold.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn hot_filtering_mechanisms_cover_all_table_kinds() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
+        BifrostClusterSpec::for_targets(&[
+            BifrostTarget::Scribe,
+            BifrostTarget::Oracle,
+            BifrostTarget::Server,
+        ]),
+        ForgeConfig::default(),
+        true,
+        false,
+    )
+    .await?;
+    let scribe = cluster.server(0).ok_or("missing Scribe node")?;
+    let oracle = cluster.server(1).ok_or("missing Oracle node")?;
+    let fixture = FilteringFixture::write(scribe).await?;
+    cluster.refresh_oracle_snapshots().await?;
+    let reader = client(oracle, "filtering-reader").await?;
+    fixture.prove_hot_cut(&cluster, scribe, &reader).await?;
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// The four-table filtering fixture: one hour of deterministic rows written
+/// as three disjoint event-time slices, each sealed as its own hot file.
+///
+/// Every expected row identity is derived from the same `(file, row)` rule
+/// that wrote it, so a query's exact answer never restates the data.
+struct FilteringFixture {
+    /// First microsecond of the fixture hour.
+    hour: i64,
+    /// Unqualified name of the caller-registered custom dataset.
+    custom: String,
+    /// The Scribe-node client that registered and wrote every table.
+    writer: wyrd_testing::bifrost::write::BifrostWriter,
+}
+
+/// One query of the filtering matrix and its exact expected row identities.
+struct FilterCase {
+    /// Name reported with every failure and evidence line.
+    name: String,
+    /// The SQL, projecting the row identity as an `Int64` `id`, ordered by it.
+    sql: String,
+    /// Ascending row identities the query must return.
+    expected: Vec<i64>,
+}
+
+/// Physical scan evidence one query's Oracle telemetry delta records.
+#[derive(Debug, Clone, Copy)]
+struct ScanEvidence {
+    /// Hot files opened.
+    files: f64,
+    /// Row groups excluded by statistics or Bloom filters.
+    row_groups_pruned: f64,
+    /// Row groups of those excluded by a Bloom filter alone.
+    bloom_pruned: f64,
+    /// Rows the page index skipped inside retained row groups.
+    page_rows_pruned: f64,
+}
+
+impl FilteringFixture {
+    /// Registers the custom dataset, provisions the signal tables, and seals
+    /// three hot files per table.
+    ///
+    /// The custom dataset is declared through the public `TableConfig` path
+    /// with an explicit hour partition, sort key, and Bloom column; its
+    /// server-resolved layout is asserted before any row is written. Each
+    /// slice writes one batch per table and then flushes, so every table seals
+    /// exactly one file per slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns registration, describe, write, or flush errors, and an error
+    /// when the resolved custom layout differs from the declaration.
+    async fn write(server: &WyrdTestServer) -> Result<Self, JourneyError> {
+        let now = chrono::Utc::now().timestamp_micros();
+        let hour = (now / FILTER_HOUR_MICROS - 2) * FILTER_HOUR_MICROS;
+        let fixture = Self {
+            hour,
+            custom: unique_table("oracle_filtering"),
+            writer: writer(server, "filtering-writer").await?,
+        };
+        fixture.register_custom().await?;
+        for (namespace, table) in [
+            ("traces", "spans"),
+            ("logs", "records"),
+            ("metrics", "points"),
+        ] {
+            server
+                .ensure_builtin_table_for_test(server.data_tenant_id(), namespace, table)
+                .await?;
+        }
+        let mut schemas = Vec::new();
+        for fqn in [
+            "vala.traces.spans",
+            "vala.logs.records",
+            "vala.metrics.points",
+        ] {
+            let described =
+                wyrd_client::bifrost::TableConfig::describe(fixture.writer.client(), fqn).await?;
+            schemas.push(std::sync::Arc::clone(described.user_schema()));
+        }
+        let [spans, records, points] = schemas.as_slice() else {
+            return Err("three signal schemas were described".into());
+        };
+        for file in 0..FILTER_FILES {
+            fixture
+                .writer
+                .write_batch(&fixture.custom_fqn(), &fixture.custom_batch(file)?)
+                .await?;
+            fixture
+                .writer
+                .write_batch("vala.traces.spans", &fixture.spans_batch(spans, file)?)
+                .await?;
+            fixture
+                .writer
+                .write_batch("vala.logs.records", &fixture.records_batch(records, file)?)
+                .await?;
+            fixture
+                .writer
+                .write_batch("vala.metrics.points", &fixture.points_batch(points, file)?)
+                .await?;
+            server.flush_bifrost().await?;
+        }
+        Ok(fixture)
+    }
+
+    /// Registers the custom dataset through the public client and asserts the
+    /// layout the server resolved from the declaration.
+    ///
+    /// # Errors
+    ///
+    /// Returns the registration or describe error, and an error when the
+    /// resolved partition, sort order, or Bloom columns differ from the
+    /// declaration.
+    async fn register_custom(&self) -> Result<(), JourneyError> {
+        use wyrd_spec::vala::api::{
+            NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
+        };
+
+        let declared_sort = vec![SortKeyWire {
+            column: "key_id".to_owned(),
+            direction: SortDirectionWire::Asc,
+            null_order: NullOrderWire::Last,
+        }];
+        let config =
+            wyrd_client::bifrost::TableConfig::from_arrow(&self.custom_fqn(), custom_schema())?
+                .with_layout(PhysicalLayoutWire {
+                    partition_granularity: TimeGranularityWire::Hour,
+                    sort_keys: declared_sort.clone(),
+                    bloom_columns: vec![CUSTOM_BLOOM_COLUMN.to_owned()],
+                });
+        wyrd_client::Bifrost::connect_with_table(self.writer.client(), config)
+            .await?
+            .register()
+            .await?;
+        let resolved = wyrd_client::Bifrost::query_only(self.writer.client())
+            .describe(&self.custom_fqn())
+            .await?
+            .physical_layout;
+        if resolved.partition_granularity != TimeGranularityWire::Hour
+            || resolved.sort_keys != declared_sort
+            || !resolved
+                .bloom_columns
+                .iter()
+                .any(|column| column == CUSTOM_BLOOM_COLUMN)
+            || resolved
+                .bloom_columns
+                .iter()
+                .any(|column| column == "key_id" || column == "score")
+        {
+            return Err(format!(
+                "the server did not resolve the declared custom layout: {resolved:?}"
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// The custom dataset's fully qualified name.
+    fn custom_fqn(&self) -> String {
+        format!("vala.datasets.{}", self.custom)
+    }
+
+    /// First microsecond of `file`'s event-time slice.
+    fn slice_start(&self, file: i64) -> i64 {
+        self.hour + file * FILTER_SLICE_MICROS
+    }
+
+    /// The half-open SQL event-time predicate selecting `file`'s slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a slice bound is not a representable timestamp.
+    fn slice_filter(&self, file: i64) -> Result<String, JourneyError> {
+        let start = self.slice_start(file);
+        Ok(format!(
+            "wyrd_event_time >= TIMESTAMP '{}' AND wyrd_event_time < TIMESTAMP '{}'",
+            sql_timestamp(start)?,
+            sql_timestamp(start + FILTER_SLICE_MICROS)?
+        ))
+    }
+
+    /// The event time of custom `key`, inside its file's slice.
+    fn custom_event_time(&self, key: i64) -> i64 {
+        self.slice_start(key / CUSTOM_ROWS_PER_FILE) + (key % CUSTOM_ROWS_PER_FILE) * 10_000
+    }
+
+    /// The event time of signal row `row` of `file`, inside the file's slice.
+    fn signal_event_time(&self, file: i64, row: i64) -> i64 {
+        self.slice_start(file) + row * 1_000_000
+    }
+
+    /// One custom slice, written in descending key order so the sealed file's
+    /// ascending order can only come from the declared sort key.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Arrow error when the batch does not assemble.
+    fn custom_batch(&self, file: i64) -> Result<arrow::record_batch::RecordBatch, JourneyError> {
+        let keys: Vec<i64> = custom_keys(file).rev().collect();
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            custom_schema(),
+            vec![
+                std::sync::Arc::new(arrow::array::Int64Array::from(keys.clone())),
+                std::sync::Arc::new(arrow::array::StringArray::from(
+                    keys.iter()
+                        .map(|key| custom_label(*key))
+                        .collect::<Vec<_>>(),
+                )),
+                std::sync::Arc::new(arrow::array::Float64Array::from(
+                    keys.iter()
+                        .map(|key| f64::from(i32::try_from(*key).unwrap_or(i32::MAX)))
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )?;
+        with_event_time(
+            &batch,
+            keys.iter()
+                .map(|key| self.custom_event_time(*key))
+                .collect(),
+        )
+    }
+
+    /// One span slice over the described schema, written in ascending event
+    /// time so the sealed descending order comes from the layout.
+    ///
+    /// Row `row` belongs to trace `fixture_trace_id(file, 2 * row)`; odd
+    /// ordinals inside a file's range are never written, which is where the
+    /// absent Bloom probe is drawn from. Even rows are roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Arrow error when the event-time column does not attach.
+    fn spans_batch(
+        &self,
+        schema: &arrow::datatypes::SchemaRef,
+        file: i64,
+    ) -> Result<arrow::record_batch::RecordBatch, JourneyError> {
+        use wyrd_testing::bifrost::canonical_signals::{Cell, Row, attributes, batch};
+
+        let rows: Vec<Row> = (0..SIGNAL_ROWS_PER_FILE)
+            .map(|row| {
+                let id = signal_id(file, row);
+                let mut cells = Row::from([
+                    (
+                        "trace_id",
+                        Cell::Bytes(fixture_trace_id(file, 2 * row).to_vec()),
+                    ),
+                    ("span_id", Cell::Bytes(fixture_span_id(file, row).to_vec())),
+                    ("name", Cell::Text(format!("operation-{row}"))),
+                    ("kind", Cell::Int32(1)),
+                    ("start_time_unix_nano", Cell::Int64(id)),
+                    ("end_time_unix_nano", Cell::Int64(id + 10)),
+                    ("duration_nano", Cell::Int64(10)),
+                    ("status_present", Cell::Bool(true)),
+                    ("status_code", Cell::Int32(1)),
+                    ("resource_present", Cell::Bool(true)),
+                    (
+                        "resource_attributes",
+                        Cell::Bytes(attributes(&[("service.name", "filtering")])),
+                    ),
+                    ("scope_present", Cell::Bool(true)),
+                    ("scope_name", Cell::Text("filtering".to_owned())),
+                    ("service_name", Cell::Text("filtering".to_owned())),
+                ]);
+                if row % 2 == 1 {
+                    cells.insert(
+                        "parent_span_id",
+                        Cell::Bytes(fixture_span_id(file, row - 1).to_vec()),
+                    );
+                }
+                cells
+            })
+            .collect();
+        with_event_time(
+            &batch(schema, &rows),
+            (0..SIGNAL_ROWS_PER_FILE)
+                .map(|row| self.signal_event_time(file, row))
+                .collect(),
+        )
+    }
+
+    /// One log slice: even rows are uncorrelated (null `trace_id`) and row 0
+    /// carries no event name; severity rises with the row.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Arrow error when the event-time column does not attach.
+    fn records_batch(
+        &self,
+        schema: &arrow::datatypes::SchemaRef,
+        file: i64,
+    ) -> Result<arrow::record_batch::RecordBatch, JourneyError> {
+        use wyrd_testing::bifrost::canonical_signals::{Cell, Row, batch};
+
+        let rows: Vec<Row> = (0..SIGNAL_ROWS_PER_FILE)
+            .map(|row| {
+                let id = signal_id(file, row);
+                let mut cells = Row::from([
+                    ("time_unix_nano", Cell::Int64(id)),
+                    ("observed_time_unix_nano", Cell::Int64(id)),
+                    ("severity_number", Cell::Int32(record_severity(row))),
+                    ("severity_text", Cell::Text("INFO".to_owned())),
+                    ("resource_present", Cell::Bool(true)),
+                    ("scope_present", Cell::Bool(true)),
+                    ("scope_name", Cell::Text("filtering".to_owned())),
+                ]);
+                if row > 0 {
+                    cells.insert("event_name", Cell::Text(format!("event-{row}")));
+                }
+                if row % 2 == 1 {
+                    cells.insert(
+                        "trace_id",
+                        Cell::Bytes(fixture_trace_id(file, 2 * row).to_vec()),
+                    );
+                    cells.insert("span_id", Cell::Bytes(fixture_span_id(file, row).to_vec()));
+                }
+                cells
+            })
+            .collect();
+        with_event_time(
+            &batch(schema, &rows),
+            (0..SIGNAL_ROWS_PER_FILE)
+                .map(|row| self.signal_event_time(file, row))
+                .collect(),
+        )
+    }
+
+    /// One point slice: even rows are integer sums and odd rows are double
+    /// gauges, so `int_value` is null on exactly the odd rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Arrow error when the event-time column does not attach.
+    fn points_batch(
+        &self,
+        schema: &arrow::datatypes::SchemaRef,
+        file: i64,
+    ) -> Result<arrow::record_batch::RecordBatch, JourneyError> {
+        use wyrd_testing::bifrost::canonical_signals::{Cell, Row, batch};
+
+        let rows: Vec<Row> = (0..SIGNAL_ROWS_PER_FILE)
+            .map(|row| {
+                let id = signal_id(file, row);
+                let mut cells = Row::from([
+                    ("metric_name", Cell::Text(metric_name(file, row))),
+                    ("unit", Cell::Text("1".to_owned())),
+                    ("time_unix_nano", Cell::Int64(id)),
+                    ("start_time_unix_nano", Cell::Int64(id)),
+                    ("resource_present", Cell::Bool(true)),
+                    ("scope_present", Cell::Bool(true)),
+                    ("scope_name", Cell::Text("filtering".to_owned())),
+                ]);
+                if row % 2 == 0 {
+                    cells.insert("metric_type", Cell::Text("sum".to_owned()));
+                    cells.insert("int_value", Cell::Int64(row));
+                    cells.insert("aggregation_temporality", Cell::Int32(2));
+                    cells.insert("is_monotonic", Cell::Bool(true));
+                } else {
+                    cells.insert("metric_type", Cell::Text("gauge".to_owned()));
+                    cells.insert("double_value", Cell::Float64(0.5));
+                }
+                cells
+            })
+            .collect();
+        with_event_time(
+            &batch(schema, &rows),
+            (0..SIGNAL_ROWS_PER_FILE)
+                .map(|row| self.signal_event_time(file, row))
+                .collect(),
+        )
+    }
+
+    /// Proves the hot-only cut, the physical layout of every sealed file, and
+    /// the per-mechanism query matrix.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage, telemetry, or query errors, and a description of the
+    /// first physical or result expectation that does not hold.
+    async fn prove_hot_cut(
+        &self,
+        cluster: &WyrdTestCluster,
+        server: &WyrdTestServer,
+        reader: &WyrdClient,
+    ) -> Result<(), JourneyError> {
+        use vala_bifrost_redux::namespaces::BifrostNamespace;
+
+        let tenant = cluster.data_tenant_id();
+        for table in [self.custom.as_str(), "spans", "records", "points"] {
+            let (compacted, hot) = file_tier_counts(cluster, tenant, table).await?;
+            if compacted != 0 || hot != FILTER_FILES {
+                return Err(format!(
+                    "{table}: the proof needs a hot-only cut of {FILTER_FILES} files: \
+                     hot={hot} compacted={compacted}"
+                )
+                .into());
+            }
+        }
+
+        let custom = SealedObject::read_tier(
+            cluster,
+            server,
+            tenant,
+            BifrostNamespace::Datasets,
+            &self.custom,
+            false,
+        )
+        .await?;
+        let spans = SealedObject::read_tier(
+            cluster,
+            server,
+            tenant,
+            BifrostNamespace::Traces,
+            "spans",
+            false,
+        )
+        .await?;
+        let records = SealedObject::read_tier(
+            cluster,
+            server,
+            tenant,
+            BifrostNamespace::Logs,
+            "records",
+            false,
+        )
+        .await?;
+        let points = SealedObject::read_tier(
+            cluster,
+            server,
+            tenant,
+            BifrostNamespace::Metrics,
+            "points",
+            false,
+        )
+        .await?;
+        let probes = self
+            .expect_physical_layout(&custom, &spans, &records, &points)
+            .await?;
+        self.run_matrix(cluster, reader, &probes).await
+    }
+
+    /// Asserts each table's sealed files follow its resolved layout and draws
+    /// the Bloom-negative probes the matrix needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns describe or decode errors, and an error naming the first file
+    /// that is out of order, lacks a declared Bloom filter, carries an
+    /// undeclared one, lacks pages, or yields no Bloom-negative probe.
+    async fn expect_physical_layout(
+        &self,
+        custom: &[SealedObject],
+        spans: &[SealedObject],
+        records: &[SealedObject],
+        points: &[SealedObject],
+    ) -> Result<FilterProbes, JourneyError> {
+        let client = self.writer.client();
+        for (fqn, objects, undeclared) in [
+            (self.custom_fqn(), custom, "score"),
+            ("vala.traces.spans".to_owned(), spans, "name"),
+            ("vala.logs.records".to_owned(), records, "severity_text"),
+            ("vala.metrics.points".to_owned(), points, "unit"),
+        ] {
+            let layout = wyrd_client::Bifrost::query_only(client)
+                .describe(&fqn)
+                .await?
+                .physical_layout;
+            if objects.len() != usize::try_from(FILTER_FILES)? {
+                return Err(format!("{fqn}: expected {FILTER_FILES} sealed files").into());
+            }
+            for object in objects {
+                object.expect_sorted(&fqn, &layout.sort_keys)?;
+                object.expect_bloom_columns(&fqn, &layout.bloom_columns, undeclared)?;
+            }
+        }
+        for object in custom {
+            let pages = object.page_count("key_id")?;
+            if pages < 2 {
+                return Err(format!(
+                    "{}: a custom file must carry several key pages, saw {pages}",
+                    object.path
+                )
+                .into());
+            }
+        }
+
+        // Odd ordinals strictly between file 1's smallest and largest written
+        // trace are unwritten yet inside its statistics bounds.
+        let span_probe = (1..2 * (SIGNAL_ROWS_PER_FILE - 1))
+            .step_by(2)
+            .map(|ordinal| fixture_trace_id(1, ordinal))
+            .find(|candidate| {
+                spans[1]
+                    .may_contain("trace_id", candidate)
+                    .is_ok_and(|hit| !hit)
+            })
+            .ok_or("no unwritten trace id inside file 1's bounds is Bloom-negative")?;
+        // Odd labels lie between every file's `label-00` and `label-14`.
+        let label_probe = (0..7)
+            .map(|index| format!("label-{:02}", 2 * index + 1))
+            .find(|candidate| {
+                custom.iter().all(|object| {
+                    object
+                        .may_contain(CUSTOM_BLOOM_COLUMN, candidate.as_bytes())
+                        .is_ok_and(|hit| !hit)
+                })
+            })
+            .ok_or("no unwritten label inside every file's bounds is Bloom-negative")?;
+        let request_ids = custom
+            .iter()
+            .map(SealedObject::request_id)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(FilterProbes {
+            span_probe,
+            label_probe,
+            request_ids,
+        })
+    }
+
+    /// Runs every table's query matrix and asserts each mechanism's evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns query or telemetry errors, and an error naming the first case
+    /// whose rows or physical evidence differ from the expectation.
+    async fn run_matrix(
+        &self,
+        cluster: &WyrdTestCluster,
+        reader: &WyrdClient,
+        probes: &FilterProbes,
+    ) -> Result<(), JourneyError> {
+        let custom = self.custom_fqn();
+        let all_custom: Vec<i64> = (0..FILTER_FILES).flat_map(custom_keys).collect();
+        let custom_where = |keep: &dyn Fn(i64) -> bool| -> Vec<i64> {
+            all_custom
+                .iter()
+                .copied()
+                .filter(|key| keep(*key))
+                .collect()
+        };
+
+        let baseline = run_case(
+            cluster,
+            reader,
+            FilterCase {
+                name: "custom unfiltered".to_owned(),
+                sql: format!("SELECT key_id AS id FROM {custom} ORDER BY id"),
+                expected: all_custom.clone(),
+            },
+        )
+        .await?;
+        expect_measure("custom unfiltered", "files", baseline.files, 3.0)?;
+        expect_measure(
+            "custom unfiltered",
+            "pruned",
+            baseline.row_groups_pruned,
+            0.0,
+        )?;
+
+        run_case(
+            cluster,
+            reader,
+            FilterCase {
+                name: "custom Bloom key present".to_owned(),
+                sql: format!(
+                    "SELECT key_id AS id FROM {custom} WHERE label = 'label-04' ORDER BY id"
+                ),
+                expected: custom_where(&|key| custom_label(key).as_deref() == Some("label-04")),
+            },
+        )
+        .await?;
+
+        let bloom = run_case(
+            cluster,
+            reader,
+            FilterCase {
+                name: "custom Bloom key absent within bounds".to_owned(),
+                sql: format!(
+                    "SELECT key_id AS id FROM {custom} WHERE label = '{}' ORDER BY id",
+                    probes.label_probe
+                ),
+                expected: Vec::new(),
+            },
+        )
+        .await?;
+        expect_measure("custom Bloom absent", "files", bloom.files, 3.0)?;
+        expect_measure("custom Bloom absent", "bloom", bloom.bloom_pruned, 3.0)?;
+        expect_measure(
+            "custom Bloom absent",
+            "pruned",
+            bloom.row_groups_pruned,
+            3.0,
+        )?;
+
+        let point = run_case(
+            cluster,
+            reader,
+            FilterCase {
+                name: "custom key min/max and page index".to_owned(),
+                sql: format!(
+                    "SELECT key_id AS id FROM {custom} WHERE key_id = {CUSTOM_PROBE_KEY} ORDER BY id"
+                ),
+                expected: vec![CUSTOM_PROBE_KEY],
+            },
+        )
+        .await?;
+        expect_measure("custom key", "files", point.files, 3.0)?;
+        expect_measure("custom key", "pruned", point.row_groups_pruned, 2.0)?;
+        expect_measure("custom key", "bloom", point.bloom_pruned, 0.0)?;
+        if point.page_rows_pruned <= 0.0 {
+            return Err(format!(
+                "custom key: the page index skipped no rows of the retained group: {point:?}"
+            )
+            .into());
+        }
+
+        let slice = run_case(
+            cluster,
+            reader,
+            FilterCase {
+                name: "custom event-time slice".to_owned(),
+                sql: format!(
+                    "SELECT key_id AS id FROM {custom} WHERE {} ORDER BY id",
+                    self.slice_filter(2)?
+                ),
+                expected: custom_keys(2).collect(),
+            },
+        )
+        .await?;
+        expect_measure("custom slice", "files", slice.files, 1.0)?;
+
+        for (name, filter, expected) in [
+            (
+                "custom mixed key/time match",
+                format!("label = 'label-04' AND {}", self.slice_filter(1)?),
+                custom_where(&|key| {
+                    key / CUSTOM_ROWS_PER_FILE == 1
+                        && custom_label(key).as_deref() == Some("label-04")
+                }),
+            ),
+            (
+                "custom mixed key/time miss",
+                format!("key_id = {CUSTOM_PROBE_KEY} AND {}", self.slice_filter(2)?),
+                Vec::new(),
+            ),
+            (
+                "custom null label",
+                "label IS NULL AND key_id < 200".to_owned(),
+                custom_where(&|key| key < 200 && custom_label(key).is_none()),
+            ),
+            ("custom key miss", "key_id = 999999".to_owned(), Vec::new()),
+        ] {
+            run_case(
+                cluster,
+                reader,
+                FilterCase {
+                    name: name.to_owned(),
+                    sql: format!("SELECT key_id AS id FROM {custom} WHERE {filter} ORDER BY id"),
+                    expected,
+                },
+            )
+            .await?;
+        }
+
+        for (file, request_id) in (0..FILTER_FILES).zip(&probes.request_ids) {
+            let present = run_case(
+                cluster,
+                reader,
+                FilterCase {
+                    name: format!("wyrd_request_id of file {file}"),
+                    sql: format!(
+                        "SELECT key_id AS id FROM {custom} \
+                         WHERE wyrd_request_id = '{request_id}' ORDER BY id"
+                    ),
+                    expected: custom_keys(file).collect(),
+                },
+            )
+            .await?;
+            expect_measure(
+                "request id present",
+                "pruned",
+                present.row_groups_pruned,
+                2.0,
+            )?;
+            expect_measure("request id present", "bloom", present.bloom_pruned, 0.0)?;
+        }
+        let absent = run_case(
+            cluster,
+            reader,
+            FilterCase {
+                name: "wyrd_request_id absent".to_owned(),
+                sql: format!(
+                    "SELECT key_id AS id FROM {custom} WHERE wyrd_request_id = '{}' ORDER BY id",
+                    uuid::Uuid::now_v7()
+                ),
+                expected: Vec::new(),
+            },
+        )
+        .await?;
+        expect_measure("request id absent", "pruned", absent.row_groups_pruned, 3.0)?;
+        expect_measure("request id absent", "bloom", absent.bloom_pruned, 0.0)?;
+
+        self.run_signal_matrix(cluster, reader, probes).await
+    }
+
+    /// Runs the spans, records, and points matrices.
+    ///
+    /// # Errors
+    ///
+    /// Returns query or telemetry errors, and an error naming the first case
+    /// whose rows or physical evidence differ from the expectation.
+    async fn run_signal_matrix(
+        &self,
+        cluster: &WyrdTestCluster,
+        reader: &WyrdClient,
+        probes: &FilterProbes,
+    ) -> Result<(), JourneyError> {
+        let signals = |keep: &dyn Fn(i64, i64) -> bool| -> Vec<i64> {
+            (0..FILTER_FILES)
+                .flat_map(|file| (0..SIGNAL_ROWS_PER_FILE).map(move |row| (file, row)))
+                .filter(|(file, row)| keep(*file, *row))
+                .map(|(file, row)| signal_id(file, row))
+                .collect()
+        };
+        let trace = |file: i64, ordinal: i64| hex::encode(fixture_trace_id(file, ordinal));
+
+        for (table, id) in [
+            ("vala.traces.spans", "start_time_unix_nano"),
+            ("vala.logs.records", "time_unix_nano"),
+            ("vala.metrics.points", "time_unix_nano"),
+        ] {
+            let baseline = run_case(
+                cluster,
+                reader,
+                FilterCase {
+                    name: format!("{table} unfiltered"),
+                    sql: format!("SELECT {id} AS id FROM {table} ORDER BY id"),
+                    expected: signals(&|_, _| true),
+                },
+            )
+            .await?;
+            expect_measure(table, "files", baseline.files, 3.0)?;
+            let slice = run_case(
+                cluster,
+                reader,
+                FilterCase {
+                    name: format!("{table} event-time slice"),
+                    sql: format!(
+                        "SELECT {id} AS id FROM {table} WHERE {} ORDER BY id",
+                        self.slice_filter(0)?
+                    ),
+                    expected: signals(&|file, _| file == 0),
+                },
+            )
+            .await?;
+            expect_measure(table, "slice files", slice.files, 1.0)?;
+        }
+
+        let absent = run_case(
+            cluster,
+            reader,
+            FilterCase {
+                name: "spans absent trace id within bounds".to_owned(),
+                sql: format!(
+                    "SELECT start_time_unix_nano AS id FROM vala.traces.spans \
+                     WHERE trace_id = X'{}' ORDER BY id",
+                    hex::encode(probes.span_probe)
+                ),
+                expected: Vec::new(),
+            },
+        )
+        .await?;
+        expect_measure("spans absent trace", "files", absent.files, 3.0)?;
+        expect_measure(
+            "spans absent trace",
+            "pruned",
+            absent.row_groups_pruned,
+            3.0,
+        )?;
+        expect_measure("spans absent trace", "bloom", absent.bloom_pruned, 1.0)?;
+
+        for (name, table, id, filter, expected) in [
+            (
+                "spans trace present",
+                "vala.traces.spans",
+                "start_time_unix_nano",
+                format!("trace_id = X'{}'", trace(1, 2)),
+                signals(&|file, row| file == 1 && row == 1),
+            ),
+            (
+                "spans mixed trace/time match",
+                "vala.traces.spans",
+                "start_time_unix_nano",
+                format!(
+                    "trace_id = X'{}' AND {}",
+                    trace(2, 4),
+                    self.slice_filter(2)?
+                ),
+                signals(&|file, row| file == 2 && row == 2),
+            ),
+            (
+                "spans mixed trace/time miss",
+                "vala.traces.spans",
+                "start_time_unix_nano",
+                format!(
+                    "trace_id = X'{}' AND {}",
+                    trace(2, 4),
+                    self.slice_filter(0)?
+                ),
+                Vec::new(),
+            ),
+            (
+                "spans root (null parent)",
+                "vala.traces.spans",
+                "start_time_unix_nano",
+                "parent_span_id IS NULL".to_owned(),
+                signals(&|_, row| row % 2 == 0),
+            ),
+            (
+                "records trace present",
+                "vala.logs.records",
+                "time_unix_nano",
+                format!("trace_id = X'{}'", trace(0, 2)),
+                signals(&|file, row| file == 0 && row == 1),
+            ),
+            (
+                "records severity key",
+                "vala.logs.records",
+                "time_unix_nano",
+                format!("severity_number = {}", record_severity(2)),
+                signals(&|_, row| row == 2),
+            ),
+            (
+                "records severity miss",
+                "vala.logs.records",
+                "time_unix_nano",
+                "severity_number = 99".to_owned(),
+                Vec::new(),
+            ),
+            (
+                "records uncorrelated in slice",
+                "vala.logs.records",
+                "time_unix_nano",
+                format!("trace_id IS NULL AND {}", self.slice_filter(1)?),
+                signals(&|file, row| file == 1 && row % 2 == 0),
+            ),
+            (
+                "points metric present",
+                "vala.metrics.points",
+                "time_unix_nano",
+                format!("metric_name = '{}'", metric_name(1, 3)),
+                signals(&|file, row| file == 1 && row == 3),
+            ),
+            (
+                "points metric miss",
+                "vala.metrics.points",
+                "time_unix_nano",
+                "metric_name = 'metric-9-9'".to_owned(),
+                Vec::new(),
+            ),
+            (
+                "points null integer",
+                "vala.metrics.points",
+                "time_unix_nano",
+                "int_value IS NULL".to_owned(),
+                signals(&|_, row| row % 2 == 1),
+            ),
+            (
+                "points mixed type/time",
+                "vala.metrics.points",
+                "time_unix_nano",
+                format!("metric_type = 'sum' AND {}", self.slice_filter(2)?),
+                signals(&|file, row| file == 2 && row % 2 == 0),
+            ),
+        ] {
+            run_case(
+                cluster,
+                reader,
+                FilterCase {
+                    name: name.to_owned(),
+                    sql: format!("SELECT {id} AS id FROM {table} WHERE {filter} ORDER BY id"),
+                    expected,
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+}
+
+/// The Bloom-negative and identity probes drawn from the sealed files.
+struct FilterProbes {
+    /// An unwritten trace id inside file 1's `trace_id` bounds whose Bloom
+    /// filter answers absent.
+    span_probe: [u8; 16],
+    /// An unwritten label inside every custom file's bounds whose Bloom
+    /// filters all answer absent.
+    label_probe: String,
+    /// The one `wyrd_request_id` each custom file carries, in file order.
+    request_ids: Vec<String>,
+}
+
+/// One sealed object read back from storage, with its decoded rows and its
+/// footer's column and offset indexes.
+struct SealedObject {
+    /// Durable `vala.file_list` path.
+    path: String,
+    /// Complete object bytes.
+    bytes: bytes::Bytes,
+    /// Footer decoded with page indexes.
+    metadata: parquet::file::metadata::ParquetMetaData,
+    /// Every row in physical order.
+    rows: arrow::record_batch::RecordBatch,
+}
+
+impl SealedObject {
+    /// Reads every hot (`compacted = false`) or Forge (`compacted = true`)
+    /// object of one table, ordered by its first event time.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL, catalog, storage, or Parquet errors.
+    async fn read_tier(
+        cluster: &WyrdTestCluster,
+        server: &WyrdTestServer,
+        tenant: DataTenantId,
+        namespace: vala_bifrost_redux::namespaces::BifrostNamespace,
+        table: &str,
+        compacted: bool,
+    ) -> Result<Vec<Self>, JourneyError> {
+        let catalog = server
+            .state()
+            .bifrost_catalog()
+            .ok_or("Scribe composition retains the shared catalog")?
+            .iceberg_catalog();
+        let binding = vala_bifrost_redux::catalog::TenantTableBinding::resolve((
+            tenant,
+            vala_bifrost_redux::catalog::TableRef::new(namespace, table),
+        ))?;
+        let loaded = catalog.load_table(&binding.table_ident()).await?;
+        let paths: Vec<String> = sqlx::query_scalar(
+            "SELECT file_path FROM vala.file_list \
+             WHERE data_tenant_id = $1 AND table_name = $2 AND compacted = $3",
+        )
+        .bind(tenant.as_uuid())
+        .bind(table)
+        .bind(compacted)
+        .fetch_all(cluster.pg_fixture().operator_pool().pool())
+        .await?;
+        let mut objects = Vec::with_capacity(paths.len());
+        for path in paths {
+            let bytes = loaded.file_io().new_input(&path)?.read().await?;
+            let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
+                .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required)
+                .parse_and_finish(&bytes)?;
+            let decoded = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?
+                .build()?
+                .collect::<Result<Vec<_>, _>>()?;
+            let schema = decoded
+                .first()
+                .map(arrow::record_batch::RecordBatch::schema)
+                .ok_or_else(|| format!("{path}: the sealed object holds no rows"))?;
+            let rows = arrow::compute::concat_batches(&schema, &decoded)?;
+            objects.push(Self {
+                path,
+                bytes,
+                metadata,
+                rows,
+            });
+        }
+        let mut keyed = objects
+            .into_iter()
+            .map(|object| object.first_event_time().map(|first| (first, object)))
+            .collect::<Result<Vec<_>, _>>()?;
+        keyed.sort_by_key(|(first, _)| *first);
+        Ok(keyed.into_iter().map(|(_, object)| object).collect())
+    }
+
+    /// The earliest `wyrd_event_time` this object holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the column is missing, mistyped, or empty.
+    fn first_event_time(&self) -> Result<i64, JourneyError> {
+        let column = self
+            .rows
+            .column_by_name(wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME)
+            .ok_or_else(|| format!("{}: no event-time column", self.path))?
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .ok_or_else(|| format!("{}: event time is not microseconds", self.path))?;
+        arrow::compute::min(column).ok_or_else(|| format!("{}: no event time", self.path).into())
+    }
+
+    /// Requires the rows to be in `keys` order.
+    ///
+    /// Rows are compared through Arrow's row format with each key's direction
+    /// and null placement, so ties are allowed and any inversion fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the first inverted row pair, or the Arrow
+    /// error when a key column is missing or cannot be encoded.
+    fn expect_sorted(
+        &self,
+        table: &str,
+        keys: &[wyrd_spec::vala::api::SortKeyWire],
+    ) -> Result<(), JourneyError> {
+        use wyrd_spec::vala::api::{NullOrderWire, SortDirectionWire};
+
+        let mut fields = Vec::with_capacity(keys.len());
+        let mut columns = Vec::with_capacity(keys.len());
+        for key in keys {
+            let column = self
+                .rows
+                .column_by_name(&key.column)
+                .ok_or_else(|| format!("{table}: sort column {} is missing", key.column))?;
+            fields.push(arrow::row::SortField::new_with_options(
+                column.data_type().clone(),
+                arrow::compute::SortOptions {
+                    descending: key.direction == SortDirectionWire::Desc,
+                    nulls_first: key.null_order == NullOrderWire::First,
+                },
+            ));
+            columns.push(std::sync::Arc::clone(column));
+        }
+        let encoded = arrow::row::RowConverter::new(fields)?.convert_columns(&columns)?;
+        for index in 1..encoded.num_rows() {
+            if encoded.row(index - 1) > encoded.row(index) {
+                return Err(format!(
+                    "{table}: {} is not in its declared order at row {index}",
+                    self.path
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Requires a Bloom filter on every declared column and none on
+    /// `undeclared`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the first column whose filter presence differs.
+    fn expect_bloom_columns(
+        &self,
+        table: &str,
+        declared: &[String],
+        undeclared: &str,
+    ) -> Result<(), JourneyError> {
+        let group = self.metadata.row_group(0);
+        for column in declared {
+            let Ok(index) = self.column_index(column) else {
+                continue;
+            };
+            if group.column(index).bloom_filter_offset().is_none() {
+                return Err(format!(
+                    "{table}: {} has no Bloom filter on declared {column}",
+                    self.path
+                )
+                .into());
+            }
+        }
+        if group
+            .column(self.column_index(undeclared)?)
+            .bloom_filter_offset()
+            .is_some()
+        {
+            return Err(format!(
+                "{table}: {} carries a Bloom filter on undeclared {undeclared}",
+                self.path
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// The leaf index of top-level column `name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the object has no such leaf.
+    fn column_index(&self, name: &str) -> Result<usize, JourneyError> {
+        self.metadata
+            .file_metadata()
+            .schema_descr()
+            .columns()
+            .iter()
+            .position(|column| column.path().string() == name)
+            .ok_or_else(|| format!("{}: no column {name}", self.path).into())
+    }
+
+    /// Whether row group 0's Bloom filter on `column` may contain `value`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the object does not decode or carries no filter
+    /// on the column.
+    fn may_contain(&self, column: &str, value: &[u8]) -> Result<bool, JourneyError> {
+        use parquet::file::reader::FileReader;
+
+        let reader = parquet::file::serialized_reader::SerializedFileReader::new_with_options(
+            self.bytes.clone(),
+            parquet::file::serialized_reader::ReadOptionsBuilder::new()
+                .with_reader_properties(
+                    parquet::file::properties::ReaderProperties::builder()
+                        .set_read_bloom_filter(true)
+                        .build(),
+                )
+                .build(),
+        )?;
+        let group = reader.get_row_group(0)?;
+        let filter = group
+            .get_column_bloom_filter(self.column_index(column)?)
+            .ok_or_else(|| format!("{}: no Bloom filter on {column}", self.path))?;
+        Ok(filter.check(value))
+    }
+
+    /// The number of pages row group 0 stores for `column`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the object carries no offset index.
+    fn page_count(&self, column: &str) -> Result<usize, JourneyError> {
+        let index = self.column_index(column)?;
+        Ok(self
+            .metadata
+            .offset_index()
+            .and_then(|groups| groups.first())
+            .and_then(|columns| columns.get(index))
+            .ok_or_else(|| format!("{}: no offset index", self.path))?
+            .page_locations()
+            .len())
+    }
+
+    /// The single `wyrd_request_id` every row of this object carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the column is missing or holds several values.
+    fn request_id(&self) -> Result<String, JourneyError> {
+        let column = self
+            .rows
+            .column_by_name("wyrd_request_id")
+            .ok_or_else(|| format!("{}: no request id column", self.path))?
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .ok_or_else(|| format!("{}: request id is not UTF-8", self.path))?;
+        let distinct = column
+            .iter()
+            .flatten()
+            .collect::<std::collections::BTreeSet<_>>();
+        match distinct.into_iter().collect::<Vec<_>>().as_slice() {
+            [only] => Ok((*only).to_owned()),
+            many => {
+                Err(format!("{}: expected one request id, saw {}", self.path, many.len()).into())
+            }
+        }
+    }
+}
+
+/// Runs one filtering case and returns the hot reader's evidence for it.
+///
+/// # Errors
+///
+/// Returns telemetry or query errors, and an error when the returned ids are
+/// not exactly the expected ids.
+async fn run_case(
+    cluster: &WyrdTestCluster,
+    reader: &WyrdClient,
+    case: FilterCase,
+) -> Result<ScanEvidence, JourneyError> {
+    let checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .map_err(|error| error.to_string())?;
+    let ids = query_ids(reader, case.sql.clone()).await?;
+    let delta = cluster
+        .telemetry()
+        .delta_since(&checkpoint)
+        .map_err(|error| error.to_string())?;
+    if ids != case.expected {
+        return Err(format!(
+            "{}: returned {} ids, expected {}; first returned {:?}, first expected {:?}; sql: {}",
+            case.name,
+            ids.len(),
+            case.expected.len(),
+            ids.iter().take(8).collect::<Vec<_>>(),
+            case.expected.iter().take(8).collect::<Vec<_>>(),
+            case.sql
+        )
+        .into());
+    }
+    let evidence = ScanEvidence {
+        files: sum_metric(&delta, "oracle_query_files_scanned_total"),
+        row_groups_pruned: sum_metric(&delta, "oracle_query_row_groups_pruned_total"),
+        bloom_pruned: sum_metric(&delta, "oracle_query_row_groups_pruned_bloom_total"),
+        page_rows_pruned: sum_metric(&delta, "oracle_query_rows_pruned_page_index_total"),
+    };
+    eprintln!(
+        "filtering case `{}`: rows={} {evidence:?}",
+        case.name,
+        ids.len()
+    );
+    Ok(evidence)
+}
+
+/// Requires one evidence measure to equal its expected value exactly.
+///
+/// # Errors
+///
+/// Returns an error naming the case, the measure, and both values.
+fn expect_measure(
+    case: &str,
+    measure: &str,
+    actual: f64,
+    expected: f64,
+) -> Result<(), JourneyError> {
+    if (actual - expected).abs() > f64::EPSILON {
+        return Err(format!("{case}: {measure} expected {expected}, saw {actual}").into());
+    }
+    Ok(())
+}
+
+/// The custom dataset's user schema: a sort key, a nullable Bloom key, and a
+/// value column with neither.
+fn custom_schema() -> arrow::datatypes::SchemaRef {
+    std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("key_id", arrow::datatypes::DataType::Int64, false),
+        arrow::datatypes::Field::new(CUSTOM_BLOOM_COLUMN, arrow::datatypes::DataType::Utf8, true),
+        arrow::datatypes::Field::new("score", arrow::datatypes::DataType::Float64, false),
+    ]))
+}
+
+/// The ascending custom keys file `file` holds; files own disjoint ranges.
+fn custom_keys(file: i64) -> std::ops::Range<i64> {
+    file * CUSTOM_ROWS_PER_FILE..(file + 1) * CUSTOM_ROWS_PER_FILE
+}
+
+/// The label of custom `key`: null on every tenth key, otherwise one of
+/// eight even-numbered labels, so odd-numbered labels lie inside every
+/// file's bounds without ever being written.
+fn custom_label(key: i64) -> Option<String> {
+    (key % 10 != 0).then(|| format!("label-{:02}", 2 * (key % 8)))
+}
+
+/// The row identity of signal row `row` of `file`.
+fn signal_id(file: i64, row: i64) -> i64 {
+    file * 100 + row + 1
+}
+
+/// A fixture trace id whose last two bytes are `file` and `ordinal`.
+///
+/// Written rows use even ordinals, so an odd ordinal below a file's largest
+/// written one is unwritten yet inside that file's `trace_id` bounds.
+fn fixture_trace_id(file: i64, ordinal: i64) -> [u8; 16] {
+    let mut id = [0xf1; 16];
+    id[14] = u8::try_from(file).unwrap_or(u8::MAX);
+    id[15] = u8::try_from(ordinal).unwrap_or(u8::MAX);
+    id
+}
+
+/// A fixture span id unique to `(file, row)`.
+fn fixture_span_id(file: i64, row: i64) -> [u8; 8] {
+    let mut id = [0x5a; 8];
+    id[6] = u8::try_from(file).unwrap_or(u8::MAX);
+    id[7] = u8::try_from(row).unwrap_or(u8::MAX);
+    id
+}
+
+/// The severity of log row `row`.
+fn record_severity(row: i64) -> i32 {
+    9 + i32::try_from(row).unwrap_or(0)
+}
+
+/// The metric name of point row `row` of `file`.
+fn metric_name(file: i64, row: i64) -> String {
+    format!("metric-{file}-{row}")
+}
+
+/// Formats `micros` as a SQL `TIMESTAMP` literal body in UTC.
+///
+/// # Errors
+///
+/// Returns an error when `micros` is not a representable instant.
+fn sql_timestamp(micros: i64) -> Result<String, JourneyError> {
+    Ok(
+        chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros)
+            .ok_or("fixture timestamp is out of range")?
+            .format("%Y-%m-%d %H:%M:%S%.6f")
+            .to_string(),
+    )
+}
+
+/// Appends a caller-supplied `wyrd_event_time` to `batch`.
+///
+/// # Errors
+///
+/// Returns the Arrow error when the column count differs from the rows.
+fn with_event_time(
+    batch: &arrow::record_batch::RecordBatch,
+    micros: Vec<i64>,
+) -> Result<arrow::record_batch::RecordBatch, JourneyError> {
+    let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
+    fields.push(std::sync::Arc::new(arrow::datatypes::Field::new(
+        wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
+        arrow::datatypes::DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ),
+        false,
+    )));
+    let mut columns = batch.columns().to_vec();
+    columns.push(std::sync::Arc::new(
+        arrow::array::TimestampMicrosecondArray::from(micros).with_timezone("UTC"),
+    ));
+    Ok(arrow::record_batch::RecordBatch::try_new(
+        std::sync::Arc::new(arrow::datatypes::Schema::new(fields)),
+        columns,
+    )?)
+}

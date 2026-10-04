@@ -336,9 +336,8 @@ RisingWave e23ddf95 source locations in Approach and scenarios.
 
 ## Implementation Evidence
 
-Status: IMPLEMENTED for Scenarios 1–3. Scenario 4 (AC-008) is OPEN until the
-revised capacity bench (GREEN above, revised 2026-10-03) reports two
-qualifying runs; results are appended below when they exist.
+Status: IMPLEMENTED for Scenarios 1–4. AC-008 closed with two qualifying
+runs at 69d2efe8c; see "AC-008 qualifying runs" below.
 
 Commits: ac84c791a, e04cef237, 179c54c72, 12bef6736, be5e7bfa6, c9cebf6da,
 dc3483751, 000fb21ba, 1463740d3, 0a6fb59c3, 9b8b8ca78, c50708084, ae4e0745b,
@@ -470,6 +469,9 @@ each fail it ("pull diverged from the scan", "index drifted after commit").
   is that added contention or noise from one sample; the qualifying runs
   must settle it. All other checks that a 1-worker run can evaluate passed.
   Drain: 0.78 rewrites/s, which is at the pull-cadence ceiling.
+  Settled: both qualifying runs at 69d2efe8c, after the review fixes, held the
+  live 10× pull p99 at 43.3 µs and 57.6 µs on a quiet host. The single
+  failing sample is therefore not reproduced, and no diagnosis was opened.
 
 - **Publication revision review (findings 1–5 and suggestions).** Every finding was
   checked against the code before it was fixed, and all five were confirmed
@@ -724,6 +726,60 @@ each fail it ("pull diverged from the scan", "index drifted after commit").
       --all-features --tests -- -D warnings`: clean.
     - `git diff --check`: clean.
 
+### AC-008 qualifying runs
+
+Commit 69d2efe8c, two back-to-back runs of `mise run bench:bifrost:forge-capacity` with the
+default envelope (coordinator revision of 2026-10-03):
+- leader: 1 CPU / 4 GiB, resolved effective_cpu 1;
+- workers: 7/3 CPU (2.33) / 4 GiB each, in fleets of 1, 2 and 3;
+- workload: 128 tables, 1 tenant, seal every 10 s, one 64-row write per table
+  per second, compaction on at the default type and target, due every 2
+  promotion commits;
+- each fleet drains its own 128 fresh due tables.
+
+Host (AMD Ryzen 9 9950X, 32 CPUs, 92 GiB) load before / after:
+
+| Run | Before | After |
+|---|---|---|
+| 1 | busy 0.38 CPUs, free 27.19, loadavg 4.81 | busy 0.40 CPUs, free 28.82, loadavg 3.18 |
+| 2 | busy 0.58 CPUs, free 29.31, loadavg 2.69 | busy 0.39 CPUs, free 28.40, loadavg 3.60 |
+
+Both hosts were well above the 8-CPU free floor. Reports are in
+`target/bifrost-forge-capacity/` and are not checked in.
+
+| Gate | Needs | Run 1 | Run 2 | Result |
+|---|---|---|---|---|
+| In-process p99 commit / pull / report at 1× (µs) | < 1000 | 21.8 / 50.6 / 2.4 | 21.3 / 56.7 / 2.3 | PASS |
+| In-process p99 commit / pull / report at 10× (µs) | < 1000 | 7.7 / 47.3 / 2.7 | 7.0 / 43.0 / 2.8 | PASS |
+| Live leader p99 commit / pull / report at 1× (µs) | < 1000 | 26.6 / 78.9 / 18.9 | 17.9 / 67.7 / 27.3 | PASS |
+| Live leader p99 commit / pull / report at 10× (µs) | < 1000 | 36.5 / 43.3 / 11.8 | 28.6 / 57.6 / 15.5 | PASS |
+| 2-worker / 1-worker completion rate | ≥ 1.7 | 2.098 | 2.098 | PASS |
+| 3-worker / 1-worker completion rate | ≥ 2.5 | 3.228 | 3.212 | PASS |
+| Pulls answered short while a table stayed due | = 0 | 0 of 97 | 0 of 97 | PASS |
+| Highest leader CPU share | < 0.70 | 0.033 | 0.031 | PASS |
+
+The in-process knee is 64,000 pulls/s in both runs: p99 pull is 561 / 585 µs
+at 10,000×, and the curve bends at 30,000×. The live 10× client round trip
+p50 is 15.4 ms in both runs; that is the probe client's own pacing, the leader
+p99s above are what the gate measures, and no gate applies to the client
+round trip.
+
+| Fleet | Run 1 rewrites/s (drain) | Run 2 rewrites/s (drain) | Rewrite p50/p99 | Promotions/s | Leader CPU | Postgres cores / xact/s | RustFS cores |
+|---|---|---|---|---|---|---|---|
+| 1 worker | 0.80 (128 tables in 161 s) | 0.80 (128 in 161 s) | 0.25 / 0.50 s | 0.84 / 0.87 | 1.3% / 1.5% | 0.043 / 90; 0.045 / 91 | 0.068 / 0.064 |
+| 2 workers | 1.67 (128 in 77 s) | 1.67 (128 in 77 s) | 0.25 / 0.25 s | 1.71 / 1.73 | 2.1% / 2.2% | 0.065 / 177; 0.067 / 180 | 0.073 / 0.077 |
+| 3 workers | 2.57 (132 in 51 s) | 2.55 (131 in 51 s) | 0.25 / 0.25 s | 2.57 / 2.53 | 3.3% / 3.1% | 0.087 / 263; 0.083 / 261 | 0.102 / 0.103 |
+
+Backlog fill (no worker running) promoted at 5.5–6.2/s with promotion
+p50/p99 of 0.05 / 0.05 s, and no write was refused.
+
+Bounding resource for the largest step, in both runs: worker pull cadence
+(106–107% of the 0.8 pulls/s-per-worker ceiling). Compactor CPU stayed
+around 1%, RustFS around 0.1 cores, Postgres under 0.09 cores, and due-table
+supply at 0–3%. Throughput scales with the number of pulling workers. No
+compute or storage resource is near its limit at this envelope, so the
+pull cadence is the measured bound, not compactor CPU, RustFS or Postgres.
+
 ### Acceptance
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
@@ -733,7 +789,7 @@ each fail it ("pull diverged from the scan", "index drifted after commit").
 | AC-005 current-head planning, no-op success, later-commit preservation, late-report ignorance | worker.rs, leader.rs `report` | redux `--test integration -E 'test(/^forge::/)'` 56/56 | PASS |
 | Multi-replica worker progress | forge_peer.rs, leadership.rs | journey lane 19/19; `mise run test:tonic` 39/39 | PASS |
 | No leader-side file inspection | leadership.rs | `leader_decision_has_no_catalog_io` (zero catalog/object IO) | PASS |
-| AC-008 capacity evidence | bench `bench:bifrost:forge-capacity` | pending revised two-run report | OPEN |
+| AC-008 capacity evidence | bench `bench:bifrost:forge-capacity` | two qualifying runs at 69d2efe8c, every gate passing (see "AC-008 qualifying runs") | PASS |
 | Review 1: crash mid-removal restarts | hot_stage.rs `retire_all`, `recover`, `validate` | `a_claim_crashed_inside_one_member_removal_retires_on_restart` | PASS |
 | Review 2: budget exhaustion is backpressure | staging_runtime.rs `ClaimTakeError`; persistence.rs `publish_claims` | journey `concurrent_flushes_share_the_claim_budget_and_publish_each_claim_once`; `a_claim_is_retryable_only_while_no_publisher_drives_it` | PASS |
 | Review 3: one publisher per claim | staging_runtime.rs `ClaimDrivers`, `DrivenClaim` | same journey (no double assemble, no `.tmp` race) | PASS |

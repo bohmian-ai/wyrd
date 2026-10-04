@@ -189,8 +189,9 @@ impl AgentTool for QueryTool {
     ///
     /// The result ceiling is the smaller of the requested `max_bytes` and the
     /// run's step-result bound, and the deadline the smaller of the requested
-    /// one and the time remaining until the prepared run's deadline. Dropping this future cancels the
-    /// owner's token; the owner keeps the response and settles it.
+    /// one and the time remaining until the prepared run's deadline. Dropping
+    /// this future cancels the owner's token; the owner keeps the response
+    /// and settles it.
     ///
     /// # Errors
     /// Returns a redacted structured failure for malformed or out-of-range

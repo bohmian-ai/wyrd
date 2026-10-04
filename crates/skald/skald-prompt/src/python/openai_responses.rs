@@ -31,6 +31,7 @@ use crate::prompt::wrong_variant;
 // OpenAI Responses — request + response
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Read-only view of an OpenAI Responses request.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponsesRequest")]
 pub struct PyOpenAiResponsesRequest {
     pub(crate) inner: Arc<ProviderRequest>,
@@ -48,6 +49,7 @@ impl PyOpenAiResponsesRequest {
 }
 #[pymethods]
 impl PyOpenAiResponsesRequest {
+    /// The `model` field.
     #[getter]
     fn model(&self) -> &str {
         &self.req().model
@@ -64,6 +66,7 @@ impl PyOpenAiResponsesRequest {
             })
             .collect()
     }
+    /// The `instructions` system text, or `None` when unset.
     #[getter]
     fn instructions(&self) -> Option<&str> {
         self.req().instructions.as_deref()
@@ -704,6 +707,7 @@ impl PyOpenAiResponsesGrammar {
 
 // OpenAI Responses response
 
+/// Read-only view of an OpenAI Responses response.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponsesResponse")]
 pub struct PyOpenAiResponsesResponse {
     inner: Arc<ProviderResponse>,
@@ -721,6 +725,7 @@ impl PyOpenAiResponsesResponse {
 }
 #[pymethods]
 impl PyOpenAiResponsesResponse {
+    /// The response `id`.
     #[getter]
     fn id(&self) -> &str {
         &self.resp().id
@@ -729,10 +734,12 @@ impl PyOpenAiResponsesResponse {
     fn object(&self) -> &str {
         &self.resp().object
     }
+    /// The `model` that produced the response.
     #[getter]
     fn model(&self) -> &str {
         &self.resp().model
     }
+    /// The response `status`, such as `"completed"` or `"incomplete"`.
     #[getter]
     fn status(&self) -> &str {
         &self.resp().status
@@ -745,6 +752,7 @@ impl PyOpenAiResponsesResponse {
     fn previous_response_id(&self) -> Option<&str> {
         self.resp().previous_response_id.as_deref()
     }
+    /// The token `usage`, or `None` when omitted.
     #[getter]
     fn usage(&self) -> Option<PyOpenAiResponsesUsage> {
         self.resp().usage.as_ref().map(|_| PyOpenAiResponsesUsage {
@@ -760,6 +768,7 @@ impl PyOpenAiResponsesResponse {
     }
 }
 
+/// The `usage` object of an OpenAI Responses response.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponsesUsage")]
 pub struct PyOpenAiResponsesUsage {
     inner: Arc<ProviderResponse>,
@@ -774,14 +783,17 @@ impl PyOpenAiResponsesUsage {
 }
 #[pymethods]
 impl PyOpenAiResponsesUsage {
+    /// The `input_tokens` count.
     #[getter]
     fn input_tokens(&self) -> u64 {
         self.u().input_tokens
     }
+    /// The `output_tokens` count.
     #[getter]
     fn output_tokens(&self) -> u64 {
         self.u().output_tokens
     }
+    /// The `total_tokens` count.
     #[getter]
     fn total_tokens(&self) -> u64 {
         self.u().total_tokens

@@ -22,6 +22,7 @@ use super::shared::ChatMessageSource;
 // OpenAI Chat — response side
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Read-only view of an OpenAI Chat Completions response.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiChatResponse")]
 pub struct PyOpenAiChatResponse {
     inner: Arc<ProviderResponse>,
@@ -39,36 +40,44 @@ impl PyOpenAiChatResponse {
 }
 #[pymethods]
 impl PyOpenAiChatResponse {
+    /// The completion `id`.
     #[getter]
     fn id(&self) -> &str {
         &self.resp().id
     }
+    /// The `object` type, `"chat.completion"` from OpenAI.
     #[getter]
     fn object(&self) -> &str {
         &self.resp().object
     }
+    /// The `created` Unix timestamp in seconds.
     #[getter]
     fn created(&self) -> u64 {
         self.resp().created
     }
+    /// The `model` that produced the completion.
     #[getter]
     fn model(&self) -> &str {
         &self.resp().model
     }
+    /// The `system_fingerprint` backend configuration id.
     #[getter]
     fn system_fingerprint(&self) -> Option<&str> {
         self.resp().system_fingerprint.as_deref()
     }
+    /// The `service_tier` that served the request.
     #[getter]
     fn service_tier(&self) -> Option<&str> {
         self.resp().service_tier.as_deref()
     }
+    /// The token `usage`, or `None` when the provider omitted it.
     #[getter]
     fn usage(&self) -> Option<PyOpenAiUsage> {
         self.resp().usage.as_ref().map(|_| PyOpenAiUsage {
             inner: Arc::clone(&self.inner),
         })
     }
+    /// The `choices` list.
     #[getter]
     fn choices(&self) -> Vec<PyOpenAiChatChoice> {
         (0..self.resp().choices.len())
@@ -87,6 +96,7 @@ impl PyOpenAiChatResponse {
     }
 }
 
+/// One entry of an OpenAI Chat response's `choices`.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiChatChoice")]
 pub struct PyOpenAiChatChoice {
     inner: Arc<ProviderResponse>,
@@ -102,14 +112,17 @@ impl PyOpenAiChatChoice {
 }
 #[pymethods]
 impl PyOpenAiChatChoice {
+    /// The choice `index`.
     #[getter]
     fn index(&self) -> u32 {
         self.c().index
     }
+    /// The `finish_reason`, such as `"stop"`, `"length"`, or `"tool_calls"`.
     #[getter]
     fn finish_reason(&self) -> Option<&str> {
         self.c().finish_reason.as_deref()
     }
+    /// The generated `message`.
     #[getter]
     fn message(&self) -> PyOpenAiChatMessage {
         PyOpenAiChatMessage {
@@ -119,6 +132,7 @@ impl PyOpenAiChatChoice {
             },
         }
     }
+    /// The `logprobs`, or `None` when not requested.
     #[getter]
     fn logprobs(&self) -> Option<PyOpenAiChatLogprobs> {
         self.c().logprobs.as_ref().map(|_| PyOpenAiChatLogprobs {
@@ -135,6 +149,7 @@ impl PyOpenAiChatChoice {
     }
 }
 
+/// The `logprobs` of an OpenAI Chat choice.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiChatLogprobs")]
 pub struct PyOpenAiChatLogprobs {
     inner: Arc<ProviderResponse>,
@@ -153,11 +168,19 @@ impl PyOpenAiChatLogprobs {
 }
 #[pymethods]
 impl PyOpenAiChatLogprobs {
+    /// The per-token `content` entries as dictionaries; empty when absent.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the value cannot be converted to Python objects.
     #[getter]
     fn content(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(py, &serde_json::Value::Array(self.l().content.clone()))
             .map_err(Into::into)
     }
+    /// The per-token `refusal` entries as dictionaries; empty when absent.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the value cannot be converted to Python objects.
     #[getter]
     fn refusal(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(py, &serde_json::Value::Array(self.l().refusal.clone()))
@@ -168,6 +191,7 @@ impl PyOpenAiChatLogprobs {
     }
 }
 
+/// The `usage` object of an OpenAI Chat response.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiUsage")]
 pub struct PyOpenAiUsage {
     inner: Arc<ProviderResponse>,
@@ -182,18 +206,22 @@ impl PyOpenAiUsage {
 }
 #[pymethods]
 impl PyOpenAiUsage {
+    /// The `prompt_tokens` count.
     #[getter]
     fn prompt_tokens(&self) -> u64 {
         self.u().prompt_tokens
     }
+    /// The `completion_tokens` count.
     #[getter]
     fn completion_tokens(&self) -> u64 {
         self.u().completion_tokens
     }
+    /// The `total_tokens` count.
     #[getter]
     fn total_tokens(&self) -> u64 {
         self.u().total_tokens
     }
+    /// The `prompt_tokens_details` breakdown, when present.
     #[getter]
     fn prompt_tokens_details(&self) -> Option<PyOpenAiPromptTokensDetails> {
         self.u()
@@ -203,6 +231,7 @@ impl PyOpenAiUsage {
                 inner: Arc::clone(&self.inner),
             })
     }
+    /// The `completion_tokens_details` breakdown, when present.
     #[getter]
     fn completion_tokens_details(&self) -> Option<PyOpenAiCompletionTokensDetails> {
         self.u()
@@ -222,6 +251,7 @@ impl PyOpenAiUsage {
     }
 }
 
+/// The `prompt_tokens_details` of an OpenAI Chat usage object.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiPromptTokensDetails")]
 pub struct PyOpenAiPromptTokensDetails {
     inner: Arc<ProviderResponse>,
@@ -242,10 +272,12 @@ impl PyOpenAiPromptTokensDetails {
 }
 #[pymethods]
 impl PyOpenAiPromptTokensDetails {
+    /// The `audio_tokens` count.
     #[getter]
     fn audio_tokens(&self) -> u64 {
         self.d().audio_tokens
     }
+    /// The `cached_tokens` count served from the prompt cache.
     #[getter]
     fn cached_tokens(&self) -> u64 {
         self.d().cached_tokens
@@ -255,6 +287,7 @@ impl PyOpenAiPromptTokensDetails {
     }
 }
 
+/// The `completion_tokens_details` of an OpenAI Chat usage object.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiCompletionTokensDetails")]
 pub struct PyOpenAiCompletionTokensDetails {
     inner: Arc<ProviderResponse>,
@@ -275,18 +308,22 @@ impl PyOpenAiCompletionTokensDetails {
 }
 #[pymethods]
 impl PyOpenAiCompletionTokensDetails {
+    /// The `accepted_prediction_tokens` count.
     #[getter]
     fn accepted_prediction_tokens(&self) -> u64 {
         self.d().accepted_prediction_tokens
     }
+    /// The `audio_tokens` count.
     #[getter]
     fn audio_tokens(&self) -> u64 {
         self.d().audio_tokens
     }
+    /// The `reasoning_tokens` count.
     #[getter]
     fn reasoning_tokens(&self) -> u64 {
         self.d().reasoning_tokens
     }
+    /// The `rejected_prediction_tokens` count.
     #[getter]
     fn rejected_prediction_tokens(&self) -> u64 {
         self.d().rejected_prediction_tokens

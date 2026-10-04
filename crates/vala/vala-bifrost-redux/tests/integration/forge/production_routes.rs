@@ -2185,3 +2185,90 @@ async fn leader_decision_has_no_catalog_io() {
     );
     supervisor.shutdown().await;
 }
+
+/// A table that declares no Forge property is compacted on the default interval.
+///
+/// The fixture's compaction opt-in and count trigger are removed before the
+/// first promotion, so the table carries exactly the properties registration
+/// writes. Its first commit must open a compaction track, the track must stay
+/// idle for the whole default one-hour interval, and the leader must dispatch
+/// it at the interval boundary.
+///
+/// # Panics
+///
+/// Panics when a fixture dependency fails, the commit opens no track, or the
+/// leader dispatches before or misses the interval boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn property_less_table_is_compacted_after_the_default_interval() {
+    let fixture = PromotionIntegrationFixture::start("default_compaction").await;
+    let iceberg = fixture.catalog.iceberg_catalog();
+    let loaded = iceberg
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("fixture table load");
+    let tx = Transaction::new(&loaded);
+    let tx = tx
+        .update_table_properties()
+        .remove("wyrd.forge.enable-compaction".to_owned())
+        .remove("wyrd.forge.compaction.trigger-snapshot-count".to_owned())
+        .apply(tx)
+        .expect("property removal applies");
+    let cleared = tx
+        .commit(iceberg.as_ref())
+        .await
+        .expect("property removal commits");
+    assert!(
+        !cleared
+            .metadata()
+            .properties()
+            .keys()
+            .any(|key| key.starts_with("wyrd.forge.")),
+        "the table declares no Forge property: {:?}",
+        cleared.metadata().properties()
+    );
+
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
+    let (clock, control) = manual_clock();
+    let mut supervised = SupervisedPromotion::start(
+        &fixture,
+        Arc::clone(&seam) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&store) as Arc<dyn ForgeObjectStore>,
+        clock,
+    );
+    supervised.join_worker().await;
+    supervised.schedule_only().await;
+
+    let forge = supervised.forge();
+    let key = ForgeTableKey {
+        tenant: fixture.tenant,
+        table: ForgeTaskTableIdentity::new(
+            "wyrd-redux",
+            fixture.binding.table_ref.namespace.as_str(),
+            &fixture.binding.table_ref.name,
+        )
+        .expect("fixture table identity"),
+    };
+    let track = forge
+        .held_leader_term()
+        .expect("the supervisor's pass holds the leader term")
+        .schedule()
+        .track_for_test(&key)
+        .expect("the first commit opens a compaction track by default");
+    assert_eq!(track.pending_commits, 1, "{track:?}");
+
+    control
+        .advance(ChronoDuration::seconds(3599))
+        .expect("manual clock advance");
+    assert!(
+        forge.pull_compaction(4).await.expect("leader pull").is_empty(),
+        "one commit waits out the one-hour default interval"
+    );
+    control
+        .advance(ChronoDuration::seconds(1))
+        .expect("manual clock advance");
+    let due = forge.pull_compaction(4).await.expect("leader pull");
+    assert_eq!(due.len(), 1, "the interval boundary dispatches: {due:?}");
+    assert_eq!(due[0].compaction_type, ForgeCompactionType::Full);
+}

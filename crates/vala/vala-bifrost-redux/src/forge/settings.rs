@@ -1,18 +1,22 @@
 //! Per-table Forge maintenance settings read from Iceberg table properties.
 //!
 //! The settings mirror `RisingWave`'s Iceberg sink options and defaults
-//! (`connector/src/sink/iceberg/config.rs` at e23ddf95): compaction is off
-//! until a table enables it, the interval is one hour, the snapshot-count
-//! trigger is disabled, the physical type is `full`, snapshot expiration is on
-//! and manifest rewriting is off. They are read by whoever already holds the
-//! loaded table, never by the leader while it decides.
+//! (`connector/src/sink/iceberg/config.rs` at e23ddf95) with one deliberate
+//! departure: Bifrost owns its tables, so compaction is on unless a table
+//! disables it, where `RisingWave`'s sink defaults it off. The interval is one
+//! hour, the snapshot-count trigger is disabled, the physical type is `full`,
+//! snapshot expiration is on and manifest rewriting is off. They are read by
+//! whoever already holds the loaded table, never by the leader while it
+//! decides.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use super::error::ForgeError;
 
-/// Enables leader-scheduled compaction for one table.
+/// Enables or disables leader-scheduled compaction for one table.
+///
+/// Absent means enabled; only an explicit `false` turns compaction off.
 pub const ENABLE_COMPACTION_PROPERTY: &str = "wyrd.forge.enable-compaction";
 /// Maximum seconds between compactions while commits are pending.
 pub const COMPACTION_INTERVAL_PROPERTY: &str = "wyrd.forge.compaction-interval-sec";
@@ -88,7 +92,7 @@ impl ForgeCompactionType {
 /// The scheduling and maintenance settings one table declares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeTableSettings {
-    /// Whether ordinary commit-driven compaction is scheduled.
+    /// Whether ordinary commit-driven compaction is scheduled; on by default.
     pub compaction_enabled: bool,
     /// Longest wait between compactions while at least one commit is pending.
     pub compaction_interval: Duration,
@@ -103,10 +107,11 @@ pub struct ForgeTableSettings {
 }
 
 impl Default for ForgeTableSettings {
-    /// Returns `RisingWave`'s Iceberg sink defaults.
+    /// Returns `RisingWave`'s Iceberg sink defaults, except that compaction is
+    /// enabled because Bifrost owns every table it writes.
     fn default() -> Self {
         Self {
-            compaction_enabled: false,
+            compaction_enabled: true,
             compaction_interval: Duration::from_hours(1),
             trigger_snapshot_count: usize::MAX,
             compaction_type: ForgeCompactionType::Full,
@@ -227,7 +232,8 @@ where
 mod tests {
     use super::*;
 
-    /// Absent properties are `RisingWave`'s defaults; present ones override them.
+    /// Absent properties are `RisingWave`'s defaults with compaction on;
+    /// present ones override them.
     ///
     /// # Panics
     /// Panics when parsing or a default disagrees with the pinned reference.
@@ -235,8 +241,18 @@ mod tests {
     fn settings_default_to_risingwave_and_parse_overrides() {
         let defaults = ForgeTableSettings::from_properties(&HashMap::new()).expect("defaults");
         assert_eq!(defaults, ForgeTableSettings::default());
-        assert!(!defaults.compaction_enabled && defaults.snapshot_expiration_enabled);
+        assert!(defaults.compaction_enabled && defaults.snapshot_expiration_enabled);
+        assert!(!defaults.manifest_rewrite_enabled);
+        assert_eq!(defaults.compaction_interval, Duration::from_hours(1));
         assert_eq!(defaults.trigger_snapshot_count, usize::MAX);
+        assert_eq!(defaults.compaction_type, ForgeCompactionType::Full);
+        let disabled = HashMap::from([(ENABLE_COMPACTION_PROPERTY.to_owned(), "false".to_owned())]);
+        assert!(
+            !ForgeTableSettings::from_properties(&disabled)
+                .expect("explicit opt-out")
+                .compaction_enabled,
+            "an explicit false still disables compaction"
+        );
 
         let declared = HashMap::from([
             (ENABLE_COMPACTION_PROPERTY.to_owned(), "true".to_owned()),

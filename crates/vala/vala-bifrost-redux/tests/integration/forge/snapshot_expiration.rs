@@ -1275,7 +1275,8 @@ async fn assert_compaction_watermark_blocks_expiry(table: &ExpirableTable) -> i6
         .expect("leader report");
 
     // A table whose compaction is disabled has no track, so a manual run
-    // creates one that has observed no snapshot.
+    // creates one that has observed no snapshot. The request carries the
+    // table's declared opt-out, so its track is temporary.
     set_table_properties(
         &table.fixture.catalog,
         &table.fixture.binding,
@@ -1289,7 +1290,10 @@ async fn assert_compaction_watermark_blocks_expiry(table: &ExpirableTable) -> i6
     );
     leader_term(table).schedule().request_compaction(
         &key,
-        &ForgeTableSettings::default(),
+        &ForgeTableSettings {
+            compaction_enabled: false,
+            ..ForgeTableSettings::default()
+        },
         chrono::Utc::now(),
     );
     let manual = forge.pull_compaction(4).await.expect("leader pull");

@@ -600,20 +600,7 @@ impl ScribeHotStage {
         tokio::fs::create_dir_all(&directory)
             .await
             .map_err(stage_io("create the member directory"))?;
-        let final_path = directory.join(RECORD_FILE_NAME);
-        let temporary = directory.join(TEMPORARY_RECORD_FILE_NAME);
-        let bytes = serde_json::to_vec(record).map_err(|error| HotStageError::Malformed {
-            name: RECORD_FILE_NAME.to_owned(),
-            detail: error.to_string(),
-        })?;
-        tokio::fs::write(&temporary, &bytes)
-            .await
-            .map_err(stage_io("write the staged record"))?;
-        fsync_file(&temporary).await?;
-        tokio::fs::rename(&temporary, &final_path)
-            .await
-            .map_err(stage_io("rename the staged record into place"))?;
-        fsync_directory(&directory).await?;
+        let final_path = write_record(&directory, record).await?;
         if let Some(parent) = directory.parent() {
             fsync_directory(parent).await?;
         }
@@ -621,6 +608,12 @@ impl ScribeHotStage {
     }
 
     /// Moves one staged member forward to its next lifecycle state.
+    ///
+    /// The new record replaces the old one in the member's existing directory,
+    /// so durability needs only the record and that directory synced: the key
+    /// directory's entry for the member was made durable when the member was
+    /// first published and does not change. A crash leaves either the old
+    /// state or the new one, never neither.
     ///
     /// Only forward moves and exact idempotent replay are accepted. A cancelled
     /// or interrupted claim keeps its members claimed: claim identity is derived from the member set, so
@@ -661,7 +654,7 @@ impl ScribeHotStage {
             });
         }
         record.state = next;
-        self.publish_record(key, &record).await?;
+        write_record(&directory, &record).await?;
         Ok(record)
     }
 
@@ -680,14 +673,43 @@ impl ScribeHotStage {
         key: &ScribeAssemblyKey,
         member: StagedMemberId,
     ) -> Result<(), HotStageError> {
-        let directory = self.member_directory(key, member);
-        match tokio::fs::remove_dir_all(&directory).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(stage_io("retire the member directory")(error)),
+        self.retire_all(key, &[member]).await
+    }
+
+    /// Removes every listed member of one key after publication and lease
+    /// drain, syncing their shared key directory once.
+    ///
+    /// Every member of a claim lives under the same key directory, so the
+    /// removals are made durable together by one sync of that directory after
+    /// the last one. Members already gone are skipped; when none was removed
+    /// nothing is synced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotStageError::Io`] when a directory cannot be removed or the
+    /// key directory cannot be synced.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation may leave some members, part of a member directory, or the
+    /// removals unsynced. Each removed member was already past its fenced
+    /// commit, so recovery retires any survivor again, and repeating the
+    /// removal is safe because each record is deleted with its directory.
+    pub async fn retire_all(
+        &self,
+        key: &ScribeAssemblyKey,
+        members: &[StagedMemberId],
+    ) -> Result<(), HotStageError> {
+        let mut removed = false;
+        for member in members {
+            match tokio::fs::remove_dir_all(self.member_directory(key, *member)).await {
+                Ok(()) => removed = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(stage_io("retire the member directory")(error)),
+            }
         }
-        if let Some(parent) = directory.parent() {
-            fsync_directory(parent).await?;
+        if removed {
+            fsync_directory(&self.root.join(hex(&key.digest()))).await?;
         }
         Ok(())
     }
@@ -929,7 +951,44 @@ async fn remove_if_present(path: &Path) -> Result<(), HotStageError> {
     }
 }
 
-/// Fsyncs one file's contents.
+/// Writes one member's record atomically into its existing directory.
+///
+/// The record goes to `.tmp`, is fsynced, renamed over the final name, and the
+/// member directory is fsynced so the rename is durable. A crash leaves either
+/// the previous record or the new one, plus at most a `.tmp` recovery removes.
+/// Returns the final record path.
+///
+/// # Errors
+///
+/// Returns [`HotStageError::Io`] for any local durable IO failure and
+/// [`HotStageError::Malformed`] when the record cannot be encoded.
+async fn write_record(
+    directory: &Path,
+    record: &StagedHotSourceRecordV1,
+) -> Result<PathBuf, HotStageError> {
+    let final_path = directory.join(RECORD_FILE_NAME);
+    let temporary = directory.join(TEMPORARY_RECORD_FILE_NAME);
+    let bytes = serde_json::to_vec(record).map_err(|error| HotStageError::Malformed {
+        name: RECORD_FILE_NAME.to_owned(),
+        detail: error.to_string(),
+    })?;
+    tokio::fs::write(&temporary, &bytes)
+        .await
+        .map_err(stage_io("write the staged record"))?;
+    fsync_file(&temporary).await?;
+    tokio::fs::rename(&temporary, &final_path)
+        .await
+        .map_err(stage_io("rename the staged record into place"))?;
+    fsync_directory(directory).await?;
+    Ok(final_path)
+}
+
+/// Counter of every fsync the staged namespace issues, files and
+/// directories alike, so the durable cost of a member's lifecycle is
+/// observable per claim.
+const STAGE_FSYNCS_TOTAL: &str = "bifrost_scribe_stage_fsyncs_total";
+
+/// Fsyncs one file's contents and counts it in [`STAGE_FSYNCS_TOTAL`].
 ///
 /// # Errors
 ///
@@ -940,10 +999,13 @@ async fn fsync_file(path: &Path) -> Result<(), HotStageError> {
         .map_err(stage_io("open a staged file for fsync"))?
         .sync_all()
         .await
-        .map_err(stage_io("fsync a staged file"))
+        .map_err(stage_io("fsync a staged file"))?;
+    metrics::counter!(STAGE_FSYNCS_TOTAL).increment(1);
+    Ok(())
 }
 
-/// Fsyncs one directory so a rename inside it is durable.
+/// Fsyncs one directory so a rename or removal inside it is durable, and
+/// counts it in [`STAGE_FSYNCS_TOTAL`].
 ///
 /// # Errors
 ///
@@ -954,7 +1016,9 @@ async fn fsync_directory(path: &Path) -> Result<(), HotStageError> {
         .map_err(stage_io("open a staged directory for fsync"))?
         .sync_all()
         .await
-        .map_err(stage_io("fsync a staged directory"))
+        .map_err(stage_io("fsync a staged directory"))?;
+    metrics::counter!(STAGE_FSYNCS_TOTAL).increment(1);
+    Ok(())
 }
 
 /// Renders bytes as lowercase hex for durable records and path components.
@@ -1281,6 +1345,90 @@ mod tests {
             matches!(missing, HotStageError::MissingRun { .. }),
             "unexpected refusal: {missing}"
         );
+    }
+
+    /// One claim's lifecycle costs two syncs per member per state and one
+    /// shared sync to retire them all.
+    ///
+    /// Each member's record is its own file in its own directory, so moving it
+    /// to a new state durably needs the record and that directory synced. The
+    /// key directory holding every member directory already names them, so a
+    /// state change never re-syncs it; retirement removes every member
+    /// directory from that one key directory and syncs it once.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture write, transition, or retirement is refused, or
+    /// when a step issues a different number of syncs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_claim_costs_two_syncs_per_member_state_and_one_to_retire() {
+        const MEMBERS: u64 = 4;
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let syncs = || {
+            recorder
+                .snapshot()
+                .counters
+                .get(super::STAGE_FSYNCS_TOTAL)
+                .copied()
+                .unwrap_or(0)
+        };
+        let directory = tempfile::tempdir().expect("staging root");
+        let stage = ScribeHotStage::new(directory.path().join("hot-stage"));
+        let key = fixture_key();
+        let members: Vec<StagedMemberId> = (0..MEMBERS)
+            .map(|generation| StagedMemberId::new(1, generation))
+            .collect();
+        for member in &members {
+            let run = write_run(
+                &stage.member_directory(&key, *member),
+                "run-0.parquet",
+                b"member-bytes",
+            )
+            .await;
+            let record = StagedHotSourceRecordV1::ready(
+                &key,
+                *member,
+                StagedLsnRange { min: 1, max: 1 },
+                vec![run],
+                ready_at(),
+            );
+            stage
+                .publish_record(&key, &record)
+                .await
+                .expect("the record publishes");
+        }
+
+        let before = syncs();
+        for member in &members {
+            stage
+                .transition(
+                    &key,
+                    *member,
+                    StagedMemberState::Claimed {
+                        claim_id: "0011".to_owned(),
+                    },
+                )
+                .await
+                .expect("ready moves to claimed");
+        }
+        assert_eq!(
+            syncs() - before,
+            2 * MEMBERS,
+            "a state change syncs each member's record and directory, nothing more"
+        );
+
+        let before = syncs();
+        stage
+            .retire_all(&key, &members)
+            .await
+            .expect("retirement removes every member");
+        assert_eq!(
+            syncs() - before,
+            1,
+            "retiring a claim's members syncs their shared key directory once"
+        );
+        assert!(stage.recover().await.expect("recovery rescans").is_empty());
     }
 
     /// Member state moves forward only, and retirement removes the member.

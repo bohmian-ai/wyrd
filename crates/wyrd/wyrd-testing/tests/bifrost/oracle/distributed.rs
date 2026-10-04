@@ -2070,3 +2070,261 @@ fn rewrite_footer_tenant(run: &Path, foreign: DataTenantId) -> Result<(), Journe
     std::fs::write(run, parquet)?;
     Ok(())
 }
+
+/// Every Bifrost field id comes from the registered Iceberg table.
+///
+/// One fresh custom table and the three fresh canonical signal tables are
+/// written through their public write doors. For each table the journey
+/// proves the single authority end to end:
+///
+/// - the built-in declaration carries no field id at any depth, and the
+///   registered table numbers its fields densely from 1, which is Iceberg's
+///   own assignment rather than an adopted declaration;
+/// - every object Scribe sealed carries, on every field at every depth, the
+///   id the registered table assigns the field at the same path;
+/// - Forge promotes those fresh objects, and every data file of the promoted
+///   snapshot carries the same ids;
+/// - Forge's footer decode refuses the same object against a table that
+///   numbers one field differently.
+///
+/// # Errors
+///
+/// Returns an error when setup, writing, promotion, or reading fails, or when
+/// any of the properties above does not hold.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn iceberg_assigned_field_ids_promote_fresh_signal_tables() -> Result<(), JourneyError> {
+    use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
+    use vala_bifrost_redux::namespaces::BifrostNamespace;
+
+    let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
+        BifrostClusterSpec::one_mixed(),
+        ForgeConfig::default(),
+        false,
+        false,
+    )
+    .await?;
+    let server = cluster.server(0).ok_or("missing node")?;
+    let tenant = cluster.data_tenant_id();
+    let custom = unique_table("oracle_field_ids");
+    register_table(server, tenant, &custom).await?;
+    let rows = writer(server, "field-id-writer").await?;
+    rows.write(
+        &format!("vala.bifrost.{custom}"),
+        &journey_schema(),
+        [journey_row(1, "target")],
+    )
+    .await?;
+    server.flush_bifrost().await?;
+    wyrd_testing::bifrost::canonical_signals::seed_canonical_signals(server, "field-id-signals")
+        .await?;
+
+    let catalog = server
+        .state()
+        .bifrost_catalog()
+        .ok_or("Scribe composition retains the shared catalog")?
+        .iceberg_catalog();
+    let tables = [
+        (BifrostNamespace::Bifrost, custom.as_str()),
+        (BifrostNamespace::Traces, "spans"),
+        (BifrostNamespace::Logs, "records"),
+        (BifrostNamespace::Metrics, "points"),
+    ];
+    for (namespace, name) in tables {
+        let table_ref = TableRef::new(namespace, name);
+        if let Some(definition) = vala_bifrost_redux::tables::builtin_table(
+            table_ref
+                .namespace
+                .as_str()
+                .strip_prefix("vala.")
+                .unwrap_or_default(),
+            name,
+        ) {
+            let declared = (definition.schema)();
+            if declared_field_ids(declared.fields()) {
+                return Err(format!("{name}: the built-in declaration carries a field id").into());
+            }
+        }
+        let binding = TenantTableBinding::resolve((tenant, table_ref))?;
+        let loaded = catalog.load_table(&binding.table_ident()).await?;
+        let registered = std::sync::Arc::clone(loaded.metadata().current_schema());
+        let mut assigned = registered_ids(registered.as_struct(), "");
+        assigned.sort_unstable_by_key(|(_, id)| *id);
+        let dense = (1..).take(assigned.len()).collect::<Vec<i32>>();
+        if assigned.iter().map(|(_, id)| *id).collect::<Vec<_>>() != dense {
+            return Err(
+                format!("{name}: the table's ids are not Iceberg's dense assignment").into(),
+            );
+        }
+
+        let sealed: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT file_path, file_size FROM vala.file_list \
+             WHERE data_tenant_id = $1 AND table_name = $2",
+        )
+        .bind(tenant.as_uuid())
+        .bind(name)
+        .fetch_all(cluster.pg_fixture().operator_pool().pool())
+        .await?;
+        if sealed.is_empty() {
+            return Err(format!("{name}: Scribe sealed no object").into());
+        }
+        for (path, size) in &sealed {
+            let bytes = loaded.file_io().new_input(path)?.read().await?;
+            expect_registered_ids(name, &bytes, &registered)?;
+            let size = u64::try_from(*size)?;
+            vala_bifrost_redux::parquet::PromotedObjectFooter::decode(
+                &bytes,
+                path,
+                std::sync::Arc::clone(&registered),
+                size,
+            )
+            .map_err(|refusal| format!("{name}: Forge refuses its own table's ids: {refusal}"))?;
+            let renumbered = renumbered_first_field(&registered)?;
+            match vala_bifrost_redux::parquet::PromotedObjectFooter::decode(
+                &bytes,
+                path,
+                std::sync::Arc::new(renumbered),
+                size,
+            ) {
+                Err(refusal) if refusal.contains("field id") => {}
+                Err(refusal) => {
+                    return Err(format!("{name}: refused for another reason: {refusal}").into());
+                }
+                Ok(_) => {
+                    return Err(format!("{name}: Forge accepted a disagreeing field id").into());
+                }
+            }
+        }
+
+        compact_sealed_batch(&cluster, tenant, name, i64::try_from(sealed.len())?).await?;
+        let promoted = catalog.load_table(&binding.table_ident()).await?;
+        let mut tasks = promoted.scan().select_all().build()?.plan_files().await?;
+        let mut data_files = 0_usize;
+        while let Some(task) = futures_util::TryStreamExt::try_next(&mut tasks).await? {
+            let bytes = promoted
+                .file_io()
+                .new_input(&task.data_file_path)?
+                .read()
+                .await?;
+            expect_registered_ids(name, &bytes, &registered)?;
+            data_files += 1;
+        }
+        if data_files == 0 {
+            return Err(format!("{name}: the promoted snapshot holds no data file").into());
+        }
+    }
+
+    let reader = client(server, "field-id-reader").await?;
+    if query_rows(&reader, &custom).await? != 1 {
+        return Err("the promoted custom table does not read back its row".into());
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Report whether any field in `fields`, at any depth, declares a field id.
+fn declared_field_ids(fields: &arrow::datatypes::Fields) -> bool {
+    use arrow::datatypes::DataType;
+
+    fields.iter().any(|field| {
+        field.metadata().contains_key("PARQUET:field_id")
+            || match field.data_type() {
+                DataType::List(element) | DataType::LargeList(element) => {
+                    declared_field_ids(&arrow::datatypes::Fields::from(vec![
+                        element.as_ref().clone(),
+                    ]))
+                }
+                DataType::Struct(children) => declared_field_ids(children),
+                _ => false,
+            }
+    })
+}
+
+/// Every `(path, id)` pair a registered Iceberg struct assigns, depth-first.
+///
+/// A list element is named `element` and a map's entries `key` and `value`,
+/// so the same path names the same field in the table and in a Parquet file
+/// read back through Iceberg's Arrow conversion.
+fn registered_ids(fields: &iceberg::spec::StructType, prefix: &str) -> Vec<(String, i32)> {
+    let mut ids = Vec::new();
+    for field in fields.fields() {
+        collect_ids(field, &format!("{prefix}{}", field.name), &mut ids);
+    }
+    ids
+}
+
+/// Push `field`'s id under `path`, then every descendant's.
+fn collect_ids(field: &iceberg::spec::NestedField, path: &str, ids: &mut Vec<(String, i32)>) {
+    use iceberg::spec::Type;
+
+    ids.push((path.to_owned(), field.id));
+    match field.field_type.as_ref() {
+        Type::Struct(children) => ids.extend(registered_ids(children, &format!("{path}."))),
+        Type::List(list) => collect_ids(&list.element_field, &format!("{path}.element"), ids),
+        Type::Map(map) => {
+            collect_ids(&map.key_field, &format!("{path}.key"), ids);
+            collect_ids(&map.value_field, &format!("{path}.value"), ids);
+        }
+        _ => {}
+    }
+}
+
+/// Require every field of one Parquet object to carry its table's id.
+///
+/// The footer schema is converted without the embedded Arrow schema, so the
+/// ids read are exactly the Parquet field ids; a field without one fails the
+/// conversion.
+///
+/// # Errors
+///
+/// Returns an error when the footer does not parse, a field carries no id, or
+/// any path's id differs from the registered table's.
+fn expect_registered_ids(
+    table: &str,
+    object: &bytes::Bytes,
+    registered: &iceberg::spec::Schema,
+) -> Result<(), JourneyError> {
+    let footer = parquet::file::metadata::ParquetMetaDataReader::new().parse_and_finish(object)?;
+    let arrow =
+        parquet::arrow::parquet_to_arrow_schema(footer.file_metadata().schema_descr(), None)?;
+    let written = iceberg::arrow::arrow_schema_to_schema(&arrow)
+        .map_err(|error| format!("{table}: an object field carries no id: {error}"))?;
+    let mut expected = registered_ids(registered.as_struct(), "");
+    let mut actual = registered_ids(written.as_struct(), "");
+    expected.sort();
+    actual.sort();
+    if actual != expected {
+        return Err(format!(
+            "{table}: object ids differ from the registered table: object={actual:?} table={expected:?}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Return `registered` with its first top-level field numbered past every id.
+///
+/// # Errors
+///
+/// Returns the Iceberg error when the renumbered schema does not build.
+fn renumbered_first_field(
+    registered: &iceberg::spec::Schema,
+) -> Result<iceberg::spec::Schema, JourneyError> {
+    let shift = registered.highest_field_id() + 1;
+    Ok(iceberg::spec::Schema::builder()
+        .with_fields(
+            registered
+                .as_struct()
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    let mut field = field.as_ref().clone();
+                    if index == 0 {
+                        field.id = shift;
+                    }
+                    std::sync::Arc::new(field)
+                }),
+        )
+        .build()?)
+}

@@ -588,6 +588,7 @@ mod pg_tests {
                 query_id,
                 node_id: self.node_id,
                 fencing_token: self.fence,
+                deadline: std::time::Duration::from_hours(1),
             }
         }
 
@@ -656,24 +657,6 @@ mod pg_tests {
             Ok(())
         }
 
-        /// Moves the Oracle fence's heartbeat outside or back inside liveness.
-        ///
-        /// # Panics
-        ///
-        /// Panics when the update fails.
-        async fn set_fence_live(&self, live: bool) {
-            sqlx::query(
-                "UPDATE vala.cluster_nodes SET heartbeat_at = statement_timestamp() \
-                   - CASE WHEN $2 THEN interval '0 seconds' ELSE interval '1 minute' END \
-                 WHERE node_id = $1 AND role = 'oracle'",
-            )
-            .bind(self.node_id)
-            .bind(live)
-            .execute(&self.superuser)
-            .await
-            .expect("heartbeat moves");
-        }
-
         /// Moves a query's abandonment time into the past or the future in
         /// database time.
         ///
@@ -683,7 +666,7 @@ mod pg_tests {
         async fn set_abandoned(&self, query_id: Uuid, past: bool) {
             sqlx::query(
                 "UPDATE vala.oracle_active_table_reads \
-                    SET acquired_at = statement_timestamp() - interval '7 hours', \
+                    SET acquired_at = statement_timestamp() - interval '2 hours', \
                         abandon_after = statement_timestamp() \
                           + CASE WHEN $2 THEN interval '-1 hour' ELSE interval '1 hour' END \
                   WHERE query_id = $1",
@@ -711,8 +694,8 @@ mod pg_tests {
     }
 
     /// Proves cut acquisition is one atomic, tenant-scoped statement whose
-    /// active reads serialize with Forge and expire only by PostgreSQL time
-    /// after their exact Oracle fence dies.
+    /// active reads serialize with Forge and expire only once PostgreSQL time
+    /// passes the query deadline bound at acquisition.
     ///
     /// # Panics
     ///
@@ -878,8 +861,8 @@ mod pg_tests {
         .expect("claim fence reads");
         assert_eq!(
             lifetime,
-            (true, 6.0 * 3600.0),
-            "exact fence, six-hour Postgres lifetime"
+            (true, 3600.0),
+            "exact fence, Postgres expiry at the bound query deadline"
         );
 
         // Tenant isolation: the same logical name resolves to tenant B's own
@@ -974,8 +957,8 @@ mod pg_tests {
             Err(SqlError::Conflict { .. })
         ));
 
-        // Abandonment needs both a dead exact fence and PostgreSQL time past
-        // abandon_after; a live owner's row never expires.
+        // A read is abandoned only once PostgreSQL time passes its own
+        // abandon_after; the owner's fence plays no part.
         let mut releaser = reads.conn(tenant_a).await;
         assert_eq!(
             OracleActiveTableReads::new(&mut releaser)
@@ -985,7 +968,6 @@ mod pg_tests {
             1
         );
         releaser.commit().await.expect("release commits");
-        reads.set_fence_live(false).await;
         reads.set_abandoned(q1, false).await;
         assert!(matches!(
             reads.forge_gate(&events_a).await,
@@ -994,24 +976,13 @@ mod pg_tests {
         assert_eq!(
             reads.rows_for(q1).await,
             2,
-            "a dead fence alone does not abandon"
+            "a read before its deadline is never discarded"
         );
-        reads.set_fence_live(true).await;
         reads.set_abandoned(q1, true).await;
-        assert!(matches!(
-            reads.forge_gate(&events_a).await,
-            Err(SqlError::Conflict { .. })
-        ));
-        assert_eq!(
-            reads.rows_for(q1).await,
-            2,
-            "a live owner's row never expires"
-        );
-        reads.set_fence_live(false).await;
         reads
             .forge_gate(&events_a)
             .await
-            .expect("an abandoned dead-fence read is discarded");
+            .expect("a read past its deadline is discarded");
         assert_eq!(
             reads.rows_for(q1).await,
             1,

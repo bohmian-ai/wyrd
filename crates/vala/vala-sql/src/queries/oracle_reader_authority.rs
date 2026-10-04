@@ -13,6 +13,8 @@
 
 // raw-query grep allowlist: the Oracle reader-authority relations post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 use wyrd_spec::DataTenantId;
@@ -209,8 +211,9 @@ pub struct ActiveTableRef<'a> {
 
 /// The exact Oracle role fence that owns one query's active table reads.
 ///
-/// Forge treats a row as abandonable only once this exact pair is no longer a
-/// live Oracle membership row, so a node ID without its token is not enough.
+/// The fence identifies the node that recorded the reads; `deadline` is the
+/// query's remaining time, from which PostgreSQL derives when a row the owner
+/// never released may be discarded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActiveReadOwner {
     /// Durable query identity Oracle already uses for the request.
@@ -219,6 +222,9 @@ pub struct ActiveReadOwner {
     pub node_id: Uuid,
     /// That node's current Oracle role fencing token.
     pub fencing_token: i64,
+    /// Remaining query deadline; PostgreSQL stores `abandon_after` as
+    /// `statement_timestamp()` plus this duration.
+    pub deadline: Duration,
 }
 
 /// One table of an acquired cut: its registered identity, the catalog pointer
@@ -259,14 +265,16 @@ impl<'conn, 'tx> OracleActiveTableReads<'conn, 'tx> {
     /// keeps its first position and yields one result and one active read. The
     /// result has exactly one entry per distinct table, in input order. A
     /// replayed acquisition for the same query refreshes the existing rows to
-    /// the caller's fence and a new PostgreSQL abandonment time.
+    /// the caller's fence and a new PostgreSQL abandonment time. Each row may be
+    /// discarded once PostgreSQL time passes acquisition plus `owner.deadline`.
     ///
     /// # Errors
     ///
     /// Returns [`SqlError::NoRows`] when any table has no registration visible
     /// to this tenant or no catalog pointer; no active read commits in that
     /// case. Returns [`SqlError::InvariantViolation`] for an empty request, a
-    /// non-positive fence, or a result that does not contain exactly one
+    /// non-positive fence, a deadline shorter than one millisecond or longer
+    /// than `i64::MAX` milliseconds, or a result that does not contain exactly one
     /// well-formed identity and pointer per requested table. Returns
     /// [`SqlError`] when the statement fails.
     ///
@@ -279,9 +287,10 @@ impl<'conn, 'tx> OracleActiveTableReads<'conn, 'tx> {
         owner: ActiveReadOwner,
         tables: &[ActiveTableRef<'_>],
     ) -> Result<Vec<AcquiredTableCut>, SqlError> {
-        if tables.is_empty() || owner.fencing_token <= 0 {
+        let deadline_ms = i64::try_from(owner.deadline.as_millis()).unwrap_or(0);
+        if tables.is_empty() || owner.fencing_token <= 0 || deadline_ms <= 0 {
             return Err(invariant(
-                "active table read acquisition needs tables and a positive fence",
+                "active table read acquisition needs tables, a positive fence, and a deadline",
             ));
         }
         let request = serde_json::Value::Array(
@@ -295,15 +304,17 @@ impl<'conn, 'tx> OracleActiveTableReads<'conn, 'tx> {
                 })
                 .collect(),
         );
-        let rows: Vec<AcquiredCutDbRow> =
-            sqlx::query_as("SELECT * FROM vala.oracle_acquire_table_cut($1, $2, $3, $4::jsonb)")
-                .bind(owner.query_id)
-                .bind(owner.node_id)
-                .bind(owner.fencing_token)
-                .bind(request)
-                .fetch_all(&mut **self.conn.transaction())
-                .await
-                .map_err(acquisition_error)?;
+        let rows: Vec<AcquiredCutDbRow> = sqlx::query_as(
+            "SELECT * FROM vala.oracle_acquire_table_cut($1, $2, $3, $4, $5::jsonb)",
+        )
+        .bind(owner.query_id)
+        .bind(owner.node_id)
+        .bind(owner.fencing_token)
+        .bind(deadline_ms)
+        .bind(request)
+        .fetch_all(&mut **self.conn.transaction())
+        .await
+        .map_err(acquisition_error)?;
         group_acquired_cut(self.conn.data_tenant_id(), tables, rows)
     }
 

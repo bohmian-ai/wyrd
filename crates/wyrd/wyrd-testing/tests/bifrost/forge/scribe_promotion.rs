@@ -415,6 +415,7 @@ async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
                     query_id,
                     node_id: uuid::Uuid::now_v7(),
                     fencing_token: 1,
+                    deadline: std::time::Duration::from_hours(1),
                 },
                 std::slice::from_ref(table),
             )

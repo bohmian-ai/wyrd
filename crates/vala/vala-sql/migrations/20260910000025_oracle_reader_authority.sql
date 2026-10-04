@@ -65,12 +65,11 @@ GRANT SELECT, INSERT, UPDATE, DELETE
 -- exists. The row names the exact Oracle node fence that owns it; it carries
 -- no snapshot, ancestry, epoch, or capacity state.
 --
--- abandon_after is PostgreSQL time: statement_timestamp() plus the six-hour
--- analytical total expiration, chosen for either query class because the
--- class is derived only after the cut is acquired. A row is discarded early
--- only by its owner's terminal release. Otherwise Forge may discard it once
--- abandon_after has passed AND its exact (node_id, fencing_token) is no longer
--- a live Oracle membership row; a live owner's row never expires.
+-- abandon_after is PostgreSQL time: statement_timestamp() plus the query's
+-- remaining deadline, bound by Oracle at acquisition. A row is discarded early
+-- only by its owner's release, which runs at terminal settlement or when the
+-- owner drops the query. A row whose owner crashed before releasing stays
+-- protective until abandon_after has passed, after which Forge discards it.
 CREATE TABLE vala.oracle_active_table_reads (
     data_tenant_id uuid   NOT NULL REFERENCES platform.tenants(data_tenant_id),
     query_id       uuid   NOT NULL,
@@ -174,36 +173,6 @@ ALTER FUNCTION vala.oracle_catalog_metadata_location(text, text) OWNER TO wyrd_p
 REVOKE ALL ON FUNCTION vala.oracle_catalog_metadata_location(text, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION vala.oracle_catalog_metadata_location(text, text) TO wyrd_app;
 
--- Oracle fences are system-owner cluster_nodes rows, invisible to a tenant-bound
--- request role. An active read is abandoned only when its exact owner fence is
--- no longer live, so this definer answers that one question for any role: it
--- returns whether the exact Oracle (node_id, fencing_token) heartbeated within
--- the caller-bound liveness window, and exposes no other node state.
-CREATE FUNCTION vala.oracle_fence_is_live(
-    p_node_id uuid,
-    p_fencing_token bigint,
-    p_liveness_secs double precision
-) RETURNS boolean
-LANGUAGE sql
-STABLE
-SECURITY DEFINER
-SET search_path = ''
-AS $$
-    SELECT EXISTS (
-        SELECT 1
-          FROM vala.cluster_nodes n
-         WHERE n.data_tenant_id = '00000000-0000-7000-8000-000000000000'::uuid
-           AND n.node_id = p_node_id
-           AND n.role = 'oracle'
-           AND n.fencing_token = p_fencing_token
-           AND n.heartbeat_at >= pg_catalog.statement_timestamp()
-                                 - (p_liveness_secs * interval '1 second'))
-$$;
-
-ALTER FUNCTION vala.oracle_fence_is_live(uuid, bigint, double precision) OWNER TO wyrd_platform_admin;
-REVOKE ALL ON FUNCTION vala.oracle_fence_is_live(uuid, bigint, double precision) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION vala.oracle_fence_is_live(uuid, bigint, double precision) TO wyrd_app;
-
 -- ---------------------------------------------------------------------------
 -- One-statement cut acquisition
 -- ---------------------------------------------------------------------------
@@ -229,6 +198,7 @@ CREATE FUNCTION vala.oracle_acquire_table_cut(
     p_query_id uuid,
     p_node_id uuid,
     p_fencing_token bigint,
+    p_deadline_ms bigint,
     p_tables jsonb
 ) RETURNS TABLE (
     ordinal integer,
@@ -270,7 +240,8 @@ DECLARE
     v_locations text[];
 BEGIN
     IF p_query_id IS NULL OR p_node_id IS NULL OR p_fencing_token IS NULL
-       OR p_fencing_token <= 0 OR pg_catalog.jsonb_typeof(p_tables) IS DISTINCT FROM 'array'
+       OR p_fencing_token <= 0 OR p_deadline_ms IS NULL OR p_deadline_ms <= 0
+       OR pg_catalog.jsonb_typeof(p_tables) IS DISTINCT FROM 'array'
        OR pg_catalog.jsonb_array_length(p_tables) = 0 THEN
         RAISE EXCEPTION 'invalid Oracle cut acquisition request'
             USING ERRCODE = 'invalid_parameter_value';
@@ -324,7 +295,7 @@ BEGIN
          node_id, fencing_token, acquired_at, abandon_after)
     SELECT wyrd.current_tenant(), p_query_id, u.table_uid, 'wyrd-redux', u.namespace_name,
            u.table_name, p_node_id, p_fencing_token, pg_catalog.statement_timestamp(),
-           pg_catalog.statement_timestamp() + interval '6 hours'
+           pg_catalog.statement_timestamp() + p_deadline_ms * interval '1 millisecond'
       FROM unnest(v_uids, v_namespaces, v_tables)
            AS u(table_uid, namespace_name, table_name)
     ON CONFLICT ON CONSTRAINT oracle_active_table_reads_pkey DO UPDATE
@@ -351,8 +322,8 @@ BEGIN
 END
 $$;
 
-REVOKE ALL ON FUNCTION vala.oracle_acquire_table_cut(uuid, uuid, bigint, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION vala.oracle_acquire_table_cut(uuid, uuid, bigint, jsonb) TO wyrd_app;
+REVOKE ALL ON FUNCTION vala.oracle_acquire_table_cut(uuid, uuid, bigint, bigint, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION vala.oracle_acquire_table_cut(uuid, uuid, bigint, bigint, jsonb) TO wyrd_app;
 
 -- ---------------------------------------------------------------------------
 -- Forge snapshot-expiration claims

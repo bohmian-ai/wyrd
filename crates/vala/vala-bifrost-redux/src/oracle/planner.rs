@@ -81,9 +81,10 @@ impl OraclePlanner {
 ///
 /// Created only by [`OraclePlanner::pin_cut`] after its acquisition statement
 /// commits, and carried inside [`ClaimedSqlCut`] and then the query's terminal
-/// owner. Release is explicit and asynchronous; dropping a claim performs no
-/// SQL and leaves its rows to PostgreSQL-time abandonment once this node's
-/// Oracle fence is no longer live.
+/// owner. Terminal settlement awaits [`Self::release`]; a claim dropped
+/// without it (an abandoned stream or a cancelled query) spawns the same
+/// release on the current runtime. Rows a crashed node never released stay
+/// protective until `PostgreSQL` time passes their query deadline.
 pub(crate) struct ActiveReadClaim {
     /// Catalog owning the tenant-scoped active-read statements.
     catalog: Arc<BifrostCatalog>,
@@ -91,6 +92,8 @@ pub(crate) struct ActiveReadClaim {
     tenant: wyrd_spec::DataTenantId,
     /// Durable query identity the rows are keyed by.
     query_id: uuid::Uuid,
+    /// Whether [`Self::release`] already ran, so drop skips its own release.
+    released: bool,
 }
 
 impl std::fmt::Debug for ActiveReadClaim {
@@ -110,19 +113,43 @@ impl ActiveReadClaim {
     /// again. A failed release is logged and counted rather than surfaced:
     /// the query already has its terminal outcome, and the rows stay
     /// protective until PostgreSQL-time abandonment reclaims them.
-    pub(crate) async fn release(self) {
-        if let Err(error) = self
-            .catalog
-            .release_active_reads(self.tenant, self.query_id)
-            .await
-        {
+    pub(crate) async fn release(mut self) {
+        self.released = true;
+        Self::release_rows(&self.catalog, self.tenant, self.query_id).await;
+    }
+
+    /// Deletes one query's active reads, logging and counting a failure.
+    async fn release_rows(
+        catalog: &BifrostCatalog,
+        tenant: wyrd_spec::DataTenantId,
+        query_id: uuid::Uuid,
+    ) {
+        if let Err(error) = catalog.release_active_reads(tenant, query_id).await {
             metrics::counter!("bifrost_oracle_active_read_release_failures_total").increment(1);
             tracing::warn!(
                 error = %error,
-                query_id = %self.query_id,
+                query_id = %query_id,
                 "Oracle could not release active table reads; rows remain until abandonment"
             );
         }
+    }
+}
+
+impl Drop for ActiveReadClaim {
+    /// Spawns the release for a claim dropped before terminal settlement.
+    ///
+    /// Outside a Tokio runtime nothing can run the statement, so the rows stay
+    /// protective until `PostgreSQL` time passes their query deadline.
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let catalog = Arc::clone(&self.catalog);
+        let (tenant, query_id) = (self.tenant, self.query_id);
+        runtime.spawn(async move { Self::release_rows(&catalog, tenant, query_id).await });
     }
 }
 
@@ -227,6 +254,7 @@ impl OraclePlanner {
             catalog: Arc::clone(catalog),
             tenant: context.data_tenant_id,
             query_id: owner.query_id,
+            released: false,
         };
         let planned = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),

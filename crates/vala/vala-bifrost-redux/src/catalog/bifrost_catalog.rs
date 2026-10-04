@@ -2325,6 +2325,7 @@ mod production_pin_tests {
             query_id: uuid::Uuid::now_v7(),
             node_id: uuid::Uuid::now_v7(),
             fencing_token: 1,
+            deadline: std::time::Duration::from_hours(1),
         };
         let acquired = catalog
             .acquire_active_cut(tenant, owner, std::slice::from_ref(table))

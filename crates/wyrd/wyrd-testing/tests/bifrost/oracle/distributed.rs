@@ -4624,23 +4624,46 @@ async fn active_reads(
         .await?)
 }
 
+/// Waits until one table holds no active read, since a dropped owner's release
+/// runs on a spawned task after the drop returns.
+///
+/// # Errors
+/// Returns an error naming `case` when a read remains after the bound, or a
+/// harness error when the count cannot be read.
+async fn await_no_active_reads(
+    cluster: &PeerCluster,
+    binding: &vala_bifrost_redux::catalog::TenantTableBinding,
+    case: &str,
+) -> Result<(), JourneyError> {
+    let deadline = tokio::time::Instant::now() + LIVE_SETTLE_TIMEOUT;
+    loop {
+        let reads = active_reads(cluster, binding).await?;
+        if reads == 0 {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("{case}: {reads} active reads remain").into());
+        }
+        tokio::time::sleep(SETTLEMENT_INTERVAL).await;
+    }
+}
+
 /// Proves one inseparable cut-and-claim owner holds active reads to the end.
 ///
 /// An Analytical graph whose follower task is held keeps its single active
 /// read; releasing the follower lets the query finish, and the read is already
 /// gone when the caller receives the terminal frame. A caller that drops the
-/// query while that follower is still held performs no release: the read
-/// survives the held descendant and the settled graph, left for
-/// PostgreSQL-time abandonment. A query dropped at its post-pin boundary —
-/// after the claim committed but before any owner received it — likewise
-/// leaves its row instead of releasing it.
+/// query while that follower is still held releases its read once the drop
+/// reaches the owner. A query dropped at its post-pin boundary — after the
+/// claim committed but before any owner received it — releases its row too.
 ///
 /// # Errors
 /// Returns cluster, ingest, or query errors.
 ///
 /// # Panics
-/// Panics when an active read is released before its last descendant settles,
-/// survives a completed terminal, or a dropped owner or pin releases its row.
+/// Panics when an active read is released before its last descendant settles
+/// or survives a completed terminal; returns an error when a dropped owner or
+/// pin never releases its row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn held_cut_owns_active_reads_until_all_descendants_settle() -> Result<(), JourneyError> {
@@ -4719,9 +4742,8 @@ async fn held_cut_owns_active_reads_until_all_descendants_settle() -> Result<(),
     let (class, ()) = tokio::try_join!(drain, hold)?;
     assert_eq!(class, Some(QueryClass::Analytical));
 
-    // Caller drop: dropping the query while its follower still reads performs
-    // no release. The row outlives the caller and the settled graph, and is
-    // left for PostgreSQL-time abandonment.
+    // Caller drop: dropping the query while its follower still reads releases
+    // the row; nothing can consume a result from the dropped leader.
     let leader_baseline = cluster.ownership_snapshot(HELD_CUT_LEADER)?;
     cluster.arm_execute_pause(HELD_CUT_FOLLOWER)?;
     tokio::select! {
@@ -4730,21 +4752,12 @@ async fn held_cut_owns_active_reads_until_all_descendants_settle() -> Result<(),
         }
         paused = cluster.await_execute_paused(HELD_CUT_FOLLOWER) => paused?,
     }
-    assert_eq!(
-        active_reads(&cluster, &binding).await?,
-        1,
-        "a dropped caller does not release while a descendant still reads"
-    );
     cluster.release_execute_pause(HELD_CUT_FOLLOWER)?;
     await_baseline(&cluster, HELD_CUT_LEADER, leader_baseline).await?;
-    assert_eq!(
-        active_reads(&cluster, &binding).await?,
-        1,
-        "a dropped owner leaves its row for PostgreSQL-time abandonment"
-    );
+    await_no_active_reads(&cluster, &binding, "a dropped caller").await?;
 
-    // Unexpected drop at the post-pin boundary: the claim committed but no
-    // owner received it, so nothing may release it early.
+    // Drop at the post-pin boundary: the claim committed but no owner
+    // received it, and the dropped pin still releases it.
     let context = query_context(tenant)?;
     cluster.arm_preparation_pause(HELD_CUT_LEADER, &context.request_id)?;
     tokio::select! {
@@ -4758,11 +4771,7 @@ async fn held_cut_owns_active_reads_until_all_descendants_settle() -> Result<(),
         } => {}
     }
     cluster.release_preparation_pause(HELD_CUT_LEADER)?;
-    assert_eq!(
-        active_reads(&cluster, &binding).await?,
-        2,
-        "a dropped pin leaves its committed row beside the dropped caller's"
-    );
+    await_no_active_reads(&cluster, &binding, "a dropped pin").await?;
     cluster.shutdown().await
 }
 

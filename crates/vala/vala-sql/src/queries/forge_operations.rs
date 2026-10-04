@@ -27,7 +27,6 @@ use wyrd_spec::vala::api::{
     ForgeSnapshotExpirePhase, audit_detail_canonical_json,
 };
 
-use crate::queries::cluster_nodes::ROLE_LIVENESS_CUTOFF;
 use crate::queries::oracle_reader_authority::BIFROST_CATALOG_NAME;
 use crate::row_types::forge_operations::{
     ForgeClaimTable, ForgeExpirationAuthority, ForgeExpirationPreparation,
@@ -1580,13 +1579,10 @@ pub(crate) async fn refuse_active_table_reads(
 ///
 /// The caller's tenant-bound transaction must already hold the table's
 /// maintenance-authority row `FOR UPDATE`, so the answer stays true for the
-/// rest of that transaction. A row is abandoned only when PostgreSQL time has
-/// passed its `abandon_after` **and** its exact Oracle `(node_id,
-/// fencing_token)` no longer has a heartbeat within [`ROLE_LIVENESS_CUTOFF`];
-/// a live owner's row never expires. Liveness is read through the
-/// `vala.oracle_fence_is_live` definer because Oracle fences are system-owner
-/// rows a tenant-bound request role cannot see. The abandonment delete commits
-/// with the caller's transaction.
+/// rest of that transaction. A row is abandoned once PostgreSQL time has
+/// passed its `abandon_after`, the owning query's deadline bound at
+/// acquisition; a live query releases its own rows before then. The
+/// abandonment delete commits with the caller's transaction.
 ///
 /// # Errors
 ///
@@ -1601,11 +1597,9 @@ pub(crate) async fn active_table_reads_exist(
          WHERE r.data_tenant_id = wyrd.current_tenant()
            AND r.table_uid = $1
            AND r.abandon_after <= statement_timestamp()
-           AND NOT vala.oracle_fence_is_live(r.node_id, r.fencing_token, $2)
         ",
     )
     .bind(identity.table_uid.as_slice())
-    .bind(ROLE_LIVENESS_CUTOFF.as_secs_f64())
     .execute(&mut **tx)
     .await
     .map_err(SqlError::from)?;

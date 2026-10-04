@@ -597,6 +597,133 @@ each fail it ("pull diverged from the scan", "index drifted after commit").
       --tests -- -D warnings`: clean.
     - `git diff --check`: clean.
 
+- **Scribe durability follow-ups (items 1–4).** Each item was checked
+  against the code first, and all four were real. Each fix started from a
+  RED test or trace. Traces were read with
+  `WYRD_LOG=info,vala_bifrost_redux=debug`.
+  - **1, restore reads its schema from retired members: CONFIRMED and FIXED
+    (290cc0dac).**
+    - Symptom: `restore_context` took the schema from the first run of any
+      recovered member of a key. That includes members of a committed claim
+      that `recover_terminal_members` has just retired and deleted.
+    - RED: `scribe::staging_runtime::pg_tests::a_key_with_finished_claim_leftovers_and_a_live_member_restores`
+      failed with `open a recovered staged run: No such file or directory (os
+      error 2)`.
+    - Fix: `restore` collects the members it keeps, and `restore_context`
+      reads the schema only from their runs.
+    - GREEN: staging_runtime tests 14/14.
+    - Residual: the RED depends on readdir order. The fixture puts four
+      leftovers next to one live member so that a leftover comes first on
+      ext4.
+  - **2, a claim refused after its commit holds its slot until restart:
+    CONFIRMED and FIXED (6b6fcc512).**
+    - Symptom: a failure after the members recorded `Published` (for
+      example a refused `CleanupPending` move, lease drain, removal, or
+      authority release) left the claim outstanding. `retryable_claims`
+      skipped claims whose members were `Published` or later, so only startup
+      `restore` finished them. A member whose record was already removed made
+      the check return an error, which stopped every later tick.
+    - RED: journey `lifecycle::scribe_tick_finishes_a_claim_that_failed_after_its_commit`.
+      It uses a test-only fault (`PersistenceFaults::fail_next_claim_retirement`)
+      that fires right after the members record `Published`. The trace shows
+      `Scribe due publication failed; next tick retries`, then nothing for
+      30 s, then a timeout with `bifrost_scribe_staging_outstanding_claims = 1`.
+    - Diagnostician (read-only; given the command, trace, and diff):
+      - Confirmed that `retryable_claims` and `publication_can_rerun` drop
+        committed claims, and that only startup finishes them.
+      - Fix site: `ScribeStagingRuntime` with `ClaimPublisher`, branching
+        before `gather`.
+      - Hazards to respect: keep drive exclusivity; treat a missing record as
+        already retired; tolerate `Unregistered` on release; keep the order
+        CleanupPending → drain → remove → release; send the Forge hint;
+        settle; never commit again.
+    - Fix:
+      - `ScribeHotStage::surviving_record` reads a member's record, or
+        returns `None` once retirement has removed it. It does not re-hash
+        the runs.
+      - `ClaimPublisher::finish_committed` treats a claim as committed when
+        any member's record is gone or names the commit. It fails closed if a
+        survivor contradicts that. It then runs the survivors through the
+        startup terminal sweep, which now takes records, in the same
+        transition order. It also deletes record-less directories and
+        releases their authorities, ignoring `Unregistered`.
+      - `ScribeStagingRuntime::finish_committed` settles the claim.
+      - `retryable_claims` is synchronous and returns every undriven
+        outstanding claim. `publication_can_rerun` is removed.
+      - `PersistenceWorker::resume_claim` finishes a committed claim, sends
+        `note_claim_published` and the Forge hint, and otherwise publishes.
+        `publish_claims` uses it for retried claims, and
+        `resume_staging_claims` uses it at startup. Fresh claims skip the
+        check.
+      - `publish_claims` now returns a count; every caller only used `.len()`.
+    - GREEN:
+      - The journey passes in 14.1 s. Its trace shows the fault at
+        05:40:34.08 and `outcome="retired_after_commit"` on the next tick at
+        05:40:35.04.
+      - It then asserts 32 rows published, no outstanding claim, no live
+        member, and that a second table publishes.
+    - Unit test: `scribe::staging_runtime::tests::a_live_claim_refused_inside_its_removal_finishes_without_republication`.
+      - A claimed-only retry is not finished.
+      - A half-retired committed claim finishes with no member, directory,
+        or authority left and its slot returned. One member is removed and
+        released, one is removed but still registered, one has lost its runs,
+        and one is whole.
+      - The pool is lazy and never connected, which proves nothing was
+        committed again.
+    - Residuals:
+      - The claim's staged candidates and publication manifest are named by
+        its WAL union, which removed members no longer carry. They stay until
+        startup publication recovery replays and removes them, as after a
+        crash between the commit and that cleanup.
+      - The `claims_published`, `files`, and `bytes` counters are not
+        incremented for a claim finished this way. The attempt that observed
+        the commit failed before counting it.
+  - **3, the telemetry journey depends on the ambient filter: CONFIRMED and
+    FIXED (ff6d630ba).**
+    - Symptom: `telemetry::scribe_hot_path_telemetry_reconciles` inferred
+      that `bifrost.scribe.wal.append` is DEBUG because it was missing from
+      the trace. A DEBUG filter makes it appear.
+    - Diagnostician: this is a harness defect. Recommended fix: capture each
+      span's level.
+    - Fix:
+      - `wyrd_telemetry::init_test_capture` (test support only) sets
+        `with_level(true)`.
+      - The journey asserts that every captured append span carries
+        `level == "DEBUG"`. The intent is unchanged: append spans are DEBUG
+        detail, not routine.
+    - GREEN under both filters: the default filter in the scribe lane, and
+      `WYRD_LOG=info,vala_bifrost_redux=debug` alone.
+    - Not changed here: the same diagnostician noted that
+      `tests/gateway/native.rs` has the opposite filter dependence.
+  - **4, the redux integration binary was untraced: CONFIRMED and FIXED
+    (2076a32a6).**
+    - Symptom: only `ForgeTelemetryCheckpoint` installed a subscriber.
+    - RED: under `WYRD_LOG=info,vala_bifrost_redux=debug`,
+      `forge::promotion::scribe_promotion_integration_appends_existing_datafile_without_put`
+      printed no INFO or DEBUG lines.
+    - Fix: `forge/support.rs` `ProcessTelemetry` is one process-wide
+      `OnceLock` owner.
+      - It installs the production-shaped recorder and `init_test_capture`,
+        which honours WYRD_LOG.
+      - `PromotionIntegrationFixture::start` and
+        `AuthorityFixture::start` initialise it.
+      - `ForgeTelemetryCheckpoint::install` reads from it and takes its own
+        span mark. Its assertions still read production emission.
+    - GREEN: the same test prints 16 `DEBUG vala_bifrost_redux` lines (for
+      example `persisting immutable Scribe generation`) and passes.
+  - Verification:
+    - `mise run test:bifrost:integration:redux`: 897/897.
+    - `mise run test:bifrost:journey:scribe`: 25/25, run with the default
+      filter.
+    - `mise run test:bifrost:journey:forge`: 21/21.
+    - `mise run test:bifrost:journey:oracle`: 42/42.
+    - `telemetry::scribe_hot_path_telemetry_reconciles` with
+      `WYRD_LOG=info,vala_bifrost_redux=debug`: passed.
+    - `mise run fmt`: clean.
+    - `cargo clippy -p vala-bifrost-redux -p wyrd-testing -p wyrd-telemetry
+      --all-features --tests -- -D warnings`: clean.
+    - `git diff --check`: clean.
+
 ### Acceptance
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
@@ -614,3 +741,7 @@ each fail it ("pull diverged from the scan", "index drifted after commit").
 | Review 5: Publishing replay is idempotent | claim_publication.rs `publication_operation_id` | `a_claim_stranded_in_publishing_publishes_after_restart` | PASS |
 | Suggestion: merge lane from free CPUs | persistence.rs `merge_lane_threads` | `merge_lane_threads_leave_the_persistence_lane_its_cpus` | PASS |
 | Suggestion: root fsync for new key | hot_stage.rs `sync_key_entry` | `the_first_record_of_a_key_syncs_the_staging_root_once` | PASS |
+| Follow-up 1: restore schema from kept members only | staging_runtime.rs `restore`, `restore_context` | `a_key_with_finished_claim_leftovers_and_a_live_member_restores` | PASS |
+| Follow-up 2: live tick finishes a claim refused after commit | claim_publication.rs `finish_committed`; staging_runtime.rs `finish_committed`, `retryable_claims`; persistence.rs `resume_claim` | journey `scribe_tick_finishes_a_claim_that_failed_after_its_commit`; `a_live_claim_refused_inside_its_removal_finishes_without_republication` | PASS |
+| Follow-up 3: telemetry journey independent of WYRD_LOG | wyrd-telemetry `init_test_capture` `with_level(true)`; telemetry.rs level assertion | `scribe_hot_path_telemetry_reconciles` under default and debug filters | PASS |
+| Follow-up 4: redux integration binary traced | forge/support.rs `ProcessTelemetry` | non-checkpoint Forge test prints DEBUG trace under WYRD_LOG | PASS |

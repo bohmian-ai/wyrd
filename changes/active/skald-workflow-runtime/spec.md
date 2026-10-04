@@ -1,6 +1,6 @@
 ---
 id: SPEC-skald-workflow-runtime
-revision: 13
+revision: 14
 status: approved
 ---
 
@@ -17,6 +17,31 @@ for single-agent and multi-agent DAGs. A user can test a code-review workflow
 locally, register the same card and its referenced Agents and Prompts, then
 choose local execution or tenant-bound server execution without rewriting the
 workflow.
+
+## Revision 14 one OpenAI Chat schema
+
+Approved by the user on 2026-10-04. A request variant names a wire schema,
+never a destination. OpenAI Chat has one schema, so it has one variant.
+
+- `ProviderRequest::OpenAiChatCompatible` is deleted, with every match arm,
+  wrapper, and builder path that exists only to handle it.
+  `ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest)` is the only OpenAI
+  Chat request, whether it goes to OpenAI, the Wyrd gateway, an external
+  OpenAI-compatible gateway, or a custom OpenAI-compatible endpoint.
+- The destination is not part of the request. `skald_spec::Prompt` gains
+  `provider: Option<ProviderName>`, omitted when absent. Native dispatch uses
+  `prompt.provider` when present and otherwise the request dialect's default
+  provider (`ProviderRequest::provider`). A custom OpenAI-compatible endpoint
+  is an `OpenAiChatCompletion` Prompt with `provider: <custom name>` dispatched
+  to the client registered under that name.
+- Gateway routes (`wyrd_gateway`, `ext_gateway`) ignore `prompt.provider`; they
+  select the upstream themselves and accept any `OpenAiChatCompletion` body.
+- `RawV1` keeps its `ProviderName`: it has no schema and is the explicit raw
+  escape hatch.
+- Nothing has shipped: no migration, alias, or compatibility reader. Rust,
+  Python, and TypeScript authoring, generated schemas, stubs, fixtures, and
+  examples move to the single variant plus `provider`, and Prompt content
+  hashes change accordingly. TASK-004 carries this change.
 
 ## Revision 13 provider-tagged requests
 
@@ -2438,7 +2463,7 @@ retried after restart.
     passing cancellation separately. Workflow correlation is trace-only, and
     errors normalize to the smallest protocol-common safe shape. Shared
     mutable adapter context is prohibited. `ProviderRequest` changes only as
-    fixed by the Revision 13 provider-tagging contract.
+    fixed by the Revision 13 and 14 request contracts.
 21. Workflow retry repeats a whole Agent step attempt, uses the exact typed
     eligibility and deterministic exponential schedule above, and composes
     per-attempt step timeout, Agent timeout, provider-internal retry, and total
@@ -2686,8 +2711,9 @@ retried after restart.
 
 ## Open material decisions
 
-None in approved Revision 13. Revision 13 changes only `ProviderRequest`
-serialization; everything else stands as approved in Revision 12. The user approved the complete remediation
+None in approved Revision 14. Revisions 13 and 14 change only
+`ProviderRequest` serialization and OpenAI Chat variants plus the Prompt
+dispatch target; everything else stands as approved in Revision 12. The user approved the complete remediation
 recommendation and explicitly requested skill, spec, task and review updates
 on 2026-10-02. Production implementation is not part of that request.
 Historical approval context: Revisions 10 and 11 (see Revision history) were approved by the user on 2026-10-02. The user approved all seven readiness-review
@@ -2720,6 +2746,11 @@ or asynchronous server lifecycle requires another material spec revision
 before implementation planning.
 
 ## Revision history
+
+- **Revision 14 — approved (2026-10-04):** User-approved deletion of
+  `ProviderRequest::OpenAiChatCompatible`: one OpenAI Chat variant, with a
+  custom dispatch target carried by optional `Prompt.provider`. No migration.
+  Carried by TASK-004.
 
 - **Revision 13 — approved (2026-10-03):** User-approved provider-tagged
   `ProviderRequest` serialization (serde adjacent tagging, derived

@@ -96,7 +96,7 @@ def test_from_path_declarative_temperature_applied(tmp_path: Path) -> None:
     yaml_file.write_text(OPENAI_DECLARATIVE_YAML)
 
     card = PromptCard.from_path(yaml_file)
-    body = json.loads(card.prompt.request.model_dump_json())
+    body = json.loads(card.prompt.request.model_dump_json())["body"]
     assert body.get("temperature") == pytest.approx(0.2)
 
 

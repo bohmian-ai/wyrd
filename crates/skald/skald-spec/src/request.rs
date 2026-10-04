@@ -1,5 +1,4 @@
-use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::value::RawValue;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::wire::anthropic_messages::AnthropicMessagesRequest;
@@ -16,10 +15,15 @@ use crate::wire::openai_responses::OpenAiResponsesTool;
 use crate::wire::vertex_generate::VertexGenerateContentRequest;
 use crate::wire::vertex_predict::VertexPredictRequest;
 
-/// One native LLM request.
-#[derive(Debug, Clone, Serialize)]
+/// One native LLM request, tagged with the provider dialect its body speaks.
+///
+/// Serialized as `{"provider": "<variant>", "body": <native provider JSON>}`.
+/// The tag selects the variant, so bodies that share a wire shape (Gemini and
+/// Vertex GenerateContent) still read back as the provider that saved them, and
+/// a body that does not match its named provider fails to deserialize.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(untagged)]
+#[serde(tag = "provider", content = "body", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ProviderRequest {
     /// OpenAI Chat Completions request.
@@ -45,126 +49,13 @@ pub enum ProviderRequest {
     Vertex(VertexGenerateContentRequest),
     /// Vertex Predict request.
     VertexPredict(VertexPredictRequest),
-    /// Raw provider request body that no typed variant claimed.
+    /// Raw provider request body that no typed variant models.
     RawV1 {
         /// Provider dispatch target for the raw body.
         provider: ProviderName,
-        /// Unmodified raw provider request JSON.
-        #[cfg_attr(feature = "schemars", schemars(with = "serde_json::Value"))]
-        body: Box<RawValue>,
+        /// Raw provider request JSON, sent as given.
+        body: Value,
     },
-}
-
-impl<'de> Deserialize<'de> for ProviderRequest {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = Value::deserialize(deserializer)?;
-
-        if let Ok(raw) = serde_json::from_value::<RawProviderRequest>(value.clone()) {
-            return Ok(Self::RawV1 {
-                provider: raw.provider,
-                body: raw.body,
-            });
-        }
-        if let Ok(request) = serde_json::from_value::<OpenAiChatCompatibleRequest>(value.clone()) {
-            return Ok(Self::OpenAiChatCompatible {
-                provider: request.provider,
-                request: request.request,
-            });
-        }
-
-        // Keep the S01 untagged ordering explicit while still giving RawV1 a
-        // dependable fallback. Deriving `Deserialize` directly would ask
-        // `Box<RawValue>` to deserialize from any JSON value and can make
-        // fallback behavior hard to reason about as typed variants evolve.
-        if value.get("max_tokens").is_some()
-            && let Ok(request) = serde_json::from_value::<AnthropicMessagesRequest>(value.clone())
-        {
-            return Ok(Self::AnthropicMessage(request));
-        }
-        if let Ok(request) = serde_json::from_value::<OpenAiChatRequest>(value.clone()) {
-            return Ok(Self::OpenAiChatCompletion(request));
-        }
-        if let Ok(request) = serde_json::from_value::<OpenAiResponsesRequest>(value.clone()) {
-            return Ok(Self::OpenAiResponses(request));
-        }
-        if let Ok(request) = serde_json::from_value::<OpenAiEmbeddingsRequest>(value.clone()) {
-            return Ok(Self::OpenAiEmbeddings(request));
-        }
-        if let Ok(request) = serde_json::from_value::<AnthropicMessagesRequest>(value.clone()) {
-            return Ok(Self::AnthropicMessage(request));
-        }
-        if let Ok(request) = serde_json::from_value::<GoogleGenerateContentRequest>(value.clone()) {
-            return Ok(Self::GeminiGenerateContent(request));
-        }
-        if let Ok(request) = serde_json::from_value::<GoogleBatchEmbedRequest>(value.clone()) {
-            return Ok(Self::GoogleBatchEmbed(request));
-        }
-        // Vertex generate is transparent over the Google request shape. This
-        // branch is retained for direct deserialization compatibility, but a
-        // bare body that also matches Google is claimed by Google first.
-        if let Ok(request) = serde_json::from_value::<VertexGenerateContentRequest>(value.clone()) {
-            return Ok(Self::Vertex(request));
-        }
-        if let Ok(request) = serde_json::from_value::<VertexPredictRequest>(value.clone()) {
-            return Ok(Self::VertexPredict(request));
-        }
-        Err(serde::de::Error::custom(
-            "data did not match any ProviderRequest variant",
-        ))
-    }
-}
-
-#[derive(Deserialize)]
-struct RawProviderRequest {
-    provider: ProviderName,
-    body: Box<RawValue>,
-}
-
-#[derive(Deserialize)]
-struct OpenAiChatCompatibleRequest {
-    provider: ProviderName,
-    request: OpenAiChatRequest,
-}
-
-impl PartialEq for ProviderRequest {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::OpenAiChatCompletion(left), Self::OpenAiChatCompletion(right)) => left == right,
-            (
-                Self::OpenAiChatCompatible {
-                    provider: left_provider,
-                    request: left_request,
-                },
-                Self::OpenAiChatCompatible {
-                    provider: right_provider,
-                    request: right_request,
-                },
-            ) => left_provider == right_provider && left_request == right_request,
-            (Self::OpenAiResponses(left), Self::OpenAiResponses(right)) => left == right,
-            (Self::OpenAiEmbeddings(left), Self::OpenAiEmbeddings(right)) => left == right,
-            (Self::AnthropicMessage(left), Self::AnthropicMessage(right)) => left == right,
-            (Self::GeminiGenerateContent(left), Self::GeminiGenerateContent(right)) => {
-                left == right
-            }
-            (Self::GoogleBatchEmbed(left), Self::GoogleBatchEmbed(right)) => left == right,
-            (Self::Vertex(left), Self::Vertex(right)) => left == right,
-            (Self::VertexPredict(left), Self::VertexPredict(right)) => left == right,
-            (
-                Self::RawV1 {
-                    provider: left_provider,
-                    body: left_body,
-                },
-                Self::RawV1 {
-                    provider: right_provider,
-                    body: right_body,
-                },
-            ) => left_provider == right_provider && left_body.get() == right_body.get(),
-            _ => false,
-        }
-    }
 }
 
 /// Which provider a request targets.
@@ -384,6 +275,67 @@ mod round_trip {
         }
     }
 
+    /// A Vertex body has the Gemini wire shape; the provider tag alone keeps it
+    /// Vertex across a save and load.
+    #[test]
+    fn vertex_request_reads_back_as_vertex() {
+        let request = ProviderRequest::Vertex(common::vertex_generate_request());
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["provider"], "vertex");
+        let reparsed: ProviderRequest = serde_json::from_value(json).unwrap();
+        assert!(matches!(reparsed, ProviderRequest::Vertex(_)));
+        assert_eq!(reparsed, request);
+    }
+
+    /// Stores such as Postgres `jsonb` reorder keys, so the body may precede
+    /// its tag; a raw body must still read back unchanged.
+    #[test]
+    fn raw_v1_request_reads_back_when_body_precedes_tag() {
+        let reparsed: ProviderRequest = serde_json::from_str(
+            r#"{"body":{"body":{"x":1},"provider":{"custom":"acme"}},"provider":"raw_v1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            reparsed,
+            ProviderRequest::RawV1 {
+                provider: ProviderName::Custom("acme".to_string()),
+                body: json!({"x": 1}),
+            }
+        );
+    }
+
+    /// A body that does not match its named provider is refused, never
+    /// claimed by another variant: closed wire structs reject another
+    /// provider's fields, and every typed variant requires its own.
+    #[test]
+    fn mismatched_body_is_refused() {
+        let mismatches = [
+            (
+                "open_ai_embeddings",
+                serde_json::to_value(common::openai_chat_request()),
+            ),
+            (
+                "vertex_predict",
+                serde_json::to_value(common::google_request()),
+            ),
+            (
+                "anthropic_message",
+                serde_json::to_value(common::google_request()),
+            ),
+            (
+                "google_batch_embed",
+                serde_json::to_value(common::anthropic_request()),
+            ),
+        ];
+        for (provider, body) in mismatches {
+            let request = json!({"provider": provider, "body": body.unwrap()});
+            assert!(
+                serde_json::from_value::<ProviderRequest>(request).is_err(),
+                "{provider} refuses another provider's body"
+            );
+        }
+    }
+
     #[test]
     fn raw_v1_response_and_message_roundtrip_preserve_body() {
         let response =
@@ -548,71 +500,8 @@ mod settings_flatten {
 
 #[cfg(test)]
 mod untagged_dispatch {
-    use serde_json::json;
-
     use crate::common;
-    use crate::{MessageNum, ProviderRequest, ProviderResponse};
-
-    #[test]
-    fn provider_request_untagged_dispatch_per_provider() {
-        assert!(matches!(
-            serde_json::from_value::<ProviderRequest>(
-                serde_json::to_value(common::openai_chat_request()).unwrap()
-            )
-            .unwrap(),
-            ProviderRequest::OpenAiChatCompletion(_)
-        ));
-        assert!(matches!(
-            serde_json::from_value::<ProviderRequest>(
-                serde_json::to_value(common::anthropic_request()).unwrap()
-            )
-            .unwrap(),
-            ProviderRequest::AnthropicMessage(_)
-        ));
-        assert!(matches!(
-            serde_json::from_value::<ProviderRequest>(
-                serde_json::to_value(common::google_request()).unwrap()
-            )
-            .unwrap(),
-            ProviderRequest::GeminiGenerateContent(_)
-        ));
-    }
-
-    #[test]
-    fn vertex_generate_body_is_transparent_google_shape() {
-        assert!(matches!(
-            serde_json::from_value::<ProviderRequest>(
-                serde_json::to_value(common::vertex_generate_request()).unwrap()
-            )
-            .unwrap(),
-            ProviderRequest::GeminiGenerateContent(_)
-        ));
-    }
-
-    #[test]
-    fn raw_v1_is_last_fallback_for_wrapped_unknown_request() {
-        let body = json!({"provider": "open_ai", "body": {"untyped": true}});
-        assert!(matches!(
-            serde_json::from_value::<ProviderRequest>(body).unwrap(),
-            ProviderRequest::RawV1 { .. }
-        ));
-    }
-
-    #[test]
-    fn deny_unknown_fields_blocks_cross_variant_confusion() {
-        let body = json!({
-            "provider": "open_ai",
-            "body": {
-                "model": "gpt-4o",
-                "messages": [{"role": "user", "content": "hi"}],
-                "unknown": true
-            }
-        });
-        assert!(matches!(
-            serde_json::from_value::<ProviderRequest>(body).unwrap(),
-            ProviderRequest::RawV1 { .. }
-        ));
-    }
+    use crate::{MessageNum, ProviderResponse};
 
     #[test]
     fn message_num_untagged_dispatch_per_provider() {

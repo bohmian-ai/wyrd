@@ -475,7 +475,7 @@ fn query_workflow() -> Result<tempfile::TempDir, JourneyError> {
     let write = |file: &str, body: &str| std::fs::write(bundle.path().join(file), body);
     write(
         "prompt.yaml",
-        "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  space: engineering\n  name: forwarded-query-prompt\n  version: \"1.0.0\"\nspec:\n  model: gpt-5-5\n  request:\n    model: gpt-5-5\n    messages:\n      - role: system\n        content: \"You count the fixture groups.\"\n      - role: user\n        content: \"Count them.\"\n  response_type: text\n",
+        "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  space: engineering\n  name: forwarded-query-prompt\n  version: \"1.0.0\"\nspec:\n  model: gpt-5-5\n  request:\n    provider: open_ai_chat_completion\n    body:\n      model: gpt-5-5\n      messages:\n        - role: system\n          content: \"You count the fixture groups.\"\n        - role: user\n          content: \"Count them.\"\n  response_type: text\n",
     )?;
     write(
         "agent.yaml",

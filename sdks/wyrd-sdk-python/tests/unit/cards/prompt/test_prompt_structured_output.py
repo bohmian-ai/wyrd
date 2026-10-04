@@ -16,7 +16,7 @@ class Recipe(BaseModel):
 
 
 def schema_from_request(prompt: Prompt) -> dict:
-    body = prompt.request.model_dump()
+    body = prompt.request.model_dump()["body"]
     if "response_format" in body:
         return body["response_format"]["json_schema"]["schema"]
     if "text" in body:

@@ -1609,8 +1609,10 @@ prompt: ./prompts/triage.yaml
 prompt:
   model: example-model
   request:
-    model: example-model
-    messages: [{role: user, content: "Hello"}]
+    provider: open_ai_chat_completion
+    body:
+      model: example-model
+      messages: [{role: user, content: "Hello"}]
   variables: []
   response_type: text
 ```

@@ -132,6 +132,8 @@ impl VertexClient {
                 Ok(ProviderResponse::VertexPredict(response))
             }
             ProviderRequest::RawV1 { body, .. } => {
+                let body = serde_json::value::to_raw_value(&body)
+                    .map_err(|error| ProviderError::decode("vertex", error))?;
                 let url = format!("{}/raw", self.auth.model_url(&self.model, "predict"));
                 let response = raw::send_raw(
                     &self.transport,

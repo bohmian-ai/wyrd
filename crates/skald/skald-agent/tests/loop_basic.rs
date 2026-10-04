@@ -274,7 +274,7 @@ async fn run_prompt_provider_mismatch_returns_409_provider_mismatch() {
     });
     let prompt_request = ProviderRequest::RawV1 {
         provider: ProviderName::Anthropic,
-        body: serde_json::value::RawValue::from_string("{}".to_owned()).unwrap(),
+        body: serde_json::json!({}),
     };
     let prompt = Prompt::from_native(
         SpecPrompt::new(prompt_request, "claude", None, ResponseType::Text).unwrap(),

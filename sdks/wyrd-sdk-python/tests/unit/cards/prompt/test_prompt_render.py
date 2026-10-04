@@ -9,7 +9,7 @@ def assert_code(error: pytest.ExceptionInfo[WyrdError], code: str) -> None:
 
 
 def rendered_text(request: ProviderRequest) -> str:
-    body = request.model_dump()
+    body = request.model_dump()["body"]
     if "messages" in body:
         content = body["messages"][-1]["content"]
         if isinstance(content, list):

@@ -13,7 +13,7 @@ def test_output_dict_of_types_builds_response_format() -> None:
         provider="openai",
         output={"summary": str, "steps": list[str]},
     )
-    fmt = prompt.request.model_dump()["response_format"]
+    fmt = prompt.request.model_dump()["body"]["response_format"]
 
     assert fmt["type"] == "json_schema"
     schema = fmt["json_schema"]["schema"]
@@ -36,7 +36,7 @@ def test_output_pydantic_model_uses_model_json_schema() -> None:
         provider="openai",
         output=Plan,
     )
-    fmt = prompt.request.model_dump()["response_format"]
+    fmt = prompt.request.model_dump()["body"]["response_format"]
 
     assert fmt["type"] == "json_schema"
     assert fmt["json_schema"]["name"] == "Plan"
@@ -49,7 +49,7 @@ def test_output_raw_schema_dict_passes_through() -> None:
         "required": ["x"],
     }
     prompt = Prompt(messages=["Hi."], model="gpt-test", provider="openai", output=raw)
-    fmt = prompt.request.model_dump()["response_format"]
+    fmt = prompt.request.model_dump()["body"]["response_format"]
 
     assert fmt["json_schema"]["schema"]["properties"]["x"] == {"type": "string"}
 
@@ -62,7 +62,7 @@ def test_output_wins_over_response_format() -> None:
         response_format=ResponseFormat.json_object(),
         output={"x": str},
     )
-    fmt = prompt.request.model_dump()["response_format"]
+    fmt = prompt.request.model_dump()["body"]["response_format"]
 
     assert fmt["type"] == "json_schema"
 

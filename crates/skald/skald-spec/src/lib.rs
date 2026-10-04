@@ -375,7 +375,7 @@ pub(crate) mod common {
     pub(crate) fn raw_request(provider: ProviderName) -> ProviderRequest {
         ProviderRequest::RawV1 {
             provider,
-            body: raw_value(json!({"custom": true, "nested": {"x": 1}})),
+            body: json!({"custom": true, "nested": {"x": 1}}),
         }
     }
 }

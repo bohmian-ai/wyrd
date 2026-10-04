@@ -270,8 +270,7 @@ mod cache_key {
 
     #[test]
     fn raw_request_returns_opaque_request_error() {
-        let body = serde_json::value::RawValue::from_string(r#"{"model":"x"}"#.to_owned())
-            .expect("raw JSON is valid");
+        let body = serde_json::json!({"model": "x"});
         let request = ProviderRequest::RawV1 {
             provider: ProviderName::Custom("local".to_owned()),
             body,

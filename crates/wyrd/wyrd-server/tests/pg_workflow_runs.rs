@@ -981,7 +981,7 @@ fn single_step(name: &str, tools: &str, route: &str, padding: usize) -> TempDir 
     write(
         "prompt.yaml",
         format!(
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  space: engineering\n  name: {name}-prompt\n  version: \"1.0.0\"\nspec:\n  model: gpt-5-5\n  request:\n    model: gpt-5-5\n    messages:\n      - role: system\n        content: \"You answer for {name}.{}\"\n      - role: user\n        content: \"Answer about {{{{code}}}}\"\n  variables: [code]\n  response_type: text\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  space: engineering\n  name: {name}-prompt\n  version: \"1.0.0\"\nspec:\n  model: gpt-5-5\n  request:\n    provider: open_ai_chat_completion\n    body:\n      model: gpt-5-5\n      messages:\n        - role: system\n          content: \"You answer for {name}.{}\"\n        - role: user\n          content: \"Answer about {{{{code}}}}\"\n  variables: [code]\n  response_type: text\n",
             " ".repeat(padding)
         ),
     );

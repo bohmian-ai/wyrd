@@ -843,16 +843,19 @@ fn metadata_error(error: MetadataError) -> WyrdPyError {
     )
 }
 
+/// Builds the empty `RawV1` placeholder Prompt a `PromptCard` holds before its
+/// native Prompt is set.
+///
+/// # Panics
+///
+/// Panics only if the static placeholder fails Prompt validation, which is an
+/// invariant of the fixed inputs.
 #[cfg(any(feature = "python", test))]
 fn default_prompt() -> skald_spec::Prompt {
-    let body = match serde_json::value::RawValue::from_string("{}".to_owned()) {
-        Ok(body) => body,
-        Err(error) => panic!("static raw JSON object is valid: {error}"),
-    };
     match skald_spec::Prompt::new(
         skald_spec::ProviderRequest::RawV1 {
             provider: skald_spec::ProviderName::Custom("placeholder".to_owned()),
-            body,
+            body: serde_json::json!({}),
         },
         "placeholder",
         None,
@@ -872,8 +875,7 @@ mod tests {
         let prompt = skald_spec::Prompt::new(
             skald_spec::ProviderRequest::RawV1 {
                 provider: skald_spec::ProviderName::Custom("unit".to_owned()),
-                body: serde_json::value::RawValue::from_string(r#"{"messages":["hi"]}"#.to_owned())
-                    .expect("static raw JSON is valid"),
+                body: serde_json::json!({"messages": ["hi"]}),
             },
             "unit-model",
             None,

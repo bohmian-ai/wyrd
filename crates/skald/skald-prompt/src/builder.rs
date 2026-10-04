@@ -1,6 +1,5 @@
 //! Provider-shaped constructors that emit native Skald prompt requests.
 
-use serde_json::value::RawValue;
 use skald_spec::wire::anthropic_messages::{
     AnthropicMessage, AnthropicMessagesRequest, AnthropicMessagesSettings,
 };
@@ -243,15 +242,20 @@ pub fn vertex(model: impl Into<String>, options: VertexOptions) -> PromptBuilder
 }
 
 /// Builds a raw passthrough prompt with a durable provider target.
+///
+/// `bytes` is parsed as JSON and stored as the `RawV1` body sent to `provider`.
+///
+/// # Errors
+///
+/// Returns an invalid-model error for a blank model and
+/// [`PromptBuilderError::InvalidRawJson`] when `bytes` is not JSON.
 pub fn raw(
     provider: ProviderName,
     model: impl Into<String>,
     bytes: &[u8],
 ) -> PromptBuilderResult<Prompt> {
     let model = checked_model(model)?;
-    let body = std::str::from_utf8(bytes)
-        .map_err(|error| PromptBuilderError::InvalidRawJson(error.to_string()))?;
-    let body = RawValue::from_string(body.to_owned())
+    let body = serde_json::from_slice(bytes)
         .map_err(|error| PromptBuilderError::InvalidRawJson(error.to_string()))?;
     finalize_prompt(skald_spec::Prompt {
         request: ProviderRequest::RawV1 { provider, body },
@@ -614,7 +618,7 @@ mod builder_tests {
     }
 
     #[test]
-    fn raw_preserves_provider_and_body_bytes() {
+    fn raw_preserves_provider_and_body() {
         let prompt = raw(
             ProviderName::Custom("local".to_owned()),
             "local-model",
@@ -626,7 +630,7 @@ mod builder_tests {
             panic!("expected raw request");
         };
         assert_eq!(provider, &ProviderName::Custom("local".to_owned()));
-        assert_eq!(body.get(), r#"{"a":1}"#);
+        assert_eq!(body, &serde_json::json!({"a": 1}));
     }
 
     #[test]

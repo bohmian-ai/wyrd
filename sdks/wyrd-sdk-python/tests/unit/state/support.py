@@ -267,8 +267,11 @@ def build_complete_bundle(tmp_path: Path, *, duplicate_model_alias: bool = False
                 {
                     "prompt": {
                         "request": {
-                            "model": "gpt-4o",
-                            "messages": [{"role": "user", "content": "inline"}],
+                            "provider": "open_ai_chat_completion",
+                            "body": {
+                                "model": "gpt-4o",
+                                "messages": [{"role": "user", "content": "inline"}],
+                            },
                         },
                         "model": "gpt-4o",
                         "variables": [],

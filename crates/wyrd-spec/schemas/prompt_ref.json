@@ -4029,100 +4029,10 @@
       ]
     },
     "ProviderRequest": {
-      "description": "One native LLM request.",
-      "anyOf": [
+      "description": "One native LLM request, tagged with the provider dialect its body speaks.\n\nSerialized as `{\"provider\": \"<variant>\", \"body\": <native provider JSON>}`. The tag selects the variant, so bodies that share a wire shape (Gemini and Vertex GenerateContent) still read back as the provider that saved them, and a body that does not match its named provider fails to deserialize.",
+      "oneOf": [
         {
           "description": "OpenAI Chat Completions request.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/OpenAiChatRequest"
-            }
-          ]
-        },
-        {
-          "description": "Custom provider that accepts OpenAI Chat Completions request semantics.",
-          "type": "object",
-          "required": [
-            "provider",
-            "request"
-          ],
-          "properties": {
-            "provider": {
-              "description": "Provider dispatch target.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/ProviderName"
-                }
-              ]
-            },
-            "request": {
-              "description": "OpenAI Chat-shaped request body.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/OpenAiChatRequest"
-                }
-              ]
-            }
-          }
-        },
-        {
-          "description": "OpenAI Responses API request.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/OpenAiResponsesRequest"
-            }
-          ]
-        },
-        {
-          "description": "OpenAI Embeddings request.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/OpenAiEmbeddingsRequest"
-            }
-          ]
-        },
-        {
-          "description": "Anthropic Messages request.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/AnthropicMessagesRequest"
-            }
-          ]
-        },
-        {
-          "description": "Google Gemini GenerateContent request.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/GoogleGenerateContentRequest"
-            }
-          ]
-        },
-        {
-          "description": "Google Gemini BatchEmbedContents request.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/GoogleBatchEmbedRequest"
-            }
-          ]
-        },
-        {
-          "description": "Vertex GenerateContent request.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/GoogleGenerateContentRequest"
-            }
-          ]
-        },
-        {
-          "description": "Vertex Predict request.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/VertexPredictRequest"
-            }
-          ]
-        },
-        {
-          "description": "Raw provider request body that no typed variant claimed.",
           "type": "object",
           "required": [
             "body",
@@ -4130,14 +4040,222 @@
           ],
           "properties": {
             "body": {
-              "description": "Unmodified raw provider request JSON."
+              "$ref": "#/definitions/OpenAiChatRequest"
             },
             "provider": {
-              "description": "Provider dispatch target for the raw body.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/ProviderName"
+              "type": "string",
+              "enum": [
+                "open_ai_chat_completion"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Custom provider that accepts OpenAI Chat Completions request semantics.",
+          "type": "object",
+          "required": [
+            "body",
+            "provider"
+          ],
+          "properties": {
+            "body": {
+              "type": "object",
+              "required": [
+                "provider",
+                "request"
+              ],
+              "properties": {
+                "provider": {
+                  "description": "Provider dispatch target.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/ProviderName"
+                    }
+                  ]
+                },
+                "request": {
+                  "description": "OpenAI Chat-shaped request body.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/OpenAiChatRequest"
+                    }
+                  ]
                 }
+              }
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "open_ai_chat_compatible"
+              ]
+            }
+          }
+        },
+        {
+          "description": "OpenAI Responses API request.",
+          "type": "object",
+          "required": [
+            "body",
+            "provider"
+          ],
+          "properties": {
+            "body": {
+              "$ref": "#/definitions/OpenAiResponsesRequest"
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "open_ai_responses"
+              ]
+            }
+          }
+        },
+        {
+          "description": "OpenAI Embeddings request.",
+          "type": "object",
+          "required": [
+            "body",
+            "provider"
+          ],
+          "properties": {
+            "body": {
+              "$ref": "#/definitions/OpenAiEmbeddingsRequest"
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "open_ai_embeddings"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Anthropic Messages request.",
+          "type": "object",
+          "required": [
+            "body",
+            "provider"
+          ],
+          "properties": {
+            "body": {
+              "$ref": "#/definitions/AnthropicMessagesRequest"
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "anthropic_message"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Google Gemini GenerateContent request.",
+          "type": "object",
+          "required": [
+            "body",
+            "provider"
+          ],
+          "properties": {
+            "body": {
+              "$ref": "#/definitions/GoogleGenerateContentRequest"
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "gemini_generate_content"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Google Gemini BatchEmbedContents request.",
+          "type": "object",
+          "required": [
+            "body",
+            "provider"
+          ],
+          "properties": {
+            "body": {
+              "$ref": "#/definitions/GoogleBatchEmbedRequest"
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "google_batch_embed"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Vertex GenerateContent request.",
+          "type": "object",
+          "required": [
+            "body",
+            "provider"
+          ],
+          "properties": {
+            "body": {
+              "$ref": "#/definitions/GoogleGenerateContentRequest"
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "vertex"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Vertex Predict request.",
+          "type": "object",
+          "required": [
+            "body",
+            "provider"
+          ],
+          "properties": {
+            "body": {
+              "$ref": "#/definitions/VertexPredictRequest"
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "vertex_predict"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Raw provider request body that no typed variant models.",
+          "type": "object",
+          "required": [
+            "body",
+            "provider"
+          ],
+          "properties": {
+            "body": {
+              "type": "object",
+              "required": [
+                "body",
+                "provider"
+              ],
+              "properties": {
+                "body": {
+                  "description": "Raw provider request JSON, sent as given."
+                },
+                "provider": {
+                  "description": "Provider dispatch target for the raw body.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/ProviderName"
+                    }
+                  ]
+                }
+              }
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "raw_v1"
               ]
             }
           }

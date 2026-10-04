@@ -31,10 +31,12 @@ metadata:
 spec:
   model: gpt-4o
   request:
-    model: gpt-4o
-    messages:
-      - role: user
-        content: "{{question}}"
+    provider: open_ai_chat_completion
+    body:
+      model: gpt-4o
+      messages:
+        - role: user
+          content: "{{question}}"
   variables: [question]
   response_type: text
 """

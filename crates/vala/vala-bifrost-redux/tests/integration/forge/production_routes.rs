@@ -2262,7 +2262,11 @@ async fn property_less_table_is_compacted_after_the_default_interval() {
         .advance(ChronoDuration::seconds(3599))
         .expect("manual clock advance");
     assert!(
-        forge.pull_compaction(4).await.expect("leader pull").is_empty(),
+        forge
+            .pull_compaction(4)
+            .await
+            .expect("leader pull")
+            .is_empty(),
         "one commit waits out the one-hour default interval"
     );
     control

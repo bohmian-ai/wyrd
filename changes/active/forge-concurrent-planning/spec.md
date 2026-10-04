@@ -314,7 +314,15 @@ are never selected again. Forge's `small-files` plan sets the core's existing gr
   plus a rate sweep to its knee; fleet throughput uses a production-like
   Scribe workload at default compaction settings and gates on 1.7x/3.0x
   scaling, full pull answers under backlog and leader CPU below 70%, naming
-  the bounding resource. The 85% occupancy gate is removed.
+  the bounding resource. The 85% occupancy gate is removed. Amended
+  2026-10-03: every Wyrd process keeps its 4 GiB boot floor
+  (`MIN_POD_MEMORY_BYTES`), so the 16 GiB envelope holds one leader
+  (1 CPU / 4 GiB) and at most three workers (7/3 CPU / 4 GiB each); the
+  scaling gates are 2 workers >= 1.7x and 3 workers >= 2.5x of 1 worker.
+  Worker throughput is measured as backlog drain: tables are written through
+  Scribe with no worker running until each holds compactable staged files,
+  then each fleet size drains an equal fresh backlog, so the measurement is
+  bounded by compaction and not by the arrival rate of due tables.
 
 ## Deletion and consumer map
 

@@ -15,9 +15,8 @@ use vala_bifrost_redux::oracle::peer::{
 };
 use wyrd_server::config::BifrostTarget;
 use wyrd_spec::vala::api::{
-    ClusterRole, ExecuteFragmentRequest, FollowerScanAssignment, NodeId,
-    OracleRoleFence, PeerContext, PersistedFileAssignment, ReservationId, ScribeProviderCut,
-    TenantTableBinding,
+    ClusterRole, ExecuteFragmentRequest, FollowerScanAssignment, NodeId, OracleRoleFence,
+    PeerContext, PersistedFileAssignment, ReservationId, ScribeProviderCut, TenantTableBinding,
 };
 use wyrd_tonic::prost::Message as _;
 use wyrd_tonic::tonic;

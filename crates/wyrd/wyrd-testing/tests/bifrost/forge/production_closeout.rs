@@ -1030,10 +1030,7 @@ impl CloseoutJourney {
                 "{family}"
             );
         }
-        eprintln!(
-            "worker identities={:?}",
-            self.observer.completed_workers()
-        );
+        eprintln!("worker identities={:?}", self.observer.completed_workers());
         operations
     }
 

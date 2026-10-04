@@ -10,10 +10,19 @@ MediaKind = Literal["image", "document"]
 class MediaRef:
     """One media item an Eval observation names for its judge Prompt.
 
-    ``id`` names an existing ``${media:id}`` variable in the resolved judge
-    Prompt; ``kind`` selects a supported media kind rather than inferring it
-    from the filename. ``uri`` is a durable object-storage locator, never
-    provider-facing prompt text.
+    Pass a list of these as ``Observe.eval(media=...)``. Only this small
+    descriptor is queued; the server reads the object at judge time. The
+    fields are checked when the observation is emitted, not on construction.
+
+    Attributes:
+        id: the name of an existing ``${media:id}`` slot in the resolved judge
+            Prompt.
+        kind: ``"image"`` or ``"document"``, stated explicitly rather than
+            inferred from the filename.
+        uri: the durable object-storage URI of the media; never sent to the
+            provider as prompt text.
+        media_type: the IANA media type, such as ``"image/png"``. ``None``
+            (the default) leaves it unstated.
     """
 
     id: str
@@ -27,6 +36,8 @@ class MediaRef:
         kind: MediaKind,
         uri: str,
         media_type: str | None = None,
-    ) -> None: ...
+    ) -> None:
+        """Create a media descriptor; the arguments are the attributes above."""
+        ...
 
 __all__ = ["MediaKind", "MediaRef"]

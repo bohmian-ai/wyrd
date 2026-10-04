@@ -28,24 +28,29 @@ class CardRefLike(Protocol):
     """
 
     def to_dict(self) -> JsonDict:
-        """Return a JSON-compatible card reference dictionary.
-
-        Returns:
-            JsonDict: Serialized card reference.
-        """
+        """Return the reference as a JSON-compatible ``CardRef`` mapping."""
         ...
 
 ### error.pyi ###
 class WyrdError(Exception):
-    """Python-facing Wyrd error with stable metadata.
+    """Wyrd failure carrying a stable, catalog-backed error code.
 
-    Wyrd raises this exception for validation and boundary failures that have a
-    durable Wyrd error code. Every attribute is projected from one RFC 9457
-    problem document, so every direct attribute agrees with that projection:
-    `code` is stable, `message` and `detail` carry the same human-readable
-    failure text, `details` carries structured context, `status`, `title`, and
-    `type` mirror the problem document, and `remediation` tells the caller what
-    to change next.
+    Every attribute is projected from one RFC 9457 problem document, so they
+    always agree. Branch on ``code``, not on the message text. Wyrd raises the
+    ``AgentError``, ``ToolError``, or ``SessionError`` subclass when the code
+    starts with ``WYRD_AGENT_``, ``WYRD_TOOL_``, or ``WYRD_SESSION_`` (or the
+    matching ``SKALD_`` prefix).
+
+    Attributes:
+        code: stable machine identifier, for example
+            ``WYRD_CLIENT_401_NO_CREDENTIALS``.
+        message: human-readable failure text.
+        detail: the same text as ``message``, under its problem-document name.
+        details: structured JSON context, or ``None`` when there is none.
+        remediation: what the caller should change before retrying.
+        status: the HTTP status the code maps to.
+        title: short catalog title for the code.
+        type: problem-type URI, ``https://wyrd.dev/problems/<code>``.
     """
 
     code: str
@@ -65,27 +70,17 @@ class WyrdError(Exception):
         details: dict[str, Any] | None = None,
         remediation: str = ...,
     ) -> None:
-        """Create a Wyrd error.
+        """Create a bare Wyrd error.
 
-        Users normally receive this from Wyrd rather than constructing it
-        directly. `code` is the machine-stable identifier; `message` is the
-        short human-readable failure; `details` is JSON-compatible context; and
-        `remediation` is the actionable recovery hint.
-
-        Args:
-            code (str): Stable Wyrd error code.
-            message (str): Human-readable failure message.
-            details (dict[str, Any] | None): Optional structured context for
-                the failure.
-            remediation (str): Actionable recovery guidance.
+        Wyrd raises fully populated instances itself. Constructing one
+        directly keeps the positional arguments in ``args`` only and does not
+        set the attributes above; call ``build_wyrd_error`` instead to get a
+        populated instance.
         """
         ...
 
 class AgentError(WyrdError):
-    """Agent-specific Wyrd error.
-
-    Raised for structured errors produced by Agent runtime behavior.
-    """
+    """``WyrdError`` for a ``WYRD_AGENT_*`` code raised by the Agent runtime."""
 
     def __init__(
         self,
@@ -95,21 +90,11 @@ class AgentError(WyrdError):
         details: dict[str, Any] | None = None,
         remediation: str = ...,
     ) -> None:
-        """Create an Agent error.
-
-        Args:
-            code (str): Stable Wyrd error code.
-            message (str): Human-readable failure message.
-            details (dict[str, Any] | None): Optional structured context.
-            remediation (str): Actionable recovery guidance.
-        """
+        """As ``WyrdError()``."""
         ...
 
 class ToolError(WyrdError):
-    """Tool-specific Wyrd error.
-
-    Raised for structured errors produced by tool registration or invocation.
-    """
+    """``WyrdError`` for a ``WYRD_TOOL_*`` code raised by tool registration or calls."""
 
     def __init__(
         self,
@@ -119,21 +104,11 @@ class ToolError(WyrdError):
         details: dict[str, Any] | None = None,
         remediation: str = ...,
     ) -> None:
-        """Create a Tool error.
-
-        Args:
-            code (str): Stable Wyrd error code.
-            message (str): Human-readable failure message.
-            details (dict[str, Any] | None): Optional structured context.
-            remediation (str): Actionable recovery guidance.
-        """
+        """As ``WyrdError()``."""
         ...
 
 class SessionError(WyrdError):
-    """Session-specific Wyrd error.
-
-    Raised for structured errors produced by session memory behavior.
-    """
+    """``WyrdError`` for a ``WYRD_SESSION_*`` code raised by session memory."""
 
     def __init__(
         self,
@@ -143,14 +118,7 @@ class SessionError(WyrdError):
         details: dict[str, Any] | None = None,
         remediation: str = ...,
     ) -> None:
-        """Create a Session error.
-
-        Args:
-            code (str): Stable Wyrd error code.
-            message (str): Human-readable failure message.
-            details (dict[str, Any] | None): Optional structured context.
-            remediation (str): Actionable recovery guidance.
-        """
+        """As ``WyrdError()``."""
         ...
 
 def build_wyrd_error(
@@ -160,17 +128,18 @@ def build_wyrd_error(
 ) -> WyrdError:
     """Build a fully populated Wyrd error from a stable catalog code.
 
-    Pure Python helpers use this instead of constructing an exception and
-    assigning a subset of its attributes, so every raised error carries the
-    catalog's status, title, type, and remediation.
+    The catalog supplies ``status``, ``title``, ``type``, and ``remediation``,
+    and the code prefix selects the subclass, as when Wyrd raises the error.
+    The error is returned, not raised.
 
     Args:
-        code (str): Stable Wyrd error code.
-        message (str): Human-readable failure message.
-        details (dict[str, Any] | None): Optional structured context.
+        code: a catalog code. An unknown code yields an ``AgentError`` with
+            code ``WYRD_AGENT_422_VALIDATION`` whose ``details`` is
+            ``{"python_error_code": code}``; the given ``details`` is dropped.
+        message: human-readable failure text.
+        details: JSON-compatible structured context. Omitted, ``details`` is
+            ``None``.
 
-    Returns:
-        WyrdError: Exception instance carrying complete Wyrd metadata.
     """
     ...
 

@@ -165,7 +165,8 @@ impl WriterPool {
     ///
     /// Both correlation fields are optional. An omitted `card_ref` becomes a
     /// null in the sealed batch, which the server stores against the
-    /// authenticated principal with a null `card_uid`.
+    /// authenticated principal with a null `card_uid`. The row is stamped
+    /// with its event time as [`Self::insert_rows`] describes.
     ///
     /// The queue-domain [`WyrdQueueError`] is propagated verbatim (rather than
     /// projected onto the shared catalog) so the client-tier code —
@@ -184,8 +185,7 @@ impl WriterPool {
         card_ref: Option<CardRef>,
         run_id: Option<RunId>,
     ) -> Result<(), WyrdQueueError> {
-        self.producer_for(table, schema)?
-            .enqueue(json, card_ref, run_id)
+        self.insert_rows(table, schema, vec![json], card_ref, run_id)
     }
 
     /// Enqueue every row of one logical record, or none of them, propagating
@@ -195,6 +195,11 @@ impl WriterPool {
     /// projects to several rows sharing one correlation, such as a Drift
     /// observation's tall feature rows. A refusal admits no row, so the caller
     /// may resubmit the whole record without duplicating a prefix.
+    ///
+    /// This is the one place a JSON row's `wyrd_event_time` is stamped: every
+    /// row of the record gets this client's clock reading taken now, at emit,
+    /// so batching, linger, retry, and flush delay never move it. A row whose
+    /// own JSON carries `wyrd_event_time` keeps that value instead.
     ///
     /// # Errors
     /// Returns [`WyrdQueueError::QueueFull`] when the pool has closed or the
@@ -210,8 +215,9 @@ impl WriterPool {
         card_ref: Option<CardRef>,
         run_id: Option<RunId>,
     ) -> Result<(), WyrdQueueError> {
+        let event_time_micros = chrono::Utc::now().timestamp_micros();
         self.producer_for(table, schema)?
-            .enqueue_rows(rows, card_ref, run_id)
+            .enqueue_rows(rows, card_ref, run_id, event_time_micros)
     }
 
     /// Enqueue one owned Arrow batch for `table` without awaiting publication.

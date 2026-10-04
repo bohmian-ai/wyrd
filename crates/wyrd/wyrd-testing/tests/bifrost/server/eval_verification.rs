@@ -629,8 +629,9 @@ async fn record_id(
 /// cross-tenant URI each settle `errored` with `eval_execution_failed`, no
 /// result, no dispatch, and no provider request.
 ///
-/// The matrix records are received one day after the SDK authors their
-/// `created_at`, so each run must read its record by the frozen managed day.
+/// The matrix records are received one day ahead of the SDK's clock, yet each
+/// run freezes and reads its record by the client emit time the SDK stamped
+/// as `wyrd_event_time`, never by the receipt day.
 ///
 /// # Errors
 /// Returns server, registration, query, or fixture errors, or a description of
@@ -671,8 +672,8 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
         .await;
 
     // The matrix records are received one day ahead of the SDK's own clock,
-    // so each row's client `created_at` and managed `wyrd_event_time` fall on
-    // different UTC days and only a read by the frozen managed day finds it.
+    // so a receipt-stamped `wyrd_event_time` would land on the next UTC day;
+    // the SDK's emit-time stamp must win.
     let scribe = server.bifrost_scribe().ok_or("the server owns no Scribe")?;
     scribe.shift_receipt_clock_for_test(DAY);
     let state = start_state(&bundle, &client).await;
@@ -702,6 +703,7 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
         .await?;
     let oversized = media(&format!("file:///{oversized_object}"));
 
+    let emitted_from = chrono::Utc::now();
     emit(
         &agent,
         &json!({ "answer": "yes", "marker": "pass" }),
@@ -742,6 +744,7 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
         Some(&oversized),
         None,
     );
+    let emitted_to = chrono::Utc::now();
     state.shutdown().await?;
     scribe.shift_receipt_clock_for_test(Duration::ZERO);
     server.flush_bifrost().await?;
@@ -839,15 +842,22 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
         )
         .into());
     }
-    // The exact row reads back by the frozen managed day, and its authored
-    // `created_at` lies on another UTC day.
+    // The run froze the SDK's emit-time stamp, not the receipt a day ahead.
+    if !(emitted_from..=emitted_to).contains(&gated_pass.event_time) {
+        return Err(format!(
+            "the run froze {} outside the emit window [{emitted_from}, {emitted_to}]",
+            gated_pass.event_time
+        )
+        .into());
+    }
+    // The exact row reads back by the frozen managed day.
     let day = gated_pass.event_time.date_naive();
-    let created = texts(
+    let read = texts(
         &query(
             &server,
             tenant,
             format!(
-                "SELECT CAST(created_at AS BIGINT) FROM vala.eval.observations \
+                "SELECT record_id FROM vala.eval.observations \
                  WHERE record_id = '{pass}' \
                    AND wyrd_event_time >= '{}' AND wyrd_event_time < '{}'",
                 day.and_hms_opt(0, 0, 0)
@@ -864,17 +874,8 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
         )
         .await?,
     )?;
-    let [Some(created)] = created.as_slice() else {
-        return Err(format!("the frozen day read {created:?} for {pass}").into());
-    };
-    let created = chrono::DateTime::from_timestamp_micros(created.parse()?)
-        .ok_or("the created_at is out of range")?;
-    if created.date_naive() == day {
-        return Err(format!(
-            "created_at {created} shares the managed day of {}",
-            gated_pass.event_time
-        )
-        .into());
+    if read != [Some(pass.clone())] {
+        return Err(format!("the frozen day read {read:?} for {pass}").into());
     }
 
     // Redacted capture stores no `actual`.
@@ -1615,7 +1616,7 @@ async fn system_reads(
 ///
 /// Both spans land on today's receipt day, exported in reverse start order.
 /// A record received today reads them; a record committed five days ago
-/// (spans after its window) and one received three days ahead (spans before
+/// (spans after its window) and one stamped three days ahead (spans before
 /// its window) read none and time out awaiting their trace. A second
 /// in-window record over the same trace, scored by a restarted runtime,
 /// produces identical canonical items. Every input read before and after the
@@ -1661,8 +1662,8 @@ async fn continuous_eval_reads_ordered_bounded_trace_evidence() -> Result<(), Se
     let subject = state.run().for_card("traced")?.card_ref().clone();
     state.shutdown().await?;
     let past = uuid::Uuid::now_v7().to_string();
-    wyrd_testing::bifrost::write::RawIngest::connect(&journey.client)
-        .await?
+    let ingest = wyrd_testing::bifrost::write::RawIngest::connect(&journey.client).await?;
+    ingest
         .insert(
             OBSERVATIONS,
             uuid::Uuid::now_v7(),
@@ -1678,12 +1679,20 @@ async fn continuous_eval_reads_ordered_bounded_trace_evidence() -> Result<(), Se
         .server
         .bifrost_scribe()
         .ok_or("the server owns no Scribe")?;
+    // The SDK stamps its own clock, so the future record is a raw frame stamped
+    // three days ahead; the shifted receipt keeps it inside Scribe's window.
+    let future = uuid::Uuid::now_v7().to_string();
     scribe.shift_receipt_clock_for_test(3 * DAY);
-    journey
-        .emit(
-            "traced",
-            EVIDENCE_TRACE,
-            &[(json!({ "marker": "future" }), None)],
+    ingest
+        .insert(
+            OBSERVATIONS,
+            uuid::Uuid::now_v7(),
+            stamped_observation(
+                &subject,
+                &future,
+                EVIDENCE_TRACE,
+                chrono::Utc::now() + chrono::Duration::days(3),
+            ),
         )
         .await?;
     scribe.shift_receipt_clock_for_test(Duration::ZERO);
@@ -1691,7 +1700,6 @@ async fn continuous_eval_reads_ordered_bounded_trace_evidence() -> Result<(), Se
     let provider = MockServer::start().await;
     let runs = journey.run_to(&provider.uri(), 3).await?;
     let evidence = record_id(&journey.server, journey.tenant, "evidence-1").await?;
-    let future = record_id(&journey.server, journey.tenant, "future").await?;
     for record in [&past, &future] {
         let outside = run_of(&runs, "eval-trace-evidence", record)?;
         assert_unresulted(&journey.server, journey.tenant, outside, "timed_out").await?;

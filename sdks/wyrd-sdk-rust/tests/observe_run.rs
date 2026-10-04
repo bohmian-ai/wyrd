@@ -706,6 +706,137 @@ async fn scoped_run_emits_drift_eval_and_generic_rows() {
     server.shutdown().await.expect("test server shuts down");
 }
 
+/// One stored `wyrd_event_time`, as microseconds since the Unix epoch.
+#[derive(Debug, Deserialize)]
+struct EventTimeRow {
+    /// `CAST(wyrd_event_time AS BIGINT)` of one row.
+    event_time: i64,
+}
+
+/// The stored `wyrd_event_time` of every row `sql` selects, ordered by it.
+///
+/// # Panics
+/// Panics when the query fails.
+async fn event_times(client: &WyrdClient, sql: &str) -> Vec<i64> {
+    let rows: Vec<EventTimeRow> = Bifrost::query_only(client)
+        .sql_as(sql)
+        .await
+        .unwrap_or_else(|error| panic!("{sql} reads back: {error}"));
+    rows.into_iter().map(|row| row.event_time).collect()
+}
+
+/// Every observation stores the client clock reading of its emit call as
+/// `wyrd_event_time`, not the server's receipt instant, and a caller-supplied
+/// `wyrd_event_time` in a record row is stored unchanged.
+///
+/// Scribe's receipt clock runs one day ahead for the whole emit-to-ingest
+/// window, so a receipt stamp could never fall between the client readings
+/// taken just before and just after the emits.
+///
+/// # Panics
+/// Panics when any journey step or stored event time differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn observations_store_the_client_emit_time() {
+    let root = tempfile::tempdir().expect("fixture root creates");
+    let service = write_service_graph(root.path());
+    let bundle = root.path().join("bundle");
+    let server = Box::pin(WyrdTestServer::start_bound())
+        .await
+        .expect("test server starts");
+    let admin = machine_key(&server, "rust_event_time_admin", &["admin"]).await;
+    let dataset = format!("vala.datasets.event_time_{}", uuid::Uuid::now_v7().simple());
+    register_dataset_table(&connect(&server, &admin), &dataset).await;
+    let receipt = hydrate_bundle(&connect(&server, &admin), root.path(), &service, &bundle).await;
+    let credential = card_bound_key(&server, &receipt, &[]).await;
+    let state = WyrdState::from_path(&bundle).expect("complete bundle loads offline");
+    state
+        .start_bifrost_with_config(&connect(&server, &credential), None, QueueConfig::default())
+        .await
+        .expect("Bifrost starts");
+    let scribe = server.bifrost_scribe().expect("the server owns a Scribe");
+    let run = state.run();
+    let run_id = run.run_id().as_str().to_owned();
+    let model = run.for_card("model").expect("model view resolves");
+    let agent = run.for_card("agent").expect("agent view resolves");
+
+    scribe.shift_receipt_clock_for_test(std::time::Duration::from_hours(24));
+    let before = chrono::Utc::now().timestamp_micros();
+    model
+        .observe()
+        .drift(
+            &Features {
+                latency_ms: 12.5,
+                tier: "gold".to_owned(),
+            },
+            None,
+        )
+        .expect("drift emits");
+    agent
+        .observe()
+        .eval(
+            &serde_json::json!({ "answer": "yes" }),
+            EvalObservationOptions::default(),
+        )
+        .expect("eval emits");
+    agent
+        .observe()
+        .record(&dataset, &serde_json::json!({ "value": 1 }))
+        .await
+        .expect("record emits");
+    let after = chrono::Utc::now().timestamp_micros();
+    let supplied = chrono::DateTime::from_timestamp_micros(before - 3_600_000_000)
+        .expect("an hour ago is representable");
+    agent
+        .observe()
+        .record(
+            &dataset,
+            &serde_json::json!({
+                "value": 2,
+                "wyrd_event_time": supplied.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            }),
+        )
+        .await
+        .expect("a caller event time emits");
+    state.shutdown().await.expect("shutdown drains");
+    server.flush_bifrost().await.expect("flush server Scribe");
+    scribe.shift_receipt_clock_for_test(std::time::Duration::ZERO);
+
+    let reader = connect(&server, &admin);
+    let mut emitted = Vec::new();
+    for (table, filter) in [
+        ("vala.drift.observations", ""),
+        ("vala.eval.observations", ""),
+        (dataset.as_str(), " AND value = 1"),
+    ] {
+        let sql = format!(
+            "SELECT CAST(wyrd_event_time AS BIGINT) AS event_time FROM {table} \
+             WHERE run_id = '{run_id}'{filter}"
+        );
+        emitted.extend(event_times(&reader, &sql).await);
+    }
+    assert_eq!(emitted.len(), 4, "two Drift rows, one Eval, one record");
+    for time in &emitted {
+        assert!(
+            (before..=after).contains(time),
+            "stored {time} is the emit-time reading in [{before}, {after}], not receipt"
+        );
+    }
+    assert_eq!(
+        event_times(
+            &reader,
+            &format!(
+                "SELECT CAST(wyrd_event_time AS BIGINT) AS event_time FROM {dataset} \
+                 WHERE run_id = '{run_id}' AND value = 2"
+            ),
+        )
+        .await,
+        [supplied.timestamp_micros()],
+        "the caller's wyrd_event_time is stored, not overwritten"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// The one field of `POST /auth/issue-key`'s response this journey reads.
 #[derive(Deserialize)]
 struct IssuedKey {

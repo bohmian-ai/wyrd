@@ -2,10 +2,12 @@
 //!
 //! The Wyrd-native `DynamicBatchBuilder` analog, minus server-stamped column
 //! injection. The client batch carries **user columns plus the two per-row
-//! correlation columns `card_ref` and `run_id`** (both client-supplied); the
-//! server stamps the per-request system columns. Rows are appended as deferred
-//! `serde_json::Value` (parse-on-build) and driven through one typed Arrow
-//! builder per column at [`finish`](BatchBuilder::finish).
+//! correlation columns `card_ref` and `run_id`** (both client-supplied), then
+//! the writer-owned `wyrd_event_time` when the rows carry one; the server
+//! stamps the per-request system columns and, for rows without an event time,
+//! the receipt instant. Rows are appended as deferred `serde_json::Value`
+//! (parse-on-build) and driven through one typed Arrow builder per column at
+//! [`finish`](BatchBuilder::finish).
 
 use std::sync::Arc;
 
@@ -20,6 +22,7 @@ use serde_json::{Map, Value};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::BifrostTableDescription;
 use wyrd_spec::vala::ids::RunId;
+use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 use crate::error::WyrdQueueError;
 
@@ -36,10 +39,18 @@ pub fn is_reserved_column(name: &str) -> bool {
     name.starts_with(RESERVED_PREFIX) || name == CARD_REF_COLUMN || name == RUN_ID_COLUMN
 }
 
+/// One appended row: its user payload, correlation, and event time.
 struct BuiltRow {
+    /// The user columns, without the reserved event-time key.
     obj: Map<String, Value>,
+    /// The serialized Card correlation, or `None` for an uncorrelated row.
     card_ref: Option<String>,
+    /// The run correlation, or `None` when the row belongs to no run.
     run_id: Option<String>,
+    /// Microseconds since the Unix epoch, UTC: the payload's own
+    /// `wyrd_event_time` when it carries one, else the writer's stamp, else
+    /// `None` so the server stamps its receipt instant.
+    event_time: Option<i64>,
 }
 
 /// Accumulates JSON rows against a resolved user-only Arrow schema and seals them
@@ -61,11 +72,11 @@ impl BatchBuilder {
 
     /// Construct a builder from one describe response.
     ///
-    /// Only `user_fields` become builder columns: the correlation columns are
-    /// appended once by [`Self::output_schema`], and the managed candidates are
-    /// omitted because this JSON-row API takes no timestamp argument and lets
-    /// the server stamp event time. Passing the described correlation fields in
-    /// here as well would send each of them twice.
+    /// Only `user_fields` become builder columns: the correlation columns and
+    /// the `wyrd_event_time` managed candidate are appended once by
+    /// [`Self::output_schema`], the latter only when the rows carry an event
+    /// time. Passing the described correlation fields in here as well would
+    /// send each of them twice.
     ///
     /// # Errors
     ///
@@ -102,25 +113,74 @@ impl BatchBuilder {
     ///
     /// `card_ref` is optional: Card correlation is an optional property of a
     /// row, so `None` is sent as a null correlation value and the server stores
-    /// the row under its authenticated principal with no `card_uid`.
+    /// the row under its authenticated principal with no `card_uid`. The row's
+    /// event time is its own `wyrd_event_time` key when present; otherwise the
+    /// server stamps its receipt instant.
     ///
     /// # Errors
-    /// - [`WyrdQueueError::SchemaParse`] if `json` is not a JSON object.
-    /// - [`WyrdQueueError::ReservedColumn`] if the row carries a `wyrd_*` key or a
-    ///   `card_ref`/`run_id` key (those are supplied via the arguments, never the
-    ///   payload).
+    /// As [`Self::append_stamped_json_row`].
     pub fn append_json_row(
         &mut self,
         json: &str,
         card_ref: Option<&CardRef>,
         run_id: Option<&RunId>,
     ) -> Result<(), WyrdQueueError> {
+        self.append_row(json, card_ref, run_id, None)
+    }
+
+    /// Append one serialized JSON row whose writer stamped its event time.
+    ///
+    /// `event_time_micros` (microseconds since the Unix epoch, UTC) becomes the
+    /// row's `wyrd_event_time` unless the payload carries its own
+    /// `wyrd_event_time`, which is kept rather than overwritten. Correlation is
+    /// as [`Self::append_json_row`].
+    ///
+    /// # Errors
+    /// - [`WyrdQueueError::SchemaParse`] if `json` is not a JSON object, or its
+    ///   `wyrd_event_time` is not an RFC 3339 timestamp string.
+    /// - [`WyrdQueueError::ReservedColumn`] if the row carries any other
+    ///   `wyrd_*` key or a `card_ref`/`run_id` key (those are supplied via the
+    ///   arguments, never the payload).
+    pub fn append_stamped_json_row(
+        &mut self,
+        json: &str,
+        card_ref: Option<&CardRef>,
+        run_id: Option<&RunId>,
+        event_time_micros: i64,
+    ) -> Result<(), WyrdQueueError> {
+        self.append_row(json, card_ref, run_id, Some(event_time_micros))
+    }
+
+    /// Parse one row, take its own event time out of the payload, and buffer it.
+    ///
+    /// A payload `wyrd_event_time` (a non-null RFC 3339 string) wins over
+    /// `stamp`; a null one is treated as absent.
+    ///
+    /// # Errors
+    /// As [`Self::append_stamped_json_row`].
+    fn append_row(
+        &mut self,
+        json: &str,
+        card_ref: Option<&CardRef>,
+        run_id: Option<&RunId>,
+        stamp: Option<i64>,
+    ) -> Result<(), WyrdQueueError> {
         let value: Value = serde_json::from_str(json)
             .map_err(|e| WyrdQueueError::SchemaParse(format!("row is not valid JSON: {e}")))?;
-        let Value::Object(obj) = value else {
+        let Value::Object(mut obj) = value else {
             return Err(WyrdQueueError::SchemaParse(
                 "row is not a JSON object".to_owned(),
             ));
+        };
+        let event_time = match obj.remove(WYRD_EVENT_TIME) {
+            None | Some(Value::Null) => stamp,
+            Some(value) => Some(value.as_str().and_then(parse_rfc3339_micros).ok_or_else(
+                || {
+                    WyrdQueueError::SchemaParse(format!(
+                        "payload `{WYRD_EVENT_TIME}` is not an RFC 3339 timestamp"
+                    ))
+                },
+            )?),
         };
         for key in obj.keys() {
             if is_reserved_column(key) {
@@ -133,19 +193,28 @@ impl BatchBuilder {
             obj,
             card_ref: card_ref.map(ToString::to_string),
             run_id: run_id.map(|r| r.as_str().to_owned()),
+            event_time,
         });
         Ok(())
     }
 
+    /// Whether the sealed batch carries `wyrd_event_time`: any row has one.
+    fn carries_event_time(&self) -> bool {
+        self.rows.iter().any(|row| row.event_time.is_some())
+    }
+
     /// Drive one typed Arrow builder per user column plus the two reserved
-    /// correlation columns, producing one `RecordBatch`.
+    /// correlation columns and, when the rows carry one, the non-null
+    /// `wyrd_event_time: Timestamp(Microsecond, UTC)` column, producing one
+    /// `RecordBatch`.
     ///
     /// # Errors
     /// [`WyrdQueueError::SchemaParse`] when a value's JSON shape does not match its
-    /// column's type, a null/absent value lands on a non-nullable column, or a
-    /// column type is unsupported by the builder.
+    /// column's type, a null/absent value lands on a non-nullable column, a
+    /// column type is unsupported by the builder, or some rows carry an event
+    /// time and others do not.
     pub fn finish(&self) -> Result<RecordBatch, WyrdQueueError> {
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len() + 2);
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len() + 3);
         for field in self.schema.fields() {
             columns.push(build_column(field, &self.rows)?);
         }
@@ -157,6 +226,19 @@ impl BatchBuilder {
         columns.push(Arc::new(StringArray::from_iter(
             self.rows.iter().map(|r| r.run_id.clone()),
         )));
+        if self.carries_event_time() {
+            let mut event_times = Vec::with_capacity(self.rows.len());
+            for (idx, row) in self.rows.iter().enumerate() {
+                event_times.push(row.event_time.ok_or_else(|| {
+                    WyrdQueueError::SchemaParse(format!(
+                        "row {idx} has no `{WYRD_EVENT_TIME}` while other rows of the batch do"
+                    ))
+                })?);
+            }
+            columns.push(Arc::new(
+                TimestampMicrosecondArray::from(event_times).with_timezone("UTC"),
+            ));
+        }
 
         let batch = RecordBatch::try_new(self.output_schema(), columns).map_err(|e| {
             WyrdQueueError::SchemaParse(format!("record batch assembly failed: {e}"))
@@ -164,7 +246,8 @@ impl BatchBuilder {
         Ok(batch)
     }
 
-    /// The sealed batch schema: user fields followed by the two correlation columns.
+    /// The sealed batch schema: user fields followed by the two correlation
+    /// columns, then `wyrd_event_time` when any buffered row carries one.
     #[must_use]
     pub fn output_schema(&self) -> SchemaRef {
         let mut fields: Vec<Field> = self
@@ -175,6 +258,13 @@ impl BatchBuilder {
             .collect();
         fields.push(Field::new(CARD_REF_COLUMN, DataType::Utf8, true));
         fields.push(Field::new(RUN_ID_COLUMN, DataType::Utf8, true));
+        if self.carries_event_time() {
+            fields.push(Field::new(
+                WYRD_EVENT_TIME,
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ));
+        }
         Arc::new(Schema::new(fields))
     }
 
@@ -568,6 +658,62 @@ mod batch_builder_tests {
             .append_json_row(r#"{"id": 1, "wyrd_ts": 1}"#, Some(&card("alpha")), None)
             .unwrap_err();
         assert_eq!(err.code(), "WYRD_VALA_400_BIFROST_RESERVED_COLUMN");
+    }
+
+    /// A writer's stamp becomes the non-null `Timestamp(Microsecond, UTC)`
+    /// `wyrd_event_time` column after correlation, a payload event time wins
+    /// over the stamp, and a batch mixing timed and untimed rows is refused.
+    #[test]
+    fn stamped_rows_carry_event_time_and_keep_a_payload_value() {
+        use arrow::array::TimestampMicrosecondArray;
+
+        let mut builder = BatchBuilder::new(user_schema());
+        builder
+            .append_stamped_json_row(r#"{"id": 1}"#, None, None, 1_000)
+            .expect("stamped row appends");
+        builder
+            .append_stamped_json_row(
+                r#"{"id": 2, "wyrd_event_time": "1970-01-01T00:00:00.000002Z"}"#,
+                None,
+                None,
+                1_000,
+            )
+            .expect("a payload event time is admitted");
+        let batch = builder.finish().expect("finish");
+        let field = batch.schema().field(4).clone();
+        assert_eq!(field.name(), "wyrd_event_time");
+        assert_eq!(
+            field.data_type(),
+            &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(!field.is_nullable());
+        let times = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("timestamp");
+        assert_eq!(
+            times.values().as_ref(),
+            [1_000, 2],
+            "the payload value wins"
+        );
+
+        let mut mixed = BatchBuilder::new(user_schema());
+        mixed
+            .append_stamped_json_row(r#"{"id": 1}"#, None, None, 1_000)
+            .expect("stamped row appends");
+        mixed
+            .append_json_row(r#"{"id": 2}"#, None, None)
+            .expect("untimed row appends");
+        assert_eq!(
+            mixed.finish().unwrap_err().code(),
+            "WYRD_VALA_400_SCHEMA_PARSE"
+        );
+
+        let err = BatchBuilder::new(user_schema())
+            .append_json_row(r#"{"id": 1, "wyrd_event_time": 5}"#, None, None)
+            .unwrap_err();
+        assert_eq!(err.code(), "WYRD_VALA_400_SCHEMA_PARSE");
     }
 
     #[test]

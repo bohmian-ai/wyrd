@@ -157,3 +157,16 @@ code-generation check to confirm the specification-only example edits do not
 alter generated contracts. Do not add a new test or repository check: existing
 type checking, format/lint lanes, focused owner/journey tests, and direct source
 review are the appropriate proof.
+
+## Implementation evidence
+
+Commits: `2dc630dfa`, `946a68633`, `3ef4700a3`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-004-15` | `spec.md` security, correctness, and final-reviewer Prompt snippets use `request.provider: open_ai_chat_completion` with the unchanged native request under `request.body`; the lead-in sentence names the envelope | Source comparison with `examples/workflows/code-review/prompts/*.yaml` and `crates/wyrd-spec/schemas/prompt_spec.json`; `mise run codegen:check` | PASS |
+| `FIND-TASK-004-16` | Module-level imports and bare names at every cited interface in `workflow/{host,runs}.rs`, `query/collect.rs`, `state.rs`, `tests/pg_workflow_runs.rs`, `wyrd-testing/src/{server,bifrost/cluster}.rs`, `wyrd-testing/tests/bifrost/oracle/{peer_cluster,workflow}.rs`; one alias, `TokioInstant`, for the real collision with `std::time::Instant`; test-support-only imports are gated by the same `cfg` as their users | `mise run fmt`; `mise run lints` (includes the non-test-support `wyrd-server` bin lane); `WYRD_TEST_PACKAGES=wyrd-server mise run test:wyrd` (683 passed); `mise run test:bifrost:journey:oracle` (43 passed) | PASS |
+| `FIND-TASK-004-17` | TASK-004 `spec_revision: 13` and `[Approved Revision 13]` link; R1 remediation `spec_revision: 13` plus one note that Revision 13 extended it after the r1 review; the R1 historical "revision 12" input and every r1 review report unchanged | Source review of the revision chain | PASS |
+| `FIND-TASK-004-18` | `AnalyticalGraphLifecycle` rustdoc: `reserve` returns grant streams held until `settle`, dropping them is the leader-side release, followers settle asynchronously and the leader never waits; `transports` documented as reservation/admission only; stale "retained release" wording removed | Source review against `AnalyticalParticipantGrants`, `ParticipantGrant`, `AnalyticalGraphLifecycle::settle`; `mise run lints` | PASS |
+
+Non-goals held: no runtime, wire, schema, or test-assertion change; no new check, setting, option, dependency, fixture, parser, or release protocol; `git diff --check` clean.

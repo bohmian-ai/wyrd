@@ -1,6 +1,6 @@
 ---
 id: SPEC-forge-concurrent-planning
-revision: 10
+revision: 11
 status: approved
 ---
 
@@ -314,16 +314,19 @@ the cut. Promotion and non-destructive catalog movement may continue. Forge
 may expire every replaced, otherwise-unreferenced snapshot at the next
 maintenance opportunity after the final active table read is released. Normal
 terminal settlement releases the rows only after every local and analytical
-descendant has stopped. An abandoned row remains protective until the query's
-already-existing total expiration. Because Oracle derives the execution class
-after acquiring the cut, PostgreSQL uses the existing six-hour analytical
-total expiration as the conservative abandonment lifetime for either possible
-class and evaluates it from `statement_timestamp()`. Forge may discard an
-abandoned row only after its exact Oracle node fence is no longer live and that
-expiration has passed. A row owned by a live Oracle never expires underneath
-its query. This stale-row cleanup does not change either class's runtime. It
-adds no retention-derived query limit, query-capacity preallocation, reader
-epoch, ancestry frontier, or IO gate.
+descendant has stopped. A query owner dropped without terminal settlement
+releases its rows when it is dropped: a dropped leader has no consumer, so no
+result can depend on a descendant that is still stopping. A row left behind by
+a crashed Oracle remains protective until the query's own deadline. Oracle
+binds the query's remaining deadline duration at acquisition and PostgreSQL
+derives each row's expiry from `statement_timestamp()`; explicit deadlines
+stay uncapped. Forge discards a row once PostgreSQL time passes that expiry.
+No Oracle fence liveness, fixed abandonment lifetime, or definer participates
+in that decision, because no query may legitimately run past its deadline.
+This stale-row cleanup does not change either class's runtime. It adds no
+retention-derived query limit, query-capacity preallocation, reader epoch,
+ancestry frontier, or IO gate. A per-query PostgreSQL session or advisory lock
+is not used: it would pin one connection for each running query.
 
 The configured default query deadline has one runtime source: the resolved
 Oracle configuration composed at server boot. Local Oracle entry and the
@@ -444,8 +447,9 @@ not add a Bloom filter for that column or promise pruning when ranges overlap.
   with fewer serial database steps than the current path. Separate evidence
   proves cross-tenant denial, exact hot/Iceberg results while publication and
   rewrite continue, refusal of destructive cleanup while held, immediate
-  eligibility after terminal release, and safe abandoned-row expiry after the
-  query's existing total expiration. Statement and step counts are asserted;
+  eligibility after terminal release, release when a query owner is dropped,
+  and abandoned-row expiry exactly once PostgreSQL time passes the query's
+  own deadline. Statement and step counts are asserted;
   no elapsed-time threshold is asserted here. A non-default configured query
   deadline is also observed identically through local and forwarded entry when
   the request omits an explicit deadline, without imposing a maximum.
@@ -489,6 +493,12 @@ handling and maintenance behavior follow the pinned RisingWave Iceberg sources.
 
 ## Revision history and authority
 
+- Revision 11 (2026-10-04, explicitly approved by the human owner): a dropped
+  query owner releases its active reads; an abandoned row expires at its own
+  query deadline in PostgreSQL time instead of after Oracle fence death plus
+  the six-hour analytical total expiration. The fence-liveness definer is
+  removed. A per-query advisory lock was rejected because it pins one
+  PostgreSQL connection per running query.
 - Revision 10 (2026-10-04, explicitly approved by the human owner): make the
   resolved Oracle runtime configuration the single default-deadline source for
   local and forwarded entry; require the held-query proof to track the exact

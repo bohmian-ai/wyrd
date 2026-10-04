@@ -39,8 +39,8 @@ Implementation must satisfy that reference; it is not optional guidance.
 - `vala-sql` owns the tenant-scoped active table-read rows and the atomic cut
   acquisition/release operations. There is exactly one durable row for each
   active query/table pair. It carries the existing durable query identity,
-  table identity, exact Oracle node fence, and PostgreSQL-computed abandonment
-  time. It carries no snapshot ancestry, reader epoch, revision state machine,
+  table identity, exact Oracle node fence, and PostgreSQL-computed expiry at
+  the query's own deadline. It carries no snapshot ancestry, reader epoch, revision state machine,
   capacity slot, or preallocated frontier.
 - `TenantConn` RLS is the tenant boundary for Bifrost registration, hot rows,
   and active reads. Do not duplicate tenant predicates on those tables. The
@@ -61,15 +61,13 @@ Implementation must satisfy that reference; it is not optional guidance.
   cancellation, and terminal settlement may move the owner but cannot extract
   a usable cut from it or detach its claim.
 - Normal terminal settlement releases active reads only after local work and
-  every analytical descendant have stopped. An unexpected drop performs no
-  blocking cleanup and leaves the durable rows protective until the query's
-  existing total expiration. Query class is derived after cut acquisition, so
-  PostgreSQL uses the existing six-hour analytical total expiration as the
-  conservative abandonment lifetime for either possible class and evaluates
-  it from `statement_timestamp()`. Forge can discard the row only after the
-  exact Oracle node fence is no longer live and that expiration has passed. A
-  live owner's row never expires underneath it. This does not change either
-  class's runtime; no Rust wall clock authorizes cleanup.
+  every analytical descendant have stopped. A dropped owner spawns a
+  non-blocking release of its rows (spec revision 11). A crashed owner's rows
+  stay protective until the query's own deadline: Oracle binds the remaining
+  deadline duration at acquisition and PostgreSQL derives the expiry from
+  `statement_timestamp()`. Forge discards a row once PostgreSQL time passes it;
+  no fence liveness participates. This does not change either class's
+  runtime; no Rust wall clock authorizes cleanup.
 - Forge owns destructive maintenance. Snapshot expiration and object cleanup
   take the existing table maintenance authority and refuse while an active
   read exists. Promotion and non-destructive catalog commits may proceed.
@@ -107,8 +105,7 @@ Implementation must satisfy that reference; it is not optional guidance.
 2. Make the tenant-scoped cut acquisition statement serialize with destructive
    maintenance, read all pointers and hot candidates, and commit active reads
    before returning any cut identity. Add idempotent terminal release and
-   PostgreSQL-time abandonment handling using the existing six-hour analytical
-   expiration because class selection follows cut acquisition.
+   PostgreSQL-time expiry at the query's own deadline.
 3. Carry the cut and its active-read ownership as one private Oracle value from
    acquisition through complete local or analytical settlement. Remove the IO
    permit, gated storage wrapper, pointer revalidation loop, epoch lifecycle,
@@ -151,10 +148,10 @@ scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner &&
 
 **GREEN.** Replace the unshipped reader schema and SQL owner with the single
 active-read relation and atomic acquisition/release behavior. PostgreSQL sets
-and evaluates the abandonment time from its own `statement_timestamp()` and
-the existing analytical total expiration. An abandoned claim is removable
-only when its exact Oracle fence is no longer live and the expiration has
-passed. The caller retains transaction ownership.
+and evaluates the expiry from its own `statement_timestamp()` plus the
+query's bound remaining deadline. A claim is removable once PostgreSQL time
+passes that expiry, whatever its Oracle fence state. The caller retains
+transaction ownership.
 
 **REFACTOR.** Delete epoch, frontier, ancestry, and reclamation code once the
 focused SQL test remains green. Keep one concrete SQL owner and reuse existing
@@ -165,9 +162,8 @@ row/domain types where they fit.
 **Behavior.** Oracle receives an opaque cut-and-claim owner. Every local scan,
 analytical graph, returned stream, cancellation path, first-batch failure, and
 terminal frame retains that owner until all descendants have settled. Normal
-terminal completion releases its active rows exactly once. An unexpected drop
-leaves the durable rows for PostgreSQL-time abandonment rather than risking an
-early release.
+terminal completion releases its active rows exactly once. A dropped owner
+releases its rows without blocking the drop.
 
 **RED.** Add
 `distributed::held_cut_owns_active_reads_until_all_descendants_settle` to the
@@ -181,12 +177,11 @@ scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner &&
 
 **GREEN.** Make the private Oracle ownership graph carry one inseparable
 cut-and-claim value through execution and terminal settlement. Release only
-after the existing local and distributed join points. Preserve a dropped or
-crashed owner's rows until their database abandonment time.
+after the existing local and distributed join points. A dropped owner spawns
+its release; only a crashed owner's rows wait for their deadline expiry.
 
 **REFACTOR.** Collapse redundant terminal wrappers after the opaque owner is
-the only way to retain a readable cut. Do not add an IO authorization layer or
-an async `Drop` workaround.
+the only way to retain a readable cut. Do not add an IO authorization layer.
 
 ### Scenario 3 — Forge deletes after the last reader, without an age wait
 
@@ -359,10 +354,9 @@ Add no TTL, archive, periodic scan, or second garbage collector.
   construction through terminal settlement. No production API returns or
   retains the cut independently.
 - Normal success, cancellation, timeout, and failure release claims after all
-  local and analytical readers stop. Unexpected loss remains protected until
-  the owning Oracle fence is no longer live and the existing analytical total
-  expiration has passed according to PostgreSQL. A live owner's row does not
-  expire.
+  local and analytical readers stop. A dropped owner releases its claims.
+  A crashed owner's claims expire once PostgreSQL time passes the query's own
+  deadline (spec revision 11).
 - Forge refuses expiration and object cleanup while a table has an active
   reader, then treats replaced snapshots as eligible without an age wait after
   the final reader releases. Every other real protection root remains.
@@ -470,7 +464,7 @@ The completion report must include:
 
 ## Authority Links
 
-- `changes/active/forge-concurrent-planning/spec.md` revision 10
+- `changes/active/forge-concurrent-planning/spec.md` revision 11
 - `changes/active/forge-concurrent-planning/revision/TASK-005-R1-implementation-reference.md`
 - `AGENTS.md`
 - `architecture/agent-rules.md`

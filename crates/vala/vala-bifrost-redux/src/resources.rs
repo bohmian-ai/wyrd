@@ -1221,6 +1221,15 @@ pub struct ScribeResources {
 }
 
 impl ScribeResources {
+    /// Returns the pod's effective CPU count from its checked resource plan.
+    ///
+    /// Persistence sizes its claim-merge lane by it, so concurrent merges never
+    /// ask for more threads than the pod's CPU quota grants.
+    #[must_use]
+    pub(crate) fn effective_cpu(&self) -> usize {
+        self.governor.plan().effective_cpu
+    }
+
     /// Builds an isolated Scribe capability over a production-floor test root.
     ///
     /// Writer and assembly tests charge their materialized buffers against it.

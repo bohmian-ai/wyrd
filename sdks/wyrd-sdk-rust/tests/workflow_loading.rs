@@ -24,6 +24,8 @@
 //!    nothing, and runs the registered Workflow through the gateway.
 
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -463,11 +465,8 @@ fn review_gateway_config(upstream: &MockServer) -> tempfile::TempDir {
     let secret = home.path().join("review-secret");
     std::fs::write(&secret, REVIEW_SECRET).expect("secret writes");
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600))
-            .expect("secret restricts");
-    }
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600))
+        .expect("secret restricts");
     std::fs::write(
         home.path().join("config.toml"),
         format!(

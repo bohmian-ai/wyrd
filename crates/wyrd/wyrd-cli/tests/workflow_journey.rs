@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead as _, BufReader, Read as _};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -146,11 +148,8 @@ fn configure_binding(config_home: &Path, origin: &str, protocol: &str) {
     let secret = config_home.join("review-secret");
     std::fs::write(&secret, SECRET).expect("secret writes");
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600))
-            .expect("secret restricts");
-    }
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600))
+        .expect("secret restricts");
     std::fs::write(
         config_home.join("config.toml"),
         format!(
@@ -194,9 +193,11 @@ fn chat_completion(text: &str) -> Value {
 /// effect, and local runs print the portable run snapshot.
 ///
 /// Malformed, mixed, or incomplete selectors, both inputs, non-object input,
-/// a file source on the server, `--detach` locally, `--server` with a file,
-/// and a malformed run ID all fail with exit code 64; the ones that parse
-/// carry `WYRD_CLI_400_INVALID_ARGUMENT`, which proves no client was built.
+/// a file source on the server, `--detach` locally, the `--server` option
+/// these commands do not take, and a malformed run ID all fail with exit code
+/// 64; the ones that parse carry `WYRD_CLI_400_INVALID_ARGUMENT`, which proves
+/// no client was built. An invalid execution choice is refused before a
+/// missing `--input-file` is read.
 /// The actual code-review bundle then runs on a local `ext_gateway` binding
 /// whose secret is read from a file at run time and never printed; a
 /// Native mock Workflow renders named outputs and, only with `--steps`, its
@@ -253,11 +254,36 @@ async fn workflow_cli_contract() {
         );
     }
 
-    let invalid: [(&[&str], &str); 7] = [
+    let missing_input = home.join("missing-input.json");
+    let missing_input = missing_input.to_str().expect("utf-8 temp path");
+    let invalid: [(&[&str], &str); 9] = [
         (&["run", "--file", local, "--input", "[1]"], "input"),
         (&["run", "--file", local, "--input", "{not json"], "input"),
         (&["run", "--file", local, "--execution", "server"], "file"),
         (&["run", "--file", local, "--detach"], "detach"),
+        (
+            &[
+                "run",
+                "--file",
+                local,
+                "--execution",
+                "server",
+                "--input-file",
+                missing_input,
+            ],
+            "file",
+        ),
+        (
+            &[
+                "run",
+                "--file",
+                local,
+                "--detach",
+                "--input-file",
+                missing_input,
+            ],
+            "detach",
+        ),
         (&["run", "--uid", "not-a-uid"], "uid"),
         (&["status", "not-a-run"], "run-id"),
         (&["cancel", "not-a-run"], "run-id"),

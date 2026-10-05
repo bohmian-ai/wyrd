@@ -9,6 +9,21 @@ Answer one question: does the resulting repository satisfy the original task
 exactly? This is an acceptance audit, not an opportunity to improve, redesign,
 or refactor the implementation.
 
+Audit the task against stronger repository and specification authority before
+treating its prescribed mechanics as acceptance criteria. Independently compare
+new or materially changed graph stores, traversals, loaders, parsers,
+transports, validators, lifecycle owners, caches, and orchestration with existing
+owners and callers. Record the existing alternative, missing behavior, and
+why extension is or is not sufficient. A meaningful dependency-owning struct
+may still duplicate an existing workflow; task compliance and leaf-call reuse
+cannot waive that violation. Use the existing maintainer and implementation
+reviewers, not an additional reviewer role or symbol allowlist.
+
+An invalid private task instruction routes to task correction through
+`$wyrd-plan`; a material behavior or boundary change returns
+`SPEC_REVISION_REQUIRED`. Do not strengthen replacement machinery merely
+because the task prescribed it.
+
 Keep the reviewed source immutable. Review the complete base-to-candidate range,
 not the implementation summary or only the latest fix diff. After remediation,
 include the original task, prior verdict and findings, remediation task, and

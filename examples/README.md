@@ -5,3 +5,6 @@ points without searching crate internals.
 
 - `examples/python/` contains Python examples.
 - `examples/rust/` contains Rust examples.
+- `examples/workflows/` contains language-neutral Workflow Card bundles; the
+  `code-review/` bundle is the canonical multi-file Workflow, Agent, and Prompt
+  Card example.

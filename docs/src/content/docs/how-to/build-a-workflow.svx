@@ -39,8 +39,12 @@ You can also author the same workflow as YAML and load it back:
 
 ```python
 from wyrd import Workflow
-wf = Workflow.load("research.yaml")
+wf = Workflow.from_path("research.yaml")
 ```
+
+`Workflow.from_path` loads local Agent and Prompt files next to the Workflow
+without a server. Steps that reference registered Agents, as this file does,
+are read from the Wyrd server using your configured credentials.
 
 ## Run
 
@@ -57,7 +61,7 @@ Mapping input supplies declared inputs by name; undeclared keys and values of th
 
 ```python
 wf.save("research.yaml")
-loaded = Workflow.load("research.yaml")
+loaded = Workflow.from_path("research.yaml")
 assert Workflow.from_yaml(wf.to_yaml()).to_yaml() == wf.to_yaml()
 ```
 

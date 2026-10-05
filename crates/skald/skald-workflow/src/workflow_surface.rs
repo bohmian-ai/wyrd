@@ -380,6 +380,10 @@ impl Workflow {
     /// `Sibling` is accepted here because the loader and registration engine
     /// have already established its exact identity. The resolver owns the
     /// durable-card lookup; this crate performs no filesystem or network IO.
+    /// A referenced step without a resolver, or an unresolved `Path`, stays
+    /// unhydrated and fails [`Self::validate`] and every run.
+    /// [`Self::from_card_bodies`] supplies already-fetched exact bodies
+    /// through this seam.
     ///
     /// # Errors
     /// Returns Workflow contract validation errors, or prompt, tool, or agent
@@ -444,7 +448,13 @@ impl Workflow {
         serde_yaml::to_string(&card).map_err(|error| WorkflowCardError::yaml(&error).into())
     }
 
-    /// Parse a workflow from canonical envelope YAML.
+    /// Parse a workflow from one canonical wire-form envelope YAML document.
+    ///
+    /// This parses a single document only: inline Agent steps hydrate, but
+    /// local `path` dependencies, sibling bundles, and Card
+    /// references are not resolved here. Load a bundle or a registered
+    /// Workflow through the shared client, which feeds
+    /// [`Self::from_card_bodies`].
     ///
     /// # Errors
     /// Returns parse, prompt resolution, or agent resolution errors.
@@ -477,7 +487,10 @@ impl Workflow {
         Ok(())
     }
 
-    /// Load this workflow from a YAML envelope on disk.
+    /// Load this workflow from one wire-form YAML envelope on disk.
+    ///
+    /// Same single-document role as [`Self::from_yaml_str`]; it does not
+    /// resolve dependency paths or Card references.
     ///
     /// # Errors
     /// Returns IO, parse, prompt resolution, or agent resolution errors.

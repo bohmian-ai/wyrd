@@ -31,6 +31,7 @@
 #![deny(missing_docs)]
 
 mod attempt;
+mod bodies;
 pub mod error;
 mod output;
 mod plan;
@@ -43,6 +44,7 @@ mod test_support;
 pub mod workflow;
 pub mod workflow_surface;
 
+pub use bodies::{CardBodies, card_body_dependencies};
 pub use error::{WorkflowError, WorkflowResult};
 pub use plan::DEFAULT_MAX_RETRIES;
 pub use route::{

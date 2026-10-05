@@ -3111,6 +3111,24 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A registered Workflow was requested with a malformed Card reference.
+    ///
+    /// Returned by the SDK `cards.workflow.load` calls before any registry
+    /// read, when the caller passes neither `uid` alone nor `space`, `name`,
+    /// and an exact `version`, or one of those fields is malformed.
+    #[error("[WYRD_WORKFLOW_400_INVALID_CARD_REF] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_400_INVALID_CARD_REF",
+        status = 400,
+        title = "Invalid Workflow Card reference",
+        remediation = "Pass either uid alone, or space, name, and an exact version of a registered Workflow."
+    )]
+    WorkflowInvalidCardRef {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload naming the offending `field`.
+        details: serde_json::Value,
+    },
     /// WorkflowCard save or envelope projection is missing a name.
     #[error("[WYRD_WORKFLOW_422_MISSING_NAME] {message}")]
     #[wyrd_error(
@@ -3850,6 +3868,7 @@ impl WyrdError {
             | Self::AgentCallbackAborted { message, details }
             | Self::AgentLoopMessageType { message, details }
             | Self::WorkflowValidation { message, details }
+            | Self::WorkflowInvalidCardRef { message, details }
             | Self::WorkflowMissingName { message, details }
             | Self::WorkflowMissingVersion { message, details }
             | Self::WorkflowDuplicateStepId { message, details }

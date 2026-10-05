@@ -469,22 +469,42 @@ impl PyWorkflow {
         Ok(self.inner.save(path)?)
     }
 
-    /// Load a workflow from disk.
+    /// Load an authored Workflow file and the Cards it references.
+    ///
+    /// Relative paths and loaded sibling Agents and Prompts resolve locally
+    /// through the shared loader; a wholly local file needs no server or
+    /// credentials. External Card refs are read exactly through the ambient
+    /// Wyrd client configuration. The GIL is released while the shared Wyrd
+    /// runtime drives loading.
+    ///
+    /// Loading only reads files and Cards; it registers and runs nothing. It
+    /// blocks until loading finishes, and a failure after some reads returns
+    /// no partial Workflow and writes nothing durable.
     ///
     /// Args:
-    ///     path (str): Filesystem path.
+    ///     path (str | os.PathLike[str]): Workflow entry file.
     ///
     /// Returns:
-    ///     Workflow: Reconstructed workflow with eager inline agent resolution.
+    ///     Workflow: Fully hydrated and validated workflow.
     ///
     /// Raises:
-    ///     `WyrdError`: When IO, codec, or resolution fails.
+    ///     `WyrdError`: `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when the file
+    ///         fails to load; `WYRD_CLIENT_401_NO_CREDENTIALS` when a
+    ///         registry ref needs a credential and none is configured;
+    ///         `WYRD_PERMISSION_403_DENIED_RBAC` when the credential cannot
+    ///         read Cards; `WYRD_REGISTRY_404_CARD_NOT_FOUND` when a referenced
+    ///         Card is missing or deleted; and the Workflow validation error
+    ///         when the loaded graph is invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the shared [`wyrd_client::Workflow::from_path`],
+    /// raised in Python as the `WyrdError` with the codes listed above.
     #[staticmethod]
-    fn load(path: PathBuf) -> WyrdPyResult<Self> {
-        let tool_resolver = skald_tool::default_registry();
-        let prompt_resolver = skald_agent::default_prompt_resolver();
-        let inner = Workflow::load(path, tool_resolver, prompt_resolver)?;
-        Ok(Self { inner })
+    fn from_path(py: Python<'_>, path: PathBuf) -> WyrdPyResult<Self> {
+        let workflow =
+            py.detach(|| wyrd_runtime::runtime().block_on(wyrd_client::Workflow::from_path(path)))?;
+        Ok(Self::from(workflow.into_skald()))
     }
 
     /// Parse a workflow from a canonical envelope YAML string.
@@ -530,6 +550,13 @@ impl PyWorkflow {
             wyrd_runtime::runtime().block_on(self.inner.run_with(providers.as_ref(), input))
         })?;
         Ok(PyWorkflowRun { run })
+    }
+}
+
+impl From<Workflow> for PyWorkflow {
+    /// Wrap a hydrated native Workflow for Python.
+    fn from(inner: Workflow) -> Self {
+        Self { inner }
     }
 }
 

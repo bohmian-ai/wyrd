@@ -9,6 +9,7 @@ pub mod client;
 pub mod gateway;
 pub mod operators;
 pub mod verification;
+pub mod workflow;
 
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex};

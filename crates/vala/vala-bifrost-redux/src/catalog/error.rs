@@ -41,6 +41,12 @@ pub enum BifrostCatalogError {
     /// A prepared row cannot be placed safely in either snapshot or hot membership.
     #[error("catalog publication visibility is ambiguous")]
     AmbiguousPublication,
+    /// A requested table's snapshot expiration has an unknown catalog outcome.
+    ///
+    /// Its pointer may still change, so no cut is admitted until Forge
+    /// reconciliation establishes the stable pointer.
+    #[error("snapshot expiration unresolved: {0}")]
+    UnresolvedExpiry(String),
     /// The physical tenant/table binding is invalid.
     #[error("invalid tenant table binding: {0}")]
     InvalidBinding(String),
@@ -90,7 +96,7 @@ impl BifrostCatalogError {
             Self::MetadataMismatch(detail) | Self::InvalidBinding(detail) => {
                 PublicError::MetadataMismatch { detail }
             }
-            Self::UnstableCut { .. } | Self::AmbiguousPublication => {
+            Self::UnstableCut { .. } | Self::AmbiguousPublication | Self::UnresolvedExpiry(_) => {
                 PublicError::QueryVisibilityUnavailable
             }
             Self::AuditUnavailable(detail) => PublicError::AuditUnavailable { detail },
@@ -125,6 +131,15 @@ mod tests {
     fn ambiguous_publication_maps_to_visibility_unavailable() {
         assert!(matches!(
             BifrostCatalogError::AmbiguousPublication.into_public(),
+            wyrd_spec::vala::BifrostError::QueryVisibilityUnavailable
+        ));
+    }
+
+    /// An unresolved snapshot expiration fails as visibility unavailable.
+    #[test]
+    fn unresolved_expiry_maps_to_visibility_unavailable() {
+        assert!(matches!(
+            BifrostCatalogError::UnresolvedExpiry("pending".to_owned()).into_public(),
             wyrd_spec::vala::BifrostError::QueryVisibilityUnavailable
         ));
     }

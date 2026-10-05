@@ -359,9 +359,10 @@ impl BifrostCatalog {
     /// # Errors
     /// Returns [`BifrostCatalogError::InvalidBinding`] when a table cannot be
     /// bound to `tenant`, [`BifrostCatalogError::TableNotFound`] when any table
-    /// has no registration or catalog pointer visible to the tenant (nothing
-    /// commits in that case), and a SQL error when the statement or commit
-    /// fails.
+    /// has no registration or catalog pointer visible to the tenant,
+    /// [`BifrostCatalogError::UnresolvedExpiry`] when any table's snapshot
+    /// expiration has an unknown catalog outcome (nothing commits in either
+    /// case), and a SQL error when the statement or commit fails.
     ///
     /// # Cancellation
     /// Dropping the future before commit rolls the acquisition back. Dropping
@@ -404,6 +405,9 @@ impl BifrostCatalog {
             Err(vala_sql::SqlError::NoRows) => {
                 let names = tables.iter().map(TableRef::fqn).collect::<Vec<_>>();
                 return Err(BifrostCatalogError::TableNotFound(names.join(", ")));
+            }
+            Err(vala_sql::SqlError::Conflict { detail }) => {
+                return Err(BifrostCatalogError::UnresolvedExpiry(detail));
             }
             other => other?,
         };

@@ -2036,7 +2036,7 @@ mod pg_tests {
                 detail: &detail,
             };
             let reset = ops
-                .reset_snapshot_expiration(operator, tenant, &reset_request)
+                .reset_snapshot_expiration(operator, tenant, None, &reset_request)
                 .await
                 .expect("reset applies");
             assert_eq!(
@@ -2067,7 +2067,7 @@ mod pg_tests {
             );
 
             let reset_replay = ops
-                .reset_snapshot_expiration(operator, tenant, &reset_request)
+                .reset_snapshot_expiration(operator, tenant, None, &reset_request)
                 .await
                 .expect("reset replay");
             assert_eq!(
@@ -2346,13 +2346,13 @@ mod pg_tests {
                     "reconciliation input must refuse a corrupted {label}"
                 );
                 assert!(
-                    ops.reset_snapshot_expiration(operator, tenant, &settle_reset_request)
+                    ops.reset_snapshot_expiration(operator, tenant, None, &settle_reset_request)
                         .await
                         .is_err(),
                     "reset must refuse a corrupted {label}"
                 );
                 assert!(
-                    ops.settle_snapshot_expiration(operator, tenant, &settlement)
+                    ops.settle_snapshot_expiration(operator, tenant, None, &settlement)
                         .await
                         .is_err(),
                     "settlement must refuse a corrupted {label}"
@@ -2407,7 +2407,7 @@ mod pg_tests {
             .expect("restore historical authority");
 
             let settled = ops
-                .settle_snapshot_expiration(operator, tenant, &settlement)
+                .settle_snapshot_expiration(operator, tenant, None, &settlement)
                 .await
                 .expect("settlement applies");
             assert!(
@@ -2426,7 +2426,7 @@ mod pg_tests {
             );
 
             let settle_replay = ops
-                .settle_snapshot_expiration(operator, tenant, &settlement)
+                .settle_snapshot_expiration(operator, tenant, None, &settlement)
                 .await
                 .expect("settlement replay");
             assert!(

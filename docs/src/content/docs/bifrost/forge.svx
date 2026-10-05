@@ -216,6 +216,13 @@ reference while Forge is working.
 Expiry uses the same recovery shape as compaction. Prepared, committed, and
 recovered operation phases describe what happened at the Iceberg boundary.
 
+The Forge lease TTL bounds how long expiry holds the table against new
+queries. If the expiry commit's outcome is still unknown at that bound, Forge
+releases the table but keeps the prepared operation. Until reconciliation
+settles which metadata pointer is current, a new query on that table fails
+with `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE`, and retrying is safe.
+Other tables are unaffected.
+
 ## Orphan garbage collection
 
 Forge GC removes objects left behind by a failed write or maintenance operation.

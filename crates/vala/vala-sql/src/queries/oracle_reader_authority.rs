@@ -390,8 +390,9 @@ impl<'conn, 'tx> OracleActiveTableReads<'conn, 'tx> {
     /// # Errors
     ///
     /// Returns [`SqlError::NoRows`] when any table has no registration visible
-    /// to this tenant or no catalog pointer; no active read commits in that
-    /// case. Returns [`SqlError::InvariantViolation`] for an empty request, a
+    /// to this tenant or no catalog pointer, and [`SqlError::Conflict`] when
+    /// any table has a snapshot expiration whose catalog outcome is still
+    /// unresolved; no active read commits in either case. Returns [`SqlError::InvariantViolation`] for an empty request, a
     /// non-positive fence, a `remaining` duration shorter than one millisecond
     /// or longer than `i64::MAX` milliseconds, or a result that does not contain exactly one
     /// well-formed identity and pointer per requested table. Returns
@@ -457,14 +458,20 @@ impl<'conn, 'tx> OracleActiveTableReads<'conn, 'tx> {
     }
 }
 
-/// Maps the acquisition function's not-found signal onto the typed absence.
+/// Maps the acquisition function's refusals onto typed errors.
 ///
 /// The function raises `no_data_found` (SQLSTATE `P0002`) for a missing
 /// registration or catalog pointer so no partial claim set can commit; callers
-/// already treat [`SqlError::NoRows`] as the catalog's table-not-found.
+/// already treat [`SqlError::NoRows`] as the catalog's table-not-found. It
+/// raises `object_not_in_prerequisite_state` (`55000`) for a table whose
+/// snapshot expiration is unresolved, returned as [`SqlError::Conflict`],
+/// which this statement produces for no other reason.
 fn acquisition_error(error: sqlx::Error) -> SqlError {
     match &error {
         sqlx::Error::Database(db) if db.code().as_deref() == Some("P0002") => SqlError::NoRows,
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("55000") => SqlError::Conflict {
+            detail: db.message().to_owned(),
+        },
         _ => SqlError::from(error),
     }
 }

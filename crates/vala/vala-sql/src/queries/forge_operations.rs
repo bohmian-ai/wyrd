@@ -976,6 +976,13 @@ impl ForgeOperations<'_> {
     /// moves the task to Succeeded with its final cleanup evidence, and
     /// advances the table's planning demand — all in one transaction.
     ///
+    /// `exclusive` is the caller's live table authority when it still holds
+    /// the row from the commit it settles; this transaction then only verifies
+    /// coverage, because locking the row would wait on the caller's own lock.
+    /// Settling before that authority is surrendered means no Oracle cut ever
+    /// observes the claims of an expiration whose outcome is known. `None`
+    /// takes the row here.
+    ///
     /// # Errors
     ///
     /// Returns [`SqlError::Conflict`] when the family, transition identity,
@@ -992,6 +999,7 @@ impl ForgeOperations<'_> {
         &self,
         operator: &OperatorPool,
         tenant: DataTenantId,
+        exclusive: Option<&ExclusiveTableAuthority<'_, '_>>,
         request: &ForgeExpirationSettlementRequest<'_>,
     ) -> Result<ForgeOperationTransition, SqlError> {
         self.require_snapshot_expire()?;
@@ -1009,7 +1017,7 @@ impl ForgeOperations<'_> {
         bind_tenant(&mut tx, tenant).await?;
         assert_lease_fence(&mut tx, request.authority).await?;
         let task_state = task_state(&mut tx, request.authority.task_id).await?;
-        lock_table_authority(&mut tx, tenant, request.table).await?;
+        hold_table_authority(&mut tx, tenant, exclusive, request.table).await?;
         self.acquire_operation_lock(&mut tx, operation_id).await?;
         let state_row: ForgeOperationStateRow = self
             .select_state_for_update(&mut tx, operation_id)
@@ -1064,6 +1072,10 @@ impl ForgeOperations<'_> {
     /// advances the table's planning demand so the selection can be recomputed
     /// against fresh table state.
     ///
+    /// `exclusive` follows the same rule as in
+    /// [`Self::settle_snapshot_expiration`]: `Some` when the caller still holds
+    /// the table's authority row, `None` to take it here.
+    ///
     /// # Errors
     ///
     /// Returns [`SqlError::Conflict`] when the family, transition identity,
@@ -1080,6 +1092,7 @@ impl ForgeOperations<'_> {
         &self,
         operator: &OperatorPool,
         tenant: DataTenantId,
+        exclusive: Option<&ExclusiveTableAuthority<'_, '_>>,
         request: &ForgeExpirationResetRequest<'_>,
     ) -> Result<ForgeExpirationResetOutcome, SqlError> {
         self.require_snapshot_expire()?;
@@ -1089,7 +1102,7 @@ impl ForgeOperations<'_> {
         bind_tenant(&mut tx, tenant).await?;
         assert_lease_fence(&mut tx, request.authority).await?;
         let task_state = task_state(&mut tx, request.authority.task_id).await?;
-        lock_table_authority(&mut tx, tenant, request.table).await?;
+        hold_table_authority(&mut tx, tenant, exclusive, request.table).await?;
         self.acquire_operation_lock(&mut tx, operation_id).await?;
         let state_row: ForgeOperationStateRow = self
             .select_state_for_update(&mut tx, operation_id)
@@ -1554,6 +1567,29 @@ pub(crate) async fn lock_table_authority(
     };
     identity.validate(BIFROST_CATALOG_NAME)?;
     Ok(identity)
+}
+
+/// Holds the table's maintenance authority for one expiration transaction.
+///
+/// With the caller's live `exclusive` capability the row is already held on
+/// the caller's connection, so this only verifies the capability covers the
+/// table; locking it here would wait on that lock. Without one it takes the
+/// row through [`lock_table_authority`].
+///
+/// # Errors
+///
+/// Returns what [`require_exclusive_authority`] or [`lock_table_authority`]
+/// returns.
+async fn hold_table_authority(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant: DataTenantId,
+    exclusive: Option<&ExclusiveTableAuthority<'_, '_>>,
+    table: &ForgeClaimTable,
+) -> Result<(), SqlError> {
+    match exclusive {
+        Some(exclusive) => require_exclusive_authority(exclusive, tenant, table),
+        None => lock_table_authority(tx, tenant, table).await.map(|_| ()),
+    }
 }
 
 /// Fails closed unless the caller's exclusive authority covers exactly the

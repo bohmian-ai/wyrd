@@ -3,6 +3,7 @@
 use super::compact::ForgeConfig;
 use super::live_reconcile::DestructiveMaintenance;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use iceberg::table::Table;
@@ -86,6 +87,26 @@ pub(crate) struct ExpiryTaskAuthority {
     pub(crate) attempt: Uuid,
     /// Worker acting on the task right now.
     pub(crate) worker: Uuid,
+}
+
+/// The fixed identity of one snapshot expiration from preparation to its
+/// resolution.
+///
+/// Preparation, the Iceberg commit, reset, and settlement all act on the same
+/// table, task, claim set, and audited selection, so they share this one
+/// borrowed value instead of each re-threading its parts.
+#[derive(Debug, Clone, Copy)]
+struct PreparedExpiry<'a> {
+    /// Tenant-qualified table the expiration acts on.
+    key: &'a ForgeTableKey,
+    /// Physical binding of that table.
+    binding: &'a TenantTableBinding,
+    /// Claimed task the expiration runs under.
+    authority: &'a ExpiryTaskAuthority,
+    /// Durable claim-table identity the claims are keyed by.
+    claim_table: &'a ForgeClaimTable,
+    /// The prepared, audited snapshot selection.
+    detail: &'a AuditDetail,
 }
 
 /// Selects every retained snapshot that is neither current nor a ref head.
@@ -201,28 +222,35 @@ impl Forge {
     /// its uncertain-effect evidence is durable before Iceberg is touched. The
     /// table's exclusive maintenance authority is the one SQL lock deliberately
     /// held across that IO: it is taken before preparation and surrendered
-    /// only once the commit's outcome is known, which is what makes the reader
-    /// check and the destructive commit inseparable.
+    /// only once the commit's outcome is known and the claims are settled or
+    /// reset, which is what makes the reader check and the destructive commit
+    /// inseparable. The Forge lease TTL bounds that hold. Claims that outlive
+    /// the authority therefore always name an expiration whose acceptance is
+    /// unknown, and Oracle refuses new cuts of the table until reconciliation
+    /// establishes the stable pointer.
     ///
     /// # Errors
     /// Returns [`ForgeError::Shutdown`] when `stop` is cancelled at a stage
     /// boundary, [`ForgeError::FenceLost`] when the table lease fence is gone,
     /// an SQL conflict when an Oracle query still holds the table's read
-    /// authority, policy and metadata errors from snapshot selection, and the
+    /// authority, policy and metadata errors from snapshot selection, the
     /// catalog, SQL, or object-store error of any reconciliation, preparation,
-    /// commit, or settlement step. Drift and a definite optimistic-commit
-    /// rejection are not errors: they reset the claims and return a blocked
+    /// commit, or settlement step, and [`ForgeError::Reconciliation`] when a
+    /// submitted commit outlives the lease bound. Drift, a definite
+    /// optimistic-commit rejection, and a lease bound reached before
+    /// submission are not errors: they reset the claims and return a blocked
     /// outcome.
     ///
     /// # Cancellation and partial progress
     /// Cancellation is observed only at stage boundaries before preparation
-    /// and before the corroborating read; nothing durable has happened at
-    /// either point. Once preparation commits, the operation, task, and claims
-    /// stay `Prepared` on every exit that does not prove the commit's outcome
-    /// (a dropped future, a retryable catalog error, or any later failure), so
-    /// the next pass reconciles that one operation instead of submitting a
-    /// second expiry. Dropping the future while the exclusive authority is
-    /// held rolls its transaction back and releases the table to readers.
+    /// and before the corroborating read. A failure after preparation but
+    /// before the commit is submitted resets the claims under the authority.
+    /// Once the commit is submitted, the operation, task, and claims stay
+    /// `Prepared` on every exit that does not prove its outcome (the lease
+    /// bound, a retryable catalog error, or any later failure), so the next
+    /// pass reconciles that one operation instead of submitting a second
+    /// expiry. Dropping the future while the exclusive authority is held rolls
+    /// its transaction back and releases the table to readers.
     async fn run_snapshot_expiry_for_table_inner(
         &self,
         lease: &mut ForgeLease,
@@ -265,10 +293,10 @@ impl Forge {
         require_running(stop)?;
         lease.require_fence(&self.core.operator_pool).await?;
         // The exclusive table authority is held from reader exclusion through
-        // the Iceberg commit's known outcome, so no Oracle cut can pin the
-        // pre-expiry pointer between the reader check and the commit. It is
-        // surrendered before reset or settlement, which take the same row on
-        // their own connection.
+        // the Iceberg commit's known outcome and the claims' resolution, so no
+        // Oracle cut can pin the pre-expiry pointer between the reader check
+        // and the commit, and none ever observes the claims of an expiration
+        // whose outcome is known. The lease TTL bounds the hold.
         let mut authority_conn = self
             .core
             .vala
@@ -279,63 +307,212 @@ impl Forge {
             .exclusive(key.tenant, &key.table_ref)
             .await?
             .ok_or_else(super::table_authority::active_read_refusal)?;
-        self.prepare_expiration(lease, key, authority, &exclusive, &claim_table, &detail)
-            .await?;
-        require_running(stop)?;
-        // The one corroborating read. Every pinned field must still be exactly
-        // what preparation recorded; anything else is definite pre-call drift
-        // that releases the claims without making a single Iceberg mutation.
-        let reloaded = self.load_table(&binding.table_ident()).await?;
-        let effect = match corroborate_expiry(&reloaded, &claim_table, &detail) {
-            Err(drift) => Err(drift),
-            Ok(()) => Ok(self
-                .complete_expiry(lease, key, &exclusive, reloaded, &detail, stop)
-                .await),
+        let expiry = PreparedExpiry {
+            key,
+            binding,
+            authority,
+            claim_table: &claim_table,
+            detail: &detail,
         };
+        let progress = ExpiryProgress::default();
+        let bounded = tokio::time::timeout(
+            self.core.config.lease_ttl,
+            // Boxed so the whole expiry state machine stays off every
+            // caller's future.
+            Box::pin(self.expire_under_authority(lease, expiry, &exclusive, &progress, stop)),
+        )
+        .await;
         drop(exclusive);
-        authority_conn.commit().await.map_err(ForgeError::Sql)?;
-        let expired_files = match effect {
-            Err(drift) => {
-                self.reset_expiration(lease, key, authority, &claim_table, &detail, &drift)
-                    .await?;
-                outcome.unresolved = outcome.unresolved.saturating_add(1);
-                outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
-                return Ok(outcome);
+        let resolution = match bounded {
+            Ok(resolution) => {
+                authority_conn.commit().await.map_err(ForgeError::Sql)?;
+                resolution?
             }
-            Ok(Ok(files)) => files,
-            // A definite optimistic-commit rejection proves the mutation was
-            // never applied, so it releases the claims exactly like drift.
-            // A retryable catalog error is not that proof: the pinned Iceberg
-            // transaction exhausted its own budget without ever learning
-            // whether the commit landed, so it falls through to the uncertain
-            // path below. Every other failure leaves acceptance unproven and
-            // therefore leaves task, operation, and claims Prepared for
-            // reconciliation.
-            Ok(Err(ForgeError::Catalog(error))) if !error.retryable() => {
-                let rejection = ForgeError::Catalog(error);
-                self.reset_expiration(lease, key, authority, &claim_table, &detail, &rejection)
-                    .await?;
-                outcome.unresolved = outcome.unresolved.saturating_add(1);
-                outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
-                return Ok(outcome);
+            // The commit may already have reached the catalog: the claims stay
+            // Prepared, which keeps new cuts off this table until
+            // reconciliation establishes the stable pointer.
+            Err(_) if progress.submitted.load(Ordering::Acquire) => {
+                authority_conn.commit().await.map_err(ForgeError::Sql)?;
+                return Err(ForgeError::Reconciliation {
+                    detail: "Iceberg snapshot expiry outlived the Forge lease bound with unknown \
+                             acceptance"
+                        .to_owned(),
+                });
             }
-            Ok(Err(error)) => return Err(error),
+            // Nothing reached the catalog: roll the authority transaction
+            // back and release any prepared claims.
+            Err(_) => {
+                drop(authority_conn);
+                if progress.prepared.load(Ordering::Acquire) {
+                    self.reset_expiration(
+                        lease,
+                        expiry,
+                        None,
+                        &ForgeError::Timeout {
+                            operation: "snapshot expiry under table authority",
+                        },
+                    )
+                    .await?;
+                }
+                ExpiryResolution::Reset
+            }
         };
-        let evidence = self
-            .settle_expiration(
-                binding,
-                &expiration_authority(authority, lease),
-                &claim_table,
-                &detail,
-                &expired_files,
-                ForgeExpirationSettlement::Committed,
-            )
-            .await?;
-        Self::record_expired_snapshots(&detail);
-        outcome.settled_evidence = Some(evidence);
-        outcome.recovered = outcome.recovered.saturating_add(1);
+        match resolution {
+            ExpiryResolution::Reset => {
+                outcome.unresolved = outcome.unresolved.saturating_add(1);
+                outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
+            }
+            ExpiryResolution::Settled(evidence) => {
+                Self::record_expired_snapshots(&detail);
+                outcome.settled_evidence = Some(evidence);
+                outcome.recovered = outcome.recovered.saturating_add(1);
+            }
+        }
         Ok(outcome)
     }
+
+    /// Prepares, commits, and resolves one expiry under the table's authority.
+    ///
+    /// `exclusive` is held throughout, so the claims are resolved before any
+    /// Oracle cut can observe them: a committed expiry settles, and drift, a
+    /// definite optimistic-commit rejection, or any failure before the commit
+    /// was submitted resets. The one corroborating read must still match
+    /// exactly what preparation recorded; anything else is definite pre-call
+    /// drift. `progress` records how far the operation got, so a caller that
+    /// cuts this future off at the lease bound knows whether the catalog may
+    /// have seen the commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns preparation failures, the failure of a reset or settlement, and
+    /// every submitted-commit failure other than a definite rejection. Any
+    /// other failure before submission is returned after its claims are
+    /// reset; one after submission leaves operation, task, and claims Prepared
+    /// for reconciliation.
+    async fn expire_under_authority(
+        &self,
+        lease: &mut ForgeLease,
+        expiry: PreparedExpiry<'_>,
+        exclusive: &ExclusiveTableAuthority<'_, '_>,
+        progress: &ExpiryProgress,
+        stop: &CancellationToken,
+    ) -> Result<ExpiryResolution, ForgeError> {
+        self.prepare_expiration(lease, expiry, exclusive).await?;
+        progress.prepared.store(true, Ordering::Release);
+        let reloaded = match self.reload_running(expiry, stop).await {
+            Ok(reloaded) => reloaded,
+            Err(error) => {
+                return Err(self
+                    .release_unsubmitted(lease, expiry, exclusive, error)
+                    .await);
+            }
+        };
+        if let Err(drift) = corroborate_expiry(&reloaded, expiry.claim_table, expiry.detail) {
+            self.reset_expiration(lease, expiry, Some(exclusive), &drift)
+                .await?;
+            return Ok(ExpiryResolution::Reset);
+        }
+        match self
+            .complete_expiry(
+                lease,
+                expiry,
+                exclusive,
+                reloaded,
+                &progress.submitted,
+                stop,
+            )
+            .await
+        {
+            Ok(expired_files) => Ok(ExpiryResolution::Settled(
+                self.settle_expiration(
+                    lease,
+                    expiry,
+                    Some(exclusive),
+                    &expired_files,
+                    ForgeExpirationSettlement::Committed,
+                )
+                .await?,
+            )),
+            // A definite optimistic-commit rejection proves the mutation was
+            // never applied, so it releases the claims exactly like drift. A
+            // retryable catalog error is not that proof: the pinned Iceberg
+            // transaction exhausted its own budget without learning whether
+            // the commit landed.
+            Err(ForgeError::Catalog(error)) if !error.retryable() => {
+                let rejection = ForgeError::Catalog(error);
+                self.reset_expiration(lease, expiry, Some(exclusive), &rejection)
+                    .await?;
+                Ok(ExpiryResolution::Reset)
+            }
+            Err(error) if !progress.submitted.load(Ordering::Acquire) => Err(self
+                .release_unsubmitted(lease, expiry, exclusive, error)
+                .await),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Reloads the prepared table for corroboration unless the pass stopped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Shutdown`] when `stop` is cancelled and the
+    /// catalog failure of the reload.
+    async fn reload_running(
+        &self,
+        expiry: PreparedExpiry<'_>,
+        stop: &CancellationToken,
+    ) -> Result<Table, ForgeError> {
+        require_running(stop)?;
+        self.load_table(&expiry.binding.table_ident()).await
+    }
+
+    /// Releases the claims of an expiry that failed before its commit was
+    /// submitted, and returns that failure.
+    ///
+    /// Nothing reached the catalog, so the claims would only keep new cuts off
+    /// the table. A reset that itself fails is logged and leaves the claims to
+    /// reconciliation.
+    async fn release_unsubmitted(
+        &self,
+        lease: &ForgeLease,
+        expiry: PreparedExpiry<'_>,
+        exclusive: &ExclusiveTableAuthority<'_, '_>,
+        error: ForgeError,
+    ) -> ForgeError {
+        if let Err(reset) = self
+            .reset_expiration(lease, expiry, Some(exclusive), &error)
+            .await
+        {
+            tracing::warn!(
+                error = %reset,
+                cause = %error,
+                "Forge could not release an unsubmitted snapshot expiration; reconciliation owns it"
+            );
+        }
+        error
+    }
+}
+
+/// How far one snapshot expiry got under its table authority.
+///
+/// Read only after the lease bound cuts the operation off, to decide whether
+/// its prepared claims can be released or must wait for reconciliation.
+#[derive(Debug, Default)]
+struct ExpiryProgress {
+    /// The preparation transaction committed the operation and its claims.
+    prepared: AtomicBool,
+    /// The Iceberg commit was handed to the catalog; its acceptance may be
+    /// unknown from here on.
+    submitted: AtomicBool,
+}
+
+/// How one expiry under table authority resolved its prepared claims.
+#[derive(Debug)]
+enum ExpiryResolution {
+    /// The commit was accepted and settled with this evidence.
+    Settled(ForgeTaskEvidence),
+    /// Nothing was expired and the claims were released.
+    Reset,
 }
 
 impl Forge {
@@ -716,7 +893,9 @@ impl Forge {
     /// borrow keeps every Oracle cut acquisition on this table waiting until
     /// the caller surrenders it after this commit's outcome is known, so a
     /// reader either committed before the authority was taken — and no
-    /// authority exists — or observes the post-expiry pointer.
+    /// authority exists — or observes the post-expiry pointer. `submitted` is
+    /// set immediately before the commit is handed to the catalog, so a caller
+    /// that cuts this future off knows whether acceptance may be unknown.
     ///
     /// # Errors
     ///
@@ -732,14 +911,15 @@ impl Forge {
     async fn complete_expiry(
         &self,
         lease: &mut ForgeLease,
-        key: &ForgeTableKey,
+        expiry: PreparedExpiry<'_>,
         exclusive: &ExclusiveTableAuthority<'_, '_>,
         table: Table,
-        detail: &AuditDetail,
+        submitted: &AtomicBool,
         stop: &CancellationToken,
     ) -> Result<ExpiredFileSet, ForgeError> {
+        let key = expiry.key;
         super::table_authority::require_covers(exclusive, key.tenant, &key.table_ref)?;
-        let selected_snapshot_ids = expiry_selection(detail, key)?;
+        let selected_snapshot_ids = expiry_selection(expiry.detail, key)?;
         if !lease.renew(&self.core.operator_pool).await? {
             return Err(ForgeError::FenceLost {
                 lease_key: lease.lease_key.clone(),
@@ -763,6 +943,7 @@ impl Forge {
             });
         }
         require_running(stop)?;
+        submitted.store(true, Ordering::Release);
         let commit = transaction.commit_once(self.core.catalog.as_ref());
         tokio::pin!(commit);
         let committed = tokio::select! {
@@ -1054,7 +1235,14 @@ impl Forge {
             outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
             return Ok(outcome);
         };
-        let expired_files = match settlement {
+        let expiry = PreparedExpiry {
+            key,
+            binding,
+            authority,
+            claim_table: &claim_table,
+            detail: &detail,
+        };
+        let evidence = match settlement {
             ForgeExpirationSettlement::Recovered => {
                 let AuditDetail::ForgeSnapshotExpire {
                     base_metadata_location,
@@ -1063,59 +1251,57 @@ impl Forge {
                 else {
                     unreachable!("detail kind was matched above")
                 };
-                derive_recovered_files(&table, base_metadata_location.as_str(), &self.core.config)
+                let expired_files = derive_recovered_files(
+                    &table,
+                    base_metadata_location.as_str(),
+                    &self.core.config,
+                )
+                .await?;
+                self.settle_expiration(lease, expiry, None, &expired_files, settlement)
                     .await?
             }
             ForgeExpirationSettlement::Committed => {
-                let Some(files) = self
-                    .retry_committed_expiry(lease, key, table, &detail, stop)
+                let Some(evidence) = self
+                    .retry_committed_expiry(lease, expiry, table, stop)
                     .await?
                 else {
                     outcome.pending = 1;
                     outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
                     return Ok(outcome);
                 };
-                files
+                evidence
             }
         };
-        let evidence = self
-            .settle_expiration(
-                binding,
-                &expiration_authority(authority, lease),
-                &claim_table,
-                &detail,
-                &expired_files,
-                settlement,
-            )
-            .await?;
         Self::record_expired_snapshots(&detail);
         outcome.settled_evidence = Some(evidence);
         outcome.recovered = 1;
         Ok(outcome)
     }
 
-    /// Retries one reconciled expiration commit under exclusive table authority.
+    /// Retries and settles one reconciled expiration under table authority.
     ///
     /// A retried commit is destructive exactly like the first one, so it holds
-    /// the same exclusive maintenance authority through its known outcome. The
-    /// authority's connection commits only after that outcome, releasing the
-    /// row before settlement takes it again.
+    /// the same exclusive maintenance authority through its known outcome and
+    /// settles before surrendering it; the lease TTL bounds the hold. A retry
+    /// still running at the bound may have reached the catalog, so its claims
+    /// stay Prepared and keep new cuts off the table for the next pass.
     ///
     /// Returns `None`, with nothing destroyed, while any reader holds the
     /// table; the operation then stays Prepared for a later pass.
     ///
     /// # Errors
     ///
-    /// Returns SQL failures acquiring or committing the authority, and every
-    /// failure [`Self::complete_expiry`] reports for the commit itself.
+    /// Returns SQL failures acquiring or committing the authority, every
+    /// failure [`Self::complete_expiry`] or settlement reports, and
+    /// [`ForgeError::Reconciliation`] when the retry outlives the lease bound.
     async fn retry_committed_expiry(
         &self,
         lease: &mut ForgeLease,
-        key: &ForgeTableKey,
+        expiry: PreparedExpiry<'_>,
         table: Table,
-        detail: &AuditDetail,
         stop: &CancellationToken,
-    ) -> Result<Option<ExpiredFileSet>, ForgeError> {
+    ) -> Result<Option<ForgeTaskEvidence>, ForgeError> {
+        let key = expiry.key;
         let mut authority_conn = self
             .core
             .vala
@@ -1129,12 +1315,32 @@ impl Forge {
             authority_conn.commit().await.map_err(ForgeError::Sql)?;
             return Ok(None);
         };
-        let files = self
-            .complete_expiry(lease, key, &exclusive, table, detail, stop)
-            .await;
+        let submitted = AtomicBool::new(false);
+        let bounded = tokio::time::timeout(
+            self.core.config.lease_ttl,
+            Box::pin(async {
+                let expired_files = self
+                    .complete_expiry(lease, expiry, &exclusive, table, &submitted, stop)
+                    .await?;
+                self.settle_expiration(
+                    lease,
+                    expiry,
+                    Some(&exclusive),
+                    &expired_files,
+                    ForgeExpirationSettlement::Committed,
+                )
+                .await
+            }),
+        )
+        .await;
         drop(exclusive);
         authority_conn.commit().await.map_err(ForgeError::Sql)?;
-        files.map(Some)
+        match bounded {
+            Ok(evidence) => evidence.map(Some),
+            Err(_) => Err(ForgeError::Reconciliation {
+                detail: "retried Iceberg snapshot expiry outlived the Forge lease bound".to_owned(),
+            }),
+        }
     }
 
     /// Counts the exact snapshots one settled expiration durably removed.
@@ -1203,12 +1409,16 @@ impl Forge {
     async fn prepare_expiration(
         &self,
         lease: &ForgeLease,
-        key: &ForgeTableKey,
-        authority: &ExpiryTaskAuthority,
+        expiry: PreparedExpiry<'_>,
         exclusive: &ExclusiveTableAuthority<'_, '_>,
-        table: &ForgeClaimTable,
-        detail: &AuditDetail,
     ) -> Result<(), ForgeError> {
+        let PreparedExpiry {
+            key,
+            authority,
+            claim_table: table,
+            detail,
+            ..
+        } = expiry;
         let resource = expiry_resource(detail)?;
         ForgeOperations::new(resource, ForgeOperationFamily::SnapshotExpire)
             .map_err(ForgeError::Sql)?
@@ -1232,6 +1442,10 @@ impl Forge {
     /// Releases an unproven selection so a successor can replan against fresh
     /// reader protection.
     ///
+    /// `exclusive` is the caller's live table authority when it still holds
+    /// it, so the claims are released before any cut can observe them; `None`
+    /// takes the authority row inside the reset transaction.
+    ///
     /// # Errors
     ///
     /// Returns [`ForgeError::Sql`] when the reset preconditions do not match
@@ -1239,18 +1453,24 @@ impl Forge {
     async fn reset_expiration(
         &self,
         lease: &ForgeLease,
-        key: &ForgeTableKey,
-        authority: &ExpiryTaskAuthority,
-        table: &ForgeClaimTable,
-        detail: &AuditDetail,
+        expiry: PreparedExpiry<'_>,
+        exclusive: Option<&ExclusiveTableAuthority<'_, '_>>,
         cause: &ForgeError,
     ) -> Result<(), ForgeError> {
+        let PreparedExpiry {
+            key,
+            authority,
+            claim_table: table,
+            detail,
+            ..
+        } = expiry;
         let resource = expiry_resource(detail)?;
         ForgeOperations::new(resource, ForgeOperationFamily::SnapshotExpire)
             .map_err(ForgeError::Sql)?
             .reset_snapshot_expiration(
                 &self.core.operator_pool,
                 key.tenant,
+                exclusive,
                 &ForgeExpirationResetRequest {
                     authority: &expiration_authority(authority, lease),
                     table,
@@ -1272,10 +1492,13 @@ impl Forge {
     /// Cleanup candidates are derived here and handed to separate cleanup
     /// through task evidence; this owner performs no delete of its own.
     ///
-    /// Tenant and table identity come from `binding`, and the caller projects
-    /// its claimed task and live lease into `authority` before calling, so
-    /// this operation carries exactly the terms the settlement transaction
-    /// verifies and nothing that would have to agree with them.
+    /// Tenant and table identity come from the expiry's binding, and its
+    /// claimed task and the live lease are projected into the settlement
+    /// authority, so this operation carries exactly the terms the settlement
+    /// transaction verifies and nothing that would have to agree with them.
+    /// `exclusive` is the caller's live table authority when it still holds
+    /// it, so the claims are deleted before any cut can observe them; `None`
+    /// takes the authority row inside the settlement transaction.
     ///
     /// # Errors
     ///
@@ -1284,13 +1507,19 @@ impl Forge {
     /// and claims Prepared for exact replay.
     async fn settle_expiration(
         &self,
-        binding: &TenantTableBinding,
-        authority: &ForgeExpirationAuthority,
-        table: &ForgeClaimTable,
-        detail: &AuditDetail,
+        lease: &ForgeLease,
+        expiry: PreparedExpiry<'_>,
+        exclusive: Option<&ExclusiveTableAuthority<'_, '_>>,
         expired_files: &ExpiredFileSet,
         settlement: ForgeExpirationSettlement,
     ) -> Result<ForgeTaskEvidence, ForgeError> {
+        let PreparedExpiry {
+            binding,
+            claim_table: table,
+            detail,
+            ..
+        } = expiry;
+        let authority = &expiration_authority(expiry.authority, lease);
         let committed = self.load_table(&binding.table_ident()).await?;
         let identity = ForgeTaskTableIdentity::new(
             BIFROST_CATALOG_NAME,
@@ -1322,6 +1551,7 @@ impl Forge {
             .settle_snapshot_expiration(
                 &self.core.operator_pool,
                 binding.tenant,
+                exclusive,
                 &ForgeExpirationSettlementRequest {
                     authority,
                     table,

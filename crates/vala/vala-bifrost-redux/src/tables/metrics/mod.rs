@@ -11,13 +11,16 @@ pub use projection::{
 #[cfg(test)]
 mod tests {
     use arrow::array::{
-        Array, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, ListArray,
-        StringArray, StructArray,
+        Array, BooleanArray, Float64Array, Int32Array, Int64Array, ListArray, StringArray,
+        StructArray,
     };
     use arrow::record_batch::RecordBatch;
+    use serde_json::json;
     use std::sync::Arc;
+    use wyrd_queue::variant::variant_cell_to_json;
+    use wyrd_spec::vala::api::VARIANT_MAX_DEPTH;
     use wyrd_tonic::otlp::common::v1::any_value::Value;
-    use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue};
+    use wyrd_tonic::otlp::common::v1::{AnyValue, ArrayValue, KeyValue};
     use wyrd_tonic::otlp::metrics::v1::{
         Exemplar, ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram,
         HistogramDataPoint, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, Summary,
@@ -27,7 +30,7 @@ mod tests {
 
     use super::points::METRIC_FIELDS;
     use super::{project_resource_metrics, validate_metric_points};
-    use crate::tables::signal::{encode_attributes, without_correlation_columns};
+    use crate::tables::signal::without_correlation_columns;
 
     /// The double whose exact bits must survive projection unchanged.
     const SIGNALLING_NAN: u64 = 0x7ff8_0000_0000_0001;
@@ -300,10 +303,44 @@ mod tests {
         let exemplars = typed::<ListArray>(&batch, "exemplars");
         assert_eq!(exemplars.value_length(0), 1);
         assert_eq!(exemplars.value_length(2), 0);
+        assert_variant_payloads(&batch);
 
         let ledger = without_correlation_columns(&batch)
             .expect("the appended correlation columns split off cleanly");
         validate_metric_points(&ledger).expect("the projected batch validates its own kind shapes");
+    }
+
+    /// Assert the Variant payloads and promoted columns of the first point.
+    ///
+    /// # Panics
+    ///
+    /// Panics when metadata, point, or exemplar attributes do not decode to
+    /// their source values, or a promotion is set under an absent resource.
+    fn assert_variant_payloads(batch: &RecordBatch) {
+        let first_exemplar = typed::<ListArray>(batch, "exemplars").value(0);
+        let filtered = first_exemplar
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .and_then(|exemplar| exemplar.column_by_name("filtered_attributes"))
+            .expect("exemplar filtered attribute column");
+        assert_eq!(
+            variant_cell_to_json(filtered.as_ref(), 0).expect("filtered attributes decode"),
+            json!({"e": true})
+        );
+        assert_eq!(
+            variant_cell_to_json(column(batch, "metadata"), 0).expect("metadata decodes"),
+            json!({"owner": "wyrd"})
+        );
+        assert_eq!(
+            variant_cell_to_json(column(batch, "attributes"), 0).expect("attributes decode"),
+            json!({"k": 1})
+        );
+        for promoted in ["service_name", "service_version", "deployment_environment"] {
+            assert!(
+                typed::<StringArray>(batch, promoted).is_null(0),
+                "{promoted} is null under an absent resource"
+            );
+        }
     }
 
     /// Inconsistent point shapes are rejected one record at a time.
@@ -516,13 +553,54 @@ mod tests {
         assert_eq!(run_ids.value(1), RUN);
         assert!(run_ids.is_null(2));
 
-        let attributes = typed::<BinaryArray>(&batch, "attributes");
-        for (row, source) in [missing, valid, duplicate].iter().enumerate() {
-            assert_eq!(
-                attributes.value(row),
-                encode_attributes(source).as_slice(),
-                "row {row} retains every ordered source attribute byte for byte"
-            );
+        correlation_fixture::assert_attribute_rows(&batch, &[&missing, &valid, &duplicate]);
+    }
+
+    /// Metric metadata nested past the Variant depth limit rejects every point
+    /// of that metric, and only that metric, with the catalogued code.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an over-deep metadata value is accepted, truncated, or
+    /// rejects a point of another metric, or when the reason lacks the code or
+    /// the first point's ordinal.
+    #[test]
+    fn over_deep_metric_metadata_rejects_each_point_of_its_metric() {
+        let mut deep = AnyValue {
+            value: Some(Value::IntValue(1)),
+        };
+        for _ in 0..VARIANT_MAX_DEPTH {
+            deep = AnyValue {
+                value: Some(Value::ArrayValue(ArrayValue { values: vec![deep] })),
+            };
         }
+        let gauge = |value| {
+            metric::Data::Gauge(Gauge {
+                data_points: vec![
+                    number_point(number_data_point::Value::AsInt(value)),
+                    number_point(number_data_point::Value::AsInt(value)),
+                ],
+            })
+        };
+        let refused = Metric {
+            metadata: vec![KeyValue {
+                key: "deep".to_owned(),
+                value: Some(deep),
+            }],
+            ..metric("gauge.deep", gauge(2))
+        };
+        let requested = request(vec![metric("gauge.kept", gauge(1)), refused]);
+        let (batch, outcome) =
+            project_resource_metrics(&requested, None, usize::MAX).expect("projection completes");
+
+        assert_eq!(outcome.accepted_points, 2);
+        assert_eq!(outcome.rejected_points, 2);
+        assert_eq!(batch.num_rows(), 2);
+        let reason = outcome.rejection_message.expect("a rejection is reported");
+        assert!(
+            reason.starts_with("WYRD_VALA_400_VARIANT_TOO_DEEP: ")
+                && reason.contains("field metadata row 2 "),
+            "the reason names the code, field, and first point: {reason}"
+        );
     }
 }

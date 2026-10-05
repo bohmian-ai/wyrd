@@ -1,119 +1,325 @@
-//! Narrow encode/decode, resource/scope, and Arrow-column helpers shared by the
-//! three canonical `OTel` signal tables.
+//! Narrow Variant projection, resource/scope, and Arrow-column helpers shared
+//! by the three canonical `OTel` signal tables.
 //!
 //! Everything here is deliberately signal-agnostic. The per-signal meaning —
 //! which field holds which protocol value, in which order, under which stable
 //! id — stays in the owning table module. What lives here is only the small
-//! machinery all three need identically: the pinned canonical protobuf
-//! encoding for attribute collections and single values, the shared
-//! resource/scope envelope every signal carries, identifier validation, and the
+//! machinery all three need identically: the projection of `OTLP` attribute
+//! collections and values into Variant, the shared resource/scope envelope and
+//! entity-reference layout every signal carries, the promoted semantic
+//! conventions more than one signal reads, identifier validation, and the
 //! typed accumulators that turn projected rows into Arrow arrays.
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, FixedSizeBinaryArray, Float64Array,
-    Int32Array, Int64Array, ListArray, StringArray, StructArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array,
+    Int64Array, ListArray, StringArray, StructArray,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::tables::TableError;
-use crate::tables::fields::{self, CanonicalField, CanonicalType};
-use prost::Message;
-use prost::encoding::{WireType, encode_key};
+use crate::tables::fields::{self, CanonicalField, CanonicalField as F, CanonicalType as T};
+use parquet_variant::{
+    BuilderSpecificState, ListBuilder, ObjectFieldBuilder, Variant, VariantBuilder,
+    VariantBuilderExt,
+};
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
+use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder, VariantViolation, narrow_integer};
 use wyrd_spec::reference::{CardRef, CardRefScope};
+use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
 use wyrd_spec::vala::managed_columns::{CARD_REF, RUN_ID};
 use wyrd_tonic::otlp::common::v1::any_value::Value;
-use wyrd_tonic::otlp::common::v1::{
-    AnyValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList,
-};
+use wyrd_tonic::otlp::common::v1::{AnyValue, EntityRef, InstrumentationScope, KeyValue};
 use wyrd_tonic::otlp::resource::v1::Resource;
 
-/// Protobuf field number of `KeyValueList.values`.
-///
-/// Attribute collections are stored as the canonical encoding of the
-/// `KeyValueList` that wraps them, which is byte-identical to concatenating
-/// each `KeyValue` under this tag.
-const KEY_VALUE_LIST_VALUES_TAG: u32 = 1;
+/// Element declaration of the key-name lists inside one entity reference.
+pub static ENTITY_REF_KEY_ELEMENT: F = F::sensitive("item", T::Utf8, false);
 
-/// Encode one attribute collection as pinned canonical `KeyValueList` bytes.
+/// Ordered fields of one `OTel` resource entity reference.
+pub static ENTITY_REF_FIELDS: [F; 4] = [
+    F::sensitive("type", T::Utf8, false),
+    F::sensitive("id_keys", T::List(&ENTITY_REF_KEY_ELEMENT), false),
+    F::sensitive("description_keys", T::List(&ENTITY_REF_KEY_ELEMENT), false),
+    F::sensitive("schema_url", T::Utf8, false),
+];
+
+/// Element declaration of every signal's `resource_entity_refs` collection.
 ///
-/// The result is exactly `KeyValueList { values }.encode_to_vec()` without
-/// cloning the borrowed entries. An empty collection encodes to zero bytes,
-/// which is the present-but-empty form; absence is represented by a null Arrow
-/// value, never by these bytes.
-#[must_use]
-pub fn encode_attributes(values: &[KeyValue]) -> Vec<u8> {
-    let mut buffer = Vec::new();
-    for value in values {
-        encode_key(
-            KEY_VALUE_LIST_VALUES_TAG,
-            WireType::LengthDelimited,
-            &mut buffer,
-        );
-        prost::encoding::encode_varint(value.encoded_len() as u64, &mut buffer);
-        value.encode_raw(&mut buffer);
+/// All three signal ledgers declare their resource entity references through
+/// this one element, so the persisted layout cannot drift between signals.
+pub static ENTITY_REF_ELEMENT: F = F::sensitive("entity_ref", T::Struct(&ENTITY_REF_FIELDS), false);
+
+/// One `OTLP` value or attribute collection that cannot be stored as Variant.
+///
+/// The failure keeps the logical field it was projected for; the rejected
+/// record's ordinal is attached only when the rejection reason is rendered,
+/// because a resource or scope value is shared by every record beneath it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariantFailure {
+    /// Logical column the value was projected into.
+    field: &'static str,
+    /// Why the encoded value cannot be stored.
+    violation: VariantViolation,
+}
+
+impl VariantFailure {
+    /// Render the partial-success rejection reason for one record.
+    ///
+    /// The reason starts with the catalogued Variant error code, followed by
+    /// that error's message, so an `OTLP` client sees the same stable code a
+    /// canonical Arrow writer would receive. `row` is the zero-based ordinal of
+    /// the rejected record in request traversal order.
+    #[must_use]
+    pub fn reason(&self, row: u64) -> Cow<'static, str> {
+        let error: BifrostError = self.violation.clone().into_error(self.field, row);
+        Cow::Owned(format!("{}: {error}", error.code()))
     }
-    buffer
 }
 
-/// Encode one protobuf value as its pinned canonical `AnyValue` bytes.
+/// Project one `OTLP` attribute collection into a Variant object.
 ///
-/// A present but wholly unset `AnyValue` encodes to zero bytes; that is
-/// distinct from absence, which the caller records as an Arrow null.
+/// The collection is a logical map carried as repeated entries, so a repeated
+/// key keeps only its final occurrence, matching the `OTel` data model and the
+/// correlation rule. The result is then fully validated, so the Bifrost depth
+/// and size limits apply exactly as they do to a canonical Arrow writer.
+///
+/// # Errors
+///
+/// Returns a [`VariantFailure`] for `field` when the encoded object exceeds
+/// the Variant size limit or nests past the depth limit.
+pub fn attributes_variant(
+    field: &'static str,
+    attributes: &[KeyValue],
+) -> Result<EncodedVariant, VariantFailure> {
+    let mut builder = VariantBuilder::new();
+    append_object(&mut builder, attributes);
+    finish_variant(field, builder)
+}
+
+/// Project one `OTLP` value into a Variant of the same type.
+///
+/// A string, boolean, or double keeps its type, an integer is stored at its
+/// narrowest Variant integer width, bytes become a Variant binary, an array
+/// becomes a list, a key-value list becomes an object, and a present but unset
+/// value becomes a Variant null.
+///
+/// # Errors
+///
+/// Returns a [`VariantFailure`] for `field` when the encoded value exceeds the
+/// Variant size limit or nests past the depth limit.
+pub fn any_value_variant(
+    field: &'static str,
+    value: &AnyValue,
+) -> Result<EncodedVariant, VariantFailure> {
+    let mut builder = VariantBuilder::new();
+    append_any_value(&mut builder, value.value.as_ref());
+    finish_variant(field, builder)
+}
+
+/// Finish one built Variant and validate it under the Bifrost limits.
+///
+/// Validation reuses the canonical Arrow writer's check, so the size limit is
+/// applied first and the depth limit, which names the first container past it,
+/// second. The protobuf decoder already bounds `OTLP` nesting, so building
+/// before validating cannot recurse without bound.
+///
+/// # Errors
+///
+/// Returns the [`VariantFailure`] of the first violated limit.
+fn finish_variant(
+    field: &'static str,
+    builder: VariantBuilder,
+) -> Result<EncodedVariant, VariantFailure> {
+    let (metadata, value) = builder.finish();
+    EncodedVariant::from_bytes(&metadata, &value)
+        .map_err(|violation| VariantFailure { field, violation })
+}
+
+/// Append one `OTLP` value at any Variant builder position.
+fn append_any_value(builder: &mut impl VariantBuilderExt, value: Option<&Value>) {
+    match value {
+        None => builder.append_value(Variant::Null),
+        Some(Value::StringValue(text)) => builder.append_value(text.as_str()),
+        Some(Value::BoolValue(flag)) => builder.append_value(*flag),
+        Some(Value::IntValue(number)) => builder.append_value(narrow_integer(*number)),
+        Some(Value::DoubleValue(number)) => builder.append_value(*number),
+        Some(Value::BytesValue(bytes)) => builder.append_value(Variant::Binary(bytes)),
+        Some(Value::ArrayValue(array)) => {
+            let mut list = builder.new_list();
+            append_items(&mut list, &array.values);
+            list.finish();
+        }
+        Some(Value::KvlistValue(list)) => append_object(builder, &list.values),
+    }
+}
+
+/// Append every `OTLP` array item to an open Variant list.
+fn append_items<S: BuilderSpecificState>(list: &mut ListBuilder<'_, S>, items: &[AnyValue]) {
+    for item in items {
+        append_any_value(list, item.value.as_ref());
+    }
+}
+
+/// Append one `OTLP` key-value collection as a Variant object.
+///
+/// Entries are visited from the last to the first and a key already written
+/// is skipped, so the final occurrence of a repeated key is the one stored.
+/// Variant objects order their keys by name, so visiting order changes
+/// nothing else. A present key whose value is unset is stored as a Variant
+/// null, which stays distinct from an absent key.
+fn append_object(builder: &mut impl VariantBuilderExt, entries: &[KeyValue]) {
+    let mut object = builder.new_object();
+    let mut written: HashSet<&str> = HashSet::with_capacity(entries.len());
+    for entry in entries.iter().rev() {
+        if !written.insert(entry.key.as_str()) {
+            continue;
+        }
+        match entry.value.as_ref().and_then(|value| value.value.as_ref()) {
+            // A field builder would treat null as an absent key.
+            None => object.insert(&entry.key, Variant::Null),
+            Some(value) => append_any_value(
+                &mut ObjectFieldBuilder::new(&entry.key, &mut object),
+                Some(value),
+            ),
+        }
+    }
+    object.finish();
+}
+
+/// Build one Variant column from encoded values; `None` is a null row.
 #[must_use]
-pub fn encode_any_value(value: &AnyValue) -> Vec<u8> {
-    value.encode_to_vec()
+pub fn variant_column<'a>(
+    values: impl ExactSizeIterator<Item = Option<&'a EncodedVariant>>,
+) -> ArrayRef {
+    let mut builder = VariantColumnBuilder::with_capacity(values.len());
+    for value in values {
+        builder.append_option(value);
+    }
+    builder.finish()
 }
 
-/// Encode one entity reference as its pinned canonical `EntityRef` bytes.
+/// Build one `resource_entity_refs` list column from flattened references.
+///
+/// `lengths` holds one entry per row, as for [`list_column`]; every reference
+/// keeps its type, both ordered key lists, and its schema URL.
+///
+/// # Errors
+///
+/// Returns [`TableError::Internal`] when the assembled column does not match
+/// [`ENTITY_REF_ELEMENT`], which would mean the ledger and this builder drift.
+pub fn entity_refs_column(
+    refs: &[EntityRef],
+    lengths: &[Option<usize>],
+) -> Result<ArrayRef, TableError> {
+    let key_element = ENTITY_REF_KEY_ELEMENT.to_arrow();
+    let keys = |select: fn(&EntityRef) -> &[String]| {
+        let values: Vec<String> = refs
+            .iter()
+            .flat_map(|entity| select(entity).to_vec())
+            .collect();
+        let lengths: Vec<Option<usize>> = refs
+            .iter()
+            .map(|entity| Some(select(entity).len()))
+            .collect();
+        list_column(&key_element, utf8_column(values), &lengths).map_err(internal)
+    };
+    let element = ENTITY_REF_ELEMENT.to_arrow();
+    let entities = struct_column(
+        &nested_fields(&element)?,
+        vec![
+            utf8_column(refs.iter().map(|entity| entity.r#type.clone()).collect()),
+            keys(|entity| &entity.id_keys)?,
+            keys(|entity| &entity.description_keys)?,
+            utf8_column(
+                refs.iter()
+                    .map(|entity| entity.schema_url.clone())
+                    .collect(),
+            ),
+        ],
+        None,
+    )
+    .map_err(internal)?;
+    list_column(&element, entities, lengths).map_err(internal)
+}
+
+/// Returns the variable-length Arrow bytes one entity reference retains.
+///
+/// Counts its strings plus one 4-byte offset per key name, matching what
+/// [`entity_refs_column`] materializes.
+fn entity_ref_bytes(entity: &EntityRef) -> usize {
+    entity.r#type.len()
+        + entity.schema_url.len()
+        + entity
+            .id_keys
+            .iter()
+            .chain(&entity.description_keys)
+            .map(|key| key.len() + size_of::<i32>())
+            .sum::<usize>()
+}
+
+/// Read the final occurrence of `key` as text; any other value is `None`.
+///
+/// Promoted semantic-convention columns are null when their source is absent
+/// or carries another protocol type, so this never rejects a record.
 #[must_use]
-pub fn encode_entity_ref(value: &EntityRef) -> Vec<u8> {
-    value.encode_to_vec()
+pub fn promoted_string(attributes: &[KeyValue], key: &str) -> Option<String> {
+    last_string_attribute(attributes, key).map(str::to_owned)
 }
 
-/// Verify supplied bytes are a canonical `KeyValueList` encoding.
-///
-/// Canonical means the bytes decode and re-encode to themselves. That rejects
-/// non-minimal varints, out-of-order or repeated fields, and trailing unknown
-/// fields, all of which would otherwise let two byte strings claim the same
-/// logical attribute collection.
-///
-/// # Errors
-///
-/// Returns a stable reason when the bytes do not decode or do not round-trip.
-pub fn verify_canonical_attributes(bytes: &[u8]) -> Result<(), &'static str> {
-    let decoded = KeyValueList::decode(bytes).map_err(|_| "attributes are not a KeyValueList")?;
-    (decoded.encode_to_vec() == bytes)
-        .then_some(())
-        .ok_or("attributes are not canonically encoded")
+/// Read the final occurrence of `key` as a signed integer; any other value is
+/// `None`.
+#[must_use]
+pub fn promoted_int(attributes: &[KeyValue], key: &str) -> Option<i64> {
+    match last_attribute(attributes, key)?
+        .value
+        .as_ref()
+        .and_then(|value| value.value.as_ref())
+    {
+        Some(Value::IntValue(number)) => Some(*number),
+        _ => None,
+    }
 }
 
-/// Verify supplied bytes are a canonical `AnyValue` encoding.
+/// The promoted `exception.*` semantic conventions of one attribute set.
 ///
-/// # Errors
-///
-/// Returns a stable reason when the bytes do not decode or do not round-trip.
-pub fn verify_canonical_any_value(bytes: &[u8]) -> Result<(), &'static str> {
-    let decoded = AnyValue::decode(bytes).map_err(|_| "value is not an AnyValue")?;
-    (decoded.encode_to_vec() == bytes)
-        .then_some(())
-        .ok_or("value is not canonically encoded")
+/// Spans read them from their last event named `exception`; log records read
+/// them from their own attributes. Each value is null when its source is
+/// absent or is not a string.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ExceptionPromotions {
+    /// `exception.type`.
+    pub exception_type: Option<String>,
+    /// `exception.message`.
+    pub message: Option<String>,
+    /// `exception.stacktrace`.
+    pub stacktrace: Option<String>,
 }
 
-/// Verify supplied bytes are a canonical `EntityRef` encoding.
-///
-/// # Errors
-///
-/// Returns a stable reason when the bytes do not decode or do not round-trip.
-pub fn verify_canonical_entity_ref(bytes: &[u8]) -> Result<(), &'static str> {
-    let decoded = EntityRef::decode(bytes).map_err(|_| "entity ref is not an EntityRef")?;
-    (decoded.encode_to_vec() == bytes)
-        .then_some(())
-        .ok_or("entity ref is not canonically encoded")
+impl ExceptionPromotions {
+    /// Read the three exception conventions from one attribute set.
+    #[must_use]
+    pub fn from_attributes(attributes: &[KeyValue]) -> Self {
+        Self {
+            exception_type: promoted_string(attributes, "exception.type"),
+            message: promoted_string(attributes, "exception.message"),
+            stacktrace: promoted_string(attributes, "exception.stacktrace"),
+        }
+    }
+
+    /// Returns the promoted text bytes these values add to one row.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        [&self.exception_type, &self.message, &self.stacktrace]
+            .into_iter()
+            .flatten()
+            .map(String::len)
+            .sum()
+    }
 }
 
 /// Validate one 16-byte OTLP trace identifier.
@@ -146,40 +352,49 @@ pub fn span_id_bytes(value: &[u8]) -> Result<[u8; 8], &'static str> {
 /// empty one; the remaining scalars carry their canonical empty values when
 /// absent and are interpreted only when `present` is true. `schema_url` comes
 /// from the enclosing `Resource*` wrapper, not from the `Resource` message.
+/// The promoted resource conventions are read once here and repeated on every
+/// row, so every signal promotes them identically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceEnvelope {
     /// Whether the OTLP `Resource` message was present.
     pub present: bool,
-    /// Canonical `KeyValueList` bytes for the resource attributes.
-    pub attributes: Vec<u8>,
+    /// Resource attributes as one Variant object; empty when absent.
+    pub attributes: EncodedVariant,
     /// Resource dropped-attribute count.
     pub dropped_attributes_count: u32,
     /// Resource schema URL from the enclosing wrapper.
     pub schema_url: String,
-    /// Canonical `EntityRef` encodings in request order.
-    pub entity_refs: Vec<Vec<u8>>,
+    /// Entity references in request order.
+    pub entity_refs: Vec<EntityRef>,
+    /// Promoted `service.name`.
+    pub service_name: Option<String>,
+    /// Promoted `service.version`.
+    pub service_version: Option<String>,
+    /// Promoted `deployment.environment.name`, else `deployment.environment`.
+    pub deployment_environment: Option<String>,
 }
 
 impl ResourceEnvelope {
     /// Project one optional OTLP resource plus its wrapper schema URL.
-    #[must_use]
-    pub fn project(resource: Option<&Resource>, schema_url: &str) -> Self {
-        match resource {
-            None => Self {
-                present: false,
-                attributes: Vec::new(),
-                dropped_attributes_count: 0,
-                schema_url: schema_url.to_owned(),
-                entity_refs: Vec::new(),
-            },
-            Some(resource) => Self {
-                present: true,
-                attributes: encode_attributes(&resource.attributes),
-                dropped_attributes_count: resource.dropped_attributes_count,
-                schema_url: schema_url.to_owned(),
-                entity_refs: resource.entity_refs.iter().map(encode_entity_ref).collect(),
-            },
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`VariantFailure`] of the resource attributes when they
+    /// cannot be stored as Variant; every record beneath the resource is then
+    /// rejected with that reason.
+    pub fn project(resource: Option<&Resource>, schema_url: &str) -> Result<Self, VariantFailure> {
+        let attributes = resource.map_or(&[][..], |value| value.attributes.as_slice());
+        Ok(Self {
+            present: resource.is_some(),
+            attributes: attributes_variant("resource_attributes", attributes)?,
+            dropped_attributes_count: resource.map_or(0, |value| value.dropped_attributes_count),
+            schema_url: schema_url.to_owned(),
+            entity_refs: resource.map_or_else(Vec::new, |value| value.entity_refs.clone()),
+            service_name: promoted_string(attributes, "service.name"),
+            service_version: promoted_string(attributes, "service.version"),
+            deployment_environment: promoted_string(attributes, "deployment.environment.name")
+                .or_else(|| promoted_string(attributes, "deployment.environment")),
+        })
     }
 
     /// Returns the variable-length payload bytes this envelope adds to each
@@ -188,10 +403,19 @@ impl ResourceEnvelope {
     pub fn repeated_bytes(&self) -> usize {
         self.attributes.len()
             + self.schema_url.len()
+            + [
+                &self.service_name,
+                &self.service_version,
+                &self.deployment_environment,
+            ]
+            .into_iter()
+            .flatten()
+            .map(String::len)
+            .sum::<usize>()
             + self
                 .entity_refs
                 .iter()
-                .map(|entity| entity.len() + size_of::<i32>())
+                .map(|entity| entity_ref_bytes(entity) + size_of::<i32>())
                 .sum::<usize>()
     }
 }
@@ -208,8 +432,8 @@ pub struct ScopeEnvelope {
     pub name: String,
     /// Scope version.
     pub version: String,
-    /// Canonical `KeyValueList` bytes for the scope attributes.
-    pub attributes: Vec<u8>,
+    /// Scope attributes as one Variant object; empty when absent.
+    pub attributes: EncodedVariant,
     /// Scope dropped-attribute count.
     pub dropped_attributes_count: u32,
     /// Scope schema URL from the enclosing wrapper.
@@ -218,26 +442,27 @@ pub struct ScopeEnvelope {
 
 impl ScopeEnvelope {
     /// Project one optional OTLP scope plus its wrapper schema URL.
-    #[must_use]
-    pub fn project(scope: Option<&InstrumentationScope>, schema_url: &str) -> Self {
-        match scope {
-            None => Self {
-                present: false,
-                name: String::new(),
-                version: String::new(),
-                attributes: Vec::new(),
-                dropped_attributes_count: 0,
-                schema_url: schema_url.to_owned(),
-            },
-            Some(scope) => Self {
-                present: true,
-                name: scope.name.clone(),
-                version: scope.version.clone(),
-                attributes: encode_attributes(&scope.attributes),
-                dropped_attributes_count: scope.dropped_attributes_count,
-                schema_url: schema_url.to_owned(),
-            },
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`VariantFailure`] of the scope attributes when they cannot
+    /// be stored as Variant; every record beneath the scope is then rejected
+    /// with that reason.
+    pub fn project(
+        scope: Option<&InstrumentationScope>,
+        schema_url: &str,
+    ) -> Result<Self, VariantFailure> {
+        Ok(Self {
+            present: scope.is_some(),
+            name: scope.map_or_else(String::new, |value| value.name.clone()),
+            version: scope.map_or_else(String::new, |value| value.version.clone()),
+            attributes: attributes_variant(
+                "scope_attributes",
+                scope.map_or(&[][..], |value| value.attributes.as_slice()),
+            )?,
+            dropped_attributes_count: scope.map_or(0, |value| value.dropped_attributes_count),
+            schema_url: schema_url.to_owned(),
+        })
     }
 
     /// Returns the variable-length payload bytes this envelope adds to each
@@ -297,9 +522,8 @@ const RUN_ID_REJECTION: &str = "wyrd.run_id is not a valid run correlation";
 /// the specification fixes: an absent attribute projects null, a present final
 /// occurrence with the declared string type and valid grammar projects its
 /// text, and a present final occurrence of any other protocol type or invalid
-/// text rejects only its own record. Earlier duplicate keys are left entirely
-/// to the lossless attribute payload — extraction never rewrites, reorders, or
-/// removes a source entry.
+/// text rejects only its own record. The stored attribute object keeps the
+/// same final occurrence, so a correlation always equals its stored source.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RecordCorrelation {
     /// Client-supplied Card reference text, when present and valid.
@@ -466,29 +690,6 @@ pub fn utf8_column(values: Vec<String>) -> ArrayRef {
 #[must_use]
 pub fn utf8_opt_column(values: Vec<Option<String>>) -> ArrayRef {
     Arc::new(StringArray::from(values))
-}
-
-/// Build a non-nullable binary column.
-#[must_use]
-pub fn binary_column(values: &[Vec<u8>]) -> ArrayRef {
-    let mut builder = BinaryBuilder::new();
-    for value in values {
-        builder.append_value(value);
-    }
-    Arc::new(builder.finish())
-}
-
-/// Build a nullable binary column.
-#[must_use]
-pub fn binary_opt_column(values: &[Option<Vec<u8>>]) -> ArrayRef {
-    let mut builder = BinaryBuilder::new();
-    for value in values {
-        match value {
-            Some(bytes) => builder.append_value(bytes),
-            None => builder.append_null(),
-        }
-    }
-    Arc::new(builder.finish())
 }
 
 /// Build a non-nullable fixed-width binary column of the declared width.
@@ -675,18 +876,6 @@ pub fn f64_column(values: Vec<f64>) -> ArrayRef {
     Arc::new(Float64Array::from(values))
 }
 
-/// Read one binary array value, rejecting an unexpected null.
-///
-/// # Errors
-///
-/// Returns a stable reason when the value is null.
-pub fn required_binary(array: &BinaryArray, row: usize) -> Result<&[u8], &'static str> {
-    array
-        .is_valid(row)
-        .then(|| array.value(row))
-        .ok_or("required canonical payload is null")
-}
-
 /// Validate one supplied canonical user-column batch against a ledger.
 ///
 /// Binding is by field *name*, never by position: a caller may present the
@@ -694,25 +883,40 @@ pub fn required_binary(array: &BinaryArray, row: usize) -> Result<&[u8], &'stati
 /// is that input projected back into declared ledger order so every downstream
 /// authority sees one canonical column order. For each declared field the
 /// supplied field must agree on Arrow type shape and nullability, recursively
-/// through every nested child. Field metadata is deliberately not compared:
-/// the sensitivity tag is the server's own physical identity, re-derived here
-/// when the validated columns are reassembled under the declared schema, and
-/// any caller-supplied field id is dropped, so a writer neither supplies nor
-/// can be wrong about either.
-/// Canonical
-/// binary payloads are additionally decoded and re-encoded so a malformed or
-/// non-canonical protobuf value is refused before any row is accepted.
+/// through every nested child, and a top-level Variant must carry the
+/// `arrow.parquet.variant` extension. Other field metadata is deliberately not
+/// compared: the sensitivity tag is the server's own physical identity,
+/// re-derived here when the validated columns are reassembled under the
+/// declared schema, and any caller-supplied field id is dropped, so a writer
+/// neither supplies nor can be wrong about either.
+///
+/// Checks run in the locked write order: an undeclared column first, then
+/// each declared field's presence and type, then every Variant value — top
+/// level or nested in a list or struct — row by row and, within a row, in
+/// ledger order. A Variant value is fully validated, size first, then
+/// encoding, then depth, exactly as the writer-side encoder enforces them.
 ///
 /// # Errors
 ///
-/// Returns a stable reason when a declared field is missing, an extra column is
-/// present, an identity or type check fails, or a canonical payload value is
-/// not canonically encoded.
+/// Returns a stable reason when a column is undeclared, a declared field is
+/// missing, an identity or type check fails, or a Variant value cannot be
+/// stored. An undeclared column and a Variant value carry their catalogued
+/// error code at the start of the reason.
 pub fn validate_canonical_user_batch(
     declared: &[CanonicalField],
     batch: &RecordBatch,
 ) -> Result<RecordBatch, String> {
     let schema = batch.schema();
+    if let Some(undeclared) = schema
+        .fields()
+        .iter()
+        .find(|supplied| !declared.iter().any(|field| field.name == supplied.name()))
+    {
+        return Err(refusal(&BifrostError::UndeclaredField {
+            field: undeclared.name().clone(),
+            row: 0,
+        }));
+    }
     if schema.fields().len() != declared.len() {
         return Err(format!(
             "canonical batch declares {} columns, expected {}",
@@ -721,34 +925,53 @@ pub fn validate_canonical_user_batch(
         ));
     }
 
-    let mut columns = Vec::with_capacity(declared.len());
+    let mut supplied = Vec::with_capacity(declared.len());
     for field in declared {
         let index = schema
             .index_of(field.name)
             .map_err(|_| format!("canonical batch is missing column {}", field.name))?;
-        let supplied = schema.field(index);
-        validate_field_identity(field, supplied)?;
-        let column = batch.column(index);
-        validate_column_values(field, column.as_ref())?;
-        columns.push(
+        validate_field_identity(field, schema.field(index))?;
+        supplied.push(Arc::clone(batch.column(index)));
+    }
+
+    let variant_columns: Vec<_> = declared
+        .iter()
+        .zip(&supplied)
+        .filter(|(field, _)| holds_variant(&field.ty))
+        .collect();
+    for row in 0..batch.num_rows() {
+        let ordinal = u64::try_from(row).unwrap_or(u64::MAX);
+        for (field, column) in &variant_columns {
+            validate_variant_values(field, field.name, column.as_ref(), row, ordinal)?;
+        }
+    }
+
+    let columns = declared
+        .iter()
+        .zip(&supplied)
+        .map(|(field, column)| {
             crate::tables::restamp_field_identity(column.as_ref(), field.to_arrow().data_type())
                 .map_err(|error| {
                     format!(
                         "canonical field {} does not carry its declared identity: {error}",
                         field.name
                     )
-                })?,
-        );
-    }
-
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let canonical = Schema::new(
         declared
             .iter()
             .map(CanonicalField::to_arrow)
             .collect::<Vec<_>>(),
     );
-    RecordBatch::try_new(std::sync::Arc::new(canonical), columns)
+    RecordBatch::try_new(Arc::new(canonical), columns)
         .map_err(|error| format!("canonical batch does not assemble: {error}"))
+}
+
+/// Render one catalogued refusal as a validator reason led by its code.
+fn refusal(error: &BifrostError) -> String {
+    format!("{}: {error}", error.code())
 }
 
 /// Verify one supplied Arrow field against its ledger declaration.
@@ -756,7 +979,7 @@ pub fn validate_canonical_user_batch(
 /// # Errors
 ///
 /// Returns a stable reason naming the first disagreement in name, type shape,
-/// nullability, or any nested child.
+/// Variant extension, nullability, or any nested child.
 fn validate_field_identity(declared: &CanonicalField, supplied: &Field) -> Result<(), String> {
     if supplied.name() != declared.name {
         return Err(format!(
@@ -766,7 +989,8 @@ fn validate_field_identity(declared: &CanonicalField, supplied: &Field) -> Resul
         ));
     }
     let expected = declared.to_arrow();
-    if !supplied.data_type().equals_datatype(expected.data_type()) {
+    let extension_matches = !matches!(declared.ty, T::Variant) || fields::is_variant(supplied);
+    if !extension_matches || !supplied.data_type().equals_datatype(expected.data_type()) {
         return Err(format!(
             "canonical field {} has type {}, expected {}",
             declared.name,
@@ -785,63 +1009,79 @@ fn validate_field_identity(declared: &CanonicalField, supplied: &Field) -> Resul
     Ok(())
 }
 
-/// Verify one supplied column's canonical payload values.
+/// Report whether a declared type is or contains a Variant.
+fn holds_variant(ty: &T) -> bool {
+    matches!(ty, T::Variant) || ty.children().iter().any(|child| holds_variant(&child.ty))
+}
+
+/// Validate every Variant value one input row holds under one declaration.
 ///
-/// Only binary payloads carry an encoding contract Arrow cannot express, so
-/// this walks into lists and structs to reach every `Binary` leaf and leaves
-/// every other type to the identity check above.
+/// `index` is the position of the value inside `column`; a list descends into
+/// the element range the value owns and a struct into each child at the same
+/// position, so nested Variants are checked with their own row. `label` is the
+/// top-level column the refusal names and `row` is the input row.
 ///
 /// # Errors
 ///
-/// Returns a stable reason when a payload value is not canonically encoded.
-fn validate_column_values(declared: &CanonicalField, column: &dyn Array) -> Result<(), String> {
+/// Returns the catalogued Variant refusal for the first value that cannot be
+/// stored, or a stable reason when a value's storage is not the declared
+/// layout.
+fn validate_variant_values(
+    declared: &CanonicalField,
+    label: &str,
+    column: &dyn Array,
+    index: usize,
+    row: u64,
+) -> Result<(), String> {
+    if column.is_null(index) {
+        return Ok(());
+    }
+    let malformed = || format!("canonical field {label} does not hold its declared layout");
     match declared.ty {
-        CanonicalType::Binary => {
-            let array = column
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| format!("canonical field {} is not binary", declared.name))?;
-            let verify = canonical_binary_verifier(declared.name);
-            for row in 0..array.len() {
-                if array.is_null(row) {
-                    continue;
-                }
-                verify(array.value(row))
-                    .map_err(|reason| format!("canonical field {}: {reason}", declared.name))?;
-            }
-            Ok(())
-        }
-        CanonicalType::List(element) => {
-            let array = column
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| format!("canonical field {} is not a list", declared.name))?;
-            validate_column_values(element, array.values().as_ref())
-        }
-        CanonicalType::Struct(children) => {
-            let array = column
+        T::Variant => {
+            let storage = column
                 .as_any()
                 .downcast_ref::<StructArray>()
-                .ok_or_else(|| format!("canonical field {} is not a struct", declared.name))?;
-            for (index, child) in children.iter().enumerate() {
-                validate_column_values(child, array.column(index).as_ref())?;
-            }
-            Ok(())
+                .ok_or_else(malformed)?;
+            let child = |name: &str| {
+                storage
+                    .column_by_name(name)
+                    .and_then(|bytes| bytes.as_any().downcast_ref::<BinaryArray>())
+                    .map(|bytes| bytes.value(index))
+            };
+            let (Some(metadata), Some(value)) = (child("metadata"), child("value")) else {
+                return Err(malformed());
+            };
+            EncodedVariant::from_bytes(metadata, value)
+                .map(drop)
+                .map_err(|violation| refusal(&violation.into_error(label, row)))
+        }
+        T::List(element) => {
+            let list = column
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(malformed)?;
+            let offsets = list.value_offsets();
+            let start = usize::try_from(offsets[index]).map_err(|_| malformed())?;
+            let end = usize::try_from(offsets[index + 1]).map_err(|_| malformed())?;
+            (start..end).try_for_each(|item| {
+                validate_variant_values(element, label, list.values().as_ref(), item, row)
+            })
+        }
+        T::Struct(children) => {
+            let nested = column
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(malformed)?;
+            children
+                .iter()
+                .zip(nested.columns())
+                .filter(|(child, _)| holds_variant(&child.ty))
+                .try_for_each(|(child, values)| {
+                    validate_variant_values(child, label, values.as_ref(), index, row)
+                })
         }
         _ => Ok(()),
-    }
-}
-
-/// Select the canonical protobuf verifier for one declared binary field.
-///
-/// A log body and a metric or attribute payload are different pinned messages,
-/// so the verifier is chosen by the declared field name rather than by type
-/// alone. Any other binary field is an opaque canonical `EntityRef`.
-fn canonical_binary_verifier(name: &str) -> fn(&[u8]) -> Result<(), &'static str> {
-    match name {
-        "body" => verify_canonical_any_value,
-        "entity_ref" => verify_canonical_entity_ref,
-        _ => verify_canonical_attributes,
     }
 }
 
@@ -853,7 +1093,8 @@ fn canonical_binary_verifier(name: &str) -> fn(&[u8]) -> Result<(), &'static str
 /// authorization rule has one fixture to update rather than three.
 #[cfg(test)]
 pub(crate) mod correlation_fixture {
-    use super::{CardRef, CardRefScope, FromStr};
+    use super::{CardRef, CardRefScope, FromStr, KeyValue, RecordBatch, attributes_variant};
+    use wyrd_queue::variant::variant_cell_to_json;
 
     /// A signed scope member whose mint-resolved UID makes it assertable.
     pub(crate) const IN_SCOPE: &str = "prod/Service/checkout@1.0.0";
@@ -877,6 +1118,31 @@ pub(crate) mod correlation_fixture {
             &root,
             [CardRef::from_str(WITHOUT_UID).expect("fixture card ref")],
         )
+    }
+
+    /// Assert each leading `attributes` row holds its source attribute set.
+    ///
+    /// Correlation never rewrites the payload, so row `n` must decode to the
+    /// Variant object `sources[n]` projects, the final duplicate winning.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a row is missing, does not decode, or differs.
+    pub(crate) fn assert_attribute_rows(batch: &RecordBatch, sources: &[&[KeyValue]]) {
+        let attributes = batch
+            .column_by_name("attributes")
+            .expect("the batch has an attributes column");
+        for (row, source) in sources.iter().enumerate() {
+            let expected = attributes_variant("attributes", source)
+                .expect("fixture attributes project")
+                .to_json()
+                .expect("fixture attributes decode");
+            assert_eq!(
+                variant_cell_to_json(attributes.as_ref(), row).expect("row decodes"),
+                expected,
+                "row {row} retains every source attribute, the final duplicate winning"
+            );
+        }
     }
 }
 
@@ -944,63 +1210,136 @@ pub(crate) fn fixed_row_bytes(fields: &Fields) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wyrd_tonic::otlp::common::v1::any_value::Value;
+    use serde_json::json;
+    use wyrd_queue::variant::variant_bytes_to_json;
+    use wyrd_spec::vala::api::VARIANT_MAX_DEPTH;
+    use wyrd_tonic::otlp::common::v1::{ArrayValue, KeyValueList};
 
-    /// The borrow-free attribute encoding must equal the pinned message form.
-    #[test]
-    fn attribute_encoding_matches_the_pinned_key_value_list() {
-        let attributes = vec![
-            KeyValue {
-                key: "service.name".to_owned(),
-                value: Some(AnyValue {
-                    value: Some(Value::StringValue("checkout".to_owned())),
-                }),
-            },
-            KeyValue {
-                key: "retries".to_owned(),
-                value: Some(AnyValue {
-                    value: Some(Value::IntValue(3)),
-                }),
-            },
-        ];
-        let expected = KeyValueList {
-            values: attributes.clone(),
+    /// Build one attribute entry with the supplied protocol value.
+    fn attribute(key: &str, value: Value) -> KeyValue {
+        KeyValue {
+            key: key.to_owned(),
+            value: Some(AnyValue { value: Some(value) }),
         }
-        .encode_to_vec();
-        assert_eq!(encode_attributes(&attributes), expected);
-        assert!(verify_canonical_attributes(&expected).is_ok());
     }
 
-    /// Empty is a present value with zero bytes, never a decode failure.
-    #[test]
-    fn empty_attribute_collections_encode_to_present_empty_bytes() {
-        assert!(encode_attributes(&[]).is_empty());
-        assert!(verify_canonical_attributes(&[]).is_ok());
-        assert!(verify_canonical_any_value(&[]).is_ok());
+    /// Decode one encoded Variant back to JSON.
+    fn json_of(encoded: &EncodedVariant) -> serde_json::Value {
+        variant_bytes_to_json(encoded.metadata(), encoded.value()).expect("valid Variant")
     }
 
-    /// Trailing garbage is not a canonical encoding even when it decodes.
+    /// Every `OTLP` value form keeps its type, and duplicate keys keep the
+    /// final occurrence.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a value changes type, an integer narrows lossily, a present
+    /// unset value is dropped, or an earlier duplicate wins.
     #[test]
-    fn non_canonical_attribute_bytes_are_rejected() {
-        assert!(verify_canonical_attributes(&[0xff, 0xff]).is_err());
+    fn otlp_attributes_project_into_typed_variant_objects() {
+        let encoded = attributes_variant(
+            "attributes",
+            &[
+                attribute("service.name", Value::StringValue("first".to_owned())),
+                attribute("retries", Value::IntValue(9_007_199_254_740_993)),
+                attribute("ratio", Value::DoubleValue(0.5)),
+                attribute("flag", Value::BoolValue(true)),
+                attribute("raw", Value::BytesValue(vec![0x00, 0xff])),
+                attribute(
+                    "list",
+                    Value::ArrayValue(ArrayValue {
+                        values: vec![
+                            AnyValue {
+                                value: Some(Value::IntValue(1)),
+                            },
+                            AnyValue { value: None },
+                        ],
+                    }),
+                ),
+                attribute(
+                    "nested",
+                    Value::KvlistValue(KeyValueList {
+                        values: vec![attribute("inner", Value::StringValue("v".to_owned()))],
+                    }),
+                ),
+                KeyValue {
+                    key: "unset".to_owned(),
+                    value: None,
+                },
+                attribute("service.name", Value::StringValue("last".to_owned())),
+            ],
+        )
+        .expect("attributes project");
+        let variant = Variant::try_new(encoded.metadata(), encoded.value()).expect("valid");
+        let object = variant.as_object().expect("an attribute set is an object");
+        assert_eq!(
+            object.get("retries"),
+            Some(Variant::Int64(9_007_199_254_740_993))
+        );
+        assert_eq!(object.get("raw"), Some(Variant::Binary(&[0x00, 0xff])));
+        assert_eq!(object.get("unset"), Some(Variant::Null));
+        assert_eq!(object.get("absent"), None);
+        assert_eq!(
+            json_of(&encoded),
+            json!({
+                "service.name": "last", "retries": 9_007_199_254_740_993_i64, "ratio": 0.5,
+                "flag": true, "raw": "AP8=", "list": [1, null], "nested": {"inner": "v"},
+                "unset": null
+            })
+        );
+        assert_eq!(
+            json_of(&attributes_variant("attributes", &[]).expect("empty projects")),
+            json!({})
+        );
+    }
+
+    /// A value nested past the depth limit is refused with its catalogue code.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the limit is off by one or the reason lacks the code.
+    #[test]
+    fn over_deep_otlp_values_are_refused_with_the_catalogued_code() {
+        let mut value = AnyValue {
+            value: Some(Value::IntValue(1)),
+        };
+        // The attribute object is the first container, so 63 nested arrays
+        // reach exactly the limit.
+        for _ in 1..VARIANT_MAX_DEPTH {
+            value = AnyValue {
+                value: Some(Value::ArrayValue(ArrayValue {
+                    values: vec![value],
+                })),
+            };
+        }
+        let at_limit = vec![KeyValue {
+            key: "deep".to_owned(),
+            value: Some(value.clone()),
+        }];
+        attributes_variant("attributes", &at_limit).expect("exactly the limit projects");
+        let past = vec![KeyValue {
+            key: "deep".to_owned(),
+            value: Some(AnyValue {
+                value: Some(Value::ArrayValue(ArrayValue {
+                    values: vec![value],
+                })),
+            }),
+        }];
+        let failure = attributes_variant("attributes", &past).expect_err("one past refuses");
+        assert!(
+            failure
+                .reason(4)
+                .starts_with("WYRD_VALA_400_VARIANT_TOO_DEEP"),
+            "the reason leads with the catalogue code"
+        );
     }
 
     /// Duplicate attribute keys resolve to the final occurrence.
     #[test]
     fn duplicate_attribute_keys_resolve_to_the_last_value() {
         let attributes = vec![
-            KeyValue {
-                key: "service.name".to_owned(),
-                value: Some(AnyValue {
-                    value: Some(Value::StringValue("first".to_owned())),
-                }),
-            },
-            KeyValue {
-                key: "service.name".to_owned(),
-                value: Some(AnyValue {
-                    value: Some(Value::StringValue("last".to_owned())),
-                }),
-            },
+            attribute("service.name", Value::StringValue("first".to_owned())),
+            attribute("service.name", Value::StringValue("last".to_owned())),
         ];
         assert_eq!(
             last_string_attribute(&attributes, "service.name"),

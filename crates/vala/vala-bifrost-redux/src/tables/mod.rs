@@ -1990,7 +1990,7 @@ mod tests {
     /// built-in claims a canonical validator it cannot own.
     #[test]
     fn builtin_registry_dispatches_canonical_value_validation() {
-        use arrow::array::{Array, BinaryArray, Int64Array};
+        use arrow::array::{Array, BinaryArray, Int64Array, StructArray};
 
         let (spans, _) =
             crate::tables::traces::project_resource_spans(&span_fixture(), None, usize::MAX)
@@ -2024,10 +2024,19 @@ mod tests {
                     .zip(batch.columns())
                     .map(|(field, column)| {
                         if field.name() == "attributes" {
-                            Arc::new(BinaryArray::from_iter_values(std::iter::repeat_n(
-                                [0xff_u8].as_slice(),
-                                batch.num_rows(),
-                            ))) as Arc<dyn Array>
+                            let invalid = || {
+                                Arc::new(BinaryArray::from_iter_values(std::iter::repeat_n(
+                                    [0xff_u8].as_slice(),
+                                    batch.num_rows(),
+                                ))) as Arc<dyn Array>
+                            };
+                            let DataType::Struct(children) =
+                                wyrd_queue::variant::variant_storage_type()
+                            else {
+                                panic!("Variant storage is a struct");
+                            };
+                            Arc::new(StructArray::new(children, vec![invalid(), invalid()], None))
+                                as Arc<dyn Array>
                         } else {
                             Arc::clone(column)
                         }
@@ -2035,9 +2044,10 @@ mod tests {
                     .collect(),
             )
             .expect("the corrupted batch still assembles");
+            let refusal = validate(&corrupted).expect_err("invalid Variant bytes are refused");
             assert!(
-                validate(&corrupted).is_err(),
-                "{namespace}.{name} rejects non-canonical payload bytes"
+                refusal.starts_with("WYRD_VALA_400_VARIANT_INVALID_JSON"),
+                "{namespace}.{name} refuses invalid Variant bytes with the catalogued code"
             );
         }
 

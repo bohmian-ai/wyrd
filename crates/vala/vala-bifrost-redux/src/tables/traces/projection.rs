@@ -13,23 +13,24 @@
 use arrow::array::ArrayRef;
 use arrow::datatypes::{Fields, Schema};
 use arrow::record_batch::RecordBatch;
+use std::borrow::Cow;
 use std::sync::Arc;
-use wyrd_tonic::otlp::common::v1::KeyValue;
+use wyrd_queue::variant::EncodedVariant;
 use wyrd_tonic::otlp::common::v1::any_value::Value;
+use wyrd_tonic::otlp::common::v1::{EntityRef, KeyValue};
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
-use super::spans::{
-    RESOURCE_ENTITY_REF_ELEMENT, SPAN_EVENT_ELEMENT, SPAN_FIELDS, SPAN_LINK_ELEMENT,
-};
+use super::spans::{SPAN_EVENT_ELEMENT, SPAN_FIELDS, SPAN_LINK_ELEMENT};
 use crate::otlp_contract::IngestOutcome;
 use crate::tables::TableError;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
-    OutputBudget, RecordCorrelation, ResourceEnvelope, ScopeEnvelope, binary_column, bool_column,
-    checked_i64, encode_attributes, fixed_binary_column, fixed_binary_opt_column, fixed_row_bytes,
-    i32_column, i32_opt_column, i64_column, i64_opt_column, internal, last_attribute,
-    last_string_attribute, list_column, nested_fields, projected_signal_schema, span_id_bytes,
-    struct_column, trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column,
+    ExceptionPromotions, OutputBudget, RecordCorrelation, ResourceEnvelope, ScopeEnvelope,
+    attributes_variant, bool_column, checked_i64, entity_refs_column, fixed_binary_column,
+    fixed_binary_opt_column, fixed_row_bytes, i32_column, i32_opt_column, i64_column,
+    i64_opt_column, internal, last_attribute, list_column, nested_fields, projected_signal_schema,
+    promoted_int, promoted_string, span_id_bytes, struct_column, trace_id_bytes, u32_as_i64_column,
+    utf8_column, utf8_opt_column, variant_column,
 };
 use wyrd_spec::reference::CardRefScope;
 
@@ -48,8 +49,9 @@ const MAX_CHILD_ATTRIBUTE_KEYS: usize = 128;
 /// Largest accepted scope version, in bytes.
 const MAX_SCOPE_VERSION_BYTES: usize = 64;
 
-/// Canonical resource attribute the nullable `service_name` column promotes.
-const SERVICE_NAME_ATTRIBUTE: &str = "service.name";
+/// Name of the span event whose attributes carry the `exception.*`
+/// conventions; the last such event is the one promoted.
+const EXCEPTION_EVENT_NAME: &str = "exception";
 
 /// The pinned `GenAI` string promotions, as (attribute key, canonical column).
 ///
@@ -76,6 +78,9 @@ const GEN_AI_INT_PROMOTIONS: [&str; 2] =
 /// relative request order, and the returned [`IngestOutcome`] carries the exact
 /// accepted and rejected counts plus the first rejection reason in traversal
 /// order, which is what the existing OTLP partial-success response encodes.
+/// A value that cannot be stored as Variant rejects its span with a reason
+/// that starts with the catalogued Variant error code and names the span's
+/// zero-based traversal ordinal; nothing is truncated.
 ///
 /// # Errors
 ///
@@ -95,35 +100,38 @@ pub fn project_resource_spans(
     let mut rejected: i64 = 0;
     let mut rejection_message: Option<String> = None;
 
+    let mut ordinal: u64 = 0;
+
     for resource in resource_spans {
         let envelope = ResourceEnvelope::project(resource.resource.as_ref(), &resource.schema_url);
         let resource_defect = validate_resource(resource);
-        let service_name = resource
-            .resource
-            .as_ref()
-            .and_then(|value| last_string_attribute(&value.attributes, SERVICE_NAME_ATTRIBUTE));
         for scope in &resource.scope_spans {
             let scope_envelope = ScopeEnvelope::project(scope.scope.as_ref(), &scope.schema_url);
             let scope_defect = resource_defect.or_else(|| validate_scope(scope));
             for span in &scope.spans {
-                let outcome = match scope_defect {
-                    Some(reason) => Err(reason),
-                    None => {
-                        columns.push(span, &envelope, &scope_envelope, service_name, card_scope)
+                let row = ordinal;
+                ordinal = ordinal.saturating_add(1);
+                let outcome = match (scope_defect, &envelope, &scope_envelope) {
+                    (Some(reason), _, _) => Err(Cow::Borrowed(reason)),
+                    (None, Err(failure), _) | (None, Ok(_), Err(failure)) => {
+                        Err(failure.reason(row))
                     }
+                    (None, Ok(envelope), Ok(scope_envelope)) => columns
+                        .push(span, envelope, scope_envelope, card_scope, row)
+                        .map(|bytes| {
+                            bytes + envelope.repeated_bytes() + scope_envelope.repeated_bytes()
+                        }),
                 };
                 match outcome {
                     Ok(payload_bytes) => budget.charge(
                         widths.row
                             + payload_bytes
-                            + envelope.repeated_bytes()
-                            + scope_envelope.repeated_bytes()
                             + span.events.len() * widths.event
                             + span.links.len() * widths.link,
                     )?,
                     Err(reason) => {
                         rejected = rejected.saturating_add(1);
-                        rejection_message.get_or_insert_with(|| reason.to_owned());
+                        rejection_message.get_or_insert_with(|| reason.into_owned());
                     }
                 }
             }
@@ -239,12 +247,12 @@ struct SpanColumns {
     status_present: Vec<bool>,
     status_code: Vec<Option<i32>>,
     status_message: Vec<Option<String>>,
-    attributes: Vec<Vec<u8>>,
+    attributes: Vec<EncodedVariant>,
     dropped_attributes_count: Vec<u32>,
     event_lengths: Vec<Option<usize>>,
     event_time: Vec<i64>,
     event_name: Vec<String>,
-    event_attributes: Vec<Vec<u8>>,
+    event_attributes: Vec<EncodedVariant>,
     event_dropped: Vec<u32>,
     dropped_events_count: Vec<u32>,
     link_lengths: Vec<Option<usize>>,
@@ -252,24 +260,33 @@ struct SpanColumns {
     link_span_id: Vec<Vec<u8>>,
     link_trace_state: Vec<String>,
     link_flags: Vec<u32>,
-    link_attributes: Vec<Vec<u8>>,
+    link_attributes: Vec<EncodedVariant>,
     link_dropped: Vec<u32>,
     dropped_links_count: Vec<u32>,
     resource_present: Vec<bool>,
-    resource_attributes: Vec<Vec<u8>>,
+    resource_attributes: Vec<EncodedVariant>,
     resource_dropped_attributes_count: Vec<u32>,
     resource_schema_url: Vec<String>,
     entity_ref_lengths: Vec<Option<usize>>,
-    entity_refs: Vec<Vec<u8>>,
+    entity_refs: Vec<EntityRef>,
     scope_present: Vec<bool>,
     scope_name: Vec<String>,
     scope_version: Vec<String>,
-    scope_attributes: Vec<Vec<u8>>,
+    scope_attributes: Vec<EncodedVariant>,
     scope_dropped_attributes_count: Vec<u32>,
     scope_schema_url: Vec<String>,
     service_name: Vec<Option<String>>,
     gen_ai_strings: [Vec<Option<String>>; 4],
     gen_ai_ints: [Vec<Option<i64>>; 2],
+    service_version: Vec<Option<String>>,
+    deployment_environment: Vec<Option<String>>,
+    http_request_method: Vec<Option<String>>,
+    http_route: Vec<Option<String>>,
+    http_response_status_code: Vec<Option<i64>>,
+    url_full: Vec<Option<String>>,
+    exception_type: Vec<Option<String>>,
+    exception_message: Vec<Option<String>>,
+    exception_stacktrace: Vec<Option<String>>,
     card_ref: Vec<Option<String>>,
     run_id: Vec<Option<String>>,
 }
@@ -282,21 +299,25 @@ impl SpanColumns {
     /// Returns the stable rejection reason for an invalid identifier, an
     /// out-of-range timestamp pair, an over-long or empty name, an attribute
     /// cardinality breach, an invalid event or link, a `GenAI` promotion whose
-    /// source attribute carries the wrong protocol type, or an optional
-    /// correlation attribute that is wrongly typed or malformed. Nothing is
-    /// appended when an error is returned.
+    /// source attribute carries the wrong protocol type, an optional
+    /// correlation attribute that is wrongly typed or malformed, or a span,
+    /// event, or link attribute set that cannot be stored as Variant. A Variant
+    /// rejection reason starts with its catalogued code and names `row`, the
+    /// span's zero-based traversal ordinal. Nothing is appended when an error
+    /// is returned.
     ///
     /// On success returns the variable-length payload bytes the span itself
-    /// appended (strings, attribute encodings, and event and link payloads);
-    /// the caller adds fixed widths and the repeated resource and scope bytes.
+    /// appended (strings, attribute encodings, promotions, and event and link
+    /// payloads); the caller adds fixed widths and the repeated resource and
+    /// scope bytes.
     fn push(
         &mut self,
         span: &Span,
         resource: &ResourceEnvelope,
         scope: &ScopeEnvelope,
-        service_name: Option<&str>,
         card_scope: Option<&CardRefScope>,
-    ) -> Result<usize, &'static str> {
+        row: u64,
+    ) -> Result<usize, Cow<'static, str>> {
         let trace_id = trace_id_bytes(&span.trace_id)?;
         let span_id = span_id_bytes(&span.span_id)?;
         let parent = if span.parent_span_id.is_empty() {
@@ -305,13 +326,13 @@ impl SpanColumns {
             Some(span_id_bytes(&span.parent_span_id)?.to_vec())
         };
         if span.name.is_empty() || span.name.len() > MAX_NAME_BYTES {
-            return Err("span name is empty or exceeds the accepted length");
+            return Err("span name is empty or exceeds the accepted length".into());
         }
         if span.trace_state.len() > MAX_TRACE_STATE_BYTES {
-            return Err("span trace_state exceeds the accepted length");
+            return Err("span trace_state exceeds the accepted length".into());
         }
         if unique_keys(&span.attributes) > MAX_SPAN_ATTRIBUTE_KEYS {
-            return Err("span declares too many distinct attribute keys");
+            return Err("span declares too many distinct attribute keys".into());
         }
         let start = checked_i64(span.start_time_unix_nano)?;
         let end = checked_i64(span.end_time_unix_nano)?;
@@ -324,9 +345,22 @@ impl SpanColumns {
         let correlation = RecordCorrelation::extract(&span.attributes, card_scope)?;
         Self::validate_events(span)?;
         Self::validate_links(span)?;
-        let attributes = encode_attributes(&span.attributes);
-        let payload_bytes = self.push_events(span)
-            + self.push_links(span)
+        let attributes = attributes_variant("attributes", &span.attributes)
+            .map_err(|failure| failure.reason(row))?;
+        let event_attributes = Self::encode_children(
+            "events",
+            span.events.iter().map(|event| event.attributes.as_slice()),
+            row,
+        )?;
+        let link_attributes = Self::encode_children(
+            "links",
+            span.links.iter().map(|link| link.attributes.as_slice()),
+            row,
+        )?;
+        let http = HttpPromotions::extract(&span.attributes);
+        let exception = Self::exception_promotions(span);
+        let payload_bytes = self.push_events(span, event_attributes)
+            + self.push_links(span, link_attributes)
             + span.trace_state.len()
             + span.name.len()
             + span
@@ -334,7 +368,8 @@ impl SpanColumns {
                 .as_ref()
                 .map_or(0, |status| status.message.len())
             + attributes.len()
-            + service_name.map_or(0, str::len)
+            + http.bytes()
+            + exception.bytes()
             + promotions
                 .strings
                 .iter()
@@ -367,6 +402,31 @@ impl SpanColumns {
         self.link_lengths.push(Some(span.links.len()));
         self.dropped_links_count.push(span.dropped_links_count);
 
+        self.push_context(resource, scope);
+        for (column, value) in self.gen_ai_strings.iter_mut().zip(promotions.strings) {
+            column.push(value);
+        }
+        for (column, value) in self.gen_ai_ints.iter_mut().zip(promotions.ints) {
+            column.push(value);
+        }
+        self.http_request_method.push(http.request_method);
+        self.http_route.push(http.route);
+        self.http_response_status_code
+            .push(http.response_status_code);
+        self.url_full.push(http.url_full);
+        self.exception_type.push(exception.exception_type);
+        self.exception_message.push(exception.message);
+        self.exception_stacktrace.push(exception.stacktrace);
+        self.card_ref.push(correlation.card_ref);
+        self.run_id.push(correlation.run_id);
+
+        self.rows += 1;
+        Ok(payload_bytes)
+    }
+
+    /// Append the resource and scope envelope one accepted span repeats,
+    /// including the promoted resource conventions.
+    fn push_context(&mut self, resource: &ResourceEnvelope, scope: &ScopeEnvelope) {
         self.resource_present.push(resource.present);
         self.resource_attributes.push(resource.attributes.clone());
         self.resource_dropped_attributes_count
@@ -374,8 +434,11 @@ impl SpanColumns {
         self.resource_schema_url.push(resource.schema_url.clone());
         self.entity_ref_lengths
             .push(Some(resource.entity_refs.len()));
-        self.entity_refs
-            .extend(resource.entity_refs.iter().cloned());
+        self.entity_refs.extend_from_slice(&resource.entity_refs);
+        self.service_name.push(resource.service_name.clone());
+        self.service_version.push(resource.service_version.clone());
+        self.deployment_environment
+            .push(resource.deployment_environment.clone());
 
         self.scope_present.push(scope.present);
         self.scope_name.push(scope.name.clone());
@@ -384,20 +447,6 @@ impl SpanColumns {
         self.scope_dropped_attributes_count
             .push(scope.dropped_attributes_count);
         self.scope_schema_url.push(scope.schema_url.clone());
-
-        self.service_name
-            .push(service_name.map(std::borrow::ToOwned::to_owned));
-        for (column, value) in self.gen_ai_strings.iter_mut().zip(promotions.strings) {
-            column.push(value);
-        }
-        for (column, value) in self.gen_ai_ints.iter_mut().zip(promotions.ints) {
-            column.push(value);
-        }
-        self.card_ref.push(correlation.card_ref);
-        self.run_id.push(correlation.run_id);
-
-        self.rows += 1;
-        Ok(payload_bytes)
     }
 
     /// Validate one span's ordered events without mutating any column.
@@ -447,22 +496,54 @@ impl SpanColumns {
         Ok(())
     }
 
+    /// Read the `exception.*` conventions from the span's last event named
+    /// `exception`; every value is null when no such event exists.
+    fn exception_promotions(span: &Span) -> ExceptionPromotions {
+        span.events
+            .iter()
+            .rev()
+            .find(|event| event.name == EXCEPTION_EVENT_NAME)
+            .map(|event| ExceptionPromotions::from_attributes(&event.attributes))
+            .unwrap_or_default()
+    }
+
+    /// Encode each nested event's or link's attribute set as a Variant object.
+    ///
+    /// Encoding happens before any column is touched, so a child that cannot
+    /// be stored rejects the whole span without leaving staged rows behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Variant rejection reason, naming `field` and the span's
+    /// traversal ordinal `row`, for the first child set that cannot be stored.
+    fn encode_children<'a>(
+        field: &'static str,
+        children: impl Iterator<Item = &'a [KeyValue]>,
+        row: u64,
+    ) -> Result<Vec<EncodedVariant>, Cow<'static, str>> {
+        children
+            .map(|attributes| {
+                attributes_variant(field, attributes).map_err(|failure| failure.reason(row))
+            })
+            .collect()
+    }
+
     /// Append one validated span's ordered events into the flattened storage.
     ///
+    /// `attributes` holds each event's encoded attribute set in event order.
     /// Returns the event names and attribute encodings' payload bytes.
     ///
     /// # Panics
     ///
     /// Panics only if a validated event time exceeds `i64`, which validation
     /// against the span's checked end time rules out.
-    fn push_events(&mut self, span: &Span) -> usize {
+    fn push_events(&mut self, span: &Span, attributes: Vec<EncodedVariant>) -> usize {
         let mut payload_bytes = 0;
-        for event in &span.events {
+        for (event, attributes) in span.events.iter().zip(attributes) {
             self.event_time.push(
                 checked_i64(event.time_unix_nano)
                     .expect("a validated event time never exceeds its span's checked end"),
             );
-            let attributes = encode_attributes(&event.attributes);
             payload_bytes += event.name.len() + attributes.len();
             self.event_name.push(event.name.clone());
             self.event_attributes.push(attributes);
@@ -473,14 +554,14 @@ impl SpanColumns {
 
     /// Append one validated span's ordered links into the flattened storage.
     ///
+    /// `attributes` holds each link's encoded attribute set in link order.
     /// Returns the links' `trace_state` and attribute encodings' payload bytes;
     /// fixed-width identifiers are charged with the link's fixed width.
-    fn push_links(&mut self, span: &Span) -> usize {
+    fn push_links(&mut self, span: &Span, attributes: Vec<EncodedVariant>) -> usize {
         let mut payload_bytes = 0;
-        for link in &span.links {
+        for (link, attributes) in span.links.iter().zip(attributes) {
             self.link_trace_id.push(link.trace_id.clone());
             self.link_span_id.push(link.span_id.clone());
-            let attributes = encode_attributes(&link.attributes);
             payload_bytes += link.trace_state.len() + attributes.len();
             self.link_trace_state.push(link.trace_state.clone());
             self.link_flags.push(link.flags);
@@ -510,7 +591,7 @@ impl SpanColumns {
             vec![
                 i64_column(self.event_time),
                 utf8_column(self.event_name),
-                binary_column(&self.event_attributes),
+                variant_column(self.event_attributes.iter().map(Some)),
                 u32_as_i64_column(self.event_dropped),
             ],
             None,
@@ -523,7 +604,7 @@ impl SpanColumns {
                 fixed_binary_column(8, &self.link_span_id).map_err(internal)?,
                 utf8_column(self.link_trace_state),
                 u32_as_i64_column(self.link_flags),
-                binary_column(&self.link_attributes),
+                variant_column(self.link_attributes.iter().map(Some)),
                 u32_as_i64_column(self.link_dropped),
             ],
             None,
@@ -546,7 +627,7 @@ impl SpanColumns {
             bool_column(self.status_present),
             i32_opt_column(self.status_code),
             utf8_opt_column(self.status_message),
-            binary_column(&self.attributes),
+            variant_column(self.attributes.iter().map(Some)),
             u32_as_i64_column(self.dropped_attributes_count),
             list_column(&SPAN_EVENT_ELEMENT.to_arrow(), events, &self.event_lengths)
                 .map_err(internal)?,
@@ -555,19 +636,14 @@ impl SpanColumns {
                 .map_err(internal)?,
             u32_as_i64_column(self.dropped_links_count),
             bool_column(self.resource_present),
-            binary_column(&self.resource_attributes),
+            variant_column(self.resource_attributes.iter().map(Some)),
             u32_as_i64_column(self.resource_dropped_attributes_count),
             utf8_column(self.resource_schema_url),
-            list_column(
-                &RESOURCE_ENTITY_REF_ELEMENT.to_arrow(),
-                binary_column(&self.entity_refs),
-                &self.entity_ref_lengths,
-            )
-            .map_err(internal)?,
+            entity_refs_column(&self.entity_refs, &self.entity_ref_lengths)?,
             bool_column(self.scope_present),
             utf8_column(self.scope_name),
             utf8_column(self.scope_version),
-            binary_column(&self.scope_attributes),
+            variant_column(self.scope_attributes.iter().map(Some)),
             u32_as_i64_column(self.scope_dropped_attributes_count),
             utf8_column(self.scope_schema_url),
             utf8_opt_column(self.service_name),
@@ -577,6 +653,15 @@ impl SpanColumns {
             utf8_opt_column(gen_ai_strings.next().unwrap_or_default()),
             i64_opt_column(gen_ai_ints.next().unwrap_or_default()),
             i64_opt_column(gen_ai_ints.next().unwrap_or_default()),
+            utf8_opt_column(self.service_version),
+            utf8_opt_column(self.deployment_environment),
+            utf8_opt_column(self.http_request_method),
+            utf8_opt_column(self.http_route),
+            i64_opt_column(self.http_response_status_code),
+            utf8_opt_column(self.url_full),
+            utf8_opt_column(self.exception_type),
+            utf8_opt_column(self.exception_message),
+            utf8_opt_column(self.exception_stacktrace),
             utf8_opt_column(self.card_ref),
             utf8_opt_column(self.run_id),
         ];
@@ -635,5 +720,42 @@ impl GenAiPromotions {
             };
         }
         Ok(promotions)
+    }
+}
+
+/// The promoted HTTP semantic conventions of one span's attributes.
+///
+/// Unlike the `GenAI` promotions, a missing or wrongly typed source is null
+/// rather than a rejection; the canonical attributes keep the original value.
+#[derive(Debug, Default)]
+struct HttpPromotions {
+    /// `http.request.method`.
+    request_method: Option<String>,
+    /// `http.route`.
+    route: Option<String>,
+    /// `http.response.status_code`, as a signed integer.
+    response_status_code: Option<i64>,
+    /// `url.full`.
+    url_full: Option<String>,
+}
+
+impl HttpPromotions {
+    /// Read the HTTP conventions from one span's attributes.
+    fn extract(attributes: &[KeyValue]) -> Self {
+        Self {
+            request_method: promoted_string(attributes, "http.request.method"),
+            route: promoted_string(attributes, "http.route"),
+            response_status_code: promoted_int(attributes, "http.response.status_code"),
+            url_full: promoted_string(attributes, "url.full"),
+        }
+    }
+
+    /// Returns the promoted text bytes these values add to one row.
+    fn bytes(&self) -> usize {
+        [&self.request_method, &self.route, &self.url_full]
+            .into_iter()
+            .flatten()
+            .map(String::len)
+            .sum()
     }
 }

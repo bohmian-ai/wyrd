@@ -15,28 +15,31 @@ use arrow::array::{Array, ArrayRef, StringArray};
 use arrow::datatypes::Fields;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::sync::Arc;
+use wyrd_queue::variant::EncodedVariant;
+use wyrd_tonic::otlp::common::v1::{EntityRef, KeyValue};
 use wyrd_tonic::otlp::metrics::v1::{
     Exemplar, ExponentialHistogramDataPoint, HistogramDataPoint, Metric, NumberDataPoint,
     ResourceMetrics, SummaryDataPoint, exemplar, metric, number_data_point,
 };
 
 use super::points::{
-    BUCKET_COUNT_ELEMENT, EXEMPLAR_ELEMENT, EXPLICIT_BOUND_ELEMENT, METRIC_ENTITY_REF_ELEMENT,
-    METRIC_FIELDS, NEGATIVE_BUCKET_COUNT_ELEMENT, NEGATIVE_BUCKET_FIELDS,
-    POSITIVE_BUCKET_COUNT_ELEMENT, POSITIVE_BUCKET_FIELDS, QUANTILE_VALUE_ELEMENT,
+    BUCKET_COUNT_ELEMENT, EXEMPLAR_ELEMENT, EXPLICIT_BOUND_ELEMENT, METRIC_FIELDS,
+    NEGATIVE_BUCKET_COUNT_ELEMENT, NEGATIVE_BUCKET_FIELDS, POSITIVE_BUCKET_COUNT_ELEMENT,
+    POSITIVE_BUCKET_FIELDS, QUANTILE_VALUE_ELEMENT,
 };
 use crate::otlp_contract::MetricsOutcome;
 use crate::tables::TableError;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
-    OutputBudget, RecordCorrelation, ResourceEnvelope, ScopeEnvelope, binary_column, bool_column,
-    bool_opt_column, checked_i64, encode_attributes, f64_column, f64_opt_column,
+    OutputBudget, RecordCorrelation, ResourceEnvelope, ScopeEnvelope, attributes_variant,
+    bool_column, bool_opt_column, checked_i64, entity_refs_column, f64_column, f64_opt_column,
     fixed_binary_opt_column, fixed_row_bytes, i32_column, i32_opt_column, i64_column,
     i64_opt_column, internal, list_column, nested_fields, projected_signal_schema, span_id_bytes,
     struct_column, trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column,
-    validate_canonical_user_batch,
+    validate_canonical_user_batch, variant_column,
 };
 use wyrd_spec::reference::CardRefScope;
 
@@ -147,7 +150,11 @@ const KIND_SPECIFIC_COLUMNS: [&str; 20] = [
 /// rejected whole, and a rejected point contributes no partial row and no
 /// partial nested collection. The returned [`MetricsOutcome`] carries the exact
 /// counts plus the first rejection reason for the existing `OTLP`
-/// partial-success response.
+/// partial-success response. A value that cannot be stored as Variant rejects
+/// its point with a reason that starts with the catalogued Variant error code
+/// and names the point's zero-based traversal ordinal; metric metadata or a
+/// resource or scope attribute set that cannot be stored rejects every point
+/// beneath it, naming the first. Nothing is truncated.
 ///
 /// # Errors
 ///
@@ -165,35 +172,41 @@ pub fn project_resource_metrics(
     let widths = MetricOutputWidths::new();
     let mut rejected: i64 = 0;
     let mut rejection_message: Option<String> = None;
-    let reject =
-        |reason: &'static str, count: usize, rejected: &mut i64, message: &mut Option<String>| {
-            *rejected = rejected.saturating_add(i64::try_from(count).unwrap_or(i64::MAX));
-            message.get_or_insert_with(|| reason.to_owned());
-        };
+    let reject = |reason: Cow<'static, str>,
+                  count: usize,
+                  rejected: &mut i64,
+                  message: &mut Option<String>| {
+        *rejected = rejected.saturating_add(i64::try_from(count).unwrap_or(i64::MAX));
+        message.get_or_insert_with(|| reason.into_owned());
+    };
+    let mut ordinal: u64 = 0;
 
     for resource in resource_metrics {
         let envelope = ResourceEnvelope::project(resource.resource.as_ref(), &resource.schema_url);
         for scope in &resource.scope_metrics {
             let scope_envelope = ScopeEnvelope::project(scope.scope.as_ref(), &scope.schema_url);
             for metric in &scope.metrics {
-                let descriptor = match MetricDescriptor::project(metric) {
-                    Ok(descriptor) => descriptor,
+                let first = ordinal;
+                let count = point_count(metric);
+                ordinal = ordinal.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+                let shared = match (&envelope, &scope_envelope) {
+                    (Err(failure), _) | (Ok(_), Err(failure)) => Err(failure.reason(first)),
+                    (Ok(envelope), Ok(scope_envelope)) => MetricDescriptor::project(metric, first)
+                        .map(|descriptor| (envelope, scope_envelope, descriptor)),
+                };
+                let (envelope, scope_envelope, descriptor) = match shared {
+                    Ok(shared) => shared,
                     Err(reason) => {
-                        reject(
-                            reason,
-                            point_count(metric),
-                            &mut rejected,
-                            &mut rejection_message,
-                        );
+                        reject(reason, count, &mut rejected, &mut rejection_message);
                         continue;
                     }
                 };
-                for row in point_rows(metric, card_scope) {
+                for row in point_rows(metric, card_scope, first) {
                     match row {
                         Ok(row) => {
                             let exemplars = row.exemplars.len();
                             let payload_bytes =
-                                columns.push(&descriptor, row, &envelope, &scope_envelope);
+                                columns.push(&descriptor, row, envelope, scope_envelope);
                             budget.charge(
                                 widths.row
                                     + payload_bytes
@@ -336,8 +349,8 @@ struct MetricDescriptor {
     description: String,
     /// Metric unit.
     unit: String,
-    /// Canonical encoding of the metric-level metadata attributes.
-    metadata: Vec<u8>,
+    /// Metric-level metadata attributes as one Variant object.
+    metadata: EncodedVariant,
     /// Canonical `metric_type` discriminant.
     kind: &'static str,
     /// Raw aggregation temporality, when the kind owns one.
@@ -351,17 +364,19 @@ impl MetricDescriptor {
     ///
     /// # Errors
     ///
-    /// Returns a stable reason when the metric carries no data oneof or when a
-    /// descriptor string exceeds its accepted length.
-    fn project(metric: &Metric) -> Result<Self, &'static str> {
+    /// Returns a stable reason when the metric carries no data oneof, a
+    /// descriptor string exceeds its accepted length, or its metadata cannot
+    /// be stored as Variant; the Variant reason names `row`, the traversal
+    /// ordinal of the metric's first point.
+    fn project(metric: &Metric, row: u64) -> Result<Self, Cow<'static, str>> {
         if metric.name.is_empty() || metric.name.len() > MAX_METRIC_NAME_BYTES {
-            return Err("metric name is empty or exceeds the accepted length");
+            return Err("metric name is empty or exceeds the accepted length".into());
         }
         if metric.description.len() > MAX_DESCRIPTION_BYTES {
-            return Err("metric description exceeds the accepted length");
+            return Err("metric description exceeds the accepted length".into());
         }
         if metric.unit.len() > MAX_UNIT_BYTES {
-            return Err("metric unit exceeds the accepted length");
+            return Err("metric unit exceeds the accepted length".into());
         }
         let (kind, temporality, monotonic) = match &metric.data {
             Some(metric::Data::Gauge(_)) => (METRIC_TYPE_GAUGE, None, None),
@@ -381,13 +396,14 @@ impl MetricDescriptor {
                 None,
             ),
             Some(metric::Data::Summary(_)) => (METRIC_TYPE_SUMMARY, None, None),
-            None => return Err("metric carries no data point collection"),
+            None => return Err("metric carries no data point collection".into()),
         };
         Ok(Self {
             name: metric.name.clone(),
             description: metric.description.clone(),
             unit: metric.unit.clone(),
-            metadata: encode_attributes(&metric.metadata),
+            metadata: attributes_variant("metadata", &metric.metadata)
+                .map_err(|failure| failure.reason(row))?,
             kind,
             temporality,
             monotonic,
@@ -396,35 +412,45 @@ impl MetricDescriptor {
 }
 
 /// Validate every data point of one metric, in request order.
+///
+/// `first` is the traversal ordinal of the metric's first point; each point's
+/// own ordinal is passed on so a Variant rejection names it.
 fn point_rows(
     metric: &Metric,
     card_scope: Option<&CardRefScope>,
-) -> Vec<Result<PointRow, &'static str>> {
+    first: u64,
+) -> Vec<Result<PointRow, Cow<'static, str>>> {
+    let ordinals = (0u64..).map(|index| first.saturating_add(index));
     match &metric.data {
         Some(metric::Data::Gauge(gauge)) => gauge
             .data_points
             .iter()
-            .map(|point| PointRow::number(point, card_scope))
+            .zip(ordinals)
+            .map(|(point, row)| PointRow::number(point, card_scope, row))
             .collect(),
         Some(metric::Data::Sum(sum)) => sum
             .data_points
             .iter()
-            .map(|point| PointRow::number(point, card_scope))
+            .zip(ordinals)
+            .map(|(point, row)| PointRow::number(point, card_scope, row))
             .collect(),
         Some(metric::Data::Histogram(histogram)) => histogram
             .data_points
             .iter()
-            .map(|point| PointRow::histogram(point, card_scope))
+            .zip(ordinals)
+            .map(|(point, row)| PointRow::histogram(point, card_scope, row))
             .collect(),
         Some(metric::Data::ExponentialHistogram(histogram)) => histogram
             .data_points
             .iter()
-            .map(|point| PointRow::exponential_histogram(point, card_scope))
+            .zip(ordinals)
+            .map(|(point, row)| PointRow::exponential_histogram(point, card_scope, row))
             .collect(),
         Some(metric::Data::Summary(summary)) => summary
             .data_points
             .iter()
-            .map(|point| PointRow::summary(point, card_scope))
+            .zip(ordinals)
+            .map(|(point, row)| PointRow::summary(point, card_scope, row))
             .collect(),
         None => Vec::new(),
     }
@@ -448,8 +474,8 @@ struct ExemplarRow {
     int_value: Option<i64>,
     /// Double alternative, when the exemplar carries one.
     double_value: Option<f64>,
-    /// Canonical encoding of the filtered attributes.
-    filtered_attributes: Vec<u8>,
+    /// Filtered attributes as one Variant object.
+    filtered_attributes: EncodedVariant,
     /// Correlated trace id, when present.
     trace_id: Option<Vec<u8>>,
     /// Correlated span id, when present.
@@ -457,7 +483,7 @@ struct ExemplarRow {
 }
 
 /// One validated data point, independent of which kind produced it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PointRow {
     /// Point observation time.
     time_unix_nano: i64,
@@ -465,8 +491,8 @@ struct PointRow {
     start_time_unix_nano: i64,
     /// Raw data-point flag word.
     flags: u32,
-    /// Canonical encoding of the point attributes.
-    attributes: Vec<u8>,
+    /// Point attributes as one Variant object.
+    attributes: EncodedVariant,
     /// Optional client-supplied Card and run correlation for this point.
     correlation: RecordCorrelation,
     /// Integer numeric alternative.
@@ -512,26 +538,31 @@ impl PointRow {
     ///
     /// Returns a stable reason when the numeric oneof is absent, a
     /// `wyrd.card_ref` or `wyrd.run_id` attribute is wrongly typed or
-    /// malformed, or an exemplar is invalid.
+    /// malformed, an attribute set cannot be stored as Variant, or an exemplar
+    /// is invalid. A Variant reason names `row`, the point's traversal ordinal.
     fn number(
         point: &NumberDataPoint,
         card_scope: Option<&CardRefScope>,
-    ) -> Result<Self, &'static str> {
+        row: u64,
+    ) -> Result<Self, Cow<'static, str>> {
         let (int_value, double_value) = match point.value {
             Some(number_data_point::Value::AsInt(value)) => (Some(value), None),
             Some(number_data_point::Value::AsDouble(value)) => (None, Some(value)),
-            None => return Err("numeric data point carries no value"),
+            None => return Err("numeric data point carries no value".into()),
         };
+        let common = Self::common(
+            point.time_unix_nano,
+            point.start_time_unix_nano,
+            point.flags,
+            &point.attributes,
+            card_scope,
+            row,
+        )?;
         Ok(Self {
-            time_unix_nano: checked_i64(point.time_unix_nano)?,
-            start_time_unix_nano: checked_i64(point.start_time_unix_nano)?,
-            flags: point.flags,
-            attributes: encode_attributes(&point.attributes),
-            correlation: RecordCorrelation::extract(&point.attributes, card_scope)?,
             int_value,
             double_value,
-            exemplars: exemplar_rows(&point.exemplars)?,
-            ..Self::default()
+            exemplars: exemplar_rows(&point.exemplars, row)?,
+            ..common
         })
     }
 
@@ -543,25 +574,27 @@ impl PointRow {
     /// bucket counts do not sum to the declared count, a bound is not finite or
     /// not strictly increasing, the collection exceeds its accepted size, a
     /// `wyrd.card_ref` or `wyrd.run_id` attribute is wrongly typed or
-    /// malformed, or an exemplar is invalid.
+    /// malformed, an attribute set cannot be stored as Variant, or an exemplar
+    /// is invalid. A Variant reason names `row`, the point's traversal ordinal.
     fn histogram(
         point: &HistogramDataPoint,
         card_scope: Option<&CardRefScope>,
-    ) -> Result<Self, &'static str> {
+        row: u64,
+    ) -> Result<Self, Cow<'static, str>> {
         if point.bucket_counts.len() > MAX_BUCKETS {
-            return Err("histogram bucket collection exceeds the accepted size");
+            return Err("histogram bucket collection exceeds the accepted size".into());
         }
         if !point.bucket_counts.is_empty()
             && point.bucket_counts.len() != point.explicit_bounds.len() + 1
         {
-            return Err("histogram bucket count does not match its explicit bounds");
+            return Err("histogram bucket count does not match its explicit bounds".into());
         }
         if point
             .explicit_bounds
             .windows(2)
             .any(|pair| pair[0].partial_cmp(&pair[1]) != Some(Ordering::Less))
         {
-            return Err("histogram explicit bounds are not strictly increasing");
+            return Err("histogram explicit bounds are not strictly increasing".into());
         }
         let observed: u64 = point
             .bucket_counts
@@ -569,14 +602,17 @@ impl PointRow {
             .try_fold(0u64, |total, count| total.checked_add(*count))
             .ok_or("histogram bucket counts overflow their total")?;
         if !point.bucket_counts.is_empty() && observed != point.count {
-            return Err("histogram bucket counts do not sum to the declared count");
+            return Err("histogram bucket counts do not sum to the declared count".into());
         }
+        let common = Self::common(
+            point.time_unix_nano,
+            point.start_time_unix_nano,
+            point.flags,
+            &point.attributes,
+            card_scope,
+            row,
+        )?;
         Ok(Self {
-            time_unix_nano: checked_i64(point.time_unix_nano)?,
-            start_time_unix_nano: checked_i64(point.start_time_unix_nano)?,
-            flags: point.flags,
-            attributes: encode_attributes(&point.attributes),
-            correlation: RecordCorrelation::extract(&point.attributes, card_scope)?,
             histogram_count: Some(checked_i64(point.count)?),
             histogram_sum: point.sum,
             histogram_min: point.min,
@@ -589,8 +625,8 @@ impl PointRow {
                     .collect::<Result<Vec<_>, _>>()?,
             ),
             explicit_bounds: Some(point.explicit_bounds.clone()),
-            exemplars: exemplar_rows(&point.exemplars)?,
-            ..Self::default()
+            exemplars: exemplar_rows(&point.exemplars, row)?,
+            ..common
         })
     }
 
@@ -600,23 +636,28 @@ impl PointRow {
     ///
     /// Returns a stable reason when a bucket collection exceeds its accepted
     /// size, the zero threshold is negative, a `wyrd.card_ref` or
-    /// `wyrd.run_id` attribute is wrongly typed or malformed, or an exemplar
-    /// is invalid.
+    /// `wyrd.run_id` attribute is wrongly typed or malformed, an attribute set
+    /// cannot be stored as Variant, or an exemplar is invalid. A Variant reason
+    /// names `row`, the point's traversal ordinal.
     fn exponential_histogram(
         point: &ExponentialHistogramDataPoint,
         card_scope: Option<&CardRefScope>,
-    ) -> Result<Self, &'static str> {
+        row: u64,
+    ) -> Result<Self, Cow<'static, str>> {
         if point.zero_threshold < 0.0 {
-            return Err("exponential histogram zero threshold is negative");
+            return Err("exponential histogram zero threshold is negative".into());
         }
         let positive = point.positive.as_ref().map(bucket_row).transpose()?;
         let negative = point.negative.as_ref().map(bucket_row).transpose()?;
+        let common = Self::common(
+            point.time_unix_nano,
+            point.start_time_unix_nano,
+            point.flags,
+            &point.attributes,
+            card_scope,
+            row,
+        )?;
         Ok(Self {
-            time_unix_nano: checked_i64(point.time_unix_nano)?,
-            start_time_unix_nano: checked_i64(point.start_time_unix_nano)?,
-            flags: point.flags,
-            attributes: encode_attributes(&point.attributes),
-            correlation: RecordCorrelation::extract(&point.attributes, card_scope)?,
             histogram_count: Some(checked_i64(point.count)?),
             histogram_sum: point.sum,
             histogram_min: point.min,
@@ -626,8 +667,8 @@ impl PointRow {
             exponential_zero_threshold: Some(point.zero_threshold),
             positive_buckets: positive,
             negative_buckets: negative,
-            exemplars: exemplar_rows(&point.exemplars)?,
-            ..Self::default()
+            exemplars: exemplar_rows(&point.exemplars, row)?,
+            ..common
         })
     }
 
@@ -638,31 +679,84 @@ impl PointRow {
     /// Returns a stable reason when the quantile collection exceeds its
     /// accepted size, a quantile lies outside the closed unit interval, or a
     /// `wyrd.card_ref` or `wyrd.run_id` attribute is wrongly typed or
-    /// malformed.
+    /// malformed, or an attribute set cannot be stored as Variant. A Variant
+    /// reason names `row`, the point's traversal ordinal.
     fn summary(
         point: &SummaryDataPoint,
         card_scope: Option<&CardRefScope>,
-    ) -> Result<Self, &'static str> {
+        row: u64,
+    ) -> Result<Self, Cow<'static, str>> {
         if point.quantile_values.len() > MAX_QUANTILES {
-            return Err("summary quantile collection exceeds the accepted size");
+            return Err("summary quantile collection exceeds the accepted size".into());
         }
         let mut quantiles = Vec::with_capacity(point.quantile_values.len());
         for entry in &point.quantile_values {
             if !(0.0..=1.0).contains(&entry.quantile) {
-                return Err("summary quantile lies outside the closed unit interval");
+                return Err("summary quantile lies outside the closed unit interval".into());
             }
             quantiles.push((entry.quantile, entry.value));
         }
+        let common = Self::common(
+            point.time_unix_nano,
+            point.start_time_unix_nano,
+            point.flags,
+            &point.attributes,
+            card_scope,
+            row,
+        )?;
         Ok(Self {
-            time_unix_nano: checked_i64(point.time_unix_nano)?,
-            start_time_unix_nano: checked_i64(point.start_time_unix_nano)?,
-            flags: point.flags,
-            attributes: encode_attributes(&point.attributes),
-            correlation: RecordCorrelation::extract(&point.attributes, card_scope)?,
             summary_count: Some(checked_i64(point.count)?),
             summary_sum: Some(point.sum),
             quantile_values: Some(quantiles),
-            ..Self::default()
+            ..common
+        })
+    }
+
+    /// Validate the fields every data-point kind shares and return a row that
+    /// owns no kind-specific column.
+    ///
+    /// Each kind constructor fills its own columns over this base, so the
+    /// shared fields are validated identically and in one order: times, then
+    /// the Variant attribute set, then the correlation attributes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable reason when a time exceeds `i64`, the attribute set
+    /// cannot be stored as Variant (naming `row`, the point's traversal
+    /// ordinal), or a `wyrd.card_ref` or `wyrd.run_id` attribute is wrongly
+    /// typed or malformed.
+    fn common(
+        time_unix_nano: u64,
+        start_time_unix_nano: u64,
+        flags: u32,
+        attributes: &[KeyValue],
+        card_scope: Option<&CardRefScope>,
+        row: u64,
+    ) -> Result<Self, Cow<'static, str>> {
+        Ok(Self {
+            time_unix_nano: checked_i64(time_unix_nano)?,
+            start_time_unix_nano: checked_i64(start_time_unix_nano)?,
+            flags,
+            attributes: attributes_variant("attributes", attributes)
+                .map_err(|failure| failure.reason(row))?,
+            correlation: RecordCorrelation::extract(attributes, card_scope)?,
+            int_value: None,
+            double_value: None,
+            histogram_count: None,
+            histogram_sum: None,
+            histogram_min: None,
+            histogram_max: None,
+            bucket_counts: None,
+            explicit_bounds: None,
+            exponential_scale: None,
+            exponential_zero_count: None,
+            exponential_zero_threshold: None,
+            positive_buckets: None,
+            negative_buckets: None,
+            summary_count: None,
+            summary_sum: None,
+            quantile_values: None,
+            exemplars: Vec::new(),
         })
     }
 }
@@ -693,11 +787,12 @@ fn bucket_row(
 /// # Errors
 ///
 /// Returns a stable reason when the collection exceeds its accepted size, an
-/// exemplar carries no value, or an exemplar's correlation identifier has the
-/// wrong width.
-fn exemplar_rows(exemplars: &[Exemplar]) -> Result<Vec<ExemplarRow>, &'static str> {
+/// exemplar carries no value, an exemplar's correlation identifier has the
+/// wrong width, or its filtered attributes cannot be stored as Variant; the
+/// Variant reason names `row`, the owning point's traversal ordinal.
+fn exemplar_rows(exemplars: &[Exemplar], row: u64) -> Result<Vec<ExemplarRow>, Cow<'static, str>> {
     if exemplars.len() > MAX_EXEMPLARS {
-        return Err("exemplar collection exceeds the accepted size");
+        return Err("exemplar collection exceeds the accepted size".into());
     }
     exemplars
         .iter()
@@ -705,7 +800,7 @@ fn exemplar_rows(exemplars: &[Exemplar]) -> Result<Vec<ExemplarRow>, &'static st
             let (int_value, double_value) = match value.value {
                 Some(exemplar::Value::AsInt(int)) => (Some(int), None),
                 Some(exemplar::Value::AsDouble(double)) => (None, Some(double)),
-                None => return Err("exemplar carries no value"),
+                None => return Err("exemplar carries no value".into()),
             };
             let trace_id = if value.trace_id.is_empty() {
                 None
@@ -721,7 +816,8 @@ fn exemplar_rows(exemplars: &[Exemplar]) -> Result<Vec<ExemplarRow>, &'static st
                 time_unix_nano: checked_i64(value.time_unix_nano)?,
                 int_value,
                 double_value,
-                filtered_attributes: encode_attributes(&value.filtered_attributes),
+                filtered_attributes: attributes_variant("exemplars", &value.filtered_attributes)
+                    .map_err(|failure| failure.reason(row))?,
                 trace_id,
                 span_id,
             })
@@ -736,12 +832,12 @@ struct PointColumns {
     metric_name: Vec<String>,
     description: Vec<String>,
     unit: Vec<String>,
-    metadata: Vec<Vec<u8>>,
+    metadata: Vec<EncodedVariant>,
     metric_type: Vec<String>,
     time_unix_nano: Vec<i64>,
     start_time_unix_nano: Vec<i64>,
     flags: Vec<u32>,
-    attributes: Vec<Vec<u8>>,
+    attributes: Vec<EncodedVariant>,
     int_value: Vec<Option<i64>>,
     double_value: Vec<Option<f64>>,
     aggregation_temporality: Vec<Option<i32>>,
@@ -774,21 +870,24 @@ struct PointColumns {
     exemplar_time: Vec<i64>,
     exemplar_int: Vec<Option<i64>>,
     exemplar_double: Vec<Option<f64>>,
-    exemplar_attributes: Vec<Vec<u8>>,
+    exemplar_attributes: Vec<EncodedVariant>,
     exemplar_trace_id: Vec<Option<Vec<u8>>>,
     exemplar_span_id: Vec<Option<Vec<u8>>>,
     resource_present: Vec<bool>,
-    resource_attributes: Vec<Vec<u8>>,
+    resource_attributes: Vec<EncodedVariant>,
     resource_dropped_attributes_count: Vec<u32>,
     resource_schema_url: Vec<String>,
     entity_ref_lengths: Vec<Option<usize>>,
-    entity_refs: Vec<Vec<u8>>,
+    entity_refs: Vec<EntityRef>,
     scope_present: Vec<bool>,
     scope_name: Vec<String>,
     scope_version: Vec<String>,
-    scope_attributes: Vec<Vec<u8>>,
+    scope_attributes: Vec<EncodedVariant>,
     scope_dropped_attributes_count: Vec<u32>,
     scope_schema_url: Vec<String>,
+    service_name: Vec<Option<String>>,
+    service_version: Vec<Option<String>>,
+    deployment_environment: Vec<Option<String>>,
     card_ref: Vec<Option<String>>,
     run_id: Vec<Option<String>>,
 }
@@ -921,8 +1020,7 @@ impl PointColumns {
         self.resource_schema_url.push(resource.schema_url.clone());
         self.entity_ref_lengths
             .push(Some(resource.entity_refs.len()));
-        self.entity_refs
-            .extend(resource.entity_refs.iter().cloned());
+        self.entity_refs.extend_from_slice(&resource.entity_refs);
 
         self.scope_present.push(scope.present);
         self.scope_name.push(scope.name.clone());
@@ -932,16 +1030,15 @@ impl PointColumns {
             .push(scope.dropped_attributes_count);
         self.scope_schema_url.push(scope.schema_url.clone());
 
+        self.service_name.push(resource.service_name.clone());
+        self.service_version.push(resource.service_version.clone());
+        self.deployment_environment
+            .push(resource.deployment_environment.clone());
+
         self.rows += 1;
         payload_bytes
     }
 
-    /// Assemble the accepted rows into the canonical point batch.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TableError::Internal`] when a column cannot be built or the
-    /// assembled columns do not match the canonical schema.
     /// Assemble the nested bucket, quantile, and exemplar element columns.
     ///
     /// These are built before the row columns so `finish` stays one flat
@@ -983,7 +1080,7 @@ impl PointColumns {
                 i64_column(std::mem::take(&mut self.exemplar_time)),
                 i64_opt_column(std::mem::take(&mut self.exemplar_int)),
                 f64_opt_column(std::mem::take(&mut self.exemplar_double)),
-                binary_column(&self.exemplar_attributes),
+                variant_column(self.exemplar_attributes.iter().map(Some)),
                 fixed_binary_opt_column(16, &self.exemplar_trace_id).map_err(internal)?,
                 fixed_binary_opt_column(8, &self.exemplar_span_id).map_err(internal)?,
             ],
@@ -999,18 +1096,27 @@ impl PointColumns {
         })
     }
 
+    /// Assemble the accepted rows into the canonical point batch.
+    ///
+    /// Column order comes from [`METRIC_FIELDS`], followed by the two nullable
+    /// correlation columns Scribe consumes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TableError::Internal`] when a column cannot be built or the
+    /// assembled columns do not match the canonical schema.
     fn finish(mut self) -> Result<RecordBatch, TableError> {
         let nested = self.nested_columns()?;
         let columns: Vec<ArrayRef> = vec![
             utf8_column(self.metric_name),
             utf8_column(self.description),
             utf8_column(self.unit),
-            binary_column(&self.metadata),
+            variant_column(self.metadata.iter().map(Some)),
             utf8_column(self.metric_type),
             i64_column(self.time_unix_nano),
             i64_column(self.start_time_unix_nano),
             u32_as_i64_column(self.flags),
-            binary_column(&self.attributes),
+            variant_column(self.attributes.iter().map(Some)),
             i64_opt_column(self.int_value),
             f64_opt_column(self.double_value),
             i32_opt_column(self.aggregation_temporality),
@@ -1051,21 +1157,19 @@ impl PointColumns {
             )
             .map_err(internal)?,
             bool_column(self.resource_present),
-            binary_column(&self.resource_attributes),
+            variant_column(self.resource_attributes.iter().map(Some)),
             u32_as_i64_column(self.resource_dropped_attributes_count),
             utf8_column(self.resource_schema_url),
-            list_column(
-                &METRIC_ENTITY_REF_ELEMENT.to_arrow(),
-                binary_column(&self.entity_refs),
-                &self.entity_ref_lengths,
-            )
-            .map_err(internal)?,
+            entity_refs_column(&self.entity_refs, &self.entity_ref_lengths)?,
             bool_column(self.scope_present),
             utf8_column(self.scope_name),
             utf8_column(self.scope_version),
-            binary_column(&self.scope_attributes),
+            variant_column(self.scope_attributes.iter().map(Some)),
             u32_as_i64_column(self.scope_dropped_attributes_count),
             utf8_column(self.scope_schema_url),
+            utf8_opt_column(self.service_name),
+            utf8_opt_column(self.service_version),
+            utf8_opt_column(self.deployment_environment),
             utf8_opt_column(self.card_ref),
             utf8_opt_column(self.run_id),
         ];

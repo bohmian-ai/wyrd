@@ -537,7 +537,11 @@ fn number_variant(
 }
 
 /// Store a signed integer at the narrowest Variant integer width.
-fn narrow_integer(integer: i64) -> Variant<'static, 'static> {
+///
+/// Every Bifrost producer that writes an integer into a Variant uses this
+/// one rule, so JSON input and protocol integers read back identically.
+#[must_use]
+pub fn narrow_integer(integer: i64) -> Variant<'static, 'static> {
     if let Ok(narrow) = i8::try_from(integer) {
         Variant::from(narrow)
     } else if let Ok(narrow) = i16::try_from(integer) {

@@ -702,11 +702,12 @@ mod pg_tests {
                 .call_tool(query(serde_json::json!({"sql": payload_sql})))
                 .await?,
         )?;
-        // The tool renders a binary column as hex, so the expected structured
-        // messages are compared in the same encoding the agent receives.
-        let payload = messages["rows"][0][0]
+        // The tool renders the Variant storage struct's binary children as hex,
+        // and a Variant string keeps its UTF-8 bytes contiguous, so the expected
+        // structured messages are compared in the encoding the agent receives.
+        let payload = messages["rows"][0][0]["value"]
             .as_str()
-            .ok_or("the attribute payload is a JSON string")?;
+            .ok_or("the Variant attribute value is a hex JSON string")?;
         let hex_of = |text: &str| {
             text.bytes()
                 .map(|byte| format!("{byte:02x}"))

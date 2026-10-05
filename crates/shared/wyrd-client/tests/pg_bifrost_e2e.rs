@@ -2671,21 +2671,16 @@ mod pg_tests {
         let stored = batches[0]
             .column_by_name("attributes")
             .expect("column `attributes`");
-        let stored = arrow::compute::cast(stored, &arrow_schema::DataType::Binary)
-            .expect("the canonical attribute payload reads back as bytes");
-        let payload = stored
-            .as_any()
-            .downcast_ref::<arrow::array::BinaryArray>()
-            .expect("the cast payload is Binary")
-            .value(0)
-            .to_vec();
-        let payload = String::from_utf8_lossy(&payload);
-        assert!(
-            payload.contains(fixture::INPUT_MESSAGES),
+        let payload = wyrd_queue::variant::variant_cell_to_json(stored.as_ref(), 0)
+            .expect("the Variant attribute payload decodes");
+        assert_eq!(
+            payload["gen_ai.input.messages"],
+            fixture::INPUT_MESSAGES,
             "the structured GenAI input messages survive the round trip verbatim"
         );
-        assert!(
-            payload.contains(fixture::OUTPUT_MESSAGES),
+        assert_eq!(
+            payload["gen_ai.output.messages"],
+            fixture::OUTPUT_MESSAGES,
             "the structured GenAI output messages survive the round trip verbatim"
         );
 

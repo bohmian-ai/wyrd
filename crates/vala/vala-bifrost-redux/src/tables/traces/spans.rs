@@ -12,6 +12,7 @@
 use arrow::datatypes::Field;
 
 use crate::tables::fields::{CanonicalField as F, CanonicalType as T, canonical_arrow_fields};
+use crate::tables::signal;
 use crate::tables::{
     CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc, sort_desc,
 };
@@ -25,7 +26,7 @@ use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 pub static SPAN_EVENT_FIELDS: [F; 4] = [
     F::sensitive("time_unix_nano", T::Int64, false),
     F::sensitive("name", T::Utf8, false),
-    F::sensitive("attributes", T::Binary, false),
+    F::sensitive("attributes", T::Variant, false),
     F::sensitive("dropped_attributes_count", T::Int64, false),
 ];
 
@@ -38,19 +39,12 @@ pub static SPAN_LINK_FIELDS: [F; 6] = [
     F::sensitive("span_id", T::FixedSizeBinary(8), false),
     F::sensitive("trace_state", T::Utf8, false),
     F::sensitive("flags", T::Int64, false),
-    F::sensitive("attributes", T::Binary, false),
+    F::sensitive("attributes", T::Variant, false),
     F::sensitive("dropped_attributes_count", T::Int64, false),
 ];
 
 /// Element declaration of the ordered span-link collection.
 pub static SPAN_LINK_ELEMENT: F = F::sensitive("link", T::Struct(&SPAN_LINK_FIELDS), false);
-
-/// Element declaration of the ordered resource entity-reference collection.
-///
-/// An entity reference is an opaque repeated protocol value with no query
-/// predicate, so it is stored as its canonical pinned `EntityRef` encoding
-/// rather than exploded into columns.
-pub static RESOURCE_ENTITY_REF_ELEMENT: F = F::sensitive("entity_ref", T::Binary, false);
 
 /// The canonical `vala.traces.spans` ledger.
 ///
@@ -58,7 +52,10 @@ pub static RESOURCE_ENTITY_REF_ELEMENT: F = F::sensitive("entity_ref", T::Binary
 /// non-null. Presence booleans (`status_present`, `resource_present`,
 /// `scope_present`) preserve the difference between an absent message and a
 /// present empty one, and their subordinate scalars carry canonical empty
-/// values when the presence bit is false.
+/// values when the presence bit is false. The trailing promoted columns copy
+/// one well-known semantic-convention attribute each out of the Variant
+/// collections so it can be filtered without decoding; each is null when the
+/// attribute is absent or carries the wrong type.
 pub static SPAN_FIELDS: &[F] = &[
     F::meta("trace_id", T::FixedSizeBinary(16), false),
     F::meta("span_id", T::FixedSizeBinary(8), false),
@@ -73,25 +70,25 @@ pub static SPAN_FIELDS: &[F] = &[
     F::meta("status_present", T::Bool, false),
     F::meta("status_code", T::Int32, true),
     F::payload("status_message", T::Utf8, true),
-    F::sensitive("attributes", T::Binary, false),
+    F::sensitive("attributes", T::Variant, false),
     F::meta("dropped_attributes_count", T::Int64, false),
     F::sensitive("events", T::List(&SPAN_EVENT_ELEMENT), false),
     F::meta("dropped_events_count", T::Int64, false),
     F::sensitive("links", T::List(&SPAN_LINK_ELEMENT), false),
     F::meta("dropped_links_count", T::Int64, false),
     F::meta("resource_present", T::Bool, false),
-    F::sensitive("resource_attributes", T::Binary, false),
+    F::sensitive("resource_attributes", T::Variant, false),
     F::meta("resource_dropped_attributes_count", T::Int64, false),
     F::meta("resource_schema_url", T::Utf8, false),
     F::sensitive(
         "resource_entity_refs",
-        T::List(&RESOURCE_ENTITY_REF_ELEMENT),
+        T::List(&signal::ENTITY_REF_ELEMENT),
         false,
     ),
     F::meta("scope_present", T::Bool, false),
     F::meta("scope_name", T::Utf8, false),
     F::meta("scope_version", T::Utf8, false),
-    F::sensitive("scope_attributes", T::Binary, false),
+    F::sensitive("scope_attributes", T::Variant, false),
     F::meta("scope_dropped_attributes_count", T::Int64, false),
     F::meta("scope_schema_url", T::Utf8, false),
     F::meta("service_name", T::Utf8, true),
@@ -101,6 +98,15 @@ pub static SPAN_FIELDS: &[F] = &[
     F::meta("gen_ai_conversation_id", T::Utf8, true),
     F::meta("gen_ai_usage_input_tokens", T::Int64, true),
     F::meta("gen_ai_usage_output_tokens", T::Int64, true),
+    F::meta("service_version", T::Utf8, true),
+    F::meta("deployment_environment", T::Utf8, true),
+    F::meta("http_request_method", T::Utf8, true),
+    F::meta("http_route", T::Utf8, true),
+    F::meta("http_response_status_code", T::Int64, true),
+    F::meta("url_full", T::Utf8, true),
+    F::meta("exception_type", T::Utf8, true),
+    F::meta("exception_message", T::Utf8, true),
+    F::meta("exception_stacktrace", T::Utf8, true),
 ];
 
 /// The canonical durable table for the OTLP trace signal.

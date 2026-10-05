@@ -365,9 +365,10 @@ async fn failed_wal_replay_is_role_local() -> Result<(), super::query::ServerJou
 ///
 /// The bound dedicated-worker topology keeps its live worker in the serve
 /// handle, so `WyrdTestServer::shutdown` must cancel and join that worker
-/// rather than drain Bifrost directly: a direct drain finds Forge supervision
-/// still running, takes Bifrost's abort path, and closes the node's storage
-/// owner underneath the worker. The worker is held after durably claiming a
+/// before it settles Bifrost: settling first would close the node's storage
+/// owner underneath the worker. Storage is therefore closed once shutdown
+/// returns, and the released claim and clean worker drain prove the join came
+/// first. The worker is held after durably claiming a
 /// seeded task, so cancellation leaves it a real drain obligation, releasing
 /// that claim to `retryable`. A router-only replica keeps the Postgres fixture
 /// alive across the worker's shutdown so the released row stays readable.
@@ -378,8 +379,8 @@ async fn failed_wal_replay_is_role_local() -> Result<(), super::query::ServerJou
 ///
 /// # Panics
 ///
-/// Panics when the worker never claims the seeded task, when shutdown aborted
-/// storage before the worker joined, or when the claim was not released.
+/// Panics when the worker never claims the seeded task, when shutdown left
+/// storage unsettled, or when the worker did not release its claim cleanly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn dedicated_forge_worker_shutdown_drains_its_claim_before_storage_settles()
@@ -435,8 +436,8 @@ async fn dedicated_forge_worker_shutdown_drains_its_claim_before_storage_settles
 
     assert_eq!(
         storage.inspect().lifecycle,
-        vala_bifrost_redux::storage::StorageLifecycle::Open,
-        "ordinary shutdown settled storage before the dedicated worker joined"
+        vala_bifrost_redux::storage::StorageLifecycle::Closed,
+        "ordinary shutdown settles storage after the dedicated worker joined"
     );
     let state: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
         .bind(task_id)

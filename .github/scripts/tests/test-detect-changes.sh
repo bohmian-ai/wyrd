@@ -226,8 +226,8 @@ fi
 check_selection "leaf crate packages nothing" \
   "package_python=false package_typescript=false package_server=false package_crates=false" \
   "crates/wyrd/wyrd-mcp/src/lib.rs"
-check_selection "shared Skald change packages Python and server" \
-  "package_python=true package_server=true package_typescript=false package_crates=false" \
+check_selection "shared Skald change packages every SDK and server" \
+  "package_python=true package_server=true package_typescript=true package_crates=false" \
   "crates/skald/skald-cache/src/lib.rs"
 check_selection "wire contract packages every deliverable" \
   "package_python=true package_typescript=true package_server=true package_crates=true" \

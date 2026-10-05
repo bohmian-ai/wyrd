@@ -1,7 +1,5 @@
 //! A second replica joins a running peer and serves remote work over mTLS.
 
-use std::time::{Duration, Instant};
-
 use wyrd_server::config::BifrostTarget;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 
@@ -33,14 +31,6 @@ const BATCHES: i64 = 4;
 
 /// Distinct `filter_key` groups the fixture generator cycles through.
 const GROUPS: i64 = 8;
-
-/// Longest a membership change may take to become observable.
-///
-/// Membership is heartbeat-driven: a join appears within one heartbeat, and a
-/// stopped member leaves once its last heartbeat ages past the fifteen-second
-/// liveness cutoff. The deadline turns a member that never appears or never
-/// leaves into a diagnosable failure; elapsed time is never itself evidence.
-const MEMBERSHIP_DEADLINE: Duration = Duration::from_secs(45);
 
 /// A running `all` and `oracle` pair discovers a third `oracle` replica that
 /// joins with its own runtime-supplied address and the shared cluster bundle.
@@ -114,15 +104,16 @@ async fn prove_peer_join_and_remote_query() -> Result<(), PeerJourneyError> {
         return Err("the joined pod advertises the first pod's address".into());
     }
 
-    await_membership(&cluster, "the join", |membership| {
-        membership.iter().any(|entry| {
-            entry.node_id == joined_node_id
-                && entry.role == "oracle"
-                && entry.ready
-                && entry.address == joined_addr
+    cluster
+        .await_membership(FIRST, "the join", |membership| {
+            membership.iter().any(|entry| {
+                entry.node_id == joined_node_id
+                    && entry.role == "oracle"
+                    && entry.ready
+                    && entry.address == joined_addr
+            })
         })
-    })
-    .await?;
+        .await?;
     if first_fences(&cluster.membership(FIRST).await?) != fences_before {
         return Err("the first pod was restarted to discover the joined pod".into());
     }
@@ -185,42 +176,16 @@ async fn prove_peer_join_and_remote_query() -> Result<(), PeerJourneyError> {
         }
         Ok(_) | Err(_) => {}
     }
-    await_membership(&cluster, "the departure", |membership| {
-        membership
-            .iter()
-            .all(|entry| entry.node_id != joined_node_id)
-    })
-    .await?;
+    cluster
+        .await_membership(FIRST, "the departure", |membership| {
+            membership
+                .iter()
+                .all(|entry| entry.node_id != joined_node_id)
+        })
+        .await?;
 
     cluster.shutdown().await?;
     Ok(())
-}
-
-/// Polls the first pod's live membership cut until `observed` holds.
-///
-/// # Errors
-///
-/// Returns a failure naming `change` and the last cut seen when the deadline
-/// passes, or the membership refresh failure unchanged.
-async fn await_membership(
-    cluster: &PeerCluster,
-    change: &str,
-    observed: impl Fn(&[MembershipEntry]) -> bool,
-) -> Result<(), PeerJourneyError> {
-    let deadline = Instant::now() + MEMBERSHIP_DEADLINE;
-    loop {
-        let membership = cluster.membership(FIRST).await?;
-        if observed(&membership) {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "the first pod never observed {change}; last membership {membership:?}"
-            )
-            .into());
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
 }
 
 /// Runs one strict fused public query on `node` and counts its rows.

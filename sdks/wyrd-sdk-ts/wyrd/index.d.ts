@@ -240,6 +240,22 @@ export declare class NativeCards {
    */
   hydrate(cardRef: string, destination: string, metadataOnly: boolean): Promise<NativeLifecycleResult>
   /**
+   * Loads one registered Workflow and its locked Agents and Prompts.
+   *
+   * `selector_json` is `{ "space", "name", "version" }` or `{ "uid" }`; any
+   * other shape, including a mix of both, is refused with
+   * `WYRD_WORKFLOW_400_INVALID_CARD_REF` before any read. A valid selector delegates
+   * to the shared [`wyrd_client::WorkflowCards::load`], which reads every
+   * Card at its locked version.
+   *
+   * Never rejects: a failure is returned in [`NativeWorkflowLoad::error`]
+   * with its catalog code, and the public TypeScript `cards.workflow.load`
+   * throws it as a `WyrdError`. Loading only reads Cards. If the Node
+   * promise is abandoned, completed reads may already have happened, but
+   * no partial Workflow is returned and nothing durable is written.
+   */
+  loadWorkflow(selectorJson: string): Promise<NativeWorkflowLoad>
+  /**
    * Soft-deletes one Card by exact reference.
    *
    * # Errors
@@ -543,6 +559,24 @@ export declare class NativeVerification {
   getRun(runId: string): Promise<NativeLifecycleResult>
 }
 
+/** Runnable Workflow loaded from a file or from the registry. */
+export declare class NativeWorkflow {
+  /** Returns the step IDs in declaration order. */
+  stepIds(): Array<string>
+  /**
+   * Runs this Workflow with the given JSON object of declared inputs.
+   *
+   * Validation, input, and route errors are returned before any step is
+   * dispatched; step failures are recorded in the returned run.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the run cannot be serialized; a
+   * malformed input or pre-dispatch refusal is returned in the result.
+   */
+  run(inputJson?: string | undefined | null): Promise<NativeLifecycleResult>
+}
+
 /** Node-facing handle to one authenticated [`WyrdClient`]. */
 export declare class NativeWyrdClient {
   /** Returns the effective HTTP server URL this client sends requests to. */
@@ -751,6 +785,22 @@ export declare function connectWyrdClient(serverUrl?: string | undefined | null,
  */
 export declare function describeTableConfig(table: string, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, tenant?: string | undefined | null): Promise<NativeTableConfigResult>
 
+/**
+ * Load an authored Workflow file and the Cards it references.
+ *
+ * Delegates to the shared [`Workflow::from_path`]: local files load without
+ * a server, and registry refs are read through the ambient client
+ * configuration (`WYRD_SERVER_URL`, `WYRD_API_KEY`). Never rejects: a load
+ * failure is returned in [`NativeWorkflowLoad::error`] with its catalog
+ * code, and the public TypeScript `Workflow.fromPath` throws it as a
+ * `WyrdError`.
+ *
+ * Loading only reads files and Cards. If the Node promise is abandoned,
+ * completed reads may already have happened, but no partial Workflow is
+ * returned and nothing durable is written.
+ */
+export declare function loadWorkflowFromPath(path: string): Promise<NativeWorkflowLoad>
+
 /** Closed result of connecting one Bifrost client: a handle or a catalog error. */
 export interface NativeBifrostConnection {
   /** Connected client when construction succeeded. */
@@ -875,6 +925,14 @@ export interface NativeVerificationConnection {
   /** Verification handle when construction succeeded. */
   verification?: NativeVerification
   /** Catalog failure when no credential resolves or the client cannot be built. */
+  error?: NativeWyrdError
+}
+
+/** Closed result of loading one Workflow: a handle or a catalog error. */
+export interface NativeWorkflowLoad {
+  /** Workflow when loading succeeded. */
+  workflow?: NativeWorkflow
+  /** Catalog failure otherwise. */
   error?: NativeWyrdError
 }
 

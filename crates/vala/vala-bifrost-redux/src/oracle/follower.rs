@@ -257,7 +257,7 @@ pub struct AuthenticatedFollowerContext<'a> {
     pub tenant_id: DataTenantId,
     /// Exact table binding recovered from checked context claims.
     pub table_binding: &'a TenantTableBinding,
-    /// Exact pending reservation owned by this receiver for the query.
+    /// Exact grant this receiver holds for the query on its leader's stream.
     pub reservation_id: &'a ReservationId,
     /// Leader incarnation recovered from checked context claims.
     pub leader_fence: OracleRoleFence,
@@ -1434,7 +1434,7 @@ where
         // The leader's own plan has only remote leaves, so this follower-side
         // capture is the only place a distributed query can observe physical
         // read volume at all.
-        let scan_stats = super::exec::OracleQueryScanStats::from_plan(plan.as_ref(), 0);
+        let scan_stats = super::exec::OracleQueryScanStats::from_plan(plan.as_ref());
         let stream = execute_stream(plan, context)
             .map_err(|error| PhysicalPlanFollowerError::Execution(error.to_string()))?;
         #[cfg(feature = "test-support")]
@@ -3107,7 +3107,6 @@ pub(crate) mod tests {
         .await;
         let evidence = FollowerScanEvidence(super::super::exec::OracleQueryScanStats::from_plan(
             plan.as_ref(),
-            0,
         ));
         let rows = collect(plan, Arc::new(TaskContext::default()))
             .await

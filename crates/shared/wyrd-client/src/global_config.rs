@@ -1,8 +1,11 @@
 //! User-scoped client configuration loaded from `config.toml`.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Deserialize;
+use wyrd_spec::card::workflow::ExternalGatewayBindingConfig;
+use wyrd_spec::ids::CredentialBindingName;
 
 use crate::error::WyrdClientError;
 
@@ -13,6 +16,22 @@ pub struct GlobalConfig {
     /// Client connection and credential settings.
     #[serde(default)]
     pub client: ClientSection,
+    /// Local Workflow execution settings.
+    #[serde(default)]
+    pub workflow: LocalWorkflowConfig,
+}
+
+/// Settings for Workflows executed in this process.
+///
+/// Holds secret references only; a run resolves the references of the
+/// bindings its routes select, and loading resolves none.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalWorkflowConfig {
+    /// External gateway bindings an `ext_gateway` route selects by name,
+    /// configured as `[workflow.external_gateway_bindings.<name>]`.
+    #[serde(default)]
+    pub external_gateway_bindings: BTreeMap<CredentialBindingName, ExternalGatewayBindingConfig>,
 }
 
 /// User-scoped client settings.

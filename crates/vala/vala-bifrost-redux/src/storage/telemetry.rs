@@ -1,21 +1,19 @@
-//! Production observation for the node's one Bifrost storage owner.
+//! Production metric emission for the node's one Bifrost storage owner.
 //!
-//! Every cache decision and metadata load the storage owner performs is
-//! published here and nowhere else. The facade follows the `ScribeTelemetry`
-//! pattern: one `record` operation advances the reconcilable totals, emits the
-//! closed metric families, and emits the structured event, so a published
-//! metric always corresponds to a real state transition rather than to a
-//! counter a test incremented on its own.
+//! Every function here is called at the real transition it measures: a cache
+//! decision, a metadata load terminal, a waiter leaving, a governed request
+//! being admitted, retried, or ending, and a change to the state the cache or
+//! request settlement actually holds. Nothing here keeps state of its own. The
+//! live counts a drained node is checked against are read from the owners —
+//! [`ParquetMetadataCache`](super::cache::ParquetMetadataCache) and the
+//! storage owner's request settlement — never from a parallel ledger.
 //!
-//! The retained [`MetadataCacheSnapshot`] is the read-only reconciliation
-//! surface. It carries enough exact state — starts against each terminal
-//! outcome, resident entries and bytes, in-flight loads, and waiters — that a
-//! drained node can be proven settled instead of merely quiet.
+//! Counters are process-lifetime totals: they reset when the process restarts
+//! and are operational rates, not exact durable accounting.
 //!
 //! Tenant, table, path, checksum, snapshot, query, and request identities are
 //! never metric labels. Scrubbed identity belongs on the caller's own span.
 
-use std::sync::Mutex;
 use std::time::Duration;
 
 use num_traits::ToPrimitive as _;
@@ -40,20 +38,6 @@ pub enum CacheEffect {
 }
 
 impl CacheEffect {
-    /// Complete closed inventory, in emission-label order.
-    pub const ALL: [Self; 5] = [Self::Hit, Self::Miss, Self::Join, Self::Bypass, Self::Evict];
-
-    /// Returns this effect's stable index into the retained totals.
-    const fn index(self) -> usize {
-        match self {
-            Self::Hit => 0,
-            Self::Miss => 1,
-            Self::Join => 2,
-            Self::Bypass => 3,
-            Self::Evict => 4,
-        }
-    }
-
     /// Returns the emitted `effect` label.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -87,26 +71,6 @@ pub enum CacheEffectReason {
 }
 
 impl CacheEffectReason {
-    /// Complete closed inventory, in emission-label order.
-    pub const ALL: [Self; 5] = [
-        Self::None,
-        Self::Disabled,
-        Self::Oversized,
-        Self::Closing,
-        Self::Unfunded,
-    ];
-
-    /// Returns this reason's stable index into the retained totals.
-    const fn index(self) -> usize {
-        match self {
-            Self::None => 0,
-            Self::Disabled => 1,
-            Self::Oversized => 2,
-            Self::Closing => 3,
-            Self::Unfunded => 4,
-        }
-    }
-
     /// Returns the emitted `reason` label.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -134,19 +98,6 @@ pub enum MetadataLoadOutcome {
 }
 
 impl MetadataLoadOutcome {
-    /// Complete closed inventory, in emission-label order.
-    pub const ALL: [Self; 4] = [Self::Success, Self::Failed, Self::Cancelled, Self::Deadline];
-
-    /// Returns this outcome's stable index into the retained totals.
-    const fn index(self) -> usize {
-        match self {
-            Self::Success => 0,
-            Self::Failed => 1,
-            Self::Cancelled => 2,
-            Self::Deadline => 3,
-        }
-    }
-
     /// Returns the emitted `outcome` label.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -195,21 +146,6 @@ pub enum StorageOperation {
 }
 
 impl StorageOperation {
-    /// Complete closed inventory, in emission-label order.
-    pub const ALL: [Self; 11] = [
-        Self::Exists,
-        Self::Stat,
-        Self::Read,
-        Self::ReadRange,
-        Self::List,
-        Self::Write,
-        Self::OpenWriter,
-        Self::WriterWrite,
-        Self::WriterClose,
-        Self::Delete,
-        Self::DeletePrefix,
-    ];
-
     /// Returns the emitted `operation` label.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -277,38 +213,6 @@ pub enum StorageRequestOutcome {
 }
 
 impl StorageRequestOutcome {
-    /// Complete closed inventory, in emission-label order.
-    pub const ALL: [Self; 11] = [
-        Self::Success,
-        Self::NotFound,
-        Self::PermissionDenied,
-        Self::Timeout,
-        Self::RateLimited,
-        Self::InvalidData,
-        Self::Backend,
-        Self::Cancelled,
-        Self::Deadline,
-        Self::Closed,
-        Self::InvalidConfiguration,
-    ];
-
-    /// Returns this outcome's stable index into the retained totals.
-    const fn index(self) -> usize {
-        match self {
-            Self::Success => 0,
-            Self::NotFound => 1,
-            Self::PermissionDenied => 2,
-            Self::Timeout => 3,
-            Self::RateLimited => 4,
-            Self::InvalidData => 5,
-            Self::Backend => 6,
-            Self::Cancelled => 7,
-            Self::Deadline => 8,
-            Self::Closed => 9,
-            Self::InvalidConfiguration => 10,
-        }
-    }
-
     /// Returns the emitted `outcome` label.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -328,11 +232,15 @@ impl StorageRequestOutcome {
     }
 }
 
-/// The storage owner's lifecycle state, as retained for reconciliation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// The storage owner's lifecycle state, read from the owner that holds it.
+///
+/// The metadata cache keeps its own copy under its state lock, which is what
+/// gates admission; [`BifrostStorage`](super::BifrostStorage) derives its
+/// test-support view from its owner token and request settlement. It is never
+/// a metric label and never a retained total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageLifecycle {
     /// Accepting new loads.
-    #[default]
     Open,
     /// Admitting no new loads while outstanding loaders settle.
     Closing,
@@ -340,545 +248,214 @@ pub enum StorageLifecycle {
     Closed,
 }
 
-impl StorageLifecycle {
-    /// Returns the retained lifecycle label.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Open => "open",
-            Self::Closing => "closing",
-            Self::Closed => "closed",
-        }
-    }
-}
-
-/// Exact retained state a caller can reconcile the published metrics against.
+/// Publishes one cache decision.
 ///
-/// Every field is a total or a live count, never a rate, so a drained node's
-/// settled state is a set of equalities rather than a judgement call:
-/// [`Self::load_starts`] equals [`Self::load_terminals`], and every live count
-/// is zero.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct MetadataCacheSnapshot {
-    /// Decisions taken, indexed by `CacheEffect::index`.
-    effects: [u64; CacheEffect::ALL.len()],
-    /// Decision reasons taken, indexed by `CacheEffectReason::index`.
-    reasons: [u64; CacheEffectReason::ALL.len()],
-    /// Metadata loads started by an owning caller.
-    load_starts: u64,
-    /// Terminal load outcomes, indexed by `MetadataLoadOutcome::index`.
-    load_terminals: [u64; MetadataLoadOutcome::ALL.len()],
-    /// Successful entries currently retained.
-    resident_entries: u64,
-    /// Charged bytes currently retained.
-    resident_bytes: u64,
-    /// Loads with an owner that has not published a terminal result.
-    inflight_loads: u64,
-    /// Callers joined to another caller's in-flight load.
-    waiters: u64,
-    /// Logical governed storage requests admitted by this owner.
-    ///
-    /// One per logical operation regardless of how many attempts it made, so a
-    /// retried read is one start, not three.
-    request_starts: u64,
-    /// Terminal request outcomes, indexed by `StorageRequestOutcome::index`.
-    request_terminals: [u64; StorageRequestOutcome::ALL.len()],
-    /// Logical requests admitted without a published terminal outcome.
-    active_requests: u64,
-    /// Attempts admitted after a logical read's first attempt.
-    ///
-    /// A one-attempt effect never contributes here, which is what makes a
-    /// nonzero value proof that only an idempotent read was replayed.
-    request_retries: u64,
-    /// The owner's retained lifecycle state.
-    lifecycle: StorageLifecycle,
-    /// Settlements that had no matching admission, indexed by
-    /// `TelemetryTransition::index`.
-    ///
-    /// Always zero on a correct owner. A nonzero value means some path
-    /// reconciled twice or reconciled work it never admitted, which is exactly
-    /// the condition that would otherwise let a saturating gauge report a
-    /// truthful-looking zero over broken accounting.
-    anomalies: [u64; TelemetryTransition::ALL.len()],
+/// `bifrost_storage_metadata_cache_effects_total{effect,reason}` counts
+/// lookups, not backend reads: a hit performs no object I/O and so never
+/// appears in `bifrost_storage_requests_total`.
+pub(crate) fn record_cache_effect(effect: CacheEffect, reason: CacheEffectReason) {
+    metrics::counter!(
+        "bifrost_storage_metadata_cache_effects_total",
+        "effect" => effect.as_str(),
+        "reason" => reason.as_str(),
+    )
+    .increment(1);
 }
 
-/// One reconcilable live-count transition the owner can settle.
+/// Publishes one terminal metadata load with its outcome and duration.
 ///
-/// A closed, deliberately tiny domain: it labels the anomaly counter, so it
-/// must never carry a tenant, object, or any other unbounded value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TelemetryTransition {
-    /// A terminal load settling the in-flight gauge.
-    LoadTerminal,
-    /// A waiter leaving the waiter gauge.
-    WaiterSettled,
-    /// A terminal governed request settling the active-request gauge.
-    RequestTerminal,
+/// Called once by the loader task that owns the load, or once by a forced
+/// close for a loader it had to abort before it could publish.
+pub(crate) fn record_load_terminal(outcome: MetadataLoadOutcome, elapsed: Duration) {
+    metrics::counter!(
+        "bifrost_storage_metadata_cache_loads_total",
+        "outcome" => outcome.as_str(),
+    )
+    .increment(1);
+    metrics::histogram!(
+        "bifrost_storage_metadata_load_seconds",
+        "outcome" => outcome.as_str(),
+    )
+    .record(elapsed.as_secs_f64());
 }
 
-impl TelemetryTransition {
-    /// Every transition, in index order.
-    pub(crate) const ALL: [Self; 3] = [
-        Self::LoadTerminal,
-        Self::WaiterSettled,
-        Self::RequestTerminal,
-    ];
-
-    /// Returns this transition's dense index into the anomaly totals.
-    pub(crate) const fn index(self) -> usize {
-        match self {
-            Self::LoadTerminal => 0,
-            Self::WaiterSettled => 1,
-            Self::RequestTerminal => 2,
-        }
-    }
-
-    /// Returns the stable metric label for this transition.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::LoadTerminal => "load_terminal",
-            Self::WaiterSettled => "waiter_settled",
-            Self::RequestTerminal => "request_terminal",
-        }
-    }
+/// Publishes how long one joined caller waited and how its wait ended.
+pub(crate) fn record_waiter_settled(outcome: MetadataLoadOutcome, elapsed: Duration) {
+    metrics::histogram!(
+        "bifrost_storage_metadata_wait_seconds",
+        "outcome" => outcome.as_str(),
+    )
+    .record(elapsed.as_secs_f64());
 }
 
-impl MetadataCacheSnapshot {
-    /// Returns how many times one decision was taken.
-    #[must_use]
-    pub const fn effect(&self, effect: CacheEffect) -> u64 {
-        self.effects[effect.index()]
-    }
-
-    /// Returns how many times one decision reason was recorded.
-    #[must_use]
-    pub const fn reason(&self, reason: CacheEffectReason) -> u64 {
-        self.reasons[reason.index()]
-    }
-
-    /// Returns metadata loads started by an owning caller.
-    #[must_use]
-    pub const fn load_starts(&self) -> u64 {
-        self.load_starts
-    }
-
-    /// Returns terminal loads recorded with one outcome.
-    #[must_use]
-    pub const fn load_terminal(&self, outcome: MetadataLoadOutcome) -> u64 {
-        self.load_terminals[outcome.index()]
-    }
-
-    /// Returns every terminal load outcome summed.
-    ///
-    /// A settled owner has this equal to [`Self::load_starts`]; any difference
-    /// names loads still outstanding, never an accounting leak on its own.
-    #[must_use]
-    pub const fn load_terminals(&self) -> u64 {
-        let mut total = 0;
-        let mut index = 0;
-        while index < self.load_terminals.len() {
-            total += self.load_terminals[index];
-            index += 1;
-        }
-        total
-    }
-
-    /// Returns successful entries currently retained.
-    #[must_use]
-    pub const fn resident_entries(&self) -> u64 {
-        self.resident_entries
-    }
-
-    /// Returns charged bytes currently retained.
-    #[must_use]
-    pub const fn resident_bytes(&self) -> u64 {
-        self.resident_bytes
-    }
-
-    /// Returns loads whose owner has not yet published a terminal result.
-    #[must_use]
-    pub const fn inflight_loads(&self) -> u64 {
-        self.inflight_loads
-    }
-
-    /// Returns callers currently joined to another caller's load.
-    #[must_use]
-    pub const fn waiters(&self) -> u64 {
-        self.waiters
-    }
-
-    /// Returns logical governed storage requests admitted by this owner.
-    #[must_use]
-    pub const fn request_starts(&self) -> u64 {
-        self.request_starts
-    }
-
-    /// Returns terminal governed requests recorded with one outcome.
-    #[must_use]
-    pub const fn request_terminal(&self, outcome: StorageRequestOutcome) -> u64 {
-        self.request_terminals[outcome.index()]
-    }
-
-    /// Returns every terminal governed request outcome summed.
-    ///
-    /// A settled owner has this equal to [`Self::request_starts`]; any
-    /// difference names logical requests still outstanding.
-    #[must_use]
-    pub const fn request_terminals(&self) -> u64 {
-        let mut total = 0;
-        let mut index = 0;
-        while index < self.request_terminals.len() {
-            total += self.request_terminals[index];
-            index += 1;
-        }
-        total
-    }
-
-    /// Returns logical requests admitted without a published terminal.
-    #[must_use]
-    pub const fn active_requests(&self) -> u64 {
-        self.active_requests
-    }
-
-    /// Returns attempts admitted after a logical read's first attempt.
-    #[must_use]
-    pub const fn request_retries(&self) -> u64 {
-        self.request_retries
-    }
-
-    /// Returns the owner's retained lifecycle state.
-    #[must_use]
-    pub const fn lifecycle(&self) -> StorageLifecycle {
-        self.lifecycle
-    }
-
-    /// Returns how many unmatched settlements one transition recorded.
-    #[must_use]
-    pub const fn anomaly(&self, transition: TelemetryTransition) -> u64 {
-        self.anomalies[transition.index()]
-    }
-
-    /// Returns every unmatched settlement summed.
-    #[must_use]
-    pub const fn anomalies(&self) -> u64 {
-        let mut total = 0;
-        let mut index = 0;
-        while index < self.anomalies.len() {
-            total += self.anomalies[index];
-            index += 1;
-        }
-        total
-    }
-
-    /// Returns whether every live count has settled to zero.
-    ///
-    /// Deliberately independent of the lifecycle state so a caller can
-    /// distinguish "declared closed" from "actually holds nothing".
-    #[must_use]
-    pub const fn is_quiescent(&self) -> bool {
-        self.resident_entries == 0
-            && self.resident_bytes == 0
-            && self.inflight_loads == 0
-            && self.waiters == 0
-            && self.active_requests == 0
-            && self.anomalies() == 0
-    }
-}
-
-/// The single production owner of Bifrost storage and cache lifecycle signals.
+/// Sets the resident-entry and resident-byte gauges from the cache's state.
 ///
-/// One instance belongs to one [`BifrostStorage`](super::BifrostStorage), so
-/// two simulated nodes sharing an OS process still publish independent
-/// reconcilable totals. Totals live under one mutex rather than as atomics
-/// because every emission already happens at a state transition and one
-/// consistent snapshot is worth more here than uncontended increments.
-#[derive(Debug, Default)]
-pub(crate) struct BifrostStorageTelemetry {
-    /// Reconcilable totals and live state published since construction.
-    totals: Mutex<MetadataCacheSnapshot>,
+/// The cache calls this under its state lock after a retention change, so
+/// the gauges describe what the cache holds rather than a value derived by
+/// counting decisions.
+pub(crate) fn record_resident(entries: u64, bytes: u64) {
+    metrics::gauge!("bifrost_storage_metadata_cache_resident_entries").set(gauge_value(entries));
+    metrics::gauge!("bifrost_storage_metadata_cache_resident_bytes").set(gauge_value(bytes));
 }
 
-impl BifrostStorageTelemetry {
-    /// Publishes one cache decision as a counter, totals, and a trace event.
-    ///
-    /// A poisoned totals lock never fails the decision being observed: the
-    /// metric is still emitted and only the reconcilable totals stop advancing,
-    /// because losing observation is strictly better than refusing admitted
-    /// work.
-    pub(crate) fn record_cache_effect(&self, effect: CacheEffect, reason: CacheEffectReason) {
-        metrics::counter!(
-            "bifrost_storage_metadata_cache_effects_total",
-            "effect" => effect.as_str(),
-            "reason" => reason.as_str(),
-        )
-        .increment(1);
-        let snapshot = self.mutate(|totals| {
-            totals.effects[effect.index()] = totals.effects[effect.index()].saturating_add(1);
-            totals.reasons[reason.index()] = totals.reasons[reason.index()].saturating_add(1);
-        });
-        tracing::debug!(
-            effect = effect.as_str(),
-            reason = reason.as_str(),
-            resident_entries = snapshot.resident_entries(),
-            resident_bytes = snapshot.resident_bytes(),
-            inflight_loads = snapshot.inflight_loads(),
-            waiters = snapshot.waiters(),
-            lifecycle = snapshot.lifecycle().as_str(),
-            "Bifrost storage metadata lifecycle"
-        );
-    }
-
-    /// Records one owning caller taking a metadata load.
-    ///
-    /// Raises the in-flight gauge until [`Self::record_load_terminal`] settles
-    /// it, so starts and terminals reconcile exactly on a drained owner.
-    pub(crate) fn record_load_start(&self) {
-        let snapshot = self.mutate(|totals| {
-            totals.load_starts = totals.load_starts.saturating_add(1);
-            totals.inflight_loads = totals.inflight_loads.saturating_add(1);
-        });
-        Self::publish_gauges(&snapshot);
-    }
-
-    /// Records one terminal metadata load with its outcome and duration.
-    pub(crate) fn record_load_terminal(&self, outcome: MetadataLoadOutcome, elapsed: Duration) {
-        metrics::counter!(
-            "bifrost_storage_metadata_cache_loads_total",
-            "outcome" => outcome.as_str(),
-        )
-        .increment(1);
-        metrics::histogram!(
-            "bifrost_storage_metadata_load_seconds",
-            "outcome" => outcome.as_str(),
-        )
-        .record(elapsed.as_secs_f64());
-        let snapshot = self.mutate(|totals| {
-            totals.load_terminals[outcome.index()] =
-                totals.load_terminals[outcome.index()].saturating_add(1);
-            settle(
-                &mut totals.inflight_loads,
-                TelemetryTransition::LoadTerminal,
-                &mut totals.anomalies,
-            );
-        });
-        Self::publish_gauges(&snapshot);
-    }
-
-    /// Records one joined waiter attaching to an in-flight load.
-    pub(crate) fn record_waiter_joined(&self) {
-        let snapshot = self.mutate(|totals| {
-            totals.waiters = totals.waiters.saturating_add(1);
-        });
-        Self::publish_gauges(&snapshot);
-    }
-
-    /// Records one joined waiter leaving, whether settled or cancelled.
-    pub(crate) fn record_waiter_settled(&self, outcome: MetadataLoadOutcome, elapsed: Duration) {
-        metrics::histogram!(
-            "bifrost_storage_metadata_wait_seconds",
-            "outcome" => outcome.as_str(),
-        )
-        .record(elapsed.as_secs_f64());
-        let snapshot = self.mutate(|totals| {
-            settle(
-                &mut totals.waiters,
-                TelemetryTransition::WaiterSettled,
-                &mut totals.anomalies,
-            );
-        });
-        Self::publish_gauges(&snapshot);
-    }
-
-    /// Republishes the resident-entry and resident-byte gauges.
-    ///
-    /// Called by the cache after every retention change so the gauges describe
-    /// the state the cache actually holds rather than a value derived by
-    /// counting decisions.
-    pub(crate) fn record_resident(&self, entries: u64, bytes: u64) {
-        let snapshot = self.mutate(|totals| {
-            totals.resident_entries = entries;
-            totals.resident_bytes = bytes;
-        });
-        Self::publish_gauges(&snapshot);
-    }
-
-    /// Records one logical governed storage request being admitted.
-    ///
-    /// Raises the active-request gauge until
-    /// [`Self::record_request_terminal`] settles it, so starts and terminals
-    /// reconcile exactly on a drained owner. Called once per logical
-    /// operation, never once per attempt.
-    pub(crate) fn record_request_start(&self, operation: StorageOperation) {
-        metrics::counter!(
-            "bifrost_storage_requests_total",
-            "operation" => operation.as_str(),
-        )
-        .increment(1);
-        let snapshot = self.mutate(|totals| {
-            totals.request_starts = totals.request_starts.saturating_add(1);
-            totals.active_requests = totals.active_requests.saturating_add(1);
-        });
-        Self::publish_gauges(&snapshot);
-    }
-
-    /// Records the one terminal outcome of a logical governed request.
-    ///
-    /// Both labels come from closed enums, so no path, tenant, table,
-    /// checksum, snapshot, query identifier, or backend error text can reach
-    /// the emitted cardinality through this boundary.
-    pub(crate) fn record_request_terminal(
-        &self,
-        operation: StorageOperation,
-        outcome: StorageRequestOutcome,
-        elapsed: Duration,
-    ) {
-        metrics::counter!(
-            "bifrost_storage_request_terminals_total",
-            "operation" => operation.as_str(),
-            "outcome" => outcome.as_str(),
-        )
-        .increment(1);
-        metrics::histogram!(
-            "bifrost_storage_request_seconds",
-            "operation" => operation.as_str(),
-            "outcome" => outcome.as_str(),
-        )
-        .record(elapsed.as_secs_f64());
-        let snapshot = self.mutate(|totals| {
-            totals.request_terminals[outcome.index()] =
-                totals.request_terminals[outcome.index()].saturating_add(1);
-            settle(
-                &mut totals.active_requests,
-                TelemetryTransition::RequestTerminal,
-                &mut totals.anomalies,
-            );
-        });
-        Self::publish_gauges(&snapshot);
-    }
-
-    /// Records one retried attempt of an idempotent governed read.
-    ///
-    /// Published at the moment the owner admits the attempt, so the total is
-    /// the count of attempts beyond the first rather than of retry decisions
-    /// that a deadline or cancellation then refused.
-    pub(crate) fn record_request_retry(&self, operation: StorageOperation) {
-        metrics::counter!(
-            "bifrost_storage_request_retries_total",
-            "operation" => operation.as_str(),
-        )
-        .increment(1);
-        self.mutate(|totals| {
-            totals.request_retries = totals.request_retries.saturating_add(1);
-        });
-    }
-
-    /// Records one settlement that had no matching admission.
-    ///
-    /// The request guard's escape hatch: a duplicate or unmatched settlement
-    /// must be visible as a bounded anomaly rather than silently reconciling a
-    /// broken owner's counts into a truthful-looking zero.
-    pub(crate) fn record_transition_anomaly(&self, transition: TelemetryTransition) {
-        self.mutate(|totals| {
-            totals.anomalies[transition.index()] =
-                totals.anomalies[transition.index()].saturating_add(1);
-        });
-        metrics::counter!(
-            "bifrost_storage_metadata_cache_transition_anomalies_total",
-            "transition" => transition.as_str(),
-        )
-        .increment(1);
-        tracing::warn!(
-            transition = transition.as_str(),
-            "Bifrost storage telemetry settled an unmatched transition"
-        );
-    }
-
-    /// Records one lifecycle transition of the storage owner.
-    pub(crate) fn record_lifecycle(&self, lifecycle: StorageLifecycle) {
-        let snapshot = self.mutate(|totals| {
-            totals.lifecycle = lifecycle;
-        });
-        tracing::debug!(
-            lifecycle = lifecycle.as_str(),
-            resident_entries = snapshot.resident_entries(),
-            inflight_loads = snapshot.inflight_loads(),
-            waiters = snapshot.waiters(),
-            "Bifrost storage metadata lifecycle"
-        );
-    }
-
-    /// Returns the retained totals and live state.
-    ///
-    /// A poisoned totals lock yields the default view rather than unwinding: a
-    /// lost observation must never fail the work being observed.
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn snapshot(&self) -> MetadataCacheSnapshot {
-        self.totals
-            .lock()
-            .map_or_else(|_| MetadataCacheSnapshot::default(), |totals| *totals)
-    }
-
-    /// Applies one mutation to the retained totals and returns the new view.
-    ///
-    /// The mutation and the read happen under one acquisition so a published
-    /// gauge describes one consistent moment rather than two. A poisoned lock
-    /// yields the default view, which stops the totals advancing without
-    /// failing the transition being observed.
-    fn mutate(&self, apply: impl FnOnce(&mut MetadataCacheSnapshot)) -> MetadataCacheSnapshot {
-        let Ok(mut totals) = self.totals.lock() else {
-            return MetadataCacheSnapshot::default();
-        };
-        apply(&mut totals);
-        *totals
-    }
-
-    /// Publishes every live gauge from one consistent retained view.
-    fn publish_gauges(snapshot: &MetadataCacheSnapshot) {
-        metrics::gauge!("bifrost_storage_metadata_cache_resident_entries")
-            .set(gauge_value(snapshot.resident_entries()));
-        metrics::gauge!("bifrost_storage_metadata_cache_resident_bytes")
-            .set(gauge_value(snapshot.resident_bytes()));
-        metrics::gauge!("bifrost_storage_metadata_cache_inflight_loads")
-            .set(gauge_value(snapshot.inflight_loads()));
-        metrics::gauge!("bifrost_storage_metadata_cache_waiters")
-            .set(gauge_value(snapshot.waiters()));
-        metrics::gauge!("bifrost_storage_active_requests")
-            .set(gauge_value(snapshot.active_requests()));
-    }
-}
-
-/// Settles one live count by exactly one admission, checked rather than clamped.
+/// Sets the in-flight load gauge from the cache's in-flight map size.
 ///
-/// A saturating decrement of a zero gauge is indistinguishable from a correct
-/// one, which is how a broken owner reports a clean drain. This records the
-/// mismatch as a bounded anomaly instead, so reconciliation failure is visible
-/// in both the totals and an emitted counter, and leaves the count at zero
-/// because that is still the only defensible value.
-fn settle(
-    count: &mut u64,
-    transition: TelemetryTransition,
-    anomalies: &mut [u64; TelemetryTransition::ALL.len()],
+/// Called under the cache's state lock whenever the map gains or loses an
+/// entry.
+pub(crate) fn record_inflight_loads(loads: usize) {
+    metrics::gauge!("bifrost_storage_metadata_cache_inflight_loads")
+        .set(gauge_value(u64::try_from(loads).unwrap_or(u64::MAX)));
+}
+
+/// Publishes one logical governed storage request being admitted.
+///
+/// Called once per logical operation, never once per attempt, so a retried
+/// read is one request. Raises `bifrost_storage_active_requests`, which the
+/// matching [`record_request_terminal`] lowers; both are driven by the request
+/// settlement that teardown waits on, so the gauge moves with that owner.
+pub(crate) fn record_request_start(operation: StorageOperation) {
+    metrics::counter!(
+        "bifrost_storage_requests_total",
+        "operation" => operation.as_str(),
+    )
+    .increment(1);
+    metrics::gauge!("bifrost_storage_active_requests").increment(1.0);
+}
+
+/// Publishes the one terminal outcome of a logical governed request.
+///
+/// Both labels come from closed enums, so no path, tenant, table, checksum,
+/// snapshot, query identifier, or backend error text can reach the emitted
+/// cardinality through this boundary.
+pub(crate) fn record_request_terminal(
+    operation: StorageOperation,
+    outcome: StorageRequestOutcome,
+    elapsed: Duration,
 ) {
-    if let Some(settled) = count.checked_sub(1) {
-        *count = settled;
-    } else {
-        anomalies[transition.index()] = anomalies[transition.index()].saturating_add(1);
-        metrics::counter!(
-            "bifrost_storage_metadata_cache_transition_anomalies_total",
-            "transition" => transition.as_str(),
-        )
-        .increment(1);
-        tracing::warn!(
-            transition = transition.as_str(),
-            "Bifrost storage metadata telemetry settled an unmatched transition"
-        );
-    }
+    metrics::counter!(
+        "bifrost_storage_request_terminals_total",
+        "operation" => operation.as_str(),
+        "outcome" => outcome.as_str(),
+    )
+    .increment(1);
+    metrics::histogram!(
+        "bifrost_storage_request_seconds",
+        "operation" => operation.as_str(),
+        "outcome" => outcome.as_str(),
+    )
+    .record(elapsed.as_secs_f64());
+    metrics::gauge!("bifrost_storage_active_requests").decrement(1.0);
 }
 
-/// Projects one retained count into a gauge value without silent truncation.
+/// Publishes one retried attempt of an idempotent governed read.
+///
+/// Published at the moment the owner admits the attempt, so the total is the
+/// count of attempts beyond the first rather than of retry decisions that a
+/// deadline or cancellation then refused.
+pub(crate) fn record_request_retry(operation: StorageOperation) {
+    metrics::counter!(
+        "bifrost_storage_request_retries_total",
+        "operation" => operation.as_str(),
+    )
+    .increment(1);
+}
+
+/// Projects one owned count into a gauge value without silent truncation.
 ///
 /// A count beyond `f64`'s exact integer range saturates to `f64::MAX` so an
 /// impossible value is visibly wrong rather than quietly rounded.
 fn gauge_value(value: u64) -> f64 {
     value.to_f64().unwrap_or(f64::MAX)
+}
+
+/// Reads the storage families back out of a scoped test recorder.
+///
+/// Storage unit tests install a [`wyrd_bench::BenchmarkRecorder`] as the
+/// thread's local recorder on a current-thread runtime, so every emission the
+/// production paths above make — including from spawned loader tasks — lands
+/// in it. These helpers only read; they never emit.
+#[cfg(test)]
+pub(crate) mod recorded {
+    use wyrd_bench::BenchmarkRecorder;
+
+    /// Logical governed requests admitted.
+    pub(crate) const REQUESTS: &str = "bifrost_storage_requests_total";
+    /// Logical governed request terminals.
+    pub(crate) const REQUEST_TERMINALS: &str = "bifrost_storage_request_terminals_total";
+    /// Attempts admitted after a read's first.
+    pub(crate) const REQUEST_RETRIES: &str = "bifrost_storage_request_retries_total";
+    /// Logical governed requests admitted and not yet settled.
+    pub(crate) const ACTIVE_REQUESTS: &str = "bifrost_storage_active_requests";
+    /// Cache decisions.
+    pub(crate) const CACHE_EFFECTS: &str = "bifrost_storage_metadata_cache_effects_total";
+    /// Metadata load terminals.
+    pub(crate) const CACHE_LOADS: &str = "bifrost_storage_metadata_cache_loads_total";
+    /// Joined-caller wait latency.
+    pub(crate) const WAIT_SECONDS: &str = "bifrost_storage_metadata_wait_seconds";
+    /// Retired: the unmatched-settlement counter the shadow ledger published.
+    pub(crate) const RETIRED_ANOMALIES: &str =
+        "bifrost_storage_metadata_cache_transition_anomalies_total";
+    /// Retired: the waiter gauge republished on every transition.
+    pub(crate) const RETIRED_WAITERS: &str = "bifrost_storage_metadata_cache_waiters";
+
+    /// Returns whether one rendered series belongs to `family` and carries
+    /// every `labels` pair.
+    fn matches(series: &str, family: &str, labels: &[(&str, &str)]) -> bool {
+        let Some(rest) = series.strip_prefix(family) else {
+            return false;
+        };
+        if !(rest.is_empty() || rest.starts_with('{')) {
+            return false;
+        }
+        labels.iter().all(|(key, value)| {
+            let pair = format!("{key}=\"{value}\"");
+            rest.contains(&format!("{{{pair}")) || rest.contains(&format!(",{pair}"))
+        })
+    }
+
+    /// Sums every counter series of `family` carrying all `labels`.
+    pub(crate) fn counter(
+        recorder: &BenchmarkRecorder,
+        family: &str,
+        labels: &[(&str, &str)],
+    ) -> u64 {
+        recorder
+            .snapshot()
+            .counters
+            .iter()
+            .filter(|(series, _)| matches(series, family, labels))
+            .map(|(_, value)| value)
+            .sum()
+    }
+
+    /// Sums the observation counts of every histogram series of `family`
+    /// carrying all `labels`.
+    pub(crate) fn observations(
+        recorder: &BenchmarkRecorder,
+        family: &str,
+        labels: &[(&str, &str)],
+    ) -> u64 {
+        recorder
+            .snapshot()
+            .histograms
+            .iter()
+            .filter(|(series, _)| matches(series, family, labels))
+            .map(|(_, histogram)| histogram.count)
+            .sum()
+    }
+
+    /// Returns the current value of one unlabelled gauge, or zero when unset.
+    pub(crate) fn gauge(recorder: &BenchmarkRecorder, family: &str) -> f64 {
+        recorder
+            .snapshot()
+            .gauges
+            .get(family)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Returns whether any series of `family` was ever registered.
+    pub(crate) fn emitted(recorder: &BenchmarkRecorder, family: &str) -> bool {
+        recorder.snapshot().contains_family(family)
+    }
 }

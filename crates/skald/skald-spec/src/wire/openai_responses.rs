@@ -351,9 +351,15 @@ pub enum OpenAiResponseItem {
         output: String,
     },
     Reasoning {
+        /// Provider item identity, required to replay the item statelessly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// Reasoning summary parts, replayed as returned.
         #[serde(default)]
-        summary: Option<String>,
-        #[serde(default)]
+        summary: Vec<OpenAiReasoningSummaryPart>,
+        /// Opaque reasoning state returned when `reasoning.encrypted_content`
+        /// is included, required to replay the item without stored state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<String>,
     },
     InputFile {
@@ -363,6 +369,18 @@ pub enum OpenAiResponseItem {
         image_url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+    },
+}
+
+/// One part of a Responses reasoning item summary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OpenAiReasoningSummaryPart {
+    /// Summary text.
+    SummaryText {
+        /// Summary text content.
+        text: String,
     },
 }
 

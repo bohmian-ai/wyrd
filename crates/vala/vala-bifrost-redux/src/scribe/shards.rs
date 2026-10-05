@@ -1087,9 +1087,6 @@ impl ScribeShardRuntime {
     /// [`ScribeError::IngestBusy`] when the target shard mailbox is full.
     pub(crate) fn try_send(&self, mut append: PreparedAppend) -> Result<(), ScribeError> {
         if self.closed.load(Ordering::Acquire) {
-            if let Some(lifecycle) = append.lifecycle.as_mut() {
-                lifecycle.settle_shutdown();
-            }
             return Err(ScribeError::IngressClosed);
         }
         let shard = self.lane_for(append.tenant, &append.table, append.batch_id);
@@ -1097,32 +1094,14 @@ impl ScribeShardRuntime {
         if let Some(memory) = append.memory.as_mut() {
             memory.transfer_category(MemoryCategory::Queued)?;
         }
-        append
-            .lifecycle
-            .as_mut()
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "prepared append lost its lifecycle owner".to_owned(),
-            })?
-            .shard_transferred();
         self.pending.fetch_add(1, Ordering::AcqRel);
         let result = self.senders[shard].try_send(ShardCommand::Append(Box::new(append)));
         if let Err(error) = result {
             self.pending.fetch_sub(1, Ordering::AcqRel);
             self.drained.notify_waiters();
             return Err(match error {
-                mpsc::error::TrySendError::Full(ShardCommand::Append(mut append)) => {
-                    if let Some(lifecycle) = append.lifecycle.as_mut() {
-                        lifecycle.revert_shard_transfer();
-                        lifecycle.refuse();
-                    }
+                mpsc::error::TrySendError::Full(ShardCommand::Append(_)) => {
                     ScribeError::IngestBusy { table: table_name }
-                }
-                mpsc::error::TrySendError::Closed(ShardCommand::Append(mut append)) => {
-                    if let Some(lifecycle) = append.lifecycle.as_mut() {
-                        lifecycle.revert_shard_transfer();
-                        lifecycle.settle_shutdown();
-                    }
-                    ScribeError::IngressClosed
                 }
                 mpsc::error::TrySendError::Closed(_) | mpsc::error::TrySendError::Full(_) => {
                     ScribeError::IngressClosed
@@ -2164,7 +2143,7 @@ impl ShardOwner {
         self.memory_ownership
             .move_active_to_immutable(frozen.arrow_bytes)?;
         self.wal_segments.remove(seal_key);
-        tracing::info!(
+        tracing::debug!(
             tenant = %seal_key.tenant,
             table = %seal_key.table,
             shard_id = self.id,
@@ -2680,7 +2659,7 @@ impl ShardOwner {
             .find(|cohort| cohort.pending_member_seal_ids.contains(&generation_id))
             .and_then(|cohort| cohort.wal_segments.first())
             .map(|segment| &segment.path);
-        tracing::info!(
+        tracing::debug!(
             tenant = %seal_key.tenant,
             table = %seal_key.table,
             shard_id = self.id,
@@ -3126,10 +3105,7 @@ impl ShardOwner {
     /// inserted that batch; a replay suppressed by the fence or the memtable
     /// identity reports no first commit. Reservations drop with each append.
     fn acknowledge_visible(state: GroupWalState) {
-        for mut append in state.prepared {
-            if let Some(lifecycle) = append.lifecycle.as_mut() {
-                lifecycle.succeed();
-            }
+        for append in state.prepared {
             if let Some(sender) = append.durable_ack {
                 let batch_id = append.batch_id.as_bytes();
                 let rows = state.rows_by_append.get(batch_id).copied().unwrap_or(0);
@@ -3246,17 +3222,14 @@ impl ShardOwner {
             "memtable_arrow"
         };
         let rotation_result = self.rotate_active_generation();
-        tracing::info!(
-            shard_id = self.id,
-            rotation_trigger,
-            terminal = true,
-            outcome = if rotation_result.is_ok() {
-                "rotated"
-            } else {
-                "failed"
-            },
-            "Scribe shard generation rotation settled"
-        );
+        if let Err(error) = &rotation_result {
+            tracing::warn!(
+                shard_id = self.id,
+                rotation_trigger,
+                error = %error,
+                "Scribe shard generation rotation failed"
+            );
+        }
         rotation_result
     }
 
@@ -3376,7 +3349,7 @@ impl ShardOwner {
                 pending_member_seal_ids,
             });
         }
-        tracing::info!(
+        tracing::debug!(
             shard_id = self.id,
             shard_generation = ?segment_refs.first().map(|segment| &segment.path),
             cohort_id = ?segment_refs.first().map(|segment| &segment.path),
@@ -3613,7 +3586,7 @@ impl ShardOwner {
                 request_id: first.request_id,
             };
             if self.commit_batch_control_fence(&postgres, &commit).await? {
-                tracing::info!(
+                tracing::debug!(
                     tenant = %append.tenant,
                     table = %append.table.fqn(),
                     batch_id = %append.batch_id,
@@ -3720,18 +3693,6 @@ impl ShardOwner {
                     Ok(Some(rows)) => {
                         let entry = rows_by_append.entry(batch_id).or_default();
                         *entry = entry.saturating_add(rows);
-                        let materialized_bytes = slice
-                            .memtable_bytes
-                            .saturating_add(slice.wal_append.data.len());
-                        append
-                            .lifecycle
-                            .as_mut()
-                            .ok_or_else(|| ScribeError::Internal {
-                                detail:
-                                    "prepared append lost lifecycle while dropping retained slice"
-                                        .to_owned(),
-                            })?
-                            .released_materialization(materialized_bytes);
                         continue;
                     }
                     Ok(None) => {}
@@ -3825,37 +3786,23 @@ impl ShardOwner {
         let schema_fingerprint = wal_append.schema_fingerprint;
         let data_digest = wal_append.logical_data_digest;
         let data_len = wal_append.logical_data_len;
-        let materialized_bytes = memtable_bytes.saturating_add(wal_append.data.len());
         if retain_rows {
             self.reserve_slice_active(append, memtable_bytes)?;
         }
         let memory = append.memory.take().ok_or_else(|| ScribeError::Internal {
             detail: "ingress root owner missing before WAL dispatch".to_owned(),
         })?;
-        let lifecycle = append
-            .lifecycle
-            .take()
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "ingress lifecycle owner missing before WAL dispatch".to_owned(),
-            })?;
         let wal_result = self
             .wal_io
             .submit(ScribeWalIoOp::WriteIngressSlice {
                 wal: self.wal_handle.clone(),
                 append: wal_append,
                 memory,
-                lifecycle,
-                materialized_bytes,
             })
             .await;
         let result = match wal_result {
-            Ok(ScribeWalIoResult::IngressSliceWritten {
-                result,
-                memory,
-                lifecycle,
-            }) => {
+            Ok(ScribeWalIoResult::IngressSliceWritten { result, memory }) => {
                 append.memory = Some(memory);
-                append.lifecycle = Some(lifecycle);
                 result
             }
             Ok(_) => {
@@ -3921,17 +3868,9 @@ impl ShardOwner {
             memtable_bytes,
             ..
         } = slice;
-        let materialized_bytes = memtable_bytes.saturating_add(wal_append.data.len());
         if retain_rows {
             self.reserve_slice_active(append, memtable_bytes)?;
         }
-        append
-            .lifecycle
-            .as_mut()
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "prepared append lost lifecycle while reusing synced slice".to_owned(),
-            })?
-            .released_materialization(materialized_bytes);
         Ok((
             DurableSlice {
                 seal_key,
@@ -4054,6 +3993,10 @@ impl ShardOwner {
 
     /// Inserts one post-fence slice and transfers its active owner to memtable.
     ///
+    /// Counts the slice's rows in `bifrost_scribe_memtable_rows_inserted_total`
+    /// only after the memtable accepted them; a spent-batch replay is settled
+    /// by [`Self::discard_already_committed_slice`] and adds nothing.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when rows are missing, rotation inspection or
@@ -4095,6 +4038,8 @@ impl ShardOwner {
             .map_err(|error| {
                 self.preserve_primary_after_active_cleanup(error, slice.memtable_bytes, true)
             })?;
+        metrics::counter!("bifrost_scribe_memtable_rows_inserted_total")
+            .increment(u64::try_from(row_count).unwrap_or(u64::MAX));
         self.active_json_bytes = self.active_json_bytes.saturating_add(payload_len);
         touched_keys.insert(slice.seal_key.clone());
         self.synced_not_inserted.remove(&AppendSliceId {
@@ -4142,9 +4087,6 @@ impl ShardOwner {
     /// Completes every prepared ACK waiter with one group failure.
     fn notify_prepared_error(prepared: &mut [PreparedAppend], error: &ScribeError) {
         for append in prepared {
-            if let Some(lifecycle) = append.lifecycle.as_mut() {
-                lifecycle.refuse();
-            }
             if let Some(sender) = append.durable_ack.take() {
                 let _ = sender.send(Err(error.completion_copy()));
             }
@@ -6449,9 +6391,6 @@ mod tests {
         let memory = budget
             .try_reserve_ingress(MemoryCategory::Raw, initial_bytes)
             .expect("ingress memory");
-        let lifecycle = Arc::new(crate::scribe::telemetry::ScribeIngressLifecycle::default());
-        let mut lifecycle = lifecycle.begin();
-        lifecycle.reserved(initial_bytes);
         let mut prepared =
             crate::scribe::preprocess::prepare_append(crate::scribe::preprocess::AdmittedAppend {
                 batch_id,
@@ -6465,7 +6404,6 @@ mod tests {
                 partition_granularity: key.partition.granularity(),
                 queued_at: std::time::Instant::now(),
                 durable_ack: None,
-                lifecycle,
             })
             .expect("prepared append");
         let prepared_bytes = prepared.prepared_bytes;

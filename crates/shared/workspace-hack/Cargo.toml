@@ -90,9 +90,9 @@ num-iter = { version = "0.1", default-features = false, features = ["i128", "std
 num-rational = { version = "0.4", default-features = false, features = ["num-bigint-std", "std"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 once_cell = { version = "1" }
-opentelemetry = { version = "0.31", features = ["spec_unstable_logs_enabled"] }
+opentelemetry = { version = "0.31" }
 opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "logs", "metrics", "trace", "with-serde"] }
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "spec_unstable_logs_enabled"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 parking_lot = { version = "0.12" }
 password-hash = { version = "0.5", features = ["alloc", "getrandom"] }
 percent-encoding = { version = "2" }
@@ -229,9 +229,9 @@ num-iter = { version = "0.1", default-features = false, features = ["i128", "std
 num-rational = { version = "0.4", default-features = false, features = ["num-bigint-std", "std"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 once_cell = { version = "1" }
-opentelemetry = { version = "0.31", features = ["spec_unstable_logs_enabled"] }
+opentelemetry = { version = "0.31" }
 opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "logs", "metrics", "trace", "with-serde"] }
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "spec_unstable_logs_enabled"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 parking_lot = { version = "0.12" }
 password-hash = { version = "0.5", features = ["alloc", "getrandom"] }
 percent-encoding = { version = "2" }

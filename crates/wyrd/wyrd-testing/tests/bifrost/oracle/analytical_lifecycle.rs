@@ -602,7 +602,6 @@ async fn prove_production_telemetry() -> Result<(), JourneyError> {
     // Resource release: every in-flight gauge is back at its baseline.
     for gauge in [
         "bifrost_oracle_analytical_attempts_active",
-        "bifrost_oracle_analytical_exchanges_active",
         "oracle_queries_active",
         "oracle_queries_queued",
     ] {

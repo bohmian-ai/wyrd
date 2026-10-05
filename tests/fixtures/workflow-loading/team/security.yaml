@@ -1,0 +1,12 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  space: workflow-loading
+  name: security-reviewer
+  version: "1.0.0"
+spec:
+  prompt: prompts/security.yaml
+  tool_names: []
+  run_config:
+    max_iterations: 1
+    timeout_ms: 60000

@@ -2429,6 +2429,8 @@ mod tests {
         fence: u64,
         /// The identity every fixture operation carries.
         identity: StageWireIdentity,
+        /// The follower-side grant, held open as the leader's stream would be.
+        _grant: super::super::dispatcher::HeldGraphGrant,
     }
 
     impl Fixture {
@@ -2446,11 +2448,11 @@ mod tests {
                 DataFusionQueryId::from_uuid(Uuid::from_u128(12)),
             );
             // The adapter forwards a message only once the follower has taken
-            // exact ownership of the graph, and ownership comes from an admitted
-            // reservation. Reserving one here keeps this a transport test rather
-            // than a test of an unreachable, ownerless graph.
-            let reservation = reservations
-                .reserve(
+            // exact ownership of the graph, and ownership comes from a held
+            // grant. Holding one here keeps this a transport test rather than a
+            // test of an unreachable, ownerless graph.
+            let grant = reservations
+                .hold(
                     &wyrd_spec::vala::api::ReserveNodeSlotsRequest {
                         query_id: wyrd_spec::vala::api::QueryId::new(
                             graph.public_query_id.as_uuid(),
@@ -2473,7 +2475,8 @@ mod tests {
                             .expect("an idle Oracle admits one analytical query"),
                     ),
                 )
-                .expect("an idle follower accepts one graph reservation");
+                .expect("an idle follower holds one graph grant");
+            let reservation = grant.reservation();
             let ingress = AnalyticalStageIngress::new(AnalyticalStageIngressConfig {
                 node_id,
                 oracle_fence: 7,
@@ -2514,6 +2517,7 @@ mod tests {
                 node_id,
                 fence: 7,
                 identity,
+                _grant: grant,
             }
         }
 

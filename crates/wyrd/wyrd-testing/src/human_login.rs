@@ -35,7 +35,7 @@ pub const FIXTURE_TENANT_SLUG: &str = "test-tenant-1";
 #[must_use]
 pub fn keycloak_issuer() -> String {
     std::env::var("WYRD_KEYCLOAK_ISSUER")
-        .unwrap_or_else(|_| "http://localhost:18080/realms/wyrd-test".to_owned())
+        .unwrap_or_else(|_| "http://localhost:8180/realms/wyrd-test".to_owned())
 }
 
 /// Served human-login steps against one bound server.

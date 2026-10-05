@@ -94,7 +94,8 @@ impl ScheduledQueryCaller {
     ///
     /// # Errors
     ///
-    /// Returns the stable pre-stream query error (an object denial is
+    /// Returns `RunningQueryControlUnavailable` when this process has no query
+    /// controls, the stable pre-stream query error (an object denial is
     /// audited first, or replaced by audit-unavailable when that append
     /// fails), a frame or Arrow decode
     /// error, [`WyrdError`] for a failed terminal, unconfirmed lifecycle routing,
@@ -103,7 +104,9 @@ impl ScheduledQueryCaller {
     ///
     /// # Cancellation
     ///
-    /// Cancelling the bound token cancels the live stream and returns
+    /// Cancelling the bound token while the stream is still opening cancels
+    /// the query at its owner and still awaits the open. Cancelling it
+    /// afterwards cancels the live stream and returns
     /// [`wyrd_spec::vala::error::BifrostError::QueryStreamIncomplete`], the
     /// same error a stream that ended without a terminal reports.
     pub async fn run(
@@ -134,7 +137,21 @@ impl ScheduledQueryCaller {
     where
         F: FnMut(RecordBatch) -> Result<(), WyrdError>,
     {
-        let mut stream = self.dispatch(request).await?;
+        let controls = self
+            .state
+            .bifrost
+            .query_controls()
+            .ok_or(BifrostError::RunningQueryControlUnavailable)?;
+        let requested_deadline_ms = request.deadline_ms;
+        let mut stream = controls
+            .open_cancellable(
+                self.dispatch(request),
+                self.context.data_tenant_id,
+                &self.context.request_id,
+                requested_deadline_ms,
+                &self.cancellation,
+            )
+            .await?;
         // The stream's absolute deadline becomes one fixed instant before any
         // frame is taken, so no leg of consumption — least of all the wait for
         // clean EOF after a terminal — can start a fresh budget.
@@ -151,10 +168,7 @@ impl ScheduledQueryCaller {
         {
             Ok(outcome) => Ok(outcome),
             Err(error) => {
-                self.state
-                    .bifrost
-                    .query_controls()
-                    .ok_or(BifrostError::RunningQueryControlUnavailable)?
+                controls
                     .cancel_and_settle(
                         self.context.data_tenant_id,
                         self.context.request_id.clone(),

@@ -153,7 +153,7 @@ impl<'a> PeerDial<'a> {
 
 /// Calls the cheapest `OraclePeerService` operation and returns its outcome.
 ///
-/// `ReserveSlots` is unary and side-effect free when it is refused, so it is
+/// `ReserveSlots` charges nothing when it is refused, so it is
 /// the right probe for asking whether the service is mounted here and whether
 /// this caller is authorized at all.
 ///
@@ -272,40 +272,6 @@ impl ReservationPlane {
     /// Returns the binding a correct reserve context must carry.
     pub(crate) fn reserve_binding(&self, query_id: uuid::Uuid) -> ReservationBinding {
         self.binding(ReservationOperationV1::ReserveSlots, query_id)
-    }
-
-    /// Returns the release the leader sends for one accepted reservation.
-    ///
-    /// The context is built exactly as for a reserve, over the context-free
-    /// release encoding and bound to the release operation, so the follower
-    /// authorizes it on the same terms and returns the reservation's units.
-    ///
-    /// # Errors
-    ///
-    /// Returns the digest failure unchanged.
-    pub(crate) fn release_request(
-        &self,
-        reservation_id: Vec<u8>,
-        query_id: uuid::Uuid,
-    ) -> Result<proto::ReleaseNodeSlotsRequest, PeerJourneyError> {
-        let mut request = proto::ReleaseNodeSlotsRequest {
-            reservation_id,
-            query_id: query_id.as_bytes().to_vec(),
-            leader_node_id: self.leader_node_id.to_string(),
-            leader_fencing_token: self.leader_fence,
-            context: None,
-        };
-        let digest = reservation_body_digest(&request.encode_to_vec())
-            .map_err(|error| format!("release body digest: {error}"))?;
-        let claims = ReservationTicketClaims::for_binding(
-            &self.binding(ReservationOperationV1::ReleaseSlots, query_id),
-            digest,
-            context_expiry(),
-        );
-        request.context = Some(proto::PeerContext {
-            claims_bytes: claims.encode_to_vec(),
-        });
-        Ok(request)
     }
 
     /// Binds one operation on `query_id` between the observed incarnations.

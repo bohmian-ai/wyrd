@@ -201,7 +201,7 @@ impl JudgeInvoker for SkaldJudgeInvoker {
 
         let run = tokio::time::timeout(
             self.call_deadline,
-            agent.run_prompt(self.providers.as_ref(), prompt, &borrowed, None),
+            agent.run_prompt(self.providers.as_ref(), prompt, &borrowed),
         )
         .await
         .map_err(|_| JudgeError::Timeout {

@@ -35,7 +35,6 @@ pub async fn send_raw(
 mod raw_passthrough {
     use crate::ProviderClient;
     use crate::common;
-    use serde_json::value::RawValue;
     use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -50,7 +49,7 @@ mod raw_passthrough {
             .respond_with(ResponseTemplate::new(200).set_body_string(response_body.clone()))
             .mount(&server)
             .await;
-        let body = RawValue::from_string(request_body.clone()).expect("raw request parses");
+        let body = serde_json::from_str(&request_body).expect("raw request parses");
 
         let response = common::openai_client(&server.uri())
             .send(ProviderRequest::RawV1 {

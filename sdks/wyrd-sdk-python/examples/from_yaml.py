@@ -4,9 +4,11 @@ from pathlib import Path
 
 from wyrd import Workflow
 
+BUNDLE = Path(__file__).parents[3] / "examples" / "workflows" / "code-review"
+
 
 def main() -> None:
-    wf = Workflow.load(Path(__file__).parent / "workflows" / "research.yaml")
+    wf = Workflow.from_path(BUNDLE / "workflow.yaml")
     print(f"workflow: {wf.name}")
     print(f"steps: {', '.join(wf.steps)}")
 

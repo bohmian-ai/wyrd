@@ -243,8 +243,7 @@ pub(crate) fn complete(
             );
             translated(usage, anthropic::response(native, model))
         }
-        ProviderResponse::GeminiGenerateContent(native)
-        | ProviderResponse::VertexGenerateContent(native) => {
+        ProviderResponse::GeminiGenerateContent(native) => {
             let usage = usage(
                 Wire::Google,
                 &serde_json::to_value(&native).unwrap_or_default(),

@@ -367,7 +367,7 @@ peer context that binds:
 - public query, DataFusion query, stage, task, and attempt identities;
 - pinned snapshot and fragment digests;
 - leader and worker fences and audience;
-- reservation identity, request digest, and absolute deadline.
+- request digest and absolute deadline.
 
 The context is unsigned. Peer mTLS with the fixed `wyrd-peer` cluster identity
 is the only peer authentication and completes before the bounded first frame is
@@ -377,9 +377,18 @@ admission window rather than replay state. A compromised cluster member is out
 of scope. Claims and body digests are verified before lazy plan decode, task
 cache lookup, provider creation, or source IO. Every worker replaces its
 process runtime with the exact query-admitted `RuntimeEnv`, `MemoryPool`, spill
-share, cancellation token, and deadline. Query-owned leases remain alive until
-coordinator end-of-stream, cancellation, or cache invalidation and all
-structured tasks have joined.
+share, cancellation token, and deadline.
+
+A follower never outlives its leader. The leader's stream owns every grant a
+follower holds for its graph: slot unit, memory, scratch share, query runtime
+and spill directory, task cache entries, and structured tasks. A follower
+takes no capacity before it accepts that stream. It admits the graph when it
+accepts the leader's stream, beneath its own local capacity root, or refuses
+at once with retry timing when full. No pending reservation, reservation
+expiry, or reclaim-by-timeout exists. When the leader stream completes, fails,
+is cancelled, or is dropped, or the deadline passes, the follower cancels the
+graph immediately and releases every owner once its structured tasks have
+joined; nothing waits for a later request or timer to reclaim it.
 
 Exchange buffers draw from the same finite query-owned memory pool as the
 operators; they are not precharged into a predicted child allocation. Before
@@ -390,8 +399,11 @@ their pinned byte backpressure without a Wyrd item-count guarantee. Oracle does
 not claim to predict every dependency allocation or transient encoded-message
 byte. Follower spill is charged to the same query-owned scratch allocation.
 Memory-pool, transport, or scratch exhaustion is typed and releases all memory,
-scratch, slot, task, cache, and transport owners exactly once after the graph
-drains. Cleanup timeout or failure is never reported as a successful release:
+scratch, slot, task, cache, and transport owners exactly once when the graph
+ends, without waiting for nested children still being torn down: a late
+child returns its bytes through the shared memory root as it frees them, and
+the query's memory view poisons the governor only when it is dropped still
+holding bytes. Cleanup failure is never reported as a successful release:
 the remaining graph stays observable to the owning supervisor, the node does
 not claim a clean terminal state, and readiness or shutdown evidence surfaces
 the failure.
@@ -451,9 +463,9 @@ itself charged as resident query memory. Concurrency is governed by slot units,
 actual cooperative reservation by the shared memory root, and spill by the
 separately leased scratch share. Every query charges exactly one unit on each
 node it runs on, whatever its class: an Interactive query on its leader, and an
-Analytical query on its leader and on every participant that reserves its
-graph. The class decides only which capacity rules apply, never the charge, and
-a peer reservation therefore carries no demand of its own. A query-local memory ceiling
+Analytical query on its leader and on every participant whose leader stream it
+has accepted. The class decides only which capacity rules apply, never the
+charge, and a participant's charge therefore carries no demand of its own. A query-local memory ceiling
 is derived once at admission:
 
 ```text
@@ -554,18 +566,24 @@ Snapshot preparation has no admission gate of its own. Table lookup, reader
 guard, and hot-cut work wait on the bounded runtime PostgreSQL pool; the
 metadata pointer read and revalidation wait on the Iceberg SQL catalog's own
 bounded pool, which pings a reused connection only after it has sat idle. All
-wait within the leader deadline, and each substep is timed on
-`oracle_query_phase_seconds`.
+wait within the leader deadline. `oracle_query_phase_seconds` times the
+leader's sequential, non-overlapping steps — `snapshot_pin` (covering every
+preparation substep above), `scribe_listing`, `provider_setup`,
+`physical_planning`, and `admission` — so they may be read as additive; total
+Oracle time is `oracle_query_duration_seconds`, not a phase.
 Remote peer work reuses one authenticated channel per ready peer incarnation and
 endpoint; a changed fence or endpoint connects anew and never inherits the
 prior peer's channel. Connect, fragment open, first remote frame, and terminal
-are timed as separate phases.
+are timed as separate `peer_*` phases; they are per-fragment latencies that can
+overlap one another and the leader steps, so they are never summed with them.
 
 An Analytical leader selects at most `max_workers_per_query` remote workers from
 the pinned eligible cut, rotating the starting position by the attempt identity
 so selection is deterministic, stable across re-projection of the same roster,
-and spread across attempts. Only selected workers reserve resources, receive
-requests, or affect the result; an unselected replica is absent from the cut
+and spread across attempts. Only selected workers admit resources, receive
+requests, or affect the result; a selected worker that refuses its leader
+stream fails that attempt before rows, and only the leader may retry it within
+the same query deadline; an unselected replica is absent from the cut
 entirely. Memory governance protects
 stability; pruning, vectorization, layout, and IO efficiency determine latency.
 
@@ -876,6 +894,64 @@ query ID, task ID, snapshot digest, and other high-cardinality values are
 scrubbed trace fields, never metric labels. Physical size, latency, throughput,
 and SLA claims require measured evidence from the production path.
 
+### Measurement meanings
+
+Request counters count attempts, including idempotent client retries. Process
+counters restart at zero with the process and are not exact durable accounting
+across a restart; durable batch, file, and task rows answer that question.
+
+- **Gate.** `bifrost_gate_requests_total{operation,outcome}` and
+  `bifrost_gate_request_duration_seconds` measure request opening: a query
+  request succeeds when its stream opens, not when it completes.
+  `bifrost_gate_query_streams_total{outcome}` and
+  `bifrost_gate_query_stream_duration_seconds{outcome}` record the
+  client-facing stream's one terminal — `success`, `degraded`, `failed`,
+  `rejected`, or `cancelled` — at the server edge. Neither includes client
+  network or SDK time.
+- **Scribe.** `bifrost_scribe_ack_seconds` measures each ACK attempt.
+  `bifrost_scribe_memtable_rows_inserted_total` counts rows the shard inserted
+  into the live memtable in this process; an idempotent same-process retry adds
+  zero, and replay after restart counts again in the new process. Receipt
+  `accepted_rows` is a client contract, not a newly-stored-row measure.
+  `bifrost_scribe_staging_live_members`, `_live_bytes`,
+  `_oldest_member_timestamp_seconds`, and `_outstanding_claims` are published
+  from the staging assembler's own state, so members restored after restart
+  appear in backlog. `bifrost_scribe_lane_queued{lane}` is waiting jobs only;
+  `bifrost_scribe_lane_active{lane}` is running jobs.
+  `bifrost_scribe_publication_files_total` and `_bytes_total` count committed
+  publication output after its catalog transaction commits.
+- **Oracle.** `oracle_query_duration_seconds{class,outcome}` starts after Gate
+  dispatch and measures Oracle execution through its terminal; the production
+  HPA and query reports read it. Outcomes are `success`, `degraded`, `failed`,
+  `cancelled`, and `client_drop`; a Degraded terminal is never counted as
+  success. `oracle_queries_queued` is waiting work and `oracle_queries_active`
+  is admitted work only. `oracle_admission_total{class,outcome,reason}`
+  pre-registers only the decisions an admission branch can make, and
+  `oracle_admission_queue_duration_seconds` records each waiter once. Scan
+  counters report the executed plan's files, bytes, partitions, and row
+  groups. `bifrost_oracle_file_pruning_total{outcome}` counts hot-object
+  exclusions decided from declared bounds; Iceberg pruning happens inside its
+  own scan planning and is not re-walked for telemetry.
+- **Storage.** `bifrost_storage_metadata_cache_effects_total{effect,reason}`
+  counts cache decisions (hit, miss, join, bypass, evict) — logical lookups,
+  not backend I/O. `bifrost_storage_metadata_cache_loads_total{outcome}`,
+  `bifrost_storage_metadata_load_seconds`, and
+  `bifrost_storage_metadata_wait_seconds` measure footer decodes and the time
+  callers waited on them. `bifrost_storage_requests_total{operation}`,
+  `bifrost_storage_request_terminals_total{operation,outcome}`,
+  `bifrost_storage_request_seconds`, and
+  `bifrost_storage_request_retries_total` measure governed backend requests; a
+  cache hit adds none. Resident entries/bytes and in-flight loads are set from
+  the cache's own state, and `bifrost_storage_active_requests` moves at request
+  admission and settlement. No telemetry copy of cache or request state exists.
+- **Traces.** A query is one trace: `bifrost.gate.query.stream` spans the
+  client-facing stream through terminal or drop, with `bifrost.gate.query`
+  dispatch as its child; `bifrost.oracle.stream` spans Oracle execution through
+  terminal cleanup, and `bifrost.oracle.peer.fragment{role,outcome}` spans each
+  remote fragment. Work `DataFusion` spawns inherits the query span, so remote
+  fragments are child work of the query that dispatched them. Each operation
+  span records exactly one `outcome`.
+
 ## Public surface
 
 Bifrost is projected consistently through Rust, HTTP, gRPC, Python, TypeScript,
@@ -970,7 +1046,7 @@ Bifrost does not provide:
 
 `DataTenantId::SYSTEM_OWNER` is the durable platform tenant for security events
 that cannot safely be attributed to caller-controlled tenant data, including
-peer refusals made before the receiver's own query, reservation, or stage state
+peer refusals made before the receiver's own query or stage state
 binds a tenant. Its canonical row is UUID
 `00000000-0000-7000-8000-000000000000`, slug `wyrd-system`, display name
 `Wyrd System`, status `active`, and `deleted_at IS NULL`. Provisioning and boot

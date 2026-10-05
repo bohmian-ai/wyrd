@@ -174,21 +174,18 @@ impl OraclePlanner {
         // guard, never drives revalidation, and never causes manifest or hot-cut
         // source IO it could observe.
         super::authorize_resolved_tables(context, &prepared).map_err(AttemptFailure::Fatal)?;
-        let started = std::time::Instant::now();
-        let guarded = authority.acquire_guard(&prepared).await;
-        super::QueryPhase::ReaderGuard.record(started);
-        let (guard, permit) = guarded.map_err(AttemptFailure::Fatal)?;
+        let (guard, permit) = authority
+            .acquire_guard(&prepared)
+            .await
+            .map_err(AttemptFailure::Fatal)?;
         // Every prepared table is revalidated before any of them materializes,
         // so a promotion is found while the whole attempt is still discardable.
         for identity in &prepared {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .ok_or(AttemptFailure::Fatal(BifrostError::QueryTimeout))?;
-            let started = std::time::Instant::now();
-            let revalidated =
-                tokio::time::timeout(remaining, catalog.revalidate_reader_identity(identity)).await;
-            super::QueryPhase::Revalidation.record(started);
-            revalidated
+            tokio::time::timeout(remaining, catalog.revalidate_reader_identity(identity))
+                .await
                 .map_err(|_| AttemptFailure::Fatal(BifrostError::QueryTimeout))?
                 .map_err(|error| match error {
                     BifrostCatalogError::MetadataMismatch(_) => {

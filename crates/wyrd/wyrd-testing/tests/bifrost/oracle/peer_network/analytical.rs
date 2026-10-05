@@ -4,7 +4,10 @@ use wyrd_spec::vala::api::BifrostQueryRequest;
 
 use super::support::PeerJourneyError;
 use crate::peer_cluster::PeerCluster;
-use crate::support::public_client;
+use crate::support::{metric_value, public_client, wait_for_spans};
+use wyrd_telemetry::CapturedSpan;
+use wyrd_testing::bifrost::BifrostTelemetryCheckpoint;
+use wyrd_testing::bifrost::telemetry::BifrostMetricKind;
 
 /// Index of the pod that leads the distributed attempt.
 const LEADER: usize = 0;
@@ -1169,11 +1172,13 @@ async fn prove_remote_live_scribe_release() -> Result<(), PeerJourneyError> {
     let sql = format!("SELECT id FROM vala.bifrost.{table}");
 
     let case = "client dropped";
+    let window = cluster.telemetry().checkpoint()?;
     let stream = open_paused_remote_live(&mut cluster, &query, &sql, LIVE_OPEN_DEADLINE_MS).await?;
     await_remote_live_held(&mut cluster, case).await?;
     drop(stream);
     await_remote_live_released(&mut cluster, case).await?;
     cluster.release_live_production_pause();
+    assert_remote_query_telemetry(&cluster, &window, "client_drop", "cancelled").await?;
 
     let case = "leader deadline";
     let mut stream =
@@ -1200,6 +1205,7 @@ async fn prove_remote_live_scribe_release() -> Result<(), PeerJourneyError> {
     cluster.release_live_production_pause();
 
     let case = "remote Scribe lost";
+    let window = cluster.telemetry().checkpoint()?;
     let mut stream =
         open_paused_remote_live(&mut cluster, &query, &sql, LIVE_OPEN_DEADLINE_MS).await?;
     await_remote_live_held(&mut cluster, case).await?;
@@ -1225,7 +1231,152 @@ async fn prove_remote_live_scribe_release() -> Result<(), PeerJourneyError> {
         .into());
     }
     await_oracles_released(&mut cluster, case).await?;
+    assert_remote_query_telemetry(&cluster, &window, "failed", "failed").await?;
     cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Proves one remote live read's production metrics and trace match its ending.
+///
+/// The window holds exactly one public query. The Gate request opened
+/// successfully whatever happened later, the Gate stream and the Oracle
+/// execution each record exactly one terminal with the expected outcome and
+/// never Success, and the leader's remote-fragment span is causal child work
+/// in the same trace as the query and the client-facing stream, ending inside
+/// the stream's lifetime with the remote ending it observed.
+///
+/// # Errors
+///
+/// Returns a telemetry error, or an error naming the span that never closed.
+///
+/// # Panics
+///
+/// Panics when an emitted fact disagrees with the ending the client observed.
+async fn assert_remote_query_telemetry(
+    cluster: &PeerCluster,
+    window: &BifrostTelemetryCheckpoint,
+    oracle_outcome: &str,
+    gate_outcome: &str,
+) -> Result<(), PeerJourneyError> {
+    let telemetry = cluster.telemetry();
+    wait_for_spans(
+        telemetry,
+        window,
+        &[
+            "bifrost.gate.query.stream",
+            "bifrost.oracle.stream",
+            "bifrost.oracle.peer.fragment",
+        ],
+    )
+    .await?;
+    let delta = telemetry.delta_since(window)?;
+    let counter = |family: &str, labels: &[(&str, &str)]| {
+        metric_value(&delta, family, BifrostMetricKind::Counter, labels)
+    };
+    assert_eq!(
+        counter(
+            "bifrost_gate_requests_total",
+            &[("operation", "query"), ("outcome", "success")]
+        ),
+        1.0,
+        "{oracle_outcome}: the stream opened as one successful Gate request"
+    );
+    assert_eq!(
+        counter("bifrost_gate_query_streams_total", &[]),
+        1.0,
+        "{oracle_outcome}: one stream has one Gate terminal"
+    );
+    assert_eq!(
+        counter(
+            "bifrost_gate_query_streams_total",
+            &[("outcome", gate_outcome)]
+        ),
+        1.0,
+        "{oracle_outcome}: the Gate terminal is {gate_outcome}"
+    );
+    assert_eq!(
+        metric_value(
+            &delta,
+            "oracle_query_duration_seconds",
+            BifrostMetricKind::HistogramCount,
+            &[]
+        ),
+        1.0,
+        "{oracle_outcome}: one query has one Oracle duration observation"
+    );
+    assert_eq!(
+        metric_value(
+            &delta,
+            "oracle_query_duration_seconds",
+            BifrostMetricKind::HistogramCount,
+            &[("outcome", oracle_outcome)]
+        ),
+        1.0,
+        "{oracle_outcome}: the Oracle execution ended {oracle_outcome}"
+    );
+    assert!(
+        metric_value(
+            &delta,
+            "oracle_query_phase_seconds",
+            BifrostMetricKind::HistogramCount,
+            &[("phase", "peer_open")]
+        ) >= 1.0,
+        "{oracle_outcome}: the remote live read opened a peer fragment"
+    );
+    if oracle_outcome == "client_drop" {
+        assert_eq!(
+            counter(
+                "oracle_query_cancellations_total",
+                &[("reason", "client_drop")]
+            ),
+            1.0,
+            "a dropped client stream is one client-drop cancellation"
+        );
+    }
+
+    let named = |name: &str| -> Vec<&CapturedSpan> {
+        delta
+            .spans
+            .iter()
+            .filter(|span| span.name == name)
+            .collect()
+    };
+    let gate_streams = named("bifrost.gate.query.stream");
+    let [gate_stream] = gate_streams.as_slice() else {
+        panic!("{oracle_outcome}: one Gate stream span, saw {gate_streams:?}");
+    };
+    assert_eq!(
+        gate_stream.attributes.get("outcome").map(String::as_str),
+        Some(gate_outcome)
+    );
+    let oracle_streams = named("bifrost.oracle.stream");
+    let [oracle_stream] = oracle_streams.as_slice() else {
+        panic!("{oracle_outcome}: one Oracle stream span, saw {oracle_streams:?}");
+    };
+    assert_eq!(oracle_stream.trace_id, gate_stream.trace_id);
+    assert_eq!(
+        oracle_stream.attributes.get("outcome").map(String::as_str),
+        Some(oracle_outcome)
+    );
+    let fragments = named("bifrost.oracle.peer.fragment");
+    assert!(
+        !fragments.is_empty()
+            && fragments.iter().all(|fragment| {
+                fragment.trace_id == oracle_stream.trace_id
+                    && fragment.duration_nanos <= gate_stream.duration_nanos
+                    && fragment.attributes.get("role").map(String::as_str) == Some("scribe")
+            }),
+        "{oracle_outcome}: every remote Scribe fragment is child work of the query, saw \
+         {fragments:?}"
+    );
+    if oracle_outcome == "failed" {
+        assert!(
+            fragments.iter().any(|fragment| {
+                fragment.attributes.get("outcome").map(String::as_str) == Some("failed")
+            }),
+            "the lost Scribe's fragment records its failure, saw {fragments:?}"
+        );
+    }
     Ok(())
 }
 

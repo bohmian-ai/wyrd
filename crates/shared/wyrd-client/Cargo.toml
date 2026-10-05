@@ -39,7 +39,11 @@ serde_jcs = { workspace = true }
 serde_json = { workspace = true }
 serde_urlencoded = { workspace = true }
 serde_yaml = { workspace = true }
+skald-providers = { workspace = true }
+skald-runtime = { workspace = true }
 skald-spec = { workspace = true }
+skald-tool = { workspace = true }
+skald-workflow = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }

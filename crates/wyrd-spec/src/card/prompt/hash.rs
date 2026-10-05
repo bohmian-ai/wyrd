@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use skald_spec::{Prompt, ProviderRequest, ResponseType};
+use skald_spec::{Prompt, ProviderName, ProviderRequest, ResponseType};
 
 use crate::card::prompt::PromptSpec;
 
@@ -28,6 +28,9 @@ struct HashProjection<'a> {
     variables: &'a [String],
     media_variables: &'a [String],
     response_type: &'a ResponseType,
+    /// Native dispatch target, part of Prompt identity; omitted when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<&'a ProviderName>,
 }
 
 impl<'a> From<&'a Prompt> for HashProjection<'a> {
@@ -38,6 +41,7 @@ impl<'a> From<&'a Prompt> for HashProjection<'a> {
             variables: &prompt.variables,
             media_variables: &prompt.media_variables,
             response_type: &prompt.response_type,
+            provider: prompt.provider.as_ref(),
         }
     }
 }

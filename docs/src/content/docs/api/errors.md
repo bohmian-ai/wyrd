@@ -67,7 +67,7 @@ This page is the generated error catalog. For how an agent should act on these e
 | `WYRD_WORKFLOW_422_MISSING_DEPENDENCY` | 422 | A step depends on an id that does not exist. |
 | `WYRD_WORKFLOW_422_DUPLICATE_STEP_ID` | 422 | Two steps share the same id. |
 | `WYRD_WORKFLOW_422_MISSING_NAME` | 422 | `save` or `to_card` was called on an anonymous workflow. |
-| `WYRD_WORKFLOW_422_MISSING_PARAMETER` | 422 | A prompt placeholder exists in neither workflow input nor upstream parameters. |
+| `WYRD_WORKFLOW_422_MISSING_PARAMETER` | 422 | A declared step binding or Workflow output selected a value the run did not produce. |
 
 ## Prompt and CLI authoring codes
 

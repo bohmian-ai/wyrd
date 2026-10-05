@@ -65,6 +65,7 @@ pub fn build_router(state: AppState) -> Router {
     let v1_group = OpenApiRouter::new()
         .merge(storage_router(&state))
         .merge(cards_router())
+        .merge(crate::components::workflow::workflow_runs_router())
         .merge(principals_router())
         .merge(verification_router())
         .merge(operator_connections_router())

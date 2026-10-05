@@ -7,32 +7,27 @@ rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
 publish = false
-description = "Skald workflow engine: DAG scheduling, tasks, cross-provider handoff."
+description = "Skald workflow engine: explicit-binding DAG execution over Skald agents and routes."
 
 [lib]
 path = "src/lib.rs"
 
 [features]
 default = []
-otel = ["skald-observer/otel"]
 python = [
     "dep:pyo3",
-    "dep:wyrd-runtime",
     "dep:wyrd-utils",
-    "skald-agent/python",
-    "skald-observer/python",
     "wyrd-utils/python",
 ]
 
 [dependencies]
 skald-spec = { workspace = true }
-skald-observer = { workspace = true }
 skald-prompt = { workspace = true }
 skald-runtime = { workspace = true }
 skald-agent = { workspace = true }
+skald-providers = { workspace = true }
 skald-tool = { workspace = true }
 wyrd-spec = { workspace = true }
-wyrd-runtime = { workspace = true, optional = true }
 wyrd-utils = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -41,14 +36,18 @@ chrono = { workspace = true }
 uuid = { workspace = true, features = ["std", "v7"] }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tokio-util = { workspace = true }
+http = { workspace = true }
+secrecy = { workspace = true }
+tracing = { workspace = true }
 jsonschema = { workspace = true }
-anyhow = "1"
+futures-util = { workspace = true }
 url = { workspace = true }
 pyo3 = { workspace = true, optional = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
-skald-providers = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-serde_json = { workspace = true }
+wyrd-telemetry = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+wiremock = { workspace = true }

@@ -579,7 +579,7 @@ description = """Stand up real OIDC providers (Keycloak + Dex), seed test users 
 admin REST API, export env gates, run the identity e2e suite against both issuers, then tear down.
 Its tests are #[ignore]d so the family lanes, which start no identity providers, skip them visibly.
 """
-env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:18080/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
+env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:8180/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
 
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:identity:journey:inner'"
 [tasks."test:identity:journey:inner"]
@@ -588,7 +588,7 @@ description = """Stand up real OIDC providers (Keycloak + Dex), seed test users 
 admin REST API, export env gates, run the identity e2e suite against both issuers, then tear down.
 Its tests are #[ignore]d so the family lanes, which start no identity providers, skip them visibly.
 """
-env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:18080/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
+env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:8180/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
 run = """
 set -e
 
@@ -608,7 +608,7 @@ docker compose up -d keycloak dex --wait
 uv run python - <<'PYEOF'
 import json, urllib.request, urllib.parse, time, sys
 
-BASE = "http://localhost:18080"
+BASE = "http://localhost:8180"
 REALM = "wyrd-test"
 
 def get_admin_token():
@@ -1198,7 +1198,7 @@ run = "uv run ruff check python/wyrd tests scripts"
 hide = true
 description = "Run ty over the generated Python stub surface"
 dir = "sdks/wyrd-sdk-python"
-run = "uv run ty check --error unused-ignore-comment python/wyrd/*.pyi python/wyrd/*/__init__.pyi tests/unit/cards/data/test_public_surface.py tests/bifrost/test_public_typing.py tests/unit/gateway/test_gateway_typing.py tests/unit/client/test_client.py tests/unit/test_operator_connections_typing.py"
+run = "uv run ty check --error unused-ignore-comment python/wyrd/*.pyi python/wyrd/*/__init__.pyi tests/unit/cards/data/test_public_surface.py tests/bifrost/test_public_typing.py tests/unit/gateway/test_gateway_typing.py tests/unit/client/test_client.py tests/unit/test_operator_connections_typing.py tests/unit/runtime/workflow/test_workflow_parameter_injection.py"
 
 [tasks."py:test:testing"]
 hide = true
@@ -1332,7 +1332,7 @@ run = "cargo run --locked -p wyrd-cli --example registration_progress"
 hide = true
 description = "Build all example binaries"
 run = [
-  "cargo build -p skald-workflow --examples --features otel",
+  "cargo build --locked -p wyrd-rust-examples",
   "cargo check --locked -p wyrd-cli --example registration_progress",
 ]
 

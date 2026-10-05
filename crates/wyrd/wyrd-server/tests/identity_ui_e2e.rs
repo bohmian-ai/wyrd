@@ -36,7 +36,7 @@ use wyrd_testing::{WyrdTestServer, WyrdTestServerBuilder, provider_sign_in};
 /// Keycloak realm issuer the lane's compose service serves.
 fn keycloak_issuer() -> String {
     std::env::var("WYRD_KEYCLOAK_ISSUER")
-        .unwrap_or_else(|_| "http://localhost:18080/realms/wyrd-test".to_owned())
+        .unwrap_or_else(|_| "http://localhost:8180/realms/wyrd-test".to_owned())
 }
 
 /// Dex issuer the lane's compose service serves: the journey's second,

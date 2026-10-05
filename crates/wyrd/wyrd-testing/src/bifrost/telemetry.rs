@@ -61,8 +61,6 @@ pub(crate) enum TelemetryUnit {
     Bytes,
     /// Seconds.
     Seconds,
-    /// Dimensionless budget-pressure ratio.
-    Ratio,
 }
 
 /// Closed requirement policy for the current representative workload.
@@ -169,12 +167,8 @@ const ORACLE_ADMISSION_LABELS: &[TelemetryLabelValues] = &[
         key: "reason",
         values: &[
             "class_capacity",
-            "tenant_budget",
             "queue_full",
             "queue_deadline",
-            "memory",
-            "spill",
-            "audit_unavailable",
             "membership",
             "shutdown",
         ],
@@ -192,7 +186,7 @@ const ORACLE_TERMINAL_LABELS: &[TelemetryLabelValues] = &[TelemetryLabelValues {
 #[cfg(test)]
 const ORACLE_CANCELLATION_LABELS: &[TelemetryLabelValues] = &[TelemetryLabelValues {
     key: "reason",
-    values: &["client_drop", "deadline", "shutdown", "peer_failure"],
+    values: &["client_drop", "shutdown"],
 }];
 
 /// Closed fragment terminal labels emitted by the Oracle dispatcher.
@@ -359,22 +353,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         allowed_label_values: &[],
     },
     TelemetryBinding {
-        id: TelemetryBindingId("gate.rows"),
-        selected_label_values: &[TelemetrySelectedLabel {
-            key: "status",
-            value: "accepted",
-        }],
-        family: "bifrost_gate_rows_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Always,
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "status",
-            values: &["accepted", "rejected"],
-        }],
-    },
-    TelemetryBinding {
         id: TelemetryBindingId("gate.active"),
         selected_label_values: &[],
         family: "bifrost_gate_active_streams",
@@ -529,15 +507,12 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
     TelemetryBinding {
         id: TelemetryBindingId("scribe.rows"),
         selected_label_values: &[],
-        family: "bifrost_scribe_rows_total",
+        family: "bifrost_scribe_memtable_rows_inserted_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("scribe"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "status",
-            values: &["accepted"],
-        }],
+        allowed_label_values: &[],
     },
     TelemetryBinding {
         id: TelemetryBindingId("forge.backlog_peak"),
@@ -573,19 +548,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         }],
     },
     TelemetryBinding {
-        id: TelemetryBindingId("oracle.tenant_pressure_peak"),
-        selected_label_values: &[],
-        family: "oracle_tenant_budget_pressure",
-        kind: BifrostMetricKind::Gauge,
-        unit: TelemetryUnit::Ratio,
-        aggregation: TelemetryAggregation::Peak,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "class",
-            values: &["interactive", "analytical"],
-        }],
-    },
-    TelemetryBinding {
         id: TelemetryBindingId("scribe.wal_bytes"),
         selected_label_values: &[],
         family: "bifrost_scribe_wal_append_bytes_total",
@@ -594,27 +556,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("scribe"),
         allowed_label_values: &[],
-    },
-    TelemetryBinding {
-        id: TelemetryBindingId("scribe.seal_rows"),
-        selected_label_values: &[TelemetrySelectedLabel {
-            key: "stage",
-            value: "file_list_transaction",
-        }],
-        family: "bifrost_scribe_seal_rows_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("scribe"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "stage",
-            values: &[
-                "freeze",
-                "parquet_encode",
-                "object_store_put",
-                "file_list_transaction",
-            ],
-        }],
     },
     TelemetryBinding {
         id: TelemetryBindingId("forge.publications"),
@@ -696,19 +637,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         }],
     },
     TelemetryBinding {
-        id: TelemetryBindingId("oracle.logical_bytes"),
-        selected_label_values: &[],
-        family: "oracle_query_logical_bytes_selected_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Bytes,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "class",
-            values: &["interactive", "analytical"],
-        }],
-    },
-    TelemetryBinding {
         id: TelemetryBindingId("oracle.physical_bytes"),
         selected_label_values: &[],
         family: "oracle_query_bytes_scanned_total",
@@ -759,51 +687,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
             key: "class",
             values: &["interactive", "analytical"],
         }],
-    },
-    TelemetryBinding {
-        id: TelemetryBindingId("oracle.spill_bytes"),
-        selected_label_values: &[],
-        family: "oracle_query_spill_bytes_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Bytes,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "class",
-            values: &["interactive", "analytical"],
-        }],
-    },
-    TelemetryBinding {
-        id: TelemetryBindingId("oracle.spill_files"),
-        selected_label_values: &[],
-        family: "oracle_query_spill_files_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "class",
-            values: &["interactive", "analytical"],
-        }],
-    },
-    TelemetryBinding {
-        id: TelemetryBindingId("oracle.spill_queries"),
-        selected_label_values: &[],
-        family: "oracle_query_spill_queries_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: &[
-            TelemetryLabelValues {
-                key: "class",
-                values: &["interactive", "analytical"],
-            },
-            TelemetryLabelValues {
-                key: "outcome",
-                values: &["success", "error", "cancelled"],
-            },
-        ],
     },
     TelemetryBinding {
         id: TelemetryBindingId("postgres.acquire"),
@@ -945,8 +828,6 @@ enum EvaluatedBindingValue {
 /// Canonical crate-local phase evidence shared by journey consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClusterPhaseTelemetryEvidence {
-    /// Gate rows accepted in the sampled phase.
-    pub(crate) gate_rows: u64,
     /// Gate frame bytes received in the sampled phase.
     pub(crate) gate_bytes: u64,
     /// Aggregate successful Gate request terminals.
@@ -967,7 +848,7 @@ pub(crate) struct ClusterPhaseTelemetryEvidence {
     pub(crate) gate_query_stream_terminals: u64,
     /// Final active Gate query streams.
     pub(crate) gate_active_streams: u64,
-    /// Scribe rows accepted in the sampled phase.
+    /// Rows newly inserted into Scribe memtables in the sampled phase.
     pub(crate) scribe_rows: u64,
     /// Rows returned by successful Oracle streams.
     pub(crate) oracle_stream_rows: u64,
@@ -1106,8 +987,6 @@ pub(crate) struct ClusterTraceTelemetryEvidence {
 /// Exact counters consumed by client, audit, and durable-state reconciliation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClusterReconciliationTelemetryEvidence {
-    /// Rows sealed durably by Scribe.
-    pub(crate) sealed_rows: u64,
     /// Successful query request terminals.
     pub(crate) successful_queries: u64,
 }
@@ -1234,6 +1113,36 @@ pub struct BifrostTelemetryDelta {
     pub interval_seconds: f64,
     /// Honest sampled process resource evidence for the capture window.
     pub(crate) process: ProcessWindow,
+}
+
+impl BifrostTelemetryDelta {
+    /// Renders this window's samples of the named families as one evidence line.
+    ///
+    /// Nonzero counter and histogram samples are window deltas, `peak:` gauges are the
+    /// highest value sampled while the window ran, and `final:` gauges are the
+    /// value rendered when it closed. Journeys print this beside the
+    /// independent fact they assert against, so a run's output records the
+    /// actual production samples rather than only the assertion's verdict.
+    /// Families with no sample in the window are omitted.
+    #[must_use]
+    pub fn evidence(&self, families: &[&str]) -> String {
+        let deltas = self
+            .metrics
+            .iter()
+            .filter(|sample| {
+                sample.kind != BifrostMetricKind::HistogramBucket && sample.value != 0.0
+            })
+            .map(|sample| ("", sample));
+        let peaks = self.gauge_maxima.iter().map(|sample| ("peak:", sample));
+        let finals = self.gauge_final.iter().map(|sample| ("final:", sample));
+        deltas
+            .chain(peaks)
+            .chain(finals)
+            .filter(|(_, sample)| families.contains(&sample.family.as_str()))
+            .map(|(prefix, sample)| format!("{prefix}{}={}", rendered_series(sample), sample.value))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 }
 
 /// Values retained by the single bounded gauge/process sampler.
@@ -1488,6 +1397,17 @@ impl BifrostTelemetryCapture {
         }
 
         report
+    }
+
+    /// Return the spans finished since `checkpoint` without consuming it.
+    ///
+    /// A streamed operation's span closes when the server drops the response
+    /// stream, which can be shortly after the client has read the terminal
+    /// frame. A journey polls this bounded read until the span it needs has
+    /// closed, then takes its single consuming delta.
+    #[must_use]
+    pub fn spans_since(&self, checkpoint: &BifrostTelemetryCheckpoint) -> Vec<CapturedSpan> {
+        self.traces.finished_since(checkpoint.spans)
     }
 
     /// Return the names of all finished spans in the shared production capture.
@@ -2039,7 +1959,6 @@ fn project_cluster_phase_evidence(
         _ => 0,
     };
     ClusterPhaseTelemetryEvidence {
-        gate_rows: counter("gate.rows"),
         gate_bytes: counter("gate.bytes"),
         gate_success: counter("gate.requests.success"),
         gate_rejected: counter("gate.requests.rejected"),
@@ -2122,7 +2041,6 @@ impl ClusterTelemetryProjection {
             process,
             traces,
             reconciliation: ClusterReconciliationTelemetryEvidence {
-                sealed_rows: binding_counter(&bindings, "scribe.seal_rows").unwrap_or(0),
                 successful_queries: binding_counter(&bindings, "gate.requests.query_success")
                     .unwrap_or(0),
             },
@@ -2212,9 +2130,7 @@ fn binding_gauge_final(
 /// Map one exact production span name to its canonical operation.
 fn cluster_trace_operation(name: &str) -> Option<ClusterTraceOperation> {
     match name {
-        "bifrost.gate.write" | "bifrost.scribe.wal.append" => {
-            Some(ClusterTraceOperation::DurableWrite)
-        }
+        "bifrost.gate.write" => Some(ClusterTraceOperation::DurableWrite),
         "bifrost.scribe.visibility.publish" | "bifrost.forge.catalog.commit" => {
             Some(ClusterTraceOperation::FlushToVisible)
         }
@@ -2362,9 +2278,6 @@ fn validate_binding_unit(binding: &TelemetryBinding) -> Result<(), BifrostTeleme
                 || (binding.family.contains("_bytes_") && binding.family.ends_with("_total"))
         }
         TelemetryUnit::Seconds => binding.family.ends_with("_seconds"),
-        TelemetryUnit::Ratio => {
-            !binding.family.ends_with("_seconds") && !binding.family.ends_with("_bytes_total")
-        }
     };
     if valid {
         Ok(())
@@ -2429,8 +2342,8 @@ impl BifrostQueryTelemetryReport {
         Ok(Self {
             query_latency_p99_us: histogram_quantile_for_label(
                 delta,
-                "bifrost_query_duration_seconds",
-                "result",
+                "oracle_query_duration_seconds",
+                "outcome",
                 "success",
                 0.99,
             )? * 1_000_000.0,
@@ -2438,19 +2351,25 @@ impl BifrostQueryTelemetryReport {
     }
 }
 
-/// Reject unexpected labels or categorical values on the server query histogram.
+/// Reject unexpected labels or categorical values on the Oracle query histogram.
 fn validate_query_label_contract(
     delta: &BifrostTelemetryDelta,
 ) -> Result<(), BifrostTelemetryReportError> {
     for sample in delta
         .metrics
         .iter()
-        .filter(|sample| sample.family == "bifrost_query_duration_seconds")
+        .filter(|sample| sample.family == "oracle_query_duration_seconds")
     {
         validate_sample_labels(
             sample,
-            &["result", "le"],
-            &[("result", &["success", "rejected", "failed"])],
+            &["class", "outcome", "le"],
+            &[
+                ("class", &["interactive", "analytical"]),
+                (
+                    "outcome",
+                    &["success", "degraded", "failed", "cancelled", "client_drop"],
+                ),
+            ],
         )?;
     }
     Ok(())
@@ -2854,11 +2773,17 @@ pub(crate) fn histogram_quantile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use BifrostMetricKind::{Counter, Gauge, HistogramBucket};
+    use TelemetryAggregation::{Delta, Final, P99, Peak};
+    use TelemetryRequirement::{Always, Role};
+    use TelemetryUnit::{Bytes, Count, Seconds};
 
     /// Construct one normalized captured production span for mapper tests.
     fn captured_span(name: &str, attributes: &[(&str, &str)]) -> CapturedSpan {
         CapturedSpan {
             trace_id: "00000000000000000000000000000001".to_owned(),
+            span_id: "0000000000000001".to_owned(),
+            parent_span_id: "0000000000000000".to_owned(),
             name: name.to_owned(),
             attributes: attributes
                 .iter()
@@ -2866,6 +2791,7 @@ mod tests {
                 .collect(),
             duration_nanos: 1,
             status: wyrd_telemetry::CapturedSpanStatus::Unset,
+            events: Vec::new(),
         }
     }
 
@@ -3271,8 +3197,7 @@ mod tests {
 
             let mut wrong_unit = *binding;
             wrong_unit.unit = match binding.unit {
-                TelemetryUnit::Count => TelemetryUnit::Seconds,
-                TelemetryUnit::Bytes | TelemetryUnit::Ratio => TelemetryUnit::Seconds,
+                TelemetryUnit::Count | TelemetryUnit::Bytes => TelemetryUnit::Seconds,
                 TelemetryUnit::Seconds => TelemetryUnit::Count,
             };
             assert!(matches!(
@@ -3518,10 +3443,6 @@ mod tests {
 
     /// Enumerate accepted-T16 emitter contracts without reading the binding ledger.
     fn emitter_contracts() -> Vec<EmitterContractFixture> {
-        use BifrostMetricKind::{Counter, Gauge, HistogramBucket};
-        use TelemetryAggregation::{Delta, Final, P99, Peak};
-        use TelemetryRequirement::{Always, Role};
-        use TelemetryUnit::{Bytes, Count, Ratio, Seconds};
         vec![
             EmitterContractFixture {
                 id: "gate.requests.success",
@@ -3624,18 +3545,6 @@ mod tests {
                 aggregation: Delta,
                 requirement: Always,
                 destination: "phase.gate_bytes",
-            },
-            EmitterContractFixture {
-                id: "gate.rows",
-                selectors: &[("status", "accepted")],
-                family: "bifrost_gate_rows_total",
-                kind: Counter,
-                keys: &["status"],
-                domains: &[("status", &["accepted", "rejected"])],
-                unit: Count,
-                aggregation: Delta,
-                requirement: Always,
-                destination: "reconciliation.gate_rows(status=accepted)",
             },
             EmitterContractFixture {
                 id: "gate.active",
@@ -3778,10 +3687,10 @@ mod tests {
             EmitterContractFixture {
                 id: "scribe.rows",
                 selectors: &[],
-                family: "bifrost_scribe_rows_total",
+                family: "bifrost_scribe_memtable_rows_inserted_total",
                 kind: Counter,
-                keys: &["status"],
-                domains: &[("status", &["accepted"])],
+                keys: &[],
+                domains: &[],
                 unit: Count,
                 aggregation: Delta,
                 requirement: Role("scribe"),
@@ -3821,12 +3730,8 @@ mod tests {
                         "reason",
                         &[
                             "class_capacity",
-                            "tenant_budget",
                             "queue_full",
                             "queue_deadline",
-                            "memory",
-                            "spill",
-                            "audit_unavailable",
                             "membership",
                             "shutdown",
                         ],
@@ -3850,18 +3755,6 @@ mod tests {
                 destination: "oracle admission queue",
             },
             EmitterContractFixture {
-                id: "oracle.tenant_pressure_peak",
-                selectors: &[],
-                family: "oracle_tenant_budget_pressure",
-                kind: Gauge,
-                keys: &["class"],
-                domains: &[("class", &["interactive", "analytical"])],
-                unit: Ratio,
-                aggregation: Peak,
-                requirement: Role("oracle"),
-                destination: "oracle tenant pressure",
-            },
-            EmitterContractFixture {
                 id: "scribe.wal_bytes",
                 selectors: &[],
                 family: "bifrost_scribe_wal_append_bytes_total",
@@ -3872,26 +3765,6 @@ mod tests {
                 aggregation: Delta,
                 requirement: Role("scribe"),
                 destination: "pillars.scribe_wal_bytes",
-            },
-            EmitterContractFixture {
-                id: "scribe.seal_rows",
-                selectors: &[("stage", "file_list_transaction")],
-                family: "bifrost_scribe_seal_rows_total",
-                kind: Counter,
-                keys: &["stage"],
-                domains: &[(
-                    "stage",
-                    &[
-                        "freeze",
-                        "parquet_encode",
-                        "object_store_put",
-                        "file_list_transaction",
-                    ],
-                )],
-                unit: Count,
-                aggregation: Delta,
-                requirement: Role("scribe"),
-                destination: "reconciliation.sealed_rows(stage=file_list_transaction)",
             },
             EmitterContractFixture {
                 id: "forge.publications",
@@ -4036,18 +3909,6 @@ mod tests {
                 destination: "phase.oracle_stream_bytes",
             },
             EmitterContractFixture {
-                id: "oracle.logical_bytes",
-                selectors: &[],
-                family: "oracle_query_logical_bytes_selected_total",
-                kind: Counter,
-                keys: &["class"],
-                domains: &[("class", &["interactive", "analytical"])],
-                unit: Bytes,
-                aggregation: Delta,
-                requirement: Role("oracle"),
-                destination: "oracle logical bytes",
-            },
-            EmitterContractFixture {
                 id: "oracle.physical_bytes",
                 selectors: &[],
                 family: "oracle_query_bytes_scanned_total",
@@ -4094,45 +3955,6 @@ mod tests {
                 aggregation: Peak,
                 requirement: Role("oracle"),
                 destination: "oracle queued peak",
-            },
-            EmitterContractFixture {
-                id: "oracle.spill_bytes",
-                selectors: &[],
-                family: "oracle_query_spill_bytes_total",
-                kind: Counter,
-                keys: &["class"],
-                domains: &[("class", &["interactive", "analytical"])],
-                unit: Bytes,
-                aggregation: Delta,
-                requirement: Role("oracle"),
-                destination: "oracle spill bytes",
-            },
-            EmitterContractFixture {
-                id: "oracle.spill_files",
-                selectors: &[],
-                family: "oracle_query_spill_files_total",
-                kind: Counter,
-                keys: &["class"],
-                domains: &[("class", &["interactive", "analytical"])],
-                unit: Count,
-                aggregation: Delta,
-                requirement: Role("oracle"),
-                destination: "oracle spill files",
-            },
-            EmitterContractFixture {
-                id: "oracle.spill_queries",
-                selectors: &[],
-                family: "oracle_query_spill_queries_total",
-                kind: Counter,
-                keys: &["class", "outcome"],
-                domains: &[
-                    ("class", &["interactive", "analytical"]),
-                    ("outcome", &["success", "error", "cancelled"]),
-                ],
-                unit: Count,
-                aggregation: Delta,
-                requirement: Role("oracle"),
-                destination: "oracle spill queries",
             },
             EmitterContractFixture {
                 id: "postgres.acquire",
@@ -4396,31 +4218,12 @@ mod tests {
         assert!(!selectors_match_allowed_domains(&inconsistent));
     }
 
-    /// Prove rejected Gate rows never inflate the accepted-row destination.
-    #[test]
-    fn gate_rows_projection_selects_only_accepted_status() {
-        let mut delta = canonical_binding_delta();
-        delta.metrics.push(BifrostMetricSample {
-            family: "bifrost_gate_rows_total".to_owned(),
-            labels: BTreeMap::from([("status".to_owned(), "rejected".to_owned())]),
-            value: 99.0,
-            kind: BifrostMetricKind::Counter,
-        });
-        assert_eq!(
-            evaluate_cluster_bindings(&delta)
-                .expect("emitter-aligned fixture evaluates")
-                .get("gate.rows"),
-            Some(&EvaluatedBindingValue::Counter(1))
-        );
-    }
-
     /// Proves every matrix phase field is read from its exact evaluated binding.
     #[test]
     fn canonical_phase_projection_retains_exact_matrix_destinations() {
         let delta = canonical_binding_delta();
         let bindings = evaluate_cluster_bindings(&delta).expect("complete bindings evaluate");
         let phase = project_cluster_phase_evidence(&bindings);
-        assert_eq!(phase.gate_rows, 1);
         assert_eq!(phase.gate_bytes, 1);
         assert_eq!(phase.gate_query_request_success, 1);
         assert_eq!(phase.gate_write_request_cancelled, 1);

@@ -26,6 +26,7 @@ const {
   connectGateway,
   connectWyrdClient,
   describeTableConfig,
+  loadWorkflowFromPath,
   openWyrdState,
   tableConfigFromJsonSchema,
 } = nativeBinding;
@@ -36,6 +37,7 @@ type NativeVerification = import("../index.cjs").NativeVerification;
 type NativeGateway = import("../index.cjs").NativeGateway;
 type NativeWyrdClient = import("../index.cjs").NativeWyrdClient;
 type NativeWyrdState = import("../index.cjs").NativeWyrdState;
+type NativeWorkflow = import("../index.cjs").NativeWorkflow;
 type NativeRun = import("../index.cjs").NativeRun;
 type NativeRunOpen = import("../index.cjs").NativeRunOpen;
 type NativeTableConfig = import("../index.cjs").NativeTableConfig;
@@ -1203,6 +1205,193 @@ export class Cards {
   /** Soft-delete one Card by exact reference. */
   async delete(ref: CardRef | string): Promise<void> {
     lifecycleValue<null>(await this.#native.delete(cardRefText(ref)));
+  }
+
+  /** Load registered Workflows through this registry client. */
+  get workflow(): WorkflowCards {
+    return new WorkflowCards(this.#native);
+  }
+}
+
+/**
+ * Selects one registered Workflow: its exact `space`, `name`, and `version`,
+ * or its `uid`. Mixing the two shapes is a type error and a runtime refusal.
+ */
+export type WorkflowSelector =
+  | {
+      readonly space: string;
+      readonly name: string;
+      readonly version: string;
+      readonly uid?: never;
+    }
+  | {
+      readonly uid: string;
+      readonly space?: never;
+      readonly name?: never;
+      readonly version?: never;
+    };
+
+/** Registered-Workflow loading for one {@link Cards} client. */
+export class WorkflowCards {
+  readonly #native: NativeCards;
+
+  /** @internal Built by {@link Cards.workflow}. */
+  constructor(native: NativeCards) {
+    this.#native = native;
+  }
+
+  /**
+   * Load one registered Workflow and the exact Card versions it pins.
+   *
+   * @example
+   * ```ts
+   * const workflow = await cards.workflow.load({
+   *   space: "reviews",
+   *   name: "code-review",
+   *   version: "1.0.0",
+   * });
+   * const same = await cards.workflow.load({ uid: workflowUid });
+   * ```
+   *
+   * @throws {WyrdError} `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no such
+   * Workflow exists, `WYRD_PERMISSION_403_DENIED_RBAC` when the credential
+   * cannot read Cards, or `WYRD_WORKFLOW_400_INVALID_CARD_REF` for a mixed
+   * or incomplete selector or a malformed field.
+   */
+  async load(selector: WorkflowSelector): Promise<Workflow> {
+    const loaded = await this.#native.loadWorkflow(JSON.stringify(selector));
+    return new Workflow(nativeHandle(loaded.workflow, loaded.error));
+  }
+}
+
+/** Any value JSON can carry: Workflow inputs, outputs, and error details. */
+export type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | readonly JsonValue[]
+  | { readonly [key: string]: JsonValue };
+
+/** Lifecycle status of a Workflow run. */
+export type WorkflowRunStatus =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "timed_out";
+
+/** Lifecycle status of one Workflow step. */
+export type WorkflowStepStatus =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "unstarted";
+
+/** Catalog error recorded on a failed run or step. */
+export interface WorkflowRunError {
+  /** Stable Wyrd error code. */
+  readonly code: string;
+  /** Safe diagnostic message. */
+  readonly message: string;
+  /** Safe structured details. */
+  readonly details: JsonValue;
+  /** Operator-facing remediation. */
+  readonly remediation: string;
+}
+
+/** Result of one Workflow step. */
+export interface WorkflowStepResult {
+  /** Step lifecycle status. */
+  readonly status: WorkflowStepStatus;
+  /** Final text output, present only for a succeeded step. */
+  readonly text: string | null;
+  /** Structured output, present only for a succeeded step. */
+  readonly structured_output: JsonValue | null;
+  /** Number of attempts begun. */
+  readonly attempts: number;
+  /** RFC 3339 first attempt start time, `null` if the step never started. */
+  readonly started_at: string | null;
+  /** RFC 3339 terminal time, `null` while the step is active. */
+  readonly ended_at: string | null;
+  /** Terminal error, present only for a failed step. */
+  readonly error: WorkflowRunError | null;
+}
+
+/** Snapshot of one Workflow run. */
+export interface WorkflowRun {
+  /** Run identity. */
+  readonly run_id: string;
+  /** Pinned Workflow Card, `null` for an unregistered local run. */
+  readonly workflow: CardRef | null;
+  /** Run lifecycle status. */
+  readonly status: WorkflowRunStatus;
+  /** Declared outputs, populated only for a succeeded run. */
+  readonly outputs: Record<string, JsonValue>;
+  /** Step results keyed by step ID. */
+  readonly steps: Record<string, WorkflowStepResult>;
+  /** RFC 3339 creation time. */
+  readonly created_at: string;
+  /** RFC 3339 start time, `null` before the run starts. */
+  readonly started_at: string | null;
+  /** RFC 3339 terminal time, `null` while the run is active. */
+  readonly ended_at: string | null;
+  /** Primary error for a `failed` or `timed_out` run. */
+  readonly error: WorkflowRunError | null;
+}
+
+/**
+ * Runnable Workflow loaded from an authored file or from the registry.
+ *
+ * Loading validates the whole graph; running happens in Rust.
+ */
+export class Workflow {
+  readonly #native: NativeWorkflow;
+
+  /** @internal Built by {@link Workflow.fromPath} or {@link WorkflowCards.load}. */
+  constructor(native: NativeWorkflow) {
+    this.#native = native;
+  }
+
+  /**
+   * Load an authored Workflow file and the Cards it references.
+   *
+   * Local files need no server. Registry refs are read with the ambient
+   * client configuration (`WYRD_SERVER_URL`, `WYRD_API_KEY`).
+   *
+   * @example
+   * ```ts
+   * const workflow = await Workflow.fromPath("workflows/code-review/workflow.yaml");
+   * console.log(workflow.stepIds);
+   * ```
+   *
+   * @throws {WyrdError} `WYRD_CLIENT_401_NO_CREDENTIALS` when the file
+   * references a registered Card and no credential is configured, or
+   * `WYRD_REGISTRY_404_CARD_NOT_FOUND` when a referenced Card is missing.
+   */
+  static async fromPath(path: string): Promise<Workflow> {
+    const loaded = await loadWorkflowFromPath(path);
+    return new Workflow(nativeHandle(loaded.workflow, loaded.error));
+  }
+
+  /** Step IDs in declaration order. */
+  get stepIds(): string[] {
+    return this.#native.stepIds();
+  }
+
+  /**
+   * Run this Workflow with its declared inputs.
+   *
+   * Validation and route refusals throw before any step runs; step failures
+   * are recorded in the returned run.
+   */
+  async run(input: Record<string, JsonValue> = {}): Promise<WorkflowRun> {
+    return lifecycleValue<WorkflowRun>(
+      await this.#native.run(JSON.stringify(input)),
+    );
   }
 }
 

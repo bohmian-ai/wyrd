@@ -447,6 +447,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use crate::storage::telemetry::recorded::{self, REQUEST_TERMINALS, REQUESTS};
     use crate::storage::{BifrostStorageConfig, BifrostStoragePolicy};
 
     /// Builds one list entry the gated wrapper is asked to expose.
@@ -712,6 +713,8 @@ mod tests {
     /// the pre-close round trip fails.
     #[tokio::test]
     async fn iceberg_reads_refuse_after_owner_close() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
         let root = tempfile::tempdir().expect("warehouse root");
         let (storage, warehouse, owner) = adapter_with_owner(root.path());
         let live = format!("{warehouse}/datasets/tenant/live.parquet");
@@ -787,19 +790,16 @@ mod tests {
             .await
             .expect_err("a closed owner admits no recursive delete");
 
-        let snapshot = owner.telemetry_snapshot();
+        let closed = crate::storage::StorageRequestOutcome::Closed.as_str();
         assert!(
-            snapshot.request_terminal(vala_storage_outcome()) >= 11,
+            recorded::counter(&recorder, REQUEST_TERMINALS, &[("outcome", closed)]) >= 11,
             "every refused Iceberg operation must publish a governed closed terminal"
         );
-        assert_eq!(snapshot.request_starts(), snapshot.request_terminals());
-        assert_eq!(snapshot.active_requests(), 0);
-        assert_eq!(snapshot.anomalies(), 0);
-    }
-
-    /// Names the closed-owner request terminal the refusals above publish.
-    const fn vala_storage_outcome() -> crate::storage::StorageRequestOutcome {
-        crate::storage::StorageRequestOutcome::Closed
+        assert_eq!(
+            recorded::counter(&recorder, REQUESTS, &[]),
+            recorded::counter(&recorder, REQUEST_TERMINALS, &[])
+        );
+        assert_eq!(owner.inspect().active_requests, 0);
     }
 
     /// The adapter admits only objects inside the warehouse it is bound to, and

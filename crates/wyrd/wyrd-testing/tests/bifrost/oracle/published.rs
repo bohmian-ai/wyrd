@@ -17,13 +17,17 @@ use std::time::Duration;
 use arrow::array::{Array, Int64Array};
 use chrono::{DateTime, Utc};
 use vala_bifrost_redux::storage::{
-    BifrostStorage, BifrostStorageError, CacheEffect, MetadataCacheSnapshot, StorageLifecycle,
-    StorageOperation, StorageOperationBarrier, StorageRequestOutcome,
+    BifrostStorage, BifrostStorageError, StorageInspection, StorageLifecycle, StorageOperation,
+    StorageOperationBarrier, StorageRequestOutcome,
 };
 use wyrd_client::WyrdClient;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_testing::WyrdTestServer;
-use wyrd_testing::bifrost::{BifrostClusterSpec, ScribeCacheMode, WyrdTestCluster};
+use wyrd_testing::bifrost::telemetry::{BifrostMetricKind, BifrostTelemetryDelta};
+use wyrd_testing::bifrost::{
+    BifrostClusterSpec, ScribeCacheMode, WyrdTestCluster, shared_process_telemetry_for_test,
+};
 
 use crate::support::*;
 
@@ -36,8 +40,9 @@ use crate::support::*;
 /// excluded before its footer is touched, a stalled backend ends in a stable
 /// terminal instead of a hang, and teardown leaves nothing retained. An
 /// aggregate counter from an earlier phase is never allowed to stand in for the
-/// identity under test, which is why each phase re-reads the owner's snapshot
-/// rather than the run's totals.
+/// identity under test, which is why each phase reads its own production
+/// metric window rather than the run's totals, and settled state is read from
+/// the owners themselves.
 ///
 /// The cancellation observation runs against a separately bound server because
 /// it needs `cancel_and_join_for_test` — a bound harness handle, not a cluster
@@ -113,6 +118,12 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
         "the neighbouring tenant reads only its row"
     );
 
+    // 1b. Query stream telemetry. The same owner query is held open after its
+    //     first batch, so request opening and stream completion are observed
+    //     as the two separate production facts they are.
+    prove_query_stream_telemetry(&cluster, server, owner.client(), &fqn, owner_tenant, &table)
+        .await?;
+
     // 2. Hot cache single-flight and reuse. A second object is published, and
     //    the first read of it is held at the owner's deterministic barrier so a
     //    concurrent identical query provably arrives while that load is still
@@ -126,7 +137,7 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
     server.flush_bifrost().await?;
     cluster.refresh_oracle_snapshots().await?;
 
-    let before = storage.telemetry_snapshot();
+    let single_flight = telemetry.checkpoint()?;
     let barrier = StorageOperationBarrier::new(StorageOperation::ReadRange);
     storage.install_operation_barrier_for_test(Arc::clone(&barrier));
     let first = tokio::spawn({
@@ -162,28 +173,28 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
         repeated, first_rows,
         "a cached read returns the same exact rows as the decode that filled it"
     );
-    let after = storage.telemetry_snapshot();
+    let delta = telemetry.delta_since(&single_flight)?;
     assert_eq!(
-        after.load_starts() - before.load_starts(),
-        1,
+        counted(&delta, CACHE_LOADS, "outcome", None),
+        1.0,
         "one immutable identity is decoded exactly once, however many callers ask"
     );
     assert!(
-        after.effect(CacheEffect::Miss) > before.effect(CacheEffect::Miss),
+        cache_effect(&delta, "miss") > 0.0,
         "the elected caller records a miss"
     );
     assert!(
-        after.effect(CacheEffect::Join) > before.effect(CacheEffect::Join),
+        cache_effect(&delta, "join") > 0.0,
         "the concurrent caller joins the in-flight load rather than starting one"
     );
     assert!(
-        after.effect(CacheEffect::Hit) > before.effect(CacheEffect::Hit),
+        cache_effect(&delta, "hit") > 0.0,
         "a later read of a retained identity is served from the cache"
     );
 
     // 3. Immutable identity miss. A third object is a different identity, so it
     //    must produce its own load rather than a hit on the retained one.
-    let before = storage.telemetry_snapshot();
+    let identity = telemetry.checkpoint()?;
     owner
         .write(&fqn, &journey_schema(), [journey_row(4, "row-4")])
         .await?;
@@ -195,18 +206,18 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
         vec![3, 4],
         "both admitted objects contribute rows"
     );
-    let after = storage.telemetry_snapshot();
+    let delta = telemetry.delta_since(&identity)?;
     assert_eq!(
-        after.load_starts() - before.load_starts(),
-        1,
+        counted(&delta, CACHE_LOADS, "outcome", None),
+        1.0,
         "a new identity loads once; the retained one is not reloaded"
     );
     assert!(
-        after.effect(CacheEffect::Miss) > before.effect(CacheEffect::Miss),
+        cache_effect(&delta, "miss") > 0.0,
         "the new identity misses"
     );
     assert!(
-        after.effect(CacheEffect::Hit) > before.effect(CacheEffect::Hit),
+        cache_effect(&delta, "hit") > 0.0,
         "the retained identity still hits"
     );
 
@@ -235,7 +246,6 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
         "the pruning phase needs both source variants present, saw {compacted} compacted \
          and {hot} hot"
     );
-    let before = storage.telemetry_snapshot();
     let checkpoint = cluster.telemetry().checkpoint()?;
     let empty = query_ids_between(
         owner.client(),
@@ -248,57 +258,54 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
         empty.is_empty(),
         "an interval no object overlaps returns exactly no rows, got {empty:?}"
     );
-    let after = storage.telemetry_snapshot();
-    assert_eq!(
-        after.load_starts(),
-        before.load_starts(),
+    let delta = cluster.telemetry().delta_since(&checkpoint)?;
+    assert!(
+        counted(&delta, CACHE_LOADS, "outcome", None).abs() < f64::EPSILON,
         "an excluded object's footer is never opened"
     );
-    let delta = cluster.telemetry().delta_since(&checkpoint)?;
-    for source in ["hot", "iceberg"] {
-        let excluded = pruning_exclusions(&delta, source);
-        assert!(
-            excluded > 0.0,
-            "the {source} source must record a pre-footer exclusion, saw {excluded}"
-        );
-    }
+    // Only the hot path decides exclusion from file bounds; the Iceberg
+    // snapshot prunes inside its own scan planning, and no second walk of the
+    // pinned file list runs to manufacture a per-source series.
+    let excluded = metric_value(
+        &delta,
+        "bifrost_oracle_file_pruning_total",
+        BifrostMetricKind::Counter,
+        &[("outcome", "excluded")],
+    );
+    assert!(
+        excluded >= 1.0 && excluded <= f64::from(u32::try_from(hot)?),
+        "every hot object is excluded before its footer, and only hot objects \
+         are counted, saw {excluded} for {hot} hot objects"
+    );
+    assert!(
+        delta
+            .metrics
+            .iter()
+            .filter(|sample| sample.family == "bifrost_oracle_file_pruning_total")
+            .all(|sample| !sample.labels.contains_key("source")),
+        "pruning carries no telemetry-only source label"
+    );
 
-    // 7 (cluster owner). Final reconciliation for the pod that served every
-    //    phase above: the owner closes, every start has a terminal, and nothing
-    //    stays resident, in flight, waiting, or unmatched.
+    // 7 (cluster owner). Final settlement for the pod that served every phase
+    //    above, read from the owners after production teardown: the owner
+    //    closes and nothing stays resident, in flight, waiting, or admitted.
     let inspection = cluster.shutdown_and_inspect().await?;
     let terminal = inspection
         .storage
         .first()
-        .ok_or("the drained pod publishes its storage-owner snapshot")?;
-    assert_reconciled(terminal, "the served pod");
-    assert!(
-        terminal.effect(CacheEffect::Hit) > 0
-            && terminal.effect(CacheEffect::Miss) > 0
-            && terminal.effect(CacheEffect::Join) > 0,
-        "the run's cache effects survive into the terminal snapshot: {terminal:?}"
-    );
-    assert!(
-        terminal.load_terminal(vala_bifrost_redux::storage::MetadataLoadOutcome::Success) > 0,
-        "every decode this run performed ended in a recorded load terminal"
-    );
-    assert!(
-        terminal.request_terminal(StorageRequestOutcome::Success) > 0,
-        "the governed object requests this run issued ended in recorded terminals"
-    );
+        .ok_or("the drained pod publishes its storage-owner state")?;
+    assert_settled(terminal, "the served pod");
 
-    // 7b. The production metric stream, not the retained totals. Everything
-    //     asserted above is read back out of what the node actually emitted,
-    //     because a retained snapshot proves only that the owner counted an
-    //     event — an owner that counted correctly and published nothing is
-    //     invisible to every operator, dashboard, and alert that consumes it.
+    // 7b. The production metric stream over the whole run. An owner that
+    //     settled correctly and published nothing is invisible to every
+    //     operator, dashboard, and alert, so the run's decisions and terminals
+    //     must be read back out of what the node actually emitted.
     let stream = telemetry.delta_since(&production)?;
-    for effect in [CacheEffect::Miss, CacheEffect::Join, CacheEffect::Hit] {
-        let emitted = counted(&stream, CACHE_EFFECTS, "effect", Some(effect.as_str()));
+    for effect in ["miss", "join", "hit"] {
+        let emitted = cache_effect(&stream, effect);
         assert!(
             emitted > 0.0,
-            "the emitted stream must carry the {} the retained snapshot recorded, saw {emitted}",
-            effect.as_str()
+            "the emitted stream must carry the run's {effect} decisions, saw {emitted}"
         );
     }
     let loads = counted(&stream, CACHE_LOADS, "outcome", Some("success"));
@@ -320,31 +327,24 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
         counted(&stream, REQUEST_TERMINALS, "outcome", Some("success")) > 0.0,
         "the emitted terminal breakdown must carry the successful reads this run made"
     );
-    // The retry counter is asserted against the retained total rather than
-    // against zero: this fixture's objects are reachable on the first attempt,
-    // so the honest statement is that the emitted stream agrees with the owner,
-    // whatever number that is. Forcing a retry here to make the counter nonzero
-    // would prove only that the fixture can break a backend.
-    let retries = counted(&stream, REQUEST_RETRIES, "operation", None);
-    #[allow(clippy::cast_precision_loss)]
-    let retained_retries = terminal.request_retries() as f64;
-    assert!(
-        (retries - retained_retries).abs() < f64::EPSILON,
-        "the emitted retry counter must agree with the owner's retained total, saw          {retries} emitted and {retained_retries} retained"
-    );
-    // The lifecycle itself is retained state rather than a series, so `Closed`
-    // is asserted from the terminal snapshot above; what the stream can state
+    // The lifecycle is owner state rather than a series, so `Closed` is
+    // asserted from the terminal inspection above; what the stream can state
     // is that the node ended with no governed request still admitted.
     let active = gauge_at_end(&stream, ACTIVE_REQUESTS);
     assert!(
         active.abs() < f64::EPSILON,
         "the emitted active-request gauge must end at zero, saw {active}"
     );
-    let anomalies = counted(&stream, TRANSITION_ANOMALIES, "transition", None);
-    assert!(
-        anomalies.abs() < f64::EPSILON,
-        "the emitted stream must carry no unmatched settlement, saw {anomalies}"
-    );
+    for retired in RETIRED_STORAGE_FAMILIES {
+        assert!(
+            stream
+                .metrics
+                .iter()
+                .chain(&stream.gauge_final)
+                .all(|sample| sample.family != retired),
+            "the retired shadow-ledger family {retired} must not be emitted"
+        );
+    }
 
     // 6. Unavailable backend cancellation. A governed read is stalled at the
     //    barrier so no cache hit can bypass it, the process is cancelled
@@ -381,9 +381,10 @@ async fn prove_cancelled_read_terminates() -> Result<(), JourneyError> {
         .await?;
     server.flush_bifrost().await?;
 
+    let (_telemetry_guard, telemetry) = shared_process_telemetry_for_test()?;
     let barrier = StorageOperationBarrier::new(StorageOperation::ReadRange);
     storage.install_operation_barrier_for_test(Arc::clone(&barrier));
-    let before_cancellation = storage.telemetry_snapshot();
+    let cancellation_window = telemetry.checkpoint()?;
     let stalled = tokio::spawn({
         let client = reader.client().clone();
         let fqn = fqn.clone();
@@ -403,31 +404,30 @@ async fn prove_cancelled_read_terminates() -> Result<(), JourneyError> {
         "a read cancelled under an unavailable backend must not return rows, got {outcome:?}"
     );
 
-    let snapshot = storage.telemetry_snapshot();
     // The stalled read must end in a terminal the owner's cancellation contract
-    // authorizes. Reconciled totals alone are not that proof: a read that hit
-    // some unrelated backend failure would reconcile just as neatly while
-    // saying nothing about whether cancellation is bounded, which is the
-    // property this phase exists to establish.
-    let cancellation: Vec<(&str, u64)> = AUTHORIZED_CANCELLATION_TERMINALS
+    // authorizes. A settled owner alone is not that proof: a read that hit some
+    // unrelated backend failure would settle just as neatly while saying
+    // nothing about whether cancellation is bounded, which is the property
+    // this phase exists to establish.
+    let window = telemetry.delta_since(&cancellation_window)?;
+    let cancellation: Vec<(&str, f64)> = AUTHORIZED_CANCELLATION_TERMINALS
         .iter()
         .map(|outcome| {
+            let label = outcome.as_str();
             (
-                outcome.as_str(),
-                snapshot
-                    .request_terminal(*outcome)
-                    .saturating_sub(before_cancellation.request_terminal(*outcome)),
+                label,
+                counted(&window, REQUEST_TERMINALS, "outcome", Some(label)),
             )
         })
-        .filter(|(_, delta)| *delta > 0)
+        .filter(|(_, delta)| *delta > 0.0)
         .collect();
-    let authorized: u64 = cancellation.iter().map(|(_, delta)| *delta).sum();
-    assert_eq!(
-        authorized, 1,
+    let authorized: f64 = cancellation.iter().map(|(_, delta)| *delta).sum();
+    assert!(
+        (authorized - 1.0).abs() < f64::EPSILON,
         "the stalled governed read must end in exactly one authorized cancellation \
-         terminal, observed {cancellation:?} against {snapshot:?}"
+         terminal, observed {cancellation:?}"
     );
-    assert_reconciled(&snapshot, "the cancelled server");
+    assert_settled(&storage.inspect(), "the cancelled server");
     server
         .shutdown()
         .await
@@ -459,7 +459,7 @@ const AUTHORIZED_CANCELLATION_TERMINALS: [StorageRequestOutcome; 3] = [
     StorageRequestOutcome::Deadline,
 ];
 
-/// Emitted counter of decisions the metadata cache took.
+/// Emitted counter of decisions the metadata cache took, by effect and reason.
 const CACHE_EFFECTS: &str = "bifrost_storage_metadata_cache_effects_total";
 /// Emitted counter of terminal metadata loads, by outcome.
 const CACHE_LOADS: &str = "bifrost_storage_metadata_cache_loads_total";
@@ -467,12 +467,23 @@ const CACHE_LOADS: &str = "bifrost_storage_metadata_cache_loads_total";
 const REQUEST_STARTS: &str = "bifrost_storage_requests_total";
 /// Emitted counter of governed logical request terminals, by outcome.
 const REQUEST_TERMINALS: &str = "bifrost_storage_request_terminals_total";
-/// Emitted counter of attempts beyond a read's first.
-const REQUEST_RETRIES: &str = "bifrost_storage_request_retries_total";
 /// Emitted gauge of governed requests admitted and not yet settled.
 const ACTIVE_REQUESTS: &str = "bifrost_storage_active_requests";
-/// Emitted counter of settlements that had no matching admission.
-const TRANSITION_ANOMALIES: &str = "bifrost_storage_metadata_cache_transition_anomalies_total";
+/// Storage families retired with the shadow ledger that fed them.
+///
+/// The anomaly counter only ever reported the ledger disagreeing with itself,
+/// and the waiter gauge was republished from that ledger on every transition;
+/// settled state is now read from the owners, so either reappearing means a
+/// deleted emitter came back.
+const RETIRED_STORAGE_FAMILIES: [&str; 2] = [
+    "bifrost_storage_metadata_cache_transition_anomalies_total",
+    "bifrost_storage_metadata_cache_waiters",
+];
+
+/// Sums one cache decision's emitted count across its reasons.
+fn cache_effect(delta: &BifrostTelemetryDelta, effect: &str) -> f64 {
+    counted(delta, CACHE_EFFECTS, "effect", Some(effect))
+}
 
 /// Sums one production counter family in a delta, optionally by one label.
 ///
@@ -511,38 +522,23 @@ fn gauge_at_end(
         .sum()
 }
 
-/// Requires one terminal owner snapshot to be closed and to retain nothing.
+/// Requires one terminal owner inspection to be closed and to hold nothing.
+///
+/// Every value is read from the owners — the request settlement teardown
+/// waits on and the metadata cache's own state — so a nonzero count is work
+/// still held, never a tally that drifted.
 ///
 /// # Panics
-/// Panics when the owner is not closed, a start has no terminal, any live count
-/// is nonzero, or any settlement was unmatched.
-fn assert_reconciled(snapshot: &MetadataCacheSnapshot, label: &str) {
+/// Panics when the owner is not closed or any live count is nonzero.
+fn assert_settled(inspection: &StorageInspection, label: &str) {
     assert_eq!(
-        snapshot.lifecycle(),
+        inspection.lifecycle,
         StorageLifecycle::Closed,
         "{label}: a drained process closes its storage owner"
     );
-    assert_eq!(
-        snapshot.load_starts(),
-        snapshot.load_terminals(),
-        "{label}: every started decode publishes a terminal"
-    );
-    assert_eq!(
-        snapshot.request_starts(),
-        snapshot.request_terminals(),
-        "{label}: every admitted governed request publishes a terminal"
-    );
-    assert_eq!(
-        (
-            snapshot.resident_entries(),
-            snapshot.resident_bytes(),
-            snapshot.inflight_loads(),
-            snapshot.waiters(),
-            snapshot.active_requests(),
-            snapshot.anomalies(),
-        ),
-        (0, 0, 0, 0, 0, 0),
-        "{label}: a drained owner retains nothing, observed {snapshot:?}"
+    assert!(
+        inspection.is_settled(),
+        "{label}: a drained owner holds nothing, observed {inspection:?}"
     );
 }
 
@@ -558,7 +554,11 @@ fn assert_reconciled(snapshot: &MetadataCacheSnapshot, label: &str) {
 /// Returns an error when no second caller queues within the bound.
 async fn wait_for_waiter(storage: &Arc<BifrostStorage>) -> Result<(), JourneyError> {
     for _ in 0..600 {
-        if storage.telemetry_snapshot().waiters() > 1 {
+        let waiters = storage
+            .inspect()
+            .metadata_cache
+            .map_or(0, |cache| cache.waiters);
+        if waiters > 1 {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -566,21 +566,310 @@ async fn wait_for_waiter(storage: &Arc<BifrostStorage>) -> Result<(), JourneyErr
     Err("no concurrent caller joined the in-flight decode".into())
 }
 
-/// Sums one source's pre-footer exclusions in a production metric delta.
-fn pruning_exclusions(
-    delta: &wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta,
-    source: &str,
-) -> f64 {
-    delta
-        .metrics
+/// Gate and Oracle families the query-stream windows print as evidence.
+const QUERY_STREAM_FAMILIES: [&str; 11] = [
+    "bifrost_gate_requests_total",
+    "bifrost_gate_query_streams_total",
+    "bifrost_gate_query_stream_duration_seconds",
+    "bifrost_gate_active_streams",
+    "oracle_queries_active",
+    "oracle_queries_queued",
+    "oracle_admission_total",
+    "oracle_query_duration_seconds",
+    "oracle_query_files_scanned_total",
+    "oracle_query_bytes_scanned_total",
+    "oracle_query_rows_total",
+];
+
+/// Families retired as zero-only, duplicate, or telemetry-only work.
+///
+/// A sample of any of these in a real query window means a deleted emitter
+/// came back: the production HPA and query report read
+/// `oracle_query_duration_seconds`, and the rest never described real work.
+const RETIRED_QUERY_FAMILIES: [&str; 6] = [
+    "bifrost_query_duration_seconds",
+    "oracle_tenant_budget_pressure",
+    "oracle_query_spill_bytes_total",
+    "oracle_query_spill_files_total",
+    "oracle_query_logical_bytes_selected_total",
+    "bifrost_oracle_analytical_exchanges_active",
+];
+
+/// Proves the Gate request, Gate stream, and Oracle query facts of one query.
+///
+/// The query is parked after its first batch frame, so the window taken while
+/// it is parked shows the request opened successfully and no stream terminal
+/// exists yet. The window taken after the client reads the terminal shows
+/// exactly one successful stream and one Oracle execution, nested inside the
+/// server-edge interval, which is itself inside the client's own clock. The
+/// trace must be one causal story: the dispatch span is a child of the stream
+/// span, and the Oracle stream span shares its trace and ends inside it.
+///
+/// # Errors
+/// Returns a client, park, Postgres, or telemetry error.
+///
+/// # Panics
+/// Panics when an emitted fact disagrees with the stream the client observed.
+async fn prove_query_stream_telemetry(
+    cluster: &WyrdTestCluster,
+    server: &WyrdTestServer,
+    client: &WyrdClient,
+    fqn: &str,
+    tenant: DataTenantId,
+    table: &str,
+) -> Result<(), JourneyError> {
+    let telemetry = cluster.telemetry();
+    let opened_window = telemetry.checkpoint()?;
+    let final_window = telemetry.checkpoint()?;
+    let park = server.park_next_query_after_rows()?;
+    let client_clock = std::time::Instant::now();
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query(&BifrostQueryRequest {
+            sql: format!("SELECT id FROM {fqn} ORDER BY id"),
+            deadline_ms: None,
+        })
+        .await?;
+    tokio::time::timeout(Duration::from_secs(30), park.wait_entered())
+        .await
+        .map_err(|_| "the query never parked after its first batch")?;
+
+    let opened = telemetry.delta_since(&opened_window)?;
+    eprintln!(
+        "evidence query_opened client_rows_read=0 parked=true samples: {}",
+        opened.evidence(&QUERY_STREAM_FAMILIES)
+    );
+    assert_eq!(
+        metric_value(
+            &opened,
+            "bifrost_gate_requests_total",
+            BifrostMetricKind::Counter,
+            &[("operation", "query"), ("outcome", "success")],
+        ),
+        1.0,
+        "an opened stream is one successful Gate query request"
+    );
+    assert_eq!(
+        metric_value(
+            &opened,
+            "bifrost_gate_query_streams_total",
+            BifrostMetricKind::Counter,
+            &[],
+        ),
+        0.0,
+        "an open, unconsumed stream has no terminal outcome yet"
+    );
+    assert_eq!(
+        metric_value(
+            &opened,
+            "bifrost_gate_query_stream_duration_seconds",
+            BifrostMetricKind::HistogramCount,
+            &[],
+        ),
+        0.0,
+        "an open stream has no server-edge duration yet"
+    );
+    let active: f64 = opened
+        .gauge_final
         .iter()
         .filter(|sample| {
-            sample.family == "bifrost_oracle_file_pruning_total"
-                && sample.labels.get("source").map(String::as_str) == Some(source)
-                && sample.labels.get("outcome").map(String::as_str) == Some("excluded")
+            sample.family == "oracle_queries_active"
+                && sample.labels.get("class").map(String::as_str) == Some("interactive")
         })
         .map(|sample| sample.value)
-        .sum()
+        .sum();
+    assert_eq!(
+        active, 1.0,
+        "the parked admitted query is the one active query"
+    );
+    assert!(
+        !opened.spans.iter().any(|span| {
+            span.name == "bifrost.gate.query.stream" || span.name == "bifrost.oracle.stream"
+        }),
+        "no query operation span closes while its stream is still open"
+    );
+
+    park.resume();
+    let mut ids = Vec::new();
+    while let Some(batch) = stream.next_batch().await? {
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or("the leading projected column is not Int64")?;
+        ids.extend(column.iter().flatten());
+    }
+    stream.terminal().ok_or("query terminal missing")?;
+    let client_elapsed = client_clock.elapsed().as_secs_f64();
+    drop(stream);
+    assert_eq!(
+        ids,
+        vec![1],
+        "the parked query returns the owner's exact row"
+    );
+    wait_for_spans(
+        telemetry,
+        &final_window,
+        &["bifrost.gate.query.stream", "bifrost.oracle.stream"],
+    )
+    .await?;
+
+    let finished = telemetry.delta_since(&final_window)?;
+    for outcome in ["success", "degraded", "rejected", "failed", "cancelled"] {
+        let expected = if outcome == "success" { 1.0 } else { 0.0 };
+        assert_eq!(
+            metric_value(
+                &finished,
+                "bifrost_gate_query_streams_total",
+                BifrostMetricKind::Counter,
+                &[("outcome", outcome)],
+            ),
+            expected,
+            "one consumed stream is exactly one {outcome} terminal when expected"
+        );
+    }
+    let gate_count = metric_value(
+        &finished,
+        "bifrost_gate_query_stream_duration_seconds",
+        BifrostMetricKind::HistogramCount,
+        &[("outcome", "success")],
+    );
+    let gate_seconds = metric_value(
+        &finished,
+        "bifrost_gate_query_stream_duration_seconds",
+        BifrostMetricKind::HistogramSum,
+        &[("outcome", "success")],
+    );
+    let oracle_count = metric_value(
+        &finished,
+        "oracle_query_duration_seconds",
+        BifrostMetricKind::HistogramCount,
+        &[("class", "interactive"), ("outcome", "success")],
+    );
+    let oracle_seconds = metric_value(
+        &finished,
+        "oracle_query_duration_seconds",
+        BifrostMetricKind::HistogramSum,
+        &[("class", "interactive"), ("outcome", "success")],
+    );
+    assert_eq!(
+        gate_count, 1.0,
+        "one server-edge stream duration observation"
+    );
+    assert_eq!(
+        oracle_count, 1.0,
+        "one Oracle execution duration observation"
+    );
+    assert!(
+        oracle_seconds <= gate_seconds && gate_seconds <= client_elapsed,
+        "Oracle work ({oracle_seconds}s) starts after the Gate stream ({gate_seconds}s), \
+         which the client clock ({client_elapsed}s) contains"
+    );
+
+    let (compacted, hot) = file_tier_counts(cluster, tenant, table).await?;
+    let files = metric_value(
+        &finished,
+        "oracle_query_files_scanned_total",
+        BifrostMetricKind::Counter,
+        &[("class", "interactive")],
+    );
+    let bytes = metric_value(
+        &finished,
+        "oracle_query_bytes_scanned_total",
+        BifrostMetricKind::Counter,
+        &[("class", "interactive")],
+    );
+    assert_eq!(
+        files,
+        f64::from(u32::try_from(compacted + hot)?),
+        "scanned files are the published objects the plan actually read"
+    );
+    assert!(bytes > 0.0, "a read of a published object scans its bytes");
+    eprintln!(
+        "evidence query_finished client_rows={} client_elapsed_seconds={client_elapsed} \
+         published_objects={} samples: {}",
+        ids.len(),
+        compacted + hot,
+        finished.evidence(&QUERY_STREAM_FAMILIES)
+    );
+
+    for family in RETIRED_QUERY_FAMILIES {
+        assert!(
+            !finished
+                .metrics
+                .iter()
+                .chain(&finished.gauge_final)
+                .any(|sample| sample.family == family && sample.value != 0.0),
+            "retired family {family} must not be emitted"
+        );
+    }
+    assert!(
+        !finished.metrics.iter().any(|sample| {
+            sample.family == "oracle_query_phase_seconds"
+                && sample.labels.get("phase").is_some_and(|phase| {
+                    [
+                        "first_row",
+                        "terminal",
+                        "table_lookup",
+                        "manifest_scan",
+                        "hot_cut",
+                    ]
+                    .contains(&phase.as_str())
+                })
+        }),
+        "duplicate and per-substep phases are not emitted"
+    );
+
+    let span = |name: &str| {
+        finished
+            .spans
+            .iter()
+            .filter(|span| span.name == name)
+            .collect::<Vec<_>>()
+    };
+    let gate_streams = span("bifrost.gate.query.stream");
+    let [gate_stream] = gate_streams.as_slice() else {
+        panic!("one query has one Gate stream span, saw {gate_streams:?}");
+    };
+    assert_eq!(
+        gate_stream.attributes.get("outcome").map(String::as_str),
+        Some("success")
+    );
+    let dispatches = span("bifrost.gate.query");
+    assert!(
+        dispatches
+            .iter()
+            .any(|dispatch| dispatch.parent_span_id == gate_stream.span_id),
+        "dispatch is causal child work of the client-facing stream"
+    );
+    let oracle_streams = span("bifrost.oracle.stream");
+    let [oracle_stream] = oracle_streams.as_slice() else {
+        panic!("one query has one Oracle stream span, saw {oracle_streams:?}");
+    };
+    assert_eq!(oracle_stream.trace_id, gate_stream.trace_id);
+    assert_eq!(
+        oracle_stream.attributes.get("outcome").map(String::as_str),
+        Some("success")
+    );
+    assert!(
+        oracle_stream.duration_nanos <= gate_stream.duration_nanos,
+        "Oracle stream work ends inside the Gate stream lifetime"
+    );
+    for span in finished
+        .spans
+        .iter()
+        .filter(|span| span.trace_id == gate_stream.trace_id)
+    {
+        eprintln!(
+            "evidence query_trace trace={} span={} parent={} name={} duration_nanos={} outcome={:?}",
+            span.trace_id,
+            span.span_id,
+            span.parent_span_id,
+            span.name,
+            span.duration_nanos,
+            span.attributes.get("outcome")
+        );
+    }
+    Ok(())
 }
 
 /// Reads one table's `id` column, optionally floored on event time.
@@ -669,15 +958,15 @@ async fn collect_ids(client: &WyrdClient, sql: String) -> Result<Vec<i64>, Journ
 /// successful all-`false` report and never touched the storage owner, so a
 /// process could exit reporting success while its metadata cache was still
 /// open and its object I/O still admissible. The assertions are therefore
-/// three: the terminal is the exact stable lifecycle failure, the retained
-/// production owner is closed and settled, and a governed read issued
+/// three: the terminal is the exact stable lifecycle failure, the production
+/// owner is closed and settled, and a governed read issued
 /// afterwards is refused by the owner rather than reaching the backend.
 ///
 /// # Panics
 ///
 /// Panics when the bound server does not start, when the join returns a
-/// successful report or a different failure, when the retained storage snapshot
-/// is not closed and quiescent, or when a post-shutdown read is admitted.
+/// successful report or a different failure, when the storage owner is not
+/// closed and settled, or when a post-shutdown read is admitted.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn expired_process_shutdown_aborts_storage_and_returns_failure() {
@@ -703,21 +992,20 @@ async fn expired_process_shutdown_aborts_storage_and_returns_failure() {
         "the expired branch must project its stable lifecycle failure, got {rendered}"
     );
 
-    let snapshot = storage.telemetry_snapshot();
+    let inspection = storage.inspect();
     assert_eq!(
-        snapshot.lifecycle(),
+        inspection.lifecycle,
         StorageLifecycle::Closed,
         "an aborted process must leave the storage owner closed"
     );
-    assert_eq!(snapshot.load_starts(), snapshot.load_terminals());
-    assert_eq!(snapshot.request_starts(), snapshot.request_terminals());
-    assert_eq!(snapshot.active_requests(), 0);
-    assert_eq!(snapshot.inflight_loads(), 0);
-    assert_eq!(snapshot.waiters(), 0);
-    assert_eq!(snapshot.resident_entries(), 0);
-    assert_eq!(snapshot.resident_bytes(), 0);
-    assert_eq!(snapshot.anomalies(), 0);
+    assert!(
+        inspection.is_settled(),
+        "an aborted process leaves nothing held, observed {inspection:?}"
+    );
 
+    let (_telemetry_guard, telemetry) =
+        shared_process_telemetry_for_test().expect("process production telemetry");
+    let refusal_window = telemetry.checkpoint().expect("refusal telemetry window");
     let refused = storage
         .read("bifrost/journey/after-shutdown.parquet")
         .await
@@ -727,13 +1015,21 @@ async fn expired_process_shutdown_aborts_storage_and_returns_failure() {
         BifrostStorageError::Closed,
         "the refusal must come from the owner, before any backend call"
     );
-    let after = storage.telemetry_snapshot();
-    assert_eq!(
-        after.request_terminal(StorageRequestOutcome::Closed),
-        snapshot.request_terminal(StorageRequestOutcome::Closed) + 1,
+    let refusal = telemetry
+        .delta_since(&refusal_window)
+        .expect("refusal telemetry delta");
+    assert!(
+        (counted(
+            &refusal,
+            REQUEST_TERMINALS,
+            "outcome",
+            Some(StorageRequestOutcome::Closed.as_str())
+        ) - 1.0)
+            .abs()
+            < f64::EPSILON,
         "the refusal must publish exactly one closed request terminal"
     );
-    assert_eq!(after.anomalies(), 0);
+    assert_eq!(storage.inspect().active_requests, 0);
 
     server
         .shutdown()

@@ -32,10 +32,18 @@ def main() -> None:
         ),
         name="writer",
     )
-    wf = Workflow.sequential("demo", planner, writer)
+    wf = (
+        Workflow.sequential("demo", planner, writer)
+        .with_inputs({"topic": ""})
+        .with_step_inputs("planner", {"topic": "input.topic"})
+        .with_step_inputs("writer", {"summary": "steps.planner.output.structured.summary"})
+        .with_outputs(
+            {"plan": "steps.planner.output.structured", "brief": "steps.writer.output.text"}
+        )
+    )
     run = wf.run({"topic": "the Rust borrow checker"})
-    print("parameters:", run.parameters)
-    print("final:", run.final_output)
+    print("status:", run.status)
+    print("outputs:", run.outputs)
 
 
 if __name__ == "__main__":

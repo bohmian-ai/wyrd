@@ -3,9 +3,10 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use skald_spec::wire::openai_chat::OpenAiMessageContent;
+use skald_spec::wire::openai_responses::{OpenAiResponseContentPart, OpenAiResponseItem};
 use skald_spec::{
     AnthropicContentBlock, AnthropicMessage, GoogleContent, GooglePart, MessageNum,
-    OpenAiChatMessage, ProviderName,
+    OpenAiChatMessage, ProviderName, ProviderRequest,
 };
 
 use crate::conversation::ConversationTurn;
@@ -107,15 +108,16 @@ pub enum SessionError {
     AppendFailed(String),
 }
 
-/// Convert a session turn to a conversation turn using the given provider to
-/// produce the correct wire format for `Role::Assistant`.
+/// Convert a session turn to a conversation turn in the native dialect of the
+/// agent's `request` for `Role::Assistant`: an OpenAI Responses request gets
+/// a Responses output message, other requests their provider's message shape.
 ///
-/// Use this in preference to the `From` impl when the provider is known (e.g.
-/// inside `seed_session_recent`). The `From` impl falls back to the OpenAI wire
-/// format for `Role::Assistant` and is only safe for OpenAI-backed agents.
+/// Use this in preference to the `From` impl inside `seed_session_recent`.
+/// The `From` impl falls back to the OpenAI Chat wire format for
+/// `Role::Assistant` and is only safe for OpenAI Chat agents.
 pub(crate) fn session_turn_to_conversation_turn(
     turn: SessionTurn,
-    provider: ProviderName,
+    request: &ProviderRequest,
 ) -> ConversationTurn {
     match turn.role {
         Role::System => ConversationTurn::System {
@@ -124,8 +126,16 @@ pub(crate) fn session_turn_to_conversation_turn(
         Role::User => ConversationTurn::User {
             content: turn.content,
         },
+        Role::Assistant if matches!(request, ProviderRequest::OpenAiResponses(_)) => {
+            ConversationTurn::Assistant {
+                message: MessageNum::OpenAiResponses(vec![OpenAiResponseItem::Message {
+                    role: "assistant".to_owned(),
+                    content: vec![OpenAiResponseContentPart::OutputText { text: turn.content }],
+                }]),
+            }
+        }
         Role::Assistant => {
-            let message = match provider {
+            let message = match request.provider() {
                 ProviderName::Anthropic => MessageNum::Anthropic(AnthropicMessage {
                     role: "assistant".to_owned(),
                     content: vec![AnthropicContentBlock::Text {

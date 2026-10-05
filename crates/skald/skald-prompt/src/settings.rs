@@ -369,8 +369,7 @@ pub fn apply_model_settings(
     };
     let mut prompt = prompt.clone();
     match &mut prompt.request {
-        ProviderRequest::OpenAiChatCompletion(request)
-        | ProviderRequest::OpenAiChatCompatible { request, .. } => {
+        ProviderRequest::OpenAiChatCompletion(request) => {
             request.settings = resolve_openai_chat_settings(Some(value))?;
         }
         ProviderRequest::OpenAiResponses(request) => {
@@ -381,9 +380,6 @@ pub fn apply_model_settings(
         }
         ProviderRequest::GeminiGenerateContent(request) => {
             request.settings = resolve_google_settings(Some(value))?;
-        }
-        ProviderRequest::Vertex(request) => {
-            request.0.settings = resolve_google_settings(Some(value))?;
         }
         _ => {
             return Err(settings_decode(

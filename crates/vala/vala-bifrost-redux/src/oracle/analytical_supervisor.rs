@@ -180,10 +180,12 @@ struct AnalyticalAttemptSlot {
 /// between them, so releasing the graph is the single act that returns it.
 struct AnalyticalGraphState {
     /// The admitted query envelope every attempt of this graph splits from.
-    resources: OracleQueryResources,
+    ///
+    /// Held only to be dropped: removing the graph returns the envelope.
+    _resources: OracleQueryResources,
     /// The query's admission permit, held for exactly as long as the graph is.
     ///
-    /// Declared after `resources` on purpose: removing the graph drops the
+    /// Declared after `_resources` on purpose: removing the graph drops the
     /// envelope first and the permit second, so admission counters never wake a
     /// queued waiter while this query's envelope is still charged. A graph that
     /// is retained as `Draining` therefore keeps both, which is what makes a
@@ -508,7 +510,7 @@ impl AnalyticalSupervisor {
         graphs.insert(
             graph,
             AnalyticalGraphEntry::Active(AnalyticalGraphState {
-                resources,
+                _resources: resources,
                 retained_admission: None,
                 running_query: None,
                 runtime,
@@ -564,35 +566,6 @@ impl AnalyticalSupervisor {
     ) -> Result<Option<CancellationToken>, BifrostError> {
         let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
         Ok(graphs.get(&graph).map(|entry| entry.state().cancel.clone()))
-    }
-
-    /// Reports whether one registered graph's envelope has no nested child left.
-    ///
-    /// An unregistered graph is idle by definition: there is no envelope left to
-    /// outlive. Callers use this to wait out a teardown they cannot observe
-    /// directly before releasing the graph, so a poison still means a leak.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
-    pub fn graph_children_idle(&self, graph: AnalyticalGraphKey) -> Result<bool, BifrostError> {
-        Ok(self.graph_children_debt(graph)? == 0)
-    }
-
-    /// Reports what one registered graph's envelope still owes its children.
-    ///
-    /// Returns the query-pool memory bytes a nested child still holds. An
-    /// unregistered graph owes nothing. This is what makes a drain timeout name
-    /// what stayed rather than only its existence.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
-    pub fn graph_children_debt(&self, graph: AnalyticalGraphKey) -> Result<usize, BifrostError> {
-        let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
-        Ok(graphs
-            .get(&graph)
-            .map_or(0, |entry| entry.state().resources.nested_memory_bytes()))
     }
 
     /// Returns the number of registered graphs, for terminal-cleanup evidence.
@@ -791,23 +764,6 @@ impl AnalyticalSupervisor {
             .lock()
             .ok()
             .and_then(|held| held.clone())
-    }
-
-    /// Clears one graph's retained cleanup once every release has resolved.
-    pub fn resolve_graph_cleanup(&self, graph: AnalyticalGraphKey) {
-        let Ok(mut graphs) = self.graphs.lock() else {
-            tracing::error!(
-                public_query_id = %graph.public_query_id,
-                "Oracle analytical graph registry is poisoned"
-            );
-            return;
-        };
-        if let Some(AnalyticalGraphEntry::Draining {
-            settlement_failure, ..
-        }) = graphs.get_mut(&graph)
-        {
-            *settlement_failure = None;
-        }
     }
 
     /// Reports why one graph's cleanup failed, when it did.
@@ -1017,10 +973,8 @@ impl AnalyticalSupervisor {
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::Internal`] when an attempt of the graph or a
-    /// nested child of its envelope is still live — releasing the envelope
-    /// beneath either would poison the resource root — or when a lock is
-    /// poisoned. Returns [`BifrostError::QueryExecutionFailed`] when the graph
+    /// Returns [`BifrostError::Internal`] when an attempt of the graph is
+    /// still live or when a lock is poisoned. Returns [`BifrostError::QueryExecutionFailed`] when the graph
     /// is not registered.
     pub(super) fn release_graph(
         &self,
@@ -1033,16 +987,6 @@ impl AnalyticalSupervisor {
                     detail: "Oracle analytical graph still owns a live attempt".to_owned(),
                 });
             }
-        }
-        // The envelope's own nested children outlive the attempts that made
-        // them: upstream drops a follower's stage plan after the coordinator
-        // channel ends, so a cache entry, exchange buffer, or spill write can
-        // still hold this envelope for a moment. Returning it now would report
-        // a live reservation back to the process governor and poison it.
-        if !self.graph_children_idle(graph)? {
-            return Err(BifrostError::Internal {
-                detail: "Oracle analytical graph still owns a live envelope child".to_owned(),
-            });
         }
         let removed = {
             let mut graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
@@ -2092,8 +2036,8 @@ mod tests {
     /// resolves to the query's own `RuntimeEnv` and pool rather than a process
     /// default, that the exchange child is charged against that pool, and that a
     /// second settlement of the same key is refused without returning any byte
-    /// twice — proven by the query owner releasing cleanly at the end, which it
-    /// refuses to do while a nested child survives.
+    /// twice — proven by the query owner returning its whole envelope at the
+    /// end.
     ///
     /// Required mutation RED: substitute a process runtime in
     /// [`AnalyticalSupervisor::spawn_attempt`] and the pool-identity assertion
@@ -2207,8 +2151,7 @@ mod tests {
                 .expect("a released query owner leaves an unpoisoned root")
                 .oracle_query_memory_used_bytes,
             0,
-            "the query owner returns its whole envelope, which it refuses to do \
-             while a nested exchange child survives"
+            "the query owner returns its whole envelope"
         );
         drop(metrics_guard);
 

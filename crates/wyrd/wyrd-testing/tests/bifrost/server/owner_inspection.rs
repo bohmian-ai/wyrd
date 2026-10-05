@@ -434,7 +434,7 @@ async fn dedicated_forge_worker_shutdown_drains_its_claim_before_storage_settles
     release.await?;
 
     assert_eq!(
-        storage.telemetry_snapshot().lifecycle(),
+        storage.inspect().lifecycle,
         vala_bifrost_redux::storage::StorageLifecycle::Open,
         "ordinary shutdown settled storage before the dedicated worker joined"
     );
@@ -488,7 +488,7 @@ async fn router_only_shutdown_settles_bifrost_before_fixture_release()
         "shutdown cancels the shared token"
     );
     assert_eq!(
-        storage.telemetry_snapshot().lifecycle(),
+        storage.inspect().lifecycle,
         vala_bifrost_redux::storage::StorageLifecycle::Closed,
         "router-only shutdown settles Bifrost before the fixture is released"
     );

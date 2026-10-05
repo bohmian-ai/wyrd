@@ -7,10 +7,12 @@ metadata:
 spec:
   prompt:
     request:
-      contents:
-        - role: user
-          parts:
-            - text: Inline triage
+      provider: gemini_generate_content
+      body:
+        contents:
+          - role: user
+            parts:
+              - text: Inline triage
     model: gpt-4o
     variables: []
     media_variables: []

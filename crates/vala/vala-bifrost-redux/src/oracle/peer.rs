@@ -443,20 +443,18 @@ impl StageTicketClaims {
 
 /// The closed set of private reservation operations on the peer plane.
 ///
-/// A leader reserves capacity on a follower and later releases it. The two are
-/// not interchangeable: a replayed release must never cancel a reservation the
-/// leader has since re-taken, and a replayed reserve must never charge a
-/// follower twice. The receiver therefore compares the operation in the
-/// context with its own entry point, exactly as the two stage operations do.
+/// A leader opens one held grant on a follower and releases it by closing that
+/// stream, so there is no release operation to replay. The receiver still
+/// compares the operation in the context with its own entry point, exactly as
+/// the two stage operations do, so a context minted for anything else is
+/// refused.
 ///
-/// The enum is deliberately closed. A third reservation operation is a protocol
-/// change, not a value a peer may present.
+/// The enum is deliberately closed. A second reservation operation is a
+/// protocol change, not a value a peer may present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReservationOperationV1 {
-    /// Take bounded pending capacity on one follower for one query.
+    /// Open one held grant on one follower for one graph.
     ReserveSlots,
-    /// Release one previously taken reservation on the same follower.
-    ReleaseSlots,
 }
 
 impl ReservationOperationV1 {
@@ -468,19 +466,18 @@ impl ReservationOperationV1 {
     pub const fn as_u32(self) -> u32 {
         match self {
             Self::ReserveSlots => 1,
-            Self::ReleaseSlots => 2,
         }
     }
 
     /// Recovers an operation from its wire discriminant.
     ///
-    /// Returns `None` for any other value, including zero, so an unknown
-    /// operation is refused at the parsing boundary rather than defaulted.
+    /// Returns `None` for any other value, including zero and the retired
+    /// release discriminant, so an unknown operation is refused at the parsing
+    /// boundary rather than defaulted.
     #[must_use]
     pub const fn from_u32(value: u32) -> Option<Self> {
         match value {
             1 => Some(Self::ReserveSlots),
-            2 => Some(Self::ReleaseSlots),
             _ => None,
         }
     }
@@ -686,8 +683,14 @@ fn encode_context<M: Message>(
     Ok(PeerContext { claims_bytes })
 }
 
-/// Fixed private stage-protocol version bound into every stage context.
-pub const STAGE_PROTOCOL_VERSION: u32 = 1;
+/// Fixed private stage-protocol version bound into every stage and grant context.
+///
+/// Version 2 makes `ReserveSlots` a held server stream and removes
+/// `ReleaseSlots`: a follower's graph grant, and every stage bound to it,
+/// lives exactly as long as its leader's stream. A version-1 leader expects a
+/// unary reserve and an explicit release, so its contexts are refused rather
+/// than admitted into grants nothing would release.
+pub const STAGE_PROTOCOL_VERSION: u32 = 2;
 
 /// Claims bytes accepted after bound, audience, and fence checks.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -24,6 +24,13 @@ Repository authority constrains the specification; implementation drift does
 not. Inspect existing owners, consumers, tests, manifests, and verification only
 far enough to distinguish current behavior from the requested outcome.
 
+Before proposing a new public surface or ownership boundary, compare the
+existing capability owners and their complete workflows. Name the missing
+behavior and any required boundary change; reuse of leaf calls alone does not
+justify replacement orchestration. Reconcile conflicting architecture prose,
+schemas, and examples before approval. Do not promote an unverified private
+design into a requirement.
+
 ## Specify decisions, not code
 
 Fix:

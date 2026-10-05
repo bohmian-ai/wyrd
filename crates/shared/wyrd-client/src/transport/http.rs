@@ -29,6 +29,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use reqwest::header::{HeaderName, HeaderValue};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -356,6 +357,68 @@ impl HttpTransport {
             message: format!("response deserialization failed: {err}"),
             details: serde_json::json!({}),
         })
+    }
+
+    /// POST one JSON body to a native-protocol route and return its raw answer.
+    ///
+    /// Native gateway ingresses answer refusals in their protocol's own error
+    /// envelope rather than `application/problem+json`, so the status and
+    /// body are returned undecoded for the caller's protocol codec. The
+    /// request carries the Wyrd bearer, a minted request id, and `headers`.
+    /// It is sent exactly once, because a model call is not replay-safe: a
+    /// `401` may come from the upstream provider after the gateway already
+    /// dispatched the call. A `401` instead renews the credential through
+    /// [`AuthMiddleware::force_refresh`] so the next call carries a fresh
+    /// bearer, and the original refusal is returned. Renewal runs as soon as
+    /// the status line reads `401`, before the body is read, so a slow,
+    /// truncated, or never-ending body cannot delay or prevent it. No total
+    /// deadline is applied; the caller bounds the call.
+    ///
+    /// Dropping the future (caller timeout or cancellation) only abandons the
+    /// local IO. Once the request has been written, the gateway may already
+    /// have accepted it and dispatched the model call; that work is not rolled
+    /// back, and the caller must not resend it as though it never happened.
+    ///
+    /// # Errors
+    /// Returns the authentication error when no bearer can be produced or
+    /// renewal after a `401` fails, or [`WyrdError::Internal`] for a transport
+    /// or body-read failure. On a `401`, a renewal failure is returned before
+    /// the body is read.
+    pub(crate) async fn post_native(
+        &self,
+        path: &str,
+        body: Bytes,
+        headers: &[(&str, &str)],
+    ) -> Result<(StatusCode, Bytes), WyrdError> {
+        let url = self.authenticated_url(path)?;
+        let request_id = self.auth.request_id(None);
+        let bearer = self.auth.bearer().await.map_err(AuthError::into_wyrd)?;
+        let mut request = self
+            .client
+            .post(&url)
+            .header(
+                HEADER_WYRD_ACCESS_TOKEN,
+                format!("Bearer {}", bearer.expose()),
+            )
+            .header(HEADER_REQUEST_ID, &request_id)
+            .header("content-type", "application/json")
+            .body(body);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = request.send().await.map_err(|err| WyrdError::Internal {
+            message: format!("transport error: {err}"),
+            details: serde_json::json!({"transport": "http"}),
+        })?;
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED {
+            self.auth
+                .force_refresh()
+                .await
+                .map_err(AuthError::into_wyrd)?;
+        }
+        let bytes = response.bytes().await.map_err(body_read_err)?;
+        Ok((status, bytes))
     }
 
     /// Send a request and return raw Arrow IPC bytes plus metadata headers.

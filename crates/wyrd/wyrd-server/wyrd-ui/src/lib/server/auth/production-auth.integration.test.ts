@@ -32,7 +32,7 @@ type Journey = {
 
 const journey = JSON.parse(process.env.WYRD_UI_JOURNEY ?? 'null') as Journey;
 const keycloakIssuer =
-  process.env.WYRD_KEYCLOAK_ISSUER ?? 'http://localhost:18080/realms/wyrd-test';
+  process.env.WYRD_KEYCLOAK_ISSUER ?? 'http://localhost:8180/realms/wyrd-test';
 /** The second realm: a distinct issuer whose `alice` shares the first realm's email. */
 const secondIssuer = `${keycloakIssuer.replace(/\/$/, '')}-2`;
 /** Dex: the different provider the multi-provider switch tenant signs in through. */

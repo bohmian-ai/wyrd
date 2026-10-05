@@ -37,6 +37,19 @@ already-approved dependencies, and test or fixture structure. Reuse the nearest
 repository behavior before adding code, abstractions, configuration, features,
 or dependencies.
 
+Revalidate the task's capability/reuse map against current source before adding
+graph stores, traversals, loaders, parsers, transports, validators, lifecycle
+owners, caches, or orchestration layers. Record the existing owner, the precise
+gap, and why the selected extension is sufficient in task evidence. Reusing
+calls inside a duplicate workflow is not reuse. A cohesive struct is not proof
+that another struct needs to exist.
+
+Do not obey invalid task mechanics literally. Resolve reversible choices
+inside the established owner yourself. If contradictory task instructions
+prevent that, return `BLOCKED` with the task conflict and route task correction
+to `$wyrd-plan` without manufacturing a product approval. A necessary change to
+approved behavior or a material boundary routes to `$wyrd-spec` instead.
+
 For non-trivial behavior, work one observable scenario at a time:
 
 1. add or select the smallest test that fails for the missing behavior;

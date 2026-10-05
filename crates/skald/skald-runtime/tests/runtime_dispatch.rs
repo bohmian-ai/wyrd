@@ -23,7 +23,7 @@ async fn routes_typed_request_by_provider_name() {
 
 #[tokio::test]
 async fn raw_v1_uses_embedded_provider_for_dispatch() {
-    let body = to_raw_value(&serde_json::json!({"custom": true})).expect("raw value builds");
+    let body = serde_json::json!({"custom": true});
     let request = ProviderRequest::RawV1 {
         provider: ProviderName::Custom("acme".to_owned()),
         body,
@@ -43,9 +43,13 @@ async fn raw_v1_uses_embedded_provider_for_dispatch() {
 
 #[tokio::test]
 async fn unregistered_provider_returns_runtime_error() {
-    let err = dispatch(&ProviderRegistry::new(), openai_request("hello"))
-        .await
-        .expect_err("provider is missing");
+    let err = dispatch(
+        &ProviderRegistry::new(),
+        ProviderName::OpenAi,
+        openai_request("hello"),
+    )
+    .await
+    .expect_err("provider is missing");
 
     assert!(matches!(
         err,
@@ -58,9 +62,13 @@ async fn unregistered_provider_returns_runtime_error() {
 
 #[tokio::test]
 async fn dispatch_stream_unregistered_provider_returns_runtime_error() {
-    let err = dispatch_stream(&ProviderRegistry::new(), openai_request("hello"))
-        .await
-        .expect_err("provider is missing");
+    let err = dispatch_stream(
+        &ProviderRegistry::new(),
+        ProviderName::OpenAi,
+        openai_request("hello"),
+    )
+    .await
+    .expect_err("provider is missing");
 
     assert!(matches!(
         err,

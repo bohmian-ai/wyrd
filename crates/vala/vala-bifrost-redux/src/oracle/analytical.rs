@@ -428,16 +428,6 @@ fn poisoned_registry() -> BifrostError {
     }
 }
 
-/// Interval between two checks that a released graph's children are gone.
-pub(super) const GRAPH_DRAIN_INTERVAL: Duration = Duration::from_millis(10);
-
-/// Maximum number of drain checks before a graph is released regardless.
-///
-/// Ten milliseconds apart, this bounds the wait at five seconds: long enough
-/// for upstream's own post-EOS task-cache eviction, short enough that a genuine
-/// leak still surfaces inside one query's lifetime.
-pub(super) const GRAPH_DRAIN_POLLS: usize = 500;
-
 /// Installs the query-owned runtime on every follower session for a graph.
 ///
 /// This is Wyrd's implementation of the upstream [`WorkerSessionBuilder`] seam.
@@ -801,10 +791,10 @@ impl AnalyticalStageEgress {
 ///
 /// A graph is addressed by many separate stage messages, and only the first one
 /// gets to say what the graph *is*. This is the exact union the follower keeps
-/// from that moment: the half it already proved when it accepted the
-/// reservation — identity, the reserving leader and fence, and the original
-/// expiry — and the half the first verified stage ticket carried, which the
-/// per-message binding check does not cover.
+/// from that moment: the half it already proved when it accepted the leader's
+/// grant stream — identity and the granting leader and fence — and the half
+/// the first verified stage ticket carried, which the per-message binding
+/// check does not cover.
 ///
 /// It is a projection of already-verified material, never a second signed
 /// inventory. [`super::peer::StageTicketClaims`] remains the only thing a peer
@@ -825,8 +815,6 @@ pub(crate) struct GraphLeaseBinding {
     reserving_leader_node_id: NodeId,
     /// Role fence the reserving leader held when it took the reservation.
     reserving_leader_fence: FencingToken,
-    /// The reservation's own expiry, which activation never extends.
-    reservation_expires_at: DateTime<Utc>,
     /// Authenticated data tenant of the graph.
     tenant_id: DataTenantId,
     /// Client-visible query identity of the graph.
@@ -876,7 +864,6 @@ impl GraphLeaseBinding {
             query_id: request.query_id,
             reserving_leader_node_id,
             reserving_leader_fence,
-            reservation_expires_at: activation.expires_at(),
             tenant_id: authorized.tenant_id,
             public_query_id: request.graph.public_query_id,
             datafusion_query_id: request.graph.datafusion_query_id,
@@ -996,6 +983,11 @@ pub struct GraphLease {
     guard: Mutex<Option<AnalyticalGraphGuard>>,
     /// Cancellation child covering every descendant of this graph.
     cancel: CancellationToken,
+    /// Cancelled when the leader's grant stream this graph was built on ends.
+    ///
+    /// The leader's stream owns the graph: once this fires the settlement
+    /// driver drains the graph however many coordinator connections remain.
+    grant_closed: CancellationToken,
     /// Attempts admitted under this graph, joined before it may be released.
     attempts: Mutex<HashMap<AnalyticalAttemptKey, AnalyticalAttemptGuard>>,
     /// Whether settlement has already run, so it can never run twice.
@@ -1111,22 +1103,17 @@ impl GraphLease {
     /// Returns everything this graph owns, in one order, exactly once.
     ///
     /// The order is the invariant: stop admitting, cancel unless the graph
-    /// succeeded, join every attempt and the descendants they own, wait for the
-    /// envelope's nested children to go idle — which is what proves no cache
-    /// entry, exchange, or spill write is still live — and only then release the
-    /// supervisor guard that returns the envelope, the egress record, and, when
-    /// the last holder of this lease goes away, the reservation's running
-    /// permit.
+    /// succeeded, join every attempt and the descendants they own, drop the
+    /// graph's worker cache and exchanges, and only then release the supervisor
+    /// guard that returns the envelope, the egress record, and, when the last
+    /// holder of this lease goes away, the reservation's running permit.
     ///
-    /// A cleanup timeout or failure is reported as a failure. It is never a
-    /// successful release: the graph keeps every owner it still holds so the
-    /// leak stays attributable to this node rather than becoming a poisoned
-    /// governor later.
+    /// A cleanup failure is never a successful release: the graph keeps every
+    /// owner it still holds, so the residue stays attributable to this node.
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::Internal`] when a lock is poisoned or the
-    /// graph's descendants did not drain within the bounded wait, and the
+    /// Returns [`BifrostError::Internal`] when a lock is poisoned, and the
     /// supervisor's or egress owner's refusal when a release fails.
     pub(crate) async fn settle(
         &self,
@@ -1138,7 +1125,6 @@ impl GraphLease {
         tracing::debug!(
             public_query_id = %self.graph.public_query_id,
             reservation_id = %self.binding.reservation_id.as_uuid(),
-            reservation_expires_at = %self.binding.reservation_expires_at,
             outcome = ?outcome,
             "Oracle analytical follower is settling a graph"
         );
@@ -1152,9 +1138,9 @@ impl GraphLease {
         for key in live {
             self.finish_attempt(key, outcome).await?;
         }
-        // Before the drain, never after. Upstream's cached stage plans own the
-        // worker connections that hold this envelope's reservations, so the
-        // cache has to go first or the drain would be waiting on bytes that
+        // Before the release, never after. Upstream's cached stage plans own
+        // the worker connections that hold this envelope's reservations, so
+        // the cache has to go first or the release would find bytes that
         // nothing in the graph's own lifetime will ever release.
         // Unconditional, and only after every attempt has been joined. The
         // graph is over on every terminal path, and its outbound exchanges are
@@ -1170,44 +1156,12 @@ impl GraphLease {
         // drops them here.
         self.exchanges.close();
         drop(self.worker.lock().map_err(|_| poisoned_ingress())?.take());
-        self.drain().await?;
         let guard = self.guard.lock().map_err(|_| poisoned_ingress())?.take();
         if let Some(guard) = guard {
             guard.release()?;
         }
         self.egress.release(self.graph)?;
         Ok(())
-    }
-
-    /// Waits, bounded, for every nested child of the graph's envelope to end.
-    ///
-    /// Upstream drops a follower's stage plan from its own task cache after the
-    /// coordinator channel ends, so the query envelope can still carry live
-    /// `DataFusion` reservations for a short moment after every governed call
-    /// for the graph has closed. Releasing into that moment would poison the
-    /// process governor for a teardown that is merely in progress.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::Internal`] when the supervisor's ownership state
-    /// is poisoned or the graph did not drain within the bounded wait.
-    async fn drain(&self) -> Result<(), BifrostError> {
-        for _ in 0..GRAPH_DRAIN_POLLS {
-            if self.supervisor.graph_children_idle(self.graph)? {
-                return Ok(());
-            }
-            tokio::time::sleep(GRAPH_DRAIN_INTERVAL).await;
-        }
-        let memory_bytes = self.supervisor.graph_children_debt(self.graph)?;
-        tracing::warn!(
-            public_query_id = %self.graph.public_query_id,
-            datafusion_query_id = %self.graph.datafusion_query_id,
-            memory_bytes,
-            "Oracle analytical graph did not drain before its follower release"
-        );
-        Err(BifrostError::Internal {
-            detail: "Oracle analytical graph cleanup did not complete".to_owned(),
-        })
     }
 }
 
@@ -1314,12 +1268,12 @@ pub struct AnalyticalStageIngressConfig {
     pub authority: Arc<dyn OracleStageAuthority>,
     /// Node-local supervisor owning graphs, attempts, and the runtime registry.
     pub supervisor: Arc<AnalyticalSupervisor>,
-    /// Reservation owner this follower activates graph leases from.
+    /// Grant owner this follower activates graph leases from.
     ///
-    /// The same registry the fragment path reserves against. A graph does not
-    /// get its own capacity book: it takes the envelope the leader already
-    /// reserved on this node, which is what makes a follower's charge for a
-    /// distributed plan the one the leader was told it would be.
+    /// A graph does not get its own capacity book: it takes the envelope the
+    /// leader's open grant stream already charged on this node, which is what
+    /// makes a follower's charge for a distributed plan the one the leader was
+    /// told it would be, and what lets that stream's end end the graph.
     pub reservations: Arc<ReservationRegistry>,
     /// Capability every Analytical leaf decoded on this node resolves through.
     pub leaf: super::codec::AnalyticalLeafBinding,
@@ -1353,7 +1307,8 @@ pub struct AnalyticalStageIngress {
     authority: Arc<dyn OracleStageAuthority>,
     /// Node-local supervisor owning graphs, attempts, and the runtime registry.
     supervisor: Arc<AnalyticalSupervisor>,
-    /// Reservation owner this follower activates graph leases from.
+    /// Grant owner this follower activates graph leases from and whose
+    /// stream closes the settlement driver watches.
     reservations: Arc<ReservationRegistry>,
     /// Capability an Analytical leaf needs to resolve its own source locally.
     ///
@@ -1423,7 +1378,10 @@ impl AnalyticalExecutePause {
     }
 
     /// Holds only the first `ExecuteTask` and lets every later one proceed.
-    async fn hold(&self) {
+    ///
+    /// The held task also continues once `graph_cancel` fires, so a graph
+    /// cancelled or expired while held settles exactly as it would unpaused.
+    async fn hold(&self, graph_cancel: &CancellationToken) {
         if self
             .claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1433,7 +1391,10 @@ impl AnalyticalExecutePause {
         }
         self.paused.notify_waiters();
         while !self.released.load(Ordering::Acquire) {
-            self.release.notified().await;
+            tokio::select! {
+                () = self.release.notified() => {}
+                () = graph_cancel.cancelled() => return,
+            }
         }
     }
 }
@@ -1449,12 +1410,13 @@ impl fmt::Debug for AnalyticalStageIngress {
 }
 
 impl AnalyticalStageIngress {
-    /// Settles every graph this node must release, and cancels each at its deadline.
+    /// Settles every graph this node must release, and cancels each at its
+    /// deadline or when its leader's grant stream ends.
     ///
-    /// The single asynchronous owner of follower settlement. It has three reasons
+    /// The single asynchronous owner of follower settlement. It has four reasons
     /// to wake — a command on its bounded queue, the earliest signed graph deadline
-    /// coming due, and the completion of a settlement it already owns — and it
-    /// serves all three from one task. The settlements it owns run concurrently in
+    /// coming due, a leader grant stream ending, and the completion of a
+    /// settlement it already owns — and it serves all four from one task. The settlements it owns run concurrently in
     /// one driver-local `FuturesUnordered`, so a graph whose cleanup drains slowly
     /// cannot stop the driver from cancelling a different graph on time; they are
     /// still this task's own futures, so nothing is detached and shutdown's join is
@@ -1467,6 +1429,7 @@ impl AnalyticalStageIngress {
     async fn drive_graph_settlements(
         mut commands: mpsc::Receiver<GraphSettlementCommand>,
         ingress: Weak<Self>,
+        grant_closed: Arc<tokio::sync::Notify>,
     ) {
         let mut settling = futures_util::stream::FuturesUnordered::new();
         let mut queue_closed = false;
@@ -1525,6 +1488,8 @@ impl AnalyticalStageIngress {
                         .expect("the timer branch is enabled only when a deadline exists")
                         .await;
                 }, if timer.is_some() => {}
+                // A closed grant is found by the rescan at the top of the loop.
+                () = grant_closed.notified(), if !queue_closed => {}
             }
         }
     }
@@ -1570,9 +1535,14 @@ impl AnalyticalStageIngress {
                 .saturating_mul(2)
                 .max(1),
         );
+        let grant_closed = reservations.grant_closed();
         Arc::new_cyclic(|weak: &Weak<Self>| {
             let driver = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                Some(handle.spawn(Self::drive_graph_settlements(receiver, Weak::clone(weak))))
+                Some(handle.spawn(Self::drive_graph_settlements(
+                    receiver,
+                    Weak::clone(weak),
+                    grant_closed,
+                )))
             } else {
                 tracing::warn!(
                     "Oracle analytical follower ingress was built outside a runtime; \
@@ -1697,7 +1667,7 @@ impl AnalyticalStageIngress {
         // Before anything is decoded, cached, resolved, or read: either this
         // message activates the graph under one serialized transaction, or the
         // graph's already-fixed authority accepts it unchanged.
-        let lease = self.activate_or_reuse(key.graph(), &request, &authorized, now)?;
+        let lease = self.activate_or_reuse(key.graph(), &request, &authorized)?;
         // Recorded from the verified claims, after the graph accepted them, so a
         // stage that this node runs in the middle of a deeper graph can sign its
         // own outbound pulls with exactly the authority it was granted.
@@ -1727,7 +1697,7 @@ impl AnalyticalStageIngress {
                     .ok()
                     .and_then(|pause| pause.as_ref().map(Arc::clone))
                 {
-                    pause.hold().await;
+                    pause.hold(&lease.cancel).await;
                 }
             }
         }
@@ -1750,8 +1720,9 @@ impl AnalyticalStageIngress {
     /// regardless of arrival order: a concurrent duplicate either finds the
     /// published lease or waits for the mutex and then finds it. Nothing is
     /// published until the runtime, the supervisor registration, and the lease
-    /// itself have all succeeded; any failure hands the reservation back under
-    /// its own unchanged expiry, so a serialized waiter may still activate it.
+    /// itself have all succeeded; any failure hands the envelope back to its
+    /// grant while the leader's stream is still open, so a serialized waiter
+    /// may still activate it.
     ///
     /// # Errors
     ///
@@ -1765,7 +1736,6 @@ impl AnalyticalStageIngress {
         graph: AnalyticalGraphKey,
         request: &GraphLeaseRequest,
         authorized: &AuthorizedStage,
-        now: DateTime<Utc>,
     ) -> Result<Arc<GraphLease>, BifrostError> {
         let mut graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
         match graphs.get(&graph) {
@@ -1783,12 +1753,12 @@ impl AnalyticalStageIngress {
         }
         let activation = self
             .reservations
-            .begin_graph_activation(request, now)
+            .begin_graph_activation(request)
             .map_err(|_| BifrostError::QueryAdmissionRejected)?;
         let lease = match self.publish(graph, activation, request, authorized) {
             Ok(lease) => lease,
             Err((activation, error)) => {
-                activation.rollback(now);
+                activation.rollback();
                 return Err(error);
             }
         };
@@ -1831,7 +1801,7 @@ impl AnalyticalStageIngress {
     /// Returns the untouched activation with the failure that stopped it.
     // justification: the error half must carry the rollback-owning
     // `PendingGraphActivation` back beside the failure that stopped it, so the
-    // caller can hand the reservation back under its own unchanged expiry. A
+    // caller can hand the envelope back to its still-open grant. A
     // one-use alias would only rename that pair, not simplify it.
     #[allow(clippy::type_complexity)]
     fn publish(
@@ -1849,6 +1819,7 @@ impl AnalyticalStageIngress {
             return Err((Box::new(activation), error));
         }
         let runtime = activation.envelope().execution().clone();
+        let grant_closed = activation.closed();
         let supervisor = Arc::clone(&self.supervisor);
         let registered = runtime.clone();
         let guard = activation
@@ -1866,6 +1837,7 @@ impl AnalyticalStageIngress {
                 Ok(Some(cancel)) => cancel,
                 Ok(None) | Err(_) => self.supervisor.root_cancellation().child_token(),
             },
+            grant_closed,
             attempts: Mutex::new(HashMap::new()),
             settled: AtomicBool::new(false),
             // The supervisor's, not a fresh one: a leader session composed for
@@ -2112,8 +2084,8 @@ impl AnalyticalStageIngress {
         })
     }
 
-    /// Moves every graph past its signed deadline to draining, and reports the
-    /// next deadline still to watch.
+    /// Moves every graph past its signed deadline, or whose leader grant stream
+    /// has ended, to draining, and reports the next deadline still to watch.
     ///
     /// One pass under one lock so the settlements the driver takes and the
     /// timer it then waits on describe the same instant. The returned
@@ -2137,7 +2109,9 @@ impl AnalyticalStageIngress {
             .iter()
             .filter_map(|(graph, entry)| match entry {
                 AnalyticalGraphEntry::Active { lease, .. } => {
-                    (lease.binding().absolute_deadline_ms() <= now_ms).then_some(*graph)
+                    (lease.binding().absolute_deadline_ms() <= now_ms
+                        || lease.grant_closed.is_cancelled())
+                    .then_some(*graph)
                 }
                 AnalyticalGraphEntry::Draining { .. } => None,
             })
@@ -2279,151 +2253,26 @@ impl AnalyticalStageIngress {
     }
 }
 
-/// Leader-side ownership of every participant reservation one attempt took.
+/// Leader-side ownership of every participant grant one attempt holds.
 ///
-/// The leader reserves a whole query envelope on each participant before it
-/// freezes the cut, and a plan does not necessarily reach every participant it
-/// froze. Something must therefore return the reservations the plan never used,
-/// or a follower holds an envelope until the reservation's own expiry — long
-/// enough for the node to refuse real work and for a shutdown to report
-/// retained resource state.
-///
-/// Releasing is idempotent: a participant that already leased its reservation
-/// into graph ownership no longer holds the pending entry and answers
-/// successfully, so this returns exactly the unused reservations without
-/// needing to know which ones the plan reached.
-pub struct AnalyticalParticipantReservations {
-    /// Directory the reservations were taken through, cleared once released.
-    transports: Option<Arc<super::dispatcher::OraclePeerTransportDirectory>>,
-    /// Every accepted reservation and the exact release it needs.
-    releases: Vec<AnalyticalRetainedRelease>,
+/// A follower holds its graph grant exactly as long as the admit stream this
+/// leader opened stays open, so this owner *is* the grants: dropping it closes
+/// every stream, and each follower releases its slot, query runtime, and spill
+/// directory and cancels any graph it built on the grant. Nothing needs an
+/// acknowledgement and nothing waits for an expiry.
+#[derive(Default)]
+pub struct AnalyticalParticipantGrants {
+    /// Every grant a participant accepted for this attempt.
+    grants: Vec<super::dispatcher::ParticipantGrant>,
 }
 
-/// One accepted reservation the leader must return, and the bound it expires under.
-///
-/// The follower's own `expires_at` travels with the release because a release
-/// whose acknowledgement never arrived is not evidence the follower dropped the
-/// reservation. Only the follower's stated expiry proves that, and only once
-/// the leader has also watched a full pending TTL elapse on its own monotonic
-/// clock — a leader whose wall clock runs ahead of the follower's would
-/// otherwise declare the envelope free while the follower still holds it.
-struct AnalyticalRetainedRelease {
-    /// Participant the reservation was accepted by.
-    candidate: super::dispatcher::DispatchCandidate,
-    /// Exact idempotent release this reservation needs.
-    request: wyrd_spec::vala::api::ReleaseNodeSlotsRequest,
-    /// Wall-clock expiry the follower minted the pending reservation with.
-    expires_at: DateTime<Utc>,
-    /// Local monotonic instant the reserve response was received at.
-    received: tokio::time::Instant,
-}
-
-impl AnalyticalRetainedRelease {
-    /// Reports whether the follower must already have dropped this reservation.
-    ///
-    /// Both clocks must agree: the follower-stated wall-clock expiry has passed
-    /// *and* a full [`super::dispatcher::PENDING_TTL`] has elapsed locally since
-    /// the response was received. Requiring the later of the two is what keeps a
-    /// leader with a fast clock from forgetting an envelope a follower still owns.
-    fn conservatively_expired(&self) -> bool {
-        Utc::now() >= self.expires_at
-            && super::dispatcher::PENDING_TTL
-                .to_std()
-                .is_ok_and(|ttl| self.received.elapsed() >= ttl)
-    }
-}
-
-impl fmt::Debug for AnalyticalParticipantReservations {
-    /// Reports how many reservations are outstanding without rendering them.
+impl fmt::Debug for AnalyticalParticipantGrants {
+    /// Reports how many grants are held without rendering them.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("AnalyticalParticipantReservations")
-            .field("outstanding", &self.releases.len())
-            .finish_non_exhaustive()
-    }
-}
-
-impl AnalyticalParticipantReservations {
-    /// Returns the owner an attempt that reserved nothing still holds.
-    const fn empty() -> Self {
-        Self {
-            transports: None,
-            releases: Vec::new(),
-        }
-    }
-
-    /// Returns every reserved participant to its owner, exactly once.
-    ///
-    /// A per-participant failure is not propagated: the attempt is already
-    /// ending, and failing the terminal because one peer was unreachable would
-    /// turn a completed query into an error. It is not forgotten either — the
-    /// unacknowledged records are returned so the graph's lifecycle task can
-    /// retain them until they are acknowledged or conservatively expire.
-    async fn release(&mut self, deadline: tokio::time::Instant) -> Vec<AnalyticalRetainedRelease> {
-        let Some(transports) = self.transports.take() else {
-            return Vec::new();
-        };
-        let mut retained = Vec::new();
-        for record in self.releases.drain(..) {
-            if !release_within(&transports, &record, deadline).await {
-                retained.push(record);
-            }
-        }
-        self.transports = Some(transports);
-        retained
-    }
-}
-
-/// Issues one release attempt under the graph's own bound, once.
-///
-/// A peer future that never resolves is indistinguishable from a peer that is
-/// merely slow, and awaiting it directly would park cleanup, settlement,
-/// conservative-expiry evaluation, and shutdown behind one unreachable node.
-/// Bounding every attempt by the earlier of the graph's absolute deadline and
-/// the retained-release cadence is what keeps the sequence itself finite, and a
-/// timeout is treated exactly like an unacknowledged release: the record stays
-/// retained until it is acknowledged or conservatively expires.
-///
-/// Returns whether the participant acknowledged. Once the graph deadline has
-/// elapsed this issues no RPC at all and reports the release as unacknowledged,
-/// because the envelope's own bound is the last moment this graph may address a
-/// peer.
-async fn release_within(
-    transports: &super::dispatcher::OraclePeerTransportDirectory,
-    record: &AnalyticalRetainedRelease,
-    deadline: tokio::time::Instant,
-) -> bool {
-    let now = tokio::time::Instant::now();
-    if now >= deadline {
-        tracing::warn!(
-            node_id = %record.candidate.node_id.as_uuid(),
-            "Oracle analytical leader passed its deadline before releasing a reservation"
-        );
-        return false;
-    }
-    let bound = deadline.min(now + RETAINED_RELEASE_RETRY);
-    match tokio::time::timeout_at(
-        bound,
-        transports.release_graph_reservation(&record.candidate, record.request.clone()),
-    )
-    .await
-    {
-        Ok(Ok(())) => true,
-        Ok(Err(error)) => {
-            tracing::warn!(
-                error = ?error,
-                node_id = %record.candidate.node_id.as_uuid(),
-                "Oracle analytical leader could not release a participant reservation"
-            );
-            false
-        }
-        Err(_) => {
-            tracing::warn!(
-                node_id = %record.candidate.node_id.as_uuid(),
-                "Oracle analytical leader's participant release did not answer in time"
-            );
-            false
-        }
+            .debug_struct("AnalyticalParticipantGrants")
+            .field("held", &self.grants.len())
+            .finish()
     }
 }
 
@@ -2642,17 +2491,18 @@ impl Drop for AnalyticalGraphSignals {
 
 /// The task-side half of one graph's lifecycle, owning every reservation it takes.
 ///
-/// Reservation is graph-wide and bulk, and it outlives the attempt that asked
-/// for it: a release whose acknowledgement never arrived has to be retried
-/// after the query has already failed. Keeping that follow-up on this one task
-/// is what avoids a detached timer, a second reservation registry, or a status
-/// RPC.
+/// Reservation is graph-wide and bulk: [`Self::reserve`] admits every remote
+/// participant and returns their grant streams as
+/// [`AnalyticalParticipantGrants`], which this task holds until
+/// [`Self::settle`]. Dropping those grants there is the leader-side release;
+/// each follower observes its stream close and settles its own graph
+/// asynchronously, and the leader never waits for that.
 pub(super) struct AnalyticalGraphLifecycle {
-    /// The graph every reservation and retained release belongs to.
+    /// The graph every reservation belongs to.
     graph: AnalyticalGraphKey,
     /// Supervisor the retained-cleanup state is made visible through.
     supervisor: Arc<AnalyticalSupervisor>,
-    /// Directory every reserve and release is issued through.
+    /// Directory participant reservation and admission are issued through.
     transports: Option<Arc<super::dispatcher::OraclePeerTransportDirectory>>,
     /// Frozen remote participants, already excluding this coordinator.
     remote: Vec<(Url, super::dispatcher::DispatchCandidate)>,
@@ -2679,22 +2529,10 @@ pub(super) struct AnalyticalGraphLifecycle {
     deadline: tokio::time::Instant,
 }
 
-/// How often a retained release is retried while it is neither acknowledged nor expired.
-///
-/// A quarter of the pending TTL, so a follower that becomes reachable again is
-/// acknowledged well inside the window rather than only at its end.
-const RETAINED_RELEASE_RETRY: std::time::Duration = std::time::Duration::from_millis(500);
-
-/// Detail one graph records while a participant release stays unacknowledged.
-///
-/// Shared by the drain that first observes it and by the settlement that fails
-/// the query on it, so the residue a node reports and the failure its caller
-/// receives name the same condition.
 /// Detail one graph records when its physical metric fold outlives the deadline.
 ///
-/// Named alongside the reservation detail because both describe the same class
-/// of end: the deadline arrived before this node could confirm what a peer did,
-/// so the graph is retained rather than reported clean.
+/// The deadline arrived before this node could confirm what a peer did, so the
+/// graph is retained rather than reported clean.
 const METRIC_FOLD_EXPIRED: &str =
     "Oracle analytical distributed metrics did not settle before the graph deadline";
 
@@ -2705,9 +2543,6 @@ const METRIC_FOLD_EXPIRED: &str =
 /// says the dependency could not build the metric-carrying plan at all. Both
 /// retain the graph; only this one names an error the dependency reported.
 const METRIC_FOLD_REFUSED: &str = "Oracle analytical distributed metric rewrite failed";
-
-const RETAINED_RELEASE_UNACKNOWLEDGED: &str =
-    "Oracle analytical participant release was not acknowledged";
 
 impl AnalyticalGraphLifecycle {
     /// Starts one graph's lifecycle task and returns its attempt-side half.
@@ -2771,10 +2606,9 @@ impl AnalyticalGraphLifecycle {
     /// Runs the graph's whole reservation and cleanup lifecycle.
     ///
     /// Ends when the attempt signals its terminal or drops the control channel,
-    /// and then only after every accepted reservation has been returned or has
-    /// conservatively expired.
+    /// and then only after every participant grant has been dropped.
     async fn run(mut self) {
-        let mut reservations = AnalyticalParticipantReservations::empty();
+        let mut grants = AnalyticalParticipantGrants::default();
         let mut requested = false;
         let outcome = loop {
             if self.control.changed().await.is_err() {
@@ -2790,25 +2624,20 @@ impl AnalyticalGraphLifecycle {
                         continue;
                     }
                     requested = true;
-                    match self.reserve().await {
-                        Ok(taken) => {
-                            reservations = taken;
-                            let _ = self.result.send(AnalyticalGraphResult::ReservationReady);
-                        }
-                        Err(taken) => {
-                            reservations = taken;
-                            let _ = self.result.send(AnalyticalGraphResult::ReservationFailed);
-                            // A refused reservation is itself the terminal: no
-                            // dispatch can follow it, so nothing is gained by
-                            // waiting for a caller to say so.
-                            break AnalyticalAttemptOutcome::Failed;
-                        }
-                    }
+                    let Some(taken) = self.reserve().await else {
+                        let _ = self.result.send(AnalyticalGraphResult::ReservationFailed);
+                        // A refused reservation is itself the terminal: no
+                        // dispatch can follow it, so nothing is gained by
+                        // waiting for a caller to say so.
+                        break AnalyticalAttemptOutcome::Failed;
+                    };
+                    grants = taken;
+                    let _ = self.result.send(AnalyticalGraphResult::ReservationReady);
                 }
                 AnalyticalGraphControl::Terminal(outcome) => break outcome,
             }
         };
-        self.settle(outcome, reservations).await;
+        self.settle(outcome, grants).await;
     }
 
     /// Folds this graph's retained physical metrics inside its own deadline.
@@ -2863,15 +2692,16 @@ impl AnalyticalGraphLifecycle {
     /// The order is the invariant, and this is the only place it exists: move
     /// the graph out of `Active` so nothing new is admitted, cancel unless the
     /// graph succeeded, join the attempt and every descendant it retained,
-    /// return every participant reservation, wait for the envelope's own nested
-    /// children to go idle, release the graph, and only then release the
-    /// admission owner. Cleanup that cannot be confirmed leaves every
+    /// drop every participant grant, release the graph, and only then release
+    /// the admission owner. Dropping a grant closes its stream, which is the
+    /// release each follower acts on asynchronously when it frees its own
+    /// graph; nothing here waits for that. Cleanup that cannot be confirmed leaves every
     /// unresolved owner in the `Draining` entry and publishes a failure, so a
     /// success terminal is unreachable and readiness stays false.
     async fn settle(
         mut self,
         outcome: AnalyticalAttemptOutcome,
-        mut reservations: AnalyticalParticipantReservations,
+        grants: AnalyticalParticipantGrants,
     ) {
         let _ = self.supervisor.signal_terminal(self.graph, outcome);
         if outcome != AnalyticalAttemptOutcome::Success
@@ -2904,29 +2734,27 @@ impl AnalyticalGraphLifecycle {
         // polling it: upstream keeps a reader task, and the buffers it charges
         // to this query's pool, alive until every partition stream it handed
         // out is dropped. Closing the graph's own exchange registry is what
-        // drops them, and it has to happen before the envelope's children are
-        // waited on or the wait would be for bytes nothing will release.
+        // drops them.
         if let Ok(Some(exchanges)) = self.supervisor.graph_exchanges(self.graph) {
             exchanges.close();
         }
-        let retained = reservations.release(self.deadline).await;
-        // A cleanup failure that is not the reservation ambiguity retains this
-        // graph however the follower answers, so only an otherwise-clean
-        // settlement has anything to gain from following the records up.
-        let otherwise_clean = failure.is_none();
-        let unresolved = self.drain(retained).await;
-        if failure.is_none() && !unresolved.is_empty() {
-            failure = Some(RETAINED_RELEASE_UNACKNOWLEDGED.to_owned());
-        }
+        // Closing every admit stream is the release: each follower drops its
+        // grant and cancels whatever it built on it.
+        drop(grants);
         let mut running_query = None;
         if failure.is_none() {
-            match self.release_graph().await {
+            #[cfg(feature = "test-support")]
+            analytical_cleanup_pause_for_test().hold().await;
+            // Removing the entry drops the envelope and only then the
+            // admission permit it retained, so the counters that wake the next
+            // query are returned last.
+            match self.supervisor.release_graph(self.graph) {
                 Ok(owner) => running_query = owner,
                 Err(error) => failure = Some(error.to_string()),
             }
         }
-        // Retired only here, after every attempt, exchange, participant,
-        // runtime, and admission owner joined: the public entry
+        // Retired only here, after every attempt, exchange, runtime, and
+        // admission owner joined and every participant grant closed: the public entry
         // describes the graph, so it outlives the stream that signalled it.
         if let Some(mut owner) = running_query {
             owner.finish(if outcome == AnalyticalAttemptOutcome::Success {
@@ -2955,148 +2783,49 @@ impl AnalyticalGraphLifecycle {
                 let _ = self.result.send(AnalyticalGraphResult::SettledFailure);
             }
         }
-        if otherwise_clean && !unresolved.is_empty() {
-            self.expire(unresolved).await;
-        }
     }
 
-    /// Holds a post-deadline reservation until it must have expired remotely.
-    ///
-    /// The deadline ends this node's right to *address* a participant, not its
-    /// ownership of what it took: until every record is authoritatively expired
-    /// this node cannot say whether a follower still holds an envelope on its
-    /// behalf, and the graph stays `Draining` for exactly that reason. So the
-    /// caller has already been failed and no further RPC is issued; only the
-    /// local two-clock predicate is re-evaluated, at the same retry cadence.
-    ///
-    /// Returns early once the supervisor stops accepting, because shutdown is
-    /// joining this task and a record that has not expired yet is residue it
-    /// must report rather than a wait it should serve. When every record does
-    /// expire, the graph, its envelope, and the admission permit it retained
-    /// are released together; a refusal there is recorded and leaves the entry
-    /// standing, exactly as the settlement sequence would.
-    async fn expire(&mut self, mut retained: Vec<AnalyticalRetainedRelease>) {
-        while !retained.is_empty() {
-            if !self.supervisor.is_healthy() {
-                return;
-            }
-            tokio::time::sleep(RETAINED_RELEASE_RETRY).await;
-            retained.retain(|record| !record.conservatively_expired());
-        }
-        // Released directly rather than through the deadline-bound wait: that
-        // wait exists to hold an ordinary settlement inside the deadline, and
-        // this one is past it by construction. The supervisor's own refusal
-        // still covers a graph whose envelope a child has not returned.
-        if let Err(error) = self.supervisor.release_graph(self.graph) {
-            tracing::error!(
-                public_query_id = %self.graph.public_query_id,
-                error = %error,
-                "Oracle analytical graph could not be released after its reservations expired"
-            );
-            self.supervisor
-                .retain_graph_cleanup(self.graph, error.to_string());
-        }
-    }
-
-    /// Waits, bounded, for the envelope's children and then releases the graph.
-    ///
-    /// Two bounds apply and the earlier one wins: the poll count, and the
-    /// graph's own absolute deadline. The deadline is checked *before* the
-    /// children are, because it is the bound the caller was promised and
-    /// idleness is not: a wait that ran past the deadline has already overrun
-    /// it, so finding the children idle at that point cannot turn the overrun
-    /// into a success. Only the post-deadline conservative-expiry path may
-    /// remove such a graph.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::Internal`] when the graph deadline arrives first
-    /// or a nested child of the query envelope is still live after the poll
-    /// count, and the supervisor's refusal when the graph itself cannot be
-    /// released.
-    async fn release_graph(
-        &mut self,
-    ) -> Result<Option<super::query_stream::RunningQueryTerminalOwner>, BifrostError> {
-        for _ in 0..GRAPH_DRAIN_POLLS {
-            let now = tokio::time::Instant::now();
-            if now >= self.deadline {
-                break;
-            }
-            if self.supervisor.graph_children_idle(self.graph)? {
-                #[cfg(feature = "test-support")]
-                analytical_cleanup_pause_for_test().hold().await;
-                // Removing the entry drops the envelope and only then the
-                // admission permit it retained, so the counters that wake the
-                // next query are returned last.
-                return self.supervisor.release_graph(self.graph);
-            }
-            tokio::time::sleep_until(self.deadline.min(now + GRAPH_DRAIN_INTERVAL)).await;
-        }
-        let memory_bytes = self.supervisor.graph_children_debt(self.graph)?;
-        tracing::warn!(
-            public_query_id = %self.graph.public_query_id,
-            datafusion_query_id = %self.graph.datafusion_query_id,
-            memory_bytes,
-            "Oracle analytical leader graph was not confirmed drained within its deadline"
-        );
-        Err(BifrostError::Internal {
-            detail: "Oracle analytical graph cleanup did not complete".to_owned(),
-        })
-    }
-
-    /// Reserves every remote participant and publishes the complete cut once.
+    /// Admits every remote participant and publishes the complete cut once.
     ///
     /// The cell is set only after the last participant has accepted and the
-    /// destination map has been frozen with the follower-minted reservation
+    /// destination map has been frozen with the follower-minted grant
     /// identities, so a partial cut is never observable and no dispatch can
     /// address a participant that has not agreed to hold the envelope.
     ///
-    /// A participant that explicitly refuses before accepting work ends the
-    /// round: every reservation the round took is released, and once every
-    /// release is acknowledged the leader waits for the refusal's retry hint
-    /// within the graph's deadline and cancellation (see
-    /// [`super::dispatcher::wait_for_peer_capacity`]) and places the graph
+    /// A participant that refuses ends the round: every grant the round took is
+    /// dropped at once, the leader waits for the refusal's retry hint within
+    /// the graph's deadline and cancellation (see
+    /// [`super::dispatcher::wait_for_peer_capacity`]), and places the graph
     /// again. Only this leader retries; a participant never waits for it.
     ///
-    /// # Errors
-    ///
-    /// Returns the accepted-reservation owner unchanged when a participant
-    /// failed ambiguously, a refusal could not be retried within the deadline
-    /// or cancellation, a round's releases were not all acknowledged, or the
-    /// cut could not be frozen, so the caller releases exactly what was taken.
-    async fn reserve(
-        &self,
-    ) -> Result<AnalyticalParticipantReservations, AnalyticalParticipantReservations> {
+    /// Returns `None` when a participant failed ambiguously, a refusal could
+    /// not be retried within the deadline or cancellation, or the cut could
+    /// not be frozen. Every grant taken is already dropped by then.
+    async fn reserve(&self) -> Option<AnalyticalParticipantGrants> {
         if self.remote.is_empty() {
             let _ = self.participants.set(Arc::new(
                 AnalyticalParticipantCut::freeze(HashMap::new())
                     .unwrap_or_else(|_| unreachable!("an empty cut always freezes")),
             ));
-            return Ok(AnalyticalParticipantReservations::empty());
+            return Some(AnalyticalParticipantGrants::default());
         }
         let Some(transports) = self.transports.as_ref() else {
             tracing::error!(
                 "Oracle analytical leader has no peer transport to reserve participants through"
             );
-            return Err(AnalyticalParticipantReservations::empty());
+            return None;
         };
         loop {
-            // Held from the first acceptance, so a later participant's refusal
-            // still returns everything already taken rather than stranding the
-            // peers that said yes.
-            let mut reserved = AnalyticalParticipantReservations {
-                transports: Some(Arc::clone(transports)),
-                releases: Vec::with_capacity(self.remote.len()),
+            let mut grants = AnalyticalParticipantGrants {
+                grants: Vec::with_capacity(self.remote.len()),
             };
-            let destinations = match self.reserve_round(transports, &mut reserved).await {
+            let destinations = match self.reserve_round(transports, &mut grants).await {
                 Ok(destinations) => destinations,
-                Err(None) => return Err(reserved),
+                Err(None) => return None,
                 Err(Some(rejected)) => {
-                    let unacknowledged = reserved.release(self.deadline).await;
-                    if !unacknowledged.is_empty() {
-                        reserved.releases = unacknowledged;
-                        return Err(reserved);
-                    }
+                    // Dropped before waiting, so no peer holds capacity for a
+                    // round that will not run.
+                    drop(grants);
                     if super::dispatcher::wait_for_peer_capacity(
                         rejected,
                         self.deadline,
@@ -3109,7 +2838,7 @@ impl AnalyticalGraphLifecycle {
                     tracing::warn!(
                         "Oracle analytical graph stopped retrying participant capacity at its deadline or cancellation"
                     );
-                    return Err(reserved);
+                    return None;
                 }
             };
             let cut = match AnalyticalParticipantCut::freeze(destinations) {
@@ -3119,47 +2848,46 @@ impl AnalyticalGraphLifecycle {
                         error = %error,
                         "Oracle analytical leader could not freeze its participant cut"
                     );
-                    return Err(reserved);
+                    return None;
                 }
             };
             let _ = self.participants.set(Arc::new(cut));
-            return Ok(reserved);
+            return Some(grants);
         }
     }
 
-    /// Reserves every remote participant once, recording each acceptance.
+    /// Admits every remote participant once, recording each grant.
     ///
-    /// Every accepted reservation is pushed onto `reserved` as it arrives, so
-    /// whatever ends the round, the caller holds exactly what was taken.
+    /// Every accepted grant is pushed onto `grants` as it arrives, so whatever
+    /// ends the round, the caller holds exactly what was taken and dropping it
+    /// releases all of it.
     ///
     /// # Errors
     ///
-    /// Returns `Err(Some(rejected))` when a participant explicitly refused
-    /// before accepting work, carrying its retry hint, and `Err(None)` for
-    /// cancellation, deadline expiry, or any transport or contract failure,
-    /// none of which is retried as capacity.
+    /// Returns `Err(Some(rejected))` when a participant refused at stream
+    /// accept, carrying its retry hint, and `Err(None)` for cancellation,
+    /// deadline expiry, or any transport or contract failure, none of which is
+    /// retried as capacity.
     async fn reserve_round(
         &self,
         transports: &super::dispatcher::OraclePeerTransportDirectory,
-        reserved: &mut AnalyticalParticipantReservations,
+        grants: &mut AnalyticalParticipantGrants,
     ) -> Result<
         HashMap<Url, AnalyticalDestination>,
         Option<wyrd_spec::vala::api::ReservationRejected>,
     > {
         let mut destinations = HashMap::with_capacity(self.remote.len());
         for (url, candidate) in &self.remote {
-            // Bounded on both edges: the graph's cancellation ends reservation
+            // Bounded on both edges: the graph's cancellation ends admission
             // the moment the attempt is gone, and the envelope's own absolute
-            // deadline ends it when a participant simply never answers. Either
-            // is the existing reservation-failed path, and `reserved` already
-            // carries every acceptance so far, so nothing taken is stranded.
-            let pending = tokio::select! {
+            // deadline ends it when a participant never answers.
+            let grant = tokio::select! {
                 biased;
                 () = self.cancel.cancelled() => {
                     tracing::warn!(
                         node_id = ?candidate.node_id,
                         url = %url,
-                        "Oracle analytical graph was cancelled while reserving a participant"
+                        "Oracle analytical graph was cancelled while admitting a participant"
                     );
                     return Err(None);
                 }
@@ -3167,13 +2895,13 @@ impl AnalyticalGraphLifecycle {
                     self.deadline,
                     transports.reserve_graph(candidate, self.request.clone()),
                 ) => match answered {
-                    Ok(Ok(Ok(pending))) => pending,
+                    Ok(Ok(Ok(grant))) => grant,
                     Ok(Ok(Err(rejected))) => {
                         tracing::info!(
                             node_id = ?candidate.node_id,
                             url = %url,
                             retry_after_ms = rejected.retry_after_ms,
-                            "Oracle analytical participant refused a graph reservation before accepting work"
+                            "Oracle analytical participant refused a graph grant at stream accept"
                         );
                         return Err(Some(rejected));
                     }
@@ -3182,7 +2910,7 @@ impl AnalyticalGraphLifecycle {
                             node_id = ?candidate.node_id,
                             url = %url,
                             error = %error,
-                            "Oracle analytical participant failed a graph reservation"
+                            "Oracle analytical participant failed a graph grant"
                         );
                         return Err(None);
                     }
@@ -3190,84 +2918,23 @@ impl AnalyticalGraphLifecycle {
                         tracing::warn!(
                             node_id = ?candidate.node_id,
                             url = %url,
-                            "Oracle analytical participant did not answer a reservation in time"
+                            "Oracle analytical participant did not answer a graph grant in time"
                         );
                         return Err(None);
                     }
                 },
             };
-            reserved.releases.push(AnalyticalRetainedRelease {
-                candidate: candidate.clone(),
-                request: wyrd_spec::vala::api::ReleaseNodeSlotsRequest {
-                    reservation_id: pending.reservation_id,
-                    query_id: self.request.query_id,
-                    leader_node_id: self.request.leader_node_id,
-                    leader_fencing_token: self.request.leader_fencing_token,
-                },
-                expires_at: pending.expires_at,
-                received: tokio::time::Instant::now(),
-            });
             destinations.insert(
                 url.clone(),
                 AnalyticalDestination {
                     node_id: candidate.node_id,
                     fence: candidate.worker_fence,
-                    reservation_id: pending.reservation_id.as_uuid().to_string(),
+                    reservation_id: grant.reservation_id().as_uuid().to_string(),
                 },
             );
+            grants.grants.push(grant);
         }
         Ok(destinations)
-    }
-
-    /// Retains every unacknowledged release until it resolves, expires, or the
-    /// graph's own deadline ends this node's right to address a peer.
-    ///
-    /// The graph stays supervisor-visible as draining for exactly as long as
-    /// this runs, because until every record resolves this node cannot say
-    /// whether a follower is still holding an envelope on its behalf.
-    ///
-    /// Returns the records still unresolved at the graph deadline, empty when
-    /// every one of them resolved. Retrying past that deadline would be an
-    /// unbounded wait on an unreachable peer, so the remote calls stop there
-    /// and the entry stays `Draining`; the returned records are what the
-    /// lifecycle task then expires locally.
-    async fn drain(
-        &self,
-        mut retained: Vec<AnalyticalRetainedRelease>,
-    ) -> Vec<AnalyticalRetainedRelease> {
-        if retained.is_empty() {
-            return Vec::new();
-        }
-        let _ = self
-            .supervisor
-            .signal_terminal(self.graph, AnalyticalAttemptOutcome::Failed);
-        self.supervisor
-            .retain_graph_cleanup(self.graph, RETAINED_RELEASE_UNACKNOWLEDGED.to_owned());
-        while !retained.is_empty() {
-            let now = tokio::time::Instant::now();
-            if now >= self.deadline {
-                tracing::warn!(
-                    public_query_id = %self.graph.public_query_id,
-                    outstanding = retained.len(),
-                    "Oracle analytical leader reached its deadline holding participant reservations"
-                );
-                return retained;
-            }
-            tokio::time::sleep_until(self.deadline.min(now + RETAINED_RELEASE_RETRY)).await;
-            let mut remaining = Vec::with_capacity(retained.len());
-            for record in retained.drain(..) {
-                let acknowledged = match self.transports.as_ref() {
-                    Some(transports) => release_within(transports, &record, self.deadline).await,
-                    None => true,
-                };
-                if !acknowledged && !record.conservatively_expired() {
-                    remaining.push(record);
-                }
-            }
-            retained = remaining;
-        }
-        self.supervisor.resolve_graph_cleanup(self.graph);
-        Vec::new()
     }
 }
 
@@ -4086,8 +3753,10 @@ mod tests {
         leader_node_id: NodeId,
         /// The reserving leader's role fence.
         leader_fence: u64,
-        /// Reservation the leader took on this follower for the graph.
+        /// Grant the leader holds on this follower for the graph.
         reservation_id: ReservationId,
+        /// The follower-side grant, held open as the leader's stream would be.
+        grant: Option<super::super::dispatcher::HeldGraphGrant>,
         /// Immutable destination cut, which never names the leader.
         participants: Vec<super::super::peer::StageParticipantV1>,
         /// Absolute deadline every fixture message carries.
@@ -4147,8 +3816,8 @@ mod tests {
                     0.0,
                 ))
                 .expect("an idle Oracle admits one analytical query");
-            let reservation = reservations
-                .reserve(
+            let grant = reservations
+                .hold(
                     &ReserveNodeSlotsRequest {
                         query_id: QueryId::new(graph.public_query_id.as_uuid()),
                         leader_node_id,
@@ -4162,7 +3831,8 @@ mod tests {
                     now,
                     Box::new(resources),
                 )
-                .expect("an idle follower accepts one graph reservation");
+                .expect("an idle follower holds one graph grant");
+            let reservation = grant.reservation();
             // The cut names the middle-stage participants only. The reserving
             // leader is deliberately absent from it, which is what makes the two
             // source-authorization branches independently observable.
@@ -4192,6 +3862,7 @@ mod tests {
                 leader_node_id,
                 leader_fence,
                 reservation_id: reservation.reservation_id,
+                grant: Some(grant),
                 participants,
                 deadline_ms: deadline.timestamp_millis(),
             }
@@ -4205,12 +3876,16 @@ mod tests {
         ///
         /// # Panics
         ///
-        /// Panics when the follower cannot admit a second graph reservation.
+        /// Panics when the follower cannot admit a second graph grant.
         fn sibling(
             &self,
             now: DateTime<Utc>,
             deadline: DateTime<Utc>,
-        ) -> (AnalyticalGraphKey, StageMessage) {
+        ) -> (
+            AnalyticalGraphKey,
+            StageMessage,
+            super::super::dispatcher::HeldGraphGrant,
+        ) {
             let graph = AnalyticalGraphKey::new(
                 PublicQueryId::from_uuid(Uuid::from_u128(21)),
                 DataFusionQueryId::from_uuid(Uuid::from_u128(22)),
@@ -4221,9 +3896,9 @@ mod tests {
                     0.0,
                 ))
                 .expect("an idle Oracle admits one analytical query");
-            let reservation = self
+            let grant = self
                 .reservations
-                .reserve(
+                .hold(
                     &ReserveNodeSlotsRequest {
                         query_id: QueryId::new(graph.public_query_id.as_uuid()),
                         leader_node_id: self.leader_node_id,
@@ -4237,12 +3912,13 @@ mod tests {
                     now,
                     Box::new(resources),
                 )
-                .expect("an idle follower accepts a second graph reservation");
+                .expect("an idle follower holds a second graph grant");
+            let reservation = grant.reservation();
             let mut message = self.leader_message(StageOperationV1::ExecuteTask);
             message.graph = graph;
             message.reservation_id = reservation.reservation_id.as_uuid().to_string();
             message.absolute_deadline_ms = deadline.timestamp_millis();
-            (graph, message)
+            (graph, message, grant)
         }
 
         /// Composes this node's production Analytical handle over the fixture.
@@ -4477,7 +4153,7 @@ mod tests {
     )> {
         let now = Utc::now();
         let expires_at = now + chrono::Duration::seconds(60);
-        let transport = Arc::new(ReservingTransport::new(accepted, expires_at));
+        let transport = Arc::new(ReservingTransport::new(accepted));
         transport.lose_refused_peers();
         let directory = Arc::new(
             super::super::dispatcher::OraclePeerTransportDirectory::new_for_test(
@@ -4689,8 +4365,7 @@ mod tests {
         Box::pin(assert_first_terminal_alone_chooses_the_settlement()).await;
         Box::pin(assert_stream_drop_leaves_a_supervisor_owned_task()).await;
         Box::pin(assert_cleanup_failure_retains_draining_ownership()).await;
-        Box::pin(assert_release_stops_at_the_graph_deadline()).await;
-        Box::pin(assert_an_idle_graph_past_the_deadline_is_not_released()).await;
+        Box::pin(assert_an_idle_graph_past_the_deadline_is_released()).await;
     }
 
     /// Successful cleanup releases every owner once, then removes the graph.
@@ -4943,122 +4618,43 @@ mod tests {
         drop(admitted);
     }
 
-    /// A live envelope child at the deadline fails settlement then, not later.
+    /// An idle graph whose query ended by its deadline releases cleanly.
     ///
-    /// The wait for a graph's nested children is bounded twice: by its own poll
-    /// count and by the envelope's absolute deadline. Only the second is a
-    /// property of the query, so a child still live when the deadline arrives
-    /// has to end the sequence immediately rather than let terminal publication
-    /// run on past the bound the caller was promised.
+    /// A query that ends by its deadline begins cleanup at or after that
+    /// instant. Its children being idle is what makes the release safe, so the
+    /// deadline having passed cannot turn a clean cleanup into retained residue.
     ///
     /// # Panics
     ///
-    /// Panics when settlement outlives the graph deadline, reports success, or
-    /// releases a graph whose envelope a child still holds.
-    async fn assert_release_stops_at_the_graph_deadline() {
-        let fixture = GraphFixture::new(Utc::now());
-        let oracle = fixture_oracle_role();
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
-        let leased = lease_over_lossy_peers_until(&fixture, &oracle, 2, deadline);
-        let (admitted, ownership, _transport) = *leased;
-        ownership
-            .publish_participants()
-            .await
-            .expect("every addressed follower accepted its reservation");
-        let graph = ownership.key().graph();
-        // A nested child the settlement sequence cannot reach: the graph's own
-        // attempt is joined, but its envelope still holds child memory.
-        let runtime = fixture
-            .supervisor
-            .graph_runtime(graph)
-            .expect("the leased graph installed a query-owned runtime");
-        let stray = datafusion::execution::memory_pool::MemoryConsumer::new("stray-child")
-            .register(&runtime.runtime().memory_pool);
-        stray
-            .try_grow(4_096)
-            .expect("the admitted envelope funds one nested child");
-        let error = ownership
-            .settle(AnalyticalAttemptOutcome::Success)
-            .await
-            .expect_err("a live envelope child prevents a success terminal");
-        let overrun = tokio::time::Instant::now().saturating_duration_since(deadline);
-        assert!(
-            matches!(error, BifrostError::Internal { .. }),
-            "an undrained envelope is reported, not logged and ignored: {error:?}"
-        );
-        assert!(
-            overrun < Duration::from_secs(1),
-            "settlement ended at the graph deadline rather than at the drain poll count: {overrun:?}"
-        );
-        assert_eq!(
-            fixture
-                .supervisor
-                .live_graphs()
-                .expect("the supervisor reports live graphs"),
-            1,
-            "an undrained graph is retained rather than released"
-        );
-        assert_eq!(
-            fixture
-                .supervisor
-                .draining_graphs()
-                .expect("the supervisor reports retained cleanup"),
-            1,
-            "the retained graph is visible as draining"
-        );
-        drop(stray);
-        drop(admitted);
-    }
-
-    /// An idle graph reached only after the deadline is retained, not released.
-    ///
-    /// Idleness is not the bound. A cleanup that took until after the envelope's
-    /// absolute deadline has already overrun it, so finding the children idle at
-    /// that point cannot turn the overrun into a success: the graph is residue
-    /// the supervisor must keep observable, and only the post-deadline
-    /// conservative-expiry path may remove it.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a settlement that began after the deadline publishes success
-    /// or releases the graph, its envelope, and its admission.
-    async fn assert_an_idle_graph_past_the_deadline_is_not_released() {
+    /// Panics when the settlement fails or leaves the graph retained.
+    async fn assert_an_idle_graph_past_the_deadline_is_released() {
         let fixture = GraphFixture::new(Utc::now());
         let oracle = fixture_oracle_role();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
         // Nothing is ever reserved: the only owner this settlement has left to
-        // confirm is the envelope itself, and it is already idle.
+        // release is the envelope itself, and it is already idle.
         let leased = lease_over_lossy_peers_until(&fixture, &oracle, 0, deadline);
-        let (admitted, ownership, transport) = *leased;
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        let error = ownership
-            .settle(AnalyticalAttemptOutcome::Success)
+        let (admitted, ownership, _transport) = *leased;
+        tokio::time::sleep_until(deadline + Duration::from_millis(30)).await;
+        ownership
+            .settle(AnalyticalAttemptOutcome::Cancelled)
             .await
-            .expect_err("cleanup that began after the deadline cannot settle as a success");
-        assert!(
-            matches!(error, BifrostError::Internal { .. }),
-            "an overrun cleanup is reported, not logged and ignored: {error:?}"
-        );
-        assert_eq!(
-            transport.releases().len(),
-            0,
-            "a graph that reserved nothing releases nothing"
-        );
+            .expect("an idle graph releases after its deadline");
         assert_eq!(
             fixture
                 .supervisor
                 .live_graphs()
                 .expect("the supervisor reports live graphs"),
-            1,
-            "an overrun cleanup retains the graph rather than releasing it"
+            0,
+            "the released graph is removed"
         );
         assert_eq!(
             fixture
                 .supervisor
                 .draining_graphs()
                 .expect("the supervisor reports retained cleanup"),
-            1,
-            "the retained graph stays observable as draining"
+            0,
+            "nothing is retained, so readiness is unaffected"
         );
         drop(admitted);
     }
@@ -5186,23 +4782,19 @@ mod tests {
         );
     }
 
-    /// A graph is released only after every child it owns has ended.
+    /// A graph is released only after every holder of it has ended.
     ///
     /// Coordinator connections and attempts are separate holders of the same
-    /// graph, and a graph may be released only when both are gone and the
-    /// envelope's own nested children have drained. When that drain does not
-    /// complete, the graph is not quietly forgotten: the follower keeps the
-    /// supervisor guard, the reservation residue, and the reason, so the leak
-    /// stays attributable to this node instead of poisoning the governor later.
+    /// graph, and a graph may be released only when both are gone.
     ///
     /// # Panics
     ///
-    /// Panics when a graph is released beneath a live holder, when a settled
-    /// graph is retained, or when a failed cleanup is reported as clean.
+    /// Panics when a graph is released beneath a live holder or when a settled
+    /// graph is retained.
     #[tokio::test]
-    async fn follower_graph_release_waits_for_children_and_retains_cleanup_failure() {
+    async fn follower_graph_release_waits_for_every_holder() {
         let now = Utc::now();
-        let fixture = GraphFixture::new(now);
+        let mut fixture = GraphFixture::new(now);
         let plan = fixture.leader_message(StageOperationV1::SetPlan);
         let attempt = fixture
             .send(&plan, now)
@@ -5263,12 +4855,17 @@ mod tests {
             "the follower retains nothing after its last connection closed"
         );
         assert_eq!(
-            fixture.reservations.cleanup_expired(now),
+            fixture.reservations.held_grants(),
+            1,
+            "settlement leaves the grant to its leader's stream"
+        );
+        drop(fixture.grant.take());
+        assert_eq!(
+            fixture.reservations.held_grants(),
             0,
-            "settlement returned the graph's reservation entry"
+            "closing the leader's stream ends the grant"
         );
 
-        follower_retains_a_graph_whose_children_never_drain().await;
         follower_scopes_one_upstream_worker_to_each_graph().await;
     }
 
@@ -5357,17 +4954,12 @@ mod tests {
     /// driver observes it, moves the graph to draining, cancels it, and runs
     /// the same joined settlement every other terminal path runs.
     ///
-    /// A sibling graph whose envelope keeps a live nested child holds its own
-    /// settlement open across the target's whole deadline, which is what proves
-    /// the driver settles concurrently rather than serially: a slow cleanup may
-    /// not stop the driver from cancelling another graph on time.
-    ///
     /// # Panics
     ///
     /// Panics when a live `ExecuteTask`-first graph is released by the end of
-    /// its unary request, when it outlives its signed deadline, when a blocked
-    /// sibling settlement delays it, or when the bounded settlement queue
-    /// cannot hold one wake plus one settlement per admitted graph.
+    /// its unary request, when it outlives its signed deadline, or when the
+    /// bounded settlement queue cannot hold one wake plus one settlement per
+    /// admitted graph.
     #[tokio::test]
     async fn execute_task_first_without_set_plan_settles_at_signed_deadline() {
         let now = Utc::now();
@@ -5382,22 +4974,13 @@ mod tests {
             "the settlement queue must hold one wake plus one settlement per admitted graph"
         );
 
-        // The sibling activates first and is handed to the driver immediately,
-        // with one real nested child that keeps its drain from completing.
-        let (sibling_graph, sibling_message) =
+        // The sibling activates first and is handed to the driver immediately.
+        let (sibling_graph, sibling_message, sibling_grant) =
             fixture.sibling(now, now + chrono::Duration::seconds(60));
         fixture
             .send(&sibling_message, now)
             .await
             .expect("the reserving leader activates the sibling graph");
-        let sibling_runtime = fixture
-            .supervisor
-            .graph_runtime(sibling_graph)
-            .expect("the sibling graph installed a query-owned runtime");
-        let gate = datafusion::execution::memory_pool::MemoryConsumer::new("sibling-gate")
-            .register(&sibling_runtime.runtime().memory_pool);
-        gate.try_grow(1024)
-            .expect("the admitted envelope funds one nested child");
         drop(
             fixture
                 .ingress
@@ -5420,8 +5003,7 @@ mod tests {
             "a completed unary ExecuteTask must not release valid work"
         );
 
-        // Past the signed deadline the target settles and releases everything,
-        // while the sibling's blocked settlement is still in flight.
+        // Past the signed deadline the target settles and releases everything.
         tokio::time::timeout(Duration::from_secs(3), async {
             while fixture.ingress.published(fixture.graph).is_ok() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -5441,14 +5023,8 @@ mod tests {
             fixture.supervisor.graph_runtime(fixture.graph).is_err(),
             "a settled graph released its supervisor registration and query runtime"
         );
-        assert!(
-            fixture.ingress.published(sibling_graph).is_ok(),
-            "the blocked sibling is still owned by the same driver"
-        );
 
-        // Releasing the gate lets the sibling's own settlement complete, and
-        // shutdown joins the one driver rather than a detached cleanup task.
-        drop(gate);
+        // Shutdown joins the one driver rather than a detached cleanup task.
         let inspection = tokio::time::timeout(Duration::from_secs(10), fixture.ingress.shutdown())
             .await
             .expect("the one settlement driver joins within the bound")
@@ -5464,6 +5040,15 @@ mod tests {
                 .expect("ownership is readable")
                 .is_clean(),
             "the follower retains nothing after both graphs settled"
+        );
+        // The sibling's grant is its leader's open stream: held through the
+        // whole settlement above, and ended only by that stream closing.
+        assert_eq!(fixture.reservations.held_grants(), 2);
+        drop(sibling_grant);
+        assert_eq!(
+            fixture.reservations.held_grants(),
+            1,
+            "closing the sibling's stream ends only its own grant"
         );
     }
 
@@ -5499,22 +5084,17 @@ mod tests {
             "a live, healthy graph does not make the node unready"
         );
 
-        // One real nested child of the graph's own envelope, so the drain that
-        // settlement performs cannot complete for a reason the follower owns.
-        let runtime = fixture
+        // A stage the follower's settlement never joins, so the supervisor
+        // refuses to release the graph for a reason the follower owns.
+        let stray = fixture
             .supervisor
-            .graph_runtime(fixture.graph)
-            .expect("the activated graph installed a query-owned runtime");
-        let stuck = datafusion::execution::memory_pool::MemoryConsumer::new("stuck-child")
-            .register(&runtime.runtime().memory_pool);
-        stuck
-            .try_grow(1024)
-            .expect("the admitted envelope funds one nested child");
+            .spawn_attempt(stray_attempt_key(fixture.graph))
+            .expect("an active graph admits one more stage");
         fixture
             .ingress
             .finish_attempt(attempt, AnalyticalAttemptOutcome::Success)
             .await
-            .expect_err("a graph whose children never drain cannot be settled");
+            .expect_err("a graph with a live stray attempt cannot be settled");
 
         let retained = fixture.ingress.live().expect("ownership is readable");
         assert_eq!(
@@ -5529,86 +5109,7 @@ mod tests {
             !handle.is_healthy(),
             "a retained follower cleanup failure fails production readiness"
         );
-        drop(stuck);
-    }
-
-    /// Proves an undrainable graph is retained, named, and never released.
-    ///
-    /// Split from the release test only to keep each phase readable; it is the
-    /// second half of the same scenario.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a failed cleanup releases a graph or is reported as clean.
-    async fn follower_retains_a_graph_whose_children_never_drain() {
-        // A graph whose envelope keeps a live nested child cannot drain. The
-        // follower must report that as a failure and keep everything it owns.
-        let now = Utc::now();
-        let fixture = GraphFixture::new(now);
-        let attempt = fixture
-            .send(&fixture.leader_message(StageOperationV1::SetPlan), now)
-            .await
-            .expect("the reserving leader activates the graph");
-        let runtime = fixture
-            .supervisor
-            .graph_runtime(fixture.graph)
-            .expect("the activated graph installed a query-owned runtime");
-        let stuck = datafusion::execution::memory_pool::MemoryConsumer::new("stuck-child")
-            .register(&runtime.runtime().memory_pool);
-        stuck
-            .try_grow(1024)
-            .expect("the admitted envelope funds one nested child");
-        fixture
-            .ingress
-            .finish_attempt(attempt, AnalyticalAttemptOutcome::Success)
-            .await
-            .expect_err("a graph whose children never drain cannot be settled");
-        let retained = fixture.ingress.live().expect("ownership is readable");
-        assert_eq!(retained.graphs, 1, "the undrained graph is still owned");
-        assert_eq!(
-            retained.cleanup_failures, 1,
-            "the follower recorded exactly why the graph could not be released"
-        );
-        assert!(
-            !retained.is_clean(),
-            "a retained cleanup failure fails follower readiness"
-        );
-        assert_eq!(
-            fixture
-                .supervisor
-                .live_graphs()
-                .expect("graphs are readable"),
-            1,
-            "a failed settlement released no supervisor guard"
-        );
-
-        // Shutdown closes admission first, then reports what stayed retained.
-        let refused = fixture
-            .send(&fixture.leader_message(StageOperationV1::ExecuteTask), now)
-            .await;
-        let inspection = fixture
-            .ingress
-            .shutdown()
-            .await
-            .expect("the follower shuts down without a poisoned lock");
-        assert!(
-            matches!(refused, Err(BifrostError::QueryExecutionFailed)),
-            "a draining graph admits nothing new"
-        );
-        assert_eq!(
-            inspection.graphs_retained, 1,
-            "shutdown reported the graph it could not release"
-        );
-        drop(stuck);
-        assert!(
-            matches!(
-                fixture
-                    .send(&fixture.leader_message(StageOperationV1::SetPlan), now)
-                    .await,
-                Err(BifrostError::QueryAdmissionRejected)
-            ),
-            "a shut-down follower admits no further stage work"
-        );
+        drop(stray);
     }
 
     /// A failed activation publishes nothing and hands the reservation back.
@@ -5616,10 +5117,9 @@ mod tests {
     /// Activation is a transaction across two fallible steps — the retained
     /// binding and the supervisor registration — and a failure in either must
     /// leave the follower exactly as it was: no published graph, no charged
-    /// envelope, and the pending reservation restored under its own unchanged
-    /// expiry so a serialized waiter can still activate it. Past that expiry
-    /// the reservation is not resurrected; its permit and envelope are released
-    /// instead. A registration refused because the graph is taken drives it.
+    /// envelope, and the held grant restored with its envelope so a serialized
+    /// waiter can still activate it. A registration refused because the graph
+    /// is taken drives it.
     ///
     /// # Panics
     ///
@@ -5668,31 +5168,6 @@ mod tests {
             fixture.reservations.graph_leases_activated_total(),
             1,
             "the restored reservation became exactly one graph"
-        );
-
-        // Past its own expiry the reservation is released, not resurrected.
-        let now = Utc::now();
-        let fixture = GraphFixture::new(now);
-        let activation = fixture
-            .reservations
-            .begin_graph_activation(
-                &GraphLeaseRequest {
-                    reservation_id: fixture.reservation_id,
-                    graph: AnalyticalGraphRef {
-                        public_query_id: fixture.graph.public_query_id.as_uuid(),
-                        datafusion_query_id: fixture.graph.datafusion_query_id.as_uuid(),
-                    },
-                    query_id: QueryId::new(fixture.graph.public_query_id.as_uuid()),
-                },
-                now,
-            )
-            .expect("the reserved graph begins activation");
-        let expired = activation.expires_at() + chrono::Duration::seconds(1);
-        activation.rollback(expired);
-        assert_eq!(
-            fixture.reservations.cleanup_expired(now),
-            0,
-            "a reservation rolled back past its expiry is released, not restored"
         );
     }
 
@@ -6127,17 +5602,18 @@ mod tests {
     /// An exceptional lifecycle end retains its graph instead of releasing it.
     ///
     /// A task that is aborted or panics never ran the one cleanup sequence, so
-    /// nothing it owned was returned. Two things must therefore hold: the
-    /// reservations it was holding produce no detached release — there is no
-    /// `Drop` cleanup left to spawn one — and the graph, its envelope, and the
-    /// query's admission permit stay registered as attributable residue rather
-    /// than being swept away by a guard's `Drop` or by shutdown.
+    /// nothing local it owned was returned. Two things must therefore hold:
+    /// every participant grant it held is closed anyway, because the grants
+    /// die with the task that owned their streams, so no follower outlives
+    /// this leader; and the graph, its envelope, and the query's admission
+    /// permit stay registered as attributable residue rather than being swept
+    /// away by a guard's `Drop` or by shutdown.
     ///
     /// # Panics
     ///
-    /// Panics when a dropped reservation owner issues an RPC, when an aborted
-    /// lifecycle silently releases its graph, or when shutdown sweeps residue
-    /// it should have reported.
+    /// Panics when an aborted lifecycle leaves a follower grant open, when it
+    /// silently releases its graph, or when shutdown sweeps residue it should
+    /// have reported.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_aborted_lifecycle_task_retains_its_graph_instead_of_releasing_it() {
         let fixture = GraphFixture::new(Utc::now());
@@ -6169,8 +5645,8 @@ mod tests {
         settle_lifecycle().await;
         assert_eq!(
             transport.releases().len(),
-            0,
-            "a dropped reservation owner spawns no detached release of its own"
+            2,
+            "an aborted lifecycle closes every follower grant with its streams"
         );
         assert!(
             fixture.supervisor.retains_admission_for_test(graph),
@@ -6213,8 +5689,8 @@ mod tests {
         );
         assert_eq!(
             transport.releases().len(),
-            0,
-            "no release RPC was ever issued outside the lifecycle sequence"
+            2,
+            "each follower grant was closed exactly once"
         );
     }
 
@@ -6223,23 +5699,20 @@ mod tests {
     /// A permanently pending peer is the only failure a reservation owner
     /// cannot distinguish from a slow one, and awaiting it directly would park
     /// reservation, cleanup, settlement, and shutdown behind one unreachable
-    /// node. Four bounds are proven on one clock: graph cancellation interrupts
-    /// an in-flight reservation, the graph deadline interrupts one nothing
-    /// cancels, a release attempt cannot outlive its own bound, and no peer
-    /// call at all begins after the deadline has passed. Settlement then
-    /// reports failure rather than hanging, and shutdown reports the residue.
+    /// node. Graph cancellation interrupts an in-flight admission, the graph
+    /// deadline interrupts one nothing cancels, and no peer call begins after
+    /// the deadline. Once admitted, a terminal drops every grant at once: there
+    /// is no release RPC to bound and no residue to retain.
     ///
     /// # Panics
     ///
-    /// Panics when a peer call outlives its bound, when an unanswerable peer
-    /// parks settlement or shutdown, or when unresolved residue is reported as
-    /// a clean terminal.
+    /// Panics when a peer call outlives its bound, or when a terminal leaves a
+    /// grant held or the graph retained.
     #[tokio::test(start_paused = true)]
     async fn graph_peer_operations_are_bounded_by_the_graph_deadline() {
         Box::pin(assert_cancellation_interrupts_a_pending_reservation()).await;
         Box::pin(assert_the_deadline_interrupts_a_pending_reservation()).await;
-        Box::pin(assert_release_is_bounded_and_residue_is_reported()).await;
-        Box::pin(assert_post_deadline_expiry_returns_the_graph()).await;
+        Box::pin(assert_terminal_drops_every_grant()).await;
     }
 
     /// Graph cancellation ends a reservation no participant will ever answer.
@@ -6334,150 +5807,57 @@ mod tests {
         );
     }
 
-    /// A release nothing acknowledges is bounded, retained, and then reported.
+    /// A terminal drops every participant grant and settles with no residue.
     ///
     /// # Panics
     ///
-    /// Panics when a release attempt outlives its bound, when a peer call
-    /// begins after the deadline, when unresolved residue settles as a success,
-    /// or when shutdown awaits an unanswerable peer instead of reporting it.
-    async fn assert_release_is_bounded_and_residue_is_reported() {
-        // Far beyond the graph deadline on purpose: conservative expiry cannot
-        // resolve these records, so the only thing that can end the retry is
-        // the graph's own bound.
-        let expires_at = Utc::now() + chrono::Duration::hours(1);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let fixture = ReservationFixture::start_bounded(2, expires_at, deadline);
+    /// Panics when a grant survives settlement, when settlement issues a peer
+    /// call, or when the graph stays retained.
+    async fn assert_terminal_drops_every_grant() {
+        let expires_at = Utc::now() + chrono::Duration::seconds(60);
+        let fixture = ReservationFixture::start_bounded(
+            2,
+            expires_at,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        );
         fixture
             .signals
             .publish_participants()
             .await
-            .expect("every addressed follower accepted its reservation");
-        fixture.transport.hang_releases();
+            .expect("every addressed follower accepted its grant");
+        assert!(
+            fixture.transport.releases().is_empty(),
+            "a published cut keeps every grant held"
+        );
+        let calls = fixture.transport.call_instants().len();
         fixture.signals.terminal(AnalyticalAttemptOutcome::Failed);
-        let error = fixture
-            .signals
-            .settled()
-            .await
-            .expect_err("unresolved reservations cannot settle as a success");
-        assert!(
-            matches!(error, BifrostError::Internal { .. }),
-            "residue is reported to the caller rather than logged: {error:?}"
-        );
-        let ended = tokio::time::Instant::now();
-        assert!(
-            ended >= deadline && ended < deadline + RETAINED_RELEASE_RETRY,
-            "cleanup retried the ambiguous release to the graph deadline and stopped there"
-        );
-        let releases = fixture.transport.releases().len();
-        assert!(
-            releases >= 2,
-            "each accepted reservation was attempted at least once: {releases}"
-        );
-        assert!(
-            fixture
-                .transport
-                .call_instants()
-                .iter()
-                .all(|began| *began < deadline),
-            "no peer call begins after the graph deadline"
-        );
-        assert_eq!(
-            fixture.draining(),
-            1,
-            "an unacknowledged release keeps the graph attributable as draining"
-        );
-        let inspection = fixture
-            .graph
-            .supervisor
-            .shutdown()
-            .await
-            .expect("shutdown joins the lifecycle task instead of awaiting a peer");
-        assert_eq!(
-            (inspection.graphs_released, inspection.graphs_retained),
-            (0, 1),
-            "shutdown reports the retained residue rather than sweeping it away"
-        );
-        assert!(
-            fixture
-                .transport
-                .call_instants()
-                .iter()
-                .all(|began| *began < deadline),
-            "shutdown issues no peer call past the graph deadline either"
-        );
-    }
-
-    /// Authoritative expiry after the deadline still returns the retained graph.
-    ///
-    /// The deadline ends this node's right to address a peer, not its ownership
-    /// of what it took. A record whose conservative expiry falls after the
-    /// deadline is therefore still the lifecycle task's to resolve: the caller
-    /// is failed on time and every RPC stops, but the local expiry check keeps
-    /// running until the follower must have dropped the envelope, and only then
-    /// are the graph and its admission returned.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the caller is failed late, when a peer call is issued past
-    /// the deadline, or when authoritative expiry leaves the graph and its
-    /// admission charged forever.
-    async fn assert_post_deadline_expiry_returns_the_graph() {
-        // Already elapsed on the wall clock, so the local pending TTL measured
-        // from the reserve response is the bound that decides — and it falls
-        // after this graph's own deadline.
-        let expires_at = Utc::now() - chrono::Duration::seconds(1);
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-        let fixture = ReservationFixture::start_bounded(2, expires_at, deadline);
         fixture
             .signals
-            .publish_participants()
-            .await
-            .expect("every addressed follower accepted its reservation");
-        fixture.transport.hang_releases();
-        fixture.signals.terminal(AnalyticalAttemptOutcome::Failed);
-        let error = fixture
-            .signals
             .settled()
             .await
-            .expect_err("unresolved reservations cannot settle as a success");
-        assert!(
-            matches!(error, BifrostError::Internal { .. }),
-            "the caller is failed at the deadline rather than held to expiry: {error:?}"
-        );
-        let ended = tokio::time::Instant::now();
-        assert!(
-            ended >= deadline && ended < deadline + RETAINED_RELEASE_RETRY,
-            "the caller's failure is published at the graph deadline"
+            .expect("dropping the grants leaves nothing to retain");
+        let mut released = fixture.transport.releases();
+        released.sort_by_key(|(node, _)| node.as_uuid());
+        assert_eq!(
+            released,
+            vec![
+                (
+                    fixture.remote[0].1.node_id,
+                    Uuid::from_u128(200).to_string()
+                ),
+                (
+                    fixture.remote[1].1.node_id,
+                    Uuid::from_u128(201).to_string()
+                ),
+            ],
+            "settlement closes every grant stream exactly once"
         );
         assert_eq!(
-            fixture.draining(),
-            1,
-            "the unacknowledged release keeps the graph attributable as draining"
+            fixture.transport.call_instants().len(),
+            calls,
+            "closing a grant is a stream drop, not another peer call"
         );
-        let attempted = fixture.transport.releases().len();
-        // Past both the deadline and the pending TTL the response was received
-        // under: the record is now authoritatively expired.
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        settle_lifecycle().await;
-        assert_eq!(
-            fixture.transport.releases().len(),
-            attempted,
-            "no peer call is issued after the graph deadline"
-        );
-        assert!(
-            fixture
-                .transport
-                .call_instants()
-                .iter()
-                .all(|began| *began < deadline),
-            "conservative expiry is a local check, not another round of RPCs"
-        );
-        assert_eq!(
-            fixture.draining(),
-            0,
-            "authoritative expiry clears the reservation ambiguity"
-        );
+        assert_eq!(fixture.draining(), 0, "nothing remote is left to retain");
         assert_eq!(
             fixture
                 .graph
@@ -6485,72 +5865,75 @@ mod tests {
                 .live_graphs()
                 .expect("the supervisor reports live graphs"),
             0,
-            "the retained graph and its admission are returned once nothing remote owns them"
+            "the graph and its admission are returned at settlement"
         );
     }
 
-    /// Deterministic peer transport recording every reserve and release it sees.
+    /// Deterministic peer transport recording every grant it opens and closes.
     ///
-    /// Both outcomes are chosen by the test rather than by timing, which is what
-    /// makes partial reservation failure and ambiguous release acknowledgement
-    /// observable without a sleep or a live peer.
+    /// Every outcome is chosen by the test rather than by timing, which is what
+    /// makes partial admission and refusal observable without a sleep or a
+    /// live peer.
     struct ReservingTransport {
-        /// Participants a reserve was issued to, in issue order.
+        /// Participants a grant was requested from, in issue order.
         reserved: std::sync::Mutex<Vec<NodeId>>,
-        /// Participants a release was issued to, with the reservation named.
-        released: std::sync::Mutex<Vec<(NodeId, String)>>,
-        /// The monotonic instant every peer call began at, reserve or release.
+        /// Grants whose stream the leader closed, with the grant named.
+        released: Arc<std::sync::Mutex<Vec<(NodeId, String)>>>,
+        /// The monotonic instant every peer call began at.
         ///
         /// A bound is only provable against the clock the bound is expressed
         /// in, so the call sites are stamped rather than merely counted.
         began: std::sync::Mutex<Vec<tokio::time::Instant>>,
-        /// While set, a reserve is accepted into a future that never resolves.
+        /// While set, a grant request parks in a future that never resolves.
         reserve_hangs: std::sync::atomic::AtomicBool,
-        /// While set, a release is accepted into a future that never resolves.
-        release_hangs: std::sync::atomic::AtomicBool,
-        /// How many reserves are accepted before the rest are refused.
+        /// How many grants are accepted before the rest are refused.
         accepted: usize,
-        /// While set, a refused reserve is a lost peer — a transport failure —
-        /// rather than an explicit pre-accept capacity refusal the leader
-        /// retries.
+        /// While set, a refused grant is a lost peer — a transport failure —
+        /// rather than an explicit stream-accept refusal the leader retries.
         refusals_are_losses: std::sync::atomic::AtomicBool,
-        /// While set, every release answers with an unacknowledged failure.
-        release_fails: std::sync::atomic::AtomicBool,
-        /// Wall-clock expiry every accepted reservation is minted with.
-        expires_at: DateTime<Utc>,
+    }
+
+    /// Stands in for one open grant stream and records when it closes.
+    struct GrantStreamProbe {
+        /// Participant that accepted the grant.
+        worker: NodeId,
+        /// Grant identity the participant minted.
+        reservation_id: String,
+        /// Log the close is recorded into.
+        released: Arc<std::sync::Mutex<Vec<(NodeId, String)>>>,
+    }
+
+    impl Drop for GrantStreamProbe {
+        /// Records the close exactly as a follower would observe the stream end.
+        fn drop(&mut self) {
+            if let Ok(mut released) = self.released.lock() {
+                released.push((self.worker, std::mem::take(&mut self.reservation_id)));
+            }
+        }
     }
 
     impl ReservingTransport {
-        /// Builds a transport accepting exactly `accepted` reservations.
-        fn new(accepted: usize, expires_at: DateTime<Utc>) -> Self {
+        /// Builds a transport accepting exactly `accepted` grants.
+        fn new(accepted: usize) -> Self {
             Self {
                 reserved: std::sync::Mutex::new(Vec::new()),
-                released: std::sync::Mutex::new(Vec::new()),
+                released: Arc::default(),
                 began: std::sync::Mutex::new(Vec::new()),
                 reserve_hangs: std::sync::atomic::AtomicBool::new(false),
-                release_hangs: std::sync::atomic::AtomicBool::new(false),
                 accepted,
                 refusals_are_losses: std::sync::atomic::AtomicBool::new(false),
-                release_fails: std::sync::atomic::AtomicBool::new(false),
-                expires_at,
             }
         }
 
-        /// Makes every later refused reserve fail as a lost peer would.
+        /// Makes every later refused grant fail as a lost peer would.
         fn lose_refused_peers(&self) {
             self.refusals_are_losses
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
-        /// Makes every later reserve park forever instead of answering.
+        /// Makes every later grant request park forever instead of answering.
         fn hang_reserves(&self) {
             self.reserve_hangs
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-
-        /// Makes every later release park forever instead of answering.
-        fn hang_releases(&self) {
-            self.release_hangs
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
@@ -6567,7 +5950,7 @@ mod tests {
                 .push(tokio::time::Instant::now());
         }
 
-        /// Returns the participants a reserve was issued to.
+        /// Returns the participants a grant was requested from.
         fn reserves(&self) -> Vec<NodeId> {
             self.reserved
                 .lock()
@@ -6575,7 +5958,7 @@ mod tests {
                 .clone()
         }
 
-        /// Returns the releases issued so far, participant and reservation.
+        /// Returns the grants closed so far, participant and grant identity.
         fn releases(&self) -> Vec<(NodeId, String)> {
             self.released
                 .lock()
@@ -6586,21 +5969,25 @@ mod tests {
 
     #[async_trait]
     impl super::super::dispatcher::OraclePeerTransport for ReservingTransport {
-        /// Accepts the first `accepted` reservations and refuses the rest.
+        /// Accepts the first `accepted` grants and refuses the rest.
         ///
-        /// A refusal is an explicit capacity rejection unless the transport
-        /// was told to lose refused peers.
+        /// A refusal is an explicit stream-accept rejection unless the
+        /// transport was told to lose refused peers. An accepted grant carries
+        /// a probe that records when the leader closes it.
         ///
         /// # Errors
         ///
         /// Returns [`super::super::dispatcher::DispatchError::Unavailable`] for
-        /// a refused reserve once refused peers are lost.
+        /// a refused grant once refused peers are lost.
         async fn reserve(
             &self,
             worker: NodeId,
             _request: ReserveNodeSlotsRequest,
         ) -> Result<
-            wyrd_spec::vala::api::ReserveNodeSlotsResponse,
+            Result<
+                super::super::dispatcher::ParticipantGrant,
+                wyrd_spec::vala::api::ReservationRejected,
+            >,
             super::super::dispatcher::DispatchError,
         > {
             self.record_call();
@@ -6621,42 +6008,19 @@ mod tests {
                 return Err(super::super::dispatcher::DispatchError::Unavailable);
             }
             if ordinal >= self.accepted {
-                return Ok(wyrd_spec::vala::api::ReserveNodeSlotsResponse::Rejected(
-                    wyrd_spec::vala::api::ReservationRejected {
-                        retry_after_ms: 1_000,
-                    },
-                ));
+                return Ok(Err(wyrd_spec::vala::api::ReservationRejected {
+                    retry_after_ms: 1_000,
+                }));
             }
-            Ok(wyrd_spec::vala::api::ReserveNodeSlotsResponse::Pending(
-                wyrd_spec::vala::api::PendingNodeReservation {
-                    reservation_id: wyrd_spec::vala::api::ReservationId::new(Uuid::from_u128(
-                        200 + ordinal as u128,
-                    )),
-                    expires_at: self.expires_at,
-                },
-            ))
-        }
-
-        /// Records the release and answers as the test currently dictates.
-        async fn release(
-            &self,
-            worker: NodeId,
-            request: wyrd_spec::vala::api::ReleaseNodeSlotsRequest,
-        ) -> Result<(), super::super::dispatcher::DispatchError> {
-            self.record_call();
-            {
-                self.released
-                    .lock()
-                    .expect("release log is writable")
-                    .push((worker, request.reservation_id.as_uuid().to_string()));
-            }
-            if self.release_hangs.load(std::sync::atomic::Ordering::SeqCst) {
-                std::future::pending::<()>().await;
-            }
-            if self.release_fails.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(super::super::dispatcher::DispatchError::Terminal);
-            }
-            Ok(())
+            let reservation_id = Uuid::from_u128(200 + ordinal as u128);
+            Ok(Ok(super::super::dispatcher::ParticipantGrant::new(
+                wyrd_spec::vala::api::ReservationId::new(reservation_id),
+                Box::new(GrantStreamProbe {
+                    worker,
+                    reservation_id: reservation_id.to_string(),
+                    released: Arc::clone(&self.released),
+                }),
+            )))
         }
 
         /// Never reached: this transport exists for reservation ownership only.
@@ -6716,7 +6080,7 @@ mod tests {
             deadline: tokio::time::Instant,
         ) -> Self {
             let graph = GraphFixture::new(Utc::now());
-            let transport = Arc::new(ReservingTransport::new(accepted, expires_at));
+            let transport = Arc::new(ReservingTransport::new(accepted));
             let directory = Arc::new(
                 super::super::dispatcher::OraclePeerTransportDirectory::new_for_test(
                     graph.node_id,
@@ -6946,7 +6310,7 @@ mod tests {
         settle_lifecycle().await;
         assert!(
             refused.graph.execution_handle().is_healthy(),
-            "an acknowledged release leaves no retained cleanup"
+            "closing the taken grants leaves no retained cleanup"
         );
     }
 
@@ -7002,118 +6366,30 @@ mod tests {
         );
     }
 
-    /// An unacknowledged release keeps the graph draining until it is answered.
-    ///
-    /// # Panics
-    ///
-    /// Panics when an ambiguous release is forgotten, when the node advertises
-    /// readiness while retaining one, or when an acknowledgement does not clear it.
-    async fn assert_ambiguous_release_retains_until_acknowledged(expires_at: DateTime<Utc>) {
-        let ambiguous = ReservationFixture::start(1, expires_at);
-        ambiguous
-            .transport
-            .release_fails
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            ambiguous.signals.publish_participants().await.is_err(),
-            "the declined participant still fails the attempt"
-        );
-        settle_lifecycle().await;
-        assert_eq!(
-            ambiguous.draining(),
-            1,
-            "an unacknowledged release keeps the graph supervisor-visible"
-        );
-        assert!(
-            !ambiguous.graph.execution_handle().is_healthy(),
-            "a node retaining a follower's envelope does not advertise readiness"
-        );
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        assert_eq!(
-            ambiguous.draining(),
-            1,
-            "the follower-stated expiry has not passed, so the record is retained"
-        );
-        ambiguous
-            .transport
-            .release_fails
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        settle_lifecycle().await;
-        assert_eq!(
-            ambiguous.draining(),
-            0,
-            "an acknowledgement clears the retained release immediately"
-        );
-    }
-
-    /// With no acknowledgement, only both bounds together free the envelope.
-    ///
-    /// # Panics
-    ///
-    /// Panics when an elapsed wall clock alone frees the record, or when the
-    /// record survives both the stated expiry and a full local pending TTL.
-    async fn assert_expiry_needs_both_clocks() {
-        let expired = ReservationFixture::start(1, Utc::now() - chrono::Duration::seconds(1));
-        expired
-            .transport
-            .release_fails
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            expired.signals.publish_participants().await.is_err(),
-            "the declined participant still fails the attempt"
-        );
-        settle_lifecycle().await;
-        assert_eq!(
-            expired.draining(),
-            1,
-            "an already-elapsed wall clock alone does not free the envelope"
-        );
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        settle_lifecycle().await;
-        assert_eq!(
-            expired.draining(),
-            0,
-            "both the stated expiry and a full local pending TTL free the envelope"
-        );
-    }
-
     /// The participant cut is reserved exactly once, immediately before dispatch.
     ///
     /// Four orderings are load-bearing and none is observable from the
     /// reservation count alone. Nothing is reserved until selection is final.
     /// The graph-owned cut cell stays unset until *every* participant has
     /// accepted, so no channel resolves against a partial cut and none is dialed
-    /// while it is unset. A loss after earlier acceptances returns exactly
-    /// the reservations that were taken and publishes nothing; an explicit
-    /// capacity refusal also releases its round before the leader waits its
-    /// hint and retries within the deadline. And a release
-    /// whose acknowledgement never arrived keeps the graph draining until either
-    /// the follower answers or both the follower-stated expiry and a full local
-    /// pending TTL have passed.
+    /// while it is unset. A loss after earlier acceptances closes exactly the
+    /// grants that were taken and publishes nothing; an explicit capacity
+    /// refusal also closes its round before the leader waits its hint and
+    /// retries within the deadline.
     ///
     /// # Panics
     ///
-    /// Panics when a reservation is taken early, taken twice, published
-    /// partially, released inexactly, or forgotten before it can be proven gone.
+    /// Panics when a grant is taken early, taken twice, published partially,
+    /// or closed inexactly.
     #[tokio::test(start_paused = true)]
     async fn participant_cut_is_reserved_once_immediately_before_dispatch() {
         let expires_at = Utc::now() + chrono::Duration::seconds(60);
-        // The pending bound the leader retains is the dispatcher's own, not a
-        // second copy of the same duration.
-        assert_eq!(
-            super::super::dispatcher::PENDING_TTL,
-            chrono::Duration::seconds(2),
-            "the retained-release bound is the canonical two-second pending TTL"
-        );
         let selected = ReservationFixture::start(2, expires_at);
         assert_nothing_reserved_before_selection(&selected).await;
         assert_reserved_once_and_published(&selected).await;
         drop(selected);
         assert_partial_reservation_releases_exactly(expires_at).await;
         assert_refused_round_retries_within_deadline(expires_at).await;
-        assert_ambiguous_release_retains_until_acknowledged(expires_at).await;
-        assert_expiry_needs_both_clocks().await;
     }
 
     /// Cancelling the graph while the leader waits a capacity hint stops the
@@ -8504,9 +7780,12 @@ impl AnalyticalAttemptOwnership {
     ///
     /// Dropping this value also releases both, but only settling joins the
     /// attempt's retained drivers first. A leader stream that ended — for any
-    /// reason — calls this so follower work is cancelled and joined before the
-    /// query envelope is returned, rather than leaving an abandoned attempt to
-    /// be swept by a drop.
+    /// reason — calls this so the leader's own drivers are cancelled and joined
+    /// before the query envelope is returned, rather than leaving an abandoned
+    /// attempt to be swept by a drop. Followers are not joined: settlement
+    /// closes each participant's grant stream, and that close is the release a
+    /// follower acts on when it frees its own graph, possibly after this
+    /// returns.
     ///
     /// # Errors
     ///

@@ -1,0 +1,23 @@
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  space: workflow-loading
+  name: security-review-prompt
+  version: "1.0.0"
+spec:
+  model: gpt-5-5
+  provider:
+    custom: mock
+  request:
+    provider: open_ai_chat_completion
+    body:
+      model: gpt-5-5
+      messages:
+        - role: system
+          content: |
+            You are a local auditor. Report only exploitable security findings.
+            For every finding, identify the affected code and a concrete failure path.
+        - role: user
+          content: "local security review of {{code}}"
+  variables: [code]
+  response_type: text

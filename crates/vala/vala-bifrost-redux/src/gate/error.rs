@@ -151,6 +151,20 @@ pub const GATE_REJECTION_REASONS: [&str; 9] = [
 ];
 
 impl IngestError {
+    /// Reports an unclassified internal failure once, at the edge answering the caller.
+    ///
+    /// Classified variants are caller-attributed refusals already counted by
+    /// the rejection metrics, so only [`IngestError::Internal`] emits an event,
+    /// carrying the underlying detail the public projection also names. The
+    /// mapping into this type stays side-effect free; each transport edge that
+    /// projects an ingest error calls this exactly once, except the native
+    /// write edge, whose own request-failure event already carries the reason.
+    pub fn report_internal_at_edge(&self) {
+        if let Self::Internal(detail) = self {
+            tracing::error!(error = %detail, "Bifrost ingest failed internally");
+        }
+    }
+
     /// Projects this refusal into its closed Gate rejection reason.
     ///
     /// Gate owns the taxonomy because it owns [`IngestError`]; the transport
@@ -317,7 +331,6 @@ impl IngestError {
             crate::contracts::ScribeError::IngressClosed => Self::IngressClosed,
             crate::contracts::ScribeError::WalDiskFull => Self::WalDiskFull,
             other => {
-                tracing::error!(error = %other, "Scribe ingest failed after transport validation");
                 // The mapped variants above are the ones a caller can act on;
                 // everything else lands here, and a bare "Scribe ingest failed"
                 // leaves the operator with nothing to act on either. Naming the

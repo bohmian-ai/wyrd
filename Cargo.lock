@@ -6480,17 +6480,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "opentelemetry-stdout"
-version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc8887887e169414f637b18751487cce4e095be787d23fad13c454e2fb1b3811"
-dependencies = [
- "chrono",
- "opentelemetry",
- "opentelemetry_sdk",
-]
-
-[[package]]
 name = "opentelemetry_sdk"
 version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8765,7 +8754,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "skald-observer",
  "skald-prompt",
  "skald-providers",
  "skald-runtime",
@@ -8778,6 +8766,7 @@ dependencies = [
  "workspace-hack",
  "wyrd-runtime",
  "wyrd-spec",
+ "wyrd-telemetry",
  "wyrd-utils",
 ]
 
@@ -8785,32 +8774,11 @@ dependencies = [
 name = "skald-cache"
 version = "0.0.1"
 dependencies = [
- "hex",
  "mini-moka",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "skald-spec",
- "thiserror 2.0.18",
  "workspace-hack",
-]
-
-[[package]]
-name = "skald-observer"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "opentelemetry",
- "opentelemetry_sdk",
- "pyo3",
- "serde",
- "serde_json",
- "skald-prompt",
- "skald-spec",
- "tokio",
- "workspace-hack",
- "wyrd-spec",
- "wyrd-utils",
 ]
 
 [[package]]
@@ -8839,7 +8807,9 @@ dependencies = [
  "insta",
  "jsonwebtoken 9.3.1",
  "rand 0.9.5",
+ "rcgen",
  "reqwest 0.13.4",
+ "rustls",
  "secrecy",
  "serde",
  "serde_json",
@@ -8911,16 +8881,17 @@ dependencies = [
 name = "skald-workflow"
 version = "0.0.1"
 dependencies = [
- "anyhow",
  "async-trait",
  "chrono",
+ "futures-util",
+ "http 1.4.2",
  "jsonschema",
  "pyo3",
+ "secrecy",
  "serde",
  "serde_json",
  "serde_yaml",
  "skald-agent",
- "skald-observer",
  "skald-prompt",
  "skald-providers",
  "skald-runtime",
@@ -8928,11 +8899,14 @@ dependencies = [
  "skald-tool",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
+ "tracing",
  "url",
  "uuid",
+ "wiremock",
  "workspace-hack",
- "wyrd-runtime",
  "wyrd-spec",
+ "wyrd-telemetry",
  "wyrd-utils",
 ]
 
@@ -11209,15 +11183,10 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 name = "wyrd"
 version = "0.0.1"
 dependencies = [
- "async-trait",
- "opentelemetry",
- "opentelemetry-stdout",
- "opentelemetry_sdk",
  "schemars 0.8.22",
  "serde",
  "serde_json",
  "skald-agent",
- "skald-observer",
  "skald-prompt",
  "skald-runtime",
  "skald-spec",
@@ -11444,7 +11413,11 @@ dependencies = [
  "serde_urlencoded",
  "serde_yaml",
  "sha2 0.10.9",
+ "skald-providers",
+ "skald-runtime",
  "skald-spec",
+ "skald-tool",
+ "skald-workflow",
  "sqlx 0.9.0",
  "tempfile",
  "thiserror 2.0.18",
@@ -11559,6 +11532,7 @@ dependencies = [
  "wyrd-crypt",
  "wyrd-spec",
  "wyrd-tls",
+ "wyrd-utils",
  "wyrd-vault",
  "zeroize",
 ]
@@ -11664,15 +11638,11 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "opentelemetry",
- "opentelemetry-stdout",
- "opentelemetry_sdk",
  "reqwest 0.13.4",
  "schemars 0.8.22",
  "serde",
  "serde_json",
  "skald-agent",
- "skald-observer",
  "skald-prompt",
  "skald-runtime",
  "skald-spec",
@@ -11697,7 +11667,6 @@ dependencies = [
  "serde",
  "serde_json",
  "skald-agent",
- "skald-observer",
  "skald-prompt",
  "skald-runtime",
  "skald-tool",
@@ -11731,9 +11700,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "skald-workflow",
  "tempfile",
  "tokio",
  "uuid",
+ "wiremock",
  "workspace-hack",
  "wyrd-client",
  "wyrd-testing",
@@ -11754,6 +11725,7 @@ dependencies = [
  "tokio",
  "wyrd-client",
  "wyrd-queue",
+ "wyrd-semver",
  "wyrd-spec",
 ]
 
@@ -11808,6 +11780,7 @@ dependencies = [
  "http-body-util",
  "iceberg",
  "insta",
+ "jsonschema",
  "jsonwebtoken 9.3.1",
  "metrics",
  "metrics-exporter-prometheus",
@@ -11826,8 +11799,11 @@ dependencies = [
  "sha2 0.10.9",
  "shellexpand",
  "skald-prompt",
+ "skald-providers",
  "skald-runtime",
  "skald-spec",
+ "skald-tool",
+ "skald-workflow",
  "sqlx 0.9.0",
  "subtle",
  "temp-env",
@@ -11871,6 +11847,7 @@ dependencies = [
  "wyrd-testing",
  "wyrd-tls",
  "wyrd-tonic",
+ "wyrd-utils",
  "wyrd-vault",
  "zeroize",
 ]
@@ -12042,6 +12019,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "skald-prompt",
+ "skald-providers",
  "skald-runtime",
  "skald-spec",
  "sqlx 0.9.0",
@@ -12121,6 +12099,7 @@ version = "0.0.1"
 dependencies = [
  "flate2",
  "pyo3",
+ "secrecy",
  "semver",
  "serde",
  "serde_json",

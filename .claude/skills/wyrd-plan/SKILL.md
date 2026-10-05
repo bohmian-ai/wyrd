@@ -31,6 +31,19 @@ inventing it.
 
 ## Decompose by outcome
 
+Before writing tasks, trace each capability through its existing owners,
+callers, and tests. Each task includes this compact source-backed table:
+
+| Capability | Existing owner/symbol | Inspected callers/tests | Missing behavior | Selected extension | New machinery justification |
+|---|---|---|---|---|---|
+
+Compare whole workflows, not only leaf calls. Extending an existing owner is
+the default. A new graph store, traversal, loader, parser, transport, validator,
+lifecycle owner, cache, or orchestration layer requires evidence that the
+existing owner cannot appropriately provide the behavior. Paths without
+inspected symbols and a precise gap are not reuse evidence. Ordinary private
+helpers remain implementation-owned; do not create a type or file allowlist.
+
 Each task owns one small observable outcome and its necessary consumer and test
 closure. Split only for a real dependency, a distinct behavioral owner, or an
 independently deliverable outcome. Do not create tasks for files, agents,
@@ -134,7 +147,9 @@ choice that tests can validate belongs to `$wyrd-implement`.
 
 Before handoff, confirm that every acceptance criterion has an owner and a
 credible proof, every non-goal remains excluded, dependencies are real, and no
-expensive-to-reverse decision is unresolved. A task that adds or changes
+expensive-to-reverse decision is unresolved. Recheck the reuse map against the
+task: it must not require replacement machinery without the stated evidence.
+A task that adds or changes
 executable behavior, scenarios, or logic is invalid when any scenario lacks an
 explicit `Behavior`, `RED`, `GREEN`, or `REFACTOR` block; do not return
 `TASKS_PROPOSED` until all four are present for every scenario. Planning does

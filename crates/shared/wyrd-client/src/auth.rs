@@ -860,9 +860,11 @@ impl AuthMiddleware {
 
     /// Unconditionally re-exchange the credential, replacing the cache.
     ///
-    /// The reactive `401` path: the HTTP/gRPC transport calls this after a
-    /// rejected request, then retries once. Takes the same single-flight gate
-    /// as [`AuthMiddleware::bearer`].
+    /// The reactive `401` path. The replay-safe HTTP/gRPC transport calls this
+    /// after a rejected request, then retries that request once. The native
+    /// gateway call, which is not replay-safe, calls it without retrying so
+    /// only later calls carry the renewed bearer. Takes the same single-flight
+    /// gate as [`AuthMiddleware::bearer`].
     ///
     /// # Errors
     /// Returns [`AuthError::Client`] on transport failure or an unsupported

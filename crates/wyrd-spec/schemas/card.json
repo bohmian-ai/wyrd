@@ -64,6 +64,12 @@
     }
   },
   "definitions": {
+    "AbsoluteUrl": {
+      "description": "Absolute URL with a scheme and authority.",
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https?://"
+    },
     "AgentRunConfigSpec": {
       "description": "Pure-serde mirror of the Skald agent run configuration.",
       "type": "object",
@@ -1521,6 +1527,10 @@
     },
     "ConnectionName": {
       "description": "Immutable tenant-scoped Operator connection name, unique per provider.",
+      "type": "string"
+    },
+    "CredentialBindingName": {
+      "description": "Operator-configured gateway credential binding name.",
       "type": "string"
     },
     "CredentialRef": {
@@ -3124,6 +3134,46 @@
         }
       }
     },
+    "ExternalGatewayProtocol": {
+      "description": "Request dialect accepted by an external gateway.",
+      "oneOf": [
+        {
+          "description": "OpenAI Chat Completions.",
+          "type": "string",
+          "enum": [
+            "openai_chat"
+          ]
+        },
+        {
+          "description": "OpenAI Responses.",
+          "type": "string",
+          "enum": [
+            "openai_responses"
+          ]
+        },
+        {
+          "description": "Anthropic Messages.",
+          "type": "string",
+          "enum": [
+            "anthropic_messages"
+          ]
+        },
+        {
+          "description": "Google Gemini GenerateContent.",
+          "type": "string",
+          "enum": [
+            "gemini_generate_content"
+          ]
+        },
+        {
+          "description": "Google Vertex GenerateContent.",
+          "type": "string",
+          "enum": [
+            "vertex_generate_content"
+          ]
+        }
+      ]
+    },
     "FeatureName": {
       "description": "Feature column name referenced by a drift Verifier signal.",
       "type": "string"
@@ -3193,6 +3243,23 @@
           "type": "string"
         }
       }
+    },
+    "GatewayFallbackOverride": {
+      "description": "Per-request or per-workflow-step ordered fallback override.",
+      "type": "object",
+      "required": [
+        "candidates"
+      ],
+      "properties": {
+        "candidates": {
+          "description": "Non-empty, ordered, duplicate-free candidates.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ModelRef"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "GoogleBatchEmbedRequest": {
       "type": "object",
@@ -4726,6 +4793,93 @@
         }
       }
     },
+    "LlmRoute": {
+      "description": "Workflow model-call route.\n\nResolution is `step.llm_route -> workflow.llm_route -> Native`. The Prompt remains the sole owner of provider, model, request fields, and response shape; the route only selects the execution boundary.",
+      "oneOf": [
+        {
+          "description": "Call the native provider declared by the Agent Prompt.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "native"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Call the execution environment's governed Wyrd gateway.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "wyrd_gateway"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Call a user-provided gateway with a named execution-environment binding.",
+          "type": "object",
+          "required": [
+            "base_url",
+            "credential_binding",
+            "kind",
+            "protocol"
+          ],
+          "properties": {
+            "base_url": {
+              "description": "Absolute gateway base URL without userinfo, query, or fragment.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/AbsoluteUrl"
+                }
+              ]
+            },
+            "credential_binding": {
+              "description": "Execution-environment binding that authorizes the origin and supplies secret headers.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CredentialBindingName"
+                }
+              ]
+            },
+            "headers": {
+              "description": "Non-secret request headers; names are case-insensitively unique.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "ext_gateway"
+              ]
+            },
+            "protocol": {
+              "description": "Request dialect the gateway accepts; must match the Prompt request.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ExternalGatewayProtocol"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
     "LogConnection": {
       "description": "Log vendor connection. Discriminated by `vendor`.",
       "oneOf": [
@@ -5139,6 +5293,10 @@
         }
       ]
     },
+    "ModelId": {
+      "description": "Provider-native gateway model identifier: 1..=255 UTF-8 bytes without control characters.",
+      "type": "string"
+    },
     "ModelInterface": {
       "description": "Framework interface tag for a Model spec.",
       "oneOf": [
@@ -5314,6 +5472,33 @@
           }
         }
       ]
+    },
+    "ModelRef": {
+      "description": "One exact provider-native model selected by a caller.\n\nTyped surfaces carry the pair; the OpenAI-compatible `model` string is the canonical `<provider>/<model>` projection, split on the first `/` so a native model identifier may itself contain slashes.",
+      "type": "object",
+      "required": [
+        "model",
+        "provider"
+      ],
+      "properties": {
+        "model": {
+          "description": "Provider-native model identifier.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ModelId"
+            }
+          ]
+        },
+        "provider": {
+          "description": "Provider that serves the model.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProviderId"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "ModelSignature": {
       "description": "Typed input and output schema for a Model spec.",
@@ -6745,6 +6930,31 @@
         "detailed"
       ]
     },
+    "OpenAiReasoningSummaryPart": {
+      "description": "One part of a Responses reasoning item summary.",
+      "oneOf": [
+        {
+          "description": "Summary text.",
+          "type": "object",
+          "required": [
+            "text",
+            "type"
+          ],
+          "properties": {
+            "text": {
+              "description": "Summary text content.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "summary_text"
+              ]
+            }
+          }
+        }
+      ]
+    },
     "OpenAiResponseContentPart": {
       "oneOf": [
         {
@@ -6963,18 +7173,26 @@
           ],
           "properties": {
             "encrypted_content": {
-              "default": null,
+              "description": "Opaque reasoning state returned when `reasoning.encrypted_content` is included, required to replay the item without stored state.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "description": "Provider item identity, required to replay the item statelessly.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "summary": {
-              "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
+              "description": "Reasoning summary parts, replayed as returned.",
+              "default": [],
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/OpenAiReasoningSummaryPart"
+              }
             },
             "type": {
               "type": "string",
@@ -8821,6 +9039,17 @@
           "description": "Model identifier used for indexing and selection.",
           "type": "string"
         },
+        "provider": {
+          "description": "Native dispatch target, such as a custom OpenAI-compatible endpoint.\n\nWhen absent, native dispatch uses the request dialect's default provider. Gateway routes select their own upstream and ignore it.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ProviderName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "request": {
           "description": "Native provider-shaped request authored with `${variable}` or `{{variable}}` placeholders.",
           "allOf": [
@@ -8875,6 +9104,17 @@
           "description": "Model identifier used for indexing and selection.",
           "type": "string"
         },
+        "provider": {
+          "description": "Native dispatch target, such as a custom OpenAI-compatible endpoint.\n\nWhen absent, native dispatch uses the request dialect's default provider. Gateway routes select their own upstream and ignore it.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ProviderName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "request": {
           "description": "Native provider-shaped request authored with `${variable}` or `{{variable}}` placeholders.",
           "allOf": [
@@ -8908,6 +9148,10 @@
           ]
         }
       }
+    },
+    "ProviderId": {
+      "description": "Tenant-visible gateway provider identifier using the canonical Wyrd name grammar.",
+      "type": "string"
     },
     "ProviderName": {
       "description": "Which provider a request targets.",
@@ -8956,100 +9200,10 @@
       ]
     },
     "ProviderRequest": {
-      "description": "One native LLM request.",
-      "anyOf": [
+      "description": "One native LLM request, tagged with the provider dialect its body speaks.\n\nSerialized as `{\"provider\": \"<variant>\", \"body\": <native provider JSON>}`. The tag selects the variant, so a body that does not match its named dialect fails to deserialize. The tag names a wire schema, not a destination: one schema served by several providers is one variant.",
+      "oneOf": [
         {
-          "description": "OpenAI Chat Completions request.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/OpenAiChatRequest"
-            }
-          ]
-        },
-        {
-          "description": "Custom provider that accepts OpenAI Chat Completions request semantics.",
-          "type": "object",
-          "required": [
-            "provider",
-            "request"
-          ],
-          "properties": {
-            "provider": {
-              "description": "Provider dispatch target.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/ProviderName"
-                }
-              ]
-            },
-            "request": {
-              "description": "OpenAI Chat-shaped request body.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/OpenAiChatRequest"
-                }
-              ]
-            }
-          }
-        },
-        {
-          "description": "OpenAI Responses API request.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/OpenAiResponsesRequest"
-            }
-          ]
-        },
-        {
-          "description": "OpenAI Embeddings request.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/OpenAiEmbeddingsRequest"
-            }
-          ]
-        },
-        {
-          "description": "Anthropic Messages request.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/AnthropicMessagesRequest"
-            }
-          ]
-        },
-        {
-          "description": "Google Gemini GenerateContent request.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/GoogleGenerateContentRequest"
-            }
-          ]
-        },
-        {
-          "description": "Google Gemini BatchEmbedContents request.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/GoogleBatchEmbedRequest"
-            }
-          ]
-        },
-        {
-          "description": "Vertex GenerateContent request.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/GoogleGenerateContentRequest"
-            }
-          ]
-        },
-        {
-          "description": "Vertex Predict request.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/VertexPredictRequest"
-            }
-          ]
-        },
-        {
-          "description": "Raw provider request body that no typed variant claimed.",
+          "description": "OpenAI Chat Completions request, whether it is sent to OpenAI, a gateway, or a custom OpenAI-compatible endpoint named by [`Prompt::provider`](crate::Prompt::provider).",
           "type": "object",
           "required": [
             "body",
@@ -9057,14 +9211,162 @@
           ],
           "properties": {
             "body": {
-              "description": "Unmodified raw provider request JSON."
+              "$ref": "#/definitions/OpenAiChatRequest"
             },
             "provider": {
-              "description": "Provider dispatch target for the raw body.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/ProviderName"
+              "type": "string",
+              "enum": [
+                "open_ai_chat_completion"
+              ]
+            }
+          }
+        },
+        {
+          "description": "OpenAI Responses API request.",
+          "type": "object",
+          "required": [
+            "body",
+            "provider"
+          ],
+          "properties": {
+            "body": {
+              "$ref": "#/definitions/OpenAiResponsesRequest"
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "open_ai_responses"
+              ]
+            }
+          }
+        },
+        {
+          "description": "OpenAI Embeddings request.",
+          "type": "object",
+          "required": [
+            "body",
+            "provider"
+          ],
+          "properties": {
+            "body": {
+              "$ref": "#/definitions/OpenAiEmbeddingsRequest"
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "open_ai_embeddings"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Anthropic Messages request.",
+          "type": "object",
+          "required": [
+            "body",
+            "provider"
+          ],
+          "properties": {
+            "body": {
+              "$ref": "#/definitions/AnthropicMessagesRequest"
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "anthropic_message"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Google GenerateContent request, sent to Gemini or, when [`Prompt::provider`](crate::Prompt::provider) is Vertex, to Vertex.",
+          "type": "object",
+          "required": [
+            "body",
+            "provider"
+          ],
+          "properties": {
+            "body": {
+              "$ref": "#/definitions/GoogleGenerateContentRequest"
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "gemini_generate_content"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Google Gemini BatchEmbedContents request.",
+          "type": "object",
+          "required": [
+            "body",
+            "provider"
+          ],
+          "properties": {
+            "body": {
+              "$ref": "#/definitions/GoogleBatchEmbedRequest"
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "google_batch_embed"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Vertex Predict request.",
+          "type": "object",
+          "required": [
+            "body",
+            "provider"
+          ],
+          "properties": {
+            "body": {
+              "$ref": "#/definitions/VertexPredictRequest"
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "vertex_predict"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Raw provider request body that no typed variant models.",
+          "type": "object",
+          "required": [
+            "body",
+            "provider"
+          ],
+          "properties": {
+            "body": {
+              "type": "object",
+              "required": [
+                "body",
+                "provider"
+              ],
+              "properties": {
+                "body": {
+                  "description": "Raw provider request JSON, sent as given."
+                },
+                "provider": {
+                  "description": "Provider dispatch target for the raw body.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/ProviderName"
+                    }
+                  ]
                 }
+              }
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "raw_v1"
               ]
             }
           }
@@ -11297,7 +11599,7 @@
       "additionalProperties": false
     },
     "WorkflowAction": {
-      "description": "Workflow action target.",
+      "description": "Workflow action target. Agent steps are the only executable action.",
       "oneOf": [
         {
           "description": "Agent action — inline body or Agent Card reference.",
@@ -11314,44 +11616,6 @@
               "type": "string",
               "enum": [
                 "agent"
-              ]
-            }
-          }
-        },
-        {
-          "description": "MCP server action.",
-          "type": "object",
-          "required": [
-            "target",
-            "type"
-          ],
-          "properties": {
-            "target": {
-              "$ref": "#/definitions/Ref"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "mcp"
-              ]
-            }
-          }
-        },
-        {
-          "description": "Prompt action.",
-          "type": "object",
-          "required": [
-            "target",
-            "type"
-          ],
-          "properties": {
-            "target": {
-              "$ref": "#/definitions/Ref"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "prompt"
               ]
             }
           }
@@ -11420,7 +11684,7 @@
       ],
       "properties": {
         "initial_backoff_ms": {
-          "description": "Initial backoff in milliseconds.",
+          "description": "Initial backoff in milliseconds; absent or zero retries immediately.",
           "type": [
             "integer",
             "null"
@@ -11429,7 +11693,7 @@
           "minimum": 0.0
         },
         "max_retries": {
-          "description": "Maximum retry attempts.",
+          "description": "Additional Workflow attempts after the first.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
@@ -11466,11 +11730,22 @@
           ]
         },
         "inputs": {
-          "description": "Typed workflow inputs.",
+          "description": "Declared workflow inputs and their native default values.\n\nInvocation input may override a default only with a value of the same `ParameterValue` variant; unknown invocation keys are rejected.",
           "type": "object",
           "additionalProperties": {
             "$ref": "#/definitions/ParameterValue"
           }
+        },
+        "llm_route": {
+          "description": "Workflow default model-call route; absent means [`LlmRoute::Native`].",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LlmRoute"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "observation_hooks": {
           "description": "Observation hooks.",
@@ -11484,9 +11759,11 @@
           ]
         },
         "outputs": {
-          "description": "Output descriptors.",
+          "description": "Named workflow outputs, each selecting one exact binding source.\n\nA succeeded run resolves every declared output; validation rejects an empty map.",
           "type": "object",
-          "additionalProperties": true
+          "additionalProperties": {
+            "type": "string"
+          }
         },
         "steps": {
           "description": "Workflow steps.",
@@ -11506,22 +11783,15 @@
       ],
       "properties": {
         "action": {
-          "description": "Step action kind.",
+          "description": "Step action.",
           "allOf": [
             {
               "$ref": "#/definitions/WorkflowAction"
             }
           ]
         },
-        "condition": {
-          "description": "Optional condition expression.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "depends_on": {
-          "description": "Dependency step IDs.",
+          "description": "Dependency step IDs. Edges order execution but inject no data.",
           "type": "array",
           "items": {
             "type": "string"
@@ -11534,16 +11804,38 @@
             "$ref": "#/definitions/NonSecretValue"
           }
         },
+        "fallback": {
+          "description": "Ordered gateway fallback, valid only for the WyrdGateway route.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GatewayFallbackOverride"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "id": {
-          "description": "Stable step ID.",
+          "description": "Stable step ID using the parameter identifier grammar.",
           "type": "string"
         },
         "inputs": {
-          "description": "Step inputs.",
+          "description": "Prompt variable bindings, keyed by unresolved Prompt variable name.",
           "type": "object",
           "additionalProperties": {
-            "$ref": "#/definitions/ParameterValue"
+            "type": "string"
           }
+        },
+        "llm_route": {
+          "description": "Step route overriding the workflow default.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LlmRoute"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "retry": {
           "description": "Retry policy.",
@@ -11557,7 +11849,7 @@
           ]
         },
         "timeout_seconds": {
-          "description": "Timeout in seconds.",
+          "description": "Per-attempt timeout in seconds.",
           "type": [
             "integer",
             "null"

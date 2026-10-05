@@ -253,7 +253,7 @@ mod tests {
     use wyrd_spec::auth::SecretBearer;
     use wyrd_spec::ids::TenantSlug;
 
-    use crate::global_config::{ClientSection, GlobalConfig};
+    use crate::global_config::{ClientSection, GlobalConfig, LocalWorkflowConfig};
     use crate::saved_login::{SavedLogin, SavedLogins};
 
     use super::{ClientConfig, TokenCacheMode};
@@ -296,6 +296,7 @@ mod tests {
                 tenant: Some("file-tenant".to_owned()),
                 token_cache: None,
             },
+            workflow: LocalWorkflowConfig::default(),
         };
         let resolved = ClientConfig::from_global_with_env(&config);
 

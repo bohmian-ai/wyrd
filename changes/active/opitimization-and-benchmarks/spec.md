@@ -52,7 +52,7 @@ change.
 
 Last measured, before its removal, with `mise run bench:bifrost:query-capacity`
 (`crates/wyrd/wyrd-testing/src/bin/bifrost_query_capacity`) on an 8-CPU/16-GiB
-node, in TASK-004 of `changes/active/bifrost-scribe-live-reads`:
+node, in TASK-004 of `changes/completed/2026/bifrost-scribe-live-reads.md`:
 
 | Measure | Result |
 |---|---|
@@ -500,7 +500,7 @@ default.
   constraining architecture rules for this change.
 - [Bifrost design](../../../architecture/bifrost-design.md) for current
   behavior only.
-- `changes/active/bifrost-scribe-live-reads` (TASK-004 profiling, capacity
+- `changes/completed/2026/bifrost-scribe-live-reads.md` (TASK-004 profiling, capacity
   benchmark).
 - ClickBench methodology: <https://github.com/ClickHouse/ClickBench> (pinned
   commit chosen at implementation).

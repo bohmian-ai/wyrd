@@ -46,7 +46,7 @@ use wyrd_spec::ids::DataTenantId;
 use crate::resources::{MetadataReservation, OracleMetadataResources};
 use crate::storage::error::BifrostStorageError;
 use crate::storage::telemetry::{
-    BifrostStorageTelemetry, CacheEffect, CacheEffectReason, MetadataLoadOutcome, StorageLifecycle,
+    self, CacheEffect, CacheEffectReason, MetadataLoadOutcome, StorageLifecycle,
 };
 
 /// One cloneable terminal load result publishable to every joined waiter.
@@ -356,7 +356,7 @@ struct CacheState {
     /// Successful entries in least-recently-used order.
     ///
     /// Holds no errors and no in-flight state, so its length and charged bytes
-    /// are exactly the resident entries a snapshot reports.
+    /// are exactly the resident entries the gauges and inspection report.
     entries: LruCache<ObjectMetadataKey, CachedMetadata>,
     /// Charged bytes currently resident in `entries`.
     resident_bytes: u64,
@@ -373,6 +373,42 @@ impl CacheState {
             u64::try_from(self.entries.len()).unwrap_or(u64::MAX),
             self.resident_bytes,
         )
+    }
+}
+
+/// The metadata cache's live state, read under its one state lock.
+///
+/// Test-support only. Every field is read from the state the cache actually
+/// mutates — the resident map, its charged bytes, the in-flight map, and each
+/// in-flight load's own waiter count — so a drained node is proven settled by
+/// the owner itself rather than by a separately maintained tally.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataCacheInspection {
+    /// Successful entries currently retained.
+    pub resident_entries: u64,
+    /// Charged bytes currently retained.
+    pub resident_bytes: u64,
+    /// Loads whose owner has not yet published a terminal result.
+    pub inflight_loads: u64,
+    /// Callers, electors included, currently joined to an in-flight load.
+    pub waiters: u64,
+    /// Whether the cache still admits new loads.
+    pub lifecycle: StorageLifecycle,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl MetadataCacheInspection {
+    /// Returns whether the cache holds nothing and owes nobody a result.
+    ///
+    /// Deliberately independent of the lifecycle so a caller can tell
+    /// "declared closed" apart from "actually holds nothing".
+    #[must_use]
+    pub const fn is_quiescent(&self) -> bool {
+        self.resident_entries == 0
+            && self.resident_bytes == 0
+            && self.inflight_loads == 0
+            && self.waiters == 0
     }
 }
 
@@ -397,7 +433,7 @@ enum Registration {
 ///
 /// Holding a guard is what makes a caller a waiter. Settling it on return, on
 /// an early error, and on drop — including the drop of a cancelled future — is
-/// what keeps the waiter gauge honest, and it is what lets the cache notice
+/// what keeps the per-load waiter count honest, and it is what lets the cache notice
 /// that the last interested caller has gone so it can stop work nobody wants.
 struct WaiterGuard {
     /// The cache whose accounting this guard settles.
@@ -451,17 +487,11 @@ pub(crate) struct ParquetMetadataCache {
     /// caller observes that same terminal lifecycle rather than running a
     /// second close over state the first one already reconciled.
     closing: tokio::sync::Mutex<Option<bool>>,
-    /// The owner's production telemetry facade.
-    telemetry: Arc<BifrostStorageTelemetry>,
 }
 
 impl ParquetMetadataCache {
     /// Builds one cache over a positive byte budget.
-    pub(crate) fn new(
-        budget_bytes: u64,
-        telemetry: Arc<BifrostStorageTelemetry>,
-        resources: OracleMetadataResources,
-    ) -> Self {
+    pub(crate) fn new(budget_bytes: u64, resources: OracleMetadataResources) -> Self {
         Self {
             state: Mutex::new(CacheState {
                 entries: LruCache::unbounded(),
@@ -472,7 +502,6 @@ impl ParquetMetadataCache {
             budget_bytes,
             resources,
             closing: tokio::sync::Mutex::new(None),
-            telemetry,
         }
     }
 
@@ -549,15 +578,13 @@ impl ParquetMetadataCache {
         };
         if state.lifecycle != StorageLifecycle::Open {
             drop(state);
-            self.telemetry
-                .record_cache_effect(CacheEffect::Bypass, CacheEffectReason::Closing);
+            telemetry::record_cache_effect(CacheEffect::Bypass, CacheEffectReason::Closing);
             return Err(Arc::new(BifrostStorageError::Closed));
         }
         if let Some(entry) = state.entries.get(key) {
             let metadata = entry.metadata.clone();
             drop(state);
-            self.telemetry
-                .record_cache_effect(CacheEffect::Hit, CacheEffectReason::None);
+            telemetry::record_cache_effect(CacheEffect::Hit, CacheEffectReason::None);
             return Ok(Registration::Resident(metadata));
         }
         if let Some(inflight) = state.inflight.get_mut(key) {
@@ -565,21 +592,13 @@ impl ParquetMetadataCache {
             let deadline = inflight.deadline;
             inflight.waiters = inflight.waiters.saturating_add(1);
             drop(state);
-            self.telemetry
-                .record_cache_effect(CacheEffect::Join, CacheEffectReason::None);
-            self.telemetry.record_waiter_joined();
+            telemetry::record_cache_effect(CacheEffect::Join, CacheEffectReason::None);
             return Ok(Registration::Joined { receiver, deadline });
         }
         let (publisher, receiver) = watch::channel(None);
         let cancel = CancellationToken::new();
         let cause = Arc::new(AtomicU8::new(CancelCause::None.code()));
-        // Recorded before the task can be scheduled, so a load that settles
-        // immediately can never publish a terminal the totals have no start
-        // for.
-        self.telemetry
-            .record_cache_effect(CacheEffect::Miss, CacheEffectReason::None);
-        self.telemetry.record_load_start();
-        self.telemetry.record_waiter_joined();
+        telemetry::record_cache_effect(CacheEffect::Miss, CacheEffectReason::None);
         let task = self.spawn_loader(
             key.clone(),
             load,
@@ -599,6 +618,7 @@ impl ParquetMetadataCache {
                 task,
             },
         );
+        telemetry::record_inflight_loads(state.inflight.len());
         drop(state);
         Ok(Registration::Joined {
             receiver,
@@ -686,11 +706,10 @@ impl ParquetMetadataCache {
         if let Some(cancel) = abandoned {
             cancel.cancel();
         }
-        self.telemetry
-            .record_waiter_settled(outcome, joined.elapsed());
+        telemetry::record_waiter_settled(outcome, joined.elapsed());
     }
 
-    /// Applies one terminal load result to the resident state and telemetry.
+    /// Applies one terminal load result to the resident state and its metrics.
     ///
     /// Removes the in-flight registration first so a caller arriving after the
     /// publish sees either the newly resident entry or a fresh miss, and never
@@ -712,10 +731,9 @@ impl ParquetMetadataCache {
             Err(_) => MetadataLoadOutcome::Failed,
         };
         let retention = self.retain(key, result.as_ref().ok());
-        self.telemetry.record_load_terminal(outcome, elapsed);
+        telemetry::record_load_terminal(outcome, elapsed);
         if let Some(reason) = retention {
-            self.telemetry
-                .record_cache_effect(CacheEffect::Bypass, reason);
+            telemetry::record_cache_effect(CacheEffect::Bypass, reason);
         }
     }
 
@@ -738,13 +756,9 @@ impl ParquetMetadataCache {
             // rather than cancelling it, which is correct — the publish that
             // follows this call is the last thing it does.
             drop(inflight);
+            telemetry::record_inflight_loads(state.inflight.len());
         }
-        let Some(metadata) = metadata else {
-            let (entries, bytes) = state.resident_totals();
-            drop(state);
-            self.telemetry.record_resident(entries, bytes);
-            return None;
-        };
+        let metadata = metadata?;
         if !metadata.is_funded() {
             drop(state);
             // The unfunded decision was already published when the root
@@ -777,12 +791,11 @@ impl ParquetMetadataCache {
         );
         state.resident_bytes = state.resident_bytes.saturating_add(weight);
         let (entries, bytes) = state.resident_totals();
+        telemetry::record_resident(entries, bytes);
         drop(state);
         for _ in 0..evicted {
-            self.telemetry
-                .record_cache_effect(CacheEffect::Evict, CacheEffectReason::None);
+            telemetry::record_cache_effect(CacheEffect::Evict, CacheEffectReason::None);
         }
-        self.telemetry.record_resident(entries, bytes);
         None
     }
 
@@ -817,8 +830,7 @@ impl ParquetMetadataCache {
                 reservation: Some(Arc::new(reservation)),
             }
         } else {
-            self.telemetry
-                .record_cache_effect(CacheEffect::Bypass, CacheEffectReason::Unfunded);
+            telemetry::record_cache_effect(CacheEffect::Bypass, CacheEffectReason::Unfunded);
             unfunded
         }
     }
@@ -886,6 +898,7 @@ impl ParquetMetadataCache {
         };
         state.lifecycle = StorageLifecycle::Closing;
         let inflight = std::mem::take(&mut state.inflight);
+        telemetry::record_inflight_loads(0);
         drop(state);
         let tasks: Vec<_> = inflight
             .into_values()
@@ -894,7 +907,6 @@ impl ParquetMetadataCache {
                 (entry, settled)
             })
             .collect();
-        self.telemetry.record_lifecycle(StorageLifecycle::Closing);
         tasks
             .into_iter()
             .map(|(entry, settled)| {
@@ -913,9 +925,36 @@ impl ParquetMetadataCache {
             state.entries.clear();
             state.resident_bytes = 0;
             state.lifecycle = StorageLifecycle::Closed;
+            telemetry::record_resident(0, 0);
         }
-        self.telemetry.record_resident(0, 0);
-        self.telemetry.record_lifecycle(StorageLifecycle::Closed);
+    }
+
+    /// Reads the cache's live state under its state lock.
+    ///
+    /// Test-support only. One acquisition, so every field describes the same
+    /// moment.
+    ///
+    /// # Panics
+    /// Panics when the state lock is poisoned, which only happens after a
+    /// panic while the lock was held and leaves nothing truthful to report.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn inspect(&self) -> MetadataCacheInspection {
+        let state = self
+            .state
+            .lock()
+            .expect("the metadata cache state lock is never poisoned in a test");
+        let (resident_entries, resident_bytes) = state.resident_totals();
+        MetadataCacheInspection {
+            resident_entries,
+            resident_bytes,
+            inflight_loads: u64::try_from(state.inflight.len()).unwrap_or(u64::MAX),
+            waiters: state
+                .inflight
+                .values()
+                .map(|inflight| inflight.waiters)
+                .sum(),
+            lifecycle: state.lifecycle,
+        }
     }
 
     /// Drains the cache within one absolute deadline.
@@ -958,8 +997,7 @@ impl ParquetMetadataCache {
                     // Without this the in-flight gauge would keep a start no
                     // terminal will ever settle, and a forced shutdown would
                     // look like a leak forever.
-                    self.telemetry
-                        .record_load_terminal(MetadataLoadOutcome::Cancelled, Duration::ZERO);
+                    telemetry::record_load_terminal(MetadataLoadOutcome::Cancelled, Duration::ZERO);
                 }
             }
         }
@@ -997,9 +1035,69 @@ mod tests {
     use super::*;
     use crate::storage::BifrostStorage;
     use crate::storage::policy::BifrostStoragePolicy;
-    use crate::storage::telemetry::{
-        CacheEffect, CacheEffectReason, MetadataCacheSnapshot, MetadataLoadOutcome,
+    use crate::storage::telemetry::recorded::{
+        self, CACHE_EFFECTS, CACHE_LOADS, REQUESTS, RETIRED_ANOMALIES, RETIRED_WAITERS,
+        WAIT_SECONDS,
     };
+    use num_traits::ToPrimitive as _;
+    use wyrd_bench::BenchmarkRecorder;
+
+    /// Counts every tracing event the storage module emits on this thread.
+    ///
+    /// Installed as the thread's default subscriber so a test can prove a
+    /// cache decision is published as its metric alone, with no parallel
+    /// per-decision lifecycle event repeating it.
+    #[derive(Clone, Default)]
+    struct StorageEvents(Arc<AtomicUsize>);
+
+    impl tracing::Subscriber for StorageEvents {
+        /// Observes every callsite so no storage event can be filtered out.
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        /// Assigns every span one placeholder id; spans are not under test.
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        /// Ignores span field updates.
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        /// Ignores span relationships.
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        /// Counts one event when it was emitted from the storage module.
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event
+                .metadata()
+                .target()
+                .starts_with("vala_bifrost_redux::storage")
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        /// Ignores span entry.
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        /// Ignores span exit.
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Returns one cache decision's emitted count.
+    fn effect(recorder: &BenchmarkRecorder, effect: &str, reason: &str) -> u64 {
+        recorded::counter(
+            recorder,
+            CACHE_EFFECTS,
+            &[("effect", effect), ("reason", reason)],
+        )
+    }
+
+    /// Returns one load terminal outcome's emitted count.
+    fn loads(recorder: &BenchmarkRecorder, outcome: &str) -> u64 {
+        recorded::counter(recorder, CACHE_LOADS, &[("outcome", outcome)])
+    }
 
     /// Writes one real Parquet object whose footer the cache will decode.
     ///
@@ -1183,22 +1281,124 @@ mod tests {
     /// Panics when a waiter task, decode, or reconciliation assertion fails.
     #[tokio::test]
     async fn metadata_cache_reconciles_single_flight_identity_and_bypass() {
+        let recorder = BenchmarkRecorder::default();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let events = StorageEvents::default();
+        let _events = tracing::subscriber::set_default(events.clone());
         let object = parquet_object(64);
         let size = u64::try_from(object.len()).expect("fixture object fits u64");
         let tenant = DataTenantId::new_v7();
         let storage = Arc::new(storage_with_cache(1 << 20));
         let deadline = Instant::now() + Duration::from_secs(30);
         let decodes = Arc::new(AtomicUsize::new(0));
-        let gate = Arc::new(Notify::new());
         let key = test_key(tenant, "a.parquet", 0x11, size);
 
         // Single flight: the owner and every joined waiter share one decode.
+        let settled = single_flight(&storage, &key, &object, &decodes, deadline).await;
+        let inspection = cache_of(&storage).inspect();
+        assert_eq!(inspection.resident_entries, 1);
+        assert!(inspection.resident_bytes > 0);
+        assert_eq!(inspection.inflight_loads, 0);
+        assert_eq!(inspection.waiters, 0);
+        assert_eq!(effect(&recorder, "miss", "none"), 1);
+        assert_eq!(effect(&recorder, "join", "none"), 3);
+        assert_eq!(loads(&recorder, "success"), 1);
+        assert_eq!(recorded::counter(&recorder, CACHE_LOADS, &[]), 1);
+        assert_eq!(
+            recorded::observations(&recorder, WAIT_SECONDS, &[("outcome", "success")]),
+            4,
+            "every joined caller's wait is observed once"
+        );
+
+        // Repeat hit: a warm entry performs no backend load at all.
+        let requests_before_hit = recorded::counter(&recorder, REQUESTS, &[]);
+        let warm = storage
+            .object_metadata(
+                key.clone(),
+                {
+                    let object = object.clone();
+                    let decodes = Arc::clone(&decodes);
+                    move || CountingReader::new(&object, &decodes, None)
+                },
+                deadline,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the warm entry is served");
+        assert!(Arc::ptr_eq(warm.metadata(), settled[0].metadata()));
+        assert_eq!(
+            decodes.load(Ordering::SeqCst),
+            1,
+            "a hit must not read the object again"
+        );
+        assert_eq!(effect(&recorder, "hit", "none"), 1);
+        assert_eq!(loads(&recorder, "success"), 1, "a hit starts no load");
+        assert_eq!(
+            recorded::counter(&recorder, REQUESTS, &[]),
+            requests_before_hit,
+            "a hit claims no backend request"
+        );
+
+        // Identity: the same path under a different checksum is a different
+        // object and must not be served by the resident entry.
+        let rewritten = storage
+            .object_metadata(
+                test_key(tenant, "a.parquet", 0x22, size),
+                {
+                    let object = object.clone();
+                    let decodes = Arc::clone(&decodes);
+                    move || CountingReader::new(&object, &decodes, None)
+                },
+                deadline,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the rewritten object decodes");
+        assert!(!Arc::ptr_eq(rewritten.metadata(), settled[0].metadata()));
+        assert_eq!(decodes.load(Ordering::SeqCst), 2, "checksum is identity");
+        assert_eq!(
+            effect(&recorder, "miss", "none"),
+            2,
+            "a changed checksum is a new object, not a hit"
+        );
+        assert_eq!(cache_of(&storage).inspect().resident_entries, 2);
+
+        // The decisions above are published once, as their metric: no
+        // per-decision lifecycle event repeats them, and the retired shadow
+        // families never appear.
+        assert_eq!(
+            events.0.load(Ordering::SeqCst),
+            0,
+            "a cache decision emits no parallel lifecycle event"
+        );
+        assert!(!recorded::emitted(&recorder, RETIRED_ANOMALIES));
+        assert!(!recorded::emitted(&recorder, RETIRED_WAITERS));
+    }
+
+    /// Drives four concurrent callers for one key and returns their settled reads.
+    ///
+    /// The first caller's decode is gated, so the other three join its single
+    /// flight before it may finish. Asserts that the four share one in-flight
+    /// load, that exactly one decode ran, and that every caller observes the
+    /// same retained metadata.
+    ///
+    /// # Panics
+    /// Panics when a waiter task fails, the decode fails, or any single-flight
+    /// assertion does not hold.
+    async fn single_flight(
+        storage: &Arc<BifrostStorage>,
+        key: &ObjectMetadataKey,
+        object: &Bytes,
+        decodes: &Arc<AtomicUsize>,
+        deadline: Instant,
+    ) -> Vec<RetainedMetadata> {
+        let gate = Arc::new(Notify::new());
         let mut waiters = Vec::new();
         for index in 0..4 {
-            let storage = Arc::clone(&storage);
+            let storage = Arc::clone(storage);
             let waiter_key = key.clone();
             let object = object.clone();
-            let decodes = Arc::clone(&decodes);
+            let decodes = Arc::clone(decodes);
             let gate = (index == 0).then(|| Arc::clone(&gate));
             waiters.push(tokio::spawn(async move {
                 storage
@@ -1212,6 +1412,12 @@ mod tests {
             }));
             tokio::task::yield_now().await;
         }
+        settled_to(cache_of(storage), |cache| cache.waiters == 4).await;
+        assert_eq!(
+            cache_of(storage).inspect().inflight_loads,
+            1,
+            "four callers share one load"
+        );
         gate.notify_waiters();
         let mut settled = Vec::new();
         for waiter in waiters {
@@ -1233,63 +1439,18 @@ mod tests {
                 "every waiter must observe the one shared decode"
             );
         }
-        let snapshot = storage.telemetry_snapshot();
-        assert_eq!(snapshot.load_starts(), 1);
-        assert_eq!(snapshot.load_terminal(MetadataLoadOutcome::Success), 1);
-        assert_eq!(snapshot.load_starts(), snapshot.load_terminals());
-        assert_eq!(snapshot.effect(CacheEffect::Miss), 1);
-        assert_eq!(snapshot.effect(CacheEffect::Join), 3);
-        assert_eq!(snapshot.resident_entries(), 1);
-        assert!(snapshot.resident_bytes() > 0);
-        assert_eq!(snapshot.inflight_loads(), 0);
-        assert_eq!(snapshot.waiters(), 0);
+        settled
+    }
 
-        // Repeat hit: a warm entry performs no backend load at all.
-        let warm = storage
-            .object_metadata(
-                key.clone(),
-                {
-                    let object = object.clone();
-                    let decodes = Arc::clone(&decodes);
-                    move || CountingReader::new(&object, &decodes, None)
-                },
-                deadline,
-                CancellationToken::new(),
-            )
-            .await
-            .expect("the warm entry is served");
-        assert!(Arc::ptr_eq(warm.metadata(), settled[0].metadata()));
-        assert_eq!(
-            decodes.load(Ordering::SeqCst),
-            1,
-            "a hit must not read the object again"
-        );
-        let snapshot = storage.telemetry_snapshot();
-        assert_eq!(snapshot.effect(CacheEffect::Hit), 1);
-        assert_eq!(snapshot.load_starts(), 1, "a hit starts no load");
-
-        // Identity: the same path under a different checksum is a different
-        // object and must not be served by the resident entry.
-        let rewritten = storage
-            .object_metadata(
-                test_key(tenant, "a.parquet", 0x22, size),
-                {
-                    let object = object.clone();
-                    let decodes = Arc::clone(&decodes);
-                    move || CountingReader::new(&object, &decodes, None)
-                },
-                deadline,
-                CancellationToken::new(),
-            )
-            .await
-            .expect("the rewritten object decodes");
-        assert!(!Arc::ptr_eq(rewritten.metadata(), settled[0].metadata()));
-        assert_eq!(decodes.load(Ordering::SeqCst), 2, "checksum is identity");
-        assert_eq!(
-            storage.telemetry_snapshot().effect(CacheEffect::Miss),
-            2,
-            "a changed checksum is a new object, not a hit"
-        );
+    /// Returns the composed cache an Oracle-serving fixture owner holds.
+    ///
+    /// # Panics
+    /// Panics when the fixture owner was composed without a cache.
+    fn cache_of(storage: &BifrostStorage) -> &Arc<ParquetMetadataCache> {
+        storage
+            .metadata_cache
+            .as_ref()
+            .expect("the fixture owner composes a metadata cache")
     }
 
     /// A composition with no metadata budget still serves every read, says so,
@@ -1304,6 +1465,8 @@ mod tests {
     /// Panics when a decode or bypass assertion fails.
     #[tokio::test]
     async fn a_composition_with_no_budget_bypasses_and_retains_nothing() {
+        let recorder = BenchmarkRecorder::default();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
         let object = parquet_object(64);
         let size = u64::try_from(object.len()).expect("fixture object fits u64");
         let tenant = DataTenantId::new_v7();
@@ -1327,13 +1490,15 @@ mod tests {
                 .await
                 .expect("a disabled composition still decodes");
         }
-        let snapshot = disabled.telemetry_snapshot();
         assert_eq!(disabled_decodes.load(Ordering::SeqCst), 2);
-        assert_eq!(snapshot.effect(CacheEffect::Bypass), 2);
-        assert_eq!(snapshot.reason(CacheEffectReason::Disabled), 2);
-        assert_eq!(snapshot.resident_entries(), 0);
-        assert_eq!(snapshot.resident_bytes(), 0);
-        assert!(snapshot.is_quiescent());
+        assert_eq!(effect(&recorder, "bypass", "disabled"), 2);
+        assert_eq!(recorded::counter(&recorder, CACHE_EFFECTS, &[]), 2);
+        let inspection = disabled.inspect();
+        assert!(
+            inspection.metadata_cache.is_none(),
+            "a disabled composition holds no cache to retain anything in"
+        );
+        assert_eq!(inspection.active_requests, 0);
     }
 
     /// The cache stays inside its byte ceiling by giving up its least recently
@@ -1348,6 +1513,8 @@ mod tests {
     /// Panics when a decode or eviction assertion fails.
     #[tokio::test]
     async fn the_cache_evicts_in_least_recently_used_order_and_refuses_oversize() {
+        let recorder = BenchmarkRecorder::default();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
         let object = parquet_object(64);
         let size = u64::try_from(object.len()).expect("fixture object fits u64");
         let tenant = DataTenantId::new_v7();
@@ -1360,10 +1527,8 @@ mod tests {
         let evicting_key = |checksum: u8, object: &str| test_key(tenant, object, checksum, size);
         let weight = u64::try_from(metadata.memory_size()).expect("footprint fits u64")
             + evicting_key(0x31, "aaa.parquet").owned_bytes();
-        let telemetry = Arc::new(BifrostStorageTelemetry::default());
         let cache = Arc::new(ParquetMetadataCache::new(
             2 * weight,
-            Arc::clone(&telemetry),
             oracle_metadata_resources(2 * 1024 * 1024 * 1024),
         ));
         let resident = |cache: &Arc<ParquetMetadataCache>, key: ObjectMetadataKey| {
@@ -1386,45 +1551,52 @@ mod tests {
         let key_c = evicting_key(0x33, "ccc.parquet");
         resident(&cache, key_a.clone()).await;
         resident(&cache, key_b.clone()).await;
-        let snapshot = telemetry.snapshot();
-        assert_eq!(snapshot.resident_entries(), 2, "the budget holds both");
-        assert_eq!(snapshot.resident_bytes(), 2 * weight);
-        assert_eq!(snapshot.effect(CacheEffect::Evict), 0);
+        let inspection = cache.inspect();
+        assert_eq!(inspection.resident_entries, 2, "the budget holds both");
+        assert_eq!(inspection.resident_bytes, 2 * weight);
+        assert_eq!(effect(&recorder, "evict", "none"), 0);
 
         // Touch A so B, not A, is least recently used.
         resident(&cache, key_a.clone()).await;
-        assert_eq!(telemetry.snapshot().effect(CacheEffect::Hit), 1);
+        assert_eq!(effect(&recorder, "hit", "none"), 1);
 
         resident(&cache, key_c).await;
-        let snapshot = telemetry.snapshot();
         assert_eq!(
-            snapshot.effect(CacheEffect::Evict),
+            effect(&recorder, "evict", "none"),
             1,
             "admitting a third entry gives up exactly one"
         );
-        assert_eq!(snapshot.resident_entries(), 2);
-        assert_eq!(snapshot.resident_bytes(), 2 * weight);
+        let inspection = cache.inspect();
+        assert_eq!(inspection.resident_entries, 2);
+        assert_eq!(inspection.resident_bytes, 2 * weight);
+        assert!(
+            (recorded::gauge(&recorder, "bifrost_storage_metadata_cache_resident_bytes")
+                - (2 * weight)
+                    .to_f64()
+                    .expect("the test weight is exactly representable"))
+            .abs()
+                < f64::EPSILON,
+            "the resident-byte gauge is set from the cache's own state"
+        );
 
         // A was touched most recently, so A survived and B is the one gone.
         resident(&cache, key_a).await;
         assert_eq!(
-            telemetry.snapshot().effect(CacheEffect::Hit),
+            effect(&recorder, "hit", "none"),
             2,
             "the recently used entry survived eviction"
         );
         resident(&cache, key_b).await;
         assert_eq!(
-            telemetry.snapshot().effect(CacheEffect::Hit),
+            effect(&recorder, "hit", "none"),
             2,
             "the least recently used entry was the one evicted"
         );
 
         // Oversized: metadata larger than the whole budget is still returned to
         // its caller and simply not retained.
-        let tiny_telemetry = Arc::new(BifrostStorageTelemetry::default());
         let tiny = Arc::new(ParquetMetadataCache::new(
             1,
-            Arc::clone(&tiny_telemetry),
             oracle_metadata_resources(2 * 1024 * 1024 * 1024),
         ));
         let loaded = Arc::clone(&metadata);
@@ -1438,11 +1610,10 @@ mod tests {
             .await
             .expect("an oversized decode still reaches its caller");
         assert!(Arc::ptr_eq(bypassed.metadata(), &metadata));
-        let snapshot = tiny_telemetry.snapshot();
-        assert_eq!(snapshot.effect(CacheEffect::Bypass), 1);
-        assert_eq!(snapshot.reason(CacheEffectReason::Oversized), 1);
-        assert_eq!(snapshot.resident_entries(), 0);
-        assert_eq!(snapshot.resident_bytes(), 0);
+        assert_eq!(effect(&recorder, "bypass", "oversized"), 1);
+        let inspection = tiny.inspect();
+        assert_eq!(inspection.resident_entries, 0);
+        assert_eq!(inspection.resident_bytes, 0);
     }
 
     /// Decodes the fixture object's real footer for use as a load result.
@@ -1459,7 +1630,7 @@ mod tests {
             .expect("fixture footer decodes")
     }
 
-    /// Waits until the owner's totals satisfy `reached`.
+    /// Waits until the cache's own live state satisfies `reached`.
     ///
     /// A barrier, not a timed assumption: no assertion below depends on how
     /// long this takes, only on the state it waits for, so a slow machine
@@ -1471,11 +1642,11 @@ mod tests {
     /// # Panics
     /// Panics when the condition is not reached within the yield budget.
     async fn settled_to(
-        telemetry: &Arc<BifrostStorageTelemetry>,
-        reached: impl Fn(&MetadataCacheSnapshot) -> bool,
+        cache: &ParquetMetadataCache,
+        reached: impl Fn(&MetadataCacheInspection) -> bool,
     ) {
         for attempt in 0..2_000_u32 {
-            if reached(&telemetry.snapshot()) {
+            if reached(&cache.inspect()) {
                 return;
             }
             if attempt % 32 == 31 {
@@ -1485,8 +1656,8 @@ mod tests {
             }
         }
         panic!(
-            "the owner never reached the awaited state: {:?}",
-            telemetry.snapshot()
+            "the cache never reached the awaited state: {:?}",
+            cache.inspect()
         );
     }
 
@@ -1512,11 +1683,11 @@ mod tests {
     /// Panics when a waiter task, terminal, or reconciliation assertion fails.
     #[tokio::test]
     async fn one_supervised_terminal_settles_every_caller_and_frees_the_key() {
+        let recorder = BenchmarkRecorder::default();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
         let tenant = DataTenantId::new_v7();
-        let telemetry = Arc::new(BifrostStorageTelemetry::default());
         let cache = Arc::new(ParquetMetadataCache::new(
             64 * 1024 * 1024,
-            Arc::clone(&telemetry),
             oracle_metadata_resources(2 * 1024 * 1024 * 1024),
         ));
         let far = Instant::now() + Duration::from_hours(1);
@@ -1544,7 +1715,7 @@ mod tests {
                     .await
             }
         });
-        settled_to(&telemetry, |snapshot| snapshot.load_starts() == 1).await;
+        settled_to(&cache, |cache| cache.inflight_loads == 1).await;
         let joiners = (0..2)
             .map(|_| {
                 tokio::spawn({
@@ -1558,7 +1729,7 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        settled_to(&telemetry, |snapshot| snapshot.waiters() == 3).await;
+        settled_to(&cache, |cache| cache.waiters == 3).await;
         gate.notify_waiters();
 
         let elected = elector.await.expect("the elector task completes");
@@ -1573,15 +1744,18 @@ mod tests {
                 ref error if matches!(**error, BifrostStorageError::NotFound { .. })
             ));
         }
-        let snapshot = telemetry.snapshot();
-        assert_eq!(snapshot.effect(CacheEffect::Miss), 1);
-        assert_eq!(snapshot.effect(CacheEffect::Join), 2);
-        assert_eq!(snapshot.load_starts(), 1);
-        assert_eq!(snapshot.load_terminal(MetadataLoadOutcome::Failed), 1);
-        assert_eq!(snapshot.inflight_loads(), 0);
-        assert_eq!(snapshot.waiters(), 0);
-
-        assert_eq!(snapshot.anomalies(), 0);
+        assert_eq!(effect(&recorder, "miss", "none"), 1);
+        assert_eq!(effect(&recorder, "join", "none"), 2);
+        assert_eq!(loads(&recorder, "failed"), 1);
+        assert_eq!(recorded::counter(&recorder, CACHE_LOADS, &[]), 1);
+        assert_eq!(
+            recorded::observations(&recorder, WAIT_SECONDS, &[("outcome", "failed")]),
+            3,
+            "every joined caller observed the one failure"
+        );
+        let inspection = cache.inspect();
+        assert_eq!(inspection.inflight_loads, 0);
+        assert_eq!(inspection.waiters, 0);
         assert!(cache.close(far).await);
     }
 
@@ -1597,13 +1771,13 @@ mod tests {
     /// Panics when a decode, terminal, or reconciliation assertion fails.
     #[tokio::test]
     async fn a_badly_ended_load_frees_its_key_for_a_later_caller() {
+        let recorder = BenchmarkRecorder::default();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
         let object = parquet_object(32);
         let decoded = decode_fixture(&object).await;
         let tenant = DataTenantId::new_v7();
-        let telemetry = Arc::new(BifrostStorageTelemetry::default());
         let cache = Arc::new(ParquetMetadataCache::new(
             64 * 1024 * 1024,
-            Arc::clone(&telemetry),
             oracle_metadata_resources(2 * 1024 * 1024 * 1024),
         ));
         let far = Instant::now() + Duration::from_hours(1);
@@ -1639,8 +1813,8 @@ mod tests {
             .await
             .expect("the retried load succeeds");
         assert_eq!(retried.memory_size(), decoded.memory_size());
-        assert_eq!(telemetry.snapshot().effect(CacheEffect::Miss), 2);
-        assert_eq!(telemetry.snapshot().resident_entries(), 1);
+        assert_eq!(effect(&recorder, "miss", "none"), 2);
+        assert_eq!(cache.inspect().resident_entries, 1);
 
         // A panicking decode is a terminal like any other: it settles every
         // caller and releases the key rather than stranding it in flight.
@@ -1655,12 +1829,15 @@ mod tests {
             .await
             .expect_err("a panicking decode fails its caller");
         assert!(matches!(*observed, BifrostStorageError::InvalidData { .. }));
-        let snapshot = telemetry.snapshot();
-        assert_eq!(snapshot.load_terminal(MetadataLoadOutcome::Failed), 2);
-        assert_eq!(snapshot.load_starts(), snapshot.load_terminals());
-        assert_eq!(snapshot.inflight_loads(), 0);
-        assert_eq!(snapshot.waiters(), 0);
-        assert_eq!(snapshot.anomalies(), 0);
+        assert_eq!(loads(&recorder, "failed"), 2);
+        assert_eq!(
+            recorded::counter(&recorder, CACHE_LOADS, &[]),
+            3,
+            "three elected loads, three terminals"
+        );
+        let inspection = cache.inspect();
+        assert_eq!(inspection.inflight_loads, 0);
+        assert_eq!(inspection.waiters, 0);
         assert!(cache.close(far).await);
     }
 
@@ -1679,11 +1856,11 @@ mod tests {
     /// fails.
     #[tokio::test]
     async fn a_shared_load_outlives_one_caller_and_ends_when_all_of_them_leave() {
+        let recorder = BenchmarkRecorder::default();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
         let tenant = DataTenantId::new_v7();
-        let telemetry = Arc::new(BifrostStorageTelemetry::default());
         let cache = Arc::new(ParquetMetadataCache::new(
             64 * 1024 * 1024,
-            Arc::clone(&telemetry),
             oracle_metadata_resources(2 * 1024 * 1024 * 1024),
         ));
         let far = Instant::now() + Duration::from_hours(1);
@@ -1700,7 +1877,7 @@ mod tests {
                     .await
             }
         });
-        settled_to(&telemetry, |snapshot| snapshot.load_starts() == 1).await;
+        settled_to(&cache, |cache| cache.inflight_loads == 1).await;
         let joiner = tokio::spawn({
             let cache = Arc::clone(&cache);
             let key = abandoned.clone();
@@ -1710,7 +1887,7 @@ mod tests {
                     .await
             }
         });
-        settled_to(&telemetry, |snapshot| snapshot.waiters() == 2).await;
+        settled_to(&cache, |cache| cache.waiters == 2).await;
 
         // The elector detaches on its own token. The load keeps running because
         // the joiner still wants the result.
@@ -1720,17 +1897,24 @@ mod tests {
             *elected.expect_err("the cancelled elector fails"),
             BifrostStorageError::Cancelled
         ));
-        settled_to(&telemetry, |snapshot| snapshot.waiters() == 1).await;
-        assert_eq!(telemetry.snapshot().inflight_loads(), 1);
+        settled_to(&cache, |cache| cache.waiters == 1).await;
+        assert_eq!(cache.inspect().inflight_loads, 1);
 
         // The last waiter's departure is what ends work nobody wants, and the
         // published cause says so.
         joiner.abort();
-        settled_to(&telemetry, |snapshot| snapshot.inflight_loads() == 0).await;
-        let snapshot = telemetry.snapshot();
-        assert_eq!(snapshot.load_terminal(MetadataLoadOutcome::Cancelled), 1);
-        assert_eq!(snapshot.waiters(), 0);
-        assert_eq!(snapshot.resident_entries(), 0);
+        settled_to(&cache, |cache| cache.inflight_loads == 0).await;
+        // The loader's terminal is published just after it retires its key.
+        for _ in 0..64 {
+            if loads(&recorder, "cancelled") == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(loads(&recorder, "cancelled"), 1);
+        let inspection = cache.inspect();
+        assert_eq!(inspection.waiters, 0);
+        assert_eq!(inspection.resident_entries, 0);
 
         // A later joiner accepts the election-fixed deadline and cannot widen
         // it: both callers observe the same deadline terminal at the elected
@@ -1755,7 +1939,7 @@ mod tests {
                     .await
             }
         });
-        settled_to(&telemetry, |snapshot| snapshot.load_starts() == 2).await;
+        settled_to(&cache, |cache| cache.inflight_loads == 1).await;
         let joiner = tokio::spawn({
             let cache = Arc::clone(&cache);
             let key = bounded.clone();
@@ -1765,7 +1949,7 @@ mod tests {
                     .await
             }
         });
-        settled_to(&telemetry, |snapshot| snapshot.waiters() == 2).await;
+        settled_to(&cache, |cache| cache.waiters == 2).await;
         for task in [elector, joiner] {
             let observed = task.await.expect("a bounded task completes");
             assert!(matches!(
@@ -1773,10 +1957,9 @@ mod tests {
                 BifrostStorageError::Deadline
             ));
         }
-        let snapshot = telemetry.snapshot();
-        assert_eq!(snapshot.load_terminal(MetadataLoadOutcome::Deadline), 1);
-        assert_eq!(snapshot.load_starts(), snapshot.load_terminals());
-        assert!(snapshot.is_quiescent());
+        assert_eq!(loads(&recorder, "deadline"), 1);
+        assert_eq!(recorded::counter(&recorder, CACHE_LOADS, &[]), 2);
+        assert!(cache.inspect().is_quiescent());
         assert!(cache.close(far).await);
     }
 
@@ -1794,10 +1977,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_settles_every_loader_once_and_shares_that_one_outcome() {
         let tenant = DataTenantId::new_v7();
-        let telemetry = Arc::new(BifrostStorageTelemetry::default());
         let cache = Arc::new(ParquetMetadataCache::new(
             64 * 1024 * 1024,
-            Arc::clone(&telemetry),
             oracle_metadata_resources(2 * 1024 * 1024 * 1024),
         ));
         let far = Instant::now() + Duration::from_hours(1);
@@ -1817,7 +1998,7 @@ mod tests {
                     .await
             }
         });
-        settled_to(&telemetry, |snapshot| snapshot.load_starts() == 1).await;
+        settled_to(&cache, |cache| cache.inflight_loads == 1).await;
 
         // Two closers race one close. Both observe the same completion, and the
         // loader settles itself inside the budget, so the close is clean.
@@ -1837,11 +2018,9 @@ mod tests {
             *observed.expect_err("a load outstanding at close fails"),
             BifrostStorageError::Closed
         ));
-        let snapshot = telemetry.snapshot();
-        assert_eq!(snapshot.load_terminal(MetadataLoadOutcome::Cancelled), 1);
-        assert_eq!(snapshot.load_starts(), snapshot.load_terminals());
-        assert_eq!(snapshot.lifecycle(), StorageLifecycle::Closed);
-        assert!(snapshot.is_quiescent());
+        let inspection = cache.inspect();
+        assert_eq!(inspection.lifecycle, StorageLifecycle::Closed);
+        assert!(inspection.is_quiescent());
 
         // Admission is closed for good: a later caller is refused, and the
         // refusal is published rather than silently treated as a miss.
@@ -1850,11 +2029,7 @@ mod tests {
             .await
             .expect_err("a request after close is refused");
         assert!(matches!(*refused, BifrostStorageError::Closed));
-        assert_eq!(
-            telemetry.snapshot().reason(CacheEffectReason::Closing),
-            1,
-            "the refusal is recorded, not silent"
-        );
+        assert!(cache.inspect().is_quiescent(), "a refusal admits nothing");
     }
 
     /// A close whose budget has already elapsed reports unclean and still
@@ -1879,10 +2054,8 @@ mod tests {
 
         let tenant = DataTenantId::new_v7();
         let far = Instant::now() + Duration::from_hours(1);
-        let forced_telemetry = Arc::new(BifrostStorageTelemetry::default());
         let forced = Arc::new(ParquetMetadataCache::new(
             64 * 1024 * 1024,
-            Arc::clone(&forced_telemetry),
             oracle_metadata_resources(2 * 1024 * 1024 * 1024),
         ));
         let (release, blocked) = std::sync::mpsc::channel::<()>();
@@ -1906,7 +2079,7 @@ mod tests {
                     .await
             }
         });
-        settled_to(&forced_telemetry, |snapshot| snapshot.load_starts() == 1).await;
+        settled_to(&forced, |cache| cache.inflight_loads == 1).await;
         let mut closing = tokio::spawn({
             let cache = Arc::clone(&forced);
             async move { cache.close(Instant::now()).await }
@@ -1935,13 +2108,12 @@ mod tests {
             observed.is_err(),
             "a load the owner had to force never returns metadata"
         );
-        let snapshot = forced_telemetry.snapshot();
-        assert_eq!(
-            snapshot.load_starts(),
-            snapshot.load_terminals(),
-            "a forced close reconciles the loads it could not wait out"
+        let inspection = forced.inspect();
+        assert_eq!(inspection.lifecycle, StorageLifecycle::Closed);
+        assert!(
+            inspection.is_quiescent(),
+            "a forced close leaves no load it could not wait out"
         );
-        assert!(snapshot.is_quiescent());
     }
 
     /// Retained metadata is owned against the Oracle memory root for as long as
@@ -1959,6 +2131,8 @@ mod tests {
     /// Panics when a decode, reservation, or root assertion fails.
     #[tokio::test]
     async fn retained_metadata_stays_charged_to_the_root_until_its_last_borrower() {
+        let recorder = BenchmarkRecorder::default();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
         let object = parquet_object(64);
         let decoded = decode_fixture(&object).await;
         let tenant = DataTenantId::new_v7();
@@ -1967,17 +2141,12 @@ mod tests {
             .snapshot()
             .expect("baseline snapshot")
             .oracle_memory_used_bytes;
-        let telemetry = Arc::new(BifrostStorageTelemetry::default());
         let key_a = test_key(tenant, "aaa.parquet", 0x51, 1);
         let key_b = test_key(tenant, "bbb.parquet", 0x52, 1);
         let weight =
             u64::try_from(decoded.memory_size()).expect("footprint fits u64") + key_a.owned_bytes();
         // Exactly one entry fits, so retaining the second must evict the first.
-        let cache = Arc::new(ParquetMetadataCache::new(
-            weight,
-            Arc::clone(&telemetry),
-            oracle.metadata(),
-        ));
+        let cache = Arc::new(ParquetMetadataCache::new(weight, oracle.metadata()));
         let far = Instant::now() + Duration::from_hours(1);
         let load = |metadata: &Arc<ParquetMetaData>| {
             let metadata = Arc::clone(metadata);
@@ -2003,8 +2172,8 @@ mod tests {
             .get_or_load(key_b.clone(), load(&decoded), far, CancellationToken::new())
             .await
             .expect("the second decode is retained");
-        assert_eq!(telemetry.snapshot().effect(CacheEffect::Evict), 1);
-        assert_eq!(telemetry.snapshot().resident_entries(), 1);
+        assert_eq!(effect(&recorder, "evict", "none"), 1);
+        assert_eq!(cache.inspect().resident_entries, 1);
         assert_eq!(
             charged(&oracle),
             2 * usize::try_from(weight).expect("fits"),
@@ -2034,10 +2203,9 @@ mod tests {
             .await
             .expect("an unfundable decode still reaches its caller");
         assert!(!unfunded.is_funded());
-        let snapshot = telemetry.snapshot();
-        assert_eq!(snapshot.reason(CacheEffectReason::Unfunded), 1);
+        assert_eq!(effect(&recorder, "bypass", "unfunded"), 1);
         assert_eq!(
-            snapshot.resident_entries(),
+            cache.inspect().resident_entries,
             1,
             "the node keeps only what the root funded"
         );
@@ -2051,7 +2219,7 @@ mod tests {
             0,
             "a drained owner returns every metadata byte it owned"
         );
-        assert!(telemetry.snapshot().is_quiescent());
+        assert!(cache.inspect().is_quiescent());
     }
 
     /// One reader that fails its first `failures` range reads from beneath

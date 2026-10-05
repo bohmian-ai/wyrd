@@ -21,14 +21,15 @@ use wyrd_auth_oidc::{AddressPolicy, ScreenedHttp};
 use wyrd_crypt::SecretKey;
 use wyrd_gateway::{
     CredentialAssignment, CredentialResolver, ManagedSecretKeys, TenantKeyring, VaultBackend,
-    read_secret_file,
 };
 use wyrd_spec::auth::{IssuerTokenPolicy, Sha256Hex};
+use wyrd_spec::card::workflow::ExternalGatewayBindingConfig;
 use wyrd_spec::gateway::{ExternalSecretReference, ProviderCredentialSourceView};
 use wyrd_spec::ids::{CredentialBindingName, SecretBackendName};
 use wyrd_spec::security::SecretRef;
 use wyrd_spec::{DataTenantId, TenantSlug};
 use wyrd_telemetry::TelemetryConfig;
+use wyrd_utils::secret::{read_secret_file, read_secret_ref};
 
 use crate::boot::data_root::DEFAULT_BIFROST_DATA_DIR;
 
@@ -1659,6 +1660,152 @@ impl Default for VerificationConfig {
     }
 }
 
+/// Bounds and bindings of accepted server Workflow runs under `[workflow]`.
+///
+/// Every omitted field takes its value from the manual [`Default`], so an
+/// operator overrides only the bounds they set. Accepted runs are
+/// process-local; terminal runs are retained for a fixed 24 hours within the
+/// retained-run ceilings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServerWorkflowConfig {
+    /// Total run deadline applied when a request names none.
+    pub default_timeout_seconds: u64,
+    /// Largest total run deadline a request may name.
+    pub max_timeout_seconds: u64,
+    /// Ready steps one run executes concurrently.
+    pub max_concurrency_per_run: usize,
+    /// Preparing and active runs across every tenant.
+    pub max_active_global: usize,
+    /// Preparing and active runs of one tenant.
+    pub max_active_per_tenant: usize,
+    /// Terminal runs retained across every tenant.
+    pub max_retained_global: usize,
+    /// Terminal runs retained for one tenant.
+    pub max_retained_per_tenant: usize,
+    /// Declared steps one Workflow may have.
+    pub max_steps_per_run: usize,
+    /// Declared dependency edges one Workflow may have, duplicates included.
+    pub max_dependency_edges_per_run: usize,
+    /// JCS bytes of the Workflow and every unique pinned Agent and Prompt
+    /// body it executes.
+    pub max_resolved_graph_bytes: usize,
+    /// JCS bytes of one run's input.
+    pub max_input_bytes: usize,
+    /// JCS bytes of one step's normalized result.
+    pub max_step_result_bytes: usize,
+    /// JCS bytes of one run's complete snapshot, including its terminal
+    /// reserve.
+    pub max_run_bytes: usize,
+    /// External gateway bindings, each assigned to exactly one tenant.
+    pub external_gateway_bindings:
+        BTreeMap<CredentialBindingName, ServerExternalGatewayBindingConfig>,
+}
+
+impl Default for ServerWorkflowConfig {
+    /// The approved server Workflow bounds and no external gateway bindings.
+    fn default() -> Self {
+        const MIB: usize = 1024 * 1024;
+        Self {
+            default_timeout_seconds: 1800,
+            max_timeout_seconds: 7200,
+            max_concurrency_per_run: 8,
+            max_active_global: 32,
+            max_active_per_tenant: 4,
+            max_retained_global: 128,
+            max_retained_per_tenant: 32,
+            max_steps_per_run: 1024,
+            max_dependency_edges_per_run: 4096,
+            max_resolved_graph_bytes: 8 * MIB,
+            max_input_bytes: MIB,
+            max_step_result_bytes: MIB,
+            max_run_bytes: 4 * MIB,
+            external_gateway_bindings: BTreeMap::new(),
+        }
+    }
+}
+
+impl ServerWorkflowConfig {
+    /// Rejects bounds that cannot admit a run or that contradict each other,
+    /// so the server fails boot.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] naming the first zero bound, a default
+    /// timeout above the maximum, a per-tenant active or retained ceiling
+    /// above its global ceiling, or a step-result bound above the run bound.
+    fn validate(&self) -> Result<(), ConfigError> {
+        let invalid = |message: String| Err(ConfigError::Invalid { message });
+        let timeouts = [
+            ("default_timeout_seconds", self.default_timeout_seconds),
+            ("max_timeout_seconds", self.max_timeout_seconds),
+        ];
+        let ceilings = [
+            ("max_concurrency_per_run", self.max_concurrency_per_run),
+            ("max_active_global", self.max_active_global),
+            ("max_active_per_tenant", self.max_active_per_tenant),
+            ("max_retained_global", self.max_retained_global),
+            ("max_retained_per_tenant", self.max_retained_per_tenant),
+            ("max_steps_per_run", self.max_steps_per_run),
+            (
+                "max_dependency_edges_per_run",
+                self.max_dependency_edges_per_run,
+            ),
+            ("max_resolved_graph_bytes", self.max_resolved_graph_bytes),
+            ("max_input_bytes", self.max_input_bytes),
+            ("max_step_result_bytes", self.max_step_result_bytes),
+            ("max_run_bytes", self.max_run_bytes),
+        ];
+        let zero = timeouts
+            .iter()
+            .find(|(_, value)| *value == 0)
+            .map(|(name, _)| name)
+            .or_else(|| {
+                ceilings
+                    .iter()
+                    .find(|(_, value)| *value == 0)
+                    .map(|(name, _)| name)
+            });
+        if let Some(name) = zero {
+            return invalid(format!("workflow.{name} must be positive"));
+        }
+        if self.default_timeout_seconds > self.max_timeout_seconds {
+            return invalid(
+                "workflow.default_timeout_seconds must not exceed max_timeout_seconds".to_owned(),
+            );
+        }
+        if self.max_active_per_tenant > self.max_active_global {
+            return invalid(
+                "workflow.max_active_per_tenant must not exceed max_active_global".to_owned(),
+            );
+        }
+        if self.max_retained_per_tenant > self.max_retained_global {
+            return invalid(
+                "workflow.max_retained_per_tenant must not exceed max_retained_global".to_owned(),
+            );
+        }
+        if self.max_step_result_bytes > self.max_run_bytes {
+            return invalid(
+                "workflow.max_step_result_bytes must not exceed max_run_bytes".to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// One server external gateway binding and the tenant it is assigned to.
+///
+/// The server keeps the secret references and resolves only the binding a
+/// run of `tenant` selects, during that run's preparation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerExternalGatewayBindingConfig {
+    /// The only tenant whose runs may select this binding.
+    pub tenant: DataTenantId,
+    /// Protocol, origin, and secret headers of the binding.
+    #[serde(flatten)]
+    pub binding: ExternalGatewayBindingConfig,
+}
+
 /// Source of the 32-byte key-encryption keys (KEKs) that wrap each Operator
 /// connection's data key.
 ///
@@ -2002,6 +2149,9 @@ pub struct WyrdServerConfig {
     /// Operator-owned gateway credential sources.
     #[serde(default)]
     pub gateway: GatewayConfig,
+    /// Accepted server Workflow run bounds and external gateway bindings.
+    #[serde(default)]
+    pub workflow: ServerWorkflowConfig,
 }
 
 impl WyrdServerConfig {
@@ -2455,7 +2605,7 @@ impl GatewayConfig {
     /// wrapping key out of per-tenant configuration, so that fails boot.
     ///
     /// A mounted file carries tenant wrapping authority, so it is read through
-    /// [`read_secret_file`] under the same open-handle, regular-file,
+    /// [`read_secret_ref`] under the same open-handle, regular-file,
     /// owner-only, bounded rule the request path applies to an operator
     /// binding: a `0644` mount is refused here rather than accepted.
     ///
@@ -2475,15 +2625,9 @@ impl GatewayConfig {
             };
             let mut versions = BTreeMap::new();
             for (version, secret) in &configured.versions {
-                let encoded = match secret {
-                    SecretRef::Env { name } => env::var(name)
-                        .map_err(|_| invalid(version, "names an unset environment variable"))?,
-                    SecretRef::File { path } => read_secret_file(Path::new(path))
-                        .map_err(|reason| invalid(version, reason))?,
-                    _ => return Err(invalid(version, "must be an env or file secret reference")),
-                };
+                let encoded = read_secret_ref(secret).map_err(|reason| invalid(version, reason))?;
                 let bytes: [u8; 32] = BASE64_STANDARD
-                    .decode(encoded.trim())
+                    .decode(encoded.expose_secret().trim())
                     .ok()
                     .and_then(|bytes| bytes.try_into().ok())
                     .ok_or_else(|| {
@@ -3169,6 +3313,7 @@ impl WyrdServerConfig {
                 .validate()
                 .map_err(|message| ConfigError::Invalid { message })?;
             self.validate_oracle_calibration()?;
+            self.workflow.validate()?;
         }
 
         // Peer mode is explicit and all-or-nothing. A split Scribe or Oracle
@@ -6055,6 +6200,115 @@ provider = "anthropic"
                     }
                 },
             );
+        }
+    }
+
+    /// Server Workflow config fills omitted fields from the approved defaults,
+    /// parses a tenant-assigned external gateway binding beside its flattened
+    /// shared shape, and rejects unknown binding members.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a default differs, the binding does not parse, or an
+    /// unknown member is accepted.
+    #[test]
+    fn workflow_config_defaults_and_tenant_bindings_parse() {
+        let tenant = wyrd_spec::DataTenantId::new_v7();
+        let config = toml::from_str::<ServerWorkflowConfig>(&format!(
+            r#"
+max_active_per_tenant = 2
+
+[external_gateway_bindings.team-llm]
+tenant = "{tenant}"
+protocol = "openai_chat"
+origin = "https://llm.example"
+secret_headers = {{ authorization = {{ source = "env", name = "TEAM_LLM_KEY" }} }}
+"#
+        ))
+        .expect("workflow config parses");
+        assert_eq!(config.max_active_per_tenant, 2);
+        assert_eq!(config.default_timeout_seconds, 1800);
+        assert_eq!(config.max_timeout_seconds, 7200);
+        assert_eq!(config.max_concurrency_per_run, 8);
+        assert_eq!(config.max_active_global, 32);
+        assert_eq!(config.max_retained_global, 128);
+        assert_eq!(config.max_retained_per_tenant, 32);
+        assert_eq!(config.max_steps_per_run, 1024);
+        assert_eq!(config.max_dependency_edges_per_run, 4096);
+        assert_eq!(config.max_resolved_graph_bytes, 8 * 1024 * 1024);
+        assert_eq!(config.max_input_bytes, 1024 * 1024);
+        assert_eq!(config.max_step_result_bytes, 1024 * 1024);
+        assert_eq!(config.max_run_bytes, 4 * 1024 * 1024);
+        let binding = config
+            .external_gateway_bindings
+            .values()
+            .next()
+            .expect("binding parses");
+        assert_eq!(binding.tenant, tenant);
+        assert_eq!(binding.binding.origin.as_str(), "https://llm.example/");
+        assert!(binding.binding.secret_headers.contains_key("authorization"));
+        config.validate().expect("workflow config validates");
+        let unknown = toml::from_str::<ServerWorkflowConfig>(&format!(
+            r#"
+[external_gateway_bindings.team-llm]
+tenant = "{tenant}"
+protocol = "openai_chat"
+origin = "https://llm.example"
+api_key = "plaintext"
+"#
+        ));
+        assert!(
+            unknown.is_err(),
+            "an unknown binding member must be refused"
+        );
+        assert!(toml::from_str::<ServerWorkflowConfig>("max_runs = 1").is_err());
+    }
+
+    /// Server Workflow validation rejects every zero bound, a default timeout
+    /// above the maximum, per-tenant ceilings above their global ceilings, and
+    /// a step-result bound above the run bound.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a contradictory configuration validates.
+    #[test]
+    fn workflow_config_rejects_zero_and_contradictory_bounds() {
+        /// One edit that makes a default Workflow configuration invalid.
+        type Contradiction = fn(&mut ServerWorkflowConfig);
+        let refused: [(&str, Contradiction); 17] = [
+            ("default_timeout_seconds", |c| c.default_timeout_seconds = 0),
+            ("max_timeout_seconds", |c| c.max_timeout_seconds = 0),
+            ("max_concurrency_per_run", |c| c.max_concurrency_per_run = 0),
+            ("max_active_global", |c| c.max_active_global = 0),
+            ("max_active_per_tenant", |c| c.max_active_per_tenant = 0),
+            ("max_retained_global", |c| c.max_retained_global = 0),
+            ("max_retained_per_tenant", |c| c.max_retained_per_tenant = 0),
+            ("max_steps_per_run", |c| c.max_steps_per_run = 0),
+            ("max_dependency_edges_per_run", |c| {
+                c.max_dependency_edges_per_run = 0;
+            }),
+            ("max_resolved_graph_bytes", |c| {
+                c.max_resolved_graph_bytes = 0
+            }),
+            ("max_input_bytes", |c| c.max_input_bytes = 0),
+            ("max_step_result_bytes", |c| c.max_step_result_bytes = 0),
+            ("max_run_bytes", |c| c.max_run_bytes = 0),
+            ("default_timeout_seconds", |c| {
+                c.default_timeout_seconds = 7201
+            }),
+            ("max_active_per_tenant", |c| c.max_active_per_tenant = 33),
+            ("max_retained_per_tenant", |c| {
+                c.max_retained_per_tenant = 129
+            }),
+            ("max_step_result_bytes", |c| c.max_run_bytes = 1024),
+        ];
+        for (field, mutate) in refused {
+            let mut config = ServerWorkflowConfig::default();
+            mutate(&mut config);
+            let Err(ConfigError::Invalid { message }) = config.validate() else {
+                panic!("{field} must be refused");
+            };
+            assert!(message.contains(field), "{field}: {message}");
         }
     }
 }

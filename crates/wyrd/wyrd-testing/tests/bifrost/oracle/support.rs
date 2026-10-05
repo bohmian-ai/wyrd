@@ -50,6 +50,56 @@ pub(crate) fn sum_metric(
         .map(|sample| sample.value)
         .sum()
 }
+/// Sums one production family's samples of `kind` carrying every label pair.
+///
+/// An empty `labels` slice sums the whole family of that kind, which is how a
+/// journey reads a total or proves a family stayed silent.
+pub(crate) fn metric_value(
+    delta: &wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta,
+    family: &str,
+    kind: wyrd_testing::bifrost::telemetry::BifrostMetricKind,
+    labels: &[(&str, &str)],
+) -> f64 {
+    delta
+        .metrics
+        .iter()
+        .filter(|sample| {
+            sample.family == family
+                && sample.kind == kind
+                && labels
+                    .iter()
+                    .all(|(key, value)| sample.labels.get(*key).map(String::as_str) == Some(*value))
+        })
+        .map(|sample| sample.value)
+        .sum()
+}
+
+/// Waits until every named span has finished since `checkpoint`.
+///
+/// A streamed query's spans close when the server drops the response stream,
+/// which can follow the client's terminal frame by a scheduler turn. Polling
+/// the non-consuming span read keeps the single delta that follows exact.
+///
+/// # Errors
+/// Returns an error naming the spans still open after the bound.
+pub(crate) async fn wait_for_spans(
+    telemetry: &wyrd_testing::bifrost::telemetry::BifrostTelemetryCapture,
+    checkpoint: &wyrd_testing::bifrost::telemetry::BifrostTelemetryCheckpoint,
+    names: &[&str],
+) -> Result<(), JourneyError> {
+    for _ in 0..500 {
+        let finished = telemetry.spans_since(checkpoint);
+        if names
+            .iter()
+            .all(|name| finished.iter().any(|span| span.name == *name))
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Err(format!("spans {names:?} never finished").into())
+}
+
 /// Register one tenant-owned Redux table through the server-owned catalog.
 pub(crate) async fn register_table(
     server: &wyrd_testing::WyrdTestServer,

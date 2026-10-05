@@ -36,6 +36,12 @@ journey obligations.
 
 ## Audit acceptance
 
+Check that integrated consumers use the selected shared owners, the task reuse
+maps match actual source, and obsolete parallel implementations were removed.
+Independently compare new machinery with existing workflows even when a task
+prescribed it. A task instruction cannot override repository authority or
+justify duplicate state, traversal, validation, transport, or lifecycle logic.
+
 Build a matrix for every `REQ-*`, `INV-*`, `AC-*`, constraint, and non-goal:
 
 | Obligation | Implementation evidence | Verification evidence | Result |

@@ -17,9 +17,9 @@ use tokio_util::sync::CancellationToken;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
     AnalyticalGraphRef, ExecuteFragmentRequest, FencingToken, NodeId, OracleRoleFence, PeerContext,
-    PendingNodeReservation, QueryAuditDigest, QueryClass, QueryId, ReleaseNodeSlotsRequest,
-    ReservationId, ReservationRejected, ReserveNodeSlotsRequest, ReserveNodeSlotsResponse,
-    WorkerAttemptFrame, WorkerFooter, WorkerScanStats,
+    PendingNodeReservation, QueryAuditDigest, QueryClass, QueryId, ReservationId,
+    ReservationRejected, ReserveNodeSlotsRequest, ReserveNodeSlotsResponse, WorkerAttemptFrame,
+    WorkerFooter, WorkerScanStats,
 };
 use wyrd_tonic::tonic::Status;
 use wyrd_tonic::tonic::transport::Channel;
@@ -44,16 +44,15 @@ use crate::cluster::{ClusterRegistry, ClusterSnapshot, ROLE_LIVENESS_CUTOFF};
 /// carried over the mTLS peer channel; receivers validate every context field
 /// against their own trusted state. A v4 peer is refused, never downgraded.
 pub const PEER_PROTOCOL_VERSION: u32 = 5;
-/// Pending reservation time to live.
-///
-/// Shared with the Analytical leader's retained-release bound so a leader that
-/// cannot confirm a release waits out exactly the window the follower grants a
-/// pending reservation, rather than a second copy of the same duration.
-pub(super) const PENDING_TTL: ChronoDuration = ChronoDuration::seconds(2);
 /// Stable peer rejection hint.
 const RESERVATION_RETRY_MS: u32 = 1_000;
+/// Acceptance window of one Scribe fragment's peer context.
+///
+/// Opening a fragment is a single round trip, so the window only has to cover
+/// it; the fragment's own deadline still bounds execution separately.
+const FRAGMENT_CONTEXT_ACCEPTANCE: ChronoDuration = ChronoDuration::seconds(2);
 
-/// Waits out one explicit pre-accept peer capacity refusal before a leader
+/// Waits out one explicit stream-accept peer capacity refusal before a leader
 /// retries placement.
 ///
 /// The wait is the refusing peer's own `retry_after_ms` hint, bounded by the
@@ -61,7 +60,7 @@ const RESERVATION_RETRY_MS: u32 = 1_000;
 /// carry the retry past the deadline is not waited at all: the query could
 /// not use the slot, so the leader stops now instead of sleeping into its own
 /// timeout. Stateless by design — the leader owns the deadline, cancellation,
-/// and every provisional reservation it must release before calling this.
+/// and every held grant it must close before calling this.
 ///
 /// Returns `true` when the leader should retry placement, and `false` when
 /// cancellation or the deadline ends the retry.
@@ -123,77 +122,85 @@ pub enum EligibleSourceLossCause {
     ProviderResolution,
 }
 
-/// Bounded role-fence-scoped pending reservation.
+/// One follower grant, alive exactly as long as its leader's grant stream.
+///
+/// There is no expiry. The entry is created when this node accepts a leader's
+/// grant stream and removed when that stream ends — the leader closed or
+/// dropped it, the query deadline passed, or the node is shutting down. Until
+/// a graph activates from it, the entry owns the charged query envelope;
+/// afterwards the graph owns the envelope and the entry keeps only the signal
+/// that ends the graph when the stream does.
 #[derive(Debug)]
-struct PendingReservation {
-    /// Query identity bound to the reservation.
+struct HeldGrant {
+    /// Query identity bound to the grant.
     query_id: QueryId,
-    /// Leader identity bound to the reservation.
+    /// Leader identity bound to the grant.
     leader_node_id: NodeId,
-    /// Leader fence preventing stale release.
+    /// Leader fence the grant was accepted under.
     leader_fencing_token: FencingToken,
-    /// Pending expiry used for eager reclamation.
-    expires_at: DateTime<Utc>,
-    /// Query envelope this node charged when it accepted the reservation.
+    /// Query envelope this node charged when it accepted the grant stream.
     ///
-    /// Reservation is the whole capacity gate. The envelope holds this node's
-    /// aggregate slot units in the shared governor ledger and its Oracle
-    /// memory, so a reserved graph can always execute: a leader never plans
-    /// over a node that has not already seated it.
-    envelope: Box<crate::resources::OracleQueryResources>,
-    /// Graph this reservation may only ever be leased to.
+    /// The envelope holds this node's slot unit in the shared governor ledger
+    /// and its Oracle memory, so a granted graph can always execute: a leader
+    /// never plans over a node that has not already seated it. `None` once a
+    /// graph has taken it, which also makes a grant single-use.
+    envelope: Option<Box<crate::resources::OracleQueryResources>>,
+    /// Graph this grant may only ever be leased to.
     graph: AnalyticalGraphRef,
+    /// Cancelled when the grant stream ends, which ends any graph built on it.
+    closed: CancellationToken,
 }
 
-/// Everything a follower must prove before one reservation becomes a graph.
+/// Everything a follower must prove before one grant becomes a graph.
 ///
 /// A graph lease is the largest thing a peer can be talked into charging, so
-/// the reservation must have been taken for exactly this query and exactly this
+/// the grant must have been taken for exactly this query and exactly this
 /// graph before its envelope changes owner. Nothing here is read from the wire
 /// framing; the caller projects every field from verified stage claims.
 ///
-/// The reservation's leader identity and fence are deliberately not re-derived
-/// here. They were checked when the reservation was accepted, and the
+/// The grant's leader identity and fence are deliberately not re-derived
+/// here. They were checked when the grant stream was accepted, and the
 /// coordinator that presents the first stage message for a graph is not always
 /// the leader — a follower running a middle stage is itself a coordinator and
 /// legitimately signs under its own identity. The stage ticket independently
 /// binds the presenting principal, this follower's node identity, and its
 /// current role fence before this is ever reached. The activator retains that
-/// reserving identity separately, in its own immutable graph binding.
+/// granting identity separately, in its own immutable graph binding.
 #[derive(Debug, Clone, Copy)]
 pub struct GraphLeaseRequest {
-    /// Reservation the leader took on this node for this graph.
+    /// Grant the leader holds open on this node for this graph.
     pub reservation_id: ReservationId,
-    /// Exact graph the reservation was taken for.
+    /// Exact graph the grant was taken for.
     pub graph: AnalyticalGraphRef,
-    /// Query identity the reservation was bound to.
+    /// Query identity the grant was bound to.
     pub query_id: QueryId,
 }
 
-/// One follower's reservation held across a fallible graph activation.
+/// One follower grant's envelope held across a fallible graph activation.
 ///
-/// This is the transaction that replaced a destructive transfer. The pending
-/// entry — envelope, reserving leader and fence, and above all its
-/// *original* expiry — is removed from the registry and retained here
-/// unchanged while the activator does the fallible work: building the query
-/// runtime and registering the graph with its supervisor. Exactly one of
+/// The envelope is taken out of the grant and retained here unchanged while
+/// the activator does the fallible work: building the query runtime and
+/// registering the graph with its supervisor. Exactly one of
 /// [`PendingGraphActivation::commit`] or [`PendingGraphActivation::rollback`]
-/// then decides whether the reservation became a graph or goes back on the
-/// shelf, so no failure path can leave the follower charged for a graph that
-/// does not exist, and no failure path can destroy a reservation that is still
-/// valid.
+/// then decides whether the envelope became a graph or goes back to its grant,
+/// so no failure path can leave the follower charged for a graph that does not
+/// exist, and no failure path can destroy a grant whose stream is still open.
 pub struct PendingGraphActivation {
-    /// Registry this reservation is restored into when activation fails.
+    /// Registry the envelope is returned to when activation fails.
     registry: Arc<ReservationRegistry>,
-    /// Identity of the reservation held open by this activation.
+    /// Identity of the grant this activation draws from.
     reservation_id: ReservationId,
-    /// Graph the reservation may only ever become.
+    /// Graph the grant may only ever become.
     graph: AnalyticalGraphRef,
-    /// The removed pending entry, retained verbatim until commit or rollback.
+    /// Leader node and fence the grant was accepted under.
+    granting_leader: (NodeId, FencingToken),
+    /// Signal the grant stream's end cancels.
+    closed: CancellationToken,
+    /// The grant's envelope, retained verbatim until commit or rollback.
     ///
     /// Cleared by whichever of the two runs, so the drop guard can tell an
     /// abandoned activation from a settled one.
-    entry: Option<PendingReservation>,
+    envelope: Option<Box<crate::resources::OracleQueryResources>>,
 }
 
 impl fmt::Debug for PendingGraphActivation {
@@ -202,50 +209,37 @@ impl fmt::Debug for PendingGraphActivation {
         formatter
             .debug_struct("PendingGraphActivation")
             .field("reservation_id", &self.reservation_id.as_uuid())
-            .field("settled", &self.entry.is_none())
+            .field("settled", &self.envelope.is_none())
             .finish_non_exhaustive()
     }
 }
 
 impl PendingGraphActivation {
-    /// Returns the leader node and fence the reservation was accepted under.
+    /// Returns the leader node and fence the grant was accepted under.
     ///
-    /// This is reservation ownership, not per-message stage authority. The
-    /// activator retains it so a later coordinator can be authorized as either
-    /// this exact pair or an exact member of the immutable destination cut.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the activation has already committed or rolled back, which
-    /// is unreachable: both consume `self`.
+    /// This is grant ownership, not per-message stage authority. The activator
+    /// retains it so a later coordinator can be authorized as either this
+    /// exact pair or an exact member of the immutable destination cut.
     #[must_use]
-    pub(crate) fn reserving_leader(&self) -> (NodeId, FencingToken) {
-        let entry = self
-            .entry
-            .as_ref()
-            .expect("a live activation owns its entry");
-        (entry.leader_node_id, entry.leader_fencing_token)
+    pub(crate) const fn reserving_leader(&self) -> (NodeId, FencingToken) {
+        self.granting_leader
     }
 
-    /// Returns the reservation's original expiry, which activation never extends.
+    /// Returns the signal cancelled when the grant's leader stream ends.
     ///
-    /// # Panics
-    ///
-    /// Panics when the activation has already committed or rolled back.
+    /// The activated graph keeps it, so the follower's settlement driver can
+    /// end the graph the moment its leader's stream does.
     #[must_use]
-    pub(crate) fn expires_at(&self) -> DateTime<Utc> {
-        self.entry
-            .as_ref()
-            .expect("a live activation owns its entry")
-            .expires_at
+    pub(crate) fn closed(&self) -> CancellationToken {
+        self.closed.clone()
     }
 
-    /// Borrows the reserved query envelope without taking ownership of it.
+    /// Borrows the granted query envelope without taking ownership of it.
     ///
     /// Building the graph's bounded runtime needs only the envelope's pool and
     /// scratch share, and it can fail. Lending rather than taking is what keeps
     /// a failed runtime build recoverable: the envelope is still here, so the
-    /// rollback restores a reservation a later activator can still use.
+    /// rollback returns it to a grant a later activator can still use.
     ///
     /// # Panics
     ///
@@ -253,27 +247,30 @@ impl PendingGraphActivation {
     /// is unreachable: both consume `self`.
     #[must_use]
     pub(crate) fn envelope(&self) -> &crate::resources::OracleQueryResources {
-        &self
-            .entry
+        self.envelope
             .as_ref()
-            .expect("a live activation owns its entry")
-            .envelope
+            .expect("a live activation owns its envelope")
     }
 
-    /// Moves the reserved envelope into `register`, keeping it on failure.
+    /// Moves the granted envelope into `register`, keeping it on failure.
     ///
     /// `register` is the single fallible act that changes the envelope's owner:
     /// it takes the admitted resources and returns whatever owns them from then
     /// on — in production, the supervisor's graph guard. A registration that
-    /// fails must hand the resources back, because the reservation this
-    /// activation restores is only usable again if it is restored complete.
+    /// fails must hand the resources back, because the grant this activation
+    /// returns them to is only usable again if it is restored complete.
     ///
     /// On success the activation's cumulative counter is advanced exactly once.
     ///
     /// # Errors
     ///
     /// Returns the unchanged activation alongside `register`'s error, so the
-    /// caller can still roll back under the original expiry.
+    /// caller can still roll back.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the activation has already settled, which is unreachable:
+    /// both settling paths consume `self`.
     pub(crate) fn commit<T, F>(mut self, register: F) -> Result<T, (Box<Self>, BifrostError)>
     where
         F: FnOnce(
@@ -281,8 +278,11 @@ impl PendingGraphActivation {
         )
             -> Result<T, (Box<crate::resources::OracleQueryResources>, BifrostError)>,
     {
-        let mut entry = self.entry.take().expect("a live activation owns its entry");
-        match register(*entry.envelope) {
+        let envelope = self
+            .envelope
+            .take()
+            .expect("a live activation owns its envelope");
+        match register(*envelope) {
             Ok(owner) => {
                 #[cfg(any(test, feature = "test-support"))]
                 self.registry
@@ -291,54 +291,53 @@ impl PendingGraphActivation {
                 tracing::debug!(
                     public_query_id = %self.graph.public_query_id,
                     datafusion_query_id = %self.graph.datafusion_query_id,
-                    "Oracle graph lease activated from its reservation"
+                    "Oracle graph lease activated from its held grant"
                 );
                 Ok(owner)
             }
             Err((resources, error)) => {
-                entry.envelope = resources;
-                self.entry = Some(entry);
+                self.envelope = Some(resources);
                 Err((Box::new(self), error))
             }
         }
     }
 
-    /// Returns the unchanged reservation to the registry, or drops it.
+    /// Returns the unchanged envelope to its grant, or drops it.
     ///
-    /// Restoration is conditional on the reservation's *own* original expiry,
-    /// never on a fresh one: a failed activation may not buy the leader more
-    /// time than it was granted. An expired or displaced reservation releases
-    /// its exact envelope instead, which returns this follower to
-    /// baseline rather than stranding capacity for a graph that never existed.
-    pub(crate) fn rollback(mut self, now: DateTime<Utc>) {
-        let Some(entry) = self.entry.take() else {
-            return;
-        };
-        self.registry.restore(self.reservation_id, entry, now);
+    /// The envelope goes back only while the grant's stream is still open; a
+    /// grant whose stream ended meanwhile is already gone, and dropping the
+    /// envelope then returns this follower to baseline rather than stranding
+    /// capacity for a graph that never existed.
+    pub(crate) fn rollback(mut self) {
+        if let Some(envelope) = self.envelope.take() {
+            self.registry.restore(self.reservation_id, envelope);
+        }
     }
 }
 
 impl Drop for PendingGraphActivation {
     /// Rolls back an activation abandoned by cancellation, panic, or early return.
     ///
-    /// The settled paths clear the entry and leave nothing to do here. This
+    /// The settled paths clear the envelope and leave nothing to do here. This
     /// covers the activator that simply went away, where the alternative is an
     /// envelope no owner can ever return.
     fn drop(&mut self) {
-        let Some(entry) = self.entry.take() else {
-            return;
-        };
-        self.registry
-            .restore(self.reservation_id, entry, Utc::now());
+        if let Some(envelope) = self.envelope.take() {
+            self.registry.restore(self.reservation_id, envelope);
+        }
     }
 }
 
-/// In-memory worker reservation owner; entries are never durable.
+/// In-memory owner of this follower's held grants; entries are never durable.
+///
+/// Every entry belongs to one open leader grant stream and is removed when
+/// that stream ends. Nothing here expires on a timer and nothing waits for a
+/// later request to reclaim it.
 #[derive(Debug)]
 pub struct ReservationRegistry {
-    /// Pending reservations keyed by their unguessable identities.
-    entries: Mutex<HashMap<ReservationId, PendingReservation>>,
-    /// Hard bound on retained pending entries for this worker role.
+    /// Held grants keyed by their unguessable identities.
+    entries: Mutex<HashMap<ReservationId, HeldGrant>>,
+    /// Hard bound on retained held grants for this worker role.
     capacity: usize,
     /// Immutable local slot-unit total, used only for placement and bounds.
     ///
@@ -346,7 +345,12 @@ pub struct ReservationRegistry {
     /// whether a unit is free. A full node refuses before accepting work and
     /// the leader owns any retry.
     total_slot_units: usize,
-    /// Cumulative count of graph leases this node activated from a reservation.
+    /// Wakes the follower settlement driver when any grant stream ends.
+    ///
+    /// A stored permit, never a lost wake: a close that lands while the driver
+    /// is busy is observed on its next pass.
+    grant_closed: Arc<tokio::sync::Notify>,
+    /// Cumulative count of graph leases this node activated from a grant.
     ///
     /// Incremented only on the first activation for a graph, never on reuse, so
     /// an integration test can assert the exactness the lease claims: one
@@ -365,29 +369,31 @@ impl ReservationRegistry {
             entries: Mutex::new(HashMap::new()),
             capacity,
             total_slot_units,
+            grant_closed: Arc::new(tokio::sync::Notify::new()),
             #[cfg(any(test, feature = "test-support"))]
             graph_leases_activated_total: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// Atomically records one pending graph reservation and returns its generated identity.
+    /// Records one held grant and returns the guard its stream owns.
     ///
     /// `envelope` was already charged against the shared governor ledger, so
     /// there is no second local semaphore to clamp leader-supplied demand
-    /// against here. The pending expiry is the earlier of the leader's request
-    /// and [`PENDING_TTL`].
+    /// against here. The returned guard is the grant's only owner: dropping it
+    /// removes the entry, returns an unused envelope, and ends any graph built
+    /// on it.
     ///
     /// # Errors
     ///
-    /// Returns terminal for an elapsed expiry, and retryable when the bounded
-    /// registry is unavailable or full. A refused `envelope` is dropped, returning its capacity.
-    pub(crate) fn reserve(
-        &self,
+    /// Returns terminal for an already-passed query deadline, and retryable
+    /// when the bounded registry is unavailable or full. A refused `envelope`
+    /// is dropped, returning its capacity.
+    pub(crate) fn hold(
+        self: &Arc<Self>,
         request: &ReserveNodeSlotsRequest,
         now: DateTime<Utc>,
         envelope: Box<crate::resources::OracleQueryResources>,
-    ) -> Result<PendingNodeReservation, DispatchError> {
-        let graph = request.graph;
+    ) -> Result<HeldGraphGrant, DispatchError> {
         if request.expires_at <= now {
             return Err(DispatchError::Terminal);
         }
@@ -395,7 +401,6 @@ impl ReservationRegistry {
             .entries
             .lock()
             .map_err(|_| DispatchError::Unavailable)?;
-        retain_live(&mut entries, now);
         if entries.len() >= self.capacity {
             return Err(DispatchError::Unavailable);
         }
@@ -405,127 +410,139 @@ impl ReservationRegistry {
                 break candidate;
             }
         };
-        let expires_at = request.expires_at.min(now + PENDING_TTL);
         entries.insert(
             reservation_id,
-            PendingReservation {
+            HeldGrant {
                 query_id: request.query_id,
                 leader_node_id: request.leader_node_id,
                 leader_fencing_token: request.leader_fencing_token,
-                expires_at,
-                envelope,
-                graph,
+                envelope: Some(envelope),
+                graph: request.graph,
+                closed: CancellationToken::new(),
             },
         );
-        Ok(PendingNodeReservation {
+        Ok(HeldGraphGrant {
+            registry: Arc::clone(self),
             reservation_id,
-            expires_at,
         })
     }
 
-    /// Removes a reservation only when the complete ownership tuple matches.
-    #[must_use]
-    pub fn release(&self, request: &ReleaseNodeSlotsRequest, now: DateTime<Utc>) -> bool {
-        let Ok(mut entries) = self.entries.lock() else {
-            return false;
-        };
-        retain_live(&mut entries, now);
-        let matches = entries
-            .get(&request.reservation_id)
-            .is_none_or(|entry| reservation_matches(entry, request));
-        if matches {
-            entries.remove(&request.reservation_id);
+    /// Ends one grant because its leader stream ended.
+    ///
+    /// Removes the entry, drops an envelope no graph took, and cancels the
+    /// grant's signal so a graph built on it is drained at once. Called only by
+    /// [`HeldGraphGrant`]'s `Drop`, so it runs exactly once per grant.
+    fn close(&self, reservation_id: ReservationId) {
+        let removed = self
+            .entries
+            .lock()
+            .ok()
+            .and_then(|mut entries| entries.remove(&reservation_id));
+        if let Some(grant) = removed {
+            grant.closed.cancel();
+            self.grant_closed.notify_one();
         }
-        matches
     }
 
-    /// Drops every pending reservation, returning each envelope's capacity.
+    /// Ends every held grant, returning each unused envelope's capacity.
     ///
-    /// Shutdown calls this after new work is refused: a pending reservation
-    /// has no graph yet, and the leader that took it can no longer activate a
-    /// graph on a node that is going away, so holding it until expiry would
-    /// only report capacity still charged for work that will never run.
-    /// Returns how many reservations were dropped.
-    pub fn drain_pending(&self) -> usize {
+    /// Shutdown calls this after new work is refused: no leader can still use
+    /// a grant on a node that is going away, so its envelope is returned now
+    /// rather than when the leader's stream happens to close. Graphs built on
+    /// the grants are signalled exactly as a closed stream would signal them.
+    /// Returns how many grants were ended.
+    pub fn close_all(&self) -> usize {
         let Ok(mut entries) = self.entries.lock() else {
             return 0;
         };
-        let drained = entries.len();
-        entries.clear();
-        drained
+        let closed = entries.len();
+        for (_, grant) in entries.drain() {
+            grant.closed.cancel();
+        }
+        if closed != 0 {
+            self.grant_closed.notify_one();
+        }
+        closed
     }
 
-    /// Opens one rollback-capable activation of a reservation into its graph.
+    /// Opens one rollback-capable activation of a held grant into its graph.
     ///
-    /// This is the only path from a reservation to a graph envelope, and it is
-    /// deliberately not the transfer it replaced. The complete ownership tuple
-    /// is checked *before* the pending entry moves anywhere, and what the caller
-    /// receives is a transaction rather than a lease: until it commits, the
-    /// reservation is still whole and still restorable under its own original
-    /// expiry.
+    /// This is the only path from a grant to a graph envelope. The complete
+    /// ownership tuple is checked *before* the envelope moves anywhere, and
+    /// what the caller receives is a transaction rather than a lease: until it
+    /// commits, the envelope still belongs to the grant.
     ///
     /// Activation refuses before any worker, cache, or provider IO when the
-    /// reservation is missing, expired, or was taken for a different query or
+    /// grant is missing, already spent, or was taken for a different query or
     /// graph.
     ///
     /// # Errors
     ///
-    /// Returns [`DispatchError::Terminal`] for a missing, expired, or
-    /// mismatched reservation, and [`DispatchError::Unavailable`] when the
-    /// reservation lock is poisoned.
+    /// Returns [`DispatchError::Terminal`] for a missing, spent, or mismatched
+    /// grant, and [`DispatchError::Unavailable`] when the registry lock is
+    /// poisoned.
     #[tracing::instrument(name = "bifrost.oracle.graph_lease", skip_all)]
     pub(crate) fn begin_graph_activation(
         self: &Arc<Self>,
         request: &GraphLeaseRequest,
-        now: DateTime<Utc>,
     ) -> Result<PendingGraphActivation, DispatchError> {
         let mut entries = self
             .entries
             .lock()
             .map_err(|_| DispatchError::Unavailable)?;
-        retain_live(&mut entries, now);
-        let entry = entries
-            .get(&request.reservation_id)
+        let grant = entries
+            .get_mut(&request.reservation_id)
             .ok_or(DispatchError::Terminal)?;
-        if entry.query_id != request.query_id || entry.graph != request.graph {
+        if grant.query_id != request.query_id || grant.graph != request.graph {
             return Err(DispatchError::Terminal);
         }
-        let entry = entries
-            .remove(&request.reservation_id)
-            .ok_or(DispatchError::Terminal)?;
+        let envelope = grant.envelope.take().ok_or(DispatchError::Terminal)?;
         Ok(PendingGraphActivation {
             registry: Arc::clone(self),
             reservation_id: request.reservation_id,
             graph: request.graph,
-            entry: Some(entry),
+            granting_leader: (grant.leader_node_id, grant.leader_fencing_token),
+            closed: grant.closed.clone(),
+            envelope: Some(envelope),
         })
     }
 
-    /// Puts one unchanged reservation back, or releases it when it cannot be.
+    /// Returns one unchanged envelope to its grant, or drops it.
     ///
-    /// Centralized here rather than in the activator because collision and
-    /// expiry are the registry's own invariants: an entry may only return to a
-    /// slot that is still vacant, and only while its own original expiry has
-    /// not passed. Everything else drops the exact envelope, which is
-    /// the honest outcome — the reservation the leader was promised is simply
-    /// over.
+    /// Centralized here rather than in the activator because the grant's
+    /// lifetime is the registry's own invariant: an envelope may only return
+    /// to a grant whose stream is still open and that holds no envelope.
+    /// Otherwise it is dropped, which is the honest outcome — the grant the
+    /// leader held is simply over.
     fn restore(
         &self,
         reservation_id: ReservationId,
-        entry: PendingReservation,
-        now: DateTime<Utc>,
+        envelope: Box<crate::resources::OracleQueryResources>,
     ) {
-        if entry.expires_at <= now {
-            return;
-        }
         let Ok(mut entries) = self.entries.lock() else {
             return;
         };
-        retain_live(&mut entries, now);
-        if entries.contains_key(&reservation_id) || entries.len() >= self.capacity {
-            return;
+        if let Some(grant) = entries.get_mut(&reservation_id)
+            && grant.envelope.is_none()
+        {
+            grant.envelope = Some(envelope);
         }
-        entries.insert(reservation_id, entry);
+    }
+
+    /// Returns the signal the follower settlement driver waits on for closes.
+    #[must_use]
+    pub(crate) fn grant_closed(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.grant_closed)
+    }
+
+    /// Returns how many grant streams this node is currently holding open.
+    ///
+    /// Test-tier visibility for the rule that a follower holds nothing once
+    /// its leader's stream has ended.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn held_grants(&self) -> usize {
+        self.entries.lock().map_or(0, |entries| entries.len())
     }
 
     /// Returns this node's immutable local slot-unit total.
@@ -559,27 +576,76 @@ impl ReservationRegistry {
         self.graph_leases_activated_total
             .load(core::sync::atomic::Ordering::Relaxed)
     }
+}
 
-    /// Reclaims expired pending reservations and returns the number still held.
+/// Follower-side owner of one held grant, carried by the leader's grant stream.
+///
+/// Dropping it is the release: the follower's stream handler drops it when
+/// the leader closes or drops the stream, when the query deadline passes, or
+/// when the node shuts down. Nothing else releases a grant.
+#[derive(Debug)]
+pub struct HeldGraphGrant {
+    /// Registry the grant lives in.
+    registry: Arc<ReservationRegistry>,
+    /// Identity of the held grant.
+    reservation_id: ReservationId,
+}
+
+impl HeldGraphGrant {
+    /// Returns the accepted grant the leader is told about.
     #[must_use]
-    pub fn cleanup_expired(&self, now: DateTime<Utc>) -> usize {
-        self.entries.lock().map_or(0, |mut entries| {
-            retain_live(&mut entries, now);
-            entries.len()
-        })
+    pub const fn reservation(&self) -> PendingNodeReservation {
+        PendingNodeReservation {
+            reservation_id: self.reservation_id,
+        }
     }
 }
 
-/// Retains only unexpired pending entries, releasing their capacity immediately.
-fn retain_live(entries: &mut HashMap<ReservationId, PendingReservation>, now: DateTime<Utc>) {
-    entries.retain(|_, entry| entry.expires_at > now);
+impl Drop for HeldGraphGrant {
+    /// Ends the grant with its stream, synchronously and without blocking.
+    fn drop(&mut self) {
+        self.registry.close(self.reservation_id);
+    }
 }
 
-/// Compares the exact query and fenced leader release tuple.
-fn reservation_matches(entry: &PendingReservation, request: &ReleaseNodeSlotsRequest) -> bool {
-    entry.query_id == request.query_id
-        && entry.leader_node_id == request.leader_node_id
-        && entry.leader_fencing_token == request.leader_fencing_token
+/// Leader-side handle to one grant a participant accepted.
+///
+/// It owns the open grant stream, so dropping it is how the leader releases
+/// the participant: the follower observes the stream end and frees the grant
+/// and anything built on it at once. There is no release request to send,
+/// retry, or lose.
+pub struct ParticipantGrant {
+    /// Grant identity the participant minted; bound into stage claims.
+    reservation_id: ReservationId,
+    /// The open stream; dropping it ends the grant on the participant.
+    _stream: Box<dyn Send>,
+}
+
+impl fmt::Debug for ParticipantGrant {
+    /// Reports the grant identity without rendering the stream.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ParticipantGrant")
+            .field("reservation_id", &self.reservation_id.as_uuid())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ParticipantGrant {
+    /// Wraps one accepted grant and the stream that keeps it open.
+    #[must_use]
+    pub fn new(reservation_id: ReservationId, stream: Box<dyn Send>) -> Self {
+        Self {
+            reservation_id,
+            _stream: stream,
+        }
+    }
+
+    /// Returns the participant-minted grant identity.
+    #[must_use]
+    pub const fn reservation_id(&self) -> ReservationId {
+        self.reservation_id
+    }
 }
 
 /// One item of a Scribe fragment's output as the leader receives it.
@@ -660,21 +726,21 @@ impl NativeOutputTally {
 /// Incremental dispatch stream shared by local and tonic transports.
 pub type WorkerAttemptStream = Pin<Box<dyn Stream<Item = Result<LiveFrame, DispatchError>> + Send>>;
 
-/// Worker-side owner of this node's Analytical graph reservations.
+/// Worker-side owner of this node's Analytical graph grants.
 ///
-/// A peer leader reserves a whole query envelope here before it plans a
-/// distributed graph over this node; the envelope stays pending in the
-/// registry until the graph's first stage activates it or the reservation
-/// expires or is released.
+/// A peer leader opens a grant stream here before it plans a distributed graph
+/// over this node. Accepting the stream charges a whole query envelope; the
+/// envelope belongs to that stream until the graph's first stage activates it,
+/// and the graph belongs to it afterwards. The stream ending ends both.
 pub struct OraclePeerWorker {
-    /// Tuple-bound pending reservations this node accepted.
+    /// Grants this node is holding for open leader streams.
     reservations: Arc<ReservationRegistry>,
-    /// Root Oracle capability every reserved graph envelope is charged against.
+    /// Root Oracle capability every granted graph envelope is charged against.
     oracle_resources: crate::resources::OracleResources,
 }
 
 impl OraclePeerWorker {
-    /// Creates the worker over this node's reservation registry and Oracle capability.
+    /// Creates the worker over this node's grant registry and Oracle capability.
     #[must_use]
     pub const fn new(
         reservations: Arc<ReservationRegistry>,
@@ -686,42 +752,45 @@ impl OraclePeerWorker {
         }
     }
 
-    /// Reserves one graph envelope for one fenced leader, or refuses at once.
+    /// Admits one graph grant for one fenced leader's stream, or refuses at once.
     ///
-    /// Reservation is the single admission gate: accepting here charges the
-    /// query envelope the graph will later execute under, so a leader that
-    /// completes its fan-out reservation knows every participant can run. A
-    /// node whose capacity is full answers `Rejected` with its retry hint
-    /// before accepting any work. It never waits on the leader's behalf:
-    /// several leaders may target this node, and only a leader knows its own
-    /// deadline, so the leader owns the bounded retry.
-    pub fn reserve(&self, request: &ReserveNodeSlotsRequest) -> ReserveNodeSlotsResponse {
-        let attempt = self
-            .acquire_graph_envelope()
-            .and_then(|envelope| self.reservations.reserve(request, Utc::now(), envelope));
-        if let Ok(pending) = attempt {
-            ReserveNodeSlotsResponse::Pending(pending)
-        } else {
-            tracing::warn!(stage = "slot_reservation", "oracle peer capacity rejection");
-            ReserveNodeSlotsResponse::Rejected(ReservationRejected {
-                retry_after_ms: RESERVATION_RETRY_MS,
+    /// Accepting the stream is the single admission gate: it charges the query
+    /// envelope the graph will later execute under, so a leader holding a grant
+    /// on every participant knows every participant can run. A node whose
+    /// capacity is full refuses with its retry hint before accepting any work.
+    /// It never waits on the leader's behalf: several leaders may target this
+    /// node, and only a leader knows its own deadline, so the leader owns the
+    /// bounded retry.
+    ///
+    /// The caller's stream must own the returned guard; dropping it is the
+    /// grant's release.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal and its retry hint when the envelope cannot be
+    /// charged or the grant cannot be recorded.
+    pub fn reserve(
+        &self,
+        request: &ReserveNodeSlotsRequest,
+    ) -> Result<HeldGraphGrant, ReservationRejected> {
+        self.acquire_graph_envelope()
+            .and_then(|envelope| self.reservations.hold(request, Utc::now(), envelope))
+            .map_err(|_| {
+                tracing::warn!(stage = "slot_reservation", "oracle peer capacity rejection");
+                ReservationRejected {
+                    retry_after_ms: RESERVATION_RETRY_MS,
+                }
             })
-        }
     }
 
-    /// Releases one matching reservation idempotently.
-    pub fn release(&self, request: &ReleaseNodeSlotsRequest) {
-        let _released = self.reservations.release(request, Utc::now());
-    }
-
-    /// Returns live pending reservations for integration-only capacity assertions.
+    /// Returns grant streams this node holds, for integration-only assertions.
     #[cfg(feature = "test-support")]
     #[must_use]
-    pub fn pending_reservations(&self) -> usize {
-        self.reservations.cleanup_expired(Utc::now())
+    pub fn held_grants(&self) -> usize {
+        self.reservations.held_grants()
     }
 
-    /// Charges the query envelope one reserved graph will execute under.
+    /// Charges the query envelope one granted graph will execute under.
     ///
     /// A graph runs a whole distributed plan on this node — several stages,
     /// their exchanges, and their spill — so it charges a full query envelope.
@@ -747,9 +816,9 @@ impl OraclePeerWorker {
 
 /// Builds the typed peer-context claims delivered to one dispatch candidate.
 ///
-/// The context expires at the earlier of the candidate's pending reservation and
-/// the query's own absolute deadline, so a peer can never hold work past either
-/// bound. The fragment digest, manifest digest, and projection digest all carry
+/// The context's acceptance window closes at the earlier of `accept_until` and
+/// the query's own absolute deadline, so a peer can never accept work past
+/// either bound. The fragment digest, manifest digest, and projection digest all carry
 /// the same plan fingerprint: the follower validates one sealed fragment, and
 /// splitting these into distinct digests would imply a per-stage binding the
 /// protocol does not have.
@@ -767,7 +836,7 @@ fn peer_ticket_claims(
     candidate: &DispatchCandidate,
     context: &DispatchContext,
     fragment: &PhysicalDispatchFragment,
-    pending: &PendingNodeReservation,
+    accept_until: DateTime<Utc>,
 ) -> Result<PeerTicketClaims, DispatchError> {
     Ok(PeerTicketClaims {
         protocol_version: PEER_PROTOCOL_VERSION,
@@ -777,8 +846,7 @@ fn peer_ticket_claims(
         leader_fence: context.leader_fence,
         query_id: context.query_id.as_uuid().as_bytes().to_vec(),
         tenant_id: context.tenant_id.as_bytes().to_vec(),
-        expires_at_ms: pending
-            .expires_at
+        expires_at_ms: accept_until
             .timestamp_millis()
             .min(fragment.deadline_unix_ms),
         execution_deadline_unix_ms: fragment.deadline_unix_ms,
@@ -936,7 +1004,11 @@ impl AttemptEncoder {
 /// One adapter contract used identically by local and tonic dispatch.
 #[async_trait]
 pub trait OraclePeerTransport: Send + Sync {
-    /// Reserves pending slots on one worker.
+    /// Opens one held graph grant on one worker.
+    ///
+    /// The inner result separates an accepted grant, which stays held until
+    /// the returned handle is dropped, from an explicit stream-accept refusal
+    /// carrying the worker's retry hint.
     ///
     /// # Errors
     /// Returns retryable availability or terminal contract failure.
@@ -944,17 +1016,7 @@ pub trait OraclePeerTransport: Send + Sync {
         &self,
         worker: NodeId,
         request: ReserveNodeSlotsRequest,
-    ) -> Result<ReserveNodeSlotsResponse, DispatchError>;
-
-    /// Releases one matching pending reservation idempotently.
-    ///
-    /// # Errors
-    /// Returns retryable availability or terminal contract failure.
-    async fn release(
-        &self,
-        worker: NodeId,
-        request: ReleaseNodeSlotsRequest,
-    ) -> Result<(), DispatchError>;
+    ) -> Result<Result<ParticipantGrant, ReservationRejected>, DispatchError>;
 
     /// Executes one ticket-bound fragment and returns footer-terminated frames.
     ///
@@ -967,10 +1029,11 @@ pub trait OraclePeerTransport: Send + Sync {
     ) -> Result<WorkerAttemptStream, DispatchError>;
 }
 
-/// Acceptance window for one reservation context, in seconds.
+/// Acceptance window for one grant-stream context, in seconds.
 ///
-/// Short by design: a reservation call is a single round trip on a local
-/// network, so the window only has to cover it.
+/// Short by design: the context is checked once, when the follower accepts
+/// the stream, so the window only has to cover that round trip. It does not
+/// bound how long the grant is held.
 const RESERVATION_CONTEXT_TTL_SECONDS: i64 = 10;
 
 /// Real tonic client transport resolving Oracle peers from live membership.
@@ -1395,16 +1458,21 @@ impl TonicOraclePeerTransport {
             .map_err(|_| DispatchError::Terminal)
     }
 
-    /// Reserves capacity for one exact planned node/fence target.
+    /// Opens one held grant on one exact planned node/fence target.
+    ///
+    /// The grant is the stream: its first message admits or refuses, and an
+    /// admitted grant stays held on the follower until the returned handle,
+    /// which owns the stream, is dropped.
     ///
     /// # Errors
     /// Returns stale-object for a changed lease, retryable for transport
-    /// failure, or terminal for invalid transport and response contracts.
+    /// failure, or terminal for invalid transport and response contracts,
+    /// including a stream that ends before its first message.
     async fn reserve_candidate(
         &self,
         candidate: &DispatchCandidate,
         request: ReserveNodeSlotsRequest,
-    ) -> Result<ReserveNodeSlotsResponse, DispatchError> {
+    ) -> Result<Result<ParticipantGrant, ReservationRejected>, DispatchError> {
         let leader_node_id = request.leader_node_id;
         let leader_fence = request.leader_fencing_token;
         let query_id = request.query_id.as_uuid();
@@ -1420,50 +1488,38 @@ impl TonicOraclePeerTransport {
         wire.context = None;
         wire.context = Some(Self::reservation_context(&wire, &binding)?);
         let mut client = self.client(candidate).await?;
-        let response = client
+        let mut stream = client
             .reserve_slots(wire)
             .await
             .map_err(|status| status_error(&status))?
             .into_inner();
-        response.try_into().map_err(|error| {
-            tracing::warn!(
-                ?error,
-                "Oracle leader could not decode a reservation response"
-            );
+        let first = stream
+            .message()
+            .await
+            .map_err(|status| status_error(&status))?
+            .ok_or(DispatchError::Terminal)?;
+        let outcome: ReserveNodeSlotsResponse = first.try_into().map_err(|error| {
+            tracing::warn!(?error, "Oracle leader could not decode a grant response");
             DispatchError::Terminal
+        })?;
+        Ok(match outcome {
+            ReserveNodeSlotsResponse::Pending(pending) => Ok(ParticipantGrant::new(
+                pending.reservation_id,
+                Box::new(stream),
+            )),
+            ReserveNodeSlotsResponse::Rejected(rejected) => Err(rejected),
         })
     }
 
-    /// Releases capacity for one exact planned node/fence target.
-    ///
-    /// # Errors
-    /// Returns stale-object for a changed lease, retryable for transport
-    /// failure, or terminal for invalid transport and response contracts.
-    async fn release_candidate(
-        &self,
-        candidate: &DispatchCandidate,
-        request: ReleaseNodeSlotsRequest,
-    ) -> Result<(), DispatchError> {
-        let mut client = self.client(candidate).await?;
-        let binding = ReservationBinding {
-            operation: ReservationOperationV1::ReleaseSlots,
-            source_node_id: request.leader_node_id,
-            source_fence: request.leader_fencing_token,
-            destination_node_id: candidate.node_id,
-            destination_fence: candidate.worker_fence,
-            query_id: request.query_id.as_uuid(),
-        };
-        let mut wire: wyrd_tonic::wyrd::v1::ReleaseNodeSlotsRequest = request.into();
-        wire.context = None;
-        wire.context = Some(Self::reservation_context(&wire, &binding)?);
-        client
-            .release_slots(wire)
-            .await
-            .map_err(|status| execution_status_error(&status))?;
-        Ok(())
-    }
-
     /// Executes a fragment for one exact planned node/fence target.
+    ///
+    /// The leader-side `bifrost.oracle.peer.fragment` span is created in the
+    /// calling query's context, so the remote fragment appears as child work of
+    /// the query that dispatched it. The span moves into the returned stream
+    /// and closes when the leader drops it: `outcome` is `success` after the
+    /// worker's last frame, `failed` on a rejected open or failed frame, and
+    /// stays empty when the query dropped the fragment first, which the parent
+    /// query span's own outcome then explains.
     ///
     /// # Errors
     /// Returns stale-object for a changed lease, retryable for transport
@@ -1473,6 +1529,14 @@ impl TonicOraclePeerTransport {
         candidate: &DispatchCandidate,
         request: ExecuteFragmentRequest,
     ) -> Result<WorkerAttemptStream, DispatchError> {
+        let span = tracing::info_span!(
+            "bifrost.oracle.peer.fragment",
+            role = match candidate.role {
+                wyrd_spec::vala::api::ClusterRole::Scribe => "scribe",
+                wyrd_spec::vala::api::ClusterRole::Oracle => "oracle",
+            },
+            outcome = tracing::field::Empty
+        );
         let mut client = self.client(candidate).await?;
         let wire: wyrd_tonic::wyrd::v1::ExecuteFragmentRequest = request.into();
         let opened = std::time::Instant::now();
@@ -1481,7 +1545,8 @@ impl TonicOraclePeerTransport {
             .await
             .inspect(|_| super::QueryPhase::PeerOpen.record(opened))
             .map_err(|status| {
-                tracing::warn!(code = ?status.code(), "Oracle peer execute rejected");
+                span.record("outcome", "failed");
+                tracing::warn!(parent: &span, code = ?status.code(), "Oracle peer execute rejected");
                 if candidate.role == wyrd_spec::vala::api::ClusterRole::Scribe {
                     live_execution_status_error(&status)
                 } else {
@@ -1496,14 +1561,19 @@ impl TonicOraclePeerTransport {
                 if std::mem::take(&mut first) {
                     super::QueryPhase::PeerFirstFrame.record(streaming);
                 }
-                yield frame.map_err(|status| {
-                    tracing::warn!(code = ?status.code(), message = status.message(), "Oracle peer worker stream failed");
+                let frame = frame.map_err(|status| {
+                    tracing::warn!(parent: &span, code = ?status.code(), message = status.message(), "Oracle peer worker stream failed");
                     stream_status_error(&status)
                 }).and_then(|frame| frame.try_into().map(LiveFrame::Wire).map_err(|error| {
-                    tracing::warn!(?error, "Oracle leader could not decode a worker frame");
+                    tracing::warn!(parent: &span, ?error, "Oracle leader could not decode a worker frame");
                     DispatchError::Terminal
                 }));
+                if frame.is_err() {
+                    span.record("outcome", "failed");
+                }
+                yield frame;
             }
+            span.record("outcome", "success");
             super::QueryPhase::PeerTerminal.record(streaming);
         };
         Ok(Box::pin(output))
@@ -1512,7 +1582,7 @@ impl TonicOraclePeerTransport {
 
 #[async_trait]
 impl OraclePeerTransport for TonicOraclePeerTransport {
-    /// Reserves pending capacity through the generated tonic client.
+    /// Opens one held grant through the generated tonic client.
     ///
     /// # Errors
     /// Returns retryable transport or terminal conversion failure.
@@ -1520,22 +1590,9 @@ impl OraclePeerTransport for TonicOraclePeerTransport {
         &self,
         worker: NodeId,
         request: ReserveNodeSlotsRequest,
-    ) -> Result<ReserveNodeSlotsResponse, DispatchError> {
+    ) -> Result<Result<ParticipantGrant, ReservationRejected>, DispatchError> {
         let candidate = self.current_candidate(worker)?;
         self.reserve_candidate(&candidate, request).await
-    }
-
-    /// Releases one tuple-bound reservation through the generated tonic client.
-    ///
-    /// # Errors
-    /// Returns retryable transport or terminal conversion failure.
-    async fn release(
-        &self,
-        worker: NodeId,
-        request: ReleaseNodeSlotsRequest,
-    ) -> Result<(), DispatchError> {
-        let candidate = self.current_candidate(worker)?;
-        self.release_candidate(&candidate, request).await
     }
 
     /// Adapts one footer-terminated tonic stream without collecting frames.
@@ -1621,18 +1678,25 @@ impl OraclePeerTransportDirectory {
         node_id == self.local_node_id
     }
 
-    /// Reserves on one remote peer.
+    /// Opens one participant's held grant for a distributed graph.
+    ///
+    /// This is the Analytical leader's only admission entry point. The grant
+    /// stays held on the participant until the returned handle is dropped,
+    /// which is how the leader releases it.
     ///
     /// # Errors
     ///
-    /// Returns [`DispatchError::Terminal`] for this node's own identity or when
-    /// no peer plane exists, and otherwise the transport's retryable or
-    /// terminal failure.
-    async fn reserve(
+    /// The outer result carries transport or contract failure, including
+    /// [`DispatchError::Terminal`] for this node's own identity or when no peer
+    /// plane exists. The inner one separates acceptance from an explicit
+    /// stream-accept refusal, which keeps the participant's `retry_after_ms`
+    /// so the leader can own a bounded retry. Only that inner refusal is proof
+    /// the participant accepted no work.
+    pub async fn reserve_graph(
         &self,
         candidate: &DispatchCandidate,
         request: ReserveNodeSlotsRequest,
-    ) -> Result<ReserveNodeSlotsResponse, DispatchError> {
+    ) -> Result<Result<ParticipantGrant, ReservationRejected>, DispatchError> {
         if self.is_local(candidate.node_id) {
             return Err(DispatchError::Terminal);
         }
@@ -1644,81 +1708,6 @@ impl OraclePeerTransportDirectory {
             #[cfg(test)]
             RemoteOraclePeerTransport::Injected(remote) => {
                 remote.reserve(candidate.node_id, request).await
-            }
-        }
-    }
-
-    /// Reserves one participant's whole query envelope for a distributed graph.
-    ///
-    /// This is the Analytical leader's only reservation entry point. It refuses
-    /// a request that names no graph rather than silently taking a fragment's
-    /// worker quantum, because the two charges are different sizes and a graph
-    /// admitted on a fragment's quantum would execute a whole plan on capacity
-    /// sized for one leaf.
-    ///
-    /// # Errors
-    ///
-    /// The outer result carries transport or contract failure; the inner one
-    /// separates acceptance from an explicit pre-accept refusal, which keeps
-    /// the participant's `retry_after_ms` so the leader can own a bounded
-    /// retry. Only that inner refusal is proof the participant accepted no
-    /// work.
-    ///
-    /// # Errors
-    ///
-    /// Returns the selected adapter's retryable or terminal failure.
-    pub async fn reserve_graph(
-        &self,
-        candidate: &DispatchCandidate,
-        request: ReserveNodeSlotsRequest,
-    ) -> Result<Result<PendingNodeReservation, ReservationRejected>, DispatchError> {
-        Ok(match self.reserve(candidate, request).await? {
-            ReserveNodeSlotsResponse::Pending(pending) => Ok(pending),
-            ReserveNodeSlotsResponse::Rejected(rejected) => Err(rejected),
-        })
-    }
-
-    /// Releases one graph reservation this node took on a participant.
-    ///
-    /// Idempotent by construction: a participant that has already leased the
-    /// reservation into graph ownership no longer holds the pending entry and
-    /// answers successfully, which is what lets a leader release every
-    /// participant it reserved without knowing which ones the plan reached.
-    ///
-    /// # Errors
-    ///
-    /// Returns the selected adapter's retryable or terminal failure.
-    pub async fn release_graph_reservation(
-        &self,
-        candidate: &DispatchCandidate,
-        request: ReleaseNodeSlotsRequest,
-    ) -> Result<(), DispatchError> {
-        self.release(candidate, request).await
-    }
-
-    /// Releases on the same remote peer a reservation was taken on.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DispatchError::Terminal`] for this node's own identity or when
-    /// no peer plane exists, and otherwise the transport's retryable or
-    /// terminal failure.
-    async fn release(
-        &self,
-        candidate: &DispatchCandidate,
-        request: ReleaseNodeSlotsRequest,
-    ) -> Result<(), DispatchError> {
-        if self.is_local(candidate.node_id) {
-            return Err(DispatchError::Terminal);
-        }
-        match &self.remote {
-            RemoteOraclePeerTransport::Production(remote) => {
-                remote.release_candidate(candidate, request).await
-            }
-            RemoteOraclePeerTransport::Unavailable => Err(DispatchError::Terminal),
-            #[cfg(test)]
-            RemoteOraclePeerTransport::Injected(remote) => {
-                remote.release(candidate.node_id, request).await
             }
         }
     }
@@ -1890,12 +1879,12 @@ fn fragment_request(
     candidate: &DispatchCandidate,
     context: &DispatchContext,
     fragment: &PhysicalDispatchFragment,
-    pending: &PendingNodeReservation,
 ) -> ExecuteFragmentRequest {
     ExecuteFragmentRequest {
         context: peer_context,
         physical_plan_bytes: fragment.physical_plan_bytes.clone(),
-        reservation_id: pending.reservation_id,
+        // Scribe fragments are never granted: the receiver requires nil.
+        reservation_id: ReservationId::new(uuid::Uuid::nil()),
         leader_fence: OracleRoleFence {
             node_id: context.leader_node_id,
             role: wyrd_spec::vala::api::ClusterRole::Oracle,
@@ -1956,16 +1945,17 @@ impl FragmentDispatcher {
         {
             return Err(DispatchError::Terminal);
         }
-        let pending = PendingNodeReservation {
-            reservation_id: ReservationId::new(uuid::Uuid::nil()),
-            expires_at: Utc::now() + PENDING_TTL,
-        };
-        let claims = peer_ticket_claims(candidate, context, fragment, &pending)?;
+        let claims = peer_ticket_claims(
+            candidate,
+            context,
+            fragment,
+            Utc::now() + FRAGMENT_CONTEXT_ACCEPTANCE,
+        )?;
         let peer_context = claims.to_context().map_err(|_| {
             tracing::error!("Oracle live Scribe peer context encoding failed");
             DispatchError::Terminal
         })?;
-        let request = fragment_request(peer_context, candidate, context, fragment, &pending);
+        let request = fragment_request(peer_context, candidate, context, fragment);
         let remaining = context
             .deadline
             .checked_duration_since(Instant::now())
@@ -2246,7 +2236,7 @@ mod tests {
         }
     }
 
-    /// Signed execution time remains distinct from the pending acceptance window.
+    /// Signed execution time remains distinct from the context acceptance window.
     ///
     /// # Panics
     ///
@@ -2272,18 +2262,15 @@ mod tests {
             worker_fence: 1,
             endpoint: None,
         };
-        let pending = PendingNodeReservation {
-            reservation_id: ReservationId::new(uuid::Uuid::now_v7()),
-            expires_at: now + PENDING_TTL,
-        };
+        let accept_until = now + FRAGMENT_CONTEXT_ACCEPTANCE;
         let mut fragment = physical_dispatch_fragment("deadline");
         fragment.deadline_unix_ms = (now + ChronoDuration::seconds(30)).timestamp_millis();
-        let claims =
-            peer_ticket_claims(&candidate, &context, &fragment, &pending).expect("signed claims");
-        assert_eq!(claims.expires_at_ms, pending.expires_at.timestamp_millis());
+        let claims = peer_ticket_claims(&candidate, &context, &fragment, accept_until)
+            .expect("signed claims");
+        assert_eq!(claims.expires_at_ms, accept_until.timestamp_millis());
         assert_eq!(claims.execution_deadline_unix_ms, fragment.deadline_unix_ms);
         fragment.deadline_unix_ms = (now + ChronoDuration::milliseconds(500)).timestamp_millis();
-        let short = peer_ticket_claims(&candidate, &context, &fragment, &pending)
+        let short = peer_ticket_claims(&candidate, &context, &fragment, accept_until)
             .expect("short query claims");
         assert_eq!(short.expires_at_ms, fragment.deadline_unix_ms);
         assert_eq!(short.execution_deadline_unix_ms, fragment.deadline_unix_ms);
@@ -2344,127 +2331,145 @@ mod tests {
             .map(Box::new)
     }
 
-    /// An expired reservation leaves the registry and its release stays idempotent.
+    /// A held grant returns its envelope the moment its stream's guard drops.
+    ///
+    /// Nothing expires and nothing waits for a later request: the follower is
+    /// back at baseline as soon as the leader's stream ends.
     ///
     /// # Panics
     ///
-    /// Panics when expiry retains the reservation or a matching release is refused.
+    /// Panics when the grant is not held while its guard lives or any charge
+    /// survives the guard.
     #[test]
-    fn peer_pending_reservation_expires() {
+    fn held_grant_returns_its_envelope_when_its_stream_ends() {
         let oracle = slot_limited_oracle(2);
-        let registry = ReservationRegistry::new(2, 2);
+        let registry = Arc::new(ReservationRegistry::new(2, 2));
         let now = Utc::now();
         let query = QueryId::new(uuid::Uuid::now_v7());
         let leader = NodeId::new(uuid::Uuid::now_v7());
-        let pending = registry
-            .reserve(
-                &reserve_request(query, leader, 9, now + ChronoDuration::milliseconds(1)),
-                now,
-                graph_envelope(&oracle).expect("first envelope"),
-            )
-            .expect("pending reservation");
-        assert_eq!(
-            registry.cleanup_expired(now + ChronoDuration::milliseconds(2)),
-            0
-        );
-        let replacement = registry
-            .reserve(
-                &reserve_request(query, leader, 9, now + ChronoDuration::seconds(1)),
-                now,
-                graph_envelope(&oracle).expect("replacement envelope"),
-            )
-            .expect("replacement reservation");
-        let request = ReleaseNodeSlotsRequest {
-            reservation_id: replacement.reservation_id,
-            query_id: query,
-            leader_node_id: leader,
-            leader_fencing_token: 9,
-        };
-        assert!(registry.release(&request, now));
-        assert!(registry.release(&request, now));
-        assert_ne!(pending.reservation_id, replacement.reservation_id);
-    }
-
-    /// An accepted graph reservation holds its envelope until release.
-    ///
-    /// Capacity is decided once, when the graph envelope is charged against the
-    /// shared governor ledger. A saturated peer refuses there, before the leader
-    /// has committed to dispatching this participant. Releasing the reservation
-    /// returns the unit.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a second envelope is admitted past saturation or release
-    /// strands the charged unit.
-    #[test]
-    fn graph_reservation_saturation_refuses_up_front() {
-        let oracle = slot_limited_oracle(1);
-        let registry = ReservationRegistry::new(1, 2);
-        let now = Utc::now();
-        let query = QueryId::new(uuid::Uuid::now_v7());
-        let leader = NodeId::new(uuid::Uuid::now_v7());
-        let expires = now + ChronoDuration::seconds(2);
-        let pending = registry
-            .reserve(
-                &reserve_request(query, leader, 13, expires),
+        let grant = registry
+            .hold(
+                &reserve_request(query, leader, 9, now + ChronoDuration::seconds(30)),
                 now,
                 graph_envelope(&oracle).expect("envelope"),
             )
-            .expect("pending reservation");
-        assert!(
-            graph_envelope(&oracle).is_err(),
-            "the shared ledger refuses a second envelope up front"
+            .expect("held grant");
+        assert_eq!(registry.held_grants(), 1);
+        assert_eq!(oracle.live_slot_units(), 1);
+        drop(grant);
+        assert_eq!(
+            registry.held_grants(),
+            0,
+            "the stream's end removes the grant"
         );
-        assert!(registry.release(
-            &ReleaseNodeSlotsRequest {
-                reservation_id: pending.reservation_id,
-                query_id: query,
-                leader_node_id: leader,
-                leader_fencing_token: 13,
-            },
-            now,
-        ));
         assert_eq!(
             oracle.live_slot_units(),
             0,
-            "release returns the charged units"
+            "the stream's end returns the charged units"
         );
     }
 
-    /// An unclaimed reservation returns its charged slot units at expiry.
+    /// A saturated follower refuses at stream accept, before any work.
     ///
-    /// Because reservation charges the shared governor ledger, a leader that
-    /// abandons a fan-out mid-negotiation would strand capacity without expiry
-    /// reclaim.
+    /// Capacity is decided once, when the graph envelope is charged against the
+    /// shared governor ledger, and a query whose deadline already passed is
+    /// refused rather than held.
     ///
     /// # Panics
     ///
-    /// Panics when expiry leaves the reservation or its slot units held.
+    /// Panics when a second envelope is admitted past saturation, a past
+    /// deadline is held, or the stream's end strands the charged unit.
     #[test]
-    fn expired_reservation_returns_its_envelope() {
+    fn graph_grant_saturation_refuses_up_front() {
         let oracle = slot_limited_oracle(1);
-        let registry = ReservationRegistry::new(1, 2);
+        let registry = Arc::new(ReservationRegistry::new(1, 2));
         let now = Utc::now();
         let query = QueryId::new(uuid::Uuid::now_v7());
         let leader = NodeId::new(uuid::Uuid::now_v7());
-        registry
-            .reserve(
+        let grant = registry
+            .hold(
                 &reserve_request(query, leader, 13, now + ChronoDuration::seconds(2)),
                 now,
                 graph_envelope(&oracle).expect("envelope"),
             )
-            .expect("pending reservation");
-        assert_eq!(oracle.live_slot_units(), 1);
-        let expired = now + ChronoDuration::seconds(3);
-        assert_eq!(
-            registry.cleanup_expired(expired),
-            0,
-            "expiry reclaims the abandoned reservation"
+            .expect("held grant");
+        assert!(
+            graph_envelope(&oracle).is_err(),
+            "the shared ledger refuses a second envelope up front"
         );
+        drop(grant);
+        assert!(matches!(
+            registry.hold(
+                &reserve_request(query, leader, 13, now),
+                now,
+                graph_envelope(&oracle).expect("freed envelope"),
+            ),
+            Err(DispatchError::Terminal)
+        ));
+        assert_eq!(oracle.live_slot_units(), 0, "nothing stays charged");
+    }
+
+    /// A grant's stream ending signals the graph built on it and spends it.
+    ///
+    /// Activation moves the envelope to the graph and leaves the grant spent,
+    /// so no second graph can activate from it. Ending the stream cancels the
+    /// signal the graph keeps, and an activation still in flight when the
+    /// stream ends drops its envelope instead of restoring a dead grant.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a spent grant activates again, the close signal is not
+    /// raised, or an envelope outlives its grant's stream.
+    #[test]
+    fn grant_close_signals_its_graph_and_never_restores_a_dead_grant() {
+        let oracle = slot_limited_oracle(2);
+        let registry = Arc::new(ReservationRegistry::new(2, 4));
+        let now = Utc::now();
+        let query = QueryId::new(uuid::Uuid::now_v7());
+        let leader = NodeId::new(uuid::Uuid::now_v7());
+        let request = reserve_request(query, leader, 3, now + ChronoDuration::seconds(30));
+        let grant = registry
+            .hold(&request, now, graph_envelope(&oracle).expect("envelope"))
+            .expect("held grant");
+        let lease = GraphLeaseRequest {
+            reservation_id: grant.reservation().reservation_id,
+            graph: request.graph,
+            query_id: query,
+        };
+        let activation = registry
+            .begin_graph_activation(&lease)
+            .expect("first activation");
+        let closed = activation.closed();
+        let graph_envelope_owner = activation
+            .commit(Ok::<_, (Box<_>, BifrostError)>)
+            .expect("commit");
+        assert!(matches!(
+            registry.begin_graph_activation(&lease),
+            Err(DispatchError::Terminal)
+        ));
+        assert!(!closed.is_cancelled());
+        drop(grant);
+        assert!(closed.is_cancelled(), "the stream's end signals the graph");
+        drop(graph_envelope_owner);
+        assert_eq!(oracle.live_slot_units(), 0);
+
+        let second = registry
+            .hold(&request, now, graph_envelope(&oracle).expect("envelope"))
+            .expect("second grant");
+        let in_flight = registry
+            .begin_graph_activation(&GraphLeaseRequest {
+                reservation_id: second.reservation().reservation_id,
+                graph: request.graph,
+                query_id: query,
+            })
+            .expect("in-flight activation");
+        drop(second);
+        in_flight.rollback();
+        assert_eq!(registry.held_grants(), 0);
         assert_eq!(
             oracle.live_slot_units(),
             0,
-            "expiry returns the charged slot units"
+            "an activation that outlived its stream returns nothing to it"
         );
     }
 
@@ -2637,11 +2642,18 @@ mod tests {
     /// DNS identity every test peer presents and every dial verifies.
     const PEER_SERVER_NAME: &str = "peer.bifrost.test";
 
-    /// Peer service that answers only slot release, which carries no state.
-    struct ReleasingPeer;
+    /// Peer service that refuses every grant at once, which holds no state.
+    struct RefusingPeer;
 
     #[async_trait]
-    impl wyrd_tonic::wyrd::v1::oracle_peer_service_server::OraclePeerService for ReleasingPeer {
+    impl wyrd_tonic::wyrd::v1::oracle_peer_service_server::OraclePeerService for RefusingPeer {
+        /// Grant stream type; every grant is refused in one message.
+        type ReserveSlotsStream = Pin<
+            Box<
+                dyn Stream<Item = Result<wyrd_tonic::wyrd::v1::ReserveNodeSlotsResponse, Status>>
+                    + Send,
+            >,
+        >;
         /// Unused worker stream type.
         type ExecuteFragmentStream = Pin<
             Box<dyn Stream<Item = Result<wyrd_tonic::wyrd::v1::WorkerAttemptFrame, Status>> + Send>,
@@ -2651,28 +2663,17 @@ mod tests {
             Box<dyn Stream<Item = Result<wyrd_tonic::wyrd::v1::QueryStreamFrame, Status>> + Send>,
         >;
 
-        /// Refuses reservation; the proof never reserves.
+        /// Refuses every grant stream with its retry hint and ends it.
         async fn reserve_slots(
             &self,
             _: Request<wyrd_tonic::wyrd::v1::ReserveNodeSlotsRequest>,
-        ) -> Result<
-            wyrd_tonic::tonic::Response<wyrd_tonic::wyrd::v1::ReserveNodeSlotsResponse>,
-            Status,
-        > {
-            Err(Status::unimplemented("reserve"))
-        }
-
-        /// Acknowledges every release so each call completes one real RPC.
-        async fn release_slots(
-            &self,
-            _: Request<wyrd_tonic::wyrd::v1::ReleaseNodeSlotsRequest>,
-        ) -> Result<
-            wyrd_tonic::tonic::Response<wyrd_tonic::wyrd::v1::ReleaseNodeSlotsResponse>,
-            Status,
-        > {
-            Ok(wyrd_tonic::tonic::Response::new(
-                wyrd_tonic::wyrd::v1::ReleaseNodeSlotsResponse::default(),
-            ))
+        ) -> Result<wyrd_tonic::tonic::Response<Self::ReserveSlotsStream>, Status> {
+            let refused = wyrd_tonic::wyrd::v1::ReserveNodeSlotsResponse::from(
+                ReserveNodeSlotsResponse::Rejected(ReservationRejected { retry_after_ms: 1 }),
+            );
+            Ok(wyrd_tonic::tonic::Response::new(Box::pin(
+                futures_util::stream::once(async move { Ok(refused) }),
+            )))
         }
 
         /// Refuses execution; the proof never opens a fragment.
@@ -2692,7 +2693,7 @@ mod tests {
         }
     }
 
-    /// Serves [`ReleasingPeer`] over mutual TLS and counts accepted connections.
+    /// Serves [`RefusingPeer`] over mutual TLS and counts accepted connections.
     ///
     /// Returns the `https` endpoint and the accepted-connection counter.
     async fn counting_peer(
@@ -2728,7 +2729,7 @@ mod tests {
             server
                 .add_service(
                     wyrd_tonic::wyrd::v1::oracle_peer_service_server::OraclePeerServiceServer::new(
-                        ReleasingPeer,
+                        RefusingPeer,
                     ),
                 )
                 .serve_with_incoming(incoming),
@@ -2763,21 +2764,26 @@ mod tests {
             worker_fence: fence,
             endpoint: Some(endpoint.to_owned()),
         };
-        let release = |candidate: DispatchCandidate| {
+        let round_trip = |candidate: DispatchCandidate| {
             let transport = &transport;
             async move {
-                transport
+                let refused = transport
                     .client(&candidate)
                     .await
                     .expect("peer is reachable")
-                    .release_slots(wyrd_tonic::wyrd::v1::ReleaseNodeSlotsRequest::default())
+                    .reserve_slots(wyrd_tonic::wyrd::v1::ReserveNodeSlotsRequest::default())
                     .await
-                    .expect("authenticated release completes");
+                    .expect("authenticated grant stream opens")
+                    .into_inner()
+                    .message()
+                    .await
+                    .expect("authenticated refusal completes");
+                assert!(refused.is_some(), "the refusal is one real message");
             }
         };
 
         for _ in 0..3 {
-            release(candidate(1, &first)).await;
+            round_trip(candidate(1, &first)).await;
         }
         assert_eq!(
             first_accepts.load(Ordering::SeqCst),
@@ -2785,15 +2791,15 @@ mod tests {
             "one ready incarnation shares one connection"
         );
 
-        release(candidate(2, &first)).await;
+        round_trip(candidate(2, &first)).await;
         assert_eq!(
             first_accepts.load(Ordering::SeqCst),
             2,
             "a new fence dials a new connection"
         );
 
-        release(candidate(2, &second)).await;
-        release(candidate(2, &second)).await;
+        round_trip(candidate(2, &second)).await;
+        round_trip(candidate(2, &second)).await;
         assert_eq!(
             second_accepts.load(Ordering::SeqCst),
             1,

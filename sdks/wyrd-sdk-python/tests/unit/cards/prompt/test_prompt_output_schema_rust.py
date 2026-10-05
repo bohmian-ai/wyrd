@@ -19,7 +19,7 @@ def test_pydantic_model_extracts_schema_at_construction():
         provider="openai",
         output=Plan,
     )
-    request = prompt.request.model_dump()
+    request = prompt.request.model_dump()["body"]
     fmt = request["response_format"]
     assert fmt["type"] == "json_schema"
     assert fmt["json_schema"]["name"] == "Plan"
@@ -32,7 +32,7 @@ def test_pydantic_model_class_name_is_schema_name():
         value: int
 
     prompt = Prompt(messages=["go"], model="gpt-test", provider="openai", output=MyOutput)
-    fmt = prompt.request.model_dump()["response_format"]
+    fmt = prompt.request.model_dump()["body"]["response_format"]
     assert fmt["json_schema"]["name"] == "MyOutput"
 
 
@@ -43,7 +43,7 @@ def test_dict_of_types_builds_schema():
         provider="openai",
         output={"foo": str, "bar": int, "items": list[str]},
     )
-    schema = prompt.request.model_dump()["response_format"]["json_schema"]["schema"]
+    schema = prompt.request.model_dump()["body"]["response_format"]["json_schema"]["schema"]
     assert schema["properties"]["foo"] == {"type": "string"}
     assert schema["properties"]["bar"] == {"type": "integer"}
     assert schema["properties"]["items"] == {
@@ -61,7 +61,7 @@ def test_raw_json_schema_passthrough():
         "required": ["x"],
     }
     prompt = Prompt(messages=["go"], model="gpt-test", provider="openai", output=raw)
-    schema = prompt.request.model_dump()["response_format"]["json_schema"]["schema"]
+    schema = prompt.request.model_dump()["body"]["response_format"]["json_schema"]["schema"]
     assert schema["properties"]["x"] == {"type": "string"}
     assert schema["additionalProperties"] is False
 
@@ -73,7 +73,7 @@ def test_additional_properties_not_overwritten():
         "additionalProperties": True,
     }
     prompt = Prompt(messages=["go"], model="gpt-test", provider="openai", output=raw)
-    schema = prompt.request.model_dump()["response_format"]["json_schema"]["schema"]
+    schema = prompt.request.model_dump()["body"]["response_format"]["json_schema"]["schema"]
     assert schema["additionalProperties"] is True
 
 
@@ -101,6 +101,6 @@ def test_rust_schema_extraction_does_not_use_output_to_json_schema():
         verified: bool
 
     prompt = Prompt(messages=["go"], model="gpt-test", provider="openai", output=Verified)
-    schema = prompt.request.model_dump()["response_format"]["json_schema"]["schema"]
+    schema = prompt.request.model_dump()["body"]["response_format"]["json_schema"]["schema"]
     assert schema["additionalProperties"] is False
     assert "verified" in schema["properties"]

@@ -1,6 +1,6 @@
 ---
 id: SPEC-forge-concurrent-planning
-revision: 11
+revision: 12
 status: approved
 ---
 
@@ -328,6 +328,23 @@ retention-derived query limit, query-capacity preallocation, reader epoch,
 ancestry frontier, or IO gate. A per-query PostgreSQL session or advisory lock
 is not used: it would pin one connection for each running query.
 
+An unresolved prepared snapshot-expiry operation is a temporary cut barrier
+for its table. If the catalog commit's acceptance is still unknown when the
+Forge lease TTL ends, Forge may release the exclusive maintenance-authority
+lock, but the existing prepared snapshot-expiration claims remain. The one
+Oracle cut-acquisition statement refuses any requested table with such a claim
+and returns `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE`; it does not poll or
+create another claim. Reconciliation removes the existing claims only after it
+establishes the stable old or new catalog pointer, after which acquisition may
+proceed normally. This reuses the existing prepared operation and claim rows;
+it adds no reader epoch, IO gate, advisory lock, per-query session, or second
+coordination protocol.
+
+The lease-TTL exception for an acceptance-unknown object deletion remains
+different: the object was already proved unreachable and cannot be named by a
+new cut, so it needs no cut barrier. Snapshot expiry changes the pointer a new
+cut selects and therefore requires the prepared-claim barrier above.
+
 The configured default query deadline has one runtime source: the resolved
 Oracle configuration composed at server boot. Local Oracle entry and the
 public forwarder use that same resolved value whenever a request omits an
@@ -453,6 +470,12 @@ not add a Bloom filter for that column or promise pruning when ranges overlap.
   no elapsed-time threshold is asserted here. A non-default configured query
   deadline is also observed identically through local and forwarded entry when
   the request omits an explicit deadline, without imposing a maximum.
+  A separate deterministic race leaves snapshot expiry acceptance unknown at
+  the lease bound, proves a new cut fails with
+  `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` while the existing prepared
+  claims remain, reconciles to the stable old or new pointer, and then proves a
+  cut succeeds with that pointer. No new coordination row or polling loop is
+  permitted.
 - AC-010: Fresh spans, points, records, and custom-table files promote and
   rewrite with field IDs matching their Iceberg table, with no declared-ID
   metadata rewrite. Forge still rejects a mismatched file.
@@ -493,6 +516,12 @@ handling and maintenance behavior follow the pinned RisingWave Iceberg sources.
 
 ## Revision history and authority
 
+- Revision 12 (2026-10-05, explicitly approved by the human owner): when
+  snapshot-expiry catalog acceptance remains unknown at the Forge lease bound,
+  reuse the existing prepared expiration claims as a temporary Oracle cut
+  barrier until reconciliation establishes the stable pointer. Keep the
+  existing unreachable-object deletion exception distinct and add no second
+  coordination protocol.
 - Revision 11 (2026-10-04, explicitly approved by the human owner): a dropped
   query owner releases its active reads; an abandoned row expires at its own
   query deadline in PostgreSQL time instead of after Oracle fence death plus

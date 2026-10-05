@@ -878,6 +878,15 @@ object-store call still running at the bound is an uncertain effect left for
 idempotent replay, so a hung store never blocks the table's readers
 indefinitely. An Oracle cut that waits on the authority waits at most until
 its query deadline and then fails with the query timeout.
+Snapshot expiry uses the existing prepared expiration claims when its catalog
+commit remains acceptance-unknown at that bound. After the authority lock is
+released, those claims block a new Oracle cut for the table with
+`WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` until reconciliation establishes
+the stable old or new pointer and removes them. This is not a reader claim or a
+second coordination protocol; the same prepared operation already required for
+expiry recovery is the barrier. Acceptance-unknown object deletion needs no
+such barrier because its candidate was proved unreachable before submission
+and cannot be named by a new cut.
 An open Scribe fragment retains its local Arrow batches and staged resources
 until its stream completes or drops. It names no Forge-collectable object and
 contributes no independent Forge GC root.

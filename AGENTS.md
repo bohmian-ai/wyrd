@@ -237,21 +237,22 @@ behavior with the wrong structural shape is incomplete.
   functional code is implementation drift, not precedent. A localized edit
   does not require an unrelated crate-wide rewrite, but every new or materially
   changed symbol and its immediate module structure must comply.
-- Stateful capabilities, multi-step workflows, dependency-backed behavior,
-  configuration-backed behavior, and invariant-bearing domain behavior MUST
-  have one clear owning concrete struct.
-- Public operations and internal orchestration that use an owner's state or
-  dependencies MUST be inherent methods on that owner. Callers should discover
-  workflows through shapes such as `cards.register(...)`,
+- Stateful capabilities and invariant-bearing domain behavior MUST have one
+  clear owning concrete struct when that owner retains meaningful state,
+  identity, resources, or invariants across operations.
+- Public operations that act on an owner's retained state or dependencies
+  SHOULD be inherent methods on that owner. Callers should discover durable
+  capabilities through shapes such as `cards.register(...)`,
   `registry.resolve(...)`, and `writer.flush(...)`.
 - Compose dependencies through explicit struct fields and constructors. When
   multiple functions repeatedly accept the same clients, stores, configuration,
   or context, consolidate that state into the owning struct instead of
   threading it through a functional call graph.
-- Free functions are permitted only for genuinely stateless, deterministic
-  helpers, narrow conversions, and algorithms with no natural owner. A
-  workflow function is not made stateless merely because all of its
-  dependencies are parameters.
+- Free functions may coordinate multi-step or async work when all state,
+  dependencies, identity, and lifetime remain caller-owned for that invocation.
+  Introduce a struct only when it earns ownership by retaining meaningful state,
+  resources, identity, or invariants across calls, or when its type prevents an
+  invalid lifecycle from being represented.
 - Do not create zero-sized utility structs solely to turn unrelated functions
   into methods. The struct must own meaningful state, dependencies, identity,
   or invariants.

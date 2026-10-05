@@ -2,12 +2,12 @@
 //! them with a backlog, and the check that the backlog is in place.
 //!
 //! Every table is registered through the public Bifrost client, as a user
-//! would. Compaction is off by default and no public route sets Iceberg table
-//! properties, so the benchmark commits each table's Forge properties as an
-//! operator would: through the Iceberg catalog over the serving Postgres
-//! login and object store the Postgres wrapper and mise task export. Only
-//! the opt-in and the snapshot-count trigger are set: the compaction type
-//! stays the default `full` and the file target the default 1 GiB. The
+//! would. No public route sets Iceberg table properties, so the benchmark
+//! commits each table's Forge properties as an operator would: through the
+//! Iceberg catalog over the serving Postgres login and object store the
+//! Postgres wrapper and mise task export. Only an explicit enable and the
+//! snapshot-count trigger are set: the compaction type stays the default
+//! `small-files` and the file target the default 1 GiB. The
 //! writers then send one small batch to every table each write interval, so
 //! Scribe seals each table at the configured age, the leader promotes and
 //! notifies every seal, and a table becomes due once the trigger's count of

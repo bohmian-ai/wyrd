@@ -100,7 +100,7 @@ pub(crate) async fn run(
                 input.to_owned(),
                 "before_agent",
             )? {
-                ChainResult::Abort(error) => {
+                ChainResult::Abort(error, _) => {
                     return Ok(AgentRun {
                         output: String::new(),
                         final_response: None,
@@ -250,6 +250,21 @@ struct RunLoopInputs<'a> {
     observer: Arc<dyn Observer>,
 }
 
+/// Drives the model/tool iterations of one run after its seed turn is built.
+///
+/// Each iteration applies `before_model`, calls the provider, journals the
+/// response, and applies `after_model`; a model with no tool calls ends the run
+/// through `after_agent`, otherwise every tool call runs between `before_tool`
+/// and `after_tool` and its result is appended for the next iteration. An
+/// agent or model hook abort returns a `CallbackAborted` run carrying the
+/// abort error; a tool hook abort reports only that call to the model as
+/// failed.
+///
+/// # Errors
+///
+/// Returns [`AgentError`] when iterations are exhausted, the provider fails,
+/// a callback panics, a tool is not attached, or the journal or session
+/// cannot be appended.
 async fn run_loop(
     this: &Agent,
     providers: &ProviderRegistry,
@@ -293,7 +308,7 @@ async fn run_loop(
             request.clone(),
             "before_model",
         )? {
-            ChainResult::Abort(error) => {
+            ChainResult::Abort(error, _) => {
                 let synthetic_resp = synthetic_null_response();
                 append_model_journal_call_result(
                     this,
@@ -360,8 +375,19 @@ async fn run_loop(
             response,
             "after_model",
         )? {
-            ChainResult::Abort(_) => {
-                unreachable!("after_model callbacks cannot skip a completed provider call")
+            ChainResult::Abort(error, _) => {
+                return Ok(AgentRun {
+                    output: String::new(),
+                    final_response: None,
+                    iterations: iteration + 1,
+                    finish_reason: FinishReason::CallbackAborted,
+                    conversation,
+                    error: Some(error),
+                    errors: Vec::new(),
+                    structured_output: None,
+                    #[cfg(feature = "python")]
+                    parsed: None,
+                });
             }
             ChainResult::Replaced(replacement) => replacement,
         };
@@ -408,9 +434,16 @@ async fn run_loop(
                 run,
                 "after_agent",
             )? {
-                ChainResult::Abort(_) => {
-                    unreachable!("after_agent callbacks cannot skip a completed agent run")
-                }
+                ChainResult::Abort(error, held) => Ok(AgentRun {
+                    output: String::new(),
+                    final_response: None,
+                    finish_reason: FinishReason::CallbackAborted,
+                    error: Some(error),
+                    structured_output: None,
+                    #[cfg(feature = "python")]
+                    parsed: None,
+                    ..held
+                }),
                 ChainResult::Replaced(replacement) => Ok(replacement),
             };
         }
@@ -460,7 +493,7 @@ async fn run_loop(
                         call.args,
                         "before_tool",
                     )? {
-                        ChainResult::Abort(error) => {
+                        ChainResult::Abort(error, _) => {
                             let content = serde_json::json!({ "skipped": true });
                             journal
                                 .append(JournalEvent::ToolResult {
@@ -489,21 +522,22 @@ async fn run_loop(
                         ChainResult::Replaced(replacement) => replacement,
                     };
                     let result = tool.invoke(args).await;
-                    let result = match apply_chain_with_panic_catch_tool_result(
+                    let (ok, content) = match apply_chain_with_panic_catch_tool_result(
                         &after_tool,
                         &ctx,
                         tool.as_ref(),
                         result,
                         "after_tool",
                     )? {
-                        ChainResult::Abort(_) => {
-                            unreachable!("after_tool callbacks cannot skip a completed tool call")
-                        }
-                        ChainResult::Replaced(replacement) => replacement,
-                    };
-                    let (ok, content) = match result {
-                        Ok(value) => (true, value),
-                        Err(error) => (
+                        ChainResult::Replaced(Ok(value)) => (true, value),
+                        ChainResult::Replaced(Err(error)) => (
+                            false,
+                            serde_json::json!({
+                                "code": error.code(),
+                                "error": error.to_string(),
+                            }),
+                        ),
+                        ChainResult::Abort(error, _) => (
                             false,
                             serde_json::json!({
                                 "code": error.code(),

@@ -43,4 +43,31 @@ mod tests {
         let _ = super::WyrdClient::from_parts;
         let _ = super::Gateway::new;
     }
+
+    /// A Rust SDK user names every compaction type and declares it on a
+    /// table config through `wyrd_sdk::bifrost` alone, with no direct
+    /// `wyrd-spec` dependency.
+    #[test]
+    fn sdk_bifrost_names_the_compaction_type() {
+        use super::bifrost::{CompactionTypeWire, TableConfig};
+
+        for kind in [
+            CompactionTypeWire::Auto,
+            CompactionTypeWire::Full,
+            CompactionTypeWire::SmallFiles,
+            CompactionTypeWire::FilesWithDelete,
+        ] {
+            let config = TableConfig::from_json_schema(
+                "vala.datasets.events",
+                &serde_json::json!({
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "required": ["id"]
+                }),
+            )
+            .expect("a one-column JSON schema is a valid table config")
+            .with_compaction_type(kind);
+            assert_eq!(config.compaction_type(), Some(kind));
+        }
+    }
 }

@@ -121,9 +121,10 @@ class WyrdState:
     def from_path(
         path: str | Path,
         *,
-        interfaces: Mapping[str, object] | None = ...,
-        load_kwargs: Mapping[str, ModelLoadArgs | DataLoadArgs | Mapping[str, object]] | None = ...,
-        trusted_artifact_hashes: Mapping[str, str] | None = ...,
+        interfaces: Mapping[str, object] | None = None,
+        load_kwargs: Mapping[str, ModelLoadArgs | DataLoadArgs | Mapping[str, object]]
+        | None = None,
+        trusted_artifact_hashes: Mapping[str, str] | None = None,
     ) -> WyrdState:
         """Load, validate, and eagerly hydrate a complete local bundle.
 

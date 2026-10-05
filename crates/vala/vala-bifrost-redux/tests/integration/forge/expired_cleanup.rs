@@ -1289,11 +1289,12 @@ async fn retry_state(pool: &sqlx::PgPool, task_id: Uuid) -> (String, Option<Stri
 /// # Panics
 ///
 /// Panics when a refused preparation reports lost ownership, consumes retry
-/// budget, moves the cursor, changes the attempt, or the replay does not
-/// converge after the read is released.
+/// budget, moves the cursor, changes the attempt, is not counted once at its
+/// `prepare` or `replay` refusal stage, or the replay does not converge after
+/// the read is released.
 #[tokio::test]
 async fn active_read_refusing_preparation_is_released_or_retained_without_retry() {
-    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let telemetry = ForgeTelemetryCheckpoint::install();
     let DrainedExpiration {
         table,
         worker,
@@ -1330,6 +1331,7 @@ async fn active_read_refusing_preparation_is_released_or_retained_without_retry(
         cursor(&table.fixture, cleanup_id).await,
         ("retryable".to_owned(), 0, None)
     );
+    assert_refusal_counts(&telemetry, (1, 0));
     table.fixture.release_active_read(reader).await;
     sqlx::query("UPDATE vala.forge_tasks SET next_eligible_at=now()-interval '1 second',ready_at=now()-interval '1 second' WHERE task_id=$1")
         .bind(cleanup_id)
@@ -1369,6 +1371,7 @@ async fn active_read_refusing_preparation_is_released_or_retained_without_retry(
         matches!(refused, ForgeError::CleanupRetained { index: 1, .. }),
         "the replay is retained, not slot-fatal: {refused}"
     );
+    assert_refusal_counts(&telemetry, (1, 2));
     assert_eq!(attempt_of(pool, cleanup_id).await, Some(attempt));
     assert_eq!(
         table.store.deletes(),
@@ -1396,6 +1399,32 @@ async fn active_read_refusing_preparation_is_released_or_retained_without_retry(
     }
 
     table.supervised.shutdown().await;
+}
+
+/// Asserts the active-read cleanup refusals counted so far, as
+/// `(prepare, replay)`.
+///
+/// A released first preparation counts at `prepare`; a retained later
+/// preparation and each refused replay of it count at `replay`.
+///
+/// # Panics
+///
+/// Panics when either stage's `bifrost_forge_expired_cleanup_refusals_total`
+/// series differs from `expected`.
+fn assert_refusal_counts(telemetry: &ForgeTelemetryCheckpoint, expected: (u64, u64)) {
+    let snapshot = telemetry.snapshot();
+    let count = |stage| {
+        super::production_routes::counter_total(
+            &snapshot,
+            "bifrost_forge_expired_cleanup_refusals_total",
+            &[("stage", stage), ("reason", "active_read")],
+        )
+    };
+    assert_eq!(
+        (count("prepare"), count("replay")),
+        expected,
+        "active-read cleanup refusals by stage"
+    );
 }
 
 /// Copies one promoted `file_list` row under a new identity, path, and table.

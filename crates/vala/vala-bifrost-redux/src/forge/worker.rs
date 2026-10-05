@@ -43,7 +43,7 @@ use super::expire::ExpiryTaskAuthority;
 use super::identity::task_table_binding;
 use super::leader::{ForgeCompactionDispatch, ForgeCompactionOutcome};
 use super::lease::{ForgeLease, forge_lease_key};
-use super::metrics::{ForgeTaskResult, ForgeTelemetry};
+use super::metrics::{ForgeCleanupRefusalStage, ForgeTaskResult, ForgeTelemetry};
 use super::orphan_gc::{ExpiredCleanupExemption, GcEligibility, ObjectEvidence};
 use super::path::catalog_path_to_object_key;
 use super::scribe_promotion::{
@@ -2464,7 +2464,7 @@ impl ForgeWorker {
         drained.extend(pool.attempts.drain().map(|(_, state)| state));
         for state in drained {
             if let Err(error) = state.fenced.heartbeat.await {
-                tracing::warn!(error = %error, "Forge claim heartbeat panicked while joining a stopped loop");
+                tracing::warn!(error = %error, "Forge claim heartbeat failed to join while stopping the loop");
             }
         }
     }
@@ -8058,12 +8058,18 @@ impl ForgeWorker {
     /// later index means an earlier candidate already moved the row to
     /// `prepared`, which generic retry cannot settle, so the exact frontier is
     /// retained as [`ForgeError::CleanupRetained`] for prepared-claim replay.
+    ///
+    /// Each refusal is counted exactly once here, labelled by that outcome:
+    /// `prepare` for a released first preparation and `replay` for a frontier
+    /// retained for prepared-claim replay.
     fn preparation_refused(index: u32) -> ForgeError {
         if index == 0 {
+            ForgeTelemetry::record_expired_cleanup_refusal(ForgeCleanupRefusalStage::Prepare);
             return ForgeError::Capacity {
                 detail: "an Oracle query is still reading this table".to_owned(),
             };
         }
+        ForgeTelemetry::record_expired_cleanup_refusal(ForgeCleanupRefusalStage::Replay);
         ForgeError::CleanupRetained {
             index,
             transition: "forge.expired_cleanup.preparation_refused",

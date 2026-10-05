@@ -625,8 +625,6 @@ impl BoundServer {
         // the embedded worker restart in place instead of stopping the API.
         if self.state.forge_handle().is_some() {
             let state = self.state.clone();
-            // The scheduler's restarts are logged; its leader term carries the
-            // scheduler's own telemetry.
             let scheduler = restarting_worker(
                 "maintenance_scheduler",
                 shutdown.clone(),
@@ -637,7 +635,7 @@ impl BoundServer {
                         }
                     })
                 },
-                |_, _| {},
+                vala_bifrost_redux::forge::ForgeTelemetry::record_scheduler_restart,
             )
             .map_err(|e| BootExit::Other(Box::new(e)))?;
             set.spawn(scheduler);

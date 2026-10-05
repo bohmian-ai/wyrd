@@ -38,7 +38,7 @@ const ZEROED_GAUGES: [&str; 3] = [
 
 /// The exact public Forge family inventory, used by documentation coverage.
 #[cfg(test)]
-pub(super) const FORGE_METRIC_FAMILIES: [&str; 21] = [
+pub(super) const FORGE_METRIC_FAMILIES: [&str; 23] = [
     "bifrost_forge_tasks_created_total",
     "bifrost_forge_active_tasks",
     "bifrost_forge_task_attempts_total",
@@ -60,6 +60,8 @@ pub(super) const FORGE_METRIC_FAMILIES: [&str; 21] = [
     "bifrost_forge_worker_backoffs_total",
     "bifrost_forge_worker_restarts_total",
     "bifrost_forge_worker_restart_backoff_seconds",
+    "bifrost_forge_scheduler_restarts_total",
+    "bifrost_forge_expired_cleanup_refusals_total",
 ];
 
 /// One leader schedule operation, the closed `operation` label.
@@ -139,6 +141,28 @@ impl ForgeLeaderRevocation {
 
 /// The `reason` label of a worker back-off: the database could not answer.
 pub(super) const WORKER_BACKOFF_DATABASE_UNAVAILABLE: &str = "database_unavailable";
+
+/// The `reason` label of an expired-cleanup refusal: a table read is active.
+pub(super) const CLEANUP_REFUSAL_ACTIVE_READ: &str = "active_read";
+
+/// Where an expired-cleanup refusal was observed, the closed `stage` label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForgeCleanupRefusalStage {
+    /// The durable preparation of one candidate was refused.
+    Prepare,
+    /// A prepared-claim replay retained its candidate after a refused preparation.
+    Replay,
+}
+
+impl ForgeCleanupRefusalStage {
+    /// Returns the stable `stage` label for this refusal.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepare => "prepare",
+            Self::Replay => "replay",
+        }
+    }
+}
 
 /// Closed durable result of one completed Forge ownership episode.
 ///
@@ -358,21 +382,45 @@ impl ForgeTelemetry {
     ///
     /// Called by the process supervisor each time it schedules a rebuild of a
     /// worker that stopped before shutdown. The `reason` label is the failure
-    /// class of the error the worker returned; a panic or an unexplained early
-    /// return (`None`) has no error to classify and is counted as an internal
+    /// class of the error the worker returned; an exit without a worker error
+    /// (`None`) has nothing to classify and is counted as an internal
     /// invariant failure. The backoff gauge holds the wait before the most
     /// recent rebuild and stays at zero until the first one.
     pub fn record_worker_restart(error: Option<&ForgeError>, backoff: Duration) {
-        let reason = error.map_or(
-            ForgeFailureClass::InternalInvariant,
-            ForgeError::failure_class,
-        );
         metrics::counter!(
             "bifrost_forge_worker_restarts_total",
-            "reason" => reason.as_str()
+            "reason" => restart_reason(error).as_str()
         )
         .increment(1);
         metrics::gauge!("bifrost_forge_worker_restart_backoff_seconds").set(backoff.as_secs_f64());
+    }
+
+    /// Counts one failed Forge maintenance scheduler restart.
+    ///
+    /// Called by the process supervisor each time it schedules a rebuild of a
+    /// scheduler that stopped before shutdown, with the same `reason`
+    /// classification as [`Self::record_worker_restart`]. The backoff is the
+    /// supervisor's and is logged with the restart, so no gauge repeats it.
+    pub fn record_scheduler_restart(error: Option<&ForgeError>, _backoff: Duration) {
+        metrics::counter!(
+            "bifrost_forge_scheduler_restarts_total",
+            "reason" => restart_reason(error).as_str()
+        )
+        .increment(1);
+    }
+
+    /// Counts one expired-cleanup candidate an active Oracle table read refused.
+    ///
+    /// `stage` says where the refusal was observed: the durable preparation of
+    /// a candidate, or a prepared-claim replay that retained its candidate
+    /// because that preparation was refused.
+    pub(super) fn record_expired_cleanup_refusal(stage: ForgeCleanupRefusalStage) {
+        metrics::counter!(
+            "bifrost_forge_expired_cleanup_refusals_total",
+            "stage" => stage.as_str(),
+            "reason" => CLEANUP_REFUSAL_ACTIVE_READ
+        )
+        .increment(1);
     }
 
     /// Opens one balanced active-task guard for the duration of an attempt.
@@ -414,6 +462,17 @@ impl Drop for ForgeActiveTask {
     fn drop(&mut self) {
         self.telemetry.active_tasks[&self.task_type].decrement(1.0);
     }
+}
+
+/// Classifies the error that stopped a restarted Forge loop.
+///
+/// An exit without a worker error has nothing to classify and is an internal
+/// invariant failure.
+fn restart_reason(error: Option<&ForgeError>) -> ForgeFailureClass {
+    error.map_or(
+        ForgeFailureClass::InternalInvariant,
+        ForgeError::failure_class,
+    )
 }
 
 /// Registers one gauge per `task_type` and publishes each explicit zero.
@@ -516,8 +575,18 @@ mod tests {
             .iter()
             .map(|reason| reason.as_str())
             .chain(LEADER_REVOCATIONS.iter().map(|reason| reason.as_str()))
-            .chain([WORKER_BACKOFF_DATABASE_UNAVAILABLE])
+            .chain([
+                WORKER_BACKOFF_DATABASE_UNAVAILABLE,
+                CLEANUP_REFUSAL_ACTIVE_READ,
+            ])
             .collect::<BTreeSet<_>>();
+        let stages = [
+            ForgeCleanupRefusalStage::Prepare,
+            ForgeCleanupRefusalStage::Replay,
+        ]
+        .iter()
+        .map(|stage| stage.as_str())
+        .collect::<BTreeSet<_>>();
         let operations = LEADER_DECISIONS
             .iter()
             .map(|operation| operation.as_str())
@@ -539,6 +608,7 @@ mod tests {
                     "reason" => &reasons,
                     "operation" => &operations,
                     "outcome" => &outcomes,
+                    "stage" => &stages,
                     other => panic!("{series} carries the unapproved label key {other}"),
                 };
                 assert!(
@@ -616,6 +686,9 @@ mod tests {
                 }),
                 Duration::from_secs(2),
             );
+            ForgeTelemetry::record_scheduler_restart(None, Duration::from_secs(1));
+            ForgeTelemetry::record_expired_cleanup_refusal(ForgeCleanupRefusalStage::Prepare);
+            ForgeTelemetry::record_expired_cleanup_refusal(ForgeCleanupRefusalStage::Replay);
 
             drop(telemetry.active_task(ForgeTaskStrategy::SmallFiles));
             let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

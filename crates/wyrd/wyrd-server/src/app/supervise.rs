@@ -78,10 +78,10 @@ const WORKER_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Used for workers whose loss costs only their own capability on this pod
 /// (the Forge worker and maintenance scheduler), so their failure must not stop
 /// the process. The first instance is built eagerly, so a misconfigured worker
-/// still fails boot. Each instance is awaited as its own task, so an error, a
-/// panic, or an early return all land here: the failure is logged,
-/// `on_restart` is told the failure (`None` for a panic or an early clean
-/// return) and the backoff about to be waited, the loop backs off (doubling
+/// still fails boot. Each instance is awaited through its own task's join
+/// handle, so any exit before shutdown lands here: the failure is logged,
+/// `on_restart` is told the failure (`None` when the exit carries no worker
+/// error) and the backoff about to be waited, the loop backs off (doubling
 /// from one second to a thirty-second cap, reset once an instance has run
 /// longer than the cap), and `build` is called again with the same shutdown
 /// token, which is exactly how boot built the first instance.
@@ -122,7 +122,7 @@ where
             if shutdown.is_cancelled() {
                 let outcome = match joined {
                     Ok(result) => result.map_err(|error| error.to_string()),
-                    Err(join_error) => Err(format!("task panicked: {join_error}")),
+                    Err(join_error) => Err(join_error.to_string()),
                 };
                 return TaskExit { id, outcome };
             }
@@ -146,7 +146,7 @@ where
                     worker = name,
                     error = %join_error,
                     backoff_ms,
-                    "worker panicked; restarting it on this pod"
+                    "worker failed; restarting it on this pod"
                 ),
             }
             on_restart(
@@ -618,9 +618,9 @@ mod tests {
         );
     }
 
-    /// Proves a restarting worker survives an error and a panic, then drains cleanly.
+    /// Proves a restarting worker survives repeated failures, then drains cleanly.
     ///
-    /// The first instance fails, the second panics, and the third parks until
+    /// The first two instances fail, and the third parks until
     /// shutdown. The loop must rebuild after each pre-shutdown exit instead of
     /// returning, and shutdown must end it as a graceful exit.
     ///
@@ -629,7 +629,7 @@ mod tests {
     /// Panics when the loop returns before shutdown, skips a rebuild, or
     /// reports the drain as a failure.
     #[tokio::test(start_paused = true)]
-    async fn restarting_worker_rebuilds_after_failure_and_panic() {
+    async fn restarting_worker_rebuilds_after_failures() {
         let shutdown = CancellationToken::new();
         let builds = Arc::new(AtomicU8::new(0));
         let parked = Arc::new(tokio::sync::Notify::new());
@@ -646,7 +646,7 @@ mod tests {
                 Ok::<_, &'static str>(async move {
                     match build {
                         0 => Err("first instance failed"),
-                        1 => panic!("second instance panicked"),
+                        1 => Err("second instance failed"),
                         _ => {
                             parked.notify_one();
                             token.cancelled().await;
@@ -671,7 +671,7 @@ mod tests {
             *restarts.lock().expect("the restart record is not poisoned"),
             [
                 (Some("first instance failed"), Duration::from_secs(1)),
-                (None, Duration::from_secs(2)),
+                (Some("second instance failed"), Duration::from_secs(2)),
             ],
             "each restart reports its failure and the doubling backoff"
         );

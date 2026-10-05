@@ -313,8 +313,8 @@ The worker and scheduler restart counters reuse these failure classes for the
 error that stopped the loop; an exit without an error to classify counts as
 `internal_invariant`. Three more families carry their own `reason` values:
 leader revocations (`renewal_refused`, `renewal_failed`, `renewal_timeout`,
-`replaced`, `shutdown`), worker back-offs (`database_unavailable`), and expired
-cleanup refusals (`active_read`).
+`replaced`, `shutdown`, `scheduler_stopped`), worker back-offs
+(`database_unavailable`), and expired cleanup refusals (`active_read`).
 
 `stage` names where an active Oracle read refused an expired-cleanup candidate
 preparation:

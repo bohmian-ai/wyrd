@@ -124,6 +124,9 @@ pub(super) enum ForgeLeaderRevocation {
     Replaced,
     /// The coordinator stopped and resigned it.
     Shutdown,
+    /// The scheduler exited, failed or was dropped before shutdown; the
+    /// election row is left to lapse.
+    SchedulerStopped,
 }
 
 impl ForgeLeaderRevocation {
@@ -135,6 +138,7 @@ impl ForgeLeaderRevocation {
             Self::RenewalTimeout => "renewal_timeout",
             Self::Replaced => "replaced",
             Self::Shutdown => "shutdown",
+            Self::SchedulerStopped => "scheduler_stopped",
         }
     }
 }

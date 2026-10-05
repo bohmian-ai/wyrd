@@ -219,15 +219,22 @@ impl ForgeLeadership {
     ///
     /// Every term enters the slot once and leaves it once, here, so each
     /// departure is counted as exactly one revocation under the reason the
-    /// caller gives, and the held gauge follows the slot.
-    fn set_held(&self, term: Option<Arc<ForgeHeldTerm>>, reason: ForgeLeaderRevocation) {
+    /// caller gives, and the held gauge follows the slot. Taking the slot's
+    /// write lock waits for every in-flight [`Self::with_term`] operation, so
+    /// none of them can act on the replaced term after it is revoked. Returns
+    /// the replaced term, if any.
+    fn set_held(
+        &self,
+        term: Option<Arc<ForgeHeldTerm>>,
+        reason: ForgeLeaderRevocation,
+    ) -> Option<Arc<ForgeHeldTerm>> {
         let held = term.is_some();
         let replaced = std::mem::replace(
             &mut *self.held.write().unwrap_or_else(PoisonError::into_inner),
             term,
         );
         ForgeTelemetry::record_leader_held(held);
-        if let Some(replaced) = replaced {
+        if let Some(replaced) = &replaced {
             replaced.revocation.cancel();
             ForgeTelemetry::record_leader_revocation(reason);
             if reason == ForgeLeaderRevocation::Shutdown {
@@ -243,6 +250,20 @@ impl ForgeLeadership {
                     "Forge leader term revoked"
                 );
             }
+        }
+        replaced
+    }
+
+    /// Revokes and removes the held term at once, without touching the row.
+    ///
+    /// The scheduler's run guard calls this on every exit, including an
+    /// unwind or a dropped future, so a failed scheduler stops serving
+    /// notify, pull and report before its same-pod restart backoff begins.
+    /// The election row is left to lapse at its own expiry; a rebuilt
+    /// scheduler on this pod contends for it again like any other replica.
+    pub(super) fn relinquish(&self) {
+        if self.slot().is_some() {
+            self.set_held(None, ForgeLeaderRevocation::SchedulerStopped);
         }
     }
 
@@ -342,10 +363,9 @@ impl ForgeLeadership {
     /// Returns SQL errors from the election row; the local term is revoked
     /// and dropped regardless, and the row then expires on its own.
     pub(super) async fn resign(&self) -> Result<(), ForgeError> {
-        let Some(term) = self.slot() else {
+        let Some(term) = self.set_held(None, ForgeLeaderRevocation::Shutdown) else {
             return Ok(());
         };
-        self.set_held(None, ForgeLeaderRevocation::Shutdown);
         self.election
             .resign(self.owner, term.fencing_token)
             .await
@@ -367,11 +387,9 @@ impl ForgeLeadership {
         notice: ForgeCommitNotice,
         now: DateTime<Utc>,
     ) -> Result<(), ForgeError> {
-        let term = self.term(fencing_token)?;
-        let started = Instant::now();
-        term.schedule.notify_commit(notice, now);
-        ForgeTelemetry::record_leader_decision(ForgeLeaderDecision::Commit, started.elapsed());
-        Ok(())
+        self.with_term(fencing_token, ForgeLeaderDecision::Commit, |schedule| {
+            schedule.notify_commit(notice, now);
+        })
     }
 
     /// Delivers one commit notice to the live leader.
@@ -415,16 +433,36 @@ impl ForgeLeadership {
             })
     }
 
-    /// Returns the unrevoked held term when it is `fencing_token`, or the
-    /// local term for the in-process path (`None`).
+    /// Runs one synchronous schedule operation as a single use of the live term.
+    ///
+    /// The term is `fencing_token`, or the local term for the in-process path
+    /// (`None`). The slot's read guard is held from validation through
+    /// `operate`, so [`Self::set_held`] cannot replace or revoke the selected
+    /// term in between: the operation either completes before that
+    /// revocation or is refused, and no schedule effect follows it. The
+    /// operation's latency is recorded as one `decision`.
     ///
     /// # Errors
     ///
     /// Returns [`ForgeError::FenceLost`] when this replica does not hold the
     /// named term or that term was revoked.
-    fn term(&self, fencing_token: Option<i64>) -> Result<Arc<ForgeHeldTerm>, ForgeError> {
-        match self.held() {
-            Some(term) if fencing_token.is_none_or(|token| token == term.fencing_token) => Ok(term),
+    fn with_term<T>(
+        &self,
+        fencing_token: Option<i64>,
+        decision: ForgeLeaderDecision,
+        operate: impl FnOnce(&ForgeSchedule) -> T,
+    ) -> Result<T, ForgeError> {
+        let slot = self.held.read().unwrap_or_else(PoisonError::into_inner);
+        match slot.as_deref() {
+            Some(term)
+                if !term.is_revoked()
+                    && fencing_token.is_none_or(|token| token == term.fencing_token) =>
+            {
+                let started = Instant::now();
+                let output = operate(&term.schedule);
+                ForgeTelemetry::record_leader_decision(decision, started.elapsed());
+                Ok(output)
+            }
             _ => Err(ForgeError::FenceLost {
                 lease_key: LEADER_LEASE_KEY.to_owned(),
             }),
@@ -443,11 +481,9 @@ impl ForgeLeadership {
         limit: usize,
         now: DateTime<Utc>,
     ) -> Result<Vec<ForgeCompactionDispatch>, ForgeError> {
-        let term = self.term(fencing_token)?;
-        let started = Instant::now();
-        let dispatches = term.schedule.pull(limit, now);
-        ForgeTelemetry::record_leader_decision(ForgeLeaderDecision::Pull, started.elapsed());
-        Ok(dispatches)
+        self.with_term(fencing_token, ForgeLeaderDecision::Pull, |schedule| {
+            schedule.pull(limit, now)
+        })
     }
 
     /// Applies one compactor report to the held term's schedule.
@@ -466,11 +502,9 @@ impl ForgeLeadership {
         outcome: ForgeCompactionOutcome,
         now: DateTime<Utc>,
     ) -> Result<bool, ForgeError> {
-        let term = self.term(fencing_token)?;
-        let started = Instant::now();
-        let matched = term.schedule.report(key, task_id, outcome, now);
-        ForgeTelemetry::record_leader_decision(ForgeLeaderDecision::Report, started.elapsed());
-        Ok(matched)
+        self.with_term(fencing_token, ForgeLeaderDecision::Report, |schedule| {
+            schedule.report(key, task_id, outcome, now)
+        })
     }
 
     /// Resolves the remote leader's term, URI and a client for it.
@@ -664,6 +698,98 @@ mod tests {
             fencing_token: 1,
             schedule: ForgeSchedule::new(DEFAULT_REPORT_TIMEOUT),
             revocation: shutdown.child_token(),
+        }
+    }
+
+    /// Builds a participant over a pool that never connects.
+    ///
+    /// These tests exercise only the local term slot, so no statement is sent.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lazy pool rejects its placeholder address.
+    fn leadership() -> ForgeLeadership {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@localhost/unused")
+            .expect("lazy pool");
+        ForgeLeadership::new(ForgeLeaderElection::new(pool.into()), Uuid::now_v7())
+    }
+
+    /// A schedule operation holds the term slot from validation to its end.
+    ///
+    /// The operation is paused after it selected the live term. Replacement
+    /// cannot take the slot while it is paused, so the operation completes
+    /// under an unrevoked term; once replacement lands, the same handler
+    /// refuses without running.
+    ///
+    /// # Panics
+    ///
+    /// Panics when replacement can interleave with a selected operation, when
+    /// the paused operation sees its term revoked, or when a revoked term
+    /// still runs an operation.
+    #[tokio::test]
+    async fn schedule_use_is_linearized_with_term_replacement() {
+        let shutdown = CancellationToken::new();
+        let leadership = leadership();
+        let held = Arc::new(term(&shutdown));
+        leadership.set_held(Some(Arc::clone(&held)), ForgeLeaderRevocation::Replaced);
+        let (entered, on_entered) = std::sync::mpsc::channel();
+        let (resume, on_resume) = std::sync::mpsc::channel::<()>();
+        let (leadership, held) = (&leadership, &held);
+        std::thread::scope(|scope| {
+            let operation = scope.spawn(move || {
+                leadership.with_term(Some(1), ForgeLeaderDecision::Pull, |_| {
+                    entered.send(()).expect("the test awaits entry");
+                    on_resume.recv().expect("the test resumes the operation");
+                    held.is_revoked()
+                })
+            });
+            on_entered.recv().expect("the operation selected its term");
+            assert!(
+                leadership.held.try_write().is_err(),
+                "a selected operation holds the slot against replacement"
+            );
+            let replacement =
+                scope.spawn(|| leadership.set_held(None, ForgeLeaderRevocation::Replaced));
+            resume.send(()).expect("the operation is paused");
+            let revoked_inside = operation
+                .join()
+                .expect("operation thread")
+                .expect("the live term serves the operation");
+            assert!(!revoked_inside, "the term stayed live through its use");
+            replacement.join().expect("replacement thread");
+        });
+        assert!(held.is_revoked());
+        let mut ran = false;
+        let refused = leadership.with_term(Some(1), ForgeLeaderDecision::Pull, |_| ran = true);
+        assert!(matches!(refused, Err(ForgeError::FenceLost { .. })));
+        assert!(!ran, "a revoked term runs no schedule operation");
+    }
+
+    /// Relinquishing revokes and removes the term so every handler refuses.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the term stays held or live, or when notify, pull or report
+    /// is still served under it.
+    #[tokio::test]
+    async fn relinquished_term_refuses_every_handler() {
+        let shutdown = CancellationToken::new();
+        let leadership = leadership();
+        let held = Arc::new(term(&shutdown));
+        leadership.set_held(Some(Arc::clone(&held)), ForgeLeaderRevocation::Replaced);
+        leadership.relinquish();
+        assert!(held.is_revoked());
+        assert!(leadership.slot().is_none());
+        for decision in [
+            ForgeLeaderDecision::Commit,
+            ForgeLeaderDecision::Pull,
+            ForgeLeaderDecision::Report,
+        ] {
+            assert!(matches!(
+                leadership.with_term(None, decision, |_| ()),
+                Err(ForgeError::FenceLost { .. })
+            ));
         }
     }
 

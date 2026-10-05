@@ -2447,3 +2447,173 @@ async fn property_less_table_is_compacted_after_the_default_interval() {
     assert_eq!(due.len(), 1, "the interval boundary dispatches: {due:?}");
     assert_eq!(due[0].compaction_type, ForgeCompactionType::SmallFiles);
 }
+
+/// Builds one coordinator over `fixture` whose scheduler passes a test requests.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot produce a validated Forge graph.
+fn coordinator(fixture: &PromotionIntegrationFixture) -> (Arc<Forge>, ForgeSchedulerTrigger) {
+    let trigger = ForgeSchedulerTrigger::with_owner_for_test(Uuid::now_v7());
+    let forge = fixture.build_forge_for_test(
+        fixture.catalog.iceberg_catalog(),
+        CountingObjectStore::new(Arc::clone(&fixture.staging)),
+        ForgeClock::system(),
+        ForgeWorkerCompletionObserver::new(),
+        trigger.clone(),
+    );
+    (forge, trigger)
+}
+
+/// Requests one scheduler pass and waits until `expected` passes completed.
+///
+/// A requested pass renews or contends for the term before it records
+/// completion, so on return the coordinator's term state is settled.
+///
+/// # Panics
+///
+/// Panics when the pass misses its diagnostic bound.
+async fn contend(trigger: &ForgeSchedulerTrigger, expected: usize) {
+    trigger.request_pass();
+    timeout(OWNERSHIP_BOUND, trigger.wait_for_passes_at_least(expected))
+        .await
+        .expect("the requested scheduler pass completes");
+}
+
+/// Asserts that notify, pull and report all refuse `fencing_token` on `forge`.
+///
+/// # Panics
+///
+/// Panics when any leader handler still serves the term.
+fn assert_handlers_refuse(
+    forge: &Forge,
+    fixture: &PromotionIntegrationFixture,
+    fencing_token: i64,
+) {
+    let key = ForgeTableKey {
+        tenant: fixture.tenant,
+        table: identity(fixture),
+    };
+    let notify = forge.accept_commit_notice(
+        fencing_token,
+        ForgeCommitNotice {
+            key: key.clone(),
+            snapshot_id: 1,
+            settings: ForgeTableSettings::default(),
+        },
+    );
+    let pull = forge.serve_compaction_pull(fencing_token, 4).map(|_| ());
+    let report = forge
+        .serve_compaction_report(
+            fencing_token,
+            &key,
+            Uuid::now_v7(),
+            ForgeCompactionOutcome::Failed,
+        )
+        .map(|_| ());
+    for (handler, result) in [("notify", notify), ("pull", pull), ("report", report)] {
+        assert!(
+            matches!(
+                result,
+                Err(vala_bifrost_redux::forge::ForgeError::FenceLost { .. })
+            ),
+            "{handler} under an ended scheduler's term: {result:?}"
+        );
+    }
+}
+
+/// A failed scheduler ends its term before the same-pod restart backoff.
+///
+/// The scheduler panics after acquiring the term. While nothing runs on that
+/// pod, its term is revoked and gone, so notify, pull and report all refuse
+/// it. Once the abandoned row lapses a standby acquires, and the rebuilt
+/// scheduler contends like any other replica and stays a standby. A rebuilt
+/// scheduler that later holds the term and is dropped ends it the same way.
+///
+/// # Panics
+///
+/// Panics when an ended scheduler's term stays held or serves a handler, when
+/// the standby cannot take over, or when the rebuilt scheduler takes the live
+/// term from the standby.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn failed_scheduler_ends_its_term_before_restart() {
+    let fixture = PromotionIntegrationFixture::start("scheduler_unwind").await;
+    let (old, old_trigger) = coordinator(&fixture);
+    let fail = CancellationToken::new();
+    let first = tokio::spawn({
+        let old = Arc::clone(&old);
+        let fail = fail.clone();
+        async move {
+            tokio::select! {
+                result = old.run(CancellationToken::new(), ForgeRoleReadiness::detached()) => {
+                    panic!("the scheduler stopped on its own: {result:?}")
+                }
+                () = fail.cancelled() => panic!("forced scheduler failure after acquisition"),
+            }
+        }
+    });
+    contend(&old_trigger, 1).await;
+    let term = old
+        .held_leader_term()
+        .expect("the first scheduler holds the term");
+    fail.cancel();
+    let failed = first.await.expect_err("the scheduler task fails");
+    assert!(failed.is_panic(), "the scheduler unwound: {failed}");
+
+    // Restart backoff: no scheduler runs on this pod, and its term is over.
+    assert!(term.is_revoked());
+    assert!(old.held_leader_term().is_none());
+    assert_handlers_refuse(&old, &fixture, term.fencing_token());
+
+    // The abandoned row lapses at its own expiry; a standby then acquires.
+    sqlx::query(
+        "UPDATE vala.forge_scheduler_state SET expires_at = statement_timestamp() WHERE singleton",
+    )
+    .execute(fixture.operator_pool.pool())
+    .await
+    .expect("the abandoned term lapses");
+    let (standby, standby_trigger) = coordinator(&fixture);
+    let standby_stop = CancellationToken::new();
+    let standby_run = tokio::spawn({
+        let standby = Arc::clone(&standby);
+        let stop = standby_stop.clone();
+        async move { standby.run(stop, ForgeRoleReadiness::detached()).await }
+    });
+    contend(&standby_trigger, 1).await;
+    let successor = standby.held_leader_term().expect("the standby takes over");
+    assert!(successor.fencing_token() > term.fencing_token());
+
+    // The rebuilt scheduler contends for the live term and stays a standby.
+    let rebuilt = AbortOnDropHandle::new(tokio::spawn({
+        let old = Arc::clone(&old);
+        async move {
+            old.run(CancellationToken::new(), ForgeRoleReadiness::detached())
+                .await
+        }
+    }));
+    contend(&old_trigger, 2).await;
+    assert!(
+        old.held_leader_term().is_none(),
+        "the live term is not taken"
+    );
+    assert!(!successor.is_revoked());
+
+    // After the standby resigns, the rebuilt scheduler acquires; dropping it
+    // then ends that term at once.
+    standby_stop.cancel();
+    standby_run
+        .await
+        .expect("standby scheduler task")
+        .expect("standby scheduler stops cleanly");
+    contend(&old_trigger, 3).await;
+    let rebuilt_term = old
+        .held_leader_term()
+        .expect("the rebuilt scheduler acquires the resigned term");
+    rebuilt.abort();
+    let dropped = rebuilt.await.expect_err("the rebuilt scheduler is dropped");
+    assert!(dropped.is_cancelled());
+    assert!(rebuilt_term.is_revoked());
+    assert!(old.held_leader_term().is_none());
+    assert_handlers_refuse(&old, &fixture, rebuilt_term.fencing_token());
+}

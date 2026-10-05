@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::error::ForgeError;
-use super::leadership::{ForgeHeldTerm, LEADER_HEARTBEAT};
+use super::leadership::{ForgeHeldTerm, ForgeLeadership, LEADER_HEARTBEAT};
 use super::{Forge, ForgeRoleReadiness, ForgeWorker, ForgeWorkerConfig};
 use crate::catalog::TenantTableBinding;
 use crate::maintenance::StagingFileCommitted;
@@ -513,19 +513,28 @@ impl Forge {
             .map_err(|_| ForgeError::AlreadyRunning)?;
         Ok(ForgeRunGuard {
             running: &self.running,
+            leadership: &self.leadership,
         })
     }
 }
 
-/// RAII guard that releases one process-local scheduler supervision slot.
+/// RAII guard that ends one scheduler run's authority and releases its slot.
 struct ForgeRunGuard<'owner> {
     /// Atomic flag owned by the enclosing Forge handle.
     running: &'owner AtomicBool,
+    /// The leadership whose locally held term this run may have acquired.
+    leadership: &'owner ForgeLeadership,
 }
 
 impl Drop for ForgeRunGuard<'_> {
-    /// Releases the supervision slot on every loop exit path.
+    /// Revokes and removes the held term, then releases the supervision slot.
+    ///
+    /// This runs on every exit path, including an unwind or a dropped run
+    /// future, so the term is gone before a same-pod restart can begin and
+    /// before a rebuilt run can take the slot. A normal stop has already
+    /// resigned the term, and this finds the slot empty.
     fn drop(&mut self) {
+        self.leadership.relinquish();
         self.running.store(false, Ordering::Release);
     }
 }

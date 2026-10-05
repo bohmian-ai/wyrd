@@ -3024,29 +3024,52 @@ impl ForgeWorker {
 
     /// Drains one claim this owner took as shutdown was signalled.
     ///
-    /// The claim is released back to `retryable` so a stopping worker leaves no
-    /// task owned by a process that will never run it, and the episode is still
-    /// observed so its duration is not lost.
+    /// A fair claim is released back to `retryable` so a stopping worker leaves
+    /// no task owned by a process that will never run it. A leader-dispatched
+    /// claim instead stays owned by the pull/report protocol: its bookkeeping
+    /// is removed here exactly once, the row closes as `cancelled` through
+    /// [`Self::close_dispatched`] so no fair claim can give it a second owner,
+    /// and the leader receives one `NotStarted` report, `RisingWave`'s failed
+    /// send, which keeps every pending commit due. A dispatched row that
+    /// already left this attempt commits nothing and sends no report: its
+    /// current owner, or the reclaim that cancelled it, reports instead. The
+    /// episode is observed either way so its duration is not lost.
     ///
     /// # Errors
     ///
-    /// Returns the release failure, which leaves the claim for lease-expiry
-    /// recovery and stops this owner.
+    /// Returns the release or close failure, which leaves the claim for
+    /// lease-expiry recovery (whose reclaim reports a dispatched row to the
+    /// leader) and stops this owner.
     async fn release_claim_at_shutdown(
         &self,
         claim: &ForgeTaskClaim,
         started: Instant,
     ) -> Result<(), ForgeError> {
         let task_id = claim.task_id;
-        let released = if let Some(attempt) = claim.attempt_id {
-            self.release_cancelled_claim(task_id, attempt).await
-        } else {
-            Ok(false)
+        let dispatch = self
+            .dispatched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&task_id);
+        let released = match (claim.attempt_id, dispatch.is_some()) {
+            (Some(attempt), true) => {
+                self.close_dispatched(claim, attempt, &ForgeError::Shutdown)
+                    .await
+            }
+            (Some(attempt), false) => self
+                .release_cancelled_claim(task_id, attempt)
+                .await
+                .map(|released| released.then_some(ForgeTaskResult::Retry)),
+            (None, _) => Ok(None),
         };
         if let Err(error) = &released {
             self.close_after_fatal();
             tracing::error!(worker = %self.owner, task_id = %task_id, error = %error,
                 "Forge claim shutdown release failed; durable state retained for lease recovery");
+        }
+        if let (Some(dispatch), Ok(Some(_))) = (&dispatch, &released) {
+            self.report_dispatch(dispatch, ForgeCompactionOutcome::NotStarted)
+                .await;
         }
         self.record_task_execution_telemetry(
             claim.data_tenant_id,
@@ -3054,8 +3077,9 @@ impl ForgeWorker {
             Self::metric_strategy(&claim.strategy),
             &tracing::Span::none(),
             started,
-            // The release committed `retryable`; a no-match committed nothing.
-            matches!(released, Ok(true)).then_some(ForgeTaskResult::Retry),
+            // The committed `retryable` or `cancelled` result; a no-match
+            // committed nothing.
+            released.as_ref().ok().copied().flatten(),
         )
         .await;
         released.map(|_| ())

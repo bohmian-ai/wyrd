@@ -461,21 +461,16 @@ impl ForgeTaskPlanning {
             .iter()
             .filter(|task| task.deletes.len() >= files_with_deletes.min_delete_file_count_threshold)
             .count();
-        let mut candidates = Vec::new();
-        if tasks.len() > 1 {
-            if delete_heavy >= AUTO_MIN_DELETE_HEAVY_FILES {
-                candidates.push((
-                    CompactionPlanningConfig::FilesWithDeletes(files_with_deletes.clone()),
-                    SelectionStrategyKind::UpstreamFilesWithDeletes,
-                ));
-            }
-            if small >= AUTO_MIN_SMALL_FILES {
-                candidates.push((
-                    CompactionPlanningConfig::SmallFiles(small_files.clone()),
-                    SelectionStrategyKind::UpstreamSmallFiles,
-                ));
-            }
-        }
+        let candidates = auto_candidates(tasks.len(), small, delete_heavy)
+            .into_iter()
+            .map(|kind| {
+                let config = if kind == SelectionStrategyKind::UpstreamFilesWithDeletes {
+                    CompactionPlanningConfig::FilesWithDeletes(files_with_deletes.clone())
+                } else {
+                    CompactionPlanningConfig::SmallFiles(small_files.clone())
+                };
+                (config, kind)
+            });
         for (config, kind) in candidates {
             let plans = FileSelector::group_tasks_with_strategy(
                 tasks.clone(),
@@ -496,6 +491,34 @@ impl ForgeTaskPlanning {
             selection_report(SelectionStrategyKind::UpstreamAuto, snapshot_id, &[])?,
         ))
     }
+}
+
+/// Returns upstream Auto's candidate strategies for one scanned snapshot, in
+/// the order [`ForgeTaskPlanning::plan`] tries them.
+///
+/// This is nimtable `74bdc45`'s table-wide gate (`config/mod.rs:596-660`,
+/// `compaction/auto.rs:131-202`): a snapshot with at most one data file has
+/// no candidate; a delete-heavy candidate exists once
+/// [`AUTO_MIN_DELETE_HEAVY_FILES`] files carry the delete threshold, and it
+/// precedes a small-file candidate, which exists once
+/// [`AUTO_MIN_SMALL_FILES`] files are small. The caller takes the first
+/// candidate whose plans are nonempty, so delete-heavy work wins.
+fn auto_candidates(
+    total_files: usize,
+    small_files: usize,
+    delete_heavy_files: usize,
+) -> Vec<SelectionStrategyKind> {
+    let mut candidates = Vec::new();
+    if total_files <= 1 {
+        return candidates;
+    }
+    if delete_heavy_files >= AUTO_MIN_DELETE_HEAVY_FILES {
+        candidates.push(SelectionStrategyKind::UpstreamFilesWithDeletes);
+    }
+    if small_files >= AUTO_MIN_SMALL_FILES {
+        candidates.push(SelectionStrategyKind::UpstreamSmallFiles);
+    }
+    candidates
 }
 
 /// Builds the selection report one upstream strategy's plans describe.
@@ -916,5 +939,31 @@ mod tests {
         };
         assert_eq!(files_with_deletes.group_filters, None);
         assert_eq!(small_files.group_filters, None);
+    }
+
+    /// Auto gates on table-wide counts and tries delete-heavy work first, as
+    /// upstream `74bdc45` does, rather than the fork's union selector.
+    ///
+    /// # Panics
+    /// Panics when the one-file guard, either count floor, or the
+    /// delete-first order departs from upstream.
+    #[test]
+    fn auto_candidates_follow_upstream_thresholds_and_delete_first_order() {
+        use SelectionStrategyKind::{UpstreamFilesWithDeletes, UpstreamSmallFiles};
+        assert!(
+            auto_candidates(1, 1, 1).is_empty(),
+            "one file plans nothing"
+        );
+        assert!(
+            auto_candidates(4, 4, 0).is_empty(),
+            "four small files stay below the floor"
+        );
+        assert_eq!(auto_candidates(5, 5, 0), vec![UpstreamSmallFiles]);
+        assert_eq!(auto_candidates(2, 0, 1), vec![UpstreamFilesWithDeletes]);
+        assert_eq!(
+            auto_candidates(6, 5, 1),
+            vec![UpstreamFilesWithDeletes, UpstreamSmallFiles],
+            "delete-heavy work is tried before small files"
+        );
     }
 }

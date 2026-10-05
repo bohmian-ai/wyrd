@@ -1837,6 +1837,78 @@ async fn worker_reports_no_plan_dispatch_as_success() {
     supervisor.shutdown().await;
 }
 
+/// Shutdown after a dispatch's durable claim, before its episode, stays leader-owned.
+///
+/// The worker pulls the promoted table, records the dispatch as its own claimed
+/// row, and is held there while shutdown is signalled. The row must close as
+/// `cancelled` — never `retryable`, where a fair claim would give the accepted
+/// dispatch a second owner — and the leader must receive the one `NotStarted`
+/// report that clears its in-flight task while keeping every pending commit.
+///
+/// # Panics
+///
+/// Panics when the claim gate is missed, the row becomes fair-claimable, or
+/// the leader still holds the dispatch in flight or lost a commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn dispatch_shutdown_before_episode_closes_and_reports_not_started() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let fixture = PromotionIntegrationFixture::start("dispatch_shutdown").await;
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let mut supervisor = SupervisedPromotion::start_serial(
+        &fixture,
+        fixture.catalog.iceberg_catalog(),
+        Arc::clone(&store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    supervisor.run_one_success().await;
+    let owed = track(&supervisor, &fixture);
+    assert_eq!(owed.in_flight, None, "nothing is dispatched yet");
+
+    supervisor.restart_worker();
+    supervisor.observer().hold_after_claims_for_test(1);
+    let stop = supervisor.worker_stop();
+    supervisor.start_worker();
+    timeout(
+        OWNERSHIP_BOUND,
+        supervisor.observer().wait_for_claims_for_test(),
+    )
+    .await
+    .expect("the dispatch's claim gate");
+    let task_id = track(&supervisor, &fixture)
+        .in_flight
+        .expect("the held claim is the leader's in-flight dispatch");
+    let held: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+        .bind(task_id)
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("the dispatch's durable claim");
+    assert_eq!(held, "claimed", "the dispatch is durably claimed");
+
+    stop.cancel();
+    supervisor.observer().release_claims_for_test();
+    supervisor.join_worker().await;
+
+    let closed: (String, Option<Uuid>) =
+        sqlx::query_as("SELECT state,attempt_id FROM vala.forge_tasks WHERE task_id=$1")
+            .bind(task_id)
+            .fetch_one(fixture.operator_pool.pool())
+            .await
+            .expect("the closed dispatch");
+    assert_eq!(
+        closed,
+        ("cancelled".to_owned(), None),
+        "an accepted dispatch never becomes fair-claimable"
+    );
+    let reported = track(&supervisor, &fixture);
+    assert_eq!(
+        (reported.in_flight, reported.pending_commits),
+        (None, owed.pending_commits),
+        "one NotStarted report clears the dispatch and keeps every commit"
+    );
+    supervisor.shutdown().await;
+}
+
 /// Counts the fixture table's Iceberg snapshots.
 ///
 /// # Panics

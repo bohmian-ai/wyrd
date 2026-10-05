@@ -366,6 +366,54 @@ seeds × 300 operations) and rebuilds the index after every operation.
 Mutations — waiting entries ignoring due time; removal leaving a stale entry —
 each fail it ("pull diverged from the scan", "index drifted after commit").
 
+### Mandatory pinned nimtable and Wyrd fork review — completed (TASK-002-R1)
+
+Revisions: nimtable `74bdc45` (RisingWave e23ddf95 `Cargo.lock:6948`), old
+fork `6773e19`, shipped fork `ef97aea` (`Cargo.toml:243`,
+`Cargo.lock:4745-4748`). Sources read with `git show <sha>:<path>` in the local
+`iceberg-compaction` clone and the cargo checkout of `ef97aea`.
+
+**Shipped-fork reconciliation.** `git diff --stat 6773e19 ef97aea` touches
+only `Cargo.toml`/`Cargo.lock`: the three commits `157a097`, `01a190b`,
+`ef97aea` re-pin bohmian `iceberg-rust` `330fe331` → `97c32f63` (the same rev
+Wyrd's `Cargo.toml:230-236` pins). `core/` is byte-identical, so every fork
+line below holds at both `6773e19` and `ef97aea`. `74bdc45..ef97aea` is 17
+nimtable-main commits (`7bae3fa..d4b7c4f`, all on `upstream/main`) followed by
+20 Wyrd commits (`880b19c..ef97aea`). The nimtable-main part supplies the
+DataFusion 55-compatible tree; neither nimtable rev links into Wyrd's
+DataFusion 55 / Arrow 59 / bohmian iceberg-rust universe.
+
+| Mode or seam | `74bdc45` (RisingWave pin) | Fork `6773e19` = `ef97aea` | Forge selected source | Focused test (TASK-002-R1 run) | Disposition |
+| --- | --- | --- | --- | --- | --- |
+| Full | `file_selection/strategy.rs:820-834` `from_full`: no file filter, no group filter, scope from config | `strategy.rs:999-1015`: identical plus a `FileSequenceNumberFilterStrategy` only when `max_file_sequence_number` is `Some` (nimtable `58a4c3c`) | `forge/managed/policy.rs` `planning` Full arm: runner terms, `max_file_sequence_number: None`, COW ⇒ `FileGroupScope::Table` | `forge::managed::policy::tests::forge_table_policy_plans_risingwave_task_types`; `forge::production_routes::worker_selects_current_iceberg_files` (Full consumes every live file at the head; COW plans one table-wide group) | Upstream semantics; sequence bound unset. No fork-only code. |
+| SmallFiles / FilesWithDelete | `strategy.rs:800-817` size `< threshold` (exclusive, `:511-525`); `:836-857` deletes `>= threshold` (inclusive, `:548-572`), filter only when threshold > 0 | `strategy.rs:973-996`, `:1020-1047`: same predicates and order (`:659-669`, `:706-710`); sequence filter only when `Some` | `policy.rs` `small_files`/`files_with_deletes`: threshold 256, scope Partition, `group_filters: None` except explicit SmallFiles `min_group_file_count = 2`, small threshold 75% of target (approved REQ-013 configuration, not a library change) | `forge::managed::policy::tests::only_small_files_requires_a_partner_file`, `small_file_threshold_is_three_quarters_of_the_resolved_target`; `forge::managed_rewrite::small_files_merges_staged_pairs_once_and_lone_files_wait`; `worker_selects_current_iceberg_files` (FilesWithDelete selects nothing without deletes) | Upstream semantics; no fork-only code. |
+| Auto | `compaction/auto.rs:131-202` + `config/mod.rs:596-660`: nothing for ≤ 1 file; delete-heavy candidate at ≥ 1 delete-heavy file, small candidate at ≥ 5 small files, both `FileGroupScope::Partition`; delete-heavy plan wins | `strategy.rs:1051-1086` `from_auto`: one union `size.or(delete)` pass with no table-wide floors (inherited from nimtable `1b4fb95`, not Wyrd) | `policy.rs` `ForgeTaskPlanning::plan` Auto branch + `auto_candidates`: ports `74bdc45` using upstream-public `FileSelector::scan_data_files` (`74bdc45 file_selection/mod.rs:55`) and `group_tasks_with_strategy` (`:79`); the fork's `from_auto` is never called | `forge::managed::policy::tests::auto_candidates_follow_upstream_thresholds_and_delete_first_order` (added by R1: one-file guard, 4-vs-5 small floor, delete-first order); `worker_selects_current_iceberg_files` (2–4 small files plan nothing) | Upstream `74bdc45` behavior in Forge; fork Auto unused. |
+| Noncommitting seam | `compaction/mod.rs:448` `plan_compaction`, `:1307` `plan_compaction_with_branch`, `:370-446` `rewrite_plan` (no commit), `:644` `compact_with_plan` (commits); `Compaction.executor` is `pub` (`:206`) | `managed/boundary.rs:38-140` `NonCommittingCompaction` (`new` 60, `rewrite` 125 = upstream `rewrite_plan` body) over `CompactionBuilder::with_executor` (`compaction/mod.rs:144`); `CompactionPlanner::plan_compaction_with_report` (`:1492`) delegates non-identity configs to `plan_compaction_with_branch` (`:1437`) and derives a `SelectionReport` | `forge/managed/executor.rs` `plan` (one loaded table, `policy.planning(..).plan`), `rewrite_plan` → `NonCommittingCompaction::new`/`rewrite`; Forge publication commits; `compact_with_plan` never called | `forge::managed_rewrite::managed_rewrite_produces_exact_handoff_without_catalog_commit`, `managed_rewrite_plan_matches_core_report_on_promoted_snapshot`; `forge::managed::fingerprint::tests::forge_selection_fingerprint_is_ordered_versioned_and_snapshot_bound`, `forge_no_progress_refuses_unchanged_semantic_debt_before_io` | Retained as the vehicle for the governed executor (below); selection is upstream's. `SelectionReport` types are retained for Forge's selection/debt fingerprints. |
+| Memory governor and spill | `executor/datafusion/datafusion_processor.rs:79-92,221-240`: own `FairSpillPool::new(max_memory_bytes)`, `spill_dir` or OS tmp; `DataFusionExecutor {}` (`executor/datafusion/mod.rs:47,77`) has no way to accept a pool | `managed/context.rs:213-400` `ManagedExecutionContext` (`with_memory_pool` 326, `with_spill_lease` 338, `build` 385 sets `DiskManagerMode::Directories([lease root])`); `DataFusionExecutor::with_context` (`executor/datafusion/mod.rs:147`) uses `context.runtime_env()` | `executor.rs` `governed_context_for`: `.with_memory_pool(resources.rewrite_memory_pool(), None)` + `.with_spill_lease(spill)`; pool from `resources.rs` `rewrite_memory_pool` (`MemoryHolder::Forge` view of the shared root) | `forge::managed::executor::tests::rewrite_pool_charges_root_and_releases_on_cancel`; `worker_selects_current_iceberg_files` → `assert_rewrite_draws_on_shared_root` (a real rewrite is refused through a fully held shared root, then completes and returns every Forge byte and spill file) | **Approved Wyrd difference** (central-governor charging, governed spill). Removal-sensitive: an upstream independent pool would admit the rewrite under the held root. |
+| Cancellation and loose outputs | `executor/datafusion/mod.rs:98` writers via detached `tokio::spawn`, `:146` `try_join_all`: drop or first error leaves sibling writers running and their objects unreported | `executor/datafusion/mod.rs:197` refuse before IO when cancelled; `:266-270` `JoinSet` aborts on drop; `:308` per-batch `token.cancelled()`; `:352` drains every writer; `:387-415` Cancelled/Failed/Succeeded ledger events; `managed/bridge.rs` `AttemptLedger`/`RollingObserverBridge`, `managed/observer.rs` | `forge/managed/observer.rs` folds `RewriteEvent` outputs → `executor.rs` `possible_outputs`/`attach_possible_outputs` → `ForgeError::RewriteUnsettled` → `worker.rs` unresolved-attempt release log and orphan reclamation | `forge::managed_rewrite::managed_rewrite_cancellation_drains_and_preserves_possible_outputs` (both opened objects reported, all settled, no commit), `managed_rewrite_failure_preserves_attempt_global_possible_outputs`, `managed_rewrite_output_identity_is_unique_across_concurrent_writers`; `forge::managed::observer::tests::forge_managed_observer_folds_peaks_and_outputs_without_semantics` | Serves the approved hot-object deletion-protection difference: no object an attempt opened goes unnamed. Removal-sensitive: detached writers break the drained two-output assertion. |
+
+**Fork-only module inventory against `ef97aea`.**
+
+| Fork-only item (commit) | Forge production consumer | Removal-sensitive test | Disposition |
+| --- | --- | --- | --- |
+| `managed/context.rs` builder, `SpillLease`; `DataFusionExecutor::with_context`; `CompactionBuilder::with_executor` (`e82b6a1`, `dde3e82`) | `executor.rs` `governed_context_for`, `rewrite_plan` | governor row tests | Retained |
+| `managed/boundary.rs` `NonCommittingCompaction` (`dde3e82`) | `executor.rs` `rewrite_plan` | noncommitting row tests | Retained |
+| `JoinSet` drain, cancel-before-IO, `CompactionError::Cancelled`, `managed/bridge.rs`, `managed/observer.rs` (`e82b6a1`, `a9c117b`) | `observer.rs` → `possible_outputs` → `RewriteUnsettled` | cancellation row tests | Retained |
+| `SelectionReport`/`SelectedFile`/`SelectionStrategyKind`/`SelectionReason` and `plan_compaction_with_report` (`36b303b`, `8e25937`) | `policy.rs` `plan`/`selection_report`, `fingerprint.rs` | fingerprint tests | Retained (bookkeeping over upstream selection) |
+| `PeakTrackingMemoryPool`, `RewriteEvent::{PeakMemory,ScratchSpill}`, `with_scratch_capacity_bytes`, `SpillLease::measure` (`e82b6a1`, `b4f2c96`) | None: Forge folds peaks only into `observer.rs` fields read by `Debug` and its unit test | none in production | **Unconsumed — not narrowed (see blocker)** |
+| `IdentityAwareSelector`, `CompactionPlanningConfig::WyrdIdentityAware`, `WyrdIdentityAwareConfig`, `MatchNoneFileFilter`, `file_selection/identity.rs`, `compaction/identity_plan.rs`, identity parts of `managed/selection.rs` (`36b303b`, `8e25937`, `7a23005`) | None (Forge deleted its WyrdIdentityAware policy) | none | **Unconsumed — not narrowed (see blocker)** |
+| `managed/dependency_universe.rs` (`2e0af6f`) | None (fork-internal test only) | none | **Unconsumed — not narrowed (see blocker)** |
+
+**Blocker (FIND-TASK-002-2, partial).** The shipped `ef97aea` still carries
+the three unconsumed groups above. They are unreachable from Forge's paths and
+change no Forge behavior, but they are retained fork-only modules with no
+consumer, which the acceptance criterion forbids. Removing them requires a new
+`bohmian-ai/iceberg-compaction` revision (delete those modules and their fork
+tests, keep everything marked Retained), pushing it, and re-pinning
+`Cargo.toml:243`/`Cargo.lock`. That is an external-repository push this task
+cannot make. Forge needs no source change for it beyond deleting the matching
+peak fields in `forge/managed/observer.rs`.
+
 ### Diagnoses
 
 - **Stale boot sizing test.** Symptom: `forge_runtime_is_role_scoped_and_cpu_sized`

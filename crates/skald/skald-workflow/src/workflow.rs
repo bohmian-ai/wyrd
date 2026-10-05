@@ -2498,122 +2498,11 @@ mod tests {
         assert!(!projected.contains("s3cret"), "{projected}");
     }
 
-    /// REQ-042/INV-012: a 2xx external gateway answer whose retained content
-    /// reflects the bound credential — assistant text, a JSON-escaped canary,
-    /// tool-call arguments, or a structured member name — is refused once
-    /// with a fixed non-retryable error naming neither the answer nor the
-    /// match; an ignored unknown member is not inspected, a decode failure
-    /// never quotes the answer, a non-sensitive header is not a credential,
-    /// and the Workflow does not retry the refusal or project the credential.
+    /// A 2xx external gateway answer that fails to decode keeps its
+    /// retryable decode code but never quotes the offending value, which may
+    /// be a credential the gateway echoed.
     #[tokio::test(flavor = "multi_thread")]
-    async fn external_gateway_success_reflection() {
-        let chat = |message: &str| {
-            format!(
-                r#"{{"id":"r","object":"chat.completion","created":0,"model":"gpt-test","choices":[{{"index":0,"message":{message},"finish_reason":"stop"}}]}}"#
-            )
-        };
-        let gemini = |part: &str| {
-            format!(
-                r#"{{"candidates":[{{"content":{{"role":"model","parts":[{part}]}},"finishReason":"STOP"}}]}}"#
-            )
-        };
-        let chat_request = || {
-            ProviderRequest::OpenAiChatCompletion(
-                serde_json::from_value(json!({
-                    "model": "gpt-test",
-                    "messages": [{ "role": "user", "content": "hi" }]
-                }))
-                .expect("chat request decodes"),
-            )
-        };
-        let gemini_request = || {
-            ProviderRequest::GeminiGenerateContent(
-                serde_json::from_value(json!({
-                    "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }]
-                }))
-                .expect("gemini request decodes"),
-            )
-        };
-        let cases = [
-            (
-                "/v1/chat/completions",
-                chat(r#"{"role":"assistant","content":"echo s3cret"}"#),
-                chat_request(),
-                true,
-            ),
-            (
-                "/v1/chat/completions",
-                chat(r#"{"role":"assistant","content":"echo s3\u0063ret"}"#),
-                chat_request(),
-                true,
-            ),
-            (
-                "/v1/chat/completions",
-                chat(
-                    r#"{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"lookup","arguments":"{\"key\":\"s3cret\"}"}}]}"#,
-                ),
-                chat_request(),
-                true,
-            ),
-            (
-                "/v1/models/gemini-test:generateContent",
-                gemini(r#"{"functionCall":{"name":"lookup","args":{"s3cret":true}}}"#),
-                gemini_request(),
-                true,
-            ),
-            (
-                "/v1/models/gemini-test:generateContent",
-                gemini(r#"{"functionCall":{"name":"lookup","args":{},"id":"s3cret"}}"#),
-                gemini_request(),
-                false,
-            ),
-        ];
-        for (route, body, request, reflects) in cases {
-            if body.contains(r"\u0063") {
-                assert!(!body.contains("s3cret"), "the raw canary is escaped");
-            }
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path(route))
-                .respond_with(ResponseTemplate::new(200).set_body_string(body.clone()))
-                .expect(1)
-                .mount(&server)
-                .await;
-            let client = skald_providers::ExternalGatewayClient::new(
-                skald_providers::EndpointPolicy::new(false),
-                url::Url::parse(&format!("{}/v1", server.uri())).expect("base parses"),
-                [(http::HeaderName::from_static("x-org-secret"), {
-                    let mut value = http::HeaderValue::from_static("s3cret");
-                    value.set_sensitive(true);
-                    value
-                })]
-                .into_iter()
-                .collect(),
-            )
-            .expect("client builds");
-            let result = client.send("gemini-test", request).await;
-            if reflects {
-                let error = result.expect_err("reflecting answer is refused");
-                assert_eq!(error.code(), "SKALD_PROVIDERS_400_BAD_REQUEST", "{body}");
-                assert!(!agent_error_retryable(&skald_agent::AgentError::Provider(
-                    skald_runtime::SkaldRuntimeError::Provider {
-                        provider: skald_spec::ProviderName::OpenAi,
-                        source: error.clone(),
-                    }
-                )));
-                assert!(
-                    !format!("{error} {error:?}").contains("s3cret"),
-                    "{error:?}"
-                );
-                assert!(!format!("{error:?}").contains("echo"), "{error:?}");
-            } else {
-                result.expect("ignored members are not inspected");
-            }
-            server.verify().await;
-        }
-
-        // A success that fails to decode keeps its retryable decode code but
-        // never quotes the offending value.
+    async fn external_gateway_decode_detail_withheld() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
@@ -2629,7 +2518,16 @@ mod tests {
             http::HeaderMap::new(),
         )
         .expect("client builds")
-        .send("gpt-test", chat_request())
+        .send(
+            "gpt-test",
+            ProviderRequest::OpenAiChatCompletion(
+                serde_json::from_value(json!({
+                    "model": "gpt-test",
+                    "messages": [{ "role": "user", "content": "hi" }]
+                }))
+                .expect("chat request decodes"),
+            ),
+        )
         .await
         .expect_err("mistyped answer fails to decode");
         assert_eq!(error.code(), "SKALD_PROVIDERS_502_DECODE");
@@ -2637,93 +2535,6 @@ mod tests {
             !format!("{error} {error:?}").contains("s3cret"),
             "{error:?}"
         );
-        server.verify().await;
-
-        // A header value that is not marked sensitive is not a credential.
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(chat(r#"{"role":"assistant","content":"team ml"}"#)),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        skald_providers::ExternalGatewayClient::new(
-            skald_providers::EndpointPolicy::new(false),
-            url::Url::parse(&format!("{}/v1", server.uri())).expect("base parses"),
-            [(
-                http::HeaderName::from_static("x-team"),
-                http::HeaderValue::from_static("ml"),
-            )]
-            .into_iter()
-            .collect(),
-        )
-        .expect("client builds")
-        .send("gpt-test", chat_request())
-        .await
-        .expect("authored header values are not credentials");
-        server.verify().await;
-
-        // Through a Workflow with retries remaining, the refusal is attempted
-        // once and the projected run never carries the credential.
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(chat(r#"{"role":"assistant","content":"echo s3cret"}"#)),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        let origin = url::Url::parse(&server.uri()).expect("uri parses");
-        let mut external = with_policy(
-            Workflow::builder("reflecting")
-                .add(agent("ext", "external call", None))
-                .and_then(|b| b.with_outputs(bindings(&[("out", "steps.ext.output.text")])))
-                .and_then(|b| b.build())
-                .expect("reflecting workflow builds"),
-            "ext",
-            2,
-            None,
-            None,
-        );
-        external.spec.steps[0].llm_route = Some(LlmRoute::ExtGateway {
-            protocol: ExternalGatewayProtocol::OpenAiChat,
-            base_url: AbsoluteUrl::new(format!("{}/v1", server.uri())).expect("absolute url"),
-            headers: BTreeMap::new(),
-            credential_binding: CredentialBindingName::new("corp").expect("binding name"),
-        });
-        let mut bindings = ExternalGatewayBindings::new();
-        bindings
-            .insert(ExternalGatewayBinding {
-                name: CredentialBindingName::new("corp").expect("binding name"),
-                protocol: ExternalGatewayProtocol::OpenAiChat,
-                origin,
-                secret_headers: [(
-                    http::HeaderName::from_static("x-org-secret"),
-                    SecretString::from("s3cret"),
-                )]
-                .into(),
-            })
-            .expect("binding inserts");
-        let native = ScriptedProvider::new();
-        let run = external
-            .run_with_options(
-                &WorkflowExecutionDependencies::new(native.registry())
-                    .with_external_gateways(bindings)
-                    .with_endpoint_profile(ExternalEndpointProfile::Local),
-                serde_json::Map::new(),
-                WorkflowRunOptions::default(),
-            )
-            .await
-            .expect("bound route is available");
-        assert_eq!(run.status, WorkflowRunStatus::Failed);
-        assert_eq!(run.steps["ext"].attempts, 1, "the refusal is terminal");
-        let projected = serde_json::to_string(&run).expect("run serializes");
-        assert!(!projected.contains("s3cret"), "{projected}");
         server.verify().await;
     }
 

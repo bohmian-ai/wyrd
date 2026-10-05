@@ -63,7 +63,9 @@ Mapping input supplies declared inputs by name; undeclared keys and values of th
 or `--space <space> --name <name> --version <version>`. Input is a JSON object
 from `--input '<json>'` or `--input-file <path>`. Runs execute in the CLI
 process by default; `--execution server` runs a registered Workflow on the
-server. `--server <url>` only selects the Wyrd endpoint.
+server. `wyrd workflow` commands take no `--server` option; the Wyrd endpoint
+and credential come from the same client configuration the SDKs read, such as
+`WYRD_SERVER_URL`.
 
 ```bash
 wyrd workflow run --file examples/workflows/code-review/workflow.yaml \

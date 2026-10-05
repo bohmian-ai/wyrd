@@ -513,7 +513,9 @@ submission, status, and cancellation ship only through the Rust
 `wyrd_client::Workflows` handle, the `/v1/workflow-runs` HTTP resource, and
 the CLI. MCP has no Workflow surface. `wyrd workflow run` takes exactly one
 source (`--file`, `--uid`, or `--space`/`--name`/`--version`) and
-`--execution local|server`; a file runs only locally. Server execution prints
+`--execution local|server`; a file runs only locally. `wyrd workflow`
+commands take no `--server` option; the endpoint comes from the ambient client
+configuration. Server execution prints
 the accepted run ID and waits unless `--detach`; an interrupted wait leaves
 the run running and never cancels or resubmits it. `wyrd workflow status` and
 `wyrd workflow cancel` act on server runs.

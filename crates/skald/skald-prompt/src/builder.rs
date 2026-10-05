@@ -238,6 +238,17 @@ pub fn gemini(model: impl Into<String>, options: GeminiOptions) -> PromptBuilder
 }
 
 /// Builds a native Vertex `GenerateContent` prompt.
+///
+/// Vertex shares the Gemini `GenerateContent` body schema, so the Prompt
+/// carries a `GeminiGenerateContent` request and sets `Prompt.provider` to
+/// Vertex as its dispatch destination.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::EmptyModel`] for a blank model,
+/// [`PromptBuilderError::InvalidResponseSchema`] when a JSON-schema response
+/// format is not a JSON object, and [`PromptBuilderError::Skald`] when native
+/// Prompt construction rejects the request.
 pub fn vertex(model: impl Into<String>, options: VertexOptions) -> PromptBuilderResult<Prompt> {
     let model = checked_model(model)?;
     google_prompt(model, options, true)
@@ -270,6 +281,17 @@ pub fn raw(
     })
 }
 
+/// Builds the shared `GenerateContent` Prompt behind [`gemini`] and [`vertex`].
+///
+/// The request body is identical for both destinations; `vertex_target` only
+/// selects whether `Prompt.provider` is set to Vertex or left unset so dispatch
+/// uses the schema's Google default.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::InvalidResponseSchema`] when a JSON-schema
+/// response format is not a JSON object, and [`PromptBuilderError::Skald`]
+/// when [`finalize_prompt`] rejects the request.
 fn google_prompt(
     model: String,
     options: GeminiOptions,
@@ -307,6 +329,21 @@ fn google_prompt(
     })
 }
 
+/// Normalizes a builder-assembled Prompt and wraps it for callers.
+///
+/// Without caller-declared variables, the Prompt is rebuilt through
+/// [`skald_spec::Prompt::new`] so variables and media placeholders are derived
+/// from the request. That constructor always resets the destination to `None`,
+/// so the builder's `provider` (for example Vertex for a shared
+/// `GenerateContent` body) is saved first and restored afterwards; dropping
+/// that step would silently retarget Vertex Prompts to Google. With declared
+/// variables, only media placeholders are normalized and the destination is
+/// untouched.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::Skald`] when system content holds a media
+/// placeholder or the request cannot be serialized for variable extraction.
 fn finalize_prompt(mut prompt: skald_spec::Prompt) -> PromptBuilderResult<Prompt> {
     if prompt.variables.is_empty() {
         let provider = prompt.provider;

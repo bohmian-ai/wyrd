@@ -7,6 +7,10 @@
 //! [`wyrd_client::Workflow`]; server runs, `status`, and `cancel` delegate to
 //! [`wyrd_client::Workflows`]. Every success prints the portable
 //! [`WorkflowRun`] snapshot; failures keep their stable Wyrd error code.
+//!
+//! These commands take no `--server` option: the Wyrd endpoint and credential
+//! come from the ambient client configuration, the same resolution the SDKs
+//! and the authored-file loader use.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -102,9 +106,6 @@ pub struct RunArgs {
     /// Output encoding; JSON prints the run snapshot.
     #[arg(long, default_value_t)]
     pub format: OutputFormat,
-    /// Wyrd server base URL; defaults to the shared client configuration.
-    #[arg(long, value_name = "URL", conflicts_with = "file")]
-    pub server: Option<String>,
 }
 
 /// Arguments naming one server run.
@@ -119,9 +120,6 @@ pub struct RunIdArgs {
     /// Output encoding; JSON prints the run snapshot.
     #[arg(long, default_value_t)]
     pub format: OutputFormat,
-    /// Wyrd server base URL; defaults to the shared client configuration.
-    #[arg(long, value_name = "URL")]
-    pub server: Option<String>,
 }
 
 /// The one Workflow a run selects.
@@ -158,8 +156,9 @@ impl WorkflowCommand {
 impl RunArgs {
     /// Validate the invocation, then run the selected Workflow.
     ///
-    /// Selector, input, and execution choices are checked before any client
-    /// is built, file is read for loading, or request is sent. A local run
+    /// Selector and execution choices are checked before the input file is
+    /// read, and input is checked before any client is built, file is read
+    /// for loading, or request is sent. A local run
     /// loads the Workflow (a file through the shared loader, a registered
     /// Workflow by its exact locked graph), runs it in this process, and
     /// prints the terminal snapshot. A server run is submitted once; its ID
@@ -167,7 +166,9 @@ impl RunArgs {
     /// snapshot is printed and the command returns; otherwise the command
     /// polls until the run is terminal. An interrupt while polling stops
     /// polling only: the run keeps going on the server, nothing is cancelled
-    /// or resubmitted, and the command exits with code 130.
+    /// or resubmitted, and the command exits with code 130. If the interrupt
+    /// listener cannot be installed, polling stops the same way and the
+    /// command fails with `WYRD_WORKFLOW_500_INTERNAL` instead.
     ///
     /// The process exits 0 when the run succeeded or was detached and 2 when
     /// it reached any other terminal status.
@@ -180,21 +181,20 @@ impl RunArgs {
     /// server error of the failing load, run, or request.
     pub async fn run(self) -> Result<ExitCode, WyrdCliError> {
         let source = self.source()?;
-        let input = self.input()?;
         match (self.execution, source) {
             (Execution::Local, _) if self.detach => Err(invalid_argument(
                 "detach",
                 "true",
                 "only with --execution server",
             )),
-            (Execution::Local, source) => self.run_local(source, input).await,
+            (Execution::Local, source) => self.run_local(source, self.input()?).await,
             (Execution::Server, Source::File(path)) => Err(invalid_argument(
                 "file",
                 &path.display().to_string(),
                 "file sources run locally; register the Workflow to run it on the server",
             )),
             (Execution::Server, Source::Registered(registered)) => {
-                self.run_server(registered, input).await
+                self.run_server(registered, self.input()?).await
             }
         }
     }
@@ -213,10 +213,10 @@ impl RunArgs {
         let workflow = match source {
             Source::File(path) => Workflow::from_path(path).await?,
             Source::Registered(Registered::Uid(selector)) => {
-                self.cards()?.workflow().load(&selector).await?
+                ambient_cards()?.workflow().load(&selector).await?
             }
             Source::Registered(Registered::Exact(card_ref)) => {
-                self.cards()?
+                ambient_cards()?
                     .workflow()
                     .load(&CardSelector::exact(card_ref))
                     .await?
@@ -239,7 +239,7 @@ impl RunArgs {
         registered: Registered,
         input: Map<String, Value>,
     ) -> Result<ExitCode, WyrdCliError> {
-        let client = crate::client::from_global(self.server.as_deref())?;
+        let client = crate::client::from_global(None)?;
         let workflow = match registered {
             Registered::Exact(card_ref) => card_ref,
             Registered::Uid(selector) => {
@@ -261,25 +261,25 @@ impl RunArgs {
         }
         tokio::select! {
             run = workflows.wait(&accepted.run_id) => report.finished(&run?),
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!(
-                    "interrupted; workflow run {id} continues on the server; \
-                     check it with `wyrd workflow status {id}`",
-                    id = accepted.run_id
-                );
-                Ok(ExitCode::from(INTERRUPTED))
-            }
+            signal = tokio::signal::ctrl_c() => match signal {
+                Ok(()) => {
+                    eprintln!(
+                        "interrupted; workflow run {id} continues on the server; \
+                         check it with `wyrd workflow status {id}`",
+                        id = accepted.run_id
+                    );
+                    Ok(ExitCode::from(INTERRUPTED))
+                }
+                Err(error) => Err(WyrdError::WorkflowInternal {
+                    message: format!(
+                        "interrupt listener failed while waiting for workflow run {}: {error}",
+                        accepted.run_id
+                    ),
+                    details: serde_json::json!({ "boundary": "signal_listener" }),
+                }
+                .into()),
+            },
         }
-    }
-
-    /// Build the registry handle for a registered local source.
-    ///
-    /// # Errors
-    /// Returns the client construction errors of [`crate::client::from_global`].
-    fn cards(&self) -> Result<Cards, WyrdCliError> {
-        Ok(Cards::with_client(crate::client::from_global(
-            self.server.as_deref(),
-        )?))
     }
 
     /// Resolve the one selected source.
@@ -347,7 +347,9 @@ impl RunIdArgs {
     /// client construction errors, and the server's stable error.
     pub async fn status(self) -> Result<ExitCode, WyrdCliError> {
         let run_id = self.run_id()?;
-        let run = self.workflows()?.get(&run_id).await?;
+        let run = Workflows::new(crate::client::from_global(None)?)
+            .get(&run_id)
+            .await?;
         Report::new(self.format, self.steps).print(&run)?;
         Ok(ExitCode::SUCCESS)
     }
@@ -361,7 +363,9 @@ impl RunIdArgs {
     /// client construction errors, and the server's stable error.
     pub async fn cancel(self) -> Result<ExitCode, WyrdCliError> {
         let run_id = self.run_id()?;
-        let run = self.workflows()?.cancel(&run_id).await?;
+        let run = Workflows::new(crate::client::from_global(None)?)
+            .cancel(&run_id)
+            .await?;
         Report::new(self.format, self.steps).print(&run)?;
         Ok(ExitCode::SUCCESS)
     }
@@ -374,16 +378,14 @@ impl RunIdArgs {
     fn run_id(&self) -> Result<WorkflowRunId, WyrdCliError> {
         parse_id("run-id", &self.run_id, "a valid UUIDv7 Workflow run ID")
     }
+}
 
-    /// Build the server-run handle.
-    ///
-    /// # Errors
-    /// Returns the client construction errors of [`crate::client::from_global`].
-    fn workflows(&self) -> Result<Workflows, WyrdCliError> {
-        Ok(Workflows::new(crate::client::from_global(
-            self.server.as_deref(),
-        )?))
-    }
+/// Build the registry handle from the ambient client configuration.
+///
+/// # Errors
+/// Returns the client construction errors of [`crate::client::from_global`].
+fn ambient_cards() -> Result<Cards, WyrdCliError> {
+    Ok(Cards::with_client(crate::client::from_global(None)?))
 }
 
 /// Renders run snapshots in the selected output encoding.

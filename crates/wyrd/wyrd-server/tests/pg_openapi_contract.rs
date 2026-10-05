@@ -149,6 +149,13 @@ async fn the_served_document_describes_the_composed_surface() {
     ] {
         assert!(paths.contains_key(path), "missing {path}");
     }
+    for (path, method) in [
+        ("/v1/workflow-runs", "post"),
+        ("/v1/workflow-runs/{run_id}", "get"),
+        ("/v1/workflow-runs/{run_id}/cancel", "post"),
+    ] {
+        assert!(paths[path][method].is_object(), "missing {method} {path}");
+    }
     assert!(
         !paths.contains_key("/v1/cards/{card_uid}/abort"),
         "a route the server does not mount is not documented"

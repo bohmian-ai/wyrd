@@ -127,22 +127,22 @@ general-purpose arbitrary-code workflow platform.
   each wire schema to one variant, made `Prompt.provider` the optional native
   destination, and represented Vertex as GenerateContent with destination
   `vertex`.
-- The explicit CLI `--server` override is refused with an authored `--file`;
-  ambient/configured endpoint selection is supported. Invalid-mode refusal may
-  read an input file first, and Ctrl-C listener-install failure is reported as
-  interruption. These accepted edge deviations do not affect the primary
-  workflow path.
-- The unsupported-media diagnostic can name Google for a Vertex request, and
-  one currently unused cache-key constructor omits provider identity. These do
-  not alter successful primary-path dispatch.
+- Human decision (follow-up): `wyrd workflow` commands take no `--server`
+  option. The endpoint and credential come only from the ambient client
+  configuration, as the SDKs and authored-file loader resolve them; other CLI
+  commands keep their own `--server`.
 - Rust and TypeScript SDK journeys register through Cards; the compiled CLI
   journey owns the independent `wyrd apply` proof. Python uses the installed
   CLI. TypeScript packages the Skald dependency cone. Development-only
   wiremock allowlist entries use the existing approved mechanism.
-- Successful external-gateway responses currently receive a bespoke
-  credential-reflection substring scan. This is not a lasting architectural
-  requirement; standard secret handling and error/log sanitization are the
-  enduring controls.
+- The review follow-ups are closed: invalid execution choices are refused
+  before the input file is read, Ctrl-C listener failure reports
+  `WYRD_WORKFLOW_500_INTERNAL`, GenerateContent media refusals name the
+  Prompt's effective provider, the unused request-only cache-key constructor
+  is deleted, and the external-gateway success-response credential scan is
+  removed in favor of standard secret handling and error/log redaction. The
+  stale Revision 13 task authority and the `new Cards()` TypeScript example
+  lived only in the removed active packet and closed with completion.
 
 ## Acceptance closure
 
@@ -151,10 +151,10 @@ general-purpose arbitrary-code workflow platform.
 | Contract, DAG, explicit bindings, results, retries, deadlines, cancellation, and tracing | Contract/runtime unit and integration evidence recorded for TASK-001, plus target-bound abort-fence closure | PASS |
 | Shared loading, exact graph registration, provenance, and Rust/Python/TypeScript local journeys | Cumulative TASK-002 PASS and later integrated SDK/CLI journeys | PASS |
 | Shared remote client, public gateway context, native renewal, cancellation, and route-selected local configuration | TASK-003 evidence and target-bound Python contract closure | PASS |
-| Server admission, authority, tools, idempotency, lifecycle, bounds, protocol matrix, and Oracle settlement | TASK-004 focused server/gateway/Oracle evidence | PASS with accepted non-critical diagnostics/docs follow-ups |
-| CLI, team reuse, all first-class SDK journeys, architecture, and aggregate repository verification | Green final aggregate at `b88102317`, three compiled CLI journeys, SDK journeys, docs check, and patch hygiene; later commits changed review Markdown only | PASS with accepted CLI edge follow-ups |
+| Server admission, authority, tools, idempotency, lifecycle, bounds, protocol matrix, and Oracle settlement | TASK-004 focused server/gateway/Oracle evidence; diagnostics/docs follow-ups closed | PASS |
+| CLI, team reuse, all first-class SDK journeys, architecture, and aggregate repository verification | Green final aggregate at `b88102317`, three compiled CLI journeys, SDK journeys, docs check, and patch hygiene; CLI edge follow-ups closed | PASS |
 | Revision 14 provider wire contract | Schema/round-trip tests, Python projection, local Vertex refusal, and server custom-Chat/Vertex journeys | PASS |
-| Served Workflow OpenAPI routes | Routes and annotations share the runtime `OpenApiRouter`; the recorded served-document test does not assert the Workflow paths specifically | Verification limit |
+| Served Workflow OpenAPI routes | `pg_openapi_contract.rs` asserts the `/v1/workflow-runs*` operations in the served document | PASS |
 
 ## Current authority, owners, and tests
 

@@ -620,7 +620,10 @@ mod tests {
                 variant.finish(),
                 Arc::new(structs),
                 Arc::new(StringArray::from(
-                    values.iter().map(|value| value.map(|_| r#"{"a":"x"}"#)).collect::<Vec<_>>(),
+                    values
+                        .iter()
+                        .map(|value| value.map(|_| r#"{"a":"x"}"#))
+                        .collect::<Vec<_>>(),
                 )),
                 Arc::new(Int64Array::from_iter_values(0..values.len() as i64)),
             ],
@@ -631,14 +634,23 @@ mod tests {
             .build();
         let context = SessionContext::new_with_state(state);
         context
-            .register_table("t", Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("table")))
+            .register_table(
+                "t",
+                Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("table")),
+            )
             .expect("register");
         context
     }
 
     /// Runs `sql` and returns its first column rendered as display strings.
     async fn column(context: &SessionContext, sql: &str) -> Vec<String> {
-        let batches = context.sql(sql).await.expect(sql).collect().await.expect(sql);
+        let batches = context
+            .sql(sql)
+            .await
+            .expect(sql)
+            .collect()
+            .await
+            .expect(sql);
         let mut out = Vec::new();
         for batch in batches {
             let rendered = arrow::util::display::ArrayFormatter::try_new(
@@ -675,7 +687,11 @@ mod tests {
             ["true", "NULL", "NULL"]
         );
         assert_eq!(
-            column(&context, "SELECT CAST(v ->> 'n' AS BIGINT) + 1 FROM t ORDER BY n").await,
+            column(
+                &context,
+                "SELECT CAST(v ->> 'n' AS BIGINT) + 1 FROM t ORDER BY n"
+            )
+            .await,
             ["8", "NULL", "NULL"]
         );
         assert_eq!(
@@ -691,7 +707,11 @@ mod tests {
             ["20", "NULL", "NULL"]
         );
         assert_eq!(
-            column(&context, "SELECT v ->> (CASE WHEN n = 0 THEN 'a' END) FROM t ORDER BY n").await,
+            column(
+                &context,
+                "SELECT v ->> (CASE WHEN n = 0 THEN 'a' END) FROM t ORDER BY n"
+            )
+            .await,
             ["x", "NULL", "NULL"]
         );
         assert_eq!(
@@ -722,7 +742,10 @@ mod tests {
             .logical_plan()
             .display_indent()
             .to_string();
-        assert!(plan.contains("variant_as_text(variant_get(t.v, Utf8(\"o\"), Utf8(\"b\")))"), "{plan}");
+        assert!(
+            plan.contains("variant_as_text(variant_get(t.v, Utf8(\"o\"), Utf8(\"b\")))"),
+            "{plan}"
+        );
         assert!(plan.contains("get_field(t.s, Utf8(\"method\"))"), "{plan}");
 
         let error = context

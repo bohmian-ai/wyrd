@@ -253,7 +253,7 @@ pub enum BifrostError {
     },
 
     /// A JSON number fits no Variant numeric type.
-    #[error("Variant numeric value out of range in field {field} row {row} at {path}")]
+    #[error("Variant {numeric_kind} value out of range in field {field} row {row} at {path}")]
     #[wyrd_error(
         code = "WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE",
         status = 400,
@@ -272,7 +272,9 @@ pub enum BifrostError {
     },
 
     /// A Variant value nests deeper than the fixed Variant depth limit.
-    #[error("Variant value in field {field} row {row} nests {depth} levels, limit {limit}")]
+    #[error(
+        "Variant value in field {field} row {row} nests {depth} levels, limit {limit} at {path}"
+    )]
     #[wyrd_error(
         code = "WYRD_VALA_400_VARIANT_TOO_DEEP",
         status = 400,

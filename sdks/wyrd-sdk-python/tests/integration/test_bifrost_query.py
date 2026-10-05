@@ -179,7 +179,6 @@ INPUT_MESSAGES = '[{"role":"user","parts":[{"type":"text","content":"summarize t
 OUTPUT_MESSAGES = '[{"role":"assistant","parts":[{"type":"text","content":"the writer stalled"}]}]'
 LOG_BODY = "tool call exhausted its retry budget"
 EVENT_NAME = "gen_ai.choice"
-LINK_TRACE_STATE = "wyrd=fixture"
 COUNTER_VALUE = 7
 GAUGE_VALUE = 0.75
 HISTOGRAM_VALUES = (1.0, 2.5, 3.0, 6.0)
@@ -221,7 +220,6 @@ def _export_canonical_signals(server: WyrdTestServer, scope: str) -> None:
         Status,
         StatusCode,
         TraceFlags,
-        TraceState,
     )
 
     endpoint = os.environ["WYRD_GRPC_URL"]
@@ -246,7 +244,6 @@ def _export_canonical_signals(server: WyrdTestServer, scope: str) -> None:
         span_id=2,
         is_remote=True,
         trace_flags=TraceFlags(TraceFlags.SAMPLED),
-        trace_state=TraceState([("wyrd", "fixture")]),
     )
     try:
         with tracer.start_as_current_span(
@@ -293,6 +290,8 @@ def _export_canonical_signals(server: WyrdTestServer, scope: str) -> None:
     latency = meter.create_histogram("wyrd.fixture.latency")
     for value in HISTOGRAM_VALUES:
         latency.record(value, attributes)
+    # An infinite interval starts no export thread, so the flush is the one export.
+    assert metrics.force_flush()
     metrics.shutdown()
 
 
@@ -417,7 +416,7 @@ def test_canonical_signal_arrow_write_and_sql_read_round_trip(
         links: int
         event_name: str
         finish_reason: str
-        link_state: str
+        link_span: bytes
         attributes: dict[str, Any]
         service: str
 
@@ -432,7 +431,7 @@ def test_canonical_signal_arrow_write_and_sql_read_round_trip(
         "CAST(array_length(links) AS BIGINT) AS links, "
         "events[1]['name'] AS event_name, "
         "events[1]['attributes'] ->> 'gen_ai.finish_reason' AS finish_reason, "
-        "links[1]['trace_state'] AS link_state, attributes, "
+        "links[1]['span_id'] AS link_span, attributes, "
         "resource_attributes ->> 'service.name' AS service "
         "FROM vala.traces.spans "
         f"WHERE scope_name = '{scope}' AND parent_span_id IS NULL",
@@ -440,12 +439,12 @@ def test_canonical_signal_arrow_write_and_sql_read_round_trip(
     )
     assert len(payload) == 1
     [row] = payload
-    assert (row.events, row.links, row.event_name, row.finish_reason, row.link_state) == (
+    assert (row.events, row.links, row.event_name, row.finish_reason, row.link_span) == (
         1,
         1,
         EVENT_NAME,
         "stop",
-        LINK_TRACE_STATE,
+        (2).to_bytes(8, "big"),
     )
     assert row.attributes["gen_ai.input.messages"] == INPUT_MESSAGES
     assert row.attributes["gen_ai.output.messages"] == OUTPUT_MESSAGES

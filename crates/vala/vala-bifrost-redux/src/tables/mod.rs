@@ -2294,9 +2294,10 @@ mod tests {
         let payload = fields::variant("payload", true);
         let mut metadata = payload.metadata().clone();
         metadata.insert(fields::WYRD_SENSITIVE.to_owned(), "false".to_owned());
-        let bytes =
-            canonical_physical_fingerprint_bytes(&Fields::from(vec![payload.with_metadata(metadata)]))
-                .expect("a Variant schema encodes");
+        let bytes = canonical_physical_fingerprint_bytes(&Fields::from(vec![
+            payload.with_metadata(metadata),
+        ]))
+        .expect("a Variant schema encodes");
         let hex = bytes.iter().fold(String::new(), |mut hex, byte| {
             use std::fmt::Write as _;
             let _ = write!(hex, "{byte:02x}");

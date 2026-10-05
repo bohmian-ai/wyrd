@@ -4271,7 +4271,9 @@ fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostEr
 ///
 /// `parse_json` raises its typed Variant error inside the execution chain;
 /// it is returned as-is so the caller sees the stable Variant code rather
-/// than a generic execution failure.
+/// than a generic execution failure. An Analytical worker's error crosses the
+/// distributed wire as its message only, so a chain element whose message is
+/// a Variant error's own rendering is rebuilt by [`remote_variant_error`].
 fn variant_query_error(error: &DataFusionError) -> Option<BifrostError> {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(current) = source {
@@ -4284,9 +4286,68 @@ fn variant_query_error(error: &DataFusionError) -> Option<BifrostError> {
         {
             return Some(found.clone());
         }
+        if let Some(found) = remote_variant_error(&current.to_string()) {
+            return Some(found);
+        }
         source = current.source();
     }
     None
+}
+
+/// Rebuilds a Variant query error from the message a remote worker sent.
+///
+/// Every Variant error's `Display` renders all of its detail fields, the
+/// free-text JSON Pointer last, so the message alone determines the error.
+/// Any other text yields `None` and leaves the error to the generic mapping.
+fn remote_variant_error(message: &str) -> Option<BifrostError> {
+    // `{field} row {row}` followed by the variant's own tail.
+    let located = |rest: &str| -> Option<(String, u64, String)> {
+        let (field, rest) = rest.split_once(" row ")?;
+        let (row, tail) = rest.split_once(' ')?;
+        Some((field.to_owned(), row.parse().ok()?, tail.to_owned()))
+    };
+    // `{count} {unit}, limit {limit}` with an optional ` at {path}` suffix.
+    let bounded = |tail: &str, verb: &str| -> Option<(u64, u64, String)> {
+        let (count, rest) = tail.strip_prefix(verb)?.split_once(' ')?;
+        let (_, rest) = rest.split_once(", limit ")?;
+        let (limit, path) = rest.split_once(" at ").unwrap_or((rest, ""));
+        Some((count.parse().ok()?, limit.parse().ok()?, path.to_owned()))
+    };
+    if let Some(rest) = message.strip_prefix("invalid Variant JSON in field ") {
+        let (field, row, tail) = located(rest)?;
+        let path = tail.strip_prefix("at ")?.to_owned();
+        return Some(BifrostError::VariantInvalidJson { field, row, path });
+    }
+    if let Some((kind, rest)) = message
+        .strip_prefix("Variant ")
+        .and_then(|rest| rest.split_once(" value out of range in field "))
+    {
+        let (field, row, tail) = located(rest)?;
+        let path = tail.strip_prefix("at ")?.to_owned();
+        return Some(BifrostError::VariantNumericOutOfRange {
+            field,
+            row,
+            path,
+            numeric_kind: kind.to_owned(),
+        });
+    }
+    let (field, row, tail) = located(message.strip_prefix("Variant value in field ")?)?;
+    if let Some((depth, limit, path)) = bounded(&tail, "nests ") {
+        return Some(BifrostError::VariantTooDeep {
+            field,
+            row,
+            path,
+            depth: u32::try_from(depth).ok()?,
+            limit: u32::try_from(limit).ok()?,
+        });
+    }
+    let (bytes, limit, _) = bounded(&tail, "encodes ")?;
+    Some(BifrostError::VariantTooLarge {
+        field,
+        row,
+        bytes,
+        limit,
+    })
 }
 
 /// Reports whether an execution error is a footer-tenant refusal.
@@ -4505,6 +4566,63 @@ mod tests {
             Permission::bifrost_query_read(),
         )
         .expect("the fixture principal forms a query context")
+    }
+
+    /// A Variant error an Analytical worker raised keeps its code and fields.
+    ///
+    /// The distributed wire carries only the worker error's message, so each
+    /// Variant variant is rendered, wrapped the way the leader receives it,
+    /// and must map back to itself; unrelated text stays a generic failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a Variant error does not survive its own rendering.
+    #[test]
+    fn remote_variant_errors_keep_their_catalog_identity() {
+        let field = "parse_json".to_owned();
+        for sent in [
+            BifrostError::VariantInvalidJson {
+                field: field.clone(),
+                row: 3,
+                path: "/a at b".to_owned(),
+            },
+            BifrostError::VariantInvalidJson {
+                field: field.clone(),
+                row: 0,
+                path: String::new(),
+            },
+            BifrostError::VariantNumericOutOfRange {
+                field: field.clone(),
+                row: 1,
+                path: "/n".to_owned(),
+                numeric_kind: "integer".to_owned(),
+            },
+            BifrostError::VariantTooDeep {
+                field: field.clone(),
+                row: 2,
+                path: "/x/0".to_owned(),
+                depth: 65,
+                limit: 64,
+            },
+            BifrostError::VariantTooLarge {
+                field,
+                row: 4,
+                bytes: 9_000_000,
+                limit: 8_388_608,
+            },
+        ] {
+            let received = DataFusionError::Context(
+                "remote stage".to_owned(),
+                Box::new(DataFusionError::External(sent.to_string().into())),
+            );
+            assert_eq!(map_datafusion_error(&received), sent);
+        }
+        assert_eq!(
+            map_datafusion_error(&DataFusionError::External(
+                "Variant value in field x".into()
+            )),
+            BifrostError::QueryExecutionFailed
+        );
     }
 
     /// Registers empty `vala.gateway.calls` and `vala.logs.records` built-ins

@@ -2752,7 +2752,9 @@ mod pg_tests {
             .expect("the canonical span batch is accepted");
         srv.flush_bifrost().await.expect("publish the spans");
 
-        let parent = format!("FROM vala.traces.spans WHERE scope_name = '{scope}' AND parent_span_id IS NULL");
+        let parent = format!(
+            "FROM vala.traces.spans WHERE scope_name = '{scope}' AND parent_span_id IS NULL"
+        );
         let raw = bifrost
             .sql(&format!("SELECT attributes {parent}"))
             .await

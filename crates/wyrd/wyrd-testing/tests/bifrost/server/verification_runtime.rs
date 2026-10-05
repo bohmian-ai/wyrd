@@ -1167,10 +1167,6 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
         &audit.entry_hash,
     )?;
 
-    // Canonical signal payloads (OTLP attributes on vala.traces.spans,
-    // vala.logs.records, and the metrics tables) are asserted here once those
-    // tables store Variant attributes.
-
     journey.server.shutdown().await?;
     Ok(())
 }

@@ -24,6 +24,11 @@
 # Operator key reads and delivery pin their Vault and provider behavior in
 # `#[cfg(test)]` modules, and the Operator Postgres journeys stand in for
 # providers, all over the server's dev-only wiremock.
+# The `#[cfg(test)]` modules of `wyrd-client/src/storage/upload/tests.rs`
+# (single-PUT Content-Length) and `wyrd-client/src/bifrost/grpc.rs` (shared
+# credential refresh), and the direct-execution journey in
+# `wyrd-server/tests/pg_verification_routes.rs`, use the same dev-only
+# wiremock.
 #
 # WHAT IT CHECKS: mockall, wiremock, and mockito references do not appear
 # outside wyrd-testing and the explicitly allowlisted test-only seams.
@@ -50,6 +55,8 @@ if rg -n 'mockall|wiremock|mockito' crates \
   --glob '!crates/shared/wyrd-client/Cargo.toml' \
   --glob '!crates/shared/wyrd-client/tests/storage_dispatch.rs' \
   --glob '!crates/shared/wyrd-client/src/cards/handle.rs' \
+  --glob '!crates/shared/wyrd-client/src/storage/upload/tests.rs' \
+  --glob '!crates/shared/wyrd-client/src/bifrost/grpc.rs' \
   --glob '!crates/shared/wyrd-auth-oidc/Cargo.toml' \
   --glob '!crates/shared/wyrd-auth-oidc/src/jwks.rs' \
   --glob '!crates/shared/wyrd-auth-oidc/src/provider.rs' \
@@ -65,6 +72,7 @@ if rg -n 'mockall|wiremock|mockito' crates \
   --glob '!crates/wyrd/wyrd-server/src/verification/operators.rs' \
   --glob '!crates/wyrd/wyrd-server/tests/pg_operator_delivery.rs' \
   --glob '!crates/wyrd/wyrd-server/tests/pg_operator_connection_routes.rs' \
+  --glob '!crates/wyrd/wyrd-server/tests/pg_verification_routes.rs' \
   --glob '!crates/wyrd/wyrd-auth/Cargo.toml' \
   --glob '!crates/wyrd/wyrd-auth/src/callback.rs' \
   --glob '!crates/wyrd/wyrd-cli/src/auth/trusted_issuer.rs'; then

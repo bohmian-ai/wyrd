@@ -353,7 +353,6 @@ fn failure(error: &WyrdError) -> ToolError {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
-    use std::sync::Arc;
     use std::time::Duration;
 
     use serde_json::json;
@@ -362,30 +361,24 @@ mod tests {
         Workflow, WorkflowExecutionDependencies, WorkflowExecutionLimits, WorkflowInput,
         WorkflowRunOptions,
     };
-    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tokio_util::sync::CancellationToken;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::card::workflow::WorkflowCard;
-    use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use super::RunTools;
     use crate::components::cards::service::reconciliation_caller;
-    use crate::postgres::ServerPostgres;
     use crate::state::AppState;
 
-    /// A well-formed server state whose pool connects lazily, enough to
-    /// construct run tools that are never called.
+    /// A server state over the shared test fixture, enough to construct run
+    /// tools that are never called.
+    ///
+    /// # Panics
+    /// Panics when the shared Postgres, storage, or catalog fixtures cannot
+    /// start.
     async fn state() -> AppState {
-        let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
-        let postgres = Arc::new(ServerPostgres::from_parts(
-            wyrd_sql::WyrdPostgres::from_pools(pool.clone(), None),
-            vala_sql::ValaPostgres::from_pool(pool),
-        ));
-        let root = tempfile::tempdir().expect("temp dir");
-        let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
         crate::test_support::test_app_state(
-            postgres,
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            crate::test_support::test_server_postgres().await,
+            crate::test_support::test_storage().await,
             crate::test_support::test_catalog().await,
         )
     }

@@ -346,6 +346,12 @@ All prefixed with `CARGO_TARGET_DIR=<repo>/target CARGO_BUILD_JOBS=12`.
 - Cause: `wyrd-client` now depends on `skald-runtime`, `skald-workflow`, `skald-tool` and `skald-providers`. The spec requires this so TypeScript `Workflow.fromPath`/`cards.workflow.load` can run locally through the shared facade (`sdks/wyrd-sdk-ts/native/src/workflow.rs` wraps `wyrd_client::Workflow`). The case's premise that Skald is outside the TypeScript cone is stale.
 - Fix site: that single expectation in `.github/scripts/tests/test-detect-changes.sh`. It is retitled "shared Skald change packages every SDK and server" and now expects `package_typescript=true` (approved by the team lead). No other case rests on that assumption, and the selector is unchanged.
 
+**check:from-pools-allowlist** (third gate run).
+- Symptom: `wyrd-server/src/components/workflow/tools.rs` test helper `state()` called `WyrdPostgres::from_pools` over a lazily connected pool.
+- Cause: the helper built its own Postgres and storage owners instead of using the shared test-support constructors.
+- Fix site: the helper now composes `test_support::{test_server_postgres, test_storage, test_catalog}`, the `query/service.rs` `state_without_oracle` pattern. The test already initialized that shared fixture through `test_catalog()`. No allowlist entry was added.
+- Verification: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --lib -E "test(=components::workflow::tools::tests::tools_use_the_prepared_run_deadline)"'` PASS.
+
 ### Limits
 
 - Scenario 5 deviation (approved by the team lead): Scenario 5 asks every SDK journey to register through the compiled CLI `wyrd apply`. The Rust and TypeScript journeys cannot, because their test runtimes have no CLI binary; reaching one would need a new mechanism (a wyrd-cli dev-dependency, an in-test cargo build, or a `target/` binary lookup), and none was added. Those two journeys register through the SDK Cards `register_from_path`, the same Cards path `wyrd apply` calls, and add the local route coverage. The compiled-CLI `wyrd apply` and team-reuse proof lives in the wyrd-cli `workflow_journey` (`workflow_file_apply_registered_local`, which runs the binary via `CARGO_BIN_EXE`). The Python journey runs the installed `wyrd apply`.

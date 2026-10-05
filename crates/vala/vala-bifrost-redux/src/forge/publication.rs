@@ -20,6 +20,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use iceberg::spec::{
     DataContentType, DataFile, Literal, PartitionSpec, PrimitiveLiteral, Struct, Transform,
 };
+use iceberg::metadata_columns::{
+    RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_ROW_ID,
+};
 use iceberg::table::Table;
 use iceberg::transaction::Transaction;
 use tokio_util::sync::CancellationToken;
@@ -370,7 +373,8 @@ impl RewriteCommitRequest {
     /// Returns [`ForgeError::Reconciliation`] when the handoff names a base,
     /// selection, input, or applied delete the base snapshot does not support,
     /// and [`ForgeError::Invariant`] when the durable selection is itself
-    /// duplicated or an output descriptor is not publishable.
+    /// duplicated or an output descriptor is not publishable, including an
+    /// output that does not prove it carries complete v3 row lineage.
     pub(super) fn derive(inputs: RewriteCommitInputs<'_>) -> Result<Self, ForgeError> {
         let RewriteCommitInputs {
             handoff,
@@ -448,6 +452,7 @@ impl RewriteCommitRequest {
                     file.file_path()
                 )));
             }
+            ensure_row_lineage_evidence(file)?;
             added_data_files.push(file.clone());
         }
         Ok(Self {
@@ -1448,9 +1453,47 @@ pub(super) fn catalog_commit_span(
     span
 }
 
+/// Reserved v3 row-lineage columns every rewrite output must physically carry.
+const ROW_LINEAGE_FIELD_IDS: [i32; 2] = [
+    RESERVED_FIELD_ID_ROW_ID,
+    RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+];
+
+/// Proves one rewrite output preserved v3 row lineage for every row it holds.
+///
+/// A rewrite that drops `_row_id` or `_last_updated_sequence_number` would
+/// silently re-identify every surviving row, because a reader falls back to
+/// the new file's `first_row_id` and data sequence number. The output's own
+/// column metrics are the evidence: each reserved column must count one
+/// non-null value per record. The check runs while deriving the commit
+/// request, so a refusal publishes nothing and the attempt fails under its
+/// existing identity.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Invariant`] when either reserved column is missing
+/// from the output's value or null counts, holds a null, or counts a
+/// different number of values than the output's records.
+fn ensure_row_lineage_evidence(file: &DataFile) -> Result<(), ForgeError> {
+    for field_id in ROW_LINEAGE_FIELD_IDS {
+        let values = file.value_counts().get(&field_id).copied();
+        let nulls = file.null_value_counts().get(&field_id).copied();
+        if values != Some(file.record_count()) || nulls != Some(0) {
+            return Err(ForgeError::Invariant {
+                detail: format!(
+                    "rewrite output {} does not carry complete row lineage for reserved field {field_id}: {values:?} values and {nulls:?} nulls over {} records",
+                    file.file_path(),
+                    file.record_count()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use iceberg::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, PrimitiveLiteral,
@@ -1480,6 +1523,8 @@ mod tests {
             .record_count(10)
             .file_size_in_bytes(1_024)
             .partition_spec_id(SPEC)
+            .value_counts(ROW_LINEAGE_FIELD_IDS.into_iter().map(|id| (id, 10)).collect())
+            .null_value_counts(ROW_LINEAGE_FIELD_IDS.into_iter().map(|id| (id, 0)).collect())
             .build()
             .expect("fixture data descriptor")
     }
@@ -1646,6 +1691,40 @@ mod tests {
         assert!(
             RewriteCommitRequest::derive(inputs(&edited, base, selected, identity)).is_err(),
             "an output must carry the base snapshot's own partition spec"
+        );
+
+        // An output whose metrics do not show one non-null `_row_id` per
+        // record would re-identify the rows it carries.
+        let unlineaged = RewriteHandoff::try_new(
+            100,
+            selected.to_vec(),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                DataFileBuilder::default()
+                    .content(DataContentType::Data)
+                    .file_path("out-1.parquet".to_owned())
+                    .file_format(DataFileFormat::Parquet)
+                    .partition(bucket(0))
+                    .record_count(10)
+                    .file_size_in_bytes(1_024)
+                    .partition_spec_id(SPEC)
+                    .value_counts(ROW_LINEAGE_FIELD_IDS.into_iter().map(|id| (id, 10)).collect())
+                    .null_value_counts(HashMap::from([
+                        (RESERVED_FIELD_ID_ROW_ID, 1),
+                        (RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, 0),
+                    ]))
+                    .build()
+                    .expect("unlineaged output descriptor"),
+            ],
+        )
+        .expect("unlineaged handoff is internally consistent");
+        assert!(
+            matches!(
+                RewriteCommitRequest::derive(inputs(&unlineaged, base, selected, identity)),
+                Err(ForgeError::Invariant { .. })
+            ),
+            "an output must prove it preserved row lineage for every record"
         );
 
         // An output that is already live in the base would republish a file the

@@ -246,6 +246,16 @@ iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compact
 # one shared native DataFusion 55 universe. Wyrd ships no distributed query path.
 datafusion-distributed = { git = "https://github.com/datafusion-contrib/datafusion-distributed", rev = "4cfa166d233207ee188a277a7849bee7d9dfd2de" }
 
+# TEMPORARY: local fork checkouts until the fork revisions are pushed and repinned.
+[patch."https://github.com/bohmian-ai/iceberg-rust"]
+iceberg = { path = "/home/thorrester/Documents/GitHub/iceberg-rust/crates/iceberg" }
+iceberg-catalog-sql = { path = "/home/thorrester/Documents/GitHub/iceberg-rust/crates/catalog/sql" }
+iceberg-datafusion = { path = "/home/thorrester/Documents/GitHub/iceberg-rust/crates/integrations/datafusion" }
+iceberg-storage-opendal = { path = "/home/thorrester/Documents/GitHub/iceberg-rust/crates/storage/opendal" }
+
+[patch."https://github.com/bohmian-ai/iceberg-compaction"]
+iceberg-compaction-core = { path = "/home/thorrester/Documents/GitHub/iceberg-compaction/core" }
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 

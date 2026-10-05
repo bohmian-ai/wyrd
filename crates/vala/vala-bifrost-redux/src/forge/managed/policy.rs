@@ -619,7 +619,7 @@ mod tests {
             iceberg::spec::PartitionSpec::unpartition_spec(),
             iceberg::spec::SortOrder::unsorted_order(),
             location.to_owned(),
-            iceberg::spec::FormatVersion::V2,
+            iceberg::spec::FormatVersion::V3,
             declared,
         )
         .expect("fixture metadata builder")

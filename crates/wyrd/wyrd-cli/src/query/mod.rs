@@ -4,7 +4,6 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use arrow::json::LineDelimitedWriter;
 use clap::{ArgGroup, Args, ValueEnum};
 use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_client::{Bifrost, WyrdClient};
@@ -142,7 +141,7 @@ fn client(command: &QueryCommand) -> Result<WyrdClient, WyrdCliError> {
     crate::client::from_global(Some(server))
 }
 
-/// Emits record batches as typed line-delimited JSON.
+/// Emits record batches as typed line-delimited JSON, Variants as JSON values.
 ///
 /// # Errors
 ///
@@ -152,7 +151,11 @@ async fn write_jsonl(
     stream: &mut QueryResultStream,
     stdout: &mut dyn Write,
 ) -> Result<(), CliBoundaryError> {
-    let mut writer = LineDelimitedWriter::new(stdout);
+    let mut writer = arrow::json::WriterBuilder::new()
+        .with_encoder_factory(std::sync::Arc::new(
+            wyrd_queue::variant::VariantJsonEncoderFactory,
+        ))
+        .build::<_, arrow::json::writer::LineDelimited>(stdout);
     while let Some(batch) = stream.next_batch().await.map_err(CliBoundaryError::from)? {
         writer
             .write(&batch)

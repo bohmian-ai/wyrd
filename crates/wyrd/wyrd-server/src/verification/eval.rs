@@ -41,8 +41,6 @@ use wyrd_runtime::{
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::agent::AgentSpec;
-
-use wyrd_queue::variant::variant_cell_to_json;
 use wyrd_spec::card::eval::EvalSpec;
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;

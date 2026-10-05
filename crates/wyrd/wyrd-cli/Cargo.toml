@@ -46,6 +46,7 @@ url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 vala-eval = { workspace = true }
 wyrd-client = { workspace = true }
+wyrd-queue = { workspace = true }
 wyrd-error-derive = { workspace = true }
 
 wyrd-loader = { workspace = true }

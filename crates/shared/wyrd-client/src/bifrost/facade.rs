@@ -892,7 +892,10 @@ impl QueryResult {
     /// Arrow's own writer produces one JSON array over the retained batches, so
     /// the column names and types `T` sees are exactly the schema the server
     /// sent — there is no second, hand-written type mapping to disagree with
-    /// it. An empty result writes no array at all, which is the zero-row case.
+    /// it. A Variant column renders as its JSON value through the shared
+    /// [`VariantJsonEncoderFactory`](wyrd_queue::variant::VariantJsonEncoderFactory),
+    /// so `T` reads it as a `serde_json::Value` or any type that value fits.
+    /// An empty result writes no array at all, which is the zero-row case.
     ///
     /// # Errors
     ///
@@ -901,7 +904,9 @@ impl QueryResult {
     fn deserialize<T: DeserializeOwned>(&self) -> Result<Vec<T>, BifrostClientError> {
         let mut bytes = Vec::new();
         {
-            let mut writer = arrow::json::ArrayWriter::new(&mut bytes);
+            let mut writer = arrow::json::WriterBuilder::new()
+                .with_encoder_factory(Arc::new(wyrd_queue::variant::VariantJsonEncoderFactory))
+                .build::<_, arrow::json::writer::JsonArray>(&mut bytes);
             for batch in &self.batches {
                 writer
                     .write(batch)

@@ -263,6 +263,68 @@ pub fn variant_cell_to_json(column: &dyn Array, row: usize) -> Result<Value, Var
     variant_bytes_to_json(metadata, value)
 }
 
+/// Renders Arrow Variant columns as their JSON value in Arrow's JSON writer.
+///
+/// Arrow's JSON writer would otherwise print a Variant as its storage struct
+/// of `metadata`/`value` bytes. Installing this factory on a writer's
+/// [`EncoderOptions`](arrow::json::writer::EncoderOptions) makes every field
+/// carrying the `arrow.parquet.variant` extension — top level or nested in a
+/// Struct or List — render through [`variant_cell_to_json`], so every
+/// row-as-JSON surface shares one rendering. Other fields keep Arrow's
+/// default encoders.
+#[derive(Debug, Default)]
+pub struct VariantJsonEncoderFactory;
+
+impl arrow::json::writer::EncoderFactory for VariantJsonEncoderFactory {
+    /// Pre-render every non-null cell of a Variant field as JSON text.
+    ///
+    /// Rendering is done up front because the encoder itself cannot fail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`arrow::error::ArrowError::JsonError`] when a cell is not a
+    /// decodable unshredded Variant.
+    fn make_default_encoder<'a>(
+        &self,
+        field: &'a arrow_schema::FieldRef,
+        array: &'a dyn Array,
+        _options: &'a arrow::json::writer::EncoderOptions,
+    ) -> Result<Option<arrow::json::writer::NullableEncoder<'a>>, arrow::error::ArrowError> {
+        if field.extension_type_name() != Some(VARIANT_EXTENSION_NAME) {
+            return Ok(None);
+        }
+        let rendered = (0..array.len())
+            .map(|row| {
+                if array.is_null(row) {
+                    return Ok(String::new());
+                }
+                variant_cell_to_json(array, row)
+                    .map(|value| value.to_string())
+                    .map_err(|_| {
+                        arrow::error::ArrowError::JsonError(format!(
+                            "field {} row {row} is not a decodable Variant",
+                            field.name()
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(arrow::json::writer::NullableEncoder::new(
+            Box::new(RenderedJson(rendered)),
+            array.logical_nulls(),
+        )))
+    }
+}
+
+/// Pre-rendered JSON text of each row of one Variant column.
+struct RenderedJson(Vec<String>);
+
+impl arrow::json::writer::Encoder for RenderedJson {
+    /// Copy row `idx`'s rendered JSON into the writer's buffer.
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        out.extend_from_slice(self.0[idx].as_bytes());
+    }
+}
+
 /// Return one binary child cell regardless of its offset width or view form.
 fn binary_cell(array: &ArrayRef, row: usize) -> Option<&[u8]> {
     use arrow::array::{BinaryArray, BinaryViewArray, LargeBinaryArray};
@@ -666,6 +728,68 @@ mod tests {
         assert_eq!(
             variant_cell_to_json(column.as_ref(), 1).expect("null"),
             Value::Null
+        );
+    }
+
+    /// Arrow's JSON writer renders top-level and nested Variants as values.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a Variant renders as its storage struct or a null drifts.
+    #[test]
+    fn json_writer_renders_variants_as_values() {
+        use arrow::array::{RecordBatch, StringArray};
+        use arrow::json::writer::JsonArray;
+        use arrow_schema::Schema;
+
+        let column = |values: &[Option<Value>]| {
+            let mut builder = VariantColumnBuilder::with_capacity(values.len());
+            for value in values {
+                match value {
+                    Some(value) => {
+                        builder.append(&EncodedVariant::from_json(value).expect("encodes"));
+                    }
+                    None => builder.append_null(),
+                }
+            }
+            builder.finish()
+        };
+        let nested = StructArray::new(
+            Fields::from(vec![
+                Field::new("method", DataType::Utf8, false),
+                variant_field("features", false),
+            ]),
+            vec![
+                Arc::new(StringArray::from(vec!["psi", "psi"])) as ArrayRef,
+                column(&[Some(json!({"k": 1})), Some(json!([1, "a"]))]),
+            ],
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            variant_field("v", true),
+            Field::new("s", nested.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                column(&[Some(json!({"big": 9_007_199_254_740_993_i64, "z": null})), None]),
+                Arc::new(nested),
+            ],
+        )
+        .expect("batch");
+        let mut writer = arrow::json::WriterBuilder::new()
+            .with_explicit_nulls(true)
+            .with_encoder_factory(Arc::new(VariantJsonEncoderFactory))
+            .build::<_, JsonArray>(Vec::new());
+        writer.write(&batch).expect("writes");
+        writer.finish().expect("finishes");
+        let rows: Value = serde_json::from_slice(&writer.into_inner()).expect("json");
+        assert_eq!(
+            rows,
+            json!([
+                {"v": {"big": 9_007_199_254_740_993_i64, "z": null}, "s": {"method": "psi", "features": {"k": 1}}},
+                {"v": null, "s": {"method": "psi", "features": [1, "a"]}},
+            ])
         );
     }
 }

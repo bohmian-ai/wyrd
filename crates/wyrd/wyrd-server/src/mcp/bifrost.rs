@@ -641,7 +641,8 @@ impl ResultCollector {
             return Err(ValaError::QueryResultTooLarge.into());
         }
         let schema = batch.schema();
-        let options = EncoderOptions::default();
+        let options = EncoderOptions::default()
+            .with_encoder_factory(Arc::new(wyrd_queue::variant::VariantJsonEncoderFactory));
         let mut encoders = Vec::with_capacity(batch.num_columns());
         for (field, array) in schema.fields().iter().zip(batch.columns()) {
             encoders.push(

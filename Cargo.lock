@@ -11310,6 +11310,7 @@ dependencies = [
  "wyrd-dev-fixtures",
  "wyrd-error-derive",
  "wyrd-loader",
+ "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
  "wyrd-server",

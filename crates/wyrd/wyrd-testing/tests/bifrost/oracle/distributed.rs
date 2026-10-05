@@ -2081,7 +2081,6 @@ fn rewrite_footer_tenant(run: &Path, foreign: DataTenantId) -> Result<(), Journe
         .filter(|entry| entry.key != tenant.key && entry.key != ARROW_SCHEMA_META_KEY)
         .collect();
     metadata.push(tenant);
-    let rows = usize::try_from(builder.metadata().file_metadata().num_rows())?;
     let schema = builder.schema().clone();
     let batches = builder.build()?.collect::<Result<Vec<_>, _>>()?;
     let mut parquet = Vec::new();

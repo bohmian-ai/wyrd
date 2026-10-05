@@ -4638,6 +4638,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.0"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=e999331f280b698bcd026550812b5047e8789df6#e999331f280b698bcd026550812b5047e8789df6"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4696,6 +4697,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.10.0"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=e999331f280b698bcd026550812b5047e8789df6#e999331f280b698bcd026550812b5047e8789df6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4710,6 +4712,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.10.0"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=e999331f280b698bcd026550812b5047e8789df6#e999331f280b698bcd026550812b5047e8789df6"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4730,6 +4733,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-sql"
 version = "0.10.0"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=e999331f280b698bcd026550812b5047e8789df6#e999331f280b698bcd026550812b5047e8789df6"
 dependencies = [
  "async-trait",
  "iceberg",
@@ -4740,6 +4744,7 @@ dependencies = [
 [[package]]
 name = "iceberg-compaction-core"
 version = "0.1.0"
+source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=94db7b94f72c48c75c937d36a59e80c237e8ca72#94db7b94f72c48c75c937d36a59e80c237e8ca72"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4769,6 +4774,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.10.0"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=e999331f280b698bcd026550812b5047e8789df6#e999331f280b698bcd026550812b5047e8789df6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4784,6 +4790,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.10.0"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=e999331f280b698bcd026550812b5047e8789df6#e999331f280b698bcd026550812b5047e8789df6"
 dependencies = [
  "anyhow",
  "async-trait",

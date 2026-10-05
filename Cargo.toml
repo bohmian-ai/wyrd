@@ -249,7 +249,9 @@ datafusion-distributed = { git = "https://github.com/datafusion-contrib/datafusi
 # TEMPORARY: local fork checkouts until the fork revisions are pushed and repinned.
 [patch."https://github.com/bohmian-ai/iceberg-rust"]
 iceberg = { path = "/home/thorrester/Documents/GitHub/iceberg-rust/crates/iceberg" }
+iceberg-catalog-glue = { path = "/home/thorrester/Documents/GitHub/iceberg-rust/crates/catalog/glue" }
 iceberg-catalog-sql = { path = "/home/thorrester/Documents/GitHub/iceberg-rust/crates/catalog/sql" }
+iceberg-catalog-rest = { path = "/home/thorrester/Documents/GitHub/iceberg-rust/crates/catalog/rest" }
 iceberg-datafusion = { path = "/home/thorrester/Documents/GitHub/iceberg-rust/crates/integrations/datafusion" }
 iceberg-storage-opendal = { path = "/home/thorrester/Documents/GitHub/iceberg-rust/crates/storage/opendal" }
 

@@ -4696,7 +4696,6 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=97c32f6377cbdfe51dbeb69e77a2a726669de93a#97c32f6377cbdfe51dbeb69e77a2a726669de93a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4711,7 +4710,6 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=97c32f6377cbdfe51dbeb69e77a2a726669de93a#97c32f6377cbdfe51dbeb69e77a2a726669de93a"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

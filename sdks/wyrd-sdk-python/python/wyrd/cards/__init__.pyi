@@ -48,6 +48,7 @@ class AgentCard:
         prompt_ref: the durable prompt reference.
         prompt: the inline `Prompt`, or `None` while the prompt is a
             reference to a registered Prompt Card.
+        kind: the Card kind, always ``"Agent"``.
     """
 
     space: str
@@ -60,6 +61,7 @@ class AgentCard:
     cascade_children: list[CardRef]
     prompt_ref: PromptReference
     prompt: Prompt | None
+    kind: str
 
     def __init__(
         self,

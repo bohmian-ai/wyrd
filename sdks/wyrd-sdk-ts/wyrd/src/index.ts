@@ -120,10 +120,10 @@ export interface TableDescription {
 
 /**
  * The physical compaction strategy a table asks Forge to apply, in its wire
- * spelling. Omitted, Forge compacts the table `small_files`; a copy-on-write table
+ * spelling. Omitted, Forge compacts the table `small-files`; a copy-on-write table
  * compacts `full` whatever it declares.
  */
-export type CompactionType = "auto" | "full" | "small_files" | "files_with_delete";
+export type CompactionType = "auto" | "full" | "small-files" | "files-with-delete";
 
 export interface RunningQueryProgress {
   readonly completedParticipants: number;
@@ -518,7 +518,7 @@ export class TableConfig {
    * target is refused rather than silently changing it.
    *
    * `compactionType` chooses the table's Forge compaction type; omitted, Forge
-   * compacts it `small_files`. Like the target, it is recorded once and a later
+   * compacts it `small-files`. Like the target, it is recorded once and a later
    * registration naming a different type is refused with
    * `WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH`.
    *
@@ -597,7 +597,7 @@ export class TableConfig {
 
   /**
    * The explicit Forge compaction type, declared or described, or undefined
-   * when the table compacts with the `small_files` default.
+   * when the table compacts with the `small-files` default.
    */
   get compactionType(): CompactionType | undefined {
     const wire = JSON.parse(this.#native.configJson) as {

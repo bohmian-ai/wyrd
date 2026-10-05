@@ -43,7 +43,7 @@ use super::expire::ExpiryTaskAuthority;
 use super::identity::task_table_binding;
 use super::leader::{ForgeCompactionDispatch, ForgeCompactionOutcome};
 use super::lease::{ForgeLease, forge_lease_key};
-use super::metrics::{ForgeTaskResult, ForgeTelemetry};
+use super::metrics::{ForgeCleanupRefusalStage, ForgeTaskResult, ForgeTelemetry};
 use super::orphan_gc::{ExpiredCleanupExemption, GcEligibility, ObjectEvidence};
 use super::path::catalog_path_to_object_key;
 use super::scribe_promotion::{
@@ -1963,6 +1963,16 @@ struct ClaimExecutionOutcome<'task> {
     result: Result<ForgeSettledAttempt, ForgeError>,
 }
 
+/// Reports whether a Prepared reconciliation outcome must stop the worker's slot.
+///
+/// Every reconciliation failure is slot-fatal except
+/// [`ForgeError::CleanupRetained`]: that outcome left the exact prepared
+/// cleanup identity intact by design, so the slot keeps running and the same
+/// prepared-task route replays the candidate on a later pass.
+fn reconciliation_is_fatal<T>(result: &Result<T, ForgeError>) -> bool {
+    matches!(result, Err(error) if !matches!(error, ForgeError::CleanupRetained { .. }))
+}
+
 /// Classifies whether prepared evidence represents progress beyond its base.
 fn prepared_effect_progressed(evidence: &ForgeTaskEvidence, base_snapshot_id: i64) -> bool {
     evidence.committed_snapshot_id != Some(base_snapshot_id) || evidence.deleted_candidate_count > 0
@@ -2043,7 +2053,7 @@ impl ForgeWorker {
         let Some(controls) = &self.loop_handles else {
             return;
         };
-        controls.readiness.publish(false);
+        publish_worker_readiness(&controls.readiness, false);
         controls.stop.cancel();
     }
 
@@ -2137,7 +2147,7 @@ impl ForgeWorker {
         if !self.start_and_drain(&shutdown).await? {
             return Ok(());
         }
-        readiness.publish(true);
+        publish_worker_readiness(&readiness, true);
         let stop = shutdown.child_token();
         self.loop_handles = Some(ForgeWorkerLoopHandles {
             readiness: readiness.clone(),
@@ -2148,7 +2158,7 @@ impl ForgeWorker {
         // stack in debug builds.
         let outcome = Box::pin(self.run_event_loop(stop)).await;
         if let Err(error) = outcome {
-            readiness.publish(false);
+            publish_worker_readiness(&readiness, false);
             tracing::error!(worker = %self.owner, error = %error, "Forge worker stopped after it could not settle its work");
             return Err(error);
         }
@@ -2399,23 +2409,85 @@ impl ForgeWorker {
     /// cancellation-release failures. Each leaves durable state that no longer
     /// describes what this owner did, so the loop stops rather than claiming
     /// again. An execution failure this attempt durably settled is not one of
-    /// them: it stays a healthy exit that permits the next claim.
+    /// them: it stays a healthy exit that permits the next claim. Neither is a
+    /// loop read the database never answered: reclaim, the recovery claim, the
+    /// unattended-authority question, and the fair claim back off through
+    /// [`Self::answered`] with readiness retracted, and the next turn retries.
+    ///
+    /// # Cancellation
+    ///
+    /// Every exit, including a failure, first joins every plan runner and
+    /// claim heartbeat this loop spawned, so a stopped loop leaves no task of
+    /// its own behind.
     async fn run_event_loop(&mut self, shutdown: CancellationToken) -> Result<(), ForgeError> {
-        let claim_limits = self.claim_limits()?;
-        // One worker owns exactly one maintenance execution position, and it is
-        // outside the compaction queue: maintenance strategies are tried first
-        // on every pass so a ready snapshot expiry is never starved behind
-        // compaction backlog.
-        let reserved_maintenance = true;
         // One FIFO, one attempt map, and one completion channel for the whole
         // worker. Constructing them here rather than per attempt is what makes
         // the parallelism and memory budgets describe this worker's real load:
         // two tasks claimed a moment apart compete for the same room, in the
         // order their plans were offered.
         let mut pool = ForgeAttemptPool::new(&self.config);
+        // Boxed for the same layout-depth reason `run` boxes this loop.
+        let outcome = Box::pin(self.drive_event_loop(&mut pool, shutdown.clone())).await;
+        shutdown.cancel();
+        Self::join_spawned(&mut pool).await;
+        outcome
+    }
+
+    /// Joins every task the event loop spawned and still holds.
+    ///
+    /// Called with the loop's stop token already cancelled. Running plans
+    /// observe it at their safe boundaries and send their one completion; each
+    /// completion is recorded so the attempt it drains can be joined. Every
+    /// attempt left in the pool then has its claim heartbeat joined; the
+    /// heartbeat exits because its operation token is a child of the cancelled
+    /// stop token. Nothing is settled here: whatever an unsettled attempt left
+    /// durable is recovered by the next owner's startup drain.
+    ///
+    /// # Cancellation
+    ///
+    /// Waits for each running plan to reach a safe boundary, exactly as a clean
+    /// shutdown does; a plan that never completes holds this join.
+    async fn join_spawned(pool: &mut ForgeAttemptPool) {
+        let mut drained = Vec::new();
+        while pool.attempts.values().any(|state| state.running > 0) {
+            let Some(completion) = pool.completion_rx.recv().await else {
+                break;
+            };
+            match Self::record_plan_completion(pool, completion) {
+                Ok(Some(state)) => drained.push(state),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "Forge plan completion could not be recorded while joining a stopped loop");
+                }
+            }
+        }
+        drained.extend(pool.attempts.drain().map(|(_, state)| state));
+        for state in drained {
+            if let Err(error) = state.fenced.heartbeat.await {
+                tracing::warn!(error = %error, "Forge claim heartbeat failed to join while stopping the loop");
+            }
+        }
+    }
+
+    /// Runs the event loop body over the worker's one attempt pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failures documented on [`Self::run_event_loop`].
+    async fn drive_event_loop(
+        &mut self,
+        pool: &mut ForgeAttemptPool,
+        shutdown: CancellationToken,
+    ) -> Result<(), ForgeError> {
+        let claim_limits = self.claim_limits()?;
+        // One worker owns exactly one maintenance execution position, and it is
+        // outside the compaction queue: maintenance strategies are tried first
+        // on every pass so a ready snapshot expiry is never starved behind
+        // compaction backlog.
+        let reserved_maintenance = true;
         let mut next_pull = Instant::now();
         loop {
-            let stranded = self.start_fitting_plans(&mut pool, &shutdown);
+            let stranded = self.start_fitting_plans(pool, &shutdown);
             for state in stranded {
                 self.settle_or_release_attempt(state, &shutdown).await?;
             }
@@ -2432,7 +2504,7 @@ impl ForgeWorker {
                     // now may be written durably, and the successor owns that
                     // proof.
                     if let Some(completion) = pool.completion_rx.recv().await
-                        && let Some(state) = Self::record_plan_completion(&mut pool, completion)?
+                        && let Some(state) = Self::record_plan_completion(pool, completion)?
                     {
                         self.settle_or_release_attempt(state, &shutdown).await?;
                     }
@@ -2442,15 +2514,26 @@ impl ForgeWorker {
                 // with nothing in flight and nothing idle cannot exist.
                 return Ok(());
             }
-            self.reclaim_expired_attempts(claim_limits.max_active_per_tenant)
-                .await?;
+            let reclaimed = self
+                .reclaim_expired_attempts(claim_limits.max_active_per_tenant)
+                .await;
+            if self.answered(reclaimed, pool, &shutdown).await?.is_none() {
+                continue;
+            }
             // Checked immediately before each durable claim so a stop signal
             // lands before this loop takes new work.
             if shutdown.is_cancelled() {
                 continue;
             }
-            if self.reconcile_one_prepared(claim_limits, &shutdown).await? {
-                continue;
+            let prepared = self.claim_prepared(claim_limits).await;
+            match self.answered(prepared, pool, &shutdown).await? {
+                Some(Some(prepared)) => {
+                    if self.reconcile_claimed_prepared(prepared, &shutdown).await? {
+                        continue;
+                    }
+                }
+                Some(None) => {}
+                None => continue,
             }
             if shutdown.is_cancelled() {
                 continue;
@@ -2459,7 +2542,7 @@ impl ForgeWorker {
             // authority is acquired, so the budget a finished plan freed is the
             // budget the pull calculation below sees.
             while let Ok(completion) = pool.completion_rx.try_recv() {
-                if let Some(state) = Self::record_plan_completion(&mut pool, completion)? {
+                if let Some(state) = Self::record_plan_completion(pool, completion)? {
                     self.settle_or_release_attempt(state, &shutdown).await?;
                 }
             }
@@ -2469,7 +2552,11 @@ impl ForgeWorker {
             if shutdown.is_cancelled() {
                 continue;
             }
-            if self.holds_unattended_authority(&pool).await? {
+            let unattended = self.holds_unattended_authority(pool).await;
+            let Some(unattended) = self.answered(unattended, pool, &shutdown).await? else {
+                continue;
+            };
+            if unattended {
                 // This owner released an attempt it could not account for: the
                 // task is still Running under its name, its operation is still
                 // Prepared, and its claim is owned until the lease lapses.
@@ -2479,20 +2566,20 @@ impl ForgeWorker {
                 // taken. Attempts already admitted keep draining: they are
                 // attended work with owners that can still settle them.
                 self.publish_readiness(false);
-                self.wait_for_progress(&mut pool, &shutdown).await?;
+                self.wait_for_progress(pool, &shutdown).await?;
                 continue;
             }
             self.publish_readiness(true);
-            if self.free_pull_room(&pool) == 0 {
+            if self.free_pull_room(pool) == 0 {
                 // No running parallelism remains, so this turn acquires no
                 // authority at all. Waiting plans keep their pending
                 // reservation; it does not authorize a pull.
-                Box::pin(self.await_loop_event(&mut pool, None, &shutdown)).await?;
+                Box::pin(self.await_loop_event(pool, None, &shutdown)).await?;
                 continue;
             }
             let Some(claimed) = self
                 .pull_claimed_tasks(
-                    &mut pool,
+                    pool,
                     claim_limits,
                     reserved_maintenance,
                     &mut next_pull,
@@ -2516,7 +2603,7 @@ impl ForgeWorker {
             // running plan is the idle wait, because polling for new work on a
             // timer would delay the settlement that frees its budget. The one
             // timer is the leader pull, which this worker has room for.
-            Box::pin(self.await_loop_event(&mut pool, Some(next_pull), &shutdown)).await?;
+            Box::pin(self.await_loop_event(pool, Some(next_pull), &shutdown)).await?;
         }
     }
 
@@ -2552,7 +2639,12 @@ impl ForgeWorker {
             let claim = self
                 .claim_next(claim_limits, reserved_maintenance)
                 .await
-                .map_err(ForgeError::Sql)?;
+                .map_err(ForgeError::Sql);
+            // The claims this turn already started are admitted work; only the
+            // unanswered claim is retried.
+            let Some(claim) = self.answered(claim, pool, shutdown).await? else {
+                return Ok(Some(claimed));
+            };
             let Some(claim) = claim else {
                 break;
             };
@@ -2973,8 +3065,9 @@ impl ForgeWorker {
     /// # Errors
     ///
     /// Returns the SQL failure the predicate raised. The answer gates readiness
-    /// and new claims, so an unanswered question must stop the loop rather than
-    /// be read as "nothing unresolved".
+    /// and new claims, so an unanswered question is never read as "nothing
+    /// unresolved": the loop stops, or backs off without claiming when the
+    /// database could not be reached.
     async fn holds_unattended_authority(
         &self,
         pool: &ForgeAttemptPool,
@@ -3012,6 +3105,41 @@ impl ForgeWorker {
         Box::pin(self.await_loop_event(pool, None, shutdown)).await
     }
 
+    /// Passes through one loop read's answer, or backs off when the
+    /// database could not answer it.
+    ///
+    /// Reclaim, the recovery claim, the unattended-authority question, and
+    /// the fair claim either answer or roll back, so a statement that never
+    /// reached the database leaves nothing to account for. Such a failure
+    /// retracts readiness, waits through [`Self::wait_for_progress`], and
+    /// returns `None` so the loop re-reads durable state; readiness returns
+    /// with the next turn that answers. Any other failure still stops the
+    /// loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns the read's error unless
+    /// [`ForgeError::is_database_unavailable`] holds, and the settlement
+    /// failures a completion recorded during the wait raises.
+    async fn answered<T>(
+        &self,
+        read: Result<T, ForgeError>,
+        pool: &mut ForgeAttemptPool,
+        shutdown: &CancellationToken,
+    ) -> Result<Option<T>, ForgeError> {
+        match read {
+            Ok(answer) => Ok(Some(answer)),
+            Err(error) if error.is_database_unavailable() => {
+                tracing::warn!(worker = %self.owner, error = %error, "Forge worker could not reach the database; backing off");
+                ForgeTelemetry::record_worker_backoff();
+                self.publish_readiness(false);
+                self.wait_for_progress(pool, shutdown).await?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Publishes this loop's readiness, when it is running under a role handle.
     ///
     /// The loop is the only readiness decider, so retracting the bit while this
@@ -3019,35 +3147,58 @@ impl ForgeWorker {
     /// owner that will not claim it.
     fn publish_readiness(&self, ready: bool) {
         if let Some(handles) = &self.loop_handles {
-            handles.readiness.publish(ready);
+            publish_worker_readiness(&handles.readiness, ready);
         }
     }
 
     /// Drains one claim this owner took as shutdown was signalled.
     ///
-    /// The claim is released back to `retryable` so a stopping worker leaves no
-    /// task owned by a process that will never run it, and the episode is still
-    /// observed so its duration is not lost.
+    /// A fair claim is released back to `retryable` so a stopping worker leaves
+    /// no task owned by a process that will never run it. A leader-dispatched
+    /// claim instead stays owned by the pull/report protocol: its bookkeeping
+    /// is removed here exactly once, the row closes as `cancelled` through
+    /// [`Self::close_dispatched`] so no fair claim can give it a second owner,
+    /// and the leader receives one `NotStarted` report, `RisingWave`'s failed
+    /// send, which keeps every pending commit due. A dispatched row that
+    /// already left this attempt commits nothing and sends no report: its
+    /// current owner, or the reclaim that cancelled it, reports instead. The
+    /// episode is observed either way so its duration is not lost.
     ///
     /// # Errors
     ///
-    /// Returns the release failure, which leaves the claim for lease-expiry
-    /// recovery and stops this owner.
+    /// Returns the release or close failure, which leaves the claim for
+    /// lease-expiry recovery (whose reclaim reports a dispatched row to the
+    /// leader) and stops this owner.
     async fn release_claim_at_shutdown(
         &self,
         claim: &ForgeTaskClaim,
         started: Instant,
     ) -> Result<(), ForgeError> {
         let task_id = claim.task_id;
-        let released = if let Some(attempt) = claim.attempt_id {
-            self.release_cancelled_claim(task_id, attempt).await
-        } else {
-            Ok(false)
+        let dispatch = self
+            .dispatched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&task_id);
+        let released = match (claim.attempt_id, dispatch.is_some()) {
+            (Some(attempt), true) => {
+                self.close_dispatched(claim, attempt, &ForgeError::Shutdown)
+                    .await
+            }
+            (Some(attempt), false) => self
+                .release_cancelled_claim(task_id, attempt)
+                .await
+                .map(|released| released.then_some(ForgeTaskResult::Retry)),
+            (None, _) => Ok(None),
         };
         if let Err(error) = &released {
             self.close_after_fatal();
             tracing::error!(worker = %self.owner, task_id = %task_id, error = %error,
                 "Forge claim shutdown release failed; durable state retained for lease recovery");
+        }
+        if let (Some(dispatch), Ok(Some(_))) = (&dispatch, &released) {
+            self.report_dispatch(dispatch, ForgeCompactionOutcome::NotStarted)
+                .await;
         }
         self.record_task_execution_telemetry(
             claim.data_tenant_id,
@@ -3055,8 +3206,9 @@ impl ForgeWorker {
             Self::metric_strategy(&claim.strategy),
             &tracing::Span::none(),
             started,
-            // The release committed `retryable`; a no-match committed nothing.
-            matches!(released, Ok(true)).then_some(ForgeTaskResult::Retry),
+            // The committed `retryable` or `cancelled` result; a no-match
+            // committed nothing.
+            released.as_ref().ok().copied().flatten(),
         )
         .await;
         released.map(|_| ())
@@ -3183,7 +3335,9 @@ impl ForgeWorker {
     ///
     /// Returns [`ForgeError::Sql`] when the bounded recovery claim fails. A
     /// reconciliation or release failure retains exact evidence and stops the
-    /// slot before any later claim.
+    /// slot before any later claim. A retained cleanup candidate
+    /// ([`ForgeError::CleanupRetained`]) is not a failure: it returns
+    /// `Ok(false)` so the caller paces the next same-identity replay.
     ///
     /// # Cancellation
     ///
@@ -3193,14 +3347,46 @@ impl ForgeWorker {
         claim_limits: ForgeClaimLimits,
         shutdown: &CancellationToken,
     ) -> Result<bool, ForgeError> {
-        let Some(prepared) = self
-            .tasks
-            .claim_prepared_for_reconciliation(self.owner, claim_limits.lease_seconds)
-            .await
-            .map_err(ForgeError::Sql)?
-        else {
+        let Some(prepared) = self.claim_prepared(claim_limits).await? else {
             return Ok(false);
         };
+        self.reconcile_claimed_prepared(prepared, shutdown).await
+    }
+
+    /// Claims one `prepared` attempt for reconciliation by this owner, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the bounded recovery claim fails.
+    async fn claim_prepared(
+        &self,
+        claim_limits: ForgeClaimLimits,
+    ) -> Result<Option<ForgePreparedTaskClaim>, ForgeError> {
+        self.tasks
+            .claim_prepared_for_reconciliation(self.owner, claim_limits.lease_seconds)
+            .await
+            .map_err(ForgeError::Sql)
+    }
+
+    /// Reconciles one `prepared` attempt this owner already claimed.
+    ///
+    /// Returns `true` when the attempt was reconciled, and `false` when an
+    /// expired cleanup retained its candidate for replay, so the caller paces
+    /// the next replay instead of reclaiming the same refusing candidate.
+    ///
+    /// # Errors
+    ///
+    /// A reconciliation or release failure retains exact evidence and is
+    /// returned, stopping the slot before any later claim.
+    ///
+    /// # Cancellation
+    ///
+    /// A cancelled reconciliation leaves the attempt durable for a later owner.
+    async fn reconcile_claimed_prepared(
+        &self,
+        prepared: ForgePreparedTaskClaim,
+        shutdown: &CancellationToken,
+    ) -> Result<bool, ForgeError> {
         #[cfg(feature = "test-support")]
         let (task_id, strategy) = (
             prepared.task.task_id,
@@ -3209,6 +3395,13 @@ impl ForgeWorker {
         let result = self.reconcile_prepared(prepared, shutdown).await;
         #[cfg(feature = "test-support")]
         self.pause_after_attempt_for_test(task_id).await;
+        if let Err(error @ ForgeError::CleanupRetained { .. }) = &result {
+            // The candidate stays prepared under its exact identity. Reporting
+            // no reconciliation lets the slot loop pace its next replay instead
+            // of spinning on a root that still refuses the delete.
+            tracing::warn!(worker = %self.owner, error = %error, "Prepared Forge cleanup retained its candidate for replay");
+            return Ok(false);
+        }
         if let Err(error) = result {
             tracing::error!(worker = %self.owner, error = %error, "Prepared Forge task reconciliation stopped; exact evidence retained");
             // A Prepared attempt already produced durable evidence a reader
@@ -3637,17 +3830,24 @@ impl ForgeWorker {
     /// evidence, so start, settlement and recovery stay those of
     /// [`Self::execute_claim`]. Returns `Ok(false)` without effect when the
     /// table already has an active attempt or the exact plan was recorded.
+    /// A cancelled `shutdown` — coordinator shutdown or the revocation of
+    /// the leader term that chose the work — records nothing, so no new
+    /// attempt starts once that authority has ended.
     ///
     /// # Errors
     ///
-    /// Returns validation and SQL errors from recording the attempt and the
-    /// errors of [`Self::execute_claim`].
+    /// Returns [`ForgeError::Shutdown`] when `shutdown` is already cancelled,
+    /// validation and SQL errors from recording the attempt, and the errors
+    /// of [`Self::execute_claim`].
     pub async fn execute_accepted(
         &self,
         task_id: Uuid,
         task: &NewForgeTask,
         shutdown: &CancellationToken,
     ) -> Result<bool, ForgeError> {
+        if shutdown.is_cancelled() {
+            return Err(ForgeError::Shutdown);
+        }
         let Some(claim) = self
             .tasks
             .insert_claimed(
@@ -4239,6 +4439,9 @@ impl ForgeWorker {
     ///
     /// # Errors
     /// Returns the original reconciliation/release error; telemetry never replaces it.
+    /// Every error closes the worker's run controls except
+    /// [`ForgeError::CleanupRetained`], which leaves the prepared candidate for
+    /// a later same-identity replay.
     ///
     /// # Cancellation
     /// Retains exact Prepared evidence when recovery cannot finish under shutdown.
@@ -4268,13 +4471,12 @@ impl ForgeWorker {
             span.clone(),
         )
         .await;
-        if result.is_err() {
+        let fatal = reconciliation_is_fatal(&result);
+        if fatal {
             self.close_after_fatal();
         }
         #[cfg(feature = "test-support")]
-        if result.is_err()
-            && let Some(observer) = &self.completion_observer
-        {
+        if fatal && let Some(observer) = &self.completion_observer {
             observer.pause_fatal_observation_for_test().await;
         }
         self.record_task_execution_telemetry(
@@ -4329,6 +4531,8 @@ impl ForgeWorker {
     /// # Errors
     /// Returns identity, evidence, heartbeat, settlement, and release failures,
     /// preserving reconciliation failure ahead of a secondary release failure.
+    /// A retained cleanup candidate surfaces as [`ForgeError::CleanupRetained`]
+    /// after its lease is released, without closing the worker's run controls.
     ///
     /// # Cancellation
     /// Cancellation retains durable evidence for a later fenced owner.
@@ -4372,7 +4576,7 @@ impl ForgeWorker {
                 &operation_stop,
             )
             .await;
-        if reconciliation.is_err() {
+        if reconciliation_is_fatal(&reconciliation) {
             self.close_after_fatal();
         }
         operation_stop.cancel();
@@ -4426,7 +4630,7 @@ impl ForgeWorker {
         // table it can no longer prove it owns, so a release-only failure is
         // fatal too. When reconciliation already failed, that error stays
         // primary and the release failure is only a secondary diagnostic.
-        if result.is_err() {
+        if reconciliation_is_fatal(&result) {
             self.close_after_fatal();
         }
         self.release_prepared_lease(task.task_id, &mut lease, result)
@@ -7740,8 +7944,11 @@ impl ForgeWorker {
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::Reconciliation`] when a candidate is refused or
-    /// its acceptance is unknown, plus protection, path-binding, object-store,
+    /// Returns [`ForgeError::CleanupRetained`] when a candidate is refused or
+    /// its acceptance is unknown and its settlement deliberately left it
+    /// prepared, or when an active table read refuses a later candidate's
+    /// preparation; [`ForgeError::Capacity`] when an active read refuses the
+    /// first preparation; plus protection, path-binding, object-store,
     /// fencing, audit, SQL, or cancellation failures.
     ///
     /// # Cancellation
@@ -7796,10 +8003,15 @@ impl ForgeWorker {
                 .tenant_conn(attempt.tenant)
                 .await
                 .map_err(ForgeError::Sql)?;
-            let exclusive = super::table_authority::TableAuthority::new(&mut authority_conn)
+            // No authority means an Oracle read holds the table. That is the
+            // typed refusal: nothing was written, and dropping the
+            // uncommitted authority connection takes no lock with it.
+            let Some(exclusive) = super::table_authority::TableAuthority::new(&mut authority_conn)
                 .exclusive(attempt.tenant, &attempt.binding.table_ref)
                 .await?
-                .ok_or_else(super::table_authority::active_read_refusal)?;
+            else {
+                return Err(Self::preparation_refused(index, prepared));
+            };
             if !prepared {
                 require_running(stop)?;
                 lease.require_fence(&self.forge.core.operator_pool).await?;
@@ -7838,11 +8050,9 @@ impl ForgeWorker {
                 .await
                 .map_err(ForgeError::Sql)?;
             if !outcome.advances() {
-                return Err(ForgeError::Reconciliation {
-                    detail: format!(
-                        "expired cleanup retained candidate {index} for replay after {}",
-                        outcome.transition_name()
-                    ),
+                return Err(ForgeError::CleanupRetained {
+                    index,
+                    transition: outcome.transition_name(),
                 });
             }
             index = index.saturating_add(1);
@@ -7857,6 +8067,36 @@ impl ForgeWorker {
             deleted_candidate_count: total,
             prepared_candidate_index: None,
         })
+    }
+
+    /// Maps an active read refusing one candidate's exclusive authority to its
+    /// outcome.
+    ///
+    /// The refusal precedes the candidate's preparation and delete and wrote
+    /// nothing, so the outcome depends only on what the durable row already
+    /// held. An unprepared index zero is the first preparation: the row is
+    /// still `running` with no evidence, so the claim is released through the
+    /// non-attempt-consuming [`ForgeError::Capacity`] path. A later index, or a
+    /// resumed candidate that is already `prepared`, means the row is already
+    /// `prepared`, which generic retry cannot settle. The exact frontier is
+    /// then retained as [`ForgeError::CleanupRetained`] for prepared-claim
+    /// replay.
+    ///
+    /// Each refusal is counted exactly once here, labelled by that outcome:
+    /// `prepare` for a released first preparation and `replay` for a frontier
+    /// retained for prepared-claim replay.
+    fn preparation_refused(index: u32, prepared: bool) -> ForgeError {
+        if index == 0 && !prepared {
+            ForgeTelemetry::record_expired_cleanup_refusal(ForgeCleanupRefusalStage::Prepare);
+            return ForgeError::Capacity {
+                detail: "an Oracle query is still reading this table".to_owned(),
+            };
+        }
+        ForgeTelemetry::record_expired_cleanup_refusal(ForgeCleanupRefusalStage::Replay);
+        ForgeError::CleanupRetained {
+            index,
+            transition: "forge.expired_cleanup.preparation_refused",
+        }
     }
 
     /// Proves one prepared candidate is still safe to delete right now.
@@ -8527,8 +8767,11 @@ impl ForgeWorker {
     /// Applies the closed bounded-retry policy at the audited worker boundary.
     ///
     /// Returns the durable result the settling transition committed, or `None`
-    /// when this call committed nothing: a post-effect retention, or a
-    /// shutdown release whose claim had already advanced.
+    /// when this call committed nothing: a post-effect retention, a retained
+    /// prepared cleanup candidate, or a shutdown release whose claim had
+    /// already advanced. Neither retention enters the generic retry, terminal,
+    /// or dispatched-close transitions, whose guards accept only `claimed` or
+    /// `running` rows and would report a `prepared` row as lost ownership.
     ///
     /// # Errors
     /// Returns SQL or audit errors; failure retains the fenced claim for reclaim.
@@ -8538,7 +8781,12 @@ impl ForgeWorker {
         attempt: Uuid,
         error: &ForgeError,
     ) -> Result<Option<ForgeTaskResult>, ForgeError> {
-        if self.is_dispatched(claim.task_id) && !matches!(error, ForgeError::ShutdownRetained) {
+        if self.is_dispatched(claim.task_id)
+            && !matches!(
+                error,
+                ForgeError::ShutdownRetained | ForgeError::CleanupRetained { .. }
+            )
+        {
             return self.close_dispatched(claim, attempt, error).await;
         }
         match error {
@@ -8554,7 +8802,10 @@ impl ForgeWorker {
                     Some(ForgeFailureClass::CapacityRefused),
                 )))
             }
-            ForgeError::ShutdownRetained => Ok(None),
+            // A retained cleanup candidate is still `prepared` under this exact
+            // attempt; its settlement already committed the only transition it
+            // may make, and the prepared-task reconciliation route owns replay.
+            ForgeError::ShutdownRetained | ForgeError::CleanupRetained { .. } => Ok(None),
             _ => {
                 let class = error.failure_class();
                 let attempts = self
@@ -8839,8 +9090,17 @@ struct ForgeWorkerReadinessGuard(super::ForgeRoleReadiness);
 
 impl Drop for ForgeWorkerReadinessGuard {
     fn drop(&mut self) {
-        self.0.publish(false);
+        publish_worker_readiness(&self.0, false);
     }
+}
+
+/// Publishes the worker's readiness and mirrors the resulting bit to its gauge.
+///
+/// The gauge reads the bit back after publishing rather than echoing `ready`,
+/// so a role the shutdown owner already closed reports not ready.
+fn publish_worker_readiness(readiness: &super::ForgeRoleReadiness, ready: bool) {
+    readiness.publish(ready);
+    ForgeTelemetry::record_worker_ready(readiness.is_ready());
 }
 
 #[cfg(test)]

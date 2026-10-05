@@ -5,8 +5,9 @@ use uuid::Uuid;
 
 use vala_bifrost_redux::catalog::TenantTableBinding;
 use vala_sql::row_types::forge_tasks::{ForgeClaimStrategy, ForgeTaskStrategy};
+use wyrd_client::bifrost::CompactionTypeWire;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{CompactionTypeWire, RegisterOutcome};
+use wyrd_spec::vala::api::RegisterOutcome;
 use wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta;
 use wyrd_testing::bifrost::{WyrdTestCluster, shared_process_telemetry_for_test};
 
@@ -1245,6 +1246,17 @@ const APPROVED_FORGE_FAMILIES: &[&str] = &[
     "bifrost_forge_snapshots_expired_total",
     "bifrost_forge_compaction_debt_files",
     "bifrost_forge_compaction_debt_bytes",
+    "bifrost_forge_leader_held",
+    "bifrost_forge_leader_acquisitions_total",
+    "bifrost_forge_leader_renewals_total",
+    "bifrost_forge_leader_renewal_seconds",
+    "bifrost_forge_leader_revocations_total",
+    "bifrost_forge_worker_ready",
+    "bifrost_forge_worker_backoffs_total",
+    "bifrost_forge_worker_restarts_total",
+    "bifrost_forge_worker_restart_backoff_seconds",
+    "bifrost_forge_scheduler_restarts_total",
+    "bifrost_forge_expired_cleanup_refusals_total",
 ];
 
 /// Promoted rows survive a rewrite whose acceptance the committer never learned.
@@ -2388,6 +2400,222 @@ async fn property_less_public_table_is_compacted_by_default() {
         "the rewrite outputs replaced the promoted inputs"
     );
     assert_public_rows(&client, &table, &expected, "after default compaction").await;
+}
+
+/// Waits until the pod's Forge worker readiness bit reads `expected`.
+///
+/// Readiness is a published atomic with no change notification, so this polls
+/// it under [`RELEASE_BOUND`], which covers the restart backoff plus the fresh
+/// worker's startup recovery.
+///
+/// # Panics
+///
+/// Panics when the bit never reaches `expected` within the bound.
+async fn await_worker_readiness(cluster: &WyrdTestCluster, expected: bool, label: &str) {
+    let readiness = cluster
+        .server(0)
+        .expect("the embedded pod is running")
+        .state()
+        .forge()
+        .expect("the embedded pod composes Forge")
+        .worker_readiness();
+    tokio::time::timeout(RELEASE_BOUND, async {
+        while readiness.is_ready() != expected {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{label}: worker readiness never reached {expected}"));
+}
+
+/// Writes two flushed eight-row commits into `table` and returns their rows.
+///
+/// # Panics
+///
+/// Panics when a public append or the pod's flush fails.
+async fn write_two_commits(
+    cluster: &WyrdTestCluster,
+    client: &wyrd_client::WyrdClient,
+    table: &JourneyTable,
+) -> Vec<ManagedRow> {
+    let server = cluster.server(0).expect("the embedded pod is running");
+    let mut rows = Vec::new();
+    for half in 0..2_i64 {
+        let values: Vec<i64> = (half * 8..half * 8 + 8).collect();
+        rows.extend(append_values(client, &table.qualified, Uuid::now_v7(), &values).await);
+        server
+            .flush_bifrost()
+            .await
+            .expect("the pod publishes its staged rows");
+    }
+    canonical_order(rows)
+}
+
+/// A failed Forge worker is rebuilt on the same pod while the API keeps serving.
+///
+/// A one-shot lease-release fault makes the worker's first rewrite fatal. While
+/// the failing worker is held at that fatal point the pod reports Forge not
+/// ready and the public read still serves. Once released, the supervisor
+/// rebuilds the worker after its backoff, readiness returns, and a second
+/// table written afterwards is compacted by the fresh worker. The production
+/// metrics then show one leader acquisition and renewals, one worker restart
+/// after a one-second backoff, a ready worker and held term, and, once the pod
+/// shuts down, one `shutdown` revocation with both gauges back at zero.
+///
+/// # Panics
+///
+/// Panics when the pod cannot start, the fault never fires, readiness does not
+/// drop and recover, a public call fails, the fresh worker commits no rewrite,
+/// or the leader and worker metrics disagree with that story.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn failed_worker_restarts_while_the_api_serves() {
+    let (_telemetry_guard, telemetry) =
+        shared_process_telemetry_for_test().expect("process production telemetry");
+    let checkpoint = telemetry
+        .checkpoint()
+        .expect("production telemetry baseline");
+    let cluster = WyrdTestCluster::start_with_embedded_forge_observer()
+        .await
+        .expect("one bound embedded Bifrost pod starts");
+    cluster.lead_forge_for_test().await;
+    let observer = cluster
+        .forge_completion_observer()
+        .expect("the journey pod carries a Forge completion observer");
+    let server = cluster.server(0).expect("the embedded pod is running");
+    let tenant = cluster.data_tenant_id();
+    let client = tenant_client(server, tenant).await;
+    await_worker_readiness(&cluster, true, "first worker").await;
+
+    let failing = register_table(server, tenant, &unique_table("restart_failing")).await;
+    let failing_rows = write_two_commits(&cluster, &client, &failing).await;
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1))
+        .expect("the written partition closes");
+    drain_forge_backlog(&cluster, &observer, &[tenant]).await;
+
+    observer.hold_before_fatal_observation_for_test();
+    observer.fail_next_lease_release();
+    server
+        .forge_clock()
+        .advance(chrono::Duration::hours(1))
+        .expect("the default compaction interval passes");
+    cluster.request_forge_scheduler_pass_for_test();
+    tokio::time::timeout(
+        RELEASE_BOUND,
+        observer.wait_for_fatal_observation_for_test(),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the rewrite release fault never fired: {:?}",
+            observer.returned_errors()
+        )
+    });
+    assert!(
+        !observer.lease_release_failure_armed(),
+        "the rewrite consumed the release fault"
+    );
+    await_worker_readiness(&cluster, false, "failing worker").await;
+    assert_public_rows(&client, &failing, &failing_rows, "while the worker fails").await;
+
+    observer.release_fatal_observation_for_test();
+    await_worker_readiness(&cluster, true, "rebuilt worker").await;
+    assert_public_rows(&client, &failing, &failing_rows, "after the restart").await;
+
+    let fresh = register_table(server, tenant, &unique_table("restart_fresh")).await;
+    let fresh_rows = write_two_commits(&cluster, &client, &fresh).await;
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1))
+        .expect("the second partition closes");
+    drain_forge_backlog(&cluster, &observer, &[tenant]).await;
+    server
+        .forge_clock()
+        .advance(chrono::Duration::hours(1))
+        .expect("the second compaction interval passes");
+    await_committed_rewrites(&cluster, &observer, &[&fresh.binding]).await;
+    assert_public_rows(
+        &client,
+        &fresh,
+        &fresh_rows,
+        "compacted by the rebuilt worker",
+    )
+    .await;
+
+    // The leader and worker lifecycle is visible on the production metrics:
+    // one acquisition renewed by the requested passes, one restart after the
+    // first one-second backoff, and a worker and leader that ended ready.
+    let running = telemetry
+        .delta_since(&checkpoint)
+        .expect("production telemetry window");
+    println!(
+        "{}",
+        running.evidence(&[
+            "bifrost_forge_leader_acquisitions_total",
+            "bifrost_forge_leader_renewals_total",
+            "bifrost_forge_worker_restarts_total",
+            "bifrost_forge_worker_restart_backoff_seconds",
+            "bifrost_forge_worker_ready",
+            "bifrost_forge_leader_held",
+        ])
+    );
+    assert_eq!(
+        counter_delta(&running, "bifrost_forge_leader_acquisitions_total", &[]),
+        1.0
+    );
+    assert!(
+        counter_delta(
+            &running,
+            "bifrost_forge_leader_renewals_total",
+            &[("outcome", "ok")]
+        ) >= 1.0
+    );
+    assert_eq!(
+        counter_delta(&running, "bifrost_forge_worker_restarts_total", &[]),
+        1.0,
+        "the injected failure restarted the worker exactly once"
+    );
+    assert_eq!(
+        gauge_final(&running, "bifrost_forge_worker_restart_backoff_seconds"),
+        1.0
+    );
+    assert_eq!(gauge_final(&running, "bifrost_forge_worker_ready"), 1.0);
+    assert_eq!(gauge_final(&running, "bifrost_forge_leader_held"), 1.0);
+
+    let running_end = telemetry
+        .checkpoint()
+        .expect("production telemetry shutdown baseline");
+    cluster.shutdown().await.expect("the pod drains");
+    let stopped = telemetry
+        .delta_since(&running_end)
+        .expect("production telemetry shutdown window");
+    assert_eq!(
+        counter_delta(
+            &stopped,
+            "bifrost_forge_leader_revocations_total",
+            &[("reason", "shutdown")]
+        ),
+        1.0,
+        "shutdown resigned the one held term"
+    );
+    assert_eq!(gauge_final(&stopped, "bifrost_forge_leader_held"), 0.0);
+    assert_eq!(gauge_final(&stopped, "bifrost_forge_worker_ready"), 0.0);
+}
+
+/// Reads one unlabelled gauge's value at the close of a telemetry window.
+///
+/// # Panics
+///
+/// Panics when the window rendered no sample of the gauge.
+fn gauge_final(delta: &BifrostTelemetryDelta, family: &str) -> f64 {
+    delta
+        .gauge_final
+        .iter()
+        .find(|sample| sample.family == family)
+        .unwrap_or_else(|| panic!("the window rendered no {family} sample"))
+        .value
 }
 
 /// Reads the compaction type of every leader-dispatched Forge task of one table.

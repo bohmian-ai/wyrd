@@ -25,6 +25,29 @@ mod tests {
             ForgeFailureClass::TransientObjectStore
         );
     }
+
+    /// Only a statement the database never answered is an unavailable
+    /// database; an answered SQL failure and a lease failure are not.
+    #[test]
+    fn database_unavailable_is_only_an_unanswered_statement() {
+        let unavailable = ForgeError::Sql(vala_sql::SqlError::Query(sqlx::Error::PoolTimedOut));
+        assert!(unavailable.is_database_unavailable());
+        assert_eq!(
+            unavailable.failure_class(),
+            ForgeFailureClass::TransientCoordination
+        );
+        assert!(
+            ForgeError::Sql(vala_sql::SqlError::Query(sqlx::Error::Io(
+                std::io::Error::from(std::io::ErrorKind::ConnectionReset)
+            )))
+            .is_database_unavailable()
+        );
+        assert!(!ForgeError::Sql(vala_sql::SqlError::NoRows).is_database_unavailable());
+        assert!(
+            !ForgeError::Lease(vala_sql::SqlError::Query(sqlx::Error::PoolTimedOut))
+                .is_database_unavailable()
+        );
+    }
 }
 
 /// Failures that preserve the durable boundary where Forge stopped.
@@ -33,7 +56,9 @@ pub enum ForgeError {
     /// A construction or runtime limit cannot safely execute Forge.
     #[error("invalid Forge configuration: {detail}")]
     InvalidConfig { detail: String },
-    /// The worker's local compaction admission refused this attempt for now.
+    /// The worker's local compaction admission, or an active table read
+    /// refusing an expired cleanup's first preparation, refused this attempt
+    /// for now. It is released without consuming retry budget.
     #[error("Forge resources are temporarily unavailable: {detail}")]
     Capacity { detail: String },
     /// A lease acquisition, renewal, fence, or release query failed.
@@ -72,6 +97,25 @@ pub enum ForgeError {
     /// Prepared or terminal durable state could not be reconciled safely.
     #[error("Forge reconciliation failed: {detail}")]
     Reconciliation { detail: String },
+    /// An expired-cleanup drain deliberately left its `prepared` task row
+    /// unchanged after a refusal or an uncertain deletion.
+    ///
+    /// Either a prepared candidate's settlement committed nothing, or an
+    /// active table read refused the next candidate's preparation after an
+    /// earlier candidate already moved the row to `prepared`. The row still
+    /// names the same task, attempt, owner, and cursor. This is a retained
+    /// outcome, not a failure to settle: the worker writes no retry or
+    /// terminal transition for it and leaves the row to the prepared-task
+    /// reconciliation route, which replays from the identical cursor under a
+    /// fresh proof once the refusing root clears.
+    #[error("Forge expired cleanup retained candidate {index} for replay after {transition}")]
+    CleanupRetained {
+        /// Cursor index the replay resumes at.
+        index: u32,
+        /// Transition that retained it: a refused or uncertain candidate
+        /// settlement, or a refused preparation.
+        transition: &'static str,
+    },
     /// The live Forge leader could not be reached or refused a peer call.
     #[error("Forge leader peer call failed: {detail}")]
     LeaderPeer { detail: String },
@@ -145,6 +189,24 @@ impl ForgeError {
         Self::Reconciliation { detail }
     }
 
+    /// Reports whether a SQL failure never reached the database.
+    ///
+    /// A pool acquire timeout or a connection I/O failure means the
+    /// statement could not be answered, which is a
+    /// [`ForgeFailureClass::TransientCoordination`] condition that a later
+    /// attempt may clear. Callers use this only for reads whose failure
+    /// leaves no durable state to account for; a settlement or release that
+    /// fails this way still stops its owner.
+    #[must_use]
+    pub fn is_database_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Sql(vala_sql::SqlError::Query(
+                sqlx::Error::PoolTimedOut | sqlx::Error::Io(_)
+            ))
+        )
+    }
+
     /// Classifies one execution failure without parsing diagnostic strings.
     #[must_use]
     pub fn failure_class(&self) -> ForgeFailureClass {
@@ -162,7 +224,8 @@ impl ForgeError {
             | Self::Sql(_)
             | Self::FenceLost { .. }
             | Self::LeaderPeer { .. }
-            | Self::Reconciliation { .. } => ForgeFailureClass::TransientCoordination,
+            | Self::Reconciliation { .. }
+            | Self::CleanupRetained { .. } => ForgeFailureClass::TransientCoordination,
             Self::Schema { .. }
             | Self::Group { .. }
             | Self::Invariant { .. }

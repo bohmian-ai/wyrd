@@ -935,6 +935,6 @@ export declare function openWyrdState(path: string): NativeWyrdState
  * not one mappable JSON Schema, a declared column is server-owned, the
  * layout is not one physical-layout declaration, the compaction target is
  * not a non-negative integer, or the compaction type is not one known
- * `snake_case` wire spelling.
+ * hyphenated wire spelling.
  */
 export declare function tableConfigFromJsonSchema(table: string, schemaJson: string, layoutJson?: string | undefined | null, compactionTargetFileSizeBytes?: number | undefined | null, compactionType?: string | undefined | null): NativeTableConfig

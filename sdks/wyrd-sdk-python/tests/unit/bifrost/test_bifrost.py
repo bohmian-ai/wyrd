@@ -65,8 +65,8 @@ def test_table_config_carries_an_optional_compaction_target():
 
 def test_table_config_carries_an_optional_compaction_type():
     """The explicit Forge compaction type reaches the native config from both
-    doors in its ``snake_case`` wire spelling; an unknown spelling, including
-    the hyphenated Iceberg property form, is refused at the boundary."""
+    doors in its hyphenated wire spelling; an unknown spelling, including the
+    underscore form, is refused at the boundary."""
 
     import pyarrow
     from pydantic import BaseModel
@@ -77,13 +77,16 @@ def test_table_config_carries_an_optional_compaction_type():
         id: int
 
     assert TableConfig(Row, "vala.datasets.t").compaction_type is None
-    declared = TableConfig(Row, "vala.datasets.t", compaction_type="small_files")
-    assert declared.compaction_type == "small_files"
+    declared = TableConfig(Row, "vala.datasets.t", compaction_type="small-files")
+    assert declared.compaction_type == "small-files"
     arrow = TableConfig.from_arrow(
         pyarrow.schema([("id", pyarrow.int64())]),
         "vala.datasets.t",
-        compaction_type="files_with_delete",
+        compaction_type="files-with-delete",
     )
-    assert arrow.compaction_type == "files_with_delete"
-    with pytest.raises(WyrdError):
-        TableConfig(Row, "vala.datasets.t", compaction_type="small-files")
+    assert arrow.compaction_type == "files-with-delete"
+    for kind in ("auto", "full", "small-files", "files-with-delete"):
+        assert TableConfig(Row, "vala.datasets.t", compaction_type=kind).compaction_type == kind
+    for refused in ("small_files", "files_with_delete"):
+        with pytest.raises(WyrdError):
+            TableConfig(Row, "vala.datasets.t", compaction_type=refused)

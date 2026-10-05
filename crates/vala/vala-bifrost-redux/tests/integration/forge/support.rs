@@ -1190,6 +1190,43 @@ impl PromotionIntegrationFixture {
         )
     }
 
+    /// Build one production Forge owner whose operator SQL runs over `operator_pool`.
+    ///
+    /// Everything else is the fixture's real graph: its catalog, staging
+    /// store, system clock and an idle trigger. A scenario passes a narrowed
+    /// pool to control when the operator database can answer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot produce a validated Forge graph.
+    pub(crate) fn build_forge_over_operator_pool_for_test(
+        &self,
+        operator_pool: vala_sql::OperatorPool,
+    ) -> Arc<Forge> {
+        let (_publisher, hints) =
+            staging_file_channel(self.config.max_hints_per_wake).expect("fixture hint capacity");
+        Arc::new(
+            Forge::new(ForgeBuildConfig {
+                resources: self.forge_resources.clone(),
+                spill_root: self.forge_spill.clone(),
+                vala: self.vala.clone(),
+                operator_pool,
+                catalog: self.catalog.iceberg_catalog(),
+                staging: Arc::clone(&self.staging),
+                object_store: CountingObjectStore::new(Arc::clone(&self.staging)),
+                hints,
+                config: self.config.clone(),
+                maintenance_interval: Duration::from_hours(1),
+                scheduler_owner: Uuid::now_v7(),
+                clock: ForgeClock::system(),
+                completion_observer: None,
+                scheduler_trigger: Some(ForgeSchedulerTrigger::default()),
+                telemetry: Arc::new(ForgeTelemetry::new()),
+            })
+            .expect("fixture Forge"),
+        )
+    }
+
     /// Reads the promotion settlement columns of the fixture table, in durable order.
     ///
     /// # Panics

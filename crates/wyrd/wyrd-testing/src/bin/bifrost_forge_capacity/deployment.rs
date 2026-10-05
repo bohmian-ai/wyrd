@@ -27,7 +27,7 @@ use crate::dependencies::{Dependencies, DependencyUsage};
 use crate::schedule::PULL_LIMIT;
 
 /// Compaction's task-type metric label. Forge labels a compaction attempt
-/// `small_files` whatever its compaction type, including the default `full`.
+/// `small_files` whatever its compaction type, including the default `small-files`.
 const COMPACTION: &str = "task_type=\"small_files\"";
 
 /// Promotion's task-type label.

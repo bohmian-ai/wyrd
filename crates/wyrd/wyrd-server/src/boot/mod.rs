@@ -1172,6 +1172,16 @@ fn forge_compaction_worker_config(
 /// admission queue, sized once at composition from the immutable resource plan.
 /// This entry point only supervises the resulting single event loop.
 ///
+/// The process supervisor calls this again to replace a failed instance. Every
+/// call clones the one boot-composed worker, so the replacement carries the
+/// same boot-resolved owner identity a process restart would, and its startup
+/// recovery reclaims lapsed claims and reconciles Prepared attempts exactly as
+/// after a restart. The failed instance cannot act again: its loop has
+/// returned only after joining its own plan runners and claim heartbeats, a
+/// same-owner table-lease acquisition bumps the fencing token so any lease it
+/// still held can no longer renew or commit, and a reclaimed claim settles
+/// only under its new attempt.
+///
 /// # Errors
 /// Returns [`ServerBootError::ForgeSchedulerRequired`] when Forge is absent or
 /// [`ServerBootError::Forge`] when the requested worker bound or per-tenant cap
@@ -1182,7 +1192,8 @@ pub fn spawn_forge_worker(
 ) -> Result<
     impl std::future::Future<Output = Result<(), vala_bifrost_redux::forge::ForgeError>>
     + Send
-    + 'static,
+    + 'static
+    + use<>,
     ServerBootError,
 > {
     let forge = state
@@ -2150,7 +2161,8 @@ pub fn spawn_maintenance_scheduler(
     Option<
         impl std::future::Future<Output = Result<(), vala_bifrost_redux::forge::ForgeError>>
         + Send
-        + 'static,
+        + 'static
+        + use<>,
     >,
     ServerBootError,
 > {

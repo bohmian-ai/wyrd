@@ -1263,6 +1263,75 @@ async fn worker_duration_includes_claim_and_failed_release() {
     );
 }
 
+/// A worker whose operator database stops answering backs off and recovers.
+///
+/// The worker's operator pool is narrowed to one connection, which the test
+/// then holds past the pool's acquire timeout. Every loop read times out
+/// without reaching the database, so the worker retracts readiness and keeps
+/// running instead of stopping its process; once the connection is released
+/// the next answered turn advertises it again.
+///
+/// # Panics
+///
+/// Panics when the worker stops, never withdraws readiness while the database
+/// is unreachable, or never advertises it again once the database answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn worker_backs_off_while_the_operator_database_is_unreachable() {
+    let fixture = PromotionIntegrationFixture::start("unreachable_operator_db").await;
+    let narrow = vala_sql::OperatorPool::from(
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_with((*fixture.operator_pool.pool().connect_options()).clone())
+            .await
+            .expect("narrow operator pool"),
+    );
+    let forge = fixture.build_forge_over_operator_pool_for_test(narrow.clone());
+    let worker =
+        ForgeWorker::new(forge, ForgeWorkerConfig::default(), Uuid::now_v7()).expect("worker");
+    let readiness = ForgeRoleReadiness::default();
+    let stop = CancellationToken::new();
+    let work = AbortOnDropHandle::new(tokio::spawn(worker.run(stop.clone(), readiness.clone())));
+    let ready = |expected: bool| {
+        let readiness = readiness.clone();
+        async move {
+            timeout(OWNERSHIP_BOUND, async {
+                while readiness.is_ready() != expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok()
+        }
+    };
+    assert!(ready(true).await, "the worker starts ready");
+
+    let held = narrow
+        .pool()
+        .acquire()
+        .await
+        .expect("the test holds the only operator connection");
+    assert!(
+        ready(false).await,
+        "an unreachable database withdraws readiness"
+    );
+    assert!(!work.is_finished(), "the worker keeps running");
+    drop(held);
+    assert!(
+        ready(true).await,
+        "the worker advertises again once the database answers: finished={}",
+        work.is_finished()
+    );
+
+    stop.cancel();
+    timeout(OWNERSHIP_BOUND, work)
+        .await
+        .expect("the worker drains")
+        .expect("the worker task joins")
+        .expect("the worker stops cleanly");
+}
+
 /// A running slot discovering invalid Prepared evidence closes readiness before
 /// held lease cleanup, preserves reconciliation over release, and observes uncertainty.
 ///
@@ -1834,6 +1903,78 @@ async fn worker_reports_no_plan_dispatch_as_success() {
         "a dispatch that planned nothing publishes nothing"
     );
     assert_eq!(store.output_writers(), 0, "planning nothing writes nothing");
+    supervisor.shutdown().await;
+}
+
+/// Shutdown after a dispatch's durable claim, before its episode, stays leader-owned.
+///
+/// The worker pulls the promoted table, records the dispatch as its own claimed
+/// row, and is held there while shutdown is signalled. The row must close as
+/// `cancelled` — never `retryable`, where a fair claim would give the accepted
+/// dispatch a second owner — and the leader must receive the one `NotStarted`
+/// report that clears its in-flight task while keeping every pending commit.
+///
+/// # Panics
+///
+/// Panics when the claim gate is missed, the row becomes fair-claimable, or
+/// the leader still holds the dispatch in flight or lost a commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn dispatch_shutdown_before_episode_closes_and_reports_not_started() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let fixture = PromotionIntegrationFixture::start("dispatch_shutdown").await;
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let mut supervisor = SupervisedPromotion::start_serial(
+        &fixture,
+        fixture.catalog.iceberg_catalog(),
+        Arc::clone(&store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    supervisor.run_one_success().await;
+    let owed = track(&supervisor, &fixture);
+    assert_eq!(owed.in_flight, None, "nothing is dispatched yet");
+
+    supervisor.restart_worker();
+    supervisor.observer().hold_after_claims_for_test(1);
+    let stop = supervisor.worker_stop();
+    supervisor.start_worker();
+    timeout(
+        OWNERSHIP_BOUND,
+        supervisor.observer().wait_for_claims_for_test(),
+    )
+    .await
+    .expect("the dispatch's claim gate");
+    let task_id = track(&supervisor, &fixture)
+        .in_flight
+        .expect("the held claim is the leader's in-flight dispatch");
+    let held: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+        .bind(task_id)
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("the dispatch's durable claim");
+    assert_eq!(held, "claimed", "the dispatch is durably claimed");
+
+    stop.cancel();
+    supervisor.observer().release_claims_for_test();
+    supervisor.join_worker().await;
+
+    let closed: (String, Option<Uuid>) =
+        sqlx::query_as("SELECT state,attempt_id FROM vala.forge_tasks WHERE task_id=$1")
+            .bind(task_id)
+            .fetch_one(fixture.operator_pool.pool())
+            .await
+            .expect("the closed dispatch");
+    assert_eq!(
+        closed,
+        ("cancelled".to_owned(), None),
+        "an accepted dispatch never becomes fair-claimable"
+    );
+    let reported = track(&supervisor, &fixture);
+    assert_eq!(
+        (reported.in_flight, reported.pending_commits),
+        (None, owed.pending_commits),
+        "one NotStarted report clears the dispatch and keeps every commit"
+    );
     supervisor.shutdown().await;
 }
 

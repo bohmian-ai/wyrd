@@ -261,16 +261,17 @@ transition after a replacement worker has taken over.
 ## Telemetry
 
 `forge/metrics.rs` is the only Forge metric owner, and it publishes exactly the
-twelve Prometheus families below. They answer the operational questions
+Prometheus families below. They answer the operational questions
 Forge is accountable for: how much work is created, how much this process is
 doing right now, how attempts ended, how
-long they took, why they failed, and how much physical data moved.
+long they took, why they failed, how much physical data moved, whether this
+replica holds the leader term, and whether its worker is running or restarting.
 
-Everything else stays where it is already authoritative. Lease, fence, catalog,
-reconciliation, cursor, scheduler, and resource mechanics are structured traces
-and durable operation and task rows; unresolved authority or recovery is
-`bifrost_role_ready`. None of it is duplicated as a metric, and no Forge series
-carries a tenant, table, task, attempt, snapshot, path, or request label.
+Everything else stays where it is already authoritative. Table lease, fence,
+catalog, reconciliation, cursor, and resource mechanics are structured traces
+and durable operation and task rows. None of it is duplicated as a metric, and
+no Forge series carries a tenant, table, task, attempt, snapshot, path, or
+request label.
 
 ### Label vocabularies
 
@@ -308,7 +309,31 @@ failure:
 | `capacity_refused` | The compaction queue refused every plan for waiting-parallelism capacity or per-plan size. |
 | `internal_invariant` | An internal invariant failed; this is a defect, not a condition. |
 
-### The twelve families
+The worker and scheduler restart counters reuse these failure classes for the
+error that stopped the loop; an exit without an error to classify counts as
+`internal_invariant`. Three more families carry their own `reason` values:
+leader revocations (`renewal_refused`, `renewal_failed`, `renewal_timeout`,
+`replaced`, `shutdown`), worker back-offs (`database_unavailable`), and expired
+cleanup refusals (`active_read`).
+
+`stage` names where an active Oracle read refused an expired-cleanup candidate
+preparation:
+
+| Value | What it means |
+| --- | --- |
+| `prepare` | The first candidate was refused before anything durable existed, so the claim was released without consuming retry budget. |
+| `replay` | A later candidate, or the replay of a retained one, was refused after the task was already prepared, so its exact frontier was retained for prepared-claim replay. |
+
+`outcome` names how one leader term renewal ended:
+
+| Value | What it means |
+| --- | --- |
+| `ok` | The election row extended this replica's term. |
+| `refused` | The election row no longer names this replica's term, so the term is revoked. |
+| `failed` | The renewal statement failed, so the term is revoked. |
+| `timeout` | The renewal was still pending at the term's local deadline, so the term is revoked. |
+
+### Task families
 
 Every family is process-local: it is produced by whichever replica did the work
 and sums across replicas.
@@ -326,7 +351,40 @@ and sums across replicas.
 | `bifrost_forge_output_bytes_total` | counter | `task_type` | After a committed or recovered effect | Absent until an effect publishes bytes | Process-local |
 | `bifrost_forge_deleted_objects_total` | counter | `task_type` | At the delete boundary itself, once per accepted delete of a freshly proven-present, eligible object | Pre-delete-missing, refused, and already-absent recovery paths count nothing | Process-local |
 | `bifrost_forge_snapshots_expired_total` | counter | — | After committed or recovered expiration settlement | Counts individual snapshots, not tasks | Process-local |
+| `bifrost_forge_expired_cleanup_refusals_total` | counter | `stage`, `reason` (`active_read`) | Once per expired-cleanup candidate preparation an active Oracle read refused | Absent until the first refusal; a steady rise means a long-running read is holding cleanup back | Process-local |
 | `bifrost_forge_leader_decision_seconds` | histogram | `operation` (`commit`, `pull`, `report`) | Around each leader schedule operation, including the wait for the schedule lock | Absent on a replica that never held the leader term; excludes RPC and worker time | Process-local (leader) |
+
+### Leader term families
+
+In the order a term lives: it is acquired, renewed on every heartbeat, and
+revoked exactly once. Acquisition is logged at info, and each revocation is
+logged at warn with its `reason`, except a `shutdown` resignation, which is
+logged at info.
+
+| Family | Type | Labels | Updated when | Zero and absence | Owner |
+| --- | --- | --- | --- | --- | --- |
+| `bifrost_forge_leader_acquisitions_total` | counter | — | Once per term this replica acquires | Absent until this replica first leads | Process-local (coordinator) |
+| `bifrost_forge_leader_held` | gauge | — | Set to 1 when this replica acquires the term and to 0 when that term is revoked | Exported as 0 from boot; exactly one replica reads 1 while a leader exists | Process-local (coordinator) |
+| `bifrost_forge_leader_renewals_total` | counter | `outcome` | Once per renewal of a held term | Absent on a replica that never held the term | Process-local (leader) |
+| `bifrost_forge_leader_renewal_seconds` | histogram | `outcome` | With the renewal counter; measures the election-row round trip | Absent on a replica that never held the term | Process-local (leader) |
+| `bifrost_forge_leader_revocations_total` | counter | `reason` | Once per held term that ends, with why it ended | Absent until a held term ends | Process-local (leader) |
+
+### Worker families
+
+In the order an operator reads a struggling worker: whether it is ready, how
+often it backs off while the database cannot answer, and how often the server
+rebuilt it after it failed. A worker failure never stops the server: it is
+logged at error, readiness drops, and the worker is rebuilt after a backoff
+that doubles from one second to a thirty-second cap. Each back-off is logged
+at warn.
+
+| Family | Type | Labels | Updated when | Zero and absence | Owner |
+| --- | --- | --- | --- | --- | --- |
+| `bifrost_forge_worker_ready` | gauge | — | Whenever the worker publishes its readiness, including when it stops | Exported as 0 from boot; 0 while recovering, backing off, restarting, or shut down | Process-local (worker) |
+| `bifrost_forge_worker_backoffs_total` | counter | `reason` (`database_unavailable`) | Once per worker turn that backs off because a loop read could not reach the database | Absent until the first back-off | Process-local (worker) |
+| `bifrost_forge_worker_restart_backoff_seconds` | gauge | — | Set to the wait before each rebuild of a failed worker | Exported as 0 from boot; holds the most recent backoff afterwards | Process-local (worker) |
+| `bifrost_forge_worker_restarts_total` | counter | `reason` | Once per rebuild of a worker that stopped before shutdown, with the failure class of its error | Absent until the first restart | Process-local (worker) |
+| `bifrost_forge_scheduler_restarts_total` | counter | `reason` | Once per rebuild of a maintenance scheduler that stopped before shutdown, with the failure class of its error, on the same backoff as the worker | Absent until the first restart | Process-local (scheduler) |
 
 ### Dashboard examples
 
@@ -352,6 +410,10 @@ sum by (task_type) (rate(bifrost_forge_deleted_objects_total[5m]))
 
 # Orphan-cleanup progress.
 sum(rate(bifrost_forge_deleted_objects_total{task_type="orphan_cleanup"}[30m]))
+
+# Exactly one leader, and worker restarts by failure class.
+sum(bifrost_forge_leader_held)
+sum by (reason) (increase(bifrost_forge_worker_restarts_total[1h]))
 
 # Role readiness and process liveness.
 min by (role) (bifrost_role_ready)

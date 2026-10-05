@@ -16,14 +16,20 @@ pub enum CallbackOutcome<T> {
     Continue,
     /// Replace the value the original operation would have returned.
     ReplaceWith(T),
-    /// Terminate the agent run with this error as the cause.
+    /// Stop the operation with this error as the cause.
+    ///
+    /// From an agent or model hook it ends the run
+    /// [`FinishReason::CallbackAborted`](crate::FinishReason::CallbackAborted)
+    /// with the error on `AgentRun.error`; from a tool hook it reports that one
+    /// tool call to the model as failed with the error and the run continues.
     Abort(WyrdError),
 }
 
 /// Result of applying a callback chain in registration order.
 pub(crate) enum ChainResult<T> {
-    /// A callback aborted the current operation.
-    Abort(WyrdError),
+    /// A callback aborted the current operation, carrying its error and the
+    /// value the chain held when it aborted.
+    Abort(WyrdError, T),
     /// Effective current value after all callbacks continue or replace.
     Replaced(T),
 }
@@ -94,7 +100,7 @@ where
         match outcome {
             Ok(CallbackOutcome::Continue) => {}
             Ok(CallbackOutcome::ReplaceWith(replacement)) => current = replacement,
-            Ok(CallbackOutcome::Abort(error)) => return Ok(ChainResult::Abort(error)),
+            Ok(CallbackOutcome::Abort(error)) => return Ok(ChainResult::Abort(error, current)),
             Err(payload) => return Err(callback_panic(hook, payload)),
         }
     }
@@ -115,7 +121,7 @@ pub(crate) fn apply_before_agent_chain_with_panic_catch(
         match outcome {
             Ok(CallbackOutcome::Continue) => {}
             Ok(CallbackOutcome::ReplaceWith(replacement)) => current = replacement,
-            Ok(CallbackOutcome::Abort(error)) => return Ok(ChainResult::Abort(error)),
+            Ok(CallbackOutcome::Abort(error)) => return Ok(ChainResult::Abort(error, current)),
             Err(payload) => return Err(callback_panic(hook, payload)),
         }
     }
@@ -137,7 +143,7 @@ pub(crate) fn apply_chain_with_panic_catch_tool(
         match outcome {
             Ok(CallbackOutcome::Continue) => {}
             Ok(CallbackOutcome::ReplaceWith(replacement)) => current = replacement,
-            Ok(CallbackOutcome::Abort(error)) => return Ok(ChainResult::Abort(error)),
+            Ok(CallbackOutcome::Abort(error)) => return Ok(ChainResult::Abort(error, current)),
             Err(payload) => return Err(callback_panic(hook, payload)),
         }
     }
@@ -159,7 +165,7 @@ pub(crate) fn apply_chain_with_panic_catch_tool_result(
         match outcome {
             Ok(CallbackOutcome::Continue) => {}
             Ok(CallbackOutcome::ReplaceWith(replacement)) => current = replacement,
-            Ok(CallbackOutcome::Abort(error)) => return Ok(ChainResult::Abort(error)),
+            Ok(CallbackOutcome::Abort(error)) => return Ok(ChainResult::Abort(error, current)),
             Err(payload) => return Err(callback_panic(hook, payload)),
         }
     }

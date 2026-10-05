@@ -4,6 +4,10 @@
 //! finish triggers cooperative shutdown; remaining tasks drain within a budget,
 //! then are aborted. The first pre-shutdown failure (or unexpected exit) is the
 //! terminal error; drain-phase exits are logged only.
+//!
+//! A worker whose loss costs only its own capability on this pod is supervised
+//! through [`restarting_worker`] instead: it never exits before shutdown, so
+//! its failure is restarted in place and never becomes the terminal error.
 
 use std::time::Duration;
 
@@ -60,6 +64,119 @@ where
 {
     let outcome = fut.await.map_err(|e| e.to_string());
     TaskExit { id, outcome }
+}
+
+/// First wait before a failed restartable worker is rebuilt.
+const WORKER_RESTART_BACKOFF_MIN: Duration = Duration::from_secs(1);
+/// Longest wait between restarts; an instance that ran this long resets it.
+// ponytail: fixed doubling 1 s → 30 s with no jitter or config; add a knob if
+// an operator needs a different ceiling.
+const WORKER_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Builds a worker once and restarts it in place whenever it stops early.
+///
+/// Used for workers whose loss costs only their own capability on this pod
+/// (the Forge worker and maintenance scheduler), so their failure must not stop
+/// the process. The first instance is built eagerly, so a misconfigured worker
+/// still fails boot. Each instance is awaited through its own task's join
+/// handle, so any exit before shutdown lands here: the failure is logged,
+/// `on_restart` is told the failure (`None` when the exit carries no worker
+/// error) and the backoff about to be waited, the loop backs off (doubling
+/// from one second to a thirty-second cap, reset once an instance has run
+/// longer than the cap), and `build` is called again with the same shutdown
+/// token, which is exactly how boot built the first instance.
+/// Readiness needs no handling here: each Forge loop's own readiness guard
+/// retracts it when the instance exits, and the fresh instance republishes it
+/// only after its startup recovery succeeds. The returned task completes only
+/// after shutdown, with the outcome of the instance that was draining.
+///
+/// # Errors
+///
+/// Returns the constructor's error when the first instance cannot be built.
+///
+/// # Cancellation
+///
+/// Dropping the returned future (the supervisor's drain-deadline abort) aborts
+/// the running instance.
+pub fn restarting_worker<B, F, E, BE, R>(
+    name: &'static str,
+    shutdown: CancellationToken,
+    mut build: B,
+    mut on_restart: R,
+) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = TaskExit> + Send>>, BE>
+where
+    B: FnMut(CancellationToken) -> Result<F, BE> + Send + 'static,
+    F: std::future::Future<Output = Result<(), E>> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+    BE: std::fmt::Display,
+    R: FnMut(Option<&E>, Duration) + Send + 'static,
+{
+    // Boxed so the deep worker state machine stays out of this loop's layout.
+    let mut instance = Box::pin(build(shutdown.clone())?);
+    let id = TaskId::Worker(name);
+    Ok(Box::pin(async move {
+        let mut backoff = WORKER_RESTART_BACKOFF_MIN;
+        loop {
+            let started = Instant::now();
+            let joined = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(instance)).await;
+            if shutdown.is_cancelled() {
+                let outcome = match joined {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(join_error) => Err(join_error.to_string()),
+                };
+                return TaskExit { id, outcome };
+            }
+            if started.elapsed() >= WORKER_RESTART_BACKOFF_MAX {
+                backoff = WORKER_RESTART_BACKOFF_MIN;
+            }
+            let backoff_ms = backoff.as_millis();
+            match &joined {
+                Ok(Ok(())) => tracing::error!(
+                    worker = name,
+                    backoff_ms,
+                    "worker exited before shutdown; restarting it on this pod"
+                ),
+                Ok(Err(error)) => tracing::error!(
+                    worker = name,
+                    %error,
+                    backoff_ms,
+                    "worker failed; restarting it on this pod"
+                ),
+                Err(join_error) => tracing::error!(
+                    worker = name,
+                    error = %join_error,
+                    backoff_ms,
+                    "worker failed; restarting it on this pod"
+                ),
+            }
+            on_restart(
+                joined
+                    .as_ref()
+                    .ok()
+                    .and_then(|result| result.as_ref().err()),
+                backoff,
+            );
+            loop {
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => return TaskExit { id, outcome: Ok(()) },
+                    () = tokio::time::sleep(backoff) => {}
+                }
+                backoff = backoff.saturating_mul(2).min(WORKER_RESTART_BACKOFF_MAX);
+                match build(shutdown.clone()) {
+                    Ok(next) => {
+                        instance = Box::pin(next);
+                        break;
+                    }
+                    Err(error) => tracing::error!(
+                        worker = name,
+                        %error,
+                        "worker could not be rebuilt; retrying"
+                    ),
+                }
+            }
+        }
+    }))
 }
 
 /// Drive the supervised set to completion. Returns the terminal error message,
@@ -499,5 +616,70 @@ mod tests {
             msg.contains("task panicked"),
             "terminal error must describe the panic: {msg}"
         );
+    }
+
+    /// Proves a restarting worker survives repeated failures, then drains cleanly.
+    ///
+    /// The first two instances fail, and the third parks until
+    /// shutdown. The loop must rebuild after each pre-shutdown exit instead of
+    /// returning, and shutdown must end it as a graceful exit.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the loop returns before shutdown, skips a rebuild, or
+    /// reports the drain as a failure.
+    #[tokio::test(start_paused = true)]
+    async fn restarting_worker_rebuilds_after_failures() {
+        let shutdown = CancellationToken::new();
+        let builds = Arc::new(AtomicU8::new(0));
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let counter = Arc::clone(&builds);
+        let parked_signal = Arc::clone(&parked);
+        let restarts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&restarts);
+        let worker = restarting_worker(
+            "probe",
+            shutdown.clone(),
+            move |token| {
+                let build = counter.fetch_add(1, Ordering::AcqRel);
+                let parked = Arc::clone(&parked_signal);
+                Ok::<_, &'static str>(async move {
+                    match build {
+                        0 => Err("first instance failed"),
+                        1 => Err("second instance failed"),
+                        _ => {
+                            parked.notify_one();
+                            token.cancelled().await;
+                            Ok(())
+                        }
+                    }
+                })
+            },
+            move |error: Option<&&'static str>, backoff| {
+                observed
+                    .lock()
+                    .expect("the restart record is not poisoned")
+                    .push((error.copied(), backoff));
+            },
+        )
+        .expect("the first instance builds");
+        let handle = tokio::spawn(worker);
+
+        parked.notified().await;
+        assert_eq!(builds.load(Ordering::Acquire), 3, "two rebuilds happened");
+        assert_eq!(
+            *restarts.lock().expect("the restart record is not poisoned"),
+            [
+                (Some("first instance failed"), Duration::from_secs(1)),
+                (Some("second instance failed"), Duration::from_secs(2)),
+            ],
+            "each restart reports its failure and the doubling backoff"
+        );
+        assert!(!handle.is_finished(), "no exit before shutdown");
+
+        shutdown.cancel();
+        let exit = handle.await.expect("the restart loop does not panic");
+        assert!(matches!(exit.id, TaskId::Worker("probe")));
+        assert!(exit.outcome.is_ok(), "shutdown drains gracefully");
     }
 }

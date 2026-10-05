@@ -116,7 +116,7 @@ impl PyTableConfig {
     /// wire contract stays the only layout shape. `compaction_target_file_size_bytes`,
     /// when present, is the explicit Forge file target the register call
     /// requests; the server validates it. `compaction_type`, when present, is
-    /// one `snake_case` wire spelling of the Forge compaction type.
+    /// one hyphenated wire spelling of the Forge compaction type.
     ///
     /// # Errors
     ///
@@ -246,8 +246,8 @@ impl PyTableConfig {
         self.inner.compaction_target_file_size_bytes()
     }
 
-    /// The explicit Forge compaction type in its `snake_case` wire spelling,
-    /// declared or described; `None` compacts with the `small_files` default.
+    /// The explicit Forge compaction type in its hyphenated wire spelling,
+    /// declared or described; `None` compacts with the `small-files` default.
     #[getter]
     fn compaction_type(&self) -> Option<String> {
         self.inner
@@ -625,7 +625,7 @@ fn apply_compaction_target(config: TableConfig, bytes: Option<u64>) -> TableConf
 
 /// Applies one optional explicit compaction type to a config.
 ///
-/// The spelling is the `snake_case` wire value, parsed by the wire type's own
+/// The spelling is the hyphenated wire value, parsed by the wire type's own
 /// serde contract so Python accepts exactly what the server accepts.
 ///
 /// # Errors

@@ -1539,6 +1539,66 @@ class Prompt:
         ...
 
     @staticmethod
+    def openai_audio(data: str, format: str) -> JsonDict:
+        """Return an OpenAI Chat ``input_audio`` content part.
+
+        Args:
+            data: the base64 audio payload.
+            format: the audio format, such as ``"wav"`` or ``"mp3"``.
+        """
+        ...
+
+    @staticmethod
+    def openai_file_data(file_data: str, filename: str | None = None) -> JsonDict:
+        """Return an OpenAI Chat inline ``file`` content part.
+
+        Args:
+            file_data: the base64 file payload or ``data:`` URL.
+            filename: the file name. Omitted, none is sent.
+        """
+        ...
+
+    @staticmethod
+    def openai_file_id(file_id: str) -> JsonDict:
+        """Return an OpenAI Chat ``file`` content part for an uploaded file id."""
+        ...
+
+    @staticmethod
+    def anthropic_image_url(url: str) -> JsonDict:
+        """Return an Anthropic URL-sourced ``image`` content block."""
+        ...
+
+    @staticmethod
+    def anthropic_image_file_id(file_id: str) -> JsonDict:
+        """Return an Anthropic ``image`` content block for an uploaded file id."""
+        ...
+
+    @staticmethod
+    def anthropic_document_text(media_type: str, data: str, title: str | None = None) -> JsonDict:
+        """Return an Anthropic plain-text ``document`` block. As ``Prompt.document_text()``."""
+        ...
+
+    @staticmethod
+    def anthropic_document_file_id(file_id: str, title: str | None = None) -> JsonDict:
+        """Return an Anthropic ``document`` block for an uploaded file id.
+
+        Args:
+            file_id: the uploaded file id.
+            title: the document title. Omitted, none is sent.
+        """
+        ...
+
+    @staticmethod
+    def google_inline_data(mime_type: str, data: str) -> JsonDict:
+        """Return a Gemini or Vertex ``inline_data`` part.
+
+        Args:
+            mime_type: the payload MIME type.
+            data: the base64 payload.
+        """
+        ...
+
+    @staticmethod
     def anthropic_image_base64(media_type: str, data: str) -> JsonDict:
         """Return an Anthropic base64 ``image`` content block.
 
@@ -1667,9 +1727,10 @@ class PromptReference:
         ...
 
 class PromptCardMetadata:
-    """The prompt a ``PromptCard`` stores as its ``spec`` body."""
+    """The prompt a ``PromptCard`` stores as its ``spec`` body.
 
-    prompt: Prompt
+    The stored prompt is read back through ``to_dict()`` or ``to_spec()``; the
+    object exposes no ``prompt`` attribute."""
 
     def __init__(
         self,
@@ -1728,7 +1789,6 @@ class PromptCard:
         content_hash: the hash of the validated ``spec`` body.
         parameters: the text variables the prompt declares.
         is_fully_bound: ``True`` when the prompt declares no text variables.
-        is_card: always ``True``; marks card holders for client code.
     """
 
     space: str
@@ -1745,7 +1805,6 @@ class PromptCard:
     content_hash: str
     parameters: list[str]
     is_fully_bound: bool
-    is_card: bool
 
     def __init__(
         self,
@@ -1821,6 +1880,15 @@ class PromptCard:
         Raises:
             WyrdError: when the file cannot be read or parsed, or is not a
                 ``wyrd/v1`` Prompt envelope with a space, uid, and version.
+        """
+        ...
+
+    def model_dump(self) -> JsonDict:
+        """Return this card's ``wyrd/v1`` envelope as a dictionary.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for invalid identity, or a
+                prompt validation error.
         """
         ...
 

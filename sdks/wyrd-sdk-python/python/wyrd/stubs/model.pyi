@@ -386,7 +386,7 @@ class HuggingfaceInterface(ModelInterface):
         self,
         *,
         model: Any = ...,
-        hf_task: str = ...,
+        hf_task: str,
         processor: Any = ...,
         repo_id: str | None = ...,
         revision: str | None = ...,
@@ -566,23 +566,21 @@ class SampleInput:
 
 class ModelCardMetadata:
     """Interface, task, signature, sample-input, and artifact-reference
-    metadata a ModelCard turns into a durable Model spec."""
+    metadata a ModelCard turns into a durable Model spec.
 
-    interface: JsonDict
-    task_type: str
-    signature: ModelSignature | JsonDict
-    sample_input: SampleInput | JsonDict | None
-    card_refs: list[CardRefLike]
+    The values are read back through ``to_dict()``; the object exposes no
+    per-field attributes."""
 
     def __init__(
         self,
+        *,
         interface: ModelInterface | JsonDict | None = ...,
         task_type: str = ...,
         signature: ModelSignature | JsonDict | None = ...,
         sample_input: SampleInput | JsonDict | None = ...,
         card_refs: Sequence[CardRefLike] | None = ...,
     ) -> None:
-        """Create ModelCard metadata.
+        """Create ModelCard metadata; every argument is keyword-only.
 
         Values are parsed, not validated; ``ModelCard`` validates the
         resulting spec.

@@ -142,6 +142,18 @@ pub fn split_text_on_media(text: &str) -> Vec<TextSegment> {
 impl Prompt {
     /// Create a prompt, split media placeholders into isolated native text
     /// parts, and populate `variables` / `media_variables` from the request.
+    ///
+    /// The request carries only the body schema, so the created Prompt has no
+    /// destination (`provider` is `None`) and native dispatch uses the
+    /// schema's default provider. A caller that targets a different
+    /// destination, such as Vertex for a shared GenerateContent body, sets
+    /// `provider` after construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkaldError::MediaInSystemMessage`] when system content holds a
+    /// `${media:name}` placeholder, and a serialization error when the request
+    /// cannot be serialized to scan its `${name}` / `{{name}}` variables.
     pub fn new(
         request: ProviderRequest,
         model: impl Into<String>,
@@ -243,6 +255,7 @@ impl Prompt {
     /// `AnthropicContentBlock::Document`, or `GooglePart::InlineData`.
     pub fn bind_media_mut(&mut self, name: &str, media: &MediaRef) -> SkaldResult<()> {
         self.normalize_media_placeholders_mut()?;
+        let provider = self.provider();
         match &mut self.request {
             ProviderRequest::OpenAiChatCompletion(request) => {
                 bind_media_openai_chat(request, name, media)?;
@@ -254,7 +267,7 @@ impl Prompt {
                 bind_media_anthropic(request, name, media)?;
             }
             ProviderRequest::GeminiGenerateContent(request) => {
-                bind_media_google(request, name, media, ProviderName::Google)?;
+                bind_media_google(request, name, media, provider)?;
             }
             ProviderRequest::OpenAiEmbeddings(_)
             | ProviderRequest::GoogleBatchEmbed(_)
@@ -1321,6 +1334,25 @@ mod prompt_media {
             https,
             SkaldError::UnsupportedMediaForProvider {
                 provider: ProviderName::Google,
+                kind: MediaKind::Image,
+            }
+        );
+
+        let mut vertex = google_prompt("${media:image}");
+        vertex.provider = Some(ProviderName::Vertex);
+        let vertex_https = vertex
+            .bind_media(
+                "image",
+                &MediaRef::image_url(
+                    "https://example.com/image.png",
+                    Some("image/png".to_owned()),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(
+            vertex_https,
+            SkaldError::UnsupportedMediaForProvider {
+                provider: ProviderName::Vertex,
                 kind: MediaKind::Image,
             }
         );

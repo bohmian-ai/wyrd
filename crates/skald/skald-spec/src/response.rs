@@ -98,7 +98,12 @@ impl ProviderResponse {
         crate::adapter::ResponseAdapter::new(self)
     }
 
-    /// Returns the provider that produced this response.
+    /// Returns the default provider of this response's schema dialect.
+    ///
+    /// This is not the destination that produced the response. GenerateContent
+    /// is one schema shared by Gemini and Vertex, so a shared GenerateContent
+    /// response reports Google even when Vertex produced it; callers that need
+    /// the destination read it from the dispatched Prompt.
     pub fn provider(&self) -> ProviderName {
         match self {
             Self::OpenAiChatCompletion(_)

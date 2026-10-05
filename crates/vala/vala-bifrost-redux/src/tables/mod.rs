@@ -2268,4 +2268,214 @@ mod tests {
             "a duplicated reserved field drifts the canonical physical identity"
         );
     }
+
+    /// Pins the revision-10 Variant contract and every built-in Variant/Struct layout.
+    ///
+    /// One test owns the persisted shapes a reader depends on: the `0x0d`
+    /// fingerprint tag with no storage children, the fixed depth and size
+    /// limits, each catalogued Variant error's code and detail fields, the
+    /// exact `drift_report`, `eval_summary`, and `resource_entity_refs`
+    /// layouts, and every built-in column revision 10 stores as Variant.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any locked value, layout, code, or detail field drifts.
+    #[test]
+    fn variant_contract_and_builtin_schemas_are_stable() {
+        use wyrd_queue::variant::VariantViolation;
+        use wyrd_spec::vala::api::{VARIANT_MAX_DEPTH, VARIANT_MAX_ENCODED_BYTES};
+
+        assert_eq!(VARIANT_TYPE_TAG, 0x0d);
+        assert_eq!(VARIANT_MAX_DEPTH, 64);
+        assert_eq!(VARIANT_MAX_ENCODED_BYTES, 8_388_608);
+
+        // A Variant commits its name, tag, and zero children; neither the
+        // storage children nor the extension keys enter the identity.
+        let payload = fields::variant("payload", true);
+        let mut metadata = payload.metadata().clone();
+        metadata.insert(fields::WYRD_SENSITIVE.to_owned(), "false".to_owned());
+        let bytes =
+            canonical_physical_fingerprint_bytes(&Fields::from(vec![payload.with_metadata(metadata)]))
+                .expect("a Variant schema encodes");
+        let hex = bytes.iter().fold(String::new(), |mut hex, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        });
+        assert_eq!(
+            hex,
+            "0200000001000000077061796c6f61640d0100000000010000000e777972643a73656e7369746976650000000566616c736500000000"
+        );
+
+        for (violation, code, detail_keys) in [
+            (
+                VariantViolation::InvalidJson { path: "/a".into() },
+                "WYRD_VALA_400_VARIANT_INVALID_JSON",
+                &["field", "path", "row"][..],
+            ),
+            (
+                VariantViolation::NumericOutOfRange {
+                    path: "/n".into(),
+                    numeric_kind: "integer",
+                },
+                "WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE",
+                &["field", "numeric_kind", "path", "row"][..],
+            ),
+            (
+                VariantViolation::TooDeep {
+                    path: "/d".into(),
+                    depth: 65,
+                },
+                "WYRD_VALA_400_VARIANT_TOO_DEEP",
+                &["depth", "field", "limit", "path", "row"][..],
+            ),
+            (
+                VariantViolation::TooLarge { bytes: 9_000_000 },
+                "WYRD_VALA_413_VARIANT_TOO_LARGE",
+                &["bytes", "field", "limit", "row"][..],
+            ),
+        ] {
+            let error = violation.into_error("payload", 3);
+            assert_eq!(error.code(), code);
+            let wire = serde_json::to_value(&error).expect("the error serializes");
+            let mut keys: Vec<&str> = wire["data"]
+                .as_object()
+                .expect("the error carries detail fields")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, detail_keys, "{code} detail fields");
+        }
+
+        let results = (builtin_table("verification", "results")
+            .expect("verification results")
+            .schema)();
+        let layout = |name: &str| -> Vec<(String, bool, bool)> {
+            let field = results.field_with_name(name).expect("the Struct column");
+            assert!(field.is_nullable(), "{name} is a nullable Struct");
+            let DataType::Struct(children) = field.data_type() else {
+                panic!("{name} is a Struct");
+            };
+            children
+                .iter()
+                .map(|child| {
+                    (
+                        child.name().clone(),
+                        child.is_nullable(),
+                        fields::is_variant(child),
+                    )
+                })
+                .collect()
+        };
+        let owned = |entries: &[(&str, bool)]| -> Vec<(String, bool, bool)> {
+            entries
+                .iter()
+                .map(|(name, variant)| ((*name).to_owned(), false, *variant))
+                .collect()
+        };
+        assert_eq!(
+            layout("drift_report"),
+            owned(&[("method", false), ("features", true), ("verdict", false)])
+        );
+        assert_eq!(
+            layout("eval_summary"),
+            owned(&[
+                ("total_tasks", false),
+                ("passed_tasks", false),
+                ("failed_tasks", false),
+                ("pass_rate", false),
+                ("duration_ms", false),
+            ])
+        );
+        assert!(results.field_with_name("details").is_err());
+
+        let entity_ref = DataType::List(Arc::new(Field::new(
+            "entity_ref",
+            DataType::Struct(Fields::from(vec![
+                Field::new("type", DataType::Utf8, false),
+                Field::new(
+                    "id_keys",
+                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+                    false,
+                ),
+                Field::new(
+                    "description_keys",
+                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+                    false,
+                ),
+                Field::new("schema_url", DataType::Utf8, false),
+            ])),
+            false,
+        )));
+        for (namespace, name, variants) in [
+            (
+                "traces",
+                "spans",
+                &["attributes", "resource_attributes", "scope_attributes"][..],
+            ),
+            (
+                "logs",
+                "records",
+                &[
+                    "body",
+                    "attributes",
+                    "resource_attributes",
+                    "scope_attributes",
+                ][..],
+            ),
+            (
+                "metrics",
+                "points",
+                &[
+                    "metadata",
+                    "attributes",
+                    "resource_attributes",
+                    "scope_attributes",
+                ][..],
+            ),
+            ("eval", "observations", &["context", "media"][..]),
+            ("eval", "result_items", &["actual", "expected"][..]),
+            (
+                "gateway",
+                "calls",
+                &["request_payload", "response_payload"][..],
+            ),
+            ("dev", "agent_traces", &["messages", "tool_io"][..]),
+            ("system", "audit_log", &["detail"][..]),
+        ] {
+            let schema = (builtin_table(namespace, name).expect("built-in").schema)();
+            for column in variants {
+                let field = schema
+                    .field_with_name(column)
+                    .unwrap_or_else(|_| panic!("vala.{namespace}.{name}.{column} exists"));
+                assert!(
+                    fields::is_variant(field),
+                    "vala.{namespace}.{name}.{column} is Variant"
+                );
+            }
+            if matches!(namespace, "traces" | "logs" | "metrics") {
+                let refs = schema
+                    .field_with_name("resource_entity_refs")
+                    .expect("signal tables carry entity references");
+                assert!(!refs.is_nullable());
+                assert!(
+                    arrow_type_shape_matches(refs.data_type(), &entity_ref),
+                    "vala.{namespace}.{name}.resource_entity_refs is the locked Struct list"
+                );
+                let DataType::List(element) = refs.data_type() else {
+                    panic!("resource_entity_refs is a list");
+                };
+                let DataType::Struct(children) = element.data_type() else {
+                    panic!("each entity reference is a Struct");
+                };
+                let order: Vec<&str> = children.iter().map(|child| child.name().as_str()).collect();
+                assert_eq!(
+                    order,
+                    ["type", "id_keys", "description_keys", "schema_url"],
+                    "entity reference field order"
+                );
+            }
+        }
+    }
 }

@@ -1,7 +1,7 @@
 ---
 id: SPEC-bifrost-variant
-revision: 2
-status: draft
+revision: 10
+status: approved
 ---
 
 # Queryable open-shaped data in Bifrost
@@ -20,8 +20,9 @@ a faster layout:
 - known shapes are stored as typed Struct columns;
 - open shapes (OTel attributes, log bodies, user JSON payloads) are stored as
   Parquet/Iceberg Variant columns that keep each value's type;
-- the heaviest Variant keys of each file are shredded into typed leaf columns
-  when the file is written and again when it is compacted;
+- each final Scribe hot object and Forge output independently infers useful
+  Variant fields from its first rows and shreds them into standard typed leaf
+  columns; recovery-stage Scribe runs remain unshredded;
 - users query open data with Logfire's `->` and `->>` operators;
 - a query on a shredded key or a Struct field reads only that leaf, filters
   while decoding, and skips row groups by the leaf's statistics;
@@ -101,7 +102,8 @@ Query path:
 
 - Oracle reads published files through the fork's `ArrowReader`
   (`OracleIcebergScanExec`) and hot files through `HotParquetExec`, not
-  DataFusion's `ParquetSource`.
+  DataFusion's `ParquetSource`. Ensure this works for both Interactive and Analytical paths.
+  There should be one shared way.
 - `classify_filter` (`B/oracle/exec.rs:3331`) pushes down only flat
   column-versus-literal predicates; the fork's `expr_to_predicate` handles only
   plain column references.
@@ -119,9 +121,10 @@ Query path:
   expression planner. DataFusion already parses `->` and `->>` to
   `Operator::Arrow` and `Operator::LongArrow`. The follower plan codec decodes
   functions from the session registry.
-- The signed follower scan assignment carries pushed-down predicates as
+- The unsigned follower scan assignment carries pushed-down predicates as
   `ScanPredicate` (`crates/wyrd-spec/src/vala/assignment_authority.rs:77`) with a
-  digest over them.
+  digest over them. Peer mTLS authenticates its origin; the digest binds the
+  assignment bytes to the authenticated peer context.
 - DataFusion 55 cannot skip row groups by nested-leaf statistics (upstream
   `apache/datafusion#20871` is open).
 
@@ -134,9 +137,11 @@ Query path:
 - The built-in table schemas listed in REQ-006 to REQ-011.
 - Struct and Variant columns in user-defined tables, including row `insert`.
 - Variant SQL operators and functions in every Oracle query session.
-- Per-file Variant shredding in Scribe and Forge.
-- Bifrost-owned leaf projection, decode-time filtering, and row-group and page
-  pruning on Struct fields and shredded Variant keys on both read paths.
+- Per-file Variant shredding in final Scribe hot objects and Forge outputs;
+  recovery-stage Scribe runs remain unshredded.
+- DataFusion shared nested-field projection, decode-time filtering, and
+  conservative row-group/page pruning for Struct fields and semantic Variant
+  access on both read paths.
 - Bloom filter sizing and `IN`-list probing.
 - Updating `architecture/bifrost-design.md` to describe the result.
 
@@ -183,6 +188,406 @@ Query path:
 - **Hot path / published path:** Oracle's read of Scribe-owned hot Parquet
   files and of Iceberg-published files.
 
+## Locked contracts
+
+These values and layouts are public or persisted behavior. Implementations do
+not choose alternatives.
+
+### Variant representation, limits, and failures
+
+- `CanonicalType::Variant` and `DataTypeSpec::Variant` represent the Arrow
+  extension named `arrow.parquet.variant`. Its schema-fingerprint tag is the
+  single byte `0x0d`, with no child or parameter bytes. Physical shredded
+  leaves and Iceberg metadata columns are excluded from that fingerprint.
+- Variant maximum depth is the fixed constant `64`; maximum encoded value size
+  is the fixed constant `8_388_608` bytes. They are not configuration knobs.
+  Depth counts the root container as one; size is the canonical encoded Variant
+  value bytes, metadata plus value, before queue reservation or durable write.
+- Conversion uses the already-locked `parquet-variant`,
+  `parquet-variant-compute`, and `parquet-variant-json` crates. No parallel
+  Variant model or validator is introduced.
+- Public failures are catalogued in `wyrd-spec` and keep these exact codes and
+  detail fields:
+
+| Code | Detail fields |
+|---|---|
+| `WYRD_VALA_400_VARIANT_INVALID_JSON` | `field`, `row`, `path` |
+| `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE` | `field`, `row`, `path`, `numeric_kind` |
+| `WYRD_VALA_400_VARIANT_TOO_DEEP` | `field`, `row`, `path`, `depth`, `limit` |
+| `WYRD_VALA_413_VARIANT_TOO_LARGE` | `field`, `row`, `bytes`, `limit` |
+| `WYRD_VALA_400_BIFROST_UNDECLARED_FIELD` | `field`, `row` |
+| `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE` | `field`, `data_type` |
+
+For a write, the existing request-envelope size limit is checked first. Rows
+are then checked in input order and fields in logical-schema order: undeclared
+field, unsupported/wire-mismatched type, Variant byte limit, JSON/extension
+validity, numeric range, then depth. The first failure is returned. Query
+`parse_json` uses `WYRD_VALA_400_VARIANT_INVALID_JSON`; `try_parse_json`
+returns SQL null.
+
+### Persisted built-in Structs
+
+Field order, names, nullability, and child nullability are fixed:
+
+```text
+resource_entity_refs: non-null List<non-null Struct<
+  type: non-null Utf8,
+  id_keys: non-null List<non-null Utf8>,
+  description_keys: non-null List<non-null Utf8>,
+  schema_url: non-null Utf8
+>>
+
+drift_report: nullable Struct<
+  method: non-null Utf8,
+  features: non-null Variant,
+  verdict: non-null Utf8
+>
+
+eval_summary: nullable Struct<
+  total_tasks: non-null Int32,
+  passed_tasks: non-null Int32,
+  failed_tasks: non-null Int32,
+  pass_rate: non-null Float64,
+  duration_ms: non-null Int64
+>
+```
+
+`DriftReport.features` is Variant because feature names are open. The owning
+enum display strings are persisted for `method` and `verdict`. Producers in
+`wyrd-server/src/verification/results.rs`,
+`wyrd-client/src/observe/eval.rs`, gateway capture, agent traces, audit
+publication, and OTLP/canonical signal projection must emit the new shapes;
+their readers, generated contracts, examples, and documentation must consume
+the same shapes. No producer may continue writing the replaced JSON-text or
+protobuf-binary form.
+
+### Queue admission and Arrow normalization
+
+The shared queue has one prepared-row boundary. Its contract is:
+
+```text
+RowPreflight::prepare(destination logical schema, complete input)
+  -> PreparedRows
+Producer::enqueue_prepared(PreparedRows)
+```
+
+`prepare` synchronously validates and normalizes the entire row set, computes
+its exact queue charge, and performs no queue or budget mutation. The producer
+then reserves once and enqueues once. A multi-row call is all-or-none.
+Cancellation before handoff releases the reservation and admits nothing;
+after handoff, the existing stable-batch retry and acknowledgement rules apply.
+No fallible schema or value conversion remains after reservation.
+
+`Bifrost::write_batch(table, batch)` keeps its public signature. At the start
+of the async call it invokes the existing authoritative `describe(table)`
+operation, then normalizes only fields declared Variant in that returned
+logical schema before direct-send admission. A describe or normalization
+failure leaves queue, byte-budget, and direct-send state unchanged. No cache,
+overload, caller-supplied schema, or duplicated inference is added. The server
+accepts only the extension and repeats validation at its trust boundary.
+`wyrd-queue` owns direct Variant JSON/value preparation.
+
+### Oracle registration and distributed wire
+
+One dependency-owning Oracle session registration method installs the `->`
+and `->>` expression planner plus `parse_json`, `try_parse_json`, and `to_json`
+before any logical-plan creation, physical-plan encode/decode, provider
+registration, or execution. Every production leader, admission, follower,
+analytical, and worker session calls it. `ORACLE_VARIANT_SQL_VERSION` is `1`
+and is included in the peer contract fingerprint; a worker refuses a different
+version before decoding a plan.
+
+Follower assignments remain unsigned. Peer mTLS authenticates the sender; the
+assignment digest uses domain `wyrd.oracle.assignment-authority.v8\0` and
+binds the canonical assignment bytes to the authenticated context. The actual
+Scribe/Oracle protobuf at `crates/wyrd/wyrd-tonic/proto/wyrd.v1.proto` changes
+in place; Bifrost has not shipped, so no compatibility fields or alternate wire
+model are retained:
+
+```proto
+enum ScanPredicateOp {
+  SCAN_PREDICATE_OP_UNSPECIFIED = 0;
+  SCAN_PREDICATE_OP_EQ = 1;
+  SCAN_PREDICATE_OP_NOT_EQ = 2;
+  SCAN_PREDICATE_OP_LT = 3;
+  SCAN_PREDICATE_OP_LT_EQ = 4;
+  SCAN_PREDICATE_OP_GT = 5;
+  SCAN_PREDICATE_OP_GT_EQ = 6;
+  SCAN_PREDICATE_OP_IS_NULL = 7;
+  SCAN_PREDICATE_OP_IS_NOT_NULL = 8;
+  SCAN_PREDICATE_OP_IN = 9;
+}
+
+message ScanColumnRef { string column = 1; }
+message ScanStructRef { string column = 1; repeated string fields = 2; }
+message ScanVariantRef { string column = 1; repeated string keys = 2; }
+message ScanLeafRef {
+  oneof kind {
+    ScanColumnRef column = 1;
+    ScanStructRef struct_field = 2;
+    ScanVariantRef variant = 3;
+  }
+}
+message ScanPredicate {
+  ScanPredicateOp op = 1;
+  ScanLeafRef leaf = 2;
+  repeated ScanLiteral literals = 3;
+}
+```
+
+Scalar comparisons require exactly one literal, `IN` requires at least one
+same-typed literal, and null tests require none. Protobuf/domain conversion
+lives only in `crates/wyrd/wyrd-tonic/src/private_conversion.rs` and rejects
+unknown or unspecified operators, a missing leaf, empty column, an empty path,
+empty path segments, the wrong literal cardinality, and mixed `IN` literal
+types. After
+table-schema resolution and before provider construction or execution,
+assignment validation rejects a leaf kind that does not match its declared
+logical root. `FollowerScanAssignment.required_columns` remains the ordered
+top-level output, predicate, and hidden-tenant closure; no second required-leaf
+field is added.
+
+Path elements are whole UTF-8 keys/fields. Canonical digest encoding writes the
+leaf tag (`0`, `1`, `2`), length-prefixed column, segment count and
+length-prefixed segments, then the domain predicate tag (`0..=8` for `Eq`,
+`NotEq`, `Lt`, `LtEq`, `Gt`, `GtEq`, `In`, `IsNull`, `IsNotNull`) and the
+existing canonical literal encoding; `In` adds a `u32` count and preserves
+literal order. The follower verifies mTLS context, peer contract version, and
+digest before plan decode, provider construction, or file IO.
+
+### Semantic Variant access on shared nested-field pushdown
+
+Struct and Variant keep distinct logical semantics and share DataFusion's
+physical nested-field machinery:
+
+- Struct syntax remains DataFusion `GetFieldFunc` / `get_field`, which promises
+  exact field extraction.
+- Literal Variant `->` and `->>` paths lower to one Oracle semantic
+  `variant_get` UDF backed by Arrow-rs `variant_get`. `->>` converts that result
+  to text afterward. Array-index and dynamic paths retain full-root evaluation.
+- The Variant UDF remains in the plan and declares every required physical
+  field: the selected `typed_value`, each path-local residual `value` needed for
+  fallback, and top-level `metadata`.
+- TASK-003's DataFusion fork exposes one narrow owned-plan facade from
+  `datafusion-datasource-parquet`:
+
+```text
+PerFileParquetReadPlanner::plan(PerFileParquetReadInput<'_>)
+  -> Result<PerFileParquetReadPlan>
+
+PerFileParquetReadInput:
+  logical projection physical expressions
+  optional logical filter physical expression
+  file Arrow schema
+  Parquet schema and metadata
+  PhysicalExprAdapterFactory
+
+PerFileParquetReadPlan:
+  ProjectionMask
+  projected Arrow schema
+  optional decoder RowFilter
+  optional row-group PruningPredicate
+  optional page-pruning predicate
+  conservative-fallback reason
+```
+
+  The facade returns this owned plan and never mutates or opens a reader.
+  Missing or invalid field requirements return a successful full-root/no-prune
+  plan with a reason. Genuine metadata or schema errors return a typed
+  DataFusion error.
+- Missing or invalid field requirements select full-root decoding with no
+  statistics pruning, never an error or guessed leaf.
+
+```text
+Struct syntax  -> get_field --------------------\
+                                                   -> logical-column auth
+Variant syntax -> variant_get + field requirements /  -> per-file read plan
+                                                      -> nested projection
+                                                      -> decoder filtering
+                                                      -> conservative pruning
+```
+
+DataFusion owns that one generic physical projection, decoder-filter, and
+statistics-pruning path without pretending Variant is exact Struct extraction.
+Variant owns path interpretation, standard layout requirements,
+missing/null/conversion semantics, and residual fallback. `HotParquetExec` and
+the pinned Iceberg `ArrowReader` call the exact same facade after their own
+footer/schema discovery, apply its returned plan, and report through their
+existing metrics. The facade owns no Wyrd metrics or IO. Interactive,
+Analytical, leader, and follower paths therefore cannot drift. No Wyrd
+Variant-specific projector, filter, pruner, general read-planning abstraction,
+or second reader is added.
+
+TASK-001 implements `variant_get`, SQL lowering, session registration, codec
+round trips, and full-root/residual correctness against the current workspace
+DataFusion source. TASK-003 alone owns the DataFusion fork, physical field
+requirements, facade, and workspace repin. That DataFusion 55 fork backports
+PR `#25013` at reviewed head
+`cfc4298af54ee1301c38b675372288d1b385c6e9`, preserving its separate
+`struct_field_access()` and
+`required_input_fields(ReturnFieldArgs) -> InputFieldRequirement` contracts.
+It also imports the nested row-group statistics patch at
+`0b0506a9acab9d5892ecf7e89243c3b34664bcc6`, rebased on that capability.
+The writable fork is `https://github.com/bohmian-ai/datafusion`, based on the
+immutable DataFusion `55.0.0` commit
+`d5552342012888b7d1a3ab88d92e3d292fc0cde0`. The reviewed source remote for
+both patch series is `https://github.com/peterxcli/datafusion`: PR `#25013`
+ends at `cfc4298af54ee1301c38b675372288d1b385c6e9`, and nested-statistics PR
+`#2` is `0b0506a9acab9d5892ecf7e89243c3b34664bcc6`. The expected sibling checkout
+is `/home/thorrester/Documents/GitHub/datafusion`.
+
+One immutable workspace-level `[patch.crates-io]` source override pins
+`datafusion`, `datafusion-common`, `datafusion-datasource-parquet`,
+`datafusion-expr`, `datafusion-functions`, `datafusion-physical-expr`,
+`datafusion-physical-expr-adapter`, and `datafusion-pruning` to the same tested
+Wyrd fork revision. The workspace, iceberg-rust, iceberg-datafusion,
+compaction, and datafusion-distributed consequently share one DataFusion source
+and type universe.
+These patches are removed when a released DataFusion provides equivalent
+capabilities; the UDF, standard files, and query behavior do not change.
+
+### Per-output-file shredding policy
+
+Scribe recovery-stage Parquet runs written by `encode_batch` retain the stable,
+unshredded logical Variant schema. `StagedRunMerge` therefore continues to
+merge exact schemas, and `staging_runtime::restore_context` can reconstruct and
+publish those runs after the WAL is retired without reconciling independently
+inferred physical layouts. No staging format, schema union, or recovery-only
+layout protocol is added.
+
+The pinned iceberg-rust fork is the single owner of the pure analyzer and the
+Arrow `ShreddedSchemaBuilder` / `shred_variant` schema-application wrapper,
+beside `ParquetWriterBuilder`. Scribe `encode_ordered_claim` calls that pure
+fork-owned API at its final-object boundary. `encode_batch` bypasses it.
+
+For Forge, the same fork provides one concrete
+`VariantParquetWriterBuilder` implementing the existing `FileWriterBuilder`.
+Each `build(output)` returns a fresh deferred writer with no opened Parquet
+encoder. That writer buffers only its output's prefix, infers the physical
+schema, constructs the ordinary Parquet writer, replays once, and streams.
+Builder clones contain policy constants only and never sample state.
+Compaction-core supplies this builder to the existing `RollingFileWriterBuilder`;
+each rollover therefore creates a new inference owner without changing the
+five-field Forge result handoff or commit authority. No Wyrd strategy framework
+or reverse dependency from the fork to Wyrd is added. Wyrd supplies the row,
+byte, frequency, candidate, emitted-child, and depth bounds as internal
+constructor values, never as public or persisted configuration.
+
+Each final Scribe hot object opened by `encode_ordered_claim` and each Forge
+output file independently retains a prefix ending
+when either 4,096 rows or 67,108,864 bytes (64 MiB) of retained Arrow memory is
+reached. Retained memory uses the writer's existing accounting measure for
+Arrow backing buffers and is charged to existing memory admission. The buffer
+does not copy Variant values unnecessarily and is not a second untracked memory
+owner.
+
+Before retaining a row or batch slice that would cross the byte bound, the
+writer stops buffering and opens from the prefix it already owns. If the first
+row alone exceeds 64 MiB, it is the sole progress exception: retain it, fully
+charge its backing memory, infer from it, and open immediately. Reaching either
+limit runs inference, constructs the standard physical schema, opens the
+Parquet writer, replays the buffer once, releases its retained-memory charge,
+and streams subsequent rows. Close infers from a shorter prefix; empty output
+creates no file. Every rollover starts a new buffer. Success, error,
+cancellation, and retry release or transfer every charge exactly once.
+Scribe charges the prefix to its existing writer admission. Forge's existing
+task reservation includes one 67,108,864-byte prefix for every concurrently
+open output writer. On rollover, the completed writer releases or transfers
+its charge and the new deferred writer begins with fresh sample state; close
+completion may remain concurrent under the existing rolling writer.
+
+For each top-level Variant column, inference ignores nulls for type choice.
+A field is eligible only when sampled observations belong to one compatible
+family. Integer widths widen together and decimal widths widen together;
+incompatible scalar families and scalar/container mixtures remain residual.
+Fields present in at least 10% of sampled non-null root Variant values are
+eligible. At each object node, inference tracks at most 1,000 candidate
+children, keeps at most 300 eligible children by observation frequency with
+unsigned UTF-8/alphabetical tie-breaking, and emits them alphabetically.
+Traversal stops at depth 50. Arrays remain residual in this change.
+
+Arrow 59.3 `ShreddedSchemaBuilder` and `shred_variant` apply the inferred
+schema. Later incompatible values use the standard residual `value`; sampling
+changes performance only, never correctness. The standard Parquet
+`metadata`/`value`/`typed_value` physical schema is the sole persisted layout
+authority. There is no Wyrd summary, footer key, staged-run merge protocol,
+table-wide shredded schema, spill, strategy abstraction, or configuration.
+
+The 4,096-row and 64-MiB limits are internal writer-policy constants, not
+public, wire, table, fingerprint, or persisted contracts. Measurements may tune
+them later without changing file compatibility or query behavior.
+
+### Safe pruning and hidden row lineage
+
+A standard shredded path may still carry incompatible later values in its
+path-local residual `value`. Its typed-leaf statistics or page index may
+exclude a row group/page only when that corresponding residual `value`
+statistics prove all null and the predicate literal/cast has the same type.
+Otherwise Oracle evaluates the semantic `variant_get` with residual and
+metadata inputs. Missing, malformed, incomplete, or type-incompatible evidence
+always means no pruning.
+Authorization of the logical source column happens before leaf resolution or
+IO.
+
+Iceberg metadata columns remain internal. Forge reads `_row_id` and
+`_last_updated_sequence_number` beside the logical projection, carries them in
+its internal physical batch, and writes those exact values for every surviving
+row. They never enter the public schema or fingerprint. The existing five-field
+Forge rewrite handoff is unchanged; lineage evidence stays in its output
+`DataFile`s. Missing, null, duplicate, or unencodable lineage fails the rewrite
+before commit, publishes no output, and follows the existing retry/recovery
+identity.
+
+### Nested-field performance evidence
+
+The performance evidence is one direct, opt-in nested-field microbenchmark,
+not the 10-million-row Bifrost capacity workload and not a before/after suite.
+It follows the published Logfire/DataFusion shape: `262_144` rows, `8_192`-byte
+string siblings, local Parquet files, optimized code only, Criterion medians,
+and a compact result table. It runs the actual nested-field planning and
+physical read path without a server, Postgres, network, or concurrent load.
+
+The benchmark has narrow, wide, and nested logical objects in both forms:
+
+- fixed Arrow/Parquet Struct; and
+- standard Parquet Variant whose selected paths are shredded into equivalent
+  `typed_value` struct leaves while metadata/residual and large siblings remain
+  physically present.
+
+`narrow` contains one 8 KiB string sibling and one `Int32`; `wide` contains
+four 8 KiB string siblings and one `Int32`; `nested` contains an inner 8 KiB
+string plus `Int32` and an outer 8 KiB string. A top-level `Int32` id supports
+the two-column case. Values vary enough that Parquet cannot collapse the large
+siblings to a constant dictionary entry.
+
+It reports these cases for each applicable Struct and Variant form:
+
+| Shape/case | Published optimized reference |
+|---|---:|
+| `wide/select_small_field` | 419 µs |
+| `wide/sum_small_field` | 638 µs |
+| `wide/select_one_string_field` | 671 µs |
+| `nested/select_extra_string` | 685 µs |
+| `nested/select_inner_small_field` | 450 µs |
+| `nested/sum_inner_small_field` | 662 µs |
+| `narrow/select_small_field` | 422 µs |
+| `narrow/select_id_and_small_field` | 445 µs |
+
+Every case first asserts the exact result, the correct logical expression
+(`get_field` for Struct or `variant_get` for Variant), the expected physical
+field requirements, and read metrics showing that no unselected sibling leaf
+was read. Variant may read only the metadata and path-local residual fields its
+semantic UDF declared. Timing starts only after fixture creation and session
+registration. There is no full-object baseline and no speedup ratio.
+
+The benchmark uses whatever CPU and memory are available, like an ordinary
+Criterion benchmark. It records local medians and selected-leaf metrics without
+hardware detection, resource reservation, host-load qualification, or absolute
+latency pass/fail thresholds. The published optimized values above identify the
+workload and expected order of magnitude; they are comparison context, not a
+gate across unlike machines. Functional result, plan-shape, and selected-leaf
+IO assertions fail on every machine.
+
 ## Required behavior
 
 ### Storage format
@@ -191,14 +596,17 @@ Query path:
 
 Every Bifrost table, built-in and user-defined, is created as Iceberg format
 v3. Physical-table validation refuses a table that is not v3. Forge
-maintenance, including garbage collection, operates on v3 tables.
+maintenance, including garbage collection, operates on v3 tables. This is the
+only initial format: non-v3 input is unsupported, not a migration or mixed-
+version rollout case. Creation and REQ-002 rewrite behavior land together.
 
 #### REQ-002 — Row lineage survives compaction
 
 Appended files assign row ids through the v3 first-row-id mechanism. A Forge
 rewrite preserves each surviving row's `_row_id` and
 `_last_updated_sequence_number`, so a row keeps the same lineage identity
-across any number of compactions.
+across any number of compactions. The hidden lineage columns follow the locked
+internal transport and never appear in the logical table schema.
 
 #### REQ-003 — Variant column type
 
@@ -399,7 +807,10 @@ analytical leader, analytical planning, and distributed worker) provides:
 - Struct field access with DataFusion's existing `s['field']` syntax.
 
 `->` and `->>` apply to Variant columns. A JSON text column is queried with
-`parse_json(column) ->> 'key'`.
+`parse_json(column) ->> 'key'`. Literal object-key chains lower to the semantic
+`variant_get` UDF backed by Arrow-rs; `->>` adds text conversion after that
+result. Struct access remains exact DataFusion `get_field`. Dynamic Variant
+paths retain full-root evaluation.
 
 #### REQ-018 — Query results
 
@@ -415,8 +826,8 @@ renders a Variant as its JSON value.
 #### REQ-019 — Stable failures
 
 Invalid JSON in `parse_json`, a numeric value no Variant type can hold, a
-Variant nested beyond the configured depth limit, and a Variant exceeding the
-configured size limit fail with stable catalog codes before acknowledgement
+Variant nested beyond depth 64, and a Variant exceeding 8,388,608 encoded bytes
+fail with stable catalog codes before acknowledgement
 (writes) or as a query error (queries). They are never truncated or stored
 partially.
 
@@ -424,26 +835,44 @@ partially.
 
 #### REQ-020 — Per-file layout
 
-For each top-level Variant column of each file Scribe or Forge writes, the
-writer considers every path that reaches a scalar value through objects only,
-at any depth up to the configured Variant depth limit, and shreds at most 128
-of them: those with the largest total value size in that file's input, ties
-broken by path. A nested path is shredded as nested typed groups, so
-`order` → `customer` → `tier` becomes its own leaf. A path's shredded type is
-the type of its values in that input, widened from integer to double when both
-occur. A path whose scalar types conflict beyond that widening is not
-shredded. Values that do not match a shredded path's type, and every value at
-an unshredded path, stay in the residual value.
+Scribe recovery-stage runs written by `encode_batch` remain unshredded and use
+the stable logical Variant schema. Each final Scribe hot object written by
+`encode_ordered_claim` and each Forge output independently retains a prefix
+until it reaches either 4,096 rows or 67,108,864 bytes of retained Arrow
+backing memory. The writer uses its existing memory-accounting measure and admission.
+It stops before accepting a row or batch slice that would cross the byte bound;
+if the first row alone exceeds it, that row is retained and fully charged as a
+progress exception. Reaching either limit infers the standard shredded schema,
+opens the writer, replays the prefix once, and streams the remainder. Each
+rollover infers again; close analyzes a shorter prefix; empty output creates no
+file. Buffer charges are released exactly once on success, error, cancellation,
+and retry. Scribe charges its existing writer admission. Forge's existing task
+reservation includes one 67,108,864-byte prefix per concurrently open output.
+
+For each top-level Variant column, nulls do not choose a type. Fields observed
+in at least 10% of sampled non-null root Variant values are eligible when their
+observations belong to one compatible family. Integer widths and decimal widths
+widen within their families; incompatible scalar families and
+container/scalar mixtures remain residual. At each object node the writer
+tracks at most 1,000 candidate children and keeps at most 300 by frequency,
+breaking ties by unsigned UTF-8/alphabetical name and emitting alphabetically.
+Traversal stops at depth 50. Arrays remain residual.
 
 #### REQ-021 — Choosing the layout without a second pass
 
-Scribe's staged runs are written unshredded and record, for each Variant
-column, a bounded summary of total value size per path. When Scribe assembles
-a published artifact it combines its runs' summaries to choose the layout
-before writing. Every file Scribe or Forge writes records its per-path size
-summary in its Parquet footer, and Forge chooses a compaction output's layout
-from its input files' summaries. The layout chosen for the same inputs is
-always the same.
+The pinned iceberg-rust fork owns the one pure analyzer and Arrow 59.3
+`ShreddedSchemaBuilder` / `shred_variant` wrapper. Scribe calls them for final
+hot objects. Forge uses the fork's `VariantParquetWriterBuilder`: each existing
+rolling-writer `build(output)` creates a fresh deferred writer that samples
+before opening its ordinary Parquet encoder; clones contain only internal
+policy constants. Later incompatible values go to the standard residual
+`value`, so the sample changes performance only. The Parquet
+`metadata`/`value`/`typed_value` schema is the only persisted layout authority;
+no Wyrd summary or layout metadata is written or required. Forge independently
+re-infers every output of its 1-GiB compaction target and never inherits or
+merges input-file selection evidence. Scribe infers only after its unshredded
+staged runs enter a final hot-object merge; it never infers or persists a
+shredded recovery run.
 
 #### REQ-022 — Shredded files are read correctly everywhere
 
@@ -455,9 +884,14 @@ hot or published; and before and after compaction.
 
 #### REQ-023 — Leaf projection
 
-A query that reads a Struct field or a shredded Variant path, at any depth,
-reads only that leaf's column chunks on both read paths, never the whole
-Struct or Variant column. An unshredded path reads the residual value.
+A Struct field remains exact `get_field`. A literal Variant path remains
+semantic `variant_get` and declares the selected `typed_value`, necessary
+path-local residual `value`, and top-level `metadata` fields to DataFusion's
+shared nested projection machinery. The one DataFusion per-file read-planning
+facade supplies both readers with the leaf projection mask, projected Arrow
+schema, adapted decoder row filter, and row-group/page pruning predicates.
+Unshredded, missing, invalid, or incompatible layouts use full-root residual
+evaluation with no statistics pruning.
 
 #### REQ-024 — Leaf filtering and row-group skipping
 
@@ -469,17 +903,23 @@ shredded Variant path, at any depth:
   `v -> 'a' -> 'b' ->> 'k'` (string-shredded paths), `CAST(<that> AS t)`
   (paths shredded as a matching type), or `s['a']['b']`.
 
-Pushed-down predicates filter rows while decoding and skip row groups and
-pages whose leaf statistics or page indexes exclude them. In a file where the
-path is not shredded, the predicate is evaluated after reading, with the same
-result. Any other predicate shape is evaluated by the query engine, with the
+DataFusion's shared nested-field pipeline handles both logical forms while
+retaining `get_field` and `variant_get` semantics. It filters while decoding and
+skips row groups and pages only when the corresponding Variant residual is
+all-null and the predicate type matches, or when fixed Struct statistics are
+complete. Otherwise the residual value is read and the predicate is evaluated
+normally. Any other predicate shape is evaluated by the query engine with the
 same result.
 
 #### REQ-025 — Distributed scans carry leaf predicates
 
-The signed follower scan assignment carries leaf predicates (a column plus a
-Struct field or Variant key path, an operator, and literals), covered by the
-assignment digest. The wire and digest format change in place.
+The unsigned follower scan assignment carries the locked `ScanLeafRef` oneof,
+`ScanPredicateOp`, and literal-cardinality contract defined above in the actual
+`wyrd.v1.proto`, covered by the v8 assignment digest. The sole protobuf/domain
+conversion validates every operator, leaf, path, and literal list; resolved
+schema validation rejects incompatible logical root kinds before execution.
+Peer mTLS authenticates the sender. The wire and digest format change in place;
+no signature, compatibility message, or unsigned side channel is added.
 
 #### REQ-026 — Exact column matching
 
@@ -507,7 +947,9 @@ retyped. A value Bifrost cannot store is refused with a stable code.
 #### INV-003 — Shredding is invisible to results
 
 Shredding layouts, their per-file differences, and compaction never change
-query results, schema fingerprints, or the logical schema users see.
+query results, schema fingerprints, or the logical schema users see. Scribe
+recovery-stage runs remain unshredded, mergeable, and restartable after WAL
+retirement; only their final hot object selects a shredded layout.
 
 #### INV-004 — Sensitive data stays gated
 
@@ -528,15 +970,20 @@ footer, Scribe, Oracle, and plan-root tripwires.
 
 #### INV-007 — Bounded processing
 
-Variant conversion, key summaries, and shredding layout selection are bounded
-in nesting depth, value size, and tracked keys before allocation or durable
-mutation.
+Variant conversion and per-file inference are bounded by value depth/size, the
+4,096-row or 64-MiB admitted Arrow buffer (with the single-row progress
+exception), 50-level inference depth, 1,000 tracked children per object node,
+and 300 emitted children per object node.
 
-#### INV-008 — One reader per path
+#### INV-008 — One nested-field pushdown pipeline
 
-The change extends the existing Oracle hot reader and the fork's Iceberg
-reader through one shared Bifrost leaf resolver and pruner. No parallel reader,
-harness, or ingest path is introduced.
+Struct remains exact DataFusion `get_field`; Variant remains semantic
+`variant_get` backed by Arrow-rs and declares its required physical Struct
+fields. Both feed DataFusion's shared nested projection, decoder filtering, and
+conservative statistics pruning through the one TASK-003-owned per-file
+read-planning facade used by both Oracle readers. No Variant-specific physical
+optimizer, parallel reader, general Wyrd planner abstraction, harness, or
+ingest path is introduced.
 
 ## Externally observable behavior
 
@@ -555,21 +1002,41 @@ harness, or ingest path is introduced.
 ## Material constraints
 
 - Server behavior stays in Rust; `wyrd-spec` remains IO-free and PyO3-free.
-- Existing Arrow 59, Parquet 59.3, DataFusion 55, and the pinned iceberg-rust
-  and compaction-core forks remain the dependency set. Variant support comes
-  from `parquet-variant`, `parquet-variant-compute`, and `parquet-variant-json`,
-  already in the lockfile through the iceberg fork. `datafusion-variant` is not
-  adopted.
-- Fork changes (shredded Variant read, Variant path predicates through the
-  metrics, Bloom, page-index, and row-filter evaluators, nested Struct field
-  references, shredded writer statistics, row-lineage preservation in
-  compaction) land on the pinned forks and are re-pinned.
+- Add direct workspace dependencies on the existing Arrow 59.3
+  `parquet-variant`, `parquet-variant-compute`, and `parquet-variant-json`
+  versions only where imported: JSON/value preparation in `wyrd-queue`, and
+  Variant query kernels in `vala-bifrost-redux`. The pinned iceberg-rust fork
+  owns the shared analyzer and standard shredding wrapper used by Scribe and
+  Forge.
+  DataFusion, Parquet, and Iceberg remain out of client-tier crates.
+- TASK-003 alone bootstraps the writable
+  `https://github.com/bohmian-ai/datafusion` fork from immutable v55 commit
+  `d5552342012888b7d1a3ab88d92e3d292fc0cde0`, then rebases the reviewed
+  `https://github.com/peterxcli/datafusion` changes ending at PR `#25013` head
+  `cfc4298af54ee1301c38b675372288d1b385c6e9` and nested-statistics patch
+  `0b0506a9acab9d5892ecf7e89243c3b34664bcc6`, plus the locked owned-plan
+  facade; record and push the tested fork revision. The exact eight
+  `[patch.crates-io]` entries listed above use that one revision, and focused
+  metadata verification rejects another source or revision. TASK-001 remains
+  on the current workspace source until TASK-003 performs the single repin.
+- In the pinned Iceberg fork, the concrete `VariantParquetWriterBuilder`
+  implements `FileWriterBuilder`, defers ordinary Parquet encoder creation
+  until one output's prefix is analyzed, and retains the logical Iceberg schema
+  for field identity and `DataFile` metadata. The reader validates standard
+  shredded layouts with `VariantArray::try_new`; whole-Variant projections
+  `unshred_variant` before cross-file union, while pushed literal paths project
+  required leaves and run `variant_get` before union. It never constructs a
+  table-wide union of incompatible `typed_value` schemas.
+- Repin to released DataFusion and iceberg-rust APIs once they provide the same
+  capabilities. Standard Parquet files and Wyrd SQL behavior remain unchanged.
 - Generated schemas, OpenAPI, stubs, and goldens are regenerated, never
   hand-edited.
-- The change ships in at most three tasks: (1) Variant storage, Iceberg v3,
-  built-in tables, query operators, and Bloom sizing; (2) user-defined Struct
-  and Variant tables in all SDKs, depending on 1; (3) shredding, leaf
-  projection, pushdown, and pruning, depending on 1 and parallel to 2.
+- The change ships in at most three tasks: (1) Variant storage, Iceberg v3 and
+  lineage-safe compaction as one atomic capability, built-in tables, query
+  operators, and Bloom sizing; (2) user-defined Struct and Variant tables in
+  all SDKs, depending on 1; (3) shredding, leaf projection, pushdown, and
+  pruning, depending on 1 and parallel to 2. No releasable state enables v3
+  creation before lineage-safe Forge rewriting exists.
 - `architecture/bifrost-design.md` is updated to describe Iceberg v3, the
   Variant type and its query surface, shredding, leaf pruning, and the
   duplicate-key rule before completion.
@@ -578,15 +1045,17 @@ harness, or ingest path is introduced.
 
 ```text
 OTLP or canonical Arrow
-  -> table-owned projection to the logical schema (Variant, Struct, promoted)
-  -> Scribe WAL and staged runs (unshredded, per-path size summaries)
-  -> Scribe artifact assembly (layout from combined summaries, shredded write,
-     footer summary)
-  -> Forge compaction (layout from input footers, shredded write, row lineage
-     preserved)
-  -> Oracle: session operators and functions; leaf predicates in the signed
-     assignment; shared leaf resolver per file; leaf projection, decode filter,
-     row-group and page pruning on hot and published paths
+  -> table-owned logical schema (Variant, Struct, promoted)
+  -> Scribe encode_batch writes unshredded recovery-stage runs
+  -> encode_ordered_claim merges them into one final hot-object stream
+  -> fork-owned analyzer handles the final Scribe object
+  -> RollingFileWriter build(output) creates a fresh deferred Forge writer
+  -> that final Scribe/Forge output retains at most 4,096 rows or 64 MiB
+  -> fork-owned Arrow ShreddedSchemaBuilder + shred_variant wrapper
+  -> standard Parquet metadata/value/typed_value file
+  -> Oracle keeps Struct get_field or semantic Variant variant_get
+  -> one DataFusion per-file facade plans projection/filter/pruning
+  -> shared nested projection, decoder filter, conservative pruning
   -> SDK result terminals (native values or Arrow extension)
 ```
 
@@ -630,23 +1099,37 @@ stable query error; `try_parse_json` returns null.
 
 #### AC-006 — Shredding equivalence
 
-A Rust Bifrost test writes nested data whose paths vary in size and type
-across files,
-and shows that the chosen layouts follow REQ-020, are identical when the same
-input is rewritten, and that a fixed set of queries returns identical results
-over hot files, published files, and compacted files, and with shredding
-disabled for comparison in the test.
+A Rust Bifrost test covers row-first and byte-first limits, the oversized-first-
+row progress exception, short close, empty output, rollover, charge release on
+every terminal, later incompatible values, and independent Scribe/Forge
+inference. A recovery test stages unshredded Variant runs whose values would
+select different physical layouts, retires the WAL after staged durability,
+stops before publication, restores and merges those exact-schema runs, and
+publishes one shredded hot object exactly once with no duplicate. Standard
+Forge tests force two rolls to choose different physical layouts while close
+completion may remain concurrent, with exact logical values and unchanged
+`DataFile` and five-field handoff evidence. Standard
+unshredded, partially shredded, differently shredded, hot, published, and
+twice-compacted files return identical logical values while v3 row lineage
+remains stable.
 
 #### AC-007 — Leaf reads and pruning
 
-Rust Bifrost tests on both read paths show, from Oracle read metrics, that a
-query on a shredded top-level key, a shredded nested path, or a nested Struct
-field reads only that leaf and skips row
-groups and pages its statistics exclude, including in a distributed query
-whose follower receives the leaf predicate in its signed assignment. A
+Rust Bifrost tests on both read paths show that Struct uses `get_field` and
+Variant uses `variant_get`, while both produce the same physical nested-field
+requirements and the same DataFusion per-file facade outputs: projection mask,
+projected schema, decoder row filter, row-group predicate, and page predicate.
+Oracle metrics prove
+selected-leaf reads, correct residual fallback, and conservative row-group/page
+skipping, including in a distributed query whose follower receives the leaf
+predicate through the revised protobuf and its unsigned, digest-protected
+assignment. Conversion tests round-trip every leaf/operator form and reject
+every malformed cardinality, path, tag, and logical-root combination. A
 regression test shows a Struct field named like a top-level column is matched
-correctly on the hot path. A benchmark records bytes read and latency for a
-shredded-key filter against the same filter on an unshredded key.
+correctly on the hot path. The locked nested-field microbenchmark proves the
+optimized Struct and shredded-Variant cases read only selected leaves and
+records the compact after-state timing table; no 10-million-row capacity run or
+before/after comparison is part of this acceptance obligation.
 
 #### AC-008 — Sensitive data stays gated
 
@@ -662,8 +1145,9 @@ Bloom column skips row groups that hold none of its values.
 
 #### AC-010 — Verification
 
-Format, lints, `codegen:check`, `test:bifrost` (all tiers and languages), and
-the boundary checks for the touched surfaces pass.
+Format, lints, `codegen:check`, `test:bifrost` (all tiers and languages),
+`docs:check`, `check:docs`, `check:examples`, and the boundary checks for the
+touched surfaces pass.
 
 ## Open material decisions
 
@@ -671,7 +1155,73 @@ None.
 
 ## Revision history
 
-- **Revision 2 (2026-10-05, draft):** Shredding chooses scalar paths at any
+- **Revision 10 (2026-10-05, approved):** Assigns the one pure Variant analyzer
+  and schema wrapper to the iceberg-rust fork and adds its concrete deferred
+  `VariantParquetWriterBuilder`, so each existing Forge rollover owns an
+  independent sample without changing the handoff. Locks Forge prefix memory
+  reservation. Creates and names the writable `bohmian-ai/datafusion` fork,
+  immutable v55 base, patch source, sibling checkout, eight source overrides,
+  and owned `PerFileParquetReadPlan` facade contract. Corrects OTLP proof
+  selectors and adds the docs-site and example gates. TASK-002 is unchanged.
+- **Revision 9 (2026-10-05, approved):** Keeps `encode_batch` recovery-stage
+  Parquet runs unshredded so exact-schema staged merges and restart after WAL
+  retirement remain safe; only `encode_ordered_claim` final hot objects and
+  Forge outputs infer layouts. Assigns all DataFusion fork/repin work to
+  TASK-003 and requires one narrow `datafusion-datasource-parquet` per-file
+  read-planning facade used by both Oracle readers for projection, decoder
+  filtering, and row-group/page pruning. Specifies the in-place
+  `wyrd.v1.proto` `ScanLeafRef`, `IN`, literal-cardinality, conversion,
+  validation, and peer round-trip contract. TASK-002 is unchanged.
+- **Revision 8 (2026-10-05, approved):** Supersedes the fixed 100-row sample
+  with a per-output-file prefix bounded by 4,096 rows or 64 MiB of retained
+  Arrow backing memory, whichever arrives first. It fixes stop-before-crossing,
+  the oversized-first-row progress exception, existing admission accounting,
+  exact charge release, rollover/close behavior, and independent Forge
+  re-inference. These limits are internal tuning policy, not persisted or
+  public compatibility contracts. The standard Variant layout and Iceberg-
+  style analyzer remain unchanged.
+- **Revision 7 (2026-10-05, approved):** Corrects the logical query contract:
+  Struct remains exact `get_field`, while Variant remains Arrow-backed semantic
+  `variant_get` and declares typed, residual, and metadata fields to
+  DataFusion's shared physical nested-field machinery. Replaces the Wyrd
+  top-128 summary/footer protocol with Apache Iceberg's independently inferred
+  per-output-file policy: 100 buffered rows, 10% frequency, 300 emitted and
+  1,000 tracked children per object node, depth 50, standard Arrow shredding,
+  and no Wyrd layout metadata. Fixes direct dependency/fork seams,
+  `write_batch` schema acquisition through `describe(table)`, clean Python and
+  TypeScript setup, and fresh-v3-only wording.
+
+- **Revision 6 (2026-10-05, approved):** Makes the focused nested-field
+  benchmark an ordinary resource-adaptive Criterion run. It uses whatever host
+  resources are available and reports local medians; there is no prescribed
+  machine, reservation, load qualification, or absolute latency gate. The
+  published optimized values remain workload context only.
+- **Revision 5 (2026-10-05, approved):** Replaces the unrelated 10-million-row
+  query-capacity benchmark with one readable after-state nested-field
+  microbenchmark aligned to Logfire/DataFusion: 262,144 rows, 8 KiB string
+  siblings, narrow/wide/nested Struct and equivalent shredded-Variant cases,
+  selected-leaf IO assertions, and published optimized reference values. No
+  baseline or speedup ratio.
+- **Revision 4 (2026-10-05, approved):** Locks one nested-field query
+  architecture with no permitted Variant-specific optimizer. Literal-key
+  Variant `->`/`->>` and nested Struct access normalize to DataFusion's
+  flattened `get_field` representation, then share authorization, per-file leaf
+  binding, projection, decode filtering, and row-group/page pruning. Standard
+  Parquet Variant shredded `typed_value` fields enter this Struct pushdown path;
+  absent or unsafe typed leaves bind to the residual Variant. `LeafRef` is only
+  its distributed wire projection.
+- **Revision 3 (2026-10-05, approved):** Addresses the readiness review by
+  making Iceberg v3 activation atomic with lineage-safe compaction; fixing the
+  Variant limits, errors, fingerprint, Struct layouts, queue preflight, Oracle
+  registration, unsigned follower wire/digest, and producer/consumer closure;
+  and defining one bounded exact summary. Summary overflow conservatively
+  writes an unshredded file, avoiding approximation, spills, or new operational
+  state. Safe pruning requires homogeneous complete leaf evidence. Follow-up
+  primary-source research confirmed that Logfire publicly specifies per-file
+  top-128 selection and residual fallback, but not its closed-source memory or
+  footer implementation; the bounded summary and nested Parquet Variant format
+  here are therefore explicit Wyrd contracts, not attributed Logfire internals.
+- **Revision 2 (2026-10-05, approved):** Shredding chooses scalar paths at any
   depth, not only top-level keys, because nested JSON payloads are the common
   case for user tables; `parquet-variant-compute` 59.3 builds nested shredded
   groups by path. Arrays stay unshredded. Leaf projection and pushdown apply to
@@ -700,4 +1250,10 @@ None.
 - `changes/active/bifrost-canonical-otel-signals/spec.md`
 - Pydantic, "Struct field pushdown": https://pydantic.dev/articles/struct-field-pushdown
 - Pydantic, "Bloom filter folding": https://pydantic.dev/articles/bloom-filter-folding-parquet-logfire
-- `apache/datafusion#20871`
+- Pydantic, "Dynamic JSON attribute shredding in Logfire": https://pydantic.dev/articles/dynamic-shredding-2026-01-26
+- Apache Parquet, `VariantShredding.md`: https://github.com/apache/parquet-format/blob/master/VariantShredding.md
+- Apache Iceberg configuration: https://github.com/apache/iceberg/blob/main/docs/docs/configuration.md
+- Wyrd DataFusion fork: https://github.com/bohmian-ai/datafusion
+- Apache DataFusion PR `#25013`: https://github.com/apache/datafusion/pull/25013
+- Nested-statistics PR: https://github.com/peterxcli/datafusion/pull/2
+- Apache DataFusion issue `#20871`: https://github.com/apache/datafusion/issues/20871

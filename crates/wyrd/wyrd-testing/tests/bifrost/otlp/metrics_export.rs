@@ -119,8 +119,8 @@ fn flatten_exemplar_values(node: &mut serde_json::Value) {
 /// Tests that need Postgres, a bound server, and the publication boundary.
 mod pg_tests {
     use arrow::array::{
-        Array, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array,
-        LargeBinaryArray, ListArray, StringArray, StructArray,
+        Array, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array, ListArray,
+        StringArray, StructArray,
     };
     use arrow::record_batch::RecordBatch;
 
@@ -186,8 +186,8 @@ mod pg_tests {
         );
         assert_eq!(column::<StringArray>(row, "unit").value(0), METRIC_UNIT);
         assert_eq!(
-            column::<LargeBinaryArray>(row, "metadata").value(0),
-            support::canonical_attribute_bytes(&support::metric_metadata()),
+            support::variant_json(column::<StructArray>(row, "metadata")),
+            support::expected_attributes(&support::metric_metadata()),
             "{transport} keeps metric metadata distinct from point attributes"
         );
         assert_eq!(column::<Int64Array>(row, "time_unix_nano").value(0), time);
@@ -197,13 +197,13 @@ mod pg_tests {
         );
         assert_eq!(column::<Int64Array>(row, "flags").value(0), METRIC_FLAGS);
         assert_eq!(
-            column::<LargeBinaryArray>(row, "attributes").value(0),
-            support::canonical_attribute_bytes(&support::point_attributes())
+            support::variant_json(column::<StructArray>(row, "attributes")),
+            support::expected_attributes(&support::point_attributes())
         );
         assert!(column::<BooleanArray>(row, "resource_present").value(0));
         assert_eq!(
-            column::<LargeBinaryArray>(row, "resource_attributes").value(0),
-            support::canonical_attribute_bytes(&support::resource_attributes())
+            support::variant_json(column::<StructArray>(row, "resource_attributes")),
+            support::expected_attributes(&support::resource_attributes())
         );
         assert_eq!(
             column::<Int64Array>(row, "resource_dropped_attributes_count").value(0),
@@ -223,8 +223,8 @@ mod pg_tests {
             SCOPE_VERSION
         );
         assert_eq!(
-            column::<LargeBinaryArray>(row, "scope_attributes").value(0),
-            support::canonical_attribute_bytes(&support::scope_attributes())
+            support::variant_json(column::<StructArray>(row, "scope_attributes")),
+            support::expected_attributes(&support::scope_attributes())
         );
         assert_eq!(
             column::<Int64Array>(row, "scope_dropped_attributes_count").value(0),
@@ -324,8 +324,8 @@ mod pg_tests {
                 EXEMPLAR_INT_VALUE
             );
             assert_eq!(
-                child::<LargeBinaryArray>(exemplars, "filtered_attributes").value(0),
-                support::canonical_attribute_bytes(&support::exemplar_attributes())
+                support::variant_json(child::<StructArray>(exemplars, "filtered_attributes")),
+                support::expected_attributes(&support::exemplar_attributes())
             );
             assert_eq!(
                 child::<FixedSizeBinaryArray>(exemplars, "trace_id").value(0),
@@ -568,18 +568,16 @@ mod pg_tests {
         ] {
             let row = row_by_string(&rows, "metric_name", name);
             assert_eq!(
-                support::decode_attributes(column::<LargeBinaryArray>(&row, "attributes").value(0))
+                support::decode_attributes(column::<StructArray>(&row, "attributes"))
                     .get("wyrd.test.marker")
                     .map(String::as_str),
                 Some("rust-metric"),
                 "`{name}` keeps the point attribute the application recorded with"
             );
             assert_eq!(
-                support::decode_attributes(
-                    column::<LargeBinaryArray>(&row, "resource_attributes").value(0)
-                )
-                .get("service.name")
-                .map(String::as_str),
+                support::decode_attributes(column::<StructArray>(&row, "resource_attributes"))
+                    .get("service.name")
+                    .map(String::as_str),
                 Some(support::STOCK_SERVICE_NAME)
             );
         }

@@ -66,10 +66,9 @@ pub(super) async fn export_logs_over_http(
 /// Tests that need Postgres, a bound server, and the publication boundary.
 mod pg_tests {
     use arrow::array::{
-        BooleanArray, FixedSizeBinaryArray, Int32Array, Int64Array, LargeBinaryArray, StringArray,
+        BooleanArray, FixedSizeBinaryArray, Int32Array, Int64Array, StringArray, StructArray,
     };
     use wyrd_runtime::Permission;
-    use wyrd_tonic::prost::Message;
 
     use super::super::support::{
         self, GRPC_SPAN, LOG_DROPPED_ATTRIBUTES, LOG_EVENT_NAME, LOG_FLAGS,
@@ -134,9 +133,9 @@ mod pg_tests {
                 "{transport} stores the OTel event name rather than folding it away"
             );
             assert_eq!(
-                column::<LargeBinaryArray>(&row, "body").value(0),
-                support::log_body().encode_to_vec(),
-                "{transport} keeps the body as its canonical AnyValue encoding"
+                support::variant_json(column::<StructArray>(&row, "body")),
+                support::expected_any_value(Some(&support::log_body())),
+                "{transport} keeps the body as a Variant of its OTLP value"
             );
             assert_eq!(
                 column::<FixedSizeBinaryArray>(&row, "trace_id").value(0),
@@ -149,8 +148,8 @@ mod pg_tests {
             );
             assert_eq!(column::<Int64Array>(&row, "flags").value(0), LOG_FLAGS);
             assert_eq!(
-                column::<LargeBinaryArray>(&row, "attributes").value(0),
-                support::canonical_attribute_bytes(&support::log_attributes())
+                support::variant_json(column::<StructArray>(&row, "attributes")),
+                support::expected_attributes(&support::log_attributes())
             );
             assert_eq!(
                 column::<Int64Array>(&row, "dropped_attributes_count").value(0),
@@ -158,8 +157,8 @@ mod pg_tests {
             );
             assert!(column::<BooleanArray>(&row, "resource_present").value(0));
             assert_eq!(
-                column::<LargeBinaryArray>(&row, "resource_attributes").value(0),
-                support::canonical_attribute_bytes(&support::resource_attributes())
+                support::variant_json(column::<StructArray>(&row, "resource_attributes")),
+                support::expected_attributes(&support::resource_attributes())
             );
             assert_eq!(
                 column::<Int64Array>(&row, "resource_dropped_attributes_count").value(0),
@@ -179,8 +178,8 @@ mod pg_tests {
                 SCOPE_VERSION
             );
             assert_eq!(
-                column::<LargeBinaryArray>(&row, "scope_attributes").value(0),
-                support::canonical_attribute_bytes(&support::scope_attributes())
+                support::variant_json(column::<StructArray>(&row, "scope_attributes")),
+                support::expected_attributes(&support::scope_attributes())
             );
             assert_eq!(
                 column::<Int64Array>(&row, "scope_dropped_attributes_count").value(0),
@@ -280,14 +279,9 @@ mod pg_tests {
             .await;
 
         assert_eq!(
-            column::<LargeBinaryArray>(&row, "body").value(0),
-            wyrd_tonic::otlp::common::v1::AnyValue {
-                value: Some(wyrd_tonic::otlp::common::v1::any_value::Value::StringValue(
-                    "order delayed".to_owned()
-                )),
-            }
-            .encode_to_vec(),
-            "the emitted body is stored as its canonical AnyValue encoding"
+            support::variant_json(column::<StructArray>(&row, "body")),
+            serde_json::json!("order delayed"),
+            "the emitted body is stored as a Variant string"
         );
         assert_eq!(
             column::<Int32Array>(&row, "severity_number").value(0),
@@ -298,17 +292,15 @@ mod pg_tests {
             "ERROR"
         );
         assert_eq!(
-            support::decode_attributes(column::<LargeBinaryArray>(&row, "attributes").value(0))
+            support::decode_attributes(column::<StructArray>(&row, "attributes"))
                 .get("wyrd.test.marker")
                 .map(String::as_str),
             Some("rust-log")
         );
         assert_eq!(
-            support::decode_attributes(
-                column::<LargeBinaryArray>(&row, "resource_attributes").value(0)
-            )
-            .get("service.name")
-            .map(String::as_str),
+            support::decode_attributes(column::<StructArray>(&row, "resource_attributes"))
+                .get("service.name")
+                .map(String::as_str),
             Some(support::STOCK_SERVICE_NAME)
         );
         assert_eq!(

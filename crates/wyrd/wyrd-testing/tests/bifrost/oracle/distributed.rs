@@ -2782,7 +2782,7 @@ impl FilteringFixture {
                     ("resource_present", Cell::Bool(true)),
                     (
                         "resource_attributes",
-                        Cell::Bytes(attributes(&[("service.name", "filtering")])),
+                        Cell::Variant(attributes(&[("service.name", "filtering")])),
                     ),
                     ("scope_present", Cell::Bool(true)),
                     ("scope_name", Cell::Text("filtering".to_owned())),

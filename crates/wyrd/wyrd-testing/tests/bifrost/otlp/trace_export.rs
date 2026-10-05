@@ -1,8 +1,8 @@
 //! The OTLP/gRPC trace journey: a maximal span survives every boundary intact.
 
 use arrow::array::{
-    Array, BooleanArray, FixedSizeBinaryArray, Int32Array, Int64Array, LargeBinaryArray, ListArray,
-    StringArray, StructArray,
+    Array, BooleanArray, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
+    StructArray,
 };
 use arrow::record_batch::RecordBatch;
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
@@ -131,8 +131,8 @@ pub(super) fn assert_maximal_span_row(row: &RecordBatch, start: i64, identity: S
     );
 
     assert_eq!(
-        column::<LargeBinaryArray>(row, "attributes").value(0),
-        support::canonical_attribute_bytes(&support::span_attributes()),
+        support::variant_json(column::<StructArray>(row, "attributes")),
+        support::expected_attributes(&support::span_attributes()),
         "every attribute shape the exporter sent survives byte-for-byte"
     );
     assert_eq!(
@@ -153,8 +153,8 @@ pub(super) fn assert_maximal_span_row(row: &RecordBatch, start: i64, identity: S
 
     assert!(column::<BooleanArray>(row, "resource_present").value(0));
     assert_eq!(
-        column::<LargeBinaryArray>(row, "resource_attributes").value(0),
-        support::canonical_attribute_bytes(&support::resource_attributes())
+        support::variant_json(column::<StructArray>(row, "resource_attributes")),
+        support::expected_attributes(&support::resource_attributes())
     );
     assert_eq!(
         column::<Int64Array>(row, "resource_dropped_attributes_count").value(0),
@@ -182,8 +182,8 @@ pub(super) fn assert_maximal_span_row(row: &RecordBatch, start: i64, identity: S
         SCOPE_VERSION
     );
     assert_eq!(
-        column::<LargeBinaryArray>(row, "scope_attributes").value(0),
-        support::canonical_attribute_bytes(&support::scope_attributes())
+        support::variant_json(column::<StructArray>(row, "scope_attributes")),
+        support::expected_attributes(&support::scope_attributes())
     );
     assert_eq!(
         column::<Int64Array>(row, "scope_dropped_attributes_count").value(0),
@@ -240,8 +240,8 @@ fn assert_events(row: &RecordBatch, start: i64) {
     );
     assert_eq!(child::<StringArray>(events, "name").value(0), EVENT_NAME);
     assert_eq!(
-        child::<LargeBinaryArray>(events, "attributes").value(0),
-        support::canonical_attribute_bytes(&support::event_attributes())
+        support::variant_json(child::<StructArray>(events, "attributes")),
+        support::expected_attributes(&support::event_attributes())
     );
     assert_eq!(
         child::<Int64Array>(events, "dropped_attributes_count").value(0),
@@ -276,8 +276,8 @@ fn assert_links(row: &RecordBatch) {
     );
     assert_eq!(child::<Int64Array>(links, "flags").value(0), LINK_FLAGS);
     assert_eq!(
-        child::<LargeBinaryArray>(links, "attributes").value(0),
-        support::canonical_attribute_bytes(&support::link_attributes())
+        support::variant_json(child::<StructArray>(links, "attributes")),
+        support::expected_attributes(&support::link_attributes())
     );
     assert_eq!(
         child::<Int64Array>(links, "dropped_attributes_count").value(0),
@@ -535,9 +535,10 @@ mod pg_tests {
             "expected test status"
         );
 
-        let attributes = support::decode_attributes(
-            support::column::<arrow::array::LargeBinaryArray>(&parent, "attributes").value(0),
-        );
+        let attributes = support::decode_attributes(support::column::<arrow::array::StructArray>(
+            &parent,
+            "attributes",
+        ));
         for (key, expected) in [
             ("wyrd.test.marker", "rust-trace"),
             ("gen_ai.input.messages", support::GEN_AI_INPUT_MESSAGES),
@@ -586,10 +587,10 @@ mod pg_tests {
             "the linked trace the application named is the one stored"
         );
 
-        let resource = support::decode_attributes(
-            support::column::<arrow::array::LargeBinaryArray>(&parent, "resource_attributes")
-                .value(0),
-        );
+        let resource = support::decode_attributes(support::column::<arrow::array::StructArray>(
+            &parent,
+            "resource_attributes",
+        ));
         assert_eq!(
             resource.get("service.name").map(String::as_str),
             Some(support::STOCK_SERVICE_NAME)

@@ -8,6 +8,8 @@
 //! agree with a matching test defect and pass.
 
 use arrow::record_batch::RecordBatch;
+use base64::Engine as _;
+use serde_json::Value as Json;
 use wyrd_testing::WyrdTestServer;
 use wyrd_tonic::otlp::common::v1::{
     AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList, any_value,
@@ -22,7 +24,6 @@ use wyrd_tonic::otlp::metrics::v1::{
 use wyrd_tonic::otlp::resource::v1::Resource;
 use wyrd_tonic::otlp::trace::v1::span::{Event, Link};
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
-use wyrd_tonic::prost::Message as _;
 
 /// The canonical span ledger every trace case reads.
 pub(super) const SPANS_TABLE: &str = "vala.traces.spans";
@@ -1164,35 +1165,82 @@ pub(super) fn column<'batch, A: arrow::array::Array + 'static>(
     })
 }
 
-/// Encodes one attribute collection exactly as the canonical ledger stores it.
+/// The JSON form one attribute collection must decode to from its Variant.
 ///
-/// This calls the production encoder rather than restating prost framing: the
-/// bytes under test are a pinned protocol encoding, and a second hand-rolled
-/// encoder in the fixture would prove only that two encoders agree.
-pub(super) fn canonical_attribute_bytes(attributes: &[KeyValue]) -> Vec<u8> {
-    vala_bifrost_redux::tables::signal::encode_attributes(attributes)
+/// This restates the documented `OTLP`-to-Variant mapping independently of the
+/// production projection, so a projection defect cannot agree with itself: a
+/// repeated key keeps its final occurrence, an integer stays an exact integer,
+/// a double stays a double, bytes render as standard base64, an array becomes
+/// a list, a key-value list becomes an object, and an unset value is a null.
+pub(super) fn expected_attributes(attributes: &[KeyValue]) -> Json {
+    Json::Object(
+        attributes
+            .iter()
+            .map(|entry| (entry.key.clone(), expected_any_value(entry.value.as_ref())))
+            .collect(),
+    )
 }
 
-/// Decodes a stored attribute blob's string-valued entries by key.
-///
-/// A stock-exporter journey cannot compare the blob byte-for-byte the way the
-/// pinned dataset does, because the SDK — not the test — decides which
-/// attributes it emits and in what order. Reading the blob back as a map lets
-/// those cases name the attributes they set without asserting anything about
-/// the ones the SDK added on its own.
+/// The JSON form one `OTLP` value must decode to from its Variant.
 ///
 /// # Panics
 ///
-/// Panics when the column does not hold a canonical `KeyValueList` encoding.
-pub(super) fn decode_attributes(bytes: &[u8]) -> std::collections::HashMap<String, String> {
-    use wyrd_tonic::otlp::common::v1::{KeyValueList, any_value};
-    KeyValueList::decode(bytes)
-        .expect("a stored attribute column is a canonical KeyValueList encoding")
-        .values
+/// Panics when a double is not finite, which no fixture sends.
+pub(super) fn expected_any_value(value: Option<&AnyValue>) -> Json {
+    match value.and_then(|value| value.value.as_ref()) {
+        None => Json::Null,
+        Some(any_value::Value::StringValue(text)) => Json::String(text.clone()),
+        Some(any_value::Value::BoolValue(flag)) => Json::Bool(*flag),
+        Some(any_value::Value::IntValue(number)) => Json::from(*number),
+        Some(any_value::Value::DoubleValue(number)) => {
+            Json::Number(serde_json::Number::from_f64(*number).expect("a fixture double is finite"))
+        }
+        Some(any_value::Value::BytesValue(bytes)) => {
+            Json::String(base64::engine::general_purpose::STANDARD.encode(bytes))
+        }
+        Some(any_value::Value::ArrayValue(array)) => Json::Array(
+            array
+                .values
+                .iter()
+                .map(|item| expected_any_value(Some(item)))
+                .collect(),
+        ),
+        Some(any_value::Value::KvlistValue(list)) => expected_attributes(&list.values),
+    }
+}
+
+/// Decodes the first row of one stored Variant column or child to JSON.
+///
+/// # Panics
+///
+/// Panics when the array is not Variant storage or its value does not decode.
+pub(super) fn variant_json(array: &arrow::array::StructArray) -> Json {
+    wyrd_queue::variant::variant_cell_to_json(array, 0)
+        .expect("a stored Variant value decodes to JSON")
+}
+
+/// Decodes a stored attribute object's string- and integer-valued entries.
+///
+/// A stock-exporter journey cannot compare the whole object the way the
+/// pinned dataset does, because the SDK — not the test — decides which
+/// attributes it emits. Reading the object back as a map lets those cases name
+/// the attributes they set without asserting anything about the ones the SDK
+/// added on its own.
+///
+/// # Panics
+///
+/// Panics when the array does not hold a Variant attribute object.
+pub(super) fn decode_attributes(
+    array: &arrow::array::StructArray,
+) -> std::collections::HashMap<String, String> {
+    let Json::Object(entries) = variant_json(array) else {
+        panic!("a stored attribute column holds a Variant object");
+    };
+    entries
         .into_iter()
-        .filter_map(|entry| match entry.value.and_then(|value| value.value) {
-            Some(any_value::Value::StringValue(text)) => Some((entry.key, text)),
-            Some(any_value::Value::IntValue(number)) => Some((entry.key, number.to_string())),
+        .filter_map(|(key, value)| match value {
+            Json::String(text) => Some((key, text)),
+            Json::Number(number) if number.is_i64() => Some((key, number.to_string())),
             _ => None,
         })
         .collect()

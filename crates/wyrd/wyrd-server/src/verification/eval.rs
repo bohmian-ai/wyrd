@@ -41,6 +41,7 @@ use wyrd_runtime::{
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::agent::AgentSpec;
 
+use wyrd_queue::variant::variant_cell_to_json;
 use wyrd_spec::card::eval::EvalSpec;
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
@@ -65,8 +66,6 @@ use wyrd_sql::queries::cards::{get_card_by_ref, get_card_by_uid};
 use wyrd_sql::queries::verifier_runs::{ClaimedRun, RunInput, TerminalStatus};
 use wyrd_storage::tenant_path;
 use wyrd_storage::{StorageError, StorageHandle};
-use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValueList, any_value};
-use wyrd_tonic::prost::Message as _;
 
 use super::engines::{EngineOutcome, VerifierReport};
 use super::telemetry::{ExecutionTelemetry, Phase, WaitSink};
@@ -922,17 +921,30 @@ fn nested<T>(
         .collect()
 }
 
-/// The canonical attribute payload in column `name` at `row` as JSON; a null
-/// payload is empty.
+/// The Variant attribute object in column `name` at `row` as JSON; a null
+/// value is empty.
+///
+/// Bytes values render as base64 text and integers keep their exact value.
 ///
 /// # Errors
-/// Returns the column or protobuf decode failure.
+/// Returns a description when the column is absent, is not Variant storage,
+/// the value does not decode, or the value is not an object.
 fn attribute_column(
     batch: &RecordBatch,
     name: &str,
     row: usize,
 ) -> Result<Map<String, Value>, String> {
-    bytes(batch, name, row)?.map_or_else(|| Ok(Map::new()), |raw| attributes(&raw))
+    let column = batch
+        .column_by_name(name)
+        .ok_or_else(|| format!("column {name} is missing"))?;
+    let ordinal = u64::try_from(row).unwrap_or(u64::MAX);
+    match variant_cell_to_json(column.as_ref(), row)
+        .map_err(|violation| violation.into_error(name, ordinal).to_string())?
+    {
+        Value::Null => Ok(Map::new()),
+        Value::Object(attributes) => Ok(attributes),
+        _ => Err(format!("column {name} does not hold an attribute object")),
+    }
 }
 
 /// Non-negative 32-bit count in 64-bit column `name` at `row`; null is zero.
@@ -942,46 +954,6 @@ fn attribute_column(
 fn count(batch: &RecordBatch, name: &str, row: usize) -> Result<u32, String> {
     u32::try_from(int64(batch, name, row)?.unwrap_or_default())
         .map_err(|_| format!("column {name} is not a 32-bit count"))
-}
-
-/// Decode a canonical `KeyValueList` attribute payload into JSON.
-///
-/// # Errors
-/// Returns the protobuf decode failure.
-fn attributes(raw: &[u8]) -> Result<Map<String, Value>, String> {
-    Ok(KeyValueList::decode(raw)
-        .map_err(|error| error.to_string())?
-        .values
-        .into_iter()
-        .map(|entry| (entry.key, any_json(entry.value)))
-        .collect())
-}
-
-/// One OTLP `AnyValue` as JSON; bytes become base64 text.
-fn any_json(value: Option<AnyValue>) -> Value {
-    match value.and_then(|value| value.value) {
-        None => Value::Null,
-        Some(any_value::Value::StringValue(text)) => Value::String(text),
-        Some(any_value::Value::BoolValue(flag)) => Value::Bool(flag),
-        Some(any_value::Value::IntValue(number)) => Value::from(number),
-        Some(any_value::Value::DoubleValue(number)) => Value::from(number),
-        Some(any_value::Value::BytesValue(raw)) => {
-            Value::String(base64::engine::general_purpose::STANDARD.encode(raw))
-        }
-        Some(any_value::Value::ArrayValue(array)) => Value::Array(
-            array
-                .values
-                .into_iter()
-                .map(|item| any_json(Some(item)))
-                .collect(),
-        ),
-        Some(any_value::Value::KvlistValue(list)) => Value::Object(
-            list.values
-                .into_iter()
-                .map(|entry| (entry.key, any_json(entry.value)))
-                .collect(),
-        ),
-    }
 }
 
 /// The UTC day containing `at`, as `[start, end)` SQL timestamp literals.

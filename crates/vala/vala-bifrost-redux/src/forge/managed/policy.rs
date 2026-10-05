@@ -531,9 +531,7 @@ fn selection_report(
     snapshot_id: i64,
     plans: &[CompactionPlan],
 ) -> Result<SelectionReport, ForgeError> {
-    let reason = kind.uniform_reason().ok_or_else(|| ForgeError::Invariant {
-        detail: format!("strategy {kind} has no uniform selection reason"),
-    })?;
+    let reason = kind.uniform_reason();
     let selected = plans
         .iter()
         .flat_map(|plan| plan.file_group.data_files.iter())
@@ -542,7 +540,7 @@ fn selection_report(
             reason,
         })
         .collect();
-    SelectionReport::new(kind, snapshot_id, None, selected).map_err(|error| ForgeError::Invariant {
+    SelectionReport::new(kind, snapshot_id, selected).map_err(|error| ForgeError::Invariant {
         detail: format!("Forge selection report is not canonical: {error}"),
     })
 }

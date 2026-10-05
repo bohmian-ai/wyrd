@@ -1050,53 +1050,7 @@ mod tests {
                 ],
                 blooms: &[],
             },
-            VerificationContract {
-                namespace: "verification",
-                name: "results",
-                columns: vec![
-                    utf8("result_id", false),
-                    utf8("implementation", false),
-                    utf8("execution_status", false),
-                    utf8("verdict", false),
-                    utf8("verifier_version", false),
-                    utf8("owner_card_uid", true),
-                    utf8("subject_card_uid", false),
-                    utf8("binding_id", true),
-                    utf8("trigger_identity", true),
-                    utf8("source_record_id", true),
-                    ts_us_utc("window_start", true),
-                    ts_us_utc("window_end", true),
-                    ts_us_utc("started_at", false),
-                    ts_us_utc("ended_at", false),
-                    Field::new(
-                        "drift_report",
-                        arrow::datatypes::DataType::Struct(
-                            vec![
-                                utf8("method", false),
-                                fields::variant("features", false),
-                                utf8("verdict", false),
-                            ]
-                            .into(),
-                        ),
-                        true,
-                    ),
-                    Field::new(
-                        "eval_summary",
-                        arrow::datatypes::DataType::Struct(
-                            vec![
-                                int32("total_tasks", false),
-                                int32("passed_tasks", false),
-                                int32("failed_tasks", false),
-                                float64("pass_rate", false),
-                                int64("duration_ms", false),
-                            ]
-                            .into(),
-                        ),
-                        true,
-                    ),
-                ],
-                blooms: &["result_id", "subject_card_uid", "binding_id"],
-            },
+            verification_results_contract(),
             VerificationContract {
                 namespace: "drift",
                 name: "result_features",
@@ -1140,6 +1094,58 @@ mod tests {
                 blooms: &["result_id"],
             },
         ]
+    }
+
+    /// The approved contract for `verification.results`, whose typed
+    /// summaries are nullable Structs written exclusively per implementation.
+    fn verification_results_contract() -> VerificationContract {
+        VerificationContract {
+            namespace: "verification",
+            name: "results",
+            columns: vec![
+                utf8("result_id", false),
+                utf8("implementation", false),
+                utf8("execution_status", false),
+                utf8("verdict", false),
+                utf8("verifier_version", false),
+                utf8("owner_card_uid", true),
+                utf8("subject_card_uid", false),
+                utf8("binding_id", true),
+                utf8("trigger_identity", true),
+                utf8("source_record_id", true),
+                ts_us_utc("window_start", true),
+                ts_us_utc("window_end", true),
+                ts_us_utc("started_at", false),
+                ts_us_utc("ended_at", false),
+                Field::new(
+                    "drift_report",
+                    arrow::datatypes::DataType::Struct(
+                        vec![
+                            utf8("method", false),
+                            fields::variant("features", false),
+                            utf8("verdict", false),
+                        ]
+                        .into(),
+                    ),
+                    true,
+                ),
+                Field::new(
+                    "eval_summary",
+                    arrow::datatypes::DataType::Struct(
+                        vec![
+                            int32("total_tasks", false),
+                            int32("passed_tasks", false),
+                            int32("failed_tasks", false),
+                            float64("pass_rate", false),
+                            int64("duration_ms", false),
+                        ]
+                        .into(),
+                    ),
+                    true,
+                ),
+            ],
+            blooms: &["result_id", "subject_card_uid", "binding_id"],
+        }
     }
 
     /// The managed envelope Bifrost appends after a verification table's

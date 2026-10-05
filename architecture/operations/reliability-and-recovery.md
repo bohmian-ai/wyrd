@@ -170,6 +170,21 @@ fabricate task completion to make health checks pass.
   claim a clean terminal state, and readiness or shutdown evidence surfaces the
   failure.
 
+## Workflow run failure boundaries
+
+- A server Workflow run lives in the process that accepted it. Process
+  restart or loss loses every queued, running, and retained run; nothing is
+  resumed or replayed, and no provider call is retried across that boundary.
+  Callers that need the outcome submit a new run.
+- Graceful shutdown cancels active runs and drains them within the process
+  shutdown budget; gateway calls they made settle through the gateway's own
+  tracked work.
+- Active and retained runs are bounded globally and per tenant. Admission
+  refuses new runs at the active ceiling with
+  `WYRD_WORKFLOW_429_RUN_CAPACITY`, and terminal runs are evicted
+  oldest-first at the retained ceiling or after 24 hours. Active runs are
+  never evicted.
+
 ## Audit history projection and retirement
 
 `vala.audit_staging` is transient write-ahead state. Retained audit history is

@@ -8666,13 +8666,10 @@ dependencies = [
 name = "skald-cache"
 version = "0.0.1"
 dependencies = [
- "hex",
  "mini-moka",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "skald-spec",
- "thiserror 2.0.18",
  "workspace-hack",
 ]
 
@@ -11600,6 +11597,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "wiremock",
  "workspace-hack",
  "wyrd-client",
  "wyrd-testing",

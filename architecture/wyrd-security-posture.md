@@ -337,6 +337,20 @@ Before fetching any user- or tenant-supplied URL, the server must:
 A string allowlist without resolved-address validation and connection pinning
 is not an SSRF control.
 
+Workflow `ext_gateway` steps use that same egress procedure from the process
+that executes them. A binding names one protocol, one exact origin, and secret
+headers given as secret references; a step's `base_url` must share the
+binding's origin and protocol. A local run reads its bindings from the shared
+client configuration under the local profile, which admits explicitly
+configured private origins and plain HTTP only to loopback; the production
+profile admits HTTPS on port 443 to public addresses only. A server run uses
+only bindings the server operator assigned to the run's tenant. Secrets are
+resolved when a run that selects the binding starts, never while loading or
+registering, and never enter Cards, run snapshots, errors, or logs. A binding
+of another protocol, an unassigned binding, or an unreadable secret refuses
+the run before any dispatch. An `ext_gateway` request never passes through
+the Wyrd gateway, and a `wyrd_gateway` request never carries binding secrets.
+
 ## Tenant and data isolation
 
 - Tenant Postgres operations use `TenantConn` and transaction-local RLS state.

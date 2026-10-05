@@ -1,14 +1,17 @@
-import { mkdtempSync } from "node:fs";
+import { chmodSync, cpSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { startTestServer } from "@wyrd/testing";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
   type Card,
   type CardRef,
   Cards,
+  Gateway,
   type RegistrationReceipt,
   Workflow,
   type WorkflowSelector,
@@ -20,6 +23,104 @@ const REPO = resolve(import.meta.dirname, "../../../../..");
 
 /** Shared Workflow loading fixtures; see their README. */
 const FIXTURES = join(REPO, "tests/fixtures/workflow-loading");
+
+/** The code-review example bundle and its checked-in input. */
+const EXAMPLE = join(REPO, "examples/workflows/code-review");
+
+/** Operator credential the harness binds to `test-provider-key`. */
+const PROVIDER_KEY = "sk-native-upstream";
+
+/** Secret the `review-gateway` binding sends to the external gateway. */
+const REVIEW_SECRET = "review-secret-value";
+
+/** Headers of each Chat Completions request the recording upstream served. */
+const chatCalls: Record<string, string>[] = [];
+
+/** Local upstream rooting the gateway adapters and serving the external gateway. */
+let upstream: Server;
+
+/** Absolute root of {@link upstream}. */
+let upstreamUrl: string;
+
+/** Records one Chat Completions request and answers it with `hi`. */
+function serve(request: IncomingMessage, response: ServerResponse): void {
+  request.resume();
+  request.on("end", () => {
+    if (request.url !== "/v1/chat/completions") {
+      response.writeHead(404).end();
+      return;
+    }
+    chatCalls.push(
+      Object.fromEntries(
+        Object.entries(request.headers).map(([name, value]) => [name, String(value)]),
+      ),
+    );
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify({
+        id: "chatcmpl-1",
+        object: "chat.completion",
+        created: 1,
+        model: "gpt-5-5",
+        choices: [{ index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" }],
+      }),
+    );
+  });
+}
+
+/** Calls the gateway dispatched with the operator credential. */
+function gatewayCalls(): number {
+  return chatCalls.filter((headers) => headers["authorization"] === `Bearer ${PROVIDER_KEY}`)
+    .length;
+}
+
+/** Calls the `review-gateway` binding sent straight to the external gateway. */
+function externalCalls(): Record<string, string>[] {
+  return chatCalls.filter((headers) => "x-review-secret" in headers);
+}
+
+/** Copy the example bundle under `directory` with its Workflow route set to `ext_gateway`. */
+function externalExample(directory: string): string {
+  cpSync(EXAMPLE, directory, { recursive: true });
+  const workflow = join(directory, "workflow.yaml");
+  const text = readFileSync(workflow, "utf8");
+  expect(text).toContain("    kind: wyrd_gateway\n");
+  writeFileSync(
+    workflow,
+    text.replace(
+      "    kind: wyrd_gateway\n",
+      "    kind: ext_gateway\n    protocol: openai_chat\n" +
+        `    base_url: ${upstreamUrl}/v1\n    credential_binding: review-gateway\n`,
+    ),
+  );
+  return workflow;
+}
+
+/** Configure the `review-gateway` binding in `configHome` with an owner-only secret file. */
+function bindReviewGateway(configHome: string): void {
+  const secret = join(configHome, "review-secret");
+  writeFileSync(secret, REVIEW_SECRET);
+  chmodSync(secret, 0o600);
+  writeFileSync(
+    join(configHome, "config.toml"),
+    "[workflow.external_gateway_bindings.review-gateway]\n" +
+      'protocol = "openai_chat"\n' +
+      `origin = "${upstreamUrl}"\n` +
+      `secret_headers = { x-review-secret = { source = "file", path = "${secret}" } }\n`,
+  );
+}
+
+beforeAll(async () => {
+  process.env.WYRD_TEST_GATEWAY_PROVIDER_KEY = PROVIDER_KEY;
+  upstream = createServer(serve);
+  await new Promise<void>((done) => upstream.listen(0, "127.0.0.1", done));
+  upstreamUrl = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
+});
+
+afterAll(async () => {
+  delete process.env.WYRD_TEST_GATEWAY_PROVIDER_KEY;
+  await new Promise<void>((done, fail) => upstream.close((error) => (error ? fail(error) : done())));
+});
 
 /** Capture the structured catalog error a promise rejects with. */
 async function rejection(promise: Promise<unknown>): Promise<WyrdError> {
@@ -70,7 +171,7 @@ const REGISTERED_REVIEW =
 
 describe("Workflow loading", () => {
   it("workflow loading journey", async () => {
-    const server = startTestServer();
+    const server = startTestServer(upstreamUrl);
     try {
       const writer = Cards.connect({ serverUrl: server.baseUrl, credential: server.apiKey });
       const readerKey = server.scopedApiKey("ts_workflow_reader", ["cards:read"]);
@@ -80,7 +181,8 @@ describe("Workflow loading", () => {
 
       // Workflow.fromPath reads credentials from the environment, so start with none.
       process.env.WYRD_SERVER_URL = server.baseUrl;
-      process.env.WYRD_CONFIG_HOME = mkdtempSync(join(tmpdir(), "wyrd-config-"));
+      const configHome = mkdtempSync(join(tmpdir(), "wyrd-config-"));
+      process.env.WYRD_CONFIG_HOME = configHome;
       delete process.env.WYRD_API_KEY;
       delete process.env.WYRD_ACCESS_TOKEN;
 
@@ -220,6 +322,68 @@ describe("Workflow loading", () => {
       expect((await rejection(outsider.workflow.load({ uid: workflowUid }))).code).toBe(
         "WYRD_PERMISSION_403_DENIED_RBAC",
       );
+
+      // 8. The code-review example runs locally through the public Wyrd
+      //    gateway and through an external gateway binding; registering it
+      //    runs nothing.
+      const credential = await fetch(
+        `${server.baseUrl}/v1/admin/gateway/provider-credentials/openai-key`,
+        {
+          method: "PUT",
+          headers: {
+            "x-wyrd-access-token": `Bearer ${server.token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            name: "openai-key",
+            provider: "openai",
+            source: { environment: { binding: "test-provider-key" } },
+          }),
+        },
+      );
+      expect(credential.status).toBe(200);
+      await Gateway.connect({ serverUrl: server.baseUrl, credential: server.apiKey }).putDeployment({
+        name: "gpt-5-5",
+        model: { provider: "openai", model: "gpt-5-5" },
+        adapter: "openai",
+        auth: { bearer: { credential: "openai-key" } },
+        capabilities: ["chat_completions"],
+        routing_weight: 1,
+      });
+      process.env.WYRD_API_KEY = server.apiKey;
+      const input = JSON.parse(readFileSync(join(EXAMPLE, "input.json"), "utf8")) as Record<
+        string,
+        string
+      >;
+      run = await (await Workflow.fromPath(join(EXAMPLE, "workflow.yaml"))).run(input);
+      expect(run.status, JSON.stringify(run.error)).toBe("succeeded");
+      expect(run.outputs).toEqual({ review: "hi" });
+      expect(gatewayCalls()).toBe(3);
+
+      bindReviewGateway(configHome);
+      const external = externalExample(mkdtempSync(join(tmpdir(), "wyrd-external-")));
+      run = await (await Workflow.fromPath(external)).run(input);
+      expect(run.status, JSON.stringify(run.error)).toBe("succeeded");
+      expect(run.outputs).toEqual({ review: "hi" });
+      expect(externalCalls()).toHaveLength(3);
+      for (const headers of externalCalls()) {
+        expect(headers["x-review-secret"]).toBe(REVIEW_SECRET);
+        expect(headers["authorization"]).toBeUndefined();
+      }
+      expect(gatewayCalls()).toBe(3);
+
+      const admin = Cards.connect({ serverUrl: server.baseUrl, credential: server.apiKey });
+      await admin.registerFromPath(EXAMPLE);
+      expect(chatCalls).toHaveLength(6);
+      const registered = await admin.workflow.load({
+        space: "engineering",
+        name: "code-review",
+        version: "1.0.0",
+      });
+      run = await registered.run(input);
+      expect(run.status, JSON.stringify(run.error)).toBe("succeeded");
+      expect(run.outputs).toEqual({ review: "hi" });
+      expect(gatewayCalls()).toBe(6);
     } finally {
       delete process.env.WYRD_SERVER_URL;
       delete process.env.WYRD_CONFIG_HOME;

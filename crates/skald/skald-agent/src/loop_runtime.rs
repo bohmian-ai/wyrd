@@ -656,8 +656,8 @@ impl Agent {
     /// Open the `invoke_agent` span for one Agent run driven by `prompt`.
     ///
     /// Carries the OpenTelemetry GenAI operation, agent ID, semantic provider
-    /// name derived from the Prompt's typed request, and the Prompt's resolved
-    /// model only; [`record_agent_outcome`] fills `error.type` with the stable
+    /// name of the Prompt's effective dispatch target (`Prompt::provider`,
+    /// not the request schema's default), and the Prompt's resolved model only; [`record_agent_outcome`] fills `error.type` with the stable
     /// Agent error code when the run fails. No prompt or input payload is
     /// recorded.
     fn invoke_agent_span(&self, prompt: &Prompt) -> Span {

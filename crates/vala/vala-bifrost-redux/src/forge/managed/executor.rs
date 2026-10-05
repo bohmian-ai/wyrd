@@ -395,8 +395,8 @@ impl ForgeManagedRewrite {
 /// The pool is a fresh view of the one shared Bifrost governor, so every
 /// reservation the rewrite grows is charged to the same cap Scribe, Oracle,
 /// and transport charge, and every byte returns when the attempt's context and
-/// reservations drop. No pool capacity or scratch capacity is named: the
-/// shared cap is the only memory bound, and `forge-spill` keeps `DataFusion`'s
+/// reservations drop. The shared cap is the only memory bound, and
+/// `forge-spill` keeps `DataFusion`'s
 /// own temp-directory limit. A fresh view per attempt means a failed attempt
 /// releases everything before its retry builds the next one.
 ///
@@ -418,7 +418,7 @@ fn governed_context_for(
         .with_attempt_id(AttemptId::from_uuid(attempt_id))
         .with_cancellation(cancel.clone())
         .with_observer(Arc::clone(observer) as Arc<_>)
-        .with_memory_pool(resources.rewrite_memory_pool(), None)
+        .with_memory_pool(resources.rewrite_memory_pool())
         .with_spill_lease(spill)
         .build()
         .map_err(|error| ForgeError::Invariant {

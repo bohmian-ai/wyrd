@@ -152,15 +152,6 @@ pub(crate) fn debt_fingerprint(
     hasher.update(DEBT_DOMAIN.as_bytes());
     hasher.update(b"\0");
     hasher.update(report.strategy.as_str().as_bytes());
-    if let Some(policy) = report.policy.as_ref() {
-        hasher.update(b"\0");
-        hasher.update(&policy.schema_id.to_be_bytes());
-        hasher.update(&policy.partition_spec_id.to_be_bytes());
-        hasher.update(&policy.sort_order_id.to_be_bytes());
-        hasher.update(policy.writer_recipe.as_bytes());
-        hasher.update(&policy.target_file_size_bytes.to_be_bytes());
-        hasher.update(&policy.small_file_threshold_bytes.to_be_bytes());
-    }
     for (reason, count) in counts {
         hasher.update(b"\0");
         hasher.update(reason.as_bytes());
@@ -174,60 +165,42 @@ pub(crate) fn debt_fingerprint(
 
 /// Computes the identity of the policy an attempt ran under.
 ///
-/// A report whose policy is absent — an upstream strategy rather than the
-/// identity-aware one — fingerprints to the strategy alone, which is correct:
-/// there is no policy for a later attempt to compare against.
+/// Every Forge selection is an upstream strategy with no further inputs in its
+/// report, so the strategy alone identifies the policy a later attempt
+/// compares against.
 #[must_use]
 pub(crate) fn policy_fingerprint(report: &SelectionReport) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(POLICY_DOMAIN.as_bytes());
     hasher.update(b"\0");
     hasher.update(report.strategy.as_str().as_bytes());
-    if let Some(policy) = report.policy.as_ref() {
-        hasher.update(b"\0");
-        hasher.update(&policy.schema_id.to_be_bytes());
-        hasher.update(&policy.partition_spec_id.to_be_bytes());
-        hasher.update(&policy.sort_order_id.to_be_bytes());
-        hasher.update(policy.writer_recipe.as_bytes());
-        hasher.update(&policy.target_file_size_bytes.to_be_bytes());
-        hasher.update(&policy.small_file_threshold_bytes.to_be_bytes());
-        hasher.update(&policy.max_file_size_bytes.to_be_bytes());
-        hasher.update(&[u8::from(policy.emit_open_partition_tail)]);
-    }
     hasher.finalize().to_hex().to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use iceberg_compaction_core::managed::{PolicyIdentity, SelectedFile, SelectionStrategyKind};
+    use iceberg_compaction_core::managed::{SelectedFile, SelectionStrategyKind};
 
     use super::*;
 
     /// Builds one canonical report over the given files.
     ///
+    /// Every file carries `strategy`'s own uniform reason, the only reason the
+    /// core accepts for it.
+    ///
     /// # Panics
     ///
     /// Panics when the report would not be canonical, which is a fixture
     /// construction invariant rather than an input.
-    fn report(snapshot: i64, files: Vec<(&str, SelectionReason)>) -> SelectionReport {
+    fn report(snapshot: i64, strategy: SelectionStrategyKind, paths: &[&str]) -> SelectionReport {
         SelectionReport::new(
-            SelectionStrategyKind::WyrdIdentityAware,
+            strategy,
             snapshot,
-            Some(PolicyIdentity {
-                schema_id: 0,
-                partition_spec_id: 0,
-                sort_order_id: 1,
-                writer_recipe: "v1".to_owned(),
-                target_file_size_bytes: 1 << 28,
-                small_file_threshold_bytes: 1 << 25,
-                max_file_size_bytes: 1 << 29,
-                emit_open_partition_tail: false,
-            }),
-            files
-                .into_iter()
-                .map(|(path, reason)| SelectedFile {
-                    file_path: path.to_owned(),
-                    reason,
+            paths
+                .iter()
+                .map(|path| SelectedFile {
+                    file_path: (*path).to_owned(),
+                    reason: strategy.uniform_reason(),
                 })
                 .collect(),
         )
@@ -245,46 +218,24 @@ mod tests {
     /// ever comparing equal to a debt summary computed over the same report.
     #[test]
     fn forge_selection_fingerprint_is_ordered_versioned_and_snapshot_bound() {
-        let forward = report(
-            41,
-            vec![
-                ("a.parquet", SelectionReason::Undersized),
-                ("b.parquet", SelectionReason::Undersized),
-            ],
-        );
-        let reversed = report(
-            41,
-            vec![
-                ("b.parquet", SelectionReason::Undersized),
-                ("a.parquet", SelectionReason::Undersized),
-            ],
-        );
+        use SelectionStrategyKind::{UpstreamFull, UpstreamSmallFiles};
+
+        let forward = report(41, UpstreamSmallFiles, &["a.parquet", "b.parquet"]);
+        let reversed = report(41, UpstreamSmallFiles, &["b.parquet", "a.parquet"]);
         assert_eq!(
             selection_fingerprint(&forward),
             selection_fingerprint(&reversed),
             "the same decision reported in a different order is the same decision"
         );
 
-        let later = report(
-            42,
-            vec![
-                ("a.parquet", SelectionReason::Undersized),
-                ("b.parquet", SelectionReason::Undersized),
-            ],
-        );
+        let later = report(42, UpstreamSmallFiles, &["a.parquet", "b.parquet"]);
         assert_ne!(
             selection_fingerprint(&forward),
             selection_fingerprint(&later),
             "the same files against a different base is a different decision"
         );
 
-        let other_reason = report(
-            41,
-            vec![
-                ("a.parquet", SelectionReason::Undersized),
-                ("b.parquet", SelectionReason::Oversized),
-            ],
-        );
+        let other_reason = report(41, UpstreamFull, &["a.parquet", "b.parquet"]);
         assert_ne!(
             selection_fingerprint(&forward),
             selection_fingerprint(&other_reason),
@@ -305,31 +256,21 @@ mod tests {
     /// Unchanged semantic debt refuses a second attempt before any object IO.
     ///
     /// The two reports name entirely different files with entirely different
-    /// paths, and describe exactly the same problem: two undersized files under
-    /// the same policy. That is the churn case — a previous attempt already
+    /// paths, and describe exactly the same problem: two small files under the
+    /// same policy. That is the churn case — a previous attempt already
     /// rewrote this table and achieved nothing, so a second attempt would burn
     /// a resource lease to produce a third set of equally wrong objects. The
     /// debt summary is equal, which is what lets the decision be made from
     /// durable evidence alone, before a single object is opened.
     ///
     /// The contrast cases prove the summary is not simply constant: a changed
-    /// reason mix, a changed policy, and a changed delete scope each move it.
+    /// file count, a changed policy, and a changed delete scope each move it.
     #[test]
     fn forge_no_progress_refuses_unchanged_semantic_debt_before_io() {
-        let before = report(
-            41,
-            vec![
-                ("old-a.parquet", SelectionReason::Undersized),
-                ("old-b.parquet", SelectionReason::Undersized),
-            ],
-        );
-        let after = report(
-            77,
-            vec![
-                ("new-a.parquet", SelectionReason::Undersized),
-                ("new-b.parquet", SelectionReason::Undersized),
-            ],
-        );
+        use SelectionStrategyKind::{UpstreamFull, UpstreamSmallFiles};
+
+        let before = report(41, UpstreamSmallFiles, &["old-a.parquet", "old-b.parquet"]);
+        let after = report(77, UpstreamSmallFiles, &["new-a.parquet", "new-b.parquet"]);
         assert_eq!(
             debt_fingerprint(&before, 0, 0),
             debt_fingerprint(&after, 0, 0),
@@ -341,24 +282,23 @@ mod tests {
             "the receipts still differ, so reconciliation is unaffected"
         );
 
-        let resolved = report(77, vec![("new-a.parquet", SelectionReason::Undersized)]);
+        let resolved = report(77, UpstreamSmallFiles, &["new-a.parquet"]);
         assert_ne!(
             debt_fingerprint(&before, 0, 0),
             debt_fingerprint(&resolved, 0, 0),
-            "fewer undersized files is real progress"
+            "fewer small files is real progress"
         );
 
-        let reclassified = report(
-            77,
-            vec![
-                ("new-a.parquet", SelectionReason::Undersized),
-                ("new-b.parquet", SelectionReason::ObsoleteSchema),
-            ],
-        );
+        let reclassified = report(77, UpstreamFull, &["new-a.parquet", "new-b.parquet"]);
         assert_ne!(
             debt_fingerprint(&before, 0, 0),
             debt_fingerprint(&reclassified, 0, 0),
-            "a different mix of reasons is a different problem"
+            "a different policy's selection is a different problem"
+        );
+        assert_ne!(
+            policy_fingerprint(&before),
+            policy_fingerprint(&reclassified),
+            "the policy identity follows the strategy"
         );
 
         assert_ne!(

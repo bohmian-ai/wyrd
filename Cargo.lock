@@ -4744,7 +4744,7 @@ dependencies = [
 [[package]]
 name = "iceberg-compaction-core"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=ef97aea028aac502f50914ac37e74edc836cfbcc#ef97aea028aac502f50914ac37e74edc836cfbcc"
+source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=380a4d0717e1786b95c4aa9f257579af496b3c8c#380a4d0717e1786b95c4aa9f257579af496b3c8c"
 dependencies = [
  "async-stream",
  "async-trait",

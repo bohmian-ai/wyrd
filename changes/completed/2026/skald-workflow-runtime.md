@@ -1,8 +1,8 @@
 # Skald workflow runtime
 
 - Change ID: `SPEC-skald-workflow-runtime`
-- Completed: 2026-10-04
-- Reviewed target: `395a3ad91a1dfa0706bc8c08c8dc3100dce3d78d`
+- Completed: 2026-10-05
+- Reviewed target: `3d2295f1a0804d388592518054968f95739a3d01`
 - Delivery reference: not supplied
 
 ## Intent and value
@@ -143,6 +143,9 @@ general-purpose arbitrary-code workflow platform.
   removed in favor of standard secret handling and error/log redaction. The
   stale Revision 13 task authority and the `new Cards()` TypeScript example
   lived only in the removed active packet and closed with completion.
+- Round-2 immutable review confirmed all twelve follow-up findings closed and
+  found no regression in the integrated Revision 14 change. Its review output
+  is retained in Git history by commit `da0ce6c03`.
 
 ## Acceptance closure
 

@@ -779,25 +779,18 @@ def _signal_rows(server: WyrdTestServer, sql: str):
     return asyncio.run(readback())
 
 
-def _any_value(value):
-    """Unwrap one decoded upstream `AnyValue` into a plain Python value."""
-
-    field = value.WhichOneof("value")
-    if field == "array_value":
-        return [_any_value(item) for item in value.array_value.values]
-    if field == "kvlist_value":
-        return {entry.key: _any_value(entry.value) for entry in value.kvlist_value.values}
-    return getattr(value, field) if field else None
+class _SignalRow(BaseModel, extra="allow"):
+    """Any selected signal columns, kept as the typed terminal decoded them."""
 
 
-def _attributes(raw: bytes) -> dict:
-    """Decode one canonical attribute column with the upstream OTLP types."""
+def _signal_dicts(server: WyrdTestServer, sql: str) -> list[dict]:
+    """Read one canonical signal query through the typed row terminal.
 
-    from opentelemetry.proto.common.v1.common_pb2 import KeyValueList
+    Variant columns, top level or nested in events, arrive as native values.
+    """
 
-    decoded = KeyValueList()
-    decoded.ParseFromString(raw)
-    return {entry.key: _any_value(entry.value) for entry in decoded.values}
+    client = Bifrost(server_url=server.base_url, credential=server.api_key)
+    return [row.model_dump() for row in client.sql(sql, _SignalRow)]
 
 
 @pytest.mark.integration
@@ -859,20 +852,28 @@ def test_standard_otel_tracer_exports_to_bifrost(wyrd_server: WyrdTestServer) ->
     assert trace_ids[parent_index] == trace_ids[child_index]
     assert rows.column("parent_span_id").to_pylist()[child_index] == span_ids[parent_index]
 
-    attributes = _attributes(rows.column("attributes").to_pylist()[parent_index])
+    decoded = {
+        row["name"]: row
+        for row in _signal_dicts(
+            wyrd_server,
+            "SELECT name, attributes, resource_attributes, events FROM vala.traces.spans "
+            f"WHERE scope_name = '{scope}'",
+        )
+    }
+    attributes = decoded["python-parent"]["attributes"]
     assert attributes["wyrd.test.marker"] == "python-trace"
     assert attributes["test.values"] == [1, 2, 3]
-    assert _attributes(rows.column("attributes").to_pylist()[child_index])["answer"] == 42
+    assert decoded["python-child"]["attributes"]["answer"] == 42
 
     assert rows.column("status_code").to_pylist()[parent_index] == 2
     assert rows.column("status_message").to_pylist()[parent_index] == "expected test status"
     assert rows.column("scope_version").to_pylist()[parent_index] == "1.0.0"
-    resource_attributes = _attributes(rows.column("resource_attributes").to_pylist()[parent_index])
+    resource_attributes = decoded["python-parent"]["resource_attributes"]
     assert resource_attributes["service.name"] == "wyrd-python-journey"
 
-    events = rows.column("events").to_pylist()[parent_index]
+    events = decoded["python-parent"]["events"]
     assert [event["name"] for event in events] == ["checkpoint"]
-    assert _attributes(events[0]["attributes"])["step"] == 1
+    assert events[0]["attributes"]["step"] == 1
 
     links = rows.column("links").to_pylist()[parent_index]
     assert len(links) == 1
@@ -937,20 +938,17 @@ def test_stdlib_logging_exports_to_bifrost(wyrd_server: WyrdTestServer) -> None:
     )
     assert rows.num_rows == 1
 
-    from opentelemetry.proto.common.v1.common_pb2 import AnyValue
-
-    body = AnyValue()
-    body.ParseFromString(rows.column("body").to_pylist()[0])
-    assert _any_value(body) == "order delayed"
+    [decoded] = _signal_dicts(
+        wyrd_server,
+        "SELECT body, attributes, resource_attributes FROM vala.logs.records "
+        f"WHERE scope_name = '{scope}'",
+    )
+    assert decoded["body"] == "order delayed"
 
     assert rows.column("severity_text").to_pylist()[0] == "WARN"
     assert rows.column("severity_number").to_pylist()[0] == 13
-    assert _attributes(rows.column("attributes").to_pylist()[0])["wyrd.test.marker"] == (
-        "python-log"
-    )
-    assert _attributes(rows.column("resource_attributes").to_pylist()[0])["service.name"] == (
-        "wyrd-python-journey"
-    )
+    assert decoded["attributes"]["wyrd.test.marker"] == "python-log"
+    assert decoded["resource_attributes"]["service.name"] == "wyrd-python-journey"
     assert rows.column("trace_id").to_pylist()[0] == expected_context.trace_id.to_bytes(16, "big")
     assert rows.column("span_id").to_pylist()[0] == expected_context.span_id.to_bytes(8, "big")
 
@@ -997,8 +995,11 @@ def test_standard_otel_metrics_export_to_bifrost(wyrd_server: WyrdTestServer) ->
         "queue.depth",
         "request.duration",
     }
-    for index in by_name.values():
-        assert _attributes(rows.column("attributes").to_pylist()[index]) == attributes
+    decoded = _signal_dicts(
+        wyrd_server,
+        f"SELECT attributes FROM vala.metrics.points WHERE scope_name = '{scope}'",
+    )
+    assert [row["attributes"] for row in decoded] == [attributes] * rows.num_rows
 
     created = by_name["orders.created"]
     assert rows.column("metric_type").to_pylist()[created] == "sum"

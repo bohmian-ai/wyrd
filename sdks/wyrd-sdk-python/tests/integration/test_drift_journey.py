@@ -221,14 +221,15 @@ def complete(
     return run["result_id"]
 
 
-def assert_spc_evidence(details: str, subgroups: int, x_bar_signals: int) -> None:
-    """Assert the persisted SPC evidence of ``latency`` in a result's ``details``.
+def assert_spc_evidence(features: str, subgroups: int, x_bar_signals: int) -> None:
+    """Assert the persisted SPC evidence of ``latency`` in a result's
+    ``drift_report['features']``, read back as JSON text.
 
     The baseline's twenty subgroups of five consecutive integers fix the X-bar
     center at 49.5 and the S center at ``sqrt(2.5)``; the limits must be the
     NIST X-bar/S limits around them, and SPC compares signals with zero.
     """
-    feature = json.loads(details)["features"]["latency"]
+    feature = json.loads(features)["latency"]
     spc = feature["evidence"]["Spc"]
     assert (spc["subgroup_size"], spc["subgroups"]) == (5, subgroups), spc
     assert spc["x_bar"]["signals"] == x_bar_signals, spc
@@ -300,7 +301,8 @@ def test_parquet_baselines_fit_and_score_drift_server_side(tmp_path: Path) -> No
             server.flush_bifrost()
             (result,) = (
                 query.sql(
-                    "SELECT execution_status, verdict, subject_card_uid, binding_id, details "
+                    "SELECT execution_status, verdict, subject_card_uid, binding_id, "
+                    "to_json(drift_report['features']) AS features "
                     f"FROM vala.verification.results WHERE result_id = '{result_id}'"
                 )
                 .to_arrow()
@@ -320,7 +322,7 @@ def test_parquet_baselines_fit_and_score_drift_server_side(tmp_path: Path) -> No
             )
             assert features == [{"feature": "latency", "verdict": "drift"}], name
             if name == "py-drift-spc":
-                assert_spc_evidence(result["details"], 24, 24)
+                assert_spc_evidence(result["features"], 24, 24)
 
         now = datetime.now(UTC)
         binding_run = verification.start_run(
@@ -340,14 +342,15 @@ def test_parquet_baselines_fit_and_score_drift_server_side(tmp_path: Path) -> No
             server.flush_bifrost()
             (bound,) = (
                 query.sql(
-                    "SELECT verdict, binding_id, details FROM vala.verification.results "
+                    "SELECT verdict, binding_id, to_json(drift_report['features']) AS features "
+                    "FROM vala.verification.results "
                     f"WHERE result_id = '{run['result_id']}'"
                 )
                 .to_arrow()
                 .to_pylist()
             )
             assert (bound["verdict"], bound["binding_id"]) == ("failed", binding_id), bound
-            assert_spc_evidence(bound["details"], 24, 24)
+            assert_spc_evidence(bound["features"], 24, 24)
 
         spc = verifiers["py-drift-spc"]
         server.retire_fitted_format(str(spc.uid))
@@ -374,14 +377,15 @@ def test_parquet_baselines_fit_and_score_drift_server_side(tmp_path: Path) -> No
         assert refused["result_id"] is None, "a refused legacy run is never scored"
         (historical,) = (
             query.sql(
-                "SELECT verdict, details FROM vala.verification.results "
+                "SELECT verdict, to_json(drift_report['features']) AS features "
+                "FROM vala.verification.results "
                 f"WHERE result_id = '{results['py-drift-spc']}'"
             )
             .to_arrow()
             .to_pylist()
         )
         assert historical["verdict"] == "failed", historical
-        assert_spc_evidence(historical["details"], 24, 24)
+        assert_spc_evidence(historical["features"], 24, 24)
 
         ipc = DataCard(
             ArrowInterface(data=pa.table({"latency": LATENCY}), format="ipc"),
@@ -513,7 +517,7 @@ def read_result(server: WyrdTestServer, query: Bifrost, result_id: str) -> tuple
     server.flush_bifrost()
     (result,) = (
         query.sql(
-            "SELECT execution_status, verdict, details "
+            "SELECT execution_status, verdict, to_json(drift_report['features']) AS features "
             f"FROM vala.verification.results WHERE result_id = '{result_id}'"
         )
         .to_arrow()
@@ -536,10 +540,10 @@ def read_result(server: WyrdTestServer, query: Bifrost, result_id: str) -> tuple
 
 
 def assert_unscored(outcome: tuple[dict, list]) -> None:
-    """Assert a result completed inconclusive before scoring: null details, no features."""
+    """Assert a result completed inconclusive before scoring: no report, no features."""
     result, features = outcome
     assert (result["execution_status"], result["verdict"]) == ("completed", "inconclusive"), result
-    assert result["details"] is None, result
+    assert result["features"] is None, result
     assert features == [], features
 
 
@@ -548,7 +552,7 @@ def test_drift_method_edges_score_through_oracle(tmp_path: Path) -> None:
     """Each Drift method's edge semantics hold through the production runtime.
 
     Before the tenant's first Drift write a Custom run completes inconclusive with
-    no details, features, or dispatch. Separate subjects then isolate each case: a
+    no report, features, or dispatch. Separate subjects then isolate each case: a
     baseline-like window passes PSI and Custom (a mean at the threshold is no
     drift); two in-control subgroups pass SPC with zero-signal evidence until a
     trailing partial subgroup leaves it unscored; three rows are too few for
@@ -616,7 +620,7 @@ def test_drift_method_edges_score_through_oracle(tmp_path: Path) -> None:
         result, features = run(spc, calm)
         assert result["verdict"] == "passed", result
         assert features == [("latency", "Spc", "no_drift")]
-        assert_spc_evidence(result["details"], 2, 0)
+        assert_spc_evidence(result["features"], 2, 0)
         emit_rows(server, admin, calm, bundles / "calm-partial", latencies([50.0, 50.0]))
         assert_unscored(run(spc, calm))
 
@@ -903,13 +907,14 @@ def rows_of(query: Bifrost, sql: str) -> list[dict]:
     return query.sql(sql).to_arrow().to_pylist()
 
 
-def assert_psi_bins(details: str, sample: int) -> None:
-    """Assert the persisted PSI bin evidence of ``latency`` in a result's ``details``.
+def assert_psi_bins(features: str, sample: int) -> None:
+    """Assert the persisted PSI bin evidence of ``latency`` in a result's
+    ``drift_report['features']``, read back as JSON text.
 
     The baseline's integers 0..99 fill ten equal-width bins with a tenth each;
     every target value lies above 99, so the whole sample lands in the last bin.
     """
-    psi = json.loads(details)["features"]["latency"]["evidence"]["Psi"]
+    psi = json.loads(features)["latency"]["evidence"]["Psi"]
     assert psi["sample"] == sample, psi
     bins = psi["bins"]
     assert len(bins) == 10, bins
@@ -1153,7 +1158,8 @@ def test_service_bindings_verify_drift_and_eval_through_an_http_operator(tmp_pat
             server.flush_bifrost()
             (result,) = rows_of(
                 query,
-                "SELECT verdict, owner_card_uid, binding_id, subject_card_uid, details "
+                "SELECT verdict, owner_card_uid, binding_id, subject_card_uid, "
+                "to_json(drift_report['features']) AS features "
                 f"FROM vala.verification.results WHERE result_id = '{settled['result_id']}'",
             )
             assert result["verdict"] == "failed", (name, result)
@@ -1166,11 +1172,11 @@ def test_service_bindings_verify_drift_and_eval_through_an_http_operator(tmp_pat
                 delivered = await_dispatches(verification, run_id)
                 assert [d["status"] for d in delivered["dispatches"]] == ["delivered"], delivered
                 assert [path for path, _ in received].count("/hook") == 1, received
-                assert_psi_bins(result["details"], DRIFT_ROWS)
+                assert_psi_bins(result["features"], DRIFT_ROWS)
             else:
                 assert settled["dispatches"] == [], "a binding without an Operator dispatches none"
             if name == "py-bound-spc":
-                assert_spc_evidence(result["details"], DRIFT_ROWS // 5, DRIFT_ROWS // 5)
+                assert_spc_evidence(result["features"], DRIFT_ROWS // 5, DRIFT_ROWS // 5)
 
         assert_direct_run_unbound(verification, query, server, uids["py-bound-psi"], model_uid)
         assert_retired_kinds_refused(cards, tmp_path)

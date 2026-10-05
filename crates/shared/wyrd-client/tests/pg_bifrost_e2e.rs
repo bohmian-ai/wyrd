@@ -2687,6 +2687,126 @@ mod pg_tests {
         srv.shutdown().await.expect("server shutdown");
     }
 
+    /// One typed row of the built-in Variant and Struct journey.
+    ///
+    /// Each field is the native value one SQL access form must produce: `->>`
+    /// as text, `->` and a whole Variant column as JSON values, and a Struct
+    /// child through exact field access.
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    struct VariantSpanRow {
+        /// `attributes ->> 'gen_ai.input.messages'`: the string attribute.
+        input_messages: String,
+        /// `resource_attributes ->> 'service.name'`: a second Variant column.
+        service: String,
+        /// `attributes -> 'absent'`: an absent key is SQL null.
+        absent: Option<serde_json::Value>,
+        /// The whole `attributes` Variant column as its JSON object.
+        attributes: serde_json::Value,
+        /// `events[1]['name']`: a Struct child read by exact field access.
+        event_name: String,
+        /// `events[1]['attributes'] ->> 'gen_ai.finish_reason'`: a Variant
+        /// nested inside a Struct.
+        finish_reason: String,
+        /// A parsed JSON literal holding an integer beyond 2^53, which must
+        /// read back exactly.
+        parsed: serde_json::Value,
+        /// `try_parse_json` over invalid JSON: null rather than an error.
+        lenient: Option<serde_json::Value>,
+    }
+
+    /// Built-in Variant and Struct payloads are queryable through the SDK.
+    ///
+    /// Writes the canonical span fixture, whose attribute collections are
+    /// Variant and whose events are Structs, then reads it through raw `sql`
+    /// and typed `sql_as`. The raw result keeps the Variant extension, the
+    /// typed result decodes every Variant into native JSON, Struct access
+    /// stays exact, and invalid JSON in `parse_json` is the stable Variant
+    /// error while `try_parse_json` is null.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture is refused, a value reads back differently, or
+    /// the invalid-JSON query does not fail with its catalog code.
+    #[tokio::test]
+    async fn builtin_variant_and_struct_payloads_are_queryable() {
+        use wyrd_testing::bifrost::canonical_signals as fixture;
+
+        let srv = WyrdTestServer::start_bound()
+            .await
+            .expect("test server start");
+        srv.ensure_builtin_table_for_test(srv.data_tenant_id(), "traces", "spans")
+            .await
+            .expect("provision the span table");
+        let client = admin_client(&srv, "sdk-variant-journey").await;
+        let bifrost = Bifrost::connect(&client).await.expect("writer connects");
+        let scope = format!("wyrd.sdk.variant.{}", uuid::Uuid::now_v7().simple());
+        let described = TableConfig::describe(&client, "vala.traces.spans")
+            .await
+            .expect("describe the span table");
+        bifrost
+            .write_batch(
+                "vala.traces.spans",
+                &fixture::spans(described.user_schema(), &scope, 1_760_000_000_000_000_000),
+            )
+            .await
+            .expect("the canonical span batch is accepted");
+        srv.flush_bifrost().await.expect("publish the spans");
+
+        let parent = format!("FROM vala.traces.spans WHERE scope_name = '{scope}' AND parent_span_id IS NULL");
+        let raw = bifrost
+            .sql(&format!("SELECT attributes {parent}"))
+            .await
+            .expect("read the raw Variant column");
+        assert_eq!(
+            raw.batches()[0]
+                .schema()
+                .field_with_name("attributes")
+                .expect("attributes column")
+                .extension_type_name(),
+            Some("arrow.parquet.variant"),
+            "the Arrow terminal keeps the Variant extension"
+        );
+
+        let rows: Vec<VariantSpanRow> = bifrost
+            .sql_as(&format!(
+                "SELECT attributes ->> 'gen_ai.input.messages' AS input_messages, \
+                        resource_attributes ->> 'service.name' AS service, \
+                        attributes -> 'absent' AS absent, \
+                        attributes, \
+                        events[1]['name'] AS event_name, \
+                        events[1]['attributes'] ->> 'gen_ai.finish_reason' AS finish_reason, \
+                        parse_json('{{\"n\": 9007199254740993, \"a\": [1, \"x\", null]}}') AS parsed, \
+                        try_parse_json('{{bad') AS lenient \
+                 {parent}"
+            ))
+            .await
+            .expect("typed Variant rows");
+        assert_eq!(
+            rows,
+            vec![VariantSpanRow {
+                input_messages: fixture::INPUT_MESSAGES.to_owned(),
+                service: "wyrd.fixture.service".to_owned(),
+                absent: None,
+                attributes: serde_json::json!({
+                    "gen_ai.input.messages": fixture::INPUT_MESSAGES,
+                    "gen_ai.output.messages": fixture::OUTPUT_MESSAGES,
+                }),
+                event_name: fixture::EVENT_NAME.to_owned(),
+                finish_reason: "stop".to_owned(),
+                parsed: serde_json::json!({"n": 9_007_199_254_740_993_i64, "a": [1, "x", null]}),
+                lenient: None,
+            }]
+        );
+
+        let invalid = bifrost
+            .sql(&format!("SELECT parse_json('{{bad') AS v {parent}"))
+            .await
+            .expect_err("invalid JSON in parse_json is a query error");
+        assert_eq!(sdk_code(&invalid), "WYRD_VALA_400_VARIANT_INVALID_JSON");
+
+        srv.shutdown().await.expect("server shutdown");
+    }
+
     /// A denied table describe is refused, audited, and admits nothing.
     ///
     /// `WyrdState::start_bifrost` and `observe.record` both reach a table only

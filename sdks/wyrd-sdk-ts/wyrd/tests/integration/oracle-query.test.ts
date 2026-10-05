@@ -1,25 +1,27 @@
+import { Metadata } from "@grpc/grpc-js";
+import { SeverityNumber } from "@opentelemetry/api-logs";
 import {
-  Data,
-  DataType,
-  Field,
-  Int as Int_,
-  RecordBatch,
-  Schema,
-  Struct,
-  Type,
-  makeBuilder,
-  makeData,
-  tableFromIPC,
-} from "apache-arrow";
+  SpanKind,
+  SpanStatusCode,
+  TraceFlags,
+  ValueType,
+  context,
+  createTraceState,
+  trace,
+} from "@opentelemetry/api";
+import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-grpc";
+import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-grpc";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-grpc";
+import { resourceFromAttributes } from "@opentelemetry/resources";
+import { BatchLogRecordProcessor, LoggerProvider } from "@opentelemetry/sdk-logs";
+import { MeterProvider, PeriodicExportingMetricReader } from "@opentelemetry/sdk-metrics";
+import { BasicTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import type { NativeWyrdTestServer } from "@wyrd/testing";
 import { startTestServer } from "@wyrd/testing";
+import { tableFromIPC } from "apache-arrow";
 import { describe, expect, it } from "vitest";
 
-import {
-  Bifrost,
-  IncompleteQueryStreamError,
-  TableConfig,
-  WyrdError,
-} from "@wyrd/sdk";
+import { Bifrost, IncompleteQueryStreamError, WyrdError } from "@wyrd/sdk";
 
 describe("Oracle query journey", () => {
   it("uses the public SDK against an in-process Wyrd server", async () => {
@@ -203,15 +205,9 @@ describe("Oracle query journey", () => {
   }, 15_000);
 });
 
-/** Hex-decoded canonical trace and span identifiers the fixture writes. */
-const TRACE_ID = Uint8Array.from(
-  Buffer.from("c1a0112233445566778899aabbccddee", "hex"),
-);
-const PARENT_SPAN_ID = Uint8Array.from(Buffer.from("a1a2a3a4a5a6a7a8", "hex"));
-const CHILD_SPAN_ID = Uint8Array.from(Buffer.from("b1b2b3b4b5b6b7b8", "hex"));
 const MODEL = "claude-opus-5";
-const INPUT_TOKENS = 1280n;
-const OUTPUT_TOKENS = 320n;
+const INPUT_TOKENS = 1280;
+const OUTPUT_TOKENS = 320;
 const INPUT_MESSAGES =
   '[{"role":"user","parts":[{"type":"text","content":"summarize the incident"}]}]';
 const OUTPUT_MESSAGES =
@@ -219,295 +215,138 @@ const OUTPUT_MESSAGES =
 const LOG_BODY = "tool call exhausted its retry budget";
 const EVENT_NAME = "gen_ai.choice";
 const LINK_TRACE_STATE = "wyrd=fixture";
-const LINKED_SPAN_ID = Uint8Array.from(Buffer.from("c1c2c3c4c5c6c7c8", "hex"));
-const COUNTER_VALUE = 7n;
+const COUNTER_VALUE = 7;
 const GAUGE_VALUE = 0.75;
-const HISTOGRAM_COUNT = 4n;
-const HISTOGRAM_SUM = 12.5;
+const HISTOGRAM_VALUES = [1, 2.5, 3, 6];
 const SERVICE = "wyrd.fixture.service";
 
-/** Concatenate protobuf fragments into one message body. */
-function concat(...parts: Uint8Array[]): Uint8Array {
-  const total = parts.reduce((sum, part) => sum + part.length, 0);
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const part of parts) {
-    out.set(part, offset);
-    offset += part.length;
-  }
-  return out;
-}
-
-/** Encode one base-128 varint, the protobuf tag and length primitive. */
-function varint(value: number): Uint8Array {
-  const bytes: number[] = [];
-  let rest = value;
-  do {
-    const byte = rest & 0x7f;
-    rest >>>= 7;
-    bytes.push(rest > 0 ? byte | 0x80 : byte);
-  } while (rest > 0);
-  return Uint8Array.from(bytes);
-}
-
-/** Encode one length-delimited protobuf field. */
-function delimited(number: number, payload: Uint8Array): Uint8Array {
-  return concat(varint((number << 3) | 2), varint(payload.length), payload);
-}
-
-/** Encode one string `AnyValue`, which a log body carries verbatim. */
-function anyValue(text: string): Uint8Array {
-  return delimited(1, new TextEncoder().encode(text));
+/** Builds the gRPC metadata a stock OTLP exporter authenticates with. */
+function exporterMetadata(server: NativeWyrdTestServer): Metadata {
+  const metadata = new Metadata();
+  metadata.set("x-wyrd-access-token", `Bearer ${server.token}`);
+  return metadata;
 }
 
 /**
- * Encode string attributes as the canonical `KeyValueList` bytes.
- *
- * Ingress decodes and re-encodes every canonical binary payload, so a fixture
- * cannot substitute a JSON blob here.
+ * Exports the GenAI chat, its failing tool call, the tool's log, and three
+ * metrics through the stock OpenTelemetry SDK and OTLP exporters, so the
+ * canonical rows and their Variant payloads come from the server's own ingress.
  */
-function attributes(pairs: Record<string, string>): Uint8Array {
-  return concat(
-    ...Object.entries(pairs).map(([key, value]) =>
-      delimited(
-        1,
-        concat(
-          delimited(1, new TextEncoder().encode(key)),
-          delimited(2, anyValue(value)),
-        ),
+async function exportCanonicalSignals(
+  server: NativeWyrdTestServer,
+  scope: string,
+): Promise<void> {
+  const resource = resourceFromAttributes({ "service.name": SERVICE });
+  const traces = new BasicTracerProvider({
+    resource,
+    spanProcessors: [
+      new BatchSpanProcessor(
+        new OTLPTraceExporter({ url: server.grpcUrl, metadata: exporterMetadata(server) }),
       ),
-    ),
-  );
-}
-
-/** The value an unnamed column takes, decided by its described type. */
-function defaultFor(field: Field): unknown {
-  if (field.nullable) {
-    return null;
-  }
-  switch (field.typeId) {
-    case Type.Utf8:
-      return "";
-    case Type.Bool:
-      return false;
-    case Type.Float:
-      return 0;
-    case Type.Int:
-      return (field.type as Int_).bitWidth === 64 ? 0n : 0;
-    case Type.Binary:
-    case Type.FixedSizeBinary:
-      return new Uint8Array(0);
-    case Type.List:
-      return [];
-    default:
-      throw new Error(`column ${field.name} has unsupported type ${field.type}`);
-  }
-}
-
-/**
- * Build one described column across every fixture row.
- *
- * A nested struct is the one shape a builder cannot express here: the ledger
- * declares its children non-nullable, so an absent struct is a null parent
- * over present children rather than nulls all the way down.
- */
-function columnData(field: Field, rows: Row[]): Data {
-  if (DataType.isStruct(field.type)) {
-    return makeData({
-      type: field.type,
-      length: rows.length,
-      nullCount: rows.length,
-      nullBitmap: new Uint8Array(Math.ceil(rows.length / 8) + 8),
-      children: field.type.children.map((child) =>
-        columnData(child, rows.map(() => ({}))),
-      ),
-    });
-  }
-  const builder = makeBuilder({ type: field.type, nullValues: [null] });
-  for (const row of rows) {
-    builder.append(field.name in row ? row[field.name] : defaultFor(field));
-  }
-  builder.finish();
-  return builder.flush();
-}
-
-/** A fixture row naming only the columns its assertions depend on. */
-type Row = Record<string, unknown>;
-
-/**
- * Build one Arrow batch over `schema` from rows that name only some columns.
- *
- * The schema is the server's own published description, so the fixture never
- * restates a second copy of the canonical ledger.
- */
-function batch(schema: Schema, rows: Row[]): RecordBatch {
-  return new RecordBatch(
-    schema,
-    makeData({
-      type: new Struct(schema.fields),
-      length: rows.length,
-      children: schema.fields.map((field) => columnData(field, rows)),
-    }),
-  );
-}
-
-/** The parent GenAI chat span and the failing tool span it made. */
-function spans(schema: Schema, scope: string, anchor: bigint): RecordBatch {
-  const envelope: Row = {
-    resource_present: true,
-    resource_attributes: attributes({ "service.name": SERVICE }),
-    scope_present: true,
-    scope_name: scope,
-    scope_version: "1.0.0",
-    service_name: SERVICE,
-    gen_ai_provider_name: "anthropic",
-    gen_ai_request_model: MODEL,
-    gen_ai_conversation_id: "conversation-fixture",
-    trace_id: TRACE_ID,
-    status_present: true,
-  };
-  return batch(schema, [
-    {
-      ...envelope,
-      span_id: PARENT_SPAN_ID,
-      name: "chat claude-opus-5",
-      kind: 3,
-      start_time_unix_nano: anchor,
-      end_time_unix_nano: anchor + 2_000_000n,
-      duration_nano: 2_000_000n,
-      status_code: 1,
-      status_message: "ok",
-      attributes: attributes({
-        "gen_ai.input.messages": INPUT_MESSAGES,
-        "gen_ai.output.messages": OUTPUT_MESSAGES,
-      }),
-      gen_ai_operation_name: "chat",
-      gen_ai_usage_input_tokens: INPUT_TOKENS,
-      gen_ai_usage_output_tokens: OUTPUT_TOKENS,
-      events: [
-        {
-          time_unix_nano: anchor + 1_000_000n,
-          name: EVENT_NAME,
-          attributes: attributes({ "gen_ai.finish_reason": "stop" }),
-          dropped_attributes_count: 0n,
-        },
-      ],
-      links: [
-        {
-          trace_id: TRACE_ID,
-          span_id: LINKED_SPAN_ID,
-          trace_state: LINK_TRACE_STATE,
-          flags: 1n,
-          attributes: attributes({ "link.kind": "follows_from" }),
-          dropped_attributes_count: 0n,
-        },
-      ],
-    },
-    {
-      ...envelope,
-      span_id: CHILD_SPAN_ID,
-      parent_span_id: PARENT_SPAN_ID,
-      name: "execute_tool search",
-      kind: 1,
-      start_time_unix_nano: anchor + 100_000n,
-      end_time_unix_nano: anchor + 900_000n,
-      duration_nano: 800_000n,
-      status_code: 2,
-      status_message: LOG_BODY,
-      attributes: attributes({ "gen_ai.tool.name": "search" }),
-      gen_ai_operation_name: "execute_tool",
-      gen_ai_usage_input_tokens: 64n,
-      gen_ai_usage_output_tokens: 16n,
-    },
-  ]);
-}
-
-/** The error log correlated to the tool span that failed. */
-function logs(schema: Schema, scope: string, anchor: bigint): RecordBatch {
-  return batch(schema, [
-    {
-      time_unix_nano: anchor + 800_000n,
-      observed_time_unix_nano: anchor + 850_000n,
-      severity_number: 17,
-      severity_text: "ERROR",
-      event_name: "tool.retry.exhausted",
-      body: anyValue(LOG_BODY),
-      trace_id: TRACE_ID,
-      span_id: CHILD_SPAN_ID,
-      attributes: attributes({ "gen_ai.tool.name": "search" }),
-      resource_present: true,
-      resource_attributes: attributes({ "service.name": SERVICE }),
-      scope_present: true,
-      scope_name: scope,
-      scope_version: "1.0.0",
-    },
-  ]);
-}
-
-/** One counter, one gauge and one histogram point. */
-function points(schema: Schema, scope: string, anchor: bigint): RecordBatch {
-  const common = (name: string, kind: string): Row => ({
-    metric_name: name,
-    description: `fixture ${kind}`,
-    unit: "1",
-    metric_type: kind,
-    time_unix_nano: anchor,
-    start_time_unix_nano: anchor,
-    attributes: attributes({ "gen_ai.request.model": MODEL }),
-    resource_present: true,
-    resource_attributes: attributes({ "service.name": SERVICE }),
-    scope_present: true,
-    scope_name: scope,
-    scope_version: "1.0.0",
+    ],
   });
-  return batch(schema, [
-    {
-      ...common("wyrd.fixture.requests", "sum"),
-      int_value: COUNTER_VALUE,
-      aggregation_temporality: 2,
-      is_monotonic: true,
-    },
-    { ...common("wyrd.fixture.saturation", "gauge"), double_value: GAUGE_VALUE },
-    {
-      ...common("wyrd.fixture.latency", "histogram"),
-      aggregation_temporality: 2,
-      histogram_count: HISTOGRAM_COUNT,
-      histogram_sum: HISTOGRAM_SUM,
-      histogram_min: 1.0,
-      histogram_max: 6.0,
-    },
-  ]);
+  const logs = new LoggerProvider({
+    resource,
+    processors: [
+      new BatchLogRecordProcessor({
+        exporter: new OTLPLogExporter({
+          url: server.grpcUrl,
+          metadata: exporterMetadata(server),
+        }),
+      }),
+    ],
+  });
+  const tracer = traces.getTracer(scope, "1.0.0");
+  const parent = tracer.startSpan("chat claude-opus-5", {
+    kind: SpanKind.CLIENT,
+    links: [
+      {
+        context: {
+          traceId: "00000000000000000000000000000001",
+          spanId: "0000000000000002",
+          traceFlags: TraceFlags.SAMPLED,
+          traceState: createTraceState(LINK_TRACE_STATE),
+        },
+      },
+    ],
+  });
+  parent.setAttributes({
+    "gen_ai.operation.name": "chat",
+    "gen_ai.request.model": MODEL,
+    "gen_ai.usage.input_tokens": INPUT_TOKENS,
+    "gen_ai.usage.output_tokens": OUTPUT_TOKENS,
+    "gen_ai.input.messages": INPUT_MESSAGES,
+    "gen_ai.output.messages": OUTPUT_MESSAGES,
+  });
+  parent.addEvent(EVENT_NAME, { "gen_ai.finish_reason": "stop" });
+  parent.setStatus({ code: SpanStatusCode.OK });
+  const child = tracer.startSpan(
+    "execute_tool search",
+    undefined,
+    trace.setSpan(context.active(), parent),
+  );
+  child.setAttributes({
+    "gen_ai.operation.name": "execute_tool",
+    "gen_ai.request.model": MODEL,
+    "gen_ai.tool.name": "search",
+    "gen_ai.usage.input_tokens": 64,
+    "gen_ai.usage.output_tokens": 16,
+  });
+  // `@opentelemetry/api` has no ambient context manager until an application
+  // registers one, so the record names the tool span's context explicitly.
+  logs.getLogger(scope, "1.0.0").emit({
+    body: LOG_BODY,
+    severityNumber: SeverityNumber.ERROR,
+    severityText: "ERROR",
+    attributes: { "gen_ai.tool.name": "search" },
+    context: trace.setSpan(context.active(), child),
+  });
+  child.setStatus({ code: SpanStatusCode.ERROR, message: LOG_BODY });
+  child.end();
+  parent.end();
+  await traces.shutdown();
+  await logs.shutdown();
+
+  // Shutdown is the single metric export: the SDK aggregates cumulatively, so
+  // a flush followed by shutdown would write each running total twice.
+  const metrics = new MeterProvider({
+    resource,
+    readers: [
+      new PeriodicExportingMetricReader({
+        exporter: new OTLPMetricExporter({
+          url: server.grpcUrl,
+          metadata: exporterMetadata(server),
+        }),
+        exportIntervalMillis: 600_000,
+      }),
+    ],
+  });
+  const meter = metrics.getMeter(scope, "1.0.0");
+  const attributes = { "gen_ai.request.model": MODEL };
+  meter
+    .createCounter("wyrd.fixture.requests", { valueType: ValueType.INT })
+    .add(COUNTER_VALUE, attributes);
+  meter.createGauge("wyrd.fixture.saturation").record(GAUGE_VALUE, attributes);
+  const latency = meter.createHistogram("wyrd.fixture.latency");
+  for (const value of HISTOGRAM_VALUES) {
+    latency.record(value, attributes);
+  }
+  await metrics.shutdown();
 }
 
 describe("Canonical signal journey", () => {
   it("canonical signal Arrow write and SQL read round-trip", async () => {
     const server = startTestServer();
     try {
-      for (const [namespace, name] of [
-        ["traces", "spans"],
-        ["logs", "records"],
-        ["metrics", "points"],
-      ] as const) {
-        server.ensureBuiltinTable(namespace, name);
-      }
+      const scope = `wyrd.ts.canonical.${Date.now()}`;
+      await exportCanonicalSignals(server, scope);
+      server.waitForBifrostPublication();
       const transport = {
         serverUrl: server.baseUrl,
-        credential: server.apiKey,
+        credential: server.token,
         grpcUrl: server.grpcUrl,
       };
       const writer = await Bifrost.connect(transport);
-      const scope = `wyrd.ts.canonical.${Date.now()}`;
-      const anchor = 1_760_000_000_000_000_000n;
-
-      for (const [fqn, build] of [
-        ["vala.traces.spans", spans],
-        ["vala.logs.records", logs],
-        ["vala.metrics.points", points],
-      ] as const) {
-        const described = await TableConfig.describe(fqn, transport);
-        await writer.writeBatch(fqn, build(described.arrowSchema, scope, anchor));
-      }
-      server.flushBifrost();
 
       const hierarchy = (
         await writer.sql(
@@ -524,6 +363,9 @@ describe("Canonical signal journey", () => {
         1n,
         0n,
       ]);
+      expect(Array.from(hierarchy.getChild("status_code")?.toArray() ?? [])).toEqual([
+        1, 2,
+      ]);
 
       const tokens = (
         await writer.sql(
@@ -534,52 +376,62 @@ describe("Canonical signal journey", () => {
         )
       ).toArrow();
       expect(tokens.get(0)?.toJSON()).toEqual({
-        input_tokens: INPUT_TOKENS + 64n,
-        output_tokens: OUTPUT_TOKENS + 16n,
+        input_tokens: BigInt(INPUT_TOKENS + 64),
+        output_tokens: BigInt(OUTPUT_TOKENS + 16),
         spans: 2n,
       });
 
-      const correlated = (
-        await writer.sql(
-          `SELECT l.severity_text, l.event_name, s.name AS span_name ` +
-            `FROM vala.logs.records l JOIN vala.traces.spans s ` +
-            `ON l.trace_id = s.trace_id AND l.span_id = s.span_id ` +
-            `WHERE l.scope_name = '${scope}'`,
-        )
-      ).toArrow();
-      expect(correlated.numRows).toBe(1);
-      expect(correlated.get(0)?.toJSON()).toEqual({
-        severity_text: "ERROR",
-        event_name: "tool.retry.exhausted",
-        span_name: "execute_tool search",
-      });
+      const correlated = await writer.sql(
+        `SELECT l.severity_text, l.body, ` +
+          `l.attributes ->> 'gen_ai.tool.name' AS tool, s.name AS span_name ` +
+          `FROM vala.logs.records l JOIN vala.traces.spans s ` +
+          `ON l.trace_id = s.trace_id AND l.span_id = s.span_id ` +
+          `WHERE l.scope_name = '${scope}'`,
+        { parse: (row) => row as Record<string, unknown> },
+      );
+      expect(correlated).toEqual([
+        {
+          severity_text: "ERROR",
+          body: LOG_BODY,
+          tool: "search",
+          span_name: "execute_tool search",
+        },
+      ]);
 
       const metrics = (
         await writer.sql(
           `SELECT metric_type, ` +
             `CAST(SUM(COALESCE(int_value, 0)) AS BIGINT) AS ints, ` +
             `CAST(SUM(COALESCE(double_value, 0.0)) AS DOUBLE) AS doubles, ` +
-            `CAST(SUM(COALESCE(histogram_count, 0)) AS BIGINT) AS observations ` +
+            `CAST(SUM(COALESCE(histogram_count, 0)) AS BIGINT) AS observations, ` +
+            `CAST(SUM(COALESCE(histogram_sum, 0.0)) AS DOUBLE) AS observed ` +
             `FROM vala.metrics.points WHERE scope_name = '${scope}' ` +
             `GROUP BY metric_type ORDER BY metric_type`,
         )
       ).toArrow();
       expect(metrics.toArray().map((row) => row.toJSON())).toEqual([
-        { metric_type: "gauge", ints: 0n, doubles: GAUGE_VALUE, observations: 0n },
+        {
+          metric_type: "gauge",
+          ints: 0n,
+          doubles: GAUGE_VALUE,
+          observations: 0n,
+          observed: 0,
+        },
         {
           metric_type: "histogram",
           ints: 0n,
           doubles: 0,
-          observations: HISTOGRAM_COUNT,
+          observations: BigInt(HISTOGRAM_VALUES.length),
+          observed: HISTOGRAM_VALUES.reduce((sum, value) => sum + value, 0),
         },
         {
           metric_type: "sum",
-          ints: COUNTER_VALUE,
+          ints: BigInt(COUNTER_VALUE),
           doubles: 0,
           observations: 0n,
+          observed: 0,
         },
       ]);
-      expect(HISTOGRAM_SUM).toBe(12.5);
 
       const payloadReader = await Bifrost.connect({
         ...transport,
@@ -587,34 +439,104 @@ describe("Canonical signal journey", () => {
           "bifrost_query:read",
         ]),
       });
-      const nested = (
-        await payloadReader.sql(
-          `SELECT CAST(array_length(events) AS BIGINT) AS events, ` +
-            `CAST(array_length(links) AS BIGINT) AS links, ` +
-            `events[1]['name'] AS event_name, links[1]['trace_state'] AS link_state ` +
-            `FROM vala.traces.spans ` +
-            `WHERE scope_name = '${scope}' AND parent_span_id IS NULL`,
-        )
-      ).toArrow();
-      expect(nested.get(0)?.toJSON()).toEqual({
+      const [payload] = await payloadReader.sql(
+        `SELECT CAST(array_length(events) AS BIGINT) AS events, ` +
+          `CAST(array_length(links) AS BIGINT) AS links, ` +
+          `events[1]['name'] AS event_name, ` +
+          `events[1]['attributes'] ->> 'gen_ai.finish_reason' AS finish_reason, ` +
+          `links[1]['trace_state'] AS link_state, attributes, ` +
+          `resource_attributes ->> 'service.name' AS service ` +
+          `FROM vala.traces.spans ` +
+          `WHERE scope_name = '${scope}' AND parent_span_id IS NULL`,
+        { parse: (row) => row as Record<string, any> },
+      );
+      expect(payload).toMatchObject({
         events: 1n,
         links: 1n,
         event_name: EVENT_NAME,
+        finish_reason: "stop",
         link_state: LINK_TRACE_STATE,
+        service: SERVICE,
       });
+      expect(payload?.attributes).toMatchObject({
+        "gen_ai.input.messages": INPUT_MESSAGES,
+        "gen_ai.output.messages": OUTPUT_MESSAGES,
+        "gen_ai.usage.input_tokens": INPUT_TOKENS,
+      });
+    } finally {
+      server.shutdown();
+    }
+  }, 60_000);
+});
 
-      const messages = (
-        await payloadReader.sql(
-          `SELECT attributes FROM vala.traces.spans ` +
-            `WHERE scope_name = '${scope}' AND parent_span_id IS NULL`,
-        )
-      ).toArrow();
-      expect(messages.numRows).toBe(1);
-      const payload = new TextDecoder().decode(
-        messages.getChild("attributes")?.get(0) as Uint8Array,
+describe("Variant query journey", () => {
+  it("builtin Variant and Struct payloads are queryable", async () => {
+    const server = startTestServer();
+    try {
+      const scope = `wyrd.ts.variant.${Date.now()}`;
+      const provider = new BasicTracerProvider({
+        resource: resourceFromAttributes({ "service.name": SERVICE }),
+        spanProcessors: [
+          new BatchSpanProcessor(
+            new OTLPTraceExporter({
+              url: server.grpcUrl,
+              metadata: exporterMetadata(server),
+            }),
+          ),
+        ],
+      });
+      const span = provider.getTracer(scope, "1.0.0").startSpan("variant-parent");
+      span.setAttribute("gen_ai.request.model", MODEL);
+      span.setAttribute("wyrd.test.big", 2 ** 60);
+      span.setAttribute("wyrd.test.values", [1, 2, 3]);
+      span.addEvent(EVENT_NAME, { "gen_ai.finish_reason": "stop" });
+      span.end();
+      await provider.forceFlush();
+      await provider.shutdown();
+      server.waitForBifrostPublication();
+
+      const reader = await Bifrost.connect({
+        serverUrl: server.baseUrl,
+        credential: server.token,
+        grpcUrl: server.grpcUrl,
+      });
+      const where = `FROM vala.traces.spans WHERE scope_name = '${scope}'`;
+      const raw = await reader.sql(`SELECT attributes ${where}`);
+      expect(
+        raw.schema.fields[0]?.metadata.get("ARROW:extension:name"),
+        "the Arrow terminal keeps the Variant extension",
+      ).toBe("arrow.parquet.variant");
+
+      const rows = await reader.sql(
+        `SELECT attributes ->> 'gen_ai.request.model' AS model, ` +
+          `resource_attributes ->> 'service.name' AS service, ` +
+          `attributes -> 'absent' AS absent, attributes, ` +
+          `events[1]['name'] AS event_name, ` +
+          `events[1]['attributes'] ->> 'gen_ai.finish_reason' AS finish_reason, ` +
+          `parse_json('{"n": 9007199254740993, "a": [1, "x", null]}') AS parsed, ` +
+          `try_parse_json('{bad') AS lenient ${where}`,
+        { parse: (row) => ({ ...(row as Record<string, unknown>) }) },
       );
-      expect(payload).toContain(INPUT_MESSAGES);
-      expect(payload).toContain(OUTPUT_MESSAGES);
+      expect(rows).toEqual([
+        {
+          model: MODEL,
+          service: SERVICE,
+          absent: null,
+          attributes: {
+            "gen_ai.request.model": MODEL,
+            "wyrd.test.big": 2n ** 60n,
+            "wyrd.test.values": [1, 2, 3],
+          },
+          event_name: EVENT_NAME,
+          finish_reason: "stop",
+          parsed: { n: 9007199254740993n, a: [1, "x", null] },
+          lenient: null,
+        },
+      ]);
+
+      await expect(
+        reader.sql(`SELECT parse_json('{bad') AS v ${where}`),
+      ).rejects.toMatchObject({ code: "WYRD_VALA_400_VARIANT_INVALID_JSON" });
     } finally {
       server.shutdown();
     }

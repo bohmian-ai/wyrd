@@ -13,7 +13,7 @@
 //! - `parse_json(text)`, `try_parse_json(text)`, and `to_json(v)`.
 //! - the expression planner that rewrites `->` and `->>` on a Variant operand.
 //!
-//! Struct access is not handled here: `s['field']` stays DataFusion's exact
+//! Struct access is not handled here: `s['field']` stays `DataFusion`'s exact
 //! `get_field`. Every Variant result is the canonical unshredded storage under
 //! the `arrow.parquet.variant` extension, so results keep the extension on the
 //! wire and a chained `->` sees a Variant operand.
@@ -116,7 +116,7 @@ impl OracleVariantSql {
     ///
     /// Call it after any default features are applied: it appends to the
     /// builder's existing function and planner lists rather than replacing
-    /// them, so the session keeps DataFusion's built-ins (including
+    /// them, so the session keeps `DataFusion`'s built-ins (including
     /// `get_field` for Struct access) and gains the Variant surface.
     #[must_use]
     pub fn install(&self, mut builder: SessionStateBuilder) -> SessionStateBuilder {
@@ -137,7 +137,7 @@ impl OracleVariantSql {
 /// A chain `v -> 'a' -> 'b'` becomes one `variant_get(v, 'a', 'b')`, so the
 /// whole literal path is one Arrow-rs path lookup. `->>` wraps that call in
 /// `variant_as_text`. An operand that is not a Variant is left alone, so
-/// DataFusion reports its ordinary type error.
+/// `DataFusion` reports its ordinary type error.
 #[derive(Debug)]
 struct VariantOperatorPlanner {
     /// The registered `variant_get` function.

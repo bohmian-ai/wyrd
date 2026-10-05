@@ -1,7 +1,9 @@
 import {
+  DataType,
   Table,
   tableFromIPC,
   tableToIPC,
+  type Field,
   type RecordBatch,
   type Schema,
 } from "apache-arrow";
@@ -28,6 +30,7 @@ const {
   describeTableConfig,
   openWyrdState,
   tableConfigFromJsonSchema,
+  variantToValue,
 } = nativeBinding;
 type NativeBifrost = import("../index.cjs").NativeBifrost;
 type NativeCards = import("../index.cjs").NativeCards;
@@ -639,6 +642,47 @@ export interface RowSchema<T> {
  * streamed one are the same rows read the same way — only the batches are
  * retained rather than yielded.
  */
+/** The Arrow extension name every Variant column carries. */
+const VARIANT_EXTENSION = "arrow.parquet.variant";
+
+/** Whether `field` is a Variant or nests one inside a Struct or List. */
+function holdsVariant(field: Field): boolean {
+  if (field.metadata.get("ARROW:extension:name") === VARIANT_EXTENSION) {
+    return true;
+  }
+  if (DataType.isStruct(field.type) || DataType.isList(field.type)) {
+    return (field.type.children as Field[]).some(holdsVariant);
+  }
+  return false;
+}
+
+/**
+ * Replace every Variant cell inside one row value with its native value,
+ * leaving every other value as Apache Arrow produced it.
+ *
+ * Decoding stays in the shared Rust owner: objects become plain objects,
+ * arrays arrays, and an integer outside the safe range a `bigint`.
+ */
+function nativeValue(field: Field, value: unknown): unknown {
+  if (value === null || value === undefined || !holdsVariant(field)) {
+    return value;
+  }
+  if (field.metadata.get("ARROW:extension:name") === VARIANT_EXTENSION) {
+    const cell = value as { metadata: Uint8Array; value: Uint8Array };
+    return variantToValue(cell.metadata, cell.value);
+  }
+  const children = field.type.children as Field[];
+  if (DataType.isStruct(field.type)) {
+    const struct = value as Record<string, unknown>;
+    return Object.fromEntries(
+      children.map((child) => [child.name, nativeValue(child, struct[child.name])]),
+    );
+  }
+  return Array.from(value as Iterable<unknown>, (item) =>
+    nativeValue(children[0] as Field, item),
+  );
+}
+
 export class QueryResult {
   readonly #batches: readonly RecordBatch[];
   readonly #terminal: QueryTerminal;
@@ -859,7 +903,8 @@ export class Bifrost {
    * A purely local projection over the completed result: the query, its
    * authorization, its limits, and its terminal are the same ones raw
    * {@link Bifrost.sql} runs. The schema never reaches the server and says
-   * nothing about the table's stored layout.
+   * nothing about the table's stored layout. Variant cells, top level or
+   * nested in a Struct or List, reach `rows` as their native value.
    *
    * @throws whatever `rows.parse` throws for the first row it rejects, so a
    * partially valid result is never returned as success.
@@ -887,12 +932,17 @@ export class Bifrost {
     if (rows === undefined) {
       return result;
     }
+    const variantFields = schema.fields.filter(holdsVariant);
     return result
       .toArrow()
       .toArray()
-      .map((row: { toJSON(): Record<string, unknown> }) =>
-        rows.parse(row.toJSON()),
-      );
+      .map((row: { toJSON(): Record<string, unknown> }) => {
+        const values = row.toJSON();
+        for (const field of variantFields) {
+          values[field.name] = nativeValue(field, values[field.name]);
+        }
+        return rows.parse(values);
+      });
   }
 
   /** Run one SQL SELECT and iterate its batches as they arrive. */

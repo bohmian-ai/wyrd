@@ -982,9 +982,62 @@ def _validated_rows(result: QueryResult, model: type[_Row]) -> list[_Row]:
     The rows come from the Arrow table the result already decoded, so the keys
     ``model`` sees are exactly the columns the server returned. Validation is
     all-or-nothing: the first rejected row raises and no partial list escapes.
+    Variant cells, top level or nested in a Struct or List, arrive as their
+    native ``dict``, ``list``, or scalar value rather than as encoded bytes.
     """
 
-    return [model.model_validate(row) for row in result.to_arrow().to_pylist()]
+    table = result.to_arrow()
+    decode = result._native.variant_to_python
+    variant_columns = [field for field in table.schema if _holds_variant(field)]
+    rows = table.to_pylist()
+    for row in rows:
+        for field in variant_columns:
+            row[field.name] = _native_value(field, row[field.name], decode)
+    return [model.model_validate(row) for row in rows]
+
+
+_VARIANT_EXTENSION = b"arrow.parquet.variant"
+
+
+def _is_variant(field: pyarrow.Field) -> bool:
+    """Whether ``field`` carries the Arrow Variant extension.
+
+    pyarrow either keeps the extension as field metadata or, when it knows the
+    type, as an extension type; both spellings name the same column.
+    """
+
+    name = getattr(field.type, "extension_name", None)
+    if name is not None:
+        return bool(name.encode() == _VARIANT_EXTENSION)
+    return (field.metadata or {}).get(b"ARROW:extension:name") == _VARIANT_EXTENSION
+
+
+def _holds_variant(field: pyarrow.Field) -> bool:
+    """Whether ``field`` is a Variant or nests one inside a Struct or List."""
+
+    if _is_variant(field):
+        return True
+    kind = field.type
+    if pyarrow.types.is_struct(kind):
+        return any(_holds_variant(kind.field(index)) for index in range(kind.num_fields))
+    if pyarrow.types.is_list(kind) or pyarrow.types.is_large_list(kind):
+        return _holds_variant(kind.value_field)
+    return False
+
+
+def _native_value(field: pyarrow.Field, value: Any, decode: Any) -> Any:
+    """Replace every Variant cell inside one ``to_pylist`` value with its
+    native Python value, leaving every other value as pyarrow produced it."""
+
+    if value is None or not _holds_variant(field):
+        return value
+    if _is_variant(field):
+        return decode(value["metadata"], value["value"])
+    kind = field.type
+    if pyarrow.types.is_struct(kind):
+        children = (kind.field(index) for index in range(kind.num_fields))
+        return {child.name: _native_value(child, value[child.name], decode) for child in children}
+    return [_native_value(kind.value_field, item, decode) for item in value]
 
 
 __all__ = [

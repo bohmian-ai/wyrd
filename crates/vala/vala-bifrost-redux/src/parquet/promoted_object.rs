@@ -146,8 +146,8 @@ fn verify_registered_field_ids(root: &types::Type, table_schema: &Schema) -> Res
 
 /// Checks one Parquet node and its descendants against one table field.
 ///
-/// The node must carry the table field's id. A struct's children are matched
-/// by name; a list's element and a map's key and value sit under the
+/// The node must carry the table field's id. A Variant's encoding group is a
+/// leaf of the table schema. A struct's children are matched by name; a list's element and a map's key and value sit under the
 /// unnumbered repeated group the Parquet list and map encodings insert, and
 /// are matched by position there.
 ///
@@ -181,6 +181,9 @@ fn verify_field_id(node: &types::Type, registered: &NestedField) -> Result<(), S
     };
     match registered.field_type.as_ref() {
         Type::Primitive(_) if node.is_primitive() => Ok(()),
+        // A Variant is one Iceberg field: its id sits on the group, and the
+        // group's `metadata` and `value` children are unnumbered encoding.
+        Type::Variant(_) if node.is_group() => Ok(()),
         Type::Struct(children) if node.is_group() => {
             node.get_fields().iter().try_for_each(|child| {
                 let field = children.field_by_name(child.name()).ok_or_else(nesting)?;

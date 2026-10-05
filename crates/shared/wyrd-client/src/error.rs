@@ -4,6 +4,7 @@
 
 use thiserror::Error;
 use wyrd_spec::error::{WyrdError, WyrdStorageError};
+use wyrd_spec::vala::error::BifrostError;
 use wyrd_tonic::error::WYRD_ERROR_HEADER;
 
 /// Concrete client-local error.
@@ -182,6 +183,12 @@ pub fn from_grpc_status(status: &wyrd_tonic::tonic::Status) -> WyrdError {
 /// identical codes always produce identical [`WyrdError`] values regardless of
 /// which transport the response arrived on.
 ///
+/// A Bifrost code whose `details` carry the serialized [`BifrostError`] (the
+/// HTTP problem document and the gRPC problem header both do) is rebuilt
+/// exactly from that payload, so every catalog Bifrost variant keeps its code
+/// and fields without a per-code arm. Bodies without that payload fall back to
+/// the message-parsing arms of `bifrost_error_from_code`.
+///
 /// Reconstruction goes through [`WyrdError::from_code`], which covers the whole
 /// catalog (every `{ message, details }` variant), so a `404`/`403`/`429`
 /// response keeps its real code **and** [`WyrdError::status`] instead of
@@ -193,6 +200,12 @@ fn code_to_wyrd_error(code: &str, message: String, details: serde_json::Value) -
         && let Ok(error) = serde_json::from_value::<WyrdStorageError>(details.clone())
     {
         return error.into();
+    }
+    if code.starts_with("WYRD_VALA_")
+        && let Ok(error) = serde_json::from_value::<BifrostError>(details.clone())
+        && error.code() == code
+    {
+        return WyrdError::Vala { error };
     }
     if let Some(bifrost) = bifrost_error_from_code(code, &message, &details) {
         return bifrost;
@@ -215,8 +228,6 @@ fn bifrost_error_from_code(
     message: &str,
     details: &serde_json::Value,
 ) -> Option<WyrdError> {
-    use wyrd_spec::vala::error::BifrostError;
-
     let table_from_message = |prefix: &str| {
         message
             .strip_prefix(prefix)
@@ -399,6 +410,25 @@ mod tests {
         });
         let err = from_problem_json(&body);
         assert_eq!(err.code(), "WYRD_SPEC_404_NOT_FOUND");
+    }
+
+    /// A Bifrost problem document round-trips to the exact variant and fields.
+    ///
+    /// The body is the server's own rendering, so a Variant query failure keeps
+    /// its catalog code and location instead of collapsing to an upstream
+    /// failure on the client.
+    #[test]
+    fn bifrost_problem_details_reconstruct_exact_variant() {
+        let sent = WyrdError::Vala {
+            error: wyrd_spec::vala::error::BifrostError::VariantInvalidJson {
+                field: "parse_json".to_owned(),
+                row: 0,
+                path: String::new(),
+            },
+        };
+        let received = from_problem_json(&sent.as_problem_json());
+        assert_eq!(received.code(), "WYRD_VALA_400_VARIANT_INVALID_JSON");
+        assert_eq!(received.as_problem_json(), sent.as_problem_json());
     }
 
     #[test]

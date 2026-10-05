@@ -17,7 +17,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use napi::Error;
 use napi::Result;
-use napi::bindgen_prelude::Buffer;
+use napi::bindgen_prelude::{Buffer, Uint8Array};
 use napi_derive::napi;
 use serde::Serialize;
 use serde_json::Value;
@@ -418,6 +418,28 @@ pub fn table_config_from_json_schema(
     let config = apply_layout(config, layout_json.as_deref())?;
     let config = apply_compaction_target(config, compaction_target_file_size_bytes)?;
     NativeTableConfig::project(&apply_compaction_type(config, compaction_type.as_deref())?)
+}
+
+/// Decodes one Variant cell's `metadata`/`value` bytes into its native
+/// JavaScript value.
+///
+/// The typed row terminal calls this for every Variant cell it finds while
+/// walking the result schema, so decoding stays in the shared `wyrd-queue`
+/// owner. napi's JSON projection makes objects plain objects, arrays arrays,
+/// and an integer outside the IEEE-754 safe range a `bigint`.
+///
+/// # Errors
+///
+/// Returns a napi error when the bytes are not a valid Variant, which only a
+/// faulty server result can produce.
+// justification: napi boundary; a JavaScript typed array arrives as an owned
+// handle, so the generated binding cannot take a borrowed slice
+#[allow(clippy::needless_pass_by_value)]
+#[napi]
+pub fn variant_to_value(metadata: Uint8Array, value: Uint8Array) -> Result<Value> {
+    wyrd_queue::variant::variant_bytes_to_json(&metadata, &value).map_err(|violation| {
+        napi_error(format!("query result Variant does not decode: {violation:?}"))
+    })
 }
 
 /// Fetches an already-registered table's config by name.

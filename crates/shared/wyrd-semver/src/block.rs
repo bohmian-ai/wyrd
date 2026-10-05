@@ -10,7 +10,7 @@ use crate::bump::VersionBump;
 use crate::error::VersionError;
 
 /// Semver-compatible version string.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct VersionBlock(String);
 
@@ -147,6 +147,22 @@ impl FromStr for VersionBlock {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::parse(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for VersionBlock {
+    /// Deserialize a version string through [`VersionBlock::parse`], so a
+    /// range, partial, or empty value can never inhabit this type.
+    ///
+    /// # Errors
+    /// Returns the deserializer's custom error when the input is not a string
+    /// or is not an exact semantic version.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -343,6 +359,34 @@ mod tests {
     fn from_triple_round_trips_to_block() {
         let block = VersionBlock::from_triple(SemverTriple::new(1, 4, 2));
         assert_eq!(block.as_str(), "1.4.2");
+    }
+
+    /// Serde round-trips exact versions and refuses everything `parse` refuses.
+    #[test]
+    fn serde_preserves_the_exact_version_invariant() {
+        for exact in ["1.2.3", "1.2.3-rc.1", "1.2.3+build.7", "1.2.3-rc.1+build.7"] {
+            let block: VersionBlock = serde_json::from_value(serde_json::json!(exact)).unwrap();
+            assert_eq!(block.as_str(), exact);
+            assert_eq!(
+                serde_json::to_value(&block).unwrap(),
+                serde_json::json!(exact)
+            );
+        }
+        for invalid in [
+            "^1.0.0",
+            "~1.2",
+            ">=1.0.0",
+            "*",
+            "1.2",
+            "1",
+            "",
+            "not-a-version",
+        ] {
+            assert!(
+                serde_json::from_value::<VersionBlock>(serde_json::json!(invalid)).is_err(),
+                "{invalid:?} must not deserialize as an exact version"
+            );
+        }
     }
 
     #[test]

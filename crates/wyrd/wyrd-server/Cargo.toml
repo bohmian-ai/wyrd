@@ -52,8 +52,10 @@ rmcp = { workspace = true, features = [
 vala-drift = { workspace = true }
 vala-eval = { workspace = true }
 skald-prompt = { workspace = true }
+skald-providers = { workspace = true }
 skald-runtime = { workspace = true }
 skald-spec = { workspace = true }
+skald-workflow = { workspace = true }
 wyrd-telemetry = { workspace = true }
 uuid = { workspace = true, features = ["v4", "v7"] }
 base64 = { workspace = true }
@@ -119,6 +121,7 @@ wyrd-cli = { path = "../wyrd-cli", version = "0.0.1" }
 wyrd-sql = { path = "../wyrd-sql", version = "0.0.1" }
 vala-sql = { path = "../../vala/vala-sql", version = "0.0.1" }
 wyrd-loader = { path = "../../shared/wyrd-loader", version = "0.0.1" }
+skald-tool = { workspace = true }
 
 [[test]]
 name = "pg_grpc_smoke"
@@ -150,3 +153,6 @@ required-features = ["storage-emulator"]
 
 [[test]]
 name = "pg_card_registration_route"
+
+[[test]]
+name = "pg_workflow_registration"

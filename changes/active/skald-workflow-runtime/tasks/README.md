@@ -1,44 +1,51 @@
-# Workflow Revision 9 task packet
+# Workflow Revision 12 task packet
 
-Status: READY — independent plan-readiness re-review passed on 2026-10-01:
-architecture PASS, executability PASS, rehearsal PASS, 0 Critical/0 Major.
-No implementation or tests have been executed by planning. Every named new selector is marked planned;
-implementers must add it, prove selection, and record RED/GREEN evidence.
+Status: READY — independent architecture/executability review passed. Revision 12 was
+explicitly approved by the user on 2026-10-02. Production implementation is
+stopped at the original TASK-002 candidate; this revision changes instructions,
+not product code. Prior readiness/implementation verdicts do not approve this
+revised packet. New selectors are planned and require selection/RED/GREEN proof.
 
-Use `$wyrd-implement` for each task. Run Cargo-backed verification sequentially
-across shared targets. Preserve unrelated user edits. Task metadata is the
-full obligation/write closure; the table below assigns a primary owner so no
-obligation is left for an unspecified later task.
+Use `wyrd-implement` for implementation, `wyrd-task-review` for immutable
+cumulative acceptance, and `wyrd-change-review` for integrated closure. Caller
+owns scheduling/Git. Preserve the stopped implementation and prior reviews;
+no reset/rebase. Superseded TASK-002 is history, not executable authority.
 
 ## Outcomes and dependency order
 
-1. [TASK-001](TASK-001-explicit-local-runtime.md) — one buildable explicit contract/runtime/local
-   Python/provider-egress outcome; no contract-only broken intermediate state.
-2. [TASK-002](TASK-002-load-and-register-graphs.md) — shared loading/exact registry graph/registration
-   validation; depends on TASK-001.
-3. [TASK-003](TASK-003-remote-client-and-public-gateway.md) — shared remote handle/public gateway adapter and
-   ingress fallback; depends on TASK-001, not server host availability.
-4. [TASK-004](TASK-004-accepted-server-jobs.md) — bounded accepted server jobs/built-in reads;
-   depends on TASK-001–003.
-5. [TASK-005](TASK-005-cli-and-integrated-proof.md) — CLI and integrated journeys/authority closure;
-   depends on TASK-001–004.
+1. [TASK-001](TASK-001-explicit-local-runtime.md) — existing native runtime
+   work carried forward. Its existing review/evidence remain candidate-bound;
+   do not infer acceptance from task sequencing. Close outstanding review
+   obligations before accepting a dependent implementation. Reopen affected
+   invariant-bearing code if cleanup changes it.
+2. [TASK-002-cleanup](TASK-002-cleanup.md) — delete duplicate machinery and
+   deliver automatic file/exact registered loading with Native execution through
+   Rust/Python/TypeScript; preserve registration/provenance/UID protections.
+3. [TASK-003](TASK-003-remote-client-and-public-gateway.md) — shared remote
+   handle, gateway caller/ingress and common local execution configuration;
+   depends on TASK-001 and cleanup, not server-run route availability.
+4. [TASK-004](TASK-004-accepted-server-jobs.md) — bounded accepted server jobs,
+   existing server graph/validation, scoped built-in reads; depends on the above.
+5. [TASK-005](TASK-005-cli-and-integrated-proof.md) — thin CLI, compiled apply,
+   team reuse and three-SDK route journeys, integrated authority/proof closure.
 
-TASK-002/003 are logically independent after TASK-001 but share some client
-exports; the execution harness chooses serial or coordinated editing. No task
-may leave compilation to a dependent repair. No arbitrary files-only phase or
-new scheduler/tool registration is authorized.
+TASK-002-cleanup must replace consumers and validation in the same complete
+outcome; deletion cannot leave an insecure registration or broken client. No
+new Workflow principal, public loader/hydrator, Workflow-root WyrdState, duplicate
+graph/parser/executor, or per-language configuration owner is authorized.
 
 ## Obligation ownership and proof
 
-All 111 unique REQ/INV/AC IDs in the approved spec are mapped. REQ/INV rows
-use their task's ordered scenarios plus relevant AC rows below; metadata in
-consumer tasks preserves cross-owner closure. AC rows name concrete proof.
+The table maps the current specification IDs, including Revision 12 additions.
+Original task metadata retains consumer closure. TASK-001 rows carry its native
+runtime obligations; new language loading/configuration closure belongs to
+cleanup/TASK-003/TASK-005. This is a proof plan, not executed evidence.
 
 | Obligation | Primary task | Required proof |
 |---|---|---|
-| AC-001 | [TASK-002](TASK-002-load-and-register-graphs.md) | T2 S1 + T5 S2: actual bundle/native loader and Rust/CLI execution |
-| AC-002 | [TASK-002](TASK-002-load-and-register-graphs.md) | T2 S2 + T5 S2: registered exact relationships and CLI apply |
-| AC-003 | [TASK-002](TASK-002-load-and-register-graphs.md) | T2 S3 + T5 S2: registered local Rust/CLI |
+| AC-001 | [TASK-002-cleanup](TASK-002-cleanup.md) | Cleanup S1–S6 + T5 S2/S5: exact automatic loading/registration across SDKs/CLI |
+| AC-002 | [TASK-002-cleanup](TASK-002-cleanup.md) | Cleanup S1–S6 + T5 S2/S5: exact automatic loading/registration across SDKs/CLI |
+| AC-003 | [TASK-002-cleanup](TASK-002-cleanup.md) | Cleanup S1–S6 + T5 S2/S5: exact automatic loading/registration across SDKs/CLI |
 | AC-004 | [TASK-004](TASK-004-accepted-server-jobs.md) | T4 S2/S3 + T5 S3: real client/server, lost reply and pinned graph |
 | AC-005 | [TASK-001](TASK-001-explicit-local-runtime.md) | T1 S2/S3 + T5 S2: overlap and dependency readiness |
 | AC-006 | [TASK-001](TASK-001-explicit-local-runtime.md) | T1 S1 + T2 S1/S2: pure and resolved negative validation |
@@ -49,7 +56,7 @@ consumer tasks preserves cross-owner closure. AC rows name concrete proof.
 | AC-011 | [TASK-001](TASK-001-explicit-local-runtime.md) | T1 S1/S4 + T5 S2/S4: exact route names/precedence |
 | AC-011A | [TASK-003](TASK-003-remote-client-and-public-gateway.md) | T1 S4 + T3 S2/S3 + T4 S5: both caller projections/native errors |
 | AC-012 | [TASK-005](TASK-005-cli-and-integrated-proof.md) | T1/T3/T4 codegen/served document + T5 JSON/aggregate |
-| AC-013 | [TASK-005](TASK-005-cli-and-integrated-proof.md) | T1–T5 focused owners + real Rust/CLI journeys |
+| AC-013 | [TASK-005](TASK-005-cli-and-integrated-proof.md) | T1–T5 focused owners + real Rust/Python/TypeScript/CLI journeys |
 | AC-014 | [TASK-004](TASK-004-accepted-server-jobs.md) | T4 S5 + T5 S2/S4: registered route boundary journeys |
 | AC-015 | [TASK-004](TASK-004-accepted-server-jobs.md) | T4 S5 + T5 S4: supported five-dialect/capability matrix |
 | AC-016 | [TASK-001](TASK-001-explicit-local-runtime.md) | T1 S5 + T4 S5 + T5 S4: bound egress negatives/private local |
@@ -65,11 +72,14 @@ consumer tasks preserves cross-owner closure. AC rows name concrete proof.
 | AC-026 | [TASK-001](TASK-001-explicit-local-runtime.md) | T1 S3/S7 + T5 S4: caller custom tool/undeclared refusal |
 | AC-027 | [TASK-004](TASK-004-accepted-server-jobs.md) | T4 S3/S4/S5: accepted scoped context/token expiry/live owners |
 | AC-028 | [TASK-004](TASK-004-accepted-server-jobs.md) | T4 S7 + T1 S1/S6: graph/terminal reserve/sibling responsiveness |
+| AC-029 | [TASK-002-cleanup](TASK-002-cleanup.md) | Cleanup S1–S6: public three-SDK/registration/provenance/pinning proof |
+| AC-030 | [TASK-002-cleanup](TASK-002-cleanup.md) | Cleanup S1–S6: public three-SDK/registration/provenance/pinning proof |
+| AC-031 | [TASK-005](TASK-005-cli-and-integrated-proof.md) | Cleanup static audit + T5 S5/integrated declarations and shared-owner review |
 | INV-001 | [TASK-001](TASK-001-explicit-local-runtime.md) | Runtime S1–S7 contract/bindings/routes/lifetime/local-language |
 | INV-002 | [TASK-001](TASK-001-explicit-local-runtime.md) | Runtime S1–S7 contract/bindings/routes/lifetime/local-language |
 | INV-003 | [TASK-001](TASK-001-explicit-local-runtime.md) | Runtime S1–S7 contract/bindings/routes/lifetime/local-language |
 | INV-004 | [TASK-001](TASK-001-explicit-local-runtime.md) | Runtime S1–S7 contract/bindings/routes/lifetime/local-language |
-| INV-005 | [TASK-002](TASK-002-load-and-register-graphs.md) | Loading/registration S1–S3 exact native graph |
+| INV-005 | [TASK-002-cleanup](TASK-002-cleanup.md) | Cleanup S1–S6 + T5 S2/S5: exact automatic loading/registration across SDKs/CLI |
 | INV-006 | [TASK-004](TASK-004-accepted-server-jobs.md) | Server S1–S7 admission/authority/tools/lifecycle/bounds |
 | INV-007 | [TASK-005](TASK-005-cli-and-integrated-proof.md) | CLI scenarios and static architecture/aggregate closure |
 | INV-008 | [TASK-001](TASK-001-explicit-local-runtime.md) | Runtime S1–S7 contract/bindings/routes/lifetime/local-language |
@@ -103,7 +113,7 @@ consumer tasks preserves cross-owner closure. AC rows name concrete proof.
 | REQ-012 | [TASK-001](TASK-001-explicit-local-runtime.md) | Runtime S1–S7 contract/bindings/routes/lifetime/local-language |
 | REQ-013 | [TASK-001](TASK-001-explicit-local-runtime.md) | Runtime S1–S7 contract/bindings/routes/lifetime/local-language |
 | REQ-013A | [TASK-001](TASK-001-explicit-local-runtime.md) | Runtime S1–S7 contract/bindings/routes/lifetime/local-language |
-| REQ-014 | [TASK-002](TASK-002-load-and-register-graphs.md) | Loading/registration S1–S3 exact native graph |
+| REQ-014 | [TASK-002-cleanup](TASK-002-cleanup.md) | Cleanup S1–S6 + T5 S2/S5: exact automatic loading/registration across SDKs/CLI |
 | REQ-015 | [TASK-001](TASK-001-explicit-local-runtime.md) | Runtime S1–S7 contract/bindings/routes/lifetime/local-language |
 | REQ-016 | [TASK-001](TASK-001-explicit-local-runtime.md) | Runtime S1–S7 contract/bindings/routes/lifetime/local-language |
 | REQ-017 | [TASK-001](TASK-001-explicit-local-runtime.md) | Runtime S1–S7 contract/bindings/routes/lifetime/local-language |
@@ -114,10 +124,10 @@ consumer tasks preserves cross-owner closure. AC rows name concrete proof.
 | REQ-022 | [TASK-001](TASK-001-explicit-local-runtime.md) | Runtime S1–S7 contract/bindings/routes/lifetime/local-language |
 | REQ-023 | [TASK-001](TASK-001-explicit-local-runtime.md) | Runtime S1–S7 contract/bindings/routes/lifetime/local-language |
 | REQ-024 | [TASK-005](TASK-005-cli-and-integrated-proof.md) | CLI scenarios and static architecture/aggregate closure |
-| REQ-025 | [TASK-002](TASK-002-load-and-register-graphs.md) | Loading/registration S1–S3 exact native graph |
+| REQ-025 | [TASK-002-cleanup](TASK-002-cleanup.md) | Cleanup S1–S6 + T5 S2/S5: exact automatic loading/registration across SDKs/CLI |
 | REQ-026 | [TASK-005](TASK-005-cli-and-integrated-proof.md) | CLI scenarios and static architecture/aggregate closure |
 | REQ-027 | [TASK-005](TASK-005-cli-and-integrated-proof.md) | CLI scenarios and static architecture/aggregate closure |
-| REQ-028 | [TASK-002](TASK-002-load-and-register-graphs.md) | Loading/registration S1–S3 exact native graph |
+| REQ-028 | [TASK-002-cleanup](TASK-002-cleanup.md) | Cleanup S1–S6 + T5 S2/S5: exact automatic loading/registration across SDKs/CLI |
 | REQ-029 | [TASK-004](TASK-004-accepted-server-jobs.md) | Server S1–S7 admission/authority/tools/lifecycle/bounds |
 | REQ-030 | [TASK-004](TASK-004-accepted-server-jobs.md) | Server S1–S7 admission/authority/tools/lifecycle/bounds |
 | REQ-031 | [TASK-003](TASK-003-remote-client-and-public-gateway.md) | Client S1–S3 native transport/public ingress |
@@ -147,53 +157,43 @@ consumer tasks preserves cross-owner closure. AC rows name concrete proof.
 | REQ-050 | [TASK-004](TASK-004-accepted-server-jobs.md) | Server S1–S7 admission/authority/tools/lifecycle/bounds |
 | REQ-051 | [TASK-001](TASK-001-explicit-local-runtime.md) | Runtime S1–S7 contract/bindings/routes/lifetime/local-language |
 | REQ-052 | [TASK-004](TASK-004-accepted-server-jobs.md) | Server S1–S7 admission/authority/tools/lifecycle/bounds |
+| REQ-053 | [TASK-001](TASK-001-explicit-local-runtime.md) | Existing native runtime/telemetry proof, candidate-bound review closure |
+| REQ-054 | [TASK-002-cleanup](TASK-002-cleanup.md) | Cleanup S1–S6: public three-SDK/registration/provenance/pinning proof |
+| REQ-055 | [TASK-002-cleanup](TASK-002-cleanup.md) | Cleanup S1–S6: public three-SDK/registration/provenance/pinning proof |
+| REQ-056 | [TASK-002-cleanup](TASK-002-cleanup.md) | Cleanup S1–S6: public three-SDK/registration/provenance/pinning proof |
+| REQ-057 | [TASK-002-cleanup](TASK-002-cleanup.md) | Cleanup S1–S6: public three-SDK/registration/provenance/pinning proof |
+| REQ-058 | [TASK-003](TASK-003-remote-client-and-public-gateway.md) | T3 S4 + T5 S5: shared selected local dependencies across SDKs/CLI |
+| REQ-059 | [TASK-002-cleanup](TASK-002-cleanup.md) | Cleanup S1–S6: public three-SDK/registration/provenance/pinning proof |
 
-## Public seams and proof discipline
+## Public seams, reuse, and verification
 
-TASK-001 embeds native DTO/call/dependency/limits/binding shapes and runtime
-ordering. TASK-002 fixes the shared loading composition and exact native resolver
-precedent; TASK-003 embeds facade/HTTP/header semantics; TASK-004 fixes host
-config, trusted context, service/audit seams and lifecycle ordering; TASK-005
-fixes CLI/config/projection. Existing uniquely named source precedents refer to
-current implementation, not removed gateway Revision 21 artifacts.
+Revision 12 fixes Workflow.from_path/fromPath and Cards.workflow.load contracts
+in all three SDKs with automatic lazy refs and exact selectors. Cleanup states
+loading/registration ordering and old-machinery deletion. TASK-003 owns shared
+local config, public gateway and remote wire contracts. TASK-004 retains scoped
+server acceptance/cancellation/drain ordering. TASK-005 delegates CLI modes and
+proves actual compiled apply and all three local SDK route surfaces.
 
-All new behavior has ordered Behavior/RED/GREEN/REFACTOR scenarios. Static
-schema/generated/docs/relocation obligations use stated static/regression proof,
-not manufactured failing tests. Unit/integration evidence does not substitute
-for real registered Rust/CLI client→server→client journeys. No new remote
-Python/TypeScript/MCP Workflow API is claimed. Python local behavior remains
-language-owned, using the single engine and public package exports.
+Every active task has a source-backed capability/owner/callers/tests/gap/extension
+map. Extending an existing owner is required unless source evidence proves it
+insufficient. Public/architectural boundaries are fixed; private helpers, module
+layout and fixture choices remain implementation-owned. Independent review
+must challenge prescribed duplication, not merely task compliance.
 
-The final aggregate is `mise run gate`; the new ignored CLI Workflow journeys
-are an explicit selection gap and their exact focused wrapper commands remain
-separate required final proof. Do not duplicate the aggregate's component lanes.
-No live cloud/model credentials or synthetic host load are needed.
+TASK-005's final aggregate is `mise run gate`. Explicit selection gaps include
+the new ignored Rust SDK Workflow target and ignored Workflow CLI journeys;
+run their exact commands separately. Python Cards integration currently selects
+one file and TS integration its directory; prove new tests are selected before
+claiming aggregate coverage. Runtime tests run in their owning languages.
 
-## Planning limitations
+## Historical records
 
-This is source/manifest/mise-backed planning, not execution evidence. New test
-selectors, CLI behavior, runtime memory/time bounds and sibling responsiveness
-are unproven until implementation executes their named scenarios. The independent
-plan-readiness review requested by the user has validated this packet for
-implementation. Readiness is not evidence that implementation or tests pass.
-
-## Readiness revision record
-
-- 2026-10-01, PR-001 validated against the packet and approved specification:
-  TASK-001 now locally states binding grammar/transitive visibility, exact
-  ExtGateway trust restrictions and gateway retry codes; TASK-003 locally
-  states protocol-native error field/category/remediation projection. No
-  approved semantics changed.
-- 2026-10-01, PR-002 validated against ResultCollector and
-  RunningQueryControls: TASK-004 fixes tracked query ownership before exposing
-  an abortable waiter, signal/Skald-drain/query-join/terminal ordering, bounded
-  honest settlement, and real forwarded-query cancel/deadline/shutdown proof.
-  TASK-001 records the cross-owner dependency. No new durable service or
-  token authority is introduced. Re-review is required; this record is not
-  a readiness verdict.
-- 2026-10-01, independent re-review returned Ready for all five tasks and 24
-  scenarios, with architecture/executability/rehearsal PASS and no blocking
-  findings. Validated report:
-  [r2 review](../../../../.dev/review/skald-workflow-runtime-plan-20261001-r2/review.md).
-  Root then changed only task status metadata from proposed to ready and
-  recorded this handoff; the reviewed behavioral contracts remain unchanged.
+The original TASK-002 and its review reports remain in the packet as superseded
+history. Earlier readiness reviews apply to their earlier revisions only.
+TASK-001 retains its existing candidate-bound findings; neither this index nor
+planning asserts a new implementation PASS. The [Revision 12 readiness review](../review/revision12-plan/review.md)
+reports Ready: architecture PASS, executability PASS, zero Critical/Major findings.
+Its [cold rehearsal](../review/revision12-plan/cold.md) and
+[system review](../review/revision12-plan/system.md) are retained. One omitted
+UID-replacement regression recipe was repaired before the final verdict.
+This is plan readiness; production implementation and runtime proof remain pending.

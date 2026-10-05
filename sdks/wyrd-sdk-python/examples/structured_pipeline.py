@@ -3,14 +3,14 @@
 from wyrd import Agent, Prompt, ProviderRequest, ProviderResponse, Workflow
 
 
-def log_request(request: ProviderRequest) -> None:
+def log_request(ctx: object, request: ProviderRequest) -> None:
     try:
         print(f"[callback] model={request.openai().model}")
     except Exception:
         pass
 
 
-def log_response(response: ProviderResponse) -> None:
+def log_response(ctx: object, response: ProviderResponse) -> None:
     try:
         usage = response.openai().usage
         if usage:
@@ -35,10 +35,16 @@ def main() -> None:
         name="writer",
         prompt=Prompt(provider="mock", model="mock-model", messages=["Brief: ${summary}"]),
     )
-    wf = Workflow.sequential("demo", planner, writer)
-    run = wf.run({"topic": "the Rust borrow checker"})
-    print("parameters:", run.parameters)
-    print("final output:", run.final_output)
+    wf = (
+        Workflow.sequential("demo", planner, writer)
+        .with_step_inputs("writer", {"summary": "steps.planner.output.structured.summary"})
+        .with_outputs(
+            {"plan": "steps.planner.output.structured", "brief": "steps.writer.output.text"}
+        )
+    )
+    run = wf.run()
+    print("status:", run.status)
+    print("outputs:", run.outputs)
 
 
 if __name__ == "__main__":

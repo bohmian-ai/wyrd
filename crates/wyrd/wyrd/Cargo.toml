@@ -14,11 +14,9 @@ path = "src/lib.rs"
 
 [features]
 default = []
-otel = ["skald-observer/otel"]
 
 [dependencies]
 skald-agent = { workspace = true }
-skald-observer = { workspace = true }
 skald-prompt = { workspace = true }
 skald-runtime = { workspace = true }
 skald-tool = { workspace = true }
@@ -27,10 +25,6 @@ wyrd-spec = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
-async-trait = { workspace = true }
-opentelemetry = { workspace = true }
-opentelemetry_sdk = { workspace = true }
-opentelemetry-stdout = { version = "0.31", features = ["trace"] }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

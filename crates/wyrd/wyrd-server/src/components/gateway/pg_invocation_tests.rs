@@ -1601,7 +1601,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
             DeploymentHealth::default(),
             Arc::new(
                 wyrd_gateway::HttpProviderDispatch::new(
-                    wyrd_gateway::EndpointPolicy::new(false),
+                    skald_providers::EndpointPolicy::new(false),
                     wyrd_gateway::BuiltinEndpoints::default(),
                 )
                 .expect("gateway dispatch builds"),
@@ -2386,7 +2386,7 @@ async fn http_replica(fixture: &PgFixture, tenant: DataTenantId, secret: &Path) 
             DeploymentHealth::default(),
             Arc::new(
                 wyrd_gateway::HttpProviderDispatch::new(
-                    wyrd_gateway::EndpointPolicy::new(false),
+                    skald_providers::EndpointPolicy::new(false),
                     wyrd_gateway::BuiltinEndpoints::default(),
                 )
                 .expect("gateway dispatch builds"),
@@ -3541,7 +3541,7 @@ async fn gateway_selected_speech_persists_one_retrievable_object() {
         &fixture,
         Arc::new(
             wyrd_gateway::HttpProviderDispatch::new(
-                wyrd_gateway::EndpointPolicy::new(false),
+                skald_providers::EndpointPolicy::new(false),
                 wyrd_gateway::BuiltinEndpoints::default(),
             )
             .expect("gateway dispatch builds"),
@@ -4250,7 +4250,7 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
             DeploymentHealth::default(),
             Arc::new(
                 wyrd_gateway::HttpProviderDispatch::new(
-                    wyrd_gateway::EndpointPolicy::new(false),
+                    skald_providers::EndpointPolicy::new(false),
                     wyrd_gateway::BuiltinEndpoints::default(),
                 )
                 .expect("gateway dispatch builds"),
@@ -4800,7 +4800,7 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
     let tenant = fixture.data_tenant_id();
     let dispatch: Arc<dyn ProviderDispatch> = Arc::new(
         wyrd_gateway::HttpProviderDispatch::new(
-            wyrd_gateway::EndpointPolicy::new(false),
+            skald_providers::EndpointPolicy::new(false),
             wyrd_gateway::BuiltinEndpoints::default(),
         )
         .expect("gateway dispatch builds"),

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde_json::json;
 use skald_prompt::{OpenAiChatOptions, Prompt, ResponseFormat, openai_chat};
 use skald_runtime::{MockProvider, ProviderRegistry};
@@ -6,6 +8,7 @@ use skald_spec::ProviderResponse;
 use skald_spec::wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatMessage, OpenAiChatResponse, OpenAiMessageContent,
 };
+use skald_workflow::WorkflowBinding;
 
 pub fn plan_prompt() -> Prompt {
     openai_chat(
@@ -42,6 +45,25 @@ pub fn write_prompt() -> Prompt {
         },
     )
     .expect("static prompt is valid")
+}
+
+/// Parse static `(name, source)` pairs into explicit Workflow bindings.
+pub fn bindings(pairs: &[(&str, &str)]) -> BTreeMap<String, WorkflowBinding> {
+    pairs
+        .iter()
+        .map(|(name, source)| {
+            let binding = WorkflowBinding::new(*source).expect("static binding is valid");
+            ((*name).to_owned(), binding)
+        })
+        .collect()
+}
+
+/// Declare one string Workflow input `name` with an empty default.
+pub fn string_input(name: &str) -> BTreeMap<String, wyrd_spec::card::common::ParameterValue> {
+    BTreeMap::from([(
+        name.to_owned(),
+        wyrd_spec::card::common::ParameterValue::Str(String::new()),
+    )])
 }
 
 pub fn mock_registry(responses: &[&str]) -> ProviderRegistry {

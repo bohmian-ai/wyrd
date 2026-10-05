@@ -253,7 +253,6 @@ async fn run_prompt_sends_rendered_prompt_verbatim_on_first_turn() {
                 SpecPrompt::new(template_request, "gpt-4o", None, ResponseType::Text).unwrap(),
             ),
             &[("name", "Ada")],
-            None,
         )
         .await
         .expect("prompt run must succeed");
@@ -284,7 +283,7 @@ async fn run_prompt_provider_mismatch_returns_409_provider_mismatch() {
         build_agent(agent_request, MockProvider::new(ProviderName::OpenAi), 10);
 
     let err = agent
-        .run_prompt(&providers, &prompt, &[], None)
+        .run_prompt(&providers, &prompt, &[])
         .await
         .expect_err("provider mismatch must fail");
     assert_eq!(err.code(), "SKALD_AGENT_409_PROVIDER_MISMATCH");
@@ -310,7 +309,7 @@ async fn run_prompt_missing_variable_emits_prompt_error() {
     ));
 
     let err = agent
-        .run_prompt(&providers, &prompt, &[], None)
+        .run_prompt(&providers, &prompt, &[])
         .await
         .expect_err("missing variables must fail");
     assert_eq!(err.code(), "SKALD_AGENT_422_PROMPT");

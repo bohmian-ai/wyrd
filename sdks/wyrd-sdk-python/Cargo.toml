@@ -22,7 +22,6 @@ python = [
     "dep:pyo3",
     "wyrd-cli/python",
     "skald-agent/python",
-    "skald-observer/python",
     "skald-workflow/python",
     "skald-tool/python",
     "skald-prompt/python",
@@ -37,7 +36,6 @@ testing = ["python", "dep:wyrd-testing", "dep:tracing", "dep:url"]
 pyo3 = { workspace = true, features = ["extension-module", "abi3-py310", "chrono"], optional = true }
 wyrd-cli = { workspace = true }
 skald-agent = { workspace = true }
-skald-observer = { workspace = true }
 skald-workflow = { workspace = true }
 skald-tool = { workspace = true }
 skald-prompt = { workspace = true }

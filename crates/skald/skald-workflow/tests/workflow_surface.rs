@@ -1,6 +1,6 @@
 use skald_agent::Agent;
 use skald_prompt::{OpenAiChatOptions, openai_chat};
-use skald_workflow::{AgentResolver, Workflow};
+use skald_workflow::{AgentResolver, Workflow, WorkflowBinding};
 use wyrd_spec::AgentSpec;
 use wyrd_spec::card::workflow::{WorkflowAction, WorkflowCard, WorkflowSpec, WorkflowStep};
 use wyrd_spec::envelope::CardKind;
@@ -104,6 +104,14 @@ fn workflow_builder_add_after_string_dep() {
         .expect("add planner")
         .add_after(build_agent("writer"), ["planner".to_owned()])
         .expect("add writer after planner")
+        .with_outputs(
+            [(
+                "report".to_owned(),
+                WorkflowBinding::new("steps.writer.output.text").expect("binding is valid"),
+            )]
+            .into(),
+        )
+        .expect("outputs declare")
         .build()
         .expect("valid DAG");
     assert_eq!(wf.spec().steps[1].depends_on, vec!["planner".to_owned()]);
@@ -138,17 +146,24 @@ fn workflow_hydrates_sibling_agent_with_explicit_resolver() {
         annotations: Annotations::default(),
         spec: WorkflowSpec {
             steps: vec![WorkflowStep {
-                id: "registered-agent".to_owned(),
+                id: "registered_agent".to_owned(),
                 action: WorkflowAction::Agent(InlineableRef::Sibling {
                     sibling: agent_ref.clone(),
                 }),
                 inputs: Default::default(),
                 depends_on: Vec::new(),
-                condition: None,
+                llm_route: None,
+                fallback: None,
                 timeout_seconds: None,
                 retry: None,
                 display: Default::default(),
             }],
+            outputs: [(
+                "report".to_owned(),
+                WorkflowBinding::new("steps.registered_agent.output.text")
+                    .expect("binding is valid"),
+            )]
+            .into(),
             ..Default::default()
         },
         cascade_children: vec![agent_ref],
@@ -166,5 +181,5 @@ fn workflow_hydrates_sibling_agent_with_explicit_resolver() {
         Some(&resolver),
     )
     .expect("sibling agent resolves");
-    assert_eq!(workflow.step_ids(), vec!["registered-agent"]);
+    assert_eq!(workflow.step_ids(), vec!["registered_agent"]);
 }

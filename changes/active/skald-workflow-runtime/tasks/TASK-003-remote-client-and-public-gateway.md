@@ -3,9 +3,9 @@ id: TASK-003
 kind: implementation
 status: ready
 spec: SPEC-skald-workflow-runtime
-spec_revision: 9
-requirements: [REQ-024, REQ-031, REQ-036A, REQ-038, REQ-039, REQ-043, REQ-045, REQ-046, INV-004, INV-007, INV-011, INV-012, INV-020, AC-011A, AC-012, AC-013, AC-019]
-depends_on: [TASK-001]
+spec_revision: 12
+requirements: [REQ-058, AC-029, AC-031, REQ-024, REQ-031, REQ-036A, REQ-038, REQ-039, REQ-043, REQ-045, REQ-046, INV-004, INV-007, INV-011, INV-012, INV-020, AC-011A, AC-012, AC-013, AC-019]
+depends_on: [TASK-001, TASK-002-cleanup]
 ---
 
 # Shared remote client and public governed calls
@@ -29,9 +29,19 @@ shared exports without enabling Python features. Add no new model ingress,
 Vertex public endpoint, credential mutation, mutable per-adapter context,
 provider-body Workflow fields, polling settings or general public header API.
 
+## Source-backed reuse map
+
+| Capability | Existing owner/symbol | Inspected callers/tests | Missing behavior | Selected extension | New machinery justification |
+|---|---|---|---|---|---|
+| Remote lifecycle | `WyrdClient::submit_idempotent`, shared HTTP transport | Cards registration transport; existing client integration layout | Workflow-run HTTP capability | Narrow Workflows facade with native DTOs | New capability has no existing lifecycle facade; no new transport |
+| Public gateway | `HttpTransport::request_json_with_headers`, `GatewayCallRequest`, existing provider codecs | gateway invocation/ingresses and PG tests | Immutable per-step fallback/deadline projection | Existing auth/transport/codec owners plus WyrdGatewayCaller adapter | Adapter earns the Skald/shared-client boundary; no new reqwest client or public header API |
+| Local execution setup | `wyrd-client/src/global_config.rs::GlobalConfig`, `skald-workflow::WorkflowExecutionDependencies`, `ExternalGatewayBindings` | existing client config, SDK facade from cleanup, CLI config consumers | One local selected-dependency path for all SDKs/CLI | Shared facade composes current config/dependencies/secret resolvers | Narrow LocalWorkflowConfig field is needed for approved bindings; no per-language configuration owner |
+| Run projections | existing `ProviderError::Status`, RemoteProblem and WyrdError metadata | runtime per-step adapter and native gateway error envelopes | Safe protocol error projection | Existing error owners | No second error catalog |
+
 ## Approach
 
-1. Implement the exact shared Workflows facade over current idempotent transport.
+1. Compose shared local Workflow execution dependencies from current configuration,
+   then implement the exact shared Workflows facade over current idempotent transport.
 2. Implement the public gateway caller using shared auth/pool/tracing with
    per-call headers, bounded remaining timeout and cancellable IO.
 3. Decode/validate the exact fallback header after ordinary authentication on
@@ -104,6 +114,39 @@ or `{}` otherwise; no arbitrary body, upstream text, prompts, credentials,
 protocol-only members, or diagnostic details survive projection. Task-001's
 bounded snapshot diagnostic projection still applies after normalization.
 
+### Shared local execution configuration
+
+This task, not TASK-005, owns `wyrd_client::GlobalConfig.workflow` and its
+SDK/CLI consumer closure. Preserve serde defaults and deny-unknown behavior:
+
+```rust
+pub struct LocalWorkflowConfig {
+    pub external_gateway_bindings:
+        BTreeMap<CredentialBindingName, ExternalGatewayBindingConfig>,
+}
+// ExternalGatewayBindingConfig is the existing pure native DTO:
+// { protocol, origin: Url, secret_headers: BTreeMap<String, SecretRef> }
+```
+
+Default bindings are empty. All three SDKs and CLI use the shared Workflow
+facade's execution composition; they do not each parse bindings or resolve
+secrets. At run time, select stored routes/bindings first, then resolve only
+selected SecretRefs with current secret helpers and construct existing
+WorkflowExecutionDependencies. Native retains the process provider registry;
+explicit native runtime injection remains supported. Public WyrdGateway uses
+existing Wyrd authentication, not provider credential administration.
+
+A Cards-loaded Workflow retains the existing Cards connection context for
+public WyrdGateway calls; a file-loaded Workflow lazily uses ambient client
+configuration when external refs or a selected WyrdGateway call require it.
+No bearer is copied into the Workflow. Purely Native runs need no Wyrd client.
+ExtGateway has the existing explicitly configured local private-address policy,
+origin/protocol/header/TLS/redirect/bounded IO checks. Config contains secret
+refs only. Loading and apply read no execution secrets and dispatch nothing.
+Per-call metadata stays immutable and out of shared provider/header state.
+Python uses the existing shared runtime bridge; TypeScript native async methods
+and Rust await the same engine. No Python/TS server-run lifecycle methods ship.
+
 ## Ordered Implementation Scenarios
 
 Selectors are **planned**, default features. Every GREEN reruns prior tests;
@@ -168,9 +211,33 @@ gateway validation/authorization/candidate selection.
 **REFACTOR.** One narrow header decoder at the owning ingress boundary;
 do not create a gateway feature route or bypass authorization for Workflow callers.
 
+### Scenario 4 — SDKs and CLI share selected local execution dependencies
+
+**Behavior.** REQ-058, AC-029/031: Native, ExtGateway and public WyrdGateway
+execution uses shared config; only selected secrets resolve at run time; file
+loading/apply do neither. Cards connection overrides remain in effect for
+registered-local public gateway calls. Caller tool registries stay unchanged.
+
+**RED.** Planned lib test `workflow::tests::selected_local_dependencies_use_shared_config`:
+`mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=workflow::tests::selected_local_dependencies_use_shared_config)'`.
+Use existing deterministic transport/upstreams and controlled secret resolver;
+assert no calls during loading, no lookup for unused bindings, same declared
+route/fallback/deadline projection, correct configured client, and pre-dispatch
+refusal for absent/wrong binding. Expect missing common configuration path.
+Native language lifetime projection is tested through the cleanup SDK journeys;
+TASK-005 adds real gateway/ExtGateway SDK route journeys after this task.
+
+**GREEN.** Existing GlobalConfig and dependency owners compose one native path;
+SDK methods and CLI consume it, while explicit native injection still works.
+
+**REFACTOR.** Remove CLI/private per-language duplicate configuration assembly;
+no global per-call state, runtime feature, or new credential API.
+
 ## Acceptance Criteria
 
-Exact shared APIs and Rust exports compile Python-free; per-call metadata
+Shared local execution/configuration serves all three SDKs and CLI with
+selected-secret-only preparation and existing client context. Exact shared
+remote APIs and Rust exports compile Python-free; per-call metadata
 isolation and native error shape are proved; every affected ingress consumes
 the header safely; ordinary clients behave identically. Served OpenAPI records
 encoding/limits and existing gateway error codes. TASK-004 owns in-process
@@ -179,10 +246,12 @@ projection and TASK-005 owns the real local Workflow→public gateway journey.
 ## Expected Write Set and Consumer Closure
 
 `crates/shared/wyrd-client/src` facade/public caller/transport-private extension
-and exports; `sdks/wyrd-sdk-rust` projection proof;
+and exports/GlobalConfig/local dependency composition; Rust/Python/TypeScript
+local projections and declaration/consumer closure; Rust SDK projection proof;
 `crates/wyrd/wyrd-server/src/components/gateway/{ingress,routes,...}`;
 owning tests above and served OpenAPI tests/docs. No provider credentials in
-client adapter, no TS/Python remote invocation surface. REQ-049 authorizes
+client adapter, no TS/Python server-run lifecycle surface; their local execution projections
+are required under Revision 12. REQ-049 authorizes
 the existing-workspace client→Skald edge; no reverse edge or python activation.
 
 ## Verification and Evidence
@@ -191,7 +260,9 @@ Focused commands above; `mise run test:shared`, `mise run test:wyrd-sdk`,
 `mise run test:gateway:native`, `mise run test:principals:integration`,
 `mise run codegen:check`, `mise run check:client-tier`,
 `mise run check:sdk-client-tier`, `mise run check:pyo3-scope`,
-`mise run fmt`, `mise run lints`, `git diff --check`.
+`mise run py:test:unit`, `mise run py:typecheck`, `mise run py:format`,
+`mise run py:lints`, `mise run ts:test:unit`, `mise run ts:typecheck`,
+`mise run ts:napi:check`, `mise run fmt`, `mise run lints`, `git diff --check`.
 Served documentation/export changes have static/regression proof, no invented
 RED for generated text. `codegen:check` does not prove OpenAPI; inspect the
 served document with the composed-server lane. Local deterministic upstreams
@@ -205,7 +276,7 @@ error normalization, Python-enabled Rust/TS dependency cone or polling knobs.
 
 ## Authority Links
 
-- [Approved Revision 9](../spec.md); [TASK-001](TASK-001-explicit-local-runtime.md)
+- [Approved Revision 12](../spec.md); [TASK-001](TASK-001-explicit-local-runtime.md)
 - `AGENTS.md`; `architecture/agent-rules.md`
 - `architecture/wyrd-design.md`; `architecture/wyrd-security-posture.md`
 - `architecture/references/languages/{agent-harness,errors,spec-driven-development,implementation-execution,testing-workflows}.md`

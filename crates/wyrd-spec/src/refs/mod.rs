@@ -280,29 +280,14 @@ impl Visit for WorkflowSpec {
         }
 
         for (step_idx, step) in self.steps.iter_mut().enumerate() {
-            match &mut step.action {
-                WorkflowAction::Agent(agent_ref) => {
-                    let path = format!("spec.steps[{}].action.Agent", step_idx);
-                    f(SlotEntry {
-                        path: path.clone(),
-                        value: SlotValue::InlineableAgent(agent_ref),
-                    });
-                    if let InlineableRef::Inline(agent) = agent_ref {
-                        visit_agent(agent, &path, f);
-                    }
-                }
-                WorkflowAction::Mcp(card_ref) => {
-                    f(SlotEntry {
-                        path: format!("spec.steps[{}].action.Mcp", step_idx),
-                        value: SlotValue::Durable(card_ref),
-                    });
-                }
-                WorkflowAction::Prompt(card_ref) => {
-                    f(SlotEntry {
-                        path: format!("spec.steps[{}].action.Prompt", step_idx),
-                        value: SlotValue::Durable(card_ref),
-                    });
-                }
+            let WorkflowAction::Agent(agent_ref) = &mut step.action;
+            let path = format!("spec.steps[{}].action.Agent", step_idx);
+            f(SlotEntry {
+                path: path.clone(),
+                value: SlotValue::InlineableAgent(agent_ref),
+            });
+            if let InlineableRef::Inline(agent) = agent_ref {
+                visit_agent(agent, &path, f);
             }
         }
     }
@@ -691,38 +676,17 @@ mod completeness_tests {
                 route_refs: vec![Ref::Ref(card_ref(CardKind::Service, "route"))],
                 ..ObservationHooks::default()
             }),
-            steps: vec![
-                WorkflowStep {
-                    id: "agent".to_owned(),
-                    action: WorkflowAction::Agent(InlineableRef::Inline(Box::new(agent()))),
-                    depends_on: Vec::new(),
-                    inputs: BTreeMap::new(),
-                    condition: None,
-                    timeout_seconds: None,
-                    retry: None,
-                    display: BTreeMap::new(),
-                },
-                WorkflowStep {
-                    id: "mcp".to_owned(),
-                    action: WorkflowAction::Mcp(Ref::Ref(card_ref(CardKind::Mcp, "mcp"))),
-                    depends_on: Vec::new(),
-                    inputs: BTreeMap::new(),
-                    condition: None,
-                    timeout_seconds: None,
-                    retry: None,
-                    display: BTreeMap::new(),
-                },
-                WorkflowStep {
-                    id: "prompt".to_owned(),
-                    action: WorkflowAction::Prompt(Ref::Ref(card_ref(CardKind::Prompt, "prompt"))),
-                    depends_on: Vec::new(),
-                    inputs: BTreeMap::new(),
-                    condition: None,
-                    timeout_seconds: None,
-                    retry: None,
-                    display: BTreeMap::new(),
-                },
-            ],
+            steps: vec![WorkflowStep {
+                id: "agent".to_owned(),
+                action: WorkflowAction::Agent(InlineableRef::Inline(Box::new(agent()))),
+                depends_on: Vec::new(),
+                inputs: BTreeMap::new(),
+                llm_route: None,
+                fallback: None,
+                timeout_seconds: None,
+                retry: None,
+                display: BTreeMap::new(),
+            }],
             ..WorkflowSpec::default()
         }
     }
@@ -886,7 +850,7 @@ mod completeness_tests {
         ] {
             count += visit_paths(spec).len();
         }
-        assert_eq!(count, 33);
+        assert_eq!(count, 31);
         assert!(visit_paths(Spec::Service(service.clone())).contains(&(
             "spec.components[0].verified_by[0].verifier".to_owned(),
             "durable"
@@ -936,8 +900,6 @@ mod completeness_tests {
                     "spec.steps[0].action.Agent.prompt".to_owned(),
                     "inlineable_prompt"
                 ),
-                ("spec.steps[1].action.Mcp".to_owned(), "durable"),
-                ("spec.steps[2].action.Prompt".to_owned(), "durable"),
             ]
         );
         assert_eq!(

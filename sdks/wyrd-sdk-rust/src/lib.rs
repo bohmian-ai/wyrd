@@ -42,5 +42,7 @@ mod tests {
         let _ = super::storage::WyrdStorageClient::new;
         let _ = super::WyrdClient::from_parts;
         let _ = super::Gateway::new;
+        let _ = super::Workflow::as_skald;
+        let _ = super::cards::Cards::workflow;
     }
 }

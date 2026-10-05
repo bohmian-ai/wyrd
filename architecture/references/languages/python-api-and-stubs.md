@@ -50,8 +50,6 @@ sdks/wyrd-sdk-python/python/wyrd/
 ├── errors.py              # structured Wyrd exception exports
 ├── model/                 # public ModelCard projection
 ├── observe/               # wyrd-client observation surface
-├── observer.py            # public observer projection
-├── otel.py                # OTEL integration helpers
 ├── prompt/                # public Prompt and PromptCard projection
 ├── state/                 # WyrdState offline hydrated graph
 └── testing/               # feature-gated, dev-only wheel

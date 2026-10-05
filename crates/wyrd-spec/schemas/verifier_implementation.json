@@ -4282,6 +4282,31 @@
         "detailed"
       ]
     },
+    "OpenAiReasoningSummaryPart": {
+      "description": "One part of a Responses reasoning item summary.",
+      "oneOf": [
+        {
+          "description": "Summary text.",
+          "type": "object",
+          "required": [
+            "text",
+            "type"
+          ],
+          "properties": {
+            "text": {
+              "description": "Summary text content.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "summary_text"
+              ]
+            }
+          }
+        }
+      ]
+    },
     "OpenAiResponseContentPart": {
       "oneOf": [
         {
@@ -4500,18 +4525,26 @@
           ],
           "properties": {
             "encrypted_content": {
-              "default": null,
+              "description": "Opaque reasoning state returned when `reasoning.encrypted_content` is included, required to replay the item without stored state.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "description": "Provider item identity, required to replay the item statelessly.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "summary": {
-              "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
+              "description": "Reasoning summary parts, replayed as returned.",
+              "default": [],
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/OpenAiReasoningSummaryPart"
+              }
             },
             "type": {
               "type": "string",

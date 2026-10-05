@@ -26,7 +26,6 @@ python = [
 
 [dependencies]
 skald-spec = { workspace = true }
-skald-observer = { workspace = true }
 skald-prompt = { workspace = true }
 skald-runtime = { workspace = true }
 skald-tool = { workspace = true }
@@ -47,6 +46,7 @@ wyrd-utils = { workspace = true, optional = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
+wyrd-telemetry = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 serde_json = { workspace = true }
 skald-providers = { workspace = true }

@@ -19,14 +19,6 @@ fn use_wyrd_agent_module_imports_compile() {
 }
 
 #[test]
-fn use_wyrd_agent_observer_imports_compile() {
-    use wyrd::agent::{NoopObserver, Observer};
-
-    let _: Option<&NoopObserver> = None;
-    fn _takes_observer(_observer: std::sync::Arc<dyn Observer>) {}
-}
-
-#[test]
 fn use_wyrd_agent_runconfig_imports_compile() {
     use wyrd::agent::{AgentContext, AgentRun, FinishReason, RunConfig};
 

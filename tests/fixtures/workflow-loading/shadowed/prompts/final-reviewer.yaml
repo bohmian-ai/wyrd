@@ -1,0 +1,23 @@
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  space: workflow-loading
+  name: final-review-prompt
+  version: "1.0.0"
+spec:
+  model: gpt-5-5
+  request:
+    provider:
+      custom: mock
+    request:
+      model: gpt-5-5
+      messages:
+        - role: system
+          content: |
+            You are the final reviewer. Validate each proposed finding against the
+            supplied code, remove duplicates and unsupported claims, and return one
+            prioritized review.
+        - role: user
+          content: "final review of {{code}} | {{security_review}} | {{correctness_review}}"
+  variables: [code, security_review, correctness_review]
+  response_type: text

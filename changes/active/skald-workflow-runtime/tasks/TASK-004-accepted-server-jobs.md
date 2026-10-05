@@ -3,9 +3,9 @@ id: TASK-004
 kind: implementation
 status: ready
 spec: SPEC-skald-workflow-runtime
-spec_revision: 9
-requirements: [REQ-014, REQ-015, REQ-017, REQ-018, REQ-019, REQ-020, REQ-021, REQ-022, REQ-023, REQ-029, REQ-030, REQ-032, REQ-032A, REQ-033, REQ-034, REQ-034A, REQ-034B, REQ-034C, REQ-036A, REQ-038, REQ-039, REQ-041, REQ-042, REQ-043, REQ-045, REQ-048, REQ-050, REQ-052, INV-001, INV-005, INV-006, INV-008, INV-009, INV-010, INV-010A, INV-011, INV-012, INV-013, INV-018, INV-019, INV-020, INV-021, INV-022, INV-023, AC-004, AC-008, AC-009, AC-010, AC-011A, AC-012, AC-014, AC-015, AC-016, AC-017, AC-018, AC-019, AC-020, AC-021, AC-022, AC-025, AC-027, AC-028]
-depends_on: [TASK-001, TASK-002, TASK-003]
+spec_revision: 12
+requirements: [REQ-057, REQ-059, AC-030, AC-031, REQ-014, REQ-015, REQ-017, REQ-018, REQ-019, REQ-020, REQ-021, REQ-022, REQ-023, REQ-029, REQ-030, REQ-032, REQ-032A, REQ-033, REQ-034, REQ-034A, REQ-034B, REQ-034C, REQ-036A, REQ-038, REQ-039, REQ-041, REQ-042, REQ-043, REQ-045, REQ-048, REQ-050, REQ-052, INV-001, INV-005, INV-006, INV-008, INV-009, INV-010, INV-010A, INV-011, INV-012, INV-013, INV-018, INV-019, INV-020, INV-021, INV-022, INV-023, AC-004, AC-008, AC-009, AC-010, AC-011A, AC-012, AC-014, AC-015, AC-016, AC-017, AC-018, AC-019, AC-020, AC-021, AC-022, AC-025, AC-027, AC-028]
+depends_on: [TASK-001, TASK-002-cleanup, TASK-003]
 ---
 
 # Bounded accepted Workflow jobs on the server
@@ -29,11 +29,31 @@ Use `Caller::from_authenticated` as the verified context precedent; `Caller`
 already retains principal/scopes/delegation but no bearer token. Capture only
 that trusted attribution/authority and the spec's graph/deadline bound.
 
-No durable queue/table/lease/recovery, new remote language/MCP surface, runtime
+No Workflow principal or Workflow-root WyrdState, client HTTP graph loading,
+durable queue/table/lease/recovery, new remote language/MCP surface, runtime
 Invoke policy, bearer retention/renewal, widening grant refresh, second audit
 writer, client-owned tenancy, arbitrary tool registration or Skald tool loop.
 Gateway credential/deployment governance remains live and gateway settlement
 remains gateway-owned. Shared Vault/Operators and Native transport are unchanged.
+
+## Source-backed reuse map
+
+| Capability | Existing owner/symbol | Inspected callers/tests | Missing behavior | Selected extension | New machinery justification |
+|---|---|---|---|---|---|
+| Graph preparation | `cards/resolve.rs::EffectiveSpecs`, `service.rs::plan_registration_graph`, canonical reference slots; Skald ResolvedGraph | cleanup registration journeys; current server Cards consumers | Admission consumes locked graph with invocation checks | Existing server Cards owner prepares bodies; Skald validates/executes | No client HTTP graph or second fetch loop |
+| Run lifecycle | current AppState/boot/shutdown, tracked task pattern; native Workflow run | server lifecycle and TASK-001 runtime proof | Accepted process-local run retention/cancel | One bounded cohesive server host over existing executor | New host owns actual accepted-run state; no second executor, durable queue or controller |
+| Authority and audit | `Caller::from_authenticated`, `audit::authorize`, runtime permission/builtin role definitions | authenticated gateway and Cards route tests | workflows:run and accepted context capture | Extend existing authorization/audit owners | New resource permission only; no Workflow principal or audit sink |
+| Gateway | `GatewayInvocation::run`, `GatewayCallRequest` | public ingress and gateway journey | In-process run-bound caller | Existing owner with captured trusted context and ordinary admission | Narrow runtime adapter, not recursive HTTP |
+| Tools | `cards::routes::get_card_for`, `query::service::stream_query`, MCP QueryArguments/ResultCollector | existing authorized Cards reads and MCP/Bifrost tests | Run-bound tool projection and shared collector use | Reuse existing permission/audit/query terminal owners | No tool registration platform, result truncator or second object checker |
+
+Registration and admission share existing server effective-body resolution and
+Skald validation. Admission additionally applies input, route suitability,
+selected credential/tool preparation and capacity bounds; registration never
+executes or resolves execution secrets. No Workflow principal is provisioned.
+Cards graph preparation must preserve exact locked UID/body and provenance;
+reuse cleanup's server extension, not shared-client HTTP or WorkflowGraph.
+WyrdState remains Service-rooted. If admission needs an extension, put it on the
+existing server Cards owner and close its registration consumers/tests.
 
 ## Approach
 
@@ -369,6 +389,10 @@ transport-limit surrogate for actual graph limits.
 
 ## Acceptance Criteria
 
+Server graph preparation reuses the cleanup Cards/Skald owners and never
+roundtrips through a client or provisions a Workflow principal. Existing
+registration provenance/UID fences and Service hydration remain proved.
+
 All exact scenarios pass against real server and shared/Rust client. HTTP bodies/
 codes/status fields match spec, no permission or audit owner bypass, no bearer
 retention or grant widening, no duplicate/untracked work, no IO under lock,
@@ -408,7 +432,7 @@ size/count defaults/accounting or gateway credential/settlement ownership.
 
 ## Authority Links
 
-- [Approved Revision 9](../spec.md); TASK-001, TASK-002, TASK-003
+- [Approved Revision 12](../spec.md); TASK-001, TASK-002-cleanup, TASK-003
 - `AGENTS.md`; `architecture/agent-rules.md`
 - `architecture/wyrd-design.md`; `architecture/wyrd-security-posture.md`
 - `architecture/bifrost-design.md` §§Query contract, Read audit and terminal

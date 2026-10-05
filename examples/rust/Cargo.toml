@@ -18,10 +18,6 @@ name = "agent_smoke"
 path = "agent_smoke.rs"
 
 [[bin]]
-name = "tracing_stdout"
-path = "tracing_stdout.rs"
-
-[[bin]]
 name = "transport_grpc"
 path = "transport_grpc.rs"
 
@@ -66,10 +62,6 @@ name = "workflow_structured_output"
 path = "workflow_structured_output.rs"
 
 [[bin]]
-name = "workflow_with_observer"
-path = "workflow_with_observer.rs"
-
-[[bin]]
 name = "client_request"
 path = "client_request.rs"
 
@@ -77,9 +69,6 @@ path = "client_request.rs"
 anyhow = "1"
 reqwest = { workspace = true }
 async-trait = { workspace = true }
-opentelemetry = { workspace = true }
-opentelemetry-stdout = { version = "0.31", features = ["trace"] }
-opentelemetry_sdk = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -90,9 +79,8 @@ skald-spec = { workspace = true }
 skald-tool = { workspace = true }
 skald-workflow = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-wyrd = { path = "../../crates/wyrd/wyrd", features = ["otel"] }
+wyrd = { path = "../../crates/wyrd/wyrd" }
 wyrd-sdk-rust = { path = "../../sdks/wyrd-sdk-rust" }
-skald-observer = { workspace = true, features = ["otel"] }
 wyrd-spec = { workspace = true }
 
 [dev-dependencies]

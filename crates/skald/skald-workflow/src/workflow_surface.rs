@@ -1,9 +1,8 @@
 //! User-facing Workflow authoring + run surface.
 //!
-//! Mirrors the [`skald_agent::Agent`] pyclass-is-the-class pattern: one struct
-//! holds envelope metadata, the durable spec body, derived cascade children,
-//! and the resolved per-step agents used at run time. The same struct serves
-//! both the Rust user surface and the Python `wyrd.agent.Workflow` class.
+//! One struct holds envelope metadata, the durable spec body, derived cascade
+//! children, and the resolved per-step agents used at run time. It is the Rust
+//! user surface; the Python SDK wraps it as the `wyrd.agent.Workflow` class.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -11,9 +10,12 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use serde_json::{Map, Value};
-use skald_agent::{Agent, Observer};
+use skald_agent::Agent;
+use wyrd_spec::card::common::ParameterValue;
+use wyrd_spec::card::prompt::is_valid_parameter_name;
 use wyrd_spec::card::workflow::{
-    WorkflowAction, WorkflowCard, WorkflowCardError, WorkflowSpec, WorkflowStep,
+    WorkflowAction, WorkflowBinding, WorkflowCard, WorkflowCardError, WorkflowRun, WorkflowSpec,
+    WorkflowStep, WorkflowValidationError,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SpaceName;
@@ -21,18 +23,21 @@ use wyrd_spec::metadata::{Annotations, CardMetadata, Labels};
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::{AgentCard, AgentSpec};
 
-use crate::context::Context;
-use crate::def::{TaskDef, WorkflowAgent, WorkflowDef, default_max_retries};
-use crate::error::{WorkflowError, WorkflowResult};
-use crate::run::WorkflowRun;
-use crate::workflow::DagExecutor;
+use crate::error::WorkflowResult;
+use crate::plan::{ExecutionPlan, ResolvedGraph};
+use crate::route::WorkflowExecutionDependencies;
+use crate::workflow::{WorkflowExecutor, WorkflowRunOptions};
 
-/// Workflow-level input accepted by [`Workflow::run`].
+/// Invocation input accepted by [`Workflow::run`].
+///
+/// Values are checked against the Workflow's declared inputs: unknown keys
+/// and values of the wrong declared type are rejected, and declared defaults
+/// fill missing keys.
 #[derive(Debug, Clone)]
 pub enum WorkflowInput {
-    /// Single text input exposed as the `input` template variable.
+    /// Shorthand for the declared string input named `input`.
     Text(String),
-    /// Pre-shaped variable bindings.
+    /// Values keyed by declared input name.
     Vars(Map<String, Value>),
 }
 
@@ -44,83 +49,46 @@ pub trait AgentResolver: Send + Sync {
 }
 
 impl<T: AgentResolver + ?Sized> AgentResolver for &T {
+    /// Delegate to the referenced resolver.
     fn resolve(&self, agent_ref: &InlineableRef<AgentSpec>) -> Result<Agent, WyrdError> {
         (**self).resolve(agent_ref)
     }
 }
 
 impl From<&str> for WorkflowInput {
+    /// Text shorthand for the declared `input`.
     fn from(value: &str) -> Self {
         Self::Text(value.to_owned())
     }
 }
 
 impl From<String> for WorkflowInput {
+    /// Text shorthand for the declared `input`.
     fn from(value: String) -> Self {
         Self::Text(value)
     }
 }
 
 impl From<Map<String, Value>> for WorkflowInput {
+    /// Values keyed by declared input name.
     fn from(value: Map<String, Value>) -> Self {
         Self::Vars(value)
     }
 }
 
-impl From<HashMap<String, String>> for WorkflowInput {
-    fn from(value: HashMap<String, String>) -> Self {
-        let mut map = Map::new();
-        for (key, item) in value {
-            map.insert(key, Value::String(item));
-        }
-        Self::Vars(map)
-    }
-}
-
-impl From<Value> for WorkflowInput {
-    fn from(value: Value) -> Self {
-        match value {
-            Value::Object(map) => Self::Vars(map),
-            other => {
-                let mut map = Map::new();
-                map.insert("input".to_owned(), other);
-                Self::Vars(map)
-            }
-        }
-    }
-}
-
-impl WorkflowInput {
-    pub(crate) fn into_context_input(self) -> Map<String, Value> {
-        match self {
-            Self::Text(text) => {
-                let mut map = Map::new();
-                map.insert("input".to_owned(), Value::String(text));
-                map
-            }
-            Self::Vars(map) => map,
-        }
-    }
-}
-
 /// User-facing workflow surface: meta + spec + resolved agents + cascade.
 ///
-/// The pyclass IS the Python class (per the Wyrd S12C doctrine). Construction
+/// The Python SDK wraps this type as `wyrd.agent.Workflow`. Construction
 /// flows through `Workflow::new`, the sugar constructors `Workflow::sequential`
 /// / `Workflow::parallel`, or the `Workflow::builder` DAG primitive. `.run()`
-/// drives the resolved agents through the internal [`DagExecutor`].
+/// validates the resolved graph and drives the Agents through the internal
+/// Workflow executor.
 #[derive(Clone)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "wyrd.agent", name = "Workflow", skip_from_py_object)
-)]
 pub struct Workflow {
     pub(crate) meta: CardMetadata,
     pub(crate) spec: WorkflowSpec,
     pub(crate) cascade_children: Vec<CardRef>,
     pub(crate) resolved_agents: HashMap<String, Arc<Agent>>,
-    /// Runtime-only observers attached to this workflow instance.
-    pub(crate) observers: Vec<Arc<dyn Observer>>,
 }
 
 impl std::fmt::Debug for Workflow {
@@ -151,7 +119,6 @@ impl Workflow {
             spec: WorkflowSpec::default(),
             cascade_children: Vec::new(),
             resolved_agents: HashMap::new(),
-            observers: Vec::new(),
         }
     }
 
@@ -167,7 +134,6 @@ impl Workflow {
             let step_id = wf.append_agent_step(agent, deps)?;
             previous = Some(step_id);
         }
-        wf.spec.validate_dag()?;
         Ok(wf)
     }
 
@@ -180,24 +146,7 @@ impl Workflow {
         for agent in agents {
             wf.append_agent_step(agent, Vec::new())?;
         }
-        wf.spec.validate_dag()?;
         Ok(wf)
-    }
-
-    /// Return a copy with runtime observers attached.
-    ///
-    /// Observers are runtime-only state. They are not serialized into the
-    /// workflow card and must be reattached after loading from YAML.
-    #[must_use]
-    pub fn with_observers(mut self, observers: Vec<Arc<dyn Observer>>) -> Self {
-        self.observers = observers;
-        self
-    }
-
-    /// Borrow the runtime observers attached to this workflow.
-    #[must_use]
-    pub fn observers(&self) -> &[Arc<dyn Observer>] {
-        &self.observers
     }
 
     /// Open a fluent builder for explicit DAG construction.
@@ -222,22 +171,41 @@ impl Workflow {
         self
     }
 
+    /// Replace the workflow's queryable labels.
+    #[must_use]
+    pub fn with_labels(mut self, labels: Labels) -> Self {
+        self.meta.labels = labels;
+        self
+    }
+
+    /// Replace the workflow's free-form annotations.
+    #[must_use]
+    pub fn with_annotations(mut self, annotations: Annotations) -> Self {
+        self.meta.annotations = annotations;
+        self
+    }
+
     /// Append `agent` as a new step with no dependencies.
     ///
+    /// Edges order execution only; bind data with
+    /// [`with_step_inputs`](Self::with_step_inputs).
+    ///
     /// # Errors
-    /// Returns DAG validation errors when the resulting graph is invalid.
+    /// Returns an error when the Agent's Card identity cannot be projected.
     // justification: builder-pattern add() means append-a-workflow-step (returns Self for chaining), not std::ops::Add arithmetic
     #[allow(clippy::should_implement_trait)]
     pub fn add(mut self, agent: Agent) -> WorkflowResult<Self> {
         self.append_agent_step(agent, Vec::new())?;
-        self.spec.validate_dag()?;
         Ok(self)
     }
 
     /// Append `agent` as a new step depending on `deps`.
     ///
+    /// Edges order execution only; bind data with
+    /// [`with_step_inputs`](Self::with_step_inputs).
+    ///
     /// # Errors
-    /// Returns DAG validation errors when the resulting graph is invalid.
+    /// Returns an error when the Agent's Card identity cannot be projected.
     pub fn add_after<I, S>(mut self, agent: Agent, deps: I) -> WorkflowResult<Self>
     where
         I: IntoIterator<Item = S>,
@@ -245,8 +213,76 @@ impl Workflow {
     {
         let deps: Vec<String> = deps.into_iter().map(Into::into).collect();
         self.append_agent_step(agent, deps)?;
-        self.spec.validate_dag()?;
         Ok(self)
+    }
+
+    /// Declare the Workflow inputs and their native defaults, replacing any
+    /// previous declaration.
+    ///
+    /// # Errors
+    /// Returns a validation error for a name outside the parameter identifier
+    /// grammar.
+    pub fn with_inputs(mut self, inputs: BTreeMap<String, ParameterValue>) -> WorkflowResult<Self> {
+        for name in inputs.keys() {
+            require_identifier(&format!("inputs.{name}"), name)?;
+        }
+        self.spec.inputs = inputs;
+        Ok(self)
+    }
+
+    /// Bind the unresolved Prompt variables of step `step_id`, replacing any
+    /// previous bindings for that step.
+    ///
+    /// Completeness against the Prompt is checked when the Workflow is
+    /// validated, built, loaded, or run.
+    ///
+    /// # Errors
+    /// Returns a validation error for an unknown step or a variable name
+    /// outside the parameter identifier grammar.
+    pub fn with_step_inputs(
+        mut self,
+        step_id: &str,
+        bindings: BTreeMap<String, WorkflowBinding>,
+    ) -> WorkflowResult<Self> {
+        for name in bindings.keys() {
+            require_identifier(&format!("steps.{step_id}.inputs.{name}"), name)?;
+        }
+        let step = self
+            .spec
+            .steps
+            .iter_mut()
+            .find(|step| step.id == step_id)
+            .ok_or_else(|| {
+                WorkflowValidationError::invalid(&format!("steps.{step_id}"), "unknown step id")
+            })?;
+        step.inputs = bindings;
+        Ok(self)
+    }
+
+    /// Declare the Workflow outputs, replacing any previous declaration.
+    ///
+    /// # Errors
+    /// Returns a validation error for a name outside the parameter identifier
+    /// grammar.
+    pub fn with_outputs(
+        mut self,
+        outputs: BTreeMap<String, WorkflowBinding>,
+    ) -> WorkflowResult<Self> {
+        for name in outputs.keys() {
+            require_identifier(&format!("outputs.{name}"), name)?;
+        }
+        self.spec.outputs = outputs;
+        Ok(self)
+    }
+
+    /// Validate the complete Workflow against its resolved Agents.
+    ///
+    /// # Errors
+    /// Returns the pure contract, missing-Agent, Prompt-variable, binding,
+    /// output-schema, and route-dialect errors that would otherwise fail a
+    /// run before dispatch.
+    pub fn validate(&self) -> WorkflowResult<()> {
+        ResolvedGraph::resolve(&self.spec, &self.resolved_agents).map(|_| ())
     }
 
     /// Borrow this workflow's envelope metadata.
@@ -344,15 +380,21 @@ impl Workflow {
     /// `Sibling` is accepted here because the loader and registration engine
     /// have already established its exact identity. The resolver owns the
     /// durable-card lookup; this crate performs no filesystem or network IO.
+    /// A referenced step without a resolver, or an unresolved `Path`, stays
+    /// unhydrated and fails [`Self::validate`] and every run.
+    /// [`Self::from_card_bodies`] supplies already-fetched exact bodies
+    /// through this seam.
     ///
     /// # Errors
-    /// Returns prompt, tool, or agent resolver errors.
+    /// Returns Workflow contract validation errors, or prompt, tool, or agent
+    /// resolver errors.
     pub fn from_card_with_agent_resolver(
         card: WorkflowCard,
         tool_resolver: &dyn skald_tool::ToolResolver,
         prompt_resolver: &dyn skald_agent::PromptResolver,
         agent_resolver: Option<&dyn AgentResolver>,
     ) -> Result<Self, WyrdError> {
+        card.spec.validate()?;
         let mut resolved = HashMap::new();
         for step in &card.spec.steps {
             match &step.action {
@@ -379,9 +421,7 @@ impl Workflow {
                         resolved.insert(step.id.clone(), Arc::new(agent));
                     }
                 }
-                WorkflowAction::Agent(InlineableRef::Path(_))
-                | WorkflowAction::Mcp(_)
-                | WorkflowAction::Prompt(_) => {}
+                WorkflowAction::Agent(InlineableRef::Path(_)) => {}
             }
         }
         Ok(Self {
@@ -396,7 +436,6 @@ impl Workflow {
             spec: card.spec,
             cascade_children: card.cascade_children,
             resolved_agents: resolved,
-            observers: Vec::new(),
         })
     }
 
@@ -409,7 +448,13 @@ impl Workflow {
         serde_yaml::to_string(&card).map_err(|error| WorkflowCardError::yaml(&error).into())
     }
 
-    /// Parse a workflow from canonical envelope YAML.
+    /// Parse a workflow from one canonical wire-form envelope YAML document.
+    ///
+    /// This parses a single document only: inline Agent steps hydrate, but
+    /// local `path` dependencies, sibling bundles, and Card
+    /// references are not resolved here. Load a bundle or a registered
+    /// Workflow through the shared client, which feeds
+    /// [`Self::from_card_bodies`].
     ///
     /// # Errors
     /// Returns parse, prompt resolution, or agent resolution errors.
@@ -442,7 +487,10 @@ impl Workflow {
         Ok(())
     }
 
-    /// Load this workflow from a YAML envelope on disk.
+    /// Load this workflow from one wire-form YAML envelope on disk.
+    ///
+    /// Same single-document role as [`Self::from_yaml_str`]; it does not
+    /// resolve dependency paths or Card references.
     ///
     /// # Errors
     /// Returns IO, parse, prompt resolution, or agent resolution errors.
@@ -457,62 +505,76 @@ impl Workflow {
         Self::from_yaml_str(&yaml, tool_resolver, prompt_resolver)
     }
 
-    /// Drive this workflow's resolved agents through the internal DAG executor.
+    /// Run against the process-default native provider registry.
     ///
     /// # Errors
-    /// Returns runtime errors when an agent is missing, the DAG cannot run, or
-    /// any per-step retries are exhausted.
+    /// Returns the pre-dispatch errors of
+    /// [`run_with_options`](Self::run_with_options).
     pub async fn run(&self, input: impl Into<WorkflowInput>) -> WorkflowResult<WorkflowRun> {
         let providers = skald_runtime::default_registry();
         self.run_with(providers.as_ref(), input).await
     }
 
-    /// Run the DAG against an explicit provider registry.
-    ///
-    /// Prefer [`run`](Self::run) for the common case. Use this variant when
-    /// injecting a test registry or a non-default provider configuration.
+    /// Run against an explicit native provider registry with local defaults.
     ///
     /// # Errors
-    /// Returns runtime errors when an agent is missing, the DAG cannot run, or
-    /// any per-step retries are exhausted.
+    /// Returns the pre-dispatch errors of
+    /// [`run_with_options`](Self::run_with_options).
     pub async fn run_with(
         &self,
         providers: &skald_runtime::ProviderRegistry,
         input: impl Into<WorkflowInput>,
     ) -> WorkflowResult<WorkflowRun> {
-        skald_observer::init();
-        let input = input.into();
-        let inner = self.run_with_inner(providers, input);
-        match self.observers.as_slice() {
-            [] => inner.await,
-            [one] => skald_observer::with_observer(Arc::clone(one), inner).await,
-            many => {
-                let composite: Arc<dyn Observer> =
-                    Arc::new(skald_observer::CompositeObserver::new(many.to_vec()));
-                skald_observer::with_observer(composite, inner).await
-            }
-        }
+        let dependencies = WorkflowExecutionDependencies::new(providers.clone());
+        self.run_with_options(&dependencies, input, WorkflowRunOptions::default())
+            .await
     }
 
-    async fn run_with_inner(
+    /// Run with explicit execution dependencies, limits, and cancellation.
+    ///
+    /// Every validation, input, route, binding-availability, and size check
+    /// runs before any step is dispatched. Once execution starts, step
+    /// failures, cancellation, deadline expiry, and size limits are reported
+    /// in the returned [`WorkflowRun`], never as an error.
+    ///
+    /// # Errors
+    /// Returns the errors of [`validate`](Self::validate), and
+    /// `WYRD_WORKFLOW_422_RUN_REQUEST`, `WYRD_WORKFLOW_413_INPUT_TOO_LARGE`,
+    /// `WYRD_WORKFLOW_413_GRAPH_TOO_LARGE`,
+    /// `WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED`, or
+    /// `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` for invalid input or an
+    /// environment that cannot serve the declared routes.
+    pub async fn run_with_options(
         &self,
-        providers: &skald_runtime::ProviderRegistry,
-        input: WorkflowInput,
+        dependencies: &WorkflowExecutionDependencies,
+        input: impl Into<WorkflowInput>,
+        options: WorkflowRunOptions,
     ) -> WorkflowResult<WorkflowRun> {
-        let def = self.to_workflow_def()?;
-        let executor = DagExecutor::build(def, providers).await?;
-        let mut ctx = Context::new();
-        ctx.input = input.into_context_input();
-        Arc::new(executor).run(ctx).await
+        let plan = ExecutionPlan::build(
+            &self.spec,
+            &self.resolved_agents,
+            dependencies,
+            input.into(),
+            options.limits.max_input_bytes,
+        )?;
+        let workflow = match &self.meta.uid {
+            Some(_) => Some(self.to_card()?.card_ref()?),
+            None => None,
+        };
+        let workflow_id = self
+            .meta
+            .name
+            .clone()
+            .unwrap_or_else(|| "workflow".to_owned());
+        let executor =
+            WorkflowExecutor::new(workflow_id, workflow, plan, dependencies.native(), options)?;
+        Ok(executor.execute().await)
     }
 
     fn append_agent_step(&mut self, agent: Agent, deps: Vec<String>) -> WorkflowResult<String> {
         let step_id = self.next_step_id(&agent);
         let agent_arc = Arc::new(agent.clone());
-        let action = if let Some(card_ref) = agent
-            .card_ref()
-            .map_err(|error| WorkflowError::Other(error.to_string()))?
-        {
+        let action = if let Some(card_ref) = agent.card_ref()? {
             self.cascade_children.push(card_ref.clone());
             WorkflowAction::Agent(InlineableRef::Ref(card_ref))
         } else {
@@ -527,7 +589,8 @@ impl Workflow {
             action,
             depends_on: deps,
             inputs: BTreeMap::new(),
-            condition: None,
+            llm_route: None,
+            fallback: None,
             timeout_seconds: None,
             retry: None,
             display: BTreeMap::new(),
@@ -537,17 +600,22 @@ impl Workflow {
         Ok(step_id)
     }
 
+    /// Derive a unique step ID from the Agent name.
+    ///
+    /// Characters outside the parameter identifier grammar become `_`, a
+    /// leading digit gains a `_` prefix, unnamed Agents become `step_<n>`, and
+    /// collisions gain a `_<n>` suffix.
     fn next_step_id(&self, agent: &Agent) -> String {
-        let base = agent
-            .name_str()
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("step-{}", self.spec.steps.len() + 1));
+        let base = agent.name_str().map_or_else(
+            || format!("step_{}", self.spec.steps.len() + 1),
+            step_id_for_name,
+        );
         if !self.resolved_agents.contains_key(&base) {
             return base;
         }
         let mut suffix = 2usize;
         loop {
-            let candidate = format!("{base}-{suffix}");
+            let candidate = format!("{base}_{suffix}");
             if !self.resolved_agents.contains_key(&candidate) {
                 return candidate;
             }
@@ -555,6 +623,7 @@ impl Workflow {
         }
     }
 
+    /// Sort and deduplicate derived cascade children.
     fn dedup_cascade(&mut self) {
         self.cascade_children.sort_by(|a, b| {
             let a_key = (
@@ -572,39 +641,6 @@ impl Workflow {
             a_key.cmp(&b_key)
         });
         self.cascade_children.dedup();
-    }
-
-    fn to_workflow_def(&self) -> WorkflowResult<WorkflowDef> {
-        let mut agents = Vec::with_capacity(self.spec.steps.len());
-        let mut tasks = Vec::with_capacity(self.spec.steps.len());
-        for step in &self.spec.steps {
-            let agent = self
-                .resolved_agents
-                .get(&step.id)
-                .ok_or_else(|| WorkflowError::AgentNotFound(step.id.clone()))?;
-            let prompt = agent.prompt.native().clone();
-            agents.push(WorkflowAgent {
-                id: step.id.clone(),
-                prompt: prompt.clone(),
-                run_config: agent.run_config.clone(),
-            });
-            tasks.push(TaskDef {
-                id: step.id.clone(),
-                agent_id: step.id.clone(),
-                prompt,
-                dependencies: step.depends_on.clone(),
-                max_retries: step
-                    .retry
-                    .as_ref()
-                    .map_or_else(default_max_retries, |r| r.max_retries),
-            });
-        }
-        Ok(WorkflowDef {
-            id: self.meta.name.clone().unwrap_or_else(|| "workflow".into()),
-            name: self.meta.name.clone().unwrap_or_else(|| "workflow".into()),
-            agents,
-            tasks,
-        })
     }
 }
 
@@ -653,13 +689,476 @@ impl WorkflowBuilder {
         Ok(self)
     }
 
-    /// Finalize the builder, validating the DAG.
+    /// Declare Workflow inputs; see [`Workflow::with_inputs`].
     ///
     /// # Errors
-    /// Returns DAG validation errors.
+    /// Returns the errors of [`Workflow::with_inputs`].
+    pub fn with_inputs(self, inputs: BTreeMap<String, ParameterValue>) -> WorkflowResult<Self> {
+        Ok(Self {
+            wf: self.wf.with_inputs(inputs)?,
+        })
+    }
+
+    /// Bind one step's Prompt variables; see [`Workflow::with_step_inputs`].
+    ///
+    /// # Errors
+    /// Returns the errors of [`Workflow::with_step_inputs`].
+    pub fn with_step_inputs(
+        self,
+        step_id: &str,
+        bindings: BTreeMap<String, WorkflowBinding>,
+    ) -> WorkflowResult<Self> {
+        Ok(Self {
+            wf: self.wf.with_step_inputs(step_id, bindings)?,
+        })
+    }
+
+    /// Declare Workflow outputs; see [`Workflow::with_outputs`].
+    ///
+    /// # Errors
+    /// Returns the errors of [`Workflow::with_outputs`].
+    pub fn with_outputs(self, outputs: BTreeMap<String, WorkflowBinding>) -> WorkflowResult<Self> {
+        Ok(Self {
+            wf: self.wf.with_outputs(outputs)?,
+        })
+    }
+
+    /// Finalize the builder after complete resolved validation.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Workflow::validate`].
     pub fn build(self) -> WorkflowResult<Workflow> {
-        let WorkflowBuilder { wf } = self;
-        wf.spec.validate_dag()?;
-        Ok(wf)
+        self.wf.validate()?;
+        Ok(self.wf)
+    }
+}
+
+/// Map an Agent name onto the step-ID grammar.
+///
+/// Characters outside `[A-Za-z0-9_]` become `_`, and a name that does not
+/// start with a letter or `_` gains a `_` prefix. Builders use this for the
+/// base step ID of a named Agent, so callers can name a predecessor step by
+/// its Agent. The Python SDK uses it to resolve an Agent passed as `after`.
+pub fn step_id_for_name(name: &str) -> String {
+    let mut id: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if !id.starts_with(|ch: char| ch.is_ascii_alphabetic() || ch == '_') {
+        id.insert(0, '_');
+    }
+    id
+}
+
+/// Require the shared parameter identifier grammar for an authored name.
+///
+/// # Errors
+/// Returns a validation error naming `field` when `name` does not match.
+fn require_identifier(field: &str, name: &str) -> Result<(), WorkflowValidationError> {
+    if is_valid_parameter_name(name) {
+        Ok(())
+    } else {
+        Err(WorkflowValidationError::invalid(
+            field,
+            "must match [A-Za-z_][A-Za-z0-9_]*",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use serde_json::{Value, json};
+    use wyrd_spec::auth::AbsoluteUrl;
+    use wyrd_spec::card::common::ParameterValue;
+    use wyrd_spec::card::workflow::{
+        ExternalGatewayProtocol, LlmRoute, WorkflowRetryPolicy, WorkflowRun, WorkflowRunStatus,
+    };
+    use wyrd_spec::ids::CredentialBindingName;
+
+    use super::{Workflow, WorkflowInput};
+    use crate::error::{WorkflowError, WorkflowResult};
+    use crate::route::WorkflowExecutionDependencies;
+    use crate::test_support::{
+        RecordingTool, Reply, ScriptedProvider, agent, bindings, string_schema,
+    };
+    use crate::workflow::{WorkflowExecutionLimits, WorkflowRunOptions};
+
+    /// Run `workflow` against `provider` with default local options.
+    async fn run_local(
+        workflow: &Workflow,
+        provider: &Arc<ScriptedProvider>,
+        input: impl Into<WorkflowInput>,
+    ) -> WorkflowResult<WorkflowRun> {
+        workflow
+            .run_with_options(
+                &WorkflowExecutionDependencies::new(provider.registry()),
+                input,
+                WorkflowRunOptions::default(),
+            )
+            .await
+    }
+
+    /// Stable code and offending field of a pre-dispatch failure.
+    fn code_and_field(error: &WorkflowError) -> (&'static str, String) {
+        let field = match error {
+            WorkflowError::Spec(error) => error.field().to_owned(),
+            WorkflowError::Wyrd(error) => {
+                let details = &error.as_problem_json()["details"];
+                details["field"]
+                    .as_str()
+                    .or_else(|| details["step"].as_str())
+                    .unwrap_or_default()
+                    .to_owned()
+            }
+            WorkflowError::AgentNotFound(step) => step.clone(),
+        };
+        (error.code(), field)
+    }
+
+    /// Two-step text Workflow `first -> second` without bindings or outputs.
+    fn pair(first: &str, second: &str, structured_first: bool) -> Workflow {
+        let schema = structured_first.then(|| string_schema(&["summary"]));
+        Workflow::new("pair")
+            .add(agent("first", first, schema))
+            .and_then(|w| w.add_after(agent("second", second, None), ["first"]))
+            .expect("fixture steps append")
+    }
+
+    /// Scenario 1: every resolved-graph defect fails with a safe,
+    /// field-specific stable error before any provider call: unbound and extra
+    /// Prompt variables, payload-kind mismatches in either direction, an
+    /// unresolved Agent, a hidden (undeclared) step reference, a cycle, an
+    /// external route whose protocol differs from the Prompt dialect, a retry
+    /// count whose final attempt cannot fit `u32`, and step timeouts or a run
+    /// deadline that cannot be represented as an instant.
+    #[tokio::test]
+    async fn resolved_bindings_reject_before_dispatch() {
+        const VALIDATION: &str = "WYRD_WORKFLOW_422_VALIDATION";
+        let with_outputs = |workflow: Workflow| {
+            workflow
+                .with_outputs(bindings(&[("out", "steps.second.output.text")]))
+                .expect("outputs declare")
+        };
+        let mut missing_agent = with_outputs(pair("first", "second", false));
+        missing_agent.resolved_agents.remove("second");
+        let mut external = with_outputs(pair("first", "second", false));
+        external.spec.steps[1].llm_route = Some(LlmRoute::ExtGateway {
+            protocol: ExternalGatewayProtocol::AnthropicMessages,
+            base_url: AbsoluteUrl::new("https://llm.example.com/v1".to_owned())
+                .expect("absolute url"),
+            headers: BTreeMap::new(),
+            credential_binding: CredentialBindingName::new("corp").expect("binding name"),
+        });
+        let retry = |max_retries: u32| {
+            let mut workflow = with_outputs(pair("first", "second", false));
+            workflow.spec.steps[1].retry = Some(WorkflowRetryPolicy {
+                max_retries,
+                initial_backoff_ms: None,
+            });
+            workflow
+        };
+        let mut timeout = with_outputs(pair("first", "second", false));
+        timeout.spec.steps[1].timeout_seconds = Some(u64::MAX);
+        let cases: Vec<(&str, Workflow, &str, &str)> = vec![
+            (
+                "unbound variable",
+                with_outputs(pair("first ${topic}", "second", false)),
+                VALIDATION,
+                "steps[0].inputs.topic",
+            ),
+            (
+                "extra binding",
+                with_outputs(
+                    pair("first", "second", false)
+                        .with_step_inputs("first", bindings(&[("extra", "input.topic")]))
+                        .expect("binding names are identifiers"),
+                ),
+                VALIDATION,
+                "steps[0].inputs.extra",
+            ),
+            (
+                "text binding to structured step",
+                with_outputs(
+                    pair("first", "second ${v}", true)
+                        .with_step_inputs("second", bindings(&[("v", "steps.first.output.text")]))
+                        .expect("binding names are identifiers"),
+                ),
+                VALIDATION,
+                "steps[1].inputs.v",
+            ),
+            (
+                "structured binding to text step",
+                with_outputs(
+                    pair("first", "second ${v}", false)
+                        .with_step_inputs(
+                            "second",
+                            bindings(&[("v", "steps.first.output.structured.summary")]),
+                        )
+                        .expect("binding names are identifiers"),
+                ),
+                VALIDATION,
+                "steps[1].inputs.v",
+            ),
+            (
+                "missing agent",
+                missing_agent,
+                "WYRD_WORKFLOW_404_AGENT",
+                "second",
+            ),
+            (
+                "hidden reference",
+                pair("first", "second", false)
+                    .with_outputs(bindings(&[("out", "steps.first.output.text")]))
+                    .and_then(|w| w.add(agent("third", "third ${v}", None)))
+                    .and_then(|w| {
+                        w.with_step_inputs("third", bindings(&[("v", "steps.first.output.text")]))
+                    })
+                    .expect("fixture builds"),
+                VALIDATION,
+                "steps[2].inputs.v",
+            ),
+            (
+                "cycle",
+                with_outputs(
+                    Workflow::new("cycle")
+                        .add_after(agent("first", "first", None), ["second"])
+                        .and_then(|w| w.add_after(agent("second", "second", None), ["first"]))
+                        .expect("fixture steps append"),
+                ),
+                "WYRD_WORKFLOW_422_CYCLE",
+                "",
+            ),
+            (
+                "external protocol mismatch",
+                external,
+                "WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED",
+                "steps[1].llm_route",
+            ),
+            (
+                "unrepresentable retry count",
+                retry(u32::MAX),
+                VALIDATION,
+                "steps[1].retry.max_retries",
+            ),
+            (
+                "unrepresentable step timeout",
+                timeout,
+                VALIDATION,
+                "steps[1].timeout_seconds",
+            ),
+        ];
+
+        for (case, workflow, code, field) in cases {
+            let provider = ScriptedProvider::new();
+            let validated = workflow.validate().expect_err(case);
+            let error = run_local(&workflow, &provider, serde_json::Map::new())
+                .await
+                .expect_err(case);
+            let (actual_code, actual_field) = code_and_field(&error);
+            assert_eq!(actual_code, code, "{case}: {error}");
+            assert_eq!(validated.code(), code, "{case}");
+            if !field.is_empty() {
+                assert_eq!(actual_field, field, "{case}: {error}");
+            }
+            assert!(provider.requests().is_empty(), "{case} dispatched");
+        }
+
+        // The largest representable retry count is accepted.
+        retry(u32::MAX - 1)
+            .validate()
+            .expect("u32::MAX - 1 retries validate");
+
+        // An unrepresentable local run deadline is refused before dispatch.
+        let provider = ScriptedProvider::new();
+        let error = with_outputs(pair("first", "second", false))
+            .run_with_options(
+                &WorkflowExecutionDependencies::new(provider.registry()),
+                serde_json::Map::new(),
+                WorkflowRunOptions {
+                    limits: WorkflowExecutionLimits {
+                        deadline: Some(Duration::MAX),
+                        ..WorkflowExecutionLimits::default()
+                    },
+                    ..WorkflowRunOptions::default()
+                },
+            )
+            .await
+            .expect_err("deadline is not representable");
+        assert_eq!(
+            code_and_field(&error),
+            ("WYRD_WORKFLOW_422_RUN_REQUEST", "deadline".to_owned())
+        );
+        assert!(provider.requests().is_empty());
+    }
+
+    /// Scenario 7: the Rust builder declares inputs, step bindings, and
+    /// outputs; `build` refuses an incomplete graph; edges inject no data;
+    /// text shorthand needs a declared string `input`; unknown or mistyped
+    /// input fails as a run request while defaults fill missing keys; and a
+    /// local tool runs only when declared on the Agent, and a model request
+    /// for an undeclared tool fails that step without executing anything.
+    #[tokio::test]
+    async fn explicit_builder_contract() {
+        let declared = Workflow::builder("explicit")
+            .add(agent("draft", "draft ${input} at ${level}", None))
+            .and_then(|b| b.add_after(agent("review", "review only", None), ["draft"]));
+        let incomplete = declared
+            .and_then(|b| b.with_outputs(bindings(&[("out", "steps.review.output.text")])))
+            .expect("fixture builds");
+        let error = incomplete.build().expect_err("draft variables are unbound");
+        assert_eq!(code_and_field(&error).1, "steps[0].inputs.input");
+
+        let unknown_step = Workflow::builder("explicit")
+            .add(agent("draft", "draft", None))
+            .and_then(|b| b.with_step_inputs("nope", bindings(&[("x", "input.x")])))
+            .err()
+            .expect("unknown step is refused");
+        assert_eq!(code_and_field(&unknown_step).1, "steps.nope");
+
+        let inputs: BTreeMap<String, ParameterValue> = [
+            ("input".to_owned(), ParameterValue::Str(String::new())),
+            ("level".to_owned(), ParameterValue::Int(2)),
+        ]
+        .into();
+        let workflow = Workflow::builder("explicit")
+            .add(agent("draft", "draft ${input} at ${level}", None))
+            .and_then(|b| b.add_after(agent("review", "review only", None), ["draft"]))
+            .and_then(|b| b.with_inputs(inputs))
+            .and_then(|b| {
+                b.with_step_inputs(
+                    "draft",
+                    bindings(&[("input", "input.input"), ("level", "input.level")]),
+                )
+            })
+            .and_then(|b| {
+                b.with_outputs(bindings(&[
+                    ("review", "steps.review.output.text"),
+                    ("level", "input.level"),
+                ]))
+            })
+            .and_then(|b| b.build())
+            .expect("explicit workflow builds");
+
+        let provider = ScriptedProvider::new();
+        provider.on("draft", vec![Reply::Text("drafted".into())]);
+        provider.on("review", vec![Reply::Text("approved".into())]);
+        let run = run_local(&workflow, &provider, "essay")
+            .await
+            .expect("text shorthand binds the declared input");
+        assert_eq!(run.status, WorkflowRunStatus::Succeeded, "{run:?}");
+        assert_eq!(run.outputs["review"], json!("approved"));
+        assert_eq!(run.outputs["level"], json!(2));
+        assert_eq!(
+            provider.requests(),
+            vec!["draft essay at 2".to_owned(), "review only".to_owned()],
+            "the edge injects nothing into review"
+        );
+
+        let refusals: [(&str, Value, &str); 2] = [
+            ("unknown input", json!({ "other": "x" }), "input.other"),
+            ("mistyped input", json!({ "level": "two" }), "input.level"),
+        ];
+        for (case, input, field) in refusals {
+            let Value::Object(input) = input else {
+                panic!("fixture input must be an object");
+            };
+            let provider = ScriptedProvider::new();
+            let error = run_local(&workflow, &provider, input)
+                .await
+                .expect_err(case);
+            assert_eq!(
+                code_and_field(&error),
+                ("WYRD_WORKFLOW_422_RUN_REQUEST", field.to_owned()),
+                "{case}"
+            );
+            assert!(provider.requests().is_empty(), "{case} dispatched");
+        }
+
+        let undeclared_text = Workflow::builder("no_input")
+            .add(agent("only", "static", None))
+            .and_then(|b| b.with_outputs(bindings(&[("out", "steps.only.output.text")])))
+            .and_then(|b| b.build())
+            .expect("static workflow builds");
+        let provider = ScriptedProvider::new();
+        let error = run_local(&undeclared_text, &provider, "loose text")
+            .await
+            .expect_err("text shorthand needs a declared string input");
+        assert_eq!(
+            code_and_field(&error),
+            ("WYRD_WORKFLOW_422_RUN_REQUEST", "input".to_owned())
+        );
+
+        let declared_tool = Arc::new(RecordingTool {
+            name: "lookup".to_owned(),
+            calls: AtomicUsize::new(0),
+        });
+        let tooled = Workflow::builder("tooled")
+            .add(agent("lookup_step", "lookup call", None).with_tool(declared_tool.clone()))
+            .and_then(|b| b.with_outputs(bindings(&[("found", "steps.lookup_step.output.text")])))
+            .and_then(|b| b.build())
+            .expect("tooled workflow builds");
+        let provider = ScriptedProvider::new();
+        provider.on(
+            "lookup call",
+            vec![
+                Reply::ToolCall("lookup".into(), json!({})),
+                Reply::Text("found it".into()),
+            ],
+        );
+        let run = run_local(&tooled, &provider, serde_json::Map::new())
+            .await
+            .expect("tooled workflow starts");
+        assert_eq!(
+            run.outputs.get("found"),
+            Some(&json!("found it")),
+            "{run:?}"
+        );
+        assert_eq!(declared_tool.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            provider
+                .requests()
+                .iter()
+                .any(|text| text.contains("answered")),
+            "the tool result is returned to the model"
+        );
+
+        let undeclared = Workflow::builder("undeclared")
+            .add(agent("plain_step", "plain call", None))
+            .and_then(|b| b.with_outputs(bindings(&[("plain", "steps.plain_step.output.text")])))
+            .and_then(|b| b.build())
+            .expect("plain workflow builds");
+        let provider = ScriptedProvider::new();
+        provider.on(
+            "plain call",
+            vec![
+                Reply::ToolCall("lookup".into(), json!({})),
+                Reply::Text("no tool".into()),
+            ],
+        );
+        let run = run_local(&undeclared, &provider, serde_json::Map::new())
+            .await
+            .expect("plain workflow starts");
+        let refused = run.steps["plain_step"]
+            .error
+            .as_ref()
+            .map(|error| error.code.as_str());
+        assert_eq!(refused, Some("WYRD_AGENT_404_TOOL_NOT_IN_AGENT"));
+        assert_eq!(run.status, WorkflowRunStatus::Failed);
+        assert_eq!(
+            declared_tool.calls.load(Ordering::SeqCst),
+            1,
+            "an Agent that does not declare the tool never executes it"
+        );
     }
 }

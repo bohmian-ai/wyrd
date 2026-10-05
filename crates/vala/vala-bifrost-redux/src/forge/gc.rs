@@ -148,10 +148,15 @@ impl Forge {
     /// compaction. A replica without the term does nothing.
     ///
     /// Per-table failures are logged and the pass continues. The pass runs
-    /// under the term's revocation, which shutdown also cancels: once the
+    /// under the term's revocation, which `shutdown` also cancels: once the
     /// term ends, the pass stops before the next table and every effect in
-    /// progress stops before its next durable step.
-    pub(super) async fn run_maintenance(&self, executor: &ForgeWorker) {
+    /// progress stops before its next durable step. A stop the revocation
+    /// caused is logged as the lost leader fence, not as shutdown.
+    pub(super) async fn run_maintenance(
+        &self,
+        executor: &ForgeWorker,
+        shutdown: &CancellationToken,
+    ) {
         let Some(term) = self.leadership.held() else {
             return;
         };
@@ -168,6 +173,7 @@ impl Forge {
                 return;
             }
             if let Err(error) = self.rewrite_manifests(schedule, key, stop).await {
+                let error = term.attribute(error, shutdown);
                 tracing::error!(error = %error, table = %key.table.table, "Forge manifest rewrite failed");
             }
         }
@@ -176,6 +182,7 @@ impl Forge {
                 return;
             }
             if let Err(error) = self.expire_snapshots(schedule, executor, key, stop).await {
+                let error = term.attribute(error, shutdown);
                 tracing::error!(error = %error, table = %key.table.table, "Forge snapshot expiration failed");
             }
         }
@@ -188,6 +195,7 @@ impl Forge {
                 continue;
             }
             if let Err(error) = self.clean_orphans(executor, &key, stop).await {
+                let error = term.attribute(error, shutdown);
                 tracing::error!(error = %error, table = %key.table.table, "Forge orphan cleanup failed");
             }
         }

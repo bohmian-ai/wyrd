@@ -128,6 +128,27 @@ impl ForgeHeldTerm {
         &self.revocation
     }
 
+    /// Reports a stop this term's revocation caused as the lost leader fence.
+    ///
+    /// Leader-only work runs under [`Self::revocation`], which both loss of
+    /// the term and coordinator `shutdown` cancel, and stops with
+    /// [`ForgeError::Shutdown`] either way. When the term was revoked while
+    /// `shutdown` was not, the stop is returned as [`ForgeError::FenceLost`]
+    /// on the leader lease, so logs say what happened. Every other error is
+    /// returned unchanged.
+    pub(super) fn attribute(&self, error: ForgeError, shutdown: &CancellationToken) -> ForgeError {
+        match error {
+            ForgeError::Shutdown | ForgeError::ShutdownRetained
+                if self.is_revoked() && !shutdown.is_cancelled() =>
+            {
+                ForgeError::FenceLost {
+                    lease_key: LEADER_LEASE_KEY.to_owned(),
+                }
+            }
+            error => error,
+        }
+    }
+
     /// Returns the fencing token of this term.
     #[must_use]
     pub fn fencing_token(&self) -> i64 {
@@ -595,5 +616,50 @@ pub fn outcome_from_wire(raw: i32) -> Result<ForgeCompactionOutcome, String> {
         Ok(Wire::Failed) => Ok(ForgeCompactionOutcome::Failed),
         Ok(Wire::NotStarted) => Ok(ForgeCompactionOutcome::NotStarted),
         _ => Err(format!("compaction outcome {raw} is not a known outcome")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds an unelected term whose revocation is a child of `shutdown`.
+    fn term(shutdown: &CancellationToken) -> ForgeHeldTerm {
+        ForgeHeldTerm {
+            fencing_token: 1,
+            schedule: ForgeSchedule::new(DEFAULT_REPORT_TIMEOUT),
+            revocation: shutdown.child_token(),
+        }
+    }
+
+    /// A stop caused by revocation reads as the lost leader fence, while a
+    /// coordinator shutdown and every unrelated error keep their own identity.
+    #[test]
+    fn revoked_stop_is_attributed_to_the_leader_fence() {
+        let shutdown = CancellationToken::new();
+        let live = term(&shutdown);
+        assert!(matches!(
+            live.attribute(ForgeError::Shutdown, &shutdown),
+            ForgeError::Shutdown
+        ));
+
+        live.revocation.cancel();
+        for stop in [ForgeError::Shutdown, ForgeError::ShutdownRetained] {
+            assert!(matches!(
+                live.attribute(stop, &shutdown),
+                ForgeError::FenceLost { lease_key } if lease_key == LEADER_LEASE_KEY
+            ));
+        }
+        assert!(matches!(
+            live.attribute(ForgeError::AlreadyRunning, &shutdown),
+            ForgeError::AlreadyRunning
+        ));
+
+        let stopping = term(&shutdown);
+        shutdown.cancel();
+        assert!(matches!(
+            stopping.attribute(ForgeError::Shutdown, &shutdown),
+            ForgeError::Shutdown
+        ));
     }
 }

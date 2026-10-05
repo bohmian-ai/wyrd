@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::error::ForgeError;
-use super::leadership::LEADER_HEARTBEAT;
+use super::leadership::{ForgeHeldTerm, LEADER_HEARTBEAT};
 use super::{Forge, ForgeWorker, ForgeWorkerConfig};
 use crate::maintenance::StagingFileCommitted;
 
@@ -118,6 +118,15 @@ impl ForgeSchedulerTrigger {
     }
 }
 
+/// Why the renewal loop asks the supervisor for one promotion-debt sweep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForgeSweep {
+    /// Production acquired a new term, so its debt is recovered at once.
+    Acquired,
+    /// A test-owned trigger requested one pass, recorded once it sweeps.
+    Requested,
+}
+
 /// Clears one Forge role's readiness when its supervised loop stops.
 ///
 /// Every exit — clean shutdown, construction failure, or an unwind — runs the
@@ -136,12 +145,14 @@ impl Forge {
     ///
     /// Every coordinator contends for the one leader term on a heartbeat and
     /// promotes the Scribe hot objects its own hints name, through a private
-    /// attempt executor. The term holder sweeps `file_list` promotion debt on
+    /// attempt executor. Term renewal is the only election path and runs in
+    /// its own loop, so neither promotion, the debt sweep nor maintenance can
+    /// delay it. Acquiring the term asks the supervisor for an immediate
+    /// `file_list` promotion-debt sweep, and the term holder sweeps again on
     /// every heartbeat; under a test-owned trigger it sweeps only on the
-    /// passes that trigger requests. Term renewal runs in its own loop and a
-    /// separate timer runs the leader's Iceberg maintenance pass, so neither
-    /// promotion nor maintenance can delay renewal. The term is resigned on
-    /// stop, so a standby takes over at once.
+    /// passes that trigger requests. A separate timer runs the leader's
+    /// Iceberg maintenance pass. The term is resigned on stop, so a standby
+    /// takes over at once.
     ///
     /// # Errors
     /// Returns [`ForgeError::AlreadyRunning`] for duplicate supervision or a
@@ -166,55 +177,9 @@ impl Forge {
             ForgeWorkerConfig::default(),
             Uuid::now_v7(),
         )?;
-        tokio::join!(
-            self.renew(&shutdown, &readiness),
-            self.supervise(&executor, &shutdown, &readiness),
-            self.maintain(&executor, &shutdown),
-        );
-        if let Err(error) = self.leadership.resign().await {
-            tracing::warn!(error = %error, "Forge leader term was not resigned; it will expire");
-        }
-        Ok(())
-    }
-
-    /// Renews or contends for the leader term on its own heartbeat until stop.
-    ///
-    /// This loop awaits nothing but the election row, so promotion, sweeps
-    /// and maintenance can never delay renewal past the term. A renewal that
-    /// fails or outlives the term revokes it inside
-    /// [`super::leadership::ForgeLeadership::heartbeat`] and clears readiness
-    /// until the next successful leader pass.
-    async fn renew(&self, shutdown: &CancellationToken, readiness: &super::ForgeRoleReadiness) {
-        let mut heartbeat = tokio::time::interval_at(
-            tokio::time::Instant::now() + LEADER_HEARTBEAT,
-            LEADER_HEARTBEAT,
-        );
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                () = shutdown.cancelled() => break,
-                _ = heartbeat.tick() => {
-                    if let Err(error) = self.leadership.heartbeat(shutdown).await {
-                        tracing::error!(error = %error, "Forge leader term renewal failed");
-                        readiness.publish(false);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Promotes hinted tables and runs leader passes until stop.
-    async fn supervise(
-        &self,
-        executor: &ForgeWorker,
-        shutdown: &CancellationToken,
-        readiness: &super::ForgeRoleReadiness,
-    ) {
-        // Production elects at once on boot and sweeps promotion debt on
-        // every heartbeat. A test that owns the trigger arranges its scenario
-        // first and owns every sweep: its first heartbeat waits a period, and
-        // its heartbeats only renew the term, so no unrequested sweep races
-        // the world the scenario is building.
+        // A test that owns the trigger arranges its scenario first: every
+        // loop waits one full period before its first tick, heartbeats only
+        // renew the term, and debt is swept only on the passes it requests.
         #[cfg(feature = "test-support")]
         let quiet = self
             .core
@@ -224,9 +189,103 @@ impl Forge {
             .is_some();
         #[cfg(not(feature = "test-support"))]
         let quiet = false;
+        let (sweeps, requested) = tokio::sync::mpsc::unbounded_channel();
+        tokio::join!(
+            self.renew(&shutdown, &readiness, &sweeps, quiet),
+            self.supervise(&executor, &shutdown, &readiness, requested, quiet),
+            self.maintain(&executor, &shutdown, quiet),
+        );
+        if let Err(error) = self.leadership.resign().await {
+            tracing::warn!(error = %error, "Forge leader term was not resigned; it will expire");
+        }
+        Ok(())
+    }
+
+    /// Renews or contends for the leader term on its own heartbeat until stop.
+    ///
+    /// This is the only caller of
+    /// [`super::leadership::ForgeLeadership::heartbeat`], and it awaits
+    /// nothing but the election row, so promotion, sweeps and maintenance can
+    /// never delay renewal past the term. A renewal that fails or outlives the
+    /// term revokes it and clears readiness; a successful one publishes it.
+    ///
+    /// Sweeps are handed to the supervisor without waiting: one for each
+    /// production acquisition, so a new leader recovers promotion debt at
+    /// once, and one for each test-requested pass, which the supervisor
+    /// records as completed after it sweeps. `quiet` marks a test-owned
+    /// trigger: the first renewal waits one period and acquisitions request
+    /// no sweep.
+    async fn renew(
+        &self,
+        shutdown: &CancellationToken,
+        readiness: &super::ForgeRoleReadiness,
+        sweeps: &tokio::sync::mpsc::UnboundedSender<ForgeSweep>,
+        quiet: bool,
+    ) {
         let now = tokio::time::Instant::now();
         let mut heartbeat = tokio::time::interval_at(
             if quiet { now + LEADER_HEARTBEAT } else { now },
+            LEADER_HEARTBEAT,
+        );
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let sweep = tokio::select! {
+                () = shutdown.cancelled() => break,
+                _ = heartbeat.tick() => {
+                    let acquired = self.renew_term(shutdown, readiness).await;
+                    (acquired && !quiet).then_some(ForgeSweep::Acquired)
+                }
+                () = self.await_triggered_pass() => {
+                    self.renew_term(shutdown, readiness).await;
+                    Some(ForgeSweep::Requested)
+                }
+            };
+            // A closed receiver means the supervisor stopped with the process.
+            if let Some(sweep) = sweep {
+                let _ = sweeps.send(sweep);
+            }
+        }
+    }
+
+    /// Runs one renewal or contention and publishes readiness.
+    ///
+    /// A replica that finds another live leader is a healthy standby. Returns
+    /// whether this call acquired a new term.
+    async fn renew_term(
+        &self,
+        shutdown: &CancellationToken,
+        readiness: &super::ForgeRoleReadiness,
+    ) -> bool {
+        match self.leadership.heartbeat(shutdown).await {
+            Ok(acquired) => {
+                readiness.publish(true);
+                acquired
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "Forge leader term renewal failed");
+                // Cleared before the next renewal, so a coordinator whose
+                // election row is unreachable stops being routed to at once.
+                readiness.publish(false);
+                false
+            }
+        }
+    }
+
+    /// Promotes hinted tables and sweeps promotion debt until stop.
+    ///
+    /// Production sweeps on every heartbeat after the first, and on every
+    /// acquisition the renewal loop reports. Under a test-owned trigger
+    /// (`quiet`) only the requested passes sweep.
+    async fn supervise(
+        &self,
+        executor: &ForgeWorker,
+        shutdown: &CancellationToken,
+        readiness: &super::ForgeRoleReadiness,
+        mut requested: tokio::sync::mpsc::UnboundedReceiver<ForgeSweep>,
+        quiet: bool,
+    ) {
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + LEADER_HEARTBEAT,
             LEADER_HEARTBEAT,
         );
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -243,11 +302,15 @@ impl Forge {
                         None => hints_open = false,
                     }
                 }
-                _ = heartbeat.tick() => self.run_pass(executor, shutdown, readiness, !quiet).await,
-                () = self.await_triggered_pass() => {
-                    self.run_pass(executor, shutdown, readiness, true).await;
+                _ = heartbeat.tick(), if !quiet => self.run_pass(executor, shutdown, readiness).await,
+                Some(sweep) = requested.recv() => {
+                    self.run_pass(executor, shutdown, readiness).await;
                     #[cfg(feature = "test-support")]
-                    self.record_completed_pass();
+                    if sweep == ForgeSweep::Requested {
+                        self.record_completed_pass();
+                    }
+                    #[cfg(not(feature = "test-support"))]
+                    let _ = sweep;
                 }
             }
         }
@@ -256,19 +319,10 @@ impl Forge {
     /// Runs the leader maintenance timer until stop.
     ///
     /// Like `RisingWave`'s GC loop, the first tick fires at once. A replica
-    /// without the term skips the tick. A test that owns this loop drives
-    /// every pass itself, so its timer waits one full interval.
-    async fn maintain(&self, executor: &ForgeWorker, shutdown: &CancellationToken) {
+    /// without the term skips the tick. A test that owns this loop (`quiet`)
+    /// drives every pass itself, so its timer waits one full interval.
+    async fn maintain(&self, executor: &ForgeWorker, shutdown: &CancellationToken, quiet: bool) {
         let interval = self.core.maintenance_interval;
-        #[cfg(feature = "test-support")]
-        let quiet = self
-            .core
-            .scheduler_trigger
-            .as_ref()
-            .and_then(ForgeSchedulerTrigger::owner_for_test)
-            .is_some();
-        #[cfg(not(feature = "test-support"))]
-        let quiet = false;
         let now = tokio::time::Instant::now();
         let mut ticker =
             tokio::time::interval_at(if quiet { now + interval } else { now }, interval);
@@ -282,7 +336,7 @@ impl Forge {
             // Boxed: the pass nests every attempt future, and inlining it in
             // this loop's state machine overflows the server's layout depth.
             tracing::Instrument::instrument(
-                Box::pin(self.run_maintenance(executor)),
+                Box::pin(self.run_maintenance(executor, shutdown)),
                 tracing::info_span!("bifrost.forge.maintenance.pass", role = "server"),
             )
             .await;
@@ -318,70 +372,42 @@ impl Forge {
         }
     }
 
-    /// Runs one heartbeat pass and publishes readiness.
+    /// Sweeps promotion debt under the held term, if any.
     ///
-    /// Every pass renews or contends for the leader term. A replica that
-    /// finds another live leader is a healthy standby; when `sweep` is set,
-    /// the term holder then sweeps promotion debt. Only a heartbeat under a
-    /// test-owned trigger clears `sweep`.
+    /// A replica without the term does nothing. A failed debt read clears
+    /// readiness until the next successful renewal publishes it again.
     async fn run_pass(
         &self,
         executor: &ForgeWorker,
-        stop: &CancellationToken,
+        shutdown: &CancellationToken,
         readiness: &super::ForgeRoleReadiness,
-        sweep: bool,
     ) {
         let span = tracing::info_span!(
             "bifrost.forge.scheduler.pass",
             result = tracing::field::Empty,
             role = "server",
         );
-        let result =
-            tracing::Instrument::instrument(self.lead(executor, stop, sweep), span.clone()).await;
-        match result {
-            Ok(leader) => {
-                span.record("result", if leader { "succeeded" } else { "standby" });
-                readiness.publish(true);
+        let Some(term) = self.leadership.held() else {
+            span.record("result", "standby");
+            return;
+        };
+        // ponytail: one indexed debt read per heartbeat; gate it on
+        // acquisition plus a slower tick if the read ever shows up.
+        let swept = tracing::Instrument::instrument(
+            self.sweep_promotion_debt(executor, &term, shutdown),
+            span.clone(),
+        )
+        .await;
+        match swept {
+            Ok(_) => {
+                span.record("result", "succeeded");
             }
             Err(error) => {
                 span.record("result", "failed");
                 tracing::error!(error = %error, "Forge leader pass failed");
-                // Cleared before the next pass, so a coordinator whose
-                // dependency failed stops being routed to immediately.
                 readiness.publish(false);
             }
         }
-    }
-
-    /// Holds the leader term for one heartbeat and, when `sweep` is set,
-    /// sweeps promotion debt.
-    ///
-    /// Returns whether this replica holds the term after the pass. A pass
-    /// without `sweep` only renews or contends for the term. The sweep runs
-    /// under the term's revocation, so a term lost mid-sweep stops it before
-    /// the next table and at each promotion's durable boundary.
-    ///
-    /// # Errors
-    ///
-    /// Returns election and promotion-debt read failures.
-    async fn lead(
-        &self,
-        executor: &ForgeWorker,
-        stop: &CancellationToken,
-        sweep: bool,
-    ) -> Result<bool, ForgeError> {
-        self.leadership.heartbeat(stop).await?;
-        let Some(term) = self.leadership.held() else {
-            return Ok(false);
-        };
-        if !sweep {
-            return Ok(true);
-        }
-        // ponytail: one indexed debt read per heartbeat; gate it on
-        // acquisition plus a slower tick if the read ever shows up.
-        self.sweep_promotion_debt(executor, term.revocation())
-            .await?;
-        Ok(self.leadership.held().is_some())
     }
 
     /// Promotes every table that still owes Scribe hot objects.
@@ -390,28 +416,32 @@ impl Forge {
     /// is the hot-object authority, so a lost hint or a dead leader never
     /// strands a promotion. Ordinary compaction counts are not recovered.
     ///
+    /// The sweep runs under `term`'s revocation, so a term lost mid-sweep
+    /// stops it before the next table and at each promotion's durable
+    /// boundary; each interrupted attempt is left to recovery from its own
+    /// row.
+    ///
+    /// Returns whether any table owed a promotion, whether this sweep ran it,
+    /// left it to an attempt already active or queued, or failed it.
+    ///
     /// # Errors
     ///
     /// Returns the debt read's SQL error; per-table failures are logged and
     /// left for the next sweep.
-    ///
-    /// `stop` is the term's revocation; a sweep it interrupts leaves each
-    /// attempt to recovery from its own row.
-    ///
-    /// Returns whether any table owed a promotion, whether this sweep ran it,
-    /// left it to an attempt already active or queued, or failed it.
     async fn sweep_promotion_debt(
         &self,
         executor: &ForgeWorker,
-        stop: &CancellationToken,
+        term: &ForgeHeldTerm,
+        shutdown: &CancellationToken,
     ) -> Result<bool, ForgeError> {
         // ponytail: sequential sweep inside the supervisor loop; fan out over
-        // the executor if promotion debt after failover ever delays heartbeats.
+        // the executor if promotion debt after failover ever delays hints.
         let tables =
             vala_sql::queries::forge_tasks::ForgeTasks::new(self.core.operator_pool.clone())
                 .tables_owing_promotion()
                 .await
                 .map_err(ForgeError::Sql)?;
+        let stop = term.revocation();
         let mut owed = false;
         for (tenant, table) in tables {
             if stop.is_cancelled() {
@@ -421,13 +451,13 @@ impl Forge {
                 Ok(table_owed) => owed |= table_owed,
                 Err(error) => {
                     owed = true;
+                    let error = term.attribute(error, shutdown);
                     tracing::warn!(error = %error, table = %table.table, "Forge promotion sweep failed for one table");
                 }
             }
         }
         Ok(owed)
     }
-
     /// Waits for the deterministic test trigger that requests one maintenance pass.
     ///
     /// Production has no such trigger, so the future never resolves there and

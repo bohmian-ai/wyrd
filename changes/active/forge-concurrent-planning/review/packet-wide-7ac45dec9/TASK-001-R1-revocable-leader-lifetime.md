@@ -93,3 +93,15 @@ Diagnosis of the one `test:bifrost` failure:
 - **Evidence:** the whole process starved for Postgres at the same moment. The card reconciler timed out on the same pool, the readiness Postgres probe timed out at 1.5s, and the next acquire took 7.58s. The only leadership SQL in the window is the initial acquire at 02:22:29.35. The new renewal loop first ticks at +10s (02:22:39), after the failure.
 - **Cause:** pool or Postgres starvation inside the verification-runtime harness, not leadership SQL from this change. It did not reproduce in two reruns. I could not identify the holder of the connections from the info-level trace.
 - **Fix site:** outside this task's write set (the verification runtime harness and pool sizing). Reported to the caller as a risk.
+
+### Follow-up: single renewal path and fence attribution
+
+| Requirement | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| One renewal path | `scheduler.rs` `Forge::renew` is the only caller of `ForgeLeadership::heartbeat`. The supervisor heartbeat only sweeps under the held term, and test-triggered passes renew in the renewal loop before the supervisor sweeps and records them | `revoked_term_stops_promotion_dispatch_and_maintenance` and `mise run test:bifrost:journey:forge` (22/22) | PASS |
+| Debt sweep starts at acquisition | In production, the renewal loop's first tick fires at boot. Each acquisition sends `ForgeSweep::Acquired` to the supervisor over an unbounded channel, so renewal never waits and the sweep starts as soon as the supervisor is free | design and code inspection; the journey lane exercises the triggered path | PASS |
+| A revoked term surfaces as `FenceLost` | `ForgeHeldTerm::attribute` maps `Shutdown`/`ShutdownRetained` to `FenceLost { forge:leader }` when the term was revoked and coordinator shutdown was not. It is applied to the maintenance and debt-sweep failure logs | unit test `forge::leadership::tests::revoked_stop_is_attributed_to_the_leader_fence`; the journey trace shows `Forge snapshot expiration failed error=Forge lost lease fence 'forge:leader'` | PASS |
+
+Commands: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=forge::leadership::tests::revoked_stop_is_attributed_to_the_leader_fence)'` PASS; the focused journey command above PASS; `mise run test:bifrost:journey:forge` 22/22 PASS; `mise run fmt`, `mise run lints` and `git diff --check` clean.
+
+Pool-timeout follow-up (read-only diagnostician): a Postgres-side stall of about 7s starved the app, operator and Vala pools at once, including a bare readiness `SELECT 1`, so the cause is not lock contention and not this change. It is fatal only because `ForgeWorker::run_event_loop` (`worker.rs` ~2444/2451/2467/2554) propagates read-only SQL errors as `Err`, and `wyrd_server::app::supervise` then terminates the process. That fix site is outside this task's write set and overlaps TASK-002-R1's `worker.rs` edits, so it is escalated to the caller.

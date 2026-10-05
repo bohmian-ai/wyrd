@@ -63,7 +63,7 @@ lets reviewers read the approved spec, tasks, and task evidence directly from
 the reviewed candidate. If review requires remediation, append remediation
 tasks to the same active packet and review the new immutable target.
 
-An `APPROVE` verdict from `$wyrd-change-review` automatically invokes
+A `PASS` verdict from `$wyrd-change-review` automatically invokes
 `$wyrd-complete` in the same workflow turn. Completion condenses durable context
 to one tracked record and removes the active packet:
 
@@ -167,16 +167,36 @@ remediates: []
 - completion evidence and material stop conditions; and
 - for remediation, the parent task and validated finding IDs.
 
-Task planning may choose private implementation mechanics. It may not weaken or
-reinterpret the approved spec. A task is ready only when an implementer can
+Task planning fixes outcomes, required boundaries, and source-backed reuse
+decisions. Reversible private mechanics remain implementation-owned. It may not
+weaken or reinterpret the approved spec. A task is ready only when an implementer can
 execute it without making a new material product, contract, ownership,
 security, tenancy, migration, rollout, or acceptance decision.
 
 Task status moves through `proposed`, `ready`, `in_progress`, `review`, and
-`approved`; use `superseded` when an approved spec revision or replacement task
+`complete`; use `superseded` when an approved spec revision or replacement task
 invalidates it. Review phases remain read-only. The caller or active execution
 harness records a task-review verdict in the active packet or delivery system
 when that durability is needed.
+
+## Reuse evidence and task conflicts
+
+Every implementation task maps each capability to an inspected existing owner
+and symbol, callers and tests, the precise missing behavior, the selected
+extension, and any justification for new machinery. Compare complete workflows:
+leaf-call reuse inside duplicate orchestration is insufficient. New graph
+stores, traversals, loaders, parsers, transports, validators, lifecycle owners,
+caches, and orchestration require evidence that extending the existing owner
+cannot appropriately satisfy the behavior. Private helper choices are not a
+symbol or file allowlist.
+
+Implementers revalidate this map before adding machinery. Reviews independently
+compare actual new machinery with existing owners even when a task prescribed
+it. Correct private task conflicts through `wyrd-plan` under the same approved
+spec; route material behavior or boundary changes through `wyrd-spec` and human
+approval. Task compliance cannot waive stronger repository authority. Existing
+review roles perform this comparison; no additional controller or check is
+required.
 
 ## Test command precision
 
@@ -241,7 +261,7 @@ Task readiness reviews one or more proposed tasks and returns `READY`,
 
 Task review inspects one immutable cumulative task candidate against the
 approved spec, original task, all remediation tasks, and available evidence. It
-returns `APPROVE`, `REMEDIATE`, `SPEC_REVISION_REQUIRED`, or `BLOCKED`.
+returns `PASS`, `FIX_REQUIRED`, `SPEC_REVISION_REQUIRED`, or `BLOCKED`.
 Post-remediation review always reassesses the original task's complete
 base-to-candidate range, not only the latest fix diff.
 
@@ -249,8 +269,8 @@ Every actionable finding has a stable ID, exact location, mapped spec and task
 obligations, reachable scenario, concrete consequence, required outcome, and
 supporting evidence. A finding is not new product authority.
 
-`wyrd-plan` converts validated `REMEDIATE` findings into the minimum cohesive
-remediation tasks. If the required outcome changes the approved behavior or a
+`wyrd-task-review` packages validated `FIX_REQUIRED` findings into the minimum
+cohesive remediation task and routes it directly to `wyrd-implement`. If the required outcome changes the approved behavior or a
 material constraint, route it to `SPEC_REVISION_REQUIRED` instead.
 
 ## Final change verification
@@ -258,10 +278,10 @@ material constraint, route it to `SPEC_REVISION_REQUIRED` instead.
 After all tasks are approved and integrated, final review maps every required
 specification obligation to the strongest applicable evidence, checks
 cross-task seams and required user journeys, and inspects the complete immutable
-base-to-target range. It returns `APPROVE`, `REMEDIATE`,
+base-to-target range. It returns `PASS`, `FIX_REQUIRED`,
 `SPEC_REVISION_REQUIRED`, or `BLOCKED`.
 
-The review phase never edits its subject. `APPROVE` immediately hands its
+The review phase never edits its subject. `PASS` immediately hands its
 validated completion payload to `$wyrd-complete`, which writes the compact
 record and removes the active packet. Completion does not merge, push, deploy,
 or grant product authorization.

@@ -1,178 +1,303 @@
+//! `wyrd auth login`, `wyrd auth logout`, and `wyrd auth status`: the saved
+//! human user login every local SDK resolves.
+//!
+//! Login uses the RFC 8628 device authorization grant, as `gh` and
+//! `aws sso login` do: it prints a one-time user code, opens the server's
+//! verification page, where the person approves the code and signs in to the
+//! tenant's provider, and polls the token endpoint with the in-memory device
+//! code until the sign-in completes. The Wyrd user credential goes straight
+//! into the private saved-login store owned by `wyrd-client`; no token is
+//! printed, logged, or placed in argv. Logout deletes the record, then revokes
+//! that login's refresh chain on the server best-effort and warns when it
+//! cannot.
+
 use std::process::ExitCode;
 
 use clap::Args;
 use url::Url;
-use wyrd_client::auth::TokenExchange;
+use wyrd_client::auth::{AuthError, TokenExchange};
+use wyrd_client::saved_login::{SavedLogin, SavedLogins, canonical_origin};
 use wyrd_client::transport::HttpConfig;
-use wyrd_spec::auth::{SecretBearer, TokenRequest, TokenResponse};
+use wyrd_spec::auth::TokenResponse;
+use wyrd_spec::ids::TenantSlug;
 
+use crate::client::map_client_error;
 use crate::error::WyrdCliError;
 
-/// Arguments for `wyrd auth login`: the server to exchange with and the trusted issuer to log in through.
+/// Exit status after the person interrupts a login with Ctrl-C.
+const INTERRUPTED: u8 = 130;
+
+/// Arguments for `wyrd auth login`.
 #[derive(Debug, Args)]
 pub struct LoginArgs {
-    /// Wyrd server base URL (e.g. `https://acme.wyrd.cloud`).
+    /// Wyrd server base URL.
     #[arg(long, value_name = "URL", env = "WYRD_SERVER_URL")]
     pub server: Url,
-    /// Trusted OIDC issuer URL registered with this Wyrd tenant.
-    #[arg(long, value_name = "URL")]
-    pub issuer: String,
+    /// Route key (slug) of the tenant to sign in to.
+    #[arg(long, value_name = "KEY", env = "WYRD_TENANT")]
+    pub tenant: TenantSlug,
+    /// Print the verification URL without opening a browser.
+    #[arg(long)]
+    pub no_browser: bool,
 }
 
-/// Walk an operator through an interactive OIDC login and print the tokens.
+/// Arguments for `wyrd auth logout`.
+#[derive(Debug, Args)]
+pub struct LogoutArgs {
+    /// Wyrd server base URL of the login to end.
+    #[arg(long, value_name = "URL", env = "WYRD_SERVER_URL")]
+    pub server: Url,
+    /// Tenant route key of the login to end; defaults to the most recent
+    /// login for the server.
+    #[arg(long, value_name = "KEY", env = "WYRD_TENANT")]
+    pub tenant: Option<String>,
+}
+
+/// One `wyrd auth login` against one server and tenant.
+struct LoginFlow {
+    /// The server's unauthenticated `/auth` surface.
+    exchange: TokenExchange,
+    /// Canonical origin the saved record is keyed by.
+    origin: String,
+    /// Tenant the login is for.
+    tenant: TenantSlug,
+    /// Where the credential is saved.
+    store: SavedLogins,
+}
+
+impl LoginFlow {
+    /// Prepare a login against `args.server` for `args.tenant`.
+    ///
+    /// # Errors
+    /// Returns a client-configuration error for an unusable server URL or
+    /// when no Wyrd configuration directory can be resolved.
+    fn new(args: &LoginArgs) -> Result<Self, WyrdCliError> {
+        Ok(Self {
+            exchange: TokenExchange::new(args.server.as_str(), HttpConfig::default().timeout_ms)
+                .map_err(map_client_error)?,
+            origin: canonical_origin(args.server.as_str()).map_err(map_client_error)?,
+            tenant: args.tenant.clone(),
+            store: saved_logins()?,
+        })
+    }
+
+    /// Authorize a device code, send the person to the verification page,
+    /// wait for the sign-in, and save the credential.
+    ///
+    /// The verification URL is always printed. Unless `--no-browser` is
+    /// given, `webbrowser` also opens it as one URL item through the
+    /// platform's own URL handler, never a command interpreter; a launch
+    /// failure only points the person at the printed URL. The `oauth2` poll
+    /// in [`TokenExchange::device_access_token`] then waits for the sign-in.
+    ///
+    /// Ctrl-C exits `130` without saving anything; the unredeemed device code
+    /// expires on the server.
+    ///
+    /// # Errors
+    /// Returns the server's stable error when the tenant has no usable SSO
+    /// login or the device code is denied or expires, and a saved-login error
+    /// when the credential cannot be stored.
+    async fn run(self, open_browser: bool) -> Result<ExitCode, WyrdCliError> {
+        let device = self
+            .exchange
+            .device_authorization(&self.tenant)
+            .await
+            .map_err(server_error)?;
+        let verification_url = device
+            .verification_uri_complete()
+            .map_or_else(|| device.verification_uri().as_str(), |url| url.secret());
+        eprintln!(
+            "First copy your one-time code: {}\nThen approve it and sign in to tenant {} at:\n  {}",
+            device.user_code().secret(),
+            self.tenant,
+            verification_url
+        );
+        if open_browser && webbrowser::open(verification_url).is_err() {
+            eprintln!("Could not open a browser; open the URL above yourself.");
+        }
+        let token = tokio::select! {
+            token = self.exchange.device_access_token(&device) => token.map_err(server_error)?,
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("Login cancelled.");
+                return Ok(ExitCode::from(INTERRUPTED));
+            }
+        };
+        self.save(token).await
+    }
+
+    /// Save `token` under this flow's origin and tenant and print its
+    /// token-free summary.
+    ///
+    /// # Errors
+    /// Returns a saved-login error when the server issued no refresh token,
+    /// the store is unsafe, or the write fails.
+    async fn save(self, token: TokenResponse) -> Result<ExitCode, WyrdCliError> {
+        let record =
+            SavedLogin::from_token(self.origin, self.tenant, token).map_err(map_client_error)?;
+        let summary = record.summary();
+        let store = self.store;
+        blocking(move || store.save(record)).await?;
+        println!(
+            "Logged in to {} tenant {}.",
+            summary.origin, summary.tenant_key
+        );
+        print_summary(&summary);
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+/// Log in and save the Wyrd user credential.
 ///
 /// # Errors
-/// Returns a client-construction error for a rejected endpoint, an IO error when
-/// the pasted callback cannot be read, [`WyrdCliError::InvalidArgument`] when it
-/// carries no code and state, and the server's stable Wyrd error when the issuer
-/// is untrusted or the code is rejected.
-pub async fn dispatch(args: LoginArgs) -> Result<ExitCode, WyrdCliError> {
-    let exchange = TokenExchange::new(args.server.as_str(), HttpConfig::default().timeout_ms)
-        .map_err(crate::client::map_client_error)?;
+/// See [`LoginFlow::run`].
+pub async fn login(args: LoginArgs) -> Result<ExitCode, WyrdCliError> {
+    let open_browser = !args.no_browser;
+    LoginFlow::new(&args)?.run(open_browser).await
+}
 
-    let init = exchange
-        .begin_login(&args.issuer)
-        .await
-        .map_err(|error| WyrdCliError::Server {
-            source: error.into_wyrd(),
-        })?;
-
-    println!("Open this URL in your browser:");
-    println!("{}", init.authorization_url);
-    println!();
-    println!("After authenticating, paste the full callback URL (or `code=<>&state=<>`):");
-
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .map_err(|source| WyrdCliError::Io { source })?;
-    let input = input.trim().to_owned();
-
-    let (code, state) = parse_callback_input(&input)?;
-
-    let token = exchange
-        .exchange(&TokenRequest::AuthorizationCode {
-            code: SecretBearer::new(code),
-            state,
+/// End the saved login for `args.server` and the selected tenant, or the
+/// most recent one for the server.
+///
+/// The record is deleted first, then its refresh chain is revoked on the
+/// server; a failed revocation is reported as a warning.
+///
+/// # Errors
+/// Returns a saved-login error when the selector names no saved tenant, the
+/// store is unsafe, or the record cannot be deleted.
+pub async fn logout(args: LogoutArgs) -> Result<ExitCode, WyrdCliError> {
+    let origin = canonical_origin(args.server.as_str()).map_err(map_client_error)?;
+    let store = saved_logins()?;
+    let removed = {
+        let origin = origin.clone();
+        blocking(move || {
+            let Some(selected) = store.select(&origin, args.tenant.as_deref())? else {
+                return Ok(None);
+            };
+            store.remove(&origin, &selected.tenant_key)
         })
-        .await
-        .map_err(|error| WyrdCliError::Server {
-            source: error.into_wyrd(),
-        })?;
-
-    print_tokens(&token);
+        .await?
+    };
+    let Some(record) = removed else {
+        println!("No saved login for {origin}.");
+        return Ok(ExitCode::SUCCESS);
+    };
+    let revoked = match TokenExchange::new(args.server.as_str(), HttpConfig::default().timeout_ms) {
+        Ok(exchange) => exchange
+            .revoke_refresh_token(&record.refresh_token)
+            .await
+            .map_err(AuthError::into_wyrd),
+        Err(error) => Err(error.into()),
+    };
+    if let Err(error) = revoked {
+        eprintln!(
+            "warning: the server did not confirm revocation ({error}); the saved login was \
+             removed locally, but its refresh token stays valid on the server until it expires"
+        );
+    }
+    println!("Logged out of {origin} tenant {}.", record.tenant_key);
     Ok(ExitCode::SUCCESS)
 }
 
-/// Print an issued token pair to the operator terminal.
-///
-/// The one place either token exists outside the server; neither is written to a
-/// file or a log by the CLI.
-pub(super) fn print_tokens(token: &TokenResponse) {
-    println!("access_token:  {}", token.access_token.expose());
-    if let Some(refresh_token) = &token.refresh_token {
-        println!("refresh_token: {}", refresh_token.expose());
-    }
-    println!("expires_at:    {}", token.expires_at);
-}
-
-/// Recover the authorization code and state from what the operator pasted.
-///
-/// The IdP redirects to a callback URL the CLI cannot listen on, so the operator
-/// carries the result back by hand. Accepts either the whole URL or just its
-/// query string, and reads the two parameters the code exchange needs.
-///
-/// The pasted text is a live credential: it carries a single-use authorization
-/// code that stays redeemable until used or expired. It is therefore never
-/// placed in the returned error, which the CLI prints to stderr twice — once as
-/// collectable JSON — where it would outlive the login in scrollback and CI
-/// logs.
+/// Print every saved login without its tokens.
 ///
 /// # Errors
-/// Returns [`WyrdCliError::InvalidArgument`] when either `code` or `state` is
-/// absent from both readings, naming which parameter was missing and nothing
-/// else about the input.
-fn parse_callback_input(input: &str) -> Result<(String, String), WyrdCliError> {
-    if let Ok(url) = Url::parse(input) {
-        let code = url
-            .query_pairs()
-            .find(|(k, _)| k == "code")
-            .map(|(_, v)| v.into_owned());
-        let state = url
-            .query_pairs()
-            .find(|(k, _)| k == "state")
-            .map(|(_, v)| v.into_owned());
-        if let (Some(c), Some(s)) = (code, state) {
-            return Ok((c, s));
-        }
+/// Returns a saved-login error when the store is unsafe or corrupt.
+pub async fn status() -> Result<ExitCode, WyrdCliError> {
+    let store = saved_logins()?;
+    let logins = blocking(move || store.list()).await?;
+    if logins.is_empty() {
+        println!("No saved logins. Run `wyrd auth login --server URL --tenant KEY`.");
     }
+    for login in logins {
+        print_summary(&login.summary());
+    }
+    Ok(ExitCode::SUCCESS)
+}
 
-    let pairs: std::collections::HashMap<_, _> =
-        url::form_urlencoded::parse(input.as_bytes()).collect();
-    let code = pairs.get("code").map(|v| v.as_ref().to_owned());
-    let state = pairs.get("state").map(|v| v.as_ref().to_owned());
-    match (code, state) {
-        (Some(c), Some(s)) => Ok((c, s)),
-        (code, state) => Err(WyrdCliError::InvalidArgument {
-            field: "callback".to_owned(),
-            value: match (code.is_some(), state.is_some()) {
-                (false, true) => "<missing code>".to_owned(),
-                (true, false) => "<missing state>".to_owned(),
-                _ => "<missing code and state>".to_owned(),
-            },
-            expected: "the full callback URL, or a `code=<>&state=<>` query string".to_owned(),
-        }),
+/// The saved-login store under the user's Wyrd configuration directory.
+///
+/// # Errors
+/// Returns a client-configuration error when no configuration directory can
+/// be resolved.
+fn saved_logins() -> Result<SavedLogins, WyrdCliError> {
+    SavedLogins::locate().ok_or_else(|| WyrdCliError::ClientConfig {
+        detail: "no Wyrd configuration directory: set WYRD_CONFIG_HOME or HOME".to_owned(),
+    })
+}
+
+/// Run one saved-login store operation, which takes an OS file lock, off the
+/// async runtime.
+///
+/// # Errors
+/// Returns the operation's own error.
+///
+/// # Panics
+/// Re-raises a panic from the operation.
+async fn blocking<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T, wyrd_client::error::WyrdClientError> + Send + 'static,
+) -> Result<T, WyrdCliError> {
+    match tokio::task::spawn_blocking(operation).await {
+        Ok(result) => result.map_err(map_client_error),
+        Err(join) => std::panic::resume_unwind(join.into_panic()),
+    }
+}
+
+/// Print one saved login's token-free summary.
+fn print_summary(summary: &wyrd_client::saved_login::SavedLoginSummary) {
+    println!("server:     {}", summary.origin);
+    println!("tenant:     {}", summary.tenant_key);
+    println!("expires_at: {}", summary.access_expires_at);
+}
+
+/// Map a `/auth` exchange failure to the CLI's server error.
+fn server_error(error: wyrd_client::auth::AuthError) -> WyrdCliError {
+    WyrdCliError::Server {
+        source: error.into_wyrd(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_callback_input;
+    use clap::Parser;
 
-    #[test]
-    fn parses_full_callback_url() {
-        let url = "http://localhost:8080/auth/callback?code=abc123&state=xyz789";
-        let (code, state) = parse_callback_input(url).expect("parses");
-        assert_eq!(code, "abc123");
-        assert_eq!(state, "xyz789");
+    use super::{LoginArgs, LogoutArgs};
+
+    /// Bare wrapper so login arguments parse without the binary's tree.
+    #[derive(Parser)]
+    struct Login {
+        /// The arguments under test.
+        #[command(flatten)]
+        args: LoginArgs,
     }
 
-    #[test]
-    fn parses_raw_query_string() {
-        let qs = "code=abc123&state=xyz789";
-        let (code, state) = parse_callback_input(qs).expect("parses");
-        assert_eq!(code, "abc123");
-        assert_eq!(state, "xyz789");
+    /// Bare wrapper so logout arguments parse without the binary's tree.
+    #[derive(Parser)]
+    struct Logout {
+        /// The arguments under test.
+        #[command(flatten)]
+        args: LogoutArgs,
     }
 
+    /// Login needs a server and a valid tenant route key; logout's tenant is
+    /// optional.
     #[test]
-    fn rejects_missing_code() {
-        let url = "http://localhost:8080/auth/callback?state=xyz789";
-        assert!(parse_callback_input(url).is_err());
-    }
-
-    /// The refusal names the missing parameter and never echoes the paste.
-    ///
-    /// A pasted callback carries a live single-use authorization code, and the
-    /// CLI prints this error to stderr twice, once as collectable JSON. Echoing
-    /// the input would put that code in scrollback and CI logs, so the rendered
-    /// error must contain neither the value nor the `code=` that precedes it.
-    #[test]
-    fn the_refusal_does_not_echo_the_pasted_callback() {
-        let error = parse_callback_input("code=super-secret-code")
-            .expect_err("a callback with no state is refused");
-        let rendered = error.to_string();
+    fn login_requires_a_server_and_a_valid_tenant() {
+        let parsed = Login::try_parse_from([
+            "login",
+            "--server",
+            "https://wyrd.example.com",
+            "--tenant",
+            "acme",
+            "--no-browser",
+        ])
+        .expect("parses");
+        assert_eq!(parsed.args.tenant.as_str(), "acme");
+        assert!(parsed.args.no_browser);
         assert!(
-            !rendered.contains("super-secret-code"),
-            "the authorization code leaked into the error: {rendered}"
+            Login::try_parse_from(["login", "--server", "https://x", "--tenant", "Not A Slug"])
+                .is_err()
         );
-        assert!(
-            !rendered.contains("code=super"),
-            "the raw paste leaked into the error: {rendered}"
-        );
-        assert!(
-            rendered.contains("<missing state>"),
-            "the error names which parameter was absent: {rendered}"
-        );
+        let logout = Logout::try_parse_from(["logout", "--server", "https://x"]).expect("parses");
+        assert!(logout.args.tenant.is_none());
     }
 }

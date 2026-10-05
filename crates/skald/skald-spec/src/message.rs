@@ -5,6 +5,7 @@ use serde_json::value::RawValue;
 use crate::wire::anthropic_messages::AnthropicMessage;
 use crate::wire::google_generate::GoogleContent;
 use crate::wire::openai_chat::OpenAiChatMessage;
+use crate::wire::openai_responses::OpenAiResponseItem;
 
 /// One native message in a provider's own shape.
 #[derive(Debug, Clone, Serialize)]
@@ -17,6 +18,9 @@ pub enum MessageNum {
     Anthropic(AnthropicMessage),
     /// Google Gemini content turn.
     Gemini(GoogleContent),
+    /// OpenAI Responses turn: the ordered `input`/`output` items it spans,
+    /// serialized as a JSON array (the only array-shaped variant).
+    OpenAiResponses(Vec<OpenAiResponseItem>),
     /// Raw provider message body that no typed variant claimed.
     RawV1(Box<RawValue>),
 }
@@ -27,6 +31,12 @@ impl<'de> Deserialize<'de> for MessageNum {
         D: Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
+
+        if value.is_array()
+            && let Ok(items) = serde_json::from_value::<Vec<OpenAiResponseItem>>(value.clone())
+        {
+            return Ok(Self::OpenAiResponses(items));
+        }
 
         // MessageNum is the workflow handoff unit. Keep provider-native
         // messages typed when their shape is known; otherwise retain the exact
@@ -53,6 +63,7 @@ impl PartialEq for MessageNum {
             (Self::OpenAi(left), Self::OpenAi(right)) => left == right,
             (Self::Anthropic(left), Self::Anthropic(right)) => left == right,
             (Self::Gemini(left), Self::Gemini(right)) => left == right,
+            (Self::OpenAiResponses(left), Self::OpenAiResponses(right)) => left == right,
             (Self::RawV1(left), Self::RawV1(right)) => left.get() == right.get(),
             _ => false,
         }

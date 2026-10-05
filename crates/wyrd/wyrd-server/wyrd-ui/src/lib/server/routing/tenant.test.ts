@@ -59,23 +59,13 @@ test('Home load preserves safe canonical problems and never serializes upstream 
   });
 });
 
-test('switching revalidates membership and CSRF, keeps other tabs bound to their URL', () => {
+test('switching revalidates membership and keeps other tabs bound to their URL', () => {
   const sessions = new LocalSessions();
   const { session } = sessions.read(sessions.create());
-  const request = new Request('http://localhost/', {
-    method: 'POST',
-    headers: { origin: 'http://localhost' }
-  });
-  expect(() => sessions.switch(session!, 'research', request, null)).toThrow();
-  const foreign = new Request('http://localhost/', {
-    method: 'POST',
-    headers: { origin: 'https://other.example' }
-  });
-  expect(() => sessions.switch(session!, 'research', foreign, session!.csrf)).toThrow();
-  expect(sessions.switch(session!, 'research', request, session!.csrf)).toBe('/t/research');
+  expect(sessions.switch(session!, 'research')).toBe('/t/research');
   expect(sessions.bind(session!, 'acme').tenant.key).toBe('acme');
   sessions.principal.memberships.splice(1);
-  expect(() => sessions.switch(session!, 'research', request, session!.csrf)).toThrow();
+  expect(() => sessions.switch(session!, 'research')).toThrow();
   expect(sessions.destination(session!)).toBe('/t/acme');
 });
 
@@ -110,14 +100,10 @@ test('tenant policy requires explicit tenant-specific reauthentication before sw
   const sessions = new LocalSessions();
   const { session } = sessions.read(sessions.create());
   sessions.principal.memberships[1].requiresReauthentication = true;
-  const request = new Request('http://localhost/', {
-    method: 'POST',
-    headers: { origin: 'http://localhost' }
-  });
-  expect(() => sessions.switch(session!, 'research', request, session!.csrf)).toThrow();
+  expect(() => sessions.switch(session!, 'research')).toThrow();
   expect(session!.recent).toBeUndefined();
-  sessions.reauthenticate(session!, 'research', request, session!.csrf);
-  expect(sessions.switch(session!, 'research', request, session!.csrf)).toBe('/t/research');
+  sessions.reauthenticate(session!, 'research');
+  expect(sessions.switch(session!, 'research')).toBe('/t/research');
   expect(sessions.bind(session!, 'acme').tenant.key).toBe('acme');
 });
 
@@ -129,6 +115,7 @@ test('real root load and actions handle tenant counts, challenge, and least priv
   const loadEvent = {
     locals: { session, sessionProblem: null, mockData: false },
     request,
+    url: new URL(request.url),
     fetch: ready
   } as unknown as Parameters<typeof rootLoad>[0];
   try {
@@ -150,7 +137,7 @@ test('real root load and actions handle tenant counts, challenge, and least priv
         request: new Request(`http://localhost/?/${action}`, {
           method: 'POST',
           headers: { origin: 'http://localhost' },
-          body: new URLSearchParams({ tenantKey: 'research', csrf: session!.csrf })
+          body: new URLSearchParams({ tenantKey: 'research' })
         })
       }) as unknown as Parameters<typeof actions.switch>[0];
     expect(await actions.switch(actionEvent('switch'))).toMatchObject({

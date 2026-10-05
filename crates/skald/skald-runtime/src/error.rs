@@ -1,6 +1,5 @@
 //! Runtime error catalog for native Skald dispatch.
 
-use skald_cache::SkaldCacheError;
 use skald_providers::ProviderError;
 use skald_spec::ProviderName;
 use thiserror::Error;
@@ -25,13 +24,6 @@ pub enum SkaldRuntimeError {
         /// Provider-layer error with its own stable code.
         #[source]
         source: ProviderError,
-    },
-    /// Prompt cache backend failed during runtime work.
-    #[error("cache error: {source}")]
-    Cache {
-        /// Cache-layer error with its own stable code.
-        #[source]
-        source: SkaldCacheError,
     },
     /// Provider output did not satisfy the prompt response schema.
     #[error("response did not match schema {schema_name}: {message}")]
@@ -64,20 +56,13 @@ impl SkaldRuntimeError {
 
     /// Returns the stable machine-readable Skald runtime code.
     ///
-    /// Provider and cache wrappers delegate to the inner error code so
-    /// downstream boundaries can preserve the original transport/cache reason.
-    pub fn code(&self) -> &'static str {
+    /// Provider wrappers delegate to the inner error code so downstream
+    /// boundaries can preserve the original transport reason.
+    pub fn code(&self) -> &str {
         match self {
             Self::ProviderNotRegistered { .. } => "SKALD_RUNTIME_404_PROVIDER",
             Self::Provider { source, .. } => source.code(),
-            Self::Cache { source } => source.code(),
             Self::ResponseDecode { .. } => "SKALD_RUNTIME_422_RESPONSE_DECODE",
         }
-    }
-}
-
-impl From<SkaldCacheError> for SkaldRuntimeError {
-    fn from(source: SkaldCacheError) -> Self {
-        Self::Cache { source }
     }
 }

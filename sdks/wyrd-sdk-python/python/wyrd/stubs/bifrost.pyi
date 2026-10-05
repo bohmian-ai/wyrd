@@ -234,6 +234,7 @@ class TableConfig:
         server_url: str | None = None,
         credential: str | None = None,
         grpc_url: str | None = None,
+        tenant: str | None = None,
     ) -> TableConfig:
         """Fetch an already-registered table's config by name.
 
@@ -245,6 +246,7 @@ class TableConfig:
             server_url: as for ``Bifrost()``.
             credential: as for ``Bifrost()``.
             grpc_url: as for ``Bifrost()``.
+            tenant: as for ``Bifrost()``.
 
         Raises:
             WyrdError: ``WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND`` for an
@@ -342,6 +344,7 @@ class _BifrostBase:
         grpc_url: str | None = None,
         client: WyrdClient | None = None,
         client_byte_limit_bytes: int | None = None,
+        tenant: str | None = None,
     ) -> None:
         """Connect one client, optionally already bound to a write target.
 
@@ -352,16 +355,21 @@ class _BifrostBase:
                 ``WYRD_SERVER_URL`` and then the compiled default if omitted.
             credential: the API key or bearer token. Resolved through
                 ``WYRD_ACCESS_TOKEN`` → ``WYRD_WORKLOAD_TOKEN`` + tenant →
-                ``WYRD_API_KEY`` → ``~/.config/wyrd/credentials.toml``
+                ``WYRD_API_KEY`` → this server's saved ``wyrd auth login`` →
+                ``~/.config/wyrd/credentials.toml``
                 ``[default].api_key`` if omitted.
             grpc_url: the ingest endpoint. Resolved from ``WYRD_GRPC_URL`` if
                 omitted.
             client: an existing ``WyrdClient``, such as one returned by
                 ``on_behalf_of``. Bifrost then uses its authentication and
                 transport; it cannot be combined with ``server_url``,
-                ``credential``, or ``grpc_url``.
+                ``credential``, ``grpc_url``, or ``tenant``.
             client_byte_limit_bytes: the handle-wide ingestion byte budget
                 shared by every table this client writes. 256 MiB if omitted.
+            tenant: the tenant route key that selects one server's saved
+                login or the workload-token tenant. An explicit credential,
+                access token, or API key already names its tenant and refuses
+                it.
 
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` when ``client`` is combined

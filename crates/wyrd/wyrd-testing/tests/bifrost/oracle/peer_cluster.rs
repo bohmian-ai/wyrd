@@ -19,7 +19,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
+use url::Url;
 use vala_bifrost_redux::oracle::OraclePreparationPause;
 use vala_bifrost_redux::oracle::analytical::{AnalyticalExecutePause, AnalyticalPhysicalEvidence};
 use wyrd_server::config::BifrostTarget;
@@ -27,10 +29,15 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::NodeId;
 use wyrd_testing::bifrost::peer_ca::{BifrostPeerCa, BifrostPeerLeaf};
+use wyrd_testing::bifrost::telemetry::BifrostMetricKind;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 use crate::support::JourneyError;
+
+/// Longest a membership change may take to become observable through
+/// [`PeerCluster::await_membership`].
+const MEMBERSHIP_DEADLINE: Duration = Duration::from_secs(45);
 
 /// How long one pod may take to report every readiness probe passing.
 const READY_DEADLINE: Duration = Duration::from_secs(60);
@@ -71,6 +78,12 @@ pub(crate) struct PeerCluster {
     preparation_pauses: BTreeMap<usize, Arc<OraclePreparationPause>>,
     /// Statement a journey started and has not yet joined, per pod.
     active: BTreeMap<usize, QuerySlot>,
+    /// Managed event time, in UTC microseconds, stamped on every fixture row.
+    ///
+    /// Fixed once at launch so every row a journey ingests lands in one
+    /// hourly partition, and therefore behind one live route and one Scribe
+    /// producer, no matter when the journey runs relative to an hour boundary.
+    fixture_event_time_micros: i64,
 }
 
 impl PeerCluster {
@@ -82,7 +95,21 @@ impl PeerCluster {
     /// pod and its failing probes.
     pub(crate) async fn start(targets: &[BifrostTarget]) -> Result<Self, JourneyError> {
         let pods: Vec<_> = targets.iter().map(|target| (*target, None)).collect();
-        Self::launch(&pods, false).await
+        Self::launch(&pods, false, None).await
+    }
+
+    /// Starts one pod per target with every pod's built-in gateway adapters
+    /// rooted at the local mock upstream `root`, and waits for readiness.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::start`].
+    pub(crate) async fn start_with_gateway_provider_root(
+        targets: &[BifrostTarget],
+        root: Url,
+    ) -> Result<Self, JourneyError> {
+        let pods: Vec<_> = targets.iter().map(|target| (*target, None)).collect();
+        Self::launch(&pods, false, Some(root)).await
     }
 
     /// Starts one pod per `(target, slot units)` pair and waits for readiness.
@@ -97,7 +124,7 @@ impl PeerCluster {
     pub(crate) async fn start_with_slots(
         pods: &[(BifrostTarget, Option<usize>)],
     ) -> Result<Self, JourneyError> {
-        Self::launch(pods, false).await
+        Self::launch(pods, false, None).await
     }
 
     /// Starts every pod but the last, which stays configured and unbooted.
@@ -110,10 +137,13 @@ impl PeerCluster {
     /// Returns the same errors as [`Self::start`].
     pub(crate) async fn start_with_joiner(targets: &[BifrostTarget]) -> Result<Self, JourneyError> {
         let pods: Vec<_> = targets.iter().map(|target| (*target, None)).collect();
-        Self::launch(&pods, true).await
+        Self::launch(&pods, true, None).await
     }
 
     /// Builds the spec, boots the pods, and waits for each booted pod.
+    ///
+    /// `gateway_provider_root`, when present, roots every pod's built-in
+    /// gateway adapters at that local mock upstream.
     ///
     /// # Errors
     ///
@@ -122,9 +152,13 @@ impl PeerCluster {
     async fn launch(
         pods: &[(BifrostTarget, Option<usize>)],
         delay_last: bool,
+        gateway_provider_root: Option<Url>,
     ) -> Result<Self, JourneyError> {
         let targets: Vec<BifrostTarget> = pods.iter().map(|(target, _)| *target).collect();
         let mut spec = BifrostClusterSpec::for_targets(&targets);
+        if let Some(root) = gateway_provider_root {
+            spec = spec.with_gateway_provider_root_for_test(root);
+        }
         for (node, (_, slots)) in spec.nodes.iter_mut().zip(pods) {
             if let Some(oracle) = node.oracle.as_mut() {
                 oracle.oracle_query_slot_limit = *slots;
@@ -143,6 +177,7 @@ impl PeerCluster {
             execute_pauses: BTreeMap::new(),
             preparation_pauses: BTreeMap::new(),
             active: BTreeMap::new(),
+            fixture_event_time_micros: chrono::Utc::now().timestamp_micros(),
         };
         let booted = peers.len() - usize::from(delay_last);
         for index in 0..booted {
@@ -298,6 +333,11 @@ impl PeerCluster {
     ///
     /// Its public request lifetime is cancelled and its serving task aborted,
     /// which is the closest a single process comes to a pod disappearing.
+    /// Aborting the serving task does not end a peer request held at the pod's
+    /// execute pause, which observes graph cancellation but not termination,
+    /// so a pause armed there is released once the pod is gone. A dead pod's held request must not keep
+    /// its leader waiting, and it cannot produce rows from attempts the
+    /// termination already cancelled.
     ///
     /// # Errors
     ///
@@ -306,6 +346,9 @@ impl PeerCluster {
         self.cluster
             .terminate_node_abruptly_for_test(self.node_id(index))
             .await?;
+        if let Some(pause) = self.execute_pauses.remove(&index) {
+            pause.release();
+        }
         Ok(())
     }
 
@@ -347,6 +390,40 @@ impl PeerCluster {
         };
         registry.refresh_snapshot().await?;
         Ok(MembershipEntry::project(&registry.snapshot()))
+    }
+
+    /// Polls pod `observer`'s live membership cut until `observed` holds.
+    ///
+    /// Membership is heartbeat-driven: a join appears within one heartbeat,
+    /// and a stopped member leaves once its last heartbeat ages past the
+    /// fifteen-second liveness cutoff. [`MEMBERSHIP_DEADLINE`] turns a member
+    /// that never appears or never leaves into a diagnosable failure; elapsed
+    /// time is never itself evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure naming `change` and the last cut seen when the
+    /// deadline passes, or the membership refresh failure unchanged.
+    pub(crate) async fn await_membership(
+        &self,
+        observer: usize,
+        change: &str,
+        observed: impl Fn(&[MembershipEntry]) -> bool,
+    ) -> Result<(), JourneyError> {
+        let deadline = std::time::Instant::now() + MEMBERSHIP_DEADLINE;
+        loop {
+            let membership = self.membership(observer).await?;
+            if observed(&membership) {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "pod {observer} never observed {change}; last membership {membership:?}"
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 
     /// Returns the private address pod `index` published into membership.
@@ -505,7 +582,7 @@ impl PeerCluster {
                 expected_schema_fingerprint: fingerprint,
                 request_id: RequestId::now_v7(),
                 batch_id: uuid::Uuid::now_v7(),
-                payload: fixture_rows_ipc(start_id, rows, groups)?,
+                payload: fixture_rows_ipc(start_id, rows, groups, self.fixture_event_time_micros)?,
             })
             .await?;
         Ok(())
@@ -734,6 +811,9 @@ impl PeerCluster {
 
     /// Totals each named family over the process samples carrying every label.
     ///
+    /// A histogram family totals its observation count; its bucket and sum
+    /// samples are not observations.
+    ///
     /// # Errors
     ///
     /// Returns the recorder parse failure.
@@ -747,7 +827,10 @@ impl PeerCluster {
             .map(|family| ((*family).to_owned(), 0.0))
             .collect();
         for sample in self.cluster.telemetry().snapshot()? {
-            let matches = labels
+            let matches = !matches!(
+                sample.kind,
+                BifrostMetricKind::HistogramBucket | BifrostMetricKind::HistogramSum
+            ) && labels
                 .iter()
                 .all(|(name, value)| sample.labels.get(name) == Some(value));
             if let Some(total) = totals.get_mut(&sample.family)
@@ -1710,30 +1793,50 @@ fn scratch_usage(root: &Path) -> Result<ScratchUsage, JourneyError> {
     Ok(usage)
 }
 
-/// Encodes `rows` deterministic `(id, filter_key)` rows as one Arrow IPC stream.
+/// Encodes `rows` deterministic `(id, filter_key, wyrd_event_time)` rows as one
+/// Arrow IPC stream.
 ///
 /// Ids run `start_id..start_id + rows`, and keys cycle `group_{id % groups}`,
-/// so a grouped aggregate has more than one non-trivial group.
+/// so a grouped aggregate has more than one non-trivial group. Every row
+/// carries `event_time_micros` in the managed event-time column, which Scribe
+/// lifts verbatim, so the caller rather than wall clock picks the partition.
 ///
 /// # Errors
 ///
 /// Returns the batch or IPC encoding failure.
-fn fixture_rows_ipc(start_id: i64, rows: i64, groups: i64) -> Result<bytes::Bytes, JourneyError> {
+fn fixture_rows_ipc(
+    start_id: i64,
+    rows: i64,
+    groups: i64,
+    event_time_micros: i64,
+) -> Result<Bytes, JourneyError> {
     let groups = groups.max(1);
     let schema = Arc::new(arrow::datatypes::Schema::new(vec![
         arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
         arrow::datatypes::Field::new("filter_key", arrow::datatypes::DataType::Utf8, false),
+        arrow::datatypes::Field::new(
+            wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
+            arrow::datatypes::DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ),
+            false,
+        ),
     ]));
     let ids: Vec<i64> = (start_id..start_id.saturating_add(rows)).collect();
     let keys: Vec<String> = ids
         .iter()
         .map(|id| format!("group_{}", id % groups))
         .collect();
+    let event_times = vec![event_time_micros; ids.len()];
     let batch = arrow::record_batch::RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
             Arc::new(arrow::array::Int64Array::from(ids)),
             Arc::new(arrow::array::StringArray::from(keys)),
+            Arc::new(
+                arrow::array::TimestampMicrosecondArray::from(event_times).with_timezone("UTC"),
+            ),
         ],
     )?;
     let mut ipc = Vec::new();
@@ -1742,7 +1845,7 @@ fn fixture_rows_ipc(start_id: i64, rows: i64, groups: i64) -> Result<bytes::Byte
         writer.write(&batch)?;
         writer.finish()?;
     }
-    Ok(bytes::Bytes::from(ipc))
+    Ok(Bytes::from(ipc))
 }
 
 /// Admits settled physical evidence only when the settlement counter advanced.

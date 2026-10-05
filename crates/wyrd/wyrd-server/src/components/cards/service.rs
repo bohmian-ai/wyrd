@@ -73,9 +73,7 @@ use wyrd_storage::tenant_path;
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::components::cards::mapping::{existing_row_to_response, outcome_row_to_response};
-use crate::components::cards::resolve::{
-    ResolvedRefs, bind_card_references, resolve_card_references,
-};
+use crate::components::cards::resolve::{EffectiveSpecs, ResolvedRefs, bind_card_references};
 use crate::components::storage::routes::storage_caller;
 use crate::state::{AppState, registry_db_error};
 
@@ -580,7 +578,9 @@ pub async fn register_card(
         let (order, root) = plan_registration_graph(&request.submissions)?;
         let external_refs = resolve_external(state, caller, &request.submissions).await?;
         let plan = plan_registration(request, request_hash, external_refs, order, root);
-        write_registration(state, caller, idempotency_key, plan, allowed).await
+        RegistrationWriter { state, caller }
+            .write(idempotency_key, plan, allowed)
+            .await
     }
     .await;
     let (operation_id, seed) = match written {
@@ -626,7 +626,7 @@ pub(crate) async fn record_allowed(
     allowed: &[AuditEvent],
 ) -> Result<(), WyrdError> {
     for event in allowed {
-        audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, event).await?;
+        audit::record_audit(state.postgres.vala(), caller.data_tenant_id, event).await?;
     }
     Ok(())
 }
@@ -999,7 +999,7 @@ async fn resolve_external(
     submissions: &[CardSubmission],
 ) -> Result<ResolvedRefs, WyrdError> {
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
-    let resolved = resolve_card_references(&mut conn, submissions).await?;
+    let resolved = EffectiveSpecs::resolve(&mut conn, submissions).await?;
     conn.commit().await.map_err(registry_db_error)?;
     Ok(resolved)
 }
@@ -1037,95 +1037,115 @@ fn plan_registration(
     }
 }
 
-/// Reserve idempotency and atomically persist every topo-ordered node and audit.
+/// Writes one planned registration in a single audited tenant transaction.
 ///
-/// Every `allowed` verdict is appended before any mutation and commits with the
-/// registration. The returned flag is `true` only when that transaction
-/// committed; a lost idempotency race rolls it back and returns the winner's
-/// replay with `false`, leaving the caller to record the verdicts standalone.
-///
-/// # Errors
-/// Returns [`WyrdError::AuditUnavailable`] when the append fails, and the
-/// dependency, idempotency, validation, or registry failure otherwise; nothing
-/// commits on any error.
-#[tracing::instrument(
-    skip(state, caller, plan, allowed),
-    fields(operation = "card.registration.write")
-)]
-async fn write_registration(
-    state: &AppState,
-    caller: &Caller,
-    idempotency_key: &str,
-    mut plan: RegistrationPlan,
-    allowed: &[AuditEvent],
-) -> Result<((RegistrationOperationId, RegistrationReplaySeed), bool), WyrdError> {
-    let operation_id = RegistrationOperationId::new(Uuid::now_v7());
-    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
-    for event in allowed {
-        audit::append_on(&mut conn, event).await?;
-    }
-    // Recheck before reserving idempotency so a dependency rejection rolls back
-    // the entire attempt, including its bookkeeping row. The row locks remain
-    // held while cards and relationships are written below.
-    let external_identities = plan
-        .external_refs
-        .iter()
-        .map(|(card_ref, _)| card_ref.clone())
-        .collect::<Vec<_>>();
-    plan.external_refs = recheck_active_card_refs(&mut conn, &external_identities).await?;
-    let inserted = insert_registration_operation(
-        &mut conn,
-        NewRegistrationOperation {
-            operation_id,
-            principal_id: caller.principal.id,
-            idempotency_key,
-            request_hash: &plan.request_hash,
-        },
-    )
-    .await?;
-    if !inserted {
-        drop(conn);
-        let replayed = wait_for_replay(state, caller, idempotency_key, &plan.request_hash).await?;
-        return Ok((replayed, false));
-    }
+/// Owns the server state and authenticated caller the atomic write needs:
+/// the tenant connection comes from `state`, and the caller's tenant and
+/// principal scope every audit append, idempotency row, and persisted node.
+/// [`RegistrationPlan`] stays a pure value; this writer carries the IO.
+struct RegistrationWriter<'a> {
+    /// Server state that opens the tenant registry connection.
+    state: &'a AppState,
+    /// Authenticated caller whose tenant and principal scope the write.
+    caller: &'a Caller,
+}
 
-    let mut sibling_uids = HashMap::new();
-    let mut outcomes = Vec::with_capacity(plan.order.nodes.len());
-    let mut resolved_root = None;
-    for node in &plan.order.nodes {
-        let is_root = same_identity(&node.card_ref, &plan.root.root);
-        let authored = find_submission(&plan.submissions, &node.card_ref)?;
-        let mut submission = authored.clone();
-        let mut spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
-            .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
-        bind_card_references(&mut spec, &plan.external_refs, &sibling_uids)?;
-        submission.spec =
-            serde_json::to_value(&spec).map_err(WyrdError::from_spec_serialization)?;
-        let outcome = persist_node(&mut conn, caller, operation_id, &mut submission).await?;
-        sibling_uids.insert(
-            graph_identity(&outcome.card_ref),
-            outcome
-                .card_ref
-                .uid
-                .clone()
-                .ok_or_else(|| WyrdError::internal("registered outcome is missing uid"))?,
-        );
-        if is_root {
-            resolved_root = Some(outcome.card_ref.clone());
+impl RegistrationWriter<'_> {
+    /// Reserve idempotency and atomically persist every topo-ordered node and audit.
+    ///
+    /// Every `allowed` verdict is appended before any mutation and commits with the
+    /// registration. The returned flag is `true` only when that transaction
+    /// committed; a lost idempotency race rolls it back and returns the winner's
+    /// replay with `false`, leaving the caller to record the verdicts standalone.
+    /// Each external dependency must still be the exact Active UID preflight
+    /// validated; a replacement at the same identity is refused, not bound.
+    /// Cancellation before commit rolls the whole transaction back.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::AuditUnavailable`] when the append fails,
+    /// `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` when a preflight-validated UID is
+    /// no longer Active, and the idempotency, validation, or registry failure
+    /// otherwise; nothing commits on any error.
+    #[tracing::instrument(
+        skip(self, plan, allowed),
+        fields(operation = "card.registration.write")
+    )]
+    async fn write(
+        &self,
+        idempotency_key: &str,
+        mut plan: RegistrationPlan,
+        allowed: &[AuditEvent],
+    ) -> Result<((RegistrationOperationId, RegistrationReplaySeed), bool), WyrdError> {
+        let operation_id = RegistrationOperationId::new(Uuid::now_v7());
+        let mut conn = self
+            .state
+            .registry_tenant_conn(self.caller.data_tenant_id)
+            .await?;
+        for event in allowed {
+            audit::append_on(&mut conn, event).await?;
         }
-        outcomes.push(outcome);
+        // Recheck the exact UIDs preflight validated before reserving idempotency,
+        // so a dependency rejection — including a replacement Card at the same
+        // identity — rolls back the entire attempt, including its bookkeeping row.
+        // The row locks remain held while cards and relationships are written below.
+        plan.external_refs = recheck_active_card_refs(&mut conn, &plan.external_refs).await?;
+        let inserted = insert_registration_operation(
+            &mut conn,
+            NewRegistrationOperation {
+                operation_id,
+                principal_id: self.caller.principal.id,
+                idempotency_key,
+                request_hash: &plan.request_hash,
+            },
+        )
+        .await?;
+        if !inserted {
+            drop(conn);
+            let replayed =
+                wait_for_replay(self.state, self.caller, idempotency_key, &plan.request_hash)
+                    .await?;
+            return Ok((replayed, false));
+        }
+
+        let mut sibling_uids = HashMap::new();
+        let mut outcomes = Vec::with_capacity(plan.order.nodes.len());
+        let mut resolved_root = None;
+        for node in &plan.order.nodes {
+            let is_root = same_identity(&node.card_ref, &plan.root.root);
+            let authored = find_submission(&plan.submissions, &node.card_ref)?;
+            let mut submission = authored.clone();
+            let mut spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
+                .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
+            bind_card_references(&mut spec, &plan.external_refs, &sibling_uids)?;
+            submission.spec =
+                serde_json::to_value(&spec).map_err(WyrdError::from_spec_serialization)?;
+            let outcome =
+                persist_node(&mut conn, self.caller, operation_id, &mut submission).await?;
+            sibling_uids.insert(
+                graph_identity(&outcome.card_ref),
+                outcome
+                    .card_ref
+                    .uid
+                    .clone()
+                    .ok_or_else(|| WyrdError::internal("registered outcome is missing uid"))?,
+            );
+            if is_root {
+                resolved_root = Some(outcome.card_ref.clone());
+            }
+            outcomes.push(outcome);
+        }
+        let root = resolved_root
+            .ok_or_else(|| WyrdError::internal("root registration outcome is missing"))?;
+        let response = CreateCardResponse {
+            root,
+            outcomes,
+            upload_plans: Vec::new(),
+        };
+        let seed = replay_seed(&response, &plan.submissions)?;
+        commit_registration_operation(&mut conn, operation_id, &seed).await?;
+        conn.commit().await.map_err(registry_db_error)?;
+        Ok(((operation_id, seed), true))
     }
-    let root =
-        resolved_root.ok_or_else(|| WyrdError::internal("root registration outcome is missing"))?;
-    let response = CreateCardResponse {
-        root,
-        outcomes,
-        upload_plans: Vec::new(),
-    };
-    let seed = replay_seed(&response, &plan.submissions)?;
-    commit_registration_operation(&mut conn, operation_id, &seed).await?;
-    conn.commit().await.map_err(registry_db_error)?;
-    Ok(((operation_id, seed), true))
 }
 
 /// Resolve one node's version, deduplicate when possible, and persist when fresh.

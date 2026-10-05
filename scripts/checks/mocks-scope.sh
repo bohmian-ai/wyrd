@@ -29,6 +29,11 @@
 # credential refresh), and the direct-execution journey in
 # `wyrd-server/tests/pg_verification_routes.rs`, use the same dev-only
 # wiremock.
+# Workflow execution pins its route dispatch the same way: the
+# `#[cfg(test)]` modules of `skald-workflow/src/workflow.rs`,
+# `skald-providers/src/endpoint.rs`, and `wyrd-client/src/workflow/mod.rs`,
+# and the `wyrd-client/tests/workflow_transport.rs` target, all stand in for
+# gateways and providers over dev-only wiremock.
 #
 # WHAT IT CHECKS: mockall, wiremock, and mockito references do not appear
 # outside wyrd-testing and the explicitly allowlisted test-only seams.
@@ -43,6 +48,9 @@ if rg -n 'mockall|wiremock|mockito' crates \
   --glob '!crates/skald/skald-providers/src/clients/openai.rs' \
   --glob '!crates/skald/skald-providers/src/clients/vertex.rs' \
   --glob '!crates/skald/skald-providers/src/clients/mod.rs' \
+  --glob '!crates/skald/skald-providers/src/endpoint.rs' \
+  --glob '!crates/skald/skald-workflow/Cargo.toml' \
+  --glob '!crates/skald/skald-workflow/src/workflow.rs' \
   --glob '!crates/shared/wyrd-vault/Cargo.toml' \
   --glob '!crates/shared/wyrd-vault/src/lib.rs' \
   --glob '!crates/wyrd/wyrd-gateway/Cargo.toml' \
@@ -57,6 +65,8 @@ if rg -n 'mockall|wiremock|mockito' crates \
   --glob '!crates/shared/wyrd-client/src/cards/handle.rs' \
   --glob '!crates/shared/wyrd-client/src/storage/upload/tests.rs' \
   --glob '!crates/shared/wyrd-client/src/bifrost/grpc.rs' \
+  --glob '!crates/shared/wyrd-client/src/workflow/mod.rs' \
+  --glob '!crates/shared/wyrd-client/tests/workflow_transport.rs' \
   --glob '!crates/shared/wyrd-auth-oidc/Cargo.toml' \
   --glob '!crates/shared/wyrd-auth-oidc/src/jwks.rs' \
   --glob '!crates/shared/wyrd-auth-oidc/src/provider.rs' \

@@ -47,8 +47,16 @@ export class WyrdClient {
     private readonly mockData: boolean
   ) {}
 
+  /** Whether the server-issued `resource:action` grants allow `permission`, honoring `wildcard`. */
+  private can(permission: string): boolean {
+    const [resource, action] = permission.split(':');
+    return [resource, 'wildcard'].some((r) =>
+      [action, 'wildcard'].some((a) => this.context.permissions.includes(`${r}:${a}`))
+    );
+  }
+
   changes(filters: Record<string, string>): ChangeList {
-    if (!this.context.permissions.includes('changes:read')) reject('denied');
+    if (!this.can('changes:read')) reject('denied');
     if (!this.mockData) reject('upstream');
     const records = [
       ...mockChanges
@@ -127,7 +135,7 @@ export class WyrdClient {
   }
 
   private changeAccess(write = false): void {
-    if (!this.context.permissions.includes(write ? 'changes:write' : 'changes:read'))
+    if (!this.can(write ? 'changes:write' : 'changes:read'))
       reject('denied');
     if (!this.mockData) reject('upstream');
   }
@@ -149,10 +157,10 @@ export class WyrdClient {
       change,
       verifiers: structuredClone(verifiers),
       capabilities: {
-        write: canAct && this.context.permissions.includes('changes:write'),
-        review: canAct && this.context.permissions.includes('changes:review'),
-        run: canAct && this.context.permissions.includes('changes:run'),
-        override: canAct && this.context.permissions.includes('changes:override')
+        write: canAct && this.can('changes:write'),
+        review: canAct && this.can('changes:review'),
+        run: canAct && this.can('changes:run'),
+        override: canAct && this.can('changes:override')
       },
       mentions: structuredClone(mentions),
       requestKey: randomUUID()
@@ -200,7 +208,7 @@ export class WyrdClient {
     confirmed: boolean
   ): void {
     this.changeAccess();
-    if (!this.context.permissions.includes('changes:run')) reject('denied');
+    if (!this.can('changes:run')) reject('denied');
     mockChanges.run(
       this.context.tenant.tenantId,
       this.context.tenant.key,
@@ -235,7 +243,7 @@ export class WyrdClient {
         : input.operation === 'close'
           ? 'changes:write'
           : 'changes:review';
-    if (!this.context.permissions.includes(permission)) reject('denied');
+    if (!this.can(permission)) reject('denied');
     return mockChanges.review(
       this.context.tenant.tenantId,
       this.context.tenant.key,
@@ -258,7 +266,7 @@ export class WyrdClient {
    */
   private observeAccess(domain: 'telemetry' | 'evals'): boolean {
     const permission = domain === 'telemetry' ? 'bifrost_query:read' : 'evals:read';
-    if (!this.context.permissions.includes(permission)) reject('denied');
+    if (!this.can(permission)) reject('denied');
     if (!this.mockData) reject('upstream');
     return this.context.tenant.key === 'acme';
   }
@@ -335,7 +343,7 @@ export class WyrdClient {
    * tenants see truthful empty results, never another tenant's registry.
    */
   private cardsAccess(): boolean {
-    if (!this.context.permissions.includes('cards:read')) reject('denied');
+    if (!this.can('cards:read')) reject('denied');
     if (!this.mockData) reject('upstream');
     return this.context.tenant.key === 'acme';
   }
@@ -353,7 +361,7 @@ export class WyrdClient {
   home(): HomeView {
     if (
       ['cards:read', 'bifrost_query:read', 'evals:read'].some(
-        (permission) => !this.context.permissions.includes(permission)
+        (permission) => !this.can(permission)
       )
     )
       reject('denied');

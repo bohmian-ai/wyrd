@@ -24,9 +24,11 @@ def test_openai_eager_image_url_base64_and_path(tmp_path: Path) -> None:
         "logo", MediaRef.image_path(image)
     )
 
-    assert url_prompt.request.model_dump()["messages"][1]["content"][0]["type"] == "image_url"
-    assert base64_prompt.request.model_dump()["messages"][0]["content"][0]["type"] == "file"
-    assert path_prompt.request.model_dump()["messages"][0]["content"][1]["image_url"][
+    assert (
+        url_prompt.request.model_dump()["body"]["messages"][1]["content"][0]["type"] == "image_url"
+    )
+    assert base64_prompt.request.model_dump()["body"]["messages"][0]["content"][0]["type"] == "file"
+    assert path_prompt.request.model_dump()["body"]["messages"][0]["content"][1]["image_url"][
         "url"
     ].startswith("data:image/png;base64,")
 
@@ -47,7 +49,7 @@ def test_anthropic_eager_image_and_document_blocks() -> None:
         .user(Prompt.anthropic_image_base64("image/png", "QUJD"))
         .user(Prompt.anthropic_document_text("text/plain", "hello", title="doc"))
     )
-    content = prompt.request.model_dump()["messages"]
+    content = prompt.request.model_dump()["body"]["messages"]
 
     assert content[0]["content"][0]["type"] == "image"
     assert content[1]["content"][0]["source"]["type"] == "base64"
@@ -62,9 +64,12 @@ def test_anthropic_late_document_url_and_base64() -> None:
         "doc", MediaRef.document_base64("application/pdf", "QUJD")
     )
 
-    assert url_prompt.request.model_dump()["messages"][0]["content"][1]["type"] == "document"
     assert (
-        b64_prompt.request.model_dump()["messages"][0]["content"][1]["source"]["type"] == "base64"
+        url_prompt.request.model_dump()["body"]["messages"][0]["content"][1]["type"] == "document"
+    )
+    assert (
+        b64_prompt.request.model_dump()["body"]["messages"][0]["content"][1]["source"]["type"]
+        == "base64"
     )
 
 
@@ -74,10 +79,10 @@ def test_gemini_inline_data_and_gs_file_uri() -> None:
         "img", MediaRef.image_url("gs://bucket/logo.png", mime_type="image/png")
     )
 
-    assert "inline_data" in inline.request.model_dump()["contents"][0]["parts"][0]
-    assert gs.request.model_dump()["contents"][0]["parts"][1]["file_data"]["file_uri"].startswith(
-        "gs://"
-    )
+    assert "inline_data" in inline.request.model_dump()["body"]["contents"][0]["parts"][0]
+    assert gs.request.model_dump()["body"]["contents"][0]["parts"][1]["file_data"][
+        "file_uri"
+    ].startswith("gs://")
 
 
 def test_gemini_rejects_ordinary_https_media_uri() -> None:
@@ -95,7 +100,7 @@ def test_vertex_mirrors_gemini_media_behavior() -> None:
     prompt = Prompt("see ${media:img}", "gemini-2.5-pro", provider="vertex")
     bound = prompt.bind_media("img", MediaRef.image_base64("image/png", "QUJD"))
 
-    assert "inline_data" in bound.request.model_dump()["contents"][0]["parts"][1]
+    assert "inline_data" in bound.request.model_dump()["body"]["contents"][0]["parts"][1]
 
 
 def test_gemini_url_missing_mime_raises_exact_code() -> None:

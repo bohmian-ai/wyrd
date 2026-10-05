@@ -30,9 +30,8 @@ pub struct PlatformOidcConnectionRow {
     pub issuer_url: String,
     /// Resolved JWKS endpoint.
     pub jwks_uri: String,
-    /// Audience this deployment expects in an ID token.
-    pub expected_audience: String,
-    /// Wyrd's OAuth 2.0 client identifier at the provider.
+    /// Wyrd's OAuth 2.0 client identifier at the provider, and the audience
+    /// every accepted ID token must name.
     pub client_id: String,
     /// Client authentication discriminant.
     pub client_auth: String,
@@ -65,7 +64,7 @@ pub async fn platform_oidc_connection(
     pool: &OperatorPool,
 ) -> Result<Option<PlatformOidcConnectionRow>, SqlError> {
     sqlx::query_as::<_, PlatformOidcConnectionRow>(
-        "SELECT issuer_url, jwks_uri, expected_audience, client_id, client_auth,
+        "SELECT issuer_url, jwks_uri, client_id, client_auth,
                 claim_mapping, jwks_ttl_secs, client_secret_enc
          FROM platform.oidc_connection",
     )
@@ -91,7 +90,6 @@ pub async fn upsert_platform_oidc_connection(
     conn: &mut TenantConn<'_>,
     issuer_url: &str,
     jwks_uri: &str,
-    expected_audience: &str,
     client_id: &str,
     client_auth: &str,
     claim_mapping: &Value,
@@ -100,13 +98,12 @@ pub async fn upsert_platform_oidc_connection(
 ) -> Result<(), SqlError> {
     sqlx::query(
         "INSERT INTO platform.oidc_connection
-             (singleton, issuer_url, jwks_uri, expected_audience, client_id,
+             (singleton, issuer_url, jwks_uri, client_id,
               client_auth, claim_mapping, jwks_ttl_secs, client_secret_enc)
-         VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7, $8)
+         VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (singleton) DO UPDATE SET
              issuer_url        = EXCLUDED.issuer_url,
              jwks_uri          = EXCLUDED.jwks_uri,
-             expected_audience = EXCLUDED.expected_audience,
              client_id         = EXCLUDED.client_id,
              client_auth       = EXCLUDED.client_auth,
              claim_mapping     = EXCLUDED.claim_mapping,
@@ -116,7 +113,6 @@ pub async fn upsert_platform_oidc_connection(
     )
     .bind(issuer_url)
     .bind(jwks_uri)
-    .bind(expected_audience)
     .bind(client_id)
     .bind(client_auth)
     .bind(claim_mapping)
@@ -142,6 +138,44 @@ pub async fn delete_platform_oidc_connection(conn: &mut TenantConn<'_>) -> Resul
         .await
         .map(|done| done.rows_affected() > 0)
         .map_err(SqlError::from)
+}
+
+/// Read the platform connection's sealed client secret for sealing-key rewrap.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the read fails.
+pub async fn platform_sealed_secret(pool: &OperatorPool) -> Result<Option<Vec<u8>>, SqlError> {
+    sqlx::query_scalar(
+        "SELECT client_secret_enc FROM platform.oidc_connection
+          WHERE client_secret_enc IS NOT NULL",
+    )
+    .fetch_optional(pool.pool())
+    .await
+    .map_err(SqlError::from)
+}
+
+/// Replace the platform connection's sealed secret if it still holds `previous`.
+///
+/// Returns `false` when the connection changed since it was read, so a
+/// concurrent reconfiguration is never overwritten by a rewrap.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the update fails.
+pub async fn swap_platform_sealed_secret(
+    pool: &OperatorPool,
+    previous: &[u8],
+    rewrapped: &[u8],
+) -> Result<bool, SqlError> {
+    sqlx::query(
+        "UPDATE platform.oidc_connection SET client_secret_enc = $2
+          WHERE client_secret_enc = $1",
+    )
+    .bind(previous)
+    .bind(rewrapped)
+    .execute(pool.pool())
+    .await
+    .map(|done| done.rows_affected() == 1)
+    .map_err(SqlError::from)
 }
 
 /// Persist one single-use login state row whose expiry `PostgreSQL` derives from

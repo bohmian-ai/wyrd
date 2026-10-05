@@ -240,6 +240,22 @@ export declare class NativeCards {
    */
   hydrate(cardRef: string, destination: string, metadataOnly: boolean): Promise<NativeLifecycleResult>
   /**
+   * Loads one registered Workflow and its locked Agents and Prompts.
+   *
+   * `selector_json` is `{ "space", "name", "version" }` or `{ "uid" }`; any
+   * other shape, including a mix of both, is refused with
+   * `WYRD_WORKFLOW_400_INVALID_CARD_REF` before any read. A valid selector delegates
+   * to the shared [`wyrd_client::WorkflowCards::load`], which reads every
+   * Card at its locked version.
+   *
+   * Never rejects: a failure is returned in [`NativeWorkflowLoad::error`]
+   * with its catalog code, and the public TypeScript `cards.workflow.load`
+   * throws it as a `WyrdError`. Loading only reads Cards. If the Node
+   * promise is abandoned, completed reads may already have happened, but
+   * no partial Workflow is returned and nothing durable is written.
+   */
+  loadWorkflow(selectorJson: string): Promise<NativeWorkflowLoad>
+  /**
    * Soft-deletes one Card by exact reference.
    *
    * # Errors
@@ -556,6 +572,24 @@ export declare class NativeVerification {
   getRun(runId: string): Promise<NativeLifecycleResult>
 }
 
+/** Runnable Workflow loaded from a file or from the registry. */
+export declare class NativeWorkflow {
+  /** Returns the step IDs in declaration order. */
+  stepIds(): Array<string>
+  /**
+   * Runs this Workflow with the given JSON object of declared inputs.
+   *
+   * Validation, input, and route errors are returned before any step is
+   * dispatched; step failures are recorded in the returned run.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the run cannot be serialized; a
+   * malformed input or pre-dispatch refusal is returned in the result.
+   */
+  run(inputJson?: string | undefined | null): Promise<NativeLifecycleResult>
+}
+
 /** Node-facing handle to one authenticated [`WyrdClient`]. */
 export declare class NativeWyrdClient {
   /** Returns the effective HTTP server URL this client sends requests to. */
@@ -589,7 +623,7 @@ export declare class NativeWyrdClient {
    * serialized `TableConfig`; the conflict, byte-budget, and ingest-dial
    * failures are returned as catalog metadata.
    */
-  connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, clientByteLimitBytes?: number | undefined | null): Promise<NativeBifrostConnection>
+  connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, clientByteLimitBytes?: number | undefined | null, tenant?: string | undefined | null): Promise<NativeBifrostConnection>
 }
 
 /**
@@ -653,7 +687,7 @@ export declare class NativeWyrdState {
    * a second start, a closed state, and credential, byte-budget, dial, and
    * fixed-table failures are returned in [`NativeLifecycleResult`].
    */
-  startBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, clientByteLimitBytes?: number | undefined | null): Promise<NativeLifecycleResult>
+  startBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, clientByteLimitBytes?: number | undefined | null, tenant?: string | undefined | null): Promise<NativeLifecycleResult>
   /**
    * Opens one invocation over this state, targeting `card` or the root Service.
    *
@@ -701,7 +735,7 @@ export declare class NativeWyrdState {
  * serialized `TableConfig`; credential, byte-budget, and ingest-dial failures
  * are returned as catalog metadata.
  */
-export declare function connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, clientByteLimitBytes?: number | undefined | null): Promise<NativeBifrostConnection>
+export declare function connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, clientByteLimitBytes?: number | undefined | null, tenant?: string | undefined | null): Promise<NativeBifrostConnection>
 
 /**
  * Builds one Card registry handle without performing IO.
@@ -710,7 +744,7 @@ export declare function connectBifrost(table?: NativeTableConfig | undefined | n
  * chain as `connectBifrost`, so both capabilities authenticate identically.
  * Credential and configuration failures are returned as catalog metadata.
  */
-export declare function connectCards(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeCardsConnection
+export declare function connectCards(serverUrl?: string | undefined | null, credential?: string | undefined | null, tenant?: string | undefined | null): NativeCardsConnection
 
 /**
  * Builds one gateway administration handle without performing IO.
@@ -723,7 +757,7 @@ export declare function connectCards(serverUrl?: string | undefined | null, cred
  * Returns a napi error when no credential resolves or the HTTP client cannot
  * be built.
  */
-export declare function connectGateway(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeGateway
+export declare function connectGateway(serverUrl?: string | undefined | null, credential?: string | undefined | null, tenant?: string | undefined | null): NativeGateway
 
 /**
  * Builds one Operator connection handle without performing IO.
@@ -731,7 +765,7 @@ export declare function connectGateway(serverUrl?: string | undefined | null, cr
  * Omitted arguments resolve through the same shared client configuration
  * chain as `connectCards`.
  */
-export declare function connectOperatorConnections(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeOperatorConnectionsConnection
+export declare function connectOperatorConnections(serverUrl?: string | undefined | null, credential?: string | undefined | null, tenant?: string | undefined | null): NativeOperatorConnectionsConnection
 
 /**
  * Builds one Verification handle without performing IO.
@@ -739,16 +773,19 @@ export declare function connectOperatorConnections(serverUrl?: string | undefine
  * Omitted arguments resolve through the same shared client configuration
  * chain as `connectCards`, so every capability authenticates identically.
  */
-export declare function connectVerification(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeVerificationConnection
+export declare function connectVerification(serverUrl?: string | undefined | null, credential?: string | undefined | null, tenant?: string | undefined | null): NativeVerificationConnection
 
 /**
  * Builds one client without performing IO.
  *
  * Omitted arguments resolve through `client_from_options`: the environment,
- * then `~/.config/wyrd/credentials.toml`. Failures are returned as catalog
- * metadata.
+ * then the saved `wyrd auth login` for this server (the one for `tenant`, a
+ * tenant route key, when given, otherwise the newest), then
+ * `~/.config/wyrd/credentials.toml`. Failures are returned as catalog
+ * metadata, including `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when this server
+ * has saved logins but none for `tenant`.
  */
-export declare function connectWyrdClient(serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): NativeWyrdClientResult
+export declare function connectWyrdClient(serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, tenant?: string | undefined | null): NativeWyrdClientResult
 
 /**
  * Fetches an already-registered table's config by name.
@@ -761,7 +798,23 @@ export declare function connectWyrdClient(serverUrl?: string | undefined | null,
  * Returns a napi error only when the described config cannot be encoded;
  * credential, transport, and server refusals are returned as catalog metadata.
  */
-export declare function describeTableConfig(table: string, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): Promise<NativeTableConfigResult>
+export declare function describeTableConfig(table: string, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, tenant?: string | undefined | null): Promise<NativeTableConfigResult>
+
+/**
+ * Load an authored Workflow file and the Cards it references.
+ *
+ * Delegates to the shared [`Workflow::from_path`]: local files load without
+ * a server, and registry refs are read through the ambient client
+ * configuration (`WYRD_SERVER_URL`, `WYRD_API_KEY`). Never rejects: a load
+ * failure is returned in [`NativeWorkflowLoad::error`] with its catalog
+ * code, and the public TypeScript `Workflow.fromPath` throws it as a
+ * `WyrdError`.
+ *
+ * Loading only reads files and Cards. If the Node promise is abandoned,
+ * completed reads may already have happened, but no partial Workflow is
+ * returned and nothing durable is written.
+ */
+export declare function loadWorkflowFromPath(path: string): Promise<NativeWorkflowLoad>
 
 /** Closed result of connecting one Bifrost client: a handle or a catalog error. */
 export interface NativeBifrostConnection {
@@ -887,6 +940,14 @@ export interface NativeVerificationConnection {
   /** Verification handle when construction succeeded. */
   verification?: NativeVerification
   /** Catalog failure when no credential resolves or the client cannot be built. */
+  error?: NativeWyrdError
+}
+
+/** Closed result of loading one Workflow: a handle or a catalog error. */
+export interface NativeWorkflowLoad {
+  /** Workflow when loading succeeded. */
+  workflow?: NativeWorkflow
+  /** Catalog failure otherwise. */
   error?: NativeWyrdError
 }
 

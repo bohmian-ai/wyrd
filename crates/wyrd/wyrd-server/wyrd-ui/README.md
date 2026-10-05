@@ -32,9 +32,10 @@ fixture identity.
 Both local sign-in and the mock switch are unavailable in production builds,
 even if their environment flags or cookies are present.
 
-Rust OIDC already exists; its browser-session integration and the UI domain
-transport are not connected yet. Turning mocks
-off therefore shows an unavailable state, not live data or an empty fixture.
-The later server integration belongs behind the same client boundary; it must
-retain server-side credentials and tenant authorization. Only Home is currently
+Production builds sign in through the Wyrd server, which is the OAuth 2.0
+authorization server. The web app is its confidential client `wyrd-ui` and uses
+`openid-client` for the authorization code flow with PKCE. It keeps the session
+in a `jose`-encrypted HttpOnly cookie, so Wyrd and provider tokens never reach
+the browser. Set `WYRD_UI_CLIENT_SECRET`, `WYRD_SERVER_URL`, and `ORIGIN`; see
+the self-hosting SSO and OIDC guide. Only Home is currently
 implemented; linked workspaces arrive with their owning tasks.

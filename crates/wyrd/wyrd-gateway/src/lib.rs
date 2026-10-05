@@ -13,7 +13,6 @@
 
 mod adapter;
 mod credential;
-mod endpoint;
 mod engine;
 mod health;
 mod managed;
@@ -27,8 +26,7 @@ pub use adapter::{
     IngressDialect, MediaRequest, UnsupportedRequest, anthropic_error_body, google_error_body,
     openai_error_body,
 };
-pub use credential::{CredentialError, CredentialResolver, ProviderSecret, read_secret_file};
-pub use endpoint::EndpointPolicy;
+pub use credential::{CredentialError, CredentialResolver, ProviderSecret};
 pub use engine::{
     AttemptRecord, AttemptResult, AttemptUsage, CallExecution, CallInput, EventStream,
     FailureClass, GatewayEngine, ProviderAttempt, ProviderDispatch, ProviderRefusal, ResponseBody,

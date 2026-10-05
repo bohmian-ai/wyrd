@@ -64,7 +64,7 @@ async fn structured_output_parses_when_schema_declared() {
     let providers = registry_returning_text(r#"{"foo":"hello","bar":"world"}"#);
 
     let run = agent
-        .run_prompt(&providers, &agent.prompt, &[], None)
+        .run_prompt(&providers, &agent.prompt, &[])
         .await
         .unwrap();
 
@@ -80,7 +80,7 @@ async fn structured_output_decode_failure_surfaces_code() {
     let providers = registry_returning_text("not json");
 
     let err = agent
-        .run_prompt(&providers, &agent.prompt, &[], None)
+        .run_prompt(&providers, &agent.prompt, &[])
         .await
         .expect_err("non-JSON response must fail");
 
@@ -101,7 +101,7 @@ async fn text_prompt_leaves_structured_output_none() {
     let providers = registry_returning_text("hello");
 
     let run = agent
-        .run_prompt(&providers, &agent.prompt, &[], None)
+        .run_prompt(&providers, &agent.prompt, &[])
         .await
         .unwrap();
 

@@ -7,9 +7,8 @@
   let {
     view,
     base,
-    csrf,
     result
-  }: { view: ChangeView; base: string; csrf: string; result?: ActionResult | null } =
+  }: { view: ChangeView; base: string; result?: ActionResult | null } =
     $props();
   let change = $derived(view.change);
 </script>
@@ -19,7 +18,7 @@
 </div><aside class="stack">
   <Panel title="Revision"><div class="kv"><span class="k">current</span><strong>revision {change.revisionNumber} · immutable</strong><span class="k">created</span><time class="mono" datetime={change.created}>{change.created}</time><span class="k">subjects</span><span>{change.subjects.length} exact</span></div><div class="row prior"> {#each change.priorRevisions as revision}<a href={`?revision=${revision}`}>{revision.replace('rev_', 'revision ')} →</a>{/each}</div></Panel>
   <section id="decisions"><Panel title="Override"><div class="kv"><span class="k">Override</span><span><Badge tone={change.override === 'None' ? 'neutral' : 'warn'}>{change.override}</Badge></span></div><p>Override is human judgment — it does not verify.</p>
-  {#if view.capabilities.override}<details class="divider"><summary>Authorize override</summary><form method="POST" action="?/review" class="stack divider" use:enhance><input type="hidden" name="csrf" value={csrf} /><input type="hidden" name="revision" value={change.revision} /><input type="hidden" name="requestKey" value={`${view.requestKey}:override`} /><input type="hidden" name="operation" value="override" /><label>Claim<select name="decision">{#each change.claims as claim}<option value={claim.id}>{claim.id} — {claim.title}</option>{/each}</select></label><label>Reason<textarea name="body" required maxlength="10000"></textarea></label><button class="control">Authorize override</button></form></details>{/if}
+  {#if view.capabilities.override}<details class="divider"><summary>Authorize override</summary><form method="POST" action="?/review" class="stack divider" use:enhance><input type="hidden" name="revision" value={change.revision} /><input type="hidden" name="requestKey" value={`${view.requestKey}:override`} /><input type="hidden" name="operation" value="override" /><label>Claim<select name="decision">{#each change.claims as claim}<option value={claim.id}>{claim.id} — {claim.title}</option>{/each}</select></label><label>Reason<textarea name="body" required maxlength="10000"></textarea></label><button class="control">Authorize override</button></form></details>{/if}
   {#if result?.problem}<p role="alert">{result.problem.title} · {result.problem.code}</p>{/if}{#if result?.message}<p role="status">{result.message}</p>{/if}
   </Panel></section>
 </aside></div></div>

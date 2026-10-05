@@ -41,10 +41,10 @@ def test_bind_media_openai_anthropic_gemini_and_vertex_native_replacement() -> N
         "img", MediaRef.image_base64("image/png", "QUJD")
     )
 
-    assert openai.request.model_dump()["messages"][0]["content"][1]["type"] == "image_url"
-    assert anthropic.request.model_dump()["messages"][0]["content"][1]["type"] == "image"
-    assert "inline_data" in gemini.request.model_dump()["contents"][0]["parts"][1]
-    assert "inline_data" in vertex.request.model_dump()["contents"][0]["parts"][1]
+    assert openai.request.model_dump()["body"]["messages"][0]["content"][1]["type"] == "image_url"
+    assert anthropic.request.model_dump()["body"]["messages"][0]["content"][1]["type"] == "image"
+    assert "inline_data" in gemini.request.model_dump()["body"]["contents"][0]["parts"][1]
+    assert "inline_data" in vertex.request.model_dump()["body"]["contents"][0]["parts"][1]
 
 
 def test_bind_media_missing_placeholder_raises_exact_code() -> None:
@@ -88,7 +88,7 @@ def test_multiple_media_placeholders_in_one_message_bind_cleanly() -> None:
     bound = prompt.bind_media("a", MediaRef.image_url("https://example.test/a.png")).bind_media(
         "b", MediaRef.image_url("https://example.test/b.png")
     )
-    content = bound.request.model_dump()["messages"][0]["content"]
+    content = bound.request.model_dump()["body"]["messages"][0]["content"]
 
     assert [part["type"] for part in content] == ["text", "image_url", "text", "image_url"]
     assert bound.media_variables == []

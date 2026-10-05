@@ -10,9 +10,6 @@ from collections.abc import Callable, Mapping, Sequence
 from types import TracebackType
 from typing import Any, Literal, Protocol, TypeAlias, overload
 
-from wyrd.observer import Observer
-from wyrd.otel import OtelObserver
-
 PathLike: TypeAlias = str | os.PathLike[str] | pathlib.Path
 JsonDict: TypeAlias = dict[str, Any]
 StringMap: TypeAlias = Mapping[str, str]

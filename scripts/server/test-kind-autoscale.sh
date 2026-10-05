@@ -196,8 +196,9 @@ echo "== seed through the anchor's Scribe"
 forward wyrd-core-0
 sdk_phase kind_seed
 fqn="$(cat "$work/kind_table")"
-token="$(curl -fsS -H 'content-type: application/json' \
-  -d "{\"grant_type\":\"wyrd_api_key\",\"api_key\":\"$api_key\"}" "$http/auth/token" \
+token="$(curl -fsS -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+  --data-urlencode "subject_token=$api_key" \
+  -d subject_token_type=urn:wyrd:oauth:token-type:api_key "$http/auth/token" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
 body="{\"sql\":\"SELECT COUNT(*) FROM $fqn\",\"visibility\":\"fused\",\"freshness\":\"allow_degraded\"}"
 k create secret generic wyrd-load --from-literal=token="$token" --from-literal=body="$body" >/dev/null

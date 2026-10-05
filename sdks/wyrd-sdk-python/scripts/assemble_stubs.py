@@ -20,7 +20,6 @@ PUBLIC_MODULE_STUBS = {
     "gateway.pyi": PACKAGE_DIR / "gateway" / "__init__.pyi",
     "model.pyi": PACKAGE_DIR / "model" / "__init__.pyi",
     "observe.pyi": PACKAGE_DIR / "observe" / "__init__.pyi",
-    "observer.pyi": PACKAGE_DIR / "observer.pyi",
     "operators.pyi": PACKAGE_DIR / "operators" / "__init__.pyi",
     "prompt.pyi": PACKAGE_DIR / "prompt" / "__init__.pyi",
     "state.pyi": PACKAGE_DIR / "state" / "__init__.pyi",
@@ -111,16 +110,10 @@ def rewrite_public_imports(filename: str, content: str) -> str:
                 "from .._wyrd import JsonDict, PathLike, WyrdError"
             ),
             "from .prompt import Prompt": "from ..prompt import Prompt",
-            "from .observer import Observer": "from ..observer import Observer",
         },
         "observe.pyi": {
             "from .bifrost import Bifrost": "from ..bifrost import Bifrost",
             "from .eval import MediaRef": "from ..eval import MediaRef",
-        },
-        "observer.pyi": {
-            "from wyrd.stubs.prompt import ProviderRequest, ProviderResponse": (
-                "from .prompt import ProviderRequest, ProviderResponse"
-            ),
         },
         "data.pyi": {
             "from .cards import CardRef, DataLoadArgs, JsonValue\nfrom .error import WyrdError\nfrom .header import CardRefLike, JsonDict, PathLike, StringMap": (
@@ -182,12 +175,6 @@ def assemble_root_stub() -> None:
         final_content.append(f"### {filename} ###")
         final_content.append(text_to_append.strip())
         final_content.append("")
-
-    final_content.append("def _init() -> None:")
-    final_content.append('    """Initialize the native Wyrd extension."""')
-    final_content.append("    ...")
-    final_content.append("")
-    master_all.append("_init")
 
     final_content.append("### GLOBAL EXPORTS ###")
     final_content.append("__all__ = [")

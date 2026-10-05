@@ -3,7 +3,7 @@
 from typing import Protocol
 
 from . import cards, client, config, data, model, prompt, state
-from ._wyrd import AgentError, SessionError, ToolError, WyrdError, _init
+from ._wyrd import AgentError, SessionError, ToolError, WyrdError
 from .agent import (
     Agent,
     AgentRun,
@@ -13,9 +13,6 @@ from .agent import (
     RunConfig,
     SessionMemory,
     SessionTurn,
-    StepEvent,
-    StepOutcome,
-    StepStatus,
     Workflow,
     WorkflowRun,
     local_registry,
@@ -27,8 +24,6 @@ from .client import WyrdClient
 from .config import WyrdConfig
 from .data import DataCard, Split
 from .model import ModelCard, ModelSignature, SampleInput
-from .observer import Observer
-from .otel import OtelObserver
 from .prompt import (
     AnthropicSettings,
     GeminiSettings,
@@ -66,8 +61,6 @@ class Card(Protocol):
 
 cards.Card = Card
 
-_init()
-
 __all__ = [
     "Agent",
     "AgentCard",
@@ -87,8 +80,6 @@ __all__ = [
     "NoSession",
     "OpenAIResponsesSettings",
     "OpenAISettings",
-    "Observer",
-    "OtelObserver",
     "Prompt",
     "PromptCard",
     "PromptCardMetadata",
@@ -104,9 +95,6 @@ __all__ = [
     "SessionMemory",
     "SessionTurn",
     "Split",
-    "StepEvent",
-    "StepOutcome",
-    "StepStatus",
     "ToolError",
     "Workflow",
     "WorkflowRun",

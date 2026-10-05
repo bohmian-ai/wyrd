@@ -569,6 +569,25 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A device-code token request (RFC 8628) issued no credential.
+    ///
+    /// `details.error` carries the RFC 8628 error: `authorization_pending`
+    /// and `slow_down` ask the client to keep polling (`slow_down` at an
+    /// interval five seconds longer); `access_denied`, `expired_token`, and
+    /// `invalid_grant` end the login.
+    #[error("[WYRD_AUTH_400_DEVICE_AUTHORIZATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_400_DEVICE_AUTHORIZATION",
+        status = 400,
+        title = "Device authorization did not issue a credential",
+        remediation = "Keep polling on `authorization_pending`, poll five seconds slower on `slow_down`, and start a new login on any other `details.error`."
+    )]
+    DeviceAuthorization {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload; `error` is the RFC 8628 error name.
+        details: serde_json::Value,
+    },
     /// OIDC callback state is missing, invalid, or replayed.
     #[error("[WYRD_AUTH_400_INVALID_STATE] {message}")]
     #[wyrd_error(
@@ -774,6 +793,62 @@ pub enum WyrdError {
         remediation = "Confirm the issuer URL (and subject for bindings) and that the resource exists in the current tenant."
     )]
     AdminNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A human-login trust write reached the workload trusted-issuer surface.
+    #[error("[WYRD_AUTH_400_HUMAN_CONNECTION_REQUIRED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_400_HUMAN_CONNECTION_REQUIRED",
+        status = 400,
+        title = "Human login uses the tenant OIDC connection",
+        remediation = "Trusted issuers and `[[trusted_issuers]]` accept only `principal_kind = workload`. Configure human sign-in through the tenant OIDC connection API: PUT /v1/identity/oidc/candidate, POST /v1/identity/oidc/candidate/test, then POST /v1/identity/oidc/candidate/activate."
+    )]
+    HumanConnectionRequired {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A tenant OIDC connection mutation lost a revision, state, or recovery check.
+    #[error("[WYRD_AUTH_409_CONNECTION_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_409_CONNECTION_CONFLICT",
+        status = 409,
+        title = "Tenant OIDC connection conflict",
+        remediation = "Re-read GET /v1/identity/oidc/connections and retry with the current `expected_revision`. Activation also requires a valid recovery API key for a headless principal of this tenant that holds `identity_connections:write`."
+    )]
+    ConnectionConflict {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Activation named a candidate without a current successful test.
+    #[error("[WYRD_AUTH_409_CONNECTION_NOT_TESTED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_409_CONNECTION_NOT_TESTED",
+        status = 409,
+        title = "Tenant OIDC candidate is not freshly tested",
+        remediation = "Run POST /v1/identity/oidc/candidate/test against this exact candidate revision, complete the provider sign-in at the returned authorization_url, and activate within 15 minutes of that successful test."
+    )]
+    ConnectionNotTested {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A tenant OIDC connection named a client-authentication method Wyrd does not implement.
+    #[error("[WYRD_AUTH_400_UNSUPPORTED_CLIENT_AUTH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_400_UNSUPPORTED_CLIENT_AUTH",
+        status = 400,
+        title = "Unsupported OIDC client authentication",
+        remediation = "Use `SecretBasic` or `SecretPost` with a client secret, or `Public` without one. `private_key_jwt` is not supported for tenant connections."
+    )]
+    UnsupportedClientAuth {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -3237,6 +3312,24 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A registered Workflow was requested with a malformed Card reference.
+    ///
+    /// Returned by the SDK `cards.workflow.load` calls before any registry
+    /// read, when the caller passes neither `uid` alone nor `space`, `name`,
+    /// and an exact `version`, or one of those fields is malformed.
+    #[error("[WYRD_WORKFLOW_400_INVALID_CARD_REF] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_400_INVALID_CARD_REF",
+        status = 400,
+        title = "Invalid Workflow Card reference",
+        remediation = "Pass either uid alone, or space, name, and an exact version of a registered Workflow."
+    )]
+    WorkflowInvalidCardRef {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload naming the offending `field`.
+        details: serde_json::Value,
+    },
     /// WorkflowCard save or envelope projection is missing a name.
     #[error("[WYRD_WORKFLOW_422_MISSING_NAME] {message}")]
     #[wyrd_error(
@@ -3321,27 +3414,13 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// A workflow lookup referenced an unknown task id.
-    #[error("[WYRD_WORKFLOW_404_TASK] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_404_TASK",
-        status = 404,
-        title = "Workflow task not found",
-        remediation = "Correct the task id; it must match a task defined in the workflow."
-    )]
-    WorkflowTaskNotFound {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// A step prompt referenced a variable absent from both workflow input and upstream output.
+    /// A declared step binding or Workflow output selected a value the run did not produce.
     #[error("[WYRD_WORKFLOW_422_MISSING_PARAMETER] {message}")]
     #[wyrd_error(
         code = "WYRD_WORKFLOW_422_MISSING_PARAMETER",
         status = 422,
-        title = "Workflow step parameter unresolved",
-        remediation = "Supply the variable in the workflow input or produce it from an upstream step."
+        title = "Workflow binding selected a missing value",
+        remediation = "Make the bound step produce the selected field, or bind a field it always produces."
     )]
     WorkflowMissingParameter {
         /// Human-readable error message.
@@ -3363,20 +3442,6 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// A workflow task's agent run completed without a consumable final provider response.
-    #[error("[WYRD_WORKFLOW_500_AGENT_RESPONSE_MISSING] {message}")]
-    #[wyrd_error(
-        code = "WYRD_WORKFLOW_500_AGENT_RESPONSE_MISSING",
-        status = 500,
-        title = "Workflow agent run produced no final response",
-        remediation = "Inspect the task's agent run; the workflow needs a final provider response to continue."
-    )]
-    WorkflowAgentResponseMissing {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
     /// The workflow user surface raised a boundary failure with no more specific code.
     #[error("[WYRD_WORKFLOW_500_INTERNAL] {message}")]
     #[wyrd_error(
@@ -3391,57 +3456,211 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// The workflow scheduler could not acquire a task lock.
-    #[error("[WYRD_WORKFLOW_500_LOCK] {message}")]
+    /// No visible Workflow run has the requested id.
+    #[error("[WYRD_WORKFLOW_404_RUN_NOT_FOUND] {message}")]
     #[wyrd_error(
-        code = "WYRD_WORKFLOW_500_LOCK",
-        status = 500,
-        title = "Workflow task lock acquisition failed",
-        remediation = "Retry the workflow run; a poisoned or contended task lock prevented scheduling."
+        code = "WYRD_WORKFLOW_404_RUN_NOT_FOUND",
+        status = 404,
+        title = "Workflow run not found",
+        remediation = "Check the run id; runs are process-local, expire after retention, and are visible only to their owning tenant and replica."
     )]
-    WorkflowLock {
+    WorkflowRunNotFound {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// A workflow task exhausted its configured retry budget.
-    #[error("[WYRD_WORKFLOW_500_MAX_RETRIES] {message}")]
+    /// The idempotency key was already used with a different Workflow run request.
+    #[error("[WYRD_WORKFLOW_409_IDEMPOTENCY_CONFLICT] {message}")]
     #[wyrd_error(
-        code = "WYRD_WORKFLOW_500_MAX_RETRIES",
-        status = 500,
-        title = "Workflow task exceeded max retries",
-        remediation = "Raise the task's retry budget or fix the underlying task failure it kept hitting."
+        code = "WYRD_WORKFLOW_409_IDEMPOTENCY_CONFLICT",
+        status = 409,
+        title = "Workflow run idempotency conflict",
+        remediation = "Reuse an Idempotency-Key only with the identical request body, or choose a new key for a different request."
     )]
-    WorkflowMaxRetries {
+    WorkflowIdempotencyConflict {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// No workflow task is ready to run yet the workflow is not complete.
-    #[error("[WYRD_WORKFLOW_500_STALLED] {message}")]
+    /// The Workflow run request has an invalid input, timeout, CardRef, or shape.
+    #[error("[WYRD_WORKFLOW_422_RUN_REQUEST] {message}")]
     #[wyrd_error(
-        code = "WYRD_WORKFLOW_500_STALLED",
-        status = 500,
-        title = "Workflow stalled with pending tasks",
-        remediation = "Inspect the pending task ids in details; their dependencies can never become ready."
+        code = "WYRD_WORKFLOW_422_RUN_REQUEST",
+        status = 422,
+        title = "Invalid Workflow run request",
+        remediation = "Fix the field named in details: the input must match the declared Workflow inputs and the timeout and CardRef must be valid."
     )]
-    WorkflowStalled {
+    WorkflowRunRequest {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// No message conversion exists between the upstream and downstream task providers.
-    #[error("[WYRD_WORKFLOW_501_UNSUPPORTED_HANDOFF] {message}")]
+    /// The resolved llm_route is not supported for this step in this execution environment.
+    #[error("[WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED] {message}")]
     #[wyrd_error(
-        code = "WYRD_WORKFLOW_501_UNSUPPORTED_HANDOFF",
-        status = 501,
-        title = "Unsupported workflow provider handoff",
-        remediation = "Keep adjacent workflow tasks on providers with a supported message conversion."
+        code = "WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED",
+        status = 422,
+        title = "Workflow route unsupported",
+        remediation = "Choose an llm_route whose protocol matches the Prompt request dialect and that this execution environment supports."
     )]
-    WorkflowUnsupportedHandoff {
+    WorkflowRouteUnsupported {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A server-executed Workflow step resolves to the native llm_route.
+    #[error("[WYRD_WORKFLOW_422_SERVER_NATIVE_UNSUPPORTED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_422_SERVER_NATIVE_UNSUPPORTED",
+        status = 422,
+        title = "Native route unsupported on the server",
+        remediation = "Set llm_route to wyrd_gateway or ext_gateway for every step before running the Workflow on the server."
+    )]
+    WorkflowServerNativeUnsupported {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A Workflow Agent declares an unknown, disallowed, or duplicate tool.
+    #[error("[WYRD_WORKFLOW_422_TOOL_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_422_TOOL_UNAVAILABLE",
+        status = 422,
+        title = "Workflow Agent tool unavailable",
+        remediation = "Declare only tools the execution environment provides, once each, in the Agent tool_names list."
+    )]
+    WorkflowToolUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The global or tenant active Workflow run capacity is exhausted.
+    #[error("[WYRD_WORKFLOW_429_RUN_CAPACITY] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_429_RUN_CAPACITY",
+        status = 429,
+        title = "Workflow run capacity exhausted",
+        remediation = "Wait for active Workflow runs to finish, then submit the run again."
+    )]
+    WorkflowRunCapacity {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A required execution-environment route binding is absent or unavailable.
+    #[error("[WYRD_WORKFLOW_503_BINDING_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_503_BINDING_UNAVAILABLE",
+        status = 503,
+        title = "Workflow route binding unavailable",
+        remediation = "Configure the named credential binding or Wyrd gateway caller in the execution environment before running the Workflow."
+    )]
+    WorkflowBindingUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The server is shutting down or cannot accept tracked Workflow work.
+    #[error("[WYRD_WORKFLOW_503_RUN_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_503_RUN_UNAVAILABLE",
+        status = 503,
+        title = "Workflow run admission unavailable",
+        remediation = "Retry once the server is accepting Workflow runs again."
+    )]
+    WorkflowRunUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The decoded Workflow input exceeds the configured input bound.
+    #[error("[WYRD_WORKFLOW_413_INPUT_TOO_LARGE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_413_INPUT_TOO_LARGE",
+        status = 413,
+        title = "Workflow input too large",
+        remediation = "Reduce the decoded Workflow input below the configured input bound."
+    )]
+    WorkflowInputTooLarge {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The Workflow graph exceeds its step, edge, byte, or terminal snapshot bound.
+    #[error("[WYRD_WORKFLOW_413_GRAPH_TOO_LARGE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_413_GRAPH_TOO_LARGE",
+        status = 413,
+        title = "Workflow graph too large",
+        remediation = "Reduce the step count, dependency edges, or resolved Agent and Prompt bodies below the configured graph bounds."
+    )]
+    WorkflowGraphTooLarge {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A normalized Workflow step result exceeds its configured bound.
+    #[error("[WYRD_WORKFLOW_413_STEP_RESULT_TOO_LARGE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_413_STEP_RESULT_TOO_LARGE",
+        status = 413,
+        title = "Workflow step result too large",
+        remediation = "Constrain the step's Prompt output or raise the configured step-result bound."
+    )]
+    WorkflowStepResultTooLarge {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The retained Workflow run snapshot exceeds its configured bound.
+    #[error("[WYRD_WORKFLOW_413_RUN_TOO_LARGE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_413_RUN_TOO_LARGE",
+        status = 413,
+        title = "Workflow run snapshot too large",
+        remediation = "Reduce step and output payload sizes or raise the configured run snapshot bound."
+    )]
+    WorkflowRunTooLarge {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A Workflow step exhausted its retries after an attempt timeout.
+    #[error("[WYRD_WORKFLOW_504_STEP_TIMEOUT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_504_STEP_TIMEOUT",
+        status = 504,
+        title = "Workflow step attempt timed out",
+        remediation = "Raise the step timeout_seconds or retry budget, or make the step's Agent finish sooner."
+    )]
+    WorkflowStepTimeout {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The total Workflow deadline expired.
+    #[error("[WYRD_WORKFLOW_504_RUN_TIMEOUT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_504_RUN_TIMEOUT",
+        status = 504,
+        title = "Workflow run deadline expired",
+        remediation = "Raise the Workflow run timeout or reduce the work the Workflow performs."
+    )]
+    WorkflowRunTimeout {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -3629,6 +3848,22 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// The saved user login selected for this server and tenant cannot be
+    /// used: the selector names no saved login, the credential file is unsafe
+    /// or corrupt, the login was removed, or the server refused its renewal.
+    #[error("[WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE",
+        status = 401,
+        title = "Saved user login cannot be used",
+        remediation = "Run `wyrd auth login --server <url> --tenant <tenant>` again, select the intended tenant with the client tenant option or WYRD_TENANT, or pass an explicit credential. The details reason names the failure."
+    )]
+    ClientSavedLoginUnusable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload (`{ reason }`).
+        details: serde_json::Value,
+    },
     /// A sealed batch, or a single row, cannot fit under the client's max_message_bytes.
     #[error("[WYRD_CLIENT_413_PAYLOAD_TOO_LARGE] {message}")]
     #[wyrd_error(
@@ -3755,6 +3990,7 @@ impl WyrdError {
             | Self::BadTokenFormat { message, details }
             | Self::UnsupportedGrantType { message, details }
             | Self::InvalidState { message, details }
+            | Self::DeviceAuthorization { message, details }
             | Self::InvalidNonce { message, details }
             | Self::RefreshReused { message, details }
             | Self::RefreshRevoked { message, details }
@@ -3769,6 +4005,10 @@ impl WyrdError {
             | Self::PrincipalNotFound { message, details }
             | Self::AdminConflict { message, details }
             | Self::AdminNotFound { message, details }
+            | Self::HumanConnectionRequired { message, details }
+            | Self::ConnectionConflict { message, details }
+            | Self::ConnectionNotTested { message, details }
+            | Self::UnsupportedClientAuth { message, details }
             | Self::GatewayInvalidConfiguration { message, details }
             | Self::GatewayResourceNotFound { message, details }
             | Self::GatewayResourceConflict { message, details }
@@ -3853,6 +4093,7 @@ impl WyrdError {
             | Self::AgentCallbackAborted { message, details }
             | Self::AgentLoopMessageType { message, details }
             | Self::WorkflowValidation { message, details }
+            | Self::WorkflowInvalidCardRef { message, details }
             | Self::WorkflowMissingName { message, details }
             | Self::WorkflowMissingVersion { message, details }
             | Self::WorkflowDuplicateStepId { message, details }
@@ -3957,17 +4198,27 @@ impl WyrdError {
             | Self::RuntimeProviderNotRegistered { message, details }
             | Self::RuntimeResponseDecode { message, details }
             | Self::WorkflowAgentNotFound { message, details }
-            | Self::WorkflowTaskNotFound { message, details }
             | Self::WorkflowMissingParameter { message, details }
             | Self::WorkflowOutputSchema { message, details }
-            | Self::WorkflowAgentResponseMissing { message, details }
             | Self::WorkflowInternal { message, details }
-            | Self::WorkflowLock { message, details }
-            | Self::WorkflowMaxRetries { message, details }
-            | Self::WorkflowStalled { message, details }
-            | Self::WorkflowUnsupportedHandoff { message, details }
+            | Self::WorkflowRunNotFound { message, details }
+            | Self::WorkflowIdempotencyConflict { message, details }
+            | Self::WorkflowRunRequest { message, details }
+            | Self::WorkflowRouteUnsupported { message, details }
+            | Self::WorkflowServerNativeUnsupported { message, details }
+            | Self::WorkflowToolUnavailable { message, details }
+            | Self::WorkflowRunCapacity { message, details }
+            | Self::WorkflowBindingUnavailable { message, details }
+            | Self::WorkflowRunUnavailable { message, details }
+            | Self::WorkflowInputTooLarge { message, details }
+            | Self::WorkflowGraphTooLarge { message, details }
+            | Self::WorkflowStepResultTooLarge { message, details }
+            | Self::WorkflowRunTooLarge { message, details }
+            | Self::WorkflowStepTimeout { message, details }
+            | Self::WorkflowRunTimeout { message, details }
             | Self::ClientConfigInvalid { message, details }
             | Self::ClientNoCredentials { message, details }
+            | Self::ClientSavedLoginUnusable { message, details }
             | Self::ClientPayloadTooLarge { message, details }
             | Self::ClientRowDeserialization { message, details }
             | Self::ClientQueueFull { message, details }
@@ -4328,20 +4579,15 @@ mod tests {
         ("WYRD_RUNTIME_404_PROVIDER", 404),
         ("WYRD_RUNTIME_422_RESPONSE_DECODE", 422),
         ("WYRD_WORKFLOW_404_AGENT", 404),
-        ("WYRD_WORKFLOW_404_TASK", 404),
         ("WYRD_WORKFLOW_422_CYCLE", 422),
         ("WYRD_WORKFLOW_422_DUPLICATE_STEP_ID", 422),
         ("WYRD_WORKFLOW_422_MISSING_DEPENDENCY", 422),
         ("WYRD_WORKFLOW_422_MISSING_PARAMETER", 422),
         ("WYRD_WORKFLOW_422_OUTPUT_SCHEMA", 422),
-        ("WYRD_WORKFLOW_500_AGENT_RESPONSE_MISSING", 500),
         ("WYRD_WORKFLOW_500_INTERNAL", 500),
-        ("WYRD_WORKFLOW_500_LOCK", 500),
-        ("WYRD_WORKFLOW_500_MAX_RETRIES", 500),
-        ("WYRD_WORKFLOW_500_STALLED", 500),
-        ("WYRD_WORKFLOW_501_UNSUPPORTED_HANDOFF", 501),
         ("WYRD_CLIENT_400_CONFIG_INVALID", 400),
         ("WYRD_CLIENT_401_NO_CREDENTIALS", 401),
+        ("WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE", 401),
         ("WYRD_CLIENT_413_PAYLOAD_TOO_LARGE", 413),
         ("WYRD_CLIENT_422_ROW_DESERIALIZATION", 422),
         ("WYRD_CLIENT_429_QUEUE_FULL", 429),
@@ -4635,6 +4881,10 @@ mod tests {
             WyrdError::InvalidState {
                 message: "state was missing or replayed".to_owned(),
                 details: serde_json::json!({}),
+            },
+            WyrdError::DeviceAuthorization {
+                message: "the person has not approved this device code yet".to_owned(),
+                details: serde_json::json!({ "error": "authorization_pending" }),
             },
             WyrdError::InvalidNonce {
                 message: "id token nonce mismatch".to_owned(),

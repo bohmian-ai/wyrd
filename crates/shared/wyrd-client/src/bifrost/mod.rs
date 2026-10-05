@@ -110,7 +110,8 @@ mod sdk {
     /// The producer pool under test, keyed on one deterministic scope.
     fn pool(sink: Arc<dyn BatchSink<ClientByteGuard>>, config: QueueConfig) -> WriterPool {
         WriterPool::new(
-            ClientScope::from_config(&config_with_key("http://x", "secret")).expect("scope"),
+            ClientScope::from_config(&config_with_key("http://127.0.0.1:1", "secret"))
+                .expect("scope"),
             sink,
             config,
         )
@@ -119,8 +120,9 @@ mod sdk {
     /// A client over `sink`, built without any IO so a mock sink can stand in
     /// for the gRPC transport the production constructor would dial.
     fn client_over(sink: Arc<dyn BatchSink<ClientByteGuard>>, config: QueueConfig) -> Bifrost {
-        let client = crate::WyrdClient::with_config(config_with_key("http://x", "secret"))
-            .expect("client assembles without IO");
+        let client =
+            crate::WyrdClient::with_config(config_with_key("http://127.0.0.1:1", "secret"))
+                .expect("client assembles without IO");
         Bifrost::with_sink(&client, None, sink, config)
     }
 
@@ -220,8 +222,10 @@ mod sdk {
 
     #[test]
     fn same_url_and_credential_collapse_to_one_scope() {
-        let a = ClientScope::from_config(&config_with_key("http://x", "secret")).expect("scope");
-        let b = ClientScope::from_config(&config_with_key("http://x", "secret")).expect("scope");
+        let a = ClientScope::from_config(&config_with_key("http://127.0.0.1:1", "secret"))
+            .expect("scope");
+        let b = ClientScope::from_config(&config_with_key("http://127.0.0.1:1", "secret"))
+            .expect("scope");
         assert_eq!(a, b, "same (url, credential) must produce one scope");
         assert_eq!(a.credential_fingerprint(), b.credential_fingerprint());
     }

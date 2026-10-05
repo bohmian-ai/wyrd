@@ -365,6 +365,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         scribe.base_url(),
         Some(api_key.expose_secret()),
         scribe.grpc_url().as_deref(),
+        None,
     )?;
     let uidless = CardRef {
         uid: None,
@@ -733,6 +734,7 @@ impl<'a> ResultLayoutJourney<'a> {
             server.base_url(),
             Some(token.access_token.expose_secret()),
             server.grpc_url().as_deref(),
+            None,
         )?;
         Ok(Self {
             cluster,

@@ -11,6 +11,8 @@ export default defineConfig({
     environment: 'jsdom',
     globals: true,
     setupFiles: ['./vitest-setup.ts'],
-    include: ['src/**/*.{test,spec}.{js,ts}']
+    include: ['src/**/*.{test,spec}.{js,ts}'],
+    // Real-server HTTP journeys run only inside the identity journey lane.
+    exclude: process.env.WYRD_UI_INTEGRATION ? [] : ['src/**/*.integration.test.ts']
   }
 });

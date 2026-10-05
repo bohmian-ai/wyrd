@@ -31,6 +31,7 @@ from .._wyrd.cards import (
     RegistrationOutcome,
     RegistrationReceipt,
     VersionBump,
+    WorkflowCards,
 )
 from .._wyrd.cards.agent import AgentCard
 
@@ -67,6 +68,7 @@ __all__ = [
     "DataCardRegistry",
     "ModelCardRegistry",
     "PromptCardRegistry",
+    "WorkflowCards",
     "CardSummary",
     "CardList",
     "RegistrationOutcome",

@@ -4,8 +4,9 @@
 //! `cargo run -p wyrd-rust-examples --bin workflow_structured_output`.
 
 use serde_json::json;
-use wyrd::agent::{Agent, OpenAiChatOptions, Workflow, openai_chat};
+use wyrd::agent::{Agent, OpenAiChatOptions, Workflow, WorkflowBinding, openai_chat};
 use wyrd::prompt::ResponseFormat;
+use wyrd_spec::card::common::ParameterValue;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -42,10 +43,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?)
     .name("writer");
 
-    let wf = Workflow::sequential("demo", [planner, writer])?;
-    let run = wf.run(json!({"topic": "the Rust borrow checker"})).await?;
+    let binding = |source: &str| WorkflowBinding::new(source);
+    let wf = Workflow::sequential("demo", [planner, writer])?
+        .with_inputs([("topic".to_owned(), ParameterValue::Str(String::new()))].into())?
+        .with_step_inputs(
+            "planner",
+            [("topic".to_owned(), binding("input.topic")?)].into(),
+        )?
+        .with_step_inputs(
+            "writer",
+            [(
+                "summary".to_owned(),
+                binding("steps.planner.output.structured.summary")?,
+            )]
+            .into(),
+        )?
+        .with_outputs(
+            [
+                (
+                    "plan".to_owned(),
+                    binding("steps.planner.output.structured")?,
+                ),
+                ("brief".to_owned(), binding("steps.writer.output.text")?),
+            ]
+            .into(),
+        )?;
+    let input =
+        serde_json::Map::from_iter([("topic".to_owned(), json!("the Rust borrow checker"))]);
+    let run = wf.run(input).await?;
 
-    println!("parameters: {:#?}", run.parameters);
-    println!("final: {}", run.final_output.as_deref().unwrap_or("(none)"));
+    println!("status: {:?}", run.status);
+    println!("outputs: {:#?}", run.outputs);
     Ok(())
 }

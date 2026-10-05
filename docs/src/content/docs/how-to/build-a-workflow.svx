@@ -10,6 +10,14 @@ order: 21
 
 A Workflow is a directed acyclic graph of Agent invocations. Use `Workflow.sequential` for linear pipelines, `Workflow.parallel` when steps can run at the same time, or `add` and `add_after` for custom shapes.
 
+Dependencies only order steps. Data moves through explicit declarations:
+
+- `with_inputs` declares the Workflow inputs and their defaults.
+- `with_step_inputs(step_id, ...)` binds each unresolved Prompt variable of a step to `input.<name>`, a dependency's `steps.<id>.output.text`, or `steps.<id>.output.structured[.<field>...]`.
+- `with_outputs` names the values the run returns.
+
+Step ids are derived deterministically from Agent names: characters outside `[A-Za-z0-9_]` become `_`, a name that does not start with a letter or `_` gains a leading `_`, an unnamed Agent becomes `step_<n>` for its position, and a repeated id gains a `_2`, `_3`, ... suffix. When an Agent name is not already a unique valid identifier, read the assigned ids from `Workflow.steps` before binding step inputs. A step whose Prompt variable has no binding, or a binding that names a step the step does not depend on, fails validation before any model call.
+
 ## Author
 
 <LangTabs>
@@ -31,28 +39,92 @@ You can also author the same workflow as YAML and load it back:
 
 ```python
 from wyrd import Workflow
-wf = Workflow.load("research.yaml")
+wf = Workflow.from_path("research.yaml")
 ```
+
+`Workflow.from_path` loads local Agent and Prompt files next to the Workflow
+without a server. Steps that reference registered Agents, as this file does,
+are read from the Wyrd server using your configured credentials.
 
 ## Run
 
 ```python
 run = wf.run({"topic": "the Rust borrow checker"})
-print(run.parameters)
-print(run.final_output)
+print(run.status)    # "succeeded", "failed", "cancelled", or "timed_out"
+print(run.outputs)   # named outputs declared with with_outputs
+print(run.steps["planner"]["structured_output"])
 ```
 
-String input is available as `${input}`. Mapping input exposes each key as a template variable. Structured output from upstream steps accumulates in `WorkflowRun.parameters` and can feed downstream prompts.
+Mapping input supplies declared inputs by name; undeclared keys and values of the wrong declared type are rejected. A string is shorthand for the declared string input named `input`. Validation, input, and route errors raise `WyrdError` before any step runs. Once the run starts, step failures are recorded in `run.steps` and `run.error` instead of being raised.
+
+## Run From The CLI
+
+`wyrd workflow run` takes exactly one source: `--file <path>`, `--uid <uid>`,
+or `--space <space> --name <name> --version <version>`. Input is a JSON object
+from `--input '<json>'` or `--input-file <path>`. Runs execute in the CLI
+process by default; `--execution server` runs a registered Workflow on the
+server. `wyrd workflow` commands take no `--server` option; the Wyrd endpoint
+and credential come from the same client configuration the SDKs read, such as
+`WYRD_SERVER_URL`.
+
+```bash
+wyrd workflow run --file examples/workflows/code-review/workflow.yaml \
+  --input-file examples/workflows/code-review/input.json
+wyrd apply examples/workflows/code-review
+wyrd workflow run --space engineering --name code-review --version 1.0.0 \
+  --input-file examples/workflows/code-review/input.json --execution server
+```
+
+`--format json` prints the `WorkflowRun` snapshot; text output prints the
+status and named outputs, and `--steps` adds every step's result. The command
+exits `0` when the run succeeded and `2` when it ended in any other status.
+
+A server run prints `accepted workflow run <id>` to stderr, then waits for the
+run to finish. `--detach` returns as soon as the run is accepted. Interrupting
+the wait exits `130` and leaves the run running on the server; it is never
+cancelled or resubmitted. Use the ID afterwards:
+
+```bash
+wyrd workflow status <run-id> --steps
+wyrd workflow cancel <run-id>
+```
+
+Server runs live in the server process that accepted them. A restart loses
+them, and a multi-replica deployment must route one run's requests to the
+same replica.
+
+## Route Model Calls
+
+`llm_route` on the Workflow, or on one step to override it, selects where each
+Agent's model calls go:
+
+- `native` (default) calls the provider from the CLI or SDK process. Server
+  runs refuse it.
+- `wyrd_gateway` calls the governed Wyrd gateway with your identity. A step
+  `fallback` travels with each call. Local runs reach the public Chat
+  Completions, Responses, Anthropic Messages, and Gemini endpoints; a Vertex
+  Prompt runs only on the server.
+- `ext_gateway` sends the native request straight to an external gateway
+  binding. Local runs read the binding from the client `config.toml`:
+
+```toml
+[workflow.external_gateway_bindings.review-gateway]
+protocol = "openai_chat"
+origin = "https://gateway.example.com"
+secret_headers = { x-gateway-key = { source = "file", path = "/run/secrets/gateway-key" } }
+```
+
+The secret is read when a run that selects the binding starts, never while
+loading or registering, and never appears in run output. Server runs use the
+bindings the server operator assigns to your tenant.
 
 ## Save And Load
 
 ```python
 wf.save("research.yaml")
-loaded = Workflow.load("research.yaml")
+loaded = Workflow.from_path("research.yaml")
 assert Workflow.from_yaml(wf.to_yaml()).to_yaml() == wf.to_yaml()
 ```
-
-Observers are not serialized. Reattach them after `load`.
 
 ## Custom DAG
 
@@ -62,6 +134,11 @@ wf.add(research_agent)
 wf.add_after(analysis_agent, after=research_agent)
 wf.add_after(summary_agent, after=research_agent)
 wf.add_after(final_agent, after=[analysis_agent, summary_agent])
+wf.with_step_inputs("final", {
+    "analysis": "steps.analysis.output.text",
+    "summary": "steps.summary.output.text",
+})
+wf.with_outputs({"report": "steps.final.output.text"})
 ```
 
 ## Parallel
@@ -83,31 +160,24 @@ Use `parallel` when steps do not depend on each other. Use `add_after` to fan ba
 
 ## Observe
 
-Observers attach to workflows. Attach one to capture lifecycle events, spans, and
-structured output across every step of the run.
+Workflow and Agent runs emit plain `tracing` spans and carry no prompt, response, or tool payloads. Install any `tracing` subscriber (for example through `wyrd_telemetry`) to collect them.
 
-<LangTabs>
-<LangTab lang="python">
+- `workflow.run` records `wyrd.workflow.id`, `wyrd.workflow.run_id`, `wyrd.workflow.step_count`, and the terminal `wyrd.workflow.status`.
+- `workflow.step` is a child span per attempt with `wyrd.workflow.step.id`, `wyrd.workflow.step.attempt`, `wyrd.workflow.step.outcome`, and `error.type` on failure.
+- A `workflow.step.backoff` event records `wyrd.workflow.step.next_attempt` and `wyrd.workflow.step.delay_ms` before a retry.
+- Each step's Agent emits `invoke_agent`, `chat`, and `execute_tool` spans with OpenTelemetry GenAI attribute names.
 
-<CodeFromFile file="sdks/wyrd-sdk-python/examples/with_observer.py" lang="python" />
-
-</LangTab>
-<LangTab lang="rust">
-
-<CodeFromFile file="examples/rust/workflow_with_observer.rs" lang="rust" />
-
-</LangTab>
-</LangTabs>
+Telemetry never changes a run's outcome.
 
 ## Typed Callback Wire
 
 ```python
 from wyrd import Agent, Prompt, ProviderRequest, ProviderResponse
 
-def log_prompt(request: ProviderRequest) -> None:
+def log_prompt(ctx: object, request: ProviderRequest) -> None:
     print(request.openai().model)
 
-def log_response(response: ProviderResponse) -> None:
+def log_response(ctx: object, response: ProviderResponse) -> None:
     usage = response.openai().usage
     if usage:
         print(usage.total_tokens)

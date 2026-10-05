@@ -7,6 +7,5 @@ export const load: LayoutServerLoad = ({ locals, cookies }) => ({
   navCollapsed: cookies.get('wyrd-nav') === 'collapsed',
   development: dev,
   loginScenario: dev ? loginScenario(cookies) : undefined,
-  mockData: locals.mockData,
-  devCsrf: dev ? locals.session?.csrf : undefined
+  mockData: locals.mockData
 });

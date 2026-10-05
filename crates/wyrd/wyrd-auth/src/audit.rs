@@ -6,7 +6,6 @@
 //! The server's `AuditPublisher` is the only thing that moves those rows into
 //! retained history; this module owns no table and no other sink.
 
-use sqlx::PgPool;
 use vala_sql::queries::audit_staging::append_audit;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
@@ -15,7 +14,7 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
 use wyrd_spec::vala::audit_detail::AuditErrorCode;
-use wyrd_sql::TenantConn;
+use wyrd_sql::{TenantConn, WyrdPostgres};
 
 /// Operation for every issued access token: authorization code, API key, JWT
 /// bearer, delegation, and refresh rotation.
@@ -26,6 +25,12 @@ pub const API_KEY_ISSUE_OPERATION: &str = "auth.api_key.issue";
 pub const REFRESH_FAMILY_REVOKE_OPERATION: &str = "auth.refresh.revoke_family";
 /// Operation for a card-ref scope minted into (or refused from) a token.
 pub const CARD_SCOPE_MINT_OPERATION: &str = "auth.card_scope.mint";
+/// Operation for a human login a provider callback completed: its User is
+/// signed in and its authorization code or device approval recorded.
+pub const LOGIN_OPERATION: &str = "auth.login";
+/// Operation for a human login whose provider-asserted groups changed the
+/// User's durable role assignments.
+pub const USER_ROLES_SYNC_OPERATION: &str = "auth.user.roles.sync";
 
 /// Parse the caller's request id into the audit correlation id.
 ///
@@ -39,10 +44,8 @@ pub fn audit_request_id(request_id: &str) -> RequestId {
 
 /// Build one auth audit event attributed to the acting principal.
 ///
-/// The resource is the acting card when there is one, otherwise the principal
-/// id. The permission is the operation name, because these grants authenticate
-/// rather than evaluate a dynamic permission; callers that did evaluate one
-/// overwrite `permission` (and `resource`) on the returned event.
+/// [`principal_event`] with `detail` attached; see it for the resource and
+/// permission rules.
 #[must_use]
 pub fn auth_event(
     request_id: &str,
@@ -52,6 +55,32 @@ pub fn auth_event(
     card_ref: Option<CardRef>,
     outcome: AuditOutcome,
     detail: AuditDetail,
+) -> AuditEvent {
+    principal_event(
+        request_id,
+        operation,
+        principal_id,
+        principal_kind,
+        card_ref,
+        outcome,
+    )
+    .with_detail(detail)
+}
+
+/// Build one detail-less auth audit event attributed to the acting principal.
+///
+/// The resource is the acting card when there is one, otherwise the principal
+/// id. The permission is the operation name, because these grants authenticate
+/// rather than evaluate a dynamic permission; callers that did evaluate one
+/// overwrite `permission` (and `resource`) on the returned event.
+#[must_use]
+pub fn principal_event(
+    request_id: &str,
+    operation: &str,
+    principal_id: PrincipalId,
+    principal_kind: PrincipalKindTag,
+    card_ref: Option<CardRef>,
+    outcome: AuditOutcome,
 ) -> AuditEvent {
     let resource = card_ref
         .as_ref()
@@ -67,7 +96,6 @@ pub fn auth_event(
         operation.to_owned(),
         outcome,
     )
-    .with_detail(detail)
 }
 
 /// Map a stored `principal_kind` column value onto its audit tag.
@@ -109,16 +137,18 @@ pub async fn append_auth_audit(
 /// Append one auth failure event in its own transaction, logging instead of
 /// failing.
 ///
+/// The transaction is opened through [`WyrdPostgres::tenant_conn`], separate
+/// from the refused grant's rolled-back one, and carries the canonical append.
 /// Refused grants already return an error to the caller; a missing refusal row
 /// must not replace that error, so acquire, append, and commit failures are
 /// logged at `error` and swallowed.
 pub async fn record_auth_audit_best_effort(
-    pool: &PgPool,
+    postgres: &WyrdPostgres,
     tenant: DataTenantId,
     event: &AuditEvent,
 ) {
     let result = async {
-        let mut conn = TenantConn::acquire(pool, tenant).await?;
+        let mut conn = postgres.tenant_conn(tenant).await?;
         append_audit(&mut conn, event).await?;
         conn.commit().await
     }
@@ -145,6 +175,7 @@ pub fn auth_failure_code(error: &WyrdError) -> AuditErrorCode {
         | WyrdError::BadTokenFormat { .. }
         | WyrdError::InvalidNonce { .. }
         | WyrdError::InvalidState { .. }
+        | WyrdError::DeviceAuthorization { .. }
         | WyrdError::CredentialRevoked { .. } => AuditErrorCode::InvalidToken,
         WyrdError::PrincipalNotFound { .. } | WyrdError::RegistryCardNotFound { .. } => {
             AuditErrorCode::NotFound

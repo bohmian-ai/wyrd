@@ -655,10 +655,10 @@ impl<'a> GatewayInvocation<'a> {
             &permission.to_string(),
             outcome,
         );
-        let pool = self.state.postgres.vala_pool().clone();
+        let vala = self.state.postgres.vala().clone();
         let tenant = caller.data_tenant_id;
         self.state.gateway_tasks.spawn(async move {
-            if let Err(error) = audit::record_audit(&pool, tenant, &event).await {
+            if let Err(error) = audit::record_audit(&vala, tenant, &event).await {
                 metrics::counter!("gateway_audit_commit_failures_total").increment(1);
                 tracing::error!(
                     %error,

@@ -55,9 +55,32 @@ test-group = 'postgres-fixtures'
 filter = 'package(wyrd-server) and binary(pg_router_smoke)'
 test-group = 'postgres-fixtures'
 
+# The platform administration journeys also boot one WyrdTestServer per test;
+# unbounded default-profile parallelism exhausts Postgres connections at boot.
+[[profile.default.overrides]]
+filter = 'package(wyrd-server) and binary(platform_admin_e2e)'
+test-group = 'postgres-fixtures'
+
 [[profile.default.overrides]]
 filter = 'package(wyrd-sql) and test(/embedded/)'
 test-group = 'embedded-postgres'
+
+# Every other server-booting wyrd-family test starts its own WyrdTestServer,
+# which holds about 14 Postgres connections: an 8-connection app pool
+# (WYRD_DB_MAX_CONNECTIONS, scripts/postgres/with-test-postgres.sh), the
+# migrator and platform-admin pools of 2 each, and its fixture-database
+# connections. The default profile runs one test per CPU, so a wide host
+# oversubscribes max_connections=400 (docker-compose.yml) and servers fail to
+# start with "too many clients". Sixteen at once is about 224 connections,
+# leaving headroom for the capped groups above and the tests outside them.
+# Binaries already in `postgres-fixtures` keep that group: the first matching
+# override wins.
+[test-groups.pg-servers]
+max-threads = 16
+
+[[profile.default.overrides]]
+filter = '(package(wyrd-server) and binary(/^pg_/)) or (package(wyrd-cli) and test(/pg_tests::/))'
+test-group = 'pg-servers'
 
 [profile.journey]
 # Tier-1 journey binaries boot a WyrdTestServer per test, each retaining its own
@@ -89,5 +112,5 @@ threads-required = 'num-test-threads'
 max-threads = 1
 
 [[profile.journey.overrides]]
-filter = 'package(wyrd-testing) and binary(oracle) and test(/^(analytical_activation|peer_network|mcp)::/)'
+filter = 'package(wyrd-testing) and binary(oracle) and test(/^(analytical_activation|peer_network|mcp|workflow)::/)'
 test-group = 'peer-clusters'

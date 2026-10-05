@@ -8,6 +8,8 @@
 //! query-file macros.
 
 pub mod api_keys;
+pub mod device_authorizations;
+pub mod human_connections;
 pub mod login_state;
 pub mod refresh_tokens;
 pub mod revocation;
@@ -22,10 +24,26 @@ pub mod workload_bindings;
 pub use api_keys::{
     ApiKeyMetadataRow, credential_belongs_to, list_api_key_metadata, revoke_api_key,
 };
-pub use login_state::{LoginStateRow, insert_login_state, take_login_state};
+pub use device_authorizations::{
+    DevicePoll, approve_device_authorization, delete_device_authorization,
+    deny_device_authorization, insert_device_authorization, pending_device_authorization,
+    poll_device_authorization,
+};
+pub use human_connections::{
+    HumanConnectionWrite, SealedSecretRow, SealedSecretTable, deactivate_active_human_connection,
+    human_candidate_test_is_current, human_connection_in_state, human_connection_is_active,
+    insert_human_candidate, live_human_connections, lock_human_connection_slot,
+    promote_tested_human_candidate, remove_human_connection, replace_human_candidate,
+    sealed_tenant_secrets, stamp_human_candidate_tested, swap_sealed_tenant_secret,
+};
+pub use login_state::{
+    LoginState, RedeemedCode, consume_login_state, insert_login_state, issue_authorization_code,
+    redeem_authorization_code,
+};
 pub use refresh_tokens::{
-    consume_active_refresh, insert_refresh_token_rotated, refresh_by_hash,
-    refresh_issuance_instant, revoke_refresh, revoke_refresh_family,
+    active_refresh, consume_active_refresh, insert_human_refresh_token, lock_refresh_family,
+    refresh_by_hash, refresh_issuance_instant, revoke_refresh, revoke_refresh_chain,
+    revoke_refresh_family,
 };
 pub use revocation::{suspend_service_account_principal, suspend_user_principal};
 pub use role_assignments::{
@@ -48,7 +66,7 @@ pub use trusted_issuers::{
     trusted_issuer_exists, trusted_issuers_for_tenant, upsert_trusted_issuer,
 };
 pub use user_identities::{upsert_user_identity, user_id_by_identity};
-pub use users::{UserRow, delete_user, insert_user, user_by_email, user_by_id};
+pub use users::{UserRow, delete_user, insert_user, user_by_id};
 pub use workload_bindings::{
     WorkloadBindingWrite, delete_workload_binding, delete_workload_bindings_for_issuer,
     insert_workload_binding, upsert_workload_binding, workload_binding_by_key,

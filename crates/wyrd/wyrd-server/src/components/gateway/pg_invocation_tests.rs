@@ -13,9 +13,10 @@ use async_trait::async_trait;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::IntoResponse as _;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse as _, Response};
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{TimeDelta, Utc};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -31,7 +32,7 @@ use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_sql::ValaPostgres;
 use wiremock::matchers::{body_partial_json, header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_gateway::{
     AttemptRecord, AttemptResult, AttemptUsage, CallExecution, CallPlan, CredentialResolver,
@@ -45,10 +46,11 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::GatewayAccess;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{
-    CurrencyCode, GatewayAccountingEntryId, GatewayAccountingEntryV1, GatewayBudgetReservationId,
-    GatewayCallId, GatewayCallOutcome, GatewayCaptureMode, GatewayCapturePolicyWrite,
-    GatewayDecimal, GatewayLimit, GatewayLimitSubject, GatewayOperation, GatewayPayloadField,
-    GatewayPolicySubject, GatewayPolicyTarget, GatewayUsageAmount, ModelRef, ProviderDeployment,
+    CurrencyCode, FALLBACK_HEADER, GatewayAccountingEntryId, GatewayAccountingEntryV1,
+    GatewayBudgetReservationId, GatewayCallId, GatewayCallOutcome, GatewayCaptureMode,
+    GatewayCapturePolicyWrite, GatewayDecimal, GatewayFallbackOverride, GatewayLimit,
+    GatewayLimitSubject, GatewayOperation, GatewayPayloadField, GatewayPolicySubject,
+    GatewayPolicyTarget, GatewayUsageAmount, ModelRef, ProviderDeployment,
 };
 use wyrd_spec::ids::{ProviderCredentialName, ProviderDeploymentName, ProviderId};
 use wyrd_spec::request_id::RequestId;
@@ -774,6 +776,7 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     let refused = super::routes::chat_completions(
         State(state.clone()),
         Ok(invoker(tenant, 1, [])),
+        HeaderMap::new(),
         Ok(Json(
             json!({"model": "acme/a", "max_tokens": 10, "messages": []}),
         )),
@@ -875,6 +878,7 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     let public = super::routes::chat_completions(
         State(state.clone()),
         Ok(broad),
+        HeaderMap::new(),
         Ok(Json(
             json!({"model": "acme/a", "max_tokens": 10, "messages": []}),
         )),
@@ -1602,7 +1606,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
             DeploymentHealth::default(),
             Arc::new(
                 wyrd_gateway::HttpProviderDispatch::new(
-                    wyrd_gateway::EndpointPolicy::new(false),
+                    skald_providers::EndpointPolicy::new(false),
                     wyrd_gateway::BuiltinEndpoints::default(),
                 )
                 .expect("gateway dispatch builds"),
@@ -1709,6 +1713,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     let streaming = super::routes::chat_completions(
         State(state.clone()),
         Ok(caller.clone()),
+        HeaderMap::new(),
         Ok(Json(chat(json!({"stream": true})))),
     )
     .await;
@@ -1786,6 +1791,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     let streamed_responses = super::routes::responses(
         State(state.clone()),
         Ok(caller.clone()),
+        HeaderMap::new(),
         Ok(Json(json!({"model": "deepseek/deepseek-chat", "input": "hi", "max_output_tokens": 8, "stream": true}))),
     )
     .await;
@@ -1835,6 +1841,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         let answered = super::routes::responses(
             State(state.clone()),
             Ok(caller.clone()),
+            HeaderMap::new(),
             Ok(Json(sent.clone())),
         )
         .await;
@@ -1862,22 +1869,22 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     let model_name = "deepseek/deepseek-chat";
     let cases: [(Handler, Value, &str); 8] = [
         (
-            |s, c, r| Box::pin(super::routes::chat_completions(s, c, r)),
+            |s, c, r| Box::pin(super::routes::chat_completions(s, c, HeaderMap::new(), r)),
             json!({"model": model_name}),
             "messages",
         ),
         (
-            |s, c, r| Box::pin(super::routes::chat_completions(s, c, r)),
+            |s, c, r| Box::pin(super::routes::chat_completions(s, c, HeaderMap::new(), r)),
             json!({"model": 7, "messages": []}),
             "body",
         ),
         (
-            |s, c, r| Box::pin(super::routes::responses(s, c, r)),
+            |s, c, r| Box::pin(super::routes::responses(s, c, HeaderMap::new(), r)),
             json!({"model": model_name}),
             "input",
         ),
         (
-            |s, c, r| Box::pin(super::routes::responses(s, c, r)),
+            |s, c, r| Box::pin(super::routes::responses(s, c, HeaderMap::new(), r)),
             json!({"model": model_name, "input": 7}),
             "body",
         ),
@@ -2124,6 +2131,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
     let limited = super::routes::chat_completions(
         State(state.clone()),
         Ok(caller.clone()),
+        HeaderMap::new(),
         Ok(Json(chat(json!({"user": "limited"})))),
     )
     .await;
@@ -2201,6 +2209,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         super::routes::chat_completions(
             State(state.clone()),
             Ok(caller.clone()),
+            HeaderMap::new(),
             Ok(Json(json!({
                 "model": format!("deepseek/{name}"),
                 "messages": [{"role": "user", "content": "hi"}],
@@ -2387,7 +2396,7 @@ async fn http_replica(fixture: &PgFixture, tenant: DataTenantId, secret: &Path) 
             DeploymentHealth::default(),
             Arc::new(
                 wyrd_gateway::HttpProviderDispatch::new(
-                    wyrd_gateway::EndpointPolicy::new(false),
+                    skald_providers::EndpointPolicy::new(false),
                     wyrd_gateway::BuiltinEndpoints::default(),
                 )
                 .expect("gateway dispatch builds"),
@@ -3507,7 +3516,7 @@ async fn gateway_selected_speech_persists_one_retrievable_object() {
             &fixture,
             Arc::new(
                 wyrd_gateway::HttpProviderDispatch::new(
-                    wyrd_gateway::EndpointPolicy::new(false),
+                    skald_providers::EndpointPolicy::new(false),
                     wyrd_gateway::BuiltinEndpoints::default(),
                 )
                 .expect("gateway dispatch builds"),
@@ -4082,7 +4091,7 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
                 DeploymentHealth::default(),
                 Arc::new(
                     wyrd_gateway::HttpProviderDispatch::new(
-                        wyrd_gateway::EndpointPolicy::new(false),
+                        skald_providers::EndpointPolicy::new(false),
                         wyrd_gateway::BuiltinEndpoints::default(),
                     )
                     .expect("gateway dispatch builds"),
@@ -4626,7 +4635,7 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
     let tenant = fixture.data_tenant_id();
     let dispatch: Arc<dyn ProviderDispatch> = Arc::new(
         wyrd_gateway::HttpProviderDispatch::new(
-            wyrd_gateway::EndpointPolicy::new(false),
+            skald_providers::EndpointPolicy::new(false),
             wyrd_gateway::BuiltinEndpoints::default(),
         )
         .expect("gateway dispatch builds"),
@@ -5081,4 +5090,399 @@ async fn gateway_accounting_failure_after_a_completed_attempt_fails_the_call_spa
         "{call:?}"
     );
     assert!(attempt[0].contains("outcome=\"succeeded\""), "{attempt:?}");
+}
+
+/// One public inference ingress that reads the `wyrd-gateway-fallback`
+/// header, with the built-in deployments that serve it.
+#[derive(Debug, Clone, Copy)]
+enum FallbackIngress {
+    /// `POST /v1/chat/completions` served by `openai`.
+    ChatCompletions,
+    /// `POST /v1/responses` served by `openai`.
+    Responses,
+    /// `POST /v1/messages` served by `anthropic`.
+    AnthropicMessages,
+    /// `POST /v1beta/models/{model}:generateContent` served by `gemini`.
+    GeminiGenerateContent,
+}
+
+impl FallbackIngress {
+    /// Every ingress the header applies to.
+    const ALL: [Self; 4] = [
+        Self::ChatCompletions,
+        Self::Responses,
+        Self::AnthropicMessages,
+        Self::GeminiGenerateContent,
+    ];
+
+    /// Provider whose built-in deployments serve this ingress.
+    const fn provider(self) -> &'static str {
+        match self {
+            Self::ChatCompletions | Self::Responses => "openai",
+            Self::AnthropicMessages => "anthropic",
+            Self::GeminiGenerateContent => "gemini",
+        }
+    }
+
+    /// Model name of this ingress's deployment `suffix`; `a` always fails
+    /// upstream and `b` always answers.
+    fn model(self, suffix: &str) -> String {
+        let family = match self {
+            Self::ChatCompletions | Self::Responses => "gpt",
+            Self::AnthropicMessages => "claude",
+            Self::GeminiGenerateContent => "gemini",
+        };
+        format!("{family}-{suffix}")
+    }
+
+    /// Exact model reference of deployment `suffix`.
+    ///
+    /// # Panics
+    /// Panics when the fixed provider and model names stop forming a valid
+    /// model projection.
+    fn model_ref(self, suffix: &str) -> ModelRef {
+        model(&format!("{}/{}", self.provider(), self.model(suffix)))
+    }
+
+    /// Calls this ingress's handler for model `a` with `headers`.
+    async fn call(
+        self,
+        state: &AppState,
+        caller: Result<Caller, WyrdErrorResponse>,
+        headers: HeaderMap,
+    ) -> Response {
+        let state = State(state.clone());
+        let requested = self.model("a");
+        let messages = json!([{"role": "user", "content": "hi"}]);
+        match self {
+            Self::ChatCompletions => {
+                let body = json!({"model": format!("openai/{requested}"), "messages": messages});
+                super::routes::chat_completions(state, caller, headers, Ok(Json(body))).await
+            }
+            Self::Responses => {
+                let body = json!({"model": format!("openai/{requested}"), "input": "hi"});
+                super::routes::responses(state, caller, headers, Ok(Json(body))).await
+            }
+            Self::AnthropicMessages => {
+                let body = json!({"model": requested, "max_tokens": 8, "messages": messages});
+                super::ingress::anthropic_messages(state, caller, headers, Ok(Json(body))).await
+            }
+            Self::GeminiGenerateContent => {
+                let body = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
+                super::ingress::gemini_generate_content(
+                    state,
+                    caller,
+                    axum::extract::Path(format!("{requested}:generateContent")),
+                    axum::extract::RawQuery(None),
+                    headers,
+                    Ok(Json(body)),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Stable Wyrd code of this ingress's error envelope `body`.
+    fn code(self, body: &Value) -> Value {
+        match self {
+            Self::ChatCompletions | Self::Responses | Self::AnthropicMessages => {
+                body["error"]["code"].clone()
+            }
+            Self::GeminiGenerateContent => body["error"]["details"][0]["reason"].clone(),
+        }
+    }
+}
+
+/// Mounts the upstream answers of every [`FallbackIngress`]: each `a` model
+/// refuses retryably with `503` and each `b` model answers.
+async fn mount_fallback_upstream(upstream: &MockServer) {
+    let chat = json!({"id": "c-1", "object": "chat.completion", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}});
+    let response = json!({"id": "r-1", "object": "response", "output": [], "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}});
+    let message = json!({"id": "msg_1", "type": "message", "role": "assistant", "model": "claude-b", "content": [], "stop_reason": "end_turn", "stop_sequence": null, "usage": {"input_tokens": 1, "output_tokens": 1}});
+    let generated = json!({"candidates": [], "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2}});
+    let refused = ResponseTemplate::new(503)
+        .set_body_json(json!({"error": {"message": "overloaded", "type": "server_error"}}));
+    for (route, answer) in [
+        ("/v1/chat/completions", chat),
+        ("/v1/responses", response),
+        ("/v1/messages", message),
+    ] {
+        let family = if route == "/v1/messages" {
+            "claude"
+        } else {
+            "gpt"
+        };
+        Mock::given(method("POST"))
+            .and(path(route))
+            .and(body_partial_json(json!({"model": format!("{family}-a")})))
+            .respond_with(refused.clone())
+            .mount(upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(route))
+            .and(body_partial_json(json!({"model": format!("{family}-b")})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+            .mount(upstream)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-a:generateContent"))
+        .respond_with(refused)
+        .mount(upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-b:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(generated))
+        .mount(upstream)
+        .await;
+}
+
+/// Encodes `candidates` as a `wyrd-gateway-fallback` header map.
+///
+/// # Panics
+/// Panics when the override cannot be serialized or its unpadded base64url
+/// encoding is not a valid header value; both hold for every model reference.
+fn fallback_headers(candidates: &[ModelRef]) -> HeaderMap {
+    let fallback = GatewayFallbackOverride {
+        candidates: candidates.to_vec(),
+    };
+    let value = fallback.to_header_value().expect("override encodes");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        FALLBACK_HEADER,
+        value.parse().expect("base64url is a header value"),
+    );
+    headers
+}
+
+/// Proves every public inference ingress consumes `wyrd-gateway-fallback`.
+///
+/// Without the header a failing model gets only tenant policy, which has no
+/// fallback, so nothing reaches model `b`. With an override naming `b` the
+/// call completes on `b`, and no provider ever sees the header. A malformed,
+/// empty, repeated, oversized, empty-list, or self-referential value is
+/// refused with `WYRD_GATEWAY_400_INVALID_REQUEST` naming `fallback` and
+/// dispatches nothing, and authentication is reported before the header.
+///
+/// # Panics
+/// Panics when the fixture, administration, a status, an envelope, or an
+/// upstream expectation fails.
+#[tokio::test]
+async fn public_ingress_workflow_fallback() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let upstream = MockServer::start().await;
+    mount_fallback_upstream(&upstream).await;
+    let root = url::Url::parse(&upstream.uri()).expect("mock url");
+    let mut openai = root.clone();
+    openai.set_path("/v1");
+    let dispatch = wyrd_gateway::HttpProviderDispatch::new(
+        skald_providers::EndpointPolicy::new(false),
+        wyrd_gateway::BuiltinEndpoints {
+            openai: Some(openai),
+            anthropic: Some(root.clone()),
+            gemini: Some(root.clone()),
+            vertex: Some(root),
+        },
+    )
+    .expect("gateway dispatch builds");
+    let keys = super::pg_administration_tests::managed_keys(&[tenant], "v1", &["v1"]);
+    let state = managed_replica(&fixture, keys, Arc::new(dispatch)).await;
+    let admin = admin(tenant);
+    let gateway = GatewayAdministration::new(&state);
+    for (provider, auth, capabilities, served) in [
+        (
+            "openai",
+            json!({"bearer": {"credential": "openai-key"}}),
+            json!(["chat_completions", "responses"]),
+            "gpt",
+        ),
+        (
+            "anthropic",
+            json!({"api_key_header": {"header": "x-api-key", "credential": "anthropic-key"}}),
+            json!(["chat_completions"]),
+            "claude",
+        ),
+        (
+            "gemini",
+            json!({"api_key_header": {"header": "x-goog-api-key", "credential": "gemini-key"}}),
+            json!(["chat_completions"]),
+            "gemini",
+        ),
+    ] {
+        let credential = format!("{provider}-key");
+        gateway
+            .put_credential(
+                &admin,
+                &ProviderCredentialName::new(&credential).expect("credential name"),
+                serde_json::from_value(json!({
+                    "name": credential,
+                    "provider": provider,
+                    "source": {"managed_secret": {"secret": "sk-upstream"}},
+                }))
+                .expect("credential decodes"),
+            )
+            .await
+            .expect("credential stores");
+        for suffix in ["a", "b"] {
+            let name = format!("{served}-{suffix}");
+            gateway
+                .put_deployment(
+                    &admin,
+                    &ProviderDeploymentName::new(&name).expect("name"),
+                    serde_json::from_value(json!({
+                        "name": name,
+                        "model": model(&format!("{provider}/{name}")),
+                        "adapter": provider,
+                        "auth": auth,
+                        "capabilities": capabilities,
+                        "routing_weight": 1,
+                    }))
+                    .expect("deployment decodes"),
+                )
+                .await
+                .expect("deployment stores");
+        }
+    }
+    gateway
+        .put_governance(
+            &admin,
+            serde_json::from_value(json!({
+                "limits": [], "budgets": [], "pricing": [], "unknown_cost": "allow_unpriced",
+            }))
+            .expect("governance decodes"),
+        )
+        .await
+        .expect("governance stores");
+    let caller = invoker(
+        tenant,
+        11,
+        ["openai", "anthropic", "gemini"].map(|provider| {
+            Permission::gateway_invoke(GatewayAccess::Provider {
+                provider: ProviderId::new(provider).expect("provider"),
+            })
+        }),
+    );
+    let reached = |requests: &[Request], name: &str| {
+        requests.iter().any(|request| {
+            request.url.path().contains(name)
+                || serde_json::from_slice::<Value>(&request.body)
+                    .is_ok_and(|body| body["model"] == name)
+        })
+    };
+
+    for ingress in FallbackIngress::ALL {
+        let b = ingress.model("b");
+        let earlier = upstream.received_requests().await.expect("recording").len();
+        let unmodified = ingress
+            .call(&state, Ok(caller.clone()), HeaderMap::new())
+            .await;
+        assert_ne!(unmodified.status(), StatusCode::OK, "{ingress:?}");
+        let requests = upstream.received_requests().await.expect("recording");
+        assert!(
+            !reached(&requests[earlier..], &b),
+            "{ingress:?}: without the header only tenant policy applies"
+        );
+
+        let overridden = ingress
+            .call(
+                &state,
+                Ok(caller.clone()),
+                fallback_headers(&[ingress.model_ref("b")]),
+            )
+            .await;
+        let status = overridden.status();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{ingress:?} {}",
+            body_json(overridden).await
+        );
+        let requests = upstream.received_requests().await.expect("recording");
+        assert!(
+            reached(&requests[earlier..], &b),
+            "{ingress:?}: the override reaches b"
+        );
+
+        let encode = |document: Value| URL_SAFE_NO_PAD.encode(document.to_string());
+        let requested = json!({"provider": ingress.provider(), "model": ingress.model("a")});
+        let refused = [
+            ("malformed", vec!["%%%".to_owned()]),
+            ("empty value", vec![String::new()]),
+            ("repeated", {
+                let value = fallback_headers(&[ingress.model_ref("b")])[FALLBACK_HEADER]
+                    .to_str()
+                    .expect("ascii")
+                    .to_owned();
+                vec![value.clone(), value]
+            }),
+            ("oversized", vec!["A".repeat(8 * 1024 + 1)]),
+            ("empty list", vec![encode(json!({"candidates": []}))]),
+            (
+                "self-referential",
+                vec![encode(json!({"candidates": [requested]}))],
+            ),
+        ];
+        for (case, values) in refused {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append(FALLBACK_HEADER, value.parse().expect("header value"));
+            }
+            let dispatched = upstream.received_requests().await.expect("recording").len();
+            let answer = ingress.call(&state, Ok(caller.clone()), headers).await;
+            assert_eq!(
+                answer.status(),
+                StatusCode::BAD_REQUEST,
+                "{ingress:?} {case}"
+            );
+            let body = body_json(answer).await;
+            assert_eq!(
+                ingress.code(&body),
+                "WYRD_GATEWAY_400_INVALID_REQUEST",
+                "{ingress:?} {case}: {body}"
+            );
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("fallback")),
+                "{ingress:?} {case}: {body}"
+            );
+            if matches!(
+                ingress,
+                FallbackIngress::ChatCompletions | FallbackIngress::Responses
+            ) {
+                assert_eq!(body["error"]["param"], "fallback", "{ingress:?} {case}");
+            }
+            assert_eq!(
+                upstream.received_requests().await.expect("recording").len(),
+                dispatched,
+                "{ingress:?} {case}: a refused header dispatches nothing"
+            );
+        }
+
+        let unauthenticated = ingress
+            .call(
+                &state,
+                Err(WyrdErrorResponse::from(WyrdError::Unauthenticated {
+                    message: "missing token".to_owned(),
+                    details: json!({}),
+                })),
+                fallback_headers(&[]),
+            )
+            .await;
+        assert_eq!(
+            unauthenticated.status(),
+            StatusCode::UNAUTHORIZED,
+            "{ingress:?}: authentication precedes the header"
+        );
+    }
+
+    let requests = upstream.received_requests().await.expect("recording");
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.headers.contains_key(FALLBACK_HEADER)),
+        "the header never reaches a provider"
+    );
+    drain_gateway(&state).await;
 }

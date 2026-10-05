@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import urllib.parse
 import urllib.request
 import uuid
 from typing import TYPE_CHECKING
@@ -1039,8 +1040,14 @@ def _access_token(server: WyrdTestServer, api_key: str) -> str:
 
     request = urllib.request.Request(
         f"{server.base_url}/auth/token",
-        data=json.dumps({"grant_type": "wyrd_api_key", "api_key": api_key}).encode(),
-        headers={"content-type": "application/json"},
+        data=urllib.parse.urlencode(
+            {
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "subject_token": api_key,
+                "subject_token_type": "urn:wyrd:oauth:token-type:api_key",
+            }
+        ).encode(),
+        headers={"content-type": "application/x-www-form-urlencoded"},
         method="POST",
     )
     with urllib.request.urlopen(request) as response:

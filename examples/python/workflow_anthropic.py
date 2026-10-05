@@ -39,13 +39,18 @@ def main() -> None:
         ),
     )
 
-    workflow = Workflow.sequential("research-and-write", researcher, writer)
+    workflow = (
+        Workflow.sequential("research-and-write", researcher, writer)
+        .with_inputs({"input": ""})
+        .with_step_inputs("researcher", {"topic": "input.input"})
+        .with_step_inputs("writer", {"research": "steps.researcher.output.text"})
+        .with_outputs({"summary": "steps.writer.output.text"})
+    )
     workflow.set_version("0.1.0")
     run = workflow.run("renewable energy storage")
 
-    print(f"steps completed: {len(run.outcomes)}")
-    if run.final_step_id:
-        print(f"final step status: {run.outcomes[run.final_step_id].status}")
+    print(f"status: {run.status}")
+    print(f"outputs: {run.outputs}")
 
 
 if __name__ == "__main__":

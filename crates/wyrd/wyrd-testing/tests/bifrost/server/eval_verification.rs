@@ -184,6 +184,7 @@ fn connect(server: &WyrdTestServer, credential: &str) -> WyrdClient {
         Some(server.base_url().expect("bound server has a URL")),
         Some(credential),
         server.grpc_url().as_deref(),
+        None,
     )
     .expect("client builds")
 }

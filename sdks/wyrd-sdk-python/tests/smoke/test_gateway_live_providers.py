@@ -177,7 +177,11 @@ def caller(server: WyrdTestServer, provider: str, models: Sequence[str]) -> str:
     )
     response = httpx.post(
         f"{server.base_url}/auth/token",
-        json={"grant_type": "wyrd_api_key", "api_key": key},
+        data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "subject_token": key,
+            "subject_token_type": "urn:wyrd:oauth:token-type:api_key",
+        },
     )
     response.raise_for_status()
     return response.json()["access_token"]

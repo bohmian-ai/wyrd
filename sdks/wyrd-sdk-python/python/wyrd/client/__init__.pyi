@@ -9,9 +9,10 @@ from typing import Literal
 class WyrdClient:
     """Authenticated Wyrd client that can act for another principal.
 
-    One client carries the HTTP and gRPC transport plus the credential every
-    request presents. Pass it to ``Bifrost(client=...)`` to reuse its
-    authentication; its own credential is the actor in ``on_behalf_of``.
+    Construction resolves omitted values from the environment, then the saved
+    ``wyrd auth login`` for this server (the newest unless ``tenant`` selects
+    one), then ``~/.config/wyrd/credentials.toml``. The client's own
+    credential is the actor in ``on_behalf_of``.
     """
 
     def __init__(
@@ -19,6 +20,7 @@ class WyrdClient:
         server_url: str | None = None,
         credential: str | None = None,
         grpc_url: str | None = None,
+        tenant: str | None = None,
     ) -> None:
         """Build a client, resolving every omitted value locally.
 
@@ -30,16 +32,24 @@ class WyrdClient:
                 ``http://localhost:8080`` if omitted.
             credential: the API key or bearer token. Resolved through
                 ``WYRD_ACCESS_TOKEN`` → ``WYRD_WORKLOAD_TOKEN`` + tenant →
-                ``WYRD_API_KEY`` → ``~/.config/wyrd/credentials.toml``
+                ``WYRD_API_KEY`` → this server's saved ``wyrd auth login`` →
+                ``~/.config/wyrd/credentials.toml``
                 ``[default].api_key`` if omitted.
             grpc_url: the gRPC endpoint. Resolved from ``WYRD_GRPC_URL`` and
                 then the effective server URL's scheme and host on port
                 ``50051`` if omitted.
+            tenant: the tenant route key that selects one server's saved
+                login or the workload-token tenant. An explicit credential,
+                access token, or API key already names its tenant and refuses
+                it.
 
         Raises:
             WyrdError: ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no credential
-                resolves; ``WYRD_CLIENT_503_TRANSPORT_DOWN`` when the HTTP
-                transport cannot be built.
+                resolves; ``WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE`` when this
+                server has saved logins but none for ``tenant``, or the saved
+                login can no longer be renewed;
+                ``WYRD_CLIENT_503_TRANSPORT_DOWN`` when the HTTP transport
+                cannot be built.
 
         """
         ...

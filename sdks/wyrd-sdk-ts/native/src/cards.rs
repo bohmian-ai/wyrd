@@ -16,6 +16,7 @@ use wyrd_client::state::WyrdState;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{CardRef, CardRefParseError};
 
+use crate::workflow::{NativeWorkflowLoad, parse_workflow_selector};
 use crate::{NativeLifecycleResult, NativeTableConfig, NativeWyrdError};
 
 /// Tenant-scoped Card registry handle over the shared `wyrd_client` Cards.
@@ -43,14 +44,17 @@ pub struct NativeCardsConnection {
 pub fn connect_cards(
     server_url: Option<String>,
     credential: Option<String>,
+    tenant: Option<String>,
 ) -> NativeCardsConnection {
     let client = wyrd_client::bifrost::client_from_options(
         server_url.as_deref(),
         credential.as_deref(),
         None,
+        tenant.as_deref(),
     );
     drop(server_url);
     drop(credential);
+    drop(tenant);
     match client {
         Ok(client) => NativeCardsConnection {
             cards: Some(NativeCards {
@@ -147,6 +151,28 @@ impl NativeCards {
             Err(error) => Err(error),
         };
         NativeLifecycleResult::outcome(result)
+    }
+
+    /// Loads one registered Workflow and its locked Agents and Prompts.
+    ///
+    /// `selector_json` is `{ "space", "name", "version" }` or `{ "uid" }`; any
+    /// other shape, including a mix of both, is refused with
+    /// `WYRD_WORKFLOW_400_INVALID_CARD_REF` before any read. A valid selector delegates
+    /// to the shared [`wyrd_client::WorkflowCards::load`], which reads every
+    /// Card at its locked version.
+    ///
+    /// Never rejects: a failure is returned in [`NativeWorkflowLoad::error`]
+    /// with its catalog code, and the public TypeScript `cards.workflow.load`
+    /// throws it as a `WyrdError`. Loading only reads Cards. If the Node
+    /// promise is abandoned, completed reads may already have happened, but
+    /// no partial Workflow is returned and nothing durable is written.
+    #[napi]
+    pub async fn load_workflow(&self, selector_json: String) -> NativeWorkflowLoad {
+        let outcome = match parse_workflow_selector(&selector_json) {
+            Ok(selector) => self.cards.workflow().load(&selector).await,
+            Err(error) => Err(error),
+        };
+        NativeWorkflowLoad::from_outcome(outcome)
     }
 
     /// Soft-deletes one Card by exact reference.
@@ -278,6 +304,7 @@ impl NativeWyrdState {
         credential: Option<String>,
         grpc_url: Option<String>,
         client_byte_limit_bytes: Option<i64>,
+        tenant: Option<String>,
     ) -> Result<NativeLifecycleResult> {
         let state = match &self.state {
             Ok(state) => state,
@@ -288,6 +315,7 @@ impl NativeWyrdState {
             server_url.as_deref(),
             credential.as_deref(),
             grpc_url.as_deref(),
+            tenant.as_deref(),
         ) {
             Ok(client) => client,
             Err(error) => {

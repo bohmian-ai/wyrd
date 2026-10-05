@@ -160,6 +160,7 @@ class WyrdState:
         credential: str | None = None,
         grpc_url: str | None = None,
         client_byte_limit_bytes: int | None = None,
+        tenant: str | None = None,
     ) -> None:
         """Connect this state's one Bifrost writer and describe the fixed tables.
 
@@ -180,6 +181,10 @@ class WyrdState:
                 then derived from the server URL if omitted.
             client_byte_limit_bytes: the handle-wide ingestion byte budget.
                 256 MiB if omitted.
+            tenant: as for ``Bifrost()``; the tenant route key that selects one server's saved
+                login or the workload-token tenant. An explicit credential,
+                access token, or API key already names its tenant and refuses
+                it.
 
         Raises:
             WyrdError: ``WYRD_SDK_409_BIFROST_ALREADY_STARTED`` when this state

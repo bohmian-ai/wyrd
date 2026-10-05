@@ -92,6 +92,7 @@ impl ClientScope {
 fn fingerprint_credential(credential: &ResolvedCredential) -> String {
     let mut hasher = Sha256::new();
     match credential {
+        ResolvedCredential::Renewable(source) => hasher.update(source.identity()),
         ResolvedCredential::BearerToken(token) => hasher.update(token.expose_secret()),
         ResolvedCredential::WorkloadJwt { jwt, .. } => hasher.update(jwt.expose_secret()),
         ResolvedCredential::ApiKey(key) => hasher.update(key.expose_secret()),

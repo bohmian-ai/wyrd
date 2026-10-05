@@ -156,9 +156,15 @@ credential.
 - Tenant access tokens expire five minutes after issuance. Privileged
   operations may require a shorter configured lifetime, but never a longer
   one.
-- Refresh tokens are stored by one-way digest, rotated on every successful
-  use, and invalidated when replay is detected. Reuse of a rotated refresh
-  token revokes its token family and emits a security audit event.
+- Only a tenant human login receives a refresh token; platform sessions are
+  access-only. Refresh tokens are stored by
+  one-way digest and rotated on every use for public clients (`wyrd-cli`):
+  reuse of a rotated refresh token revokes its rotation chain and emits a
+  security audit event (RFC 9700 §4.14.2). The confidential web-app client
+  (`wyrd-ui`) authenticates every refresh, so its refresh token does not
+  rotate and ends at a fixed 12-hour absolute lifetime. Revoking a refresh
+  token (RFC 7009) ends that one login's renewal; it does not withdraw access
+  tokens already issued.
 - Every tenant access token carries issuer, audience `wyrd`, subject,
   issued-at, expiry, unique token identity, principal, tenant, Card scope,
   credential attribution, delegation chain, informational roles, and one
@@ -188,9 +194,60 @@ credential.
   token already issued keeps its snapshot authority until its five-minute
   expiry; there is no revocation list or authorization epoch. The platform
   plane instead revalidates current state on every request.
+- An accepted server Workflow run is the one bounded exception to
+  request-scoped authority. Its audited `workflows:run` submission captures a
+  token-free snapshot of principal attribution and scopes, bounded to the
+  run's pinned graph and total deadline; no bearer token or secret is
+  retained, renewed, or exposed. Token expiry, revocation, or later grant
+  change neither cancels nor widens the run, and the snapshot ends with it.
+  Later HTTP create/replay, get, and cancel requests authenticate and
+  authorize afresh. Cards reads, Bifrost queries, and gateway calls inside
+  the run still make and audit their own live per-call decisions, including
+  current gateway deployment and credential eligibility.
 - Bearer access tokens remain replayable until expiry. TLS, short lifetime,
   token-family replay detection, least privilege, and audit are the required
   replay controls. Logs and traces never record bearer material.
+
+### OAuth authorization server
+
+- Wyrd is the OAuth 2.0 authorization server for its own clients. It
+  implements only the authorization code grant with PKCE S256 at
+  `GET /auth/authorize` (RFC 6749 §4.1, RFC 7636), the device authorization
+  grant (RFC 8628), the refresh grant (RFC 6749 §6), revocation (RFC 7009),
+  token exchange (RFC 8693), JWT bearer assertions (RFC 7523), and RFC 8414
+  metadata at `/.well-known/oauth-authorization-server`.
+- Two clients are registered. `wyrd-ui`, the web app's backend-for-frontend,
+  is confidential and authenticates with `client_secret_basic`; the server
+  holds only SHA-256 digests of its secret. `wyrd-cli` is public. The
+  `wyrd-ui` redirect URI is fixed to `{public origin}/login/callback` and is
+  matched exactly.
+- An authorization code is stored by digest, expires within 60 seconds, is
+  single-use, and is bound to the client, redirect URI, PKCE challenge,
+  tenant, and principal. A device approval records only the approving
+  principal, tenant, and connection; tokens are minted when the code or
+  device code is redeemed, never stored awaiting pickup.
+- The token, platform token, revocation, and device authorization endpoints
+  take form-encoded bodies and answer with `Cache-Control: no-store`. Token
+  success is the RFC 6749 §5.1 token response, device authorization success
+  is the RFC 8628 §3.2 response, and revocation success is an empty `200`
+  (RFC 7009 §2.2). Every refusal is the RFC 6749 §5.2 error JSON, with
+  `400`, `401` for `invalid_client`, `500` for `server_error`, or `503` for
+  `temporarily_unavailable`. They are
+  the one exception to `WyrdError` problem+json: a refusal converted from a
+  `WyrdError` is logged under its Wyrd code, while a malformed form or
+  client-identification refusal is answered directly with no Wyrd code.
+- The web app keeps a person's session in one Secure, HttpOnly,
+  SameSite=Lax cookie that it encrypts and that holds the refresh token (or,
+  for operator recovery sign-in, the API key). No token reaches page data,
+  URLs, or browser JavaScript. Logout clears the cookie and revokes the
+  refresh token best-effort; it does not end the IdP session, and an access
+  token the web app already cached stays valid until it expires.
+- Interactive CLI login rate limiting is an ingress concern: deployments
+  rate-limit `POST /auth/device`, the user-code entry form, per client address
+  (RFC 8628 §5.1).
+- The deployment sealing keyring protects only stored provider and
+  workload-issuer client secrets. Wyrd stores no recoverable access token,
+  refresh token, authorization code, device code, or API key.
 
 ### Delegation and federation
 
@@ -218,6 +275,28 @@ credential.
   administrative credential.
 - Unknown issuers, unknown keys after one bounded refresh, unavailable JWKS,
   invalid claims, and ambiguous claim mappings fail authentication.
+- Every tenant shares one human-login callback, so authorization responses are
+  bound to their issuer (RFC 9207) after the login state is consumed and
+  before any token-endpoint request: a present `iss` must equal the issuer the
+  login state recorded, byte for byte, and an absent `iss` is refused when the
+  provider's discovery advertises
+  `authorization_response_iss_parameter_supported`. Either refusal is audited
+  as a denied exchange and issues no authorization code or token. Support is not
+  required to test or activate a connection, so providers that neither send
+  nor advertise `iss` (Microsoft Entra ID, Okta, Auth0) still work; for them
+  server-bound state, PKCE, and ID-token issuer validation are the controls.
+- Residual mix-up exposure: an authorization response without `iss` cannot
+  be attributed to an issuer before the code is redeemed. Exploiting that
+  requires a malicious tenant connection on the shared callback: a person
+  begins login through the attacker's connection, its provider bounces them
+  to an honest provider that sends no `iss`, and Wyrd redeems the honest
+  provider's code, with the login's PKCE verifier, at the attacker's token
+  endpoint. That can disclose a code the attacker may redeem at the honest
+  provider for a public client; it never yields a Wyrd session for the
+  victim, because the ID token must still verify under the attacker
+  connection's own issuer and tenant. Honest providers that send `iss` are
+  not exposed. Per-connection callback URLs would close the gap and are the
+  upgrade path if it ever needs closing.
 
 ## Wyrd signing keys and JWKS
 
@@ -259,7 +338,7 @@ approved scoped decision is bound into the distributed permission digest so a
 worker cannot widen it.
 
 There is no runtime cross-service invoke policy decision point. Wyrd
-authorizes every API request with its own RBAC permission check on the
+authorizes every protected API request with its own RBAC permission check on the
 verified principal, recorded to canonical audit; there is no separate
 policy engine, policy cache, or stale-allow mode to reason about.
 
@@ -336,6 +415,20 @@ Before fetching any user- or tenant-supplied URL, the server must:
 
 A string allowlist without resolved-address validation and connection pinning
 is not an SSRF control.
+
+Workflow `ext_gateway` steps use that same egress procedure from the process
+that executes them. A binding names one protocol, one exact origin, and secret
+headers given as secret references; a step's `base_url` must share the
+binding's origin and protocol. A local run reads its bindings from the shared
+client configuration under the local profile, which admits explicitly
+configured private origins and plain HTTP only to loopback; the production
+profile admits HTTPS on port 443 to public addresses only. A server run uses
+only bindings the server operator assigned to the run's tenant. Secrets are
+resolved when a run that selects the binding starts, never while loading or
+registering, and never enter Cards, run snapshots, errors, or logs. A binding
+of another protocol, an unassigned binding, or an unreadable secret refuses
+the run before any dispatch. An `ext_gateway` request never passes through
+the Wyrd gateway, and a `wyrd_gateway` request never carries binding secrets.
 
 ## Tenant and data isolation
 

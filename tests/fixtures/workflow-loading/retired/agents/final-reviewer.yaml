@@ -1,0 +1,12 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  space: workflow-loading
+  name: final-reviewer
+  version: "1.0.0"
+spec:
+  prompt: ../prompts/final-reviewer.yaml
+  tool_names: []
+  run_config:
+    max_iterations: 1
+    timeout_ms: 60000

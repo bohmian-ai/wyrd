@@ -31,7 +31,7 @@
     <span class="brand"><img src={logo} alt="" width="28" height="28" /><span class="wordmark">bohmian</span></span>
     <span class="product">WYRD</span>
     {#if data.session}
-      <details><summary class="app-control">{data.session.subject.name}</summary><form method="POST" action="?/logout"><input type="hidden" name="csrf" value={data.session.csrf} /><button class="app-control" type="submit">Sign out</button></form></details>
+      <details><summary class="app-control">{data.session.subject.name}</summary><form method="POST" action="?/logout"><button class="app-control" type="submit">Sign out</button></form></details>
     {/if}
     <button class="app-control" type="button" onclick={toggleMode} aria-label={`Switch to ${theme.mode === 'dark' ? 'light' : 'dark'} mode`}>◐ {theme.mode === 'dark' ? 'Light' : 'Dark'}</button>
   </header>
@@ -44,12 +44,17 @@
         <details class="error-details"><summary>Technical details</summary><code>{issue.code}</code></details>
       </div>
     {/if}
-    {#if !data.session}
+    {#if !data.session && data.tenantEntry}
+      <form class="tenant-entry" method="POST" action="?/tenant">
+        <label for="tenant-key">Tenant</label>
+        <input id="tenant-key" class="app-input" name="tenantKey" required autocomplete="organization" placeholder="acme" pattern={'[a-z0-9][a-z0-9_\\-]{0,62}'} />
+        <button class="app-control primary sign-in" type="submit">Continue to sign-in</button>
+      </form>
+    {:else if !data.session}
       <form method="POST" action="?/login"><button class="app-control primary sign-in" type="submit">Sign in with SSO</button></form>
     {:else if reauthentication}
       <p>This tenant requires a fresh sign-in before you continue.</p>
       <form method="POST" action="?/reauthenticate">
-        <input type="hidden" name="csrf" value={data.session.csrf} />
         <input type="hidden" name="tenantKey" value={reauthentication.key} />
         <button class="app-control primary sign-in" type="submit">Sign in with SSO</button>
       </form>
@@ -189,6 +194,13 @@
     display: block;
     margin-top: 8px;
     overflow-wrap: anywhere;
+  }
+  .tenant-entry {
+    display: grid;
+    gap: 10px;
+  }
+  .tenant-entry label {
+    font: 700 11px var(--font-mono);
   }
   .access-help {
     text-align: center;

@@ -566,12 +566,7 @@ impl<'a> VerificationControl<'a> {
             &Permission::eval_run().to_string(),
             AuditOutcome::Denied,
         );
-        audit::record_audit(
-            self.state.postgres.vala_pool(),
-            caller.data_tenant_id,
-            &denied,
-        )
-        .await?;
+        audit::record_audit(self.state.postgres.vala(), caller.data_tenant_id, &denied).await?;
         Err(Self::scope_denied(resource))
     }
 

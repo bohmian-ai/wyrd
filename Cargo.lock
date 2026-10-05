@@ -1376,7 +1376,7 @@ dependencies = [
  "async-trait",
  "azure_core",
  "futures",
- "oauth2",
+ "oauth2 4.4.2",
  "pin-project",
  "serde",
  "time",
@@ -1464,6 +1464,12 @@ name = "base64"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
+
+[[package]]
+name = "base64"
+version = "0.21.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
 
 [[package]]
 name = "base64"
@@ -3483,6 +3489,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dispatch2"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
+dependencies = [
+ "bitflags 2.13.0",
+ "objc2",
+]
+
+[[package]]
 name = "displaydoc"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3586,6 +3602,7 @@ dependencies = [
  "ff",
  "generic-array",
  "group",
+ "hkdf 0.12.4",
  "pem-rfc7468",
  "pkcs8",
  "rand_core 0.6.4",
@@ -3870,16 +3887,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "forwarded-header-value"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8835f84f38484cc86f110a805655697908257fb9a7af005234060891557198e9"
-dependencies = [
- "nonempty",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "fraction"
 version = "0.15.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4004,12 +4011,6 @@ name = "futures-task"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "037711b3d59c33004d3856fbdc83b99d4ff37a24768fa1be9ce3538a1cde4393"
-
-[[package]]
-name = "futures-timer"
-version = "3.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af43fadb8a98512d547e37b4e92e0ced13e205c061b87b4623eff01d918d6968"
 
 [[package]]
 name = "futures-util"
@@ -4161,11 +4162,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -4208,29 +4207,6 @@ dependencies = [
  "futures-core",
  "js-sys",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "governor"
-version = "0.10.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9efcab3c1958580ff1f25a2a41be1668f7603d849bb63af523b208a3cc1223b8"
-dependencies = [
- "cfg-if",
- "dashmap 6.2.1",
- "futures-sink",
- "futures-timer",
- "futures-util",
- "getrandom 0.3.4",
- "hashbrown 0.16.1",
- "nonzero_ext",
- "parking_lot",
- "portable-atomic",
- "quanta",
- "rand 0.9.5",
- "smallvec",
- "spinning_top",
- "web-time",
 ]
 
 [[package]]
@@ -4672,7 +4648,7 @@ dependencies = [
  "moka",
  "murmur3",
  "once_cell",
- "ordered-float",
+ "ordered-float 4.6.0",
  "parquet",
  "rand 0.9.5",
  "reqwest 0.12.28",
@@ -5773,6 +5749,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ndk-context"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
+
+[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5796,18 +5778,6 @@ checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
 dependencies = [
  "memchr",
 ]
-
-[[package]]
-name = "nonempty"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9e591e719385e6ebaeb5ce5d3887f7d5676fceca6411d1925ccc95745f3d6f7"
-
-[[package]]
-name = "nonzero_ext"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
 
 [[package]]
 name = "normalize-line-endings"
@@ -5972,6 +5942,73 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 1.0.69",
  "url",
+]
+
+[[package]]
+name = "oauth2"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "getrandom 0.2.17",
+ "http 1.4.2",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "url",
+]
+
+[[package]]
+name = "objc2"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a12a8ed07aefc768292f076dc3ac8c48f3781c8f2d5851dd3d98950e8c5a89f"
+dependencies = [
+ "objc2-encode",
+]
+
+[[package]]
+name = "objc2-app-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c"
+dependencies = [
+ "bitflags 2.13.0",
+ "objc2",
+ "objc2-foundation",
+]
+
+[[package]]
+name = "objc2-core-foundation"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
+dependencies = [
+ "bitflags 2.13.0",
+ "dispatch2",
+ "objc2",
+]
+
+[[package]]
+name = "objc2-encode"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef25abbcd74fb2609453eb695bd2f860d389e457f67dc17cafc8b8cbc89d0c33"
+
+[[package]]
+name = "objc2-foundation"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
+dependencies = [
+ "bitflags 2.13.0",
+ "objc2",
+ "objc2-core-foundation",
 ]
 
 [[package]]
@@ -6306,6 +6343,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "openidconnect"
+version = "4.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d8c6709ba2ea764bbed26bce1adf3c10517113ddea6f2d4196e4851757ef2b2"
+dependencies = [
+ "base64 0.21.7",
+ "chrono",
+ "dyn-clone",
+ "ed25519-dalek",
+ "hmac 0.12.1",
+ "http 1.4.2",
+ "itertools 0.10.5",
+ "log",
+ "oauth2 5.0.0",
+ "p256",
+ "p384",
+ "rand 0.8.7",
+ "rsa",
+ "serde",
+ "serde-value",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_plain",
+ "serde_with",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror 1.0.69",
+ "url",
+]
+
+[[package]]
 name = "openssl"
 version = "0.10.81"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6412,17 +6480,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "opentelemetry-stdout"
-version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc8887887e169414f637b18751487cce4e095be787d23fad13c454e2fb1b3811"
-dependencies = [
- "chrono",
- "opentelemetry",
- "opentelemetry_sdk",
-]
-
-[[package]]
 name = "opentelemetry_sdk"
 version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6444,6 +6501,15 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "ordered-float"
+version = "2.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68f19d67e5a2795c94e73e0bb1cc1a7edeb2e28efd39e2e1c9b7a40c1108b11c"
+dependencies = [
+ "num-traits",
+]
 
 [[package]]
 name = "ordered-float"
@@ -6475,6 +6541,18 @@ name = "p256"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
+dependencies = [
+ "ecdsa",
+ "elliptic-curve",
+ "primeorder",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "p384"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe42f1670a52a47d448f14b6a5c61dd78fce51856e68edaa38f7ae3a46b8d6b6"
 dependencies = [
  "ecdsa",
  "elliptic-curve",
@@ -8304,6 +8382,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-value"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3a1a3341211875ef120e117ea7fd5228530ae7e7036a779fdc9117be6b3282c"
+dependencies = [
+ "ordered-float 2.10.1",
+ "serde",
+]
+
+[[package]]
 name = "serde_bytes"
 version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8378,6 +8466,15 @@ dependencies = [
  "itoa",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "serde_plain"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ce1fc6db65a611022b23a0dec6975d63fb80a302cb3388835ff02c097258d50"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -8657,7 +8754,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "skald-observer",
  "skald-prompt",
  "skald-providers",
  "skald-runtime",
@@ -8670,6 +8766,7 @@ dependencies = [
  "workspace-hack",
  "wyrd-runtime",
  "wyrd-spec",
+ "wyrd-telemetry",
  "wyrd-utils",
 ]
 
@@ -8677,32 +8774,11 @@ dependencies = [
 name = "skald-cache"
 version = "0.0.1"
 dependencies = [
- "hex",
  "mini-moka",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "skald-spec",
- "thiserror 2.0.18",
  "workspace-hack",
-]
-
-[[package]]
-name = "skald-observer"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "opentelemetry",
- "opentelemetry_sdk",
- "pyo3",
- "serde",
- "serde_json",
- "skald-prompt",
- "skald-spec",
- "tokio",
- "workspace-hack",
- "wyrd-spec",
- "wyrd-utils",
 ]
 
 [[package]]
@@ -8731,7 +8807,9 @@ dependencies = [
  "insta",
  "jsonwebtoken 9.3.1",
  "rand 0.9.5",
+ "rcgen",
  "reqwest 0.13.4",
+ "rustls",
  "secrecy",
  "serde",
  "serde_json",
@@ -8803,16 +8881,17 @@ dependencies = [
 name = "skald-workflow"
 version = "0.0.1"
 dependencies = [
- "anyhow",
  "async-trait",
  "chrono",
+ "futures-util",
+ "http 1.4.2",
  "jsonschema",
  "pyo3",
+ "secrecy",
  "serde",
  "serde_json",
  "serde_yaml",
  "skald-agent",
- "skald-observer",
  "skald-prompt",
  "skald-providers",
  "skald-runtime",
@@ -8820,11 +8899,14 @@ dependencies = [
  "skald-tool",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
+ "tracing",
  "url",
  "uuid",
+ "wiremock",
  "workspace-hack",
- "wyrd-runtime",
  "wyrd-spec",
+ "wyrd-telemetry",
  "wyrd-utils",
 ]
 
@@ -8897,15 +8979,6 @@ name = "spin"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
-
-[[package]]
-name = "spinning_top"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d96d2d1d716fb500937168cc09353ffdc7a012be8475ac7308e1bdf0e3923300"
-dependencies = [
- "lock_api",
-]
 
 [[package]]
 name = "spki"
@@ -9908,23 +9981,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
-name = "tower_governor"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44de9b94d849d3c46e06a883d72d408c2de6403367b39df2b1c9d9e7b6736fe6"
-dependencies = [
- "axum",
- "forwarded-header-value",
- "governor",
- "http 1.4.2",
- "pin-project",
- "thiserror 2.0.18",
- "tonic",
- "tower",
- "tracing",
-]
-
-[[package]]
 name = "tracing"
 version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10313,7 +10369,6 @@ dependencies = [
  "num-traits",
  "opendal 0.57.0",
  "parquet",
- "prost",
  "rand 0.8.7",
  "rayon",
  "rcgen",
@@ -10610,6 +10665,22 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webbrowser"
+version = "1.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62c35be770821a214dbc362fc26908c853e776c0004294d0b10b8a6bad582f94"
+dependencies = [
+ "jni",
+ "log",
+ "ndk-context",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "url",
+ "web-sys",
 ]
 
 [[package]]
@@ -10977,11 +11048,14 @@ dependencies = [
  "console",
  "crossbeam-epoch",
  "crossbeam-utils",
+ "crypto-bigint",
  "crypto-common 0.1.7",
  "deranged",
  "digest 0.10.7",
  "digest 0.11.3",
+ "ed25519-dalek",
  "either",
+ "elliptic-curve",
  "errno",
  "flate2",
  "foldhash 0.2.0",
@@ -11034,7 +11108,6 @@ dependencies = [
  "percent-encoding",
  "petgraph 0.8.3",
  "pkcs8",
- "portable-atomic",
  "ppv-lite86",
  "proc-macro2",
  "prost",
@@ -11052,6 +11125,7 @@ dependencies = [
  "reqwest 0.13.4",
  "ring",
  "rmcp",
+ "rsa",
  "rustix",
  "rustls",
  "rustls-webpki",
@@ -11064,7 +11138,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sha2 0.11.0",
- "signature",
  "slab",
  "smallvec",
  "sqlx-core 0.9.0",
@@ -11080,6 +11153,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tokio-util",
+ "toml_edit",
  "tonic",
  "tower",
  "tower-http",
@@ -11109,15 +11183,10 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 name = "wyrd"
 version = "0.0.1"
 dependencies = [
- "async-trait",
- "opentelemetry",
- "opentelemetry-stdout",
- "opentelemetry_sdk",
  "schemars 0.8.22",
  "serde",
  "serde_json",
  "skald-agent",
- "skald-observer",
  "skald-prompt",
  "skald-runtime",
  "skald-spec",
@@ -11136,7 +11205,6 @@ dependencies = [
  "chrono",
  "jsonwebtoken 9.3.1",
  "rand 0.9.5",
- "reqwest 0.13.4",
  "secrecy",
  "serde",
  "serde_json",
@@ -11188,8 +11256,11 @@ dependencies = [
 name = "wyrd-auth-oidc"
 version = "0.0.1"
 dependencies = [
+ "chrono",
+ "flate2",
  "jsonwebtoken 9.3.1",
  "moka",
+ "openidconnect",
  "reqwest 0.13.4",
  "secrecy",
  "serde",
@@ -11299,6 +11370,7 @@ dependencies = [
  "url",
  "uuid",
  "vala-eval",
+ "webbrowser",
  "wiremock",
  "workspace-hack",
  "wyrd-client",
@@ -11329,8 +11401,10 @@ dependencies = [
  "futures-util",
  "hex",
  "indicatif",
+ "oauth2 5.0.0",
  "opentelemetry",
  "reqwest 0.13.4",
+ "rustix",
  "schemars 0.8.22",
  "secrecy",
  "serde",
@@ -11339,7 +11413,11 @@ dependencies = [
  "serde_urlencoded",
  "serde_yaml",
  "sha2 0.10.9",
+ "skald-providers",
+ "skald-runtime",
  "skald-spec",
+ "skald-tool",
+ "skald-workflow",
  "sqlx 0.9.0",
  "tempfile",
  "thiserror 2.0.18",
@@ -11347,6 +11425,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "toml",
+ "toml_edit",
  "tracing",
  "tracing-opentelemetry",
  "urlencoding",
@@ -11391,6 +11470,7 @@ version = "0.0.1"
 dependencies = [
  "aes-gcm",
  "argon2",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "workspace-hack",
  "zeroize",
@@ -11452,6 +11532,7 @@ dependencies = [
  "wyrd-crypt",
  "wyrd-spec",
  "wyrd-tls",
+ "wyrd-utils",
  "wyrd-vault",
  "zeroize",
 ]
@@ -11557,15 +11638,11 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "opentelemetry",
- "opentelemetry-stdout",
- "opentelemetry_sdk",
  "reqwest 0.13.4",
  "schemars 0.8.22",
  "serde",
  "serde_json",
  "skald-agent",
- "skald-observer",
  "skald-prompt",
  "skald-runtime",
  "skald-spec",
@@ -11590,7 +11667,6 @@ dependencies = [
  "serde",
  "serde_json",
  "skald-agent",
- "skald-observer",
  "skald-prompt",
  "skald-runtime",
  "skald-tool",
@@ -11627,6 +11703,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "skald-prompt",
+ "skald-workflow",
  "tempfile",
  "tokio",
  "url",
@@ -11653,6 +11730,7 @@ dependencies = [
  "tokio",
  "wyrd-client",
  "wyrd-queue",
+ "wyrd-semver",
  "wyrd-spec",
 ]
 
@@ -11707,10 +11785,12 @@ dependencies = [
  "http-body-util",
  "iceberg",
  "insta",
+ "jsonschema",
  "jsonwebtoken 9.3.1",
  "metrics",
  "metrics-exporter-prometheus",
  "mimalloc",
+ "oauth2 5.0.0",
  "opendal 0.57.0",
  "rand 0.9.5",
  "reqwest 0.13.4",
@@ -11724,8 +11804,11 @@ dependencies = [
  "sha2 0.10.9",
  "shellexpand",
  "skald-prompt",
+ "skald-providers",
  "skald-runtime",
  "skald-spec",
+ "skald-tool",
+ "skald-workflow",
  "sqlx 0.9.0",
  "subtle",
  "temp-env",
@@ -11737,7 +11820,6 @@ dependencies = [
  "toml",
  "tower",
  "tower-http",
- "tower_governor",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -11770,6 +11852,7 @@ dependencies = [
  "wyrd-testing",
  "wyrd-tls",
  "wyrd-tonic",
+ "wyrd-utils",
  "wyrd-vault",
  "zeroize",
 ]
@@ -11943,6 +12026,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "skald-prompt",
+ "skald-providers",
  "skald-runtime",
  "skald-spec",
  "sqlx 0.9.0",
@@ -12024,6 +12108,7 @@ version = "0.0.1"
 dependencies = [
  "flate2",
  "pyo3",
+ "secrecy",
  "semver",
  "serde",
  "serde_json",

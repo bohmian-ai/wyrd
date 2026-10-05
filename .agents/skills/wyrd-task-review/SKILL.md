@@ -9,10 +9,30 @@ Answer one question: does the resulting repository satisfy the original task
 exactly? This is an acceptance audit, not an opportunity to improve, redesign,
 or refactor the implementation.
 
+Audit the task against stronger repository and specification authority before
+treating its prescribed mechanics as acceptance criteria. Independently compare
+new or materially changed graph stores, traversals, loaders, parsers,
+transports, validators, lifecycle owners, caches, and orchestration with existing
+owners and callers. Record the existing alternative, missing behavior, and
+why extension is or is not sufficient. A meaningful dependency-owning struct
+may still duplicate an existing workflow; task compliance and leaf-call reuse
+cannot waive that violation. Use the existing maintainer and implementation
+reviewers, not an additional reviewer role or symbol allowlist.
+
+An invalid private task instruction routes to task correction through
+`$wyrd-plan`; a material behavior or boundary change returns
+`SPEC_REVISION_REQUIRED`. Do not strengthen replacement machinery merely
+because the task prescribed it.
+
 Keep the reviewed source immutable. Review the complete base-to-candidate range,
 not the implementation summary or only the latest fix diff. After remediation,
 include the original task, prior verdict and findings, remediation task, and
 cumulative candidate.
+
+On a remediation round, use the latest fix diff to locate changed owners and
+check closure of prior findings, while retaining the complete cumulative
+acceptance audit. A previously closed finding stays closed only with source
+evidence. Do not rediscover the same defect one caller at a time.
 
 ## Establish the subject
 
@@ -103,11 +123,27 @@ standard-library, native-platform, or installed-dependency behavior before
 accepting new code. Require the smallest safe root-cause correction without
 weakening validation, error handling, security, accessibility, or durability.
 
+Reject unearned complexity. Where a standard and conventional way exists (a
+published standard such as an RFC, or the established practice of comparable
+widely used projects), the candidate must use it. Classify any mechanism,
+state, check, file, setting, option, or error beyond that standard as `DRIFT`
+unless approved authority explicitly requires it. Never require one in a
+finding or remediation; a correction follows the standard way too.
+
 Treat each failure diagnosis in the task evidence as a claim to falsify: the
 recorded cause must explain the trace, and the fix must sit at that cause. A
 change to a test, assertion, timeout, sleep, retry, `#[ignore]`, `#[allow]`, or
 skip made to clear a failure, without a recorded diagnosis and diagnostician
 report, is a `VIOLATION`.
+
+For each suspected defect, enumerate sibling callers and writers of the same
+authority before proposing a correction. If the candidate adds a second way
+to resolve the same identity, use the same SQL capability, lock the same
+authority, validate the same token profile, or observe the same test condition,
+report the shared cause and the existing owner to reuse. Distinguish a
+standard-required check from task drift: for OIDC ID tokens and JWT bearer
+assertions, compare the complete applicable OIDC Core, RFC 7523, and RFC 8725
+rules without duplicating signature/JWKS verification or inventing a profile.
 
 Build an explicit matrix:
 
@@ -124,7 +160,14 @@ Inspect specifically for:
 - **REGRESSION** — existing behavior was unintentionally changed.
 
 Do not report optional improvements, speculative hardening, preferences,
-unrelated pre-existing debt, or refactors not required by the task. Tests prove
+unrelated pre-existing debt, or refactors not required by the task.
+
+A finding blocks only when it has a behavioral, security, tenancy,
+durability, or public-contract consequence, or when it deletes unearned code.
+Placement, naming, structure, and wording findings with no such consequence
+are non-blocking even when a style rule can be cited; record them under
+non-blocking notes and never let them alone produce `FIX_REQUIRED`. Missing
+rustdoc on a changed item stays blocking per `AGENTS.md`. Tests prove
 behavior; they do not prove that the requested behavior was built. Rely on
 repository source and the diff, not agent summaries.
 
@@ -151,6 +194,12 @@ tests, manifests, generated artifacts, and consumers to determine compliance.
 It audits all touched languages and layers; one surface cannot stand in for
 Rust, Python, TypeScript, server, contract, test, documentation, or tooling
 rules that independently apply.
+
+Inspect actual SQL capability types in production signatures and fields.
+`check:from-pools-allowlist` covers construction, not raw-pool propagation;
+a green check cannot excuse `PgPool` where `OperatorPool` or `TenantConn` is
+required. Include materially changed test helpers and rustdoc in the same
+standards pass, so documentation corrections do not become separate rounds.
 
 The `repo-rev` returns:
 
@@ -265,9 +314,10 @@ proposed remediation:
 
 1. Can it be deleted while preserving the complete task?
 2. Does existing repository behavior already solve it?
-3. Does the standard library or native platform solve it?
-4. Does an already-installed dependency solve it?
-5. Only then, what is the minimum necessary correction?
+3. Is there a standard and conventional way to do it? Use that, nothing more.
+4. Does the standard library or native platform solve it?
+5. Does an already-installed dependency solve it?
+6. Only then, what is the minimum necessary correction?
 
 Prefer a correction at the source that makes invalid state unrepresentable or
 prevents it from being produced. A guard at a consumer is appropriate when that
@@ -277,8 +327,9 @@ simplification when it weakens validation, error handling, security,
 accessibility, durability, or another explicit requirement. For each proposed
 finding the `ponytail-rev` must:
 
-1. trace the failing state from its producer to the observed consumer, inspect
-   sibling consumers, and read the full body and callers of each function the
+1. trace the failing state from its producer to the observed consumer,
+   including every caller, sibling consumer and writer of the same durable
+   authority, and existing helper; read the full body of each function the
    correction would change or move;
 2. prove the reported path is reachable and required by the approved task,
    rejecting dormant, test-only, speculative, or zero-caller surfaces unless
@@ -304,6 +355,9 @@ prior `FIND-*` IDs during remediation and assign the next unused number only to
 new findings. Each correction selects the smallest safe approach, names the
 existing owner or mechanism to reuse, and preserves adjacent behavior. When
 discovery proposed no findings, return an explicitly validated empty ledger.
+Group findings with one cause into one correction boundary and list all
+affected paths. Treat human-directed additions as separate from independently
+validated reviewer findings; never assign them a `FIND-*` ID retroactively.
 
 The orchestrator may include only independently confirmed or revised findings.
 A rejected finding is omitted, not softened into optional advice. If validation
@@ -354,7 +408,15 @@ For `FIX_REQUIRED`, also write one self-contained remediation task named
    closes the diagnosed gap without relying on repeated downstream guards;
 5. constraints, preserved behavior, and explicit non-goals;
 6. acceptance criteria mapped to every finding; and
-7. focused proof that directly exercises the gap plus broader verification.
+7. focused proof that directly exercises the gap plus only the narrowest
+   lanes covering the remediation's write set. Never require full user-journey
+   suites or broad aggregates in a task remediation; they run once at change
+   review.
+
+Batch bounded documentation corrections with the same remediation task. Keep
+the rustdoc gate intact, but never create a style-only round. If approved spec text
+conflicts with the required correction, return `SPEC_REVISION_REQUIRED` and
+name the conflict instead of prescribing an unapproved behavior change.
 
 Do not write an outcome checklist or merely restate the acceptance matrix. The
 diagnosis and recommendation are the substance of the remediation task;

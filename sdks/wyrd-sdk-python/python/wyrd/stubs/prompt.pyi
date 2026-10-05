@@ -166,8 +166,9 @@ class ProviderRequest:
     ``model_dump()`` for any request, including raw passthrough requests.
 
     Attributes:
-        provider: ``"openai"``, ``"anthropic"``, ``"google"``, ``"vertex"``,
-            or a custom provider name.
+        provider: the request dialect's default provider, such as
+            ``"google"`` for a Vertex body; ``Prompt.provider`` names the
+            dispatch destination.
         messages: the native messages or content turns as dictionaries; for
             OpenAI Responses, the input items. Empty for raw requests.
         message: the last entry of ``messages``, or ``None``.
@@ -212,10 +213,6 @@ class ProviderRequest:
         """Return the typed Gemini GenerateContent view."""
         ...
 
-    def vertex(self) -> VertexRequest:
-        """Return the typed Vertex GenerateContent view."""
-        ...
-
     def __str__(self) -> str:
         """Return the request as pretty-printed JSON."""
         ...
@@ -225,10 +222,10 @@ class ProviderResponse:
 
     @property
     def provider(self) -> str:
-        """``"openai"``, ``"anthropic"``, ``"google"``, ``"vertex"``, or a custom name.
+        """The response dialect's default provider, such as ``"google"`` for a Vertex body.
 
-        OpenAI Chat and OpenAI Responses both report ``"openai"``; Gemini
-        reports ``"google"``.
+        OpenAI Chat and OpenAI Responses both report ``"openai"``.
+        ``Prompt.provider`` names the dispatch destination.
         """
         ...
     def openai(self) -> OpenAiChatResponse:
@@ -247,9 +244,6 @@ class ProviderResponse:
         ...
     def gemini(self) -> GeminiResponse:
         """Return the typed Gemini GenerateContent view."""
-        ...
-    def vertex(self) -> VertexResponse:
-        """Return the typed Vertex GenerateContent view."""
         ...
     def model_dump(self) -> JsonDict:
         """Return the native provider response as a dictionary."""
@@ -772,22 +766,6 @@ class GoogleUsageMetadata:
     @property
     def total_token_count(self) -> int:
         """The ``totalTokenCount``."""
-        ...
-
-class VertexRequest:
-    """Read-only view of a Vertex GenerateContent request."""
-
-    @property
-    def contents(self) -> list[GoogleContent]:
-        """The ``contents`` turns, in order."""
-        ...
-
-class VertexResponse:
-    """Read-only view of a Vertex GenerateContent response."""
-
-    @property
-    def candidates(self) -> list[GoogleCandidate]:
-        """The ``candidates`` list."""
         ...
 
 class OpenAiResponsesRequest:

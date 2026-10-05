@@ -139,6 +139,7 @@ cargo nextest run --locked -p wyrd-sql --test pg_platform_identity
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^platform_authz::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^platform_credentials::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^platform_sessions::pg_tests::/)'
+cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^platform_login::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^issuance::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^exchange_api_key::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^revoke::pg_tests::/)'
@@ -683,8 +684,8 @@ def get_admin_token():
     resp = json.loads(urllib.request.urlopen(req).read())
     return resp["access_token"]
 
-def api(method, path, body=None, token=None):
-    url = f"{BASE}/admin/realms/{REALM}{path}"
+def api(method, path, body=None, token=None, realm=REALM):
+    url = f"{BASE}/admin/realms/{realm}{path}"
     data = json.dumps(body).encode() if body else None
     headers = {"Content-Type": "application/json"}
     if token:
@@ -709,7 +710,7 @@ for attempt in range(30):
 else:
     sys.exit("Keycloak admin API not ready after 60s")
 
-def create_user(username, email, password, group_path):
+def create_user(username, email, password, group_path, realm=REALM):
     api("POST", "/users", {
         "username": username,
         "email": email,
@@ -718,8 +719,8 @@ def create_user(username, email, password, group_path):
         "emailVerified": True,
         "enabled": True,
         "requiredActions": [],
-    }, token)
-    users = api("GET", f"/users?username={username}", token=token) or []
+    }, token, realm)
+    users = api("GET", f"/users?username={username}", token=token, realm=realm) or []
     if not users:
         sys.exit(f"user {username} not found after creation")
     uid = users[0]["id"]
@@ -727,17 +728,147 @@ def create_user(username, email, password, group_path):
         "type": "password",
         "temporary": False,
         "value": password,
-    }, token)
-    groups = api("GET", f"/groups?search={group_path.lstrip('/')}", token=token) or []
+    }, token, realm)
+    groups = api("GET", f"/groups?search={group_path.lstrip('/')}", token=token, realm=realm) or []
     if groups:
-        api("PUT", f"/users/{uid}/groups/{groups[0]['id']}", token=token)
+        api("PUT", f"/users/{uid}/groups/{groups[0]['id']}", token=token, realm=realm)
 
 create_user("alice", "alice@wyrd.test", "alice-password", "wyrd-admins")
 create_user("bob", "bob@wyrd.test", "wyrd-test", "wyrd-viewers")
+# The second provider's alice shares the first's email: a provider switch must
+# still make her a separate Wyrd user.
+create_user("alice", "alice@wyrd.test", "alice-password", "wyrd-admins", realm="wyrd-test-2")
 print("Keycloak users seeded")
 PYEOF
 
-cargo nextest run --locked -p wyrd-server --test identity_e2e --run-ignored=all --test-threads=1
+# WYRD_IDENTITY_TARGET selects the suite: `server` (Rust identity_e2e), `ui`
+# (the production BFF journey: identity_ui_e2e starts the real server and two
+# `node build` BFF replicas sharing its Postgres and public origin, then runs
+# the Vitest HTTP journey against them), or one saved-login journey: `cli`
+# (`wyrd auth login`), `rust`, `python`, and `typescript` (each public SDK over
+# a CLI-established login), and `client` (concurrent saved-login renewal
+# across processes). WYRD_IDENTITY_FILTER selects one exact test of that suite
+# and must select exactly one. Unfiltered runs every suite, and first proves
+# each named journey still selects exactly one test so a rename cannot
+# silently drop it.
+target="${WYRD_IDENTITY_TARGET:-}"
+case "$target" in
+  ""|server|ui|cli|rust|client|python|typescript) ;;
+  *) echo "unsupported WYRD_IDENTITY_TARGET=$target (supported: server, ui, cli, rust, client, python, typescript)" >&2; exit 2 ;;
+esac
+# One saved-login journey: its exact selector must select exactly one test,
+# and a filter, when given, must name that journey.
+saved_login_journey() {
+  case "$1" in
+    cli) name=cli_device_login_journey ;;
+    rust) name=saved_user_auth_journey ;;
+    client) name=concurrent_saved_renewal ;;
+    python) name=test_saved_user_auth_journey ;;
+    typescript) name="saved user auth journey" ;;
+  esac
+  if [ -n "${WYRD_IDENTITY_FILTER:-}" ] && [ "$WYRD_IDENTITY_FILTER" != "$name" ]; then
+    echo "WYRD_IDENTITY_FILTER=$WYRD_IDENTITY_FILTER selects no $1 journey; expected '$name'" >&2
+    exit 1
+  fi
+  case "$1" in
+    cli) rust_journey wyrd-cli cli "$name" ;;
+    rust) rust_journey wyrd-sdk-rust cards_state "$name" ;;
+    client) rust_journey wyrd-client pg_auth_e2e_against_fixture "$name" ;;
+    python)
+      mise run py:setup
+      selector="tests/integration/auth/test_saved_user_auth.py::$name"
+      count="$(cd sdks/wyrd-sdk-python && uv run python -m pytest -q --collect-only -m identity "$selector" | grep -c "::$name" || true)"
+      if [ "$count" != 1 ]; then
+        echo "Python journey $name selects $count tests; expected exactly 1" >&2
+        exit 1
+      fi
+      (cd sdks/wyrd-sdk-python && uv run python -m pytest -q -m identity "$selector")
+      ;;
+    typescript)
+      mise run ts:build
+      mise run ts:build:testing
+      journey=tests/integration/saved-user-auth.test.ts
+      count="$(cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest list "$journey" -t "$name" | grep -cF "$name" || true)"
+      if [ "$count" != 1 ]; then
+        echo "TypeScript journey '$name' selects $count tests; expected exactly 1" >&2
+        exit 1
+      fi
+      (cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run "$journey" -t "$name")
+      ;;
+  esac
+}
+# One ignored Rust journey by exact name, after proving it selects one test.
+rust_journey() {
+  expr="test(=$3)"
+  count="$(cargo nextest list --locked -p "$1" --test "$2" --run-ignored=all --message-format oneline -E "$expr" | grep -c . || true)"
+  if [ "$count" != 1 ]; then
+    echo "$1 --test $2 $3 selects $count tests; expected exactly 1" >&2
+    exit 1
+  fi
+  cargo nextest run --locked -p "$1" --test "$2" --run-ignored=all -E "$expr"
+}
+if [ -n "${WYRD_IDENTITY_FILTER:-}" ] && [ -z "$target" ]; then
+  target=server
+fi
+ui_dir=crates/wyrd/wyrd-server/wyrd-ui
+ui_journey=src/lib/server/auth/production-auth.integration.test.ts
+selected_count() {
+  cargo nextest list --locked -p wyrd-server --test identity_e2e --run-ignored=all --message-format oneline -E "$1" | grep -c . || true
+}
+ui_selected_count() {
+  (cd "$ui_dir" && WYRD_UI_INTEGRATION=1 pnpm exec vitest list "$ui_journey" -t "$1" | grep -cF "$1") || true
+}
+run_ui() {
+  pnpm --dir "$ui_dir" install --frozen-lockfile
+  pnpm --dir "$ui_dir" build
+  for required in "production SSO crosses replicas" "OIDC-off credential UI" "production multi-provider tenant switch" "production provider replacement settings"; do
+    count="$(ui_selected_count "$required")"
+    if [ "$count" != 1 ]; then
+      echo "UI identity journey '$required' selects $count tests; expected exactly 1" >&2
+      exit 1
+    fi
+  done
+  # The host test's own name selects every UI journey it runs.
+  if [ -n "${WYRD_IDENTITY_FILTER:-}" ] && [ "$WYRD_IDENTITY_FILTER" != production_ui_bff_journey ]; then
+    count="$(ui_selected_count "$WYRD_IDENTITY_FILTER")"
+    if [ "$count" != 1 ]; then
+      echo "WYRD_IDENTITY_FILTER=$WYRD_IDENTITY_FILTER selects $count UI tests; expected exactly 1" >&2
+      exit 1
+    fi
+    export WYRD_UI_FILTER="$WYRD_IDENTITY_FILTER"
+  fi
+  cargo nextest run --locked -p wyrd-server --test identity_ui_e2e --run-ignored=all --no-capture -E 'test(=production_ui_bff_journey)'
+}
+if [ "$target" = ui ]; then
+  run_ui
+elif [ -n "$target" ] && [ "$target" != server ]; then
+  saved_login_journey "$target"
+elif [ -n "${WYRD_IDENTITY_FILTER:-}" ]; then
+  expr="test(=${WYRD_IDENTITY_FILTER})"
+  count="$(selected_count "$expr")"
+  if [ "$count" != 1 ]; then
+    echo "WYRD_IDENTITY_FILTER=$WYRD_IDENTITY_FILTER selects $count tests; expected exactly 1" >&2
+    exit 1
+  fi
+  cargo nextest run --locked -p wyrd-server --test identity_e2e --run-ignored=all --test-threads=1 -E "$expr"
+else
+  for required in tenant_connection_admin_journey tenant_connection_rotation_journey tenant_connection_session_cutoff_journey tenant_human_login_journey tenant_callback_refusal_journey tenant_callback_issuer_binding_journey tenant_connection_test_sign_in_journey tenant_provider_switch_journey tenant_machine_independence_journey; do
+    count="$(selected_count "test(=$required)")"
+    if [ "$count" != 1 ]; then
+      echo "identity journey $required selects $count tests; expected exactly 1" >&2
+      exit 1
+    fi
+  done
+  if [ "$target" != server ]; then
+    run_ui
+  fi
+  cargo nextest run --locked -p wyrd-server --test identity_e2e --run-ignored=all --test-threads=1
+  if [ "$target" != server ]; then
+    for journey in cli rust client python typescript; do
+      saved_login_journey "$journey"
+    done
+  fi
+fi
 """
 
 [tasks."build:server"]
@@ -1127,7 +1258,7 @@ run = "uv run ruff check python/wyrd tests scripts"
 hide = true
 description = "Run ty over the generated Python stub surface"
 dir = "sdks/wyrd-sdk-python"
-run = "uv run ty check --error unused-ignore-comment python/wyrd/*.pyi python/wyrd/*/__init__.pyi tests/unit/cards/data/test_public_surface.py tests/bifrost/test_public_typing.py tests/unit/gateway/test_gateway_typing.py tests/unit/client/test_client.py tests/unit/test_operator_connections_typing.py tests/unit/runtime/test_public_api_parity.py"
+run = "uv run ty check --error unused-ignore-comment python/wyrd/*.pyi python/wyrd/*/__init__.pyi tests/unit/cards/data/test_public_surface.py tests/bifrost/test_public_typing.py tests/unit/gateway/test_gateway_typing.py tests/unit/client/test_client.py tests/unit/test_operator_connections_typing.py tests/unit/runtime/test_public_api_parity.py tests/unit/runtime/workflow/test_workflow_parameter_injection.py"
 
 [tasks."py:test:testing"]
 hide = true
@@ -1146,7 +1277,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 hide = true
 description = "Run wyrd.testing integration journeys against a live Postgres-backed server"
 dir = "sdks/wyrd-sdk-python"
-run = "uv run python -m pytest -q -m integration"
+run = "uv run python -m pytest -q -m 'integration and not identity'"
 
 [tasks."py:test:cards:integration"]
 hide = true
@@ -1177,9 +1308,17 @@ hide = true
 description = "Assert the production wyrd-sdk-python wheel does not expose wyrd.testing"
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
+# py:setup installs the testing-enabled development build, so the check builds
+# the default wheel itself and imports it from an isolated environment; the
+# plain `import wyrd` proves that environment loads the wheel at all.
 run = """
 set -eu
-if uv run python -c 'import wyrd.testing' 2>/dev/null; then
+out="$(mktemp -d)"
+trap 'rm -rf "$out"' EXIT
+uv run maturin build --out "$out"
+wheel="$(ls "$out"/*.whl)"
+uv run --isolated --no-project --with "$wheel" python -c 'import wyrd'
+if uv run --isolated --no-project --with "$wheel" python -c 'import wyrd.testing' 2>/dev/null; then
   echo 'FAIL: wyrd.testing leaked into the default wyrd-sdk-python wheel'
   exit 1
 fi
@@ -1253,7 +1392,7 @@ run = "cargo run --locked -p wyrd-cli --example registration_progress"
 hide = true
 description = "Build all example binaries"
 run = [
-  "cargo build -p skald-workflow --examples --features otel",
+  "cargo build --locked -p wyrd-rust-examples",
   "cargo check --locked -p wyrd-cli --example registration_progress",
 ]
 
@@ -1528,7 +1667,9 @@ seeds a tenant, mints a key, and drives @wyrd/sdk against it, tearing down via s
 in finally — symmetric with the Python journey.
 """
 dir = "sdks/wyrd-sdk-ts/wyrd"
-run = "pnpm exec vitest run tests/integration"
+# The saved user login journey needs the identity lane's Keycloak; only
+# test:identity:journey runs it.
+run = "pnpm exec vitest run tests/integration --exclude tests/integration/saved-user-auth.test.ts"
 
 [tasks."check:single-into-response-impl"]
 hide = true

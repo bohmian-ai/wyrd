@@ -1,6 +1,6 @@
 //! Generic OIDC verification toolkit.
 //!
-//! Provides provider discovery, JWKS caching, trusted-issuer registry, claim
+//! Provides the human-login relying party ([`relying_party`]), JWKS caching, trusted-issuer registry, claim
 //! mapping, and configuration resolver traits for any conformant OIDC provider.
 //!
 //! # Design constraints
@@ -17,17 +17,22 @@ pub mod claims;
 pub mod config;
 pub mod error;
 pub mod jwks;
-pub mod provider;
 pub mod registry;
+pub mod relying_party;
 pub mod screening;
 
 pub use claims::{MappedClaims, map_claims};
 pub use config::IssuerConfigResolver;
 pub use error::OidcError;
 pub use jwks::{JwksCache, OidcKid};
-pub use provider::{OidcProvider, ProviderMetadata};
 pub use registry::{
     ClaimMapping, ClaimPath, ClientAuth, IssuerVerification, TrustedIssuer, TrustedIssuerRegistry,
     WorkloadBinding, WorkloadBindingResolver,
 };
-pub use screening::{AddressPolicy, ScreenError, ScreenedHttp};
+pub use relying_party::{
+    Authorization, CodeRedemption, IssuerParameterMetadata, ProviderHttpError, ProviderMetadata,
+    RelyingParty, RelyingPartyError, VerifiedIdToken,
+};
+pub use screening::{
+    AddressPolicy, MAX_RESPONSE_BYTES, ScreenError, ScreenedHttp, read_bounded_body,
+};

@@ -1,18 +1,28 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TokenRequest",
-  "description": "Body of `POST /auth/token`.",
+  "description": "Parameters of `POST /auth/token`, discriminated by `grant_type`.",
   "oneOf": [
     {
-      "description": "Wyrd-native API key exchange.",
+      "description": "RFC 6749 §4.1.3: redeem a Wyrd authorization code with its PKCE verifier (RFC 7636 §4.5).",
       "type": "object",
       "required": [
-        "api_key",
-        "grant_type"
+        "code",
+        "code_verifier",
+        "grant_type",
+        "redirect_uri"
       ],
       "properties": {
-        "api_key": {
-          "description": "API key from the deployment secret store.",
+        "code": {
+          "description": "The code `GET /auth/authorize` returned to the redirect URI.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SecretBearer"
+            }
+          ]
+        },
+        "code_verifier": {
+          "description": "The PKCE code verifier whose S256 challenge the request carried.",
           "allOf": [
             {
               "$ref": "#/definitions/SecretBearer"
@@ -22,45 +32,102 @@
         "grant_type": {
           "type": "string",
           "enum": [
-            "wyrd_api_key"
+            "authorization_code"
           ]
+        },
+        "redirect_uri": {
+          "description": "The exact redirect URI the authorization request carried.",
+          "type": "string"
         }
-      },
-      "additionalProperties": false
+      }
     },
     {
-      "description": "RFC 8693 token exchange: the actor acts on behalf of the subject.\n\nThe issued token names the subject as its top-level principal, the actor as the outermost `act` layer, and `audience` as its `aud`. Its authority is the intersection of both parties' permissions.",
+      "description": "RFC 6749 §6: renew a human session.",
       "type": "object",
       "required": [
-        "actor_token",
-        "actor_token_type",
-        "audience",
         "grant_type",
-        "subject_token",
-        "subject_token_type"
+        "refresh_token"
       ],
       "properties": {
-        "actor_token": {
-          "description": "Wyrd access token of the party doing the work (the actor).",
+        "grant_type": {
+          "type": "string",
+          "enum": [
+            "refresh_token"
+          ]
+        },
+        "refresh_token": {
+          "description": "The Wyrd refresh token.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SecretBearer"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "description": "RFC 8628 §3.4: poll with the device code from `POST /auth/device_authorization`.",
+      "type": "object",
+      "required": [
+        "device_code",
+        "grant_type"
+      ],
+      "properties": {
+        "device_code": {
+          "description": "The device code.",
           "allOf": [
             {
               "$ref": "#/definitions/SecretBearer"
             }
           ]
         },
+        "grant_type": {
+          "type": "string",
+          "enum": [
+            "urn:ietf:params:oauth:grant-type:device_code"
+          ]
+        }
+      }
+    },
+    {
+      "description": "RFC 8693 §2.1 token exchange.\n\nWith an [`ExchangeTokenType::ApiKey`] subject and no actor, the Wyrd API key is exchanged for an access token of its own principal. With an [`ExchangeTokenType::AccessToken`] subject and actor, the actor acts on behalf of the subject: the issued token names the subject as its principal, the actor as its outermost `act`, and `audience` as its `aud`, with the intersection of both parties' permissions.",
+      "type": "object",
+      "required": [
+        "grant_type",
+        "subject_token",
+        "subject_token_type"
+      ],
+      "properties": {
+        "actor_token": {
+          "description": "Access token of the party doing the work; delegation only.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretBearer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "actor_token_type": {
           "description": "Type of `actor_token`.",
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/ExchangeTokenType"
+            },
+            {
+              "type": "null"
             }
           ]
         },
         "audience": {
-          "description": "Wyrd resource the delegated token is issued for.",
-          "allOf": [
+          "description": "Wyrd resource a delegated token is issued for; delegation only.",
+          "anyOf": [
             {
               "$ref": "#/definitions/TokenAudience"
+            },
+            {
+              "type": "null"
             }
           ]
         },
@@ -71,7 +138,7 @@
           ]
         },
         "subject_token": {
-          "description": "Wyrd access token of the party being acted for (the subject).",
+          "description": "The API key, or the access token of the party acted for.",
           "allOf": [
             {
               "$ref": "#/definitions/SecretBearer"
@@ -86,43 +153,10 @@
             }
           ]
         }
-      },
-      "additionalProperties": false
+      }
     },
     {
-      "description": "Human OIDC login completion.\n\nThe public completion carries only callback material. The server loads `code_verifier`, `nonce`, `redirect_uri`, issuer, and tenant from the login state keyed by `state`.",
-      "type": "object",
-      "required": [
-        "code",
-        "grant_type",
-        "state"
-      ],
-      "properties": {
-        "code": {
-          "description": "Authorization code from the identity provider callback.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/SecretBearer"
-            }
-          ]
-        },
-        "grant_type": {
-          "type": "string",
-          "enum": [
-            "authorization_code"
-          ]
-        },
-        "state": {
-          "description": "Single-use login state key generated by Wyrd.",
-          "type": "string",
-          "maxLength": 512,
-          "minLength": 1
-        }
-      },
-      "additionalProperties": false
-    },
-    {
-      "description": "Workload identity: platform-attested OIDC assertion.",
+      "description": "RFC 7523 §2.1: a platform-attested workload assertion.",
       "type": "object",
       "required": [
         "assertion",
@@ -154,44 +188,25 @@
             }
           ]
         }
-      },
-      "additionalProperties": false
-    },
-    {
-      "description": "Wyrd refresh-token rotation.",
-      "type": "object",
-      "required": [
-        "grant_type",
-        "refresh_token"
-      ],
-      "properties": {
-        "grant_type": {
-          "type": "string",
-          "enum": [
-            "refresh_token"
-          ]
-        },
-        "refresh_token": {
-          "description": "Signed Wyrd refresh token.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/SecretBearer"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false
+      }
     }
   ],
   "definitions": {
     "ExchangeTokenType": {
-      "description": "Supported RFC 8693 token type for a subject or actor token.",
+      "description": "RFC 8693 §3 token type of a subject, actor, or issued token.",
       "oneOf": [
         {
           "description": "OAuth access token.",
           "type": "string",
           "enum": [
             "urn:ietf:params:oauth:token-type:access_token"
+          ]
+        },
+        {
+          "description": "A Wyrd API key (`wyrd_sk_…`) or platform credential.",
+          "type": "string",
+          "enum": [
+            "urn:wyrd:oauth:token-type:api_key"
           ]
         }
       ]

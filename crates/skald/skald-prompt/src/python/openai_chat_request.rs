@@ -3,7 +3,7 @@
 //! Each wrapper holds an `Arc<ProviderRequest>` plus the index (or other
 //! locator) into the target field. Variant projection is guarded by
 //! construction: callers only build these wrappers from a
-//! `ProviderRequest::OpenAiChatCompletion` / `OpenAiChatCompatible`, so the
+//! `ProviderRequest::OpenAiChatCompletion`, so the
 //! `.expect("guarded")` calls and `unreachable!()` arms below assert that
 //! invariant, not a runtime fact.
 
@@ -46,7 +46,6 @@ impl PyOpenAiChatRequest {
     fn req(&self) -> &OpenAiChatRequest {
         match self.inner.as_ref() {
             ProviderRequest::OpenAiChatCompletion(r) => r,
-            ProviderRequest::OpenAiChatCompatible { request, .. } => request,
             _ => unreachable!(),
         }
     }
@@ -137,7 +136,6 @@ impl PyOpenAiChatSettings {
     fn s(&self) -> &skald_spec::wire::openai_chat::OpenAiChatSettings {
         match self.inner.as_ref() {
             ProviderRequest::OpenAiChatCompletion(r) => &r.settings,
-            ProviderRequest::OpenAiChatCompatible { request, .. } => &request.settings,
             _ => unreachable!(),
         }
     }
@@ -296,9 +294,6 @@ impl PyOpenAiStop {
     fn s(&self) -> &OpenAiStop {
         match self.inner.as_ref() {
             ProviderRequest::OpenAiChatCompletion(r) => r.settings.stop.as_ref().expect("guarded"),
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                request.settings.stop.as_ref().expect("guarded")
-            }
             _ => unreachable!(),
         }
     }
@@ -337,9 +332,6 @@ impl PyOpenAiChatAudio {
     fn a(&self) -> &OpenAiChatAudio {
         match self.inner.as_ref() {
             ProviderRequest::OpenAiChatCompletion(r) => r.settings.audio.as_ref().expect("guarded"),
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                request.settings.audio.as_ref().expect("guarded")
-            }
             _ => unreachable!(),
         }
     }
@@ -377,9 +369,6 @@ impl PyOpenAiVoice {
         match self.inner.as_ref() {
             ProviderRequest::OpenAiChatCompletion(r) => {
                 &r.settings.audio.as_ref().expect("guarded").voice
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                &request.settings.audio.as_ref().expect("guarded").voice
             }
             _ => unreachable!(),
         }
@@ -437,9 +426,6 @@ impl PyOpenAiPredictionContent {
             ProviderRequest::OpenAiChatCompletion(r) => {
                 r.settings.prediction.as_ref().expect("guarded")
             }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                request.settings.prediction.as_ref().expect("guarded")
-            }
             _ => unreachable!(),
         }
     }
@@ -486,9 +472,6 @@ impl PredictionRef for ProviderRequest {
     fn prediction_ref(&self) -> Option<&OpenAiPredictionContent> {
         match self {
             ProviderRequest::OpenAiChatCompletion(r) => r.settings.prediction.as_ref(),
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                request.settings.prediction.as_ref()
-            }
             _ => None,
         }
     }
@@ -564,9 +547,6 @@ impl PyOpenAiStreamOptions {
     fn s(&self) -> &OpenAiStreamOptions {
         match self.inner.as_ref() {
             ProviderRequest::OpenAiChatCompletion(r) => r.stream_options.as_ref().expect("guarded"),
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                request.stream_options.as_ref().expect("guarded")
-            }
             _ => unreachable!(),
         }
     }
@@ -595,9 +575,6 @@ impl PyOpenAiResponseFormat {
         match self.inner.as_ref() {
             ProviderRequest::OpenAiChatCompletion(r) => {
                 r.response_format.as_ref().expect("guarded")
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                request.response_format.as_ref().expect("guarded")
             }
             _ => unreachable!(),
         }
@@ -635,12 +612,6 @@ impl PyOpenAiJsonSchema {
         match self.inner.as_ref() {
             ProviderRequest::OpenAiChatCompletion(r) => {
                 match r.response_format.as_ref().expect("guarded") {
-                    OpenAiResponseFormat::JsonSchema { json_schema } => json_schema,
-                    _ => unreachable!(),
-                }
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match request.response_format.as_ref().expect("guarded") {
                     OpenAiResponseFormat::JsonSchema { json_schema } => json_schema,
                     _ => unreachable!(),
                 }
@@ -690,9 +661,6 @@ impl PyOpenAiTool {
             ProviderRequest::OpenAiChatCompletion(r) => {
                 &r.tools.as_ref().expect("guarded")[self.index]
             }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                &request.tools.as_ref().expect("guarded")[self.index]
-            }
             _ => unreachable!(),
         }
     }
@@ -739,12 +707,6 @@ impl PyOpenAiFunction {
         match self.inner.as_ref() {
             ProviderRequest::OpenAiChatCompletion(r) => {
                 match &r.tools.as_ref().expect("guarded")[self.tool_index] {
-                    OpenAiTool::Function { function } => function,
-                    _ => unreachable!(),
-                }
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match &request.tools.as_ref().expect("guarded")[self.tool_index] {
                     OpenAiTool::Function { function } => function,
                     _ => unreachable!(),
                 }
@@ -797,12 +759,6 @@ impl PyOpenAiCustomTool {
                     _ => unreachable!(),
                 }
             }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match &request.tools.as_ref().expect("guarded")[self.tool_index] {
-                    OpenAiTool::Custom { custom } => custom,
-                    _ => unreachable!(),
-                }
-            }
             _ => unreachable!(),
         }
     }
@@ -839,12 +795,6 @@ impl PyOpenAiCustomToolFormat {
         match self.inner.as_ref() {
             ProviderRequest::OpenAiChatCompletion(r) => {
                 match &r.tools.as_ref().expect("guarded")[self.tool_index] {
-                    OpenAiTool::Custom { custom } => custom.format.as_ref().expect("guarded"),
-                    _ => unreachable!(),
-                }
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match &request.tools.as_ref().expect("guarded")[self.tool_index] {
                     OpenAiTool::Custom { custom } => custom.format.as_ref().expect("guarded"),
                     _ => unreachable!(),
                 }
@@ -893,16 +843,6 @@ impl PyOpenAiGrammar {
                 },
                 OpenAiTool::Function { .. } => unreachable!(),
             },
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match &request.tools.as_ref().expect("guarded")[self.tool_index] {
-                    OpenAiTool::Custom { custom } => match custom.format.as_ref().expect("guarded")
-                    {
-                        OpenAiCustomToolFormat::Grammar { grammar } => grammar,
-                        OpenAiCustomToolFormat::Text => unreachable!(),
-                    },
-                    OpenAiTool::Function { .. } => unreachable!(),
-                }
-            }
             _ => unreachable!(),
         }
     }
@@ -933,9 +873,6 @@ impl PyOpenAiChatToolChoice {
     fn c(&self) -> &OpenAiChatToolChoice {
         match self.inner.as_ref() {
             ProviderRequest::OpenAiChatCompletion(r) => r.tool_choice.as_ref().expect("guarded"),
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                request.tool_choice.as_ref().expect("guarded")
-            }
             _ => unreachable!(),
         }
     }
@@ -1003,12 +940,6 @@ impl PyOpenAiAllowedToolsChoice {
                     _ => unreachable!(),
                 }
             }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match request.tool_choice.as_ref().expect("guarded") {
-                    OpenAiChatToolChoice::Allowed(a) => a,
-                    _ => unreachable!(),
-                }
-            }
             _ => unreachable!(),
         }
     }
@@ -1041,12 +972,6 @@ impl PyOpenAiAllowedTools {
         match self.inner.as_ref() {
             ProviderRequest::OpenAiChatCompletion(r) => {
                 match r.tool_choice.as_ref().expect("guarded") {
-                    OpenAiChatToolChoice::Allowed(a) => &a.allowed_tools,
-                    _ => unreachable!(),
-                }
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match request.tool_choice.as_ref().expect("guarded") {
                     OpenAiChatToolChoice::Allowed(a) => &a.allowed_tools,
                     _ => unreachable!(),
                 }
@@ -1093,12 +1018,6 @@ impl PyOpenAiNamedFunctionToolChoice {
                     _ => unreachable!(),
                 }
             }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match request.tool_choice.as_ref().expect("guarded") {
-                    OpenAiChatToolChoice::Function(f) => f,
-                    _ => unreachable!(),
-                }
-            }
             _ => unreachable!(),
         }
     }
@@ -1135,12 +1054,6 @@ impl PyOpenAiFunctionChoice {
                     _ => unreachable!(),
                 }
             }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match request.tool_choice.as_ref().expect("guarded") {
-                    OpenAiChatToolChoice::Function(f) => &f.function,
-                    _ => unreachable!(),
-                }
-            }
             _ => unreachable!(),
         }
     }
@@ -1165,12 +1078,6 @@ impl PyOpenAiNamedCustomToolChoice {
         match self.inner.as_ref() {
             ProviderRequest::OpenAiChatCompletion(r) => {
                 match r.tool_choice.as_ref().expect("guarded") {
-                    OpenAiChatToolChoice::Custom(c) => c,
-                    _ => unreachable!(),
-                }
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match request.tool_choice.as_ref().expect("guarded") {
                     OpenAiChatToolChoice::Custom(c) => c,
                     _ => unreachable!(),
                 }
@@ -1207,12 +1114,6 @@ impl PyOpenAiCustomChoice {
         match self.inner.as_ref() {
             ProviderRequest::OpenAiChatCompletion(r) => {
                 match r.tool_choice.as_ref().expect("guarded") {
-                    OpenAiChatToolChoice::Custom(c) => &c.custom,
-                    _ => unreachable!(),
-                }
-            }
-            ProviderRequest::OpenAiChatCompatible { request, .. } => {
-                match request.tool_choice.as_ref().expect("guarded") {
                     OpenAiChatToolChoice::Custom(c) => &c.custom,
                     _ => unreachable!(),
                 }

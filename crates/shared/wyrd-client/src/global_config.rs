@@ -1,8 +1,11 @@
 //! User-scoped client configuration loaded from `config.toml`.
 
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
+use std::path::Path;
 
 use serde::Deserialize;
+use wyrd_spec::card::workflow::ExternalGatewayBindingConfig;
+use wyrd_spec::ids::CredentialBindingName;
 
 use crate::error::WyrdClientError;
 
@@ -13,6 +16,22 @@ pub struct GlobalConfig {
     /// Client connection and credential settings.
     #[serde(default)]
     pub client: ClientSection,
+    /// Local Workflow execution settings.
+    #[serde(default)]
+    pub workflow: LocalWorkflowConfig,
+}
+
+/// Settings for Workflows executed in this process.
+///
+/// Holds secret references only; a run resolves the references of the
+/// bindings its routes select, and loading resolves none.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalWorkflowConfig {
+    /// External gateway bindings an `ext_gateway` route selects by name,
+    /// configured as `[workflow.external_gateway_bindings.<name>]`.
+    #[serde(default)]
+    pub external_gateway_bindings: BTreeMap<CredentialBindingName, ExternalGatewayBindingConfig>,
 }
 
 /// User-scoped client settings.
@@ -35,8 +54,6 @@ pub struct ClientSection {
 pub struct TokenCacheSection {
     /// Cache persistence strategy.
     pub kind: Option<TokenCacheKind>,
-    /// Path used when the cache is persisted to disk.
-    pub path: Option<PathBuf>,
 }
 
 /// Supported access-token cache persistence strategies.
@@ -45,7 +62,7 @@ pub struct TokenCacheSection {
 pub enum TokenCacheKind {
     /// Keep access tokens in memory only.
     InMemory,
-    /// Persist access tokens on disk.
+    /// Also cache an API key's access token in `credentials.toml`.
     Disk,
 }
 
@@ -107,7 +124,7 @@ mod tests {
         let path = directory.path().join("config.toml");
         fs::write(
             &path,
-            "[client]\ngrpc_url = \"grpc\"\nhttp_url = \"http\"\ntenant = \"acme\"\n\n[client.token_cache]\nkind = \"disk\"\npath = \"tokens\"\n",
+            "[client]\ngrpc_url = \"grpc\"\nhttp_url = \"http\"\ntenant = \"acme\"\n\n[client.token_cache]\nkind = \"disk\"\n",
         )
         .unwrap();
 
@@ -117,7 +134,6 @@ mod tests {
         assert_eq!(config.client.tenant.as_deref(), Some("acme"));
         let cache = config.client.token_cache.as_ref().unwrap();
         assert_eq!(cache.kind, Some(TokenCacheKind::Disk));
-        assert_eq!(cache.path.as_deref(), Some(std::path::Path::new("tokens")));
     }
 
     #[test]

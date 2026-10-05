@@ -8,13 +8,13 @@
 # an explicit audit, not just a passing test.
 #
 # WHAT IT CHECKS: from_pools (both method and associated-function call forms)
-# does not appear outside the 2 definition files, 8 production wiring sites,
-# and 2 test sites listed in the glob exclusions below.
+# does not appear outside the 2 definition files, 9 production wiring sites,
+# and the test sites listed in the glob exclusions below.
 set -e
 # from_pools may only be called from the sites below.
 # 2 definition files: wyrd-sql/src/postgres.rs, vala-sql/src/postgres.rs
-# 8 production wiring files: wyrd-server/src/{state,boot/mod,http/middleware/authenticate,components/{auth/{principal_extractor,caller_extractor,routes},health},postgres}.rs
-# 4 in-src #[cfg(test)] sites: wyrd-server/src/{bifrost/service,query/service,app/server,oracle/lifecycle_service}.rs
+# 9 production wiring files: wyrd-server/src/{state,boot/mod,http/middleware/authenticate,components/{auth/{principal_extractor,caller_extractor,policy_hook,routes},health},postgres}.rs
+# 6 in-src #[cfg(test)] sites: wyrd-server/src/{bifrost/service,query/service,app/server,oracle/lifecycle_service,boot/auth,boot/issuer}.rs
 # 1 Vala test file: vala-bifrost-redux/tests/pg_scribe_seal.rs
 # Harness audited FD-009: constructs ValaPostgres for test fixture only.
 ! rg -n --no-heading -e '\.from_pools\(|::from_pools\(' \
@@ -32,5 +32,7 @@ set -e
     --glob '!crates/wyrd/wyrd-server/src/query/service.rs' \
     --glob '!crates/wyrd/wyrd-server/src/app/server.rs' \
     --glob '!crates/wyrd/wyrd-server/src/oracle/lifecycle_service.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/boot/auth.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/boot/issuer.rs' \
     --glob '!crates/vala/vala-bifrost-redux/tests/pg_scribe_seal.rs' \
     crates/ sdks/

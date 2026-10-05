@@ -71,6 +71,15 @@ impl<'a> TenantConn<'a> {
     pub async fn commit(self) -> Result<(), SqlError> {
         self.tx.commit().await.map_err(SqlError::TxFailed)
     }
+
+    /// Roll the transaction back now, releasing its row locks before the
+    /// caller continues, instead of deferring the rollback to drop.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::TxFailed`] when Postgres rejects the rollback.
+    pub async fn rollback(self) -> Result<(), SqlError> {
+        self.tx.rollback().await.map_err(SqlError::TxFailed)
+    }
 }
 
 fn tenant_binding_value(data_tenant_id: DataTenantId) -> String {

@@ -1,14 +1,15 @@
-//! Exact Card graph resolution for local hydration.
+//! Exact Card graph resolution for local hydration and Workflow loading.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use wyrd_spec::{
-    envelope::Card,
+    envelope::{Card, CardKind},
     error::WyrdError,
     reference::CardRef,
     registry::{ArtifactInventoryResponse, GetCardResponse},
 };
 
+use super::CardGraphHydrator;
 use crate::cards::{CardSelector, engine::RegistryEngine, reads};
 
 /// One fully resolved Card and the registry metadata needed to materialize it.
@@ -18,7 +19,8 @@ pub(super) struct ResolvedCard {
     pub(super) card_ref: CardRef,
     /// Server-returned Card envelope.
     pub(super) card: Card,
-    /// Server-owned artifact inventory.
+    /// Server-owned artifact inventory; empty under [`GraphScope::Runtime`],
+    /// which never reads inventories.
     pub(super) inventory: ArtifactInventoryResponse,
     /// Validated local aliases collected from every inbound relationship.
     pub(super) aliases: BTreeSet<String>,
@@ -31,6 +33,27 @@ pub(super) struct ResolvedGraph {
     pub(super) root: CardRef,
     /// Unique Cards ordered by exact reference.
     pub(super) cards: Vec<ResolvedCard>,
+}
+
+/// Which relationships a traversal follows and what it reads per Card.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum GraphScope {
+    /// Every typed relationship plus each Card's artifact inventory, for
+    /// publishing a complete hydration bundle.
+    Bundle,
+    /// Only Agent and Prompt relationships and no artifact inventories, for
+    /// in-memory Workflow hydration that never touches artifacts or disk.
+    Runtime,
+}
+
+impl GraphScope {
+    /// Return whether a relationship to `card_ref` belongs to this scope.
+    fn follows(self, card_ref: &CardRef) -> bool {
+        match self {
+            Self::Bundle => true,
+            Self::Runtime => matches!(card_ref.kind, CardKind::Agent | CardKind::Prompt),
+        }
+    }
 }
 
 /// One pending depth-first traversal operation.
@@ -47,8 +70,6 @@ struct GraphVisitEntry {
     card_ref: CardRef,
     /// Validated bundle alias used to reach the Card.
     alias: String,
-    /// Whether this entry consumes the root response loaded before traversal.
-    is_root: bool,
 }
 
 /// Resolution state used to identify cycles and completed shared descendants.
@@ -76,8 +97,8 @@ struct LoadedCard {
 struct GraphTraversal<'a> {
     /// Registry engine used only at remote read boundaries.
     engine: &'a RegistryEngine,
-    /// Exact root retained independently from deterministic Card ordering.
-    root: CardRef,
+    /// Relationships followed and reads performed per Card.
+    scope: GraphScope,
     /// Pending enter and exit operations.
     pending: Vec<GraphVisit>,
     /// Active and completed state keyed by exact Card reference.
@@ -86,26 +107,45 @@ struct GraphTraversal<'a> {
     aliases: BTreeMap<String, String>,
     /// Resolved nodes keyed by exact Card reference.
     nodes: BTreeMap<String, ResolvedCard>,
-    /// Root response fetched while converting the selector to an exact identity.
-    root_response: Option<GetCardResponse>,
+    /// Entry responses already read while converting a selector or authored
+    /// reference to an exact identity, keyed by exact Card reference; each is
+    /// consumed once in place of a second read.
+    preloaded: BTreeMap<String, GetCardResponse>,
 }
 
 impl<'a> GraphTraversal<'a> {
-    /// Creates traversal state around an already loaded exact root.
-    fn new(engine: &'a RegistryEngine, root: CardRef, root_response: GetCardResponse) -> Self {
+    /// Creates empty traversal state; [`Self::enter_loaded`] seeds it.
+    fn new(engine: &'a RegistryEngine, scope: GraphScope) -> Self {
         Self {
             engine,
-            pending: vec![GraphVisit::Enter(GraphVisitEntry {
-                card_ref: root.clone(),
-                alias: String::from("root"),
-                is_root: true,
-            })],
-            root,
+            scope,
+            pending: Vec::new(),
             states: BTreeMap::new(),
             aliases: BTreeMap::new(),
             nodes: BTreeMap::new(),
-            root_response: Some(root_response),
+            preloaded: BTreeMap::new(),
         }
+    }
+
+    /// Schedules an entry Card whose exact response was already read, under
+    /// `alias`, so traversal starts there without reading it again.
+    fn enter_loaded(&mut self, card_ref: CardRef, alias: String, response: GetCardResponse) {
+        self.preloaded.insert(card_ref.to_string(), response);
+        self.pending
+            .push(GraphVisit::Enter(GraphVisitEntry { card_ref, alias }));
+    }
+
+    /// Drives every scheduled operation until the closure is complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error of [`Self::process`]. Cancellation stops the
+    /// active remote read and leaves no local state.
+    async fn run(&mut self) -> Result<(), WyrdError> {
+        while let Some(visit) = self.next() {
+            self.process(visit).await?;
+        }
+        Ok(())
     }
 
     /// Removes the next depth-first operation from the traversal stack.
@@ -164,27 +204,21 @@ impl<'a> GraphTraversal<'a> {
         Ok(())
     }
 
-    /// Loads and validates one exact Card plus its artifact inventory.
+    /// Loads and validates one exact Card plus, in bundle scope, its artifact inventory.
     ///
     /// # Errors
     ///
-    /// Returns an error when the root response is reused, a remote read fails, the response does
-    /// not match the expected exact reference, or the Card has no UID.
+    /// Returns an error when a remote read fails, the response does not match the expected exact
+    /// reference, or the Card has no UID.
     async fn load_card(&mut self, entry: GraphVisitEntry) -> Result<LoadedCard, WyrdError> {
-        let response = if entry.is_root {
-            self.root_response
-                .take()
-                .ok_or_else(|| WyrdError::Internal {
-                    message: "hydration root response was consumed more than once".to_owned(),
-                    details: serde_json::json!({ "card_ref": entry.card_ref }),
-                })?
-        } else {
-            reads::get_response(
+        let response = match self.preloaded.remove(&entry.card_ref.to_string()) {
+            Some(response) => response,
+            None => reads::get_response(
                 &self.engine.client,
                 &CardSelector::exact(entry.card_ref.clone()),
             )
             .await
-            .map_err(WyrdError::from)?
+            .map_err(WyrdError::from)?,
         };
         let resolved = reads::card_ref_from_card(&response.card).map_err(WyrdError::from)?;
         if resolved != entry.card_ref {
@@ -199,9 +233,14 @@ impl<'a> GraphTraversal<'a> {
                 &entry.card_ref,
             )
         })?;
-        let inventory = reads::list_artifacts(&self.engine.client, uid)
-            .await
-            .map_err(WyrdError::from)?;
+        let inventory = match self.scope {
+            GraphScope::Bundle => reads::list_artifacts(&self.engine.client, uid)
+                .await
+                .map_err(WyrdError::from)?,
+            GraphScope::Runtime => ArtifactInventoryResponse {
+                artifacts: Vec::new(),
+            },
+        };
         Ok(LoadedCard {
             card_ref: entry.card_ref,
             card: response.card,
@@ -210,7 +249,7 @@ impl<'a> GraphTraversal<'a> {
         })
     }
 
-    /// Schedules outbound relationships in stable server order for depth-first traversal.
+    /// Schedules in-scope outbound relationships in stable server order for depth-first traversal.
     ///
     /// # Errors
     ///
@@ -218,6 +257,9 @@ impl<'a> GraphTraversal<'a> {
     /// a Card currently on the active traversal stack.
     fn schedule_relationships(&mut self, card: &Card) -> Result<(), WyrdError> {
         for relationship in card.relationships.outbound_refs.iter().rev() {
+            if !self.scope.follows(&relationship.card_ref) {
+                continue;
+            }
             let child = relationship.card_ref.clone();
             let child_alias = relationship
                 .alias
@@ -241,7 +283,6 @@ impl<'a> GraphTraversal<'a> {
                 None => self.pending.push(GraphVisit::Enter(GraphVisitEntry {
                     card_ref: child,
                     alias: child_alias,
-                    is_root: false,
                 })),
             }
         }
@@ -261,75 +302,113 @@ impl<'a> GraphTraversal<'a> {
         );
     }
 
-    /// Converts completed traversal state into an explicit root and deterministic Card list.
-    fn finish(self) -> ResolvedGraph {
-        ResolvedGraph {
-            root: self.root,
-            cards: self.nodes.into_values().collect(),
-        }
+    /// Converts completed traversal state into its deterministic Card list.
+    fn finish(self) -> Vec<ResolvedCard> {
+        self.nodes.into_values().collect()
     }
 }
 
-/// Resolves a selector and every reachable typed outbound relationship.
-///
-/// A versionless selector is first converted to an exact root. Traversal validates identities,
-/// aliases, cycles, and relationship typing while loading every Card and artifact inventory.
-///
-/// # Errors
-///
-/// Returns an error when root resolution or any graph read fails, or when the graph violates
-/// identity, alias, cycle, UID, or relationship invariants.
-///
-/// Cancellation stops the active remote read and does not create local bundle state.
-pub(super) async fn resolve_graph(
-    engine: &RegistryEngine,
-    selector: &CardSelector,
-) -> Result<ResolvedGraph, WyrdError> {
-    let (root, root_response) = load_root(engine, selector).await?;
-    let mut traversal = GraphTraversal::new(engine, root, root_response);
-    while let Some(visit) = traversal.next() {
-        traversal.process(visit).await?;
+impl CardGraphHydrator {
+    /// Resolves a selector and every reachable in-scope typed outbound relationship.
+    ///
+    /// A versionless selector is first converted to an exact root. Traversal validates
+    /// identities, aliases, cycles, and relationship typing while loading every Card and, in
+    /// bundle scope, its artifact inventory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when root resolution or any graph read fails, or when the graph violates
+    /// identity, alias, cycle, UID, or relationship invariants.
+    ///
+    /// Cancellation stops the active remote read and does not create local bundle state.
+    pub(super) async fn resolve_graph(
+        &self,
+        selector: &CardSelector,
+        scope: GraphScope,
+    ) -> Result<ResolvedGraph, WyrdError> {
+        let (root, root_response) = self.load_root(selector).await?;
+        let mut traversal = GraphTraversal::new(&self.context.engine, scope);
+        traversal.enter_loaded(root.clone(), String::from("root"), root_response);
+        traversal.run().await?;
+        Ok(ResolvedGraph {
+            root,
+            cards: traversal.finish(),
+        })
     }
-    Ok(traversal.finish())
-}
 
-/// Loads the selected root and returns its exact identity with the reusable response.
-///
-/// # Errors
-///
-/// Returns an error when the selector cannot be read or the response cannot form an exact
-/// reference.
-async fn load_root(
-    engine: &RegistryEngine,
-    selector: &CardSelector,
-) -> Result<(CardRef, GetCardResponse), WyrdError> {
-    let exact_selector = resolve_root_selector(engine, selector).await?;
-    let response = reads::get_response(&engine.client, &exact_selector)
-        .await
-        .map_err(WyrdError::from)?;
-    let card_ref = reads::card_ref_from_card(&response.card).map_err(WyrdError::from)?;
-    Ok((card_ref, response))
-}
-
-/// Converts latest-by-name lookup into an exact selector while preserving exact and UID inputs.
-///
-/// # Errors
-///
-/// Returns an error when a versionless root cannot be read or converted to an exact reference.
-async fn resolve_root_selector(
-    engine: &RegistryEngine,
-    selector: &CardSelector,
-) -> Result<CardSelector, WyrdError> {
-    match selector {
-        CardSelector::Named { version: None, .. } => {
-            let response = reads::get_response(&engine.client, selector)
-                .await
-                .map_err(WyrdError::from)?;
-            reads::card_ref_from_card(&response.card)
-                .map(CardSelector::exact)
-                .map_err(WyrdError::from)
+    /// Resolves authored external references and their in-scope transitive relationships.
+    ///
+    /// Each reference is read through its exact selector, which asserts its identity and any UID
+    /// it carries; traversal then follows the registered Cards' UID-bearing relationships
+    /// exactly as [`resolve_graph`](Self::resolve_graph) does. References are read in order, and
+    /// a Card reached more than once is loaded once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any read fails or a response does not match its reference, and the
+    /// traversal errors of [`resolve_graph`](Self::resolve_graph).
+    ///
+    /// Cancellation stops the active remote read and leaves no local state.
+    pub(super) async fn resolve_refs(
+        &self,
+        refs: &[CardRef],
+        scope: GraphScope,
+    ) -> Result<Vec<ResolvedCard>, WyrdError> {
+        let engine = &self.context.engine;
+        let mut traversal = GraphTraversal::new(engine, scope);
+        for card_ref in refs {
+            let response =
+                reads::get_response(&engine.client, &CardSelector::exact(card_ref.clone()))
+                    .await
+                    .map_err(WyrdError::from)?;
+            let exact = reads::card_ref_from_card(&response.card).map_err(WyrdError::from)?;
+            let alias = default_alias(&exact);
+            traversal.enter_loaded(exact, alias, response);
         }
-        _ => Ok(selector.clone()),
+        traversal.run().await?;
+        Ok(traversal.finish())
+    }
+
+    /// Loads the selected root and returns its exact identity with the reusable response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selector cannot be read or the response cannot form an exact
+    /// reference.
+    async fn load_root(
+        &self,
+        selector: &CardSelector,
+    ) -> Result<(CardRef, GetCardResponse), WyrdError> {
+        let exact_selector = self.resolve_root_selector(selector).await?;
+        let response = reads::get_response(&self.context.engine.client, &exact_selector)
+            .await
+            .map_err(WyrdError::from)?;
+        let card_ref = reads::card_ref_from_card(&response.card).map_err(WyrdError::from)?;
+        Ok((card_ref, response))
+    }
+
+    /// Converts latest-by-name lookup into an exact selector while preserving exact and UID
+    /// inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a versionless root cannot be read or converted to an exact
+    /// reference.
+    async fn resolve_root_selector(
+        &self,
+        selector: &CardSelector,
+    ) -> Result<CardSelector, WyrdError> {
+        match selector {
+            CardSelector::Named { version: None, .. } => {
+                let response = reads::get_response(&self.context.engine.client, selector)
+                    .await
+                    .map_err(WyrdError::from)?;
+                reads::card_ref_from_card(&response.card)
+                    .map(CardSelector::exact)
+                    .map_err(WyrdError::from)
+            }
+            _ => Ok(selector.clone()),
+        }
     }
 }
 

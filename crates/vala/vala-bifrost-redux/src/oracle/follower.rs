@@ -18,13 +18,13 @@ use datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec;
 use datafusion_proto::protobuf::{PhysicalPlanNode, physical_plan_node::PhysicalPlanType};
 use iceberg::io::FileIO;
 use iceberg_datafusion::physical_plan::IcebergTableScan;
-use prost::Message;
 use thiserror::Error;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
     ClusterRole, ExecuteFragmentRequest, FollowerScanAssignment, OracleRoleFence,
     PersistedFileDescriptor, ReservationId, TenantTableBinding,
 };
+use wyrd_tonic::prost::Message;
 
 use super::codec::{OraclePhysicalExtensionCodec, physical_plan_fingerprint};
 use crate::catalog::layout::TimePartition;

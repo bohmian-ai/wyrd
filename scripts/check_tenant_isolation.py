@@ -49,7 +49,7 @@ VALA_CATALOG_ALLOWLIST = {
 # global keys without a tenant column; the Forge active-table roster deliberately
 # inventories active tenant registrations. Both are operator-only surfaces, so
 # their isolation boundary is the DB role rather than tenant-scoped RLS. Must
-# take PgPool/OperatorPool.
+# take OperatorPool.
 VALA_OPERATOR_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/maintenance_leases.rs",
     # Cross-tenant active Bifrost roster used only by the Forge scheduler.
@@ -102,15 +102,30 @@ RAW_QUERY_ALLOWLIST_MARKERS = [
 
 TENANT_QUERY_EXCEPTION_MARKER = "tenant-isolation: cross-tenant OperatorPool"
 
+# The server's Postgres composition owner; the only server file that may name
+# a raw pool (it wraps `WyrdPostgres`/`ValaPostgres` and closes their pools).
 SERVER_POOL_ALLOWLIST_PREFIXES = (
-    "crates/wyrd/wyrd-server/src/boot/",
-    "crates/wyrd/wyrd-server/src/boot.rs",
-    "crates/wyrd/wyrd-server/src/main.rs",
     "crates/wyrd/wyrd-server/src/postgres.rs",
-    "crates/wyrd/wyrd-server/src/state.rs",
-    "crates/wyrd/wyrd-server/src/routes/platform/",
-    "crates/wyrd/wyrd-server/src/components/admin/",
 )
+
+# Production query and auth code whose SQL capabilities are restricted to
+# `TenantConn` and `OperatorPool` (agent-rules: raw `PgPool` is banned from
+# library signatures and fields). `WyrdPostgres` remains the connection owner
+# these callers acquire `tenant_conn`/`resolve_tenant_slug` from; the raw pool
+# never leaves it. `check:from-pools-allowlist` separately guards where pools
+# are *constructed*; this guards where they are *propagated*.
+SQL_CAPABILITY_DIRS = (
+    "crates/wyrd/wyrd-sql/src/queries/",
+    "crates/vala/vala-sql/src/queries/",
+    "crates/wyrd/wyrd-auth/src/",
+    "crates/wyrd/wyrd-server/src/auth/",
+    "crates/wyrd/wyrd-server/src/components/auth/",
+    "crates/wyrd/wyrd-server/src/boot/",
+    # The canonical audit append: standalone forms acquire through `ValaPostgres`.
+    "crates/wyrd/wyrd-server/src/audit/",
+)
+RAW_POOL_PATTERN = r"\bPgPool\b|\.(app|vala)_pool\s*\(\s*\)"
+
 
 CLIENT_TIER_CRATES = [
     "crates/wyrd-spec",
@@ -128,6 +143,7 @@ def main() -> int:
     check_migration_drift(failures)
     check_query_modules(failures)
     check_server_pool_usage(failures)
+    check_sql_capability_signatures(failures)
     check_platform_capability_boundary(failures)
     check_sql_source_hygiene(failures)
     check_dependency_boundaries(failures)
@@ -253,20 +269,16 @@ def check_wyrd_query_modules(failures: list[str]) -> None:
                 failures.append(
                     f"{relative}: platform query module references tenant schema"
                 )
-            if (
-                has_public_async_fn(code)
-                and not has_platform_executor(code)
-                and relative not in PLATFORM_EXECUTOR_ALLOWLIST
-            ):
+            if has_public_async_fn(code) and not has_platform_executor(code):
                 failures.append(
-                    f"{relative}: platform public async fn must take PgPool or Transaction"
+                    f"{relative}: platform public async fn must take OperatorPool or TenantConn"
                 )
             continue
 
         if is_admin:
             if has_public_async_fn(code) and not has_platform_executor(code):
                 failures.append(
-                    f"{relative}: admin public async fn must take PgPool or Transaction"
+                    f"{relative}: admin public async fn must take OperatorPool or TenantConn"
                 )
             continue
 
@@ -278,17 +290,6 @@ def check_vala_query_modules(failures: list[str]) -> None:
         relative = rel(path)
         body = production_source(path.read_text())
         code = strip_line_comments(body)
-
-        if relative in VALA_CATALOG_ALLOWLIST:
-            if references_tenant_schema(code):
-                failures.append(
-                    f"{relative}: catalog query module must not reference tenant schema"
-                )
-            if has_public_async_fn(code) and not has_platform_executor(code):
-                failures.append(
-                    f"{relative}: catalog public async fn must take PgPool or Transaction"
-                )
-            continue
 
         if relative in VALA_OPERATOR_ALLOWLIST:
             # A struct-centred owner holds its OperatorPool as a field, so its
@@ -417,6 +418,24 @@ def check_server_pool_usage(failures: list[str]) -> None:
             failures.append(
                 f"{relative}: tenant-scoped server code must use TenantConn, not raw PgPool"
             )
+
+
+def check_sql_capability_signatures(failures: list[str]) -> None:
+    """Forbid raw-pool capability in production query and auth code.
+
+    A raw `PgPool` in a signature or field lets its holder open a transaction
+    for any tenant, or run pre-tenant SQL on the RLS app role, bypassing the
+    `TenantConn`/`OperatorPool` boundary. Borrowing `app_pool()` is the same
+    capability at the call site.
+    """
+    for directory in SQL_CAPABILITY_DIRS:
+        for path in rust_files(ROOT / directory):
+            code = strip_line_comments(production_source(path.read_text()))
+            if re.search(RAW_POOL_PATTERN, code):
+                failures.append(
+                    f"{rel(path)}: production query/auth code must take TenantConn or "
+                    "OperatorPool, not a raw PgPool"
+                )
 
 
 def check_sql_source_hygiene(failures: list[str]) -> None:
@@ -737,7 +756,7 @@ def tenant_conn_owner_violations(code: str) -> list[str]:
 def has_platform_executor(code: str) -> bool:
     return (
         re.search(
-            r"&\s*PgPool\b|&\s*mut\s+TenantConn\s*<\s*'_|&\s*OperatorPool\b", code
+            r"&\s*mut\s+TenantConn\s*<\s*'_|&\s*OperatorPool\b", code
         )
         is not None
     )
@@ -756,9 +775,8 @@ RAW_TRANSACTION_PATTERN = r"\bTransaction\s*<\s*'"
 # any reason. Pool composition belongs to boot and to the route boundary that
 # already resolves the caller's tenant; the platform workflow owners below it
 # take the acquired `TenantConn` and the `OperatorPool` their platform rows
-# need, and nothing wider. Scoped to the server components: the platform query
-# modules include the pre-tenant slug resolver, which necessarily runs on the
-# app pool before any tenant is known.
+# need, and nothing wider. Scoped to the server components; the platform query
+# modules are covered by `check_sql_capability_signatures`.
 BROAD_POOL_PATTERN = r"\bWyrdPostgres\b|\bPgPool\b"
 
 PLATFORM_SERVER_DIRS = (

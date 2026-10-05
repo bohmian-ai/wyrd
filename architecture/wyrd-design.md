@@ -378,11 +378,26 @@ spec:
 ```
 
 ### Prompt
-Provider-specific request shape, flat-flattened from Skald.
+Provider-native request envelope, the serialized Skald `Prompt`.
 ```yaml
 spec:
-  # Flattened Skald Prompt: provider, model, messages, variables, response_format, ...
+  model: string
+  provider?: ProviderName          # destination; absent = the request schema's default provider
+  request:
+    provider: <wire schema>        # open_ai_chat_completion | open_ai_responses | anthropic_messages | gemini_generate_content | ...
+    body: { ... }                  # that schema's native request body
+  variables: [string]
+  response_type: text | json
 ```
+
+`request.provider` names a wire schema, never a destination; each schema has
+one variant. `provider` names where native dispatch sends it, so a custom
+OpenAI-compatible endpoint is an `open_ai_chat_completion` request with
+`provider: {custom: <name>}`, and a Vertex Prompt is a Gemini GenerateContent
+body with `provider: vertex`. Gateway routes ignore `provider` and select the
+upstream themselves. Standalone Prompt Cards may still be authored with the
+declarative `provider`/`model`/`messages` shorthand, which compiles to this
+envelope; an Agent's inline Prompt is the native envelope itself.
 
 ### Agent
 Agent contract: prompt + tools + run config. Tool names resolve through the
@@ -402,11 +417,106 @@ DAG of steps invoking other cards.
 spec:
   description?: string
   inputs: { string: ParameterValue }
-  steps: [WorkflowStep]
-  outputs: { string: json }
+  llm_route?: LlmRoute             # native (default) | wyrd_gateway | ext_gateway
+  steps: [WorkflowStep]            # id, action, depends_on, inputs, llm_route?, fallback?, timeout_seconds?, retry?
+  outputs: { string: WorkflowBinding }
   governance?: Governance
   details: { string: NonSecretValue }
 ```
+
+Data flow is explicit. A step's `inputs` bind exact sources (`input.<name>`,
+`steps.<id>.output.text`, a structured-output path) to declared Prompt
+variables, `depends_on` alone orders steps, and the Workflow's `outputs` name
+every result a run returns. Nothing is forwarded implicitly and there is no
+last-step result. Local and server runs return the same `WorkflowRun`
+snapshot, addressed by output name and step ID.
+
+A step's `llm_route` overrides the Workflow's. `native` uses the local
+process's provider registry and the Prompt's destination; server execution
+refuses it at submission with `WYRD_WORKFLOW_422_SERVER_NATIVE_UNSUPPORTED`. `wyrd_gateway` calls
+the governed Wyrd gateway with the caller's identity: locally through the
+public protocol ingress (Chat Completions, Responses, Anthropic Messages, or
+Gemini GenerateContent; a Vertex Prompt is refused before dispatch because
+the public ingress serves no Vertex dialect), and on the server in process,
+where Vertex is served. `ext_gateway` is execution-local: the process running
+the step sends the native body directly to the named binding's origin. A
+local run reads that binding from the `[workflow.external_gateway_bindings]`
+section of the shared client `config.toml`, whose secret headers are secret
+references resolved at run start for the selected bindings only; a server run
+uses the tenant-assigned server binding. An `ext_gateway` call never passes
+through the Wyrd gateway, and a binding of another protocol or with an
+unreadable secret is refused before any dispatch. Loading and registration
+never read a binding or secret.
+
+Workflow is a declarative Card, not a principal. It owns no credential, role,
+or authority; invocation uses the caller's identity. WyrdState remains a
+Service-root hydrated state and is not required for standalone Workflow loading.
+
+Clients expose `Workflow.from_path(path)` (Python), `Workflow.fromPath(path)`
+(TypeScript), and async `Workflow::from_path(path)` (Rust), including hydration.
+Fully local paths/inline bodies require no registry or credential; external
+Agent/Prompt refs and their transitive dependencies automatically use lazy
+existing default client configuration. Loading never registers, executes, or
+resolves execution secrets. Missing/denied/inactive dependencies fail before
+execution. Registered loading is `cards.workflow.load` (Python/TypeScript) or
+`cards.workflow().load` (Rust), selecting an exact named version or UID and
+following locked relationships. No loaded dependency floats to a newer version.
+
+The shared client composes existing wyrd-loader, Cards hydration, and Skald
+resolved validation/execution. Its thin Workflow facade adds the client IO
+boundary without duplicating graph state, traversal, parsing, validation, or
+runtime logic. Language SDKs project that facade; no public loader or hydrator
+is required. Shared local execution configuration serves SDKs and CLI, while
+Skald remains independent of registry IO and server tenancy.
+
+A `wyrd_gateway` step calls the existing authenticated public gateway ingress.
+Its per-step fallback travels in the optional `wyrd-gateway-fallback` request
+header: unpadded base64url over the JCS UTF-8 serialization of a
+`GatewayFallbackOverride`, at most 8 KiB encoded and 4 KiB decoded. The ingress
+authenticates the caller before parsing the header, refuses a repeated,
+malformed, oversized, empty, duplicated, or self-listing value with
+`WYRD_GATEWAY_400_INVALID_REQUEST` naming `fallback` before any dispatch, and
+consumes the header without forwarding it to a provider. Without the header,
+tenant fallback policy applies unchanged, so unmodified clients behave as
+before.
+
+A server-hosted Workflow run is an accepted job. The authenticated,
+`workflows:run`-authorized, audited submission pins the exact active graph and
+captures token-free execution authority: the caller's principal attribution
+and scopes, bounded to that run's pinned graph and total deadline. Neither a
+bearer token nor a secret is retained. Token expiry and later grant or
+credential changes neither cancel nor widen an accepted run. Later HTTP
+create/replay, get, and cancel requests authenticate and authorize afresh,
+and replay never replaces run authority. Within the run, Cards reads, Bifrost
+queries, and gateway calls still make and audit their own live per-call
+decisions under the captured authority and current owner admission rules.
+Runs are process-local; restart loses them.
+
+The server bounds runs before acceptance: step count, dependency edges,
+resolved graph bytes, decoded input bytes, and a complete-snapshot budget
+from which it reserves room for a payload-free terminal snapshot of every
+declared step, including bounded run and step error projections. A graph whose terminal snapshot cannot fit is
+refused at submission. An oversized step result fails its step, and a
+transition whose full snapshot would exceed the budget discards the provider
+payload and fails the run, so no terminal transition lacks room for its
+statuses or errors. Active and retained runs have global and per-tenant
+ceilings; terminal runs are queryable for 24 hours or until oldest-first
+eviction. Shutdown cancels and drains active runs. A multi-replica
+deployment must route a run's create, get, and cancel requests to the replica
+that owns it; any other replica answers not found.
+
+Workflow surfaces are scoped by capability. Rust, Python, and TypeScript load
+and run authored files and registered Workflows locally. Server-run
+submission, status, and cancellation ship only through the Rust
+`wyrd_client::Workflows` handle, the `/v1/workflow-runs` HTTP resource, and
+the CLI. MCP has no Workflow surface. `wyrd workflow run` takes exactly one
+source (`--file`, `--uid`, or `--space`/`--name`/`--version`) and
+`--execution local|server`; a file runs only locally. `wyrd workflow`
+commands take no `--server` option; the endpoint comes from the ambient client
+configuration. Server execution prints
+the accepted run ID and waits unless `--detach`; an interrupted wait leaves
+the run running and never cancels or resubmits it. `wyrd workflow status` and
+`wyrd workflow cancel` act on server runs.
 
 ### Mcp
 MCP server registration. The server enumerates its own tools at runtime; we do
@@ -538,8 +648,8 @@ Secrets Manager CSI driver, etc.) puts the API key into the pod as
 JWT (five minutes) and re-exchanges the same durable key when that token nears expiry
 or is refused — a machine grant issues no refresh token, so the key in the
 secret store is the only renewable authority and revoking it ends renewal.
-Rotating renewal authority is a human concern: only an OIDC login returns a
-refresh token, and only that token rotates. `/auth/token`
+Renewal authority is a human concern: only a tenant human login returns a
+refresh token (a platform login is access-only), and only the public CLI client's refresh token rotates. `/auth/token`
 derives `tenant_id` and `principal_id` from the verified API-key record;
 no client-supplied tenant header is accepted. The JWT carries the principal
 as the top-level `principal` claim, the `permissions` resolved from its current
@@ -555,6 +665,34 @@ Env vars in deployed services:
 | `WYRD_API_KEY` | REQUIRED | Deploy environment's secret store (key minted by `wyrd auth issue-key <card_ref>`) | Exchanged at `POST /auth/token` for a short-lived JWT and re-exchanged by the SDK when that token expires or is refused; no refresh token is issued. JWT carries the card-bound `principal` claim (kind, id, tenant, `card_ref`). |
 | `WYRD_SERVER_URL` | REQUIRED | Static config | Wyrd server HTTP base URL (default `http://localhost:8080`). Read by `ClientConfig::from_env`. |
 | `WYRD_GRPC_URL` | OPTIONAL | Static config | Wyrd server gRPC endpoint (default `http://localhost:50051`). Read by `ClientConfig::from_env`. |
+
+#### Human sign-in
+
+Human federation is optional per tenant. A tenant has at most one active OIDC
+connection, administered through `/v1/identity/oidc/*`; Wyrd is an OpenID
+Connect relying party of that provider (`openidconnect`) and the OAuth 2.0
+authorization server for its own clients. The provider authenticates the
+person; Wyrd resolves the tenant `User` by verified `(issuer, subject)`, maps
+provider groups only to that tenant's roles, and issues Wyrd tokens. Provider
+tokens are never Wyrd authority.
+
+| Client | OAuth client | Grant | Session holder |
+|---|---|---|---|
+| Web app | `wyrd-ui`, confidential (`client_secret_basic`) | Authorization code + PKCE (`GET /auth/authorize`) | The BFF's encrypted HttpOnly cookie; refresh token does not rotate, 12-hour absolute lifetime |
+| CLI and SDKs | `wyrd-cli`, public | Device authorization (RFC 8628) | `credentials.toml`, owned by `wyrd-client`; refresh token rotates on every use |
+
+The BFF uses `openid-client`; the shared Rust client uses `oauth2`, so Rust,
+Python, and TypeScript share one implementation. The four OAuth form
+endpoints (`POST /auth/token`, `/auth/platform/token`,
+`/auth/device_authorization`, and `/auth/revoke`) take form bodies, refuse
+with RFC 6749 §5.2 JSON, and are the one exception to `WyrdError`
+problem+json; their successes keep their own standard shapes (RFC 6749 §5.1
+tokens, the RFC 8628 §3.2 device response, an empty RFC 7009 revocation
+`200`). Browser interactions are not form endpoints: `GET /auth/authorize`
+redirects with an RFC 6749 §4.1.2.1 `error` once the client and redirect URI
+are trusted and shows a local HTML page before that, while `GET /auth/callback`
+and the `/auth/device` page answer with redirects, HTML, or Problem Details. Deployed Services and Agents keep their own API keys or
+workload assertions; human SSO never replaces or disables them.
 
 #### Cross-service delegation
 
@@ -1532,8 +1670,8 @@ serialization across HTTP, Python, TypeScript, MCP, and CLI surfaces.
 ## Spec-file authoring
 
 Two complementary mechanisms — `wyrd apply -f file.yaml` reads + registers in
-one move, and reference slots accept `Ref` or `InlineableRef<T>`. A `path:` is
-loader-only authoring syntax resolved to a durable `ref:` before send; inline
+one move, and reference slots accept `Ref` or `InlineableRef<T>`. A path string is
+loader-only authoring syntax projected to a Ref/Sibling before send; inline
 is available only at `InlineableRef<T>` slots.
 
 ### Pre-registration matrix (Rule 16)
@@ -1555,45 +1693,50 @@ ship in one file.
 
 ### Reference forms
 
-A reference slot accepts `ref` or `path`; an inlineable slot also accepts
-`inline`. The key is the discriminator. `path` and `inline` are authored
-locally; only `ref` and inline child bodies cross the wire.
+`Ref` and `InlineableRef<T>` are untagged values. A CardRef mapping is an
+external reference, a string is a loader-local path, and an inlineable slot may
+contain its native child body directly. There is no additional keyed
+`ref`/`path`/`inline` discriminator wrapper around a slot value.
 
 ```yaml
-# 1. ref — points at a registered card by identity.
-#    kind, name, one version field, optional space, optional uid.
-#    No labels/annotations here.
-ref: { kind: Policy, name: pii-redaction, version: "1.0.0", space: prod }
+# Registered Prompt reference at Agent.prompt.
+prompt: { kind: Prompt, name: triage, version: "1.0.0", space: prod }
 
-# 2. path — authoring sugar. Targets a FULL card envelope on disk
-#    (apiVersion + kind + metadata + spec). The loader registers it as an
-#    independent card and rewrites this slot to `ref: CardRef`.
-path: ./policies/pii-redaction.yaml
+# Local full Card envelope, resolved relative to the containing file.
+prompt: ./prompts/triage.yaml
 
-# 3. inline — full spec body embedded in the parent. No card identity.
-inline:
-  description: inline workflow agent
-  prompt: { kind: Prompt, name: triage, version: "1.0.0", space: prod }
+# Inline native Prompt body: no independent Card identity.
+prompt:
+  model: example-model
+  request:
+    provider: open_ai_chat_completion
+    body:
+      model: example-model
+      messages: [{role: user, content: "Hello"}]
+  variables: []
+  response_type: text
 ```
 
-`CardRef` carries `kind`, `name`, one `version` field, optional `space`, and
-optional `uid`. It never carries labels, annotations, or a separate version
-requirement. When `space` is omitted, resolution uses the enclosing authored
-context; when present, it is preserved verbatim.
-
-In context — `Service.components[]` mixing durable and loader-local forms plus a heavy-card ref:
+The owning spec may itself name a field `ref`; this does not introduce a
+reference discriminator. Service components retain that field for every form:
 
 ```yaml
 components:
   - alias: agent
-    ref:  { kind: Agent, name: support-triage,   version: "1.0.0", space: prod }
+    ref: { kind: Agent, name: support-triage, version: "1.0.0", space: prod }
   - alias: model
     ref: { kind: Model, name: churn-classifier, version: "1.0.0", space: prod }
   - alias: prompt
-    path: ./prompts/triage-system.yaml
-  - alias: pii-policy
-    ref: { kind: Policy, name: pii-redaction, version: "1.0.0", space: prod }
+    ref: ./prompts/triage-system.yaml
 ```
+
+`CardRef` carries `kind`, `name`, one `version`, optional `space`, and optional
+`uid`; never labels, annotations, or a version requirement. An omitted space
+inherits the containing authored context. Local loading never registers. Apply
+registers path-loaded Cards in the same composite request, projects paths to
+Sibling references, and preserves external refs even at matching identities.
+Inline bodies remain embedded. Only resolved Ref/Sibling and inline bodies
+cross registration; durable persistence contains no Path or Sibling.
 
 ### Reference-slot inventory
 
@@ -1618,9 +1761,9 @@ relationship tests all project from it:
 
 ### Path resolution rules (loader contract)
 
-`path:` is **client-side authoring sugar**, not a wire variant. It targets a
-full card envelope on disk; the loader registers that envelope as an
-independent card and rewrites the referring slot to an explicit
+A path string is **client-side authoring sugar**, not a durable wire variant.
+It targets a full Card envelope on disk; the loader reads it without registering.
+Apply submits it as an independent Card and rewrites the referring slot to an explicit
 registration reference. When the target is part of the same composite
 submission, the registration reference is `Sibling { sibling: CardRef }`;
 an authored external `ref: CardRef` remains `Ref(CardRef)`. This preserves

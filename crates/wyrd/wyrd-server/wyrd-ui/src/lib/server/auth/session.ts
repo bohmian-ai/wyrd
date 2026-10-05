@@ -16,7 +16,6 @@ export type LocalPrincipal = {
 };
 export type Session = LocalPrincipal & {
   expiresAt: number;
-  csrf: string;
   recent?: string;
   confirmedTenants: string[];
 };
@@ -86,7 +85,6 @@ export class LocalSessions {
         )
       ),
       expiresAt: now + sessionLifetime,
-      csrf: randomBytes(32).toString('hex'),
       confirmedTenants: []
     });
     return id;
@@ -137,13 +135,7 @@ export class LocalSessions {
     };
   }
 
-  reauthenticate(
-    session: Session,
-    key: string,
-    request: Request,
-    csrf: FormDataEntryValue | null
-  ): void {
-    this.checkAction(session, request, csrf);
+  reauthenticate(session: Session, key: string): void {
     this.authorize(session, key);
     // Local sign-in deliberately has no external identity provider or credential exchange.
     if (!session.confirmedTenants.includes(key)) session.confirmedTenants.push(key);
@@ -156,24 +148,7 @@ export class LocalSessions {
       : null;
   }
 
-  checkAction(session: Session, request: Request, csrf: FormDataEntryValue | null): void {
-    if (session.expiresAt <= Date.now()) reject('expired');
-    if (
-      request.method !== 'POST' ||
-      request.headers.get('origin') !== new URL(request.url).origin ||
-      typeof csrf !== 'string' ||
-      csrf !== session.csrf
-    )
-      reject('denied');
-  }
-
-  switch(
-    session: Session,
-    key: string,
-    request: Request,
-    csrf: FormDataEntryValue | null
-  ): string {
-    this.checkAction(session, request, csrf);
+  switch(session: Session, key: string): string {
     const context = this.bind(session, key);
     session.recent = context.tenant.key;
     return `/t/${encodeURIComponent(context.tenant.key)}`;
@@ -183,7 +158,6 @@ export class LocalSessions {
     return {
       subject: session.subject,
       expiresAt: session.expiresAt,
-      csrf: session.csrf,
       tenants: this.principal.memberships
         .filter((current) =>
           session.memberships.some(

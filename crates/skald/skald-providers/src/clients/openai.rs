@@ -492,6 +492,8 @@ impl OpenAiClient {
                 Ok(ProviderResponse::OpenAiEmbeddings(response))
             }
             ProviderRequest::RawV1 { body, .. } => {
+                let body = serde_json::value::to_raw_value(&body)
+                    .map_err(|error| ProviderError::decode("openai", error))?;
                 let url = format!("{}/raw", self.auth.base_url());
                 let response = raw::send_raw(
                     &self.transport,

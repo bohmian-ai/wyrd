@@ -14,8 +14,9 @@ Reference for the `wyrd` binary. It has four command groups: `auth`, `eval`,
 Every server-facing command reads `--server` from `WYRD_SERVER_URL` when the flag
 is omitted. No command takes a secret as an argument: server-facing commands
 read their credential from the ambient chain (`WYRD_ACCESS_TOKEN`, workload
-identity, `WYRD_API_KEY`, or `~/.config/wyrd/credentials.toml`), so it never
-lands in shell history or the process table.
+identity, `WYRD_API_KEY`, a saved `wyrd auth login`, or
+`~/.config/wyrd/credentials.toml`), so it never lands in shell history or the
+process table. See [Client configuration](/get-started/client-configuration/#credentials).
 
 ## wyrd auth
 
@@ -23,11 +24,16 @@ Authenticate with a Wyrd server and manage credentials.
 
 ### auth login
 
-Initiate an OIDC login flow and exchange the callback code for a Wyrd access
-token. Prints a URL to open in your browser.
+Sign a person in to one tenant with OAuth 2.0 device authorization
+([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)) and save the login every
+local SDK uses. The command prints a one-time code and a verification URL and
+opens it in a browser; the person approves the code and signs in at the
+tenant's IdP. No token is printed. Each completed login becomes the newest for its
+server. Logging in again to the same tenant replaces its earlier login; logins
+to other tenants are kept. Ctrl-C cancels.
 
 ```bash
-wyrd auth login --server https://acme.wyrd.cloud --issuer https://id.acme.com
+wyrd auth login --server https://wyrd.example.com --tenant acme
 ```
 
 <DataTable
@@ -39,9 +45,44 @@ wyrd auth login --server https://acme.wyrd.cloud --issuer https://id.acme.com
   ]}
   rows={[
     ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL.'],
-    ['--issuer', 'yes', '—', 'Trusted OIDC issuer URL registered with this tenant.']
+    ['--tenant', 'yes', 'WYRD_TENANT', 'Route key of the tenant to sign in to.'],
+    ['--no-browser', 'no', '—', 'Print the verification URL without opening a browser.']
   ]}
 />
+
+### auth logout
+
+End a saved login: delete it locally, then revoke it on the server
+best-effort ([RFC 7009](https://www.rfc-editor.org/rfc/rfc7009)). A failed
+revocation prints a warning; the login is already gone locally. An access
+token already issued stays valid until it expires, at most five minutes.
+Logout does not end the IdP session.
+
+```bash
+wyrd auth logout --server https://wyrd.example.com --tenant acme
+```
+
+<DataTable
+  columns={[
+    { header: 'Flag', role: 'name' },
+    { header: 'Required' },
+    { header: 'Env' },
+    { header: 'Meaning' }
+  ]}
+  rows={[
+    ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL of the login to end.'],
+    ['--tenant', 'no', 'WYRD_TENANT', 'Tenant of the login to end. Defaults to the newest login for the server.']
+  ]}
+/>
+
+### auth status
+
+List saved logins (server, tenant, and access-token expiry) without printing
+any token.
+
+```bash
+wyrd auth status
+```
 
 ### auth refresh
 

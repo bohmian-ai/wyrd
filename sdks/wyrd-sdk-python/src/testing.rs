@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Display;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -19,6 +20,7 @@ use url::Url;
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
+use wyrd_testing::human_login::{HUMAN_PUBLIC_ORIGIN, HumanSso};
 use wyrd_testing::server::BifrostQueryResourceSnapshot;
 use wyrd_testing::{Bootstrap, WyrdTestServer as TestServer, WyrdTestServerError};
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
@@ -112,6 +114,9 @@ pub struct WyrdTestServer {
     /// Whether every built-in gateway adapter targets its real provider
     /// endpoint, for the opt-in live smoke lane.
     live_providers: bool,
+    /// Whether the server answers at the public origin the Keycloak fixture
+    /// clients register, so human sign-ins can complete against it.
+    human_sso: bool,
     /// Bound HTTP base URL while entered.
     base_url: Option<String>,
     /// Writer service API key bootstrapped on entry.
@@ -138,13 +143,15 @@ impl WyrdTestServer {
     /// `OpenAI` LLM judge of the verification runtime, so a continuous Eval
     /// journey's judge calls `<root>/v1/chat/completions`. `live_providers` instead points every
     /// built-in adapter at its real provider endpoint, which only the opt-in
-    /// live smoke lane asks for.
+    /// live smoke lane asks for. `human_sso` serves the public origin the
+    /// identity lane's Keycloak clients register, for saved user login
+    /// journeys.
     ///
     /// # Errors
     /// Raises the harness error when `provider_base_url` is not an absolute
     /// URL, or when it is combined with `live_providers`.
     #[new]
-    #[pyo3(signature = (cleanup = true, mutate_env = true, audit_publication = true, verification_runtime = false, provider_base_url = None, live_providers = false))]
+    #[pyo3(signature = (cleanup = true, mutate_env = true, audit_publication = true, verification_runtime = false, provider_base_url = None, live_providers = false, human_sso = false))]
     // justification: PyO3 projects the existing Python test-harness flags directly
     #[allow(clippy::fn_params_excessive_bools)]
     fn __new__(
@@ -154,6 +161,7 @@ impl WyrdTestServer {
         verification_runtime: bool,
         provider_base_url: Option<&str>,
         live_providers: bool,
+        human_sso: bool,
     ) -> WyrdPyResult<Self> {
         if live_providers && provider_base_url.is_some() {
             return Err(harness_error(
@@ -173,6 +181,7 @@ impl WyrdTestServer {
             verification_runtime,
             provider_base_url,
             live_providers,
+            human_sso,
             base_url: None,
             api_key: None,
             tenant_id: None,
@@ -193,6 +202,7 @@ impl WyrdTestServer {
         let live_providers = slf.live_providers;
         let audit_publication = slf.audit_publication;
         let verification_runtime = slf.verification_runtime;
+        let human_sso = slf.human_sso;
         let (server, api_key) = wyrd_runtime::runtime()
             .block_on(async {
                 let mut builder = TestServer::builder();
@@ -201,6 +211,11 @@ impl WyrdTestServer {
                 }
                 if verification_runtime {
                     builder = builder.with_verification_runtime_for_test();
+                }
+                if human_sso {
+                    builder = builder.with_public_origin(
+                        Url::parse(HUMAN_PUBLIC_ORIGIN).expect("the fixture origin is a URL"),
+                    );
                 }
                 if let Some(root) = root {
                     builder = builder.with_gateway_provider_root_for_test(root);
@@ -765,6 +780,113 @@ impl WyrdTestServer {
                 .block_on(server.wait_oracle_audit_staged(Duration::from_millis(budget_ms)))
         })
         .map_err(py_error)
+    }
+
+    /// Stage, test, and activate the identity lane's Keycloak sign-in for the
+    /// tenant `admin_key` administers, mapping `wyrd-admins` to `admin` and
+    /// `wyrd-viewers` to `reader`.
+    ///
+    /// Needs `human_sso=True` and the identity lane's Keycloak.
+    ///
+    /// # Errors
+    /// Raises the harness error outside the context manager.
+    ///
+    /// # Panics
+    /// Panics (a Python `PanicException`) when any served step fails.
+    fn activate_human_sso(&self, py: Python<'_>, admin_key: &str) -> WyrdPyResult<()> {
+        let sso = HumanSso::new(&self.base_url()?);
+        py.detach(|| wyrd_runtime::runtime().block_on(sso.activate_keycloak(admin_key)));
+        Ok(())
+    }
+
+    /// Log `username` in to `tenant` through the RFC 8628 device login and
+    /// save the credential under the Wyrd configuration directory `config_home`,
+    /// exactly as `wyrd auth login` does.
+    ///
+    /// # Errors
+    /// Raises the harness error outside the context manager.
+    ///
+    /// # Panics
+    /// Panics (a Python `PanicException`) when the login or the save fails.
+    fn save_human_login(
+        &self,
+        py: Python<'_>,
+        config_home: PathBuf,
+        tenant: &str,
+        username: &str,
+        password: &str,
+    ) -> WyrdPyResult<()> {
+        let sso = HumanSso::new(&self.base_url()?);
+        py.detach(move || {
+            wyrd_runtime::runtime().block_on(sso.save_login(
+                &config_home,
+                tenant,
+                username,
+                password,
+            ))
+        });
+        Ok(())
+    }
+
+    /// Make the saved login for `tenant` under `config_home` stale, so the
+    /// next client renews it.
+    ///
+    /// # Errors
+    /// Raises the harness error outside the context manager.
+    ///
+    /// # Panics
+    /// Panics (a Python `PanicException`) when the login is missing or cannot
+    /// be saved.
+    fn expire_saved_login(
+        &self,
+        py: Python<'_>,
+        config_home: PathBuf,
+        tenant: &str,
+    ) -> WyrdPyResult<()> {
+        let sso = HumanSso::new(&self.base_url()?);
+        py.detach(move || sso.expire_saved(&config_home, tenant));
+        Ok(())
+    }
+
+    /// Whether the saved login for `tenant` under `config_home` holds an
+    /// expired access token, so a journey can prove a renewal was saved.
+    ///
+    /// # Errors
+    /// Raises the harness error outside the context manager.
+    ///
+    /// # Panics
+    /// Panics (a Python `PanicException`) when the login is missing.
+    fn saved_login_is_stale(
+        &self,
+        py: Python<'_>,
+        config_home: PathBuf,
+        tenant: &str,
+    ) -> WyrdPyResult<bool> {
+        let sso = HumanSso::new(&self.base_url()?);
+        Ok(py.detach(move || sso.saved_is_stale(&config_home, tenant)))
+    }
+
+    /// Revoke the server-side refresh chain of the saved login for `tenant`
+    /// under `config_home` without touching the record, as another device's
+    /// logout would.
+    ///
+    /// # Errors
+    /// Raises the harness error outside the context manager.
+    ///
+    /// # Panics
+    /// Panics (a Python `PanicException`) when the login is not ready or the
+    /// server refuses the revocation.
+    fn revoke_saved_login(
+        &self,
+        py: Python<'_>,
+        config_home: PathBuf,
+        tenant: &str,
+    ) -> WyrdPyResult<()> {
+        let sso = HumanSso::new(&self.base_url()?);
+        py.detach(move || {
+            wyrd_runtime::runtime().block_on(sso.revoke_saved(&config_home, tenant));
+        });
+        Ok(())
     }
 }
 

@@ -7,6 +7,7 @@
 //! built per request and scoped to the caller's tenant — never a shared
 //! `SessionContext` — so cross-tenant reads are impossible before planning.
 
+pub(crate) mod collect;
 pub mod floor;
 pub mod routes;
 pub mod scheduled;

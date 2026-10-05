@@ -28,6 +28,14 @@ const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
 /// Name the contract gives the one Wyrd authentication scheme.
 const WYRD_ACCESS_TOKEN_SCHEME: &str = "wyrdAccessToken";
 
+/// The served contract's name for confidential OAuth client HTTP Basic.
+const OAUTH_CLIENT_BASIC_SCHEME: &str = "oauthClientBasic";
+
+/// The OAuth client endpoints: each identifies its client by the public
+/// form's `client_id` or by confidential HTTP Basic.
+const OAUTH_CLIENT_OPERATIONS: [&str; 3] =
+    ["/auth/token", "/auth/device_authorization", "/auth/revoke"];
+
 /// The HTTP methods an `OpenAPI` path item may key an operation by.
 const METHODS: [&str; 7] = ["get", "put", "post", "delete", "options", "head", "patch"];
 
@@ -76,6 +84,18 @@ async fn problem_json(response: Response) -> Value {
     serde_json::from_slice(&body).expect("problem JSON")
 }
 
+/// The RFC 8693 form body that exchanges a Wyrd API key for an access token.
+fn api_key_exchange(api_key: &str) -> String {
+    url::form_urlencoded::Serializer::new(String::new())
+        .append_pair(
+            "grant_type",
+            "urn:ietf:params:oauth:grant-type:token-exchange",
+        )
+        .append_pair("subject_token", api_key)
+        .append_pair("subject_token_type", "urn:wyrd:oauth:token-type:api_key")
+        .finish()
+}
+
 /// Pull every `WYRD_…` stable code named in a response description.
 ///
 /// Descriptions are prose with codes in parentheses rather than a structured
@@ -108,7 +128,10 @@ fn catalog_status(code: &str) -> Option<u16> {
 /// Routing and documentation come out of one `utoipa-axum` registration for
 /// every route registered through `routes!`. What is pinned here is that the
 /// composition actually ran: that the nesting prefix reached the operations and
-/// that the surfaces mounted on both planes are present.
+/// that the surfaces mounted on both planes are present. It also pins that
+/// platform connection configuration, which discovers the issuer before
+/// storing it, publishes that discovery's
+/// `503 WYRD_AUTH_503_DISCOVERY_UNAVAILABLE` as problem+json.
 #[tokio::test]
 async fn the_served_document_describes_the_composed_surface() {
     let server = WyrdTestServer::start_in_process()
@@ -133,6 +156,9 @@ async fn the_served_document_describes_the_composed_surface() {
         "/v1/bifrost/tables",
         "/v1/bifrost/tables/{namespace}/{name}",
         "/auth/token",
+        "/auth/device_authorization",
+        "/auth/device",
+        "/auth/revoke",
         "/platform/tenants",
         "/v1/admin/gateway/provider-credentials",
         "/v1/admin/gateway/provider-credentials/{name}",
@@ -149,6 +175,13 @@ async fn the_served_document_describes_the_composed_surface() {
     ] {
         assert!(paths.contains_key(path), "missing {path}");
     }
+    for (path, method) in [
+        ("/v1/workflow-runs", "post"),
+        ("/v1/workflow-runs/{run_id}", "get"),
+        ("/v1/workflow-runs/{run_id}/cancel", "post"),
+    ] {
+        assert!(paths[path][method].is_object(), "missing {method} {path}");
+    }
     assert!(
         !paths.contains_key("/v1/cards/{card_uid}/abort"),
         "a route the server does not mount is not documented"
@@ -157,6 +190,198 @@ async fn the_served_document_describes_the_composed_surface() {
         !paths.contains_key("/mcp"),
         "the MCP endpoint speaks its own protocol and is not an OpenAPI operation"
     );
+    let configure = &document["paths"]["/platform/oidc/connection"]["put"]["responses"]["503"];
+    assert_eq!(
+        configure["content"][PROBLEM_MEDIA_TYPE]["schema"]["$ref"],
+        "#/components/schemas/WyrdProblem",
+        "platform connection configuration publishes its discovery 503 as problem+json"
+    );
+    assert!(
+        configure["description"]
+            .as_str()
+            .is_some_and(|text| text.contains("WYRD_AUTH_503_DISCOVERY_UNAVAILABLE")),
+        "the 503 names the stable discovery code: {configure}"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// The tenant human-connection administration surface is served with its typed
+/// contract and no secret-bearing or unsupported shape.
+///
+/// Each of the six operations publishes its route-specific refusals as
+/// problem+json; the redacted view and list shapes expose no secret field; the
+/// input schema offers exactly the three supported client-authentication
+/// methods (never `PrivateKeyJwt`); the candidate PUT publishes that input as
+/// its request body; and activation requires the recovery key.
+#[tokio::test]
+async fn identity_connection_operations_publish_their_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let operations: [(&str, &str, &[&str]); 6] = [
+        ("/v1/identity/oidc/connections", "get", &["403", "503"]),
+        (
+            "/v1/identity/oidc/candidate",
+            "put",
+            &["400", "403", "409", "503"],
+        ),
+        (
+            "/v1/identity/oidc/candidate/test",
+            "post",
+            &["400", "403", "409", "503"],
+        ),
+        (
+            "/v1/identity/oidc/candidate/activate",
+            "post",
+            &["403", "409", "503"],
+        ),
+        (
+            "/v1/identity/oidc/active/deactivate",
+            "post",
+            &["403", "404", "503"],
+        ),
+        (
+            "/v1/identity/oidc/connections/{id}",
+            "delete",
+            &["403", "404", "503"],
+        ),
+    ];
+    for (path, method, statuses) in operations {
+        let operation = &document["paths"][path][method];
+        assert!(operation.is_object(), "missing {method} {path}");
+        assert!(
+            operation.get("security").is_none(),
+            "{method} {path} must require the Wyrd access token"
+        );
+        for status in statuses {
+            assert_eq!(
+                operation["responses"][*status]["content"][PROBLEM_MEDIA_TYPE]["schema"]["$ref"],
+                "#/components/schemas/WyrdProblem",
+                "{method} {path} must publish {status} as problem+json"
+            );
+        }
+    }
+
+    assert_eq!(
+        document["paths"]["/v1/identity/oidc/candidate"]["put"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/ConnectionInput",
+        "the candidate PUT publishes its typed body although it reads raw bytes"
+    );
+
+    let schemas = &document["components"]["schemas"];
+    let view_fields = schemas["HumanConnectionView"]["properties"]
+        .as_object()
+        .expect("HumanConnectionView publishes its properties");
+    assert!(
+        view_fields.keys().all(|field| !field.contains("secret")),
+        "the redacted view must not carry a secret field: {:?}",
+        view_fields.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        schemas["HumanClientAuth"]["enum"],
+        serde_json::json!(["SecretBasic", "SecretPost", "Public"]),
+        "only supported client authentication methods are offered"
+    );
+    let activate = &schemas["ConnectionActivate"]["required"];
+    assert!(
+        activate
+            .as_array()
+            .is_some_and(|required| required.contains(&"recovery_api_key".into())),
+        "activation requires the recovery key: {activate}"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// Tenant human login publishes its OAuth authorization-server contract.
+///
+/// The browser begins at `GET /auth/authorize`, which answers `303`; the
+/// retired `/auth/login` is not served. The common callback publishes the
+/// browser's `303` back to the client (with its `Location`) and the CLI's
+/// `text/html` page, never a token body. The token endpoint takes an RFC 6749
+/// form body that offers the authorization-code grant, and RFC 8414 metadata
+/// is served. The token, device authorization, and revocation forms publish
+/// the public client's optional `client_id`, and each operation accepts
+/// either that public form or confidential RFC 7617 Basic client
+/// authentication.
+#[tokio::test]
+async fn tenant_login_operations_publish_their_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+
+    assert!(
+        document["paths"]["/auth/login"].is_null(),
+        "/auth/login is retired"
+    );
+    let authorize = &document["paths"]["/auth/authorize"]["get"];
+    assert_eq!(authorize["security"], serde_json::json!([{}]));
+    assert!(
+        authorize["responses"]["303"].is_object(),
+        "authorize redirects: {authorize}"
+    );
+    assert!(
+        document["paths"]["/.well-known/oauth-authorization-server"]["get"].is_object(),
+        "RFC 8414 metadata is published"
+    );
+
+    let callback = &document["paths"]["/auth/callback"]["get"]["responses"];
+    assert!(
+        callback["303"]["headers"]["Location"].is_object(),
+        "the browser completion redirect publishes its Location: {callback}"
+    );
+    assert!(
+        callback["200"]["content"]["text/html"].is_object(),
+        "the CLI completion page is HTML: {callback}"
+    );
+    assert!(
+        callback["200"]["content"]["application/json"].is_null(),
+        "the callback never returns a token body: {callback}"
+    );
+    let token = &document["paths"]["/auth/token"]["post"]["requestBody"]["content"];
+    assert!(
+        token["application/x-www-form-urlencoded"].is_object(),
+        "the token endpoint takes a form body: {token}"
+    );
+    assert!(
+        document["components"]["schemas"]["TokenRequest"]
+            .to_string()
+            .contains("authorization_code"),
+        "the token endpoint offers the authorization-code grant"
+    );
+
+    let basic = &document["components"]["securitySchemes"][OAUTH_CLIENT_BASIC_SCHEME];
+    assert_eq!(basic["type"], "http", "{basic}");
+    assert_eq!(basic["scheme"], "basic", "{basic}");
+    for path in OAUTH_CLIENT_OPERATIONS {
+        let operation = &document["paths"][path]["post"];
+        assert_eq!(
+            operation["security"],
+            serde_json::json!([{}, { OAUTH_CLIENT_BASIC_SCHEME: [] }]),
+            "{path} accepts the public form or confidential Basic"
+        );
+        let form = resolve_schema(
+            &document,
+            &operation["requestBody"]["content"]["application/x-www-form-urlencoded"]["schema"],
+        );
+        let client_id = form["allOf"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|part| resolve_schema(&document, part))
+            .find(|part| part["properties"]["client_id"].is_object())
+            .unwrap_or_else(|| panic!("{path} form publishes client_id: {form}"));
+        assert!(
+            !client_id["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&"client_id".into())),
+            "{path} client_id is optional: {client_id}"
+        );
+    }
 
     server.shutdown().await.expect("server shuts down");
 }
@@ -339,8 +564,10 @@ async fn every_problem_response_declares_its_media_type_and_stable_code() {
 /// declared once on the document and inherited. An operation a caller reaches
 /// before it can have a session clears the requirement beside its own handler
 /// with `security(())`, which is the only override the contract permits: a
-/// per-operation requirement naming some *other* scheme would be a second
-/// authentication story, and there is only one header.
+/// per-operation requirement naming some *other* caller scheme would be a
+/// second authentication story, and there is only one header. The one
+/// exception is OAuth client authentication: the OAuth client endpoints offer
+/// confidential HTTP Basic beside the empty requirement.
 #[tokio::test]
 async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
     let server = WyrdTestServer::start_in_process()
@@ -365,8 +592,12 @@ async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
             };
             // utoipa renders `security(())` as one empty requirement object,
             // which is OpenAPI's way of saying the operation needs nothing.
+            let oauth_client = OAUTH_CLIENT_OPERATIONS.contains(&path.as_str())
+                && overridden == &serde_json::json!([{}, { OAUTH_CLIENT_BASIC_SCHEME: [] }]);
             assert!(
-                overridden == &serde_json::json!([]) || overridden == &serde_json::json!([{}]),
+                oauth_client
+                    || overridden == &serde_json::json!([])
+                    || overridden == &serde_json::json!([{}]),
                 "{method} {path} overrides the document requirement with a second scheme"
             );
             cleared.insert(path.clone());
@@ -801,6 +1032,58 @@ async fn gateway_ingress_publishes_typed_contracts() {
             "{component} must accept native extensions"
         );
     }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// Every public inference ingress publishes the optional
+/// `wyrd-gateway-fallback` header with its encoding, size limits, and refusal
+/// code, while ingresses that ignore it publish no such parameter.
+///
+/// # Panics
+/// Panics when the server fails to start or stop or a published header
+/// contract differs.
+#[tokio::test]
+async fn gateway_inference_ingress_publishes_the_fallback_header() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let fallback = |path: &str| {
+        document["paths"][path]["post"]["parameters"]
+            .as_array()
+            .and_then(|parameters| {
+                parameters
+                    .iter()
+                    .find(|parameter| parameter["name"] == "wyrd-gateway-fallback")
+            })
+            .cloned()
+    };
+
+    for path in [
+        "/v1/chat/completions",
+        "/v1/responses",
+        "/v1/messages",
+        "/v1beta/models/{target}",
+    ] {
+        let header = fallback(path).unwrap_or_else(|| panic!("{path} publishes the header"));
+        assert_eq!(header["in"], "header", "{path}");
+        assert_ne!(header["required"], true, "{path} header is optional");
+        let description = header["description"].as_str().unwrap_or_default();
+        for term in [
+            "unpadded base64url",
+            "JCS",
+            "8 KiB",
+            "4 KiB",
+            "WYRD_GATEWAY_400_INVALID_REQUEST",
+        ] {
+            assert!(description.contains(term), "{path} documents {term}");
+        }
+    }
+    assert!(
+        fallback("/v1/embeddings").is_none(),
+        "embeddings ignores the header"
+    );
 
     server.shutdown().await.expect("server shuts down");
 }
@@ -1429,10 +1712,8 @@ async fn a_malformed_administrative_identifier_answers_with_a_documented_problem
             Request::builder()
                 .method("POST")
                 .uri("/auth/platform/token")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::json!({ "credential": root.expose_secret() }).to_string(),
-                ))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(api_key_exchange(root.expose_secret())))
                 .expect("request builds"),
         )
         .await
@@ -1576,18 +1857,18 @@ async fn an_unavailable_audit_store_answers_with_a_code_the_operation_documents(
 }
 
 /// A credential exchange whose audit cannot be staged fails closed with the
-/// stable code `/auth/token` documents.
+/// RFC 6749 §5.2 error `/auth/token` documents.
 ///
 /// `/auth/token` is the one operation every caller reaches before it has a
 /// session, so the set of refusals it declares is the set a client has to be
-/// able to branch on. The audit-unavailable arm is the one that used to go
-/// undeclared: it is reachable from a perfectly valid credential, and it is the
-/// arm that proves the grant and its audit commit together.
+/// able to branch on. The audit-unavailable arm is reachable from a perfectly
+/// valid credential, and it is the arm that proves the grant and its audit
+/// commit together: it answers `temporarily_unavailable` and no token.
 ///
 /// The failure is injected at the store — the canonical staging table is
 /// renamed out from under the append — so no handler seam has to be stubbed.
 #[tokio::test]
-async fn an_unstageable_exchange_audit_answers_with_a_code_the_token_operation_documents() {
+async fn an_unstageable_exchange_audit_answers_with_an_error_the_token_operation_documents() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1616,27 +1897,25 @@ async fn an_unstageable_exchange_audit_answers_with_a_code_the_token_operation_d
             Request::builder()
                 .method("POST")
                 .uri("/auth/token")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "grant_type": "wyrd_api_key",
-                        "api_key": api_key,
-                    })
-                    .to_string(),
-                ))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(api_key_exchange(&api_key)))
                 .expect("request builds"),
         )
         .await
         .expect("router responds");
 
     let status = response.status();
-    let problem = problem_json(response).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{problem}");
-    let code = problem["code"].as_str().expect("problem carries a code");
-    assert_eq!(code, "WYRD_AUDIT_503_UNAVAILABLE");
+    let body = problem_json(response).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], "temporarily_unavailable", "{body}");
     assert!(
-        documented_description(&document, "/auth/token", "post", 503).contains(code),
-        "the token operation names {code} on its 503"
+        body.get("access_token").is_none(),
+        "no token is served: {body}"
+    );
+    assert!(
+        documented_description(&document, "/auth/token", "post", 503)
+            .contains("temporarily_unavailable"),
+        "the token operation names temporarily_unavailable on its 503"
     );
 
     sqlx::query("ALTER TABLE vala.audit_staging_offline RENAME TO audit_staging")

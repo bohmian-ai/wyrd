@@ -1,7 +1,7 @@
 ---
 id: SPEC-verified-change-contract
-revision: 63
-status: approved
+revision: 64
+status: draft
 ---
 
 # Verification contract
@@ -1338,15 +1338,12 @@ table on `(data_tenant_id, result_id)`.
   `Idempotency-Key` contract, not a new activation resource. Invalid target,
   window, unauthorized subject, tenant mismatch, or unready baseline MUST
   fail before enqueue with a structured Wyrd error.
-- **REQ-137**: Rust, Python, and TypeScript MUST project the same typed
-  `get_binding`, `start_run`, and `get_run` operations through the shared
-  `wyrd-client` Verification capability; TypeScript uses `getBinding`,
-  `startRun`, and `getRun`. Python uses its existing synchronous SDK boundary;
-  Rust and TypeScript await these network operations. Baseline status uses
-  the existing Cards read
-  capability, and analytical results use the existing Bifrost query API with
-  `result_id` and the registered result/detail tables. No SDK implements a
-  separate status engine or adds a result/dispatch transport. MCP MUST expose
+- **REQ-137** (revised in revision 64): Binding status, manual run start,
+  and run status are operator control-plane operations. They stay on HTTP and
+  MCP and MUST NOT be exposed by the Rust, Python, or TypeScript SDKs (see
+  REQ-189). Baseline status uses the existing Cards read capability, and
+  analytical results use the existing Bifrost query API with `result_id` and
+  the registered result/detail tables. MCP MUST expose
   `cards.get`, `verification.get_binding`, `verification.start_run`, and
   `verification.get_run` as typed projections of those same server
   operations. `verification.start_run` requires an explicit write scope;
@@ -1485,6 +1482,64 @@ table on `(data_tenant_id, result_id)`.
   observation that reaches the server more than 30 seconds after its scheduled
   window ended is stored, but that window has already been read and does not
   count it.
+- **REQ-188**: A Run view MUST expose real-time verification as
+  `observe.verify(verifier, input)` in all three SDKs (Rust
+  `run.observe().verify(...)`, Python and TypeScript `run.observe.verify(...)`).
+  - `verifier` is the `metadata.name` of a Verifier Card bound in
+    `verified_by` to the view's subject Card in the hydrated graph. The client
+    resolves it to the exact Verifier locally. A name that is not bound to the
+    view's subject fails locally with `WYRD_SDK_404_UNKNOWN_VERIFIER` before
+    any network call. The hydrated graph MUST carry what this resolution needs.
+  - The subject is always the view's subject Card. The caller never passes a
+    Card UID.
+  - An Eval Verifier takes one context in the forms `observe.eval` accepts,
+    with the same optional media. A Drift Verifier takes a non-empty sequence
+    of feature rows in the forms `observe.drift` accepts; the client turns the
+    rows into REQ-167 columns. Input of the wrong shape for the Verifier's kind
+    fails locally with `WYRD_SDK_400_INVALID_OBSERVATION`.
+  - It judges only. It records no observation, creates no run, dispatches no
+    Operator, and writes nothing to Bifrost. It calls REQ-167 and keeps
+    REQ-168's authorization, audit, bounds, errors, and no-retry rule. It does
+    not require Bifrost to be started.
+  - It returns a typed `Judgment`: `verdict` (`passed | failed |
+    inconclusive`), `passed` (true only for `passed`), `summary`, `counts`, the
+    exact `verifier` and `subject` references, `execution_id`, and a typed
+    Drift or Eval report. A `failed` verdict is a normal return, never an
+    error. Python is synchronous; Rust and TypeScript await it.
+  - `architecture/wyrd-design.md` documents `observe.verify` beside `drift`,
+    `eval`, and `record`.
+- **REQ-189**: The `Verification` client handle (`get_binding`, `start_run`,
+  `get_run`, `execute`) and the Python `wyrd.verification` module MUST be
+  removed from the Rust, Python, and TypeScript SDKs, their exports, and their
+  generated stubs and declarations. No alias or compatibility shim remains.
+  `wyrd-client` keeps only the transport `observe.verify` needs.
+- **REQ-190**: An `http` Operator action whose `auth` names an `http`
+  connection MAY give `url` as a path template beginning with `/`. The
+  request then goes to the connection's stored origin, read at each attempt.
+  A path-only `url` without a named connection MUST be refused at
+  registration with the existing invalid-Operator error. Absolute URLs keep
+  today's rules, including that their origin equal the named connection's
+  origin. This lets one Card run unchanged against different environments.
+- **REQ-191**: An authored artifact entry MAY omit `sha256` and `size_bytes`.
+  The client computes both from the local file before any registration call.
+  Values that are present are still checked and refused on mismatch with
+  `RegistryManifestHashMismatch`. Served and downloaded Cards always carry
+  both.
+- **REQ-192**: The verification user journeys in all three SDKs MUST follow
+  one style, recorded in `TESTING.md` as the repository's journey standard:
+  - Card graphs are checked-in YAML fixture directories shared by the three
+    SDKs. No test builds Card YAML in code or splices values into it.
+  - A test uses only the public SDK, `WyrdTestServer` lifecycle, and the
+    server's documented test-only clock control (making a schedule due). It
+    runs no SQL against server tables, no CLI subprocess for a read the SDK
+    offers, and no polling of server-internal state.
+  - One user story per test, readable top to bottom, with typed inputs and
+    results and domain objects as fixtures.
+  - Assertions are on what a user can observe: a `Judgment`, an Operator
+    request received by a local endpoint, or rows the user reads through the
+    public Bifrost query API.
+  - Engine statistics (PSI bins, SPC limits, judge scoring) are proven by Rust
+    engine tests, not SDK journeys.
 
 - **REQ-152**: Verification coordination MUST use PostgreSQL as its clock.
   PostgreSQL MUST write and evaluate runtime activity, schedule eligibility,
@@ -1720,9 +1775,10 @@ table on `(data_tenant_id, result_id)`.
   The operation is not idempotent, takes no `Idempotency-Key`, and is never
   retried automatically by an SDK. A client disconnect cancels in-flight work.
   Provider calls already issued may have incurred cost.
-- **REQ-169**: `wyrd-client` and the Rust, Python, and TypeScript SDKs MUST
-  expose `verification.execute(...)` over REQ-167 without duplicating
-  transport or scoring. MCP MUST expose the write tool `verification_execute`,
+- **REQ-169** (revised in revision 64): The Rust, Python, and TypeScript SDKs
+  MUST expose REQ-167 only as `observe.verify(...)` (REQ-188), implemented
+  once in `wyrd-client` without duplicating transport or scoring. MCP MUST
+  expose the write tool `verification_execute`,
   gated on `evals:run`, and the served OpenAPI MUST describe the operation.
 - **REQ-170**: Verifier execution telemetry MUST follow the TASK-008 closeout
   telemetry contract. Required elements:
@@ -2455,6 +2511,22 @@ published image pinned by an immutable registry digest before release.
     load its Card, and a run whose Verifier was deleted settles `errored`;
   - a run refused by a full shared resource returns to the queue without
     consuming an attempt, and claiming resumes when a running run finishes.
+- **AC-045**: In Rust, Python, and TypeScript journeys, `observe.verify`
+  returns a passing and a failing Eval `Judgment` and a Drift `Judgment`
+  through the fixture graph; an unbound Verifier name fails locally with no
+  request sent; a caller without `evals:run` is refused with REQ-168's error;
+  and a public Bifrost read shows no observation row for the verified input.
+- **AC-046**: No SDK exports `Verification`, `wyrd.verification` does not
+  import, and `mise run codegen:check` passes with the handle removed.
+- **AC-047**: A static fixture Service whose `http` Operator names a
+  connection and a path-only `url` delivers to the local origin the test
+  registered on that connection; a path-only `url` without a connection is
+  refused at registration. A fixture artifact without `sha256` and
+  `size_bytes` registers, and a wrong declared digest is refused.
+- **AC-048**: `TESTING.md` records the REQ-192 standard, and every
+  verification journey in the three SDKs conforms to it: shared fixture
+  directories, no Card YAML in code, no SQL against server tables, no CLI
+  subprocess reads, and one story per test.
 
 ## Open material decisions
 
@@ -2494,6 +2566,17 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 
 ## Revision history
 
+- **Revision 64 SDK verification ergonomics (2026-10-05, draft):** The
+  user found the SDK verification surface and its journeys unusable: a
+  separate `Verification` handle driven by raw dicts and UIDs, polling, raw
+  SQL, and Card YAML built from Python strings. Real-time verification moves
+  to `observe.verify(...)` on the Run view, judge-only, returning a typed
+  `Judgment` (REQ-188). The SDK `Verification` handle is removed; binding,
+  run start, and run status stay on HTTP and MCP (REQ-137, REQ-169, REQ-189).
+  HTTP Operators may take their origin from a named connection (REQ-190) and
+  artifact digests may be computed by the client (REQ-191), so fixture Cards
+  are static files. REQ-192 sets the journey test standard, modelled on the
+  opsml client, PromptCard, and agent-service tests.
 - **Revision 63 Observations carry their own event time (2026-10-03, approved
   on user direction):** SDK observations omitted `wyrd_event_time`, so Scribe
   stamped the batch's receipt time and a buffered observation landed in the

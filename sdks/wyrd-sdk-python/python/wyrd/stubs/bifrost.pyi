@@ -194,9 +194,9 @@ class TableConfig:
                 this table toward, at least 134217728 (128 MiB). Omitted, the
                 table follows the deployment default (1 GiB unless the
                 operator changed it).
-            compaction_type: ``"auto"``, ``"full"``, ``"small_files"``, or
-                ``"files_with_delete"``. Omitted, Forge compacts
-                ``small_files``. A copy-on-write table always compacts
+            compaction_type: ``"auto"``, ``"full"``, ``"small-files"``, or
+                ``"files-with-delete"``. Omitted, Forge compacts
+                ``small-files``. A copy-on-write table always compacts
                 ``full``.
 
         Raises:
@@ -274,7 +274,7 @@ class TableConfig:
     @property
     def compaction_type(self) -> str | None:
         """The explicit Forge compaction type, or ``None`` for the
-        ``small_files`` default."""
+        ``small-files`` default."""
         ...
     @property
     def resolved(self) -> ResolvedTable | None:

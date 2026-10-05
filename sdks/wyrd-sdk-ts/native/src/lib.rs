@@ -400,7 +400,7 @@ fn decode_batch_ipc(bytes: &[u8]) -> Result<RecordBatch> {
 /// not one mappable JSON Schema, a declared column is server-owned, the
 /// layout is not one physical-layout declaration, the compaction target is
 /// not a non-negative integer, or the compaction type is not one known
-/// `snake_case` wire spelling.
+/// hyphenated wire spelling.
 // justification: napi boundary; a JavaScript string is primitive and cannot be
 // passed by reference, so the generated binding requires an owned String
 #[allow(clippy::needless_pass_by_value)]
@@ -502,7 +502,7 @@ fn apply_compaction_target(config: TableConfig, bytes: Option<f64>) -> Result<Ta
 
 /// Applies one optional explicit Forge compaction type to a config.
 ///
-/// The spelling is the `snake_case` wire value, parsed by the wire type's own
+/// The spelling is the hyphenated wire value, parsed by the wire type's own
 /// serde contract so JavaScript accepts exactly what the server accepts.
 ///
 /// # Errors

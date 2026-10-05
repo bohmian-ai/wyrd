@@ -537,7 +537,7 @@ mod pg_tests {
     /// An explicit compaction type is stored on create, described back,
     /// accepted when repeated or omitted, and refused with its own stable code
     /// when it differs — without changing the stored type. An omitted type
-    /// stores nothing, so the table compacts with Forge's `full` default.
+    /// stores nothing, so the table compacts with Forge's `small-files` default.
     ///
     /// # Panics
     /// Panics when the fixture cannot start or any registration or describe

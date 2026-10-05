@@ -284,16 +284,16 @@ describe("Bifrost write journey", () => {
           })
         ).compactionType;
 
-      expect(await register("small_files")).toBe("created");
-      expect(await describeType()).toBe("small_files");
-      expect(await register("small_files")).toBe("already_exists");
+      expect(await register("small-files")).toBe("created");
+      expect(await describeType()).toBe("small-files");
+      expect(await register("small-files")).toBe("already_exists");
       // Omitting the type defers to what the table already recorded.
       expect(await register()).toBe("already_exists");
 
       const mismatch = await rejection(register("full"));
       expect(mismatch.code).toBe("WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH");
       expect(mismatch.status).toBe(409);
-      expect(await describeType()).toBe("small_files");
+      expect(await describeType()).toBe("small-files");
     } finally {
       server.shutdown();
     }

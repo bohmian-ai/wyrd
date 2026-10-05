@@ -28,7 +28,7 @@
       "minimum": 0.0
     },
     "compaction_type": {
-      "description": "The table's explicit Forge compaction type.\n\nPresent only when the table stores its own `wyrd.forge.compaction.type`; omitted means Forge compacts it `full`.",
+      "description": "The table's explicit Forge compaction type.\n\nPresent only when the table stores its own `wyrd.forge.compaction.type`; omitted means Forge compacts it `small-files`.",
       "anyOf": [
         {
           "$ref": "#/definitions/CompactionTypeWire"
@@ -127,7 +127,7 @@
       }
     },
     "CompactionTypeWire": {
-      "description": "Physical compaction strategy a table asks Forge to apply.\n\nStored as the table's `wyrd.forge.compaction.type` Iceberg property, whose own spelling is hyphenated (`small-files`); the wire keeps the `snake_case` convention every other Wyrd enum uses. A copy-on-write table always compacts `full` whatever it names.",
+      "description": "Physical compaction strategy a table asks Forge to apply.\n\nThe public wire spelling is hyphenated (`auto`, `full`, `small-files`, `files-with-delete`), matching the table's stored `wyrd.forge.compaction.type` Iceberg property; underscore spellings are rejected. A table that names no type compacts `small-files`, and a copy-on-write table always compacts `full` whatever it names.",
       "oneOf": [
         {
           "description": "Choose a delete-heavy or small-file plan from table-wide thresholds.",
@@ -137,24 +137,24 @@
           ]
         },
         {
-          "description": "Rewrite every live data file; the default when none is declared.",
+          "description": "Rewrite every live data file.",
           "type": "string",
           "enum": [
             "full"
           ]
         },
         {
-          "description": "Rewrite only data files below the small-file threshold.",
+          "description": "Rewrite only data files below the small-file threshold; the default when none is declared.",
           "type": "string",
           "enum": [
-            "small_files"
+            "small-files"
           ]
         },
         {
           "description": "Rewrite only data files with associated delete files.",
           "type": "string",
           "enum": [
-            "files_with_delete"
+            "files-with-delete"
           ]
         }
       ]

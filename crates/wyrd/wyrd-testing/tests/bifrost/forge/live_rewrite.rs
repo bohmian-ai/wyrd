@@ -5,8 +5,9 @@ use uuid::Uuid;
 
 use vala_bifrost_redux::catalog::TenantTableBinding;
 use vala_sql::row_types::forge_tasks::{ForgeClaimStrategy, ForgeTaskStrategy};
+use wyrd_client::bifrost::CompactionTypeWire;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{CompactionTypeWire, RegisterOutcome};
+use wyrd_spec::vala::api::RegisterOutcome;
 use wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta;
 use wyrd_testing::bifrost::{WyrdTestCluster, shared_process_telemetry_for_test};
 

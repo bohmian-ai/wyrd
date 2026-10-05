@@ -202,8 +202,18 @@ it is not a Bifrost data or Iceberg migration.
 12. `mise exec -- cargo nextest run --locked --manifest-path /home/thorrester/Documents/GitHub/iceberg-rust/Cargo.toml -p iceberg --lib -E 'test(=arrow::schema::tests::variant_round_trips_unshredded)'`
 13. `mise exec -- cargo nextest run --locked --manifest-path /home/thorrester/Documents/GitHub/iceberg-compaction/Cargo.toml -p iceberg-compaction-core --lib -E 'test(=compaction::tests::rewrite_preserves_v3_row_lineage)'`
    Record both tested revisions, then repin.
-14. `mise run codegen:check`
-15. `git diff --check`
+14. `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run py:setup && cd sdks/wyrd-sdk-python && mise exec -- uv run python -m pytest -q -m integration tests/integration/test_bifrost_query.py::test_canonical_signal_arrow_write_and_sql_read_round_trip'`
+15. `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run ts:build && mise run ts:build:testing && cd sdks/wyrd-sdk-ts/wyrd && mise exec -- pnpm exec vitest run tests/integration/oracle-query.test.ts -t "canonical signal Arrow write and SQL read round-trip"'`
+   Built-in signal `attributes`, `resource_attributes`, and log `body` are
+   Variant here, and Python/TypeScript cannot author Variant Arrow columns until
+   TASK-002 scenario 3. Commands 14–15 therefore produce their rows through the
+   stock OTLP exporters and still read the Variant columns back natively through
+   SQL; canonical-Arrow write equivalence stays proven in Rust. TASK-002
+   scenario 5 restores the direct Python/TypeScript Arrow write. Add no
+   per-fixture Variant encoder and do not pull `write_batch` JSON-text
+   normalization into this task.
+16. `mise run codegen:check`
+17. `git diff --check`
 
 ## Material Stop Conditions
 

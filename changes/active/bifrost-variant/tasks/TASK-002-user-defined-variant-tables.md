@@ -137,6 +137,37 @@ observable matrix pass in all three SDKs, then rerun scenarios 1–3.
 
 **REFACTOR.** Remove language-local durable conversion or validation.
 
+### 5. Python and TypeScript canonical-signal Arrow journeys write Variant columns
+
+**Behavior.** TASK-001 made the built-in signal `attributes`,
+`resource_attributes`, and log `body` columns Variant and temporarily routed the
+Python and TypeScript canonical-signal journeys through the stock OTLP
+exporters, because neither SDK could author Variant columns. With scenario 3 in
+place, both journeys again build canonical signal Arrow batches directly: the
+Variant columns are Utf8 JSON text, `write_batch` normalizes them to the Variant
+extension, and the journey flushes, reads the rows back through SQL, and asserts
+native values plus semantic `variant_get` access into `attributes`,
+`resource_attributes`, and log `body`. The Arrow terminal retains the
+extension. No per-fixture Variant encoder exists. This restores Python and
+TypeScript canonical-Arrow write coverage and proves REQ-014, AC-004, and
+AC-005 on the built-in signal tables.
+
+**RED.** Restore the direct canonical-Arrow write in
+`sdks/wyrd-sdk-python/tests/integration/test_bifrost_query.py::test_canonical_signal_arrow_write_and_sql_read_round_trip`
+and the TypeScript `oracle-query.test.ts` test
+"canonical signal Arrow write and SQL read round-trip", passing JSON text for
+every Variant column. Each must fail on the missing normalization, not setup.
+Run:
+`scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run py:setup && cd sdks/wyrd-sdk-python && mise exec -- uv run python -m pytest -q -m integration tests/integration/test_bifrost_query.py::test_canonical_signal_arrow_write_and_sql_read_round_trip'`
+and
+`scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run ts:build && mise run ts:build:testing && cd sdks/wyrd-sdk-ts/wyrd && mise exec -- pnpm exec vitest run tests/integration/oracle-query.test.ts -t "canonical signal Arrow write and SQL read round-trip"'`.
+
+**GREEN.** No new code beyond scenario 3; the shared `write_batch`
+normalization makes both journeys pass.
+
+**REFACTOR.** Delete the OTLP-exporter detour TASK-001 added to these two
+journeys.
+
 ## Acceptance Criteria
 
 - Every declaration in REQ-012 has the exact type/nullability or exact refusal
@@ -147,6 +178,10 @@ observable matrix pass in all three SDKs, then rerun scenarios 1–3.
   Arrow conversion, and the server receives only the Variant extension.
 - Rust, Python, and TypeScript journeys round-trip native and Arrow values and
   prove refusals create no durable row.
+- Python and TypeScript canonical-signal journeys write built-in signal
+  Variant columns (`attributes`, `resource_attributes`, log `body`) directly as
+  Arrow JSON text through `write_batch` and read them back natively through SQL
+  and `variant_get`; the TASK-001 OTLP-exporter detour is gone.
 
 ## Expected Write Set and Consumer Closure
 
@@ -168,10 +203,12 @@ it is not a Bifrost data or Iceberg migration.
 4. `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-client --test pg_bifrost_e2e -P journey --run-ignored=all -E "test(=pg_tests::variant_tables_round_trip_and_refuse_atomically)"'`
 5. `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run py:setup && cd sdks/wyrd-sdk-python && mise exec -- uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py::test_variant_tables_round_trip_and_refuse_atomically'`
 6. `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run ts:build && mise run ts:build:testing && cd sdks/wyrd-sdk-ts/wyrd && mise exec -- pnpm exec vitest run tests/integration/bifrost-write.test.ts -t "variant tables round trip and refuse atomically"'`
-7. `mise run py:typecheck`
-8. `mise run ts:typecheck`
-9. `mise run codegen:check`
-10. `git diff --check`
+7. `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run py:setup && cd sdks/wyrd-sdk-python && mise exec -- uv run python -m pytest -q -m integration tests/integration/test_bifrost_query.py::test_canonical_signal_arrow_write_and_sql_read_round_trip'`
+8. `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run ts:build && mise run ts:build:testing && cd sdks/wyrd-sdk-ts/wyrd && mise exec -- pnpm exec vitest run tests/integration/oracle-query.test.ts -t "canonical signal Arrow write and SQL read round-trip"'`
+9. `mise run py:typecheck`
+10. `mise run ts:typecheck`
+11. `mise run codegen:check`
+12. `git diff --check`
 
 ## Material Stop Conditions
 

@@ -11,17 +11,17 @@ use sqlx::{AssertSqlSafe, types::Uuid};
 use wyrd_spec::DataTenantId;
 
 use crate::queries::forge_operations::{
-    assert_lease_fence, bind_tenant, lock_table_authority, refuse_active_table_reads,
+    active_table_reads_exist, assert_lease_fence, bind_tenant, lock_table_authority,
 };
 use crate::row_types::forge_operations::{ForgeClaimTable, ForgeExpirationAuthority};
 use crate::row_types::forge_tasks::{
     ExpiredCleanupCandidateRequest, ExpiredCleanupOutcome, ExpiredCleanupPayload,
-    FORGE_TASK_PAYLOAD_VERSION, ForgeCleanupCandidate, ForgePreparedTaskClaim,
-    ForgePreparedTaskClaimSqlRow, ForgeTask, ForgeTaskClaim, ForgeTaskClaimSqlRow,
-    ForgeTaskEvidence, ForgeTaskPage, ForgeTaskPlan, ForgeTaskRowEvidence, ForgeTaskSqlRow,
-    ForgeTaskState, ForgeTaskStrategy, ForgeTaskTableIdentity, ForgeTaskTransition,
-    ForgeTaskTransitionOutcome, NewForgeTask, OrphanCleanupCursor, SnapshotWatermark,
-    TaskProgressEffect,
+    ExpiredCleanupPreparation, FORGE_TASK_PAYLOAD_VERSION, ForgeCleanupCandidate,
+    ForgePreparedTaskClaim, ForgePreparedTaskClaimSqlRow, ForgeTask, ForgeTaskClaim,
+    ForgeTaskClaimSqlRow, ForgeTaskEvidence, ForgeTaskPage, ForgeTaskPlan, ForgeTaskRowEvidence,
+    ForgeTaskSqlRow, ForgeTaskState, ForgeTaskStrategy, ForgeTaskTableIdentity,
+    ForgeTaskTransition, ForgeTaskTransitionOutcome, NewForgeTask, OrphanCleanupCursor,
+    SnapshotWatermark, TaskProgressEffect,
 };
 use crate::{OperatorPool, SqlError, TenantConn};
 
@@ -1167,12 +1167,14 @@ impl ForgeTasks {
     ///
     /// Every candidate preparation, including an exact replay, refuses while
     /// any Oracle query still holds an active read on the table, so no
-    /// physical delete is prepared from a previously observed absence.
+    /// physical delete is prepared from a previously observed absence. That
+    /// refusal is the typed [`ExpiredCleanupPreparation::ActiveReadRefused`]:
+    /// the transaction rolls back, nothing is written, and the durable cursor
+    /// still names exactly what the caller's attempt owns.
     ///
     /// # Errors
     ///
-    /// Returns [`SqlError::Conflict`] when an Oracle query still reads the
-    /// table, the lease fence is lost, the task,
+    /// Returns [`SqlError::Conflict`] when the lease fence is lost, the task,
     /// attempt, owner, table, or claim does not match exactly, the plan and
     /// evidence disagree, the cursor is not `request.index`, a candidate is
     /// already prepared, or the named candidate is not the plan's candidate at
@@ -1187,7 +1189,7 @@ impl ForgeTasks {
         &self,
         tenant: DataTenantId,
         request: ExpiredCleanupCandidateRequest<'_>,
-    ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
+    ) -> Result<ExpiredCleanupPreparation, SqlError> {
         let mut tx = self
             .operator_pool
             .pool()
@@ -1201,7 +1203,12 @@ impl ForgeTasks {
         // cut acquisition, so the active-read refusal below stays true until
         // this transaction commits the prepared candidate.
         let identity = lock_table_authority(&mut tx, tenant, request.table).await?;
-        refuse_active_table_reads(&mut tx, &identity).await?;
+        if active_table_reads_exist(&mut tx, &identity).await? {
+            // The refusal writes nothing, so the durable cursor stays exactly
+            // what the caller's attempt already owns.
+            tx.rollback().await.map_err(SqlError::from)?;
+            return Ok(ExpiredCleanupPreparation::ActiveReadRefused);
+        }
         let payload = locked.payload()?;
         require_named_candidate(&payload, request.index, request.candidate)?;
 
@@ -1211,7 +1218,9 @@ impl ForgeTasks {
                 && evidence.deleted_candidate_count == request.index
             {
                 tx.commit().await.map_err(SqlError::from)?;
-                return Ok(ForgeTaskTransitionOutcome::AlreadyApplied);
+                return Ok(ExpiredCleanupPreparation::Prepared(
+                    ForgeTaskTransitionOutcome::AlreadyApplied,
+                ));
             }
             if evidence.prepared_candidate_index.is_some()
                 || evidence.deleted_candidate_count != request.index
@@ -1249,7 +1258,9 @@ impl ForgeTasks {
             .rows_affected();
         exact_one(changed, "expired cleanup candidate preparation")?;
         tx.commit().await.map_err(SqlError::from)?;
-        Ok(ForgeTaskTransitionOutcome::Applied)
+        Ok(ExpiredCleanupPreparation::Prepared(
+            ForgeTaskTransitionOutcome::Applied,
+        ))
     }
 
     /// Atomically records one prepared candidate's external outcome.

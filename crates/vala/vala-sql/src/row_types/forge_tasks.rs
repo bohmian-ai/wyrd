@@ -1552,6 +1552,21 @@ pub enum ForgeTaskTransitionOutcome {
     AlreadyApplied,
 }
 
+/// Result of one expired-cleanup candidate preparation.
+///
+/// An active Oracle read on the table is a typed refusal rather than an
+/// error: it proves nothing was written and the exact durable cursor is
+/// unchanged, so the worker can retain or release the attempt without
+/// treating the refusal as a lost-ownership or settlement failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpiredCleanupPreparation {
+    /// The candidate was prepared now, or the identical preparation was
+    /// already durable.
+    Prepared(ForgeTaskTransitionOutcome),
+    /// An active table read refused the preparation; nothing was written.
+    ActiveReadRefused,
+}
+
 /// Which physical outcome one prepared cleanup candidate reached.
 ///
 /// Only [`Self::Deleted`] and [`Self::Missing`] are proofs: both mean the

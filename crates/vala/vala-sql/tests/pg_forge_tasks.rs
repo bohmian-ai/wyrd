@@ -10,9 +10,9 @@ mod pg_tests {
     use vala_sql::row_types::forge_operations::{ForgeClaimTable, ForgeExpirationAuthority};
     use vala_sql::row_types::forge_tasks::{
         ExpiredCleanupCandidateRequest, ExpiredCleanupOutcome, ExpiredCleanupPayload,
-        FORGE_TASK_PAYLOAD_VERSION, ForgeClaimStrategy, ForgeCleanupCandidate,
-        ForgeCleanupCategory, ForgeCleanupPath, ForgeTaskEstimates, ForgeTaskEvidence,
-        ForgeTaskPlan, ForgeTaskRowEvidence, ForgeTaskState, ForgeTaskStrategy,
+        ExpiredCleanupPreparation, FORGE_TASK_PAYLOAD_VERSION, ForgeClaimStrategy,
+        ForgeCleanupCandidate, ForgeCleanupCategory, ForgeCleanupPath, ForgeTaskEstimates,
+        ForgeTaskEvidence, ForgeTaskPlan, ForgeTaskRowEvidence, ForgeTaskState, ForgeTaskStrategy,
         ForgeTaskTableIdentity, ForgeTaskTransition, ForgeTaskTransitionOutcome,
         MAINTENANCE_STRATEGIES, NewForgeTask, ORPHAN_CLEANUP_PAYLOAD_VERSION, OrphanCleanupPayload,
         SnapshotWatermark,
@@ -1894,6 +1894,14 @@ mod pg_tests {
             .expect("drop the malformed source");
     }
 
+    /// Proves the expired-cleanup handoff and per-candidate prepare/settle
+    /// lifecycle are exact and atomic, including the typed
+    /// [`ExpiredCleanupPreparation::ActiveReadRefused`] refusal that writes
+    /// no evidence while an Oracle read holds the table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any transition, refusal, or durable cursor differs.
     #[tokio::test]
     async fn expired_cleanup_handoff_and_candidate_lifecycle_are_exact_atomic_and_audited() {
         let (fixture, admin) = setup().await;
@@ -2087,7 +2095,7 @@ mod pg_tests {
                         },
                     )
                     .await,
-                Err(vala_sql::SqlError::Conflict { .. })
+                Ok(ExpiredCleanupPreparation::ActiveReadRefused)
             ),
             "an active table read refuses cleanup preparation"
         );
@@ -2115,7 +2123,7 @@ mod pg_tests {
                 )
                 .await
                 .expect("prepare candidate zero"),
-            ForgeTaskTransitionOutcome::Applied
+            ExpiredCleanupPreparation::Prepared(ForgeTaskTransitionOutcome::Applied)
         );
         let prepared = evidence_of(&admin, cleanup_id).await.expect("evidence");
         assert_eq!(prepared.prepared_candidate_index, Some(0));
@@ -2136,7 +2144,7 @@ mod pg_tests {
                 )
                 .await
                 .expect("replay preparation"),
-            ForgeTaskTransitionOutcome::AlreadyApplied
+            ExpiredCleanupPreparation::Prepared(ForgeTaskTransitionOutcome::AlreadyApplied)
         );
 
         // A stale owner can neither prepare nor settle.

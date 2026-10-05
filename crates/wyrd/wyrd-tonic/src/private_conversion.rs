@@ -2,10 +2,10 @@
 
 use std::str::FromStr;
 
-use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api as domain;
 use wyrd_spec::vala::assignment_authority;
+use wyrd_spec::DataTenantId;
 
 use crate::wyrd::v1 as proto;
 

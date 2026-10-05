@@ -10,18 +10,34 @@
 //! object store, and the real resource governor — never a scheduler, never a
 //! worker, and never a fabricated plan.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use iceberg::spec::{DataContentType, DataFile};
+use arrow::array::{Array as _, AsArray as _};
+use futures_util::TryStreamExt as _;
+use iceberg::metadata_columns::{
+    RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
+    RESERVED_COL_NAME_ROW_ID,
+};
+use iceberg::spec::{
+    DataContentType, DataFile, DataFileBuilder, FormatVersion, ManifestContentType, Operation,
+};
+use iceberg::table::Table;
+use iceberg::transaction::{ApplyTransactionAction as _, Transaction};
 use vala_bifrost_redux::catalog::layout::FORGE_WRITER_RECIPE;
-use vala_bifrost_redux::forge::{ForgeClock, ForgeError, ForgeObjectStore, ForgeUnsettledOutput};
+use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
+use vala_bifrost_redux::forge::{
+    ForgeClock, ForgeError, ForgeObjectStore, ForgeTableKey, ForgeUnsettledOutput,
+};
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::tables::builtin_tables;
+use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
 
 use super::rewrite_support::{AttemptRun, PromotedRewriteFixture, RewriteOutputBreak};
 use super::support::{
-    CountingObjectStore, PromotionCatalogSeam, SupervisedPromotion, remove_table_properties,
-    set_table_properties,
+    CountingObjectStore, PromotionCatalogSeam, PromotionIntegrationFixture, SupervisedPromotion,
+    remove_table_properties, set_table_properties,
 };
 
 /// Runs one whole attempt over the promoted snapshot with no plan budget.
@@ -1081,4 +1097,634 @@ async fn small_files_merges_staged_pairs_once_and_lone_files_wait() {
         lone,
         "single-file days still wait"
     );
+}
+
+/// Upper bound on production steps any one lineage phase may take.
+const LINEAGE_STEPS: usize = 24;
+
+/// Distinct files every original row must have lived in: its promoted object
+/// and two successive rewrite outputs.
+const REWRITTEN_TWICE: usize = 3;
+
+/// Hidden v3 lineage of one live row beside the logical value naming it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RowLineage {
+    /// `_last_updated_sequence_number` the reader resolves for the row.
+    last_updated_sequence_number: i64,
+    /// Logical identity of the row, rendered from its key column.
+    key: String,
+}
+
+/// One table whose lineage the scenario follows across every rewrite.
+struct LineageTable {
+    /// Bound tenant table the rows live in.
+    binding: TenantTableBinding,
+    /// Logical column that identifies each generated row.
+    key_column: &'static str,
+    /// Every row seen so far, as it was first observed.
+    rows: BTreeMap<i64, RowLineage>,
+    /// Every data file each row has lived in, keyed by `_row_id`.
+    homes: BTreeMap<i64, BTreeSet<String>>,
+    /// Rows promoted before the first rewrite, which must be rewritten twice.
+    original: BTreeSet<i64>,
+}
+
+impl LineageTable {
+    /// Starts following one table that has not been observed yet.
+    fn new(binding: TenantTableBinding, key_column: &'static str) -> Self {
+        Self {
+            binding,
+            key_column,
+            rows: BTreeMap::new(),
+            homes: BTreeMap::new(),
+            original: BTreeSet::new(),
+        }
+    }
+
+    /// Loads the table's current metadata through the real catalog.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the table cannot be loaded.
+    async fn load(&self, fixture: &PromotionIntegrationFixture) -> Table {
+        fixture
+            .catalog
+            .iceberg_catalog()
+            .load_table(&self.binding.table_ident())
+            .await
+            .expect("lineage table loads")
+    }
+
+    /// Scans every live row's hidden lineage and file, keyed by `_row_id`.
+    ///
+    /// The scan asks the fork reader for both reserved columns and `_file`
+    /// beside the key column, which is the resolution any reader of the table
+    /// gets: a physical value when a rewrite wrote one, otherwise the value
+    /// inherited from the file's `first_row_id` and data sequence number.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the scan fails, when a lineage value is null, or when two
+    /// live rows share one `_row_id`.
+    async fn scan(
+        &self,
+        fixture: &PromotionIntegrationFixture,
+    ) -> BTreeMap<i64, (RowLineage, String)> {
+        let table = self.load(fixture).await;
+        let mut rows = BTreeMap::new();
+        if table.metadata().current_snapshot().is_none() {
+            return rows;
+        }
+        let batches: Vec<arrow::array::RecordBatch> = table
+            .scan()
+            .select([
+                self.key_column,
+                RESERVED_COL_NAME_ROW_ID,
+                RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
+                RESERVED_COL_NAME_FILE,
+            ])
+            .build()
+            .expect("lineage scan builds")
+            .to_arrow()
+            .await
+            .expect("lineage scan starts")
+            .try_collect()
+            .await
+            .expect("lineage scan reads");
+        for batch in &batches {
+            let cast = |name: &str, to: &arrow::datatypes::DataType| {
+                let column = batch
+                    .column_by_name(name)
+                    .unwrap_or_else(|| panic!("the scan returns {name}"));
+                let cast = arrow::compute::cast(column, to).expect("lineage values cast");
+                assert_eq!(cast.null_count(), 0, "every live row carries {name}");
+                cast
+            };
+            let int64 = arrow::datatypes::DataType::Int64;
+            let row_ids = cast(RESERVED_COL_NAME_ROW_ID, &int64);
+            let sequences = cast(RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, &int64);
+            let files = cast(RESERVED_COL_NAME_FILE, &arrow::datatypes::DataType::Utf8);
+            let row_ids = row_ids.as_primitive::<arrow::datatypes::Int64Type>();
+            let sequences = sequences.as_primitive::<arrow::datatypes::Int64Type>();
+            let files = files.as_string::<i32>();
+            let keys = batch
+                .column_by_name(self.key_column)
+                .expect("the scan returns the key column");
+            for row in 0..batch.num_rows() {
+                let lineage = RowLineage {
+                    last_updated_sequence_number: sequences.value(row),
+                    key: arrow::util::display::array_value_to_string(keys, row)
+                        .expect("key renders"),
+                };
+                let previous =
+                    rows.insert(row_ids.value(row), (lineage, files.value(row).to_owned()));
+                assert!(
+                    previous.is_none(),
+                    "two live rows share _row_id {}",
+                    row_ids.value(row)
+                );
+            }
+        }
+        rows
+    }
+
+    /// Proves every row seen before is still live with the lineage it was
+    /// first seen with, then records new rows and each row's current file.
+    ///
+    /// New rows must take ids no earlier row holds, which the scan's own
+    /// uniqueness check and the metadata's `next-row-id` bound prove together.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a known row vanished or changed its `_row_id`,
+    /// `_last_updated_sequence_number`, or key, or when an id reaches
+    /// `next-row-id`.
+    async fn observe(&mut self, fixture: &PromotionIntegrationFixture) {
+        let current = self.scan(fixture).await;
+        let name = &self.binding.table_ref.name;
+        for (row_id, lineage) in &self.rows {
+            assert_eq!(
+                current.get(row_id).map(|(lineage, _)| lineage),
+                Some(lineage),
+                "row {row_id} of {name} keeps its _row_id and _last_updated_sequence_number"
+            );
+        }
+        let next = i64::try_from(self.load(fixture).await.metadata().next_row_id())
+            .expect("next-row-id fits i64");
+        for (row_id, (lineage, file)) in current {
+            assert!(
+                row_id < next,
+                "_row_id {row_id} of {name} is below next-row-id {next}"
+            );
+            self.rows.entry(row_id).or_insert(lineage);
+            self.homes.entry(row_id).or_default().insert(file);
+        }
+    }
+
+    /// Marks every row seen so far as one that must be rewritten twice.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a row already lived in more than its promoted object, which
+    /// would mean a rewrite ran before the baseline was taken.
+    fn freeze_original(&mut self) {
+        for (row_id, homes) in &self.homes {
+            assert_eq!(
+                homes.len(),
+                1,
+                "row {row_id} is recorded before any rewrite"
+            );
+        }
+        self.original = self.rows.keys().copied().collect();
+    }
+
+    /// Reports whether every original row has lived in two rewrite outputs.
+    fn rewritten_twice(&self) -> bool {
+        !self.original.is_empty()
+            && self.original.iter().all(|row_id| {
+                self.homes
+                    .get(row_id)
+                    .is_some_and(|homes| homes.len() >= REWRITTEN_TWICE)
+            })
+    }
+
+    /// Reports whether the held leader term currently owes this table a rewrite.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the table identity is invalid.
+    fn owes_compaction(
+        &self,
+        fixture: &PromotionIntegrationFixture,
+        supervisor: &SupervisedPromotion,
+    ) -> bool {
+        let key = ForgeTableKey {
+            tenant: fixture.tenant,
+            table: ForgeTaskTableIdentity::new(
+                "wyrd-redux",
+                self.binding.table_ref.namespace.as_str(),
+                &self.binding.table_ref.name,
+            )
+            .expect("lineage table identity"),
+        };
+        supervisor
+            .forge()
+            .held_leader_term()
+            .is_some_and(|term| term.schedule().owes_compaction(&key))
+    }
+}
+
+/// Requests one production pass and settles the attempts it makes runnable.
+///
+/// Two tables share the worker, so one pass can make more than one attempt
+/// runnable; this requires success and progress rather than exactly one.
+///
+/// # Panics
+///
+/// Panics when the pass or the attempts miss their bound or any attempt fails.
+async fn advance(supervisor: &mut SupervisedPromotion) {
+    supervisor.restart_worker();
+    let pass = supervisor.request_pass();
+    supervisor.settle_some_success().await;
+    supervisor.await_pass(pass).await;
+}
+
+/// Runs one production step and re-observes every table.
+///
+/// # Panics
+///
+/// Panics when the step fails or any observation fails.
+async fn advance_and_observe(
+    supervisor: &mut SupervisedPromotion,
+    fixture: &PromotionIntegrationFixture,
+    tables: &mut [LineageTable],
+) {
+    advance(supervisor).await;
+    for table in tables.iter_mut() {
+        table.observe(fixture).await;
+    }
+}
+
+/// Publishes a byte-identical copy of one live rewrite output beside it.
+///
+/// The copy carries the original's physical `_row_id` values, so the next
+/// rewrite of that partition reads every one of those ids twice. The copy is
+/// committed directly, as a foreign writer would, so it makes no rewrite due
+/// by itself. Returns the copy's descriptor so the scenario can withdraw it.
+///
+/// # Panics
+///
+/// Panics when the table holds no rewritten file or the copy cannot be
+/// committed.
+async fn publish_duplicate_lineage(promoted: &PromotedRewriteFixture) -> DataFile {
+    let table = promoted.load_table().await;
+    let original = promoted
+        .live_data_files()
+        .await
+        .into_iter()
+        .find(|file| {
+            file.value_counts()
+                .contains_key(&iceberg::metadata_columns::RESERVED_FIELD_ID_ROW_ID)
+        })
+        .expect("a live rewrite output carries physical lineage");
+    let prefix = &promoted.fixture.binding.object_prefix;
+    let key = |path: &str| {
+        path.split_once(&format!("{prefix}/")).map_or_else(
+            || path.to_owned(),
+            |(_, suffix)| format!("{prefix}/{suffix}"),
+        )
+    };
+    let copy_path = format!("{}.duplicate.parquet", original.file_path());
+    let bytes = promoted
+        .fixture
+        .staging
+        .read(&key(original.file_path()))
+        .await
+        .expect("the live output is readable")
+        .to_bytes();
+    promoted
+        .fixture
+        .staging
+        .write(&key(&copy_path), bytes)
+        .await
+        .expect("the duplicate is writable");
+    let copy = DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path(copy_path)
+        .file_format(original.file_format())
+        .partition(original.partition().clone())
+        .record_count(original.record_count())
+        .file_size_in_bytes(original.file_size_in_bytes())
+        .partition_spec_id(original.partition_spec_id())
+        .build()
+        .expect("the duplicate descriptor builds");
+    let transaction = Transaction::new(&table);
+    transaction
+        .fast_append()
+        .add_data_files([copy.clone()])
+        .apply(transaction)
+        .expect("the duplicate append applies")
+        .commit(promoted.fixture.catalog.iceberg_catalog().as_ref())
+        .await
+        .expect("the duplicate append commits");
+    copy
+}
+
+/// Withdraws a file published by [`publish_duplicate_lineage`].
+///
+/// # Panics
+///
+/// Panics when the removal cannot be committed.
+async fn withdraw(promoted: &PromotedRewriteFixture, file: DataFile) {
+    let table = promoted.load_table().await;
+    let transaction = Transaction::new(&table);
+    transaction
+        .rewrite_files()
+        .set_enable_delete_filter_manager(false)
+        .delete_files([file])
+        .apply(transaction)
+        .expect("the withdrawal applies")
+        .commit(promoted.fixture.catalog.iceberg_catalog().as_ref())
+        .await
+        .expect("the withdrawal commits");
+}
+
+/// Counts the data manifests of a table's current snapshot.
+///
+/// # Panics
+///
+/// Panics when the table has no head or its manifest list cannot be read.
+async fn head_data_manifests(table: &Table) -> usize {
+    let head = table.metadata().current_snapshot().expect("a head");
+    table
+        .manifest_list_reader(head)
+        .load()
+        .await
+        .expect("manifest list loads")
+        .entries()
+        .iter()
+        .filter(|manifest| manifest.content == ManifestContentType::Data)
+        .count()
+}
+
+/// Provisions every built-in and asserts each is created as format v3.
+///
+/// # Panics
+///
+/// Panics when a built-in cannot be provisioned or loaded, or is not v3.
+async fn assert_builtins_are_v3(fixture: &PromotionIntegrationFixture) {
+    for definition in builtin_tables() {
+        fixture
+            .catalog
+            .ensure_builtin(fixture.tenant, definition)
+            .await
+            .expect("every built-in provisions");
+        let namespace = BifrostNamespace::from_domain_namespace(definition.namespace)
+            .expect("built-in namespace");
+        let binding = TenantTableBinding::resolve((
+            fixture.tenant,
+            TableRef::new(namespace, definition.name),
+        ))
+        .expect("built-in binding");
+        let table = fixture
+            .catalog
+            .iceberg_catalog()
+            .load_table(&binding.table_ident())
+            .await
+            .expect("built-in loads");
+        assert_eq!(
+            table.metadata().format_version(),
+            FormatVersion::V3,
+            "vala.{}.{} is v3",
+            definition.namespace,
+            definition.name
+        );
+    }
+}
+
+/// Proves a rewrite whose lineage cannot be preserved commits nothing.
+///
+/// A byte copy of one rewrite output duplicates that partition's physical
+/// `_row_id` values. Forge's partial-progress rule still publishes the
+/// healthy sibling partitions, so the refusal shows as the poisoned
+/// partition left exactly as it was; once the copy is withdrawn the
+/// partition rewrites again with every observed lineage intact.
+///
+/// # Panics
+///
+/// Panics when the poisoned partition changes while the copy is live, does
+/// not rewrite after the copy is withdrawn, or any lineage observation fails.
+async fn refuse_unencodable_lineage(
+    promoted: &PromotedRewriteFixture,
+    supervisor: &mut SupervisedPromotion,
+    tables: &mut [LineageTable],
+) {
+    let fixture = &promoted.fixture;
+    let duplicate = publish_duplicate_lineage(promoted).await;
+    let partition = duplicate.partition().clone();
+    let poisoned = |files: Vec<DataFile>| {
+        files
+            .into_iter()
+            .filter(|file| file.partition() == &partition)
+            .map(|file| file.file_path().to_owned())
+            .collect::<BTreeSet<_>>()
+    };
+    let before = poisoned(promoted.live_data_files().await);
+    assert_eq!(
+        before.len(),
+        2,
+        "the partition holds the output and its copy"
+    );
+    fixture.seal_more(1).await;
+    advance(supervisor).await;
+    assert!(
+        tables[0].owes_compaction(fixture, supervisor),
+        "the promotion makes the poisoned partition due"
+    );
+    advance(supervisor).await;
+    assert_eq!(
+        poisoned(promoted.live_data_files().await),
+        before,
+        "a rewrite whose lineage is not preserved commits nothing"
+    );
+    withdraw(promoted, duplicate).await;
+    fixture.clear_task_backoff().await;
+    for _ in 0..LINEAGE_STEPS {
+        if poisoned(promoted.live_data_files().await).is_disjoint(&before) {
+            break;
+        }
+        if !tables[0].owes_compaction(fixture, supervisor) {
+            fixture.seal_more(1).await;
+        }
+        advance_and_observe(supervisor, fixture, tables).await;
+    }
+    assert!(
+        poisoned(promoted.live_data_files().await).is_disjoint(&before),
+        "the partition rewrites again once its lineage is encodable"
+    );
+}
+
+/// Fragments the user table's head and lets one leader pass collect it.
+///
+/// Compaction is disabled and drained first so the fragmenting promotion is
+/// the head; the maintenance pass must then rewrite the v3 manifests, expire
+/// replaced snapshots, and leave every observed lineage intact. Returns the
+/// user row count before the fragmenting promotion.
+///
+/// # Panics
+///
+/// Panics when the head is not fragmented, the pass does not rewrite and
+/// expire, or any lineage observation fails.
+async fn collect_v3_garbage(
+    fixture: &PromotionIntegrationFixture,
+    supervisor: &mut SupervisedPromotion,
+    tables: &mut [LineageTable],
+) -> usize {
+    set_table_properties(
+        &fixture.catalog,
+        &fixture.binding,
+        &[("wyrd.forge.enable-compaction", "false")],
+    )
+    .await;
+    for _ in 0..LINEAGE_STEPS {
+        if !tables[0].owes_compaction(fixture, supervisor) {
+            break;
+        }
+        advance_and_observe(supervisor, fixture, tables).await;
+    }
+    let rows_before = tables[0].rows.len();
+    fixture.seal_more(1).await;
+    advance_and_observe(supervisor, fixture, tables).await;
+    assert_eq!(
+        tables[0].rows.len(),
+        rows_before + 2,
+        "the fragmenting rows are promoted"
+    );
+    let before = tables[0].load(fixture).await;
+    let before_manifests = head_data_manifests(&before).await;
+    let before_snapshots = before.metadata().snapshots().count();
+    assert!(
+        before_manifests >= 2,
+        "the head is fragmented: {before_manifests}"
+    );
+    supervisor.maintain_only().await;
+    let after = tables[0].load(fixture).await;
+    assert_eq!(
+        after
+            .metadata()
+            .current_snapshot()
+            .expect("a head")
+            .summary()
+            .operation,
+        Operation::Replace,
+        "the leader pass rewrote the v3 manifests"
+    );
+    assert!(
+        head_data_manifests(&after).await < before_manifests,
+        "the leader pass merged the v3 manifests"
+    );
+    assert!(
+        after.metadata().snapshots().count() < before_snapshots,
+        "the leader pass expired replaced snapshots"
+    );
+    tables[0].observe(fixture).await;
+    rows_before
+}
+
+/// Hidden v3 row lineage survives repeated Forge rewrites and v3 GC.
+///
+/// Every built-in and the user table are created as format v3. A user table
+/// and a built-in table are written through the real Scribe and promoted;
+/// the production scheduler and worker then rewrite them until every
+/// originally promoted row has lived in two successive rewrite outputs, with
+/// more rows promoted between rounds because only Forge's own commits make a
+/// table due. After every step each known row must still carry the `_row_id`
+/// and `_last_updated_sequence_number` it was first seen with. A duplicate of
+/// one rewrite output then makes that partition's lineage unencodable: its
+/// rewrite fails and commits nothing, and once the duplicate is withdrawn
+/// the table rewrites again with lineage intact. Finally a leader maintenance
+/// pass rewrites the user table's fragmented manifests and expires its
+/// replaced snapshots, and both existing lineage and fresh row-id assignment
+/// survive it.
+///
+/// # Panics
+///
+/// Panics when a table is not v3, when any row's lineage changes, when the
+/// injected duplicate commits, or when GC does not rewrite and expire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn v3_row_lineage_survives_repeated_rewrite() {
+    let promoted = PromotedRewriteFixture::start_unpromoted("v3_lineage").await;
+    let fixture = &promoted.fixture;
+    assert_builtins_are_v3(fixture).await;
+    let mut builtin_files = 2;
+    let builtin = fixture
+        .seal_builtin_table(
+            BifrostNamespace::Verification,
+            "results",
+            0,
+            builtin_files,
+            3,
+        )
+        .await;
+    set_table_properties(
+        &fixture.catalog,
+        &fixture.binding,
+        &[
+            ("wyrd.forge.enable-manifest-rewrite", "true"),
+            ("commit.manifest.min-count-to-merge", "2"),
+        ],
+    )
+    .await;
+    let mut tables = [
+        LineageTable::new(fixture.binding.clone(), "value"),
+        LineageTable::new(builtin, "result_id"),
+    ];
+    assert_eq!(
+        tables[0].load(fixture).await.metadata().format_version(),
+        FormatVersion::V3,
+        "the user table is v3"
+    );
+
+    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let mut supervisor = SupervisedPromotion::start_serial(
+        fixture,
+        fixture.catalog.iceberg_catalog(),
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    supervisor.join_worker().await;
+
+    // Promotion publishes the sealed rows; their lineage is the baseline.
+    advance_and_observe(&mut supervisor, fixture, &mut tables).await;
+    assert_eq!(tables[0].rows.len(), 4, "the user rows are promoted");
+    assert_eq!(tables[1].rows.len(), 6, "the built-in rows are promoted");
+    for table in &mut tables {
+        table.freeze_original();
+    }
+
+    // Rewrite until every original row has moved through two outputs.
+    for _ in 0..LINEAGE_STEPS {
+        if tables.iter().all(LineageTable::rewritten_twice) {
+            break;
+        }
+        if !tables
+            .iter()
+            .any(|table| table.owes_compaction(fixture, &supervisor))
+        {
+            fixture.seal_more(1).await;
+            fixture
+                .seal_builtin_table(
+                    BifrostNamespace::Verification,
+                    "results",
+                    builtin_files,
+                    1,
+                    3,
+                )
+                .await;
+            builtin_files += 1;
+        }
+        advance_and_observe(&mut supervisor, fixture, &mut tables).await;
+    }
+    for table in &tables {
+        assert!(
+            table.rewritten_twice(),
+            "every original row of {} was rewritten twice",
+            table.binding.table_ref.name
+        );
+    }
+
+    refuse_unencodable_lineage(&promoted, &mut supervisor, &mut tables).await;
+
+    let rows_before = collect_v3_garbage(fixture, &mut supervisor, &mut tables).await;
+
+    // Row ids assigned after the manifest rewrite come from fresh space.
+    fixture.seal_more(1).await;
+    advance_and_observe(&mut supervisor, fixture, &mut tables).await;
+    assert_eq!(
+        tables[0].rows.len(),
+        rows_before + 4,
+        "the fresh rows are promoted"
+    );
+    supervisor.shutdown().await;
 }

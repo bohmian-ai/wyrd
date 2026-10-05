@@ -884,7 +884,9 @@ impl BifrostCatalog {
 
     /// Resolve one canonical layout and register the tenant-qualified table.
     ///
-    /// The order is fixed and fail-closed: caller input is rejected, the
+    /// The order is fixed and fail-closed: caller fields that name a managed
+    /// column are rejected (a built-in's server-owned definition may declare
+    /// one as content, as the code-axis `run_id` does), the
     /// binding and physical schema are resolved, the layout is canonicalized —
     /// all before a transaction opens. Inside the tenant transaction the
     /// advisory lock serializes concurrent registrations of the same FQN; an
@@ -915,7 +917,9 @@ impl BifrostCatalog {
         canonical_schema: Option<SchemaRef>,
         compaction: CompactionRegistration,
     ) -> Result<TableUid, BifrostCatalogError> {
-        reject_reserved_field_names(&request.user_fields)?;
+        if canonical_schema.is_none() {
+            reject_reserved_field_names(&request.user_fields)?;
+        }
         let binding = TenantTableBinding::resolve((request.tenant, request.table))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let fqn = binding.table_ref.fqn();

@@ -17,11 +17,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use iceberg::spec::{
-    DataContentType, DataFile, Literal, PartitionSpec, PrimitiveLiteral, Struct, Transform,
-};
 use iceberg::metadata_columns::{
     RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_ROW_ID,
+};
+use iceberg::spec::{
+    DataContentType, DataFile, Literal, PartitionSpec, PrimitiveLiteral, Struct, Transform,
 };
 use iceberg::table::Table;
 use iceberg::transaction::Transaction;
@@ -1523,8 +1523,18 @@ mod tests {
             .record_count(10)
             .file_size_in_bytes(1_024)
             .partition_spec_id(SPEC)
-            .value_counts(ROW_LINEAGE_FIELD_IDS.into_iter().map(|id| (id, 10)).collect())
-            .null_value_counts(ROW_LINEAGE_FIELD_IDS.into_iter().map(|id| (id, 0)).collect())
+            .value_counts(
+                ROW_LINEAGE_FIELD_IDS
+                    .into_iter()
+                    .map(|id| (id, 10))
+                    .collect(),
+            )
+            .null_value_counts(
+                ROW_LINEAGE_FIELD_IDS
+                    .into_iter()
+                    .map(|id| (id, 0))
+                    .collect(),
+            )
             .build()
             .expect("fixture data descriptor")
     }
@@ -1709,7 +1719,12 @@ mod tests {
                     .record_count(10)
                     .file_size_in_bytes(1_024)
                     .partition_spec_id(SPEC)
-                    .value_counts(ROW_LINEAGE_FIELD_IDS.into_iter().map(|id| (id, 10)).collect())
+                    .value_counts(
+                        ROW_LINEAGE_FIELD_IDS
+                            .into_iter()
+                            .map(|id| (id, 10))
+                            .collect(),
+                    )
                     .null_value_counts(HashMap::from([
                         (RESERVED_FIELD_ID_ROW_ID, 1),
                         (RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, 0),

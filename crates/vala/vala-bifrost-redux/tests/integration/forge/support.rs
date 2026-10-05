@@ -1482,6 +1482,58 @@ impl PromotionIntegrationFixture {
         age_files(&self.operator_pool, self.tenant, &binding, seeded_at).await;
     }
 
+    /// Provisions one flat built-in table and seals generated rows into it.
+    ///
+    /// The table is created through the production lazy-provisioning owner, so
+    /// its schema, layout, and format are exactly what a tenant's first write
+    /// would get, and provisioning again is a no-op. Each sealed object carries
+    /// `rows_per_file` rows generated from the built-in's own authored fields
+    /// and lands in its own closed day, `first_file` onwards counted back from
+    /// the fixture day, so every object is one Forge plan and repeated calls
+    /// stay disjoint. The table is declared compaction-enabled as the fixture
+    /// table is.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the built-in is unknown, when an authored field is not a
+    /// flat string, integer, boolean, or UTC microsecond timestamp, or when
+    /// provisioning, sealing, or eligibility aging fails.
+    pub(crate) async fn seal_builtin_table(
+        &self,
+        namespace: BifrostNamespace,
+        name: &str,
+        first_file: usize,
+        files: usize,
+        rows_per_file: usize,
+    ) -> TenantTableBinding {
+        let segment = namespace
+            .as_str()
+            .strip_prefix("vala.")
+            .expect("built-in namespaces are vala-qualified");
+        let definition = vala_bifrost_redux::tables::builtin_table(segment, name)
+            .expect("the built-in definition resolves");
+        self.catalog
+            .ensure_builtin(self.tenant, definition)
+            .await
+            .expect("the built-in provisions");
+        let binding = TenantTableBinding::resolve((self.tenant, TableRef::new(namespace, name)))
+            .expect("built-in table binding");
+        enable_compaction(&self.catalog, &binding).await;
+        let seeded_at: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+            .fetch_one(self.operator_pool.pool())
+            .await
+            .expect("fixture seed marker");
+        let fields = (definition.arrow_fields)();
+        let first = i64::try_from(first_file).expect("bounded fixture count");
+        let count = i64::try_from(files).expect("bounded fixture count");
+        for file_number in first..first + count {
+            let batch = flat_builtin_batch(&fields, file_number, rows_per_file);
+            append_and_seal(&self.scribe, &self.catalog, self.tenant, &binding, &batch).await;
+        }
+        age_files(&self.operator_pool, self.tenant, &binding, seeded_at).await;
+        binding
+    }
+
     /// Reads every durable Forge task of this fixture's table, in durable order.
     ///
     /// The rows are returned untyped so a scenario asserts on the exact durable
@@ -2255,10 +2307,15 @@ impl SupervisedPromotion {
             self.worker_observer.returned_errors()
         );
         self.stop_worker().await;
-        assert!(
-            self.worker_observer.completed() > before,
-            "the worker settled no attempt"
-        );
+        // A promotion the scheduler pass executes records its completion after
+        // the held attempt is released, independently of the worker join.
+        tokio::time::timeout(
+            FIXTURE_BOUND,
+            self.worker_observer
+                .wait_for_at_least(before.saturating_add(1)),
+        )
+        .await
+        .expect("the worker settled no attempt");
     }
 
     /// Schedule one pass and await exactly one returned worker error while
@@ -2786,6 +2843,76 @@ fn ingress_batch(schema: &Arc<ArrowSchema>, file_number: i64) -> RecordBatch {
         ],
     )
     .expect("fixture ingress batch")
+}
+
+/// Generates one batch of distinct rows for a flat built-in's authored fields.
+///
+/// Every authored column is populated, including nullable ones, so a rewrite
+/// that mixed rows up would be visible in any column. `wyrd_event_time` is
+/// appended explicitly and places the whole batch at noon of the day
+/// `file_number` days before the fixture day, as [`ingress_batch`] does.
+///
+/// # Panics
+///
+/// Panics when a field is not a flat string, integer, boolean, or UTC
+/// microsecond timestamp, or when the batch cannot be assembled.
+fn flat_builtin_batch(fields: &[Field], file_number: i64, rows: usize) -> RecordBatch {
+    let noon = (fixture_day() - chrono::Duration::days(file_number))
+        .and_hms_opt(12, 0, 0)
+        .expect("fixture timestamp")
+        .and_utc()
+        .timestamp_micros();
+    let offsets: Vec<i64> = (0..i64::try_from(rows).expect("bounded fixture rows")).collect();
+    let event_times = || {
+        Arc::new(
+            TimestampMicrosecondArray::from_iter_values(offsets.iter().map(|row| noon + row))
+                .with_timezone("UTC"),
+        ) as arrow::array::ArrayRef
+    };
+    let mut columns: Vec<arrow::array::ArrayRef> = fields
+        .iter()
+        .map(|field| -> arrow::array::ArrayRef {
+            match field.data_type() {
+                DataType::Utf8 => Arc::new(arrow::array::StringArray::from_iter_values(
+                    offsets
+                        .iter()
+                        .map(|row| format!("{}-{file_number}-{row}", field.name())),
+                )),
+                DataType::Int64 => Arc::new(Int64Array::from_iter_values(
+                    offsets.iter().map(|row| file_number * 1_000 + row),
+                )),
+                DataType::Int32 => Arc::new(arrow::array::Int32Array::from_iter_values(
+                    offsets.iter().map(|row| {
+                        i32::try_from(file_number * 1_000 + row).expect("bounded fixture value")
+                    }),
+                )),
+                DataType::Boolean => Arc::new(
+                    offsets
+                        .iter()
+                        .map(|row| Some(row % 2 == 0))
+                        .collect::<arrow::array::BooleanArray>(),
+                ),
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some(zone))
+                    if zone.as_ref() == "UTC" =>
+                {
+                    event_times()
+                }
+                other => panic!(
+                    "a flat built-in fixture cannot generate {}: {other}",
+                    field.name()
+                ),
+            }
+        })
+        .collect();
+    let mut schema_fields = fields.to_vec();
+    schema_fields.push(Field::new(
+        wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+        false,
+    ));
+    columns.push(event_times());
+    RecordBatch::try_new(Arc::new(ArrowSchema::new(schema_fields)), columns)
+        .expect("fixture built-in batch")
 }
 
 /// Encodes one batch as the native Arrow IPC stream Scribe ingress accepts.

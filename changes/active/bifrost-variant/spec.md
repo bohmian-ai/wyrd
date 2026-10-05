@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-variant
-revision: 1
+revision: 2
 status: draft
 ---
 
@@ -146,8 +146,9 @@ Query path:
 - Moving the published read path to DataFusion's `ParquetSource`.
 - Bloom filters on shredded Variant leaves; leaves are pruned by statistics
   and page indexes only.
-- Shredding nested objects below a Variant's top-level keys, or Variant values
-  nested inside lists (span event and link attributes, exemplar attributes).
+- Shredding arrays, values reached through an array, or Variant values nested
+  inside lists (span event and link attributes, exemplar attributes). They are
+  stored and queried correctly from the residual value.
 - Inferring JSON from text: a string column holding JSON text stays text.
 - A configurable shredding key count.
 - A TypeScript `TableConfig.fromArrow`.
@@ -163,15 +164,20 @@ Query path:
   in the Parquet/Iceberg Variant encoding: null, boolean, integer, floating
   point, decimal, string, binary, date, timestamp, array, and object. On the
   Arrow wire it is the canonical `arrow.parquet.variant` extension type.
-- **Shredding:** storing selected top-level object keys of a Variant column in
-  one file as typed Parquet leaf columns (`typed_value`), with every value that
+- **Path:** the sequence of object keys from a Variant column's root to a
+  value at any depth, for example `order` → `customer` → `tier`. Each element
+  is one whole key, so the flat OTel key `http.route` is a one-element path,
+  distinct from the two-element path `http` → `route`.
+- **Shredding:** storing the scalar values at selected paths of a Variant
+  column in one file as typed Parquet leaf columns (`typed_value`, nested as
+  groups for nested objects), with every value that
   is not shredded, or does not match the shredded type, kept in the residual
   Variant value. Shredding is a per-file physical layout and never changes the
   logical value.
 - **Logical schema:** the table's schema with Variant columns unshredded. It is
   the schema users see and the one fingerprints cover.
-- **Leaf:** one Parquet column chunk path: a Struct field or a shredded Variant
-  key.
+- **Leaf:** one Parquet column chunk path: a Struct field at any depth or a
+  shredded Variant path.
 - **Promoted column:** a nullable typed column copied from a canonical
   attribute; the attribute itself stays in its Variant column.
 - **Hot path / published path:** Oracle's read of Scribe-owned hot Parquet
@@ -419,19 +425,22 @@ partially.
 #### REQ-020 — Per-file layout
 
 For each top-level Variant column of each file Scribe or Forge writes, the
-writer shreds at most 128 top-level object keys: those with the largest total
-value size in that file's input, ties broken by key name. A key's shredded
-type is the type of its values in that input, widened from integer to double
-when both occur. A key whose values are mostly objects or arrays, or whose
-scalar types conflict beyond that widening, is not shredded. Values that do
-not match a shredded key's type stay in the residual value.
+writer considers every path that reaches a scalar value through objects only,
+at any depth up to the configured Variant depth limit, and shreds at most 128
+of them: those with the largest total value size in that file's input, ties
+broken by path. A nested path is shredded as nested typed groups, so
+`order` → `customer` → `tier` becomes its own leaf. A path's shredded type is
+the type of its values in that input, widened from integer to double when both
+occur. A path whose scalar types conflict beyond that widening is not
+shredded. Values that do not match a shredded path's type, and every value at
+an unshredded path, stay in the residual value.
 
 #### REQ-021 — Choosing the layout without a second pass
 
 Scribe's staged runs are written unshredded and record, for each Variant
-column, a bounded summary of total value size per key. When Scribe assembles
+column, a bounded summary of total value size per path. When Scribe assembles
 a published artifact it combines its runs' summaries to choose the layout
-before writing. Every file Scribe or Forge writes records its per-key size
+before writing. Every file Scribe or Forge writes records its per-path size
 summary in its Parquet footer, and Forge chooses a compaction output's layout
 from its input files' summaries. The layout chosen for the same inputs is
 always the same.
@@ -439,29 +448,30 @@ always the same.
 #### REQ-022 — Shredded files are read correctly everywhere
 
 Both read paths read shredded files. For every query, the result is identical
-whether a key is shredded, partly shredded, or unshredded; whether the file is
+whether a path is shredded, partly shredded, or unshredded, at any depth; whether the file is
 hot or published; and before and after compaction.
 
 ### Pruning
 
 #### REQ-023 — Leaf projection
 
-A query that reads a Struct field or a shredded Variant key reads only that
-leaf's column chunks on both read paths, never the whole Struct or Variant
-column. An unshredded key reads the residual value.
+A query that reads a Struct field or a shredded Variant path, at any depth,
+reads only that leaf's column chunks on both read paths, never the whole
+Struct or Variant column. An unshredded path reads the residual value.
 
 #### REQ-024 — Leaf filtering and row-group skipping
 
 On both read paths, Bifrost pushes these predicates down to a Struct field or
-shredded Variant key:
+shredded Variant path, at any depth:
 
 - `=`, `<>`, `<`, `<=`, `>`, `>=`, `IN`, `IS NULL`, and `IS NOT NULL`
-  comparing `v ->> 'key'` (string-shredded keys), `CAST(v ->> 'key' AS t)`
-  (keys shredded as a matching type), or `s['field']` with a literal.
+  comparing a literal with `v ->> 'k'` or a chain such as
+  `v -> 'a' -> 'b' ->> 'k'` (string-shredded paths), `CAST(<that> AS t)`
+  (paths shredded as a matching type), or `s['a']['b']`.
 
 Pushed-down predicates filter rows while decoding and skip row groups and
 pages whose leaf statistics or page indexes exclude them. In a file where the
-key is not shredded, the predicate is evaluated after reading, with the same
+path is not shredded, the predicate is evaluated after reading, with the same
 result. Any other predicate shape is evaluated by the query engine, with the
 same result.
 
@@ -569,7 +579,7 @@ harness, or ingest path is introduced.
 ```text
 OTLP or canonical Arrow
   -> table-owned projection to the logical schema (Variant, Struct, promoted)
-  -> Scribe WAL and staged runs (unshredded, per-key size summaries)
+  -> Scribe WAL and staged runs (unshredded, per-path size summaries)
   -> Scribe artifact assembly (layout from combined summaries, shredded write,
      footer summary)
   -> Forge compaction (layout from input footers, shredded write, row lineage
@@ -620,7 +630,8 @@ stable query error; `try_parse_json` returns null.
 
 #### AC-006 — Shredding equivalence
 
-A Rust Bifrost test writes data whose keys vary in size and type across files,
+A Rust Bifrost test writes nested data whose paths vary in size and type
+across files,
 and shows that the chosen layouts follow REQ-020, are identical when the same
 input is rewritten, and that a fixed set of queries returns identical results
 over hot files, published files, and compacted files, and with shredding
@@ -629,7 +640,8 @@ disabled for comparison in the test.
 #### AC-007 — Leaf reads and pruning
 
 Rust Bifrost tests on both read paths show, from Oracle read metrics, that a
-query on a shredded key or a Struct field reads only that leaf and skips row
+query on a shredded top-level key, a shredded nested path, or a nested Struct
+field reads only that leaf and skips row
 groups and pages its statistics exclude, including in a distributed query
 whose follower receives the leaf predicate in its signed assignment. A
 regression test shows a Struct field named like a top-level column is matched
@@ -659,6 +671,11 @@ None.
 
 ## Revision history
 
+- **Revision 2 (2026-10-05, draft):** Shredding chooses scalar paths at any
+  depth, not only top-level keys, because nested JSON payloads are the common
+  case for user tables; `parquet-variant-compute` 59.3 builds nested shredded
+  groups by path. Arrays stay unshredded. Leaf projection and pushdown apply to
+  nested paths and nested Struct fields.
 - **Revision 1 (2026-10-05, draft):** Created from the closeout research on
   `wyrd-forge` HEAD `30d31ebac`, following Pydantic Logfire's struct-field
   pushdown and Bloom-folding practices. Moves the Bifrost parts of

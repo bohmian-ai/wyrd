@@ -1,6 +1,8 @@
 # Forge implementation tasks
 
-The approved revision 10 spec has six behavioral implementation steps, in order:
+The current approved authority is spec revision 12. The tasks were derived from
+earlier revisions, recorded in each task's `spec_revision`. There are six
+behavioral implementation steps, in order:
 
 1. TASK-001-leader-and-promotion.md — one leader and exact Iceberg commit tracking.
 2. TASK-002-pull-and-worker-results.md — compactor pull, worker planning and reports.
@@ -11,7 +13,7 @@ The approved revision 10 spec has six behavioral implementation steps, in order:
    one tenant-scoped active cut, reader-controlled destructive cleanup, and
    terminal hot-file metadata retirement; passing it completes TASK-005.
 
-Only the approved revision-10 spec and these tasks direct Forge and Oracle cut implementation. The separate Python docstring task remains an owner-directed documentation task.
+Only the approved revision-12 spec, these tasks, and their review remediation tasks direct Forge and Oracle cut implementation. The separate Python docstring task remains an owner-directed documentation task.
 
 Start by dropping the nine Forge concurrent-planning/review commits after
 `ce5c09ef3b559c35e65d6a3e73beebe0a69ae5bd`; keep the unrelated

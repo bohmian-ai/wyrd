@@ -1,12 +1,19 @@
 //! Attempt-scoped supervision for Oracle's Analytical execution path.
 //!
-//! A distributed graph fans work out across followers, so nothing about its
-//! cleanup is implied by a leader stream ending. This module owns the one place
-//! that knows an attempt exists: it registers the attempt's query-owned runtime,
-//! splits the attempt's exchange children from the query admission already
-//! charged, hands out a cancellation child, retains every driver future
-//! started under that attempt, and releases all of it exactly once on every
-//! terminal path — success, retry, cancellation, deadline, error, or shutdown.
+//! The leader query stream owns the complete lifetime of a distributed graph.
+//! Its [`super::analytical`] graph lifecycle revokes every follower grant,
+//! closes the graph's exchanges, and aborts local drivers synchronously when
+//! the stream ends. The stream releases the query's active-read claim only
+//! after that revocation.
+//! Remote IO that has already lost its consumer may finish after that
+//! revocation; it can no longer deliver a result or extend the claim.
+//!
+//! This module does not own query lifetime. It indexes and routes the state a
+//! follower needs between separate stage operations: it registers the
+//! attempt's query-owned runtime, splits the attempt's exchange children from
+//! the query admission already charged, hands out a cancellation child, and
+//! settles each attempt exactly once. A graph whose cleanup cannot be confirmed
+//! stays here as charged capacity residue rather than as a free slot.
 //!
 //! Two properties are structural rather than conventional:
 //!

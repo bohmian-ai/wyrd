@@ -3,6 +3,7 @@ id: TASK-004
 kind: implementation
 status: review
 spec: SPEC-forge-concurrent-planning
+spec_revision: 6
 requirements: [REQ-011, REQ-012, REQ-013]
 depends_on: [TASK-003]
 ---

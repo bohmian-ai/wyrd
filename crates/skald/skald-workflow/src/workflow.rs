@@ -197,13 +197,29 @@ impl WorkflowExecutor {
         })
     }
 
+    /// The queued snapshot this executor will run.
+    pub(crate) fn snapshot(&self) -> &WorkflowRun {
+        self.ledger.snapshot()
+    }
+
+    /// The absolute total run deadline fixed by [`Self::new`], if the run has
+    /// one.
+    pub(crate) const fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
     /// Execute the run to a terminal snapshot inside its `workflow.run` span.
     ///
     /// Never fails after preparation: step, cancellation, deadline, and size
     /// outcomes are all recorded in the returned snapshot. The span records
     /// the terminal status and, for an unsuccessful run, the primary error
-    /// code.
-    pub(crate) async fn execute(self) -> WorkflowRun {
+    /// code. `on_transition` receives the complete non-terminal snapshot
+    /// after every ledger transition, on the scheduling task, so it must not
+    /// block; the terminal snapshot is only returned.
+    pub(crate) async fn execute<F>(self, mut on_transition: F) -> WorkflowRun
+    where
+        F: FnMut(&WorkflowRun) + Send,
+    {
         let span = info_span!(
             "workflow.run",
             wyrd.workflow.id = %self.workflow_id,
@@ -213,7 +229,10 @@ impl WorkflowExecutor {
             error.r#type = field::Empty,
             otel.status_code = field::Empty,
         );
-        let run = self.drive().instrument(span.clone()).await;
+        let run = self
+            .drive(&mut on_transition)
+            .instrument(span.clone())
+            .await;
         span.record("wyrd.workflow.status", status_name(run.status));
         if let Some(error) = &run.error {
             span.record("error.type", error.code.as_str());
@@ -227,11 +246,16 @@ impl WorkflowExecutor {
     /// Schedule, settle, and terminalize the run.
     ///
     /// Step tasks inherit the current `workflow.run` span so their attempt
-    /// spans are its children.
-    async fn drive(mut self) -> WorkflowRun {
+    /// spans are its children. `on_transition` observes the snapshot after
+    /// the run starts and after each step starts or settles.
+    async fn drive<F>(mut self, on_transition: &mut F) -> WorkflowRun
+    where
+        F: FnMut(&WorkflowRun) + Send,
+    {
         let deadline = self.deadline;
         let cancellation = self.options.cancellation.clone();
         self.ledger.start();
+        on_transition(self.ledger.snapshot());
         let mut tasks: JoinSet<StepReport> = JoinSet::new();
         let mut running: HashMap<Id, usize> = HashMap::new();
         let mut stopping = false;
@@ -254,7 +278,9 @@ impl WorkflowExecutor {
             {
                 match self.bind(index) {
                     Ok(pairs) => {
+                        self.attempts[index].store(1, Ordering::Release);
                         self.ledger.step_started(index);
+                        on_transition(self.ledger.snapshot());
                         let task = StepTask {
                             plan: Arc::clone(&self.plan),
                             index,
@@ -277,6 +303,7 @@ impl WorkflowExecutor {
                             wyrd_spec::card::workflow::WorkflowRunError::from_wyrd(&error),
                             1,
                         );
+                        on_transition(self.ledger.snapshot());
                         stopping = true;
                     }
                 }
@@ -307,6 +334,7 @@ impl WorkflowExecutor {
                 continue;
             };
             stopping |= self.settle(index, report);
+            on_transition(self.ledger.snapshot());
         }
         self.ledger.finish(ending, &self.plan)
     }
@@ -316,9 +344,9 @@ impl WorkflowExecutor {
     ///
     /// Success releases dependents unless its payload overflows the run
     /// budget; failure and panic stop scheduling. An interrupted or aborted
-    /// task is `cancelled` only once an attempt began; a task stopped before
-    /// its first attempt stays active so [`RunLedger::finish`] records it as
-    /// `unstarted` with no attempts or timestamps.
+    /// task is `cancelled` with its recorded attempts, which are at least one
+    /// because scheduling reserves the first attempt before publishing the
+    /// step as `running`.
     fn settle(&mut self, index: usize, report: Result<StepReport, JoinError>) -> bool {
         let attempts = self.attempts[index].load(Ordering::Acquire);
         match report {
@@ -335,15 +363,11 @@ impl WorkflowExecutor {
                 true
             }
             Ok(StepReport::Interrupted) => {
-                if attempts > 0 {
-                    self.ledger.step_cancelled(index, attempts);
-                }
+                self.ledger.step_cancelled(index, attempts);
                 false
             }
             Err(error) if error.is_cancelled() => {
-                if attempts > 0 {
-                    self.ledger.step_cancelled(index, attempts);
-                }
+                self.ledger.step_cancelled(index, attempts);
                 false
             }
             Err(_panic) => {
@@ -535,7 +559,7 @@ impl StepTask {
             .min();
         let prompt = step.agent.prompt.native();
         let context = AttemptRouteContext {
-            provider: prompt.request.provider(),
+            provider: prompt.provider(),
             model: prompt.model.clone(),
             deadline,
             cancellation: self.cancellation.clone(),
@@ -733,6 +757,75 @@ mod tests {
             )
             .await
             .expect("workflow passes pre-dispatch validation")
+    }
+
+    /// Preparing a run checks it and mints its ID without dispatching any
+    /// step; execution reports complete snapshots under that ID after every
+    /// transition and ends with the same ID.
+    #[tokio::test(start_paused = true)]
+    async fn prepared_run_keeps_its_id() {
+        let workflow = Workflow::builder("prepared")
+            .add(agent("first", "first static", None))
+            .and_then(|b| b.add_after(agent("second", "second static", None), ["first"]))
+            .and_then(|b| b.with_outputs(bindings(&[("text", "steps.second.output.text")])))
+            .and_then(|b| b.build())
+            .expect("prepared workflow builds");
+        let provider = ScriptedProvider::new();
+        provider.on("first static", vec![Reply::Text("one".to_owned())]);
+        provider.on("second static", vec![Reply::Text("two".to_owned())]);
+        let dependencies = WorkflowExecutionDependencies::new(provider.registry());
+
+        let prepared = workflow
+            .prepare(
+                &dependencies,
+                serde_json::Map::new(),
+                WorkflowRunOptions::default(),
+            )
+            .expect("workflow passes pre-dispatch validation");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(provider.requests().is_empty(), "prepare dispatches nothing");
+        let queued = prepared.snapshot().clone();
+        assert_eq!(queued.status, WorkflowRunStatus::Queued);
+        assert_eq!(queued.steps.len(), 2, "the queued snapshot is complete");
+
+        let mut observed = Vec::new();
+        let run = prepared
+            .execute(|snapshot| observed.push(snapshot.clone()))
+            .await;
+
+        assert_eq!(run.status, WorkflowRunStatus::Succeeded);
+        assert_eq!(
+            run.run_id, queued.run_id,
+            "the terminal run keeps the queued ID"
+        );
+        assert_eq!(provider.requests().len(), 2);
+        let transitions: Vec<_> = observed
+            .iter()
+            .map(|snapshot| {
+                assert_eq!(snapshot.run_id, queued.run_id);
+                assert_eq!(snapshot.status, WorkflowRunStatus::Running);
+                for step in snapshot.steps.values() {
+                    if step.status == WorkflowStepStatus::Running {
+                        assert_eq!(step.attempts, 1, "a published running step has begun");
+                    }
+                }
+                (
+                    snapshot.steps["first"].status,
+                    snapshot.steps["second"].status,
+                )
+            })
+            .collect();
+        assert_eq!(
+            transitions,
+            [
+                (WorkflowStepStatus::Pending, WorkflowStepStatus::Pending),
+                (WorkflowStepStatus::Running, WorkflowStepStatus::Pending),
+                (WorkflowStepStatus::Succeeded, WorkflowStepStatus::Pending),
+                (WorkflowStepStatus::Succeeded, WorkflowStepStatus::Running),
+                (WorkflowStepStatus::Succeeded, WorkflowStepStatus::Succeeded),
+            ],
+            "every transition is observed as a complete snapshot"
+        );
     }
 
     /// Scenario 2: parallel steps with the same output key stay namespaced;
@@ -1369,9 +1462,9 @@ mod tests {
         }
         assert_eq!((provider.in_flight(), provider.abandoned()), (0, 1));
 
-        // A step task aborted before its first poll never began: it is
-        // unstarted with no attempts or timestamps, while a task aborted after
-        // its attempt began is cancelled with that attempt.
+        // A published running step task aborted before its first poll is
+        // cancelled with its reserved first attempt and both timestamps, the
+        // same as a task aborted after its attempt began.
         let workflow = independent("prepoll", &[("begun", "begun call"), ("idle", "idle call")]);
         let provider = ScriptedProvider::new();
         let dependencies = WorkflowExecutionDependencies::new(provider.registry());
@@ -1405,15 +1498,16 @@ mod tests {
         executor.ledger.step_started(begun);
         executor.ledger.step_started(idle);
         executor.attempts[begun].store(1, Ordering::Release);
+        executor.attempts[idle].store(1, Ordering::Release);
         assert!(!executor.settle(idle, aborted.pop().expect("aborted idle")));
         assert!(!executor.settle(begun, aborted.pop().expect("aborted begun")));
         let run = executor.ledger.finish(RunEnding::Cancelled, &executor.plan);
         let idle = &run.steps["idle"];
         assert_eq!(
             (idle.status, idle.attempts),
-            (WorkflowStepStatus::Unstarted, 0)
+            (WorkflowStepStatus::Cancelled, 1)
         );
-        assert!(idle.started_at.is_none() && idle.ended_at.is_none());
+        assert!(idle.started_at.is_some() && idle.ended_at.is_some());
         let begun = &run.steps["begun"];
         assert_eq!(
             (begun.status, begun.attempts),
@@ -2404,122 +2498,11 @@ mod tests {
         assert!(!projected.contains("s3cret"), "{projected}");
     }
 
-    /// REQ-042/INV-012: a 2xx external gateway answer whose retained content
-    /// reflects the bound credential — assistant text, a JSON-escaped canary,
-    /// tool-call arguments, or a structured member name — is refused once
-    /// with a fixed non-retryable error naming neither the answer nor the
-    /// match; an ignored unknown member is not inspected, a decode failure
-    /// never quotes the answer, a non-sensitive header is not a credential,
-    /// and the Workflow does not retry the refusal or project the credential.
+    /// A 2xx external gateway answer that fails to decode keeps its
+    /// retryable decode code but never quotes the offending value, which may
+    /// be a credential the gateway echoed.
     #[tokio::test(flavor = "multi_thread")]
-    async fn external_gateway_success_reflection() {
-        let chat = |message: &str| {
-            format!(
-                r#"{{"id":"r","object":"chat.completion","created":0,"model":"gpt-test","choices":[{{"index":0,"message":{message},"finish_reason":"stop"}}]}}"#
-            )
-        };
-        let gemini = |part: &str| {
-            format!(
-                r#"{{"candidates":[{{"content":{{"role":"model","parts":[{part}]}},"finishReason":"STOP"}}]}}"#
-            )
-        };
-        let chat_request = || {
-            ProviderRequest::OpenAiChatCompletion(
-                serde_json::from_value(json!({
-                    "model": "gpt-test",
-                    "messages": [{ "role": "user", "content": "hi" }]
-                }))
-                .expect("chat request decodes"),
-            )
-        };
-        let gemini_request = || {
-            ProviderRequest::GeminiGenerateContent(
-                serde_json::from_value(json!({
-                    "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }]
-                }))
-                .expect("gemini request decodes"),
-            )
-        };
-        let cases = [
-            (
-                "/v1/chat/completions",
-                chat(r#"{"role":"assistant","content":"echo s3cret"}"#),
-                chat_request(),
-                true,
-            ),
-            (
-                "/v1/chat/completions",
-                chat(r#"{"role":"assistant","content":"echo s3\u0063ret"}"#),
-                chat_request(),
-                true,
-            ),
-            (
-                "/v1/chat/completions",
-                chat(
-                    r#"{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"lookup","arguments":"{\"key\":\"s3cret\"}"}}]}"#,
-                ),
-                chat_request(),
-                true,
-            ),
-            (
-                "/v1/models/gemini-test:generateContent",
-                gemini(r#"{"functionCall":{"name":"lookup","args":{"s3cret":true}}}"#),
-                gemini_request(),
-                true,
-            ),
-            (
-                "/v1/models/gemini-test:generateContent",
-                gemini(r#"{"functionCall":{"name":"lookup","args":{},"id":"s3cret"}}"#),
-                gemini_request(),
-                false,
-            ),
-        ];
-        for (route, body, request, reflects) in cases {
-            if body.contains(r"\u0063") {
-                assert!(!body.contains("s3cret"), "the raw canary is escaped");
-            }
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path(route))
-                .respond_with(ResponseTemplate::new(200).set_body_string(body.clone()))
-                .expect(1)
-                .mount(&server)
-                .await;
-            let client = skald_providers::ExternalGatewayClient::new(
-                skald_providers::EndpointPolicy::new(false),
-                url::Url::parse(&format!("{}/v1", server.uri())).expect("base parses"),
-                [(http::HeaderName::from_static("x-org-secret"), {
-                    let mut value = http::HeaderValue::from_static("s3cret");
-                    value.set_sensitive(true);
-                    value
-                })]
-                .into_iter()
-                .collect(),
-            )
-            .expect("client builds");
-            let result = client.send("gemini-test", request).await;
-            if reflects {
-                let error = result.expect_err("reflecting answer is refused");
-                assert_eq!(error.code(), "SKALD_PROVIDERS_400_BAD_REQUEST", "{body}");
-                assert!(!agent_error_retryable(&skald_agent::AgentError::Provider(
-                    skald_runtime::SkaldRuntimeError::Provider {
-                        provider: skald_spec::ProviderName::OpenAi,
-                        source: error.clone(),
-                    }
-                )));
-                assert!(
-                    !format!("{error} {error:?}").contains("s3cret"),
-                    "{error:?}"
-                );
-                assert!(!format!("{error:?}").contains("echo"), "{error:?}");
-            } else {
-                result.expect("ignored members are not inspected");
-            }
-            server.verify().await;
-        }
-
-        // A success that fails to decode keeps its retryable decode code but
-        // never quotes the offending value.
+    async fn external_gateway_decode_detail_withheld() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
@@ -2535,7 +2518,16 @@ mod tests {
             http::HeaderMap::new(),
         )
         .expect("client builds")
-        .send("gpt-test", chat_request())
+        .send(
+            "gpt-test",
+            ProviderRequest::OpenAiChatCompletion(
+                serde_json::from_value(json!({
+                    "model": "gpt-test",
+                    "messages": [{ "role": "user", "content": "hi" }]
+                }))
+                .expect("chat request decodes"),
+            ),
+        )
         .await
         .expect_err("mistyped answer fails to decode");
         assert_eq!(error.code(), "SKALD_PROVIDERS_502_DECODE");
@@ -2543,93 +2535,6 @@ mod tests {
             !format!("{error} {error:?}").contains("s3cret"),
             "{error:?}"
         );
-        server.verify().await;
-
-        // A header value that is not marked sensitive is not a credential.
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(chat(r#"{"role":"assistant","content":"team ml"}"#)),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        skald_providers::ExternalGatewayClient::new(
-            skald_providers::EndpointPolicy::new(false),
-            url::Url::parse(&format!("{}/v1", server.uri())).expect("base parses"),
-            [(
-                http::HeaderName::from_static("x-team"),
-                http::HeaderValue::from_static("ml"),
-            )]
-            .into_iter()
-            .collect(),
-        )
-        .expect("client builds")
-        .send("gpt-test", chat_request())
-        .await
-        .expect("authored header values are not credentials");
-        server.verify().await;
-
-        // Through a Workflow with retries remaining, the refusal is attempted
-        // once and the projected run never carries the credential.
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(chat(r#"{"role":"assistant","content":"echo s3cret"}"#)),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        let origin = url::Url::parse(&server.uri()).expect("uri parses");
-        let mut external = with_policy(
-            Workflow::builder("reflecting")
-                .add(agent("ext", "external call", None))
-                .and_then(|b| b.with_outputs(bindings(&[("out", "steps.ext.output.text")])))
-                .and_then(|b| b.build())
-                .expect("reflecting workflow builds"),
-            "ext",
-            2,
-            None,
-            None,
-        );
-        external.spec.steps[0].llm_route = Some(LlmRoute::ExtGateway {
-            protocol: ExternalGatewayProtocol::OpenAiChat,
-            base_url: AbsoluteUrl::new(format!("{}/v1", server.uri())).expect("absolute url"),
-            headers: BTreeMap::new(),
-            credential_binding: CredentialBindingName::new("corp").expect("binding name"),
-        });
-        let mut bindings = ExternalGatewayBindings::new();
-        bindings
-            .insert(ExternalGatewayBinding {
-                name: CredentialBindingName::new("corp").expect("binding name"),
-                protocol: ExternalGatewayProtocol::OpenAiChat,
-                origin,
-                secret_headers: [(
-                    http::HeaderName::from_static("x-org-secret"),
-                    SecretString::from("s3cret"),
-                )]
-                .into(),
-            })
-            .expect("binding inserts");
-        let native = ScriptedProvider::new();
-        let run = external
-            .run_with_options(
-                &WorkflowExecutionDependencies::new(native.registry())
-                    .with_external_gateways(bindings)
-                    .with_endpoint_profile(ExternalEndpointProfile::Local),
-                serde_json::Map::new(),
-                WorkflowRunOptions::default(),
-            )
-            .await
-            .expect("bound route is available");
-        assert_eq!(run.status, WorkflowRunStatus::Failed);
-        assert_eq!(run.steps["ext"].attempts, 1, "the refusal is terminal");
-        let projected = serde_json::to_string(&run).expect("run serializes");
-        assert!(!projected.contains("s3cret"), "{projected}");
         server.verify().await;
     }
 

@@ -489,7 +489,7 @@ async fn registers_only_valid_explicit_workflow_graphs() {
     let tooling = tempfile::tempdir().expect("tooling bundle creates");
     std::fs::write(
         tooling.path().join("prompt.yaml"),
-        "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  space: engineering\n  name: tooling-prompt\n  version: \"1.0.0\"\nspec:\n  model: gpt-5-5\n  request:\n    model: gpt-5-5\n    messages:\n      - role: user\n        content: \"Summarize {{code}}\"\n  variables: [code]\n  response_type: text\n",
+        "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  space: engineering\n  name: tooling-prompt\n  version: \"1.0.0\"\nspec:\n  model: gpt-5-5\n  request:\n    provider: open_ai_chat_completion\n    body:\n      model: gpt-5-5\n      messages:\n        - role: user\n          content: \"Summarize {{code}}\"\n  variables: [code]\n  response_type: text\n",
     )
     .expect("prompt writes");
     std::fs::write(
@@ -627,7 +627,7 @@ async fn registers_only_valid_explicit_workflow_graphs() {
     let registered = tempfile::tempdir().expect("registered Agent workspace creates");
     std::fs::write(
         registered.path().join("agent.yaml"),
-        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  space: engineering\n  name: collision-reviewer\n  version: \"1.0.0\"\nspec:\n  prompt:\n    model: gpt-5-5\n    request:\n      model: gpt-5-5\n      messages:\n        - role: user\n          content: \"Inspect {{diff}}\"\n    variables: [diff]\n    response_type: text\n",
+        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  space: engineering\n  name: collision-reviewer\n  version: \"1.0.0\"\nspec:\n  prompt:\n    model: gpt-5-5\n    request:\n      provider: open_ai_chat_completion\n      body:\n        model: gpt-5-5\n        messages:\n          - role: user\n            content: \"Inspect {{diff}}\"\n    variables: [diff]\n    response_type: text\n",
     )
     .expect("registered Agent writes");
     cards
@@ -700,7 +700,7 @@ async fn registers_only_valid_explicit_workflow_graphs() {
 /// `version_line` is the authored `metadata.version` line, or empty to omit it.
 fn inline_workflow(name: &str, version_line: &str) -> String {
     format!(
-        "apiVersion: wyrd/v1\nkind: Workflow\nmetadata:\n  space: engineering\n  name: {name}\n{version_line}spec:\n  llm_route:\n    kind: wyrd_gateway\n  inputs:\n    code:\n      type: str\n      value: \"\"\n  steps:\n    - id: summarize\n      action:\n        type: agent\n        target:\n          prompt:\n            model: gpt-5-5\n            request:\n              model: gpt-5-5\n              messages:\n                - role: user\n                  content: \"Summarize {{{{code}}}}\"\n            variables: [code]\n            response_type: text\n          tool_names: []\n          run_config:\n            max_iterations: 1\n      inputs:\n        code: input.code\n  outputs:\n    summary: steps.summarize.output.text\n"
+        "apiVersion: wyrd/v1\nkind: Workflow\nmetadata:\n  space: engineering\n  name: {name}\n{version_line}spec:\n  llm_route:\n    kind: wyrd_gateway\n  inputs:\n    code:\n      type: str\n      value: \"\"\n  steps:\n    - id: summarize\n      action:\n        type: agent\n        target:\n          prompt:\n            model: gpt-5-5\n            request:\n              provider: open_ai_chat_completion\n              body:\n                model: gpt-5-5\n                messages:\n                  - role: user\n                    content: \"Summarize {{{{code}}}}\"\n            variables: [code]\n            response_type: text\n          tool_names: []\n          run_config:\n            max_iterations: 1\n      inputs:\n        code: input.code\n  outputs:\n    summary: steps.summarize.output.text\n"
     )
 }
 
@@ -964,8 +964,11 @@ async fn refuses_stale_preflight_after_dependency_replacement() {
     .bind(json!({
         "model": "gpt-5-5",
         "request": {
-            "model": "gpt-5-5",
-            "messages": [{ "role": "user", "content": "Inspect {{diff}}" }]
+            "provider": "open_ai_chat_completion",
+            "body": {
+                "model": "gpt-5-5",
+                "messages": [{ "role": "user", "content": "Inspect {{diff}}" }]
+            }
         },
         "variables": ["diff"],
         "response_type": "text"

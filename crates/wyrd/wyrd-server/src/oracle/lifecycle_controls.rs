@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use futures_util::StreamExt as _;
-use vala_bifrost_redux::oracle::{OracleQueryStream, RunningQueryRegistry};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+use vala_bifrost_redux::oracle::{DEFAULT_QUERY_DEADLINE, OracleQueryStream, RunningQueryRegistry};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
@@ -58,7 +60,7 @@ impl RunningQueryControls {
                 .saturating_sub(chrono::Utc::now().timestamp_millis()),
         )
         .unwrap_or(0);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(remaining);
+        let deadline = Instant::now() + std::time::Duration::from_millis(remaining);
         tokio::time::timeout_at(deadline, async {
             if let Some(observed) = &terminal {
                 observed
@@ -112,6 +114,51 @@ impl RunningQueryControls {
         })
         .await
         .map_err(|_| WyrdError::from(BifrostError::QueryStreamIncomplete))?
+    }
+
+    /// Awaits a query's stream `open`, cancelling the query at its owner if
+    /// `cancel` fires first.
+    ///
+    /// An Analytical leader opens its stream only with its first batch, so a
+    /// cancellation that waited for the open would wait for the query itself.
+    /// The cancellation is routed to the request's registered owner through
+    /// [`Self::cancel`] and the same open is still awaited rather than dropped,
+    /// so whatever it returns is settled by the caller instead of being
+    /// abandoned mid-flight. A query its owner has not registered yet is not
+    /// found; the caller cancels it through [`Self::cancel_and_settle`] once its
+    /// stream opens.
+    ///
+    /// `requested_deadline_ms` is the query request's own relative deadline,
+    /// read before the open starts, so the instant it fixes is never later
+    /// than the deadline the Oracle captures. Once cancellation wins, the
+    /// owner signal and the rest of the open share that one instant; neither
+    /// starts a fresh budget.
+    ///
+    /// # Errors
+    /// Returns the open's own error, and `QueryStreamIncomplete` when the
+    /// query's deadline passes after cancellation before the open returns;
+    /// the open is then dropped, which releases its query guards. A refused
+    /// cancellation is not an error.
+    pub async fn open_cancellable(
+        &self,
+        open: impl Future<Output = Result<OracleQueryStream, WyrdError>>,
+        tenant_id: DataTenantId,
+        request_id: &RequestId,
+        requested_deadline_ms: Option<i64>,
+        cancel: &CancellationToken,
+    ) -> Result<OracleQueryStream, WyrdError> {
+        let duration = requested_deadline_ms
+            .and_then(|deadline_ms| u64::try_from(deadline_ms).ok())
+            .filter(|deadline_ms| *deadline_ms != 0)
+            .map_or(DEFAULT_QUERY_DEADLINE, std::time::Duration::from_millis);
+        let deadline = Instant::now() + duration;
+        cancel_while_opening(
+            open,
+            self.cancel(tenant_id, request_id.clone()),
+            cancel,
+            deadline,
+        )
+        .await
     }
 
     /// Creates the facade from explicit process-owned dependencies.
@@ -248,5 +295,140 @@ impl RunningQueryControls {
             1 => Ok(owners.remove(0)),
             _ => Err(BifrostError::RunningQueryConflict.into()),
         }
+    }
+}
+
+/// Awaits `open`; if `cancel` fires first, awaits `cancel_owner` once and then
+/// the same `open`, both before `deadline`.
+///
+/// While the deadline holds, the open is never dropped, so its result reaches
+/// the caller. The cancellation request's own refusal is only logged, because
+/// the caller settles whatever the open returns.
+///
+/// # Errors
+/// Returns the open's own error, and `QueryStreamIncomplete` when `deadline`
+/// passes after cancellation before the open returns.
+async fn cancel_while_opening<T, C>(
+    open: impl Future<Output = Result<T, WyrdError>>,
+    cancel_owner: impl Future<Output = Result<C, WyrdError>>,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<T, WyrdError> {
+    tokio::pin!(open);
+    tokio::select! {
+        biased;
+        opened = &mut open => return opened,
+        () = cancel.cancelled() => {}
+    }
+    tokio::time::timeout_at(deadline, async {
+        if let Err(error) = cancel_owner.await {
+            tracing::debug!(
+                code = error.code(),
+                "the opening query had no cancellable owner yet"
+            );
+        }
+        open.await
+    })
+    .await
+    .map_err(|_| WyrdError::from(BifrostError::QueryStreamIncomplete))?
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+    use tokio_util::sync::CancellationToken;
+    use wyrd_spec::error::WyrdError;
+    use wyrd_spec::vala::BifrostError;
+
+    use super::cancel_while_opening;
+
+    /// An open that finishes first is returned without any cancellation; a
+    /// cancellation during the open is requested once and the same open still
+    /// completes and is returned, even when the owner refuses the request.
+    ///
+    /// # Panics
+    /// Panics if an uncancelled open requests cancellation, a cancelled open
+    /// is dropped instead of completed, or a refused request hides the open.
+    #[tokio::test]
+    async fn cancel_while_opening_requests_cancellation_and_keeps_the_open() {
+        let requested = AtomicBool::new(false);
+        let owner = || async {
+            requested.store(true, Ordering::Release);
+            Ok::<(), WyrdError>(())
+        };
+        let opened =
+            cancel_while_opening(async { Ok(7) }, owner(), &CancellationToken::new(), later())
+                .await
+                .expect("an uncancelled open returns its stream");
+        assert_eq!(opened, 7);
+        assert!(!requested.load(Ordering::Acquire));
+
+        // The open completes only after the owner was asked to cancel, so a
+        // dropped open or a skipped request cannot return its result.
+        let cancel = CancellationToken::new();
+        let (opening, open) = tokio::sync::oneshot::channel::<u32>();
+        let (asked, request) = tokio::sync::oneshot::channel::<()>();
+        let open = async { Ok(open.await.expect("the test sends the open result")) };
+        let owner = async {
+            asked.send(()).expect("the test awaits the request");
+            Ok::<(), WyrdError>(())
+        };
+        let signal = async {
+            cancel.cancel();
+            request.await.expect("cancellation reaches the owner");
+            opening.send(9).expect("the open is still awaited");
+        };
+        let (opened, ()) =
+            tokio::join!(cancel_while_opening(open, owner, &cancel, later()), signal);
+        assert_eq!(opened.expect("a cancelled open still returns"), 9);
+
+        let refused = async { Err::<(), WyrdError>(BifrostError::RunningQueryNotFound.into()) };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let opened = cancel_while_opening(async { Ok(3) }, refused, &cancel, later()).await;
+        assert_eq!(opened.expect("a refused cancellation keeps the open"), 3);
+    }
+
+    /// A deadline far enough away that no test reaches it.
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(3_600)
+    }
+
+    /// A cancellation owner slower than the query's remaining deadline is
+    /// asked once, and the cancel-during-open phase ends at the original
+    /// deadline with an incomplete stream instead of starting a fresh budget.
+    ///
+    /// # Panics
+    /// Panics if the owner is asked more than once, the phase outlives the
+    /// deadline, or the expiry is reported as anything but incomplete.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_while_opening_ends_at_the_original_deadline() {
+        let asked = AtomicUsize::new(0);
+        let owner = async {
+            asked.fetch_add(1, Ordering::AcqRel);
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok::<(), WyrdError>(())
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(500);
+        let error = cancel_while_opening(
+            std::future::pending::<Result<u32, WyrdError>>(),
+            owner,
+            &cancel,
+            deadline,
+        )
+        .await
+        .expect_err("an open past its deadline is incomplete");
+        assert_eq!(
+            error.code(),
+            WyrdError::from(BifrostError::QueryStreamIncomplete).code()
+        );
+        assert_eq!(Instant::now(), deadline);
+        assert_eq!(asked.load(Ordering::Acquire), 1);
     }
 }

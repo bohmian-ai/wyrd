@@ -4,8 +4,9 @@
 //! reconciliation, role-separated and distributed dispatch, multitenant
 //! isolation and fairness, spill accounting, peer security, Scribe tail
 //! fencing, cancellation and terminal recovery, read-audit staging, the public gRPC
-//! frame-parity and resource-release journeys, the typed Vala route cut, and
-//! the Oracle production-telemetry contract.
+//! frame-parity and resource-release journeys, the typed Vala route cut, the
+//! Oracle production-telemetry contract, and settlement of an accepted
+//! Workflow's forwarded `bifrost.query` call.
 //!
 //! Setup: Postgres plus a booted server; the peer journey stands up a
 //! three-server follower cluster.
@@ -35,3 +36,4 @@ mod peer_cluster;
 mod peer_network;
 mod published;
 mod support;
+mod workflow;

@@ -26,7 +26,6 @@ impl ChatMessageSource {
         match self {
             Self::Request { inner, index } => match inner.as_ref() {
                 ProviderRequest::OpenAiChatCompletion(r) => &r.messages[*index],
-                ProviderRequest::OpenAiChatCompatible { request, .. } => &request.messages[*index],
                 _ => unreachable!(),
             },
             Self::Choice {

@@ -44,7 +44,7 @@ mod test_support;
 pub mod workflow;
 pub mod workflow_surface;
 
-pub use bodies::{CardBodies, card_body_dependencies};
+pub use bodies::{AgentTools, CardBodies, card_body_dependencies};
 pub use error::{WorkflowError, WorkflowResult};
 pub use plan::DEFAULT_MAX_RETRIES;
 pub use route::{
@@ -54,7 +54,7 @@ pub use route::{
 };
 pub use workflow::{DEFAULT_MAX_CONCURRENCY, WorkflowExecutionLimits, WorkflowRunOptions};
 pub use workflow_surface::{
-    AgentResolver, Workflow, WorkflowBuilder, WorkflowInput, step_id_for_name,
+    AgentResolver, PreparedWorkflowRun, Workflow, WorkflowBuilder, WorkflowInput, step_id_for_name,
 };
 pub use wyrd_spec::card::workflow::{
     WorkflowBinding, WorkflowRun, WorkflowRunError, WorkflowRunStatus, WorkflowStepResult,

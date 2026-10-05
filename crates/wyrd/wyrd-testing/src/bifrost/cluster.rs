@@ -10,6 +10,7 @@ use opendal::Operator;
 use sqlx::Row;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+use url::Url;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::RoleTiming;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
@@ -141,6 +142,8 @@ pub struct BifrostClusterSpec {
     storage_io: wyrd_server::config::BifrostStorageIoConfig,
     /// Oracle runtime bounds every Oracle node boots with, when not the defaults.
     oracle_runtime: Option<wyrd_server::config::OracleRuntimeConfig>,
+    /// Local mock upstream every node's built-in gateway adapters reach.
+    gateway_provider_root: Option<Url>,
 }
 
 impl BifrostClusterSpec {
@@ -204,6 +207,19 @@ impl BifrostClusterSpec {
         self
     }
 
+    /// Boots every node with its built-in gateway adapters rooted at one
+    /// local mock upstream `root`.
+    ///
+    /// The value passes through
+    /// [`WyrdTestServerBuilder::with_gateway_provider_root_for_test`], so a
+    /// journey drives governed model calls on a cluster pod without reaching
+    /// a real provider.
+    #[must_use]
+    pub fn with_gateway_provider_root_for_test(mut self, root: Url) -> Self {
+        self.gateway_provider_root = Some(root);
+        self
+    }
+
     /// Applies one raw process observation to every Oracle node.
     ///
     /// Restarted nodes retain this observation and rerun the production policy;
@@ -244,6 +260,7 @@ impl BifrostClusterSpec {
             scribe_persistence_faults_for_test: None,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
             oracle_runtime: None,
+            gateway_provider_root: None,
         }
     }
 
@@ -266,6 +283,7 @@ impl BifrostClusterSpec {
             scribe_persistence_faults_for_test: None,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
             oracle_runtime: None,
+            gateway_provider_root: None,
         }
     }
 
@@ -293,6 +311,7 @@ impl BifrostClusterSpec {
             scribe_persistence_faults_for_test: None,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
             oracle_runtime: None,
+            gateway_provider_root: None,
         }
     }
 
@@ -323,6 +342,7 @@ impl BifrostClusterSpec {
             scribe_persistence_faults_for_test: None,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
             oracle_runtime: None,
+            gateway_provider_root: None,
         }
     }
 
@@ -365,6 +385,7 @@ impl BifrostClusterSpec {
             scribe_persistence_faults_for_test: None,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
             oracle_runtime: None,
+            gateway_provider_root: None,
         }
     }
 
@@ -388,6 +409,7 @@ impl BifrostClusterSpec {
             scribe_persistence_faults_for_test: None,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
             oracle_runtime: None,
+            gateway_provider_root: None,
         }
     }
 
@@ -864,6 +886,8 @@ pub struct WyrdTestCluster {
     storage_io: wyrd_server::config::BifrostStorageIoConfig,
     /// Oracle runtime bounds every node start and restart boots with.
     oracle_runtime: Option<wyrd_server::config::OracleRuntimeConfig>,
+    /// Mock upstream root every node start and restart roots its gateway at.
+    gateway_provider_root: Option<Url>,
     /// Scoped transport fault state.
     faults: OracleFaultController,
     /// Read-only process telemetry handle.
@@ -1597,6 +1621,7 @@ impl WyrdTestCluster {
         let scribe_persistence_faults_for_test = spec.scribe_persistence_faults_for_test.clone();
         let storage_io = spec.storage_io;
         let oracle_runtime = spec.oracle_runtime.clone();
+        let gateway_provider_root = spec.gateway_provider_root.clone();
         let process = process_telemetry()?;
         // `explicit_root` is the storage root to reuse (a shared or a
         // caller-declared dedicated root); `None` selects a temporary root.
@@ -1720,6 +1745,7 @@ impl WyrdTestCluster {
             scribe_persistence_faults_for_test,
             storage_io,
             oracle_runtime,
+            gateway_provider_root,
             faults: OracleFaultController::default(),
             telemetry: process.forge_capture.clone(),
             oracle_peer_tls,
@@ -1777,6 +1803,9 @@ impl WyrdTestCluster {
         }
         if let Some(oracle) = self.oracle_runtime.clone() {
             builder = builder.with_oracle_runtime_for_test(oracle);
+        }
+        if let Some(root) = self.gateway_provider_root.clone() {
+            builder = builder.with_gateway_provider_root_for_test(root);
         }
         builder = builder.with_forge_process_role_for_test(resources.process_role);
         builder = builder.with_forge_interval(self.forge_interval);

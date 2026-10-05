@@ -190,7 +190,6 @@ pub fn request_variant_label(request: &skald_spec::ProviderRequest) -> &'static 
         skald_spec::ProviderRequest::AnthropicMessage(_) => "anthropic_message",
         skald_spec::ProviderRequest::GeminiGenerateContent(_) => "gemini_generate_content",
         skald_spec::ProviderRequest::GoogleBatchEmbed(_) => "google_batch_embed",
-        skald_spec::ProviderRequest::Vertex(_) => "vertex_generate_content",
         skald_spec::ProviderRequest::VertexPredict(_) => "vertex_predict",
         skald_spec::ProviderRequest::RawV1 { .. } => "raw_v1",
         _ => "unknown",

@@ -233,13 +233,11 @@ impl NativeCall {
     ///
     /// # Errors
     /// Returns [`ProviderError::BadRequest`] for a dialect the public gateway
-    /// does not serve, including Vertex, or a body that does not serialize.
+    /// does not serve, including a GenerateContent body for a `vertex` model,
+    /// or a body that does not serialize.
     fn project(request: ProviderRequest, model: &ModelRef) -> Result<Self, ProviderError> {
         let (ingress, path, body) = match request {
-            ProviderRequest::OpenAiChatCompletion(mut body)
-            | ProviderRequest::OpenAiChatCompatible {
-                request: mut body, ..
-            } => {
+            ProviderRequest::OpenAiChatCompletion(mut body) => {
                 body.model = model.to_string();
                 (
                     Ingress::OpenAiChat,
@@ -263,14 +261,16 @@ impl NativeCall {
                     encode(&body)?,
                 )
             }
-            ProviderRequest::GeminiGenerateContent(body) => (
-                Ingress::GeminiGenerateContent,
-                format!(
-                    "/v1beta/models/{}:generateContent",
-                    urlencoding::encode(model.model.as_str())
-                ),
-                encode(&body)?,
-            ),
+            ProviderRequest::GeminiGenerateContent(body) if model.provider.as_str() != "vertex" => {
+                (
+                    Ingress::GeminiGenerateContent,
+                    format!(
+                        "/v1beta/models/{}:generateContent",
+                        urlencoding::encode(model.model.as_str())
+                    ),
+                    encode(&body)?,
+                )
+            }
             _ => {
                 return Err(ProviderError::bad_request(
                     PROVIDER,

@@ -17,18 +17,28 @@
 //! 5. loads the applied Workflow through `cards.workflow()` by exact ref and
 //!    by UID, runs it, and checks the newer Agent did not float in;
 //! 6. checks wrong, versionless, mismatched, and unauthorized selectors are
-//!    refused.
+//!    refused;
+//! 7. runs the code-review example from its file through the public Wyrd
+//!    gateway and through an external gateway binding, against one local
+//!    upstream that counts every call, then registers it, which calls
+//!    nothing, and runs the registered Workflow through the gateway.
 
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use secrecy::ExposeSecret;
 use serde_json::{Map, Value, json};
 use skald_workflow::{WorkflowRun, WorkflowRunStatus};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+use wyrd_client::gateway_credential::CredentialWriter;
 use wyrd_sdk::Workflow;
 use wyrd_sdk::bifrost::client_from_options;
 use wyrd_sdk::cards::{CardKind, CardRef, CardSelector, Cards};
+use wyrd_sdk::{Gateway, WyrdClient};
 use wyrd_testing::Bootstrap;
 use wyrd_testing::server::WyrdTestServer;
 
@@ -41,6 +51,9 @@ const CHILD_OUTCOME: &str = "WORKFLOW_LOADING_CHILD_OUTCOME ";
 /// The `final_review` output the `mixed` Workflow produces from the
 /// registered 1.0.0 team Agents.
 const REGISTERED_REVIEW: &str = "final review of diff | registered security review of diff | registered correctness review of diff";
+
+/// Secret the `review-gateway` binding sends to the external gateway.
+const REVIEW_SECRET: &str = "review-secret-value";
 
 /// Run `workflow` with the fixed input `code = "diff"`.
 ///
@@ -87,18 +100,26 @@ async fn api_key(server: &WyrdTestServer, name: &str, roles: &[&str]) -> String 
     api_key.expose_secret().to_owned()
 }
 
+/// Return a shared client of `server` authenticated with `api_key`.
+///
+/// # Panics
+/// Panics when the client cannot build.
+fn client_with(server: &WyrdTestServer, api_key: &str) -> WyrdClient {
+    let base_url = server.base_url().expect("bound server has a URL");
+    client_from_options(Some(base_url), Some(api_key), None).expect("client builds")
+}
+
 /// Return a Cards handle authenticated with `api_key`.
 ///
 /// # Panics
 /// Panics when the client cannot build.
 fn cards_with(server: &WyrdTestServer, api_key: &str) -> Cards {
-    let base_url = server.base_url().expect("bound server has a URL");
-    let client = client_from_options(Some(base_url), Some(api_key), None).expect("client builds");
-    Cards::with_client(client)
+    Cards::with_client(client_with(server, api_key))
 }
 
-/// Load the authored Workflow at `relative` in a child process whose only
-/// configuration is `WYRD_SERVER_URL` and, when given, `WYRD_API_KEY`.
+/// Load the authored Workflow at `path` in a child process whose only
+/// configuration is `WYRD_SERVER_URL`, when given `WYRD_API_KEY`, and the
+/// client configuration home `config_home`, or an empty one.
 ///
 /// `Workflow::from_path` reads that configuration from the process
 /// environment. Setting it inside this multithreaded test would need
@@ -110,17 +131,22 @@ fn cards_with(server: &WyrdTestServer, api_key: &str) -> Cards {
 ///
 /// # Panics
 /// Panics when the child cannot start, fails, or reports no outcome.
-fn load_in_child(server: &WyrdTestServer, api_key: Option<&str>, relative: &str) -> Value {
-    let config_home = tempfile::tempdir().expect("empty config home creates");
+fn load_in_child(
+    server: &WyrdTestServer,
+    api_key: Option<&str>,
+    path: &Path,
+    config_home: Option<&Path>,
+) -> Value {
+    let empty = tempfile::tempdir().expect("empty config home creates");
     let mut command = Command::new(std::env::current_exe().expect("current test executable"));
     command
         .args(["authored_load_child", "--exact", "--ignored", "--nocapture"])
-        .env(CHILD_PATH, fixture(relative))
+        .env(CHILD_PATH, path)
         .env(
             "WYRD_SERVER_URL",
             server.base_url().expect("bound server has a URL"),
         )
-        .env("WYRD_CONFIG_HOME", config_home.path())
+        .env("WYRD_CONFIG_HOME", config_home.unwrap_or(empty.path()))
         .env_remove("WYRD_API_KEY")
         .env_remove("WYRD_ACCESS_TOKEN");
     if let Some(api_key) = api_key {
@@ -328,14 +354,24 @@ async fn assert_authored_loads(
     no_roles_key: &str,
 ) {
     assert_eq!(
-        load_in_child(server, None, "mixed/workflow.yaml"),
+        load_in_child(server, None, &fixture("mixed/workflow.yaml"), None),
         json!({ "error": "WYRD_CLIENT_401_NO_CREDENTIALS" })
     );
     assert_eq!(
-        load_in_child(server, Some(no_roles_key), "mixed/workflow.yaml"),
+        load_in_child(
+            server,
+            Some(no_roles_key),
+            &fixture("mixed/workflow.yaml"),
+            None
+        ),
         json!({ "error": "WYRD_PERMISSION_403_DENIED_RBAC" })
     );
-    let mixed = load_in_child(server, Some(reader_key), "mixed/workflow.yaml");
+    let mixed = load_in_child(
+        server,
+        Some(reader_key),
+        &fixture("mixed/workflow.yaml"),
+        None,
+    );
     assert_eq!(mixed["run"]["status"], "succeeded");
     assert_eq!(
         mixed["run"]["outputs"],
@@ -344,7 +380,12 @@ async fn assert_authored_loads(
 
     // A local sibling and the registered Agent with the same identity each
     // run their own Prompt.
-    let shadowed = load_in_child(server, Some(reader_key), "shadowed/workflow.yaml");
+    let shadowed = load_in_child(
+        server,
+        Some(reader_key),
+        &fixture("shadowed/workflow.yaml"),
+        None,
+    );
     assert_eq!(shadowed["run"]["status"], "succeeded");
     assert_eq!(
         shadowed["run"]["outputs"],
@@ -368,9 +409,214 @@ async fn assert_authored_loads(
         .await
         .expect("retired Prompt deletes");
     assert_eq!(
-        load_in_child(server, Some(reader_key), "retired/workflow.yaml"),
+        load_in_child(
+            server,
+            Some(reader_key),
+            &fixture("retired/workflow.yaml"),
+            None
+        ),
         json!({ "error": "WYRD_REGISTRY_404_CARD_NOT_FOUND" })
     );
+}
+
+/// Copy the code-review example into a temporary bundle whose Workflow sends
+/// every model call over the `ext_gateway` route to `upstream` through the
+/// `review-gateway` binding.
+///
+/// # Panics
+/// Panics when the example cannot be read or the copy cannot be written.
+fn external_example(upstream: &MockServer) -> tempfile::TempDir {
+    let example = repo_file("examples/workflows/code-review");
+    let bundle = tempfile::tempdir().expect("bundle directory creates");
+    for directory in ["agents", "prompts"] {
+        std::fs::create_dir(bundle.path().join(directory)).expect("bundle directory creates");
+        for file in ["security", "correctness", "final-reviewer"] {
+            let relative = format!("{directory}/{file}.yaml");
+            std::fs::copy(example.join(&relative), bundle.path().join(&relative))
+                .expect("bundle file copies");
+        }
+    }
+    let workflow =
+        std::fs::read_to_string(example.join("workflow.yaml")).expect("example Workflow reads");
+    assert!(
+        workflow.contains("    kind: wyrd_gateway\n"),
+        "example route moved"
+    );
+    let route = format!(
+        "    kind: ext_gateway\n    protocol: openai_chat\n    base_url: {}/v1\n    credential_binding: review-gateway\n",
+        upstream.uri()
+    );
+    std::fs::write(
+        bundle.path().join("workflow.yaml"),
+        workflow.replacen("    kind: wyrd_gateway\n", &route, 1),
+    )
+    .expect("external Workflow writes");
+    bundle
+}
+
+/// Write a client configuration home whose `review-gateway` binding speaks
+/// Chat Completions to `upstream` and sends the owner-only secret file as
+/// `x-review-secret`.
+///
+/// # Panics
+/// Panics when the files cannot be written.
+fn review_gateway_config(upstream: &MockServer) -> tempfile::TempDir {
+    let home = tempfile::tempdir().expect("config home creates");
+    let secret = home.path().join("review-secret");
+    std::fs::write(&secret, REVIEW_SECRET).expect("secret writes");
+    #[cfg(unix)]
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600))
+        .expect("secret restricts");
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "[workflow.external_gateway_bindings.review-gateway]\n\
+             protocol = \"openai_chat\"\n\
+             origin = \"{}\"\n\
+             secret_headers = {{ x-review-secret = {{ source = \"file\", path = \"{}\" }} }}\n",
+            upstream.uri(),
+            secret.display()
+        ),
+    )
+    .expect("config writes");
+    home
+}
+
+/// Start the local upstream that answers every Chat Completions call with
+/// `hi`. It roots the server's gateway adapters and also serves as the
+/// external gateway, so its request log counts every model call.
+async fn chat_upstream() -> MockServer {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gpt-5-5",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "hi" },
+                "finish_reason": "stop"
+            }]
+        })))
+        .mount(&upstream)
+        .await;
+    upstream
+}
+
+/// Count the calls `upstream` received through the gateway, which carry
+/// `authorization`, and through the `review-gateway` binding, which carry
+/// the binding secret and no `authorization`.
+///
+/// # Panics
+/// Panics when request recording is disabled or a call carries neither, or a
+/// binding call carries the wrong secret.
+async fn model_calls(upstream: &MockServer) -> (usize, usize) {
+    let requests = upstream
+        .received_requests()
+        .await
+        .expect("request recording is on");
+    let gateway = requests
+        .iter()
+        .filter(|request| request.headers.contains_key("authorization"))
+        .count();
+    let external = requests
+        .iter()
+        .filter(|request| !request.headers.contains_key("authorization"))
+        .inspect(|request| {
+            assert_eq!(
+                request
+                    .headers
+                    .get("x-review-secret")
+                    .and_then(|value| value.to_str().ok()),
+                Some(REVIEW_SECRET),
+                "external call carries the binding secret"
+            );
+        })
+        .count();
+    (gateway, external)
+}
+
+/// Deploy `openai/gpt-5-5` for Chat Completions behind a managed provider
+/// key, as the administrator `client`.
+///
+/// # Panics
+/// Panics when the credential or deployment is refused.
+async fn deploy_gpt_5_5(client: WyrdClient) {
+    let credential = serde_json::from_value(json!({
+        "name": "openai-key",
+        "provider": "openai",
+        "source": { "managed_secret": { "secret": "sk-native-upstream" } },
+    }))
+    .expect("credential decodes");
+    CredentialWriter::new(client.clone())
+        .put_credential(&credential)
+        .await
+        .expect("credential puts");
+    let deployment = serde_json::from_value(json!({
+        "name": "gpt-5-5",
+        "model": { "provider": "openai", "model": "gpt-5-5" },
+        "adapter": "openai",
+        "auth": { "bearer": { "credential": "openai-key" } },
+        "capabilities": ["chat_completions"],
+        "routing_weight": 1,
+    }))
+    .expect("deployment decodes");
+    Gateway::new(client)
+        .put_deployment(&deployment)
+        .await
+        .expect("deployment puts");
+}
+
+/// Check that the code-review example runs from its file through the public
+/// Wyrd gateway and through the `review-gateway` binding, that registering
+/// it calls no model, and that the registered Workflow runs through the
+/// gateway. `admin_key` may read Cards and invoke the gateway.
+///
+/// # Panics
+/// Panics when a run, registration, or call count diverges.
+async fn assert_example_routes(server: &WyrdTestServer, admin_key: &str, upstream: &MockServer) {
+    deploy_gpt_5_5(client_with(server, admin_key)).await;
+    let reviewed = json!({ "review": "hi" });
+    let example = repo_file("examples/workflows/code-review/workflow.yaml");
+    let public = load_in_child(server, Some(admin_key), &example, None);
+    assert_eq!(public["run"]["status"], "succeeded", "{public}");
+    assert_eq!(public["run"]["outputs"], reviewed);
+    assert_eq!(model_calls(upstream).await, (3, 0));
+
+    let bundle = external_example(upstream);
+    let config_home = review_gateway_config(upstream);
+    let external = load_in_child(
+        server,
+        Some(admin_key),
+        &bundle.path().join("workflow.yaml"),
+        Some(config_home.path()),
+    );
+    assert_eq!(external["run"]["status"], "succeeded", "{external}");
+    assert_eq!(external["run"]["outputs"], reviewed);
+    assert_eq!(model_calls(upstream).await, (3, 3));
+
+    let admin = cards_with(server, admin_key);
+    Box::pin(admin.register_from_path(&repo_file("examples/workflows/code-review")))
+        .await
+        .expect("example registers");
+    assert_eq!(model_calls(upstream).await, (3, 3));
+    let registered = admin
+        .workflow()
+        .load(&CardSelector::exact(
+            serde_json::from_value(json!({
+                "kind": "Workflow",
+                "name": "code-review",
+                "version": "1.0.0",
+                "space": "engineering",
+            }))
+            .expect("example reference decodes"),
+        ))
+        .await
+        .expect("registered example loads");
+    assert_succeeded(&run(&registered).await, &reviewed);
+    assert_eq!(model_calls(upstream).await, (6, 3));
 }
 
 /// Child half of [`load_in_child`]: load the Workflow file named by
@@ -412,9 +658,16 @@ async fn workflow_loading_journey() {
         }),
     );
 
-    let server = Box::pin(WyrdTestServer::start_bound())
-        .await
-        .expect("test server starts");
+    let upstream = chat_upstream().await;
+    let server = Box::pin(
+        WyrdTestServer::builder()
+            .with_gateway_provider_root_for_test(
+                upstream.uri().parse().expect("upstream URL parses"),
+            )
+            .start_bound(),
+    )
+    .await
+    .expect("test server starts");
     let writer = cards_with(
         &server,
         &api_key(&server, "workflow_writer", &["writer"]).await,
@@ -474,5 +727,10 @@ async fn workflow_loading_journey() {
         &uid(&refs, "correctness-reviewer"),
     )
     .await;
+
+    // 7. The code-review example runs over the public gateway and an
+    //    external gateway binding; registering it runs nothing.
+    let admin_key = api_key(&server, "workflow_admin", &["admin"]).await;
+    assert_example_routes(&server, &admin_key, &upstream).await;
     server.shutdown().await.expect("test server shuts down");
 }

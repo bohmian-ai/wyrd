@@ -31,6 +31,7 @@ mod local;
 mod remote;
 
 pub use gateway::PublicWyrdGatewayCaller;
+pub use local::resolve_binding;
 pub use remote::Workflows;
 
 /// A loaded, validated Workflow ready to run on the local Skald runtime.

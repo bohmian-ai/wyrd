@@ -28,7 +28,6 @@ use skald_spec::wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse, OpenAiChatSettings,
     OpenAiMessageContent, OpenAiToolCall, OpenAiToolFunctionCall,
 };
-use skald_spec::wire::vertex_generate::VertexGenerateContentRequest;
 use skald_spec::{
     Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
 };
@@ -341,26 +340,17 @@ async fn agent_run_genai_google_provider_and_model() {
         ),
     ];
     for (agent_id, provider, model, provider_name) in cases {
-        let request = match provider {
-            ProviderName::Vertex => {
-                ProviderRequest::Vertex(VertexGenerateContentRequest(google_request(Vec::new())))
-            }
-            _ => ProviderRequest::GeminiGenerateContent(google_request(Vec::new())),
-        };
-        let answer = google_answer("final-output-pii-marker");
-        let response = match provider {
-            ProviderName::Vertex => ProviderResponse::VertexGenerateContent(answer),
-            _ => ProviderResponse::GeminiGenerateContent(answer),
-        };
-        let mock = MockProvider::new(provider);
+        let request = ProviderRequest::GeminiGenerateContent(google_request(Vec::new()));
+        let response =
+            ProviderResponse::GeminiGenerateContent(google_answer("final-output-pii-marker"));
+        let mock = MockProvider::new(provider.clone());
         mock.push_response(response);
         let mut providers = ProviderRegistry::new();
         providers.register(Arc::new(mock));
-        let prompt = Prompt::from_native(
-            SpecPrompt::new(request, model, None, ResponseType::Text)
-                .expect("Google prompt builds"),
-        );
-        let agent = Agent::new(prompt).with_id(agent_id);
+        let mut native = SpecPrompt::new(request, model, None, ResponseType::Text)
+            .expect("Google prompt builds");
+        native.provider = Some(provider);
+        let agent = Agent::new(Prompt::from_native(native)).with_id(agent_id);
 
         let run = agent
             .run_with(&providers, None, "input-pii-marker")

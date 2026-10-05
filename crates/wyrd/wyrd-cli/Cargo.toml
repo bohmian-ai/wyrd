@@ -39,7 +39,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 shellexpand = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 toml = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }

@@ -7,11 +7,13 @@ metadata:
 spec:
   model: gpt-5-5
   request:
-    model: gpt-5-5
-    messages:
-      - role: system
-        content: You are a security reviewer.
-      - role: user
-        content: "{{code}}"
+    provider: open_ai_chat_completion
+    body:
+      model: gpt-5-5
+      messages:
+        - role: system
+          content: You are a security reviewer.
+        - role: user
+          content: "{{code}}"
   variables: [code]
   response_type: text

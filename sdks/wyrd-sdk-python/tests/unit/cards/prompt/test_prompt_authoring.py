@@ -21,7 +21,7 @@ def test_prompt_new_builds_openai_chat_by_default() -> None:
     assert prompt.provider == "openai"
     assert prompt.model == "gpt-4o"
     assert prompt.variables == ["name"]
-    body = prompt.request.model_dump()
+    body = prompt.request.model_dump()["body"]
     assert body["model"] == "gpt-4o"
     assert body["messages"][0]["content"] == "Hello {{name}}"
 
@@ -34,7 +34,7 @@ def test_prompt_new_selects_openai_responses() -> None:
         operation="responses",
     )
 
-    body = prompt.request.model_dump()
+    body = prompt.request.model_dump()["body"]
     assert body["input"][0]["content"][0]["text"] == "Summarize {{topic}}"
     assert prompt.variables == ["topic"]
 
@@ -59,7 +59,7 @@ def test_bind_media_replaces_native_media_placeholder() -> None:
     assert prompt.media_variables == ["logo"]
 
     bound = prompt.bind_media("logo", MediaRef.image_url("https://example.test/logo.png"))
-    body = bound.request.model_dump()
+    body = bound.request.model_dump()["body"]
     image = body["messages"][0]["content"][1]["image_url"]["url"]
     assert image == "https://example.test/logo.png"
     assert bound.media_variables == []
@@ -85,7 +85,7 @@ def test_prompt_response_format_and_str_are_json_inspectable() -> None:
     )
 
     assert json.loads(str(prompt))["model"] == "gpt-4o"
-    assert "response_format" in prompt.request.model_dump()
+    assert "response_format" in prompt.request.model_dump()["body"]
 
 
 def test_every_provider_builder_constructs_promptcard_and_round_trips_json() -> None:
@@ -100,10 +100,9 @@ def test_every_provider_builder_constructs_promptcard_and_round_trips_json() -> 
 
     for prompt in prompts:
         card = PromptCard(prompt)
-        expected_provider = "google" if prompt.provider == "vertex" else prompt.provider
         assert (
             PromptCard.model_validate_json(card.model_dump_json()).prompt.provider
-            == expected_provider
+            == prompt.provider
         )
 
 
@@ -115,7 +114,7 @@ def test_role_helpers_cover_system_user_assistant_and_tool_result() -> None:
         .assistant("assistant")
         .tool_result("call-1", "result")
     )
-    roles = [message["role"] for message in prompt.request.model_dump()["messages"]]
+    roles = [message["role"] for message in prompt.request.model_dump()["body"]["messages"]]
 
     assert roles == ["system", "user", "assistant", "tool"]
 
@@ -124,8 +123,10 @@ def test_message_inputs_accept_string_and_list_of_strings() -> None:
     string_prompt = Prompt.anthropic("claude-sonnet-4", messages="hello")
     list_prompt = Prompt.gemini("gemini-2.5-pro", messages=["hello", "world"])
 
-    assert string_prompt.request.model_dump()["messages"][0]["content"][0]["text"] == "hello"
-    assert len(list_prompt.request.model_dump()["contents"]) == 2
+    assert (
+        string_prompt.request.model_dump()["body"]["messages"][0]["content"][0]["text"] == "hello"
+    )
+    assert len(list_prompt.request.model_dump()["body"]["contents"]) == 2
 
 
 def test_provider_settings_constructor_smoke() -> None:
@@ -179,23 +180,23 @@ def test_provider_settings_constructor_smoke() -> None:
 
     for prompt, key, value in cases:
         if isinstance(value, float):
-            assert prompt.request.model_dump()[key] == pytest.approx(value)
+            assert prompt.request.model_dump()["body"][key] == pytest.approx(value)
         elif key == "generation_config" and "temperature" in value:
-            assert prompt.request.model_dump()[key]["temperature"] == pytest.approx(
+            assert prompt.request.model_dump()["body"][key]["temperature"] == pytest.approx(
                 value["temperature"]
             )
         else:
-            assert prompt.request.model_dump()[key] == value
+            assert prompt.request.model_dump()["body"][key] == value
 
 
 def test_openai_responses_input_getter_projects_text_and_item_forms() -> None:
     items_prompt = Prompt.openai_responses("gpt-4.1", messages="Hello")
     body = json.loads(items_prompt.model_dump_json())
-    body["request"]["input"] = "Hello"
+    body["request"]["body"]["input"] = "Hello"
     text_prompt = Prompt.model_validate_json(json.dumps(body))
 
     for prompt in (items_prompt, text_prompt):
         (item,) = prompt.request.openai_responses().input
         assert item.kind == "message"
         assert item.as_message_role() == "user"
-    assert text_prompt.request.model_dump()["input"] == "Hello"
+    assert text_prompt.request.model_dump()["body"]["input"] == "Hello"

@@ -62,7 +62,7 @@ def prompt_cases() -> list[tuple[str, Prompt]]:
 
 
 def message_text(prompt: Prompt) -> str:
-    body = prompt.request.model_dump()
+    body = prompt.request.model_dump()["body"]
     if "messages" in body:
         content = body["messages"][-1]["content"]
         if isinstance(content, list):
@@ -94,8 +94,7 @@ def test_prompt_load_yaml_and_json_preserve_deep_fields(
     yaml_loaded = Prompt.load(yaml_path)
     json_loaded = Prompt.load(json_path)
 
-    expected_provider = "google" if name == "vertex" else prompt.provider
-    assert yaml_loaded.provider == expected_provider
+    assert yaml_loaded.provider == prompt.provider
     assert yaml_loaded.model == prompt.model
     assert json_loaded.model_dump() == yaml_loaded.model_dump()
     if name != "raw_v1":
@@ -112,7 +111,7 @@ def test_prompt_load_raw_v1_preserves_provider_and_body(tmp_path: Path) -> None:
     loaded = Prompt.load(path)
 
     assert loaded.provider == "openai"
-    assert loaded.request.model_dump()["body"]["future"] is True
+    assert loaded.request.model_dump()["body"]["body"]["future"] is True
 
 
 def test_prompt_load_error_codes(tmp_path: Path) -> None:
@@ -152,4 +151,4 @@ def test_prompt_load_declarative_yaml_with_model_settings(tmp_path: Path) -> Non
 
     assert prompt.provider == "openai"
     assert prompt.model == "gpt-4o"
-    assert prompt.request.model_dump()["seed"] == 99
+    assert prompt.request.model_dump()["body"]["seed"] == 99

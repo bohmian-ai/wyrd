@@ -34,6 +34,7 @@ TYPED_STATE_SOURCE = (
 EXPECTED_ALIASES = (
     "agent_inline",
     "agent_triage",
+    "default-Agent-triage-1.0.0",
     "default-Data-training-1.0.0",
     "default-Prompt-triage-prompt-1.0.0",
     "default-Verifier-model-drift-1.0.0",
@@ -254,7 +255,9 @@ def test_service_bundle_hydrates_complete_python_runtime_offline(
     assert drift.kind is wyrd.CardKind.Verifier
     assert drift.spec["implementation"]["kind"] == "drift"
     assert state.workflow("runtime_workflow").kind is wyrd.CardKind.Workflow
-    assert state.workflow("runtime_workflow").spec == {}
+    assert state.workflow("runtime_workflow").spec["outputs"] == {
+        "answer": "steps.triage.output.text"
+    }
     assert_all_refs_are_exact_and_uid_bearing(state)
     assert_all_artifacts_are_confined_to_bundle(state, bundle)
 

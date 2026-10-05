@@ -68,7 +68,7 @@ use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
 use wyrd_server::config::{
     BifrostRuntimeConfig, BifrostRuntimeRole, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig,
     GatewayConfig, GatewayManagedSecretKeys, IssuerEntry, OperatorKeySource, OperatorKeysConfig,
-    ServeMode, WorkloadBindingEntry,
+    ServeMode, ServerWorkflowConfig, WorkloadBindingEntry,
 };
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
@@ -482,6 +482,8 @@ pub struct WyrdTestServerBuilder {
     omit_token_verifier: bool,
     /// Optional non-default edge limits applied to the composed `AppState`.
     limits: Option<wyrd_server::state::LimitsConfig>,
+    /// Optional non-default Workflow run bounds and bindings.
+    workflow_config: Option<ServerWorkflowConfig>,
     /// Built-in provider base URLs of an attached HTTP gateway engine; `None`
     /// keeps the default engine that dispatches nothing.
     gateway_endpoints: Option<BuiltinEndpoints>,
@@ -620,6 +622,7 @@ impl Default for WyrdTestServerBuilder {
             readiness_failure: false,
             omit_token_verifier: false,
             limits: None,
+            workflow_config: None,
             gateway_endpoints: None,
             gateway_vault_backend: None,
             stalled_drain_for_test: None,
@@ -3842,6 +3845,14 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Compose the server with `config` as its Workflow run bounds and
+    /// tenant-assigned external gateway bindings instead of the defaults.
+    #[must_use]
+    pub fn with_workflow_config_for_test(mut self, config: ServerWorkflowConfig) -> Self {
+        self.workflow_config = Some(config);
+        self
+    }
+
     /// Register the test-support MCP context probe in this server's `/mcp`
     /// tool catalog.
     ///
@@ -4614,6 +4625,9 @@ impl WyrdTestServerBuilder {
         }
         if let Some(limits) = self.limits {
             state = state.with_limits(limits);
+        }
+        if let Some(workflow) = self.workflow_config {
+            state = state.with_workflow_config(workflow);
         }
         state = state
             .with_mcp_context_probe(self.mcp_context_probe)

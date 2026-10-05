@@ -658,13 +658,6 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
         stream_cancellation,
     );
     settle_distributed(distributed_settlement, outcome, stream_cancellation).await;
-    // A failed plan's aborted partition tasks drop their reservations only on
-    // a later runtime poll; release must not race that teardown.
-    if outcome == QueryTerminalOutcome::Failed
-        && let Some(admitted) = admitted.as_mut()
-    {
-        admitted.drain_children().await;
-    }
     // A cleanup that could not be confirmed cannot become a success terminal:
     // the graph is retained as draining, so rows this query produced are not
     // provably complete and its owners are not provably returned.
@@ -793,8 +786,9 @@ async fn settle_distributed(
 /// explicit settlement cancels the attempt's cancellation child and joins the
 /// driver futures started beneath it. Doing that here — after the distributed
 /// join and before admission release — is what makes a leader stream's end,
-/// however it ended, the point at which follower work stops rather than the
-/// point at which it is merely no longer awaited.
+/// however it ended, the point at which the leader's own work stops rather than
+/// the point at which it is merely no longer awaited. Followers stop when the
+/// settlement closes their grant streams and free their own graphs afterwards.
 ///
 /// Signalling and awaiting is the whole of this stream's part in settlement:
 /// the graph's lifecycle task owns the cleanup order, and reproducing any of it

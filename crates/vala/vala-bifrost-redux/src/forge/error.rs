@@ -72,6 +72,22 @@ pub enum ForgeError {
     /// Prepared or terminal durable state could not be reconciled safely.
     #[error("Forge reconciliation failed: {detail}")]
     Reconciliation { detail: String },
+    /// An expired-cleanup drain deliberately left its current candidate
+    /// `prepared` after a refusal or an uncertain deletion.
+    ///
+    /// The candidate's settlement committed nothing, so the task row still
+    /// names the same task, attempt, owner, and prepared cursor index. This is
+    /// a retained outcome, not a failure to settle: the worker writes no retry
+    /// or terminal transition for it and leaves the row to the prepared-task
+    /// reconciliation route, which replays the identical candidate under a
+    /// fresh proof once the refusing root clears.
+    #[error("Forge expired cleanup retained candidate {index} for replay after {transition}")]
+    CleanupRetained {
+        /// Cursor index of the candidate that is still prepared.
+        index: u32,
+        /// Settlement transition that retained it (refused or uncertain).
+        transition: &'static str,
+    },
     /// The live Forge leader could not be reached or refused a peer call.
     #[error("Forge leader peer call failed: {detail}")]
     LeaderPeer { detail: String },
@@ -162,7 +178,8 @@ impl ForgeError {
             | Self::Sql(_)
             | Self::FenceLost { .. }
             | Self::LeaderPeer { .. }
-            | Self::Reconciliation { .. } => ForgeFailureClass::TransientCoordination,
+            | Self::Reconciliation { .. }
+            | Self::CleanupRetained { .. } => ForgeFailureClass::TransientCoordination,
             Self::Schema { .. }
             | Self::Group { .. }
             | Self::Invariant { .. }

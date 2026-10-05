@@ -1962,6 +1962,16 @@ struct ClaimExecutionOutcome<'task> {
     result: Result<ForgeSettledAttempt, ForgeError>,
 }
 
+/// Reports whether a Prepared reconciliation outcome must stop the worker's slot.
+///
+/// Every reconciliation failure is slot-fatal except
+/// [`ForgeError::CleanupRetained`]: that outcome left the exact prepared
+/// cleanup identity intact by design, so the slot keeps running and the same
+/// prepared-task route replays the candidate on a later pass.
+fn reconciliation_is_fatal<T>(result: &Result<T, ForgeError>) -> bool {
+    matches!(result, Err(error) if !matches!(error, ForgeError::CleanupRetained { .. }))
+}
+
 /// Classifies whether prepared evidence represents progress beyond its base.
 fn prepared_effect_progressed(evidence: &ForgeTaskEvidence, base_snapshot_id: i64) -> bool {
     evidence.committed_snapshot_id != Some(base_snapshot_id) || evidence.deleted_candidate_count > 0
@@ -3182,7 +3192,9 @@ impl ForgeWorker {
     ///
     /// Returns [`ForgeError::Sql`] when the bounded recovery claim fails. A
     /// reconciliation or release failure retains exact evidence and stops the
-    /// slot before any later claim.
+    /// slot before any later claim. A retained cleanup candidate
+    /// ([`ForgeError::CleanupRetained`]) is not a failure: it returns
+    /// `Ok(false)` so the caller paces the next same-identity replay.
     ///
     /// # Cancellation
     ///
@@ -3208,6 +3220,13 @@ impl ForgeWorker {
         let result = self.reconcile_prepared(prepared, shutdown).await;
         #[cfg(feature = "test-support")]
         self.pause_after_attempt_for_test(task_id).await;
+        if let Err(error @ ForgeError::CleanupRetained { .. }) = &result {
+            // The candidate stays prepared under its exact identity. Reporting
+            // no reconciliation lets the slot loop pace its next replay instead
+            // of spinning on a root that still refuses the delete.
+            tracing::warn!(worker = %self.owner, error = %error, "Prepared Forge cleanup retained its candidate for replay");
+            return Ok(false);
+        }
         if let Err(error) = result {
             tracing::error!(worker = %self.owner, error = %error, "Prepared Forge task reconciliation stopped; exact evidence retained");
             // A Prepared attempt already produced durable evidence a reader
@@ -4238,6 +4257,9 @@ impl ForgeWorker {
     ///
     /// # Errors
     /// Returns the original reconciliation/release error; telemetry never replaces it.
+    /// Every error closes the worker's run controls except
+    /// [`ForgeError::CleanupRetained`], which leaves the prepared candidate for
+    /// a later same-identity replay.
     ///
     /// # Cancellation
     /// Retains exact Prepared evidence when recovery cannot finish under shutdown.
@@ -4267,13 +4289,12 @@ impl ForgeWorker {
             span.clone(),
         )
         .await;
-        if result.is_err() {
+        let fatal = reconciliation_is_fatal(&result);
+        if fatal {
             self.close_after_fatal();
         }
         #[cfg(feature = "test-support")]
-        if result.is_err()
-            && let Some(observer) = &self.completion_observer
-        {
+        if fatal && let Some(observer) = &self.completion_observer {
             observer.pause_fatal_observation_for_test().await;
         }
         self.record_task_execution_telemetry(
@@ -4328,6 +4349,8 @@ impl ForgeWorker {
     /// # Errors
     /// Returns identity, evidence, heartbeat, settlement, and release failures,
     /// preserving reconciliation failure ahead of a secondary release failure.
+    /// A retained cleanup candidate surfaces as [`ForgeError::CleanupRetained`]
+    /// after its lease is released, without closing the worker's run controls.
     ///
     /// # Cancellation
     /// Cancellation retains durable evidence for a later fenced owner.
@@ -4371,7 +4394,7 @@ impl ForgeWorker {
                 &operation_stop,
             )
             .await;
-        if reconciliation.is_err() {
+        if reconciliation_is_fatal(&reconciliation) {
             self.close_after_fatal();
         }
         operation_stop.cancel();
@@ -4425,7 +4448,7 @@ impl ForgeWorker {
         // table it can no longer prove it owns, so a release-only failure is
         // fatal too. When reconciliation already failed, that error stays
         // primary and the release failure is only a secondary diagnostic.
-        if result.is_err() {
+        if reconciliation_is_fatal(&result) {
             self.close_after_fatal();
         }
         self.release_prepared_lease(task.task_id, &mut lease, result)
@@ -7739,9 +7762,10 @@ impl ForgeWorker {
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::Reconciliation`] when a candidate is refused or
-    /// its acceptance is unknown, plus protection, path-binding, object-store,
-    /// fencing, audit, SQL, or cancellation failures.
+    /// Returns [`ForgeError::CleanupRetained`] when a candidate is refused or
+    /// its acceptance is unknown and its settlement deliberately left it
+    /// prepared, plus protection, path-binding, object-store, fencing, audit,
+    /// SQL, or cancellation failures.
     ///
     /// # Cancellation
     ///
@@ -7818,11 +7842,9 @@ impl ForgeWorker {
                 .await
                 .map_err(ForgeError::Sql)?;
             if !outcome.advances() {
-                return Err(ForgeError::Reconciliation {
-                    detail: format!(
-                        "expired cleanup retained candidate {index} for replay after {}",
-                        outcome.transition_name()
-                    ),
+                return Err(ForgeError::CleanupRetained {
+                    index,
+                    transition: outcome.transition_name(),
                 });
             }
             index = index.saturating_add(1);
@@ -8497,8 +8519,11 @@ impl ForgeWorker {
     /// Applies the closed bounded-retry policy at the audited worker boundary.
     ///
     /// Returns the durable result the settling transition committed, or `None`
-    /// when this call committed nothing: a post-effect retention, or a
-    /// shutdown release whose claim had already advanced.
+    /// when this call committed nothing: a post-effect retention, a retained
+    /// prepared cleanup candidate, or a shutdown release whose claim had
+    /// already advanced. Neither retention enters the generic retry, terminal,
+    /// or dispatched-close transitions, whose guards accept only `claimed` or
+    /// `running` rows and would report a `prepared` row as lost ownership.
     ///
     /// # Errors
     /// Returns SQL or audit errors; failure retains the fenced claim for reclaim.
@@ -8508,7 +8533,12 @@ impl ForgeWorker {
         attempt: Uuid,
         error: &ForgeError,
     ) -> Result<Option<ForgeTaskResult>, ForgeError> {
-        if self.is_dispatched(claim.task_id) && !matches!(error, ForgeError::ShutdownRetained) {
+        if self.is_dispatched(claim.task_id)
+            && !matches!(
+                error,
+                ForgeError::ShutdownRetained | ForgeError::CleanupRetained { .. }
+            )
+        {
             return self.close_dispatched(claim, attempt, error).await;
         }
         match error {
@@ -8524,7 +8554,10 @@ impl ForgeWorker {
                     Some(ForgeFailureClass::CapacityRefused),
                 )))
             }
-            ForgeError::ShutdownRetained => Ok(None),
+            // A retained cleanup candidate is still `prepared` under this exact
+            // attempt; its settlement already committed the only transition it
+            // may make, and the prepared-task reconciliation route owns replay.
+            ForgeError::ShutdownRetained | ForgeError::CleanupRetained { .. } => Ok(None),
             _ => {
                 let class = error.failure_class();
                 let attempts = self

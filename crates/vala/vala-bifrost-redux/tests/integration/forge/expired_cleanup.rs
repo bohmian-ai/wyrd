@@ -1261,6 +1261,143 @@ async fn refused_prepared_cleanup_retains_identity_and_replays_after_root_clears
     table.supervised.shutdown().await;
 }
 
+/// Reads one task's durable state, failure class, and consumed attempt count.
+///
+/// # Panics
+///
+/// Panics when the task is unreadable.
+async fn retry_state(pool: &sqlx::PgPool, task_id: Uuid) -> (String, Option<String>, i32) {
+    sqlx::query_as(
+        "SELECT state, failure_class, attempt_count FROM vala.forge_tasks WHERE task_id = $1",
+    )
+    .bind(task_id)
+    .fetch_one(pool)
+    .await
+    .expect("cleanup task readable")
+}
+
+/// Proves an active read refusing a candidate preparation never reaches
+/// generic retry settlement.
+///
+/// The first preparation is refused while the row is still `running`: nothing
+/// durable exists, so the claim is released without consuming retry budget.
+/// A later preparation is refused after the row is already `prepared` at a
+/// nonzero frontier: the exact identity is retained for the prepared-claim
+/// route, which replays it — still refused while the read is held — and
+/// converges once the read is released.
+///
+/// # Panics
+///
+/// Panics when a refused preparation reports lost ownership, consumes retry
+/// budget, moves the cursor, changes the attempt, or the replay does not
+/// converge after the read is released.
+#[tokio::test]
+async fn active_read_refusing_preparation_is_released_or_retained_without_retry() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let DrainedExpiration {
+        table,
+        worker,
+        cleanup_id,
+        mut payload,
+    } = Box::pin(drained_expiration("cleanup_prepare_refusal")).await;
+    let pool = table.fixture.operator_pool.pool();
+    payload
+        .cleanup_candidates
+        .extend(seed_extra_candidates(&table, &payload, &["wyrd-second-expired.parquet"]).await);
+    payload.cleanup_candidates.sort();
+    persist_cleanup_plan(&table.fixture, cleanup_id, &payload).await;
+    let deletes_before = table.store.deletes();
+
+    // First preparation refused while the row is still `running`.
+    let reader = table.fixture.hold_active_read().await;
+    assert!(
+        worker
+            .execute_one_for_test(&CancellationToken::new())
+            .await
+            .expect("a refused first preparation releases its claim"),
+        "the fair-claimed cleanup attempt ran"
+    );
+    assert_eq!(
+        retry_state(pool, cleanup_id).await,
+        (
+            "retryable".to_owned(),
+            Some("capacity_refused".to_owned()),
+            0
+        ),
+        "a refused first preparation consumes no retry budget"
+    );
+    assert_eq!(
+        cursor(&table.fixture, cleanup_id).await,
+        ("retryable".to_owned(), 0, None)
+    );
+    table.fixture.release_active_read(reader).await;
+    sqlx::query("UPDATE vala.forge_tasks SET next_eligible_at=now()-interval '1 second',ready_at=now()-interval '1 second' WHERE task_id=$1")
+        .bind(cleanup_id)
+        .execute(pool)
+        .await
+        .expect("the released refusal becomes eligible now");
+
+    // Candidate zero is proven, then a read arrives before its delete is
+    // submitted; candidate one's preparation is refused with the row already
+    // `prepared` at frontier one.
+    table.store.pause_delete_at(1);
+    let stop = CancellationToken::new();
+    let (result, reader) = tokio::join!(worker.execute_one_for_test(&stop), async {
+        table.store.delete_paused().await;
+        let reader = table.fixture.hold_active_read().await;
+        table.store.release_delete();
+        reader
+    });
+    assert!(
+        result.expect("a refused later preparation settles without an ownership conflict"),
+        "the fair-claimed cleanup attempt ran"
+    );
+    assert_eq!(
+        cursor(&table.fixture, cleanup_id).await,
+        ("prepared".to_owned(), 1, None),
+        "the refused preparation retains the advanced frontier"
+    );
+    let attempt = attempt_of(pool, cleanup_id)
+        .await
+        .expect("the retained row keeps its attempt");
+
+    let refused = worker
+        .execute_one_for_test(&CancellationToken::new())
+        .await
+        .expect_err("the held read refuses the replayed preparation");
+    assert!(
+        matches!(refused, ForgeError::CleanupRetained { index: 1, .. }),
+        "the replay is retained, not slot-fatal: {refused}"
+    );
+    assert_eq!(attempt_of(pool, cleanup_id).await, Some(attempt));
+    assert_eq!(
+        table.store.deletes(),
+        deletes_before + 1,
+        "only candidate zero was ever submitted"
+    );
+
+    table.fixture.release_active_read(reader).await;
+    assert!(
+        worker
+            .execute_one_for_test(&CancellationToken::new())
+            .await
+            .expect("the retained frontier replays after the read is released"),
+        "the prepared cleanup task is reconciled"
+    );
+    let (state, frontier, prepared) = cursor(&table.fixture, cleanup_id).await;
+    assert_eq!(state, "succeeded");
+    assert_eq!(frontier as usize, payload.cleanup_candidates.len());
+    assert_eq!(prepared, None);
+    for candidate in &payload.cleanup_candidates {
+        assert!(
+            !object_exists(&table.fixture, candidate.path.as_str()).await,
+            "every candidate is removed once the read is released"
+        );
+    }
+
+    table.supervised.shutdown().await;
+}
+
 /// Copies one promoted `file_list` row under a new identity, path, and table.
 ///
 /// The copy keeps the source row's settlement columns, so a copy of a

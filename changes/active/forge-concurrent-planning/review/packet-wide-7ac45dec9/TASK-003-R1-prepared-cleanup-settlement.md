@@ -94,8 +94,36 @@ Non-goals held: no SQL, durable state, retry ledger, or parallel cleanup owner;
 deletion proof and refusal checks unchanged. Files changed: `forge/error.rs`,
 `forge/worker.rs`, `tests/integration/forge/expired_cleanup.rs`, this task.
 
-Residual risk (outside this finding, not changed): once a cleanup row is
-`prepared`, a *preparation* of a later candidate refused by an active read
-(`refuse_active_table_reads`, an untyped `SqlError::Conflict`) still routes
-through generic retry settlement and reports lost ownership. Same root
-pattern; fixing it needs a typed refusal at the SQL owner.
+### Follow-up: active read refusing a candidate *preparation*
+
+The same root pattern also hit candidate preparation: an active read made
+`prepare_expired_cleanup_candidate` return an untyped `SqlError::Conflict`,
+which reached generic retry. For a row already `prepared` that reported lost
+ownership; for the first preparation it consumed retry budget.
+
+Fix at the SQL owner: `prepare_expired_cleanup_candidate` now returns
+`ExpiredCleanupPreparation` (`crates/vala/vala-sql/src/row_types/forge_tasks.rs`),
+whose `ActiveReadRefused` variant rolls back and writes nothing. In the worker,
+`ForgeWorker::preparation_refused` maps it from the durable row it implies:
+index 0 (row still `running`, no evidence) becomes `ForgeError::Capacity`,
+which releases the claim without consuming retry budget. Any later index (row
+already `prepared`) becomes `ForgeError::CleanupRetained`, which the
+prepared-claim route replays. Neither outcome reaches generic retry.
+
+| Criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Typed SQL refusal, no write | `queries/forge_tasks.rs` `prepare_expired_cleanup_candidate`; `row_types/forge_tasks.rs` `ExpiredCleanupPreparation` | `pg_tests::expired_cleanup_handoff_and_candidate_lifecycle_are_exact_atomic_and_audited` asserts `Ok(ActiveReadRefused)` and no evidence | PASS |
+| First-preparation refusal settles without generic retry | `worker.rs` `drain_expired_cleanup`, `preparation_refused` | `forge::expired_cleanup::active_read_refusing_preparation_is_released_or_retained_without_retry`: `retryable / capacity_refused / attempt_count 0`. Red before the fix: `transient_coordination`, attempt_count 1 | PASS |
+| Later-preparation refusal is retained, replays, and converges | same | same test: cursor `prepared/1/None` with no ownership error; the held-read replay returns `CleanupRetained { index: 1 }` with the same attempt and one delete total; after release the task succeeds and every candidate is removed | PASS |
+
+Commands:
+
+- `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p vala-sql --test pg_forge_tasks -E "test(=pg_tests::expired_cleanup_handoff_and_candidate_lifecycle_are_exact_atomic_and_audited)"'`: 1/1 passed
+- The same wrapper with `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --test integration -P journey --run-ignored=all` and an `-E` filter naming the four `forge::expired_cleanup::` tests above: 4/4 passed
+- `mise exec -- cargo nextest run --locked -p vala-sql --test pg_forge_tasks` (whole target, under the Postgres wrapper): 24/24 passed
+- `mise run test:bifrost:integration:redux`: 892/892 passed
+- `mise run test:bifrost:journey:forge`: 21/21 passed
+- `mise run fmt`, `mise run lints`, `git diff --check`: clean
+
+Non-goals held: no migration, durable state, or new owner. `refuse_active_table_reads`
+still serves its other caller (`forge_operations.rs`) unchanged.

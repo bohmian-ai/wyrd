@@ -26,10 +26,11 @@ use vala_sql::row_types::forge_operations::ForgeExpirationAuthority;
 use vala_sql::row_types::forge_operations::ForgeOperationFamily;
 use vala_sql::row_types::forge_tasks::{
     ExpiredCleanupCandidateRequest, ExpiredCleanupOutcome, ExpiredCleanupPayload,
-    FORGE_TASK_PAYLOAD_VERSION, ForgeClaimStrategy, ForgeCleanupCandidate, ForgePreparedTaskClaim,
-    ForgeTask, ForgeTaskClaim, ForgeTaskEvidence, ForgeTaskRowEvidence, ForgeTaskState,
-    ForgeTaskStrategy, ForgeTaskTableIdentity, ForgeTaskTransition, MAINTENANCE_STRATEGIES,
-    NewForgeTask, SnapshotWatermark, TaskProgressEffect,
+    ExpiredCleanupPreparation, FORGE_TASK_PAYLOAD_VERSION, ForgeClaimStrategy,
+    ForgeCleanupCandidate, ForgePreparedTaskClaim, ForgeTask, ForgeTaskClaim, ForgeTaskEvidence,
+    ForgeTaskRowEvidence, ForgeTaskState, ForgeTaskStrategy, ForgeTaskTableIdentity,
+    ForgeTaskTransition, MAINTENANCE_STRATEGIES, NewForgeTask, SnapshotWatermark,
+    TaskProgressEffect,
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
@@ -7764,8 +7765,10 @@ impl ForgeWorker {
     ///
     /// Returns [`ForgeError::CleanupRetained`] when a candidate is refused or
     /// its acceptance is unknown and its settlement deliberately left it
-    /// prepared, plus protection, path-binding, object-store, fencing, audit,
-    /// SQL, or cancellation failures.
+    /// prepared, or when an active table read refuses a later candidate's
+    /// preparation; [`ForgeError::Capacity`] when an active read refuses the
+    /// first preparation; plus protection, path-binding, object-store,
+    /// fencing, audit, SQL, or cancellation failures.
     ///
     /// # Cancellation
     ///
@@ -7811,7 +7814,8 @@ impl ForgeWorker {
             if !prepared {
                 require_running(stop)?;
                 lease.require_fence(&self.forge.core.operator_pool).await?;
-                self.tasks
+                let preparation = self
+                    .tasks
                     .prepare_expired_cleanup_candidate(
                         attempt.tenant,
                         ExpiredCleanupCandidateRequest {
@@ -7823,6 +7827,9 @@ impl ForgeWorker {
                     )
                     .await
                     .map_err(ForgeError::Sql)?;
+                if preparation == ExpiredCleanupPreparation::ActiveReadRefused {
+                    return Err(Self::preparation_refused(index));
+                }
             }
             prepared = false;
             let outcome = self
@@ -7859,6 +7866,27 @@ impl ForgeWorker {
             deleted_candidate_count: total,
             prepared_candidate_index: None,
         })
+    }
+
+    /// Maps an active-read refusal of one candidate preparation to its outcome.
+    ///
+    /// The refusal wrote nothing, so the outcome depends only on what the
+    /// durable row already held. Index zero is always the first preparation:
+    /// the row is still `running` with no evidence, so the claim is released
+    /// through the non-attempt-consuming [`ForgeError::Capacity`] path. Any
+    /// later index means an earlier candidate already moved the row to
+    /// `prepared`, which generic retry cannot settle, so the exact frontier is
+    /// retained as [`ForgeError::CleanupRetained`] for prepared-claim replay.
+    fn preparation_refused(index: u32) -> ForgeError {
+        if index == 0 {
+            return ForgeError::Capacity {
+                detail: "an Oracle query is still reading this table".to_owned(),
+            };
+        }
+        ForgeError::CleanupRetained {
+            index,
+            transition: "forge.expired_cleanup.preparation_refused",
+        }
     }
 
     /// Proves one prepared candidate is still safe to delete right now.

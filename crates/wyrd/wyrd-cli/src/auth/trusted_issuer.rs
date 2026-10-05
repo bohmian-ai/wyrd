@@ -67,7 +67,9 @@ pub struct AddArgs {
     /// group may be given multiple times to grant multiple roles.
     #[arg(long = "group-role", value_name = "GROUP=ROLE")]
     pub group_roles: Vec<String>,
-    /// Whether tokens represent humans or machine workloads (Human, Workload).
+    /// Principal kind the issuer's tokens represent. Only `Workload` is
+    /// accepted: human sign-in is configured through the tenant connection API
+    /// (`/v1/identity/oidc/candidate`), so `Human` is refused before any IO.
     #[arg(long, value_name = "KIND")]
     pub principal_kind: String,
     /// JWKS key-cache TTL override in seconds.
@@ -123,8 +125,9 @@ pub async fn dispatch(command: TrustedIssuerCommand) -> Result<ExitCode, WyrdCli
 ///
 /// # Errors
 /// Returns [`WyrdCliError::InvalidArgument`] for a malformed issuer URL, client
-/// auth method, principal kind, or group mapping; an IO error when the secret
-/// file cannot be read; and the server's stable Wyrd error when the caller is
+/// auth method, principal kind, or group mapping; the stable
+/// `HUMAN_CONNECTION_REQUIRED` error for a `Human` principal kind, before any
+/// IO; an IO error when the secret file cannot be read; and the server's stable Wyrd error when the caller is
 /// unauthorized or the issuer cannot be screened.
 async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
     let issuer: IssuerUrl = args
@@ -133,6 +136,7 @@ async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
         .map_err(|error| invalid("issuer", &args.issuer, &format!("an issuer URL: {error}")))?;
     let client_auth = parse_client_auth(&args.client_auth)?;
     let principal_kind = parse_principal_kind(&args.principal_kind)?;
+    wyrd_spec::auth::refuse_human_trusted_issuer(principal_kind)?;
     let client_secret = resolve_client_secret(args.client_secret_file)?
         .map(|secret| SecretBearer::new(secret.expose_secret().to_owned()));
     let group_role_map = parse_group_roles(&args.group_roles)?;
@@ -512,6 +516,17 @@ mod tests {
         assert!(parse_principal_kind("Robot").is_err());
     }
 
+    /// `Human` parses but is refused before any IO with the stable
+    /// `HUMAN_CONNECTION_REQUIRED` error that names the connection API.
+    #[test]
+    fn human_principal_kind_is_refused_before_io() {
+        let error = super::parse_principal_kind("Human")
+            .map(wyrd_spec::auth::refuse_human_trusted_issuer)
+            .expect("Human parses")
+            .expect_err("Human is refused");
+        assert_eq!(error.code(), "WYRD_AUTH_400_HUMAN_CONNECTION_REQUIRED");
+    }
+
     /// The client secret is never an argument: an inline value is refused
     /// without being echoed back.
     ///
@@ -576,7 +591,7 @@ mod tests {
             "--group-role",
             "ops=admin",
             "--principal-kind",
-            "Human",
+            "Workload",
             "--server",
             "https://acme.wyrd.cloud",
         ]);

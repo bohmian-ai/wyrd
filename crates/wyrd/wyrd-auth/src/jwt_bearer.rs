@@ -21,7 +21,7 @@ use wyrd_sql::{TenantConn, WyrdPostgres};
 use crate::audit::{
     TOKEN_EXCHANGE_OPERATION, auth_event, auth_failure_code, record_auth_audit_best_effort,
 };
-use crate::error::auth_error_to_wyrd;
+use crate::error::{auth_error_to_wyrd, store_error};
 use crate::issuance::{ExchangedToken, IssuanceError, TenantGrant, TenantTokenIssuer};
 use crate::issue_api_key::principal_kind_for_card;
 use crate::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
@@ -64,7 +64,7 @@ impl JwtBearer {
                 .verify_workload_assertion(tenant_id, assertion.expose_secret())
                 .await?;
             let card_ref = self.resolve_workload_binding(tenant_id, &verified).await?;
-            let mut conn = postgres.tenant_conn(tenant_id).await.map_err(sql_error)?;
+            let mut conn = postgres.tenant_conn(tenant_id).await.map_err(store_error)?;
             let principal_id = bound_service_account(&mut conn, &card_ref).await?;
             audit_principal_id = principal_id;
             let exchanged = self
@@ -75,7 +75,7 @@ impl JwtBearer {
                     IssuanceError::PrincipalInactive => principal_not_found_for_card_ref(&card_ref),
                     error => error.into(),
                 })?;
-            conn.commit().await.map_err(sql_error)?;
+            conn.commit().await.map_err(store_error)?;
             Ok(exchanged)
         }
         .await;
@@ -153,7 +153,7 @@ async fn bound_service_account(
     let principal_kind = principal_kind_for_card(card_ref).map_err(WyrdError::from)?;
     service_account_by_card_ref(conn, principal_kind, card_ref)
         .await
-        .map_err(sql_error)?
+        .map_err(store_error)?
         .map(|row| row.id)
         .ok_or_else(|| principal_not_found_for_card_ref(card_ref))
 }
@@ -181,7 +181,7 @@ async fn audit_workload_failure(
             error_code: auth_failure_code(error),
         },
     );
-    record_auth_audit_best_effort(postgres.app_pool(), tenant_id, &event).await;
+    record_auth_audit_best_effort(postgres, tenant_id, &event).await;
 }
 
 fn principal_not_found(subject: &str, issuer: &IssuerUrl) -> WyrdError {
@@ -205,14 +205,5 @@ fn invalid_token(message: &str) -> WyrdError {
     WyrdError::InvalidToken {
         message: message.to_owned(),
         details: json!({}),
-    }
-}
-
-fn sql_error(error: impl Into<wyrd_sql::SqlError>) -> WyrdError {
-    let error = error.into();
-    tracing::warn!(error = %error, "auth db unavailable");
-    WyrdError::AuthVerifyUnavailable {
-        message: "auth backend unavailable".to_owned(),
-        details: json!({ "retry_after_seconds": 1 }),
     }
 }

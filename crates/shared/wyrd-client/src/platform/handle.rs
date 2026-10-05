@@ -11,10 +11,10 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     ConfigurePlatformOidcRequest, CreateTenantRequest, CreateTenantResponse,
     CredentialListResponse, IssuePlatformCredentialRequest, IssuedCredential,
-    PlatformOidcConnectionView, PlatformPrincipalListResponse, PlatformTokenRequest, PrincipalId,
-    ProvisionedTenant, ProvisionedTenantAdmin, RecoverTenantAdminRequest,
-    RegisterPlatformAdminRequest, RegisterPlatformAdminResponse, SecretBearer,
-    SetPlatformPrincipalStatusRequest, SetTenantStatusRequest, TenantListResponse,
+    PlatformOidcConnectionView, PlatformPrincipalListResponse, PrincipalId, ProvisionedTenant,
+    ProvisionedTenantAdmin, RecoverTenantAdminRequest, RegisterPlatformAdminRequest,
+    RegisterPlatformAdminResponse, SecretBearer, SetPlatformPrincipalStatusRequest,
+    SetTenantStatusRequest, TenantListResponse,
 };
 use wyrd_spec::error::WyrdError;
 
@@ -79,9 +79,7 @@ impl Platform {
         let exchange = TokenExchange::new(&config.http.base_url, config.http.timeout_ms)
             .map_err(WyrdError::from)?;
         let response = exchange
-            .platform_session(&PlatformTokenRequest {
-                credential: SecretBearer::new(credential.expose_secret().to_owned()),
-            })
+            .platform_session(&SecretBearer::new(credential.expose_secret().to_owned()))
             .await
             .map_err(crate::auth::AuthError::into_wyrd)?;
         let session = PlatformSession(SecretString::from(

@@ -360,3 +360,138 @@ async fn failed_wal_replay_is_role_local() -> Result<(), super::query::ServerJou
     server.shutdown().await?;
     Ok(())
 }
+
+/// Ordinary shutdown joins a dedicated Forge worker's drain before any Bifrost settlement.
+///
+/// The bound dedicated-worker topology keeps its live worker in the serve
+/// handle, so `WyrdTestServer::shutdown` must cancel and join that worker
+/// before it settles Bifrost: settling first would close the node's storage
+/// owner underneath the worker. Storage is therefore closed once shutdown
+/// returns, and the released claim and clean worker drain prove the join came
+/// first. The worker is held after durably claiming a
+/// seeded task, so cancellation leaves it a real drain obligation, releasing
+/// that claim to `retryable`. A router-only replica keeps the Postgres fixture
+/// alive across the worker's shutdown so the released row stays readable.
+///
+/// # Errors
+///
+/// Returns the first startup, seeding, shutdown, or read failure.
+///
+/// # Panics
+///
+/// Panics when the worker never claims the seeded task, when shutdown left
+/// storage unsettled, or when the worker did not release its claim cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn dedicated_forge_worker_shutdown_drains_its_claim_before_storage_settles()
+-> Result<(), super::query::ServerJourneyError> {
+    let observer = vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new();
+    observer.hold_after_claims_for_test(1);
+    let worker = wyrd_testing::WyrdTestServer::builder()
+        .with_forge_process_role_for_test(wyrd_server::BifrostTarget::ForgeWorker)
+        .with_forge_completion_observer_for_test(observer.clone())
+        .start_bound()
+        .await?;
+    let keeper = worker
+        .start_replica(wyrd_testing::WyrdTestServer::builder())
+        .await?;
+    let pool = keeper.pg_fixture().superuser_pool().await?;
+    let task_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,\
+         namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,\
+         estimated_bytes,state,ready_at,next_eligible_at,updated_at) \
+         VALUES ($1,$2,'wyrd-redux','vala.bifrost','dedicated_shutdown','small_files',4242,\
+         '{\"version\":1,\"inputs\":[\"a.parquet\"],\"parameters\":{\"kind\":\"live_rewrite\"}}'::jsonb,\
+         decode(repeat('33',32),'hex'),1,100,'ready',statement_timestamp()-interval '1 hour',\
+         statement_timestamp()-interval '1 hour',statement_timestamp())",
+    )
+    .bind(task_id)
+    .bind(uuid::Uuid::from(worker.data_tenant_id()))
+    .execute(&pool)
+    .await?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        observer.wait_for_claims_for_test(),
+    )
+    .await
+    .expect("the dedicated worker durably claims the seeded task");
+
+    let storage = Arc::clone(
+        worker
+            .state()
+            .bifrost_storage()
+            .ok_or("the dedicated worker composes a storage owner")?,
+    );
+    let cancelled = worker.state().shutdown_token.clone();
+    let release = tokio::spawn({
+        let observer = observer.clone();
+        async move {
+            cancelled.cancelled().await;
+            observer.release_claims_for_test();
+        }
+    });
+    worker.shutdown().await?;
+    release.await?;
+
+    assert_eq!(
+        storage.inspect().lifecycle,
+        vala_bifrost_redux::storage::StorageLifecycle::Closed,
+        "ordinary shutdown settles storage after the dedicated worker joined"
+    );
+    let state: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        state, "retryable",
+        "the joined worker released its cancelled claim before shutdown returned"
+    );
+    assert!(
+        observer.returned_errors().is_empty(),
+        "the worker drained cleanly: {:?}",
+        observer.returned_errors()
+    );
+    keeper.shutdown().await?;
+    Ok(())
+}
+
+/// Ordinary shutdown of a router-only in-process server settles Bifrost itself.
+///
+/// No serve task exists to drain Bifrost, so `WyrdTestServer::shutdown`
+/// cancels the shared shutdown token and settles Bifrost before the Postgres
+/// fixture is dropped. Storage is the last owner that settlement closes, after
+/// the Oracle, so a closed storage owner proves the Oracle reader epoch no
+/// longer outlives the database.
+///
+/// # Errors
+///
+/// Returns the startup or shutdown failure.
+///
+/// # Panics
+///
+/// Panics when the token is left uncancelled or storage is left open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn router_only_shutdown_settles_bifrost_before_fixture_release()
+-> Result<(), super::query::ServerJourneyError> {
+    let server = wyrd_testing::WyrdTestServer::start_in_process().await?;
+    let storage = Arc::clone(
+        server
+            .state()
+            .bifrost_storage()
+            .ok_or("the default target composes a storage owner")?,
+    );
+    let cancelled = server.state().shutdown_token.clone();
+    server.shutdown().await?;
+    assert!(
+        cancelled.is_cancelled(),
+        "shutdown cancels the shared token"
+    );
+    assert_eq!(
+        storage.inspect().lifecycle,
+        vala_bifrost_redux::storage::StorageLifecycle::Closed,
+        "router-only shutdown settles Bifrost before the fixture is released"
+    );
+    Ok(())
+}

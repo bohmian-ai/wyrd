@@ -23,7 +23,6 @@
   {#if data.development}
     <div class="dev-tools" role="region" aria-label="Development tools">
     <form method="POST" action="/?/mockData">
-      <input type="hidden" name="csrf" value={data.devCsrf ?? ''} />
       <input type="hidden" name="enabled" value={String(!data.mockData)} />
       <input type="hidden" name="returnTo" value={page.url.pathname + page.url.search} />
       <span>DEV</span><button class="app-control" type="submit" aria-pressed={data.mockData}>Mock data: {data.mockData ? 'On' : 'Off'}</button>
@@ -35,7 +34,6 @@
       <details>
         <summary>Test login</summary>
         <form method="POST" action="/?/loginScenario" class="login-scenarios">
-          <input type="hidden" name="csrf" value={data.devCsrf ?? ''} />
           <label for="login-scenario">Access after sign-in</label>
           <select id="login-scenario" class="app-input" name="scenario">
             <option value="single" selected={data.loginScenario === 'single'}>One tenant — go to Home</option>

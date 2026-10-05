@@ -8,7 +8,8 @@ use secrecy::SecretString;
 
 use crate::cards::error::RegistryEngineError;
 
-/// Resolve the shared Wyrd client for a registry handle.
+/// Resolve the shared Wyrd client for a registry handle, applying the
+/// explicit credential and tenant selector over the configured ones.
 ///
 /// Repository filesystem configuration is intentionally not loaded here.
 /// `wyrd-loader` owns authored-card and `wyrd.toml` discovery; this module only
@@ -18,10 +19,12 @@ use crate::cards::error::RegistryEngineError;
 ///
 /// Returns [`RegistryEngineError::Client`] when the global client
 /// configuration cannot be read or parsed, when an explicit `server_url` is
-/// empty, or when the authenticated transport cannot be constructed.
+/// empty, when the saved-login selection fails, or when the authenticated
+/// transport cannot be constructed.
 pub(crate) fn load(
     server_url: Option<&str>,
     credential: Option<SecretString>,
+    tenant: Option<&str>,
 ) -> Result<WyrdClient, RegistryEngineError> {
     if server_url.is_some_and(str::is_empty) {
         return Err(WyrdClientError::Config {
@@ -34,6 +37,9 @@ pub(crate) fn load(
         ClientConfig::from_global_with_overrides(&GlobalConfig::load()?, server_url, None);
     if credential.is_some() {
         client_config.credential = credential;
+    }
+    if let Some(tenant) = tenant {
+        client_config.tenant = Some(tenant.to_owned());
     }
     Ok(WyrdClient::with_config(client_config)?)
 }

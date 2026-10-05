@@ -1,11 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "HttpConfig",
-  "description": "Configuration for the HTTP transport.\n\nThe HTTP transport is a fallback for environments where gRPC is unavailable or blocked. Ingest routes are appended by the client at call time; `base_url` is the common prefix.\n\nThis config carries transport wiring only. Authentication is owned by `AuthMiddleware`, which injects the `x-wyrd-access-token` credential per call; there is no auth field here.",
+  "description": "Configuration for the HTTP transport.\n\nThe HTTP transport is a fallback for environments where gRPC is unavailable or blocked. [`HttpConfig::validate`] reduces `base_url` to its deployment origin, and every route is appended to that origin at call time.\n\nThis config carries transport wiring only. Authentication is owned by `AuthMiddleware`, which injects the `x-wyrd-access-token` credential per call; there is no auth field here.",
   "type": "object",
   "properties": {
     "base_url": {
-      "description": "Base URL for all ingest routes. Must be non-empty. Ingest routes (`/api/v1/observations`, `/api/v1/records`, etc.) are appended at call time.\n\nExample: `\"https://wyrd-ingest.example.com\"`. Default: [`HTTP_DEFAULT_BASE_URL`] (`\"http://localhost:8080\"`).",
+      "description": "Deployment URL. Must be non-empty, HTTPS or loopback HTTP, and free of userinfo. It is normalized to its origin, `scheme://host[:port]`; any path, query, or fragment is discarded before client endpoints are built, and routes (`/auth/token`, `/api/v1/observations`, etc.) are appended to that origin at call time.\n\nExample: `\"https://wyrd-ingest.example.com\"`. Default: [`HTTP_DEFAULT_BASE_URL`] (`\"http://localhost:8080\"`).",
       "default": "http://localhost:8080",
       "type": "string"
     },

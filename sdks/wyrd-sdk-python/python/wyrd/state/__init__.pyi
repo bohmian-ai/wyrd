@@ -156,10 +156,11 @@ class WyrdState:
         server_url: str | None = None,
         credential: str | None = None,
         grpc_url: str | None = None,
+        tenant: str | None = None,
     ) -> None:
         """Connect this state's one Bifrost writer and describe the fixed tables.
 
-        The four arguments are ``Bifrost(...)``'s and pass straight through,
+        The five arguments are ``Bifrost(...)``'s and pass straight through,
         including its environment and default resolution. Startup describes
         ``vala.drift.observations`` and ``vala.eval.observations`` before
         succeeding, so a run can never enqueue against a missing, unauthorized,

@@ -1,7 +1,8 @@
 //! Boot-time trusted-issuer seeding for self-hosted deployments.
 //!
-//! Self-hosted Wyrd declares its trusted OIDC issuers in `[[trusted_issuers]]`
-//! config. At boot, [`seed_trusted_issuers`] runs OIDC discovery per entry
+//! Self-hosted Wyrd declares its trusted workload OIDC issuers in
+//! `[[trusted_issuers]]` config; a `principal_kind = human` entry is refused,
+//! because human login trust lives only in the tenant OIDC connection store. At boot, [`seed_trusted_issuers`] runs OIDC discovery per entry
 //! (under a bounded retry schedule), maps each config DTO to the
 //! [`TrustedIssuer`] domain type, encrypts any client secret with the sealing
 //! key, and upserts the row into `wyrd.auth_trusted_issuers`. Postgres is then
@@ -11,7 +12,7 @@
 //! Issuer trust is tenant-scoped (F02). Boot has no request `Host` to derive
 //! the tenant from, so the operator declares the deployment's implicit tenant
 //! via `[auth] tenant_slug`. [`resolve_implicit_tenant`] resolves that slug
-//! through the SAME `resolve_by_slug_for_app` path the request handlers use, so
+//! through the SAME `WyrdPostgres::resolve_tenant_slug` the request handlers use, so
 //! the bound `DataTenantId` equals what the resolver reads at request time, by
 //! construction.
 //!
@@ -23,19 +24,17 @@
 
 use std::time::Duration;
 
-use sqlx::PgPool;
 use url::Url;
 use wyrd_auth_oidc::{
-    ClaimMapping, ClaimPath, ClientAuth, OidcProvider, ProviderMetadata, TrustedIssuer,
-    WorkloadBinding,
+    ClaimMapping, ClaimPath, ClientAuth, ScreenedHttp, TrustedIssuer, WorkloadBinding,
 };
-use wyrd_crypt::SecretKey;
+use wyrd_crypt::SealingKeyring;
 use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::{DataTenantId, TenantSlug};
-use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     trusted_issuer_exists, upsert_trusted_issuer, upsert_workload_binding,
 };
+use wyrd_sql::{TenantConn, WyrdPostgres};
 
 use crate::auth::pg_resolvers::{binding_write_from_binding, issuer_write_from_trusted};
 use crate::boot::ServerBootError;
@@ -61,20 +60,20 @@ fn backoff_ms(attempt: u32) -> u64 {
 
 /// Resolve the deployment's implicit tenant slug to its `DataTenantId`.
 ///
-/// Reuses [`resolve_by_slug_for_app`](wyrd_sql::queries::platform::tenant_resolver::resolve_by_slug_for_app),
-/// the same resolver the request handlers (`callback.rs`/`login.rs`/
-/// `jwt_bearer.rs`) use, so the boot tenant matches request-time lookups.
-/// Commit 03 reuses this helper for workload bindings.
+/// Reuses [`WyrdPostgres::resolve_tenant_slug`], the one resolver tenant
+/// login and workload exchange use, so the boot tenant matches request-time
+/// lookups by construction.
 ///
 /// # Errors
-/// Returns [`ServerBootError::Sql`] when the resolver query fails, and
+/// Returns [`ServerBootError::Sql`] when the resolver query fails or no
+/// operator pool is configured, and
 /// [`ServerBootError::TenantSlugUnresolved`] when the slug does not resolve to
 /// an active tenant.
 pub async fn resolve_implicit_tenant(
-    pool: &PgPool,
+    postgres: &WyrdPostgres,
     slug: &TenantSlug,
 ) -> Result<DataTenantId, ServerBootError> {
-    match wyrd_sql::queries::platform::tenant_resolver::resolve_by_slug_for_app(pool, slug).await? {
+    match postgres.resolve_tenant_slug(slug).await? {
         Some(tenant_id) => Ok(tenant_id),
         None => Err(ServerBootError::TenantSlugUnresolved {
             slug: slug.to_string(),
@@ -87,7 +86,8 @@ pub async fn resolve_implicit_tenant(
 /// For each entry: run OIDC discovery (bounded retry), map the config DTO to a
 /// [`TrustedIssuer`], encrypt any client secret with `sealing_key`, and upsert
 /// the row (`ON CONFLICT DO UPDATE`, so re-seeding from config is idempotent).
-/// All writes share one tenant transaction, committed once at the end.
+/// All writes share one tenant transaction opened through
+/// [`WyrdPostgres::tenant_conn`], committed once at the end.
 ///
 /// Discovery that is unreachable for an issuer whose row already exists is
 /// non-fatal (a restart while the IdP is briefly down keeps the prior row).
@@ -95,20 +95,30 @@ pub async fn resolve_implicit_tenant(
 /// boot closed.
 ///
 /// # Errors
-/// Returns [`ServerBootError::IssuerDiscoveryUnavailable`] when another Rustls
+/// Returns [`ServerBootError::HumanIssuerSeed`] before any IO when an entry is
+/// `principal_kind = human`: human login trust lives only in the tenant OIDC
+/// connection store. Returns [`ServerBootError::IssuerDiscoveryUnavailable`] when another Rustls
 /// provider already owns the process or for an unreachable, never-seeded
 /// issuer; [`ServerBootError::IssuerSeal`] when a secret-bearing issuer has no
 /// sealing key; and [`ServerBootError::Sql`] on a write failure. Cancellation
 /// may leave earlier issuer entries committed while later entries remain
 /// unprocessed.
 pub async fn seed_trusted_issuers(
-    pool: &PgPool,
+    postgres: &WyrdPostgres,
     tenant_id: DataTenantId,
     entries: &[IssuerEntry],
-    sealing_key: Option<&SecretKey>,
+    sealing_key: Option<&SealingKeyring>,
 ) -> Result<(), ServerBootError> {
     if entries.is_empty() {
         return Ok(());
+    }
+    if let Some(human) = entries
+        .iter()
+        .find(|entry| entry.principal_kind == IssuerTokenPolicy::Human)
+    {
+        return Err(ServerBootError::HumanIssuerSeed {
+            issuer: human.issuer.clone(),
+        });
     }
     wyrd_tls::install_crypto_provider().map_err(|error| {
         ServerBootError::IssuerDiscoveryUnavailable {
@@ -116,14 +126,12 @@ pub async fn seed_trusted_issuers(
             message: error.to_string(),
         }
     })?;
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("discovery client config is valid");
-    let mut conn = TenantConn::acquire(pool, tenant_id).await?;
+    // Boot issuers are operator configuration, so internal addresses stay
+    // reachable; requests still go through the redirect-disabled transport.
+    let discovery = ScreenedHttp::allowing_internal();
+    let mut conn = postgres.tenant_conn(tenant_id).await?;
     for entry in entries {
-        seed_one_trusted_issuer(&mut conn, tenant_id, entry, sealing_key, &http).await?;
+        seed_one_trusted_issuer(&mut conn, tenant_id, entry, sealing_key, &discovery).await?;
     }
     conn.commit().await?;
     Ok(())
@@ -134,12 +142,12 @@ async fn seed_one_trusted_issuer(
     conn: &mut TenantConn<'_>,
     tenant_id: DataTenantId,
     entry: &IssuerEntry,
-    sealing_key: Option<&SecretKey>,
-    http: &reqwest::Client,
+    sealing_key: Option<&SealingKeyring>,
+    discovery: &ScreenedHttp,
 ) -> Result<(), ServerBootError> {
-    match discover_with_retry(&entry.issuer, http).await {
-        Ok(metadata) => {
-            let trusted = build_trusted_issuer(entry, tenant_id, &metadata)?;
+    match discover_with_retry(&entry.issuer, discovery).await {
+        Ok(jwks_uri) => {
+            let trusted = build_trusted_issuer(entry, tenant_id, jwks_uri)?;
             let write = issuer_write_from_trusted(&trusted, sealing_key).map_err(|error| {
                 ServerBootError::IssuerSeal {
                     issuer: entry.issuer.clone(),
@@ -179,21 +187,21 @@ async fn seed_one_trusted_issuer(
 /// Each binding's structured `card_ref` is encoded to JSONB and upserted
 /// (`ON CONFLICT DO UPDATE`). The referenced trusted issuer must already be
 /// seeded (FK), so callers seed issuers first. All writes share one tenant
-/// transaction.
+/// transaction opened through [`WyrdPostgres::tenant_conn`].
 ///
 /// # Errors
 /// Returns [`ServerBootError::InvalidWorkloadBinding`] when a binding's
 /// `card_ref` cannot be serialized, and [`ServerBootError::Sql`] on a write
 /// failure (including an FK violation when the issuer was not seeded).
 pub async fn seed_workload_bindings(
-    pool: &PgPool,
+    postgres: &WyrdPostgres,
     tenant_id: DataTenantId,
     bindings: &[WorkloadBinding],
 ) -> Result<(), ServerBootError> {
     if bindings.is_empty() {
         return Ok(());
     }
-    let mut conn = TenantConn::acquire(pool, tenant_id).await?;
+    let mut conn = postgres.tenant_conn(tenant_id).await?;
     for (index, binding) in bindings.iter().enumerate() {
         let write = binding_write_from_binding(binding).map_err(|error| {
             ServerBootError::InvalidWorkloadBinding {
@@ -209,22 +217,31 @@ pub async fn seed_workload_bindings(
     Ok(())
 }
 
-/// Run OIDC discovery for `issuer`, retrying transient failures on the bounded
-/// backoff schedule. Returns the discovered metadata or a fail-closed error.
+/// Read `issuer`'s discovery document through `discovery`, retrying
+/// transient failures on the bounded backoff schedule, and return the key-set
+/// URI the provider published.
+///
+/// Only the document is read ([`ScreenedHttp::provider_metadata`]); the
+/// workload verifier fetches the keys when an assertion first needs them, so
+/// a key set that is briefly unavailable does not block seeding.
+///
+/// # Errors
+/// Returns [`ServerBootError::IssuerDiscoveryUnavailable`] when `issuer` is
+/// not a valid issuer URL (without retrying) or every attempt fails.
 async fn discover_with_retry(
     issuer: &str,
-    http: &reqwest::Client,
-) -> Result<ProviderMetadata, ServerBootError> {
+    discovery: &ScreenedHttp,
+) -> Result<Url, ServerBootError> {
     let issuer_url =
-        Url::parse(issuer).map_err(|e| ServerBootError::IssuerDiscoveryUnavailable {
+        IssuerUrl::new(issuer).map_err(|e| ServerBootError::IssuerDiscoveryUnavailable {
             issuer: issuer.to_owned(),
             message: format!("issuer URL could not be parsed: {e}"),
         })?;
 
     let mut last_message = String::from("discovery did not complete");
     for attempt in 0..DISCOVERY_MAX_ATTEMPTS {
-        match OidcProvider::discover(issuer_url.clone(), http.clone()).await {
-            Ok(provider) => return Ok(provider.metadata),
+        match discovery.provider_metadata(&issuer_url).await {
+            Ok(metadata) => return Ok(metadata.jwks_uri().url().clone()),
             Err(error) => {
                 tracing::warn!(
                     issuer,
@@ -246,14 +263,14 @@ async fn discover_with_retry(
     })
 }
 
-/// Map one config DTO plus its discovered metadata to a [`TrustedIssuer`].
+/// Map one config DTO plus its discovered key-set URI to a [`TrustedIssuer`].
 ///
 /// `jwks_uri` comes solely from discovery (F04: never hand-authored from
 /// config, no `card_ref` on this path).
 fn build_trusted_issuer(
     entry: &IssuerEntry,
     tenant_id: DataTenantId,
-    metadata: &ProviderMetadata,
+    jwks_uri: Url,
 ) -> Result<TrustedIssuer, ServerBootError> {
     let issuer = IssuerUrl::new(entry.issuer.clone()).map_err(|e| {
         ServerBootError::IssuerDiscoveryUnavailable {
@@ -265,7 +282,7 @@ fn build_trusted_issuer(
     Ok(TrustedIssuer {
         tenant_id,
         issuer,
-        jwks_uri: metadata.jwks_uri.clone(),
+        jwks_uri,
         expected_audience: entry.expected_audience.clone(),
         client_id: entry.client_id.clone(),
         client_auth: map_client_auth(&entry.client_auth),
@@ -307,7 +324,7 @@ mod pg_tests {
     use secrecy::{ExposeSecret, SecretString};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-    use wyrd_crypt::SecretKey;
+    use wyrd_crypt::{SealingKeyring, SecretKey};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_sql::queries::auth::upsert_trusted_issuer;
 
@@ -325,24 +342,47 @@ mod pg_tests {
             "authorization_endpoint": format!("{issuer}/authorize"),
             "token_endpoint": format!("{issuer}/token"),
             "jwks_uri": format!("{issuer}/jwks"),
+            "response_types_supported": ["id_token"],
+            "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["RS256", "EdDSA"]
         })
     }
 
-    fn fake_metadata(issuer: &str) -> ProviderMetadata {
-        ProviderMetadata {
-            issuer: issuer.to_owned(),
-            authorization_endpoint: format!("{issuer}/authorize")
-                .parse()
-                .expect("authorize url is valid"),
-            token_endpoint: Some(
-                format!("{issuer}/token")
-                    .parse()
-                    .expect("token url is valid"),
-            ),
-            jwks_uri: format!("{issuer}/jwks").parse().expect("jwks url is valid"),
-            id_token_signing_alg_values_supported: vec!["RS256".to_owned()],
-        }
+    /// Make `server`'s `/jwks` unavailable: workload seeding reads only the
+    /// discovery document, so it must succeed without the key set.
+    async fn mount_unavailable_key_set(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(server)
+            .await;
+    }
+
+    /// Requests `server` received for its key set.
+    ///
+    /// # Panics
+    /// Panics when the mock server does not record requests.
+    async fn key_set_requests(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("requests are recorded")
+            .iter()
+            .filter(|request| request.url.path() == "/jwks")
+            .count()
+    }
+
+    /// The discovery transport the boot tests use.
+    fn discovery() -> ScreenedHttp {
+        ScreenedHttp::allowing_internal()
+    }
+
+    /// The conventional key-set URI of `issuer`.
+    ///
+    /// # Panics
+    /// Panics when `issuer` does not form a valid URL.
+    fn fake_jwks_uri(issuer: &str) -> Url {
+        format!("{issuer}/jwks").parse().expect("jwks url is valid")
     }
 
     fn issuer_entry(issuer: &str) -> IssuerEntry {
@@ -373,11 +413,18 @@ mod pg_tests {
             .mount(&server)
             .await;
 
-        let metadata = discover_with_retry(&issuer, &reqwest::Client::new())
-            .await
-            .expect("discovery should succeed");
+        mount_unavailable_key_set(&server).await;
 
-        assert!(metadata.jwks_uri.as_str().ends_with("/jwks"));
+        let jwks_uri = discover_with_retry(&issuer, &discovery())
+            .await
+            .expect("discovery should succeed while the key set is unavailable");
+
+        assert!(jwks_uri.as_str().ends_with("/jwks"));
+        assert_eq!(
+            key_set_requests(&server).await,
+            0,
+            "seeding never fetches keys"
+        );
     }
 
     #[tokio::test]
@@ -390,7 +437,7 @@ mod pg_tests {
             .mount(&server)
             .await;
 
-        let error = discover_with_retry(&issuer, &reqwest::Client::new())
+        let error = discover_with_retry(&issuer, &discovery())
             .await
             .expect_err("unreachable issuer must fail closed");
 
@@ -426,21 +473,21 @@ mod pg_tests {
             .mount(&server)
             .await;
 
-        let metadata = discover_with_retry(&issuer, &reqwest::Client::new())
+        mount_unavailable_key_set(&server).await;
+
+        let jwks_uri = discover_with_retry(&issuer, &discovery())
             .await
             .expect("discovery should recover after a transient failure");
 
-        assert!(metadata.jwks_uri.as_str().ends_with("/jwks"));
+        assert!(jwks_uri.as_str().ends_with("/jwks"));
     }
 
     #[test]
     fn issuer_boot_build_trusted_issuer_maps_dto_fields() {
         let issuer = "https://idp.example.com/realms/acme";
         let entry = issuer_entry(issuer);
-        let metadata = fake_metadata(issuer);
-
-        let trusted =
-            build_trusted_issuer(&entry, tenant(), &metadata).expect("mapping should succeed");
+        let trusted = build_trusted_issuer(&entry, tenant(), fake_jwks_uri(issuer))
+            .expect("mapping should succeed");
 
         assert_eq!(trusted.tenant_id, tenant());
         assert_eq!(trusted.issuer.as_str(), issuer);
@@ -468,9 +515,7 @@ mod pg_tests {
     fn issuer_boot_build_trusted_issuer_rejects_non_https_issuer() {
         let issuer = "http://insecure.example.com";
         let entry = issuer_entry(issuer);
-        let metadata = fake_metadata(issuer);
-
-        let error = build_trusted_issuer(&entry, tenant(), &metadata)
+        let error = build_trusted_issuer(&entry, tenant(), fake_jwks_uri(issuer))
             .expect_err("non-https issuer must fail closed");
 
         assert!(
@@ -487,11 +532,11 @@ mod pg_tests {
     async fn seed_keeps_existing_row_when_discovery_unreachable_on_restart() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant_id = fixture.data_tenant_id();
-        let key = SecretKey::from_bytes([3_u8; 32]);
+        let key = SealingKeyring::new(SecretKey::from_bytes([3_u8; 32]));
 
         // Pre-seed the row as a prior successful boot would have.
         let entry = issuer_entry(UNREACHABLE_ISSUER);
-        let trusted = build_trusted_issuer(&entry, tenant_id, &fake_metadata(UNREACHABLE_ISSUER))
+        let trusted = build_trusted_issuer(&entry, tenant_id, fake_jwks_uri(UNREACHABLE_ISSUER))
             .expect("issuer maps");
         let write = crate::auth::pg_resolvers::issuer_write_from_trusted(&trusted, Some(&key))
             .expect("issuer encodes");
@@ -502,7 +547,7 @@ mod pg_tests {
         conn.commit().await.expect("pre-seed commits");
 
         // Boot again with the IdP unreachable: the existing row makes this non-fatal.
-        seed_trusted_issuers(fixture.app_pool(), tenant_id, &[entry], Some(&key))
+        seed_trusted_issuers(fixture.wyrd_postgres(), tenant_id, &[entry], Some(&key))
             .await
             .expect("restart with unreachable but already-seeded issuer must not fail boot");
     }
@@ -511,15 +556,35 @@ mod pg_tests {
     async fn seed_fails_closed_for_unreachable_unseeded_issuer() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant_id = fixture.data_tenant_id();
-        let key = SecretKey::from_bytes([4_u8; 32]);
+        let key = SealingKeyring::new(SecretKey::from_bytes([4_u8; 32]));
 
         let entry = issuer_entry("https://idp.invalid/realms/never-seeded");
-        let error = seed_trusted_issuers(fixture.app_pool(), tenant_id, &[entry], Some(&key))
+        let error = seed_trusted_issuers(fixture.wyrd_postgres(), tenant_id, &[entry], Some(&key))
             .await
             .expect_err("a never-seeded unreachable issuer must fail boot closed");
         assert!(
             matches!(error, ServerBootError::IssuerDiscoveryUnavailable { .. }),
             "expected IssuerDiscoveryUnavailable, got {error:?}"
         );
+    }
+
+    /// A human `[[trusted_issuers]]` entry is refused before any IO and names
+    /// the connection API; nothing is seeded that login would ignore.
+    #[tokio::test]
+    async fn seed_refuses_a_human_issuer_before_discovery() {
+        let mut entry = issuer_entry("https://idp.invalid/realms/human");
+        entry.principal_kind = IssuerTokenPolicy::Human;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused.invalid/none")
+            .expect("lazy pool builds without connecting");
+
+        let postgres = WyrdPostgres::from_pools(pool, None);
+
+        let error = seed_trusted_issuers(&postgres, tenant(), &[entry], None)
+            .await
+            .expect_err("a human issuer must not seed");
+
+        assert!(matches!(error, ServerBootError::HumanIssuerSeed { .. }));
+        assert!(error.to_string().contains("/v1/identity/oidc/candidate"));
     }
 }

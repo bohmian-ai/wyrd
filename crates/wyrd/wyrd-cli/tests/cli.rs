@@ -2,6 +2,9 @@
 mod auth_issue_key_journey;
 #[path = "card_lifecycle.rs"]
 mod card_lifecycle;
+/// Provider-backed `wyrd auth login`, `status`, and `logout` journey.
+#[path = "cli_login_journey.rs"]
+mod cli_login_journey;
 #[path = "eval_local_records.rs"]
 mod eval_local_records;
 #[path = "eval_support/mod.rs"]
@@ -20,3 +23,16 @@ mod query_server_journey;
 mod secret_sources;
 #[path = "workflow_journey.rs"]
 mod workflow_journey;
+
+/// Root of the provider-backed CLI login journey, so its exact name
+/// `cli_device_login_journey` selects it; only the Keycloak identity lane
+/// runs it.
+///
+/// # Panics
+/// Panics when any step of [`cli_login_journey::cli_device_login_journey`]
+/// differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the Keycloak identity lane; run via `mise run test:identity:journey`"]
+async fn cli_device_login_journey() {
+    cli_login_journey::cli_device_login_journey().await;
+}

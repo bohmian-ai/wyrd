@@ -626,7 +626,7 @@ pub(crate) async fn record_allowed(
     allowed: &[AuditEvent],
 ) -> Result<(), WyrdError> {
     for event in allowed {
-        audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, event).await?;
+        audit::record_audit(state.postgres.vala(), caller.data_tenant_id, event).await?;
     }
     Ok(())
 }

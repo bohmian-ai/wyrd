@@ -549,7 +549,11 @@ def _access_token(wyrd_server, api_key: str) -> str:
     """Exchange an API key for a Wyrd access token through the public auth route."""
     response = httpx.post(
         f"{wyrd_server.base_url}/auth/token",
-        json={"grant_type": "wyrd_api_key", "api_key": api_key},
+        data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "subject_token": api_key,
+            "subject_token_type": "urn:wyrd:oauth:token-type:api_key",
+        },
     )
     response.raise_for_status()
     return response.json()["access_token"]

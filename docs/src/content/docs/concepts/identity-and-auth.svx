@@ -1,6 +1,6 @@
 ---
 title: Identity and auth
-description: End-to-end map of how Wyrd scopes identity across its platform and tenant planes and five principal kinds, and how the server verifies every request.
+description: End-to-end map of how Wyrd scopes identity across its platform and tenant planes and five principal kinds, and how the server verifies every protected request.
 pillar: wyrd
 group: Concepts
 order: 6
@@ -8,11 +8,12 @@ order: 6
 
 # Identity and auth
 
-Wyrd owns identity and authorization on the server. Every request carries exactly
-one credential: a Wyrd-signed access token in the `X-Wyrd-Access-Token` header.
+Wyrd owns identity and authorization on the server. Every authenticated request
+carries exactly one credential: a Wyrd-signed access token in the
+`X-Wyrd-Access-Token` header.
 The server verifies it, resolves the caller's permissions, and decides what runs.
-There is no session cookie and no ambient identity. A client can hold a token, but
-only the server decides what it means.
+The server keeps no session and no ambient identity. A client can hold a token,
+but only the server decides what it means.
 
 Identity spans two planes. The **platform plane** operates the deployment
 itself — creating tenants, recovering tenant administration — and its principals
@@ -34,15 +35,15 @@ This page is the map. The three pages it links to hold the detail:
     { header: 'Meaning' }
   ]}
   rows={[
-    ['Tenant', 'Isolation boundary. Every principal, token, role, issuer, and binding belongs to exactly one tenant. Postgres row-level security enforces it.'],
+    ['Tenant', 'Isolation boundary. Every tenant-plane principal, token, role, issuer, and binding belongs to exactly one tenant. Postgres row-level security enforces it. Platform principals and sessions hold no tenant.'],
     ['Principal', 'The identity a token acts as. One of five kinds: GlobalAdmin, TenantAdmin, User, Service, or Agent.'],
     ['GlobalAdmin', 'Platform-plane administrator. Holds no tenant and operates tenant lifecycle and tenant-administration recovery; never implicitly authorized over a tenant\'s resources.'],
     ['TenantAdmin', 'The tenant\'s headless root of trust, created during provisioning. Carries no card.'],
-    ['User', 'A human, authenticated through OIDC. Identified by email; no card.'],
+    ['User', 'A human. A tenant User authenticates through the tenant\'s OIDC connection and is identified by the provider\'s issuer and subject, never by email; no card. A platform User is a pre-registered, tenantless platform administrator who signs in through the deployment-wide platform connection.'],
     ['Service', 'A non-human principal that may be bound to a ServiceCard. Authenticates with an API key or a workload assertion.'],
     ['Agent', 'A non-human principal, always bound to an AgentCard. Same auth paths as a Service.'],
-    ['Access token', 'Short-lived EdDSA JWT sent on every request. Carries the principal, tenant, and role claims.'],
-    ['Refresh token', 'Single-use, rotated token that mints a new access token. Issued only for human OIDC login; a machine re-exchanges its durable credential instead.'],
+    ['Access token', 'Short-lived EdDSA JWT sent on every protected request. A tenant token carries the principal, tenant, role, and permission claims. A platform session token carries platform scope and principal and session identifiers but no tenant or roles; the server re-reads the principal\'s current platform grants on each request.'],
+    ['Refresh token', 'Token that mints a new access token. Issued only for tenant human login: the CLI\'s rotates on every use, the web app\'s does not and ends after 12 hours. A machine re-exchanges its durable credential instead.'],
     ['Delegated token', 'Access token minted on behalf of another Service/Agent, carrying an act chain. No refresh token.'],
     ['act chain', 'RFC 8693 delegation record embedded in a token: the ordered list of principals that delegated down to the callee.'],
     ['Trusted issuer', 'An external OIDC issuer whose JWTs Wyrd will verify, scoped to one tenant.'],
@@ -53,7 +54,9 @@ This page is the map. The three pages it links to hold the detail:
 
 ## The authenticated request path
 
-Once a caller has an access token, every request follows the same path. The
+Once a caller has a tenant access token, every protected tenant request
+follows the same path. (A platform session is verified by the platform plane,
+which re-reads current grants.) The
 server never trusts the token's contents until `TokenVerifier::verify` has
 checked them; the tenant is read from the unverified token only to route to the
 correct tenant verifier, not to grant anything.
@@ -85,34 +88,42 @@ once after an authentication refusal.
 
 ## Obtaining a token: `/auth/token` grant dispatch
 
-All machine-facing token issuance goes through one route, `POST /auth/token`,
+All tenant-plane token issuance goes through one route, `POST /auth/token`,
 which matches on the `TokenRequest` grant and dispatches to the right exchange.
-Human login is the exception: it starts at `GET /auth/login` and finishes with the
-`authorization_code` grant on the same route.
+Tenant human login also ends there: the web app begins at `GET /auth/authorize` and
+redeems its authorization code at `/auth/token`, and the CLI redeems its
+device code there.
 
 <WyrdFlowDiagram
   variant="fan"
   title="/auth/token grant dispatch"
   steps={[
     { label: 'POST /auth/token', sub: 'match TokenRequest' },
-    { label: 'wyrd_api_key', sub: 'API key → access only' },
+    { label: 'authorization_code · device_code', sub: 'human login → access + refresh' },
     { label: 'jwt-bearer', sub: 'workload assertion → access only' },
-    { label: 'authorization_code', sub: 'OIDC callback → access + refresh' },
-    { label: 'refresh_token', sub: 'rotate → access + refresh' },
-    { label: 'token-exchange', sub: 'delegation → access only' }
+    { label: 'refresh_token', sub: 'CLI: rotate · web app: access only' },
+    { label: 'token-exchange', sub: 'API key or delegation → access only' }
   ]}
 />
 
 Who uses which grant:
 
-- **Humans** log in through OIDC (`authorization_code`) and receive **User**
-  tokens.
-- **Services and Agents** authenticate with an API key (`wyrd_api_key`) or a
+- **Humans** log in through their tenant's Active OIDC connection and receive
+  **User** tokens (access + refresh) at `/auth/token`.
+- **Services and Agents** authenticate with an API key (`token-exchange`) or a
   workload assertion (`jwt-bearer`). Neither grant returns a refresh token: a
   machine renews by re-exchanging the durable credential it already holds, so
   revoking that credential ends its renewal.
 - **Delegation** (`token-exchange`) lets a caller mint a scoped token for
   another Service/Agent. It never issues a refresh token. See [Authorization](/concepts/authorization/#delegation).
+
+The platform plane has its own routes and never uses `/auth/token`. A
+platform credential is exchanged at `POST /auth/platform/token` (RFC 8693
+token exchange with the API key as the subject token). A platform
+administrator's federated login begins at `POST /auth/platform/login` and
+completes at `POST /auth/platform/callback`. Both return an access token only:
+the platform plane issues no refresh token, so a platform session ends at
+expiry and the caller signs in or exchanges its credential again.
 
 The per-grant flows, with diagrams, are on the
 [Authentication](/concepts/authentication/) page.
@@ -155,8 +166,10 @@ In **production** (staging or production), boot fails closed without
     ['APP_ENV', 'development | staging | production. Selects the deployment profile; staging and production both harden.'],
     ['WYRD_SIGNING_KEY_FILE', 'Path to the Ed25519 signing-key PEM (preferred; keeps the key out of the process environment). Required in production.'],
     ['WYRD_SIGNING_KEY_PEM', 'Inline Ed25519 signing-key PEM (fallback). Setting both file and inline is a configuration error.'],
-    ['WYRD_SERVER_TENANT_SLUG', 'Implicit tenant slug used to seed trusted issuers/bindings at boot and to resolve the login tenant.'],
-    ['WYRD_SEALING_KEY_FILE', 'AES-256-GCM key file for OIDC client-secret encryption at rest. See Cloud identity.'],
+    ['WYRD_SERVER_TENANT_SLUG', 'Implicit tenant slug used to seed workload trusted issuers and bindings at boot.'],
+    ['WYRD_PUBLIC_ORIGIN', 'Public origin browsers and IdPs reach Wyrd on. Required for human SSO; the provider callback is this origin plus /auth/callback.'],
+    ['WYRD_UI_CLIENT_SECRET_SHA256', 'SHA-256 of the web app\'s wyrd-ui client secret (two comma-separated during rotation). Without it, no authorization-code grant is accepted.'],
+    ['WYRD_SEALING_KEY_FILE', 'AES-256-GCM key file that seals stored IdP client secrets. Needed only when a stored connection or issuer has a secret.'],
     ['WYRD_SEALING_KEY_BASE64', 'Inline base64 sealing key (fallback for the file form).']
   ]}
 />

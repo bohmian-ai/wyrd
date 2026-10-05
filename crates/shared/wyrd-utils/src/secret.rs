@@ -1,8 +1,9 @@
 //! The one reader for environment and mounted-file secret references.
 //!
 //! Every Wyrd process that resolves a [`SecretRef`] itself — gateway
-//! credential bindings, the server's tenant wrapping keys, and local Workflow
-//! gateway bindings — reads it here, so all share one rule: a file is checked
+//! credential bindings, the server's tenant wrapping keys, signing key, and
+//! issuer sealing keys, and local Workflow gateway bindings — reads it here,
+//! so all share one rule: a file is checked
 //! through metadata of the already-open handle, so no path swap can slip
 //! between check and read, and must be a regular file that, on Unix, has no
 //! group or other permission bits, holding at most [`MAX_SECRET_FILE_BYTES`].
@@ -45,7 +46,7 @@ pub fn read_secret_ref(secret: &SecretRef) -> Result<SecretString, &'static str>
 ///
 /// Returns a short static reason — unopenable, non-regular or permissive, or
 /// oversized — naming no path and no content.
-fn read_secret_file(path: &Path) -> Result<String, &'static str> {
+pub fn read_secret_file(path: &Path) -> Result<String, &'static str> {
     let file = File::open(path).map_err(|_| "names an unreadable file")?;
     let metadata = file.metadata().map_err(|_| "names an unreadable file")?;
     if !restrictive(&metadata) {

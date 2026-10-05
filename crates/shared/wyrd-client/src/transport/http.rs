@@ -35,6 +35,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::operator_connection::HttpsOrigin;
 use wyrd_spec::request_id::RequestId;
 
 use crate::auth::{AuthError, AuthMiddleware};
@@ -123,23 +124,29 @@ pub struct HttpTransport {
     /// Total request/response deadline applied to each `send_with_retry` attempt.
     request_timeout: Duration,
     auth: Arc<AuthMiddleware>,
-    base_url: String,
+    /// Deployment origin from [`HttpConfig::validate`]; every request path is
+    /// joined to it, and only absolute URLs of this origin carry credentials.
+    origin: HttpsOrigin,
 }
 
 impl std::fmt::Debug for HttpTransport {
+    /// Prints only the normalized, userinfo-free deployment origin. The pool,
+    /// the auth middleware, and the configured URL spelling are omitted, so no
+    /// credential or credential-bearing URL reaches a log line through this
+    /// value.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpTransport")
-            .field("base_url", &self.base_url)
+            .field("origin", &self.origin)
             .finish_non_exhaustive()
     }
 }
 
 impl HttpTransport {
-    /// The HTTP base URL every request path is joined to, without a trailing
-    /// slash.
+    /// The deployment origin every request path is joined to,
+    /// `scheme://host[:port]` without a trailing slash.
     #[must_use]
     pub fn base_url(&self) -> &str {
-        &self.base_url
+        self.origin.as_str()
     }
 
     /// Clone the shared reqwest client for a capability that must reuse this
@@ -150,19 +157,23 @@ impl HttpTransport {
     }
     /// Build a transport from config and a shared auth middleware.
     ///
-    /// Builds one client whose connection establishment is bounded by
+    /// Validates `config` first: its [`HttpConfig::validate`] origin, the same
+    /// one the token exchange uses, is the root every request path joins.
+    /// Then builds one client whose connection establishment is bounded by
     /// `config.timeout_ms`; the same duration becomes the per-attempt total
     /// deadline of retried JSON and control requests.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::TransportDown`] when the underlying
+    /// Returns [`WyrdClientError::Config`] when `config` fails validation, and
+    /// [`WyrdClientError::TransportDown`] when the underlying
     /// `reqwest::Client` cannot be constructed.
     pub fn new(config: &HttpConfig, auth: Arc<AuthMiddleware>) -> Result<Self, WyrdClientError> {
+        let origin = config.validate()?;
         Ok(Self {
             client: build_http_client(config)?,
             request_timeout: Duration::from_millis(config.timeout_ms),
             auth,
-            base_url: config.base_url.trim_end_matches('/').to_owned(),
+            origin,
         })
     }
 
@@ -177,7 +188,7 @@ impl HttpTransport {
             client: self.client.clone(),
             request_timeout: self.request_timeout,
             auth,
-            base_url: self.base_url.clone(),
+            origin: self.origin.clone(),
         }
     }
 
@@ -801,17 +812,21 @@ impl HttpTransport {
     /// Resolve a path or absolute URL to a same-origin URL suitable for
     /// authenticated requests.
     ///
-    /// A relative path is joined to the configured `base_url`. An absolute URL
-    /// is accepted only when it targets the exact configured Wyrd origin;
-    /// cross-origin URLs are rejected so that `x-wyrd-access-token` and
-    /// `wyrd-request-id` never travel to a third-party host (V-001).
+    /// A relative path is joined to the configured origin. An absolute URL
+    /// is accepted only when [`HttpsOrigin::of_url`] gives it the exact
+    /// configured Wyrd origin; cross-origin and userinfo-carrying URLs are
+    /// rejected so that `x-wyrd-access-token` and `wyrd-request-id` never
+    /// travel to a third-party host (V-001).
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] when the input is an absolute URL
-    /// whose scheme+authority does not match the configured base URL.
+    /// whose origin does not match the configured one.
     fn authenticated_url(&self, path: &str) -> Result<String, WyrdError> {
         if path.starts_with("http://") || path.starts_with("https://") {
-            if same_origin(&self.base_url, path) {
+            let origin = reqwest::Url::parse(path)
+                .ok()
+                .and_then(|url| HttpsOrigin::of_url(&url).ok());
+            if origin.as_ref() == Some(&self.origin) {
                 Ok(path.to_owned())
             } else {
                 Err(WyrdError::Validation {
@@ -824,11 +839,7 @@ impl HttpTransport {
                 })
             }
         } else {
-            Ok(format!(
-                "{}/{}",
-                self.base_url,
-                path.trim_start_matches('/')
-            ))
+            Ok(format!("{}/{}", self.origin, path.trim_start_matches('/')))
         }
     }
 
@@ -1021,35 +1032,6 @@ fn body_read_err(err: reqwest::Error) -> WyrdError {
 /// Extract a response header value as a `&str`.
 fn header_str<'a>(resp: &'a reqwest::Response, name: &str) -> Option<&'a str> {
     resp.headers().get(name)?.to_str().ok()
-}
-
-/// Return `true` when `candidate` targets the same scheme+authority as
-/// `configured_origin`.
-///
-/// Compares the scheme (`http`/`https`) and authority (host and optional
-/// port) portions and requires them to be byte-for-byte identical. Paths are
-/// intentionally ignored — the caller may reach any route under the origin,
-/// but never a different host.
-fn same_origin(configured_origin: &str, candidate: &str) -> bool {
-    match (split_origin(configured_origin), split_origin(candidate)) {
-        (Some(base), Some(cand)) => base == cand,
-        _ => false,
-    }
-}
-
-/// Extract the `(scheme, authority)` prefix of an absolute URL, or `None` if
-/// the input is not a recognizable absolute URL.
-fn split_origin(url: &str) -> Option<(&str, &str)> {
-    let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
-        ("https", rest)
-    } else {
-        ("http", url.strip_prefix("http://")?)
-    };
-    let authority = rest.split('/').next().unwrap_or("");
-    if authority.is_empty() {
-        return None;
-    }
-    Some((scheme, authority))
 }
 
 #[cfg(test)]

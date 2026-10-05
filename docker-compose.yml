@@ -43,6 +43,7 @@ services:
       KC_LOG_LEVEL: WARN
     volumes:
       - ./tests/fixtures/identity/keycloak-realm.json:/opt/keycloak/data/import/keycloak-realm.json:ro
+      - ./tests/fixtures/identity/keycloak-realm-2.json:/opt/keycloak/data/import/keycloak-realm-2.json:ro
     # Published on the loopback address only, on a dedicated host port. 8080
     # is wyrd-server's canonical public HTTP port, so publishing Keycloak there
     # collides with any locally running server or bench, and a wildcard

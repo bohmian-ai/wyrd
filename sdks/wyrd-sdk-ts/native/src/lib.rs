@@ -439,11 +439,13 @@ pub async fn describe_table_config(
     server_url: Option<String>,
     credential: Option<String>,
     grpc_url: Option<String>,
+    tenant: Option<String>,
 ) -> Result<NativeTableConfigResult> {
     let described = match wyrd_client::bifrost::client_from_options(
         server_url.as_deref(),
         credential.as_deref(),
         grpc_url.as_deref(),
+        tenant.as_deref(),
     ) {
         Ok(client) => TableConfig::describe(&client, &table).await,
         Err(error) => Err(error),
@@ -532,12 +534,14 @@ pub async fn connect_bifrost(
     server_url: Option<String>,
     credential: Option<String>,
     grpc_url: Option<String>,
+    tenant: Option<String>,
 ) -> Result<NativeBifrostConnection> {
     let table = table.map(|table| table.parse()).transpose()?;
     let connected = match wyrd_client::bifrost::client_from_options(
         server_url.as_deref(),
         credential.as_deref(),
         grpc_url.as_deref(),
+        tenant.as_deref(),
     ) {
         Ok(client) => Bifrost::connect_with_config(&client, table, QueueConfig::default()).await,
         Err(error) => Err(error),

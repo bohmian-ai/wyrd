@@ -89,8 +89,10 @@ unchanged.
 | `WYRD_PEER_ADDRESS` | Required | `$(POD_IP):50052` | The address other replicas dial. No replica has an authored address. |
 | `WYRD_PEER_TLS_DIR` | Required | `/etc/wyrd/peer` | Secret `wyrd-peer-tls`: `ca.crt`, `tls.crt`, `tls.key`. |
 | `WYRD_METRICS_BIND` | Required for autoscaling | `$(POD_IP):9464` | The Prometheus endpoint scraped for the Oracle read rate. |
-| `WYRD_SEALING_KEY_FILE` | Conditional | `/run/wyrd-sealing/key` | Only if a trusted OIDC issuer carries a client secret. |
-| `WYRD_SERVER_TENANT_SLUG` | Conditional | e.g. `acme` | Only once you configure a trusted issuer or workload binding. The tenant must exist first. See [SSO and OIDC](/self-hosting/sso-and-oidc/). |
+| `WYRD_PUBLIC_ORIGIN` | Conditional | `https://wyrd.example.com` | Only for human SSO. The same value goes in the web app's `ORIGIN`. See [SSO and OIDC](/self-hosting/sso-and-oidc/#deployment-setup). |
+| `WYRD_UI_CLIENT_SECRET_SHA256` | Conditional | from Secret `wyrd-ui-client` | Only for web-app SSO. The web app reads the secret itself as `WYRD_UI_CLIENT_SECRET`. |
+| `WYRD_SEALING_KEY_FILE` | Conditional | `/run/wyrd-sealing/key` | Only if a stored OIDC connection or issuer carries a client secret. |
+| `WYRD_SERVER_TENANT_SLUG` | Conditional | e.g. `acme` | Only once you seed a workload issuer or binding at boot. The tenant must exist first. See [SSO and OIDC](/self-hosting/sso-and-oidc/). |
 
 ## 1. Database roles and Secrets
 
@@ -719,10 +721,13 @@ in [Authentication](/self-hosting/authentication/).
 
 ### OIDC
 
-Once the tenant exists, federating identity adds two conditional inputs:
-`WYRD_SERVER_TENANT_SLUG=acme` on every pod, and `WYRD_SEALING_KEY_FILE` (a
-base64 32-byte key in its own Secret) if an issuer carries a client secret.
-See [SSO and OIDC](/self-hosting/sso-and-oidc/).
+Human single sign-on adds `WYRD_PUBLIC_ORIGIN` and `WYRD_UI_CLIENT_SECRET_SHA256`
+on every pod, with `ORIGIN` and `WYRD_UI_CLIENT_SECRET` for the web app, and
+`WYRD_SEALING_KEY_FILE` (a base64 32-byte key in its own Secret) if a
+connection stores a client secret. Each tenant then stages and activates its
+own connection at runtime. Rate-limit `POST /auth/device` per client address at
+your ingress. Seeding workload issuers at boot also needs
+`WYRD_SERVER_TENANT_SLUG=acme`. See [SSO and OIDC](/self-hosting/sso-and-oidc/).
 
 ## 6. Verify
 

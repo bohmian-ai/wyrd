@@ -29,6 +29,11 @@ aggregate behavior, public and durable contracts, security and reliability
 boundaries, required journeys, and integrated regressions. Do not provide an
 intended verdict or rely on implementation summaries.
 
+Change review is where the full user-journey suites and broad aggregates run,
+once, on the integrated candidate. Task verification is deliberately narrow, so
+run the full journey lanes for every surface the change ships before judging
+journey obligations.
+
 ## Audit acceptance
 
 Check that integrated consumers use the selected shared owners, the task reuse
@@ -52,6 +57,13 @@ Classify material concerns only as `MISSING`, `INCORRECT`, `DRIFT`, `VIOLATION`,
 or `REGRESSION`. Do not report optional improvements, preferences, unrelated
 debt, or speculative hardening. Each finding names the violated obligation,
 exact location, evidence, consequence, required outcome, and closure proof.
+
+Reject unearned complexity. Where a standard and conventional way exists (a
+published standard such as an RFC, or the established practice of comparable
+widely used projects), the integrated change must use it. Classify any
+mechanism, state, check, file, setting, option, or error beyond that standard
+as `DRIFT` unless approved authority explicitly requires it. Never require one
+in a finding or remediation; a correction follows the standard way too.
 
 ## Verdict and routing
 

@@ -14,7 +14,8 @@ use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::queries::auth::{
-    ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix, touch_api_key_last_used,
+    ApiKeyLookupRow, ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix,
+    touch_api_key_last_used,
 };
 use wyrd_sql::{SqlError, TenantConn};
 
@@ -161,11 +162,6 @@ impl ExchangeApiKey {
     /// # Errors
     /// All authentication failures map to `WyrdError::ApiKeyInvalid` at the HTTP
     /// boundary. Internal variants carry distinct failure paths for diagnostics.
-    ///
-    /// # Panics
-    /// Panics only if the refusal bookkeeping below is ever changed so that an
-    /// absent credential row leaves no refusal — the invariant the `expect`
-    /// names.
     #[tracing::instrument(level = "debug", skip(self, conn, api_key), err)]
     pub async fn execute(
         &self,
@@ -173,33 +169,7 @@ impl ExchangeApiKey {
         api_key: SecretString,
         request_id: &str,
     ) -> Result<ExchangedToken, ExchangeError> {
-        // Every refusal is decided first and answered last, because Argon2 is
-        // what a refusal costs. A malformed key, another tenant's key, or an
-        // unknown prefix must not return before verification runs, or a live
-        // prefix with a wrong tail would take measurably longer than any of
-        // them — enough to enumerate live prefixes by clock.
-        let (row, refusal) = match WyrdApiKey::parse(api_key.expose_secret()) {
-            Err(_) => (None, Some(ExchangeError::NotFound)),
-            Ok(parsed) if parsed.tenant_id != conn.data_tenant_id() => {
-                (None, Some(ExchangeError::CrossTenant))
-            }
-            Ok(parsed) => match api_key_by_prefix(conn, &parsed.prefix).await? {
-                None => (None, Some(ExchangeError::NotFound)),
-                Some(row) => (Some(row), None),
-            },
-        };
-
-        let matched = verify_presented(&api_key, row.as_ref().map(|row| row.key_hash.as_str()))
-            .await
-            .map_err(ExchangeError::Join)?;
-        if let Some(refusal) = refusal {
-            return Err(refusal);
-        }
-        let row = row.expect("invariant: a refusal was recorded for every absent row");
-        if !matched {
-            return Err(ExchangeError::HashMismatch);
-        }
-
+        let row = verify_api_key(conn, &api_key).await?;
         touch_api_key_last_used(conn, row.api_key_id).await?;
         Ok(self
             .issuer
@@ -213,6 +183,53 @@ impl ExchangeApiKey {
             )
             .await?)
     }
+}
+
+/// Verify a presented tenant API key at a fixed cost and return its row.
+///
+/// Shared by the API-key exchange and the tenant connection recovery-key
+/// check, so both refuse identically. Every refusal is decided first and
+/// answered last, because Argon2 is what a refusal costs: a malformed key,
+/// another tenant's key, or an unknown prefix must not return before
+/// verification runs, or a live prefix with a wrong tail would take measurably
+/// longer than any of them — enough to enumerate live prefixes by clock.
+///
+/// # Errors
+/// Returns [`ExchangeError::NotFound`] for a malformed key or unknown prefix,
+/// [`ExchangeError::CrossTenant`] for another tenant's key,
+/// [`ExchangeError::HashMismatch`] when the secret does not verify,
+/// [`ExchangeError::Database`] when the lookup fails, and
+/// [`ExchangeError::Join`] when the verification task fails.
+///
+/// # Panics
+/// Panics only if the refusal bookkeeping below is ever changed so that an
+/// absent credential row leaves no refusal — the invariant the `expect` names.
+pub(crate) async fn verify_api_key(
+    conn: &mut TenantConn<'_>,
+    api_key: &SecretString,
+) -> Result<ApiKeyLookupRow, ExchangeError> {
+    let (row, refusal) = match WyrdApiKey::parse(api_key.expose_secret()) {
+        Err(_) => (None, Some(ExchangeError::NotFound)),
+        Ok(parsed) if parsed.tenant_id != conn.data_tenant_id() => {
+            (None, Some(ExchangeError::CrossTenant))
+        }
+        Ok(parsed) => match api_key_by_prefix(conn, &parsed.prefix).await? {
+            None => (None, Some(ExchangeError::NotFound)),
+            Some(row) => (Some(row), None),
+        },
+    };
+
+    let matched = verify_presented(api_key, row.as_ref().map(|row| row.key_hash.as_str()))
+        .await
+        .map_err(ExchangeError::Join)?;
+    if let Some(refusal) = refusal {
+        return Err(refusal);
+    }
+    let row = row.expect("invariant: a refusal was recorded for every absent row");
+    if !matched {
+        return Err(ExchangeError::HashMismatch);
+    }
+    Ok(row)
 }
 
 impl DelegateToken {
@@ -520,8 +537,10 @@ impl From<DelegateError> for WyrdError {
     }
 }
 
+/// Postgres-backed API-key and token-exchange behavior, and the shared
+/// fixtures that seed users, service accounts, and live API keys.
 #[cfg(test)]
-mod pg_tests {
+pub(crate) mod pg_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -564,7 +583,7 @@ mod pg_tests {
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
 
     /// The default static Service Card reference, named `test-service`.
-    fn test_service_card_ref() -> CardRef {
+    pub(crate) fn test_service_card_ref() -> CardRef {
         named_service_card_ref("test-service")
     }
 
@@ -668,7 +687,15 @@ mod pg_tests {
         )
     }
 
-    async fn insert_test_user(conn: &mut TenantConn<'_>, tenant_id: DataTenantId) -> Uuid {
+    /// Seed one active password user in `tenant_id` and return its id, as the
+    /// creator other seeded rows name.
+    ///
+    /// # Panics
+    /// Panics when the insert fails.
+    pub(crate) async fn insert_test_user(
+        conn: &mut TenantConn<'_>,
+        tenant_id: DataTenantId,
+    ) -> Uuid {
         let user_id = Uuid::now_v7();
         sqlx::query(
             "INSERT INTO wyrd.auth_users (id, data_tenant_id, email, auth_type, status)
@@ -683,7 +710,12 @@ mod pg_tests {
         user_id
     }
 
-    async fn insert_test_service_account(
+    /// Seed `card_ref`'s backing Card and one active service account bound to
+    /// it, returning the account id an API key can be issued to.
+    ///
+    /// # Panics
+    /// Panics when the Card or account insert fails.
+    pub(crate) async fn insert_test_service_account(
         conn: &mut TenantConn<'_>,
         tenant_id: DataTenantId,
         created_by: Uuid,
@@ -828,22 +860,18 @@ mod pg_tests {
         assert_eq!(flat[1], b.principal.id.to_string());
     }
 
-    /// A machine credential exchange mints no refresh token and no refresh row.
+    /// Seed a live API key for `principal_id` in `conn`'s open transaction and
+    /// return its row id and presentable secret.
     ///
-    /// Machine clients renew by presenting their durable API key again, so the
-    /// grant has nothing to rotate. The response field has to stay absent and —
-    /// the half a response assertion cannot see — the transaction must leave
-    /// `wyrd.auth_refresh_tokens` empty, because a stored row would be a
-    /// long-lived credential nobody ever asked for and nobody rotates.
+    /// Generates a tenant-bound key, stores its Argon2 hash and prefix in
+    /// `wyrd.auth_api_keys` with a one-day expiry, and writes nothing else; the
+    /// caller commits. The row id is what a grant record and the browser
+    /// session tests' key-use reads must name, so callers need it rather than a
+    /// fresh UUID.
     ///
     /// # Panics
-    ///
-    /// Panics when the fixture cannot start or any assertion fails.
-    /// Seed a live API key for a principal and return its row id and secret.
-    ///
-    /// The row id is what a grant record must name, so the attribution tests
-    /// need it rather than a fresh UUID.
-    async fn insert_live_api_key(
+    /// Panics when the generated secret cannot be hashed or the insert fails.
+    pub(crate) async fn insert_live_api_key(
         conn: &mut TenantConn<'_>,
         tenant: DataTenantId,
         principal_id: Uuid,

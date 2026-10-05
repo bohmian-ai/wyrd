@@ -159,3 +159,20 @@ test('cards:read is required before any inventory or detail projection', () => {
   for (const read of [() => denied.cards({}), () => denied.card('card_service_01')])
     expect(read).toThrowError(expect.objectContaining({ status: 403 }));
 });
+
+test('server wildcard grants satisfy cards:read', () => {
+  const client = (permissions: string[]) =>
+    new WyrdClient(
+      {
+        tenant: { key: 'acme', name: 'Acme', tenantId: 't', permissions },
+        subject: { id: 's', name: 'S' },
+        permissions
+      },
+      true
+    );
+  for (const grants of [['wildcard:wildcard'], ['cards:wildcard'], ['wildcard:read']])
+    expect(() => client(grants).cards({})).not.toThrow();
+  expect(() => client(['artifacts:wildcard']).cards({})).toThrowError(
+    expect.objectContaining({ status: 403 })
+  );
+});

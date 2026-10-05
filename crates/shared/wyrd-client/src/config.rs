@@ -7,26 +7,25 @@
 //! file credentials, then call [`ClientConfig::resolve_credential`] to obtain
 //! the effective [`ResolvedCredential`].
 
-use std::path::PathBuf;
-
 use secrecy::SecretString;
 
+use crate::auth::TokenExchange;
 use crate::error::WyrdClientError;
 use crate::global_config::{GlobalConfig, TokenCacheKind};
+use crate::saved_login::{SavedLogins, canonical_origin};
 use crate::transport::{
     config::{GrpcConfig, HTTP_DEFAULT_BASE_URL, HttpConfig, grpc_endpoint_for},
     credential::{CredentialChain, CredentialSource, ResolvedCredential},
 };
 
-/// Token cache strategy.
-///
-/// Declared here (commit 04); behavior is implemented in commit 05.
+/// Where an API key's exchanged access token is cached.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum TokenCacheMode {
     /// Cache resolved tokens in memory only (default).
     #[default]
     InMemory,
-    /// Persist resolved tokens to disk for reuse across process restarts.
+    /// Also cache an API key's access token in `credentials.toml`, beside
+    /// that `[default].api_key`, so every process using the key reuses it.
     Disk,
 }
 
@@ -48,12 +47,17 @@ pub struct ClientConfig {
     /// always wins over `WYRD_API_KEY`, `WYRD_ACCESS_TOKEN`, and the
     /// `credentials.toml` floor.
     pub credential: Option<SecretString>,
-    /// Optional tenant slug used with workload identity credentials.
+    /// Optional tenant selector: a tenant route key, the one `wyrd auth login`
+    /// takes. It picks one saved user login for this server and is the tenant
+    /// a workload token's exchange asks for, ahead of an ambient
+    /// `WYRD_TENANT`. Without it, the newest saved login for this server is
+    /// used; with it, a server whose saved logins all belong to other tenants
+    /// is refused with `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE`. A bearer or API
+    /// key already names its tenant, so resolving one beside a selector is
+    /// refused.
     pub tenant: Option<String>,
     /// Token cache mode.
     pub token_cache: TokenCacheMode,
-    /// Path used by the disk token cache.
-    pub token_cache_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for ClientConfig {
@@ -67,7 +71,6 @@ impl std::fmt::Debug for ClientConfig {
             )
             .field("tenant", &self.tenant)
             .field("token_cache", &self.token_cache)
-            .field("token_cache_path", &self.token_cache_path)
             .finish()
     }
 }
@@ -142,14 +145,6 @@ impl ClientConfig {
                 TokenCacheKind::InMemory => TokenCacheMode::InMemory,
                 TokenCacheKind::Disk => TokenCacheMode::Disk,
             });
-        let token_cache_path = configured_cache
-            .and_then(|cache| cache.path.clone())
-            .or_else(|| {
-                std::env::var("WYRD_TOKEN_CACHE_PATH")
-                    .ok()
-                    .map(PathBuf::from)
-            })
-            .or_else(|| wyrd_utils::config_dir::wyrd_config_dir().map(|path| path.join("tokens")));
 
         Self {
             grpc: GrpcConfig {
@@ -163,7 +158,6 @@ impl ClientConfig {
             credential: None,
             tenant,
             token_cache,
-            token_cache_path,
         }
     }
 
@@ -172,22 +166,73 @@ impl ClientConfig {
     /// Precedence (lowest index wins):
     /// 1. `self.credential` — explicit credential set by caller
     /// 2. `WYRD_ACCESS_TOKEN` — tier 1 env
-    /// 3. `WYRD_WORKLOAD_TOKEN` + `WYRD_TENANT` — tier 2 env
+    /// 3. `WYRD_WORKLOAD_TOKEN` + `self.tenant`, else `WYRD_TENANT` — tier 2 env
     /// 4. `WYRD_API_KEY` — tier 3 env
-    /// 5. `~/.config/wyrd/credentials.toml` `[default].api_key` — file floor
+    /// 5. the saved user login `wyrd auth login` wrote for this server origin
+    ///    ([`SavedLogins::select`]): the one for `self.tenant` when it is set,
+    ///    otherwise the newest login for the server; renewed in place
+    /// 6. `~/.config/wyrd/credentials.toml` `[default].api_key` — file floor
+    ///
+    /// A `credentials.toml` that is unsafe or corrupt, or a selected tenant
+    /// with no saved login when the server has others, fails here instead of
+    /// falling through to the floor, so a person's selection is never
+    /// silently replaced by another identity. A tenant selector beside
+    /// a bearer or API key (tiers 1, 2, 4, and 6) is refused rather than
+    /// ignored, because that credential already names its tenant.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::NoCredentials`] when the chain (including the
-    /// file floor) yields nothing.
+    /// Returns [`WyrdClientError::SavedLogin`] for the saved-login refusals
+    /// above, [`WyrdClientError::Config`] for an unparsable server URL or a
+    /// tenant selector beside a bearer or API key, and
+    /// [`WyrdClientError::NoCredentials`] when no tier yields a credential.
     pub fn resolve_credential(&self) -> Result<ResolvedCredential, WyrdClientError> {
         let mut chain = CredentialChain::default();
         if let Some(credential) = &self.credential {
             chain.push(CredentialSource::explicit(credential.clone()));
         }
-        chain.extend(CredentialChain::from_env_with_tenant(
-            self.tenant.as_deref(),
-        ));
-        chain.resolve()
+        chain.extend(CredentialChain::env_only(self.tenant.as_deref()));
+        if !chain.is_empty() {
+            return self.refuse_selector(chain.resolve()?);
+        }
+        if let Some(store) = SavedLogins::locate() {
+            let origin = canonical_origin(&self.http.base_url)?;
+            if let Some(login) = store.select(&origin, self.tenant.as_deref())? {
+                let exchange = TokenExchange::new(&self.http.base_url, self.http.timeout_ms)?;
+                return Ok(ResolvedCredential::Renewable(
+                    store.source(&login, exchange),
+                ));
+            }
+        }
+        self.refuse_selector(CredentialChain::credentials_file().resolve()?)
+    }
+
+    /// Pass `credential` through unless it is a bearer or API key resolved
+    /// beside a non-empty tenant selector.
+    ///
+    /// Such a credential is bound to its tenant by the server, so the
+    /// selector could only be ignored or contradicted; refusing keeps a
+    /// person's selection from silently meaning nothing.
+    ///
+    /// # Errors
+    /// Returns [`WyrdClientError::Config`] on field `tenant` for a bearer or
+    /// API key with a selector set.
+    fn refuse_selector(
+        &self,
+        credential: ResolvedCredential,
+    ) -> Result<ResolvedCredential, WyrdClientError> {
+        let selector = self.tenant.as_deref().filter(|tenant| !tenant.is_empty());
+        match (&credential, selector) {
+            (ResolvedCredential::BearerToken(_) | ResolvedCredential::ApiKey(_), Some(tenant)) => {
+                Err(WyrdClientError::Config {
+                    field: "tenant".to_owned(),
+                    reason: format!(
+                        "this credential already names its tenant; remove the tenant selector \
+                         {tenant} (client tenant option, client.tenant, or WYRD_TENANT)"
+                    ),
+                })
+            }
+            _ => Ok(credential),
+        }
     }
 }
 
@@ -203,7 +248,13 @@ mod tests {
     const API_KEY_FIXTURE: &str =
         "wyrd_sk_4d5e1c3a9b7f4e2d8a6c0b1e2f3a4b5c_1a2b3c4d_9f8e7d6c5b4a39281706f5e4d3c2b1a0";
 
+    use std::str::FromStr;
+
+    use wyrd_spec::auth::SecretBearer;
+    use wyrd_spec::ids::TenantSlug;
+
     use crate::global_config::{ClientSection, GlobalConfig, LocalWorkflowConfig};
+    use crate::saved_login::{SavedLogin, SavedLogins};
 
     use super::{ClientConfig, TokenCacheMode};
     use crate::transport::{
@@ -473,7 +524,9 @@ mod tests {
             std::env::remove_var("WYRD_API_KEY");
         }
 
-        let cfg = ClientConfig::from_env();
+        let mut cfg = ClientConfig::from_env();
+        // Workload routing reads the ambient tenant; no selector is set.
+        cfg.tenant = None;
         let cred = cfg.resolve_credential().expect("resolves from env");
 
         // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
@@ -507,6 +560,8 @@ mod tests {
         }
 
         let mut cfg = ClientConfig::from_env();
+        // Workload routing reads the ambient tenant; no selector is set.
+        cfg.tenant = None;
         cfg.credential = Some(API_KEY_FIXTURE.to_owned().into());
         let cred = cfg.resolve_credential().expect("explicit key resolves");
 
@@ -574,5 +629,186 @@ mod tests {
             "Debug must not expose the raw credential"
         );
         assert!(debug.contains("REDACTED"));
+    }
+
+    /// A saved user login ranks below every environment tier and above the
+    /// `credentials.toml` floor, a `credentials.toml` other users can read
+    /// fails closed, and a tenant selector naming no saved login for the
+    /// server fails instead of falling through to the floor.
+    #[cfg(unix)]
+    #[test]
+    fn saved_login_ranks_between_env_and_credentials_file() {
+        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let home = crate::credentials_file::private_tempdir();
+        std::fs::write(
+            home.path().join("credentials.toml"),
+            format!("[default]\napi_key = \"{API_KEY_FIXTURE}\"\n"),
+        )
+        .expect("writes floor");
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
+        unsafe {
+            std::env::set_var("WYRD_CONFIG_HOME", home.path());
+            std::env::remove_var("WYRD_ACCESS_TOKEN");
+            std::env::remove_var("WYRD_WORKLOAD_TOKEN");
+            std::env::remove_var("WYRD_API_KEY");
+        }
+        let mut cfg = ClientConfig::from_env();
+        cfg.http.base_url = "https://wyrd.example.com/".to_owned();
+        cfg.tenant = None;
+        let chmod = |mode: u32| {
+            std::fs::set_permissions(
+                home.path().join("credentials.toml"),
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(mode),
+            )
+            .expect("chmod");
+        };
+        chmod(0o644);
+        let exposed = cfg.resolve_credential().map(|_| ());
+        chmod(0o600);
+        let floor = cfg.resolve_credential().expect("floor resolves");
+
+        let store = SavedLogins::locate().expect("config home");
+        let tenant_key = TenantSlug::from_str("acme").expect("slug");
+        store
+            .save(SavedLogin {
+                origin: "https://wyrd.example.com".to_owned(),
+                tenant_key,
+                access_token: SecretBearer::new("access".to_owned()),
+                access_expires_at: chrono::Utc::now(),
+                refresh_token: SecretBearer::new("refresh".to_owned()),
+            })
+            .expect("saves");
+        let saved = cfg.resolve_credential().expect("saved login resolves");
+        cfg.tenant = Some("globex".to_owned());
+        let mismatch = cfg.resolve_credential().map(|_| ());
+        cfg.tenant = None;
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
+        unsafe {
+            std::env::set_var("WYRD_API_KEY", "env_api_key_value");
+        }
+        let env = cfg.resolve_credential().expect("env resolves");
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
+        unsafe {
+            std::env::remove_var("WYRD_API_KEY");
+            std::env::remove_var("WYRD_CONFIG_HOME");
+        }
+
+        let error = exposed.expect_err("a credential file others can read fails closed");
+        assert!(error.to_string().contains("unsafe_store"), "{error}");
+        assert!(matches!(floor, ResolvedCredential::ApiKey(_)), "{floor:?}");
+        match saved {
+            ResolvedCredential::Renewable(source) => {
+                assert!(
+                    source
+                        .identity()
+                        .starts_with("saved-login:https://wyrd.example.com:")
+                );
+            }
+            other => panic!("expected the saved login, got {other:?}"),
+        }
+        let error = mismatch.expect_err("tenant mismatch fails closed");
+        assert!(error.to_string().contains("tenant_mismatch"), "{error}");
+        assert!(
+            matches!(&env, ResolvedCredential::ApiKey(key) if key.expose_secret() == "env_api_key_value"),
+            "{env:?}"
+        );
+    }
+
+    /// A tenant selector beside a credential that already names its tenant —
+    /// an explicit bearer or API key, `WYRD_ACCESS_TOKEN`, `WYRD_API_KEY`, or
+    /// the `credentials.toml` floor — is refused during resolution, before any
+    /// request, and never falls to another tier; the selector routes a
+    /// workload token ahead of an ambient `WYRD_TENANT`.
+    ///
+    /// # Panics
+    /// Panics when a tier accepts a selector or the workload is misrouted.
+    #[cfg(unix)]
+    #[test]
+    fn tenant_selector_is_refused_beside_a_self_naming_credential() {
+        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let home = crate::credentials_file::private_tempdir();
+        let floor = home.path().join("credentials.toml");
+        std::fs::write(
+            &floor,
+            format!("[default]\napi_key = \"{API_KEY_FIXTURE}\"\n"),
+        )
+        .expect("writes floor");
+        std::fs::set_permissions(
+            &floor,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .expect("chmod");
+        let names = [
+            "WYRD_ACCESS_TOKEN",
+            "WYRD_WORKLOAD_TOKEN",
+            "WYRD_TENANT",
+            "WYRD_API_KEY",
+        ];
+        let tiers = [
+            ("explicit bearer", Some("explicit-access-token"), None),
+            ("explicit API key", Some(API_KEY_FIXTURE), None),
+            (
+                "WYRD_ACCESS_TOKEN",
+                None,
+                Some(("WYRD_ACCESS_TOKEN", "env-access-token")),
+            ),
+            (
+                "WYRD_API_KEY",
+                None,
+                Some(("WYRD_API_KEY", API_KEY_FIXTURE)),
+            ),
+            ("credentials.toml floor", None, None),
+        ];
+        let mut outcomes = Vec::new();
+        for (tier, credential, env) in tiers {
+            // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
+            unsafe {
+                std::env::set_var("WYRD_CONFIG_HOME", home.path());
+                for name in names {
+                    std::env::remove_var(name);
+                }
+                if let Some((name, value)) = env {
+                    std::env::set_var(name, value);
+                }
+            }
+            let mut cfg = ClientConfig::from_env();
+            cfg.http.base_url = "https://wyrd.example.com".to_owned();
+            cfg.credential = credential.map(|value| value.to_owned().into());
+            let unselected = cfg.resolve_credential().map(|_| ());
+            cfg.tenant = Some("acme".to_owned());
+            outcomes.push((tier, unselected, cfg.resolve_credential().map(|_| ())));
+        }
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
+        unsafe {
+            for name in names {
+                std::env::remove_var(name);
+            }
+            std::env::set_var("WYRD_WORKLOAD_TOKEN", "workload-assertion");
+            std::env::set_var("WYRD_TENANT", "globex");
+        }
+        let mut cfg = ClientConfig::from_env();
+        cfg.tenant = Some("acme".to_owned());
+        let routed = cfg.resolve_credential();
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
+        unsafe {
+            for name in names {
+                std::env::remove_var(name);
+            }
+            std::env::remove_var("WYRD_CONFIG_HOME");
+        }
+
+        for (tier, unselected, selected) in outcomes {
+            unselected.unwrap_or_else(|error| panic!("{tier} resolves alone: {error}"));
+            let error = selected.expect_err("a selector beside a self-naming credential");
+            assert_eq!(error.code(), "WYRD_CLIENT_400_CONFIG_INVALID", "{tier}");
+            assert!(
+                error.to_string().contains("already names its tenant"),
+                "{tier}: {error}"
+            );
+        }
+        match routed.expect("workload resolves") {
+            ResolvedCredential::WorkloadJwt { tenant, .. } => assert_eq!(tenant, "acme"),
+            other => panic!("expected WorkloadJwt, got {other:?}"),
+        }
     }
 }

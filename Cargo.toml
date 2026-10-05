@@ -93,6 +93,17 @@ rmcp = { version = "3.2.0", default-features = false }
 # signatures. Wyrd never parses SSE itself; it only has to name the type.
 sse-stream = "0.2.4"
 http = "1"
+# Vetted OpenID Connect relying party (discovery, PKCE, code exchange, ID-token
+# validation). Its `reqwest` feature stays off: provider HTTP runs through the
+# screened transport in `wyrd-auth-oidc`.
+openidconnect = { version = "=4.0.1", default-features = false }
+# Vetted OAuth 2.0 client for the CLI and SDK device and refresh grants. Its
+# `reqwest` feature stays off: requests run through the redirect-free adapter
+# in `wyrd-client`, which also sends the RFC 8693, RFC 7523, and RFC 7009 form
+# POSTs.
+oauth2 = { version = "=5.0.0", default-features = false }
+# Opens the device-login verification URL in the platform browser.
+webbrowser = "=1.2.4"
 http-body = "1"
 serde = { version = "1", features = ["derive"] }
 serde_jcs = "0.1"
@@ -145,8 +156,6 @@ password-hash = { version = "0.5", features = ["getrandom"] }
 secrecy = "0.10"
 subtle = "2.6"
 zeroize = "1"
-governor = "0.10"
-tower_governor = { version = "0.8", features = ["axum"] }
 rand = "0.9"
 url = { version = "2", features = ["serde"] }
 urlencoding = "2"
@@ -177,6 +186,7 @@ jsonpath-rust = "0.7"
 tracing-opentelemetry = "0.32"
 pyo3 = { version = "0.28", features = ["abi3-py310", "chrono", "py-clone"] }
 toml = "0.8"
+toml_edit = "0.22"
 shellexpand = "3"
 ipnetwork = "0.20"
 wyrd-telemetry = { path = "crates/shared/wyrd-telemetry", version = "0.0.1" }

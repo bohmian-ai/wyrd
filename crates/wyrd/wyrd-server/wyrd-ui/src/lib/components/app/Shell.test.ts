@@ -7,12 +7,11 @@ const tenant = { key: 'acme', name: 'Acme' };
 const session = {
   subject: { id: 'user', name: 'Jordan Reyes' },
   tenants: [tenant],
-  csrf: 'csrf',
   expiresAt: 1
 };
 const children = createRawSnippet(() => ({ render: () => '<h1>Workspace</h1>' }));
 
-test('exactly five tenant-relative destinations and static single-tenant identity', () => {
+test('exactly six tenant-relative destinations and static single-tenant identity', () => {
   const view = render(Shell, { tenant, session, pathname: '/t/acme/cards/item', children });
   const nav = within(view.getByRole('navigation', { name: 'Primary' }));
   // Each entry renders its full label plus the two-letter rail abbreviation;
@@ -24,7 +23,8 @@ test('exactly five tenant-relative destinations and static single-tenant identit
     'Cards',
     'Observe',
     'Changes',
-    'Query'
+    'Query',
+    'Settings'
   ]);
   expect(nav.getByRole('link', { name: 'Cards' })).toHaveAttribute('aria-current', 'page');
   expect(nav.getByRole('link', { name: 'Home' })).toHaveAttribute('href', '/t/acme');
@@ -33,7 +33,7 @@ test('exactly five tenant-relative destinations and static single-tenant identit
   expect(view.getByRole('link', { name: 'Skip to content' })).toHaveAttribute('href', '#main');
 });
 
-test('multiple tenants have searchable CSRF-protected switching and accessible mobile navigation', async () => {
+test('multiple tenants have searchable switching and accessible mobile navigation', async () => {
   const view = render(Shell, {
     tenant,
     session: { ...session, tenants: [tenant, { key: 'research', name: 'Research' }] },
@@ -46,12 +46,11 @@ test('multiple tenants have searchable CSRF-protected switching and accessible m
   expect(view.queryByRole('button', { name: 'Acme' })).toBeNull();
   const destination = view.getByRole('button', { name: 'Research' });
   expect(destination.closest('form')).toHaveAttribute('action', '/?/switch');
-  expect(destination.closest('form')?.querySelector('[name="csrf"]')).toHaveValue('csrf');
   const menu = view.getByRole('button', { name: /^Menu$/ });
   await fireEvent.click(menu);
   expect(menu).toHaveAttribute('aria-expanded', 'true');
   const disclosure = within(view.getByRole('region', { name: 'Menu' }));
-  expect(disclosure.getAllByRole('link')).toHaveLength(5);
+  expect(disclosure.getAllByRole('link')).toHaveLength(6);
   expect(disclosure.getByText('Acme')).toBeInTheDocument();
   expect(disclosure.getByText('Current area: Home')).toBeInTheDocument();
   await fireEvent.click(disclosure.getByRole('button', { name: 'Close menu' }));

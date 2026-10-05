@@ -1,12 +1,18 @@
 //! Runtime tenant slug resolver for the auth boundary.
 
-use sqlx::{Error as SqlxError, PgPool, types::Uuid};
+use sqlx::{Error as SqlxError, types::Uuid};
 use wyrd_spec::{DataTenantId, TenantSlug};
 
-use crate::{SqlError, TenantConn};
+use crate::{OperatorPool, SqlError, TenantConn};
 
-/// Resolve a URL tenant slug to its tenant UUID using the SECURITY DEFINER
-/// bridge granted to the runtime `wyrd_app` role.
+/// Resolve a URL tenant slug to its tenant UUID through the SECURITY DEFINER
+/// `platform.resolve_tenant_by_slug` bridge on the operator pool.
+///
+/// A slug names no tenant yet, so this pre-tenant directory read runs on the
+/// audited `wyrd_platform_admin` role rather than a tenant transaction. It is
+/// crate-private: [`crate::WyrdPostgres::resolve_tenant_slug`] is the single
+/// resolver every login, workload, and boot caller goes through, and it fails
+/// closed when no operator pool is configured.
 ///
 /// Returns `Ok(None)` when the slug is absent, suspended, or deleted.
 ///
@@ -14,17 +20,17 @@ use crate::{SqlError, TenantConn};
 /// Returns [`SqlError::Query`] when Postgres rejects the resolver query.
 /// Returns [`SqlError::InvalidDataTenantId`] if stored tenant data violates the
 /// Wyrd UUIDv7 tenant-id contract.
-pub async fn resolve_by_slug_for_app(
-    pool: &PgPool,
+pub(crate) async fn resolve_by_slug(
+    operator: &OperatorPool,
     slug: &TenantSlug,
 ) -> Result<Option<DataTenantId>, SqlError> {
     // Dynamic query is intentional until the workspace has a refreshed SQLx
-    // offline bundle for this new hot-path function. Plan 12's raw-query grep
-    // allowlist should keep this exception explicit.
+    // offline bundle for this hot-path function; the raw-query grep allowlist
+    // keeps this exception explicit.
     let tenant_uuid =
         sqlx::query_scalar::<_, Option<Uuid>>("SELECT platform.resolve_tenant_by_slug($1)")
             .bind(slug.as_str())
-            .fetch_one(pool)
+            .fetch_one(operator.pool())
             .await
             .map_err(SqlError::from)?;
 

@@ -15,7 +15,6 @@
   let {
     initial,
     verifiers,
-    csrf,
     requestKey,
     base,
     revision = '',
@@ -23,7 +22,6 @@
   }: {
     initial: Draft;
     verifiers: VerifierChoice[];
-    csrf: string;
     requestKey: string;
     base: string;
     revision?: string;
@@ -58,7 +56,7 @@
   }
 </script>
 <form method="POST" action="?/save" class="stack draft" use:enhance={() => { busy = true; return async ({ update }) => { await update({ reset: false }); busy = false; }; }}>
-  <input type="hidden" name="csrf" value={csrf} /><input type="hidden" name="requestKey" value={requestKey} /><input type="hidden" name="revision" value={revision} /><input type="hidden" name="subjects" value={JSON.stringify(draft.subjects)} /><input type="hidden" name="claims" value={JSON.stringify(draft.claims)} />
+  <input type="hidden" name="requestKey" value={requestKey} /><input type="hidden" name="revision" value={revision} /><input type="hidden" name="subjects" value={JSON.stringify(draft.subjects)} /><input type="hidden" name="claims" value={JSON.stringify(draft.claims)} />
   <div class="row between"><div><h1>{revision ? 'Edit draft' : 'New Change Request'}</h1><p class="muted">Save an incomplete draft at any point.</p></div></div>
   {#if result?.problem}<StateBlock state="error" title={result.problem.title} code={result.problem.code} detail="Your draft is preserved. Check the fields and retry." />{/if}
   <div class="columns"><div class="stack">

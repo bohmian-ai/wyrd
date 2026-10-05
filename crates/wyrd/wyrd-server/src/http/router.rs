@@ -15,7 +15,7 @@ use utoipa_axum::router::OpenApiRouter;
 use wyrd_spec::error::WyrdError;
 
 use crate::bifrost::routes::router as bifrost_router;
-use crate::components::admin::admin_router;
+use crate::components::admin::{admin_router, identity_router};
 use crate::components::auth::AuthenticatedPrincipal;
 use crate::components::auth::auth_router;
 use crate::components::cards::cards_router;
@@ -70,6 +70,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(verification_router())
         .merge(operator_connections_router())
         .merge(admin_router())
+        .merge(identity_router())
         .merge(gateway_router())
         .merge(otlp_router())
         .layer(middleware::from_fn_with_state(

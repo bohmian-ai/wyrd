@@ -8,25 +8,25 @@ order: 7
 
 # Authentication
 
-Wyrd authenticates every request with a signed token. There is no session cookie and no ambient identity: a caller presents a bearer token in the `X-Wyrd-Access-Token: Bearer <token>` header, and that token is the only credential the server trusts per request. This page is the operator view. For the deeper model behind it, read [Authentication](/concepts/authentication/) and [Authorization](/concepts/authorization/) in Concepts.
+Wyrd authenticates every protected request (the `/v1` API and MCP) with a signed token. The sign-in, token, revocation, metadata, health, and OpenAPI routes are reached without one, because they establish a credential or are public. The Wyrd API server keeps no browser session and no ambient identity: a protected request presents a bearer token in the `X-Wyrd-Access-Token: Bearer <token>` header, and that token is the only credential the server trusts per request. The web app is a separate backend-for-frontend (BFF): it keeps a person's refresh token, or an operator's recovery API key, in its own encrypted Secure, HttpOnly, SameSite=Lax cookie and sends the server a Wyrd access token on each call. Rotating the web-app client secret invalidates those cookies. Logout revokes the refresh token best-effort, and an access token already issued stays valid until it expires. This page is the operator view. For the deeper model behind it, read [Authentication](/concepts/authentication/) and [Authorization](/concepts/authorization/) in Concepts.
 
 ## Principals
 
-Every token belongs to a principal, and there are five kinds across two planes. On the **platform plane**, a **GlobalAdmin** operates the deployment itself — creating tenants and recovering tenant administration — and holds no tenant. Inside a tenant, a **TenantAdmin** is the tenant's headless root of trust, a **User** is a human who logged in through an IdP (identified by email), a **Service** is a machine principal that may be bound to a ServiceCard, and an **Agent** is a machine principal that is always bound to an AgentCard. Services and Agents authenticate the same way. Neither plane's credential or token is accepted by the other. See [Authentication](/concepts/authentication/) in Concepts for the full principal and token model.
+Every token belongs to a principal, and there are five kinds across two planes. On the **platform plane**, a **GlobalAdmin** operates the deployment itself — creating tenants and recovering tenant administration — and holds no tenant; a platform administrator who signs in through the deployment-wide platform connection is a tenantless platform **User**. Inside a tenant, a **TenantAdmin** is the tenant's headless root of trust, a **User** is a human who logged in through the tenant's IdP (identified by that IdP's issuer and subject, never by email), a **Service** is a machine principal that may be bound to a ServiceCard, and an **Agent** is a machine principal that is always bound to an AgentCard. Services and Agents authenticate the same way. Neither plane's credential or token is accepted by the other. See [Authentication](/concepts/authentication/) in Concepts for the full principal and token model.
 
 ## Tokens
 
-Wyrd mints EdDSA (Ed25519) JWTs signed with its own key, presented on every request. Access tokens are short-lived. Only a human OIDC login receives a rotating refresh token; a machine receives access only and renews by re-exchanging the durable credential it already holds, so revoking that credential ends its access. How a token is verified, and what each grant returns, is covered in [Authentication](/concepts/authentication/). What an operator supplies is the key material below.
+Wyrd mints EdDSA (Ed25519) JWTs signed with its own key, presented on every protected request. Access tokens are short-lived. Only a tenant human OIDC login receives a refresh token (a platform session is access-only): the CLI's rotates on every use, and the web app's does not rotate and ends after 12 hours; a machine receives access only and renews by re-exchanging the durable credential it already holds, so revoking that credential ends its access. How a token is verified, and what each grant returns, is covered in [Authentication](/concepts/authentication/). What an operator supplies is the key material below.
 
 ## Grants
 
-A **grant** is how a caller proves its identity at `POST /auth/token` to get a Wyrd access token. Which one you use depends on who is calling.
+A **grant** is how a caller proves its identity to get a Wyrd access token. Every tenant-plane grant below ends at `POST /auth/token`; a person starts with the login flow first. The platform plane is separate: a platform credential is exchanged only at `POST /auth/platform/token` ([RFC 8693](https://www.rfc-editor.org/rfc/rfc8693)), and `/auth/token` refuses it. Which tenant grant you use depends on who is calling.
 
 | Caller | Grant | Set up in |
 | --- | --- | --- |
-| A person logging in through your IdP | `authorization_code` (with PKCE) | [SSO and OIDC](/self-hosting/sso-and-oidc/#human-single-sign-on) |
+| A person logging in through your IdP | Web app: `authorization_code` with PKCE. CLI: device authorization (RFC 8628). | [SSO and OIDC](/self-hosting/sso-and-oidc/#human-single-sign-on) |
 | A machine workload (CI job, Kubernetes pod) | `jwt-bearer` | [SSO and OIDC](/self-hosting/sso-and-oidc/#workload-federation) |
-| A service or script holding an API key | API-key exchange | [Running the server](/self-hosting/running-the-server/#init) |
+| A service or script holding an API key | `token-exchange` with the API key as the subject token | [Running the server](/self-hosting/running-the-server/#init) |
 | A person renewing an expiring session | `refresh_token` | Automatic once a login issues one |
 | A machine renewing an expiring token | The same grant it started with | Nothing — the client re-exchanges its durable credential |
 
@@ -50,6 +50,8 @@ export WYRD_SIGNING_KEY_FILE=/run/secrets/signing-key.pem
 export WYRD_SIGNING_KEY_PEM="$(cat signing-key.pem)"
 ```
 
+The signing key file follows the same rule as the sealing key files below: a regular file readable by its owner only (mode `0600` or `0400`), no larger than 64 KiB. Boot refuses anything else without quoting the key.
+
 In a production profile, boot fails closed if neither is set. In development the server mints an ephemeral key on each start and logs a warning, so local runs work with no secret. That key does not survive a restart, so tokens minted against it stop verifying when the process restarts. Never use an ephemeral key outside development.
 
 <Aside title="Rotation">
@@ -60,16 +62,30 @@ Rotating the signing key invalidates every token signed with the old key. Plan a
 
 ## Sealing key
 
-The sealing key encrypts IdP client secrets at rest with AES-256-GCM. You only need it if a trusted issuer you configure carries a client secret (`secret_basic` or `secret_post` client auth). A deployment that uses only public PKCE clients and workload federation does not need one.
+The sealing key encrypts IdP client secrets at rest with AES-256-GCM: tenant OIDC connection secrets, workload issuer secrets, and the platform connection secret. You need it for any IdP client that uses `SecretBasic` or `SecretPost`. A deployment whose IdP clients carry no secret does not need one.
 
 Generate a 32-byte key, base64-encoded, and put it in a file:
 
 ```bash
-openssl rand -base64 32 > sealing-key.b64
+(umask 077 && openssl rand -base64 32 > sealing-key.b64)
 export WYRD_SEALING_KEY_FILE=/run/secrets/sealing-key.b64
 ```
 
-The file holds base64 that must decode to exactly 32 bytes. Boot fails closed if it decodes to any other length, or if an issuer needs a sealing key and none is set.
+The sealing key file and the retained keys file must be regular files readable by their owner only (mode `0600` or `0400`) and no larger than 64 KiB. Boot refuses a group- or world-readable file, a directory or other non-regular path, or an oversized file, and the refusal never includes key material. When you replace either file, write the new content to a temporary file in the same directory with owner-only mode, then `mv` it over the old one, so the server never reads a partial or permissive file.
+
+The file holds base64 that must decode to exactly 32 bytes. Boot fails closed if it decodes to any other length, or if a stored secret needs a sealing key and none is set. Every sealed value records which key sealed it, so the server can hold older keys during a rotation.
+
+### Rotating the sealing key
+
+Retained keys are read from `WYRD_SEALING_RETAINED_KEYS_FILE` (one base64 key per line) or `WYRD_SEALING_RETAINED_KEYS_BASE64` (comma-separated). They only open older values; new values are always sealed with the key in `WYRD_SEALING_KEY_FILE`.
+
+1. Generate the new key. Add it to every replica's retained keys and roll the deployment. All replicas can now open values sealed with either key.
+2. Make the new key the sealing key on every replica and move the old key into the retained keys. Roll the deployment.
+3. On boot, each replica reseals every stored secret that the new key did not seal — its IdP client secrets — and logs `sealed secret rewrap finished` with `rewrapped`, `current`, and `remaining` counts. The log never includes a key or a secret. Rewrapping is idempotent and safe for replicas to run at the same time. Each value is replaced only if it is unchanged since the pass read it, so a secret changed during the pass keeps its own write, and that value counts as `remaining` until a later pass.
+4. Once the roll in step 2 has finished and every serving replica seals with the new key, run one more verification pass by restarting any replica. Counts reported during the roll prove nothing: a replica still sealing with the old key can store a new secret after another replica counted zero. The post-roll pass also reseals any such late write.
+5. When that post-roll pass reports `remaining = 0`, no stored secret needs the old key. If it reports a nonzero count because a secret changed during the pass, restart a replica again until a pass reports zero. Then remove the old key from the retained keys and roll once more.
+
+If `remaining` stays above zero, the log names the table and tenant of each value no held key can open. Keep the old key until you have restored the right key or re-entered that secret, for example by staging and activating a new connection candidate.
 
 ## Platform and tenant credentials
 

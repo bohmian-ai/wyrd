@@ -1,7 +1,7 @@
 ---
 id: TASK-PACKET-R1
 kind: remediation
-status: ready
+status: review
 spec: SPEC-forge-concurrent-planning
 spec_revision: 11
 parent_task: packet-wide
@@ -92,7 +92,7 @@ Changed-symbol audit method:
 | `FIND-PACKET-1` | 94 Rust files. All reviewer-named sites are covered: `ensure_builtin`, `reject_reserved_field_names`, `run_snapshot_expiry_for_table_inner` (now with cancellation and partial-progress prose), `load_maintenance_protection_inner` (the misattached impl-block prose was moved onto it), `build_frames`, the three `forge_peer` service methods, `DrivenClaim::Target`, the `push_*` digest helpers, `leader::tests::key`, `DEFAULT_MAINTENANCE_INTERVAL`, `ADMITTED_AT`, `MEMBERS`, and the renamed cleanup test. The rest of the changed-symbol set gained rustdoc, `# Errors`, and `# Panics` where its body requires them. | Clippy doc-lint residue on changed items: **0**. Source-scan residue: 3 false positives. `oracle::run_sql_query` and `olap_catalog::registered_physical_layout` are documented with `# Errors`; the scanner stops at a multi-line attribute or a `// tenant-isolation` comment. `Debug::fmt` in `planner.rs` returns `fmt::Result`. | PASS |
 | `FIND-PACKET-2` | Function-local imports moved to module or `mod tests` import blocks. These include `settings.rs`, `exec.rs` (`BloomProbe::for_column` and test functions), `leader.rs`, `leadership.rs` (the `Wire` alias was removed), `fingerprint.rs`, `policy.rs`, `promoted_object.rs`, `tables/mod.rs`, `persistence.rs`, `staging_runtime.rs`, `analytical_supervisor.rs`, `sdks/wyrd-sdk-rust/src/lib.rs`, and 25 imports in `wyrd-testing/tests/bifrost/oracle/distributed.rs`. Qualified signature, field, and impl types are now bare names with top-level `use` across catalog, forge, oracle, scribe, vala-sql, wyrd-spec, wyrd-tonic, wyrd-server, wyrd-testing, and the integration tests. Test-only imports carry the same `cfg` as the items that use them. | Shape-scan residue: 13 sites, all in the permitted form. Ten import the parent module because a bare name would collide: `spec::Schema` (arrow vs iceberg) ×4, `types::Type` (parquet vs iceberg) ×2, `v1::ForgeCompactionOutcome` (domain vs wire), `sync::Mutex<time::Instant>` and `time::Instant` (std vs tokio), and `watch::Sender`. The other three are `T::Err`, an associated-type projection, and `fmt::Debug`/`fmt::Formatter`/`fmt::Result`. No function-local `use` remains apart from `Trait as _`. | PASS |
 | `FIND-PACKET-3` | The extra EOF blank lines were removed from TASK-002-R1, TASK-004-R1, TASK-006-R1, TASK-005-R1-implementation-reference, and TASK-003. The remediation merges had added three more beyond the two the reviewer found. | `git diff --check c1508b375` → exit 0 | PASS |
-| `FIND-PACKET-4` | Final aggregate on the corrected immutable candidate | `mise run gate`, run by the lead after the benchmark | PENDING |
+| `FIND-PACKET-4` | Final aggregate on the corrected immutable candidate | `mise run bench:bifrost:forge-capacity` on `ec9692bcf`: 16/16 PASS (live leader p99 decisions ≤ 80 µs, drain 2.10x/3.17x, leader CPU 3.1%). First `mise run gate` on `ec9692bcf` failed only `check:mocks-scope` (three dev-only wiremock seams unlisted); allowlisted in `30d31ebac`. `mise run gate` on `30d31ebac`: exit 0 (1638 s) | PASS |
 
 Commands, all exit 0:
 

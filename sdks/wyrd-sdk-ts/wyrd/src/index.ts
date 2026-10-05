@@ -562,7 +562,6 @@ export class TableConfig {
       readonly serverUrl?: string;
       readonly credential?: string;
       readonly grpcUrl?: string;
-      readonly tenant?: string;
     } = {},
   ): Promise<TableConfig> {
     const described = await describeTableConfig(
@@ -570,7 +569,6 @@ export class TableConfig {
       transport.serverUrl,
       transport.credential,
       transport.grpcUrl,
-      transport.tenant,
     );
     return new TableConfig(nativeHandle(described.config, described.error));
   }
@@ -726,7 +724,7 @@ export class Bifrost {
    * `WYRD_SERVER_URL`, `grpcUrl` from `WYRD_GRPC_URL`, and `credential`
    * through `WYRD_ACCESS_TOKEN` → `WYRD_WORKLOAD_TOKEN` + tenant →
    * `WYRD_API_KEY` → the saved `wyrd auth login` for this server and
-   * `tenant` (a tenant route key) → `~/.config/wyrd/credentials.toml`.
+   * `WYRD_TENANT` → `~/.config/wyrd/credentials.toml`.
    *
    * `client` reuses an existing, possibly delegated, {@link WyrdClient} for
    * authentication and transport. It cannot be combined with `serverUrl`,
@@ -743,7 +741,6 @@ export class Bifrost {
           readonly serverUrl?: string;
           readonly credential?: string;
           readonly grpcUrl?: string;
-          readonly tenant?: string;
           readonly client?: never;
           readonly clientByteLimitBytes?: number;
         }
@@ -754,7 +751,6 @@ export class Bifrost {
           readonly credential?: never;
           readonly grpcUrl?: never;
           readonly clientByteLimitBytes?: number;
-          readonly tenant?: never;
         } = {},
   ): Promise<Bifrost> {
     const connection =
@@ -765,7 +761,6 @@ export class Bifrost {
             options.credential,
             options.grpcUrl,
             options.clientByteLimitBytes,
-            options.tenant,
           )
         : await wyrdClientNative(options.client).connectBifrost(
             options.table?.native,
@@ -773,7 +768,6 @@ export class Bifrost {
             options.credential,
             options.grpcUrl,
             options.clientByteLimitBytes,
-            options.tenant,
           );
     return new Bifrost(nativeHandle(connection.bifrost, connection.error));
   }
@@ -1114,9 +1108,9 @@ export class WyrdClient {
    * Build a client without performing IO.
    *
    * Omitted options resolve from the environment, then the saved
-   * `wyrd auth login` for this server (the one for `tenant`, a tenant route
-   * key, when given, otherwise the newest), then
-   * `~/.config/wyrd/credentials.toml`. A `tenant` that matches none of this
+   * `wyrd auth login` for this server (the one for `WYRD_TENANT` when set,
+   * otherwise the newest), then
+   * `~/.config/wyrd/credentials.toml`. A `WYRD_TENANT` that matches none of this
    * server's saved logins, or a saved login that cannot be used, raises
    * `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE`.
    */
@@ -1125,14 +1119,12 @@ export class WyrdClient {
       readonly serverUrl?: string;
       readonly credential?: string;
       readonly grpcUrl?: string;
-      readonly tenant?: string;
     } = {},
   ): WyrdClient {
     const result = connectWyrdClient(
       options.serverUrl,
       options.credential,
       options.grpcUrl,
-      options.tenant,
     );
     return new WyrdClient(nativeHandle(result.client, result.error));
   }
@@ -1192,13 +1184,11 @@ export class Cards {
     options: {
       readonly serverUrl?: string;
       readonly credential?: string;
-      readonly tenant?: string;
     } = {},
   ): Cards {
     const connection = connectCards(
       options.serverUrl,
       options.credential,
-      options.tenant,
     );
     return new Cards(nativeHandle(connection.cards, connection.error));
   }
@@ -1572,13 +1562,11 @@ export class Verification {
     options: {
       readonly serverUrl?: string;
       readonly credential?: string;
-      readonly tenant?: string;
     } = {},
   ): Verification {
     const connection = connectVerification(
       options.serverUrl,
       options.credential,
-      options.tenant,
     );
     return new Verification(
       nativeHandle(connection.verification, connection.error),
@@ -1749,13 +1737,11 @@ export class OperatorConnections {
     options: {
       readonly serverUrl?: string;
       readonly credential?: string;
-      readonly tenant?: string;
     } = {},
   ): OperatorConnections {
     const connection = connectOperatorConnections(
       options.serverUrl,
       options.credential,
-      options.tenant,
     );
     return new OperatorConnections(
       nativeHandle(connection.connections, connection.error),
@@ -2169,7 +2155,6 @@ export class WyrdState {
       readonly credential?: string;
       readonly grpcUrl?: string;
       readonly clientByteLimitBytes?: number;
-      readonly tenant?: string;
     } = {},
   ): Promise<void> {
     lifecycleValue<null>(
@@ -2179,7 +2164,6 @@ export class WyrdState {
         options.credential,
         options.grpcUrl,
         options.clientByteLimitBytes,
-        options.tenant,
       ),
     );
   }
@@ -2419,10 +2403,9 @@ export class Gateway {
     options: {
       readonly serverUrl?: string;
       readonly credential?: string;
-      readonly tenant?: string;
     } = {},
   ): Gateway {
-    return new Gateway(connectGateway(options.serverUrl, options.credential, options.tenant));
+    return new Gateway(connectGateway(options.serverUrl, options.credential));
   }
 
   /** Read one redacted provider credential. */

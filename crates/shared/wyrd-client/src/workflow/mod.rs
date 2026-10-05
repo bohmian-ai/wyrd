@@ -85,7 +85,7 @@ impl Workflow {
         let refs = bodies.external_refs(&workflow);
         let mut client = None;
         if !refs.is_empty() {
-            let cards = tokio::task::spawn_blocking(|| Cards::new(None, None, None))
+            let cards = tokio::task::spawn_blocking(|| Cards::new(None, None))
                 .await
                 .map_err(|error| blocking_task_failed("workflow_cards_client", &error))??;
             CardGraphHydrator::new(cards.registry_context())

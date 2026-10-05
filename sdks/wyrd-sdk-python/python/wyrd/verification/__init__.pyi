@@ -18,7 +18,6 @@ class Verification:
         self,
         server_url: str | None = None,
         credential: str | None = None,
-        tenant: str | None = None,
     ) -> None:
         """Build a handle; no network call happens here.
 
@@ -30,10 +29,6 @@ class Verification:
                 ``WYRD_API_KEY`` → this server's saved ``wyrd auth login`` →
                 ``~/.config/wyrd/credentials.toml``
                 ``[default].api_key`` if omitted.
-            tenant: the tenant route key that selects one server's saved
-                login or the workload-token tenant. An explicit credential,
-                access token, or API key already names its tenant and refuses
-                it.
 
         Raises:
             WyrdError: ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no credential

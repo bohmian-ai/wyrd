@@ -121,22 +121,17 @@ impl PyGateway {
 #[pymethods]
 impl PyGateway {
     /// Connects to a Wyrd server; omitted options resolve from the environment,
-    /// and `tenant` (a tenant route key) selects the saved user login.
+    /// and `WYRD_TENANT` selects the saved user login.
     ///
     /// # Errors
     ///
     /// Raises `WyrdError` with `WYRD_CLIENT_401_NO_CREDENTIALS` when no
     /// credential resolves, or a transport error when the client cannot build.
     #[new]
-    #[pyo3(signature = (server_url=None, credential=None, tenant=None))]
-    fn __new__(
-        server_url: Option<&str>,
-        credential: Option<&str>,
-        tenant: Option<&str>,
-    ) -> WyrdPyResult<Self> {
-        let client =
-            wyrd_client::bifrost::client_from_options(server_url, credential, None, tenant)
-                .map_err(WyrdError::from)?;
+    #[pyo3(signature = (server_url=None, credential=None))]
+    fn __new__(server_url: Option<&str>, credential: Option<&str>) -> WyrdPyResult<Self> {
+        let client = wyrd_client::bifrost::client_from_options(server_url, credential, None)
+            .map_err(WyrdError::from)?;
         Ok(Self {
             inner: wyrd_client::Gateway::new(client),
         })

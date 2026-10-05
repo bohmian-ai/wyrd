@@ -37,6 +37,15 @@ def test_saved_user_auth_journey(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("WYRD_CONFIG_HOME", str(tmp_path))
     with WyrdTestServer(mutate_env=False, human_sso=True) as server:
         url = server.base_url
+
+        def cards(tenant: str | None = None, **options: str) -> Cards:
+            """Build ``Cards`` with ``WYRD_TENANT`` set to ``tenant``, the only selector."""
+            if tenant is None:
+                monkeypatch.delenv("WYRD_TENANT", raising=False)
+            else:
+                monkeypatch.setenv("WYRD_TENANT", tenant)
+            return Cards(server_url=url, **options)
+
         server.activate_human_sso(server.api_key)
         second = server.seed_tenant(SECOND_TENANT)
         server.activate_human_sso(server.bootstrap_service_in_tenant(second, ["admin"]))
@@ -45,36 +54,36 @@ def test_saved_user_auth_journey(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
         # Without a selector the newest login, alice's admin login, is used; a
         # selector must name a saved login.
-        Cards(server_url=url).register(_prompt())
+        cards().register(_prompt())
         with pytest.raises(WyrdError) as unmatched:
-            Cards(server_url=url, tenant="no-such-tenant")
+            cards("no-such-tenant")
         assert _reason(unmatched) == "tenant_mismatch"
 
         # Bob is a reader: the read is allowed and the write denied.
-        reader = Cards(server_url=url, tenant=FIXTURE_TENANT)
+        reader = cards(FIXTURE_TENANT)
         reader.prompt.list(space="saved-login")
         with pytest.raises(WyrdError) as denied:
             reader.register(_prompt())
         assert denied.value.status == 403
-        Cards(server_url=url, tenant=SECOND_TENANT).prompt.list(space="saved-login")
+        cards(SECOND_TENANT).prompt.list(space="saved-login")
 
         # A stale login renews through Wyrd and the renewal is saved.
         server.expire_saved_login(tmp_path, FIXTURE_TENANT)
         assert server.saved_login_is_stale(tmp_path, FIXTURE_TENANT)
-        Cards(server_url=url, tenant=FIXTURE_TENANT).prompt.list(space="saved-login")
+        cards(FIXTURE_TENANT).prompt.list(space="saved-login")
         assert not server.saved_login_is_stale(tmp_path, FIXTURE_TENANT)
 
         # An explicit machine credential overrides the saved reader; it names
         # its own tenant, so a selector beside it is refused.
         with pytest.raises(WyrdError) as selected:
-            Cards(server_url=url, credential=server.api_key, tenant=FIXTURE_TENANT)
+            cards(FIXTURE_TENANT, credential=server.api_key)
         assert selected.value.code == "WYRD_CLIENT_400_CONFIG_INVALID"
         assert "already names its tenant" in str(selected.value)
-        Cards(server_url=url, credential=server.api_key).register(_prompt())
+        cards(credential=server.api_key).register(_prompt())
 
         # Once the chain is revoked the login fails closed and asks for a new login.
         server.revoke_saved_login(tmp_path, FIXTURE_TENANT)
         server.expire_saved_login(tmp_path, FIXTURE_TENANT)
         with pytest.raises(WyrdError) as refused:
-            Cards(server_url=url, tenant=FIXTURE_TENANT).prompt.list(space="saved-login")
+            cards(FIXTURE_TENANT).prompt.list(space="saved-login")
         assert _reason(refused) == "refresh_refused"

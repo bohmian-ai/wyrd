@@ -99,16 +99,15 @@ mod tests {
             std::env::set_var("HOME", home.path());
         }
 
-        let missing = Cards::new(Some("http://127.0.0.1:1"), None, None)
+        let missing = Cards::new(Some("http://127.0.0.1:1"), None)
             .err()
             .expect("an empty credential chain is refused");
-        let invalid = Cards::new(Some(""), Some(SecretString::from("wyrd_sk_t_v_s")), None)
+        let invalid = Cards::new(Some(""), Some(SecretString::from("wyrd_sk_t_v_s")))
             .err()
             .expect("an empty explicit server URL is refused");
         let cards = Cards::new(
             Some("http://127.0.0.1:1"),
             Some(SecretString::from("wyrd_sk_t_v_s")),
-            None,
         )
         .expect("a complete offline configuration constructs without network");
         // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.

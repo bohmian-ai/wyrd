@@ -146,7 +146,7 @@ impl PyWyrdState {
 
     /// Connect this state's one Bifrost writer and describe both fixed tables.
     ///
-    /// The transport arguments, including `tenant`, are `Bifrost(...)`'s and pass straight through to
+    /// The transport arguments are `Bifrost(...)`'s and pass straight through to
     /// it, including its environment and default resolution.
     /// `client_byte_limit_bytes` overrides the handle-wide ingestion byte
     /// budget (256 MiB by default). Synchronous because a caller starts
@@ -160,7 +160,7 @@ impl PyWyrdState {
     /// to seal one message, and the catalog error for a missing credential, an
     /// undialable ingest channel, or a missing, unauthorized, or incompatible
     /// fixed observation table.
-    #[pyo3(signature = (table=None, server_url=None, credential=None, grpc_url=None, client_byte_limit_bytes=None, tenant=None))]
+    #[pyo3(signature = (table=None, server_url=None, credential=None, grpc_url=None, client_byte_limit_bytes=None))]
     fn start_bifrost(
         &self,
         py: Python<'_>,
@@ -169,9 +169,8 @@ impl PyWyrdState {
         credential: Option<&str>,
         grpc_url: Option<&str>,
         client_byte_limit_bytes: Option<usize>,
-        tenant: Option<&str>,
     ) -> CardPyResult<()> {
-        let client = client_from_options(server_url, credential, grpc_url, tenant)
+        let client = client_from_options(server_url, credential, grpc_url)
             .map_err(|error| WyrdPyError::from(WyrdError::from(error)))?;
         let table = table.map(PyTableConfig::into_native);
         py.detach(|| {
@@ -1606,28 +1605,18 @@ impl PyCards {
     /// # Arguments
     /// * `server_url` - Optional Wyrd server URL override.
     /// * `credential` - Optional explicit credential override.
-    /// * `tenant` - Optional tenant route key selecting the saved user
-    ///   login.
     ///
     /// # Errors
     /// Returns a Wyrd error when local configuration, the credential override,
     /// or the saved-login selection cannot be loaded.
     #[new]
-    #[pyo3(signature = (server_url=None, credential=None, tenant=None))]
+    #[pyo3(signature = (server_url=None, credential=None))]
     // justification: pyo3 boundary; Python callers provide owned optional strings and credential is consumed into SecretString
     #[allow(clippy::needless_pass_by_value)]
-    fn __new__(
-        server_url: Option<String>,
-        credential: Option<String>,
-        tenant: Option<String>,
-    ) -> CardPyResult<Self> {
-        Cards::new(
-            server_url.as_deref(),
-            credential.map(SecretString::from),
-            tenant.as_deref(),
-        )
-        .map(|inner| Self { inner })
-        .map_err(WyrdPyError::from)
+    fn __new__(server_url: Option<String>, credential: Option<String>) -> CardPyResult<Self> {
+        Cards::new(server_url.as_deref(), credential.map(SecretString::from))
+            .map(|inner| Self { inner })
+            .map_err(WyrdPyError::from)
     }
 
     /// Return the typed view for `DataCard` operations.

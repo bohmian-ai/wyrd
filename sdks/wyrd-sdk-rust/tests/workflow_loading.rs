@@ -106,7 +106,7 @@ async fn api_key(server: &WyrdTestServer, name: &str, roles: &[&str]) -> String 
 /// Panics when the client cannot build.
 fn client_with(server: &WyrdTestServer, api_key: &str) -> WyrdClient {
     let base_url = server.base_url().expect("bound server has a URL");
-    client_from_options(Some(base_url), Some(api_key), None, None).expect("client builds")
+    client_from_options(Some(base_url), Some(api_key), None).expect("client builds")
 }
 
 /// Return a Cards handle authenticated with `api_key`.

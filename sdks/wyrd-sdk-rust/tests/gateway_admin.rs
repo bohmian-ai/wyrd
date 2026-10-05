@@ -50,7 +50,7 @@ async fn machine_key(server: &WyrdTestServer, name: &str, roles: &[&str]) -> Str
 /// Panics when the shared client cannot be assembled.
 fn connect(base_url: &str, credential: &str) -> Gateway {
     Gateway::new(
-        client_from_options(Some(base_url), Some(credential), None, None).expect("client builds"),
+        client_from_options(Some(base_url), Some(credential), None).expect("client builds"),
     )
 }
 
@@ -83,7 +83,7 @@ async fn administers_redacted_gateway_configuration() {
 
     let writer_key = machine_key(&server, "rust_gateway_writer", &["admin"]).await;
     let credentials = CredentialWriter::new(
-        client_from_options(Some(&base_url), Some(&writer_key), None, None).expect("client builds"),
+        client_from_options(Some(&base_url), Some(&writer_key), None).expect("client builds"),
     );
     let view = credentials
         .put_credential(&write)

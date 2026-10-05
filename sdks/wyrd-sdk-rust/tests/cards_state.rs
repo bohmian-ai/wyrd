@@ -15,8 +15,10 @@ use secrecy::{ExposeSecret, SecretString};
 use sha2::Digest;
 use wyrd_sdk::bifrost::client_from_options;
 use wyrd_sdk::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode, ListCardsRequest};
+use wyrd_sdk::config::ClientConfig;
 use wyrd_sdk::saved_login::canonical_origin;
 use wyrd_sdk::state::WyrdState;
+use wyrd_sdk::{GlobalConfig, WyrdClient};
 use wyrd_testing::Bootstrap;
 use wyrd_testing::human_login::{
     FIXTURE_TENANT_SLUG, HUMAN_PUBLIC_ORIGIN, HumanSso, expire_saved_access, saved_login,
@@ -192,7 +194,7 @@ async fn machine_key(server: &WyrdTestServer, name: &str, roles: &[&str]) -> Str
 /// Panics when the shared client cannot be assembled.
 fn connect(base_url: &str, credential: &str) -> Cards {
     Cards::with_client(
-        client_from_options(Some(base_url), Some(credential), None, None).expect("client builds"),
+        client_from_options(Some(base_url), Some(credential), None).expect("client builds"),
     )
 }
 
@@ -337,7 +339,9 @@ async fn run_script(phase: &str, config: &Path, base_url: &str, second: &str, ma
 }
 
 /// One phase of a local script using the saved logins, run only as the child
-/// [`run_script`] starts; without [`SCRIPT_PHASE`] it does nothing.
+/// [`run_script`] starts; without [`SCRIPT_PHASE`] it does nothing. A phase
+/// selects a saved login through the configured tenant (`ClientConfig.tenant`,
+/// what `WYRD_TENANT` sets), since constructors take no tenant.
 ///
 /// `select`: without a selector the newest login (alice's admin login to the
 /// second tenant) registers a Card, a selector naming no saved login fails, the reader's saved login lists Cards
@@ -357,7 +361,16 @@ async fn saved_user_auth_script() {
     };
     let base_url = std::env::var("WYRD_SAVED_LOGIN_SERVER").expect("server URL");
     let connect = |credential: Option<String>, tenant: Option<&str>| {
-        Cards::new(Some(&base_url), credential.map(SecretString::from), tenant)
+        let mut config = ClientConfig::from_global_with_overrides(
+            &GlobalConfig::default(),
+            Some(&base_url),
+            None,
+        );
+        config.credential = credential.map(SecretString::from);
+        if let Some(tenant) = tenant {
+            config.tenant = Some(tenant.to_owned());
+        }
+        WyrdClient::with_config(config).map(Cards::with_client)
     };
     match phase.as_str() {
         "select" => {

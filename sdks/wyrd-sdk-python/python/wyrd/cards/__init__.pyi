@@ -324,7 +324,6 @@ class Cards:
         self,
         server_url: str | None = ...,
         credential: str | None = ...,
-        tenant: str | None = ...,
     ) -> None:
         """Build a registry client. No network call or token exchange happens here.
 
@@ -336,10 +335,6 @@ class Cards:
                 omitted.
             credential: the API key or bearer token. Resolved as for
                 ``WyrdClient()`` if omitted.
-            tenant: the tenant route key that selects one server's saved
-                login or the workload-token tenant. An explicit credential,
-                access token, or API key already names its tenant and refuses
-                it.
 
         Raises:
             WyrdError: ``WYRD_CLIENT_400_CONFIG_INVALID`` for an empty

@@ -1042,11 +1042,11 @@ mod tests {
                 columns: vec![
                     utf8("record_id", false),
                     utf8("session_id", true),
-                    utf8("context", false),
+                    fields::variant("context", false),
                     fields::fixed_binary("trace_id", 16, true),
                     fields::fixed_binary("span_id", 8, true),
                     ts_us_utc("created_at", false),
-                    utf8("media", true),
+                    fields::variant("media", true),
                 ],
                 blooms: &[],
             },
@@ -1068,7 +1068,32 @@ mod tests {
                     ts_us_utc("window_end", true),
                     ts_us_utc("started_at", false),
                     ts_us_utc("ended_at", false),
-                    utf8("details", true),
+                    Field::new(
+                        "drift_report",
+                        arrow::datatypes::DataType::Struct(
+                            vec![
+                                utf8("method", false),
+                                fields::variant("features", false),
+                                utf8("verdict", false),
+                            ]
+                            .into(),
+                        ),
+                        true,
+                    ),
+                    Field::new(
+                        "eval_summary",
+                        arrow::datatypes::DataType::Struct(
+                            vec![
+                                int32("total_tasks", false),
+                                int32("passed_tasks", false),
+                                int32("failed_tasks", false),
+                                float64("pass_rate", false),
+                                int64("duration_ms", false),
+                            ]
+                            .into(),
+                        ),
+                        true,
+                    ),
                 ],
                 blooms: &["result_id", "subject_card_uid", "binding_id"],
             },
@@ -1102,8 +1127,8 @@ mod tests {
                     utf8("task_id", false),
                     utf8("outcome_kind", false),
                     boolean("passed", true),
-                    utf8("actual", true),
-                    utf8("expected", true),
+                    fields::variant("actual", true),
+                    fields::variant("expected", true),
                     utf8("operator", true),
                     utf8("message", true),
                     int32("stage", true),
@@ -1146,7 +1171,7 @@ mod tests {
     /// them and dashboards query them — so a reordered, retyped, renamed, or
     /// newly nullable column is a breaking change rather than an
     /// implementation detail. Pinning the whole physical list here, including
-    /// nullable `owner_card_uid` and Drift `details`, is what makes that break
+    /// nullable `owner_card_uid` and the typed `drift_report`, is what makes that break
     /// fail in this crate instead of at a caller's insert.
     ///
     /// # Panics

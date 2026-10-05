@@ -1496,7 +1496,7 @@ impl PromotionIntegrationFixture {
     /// # Panics
     ///
     /// Panics when the built-in is unknown, when an authored field is not a
-    /// flat string, integer, boolean, or UTC microsecond timestamp, or when
+    /// type the fixture generator supports, or when
     /// provisioning, sealing, or eligibility aging fails.
     pub(crate) async fn seal_builtin_table(
         &self,
@@ -2845,17 +2845,20 @@ fn ingress_batch(schema: &Arc<ArrowSchema>, file_number: i64) -> RecordBatch {
     .expect("fixture ingress batch")
 }
 
-/// Generates one batch of distinct rows for a flat built-in's authored fields.
+/// Generates one batch of distinct rows for a built-in's authored fields.
 ///
 /// Every authored column is populated, including nullable ones, so a rewrite
-/// that mixed rows up would be visible in any column. `wyrd_event_time` is
-/// appended explicitly and places the whole batch at noon of the day
-/// `file_number` days before the fixture day, as [`ingress_batch`] does.
+/// that mixed rows up would be visible in any column. Struct columns recurse
+/// into their children and Variant columns hold one distinct JSON object per
+/// row. `wyrd_event_time` is appended explicitly and places the whole batch at
+/// noon of the day `file_number` days before the fixture day, as
+/// [`ingress_batch`] does.
 ///
 /// # Panics
 ///
-/// Panics when a field is not a flat string, integer, boolean, or UTC
-/// microsecond timestamp, or when the batch cannot be assembled.
+/// Panics when a field is not a string, integer, float, boolean, UTC
+/// microsecond timestamp, Variant, or Struct of those, or when the batch
+/// cannot be assembled.
 fn flat_builtin_batch(fields: &[Field], file_number: i64, rows: usize) -> RecordBatch {
     let noon = (fixture_day() - chrono::Duration::days(file_number))
         .and_hms_opt(12, 0, 0)
@@ -2863,56 +2866,93 @@ fn flat_builtin_batch(fields: &[Field], file_number: i64, rows: usize) -> Record
         .and_utc()
         .timestamp_micros();
     let offsets: Vec<i64> = (0..i64::try_from(rows).expect("bounded fixture rows")).collect();
-    let event_times = || {
-        Arc::new(
-            TimestampMicrosecondArray::from_iter_values(offsets.iter().map(|row| noon + row))
-                .with_timezone("UTC"),
-        ) as arrow::array::ArrayRef
-    };
-    let mut columns: Vec<arrow::array::ArrayRef> = fields
-        .iter()
-        .map(|field| -> arrow::array::ArrayRef {
-            match field.data_type() {
-                DataType::Utf8 => Arc::new(arrow::array::StringArray::from_iter_values(
-                    offsets
-                        .iter()
-                        .map(|row| format!("{}-{file_number}-{row}", field.name())),
-                )),
-                DataType::Int64 => Arc::new(Int64Array::from_iter_values(
-                    offsets.iter().map(|row| file_number * 1_000 + row),
-                )),
-                DataType::Int32 => Arc::new(arrow::array::Int32Array::from_iter_values(
-                    offsets.iter().map(|row| {
-                        i32::try_from(file_number * 1_000 + row).expect("bounded fixture value")
-                    }),
-                )),
-                DataType::Boolean => Arc::new(
-                    offsets
-                        .iter()
-                        .map(|row| Some(row % 2 == 0))
-                        .collect::<arrow::array::BooleanArray>(),
-                ),
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some(zone))
-                    if zone.as_ref() == "UTC" =>
-                {
-                    event_times()
-                }
-                other => panic!(
-                    "a flat built-in fixture cannot generate {}: {other}",
-                    field.name()
-                ),
-            }
-        })
-        .collect();
     let mut schema_fields = fields.to_vec();
     schema_fields.push(Field::new(
         wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
         DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
         false,
     ));
-    columns.push(event_times());
+    let columns: Vec<arrow::array::ArrayRef> = schema_fields
+        .iter()
+        .map(|field| fixture_column(field, file_number, noon, &offsets))
+        .collect();
     RecordBatch::try_new(Arc::new(ArrowSchema::new(schema_fields)), columns)
         .expect("fixture built-in batch")
+}
+
+/// Generates one fixture column of distinct non-null values for `field`.
+///
+/// Values derive from the field name, `file_number`, and each row offset, so
+/// every cell of every file is distinct; timestamps are `noon` plus the row
+/// offset.
+///
+/// # Panics
+///
+/// Panics when the field type is not one [`flat_builtin_batch`] supports or a
+/// Variant value cannot be encoded.
+fn fixture_column(
+    field: &Field,
+    file_number: i64,
+    noon: i64,
+    offsets: &[i64],
+) -> arrow::array::ArrayRef {
+    if vala_bifrost_redux::tables::fields::is_variant(field) {
+        let mut builder = wyrd_queue::variant::VariantColumnBuilder::with_capacity(offsets.len());
+        for row in offsets {
+            let value = serde_json::json!({ field.name().as_str(): [file_number, row] });
+            builder.append(
+                &wyrd_queue::variant::EncodedVariant::from_json(&value)
+                    .expect("fixture Variant encodes"),
+            );
+        }
+        return builder.finish();
+    }
+    match field.data_type() {
+        DataType::Utf8 => Arc::new(arrow::array::StringArray::from_iter_values(
+            offsets
+                .iter()
+                .map(|row| format!("{}-{file_number}-{row}", field.name())),
+        )),
+        DataType::Int64 => Arc::new(Int64Array::from_iter_values(
+            offsets.iter().map(|row| file_number * 1_000 + row),
+        )),
+        DataType::Int32 => Arc::new(arrow::array::Int32Array::from_iter_values(
+            offsets.iter().map(|row| {
+                i32::try_from(file_number * 1_000 + row).expect("bounded fixture value")
+            }),
+        )),
+        DataType::Float64 => Arc::new(arrow::array::Float64Array::from_iter_values(
+            offsets.iter().map(|row| {
+                f64::from(i32::try_from(file_number * 1_000 + row).expect("bounded fixture value"))
+            }),
+        )),
+        DataType::Boolean => Arc::new(
+            offsets
+                .iter()
+                .map(|row| Some(row % 2 == 0))
+                .collect::<arrow::array::BooleanArray>(),
+        ),
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some(zone))
+            if zone.as_ref() == "UTC" =>
+        {
+            Arc::new(
+                TimestampMicrosecondArray::from_iter_values(offsets.iter().map(|row| noon + row))
+                    .with_timezone("UTC"),
+            )
+        }
+        DataType::Struct(children) => Arc::new(arrow::array::StructArray::new(
+            children.clone(),
+            children
+                .iter()
+                .map(|child| fixture_column(child, file_number, noon, offsets))
+                .collect(),
+            None,
+        )),
+        other => panic!(
+            "a built-in fixture cannot generate {}: {other}",
+            field.name()
+        ),
+    }
 }
 
 /// Encodes one batch as the native Arrow IPC stream Scribe ingress accepts.

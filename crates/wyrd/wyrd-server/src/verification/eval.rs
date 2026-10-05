@@ -33,6 +33,7 @@ use vala_eval::{
     EvalExecError, EvalReport, InMemoryTraceSource, JudgeError, JudgeInvoker, MediaBindings,
 };
 use vala_sql::queries::olap_catalog::get_by_fqn;
+use wyrd_queue::variant::variant_cell_to_json;
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
 use wyrd_runtime::{
@@ -702,20 +703,20 @@ impl BifrostReader {
         let created_at = int64(batch, "created_at", 0)?
             .and_then(DateTime::<Utc>::from_timestamp_micros)
             .ok_or("created_at is missing")?;
-        let json_text = |name| -> Result<Value, String> {
-            text(batch, name, 0)?
-                .map(|raw| serde_json::from_str(&raw).map_err(|error| error.to_string()))
-                .transpose()
-                .map(Option::unwrap_or_default)
+        let variant = |name: &str| -> Result<Value, String> {
+            let column = batch
+                .column_by_name(name)
+                .ok_or_else(|| format!("{name} is missing"))?;
+            variant_cell_to_json(column.as_ref(), 0).map_err(|_| format!("{name} does not decode"))
         };
         serde_json::from_value(json!({
             "record_id": text(batch, "record_id", 0)?,
             "session_id": text(batch, "session_id", 0)?,
-            "context": json_text("context")?,
+            "context": variant("context")?,
             "trace_id": trace_id.map(|id| id.to_hex()),
             "span_id": span_id.map(|id| id.to_hex()),
             "created_at": created_at,
-            "media": json_text("media")?,
+            "media": variant("media")?,
         }))
         .map_err(|error| format!("record {record_id} does not decode: {error}").into())
     }

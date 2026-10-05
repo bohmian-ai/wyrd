@@ -1,7 +1,8 @@
 //! `vala.gateway.calls` — one terminal analytical row per captured gateway call.
 //!
-//! The user fields are the exact `GatewayCallPayloadV1` record, field for
-//! field and in declaration order; the Observation policy appends the canonical
+//! The user fields are the `GatewayCallPayloadV1` record in declaration order,
+//! except that its two canonical payload JSON texts are stored as the Variant
+//! columns `request_payload` and `response_payload`; the Observation policy appends the canonical
 //! managed envelope. Only the gateway capture principal may write the table,
 //! which Gate enforces, and the two payload columns require the additional
 //! payload-read permission, which Oracle enforces.
@@ -10,18 +11,18 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields};
 
-use crate::tables::fields::{boolean, int32, int64, ts_us_utc, utf8};
+use crate::tables::fields::{boolean, int32, int64, ts_us_utc, utf8, variant};
 use crate::tables::{
     CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc, sort_desc,
 };
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
-/// Canonical redacted request JSON column, readable only with payload authority.
-pub const REQUEST_PAYLOAD_JSON: &str = "request_payload_json";
+/// Redacted request payload Variant column, readable only with payload authority.
+pub const REQUEST_PAYLOAD: &str = "request_payload";
 
-/// Canonical redacted response JSON column, readable only with payload authority.
-pub const RESPONSE_PAYLOAD_JSON: &str = "response_payload_json";
+/// Redacted response payload Variant column, readable only with payload authority.
+pub const RESPONSE_PAYLOAD: &str = "response_payload";
 
 /// Built-in definition of `vala.gateway.calls`.
 pub struct CallsTable;
@@ -84,8 +85,7 @@ impl DomainTable for CallsTable {
     const NAME: &'static str = "calls";
     const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
-    const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] =
-        &[REQUEST_PAYLOAD_JSON, RESPONSE_PAYLOAD_JSON];
+    const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[REQUEST_PAYLOAD, RESPONSE_PAYLOAD];
 
     /// The `GatewayCallPayloadV1` fields in contract order.
     ///
@@ -113,8 +113,8 @@ impl DomainTable for CallsTable {
             utf8("currency", true),
             Field::new("pricing_versions", Self::pricing_versions_type(), false),
             int64("capture_policy_version", false),
-            utf8(REQUEST_PAYLOAD_JSON, true),
-            utf8(RESPONSE_PAYLOAD_JSON, true),
+            variant(REQUEST_PAYLOAD, true),
+            variant(RESPONSE_PAYLOAD, true),
             Field::new(
                 "payload_object_refs",
                 Self::payload_object_refs_type(),
@@ -179,8 +179,8 @@ mod tests {
                 ("currency", true),
                 ("pricing_versions", false),
                 ("capture_policy_version", false),
-                ("request_payload_json", true),
-                ("response_payload_json", true),
+                ("request_payload", true),
+                ("response_payload", true),
                 ("payload_object_refs", false),
                 (RUN_ID, true),
                 (CARD_UID, true),
@@ -192,7 +192,7 @@ mod tests {
         );
         assert_eq!(
             definition.sensitive_payload_columns,
-            ["request_payload_json", "response_payload_json"]
+            ["request_payload", "response_payload"]
         );
         assert!(matches!(
             schema.field_with_name("usage").expect("usage").data_type(),

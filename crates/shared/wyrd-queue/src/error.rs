@@ -8,6 +8,7 @@
 //! translation in `wyrd_client::bifrost`).
 
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::vala::BifrostError;
 
 /// Concrete error produced by the producer, queue, and batch builder.
 #[derive(thiserror::Error, Debug)]
@@ -60,6 +61,11 @@ pub enum WyrdQueueError {
     #[error("reserved column: {0}")]
     ReservedColumn(String),
 
+    /// A Variant value is out of range, too deep, or too large to store.
+    /// Carries the stable catalogued Variant error with its field and row.
+    #[error("variant value refused: {0}")]
+    Variant(#[source] BifrostError),
+
     /// A sink-reported server error, already mapped to the stable catalog.
     #[error("sink error: {0}")]
     Sink(#[source] WyrdError),
@@ -77,6 +83,7 @@ impl WyrdQueueError {
             Self::ConfigInvalid { .. } => "WYRD_CLIENT_400_CONFIG_INVALID",
             Self::SchemaParse(_) => "WYRD_VALA_400_SCHEMA_PARSE",
             Self::ReservedColumn(_) => "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
+            Self::Variant(err) => err.code(),
             Self::Sink(err) => err.code(),
         }
     }
@@ -88,11 +95,14 @@ impl From<WyrdQueueError> for WyrdError {
     /// The queue-domain codes project onto typed `WyrdError` variants via the
     /// shared `WyrdError::from_code` reconstruction (so the client boundary
     /// reports the real status/code); the `Sink` variant passes its already-mapped
-    /// error straight through.
+    /// error straight through and the `Variant` variant lifts its catalogued
+    /// Bifrost error with its details intact.
     fn from(err: WyrdQueueError) -> Self {
-        if let WyrdQueueError::Sink(inner) = err {
-            return inner;
-        }
+        let err = match err {
+            WyrdQueueError::Sink(inner) => return inner,
+            WyrdQueueError::Variant(inner) => return inner.into(),
+            other => other,
+        };
         let code = err.code();
         let message = err.to_string();
         WyrdError::from_code(code, message.clone(), serde_json::json!({})).unwrap_or(

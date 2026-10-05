@@ -36,6 +36,7 @@ use wyrd_client::cards::{
 use wyrd_client::observe::{EvalObservationOptions, Run};
 use wyrd_client::state::WyrdState;
 use wyrd_client::{QueueConfig, WyrdClient};
+use wyrd_queue::variant::variant_cell_to_json;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_server::verification::{RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
@@ -389,6 +390,33 @@ fn texts(batches: &[RecordBatch]) -> Result<Vec<Option<String>>, ServerJourneyEr
             .ok_or("the cast column is not text")?;
         for row in 0..column.len() {
             values.push(column.is_valid(row).then(|| column.value(row).to_owned()));
+        }
+    }
+    Ok(values)
+}
+
+/// Every Variant cell of column `index` of `batches`, rendered as JSON text.
+///
+/// A null cell is `None`; a stored JSON null renders as the text `null`.
+///
+/// # Errors
+/// Returns an error when the column is absent or a cell is not a valid
+/// Variant.
+fn variant_texts(
+    batches: &[RecordBatch],
+    index: usize,
+) -> Result<Vec<Option<String>>, ServerJourneyError> {
+    let mut values = Vec::new();
+    for batch in batches {
+        let column = batch.column(index);
+        for row in 0..column.len() {
+            if column.is_null(row) {
+                values.push(None);
+                continue;
+            }
+            let value = variant_cell_to_json(column.as_ref(), row)
+                .map_err(|violation| format!("a Variant cell does not decode: {violation:?}"))?;
+            values.push(Some(serde_json::to_string(&value)?));
         }
     }
     Ok(values)
@@ -904,7 +932,7 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
 
     // Redacted capture stores no `actual`.
     let ungated = run_of(&runs, "eval-ungated", &pass)?;
-    let actual = texts(
+    let actual = variant_texts(
         &query(
             &server,
             tenant,
@@ -914,6 +942,7 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
             ),
         )
         .await?,
+        0,
     )?;
     if actual != [None] {
         return Err(format!("redacted capture stored {actual:?}").into());
@@ -1024,7 +1053,7 @@ fn unstamped_observation(subject: &wyrd_spec::reference::CardRef, record: &str) 
         .append_json_row(
             &json!({
                 "record_id": record,
-                "context": json!({ "answer": "yes" }).to_string(),
+                "context": { "answer": "yes" },
                 "created_at": chrono::Utc::now().to_rfc3339(),
             })
             .to_string(),
@@ -1550,20 +1579,25 @@ impl TraceJourney {
     /// Returns the query error.
     async fn items(&self, result: Option<uuid::Uuid>) -> Result<Vec<String>, ServerJourneyError> {
         let result = result.ok_or("the run has no result")?;
-        let mut items: Vec<String> = texts(
-            &query(
-                &self.server,
-                self.tenant,
+        let batches = query(
+            &self.server,
+            self.tenant,
+            format!(
+                "SELECT task_id, actual FROM vala.eval.result_items WHERE result_id = '{result}'"
+            ),
+        )
+        .await?;
+        let mut items: Vec<String> = texts(&batches)?
+            .into_iter()
+            .zip(variant_texts(&batches, 1)?)
+            .map(|(task, actual)| {
                 format!(
-                    "SELECT task_id || '=' || actual FROM vala.eval.result_items \
-                     WHERE result_id = '{result}'"
-                ),
-            )
-            .await?,
-        )?
-        .into_iter()
-        .map(Option::unwrap_or_default)
-        .collect();
+                    "{}={}",
+                    task.unwrap_or_default(),
+                    actual.unwrap_or_default()
+                )
+            })
+            .collect();
         items.sort();
         Ok(items)
     }
@@ -1605,7 +1639,7 @@ fn stamped_observation(
         .append_json_row(
             &json!({
                 "record_id": record,
-                "context": json!({ "marker": record }).to_string(),
+                "context": { "marker": record },
                 "trace_id": trace,
                 "created_at": at.to_rfc3339(),
             })

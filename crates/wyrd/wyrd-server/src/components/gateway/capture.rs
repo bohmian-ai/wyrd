@@ -17,7 +17,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arrow::array::RecordBatch;
+use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::StreamWriter;
 use arrow::json::ReaderBuilder;
@@ -35,11 +35,12 @@ use vala_bifrost_redux::cluster::ClusterRegistry;
 use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeError, ScribeIngressFrame};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
-use vala_bifrost_redux::tables::gateway::CallsTable;
+use vala_bifrost_redux::tables::gateway::{CallsTable, REQUEST_PAYLOAD, RESPONSE_PAYLOAD};
 use vala_bifrost_redux::tables::signal::correlation_fields;
 use vala_bifrost_redux::tables::traces::project_resource_spans;
 use vala_bifrost_redux::tables::{DomainTable, SpansTable};
 use wyrd_gateway::{AttemptRecord, IngressDialect, MediaRequest, UploadContent};
+use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalId};
@@ -463,23 +464,51 @@ impl CallCapture {
     /// Builds the one-row `vala.gateway.calls` batch over the table's user
     /// fields followed by its null `card_ref` and `run_id` correlation inputs.
     ///
+    /// The scalar columns decode from the serialized payload; the
+    /// `request_payload` and `response_payload` Variant columns encode the
+    /// payload's redacted canonical JSON texts, keeping their JSON types.
+    ///
     /// # Errors
     ///
-    /// Returns [`CaptureDrop::Projection`] when Arrow cannot decode the row.
+    /// Returns [`CaptureDrop::Projection`] when Arrow cannot decode the row
+    /// and [`CaptureDrop::Payload`] when a selected payload exceeds a Variant
+    /// limit.
     pub(crate) fn calls_batch(&self) -> Result<RecordBatch, CaptureDrop> {
         let mut fields = CallsTable::arrow_fields();
         fields.extend(correlation_fields());
-        let mut decoder = ReaderBuilder::new(Arc::new(Schema::new(fields)))
+        let schema = Arc::new(Schema::new(fields));
+        let scalars = Schema::new(
+            schema
+                .fields()
+                .iter()
+                .filter(|field| !is_payload_column(field.name()))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let mut decoder = ReaderBuilder::new(Arc::new(scalars))
             .build_decoder()
             .map_err(|_| CaptureDrop::Projection)?;
         decoder
             .serialize(std::slice::from_ref(&self.payload))
             .map_err(|_| CaptureDrop::Projection)?;
-        decoder
+        let decoded = decoder
             .flush()
             .ok()
             .flatten()
-            .ok_or(CaptureDrop::Projection)
+            .ok_or(CaptureDrop::Projection)?;
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| match field.name().as_str() {
+                REQUEST_PAYLOAD => payload_column(self.payload.request_payload_json.as_deref()),
+                RESPONSE_PAYLOAD => payload_column(self.payload.response_payload_json.as_deref()),
+                name => decoded
+                    .column_by_name(name)
+                    .cloned()
+                    .ok_or(CaptureDrop::Projection),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        RecordBatch::try_new(schema, columns).map_err(|_| CaptureDrop::Projection)
     }
 
     /// Builds the canonical `vala.traces.spans` batch of the attempt spans.
@@ -978,6 +1007,29 @@ impl PayloadObjects {
     }
 }
 
+/// Whether `name` is one of the two Variant payload columns of
+/// `vala.gateway.calls`, which the JSON row decoder cannot build.
+fn is_payload_column(name: &str) -> bool {
+    name == REQUEST_PAYLOAD || name == RESPONSE_PAYLOAD
+}
+
+/// Encodes one optional canonical JSON payload text as a one-row Variant
+/// column; an unselected payload is a null row.
+///
+/// # Errors
+///
+/// Returns [`CaptureDrop::Payload`] when the text is not JSON or exceeds a
+/// Variant limit, so the capture is dropped rather than stored partially.
+fn payload_column(text: Option<&str>) -> Result<ArrayRef, CaptureDrop> {
+    let encoded = text
+        .map(EncodedVariant::from_json_text)
+        .transpose()
+        .map_err(|_| CaptureDrop::Payload)?;
+    let mut builder = VariantColumnBuilder::with_capacity(1);
+    builder.append_option(encoded.as_ref());
+    Ok(builder.finish())
+}
+
 /// Redacts `value`, collecting substituted binary content into `objects`, and
 /// returns its RFC 8785 canonical JSON.
 ///
@@ -1362,7 +1414,7 @@ mod tests {
 
         let calls = capture.calls_batch().expect("calls batch");
         assert_eq!(calls.num_rows(), 1);
-        for column in ["card_ref", "run_id", "request_payload_json"] {
+        for column in ["card_ref", "run_id", "request_payload", "response_payload"] {
             let array = calls.column_by_name(column).expect(column);
             assert_eq!(array.null_count(), 1, "{column} is null");
         }

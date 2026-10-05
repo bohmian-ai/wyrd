@@ -15,7 +15,7 @@ use wyrd_spec::ids::CardUid;
 use crate::contracts::ScribeError;
 use crate::scribe::execution_lanes::resolve_card_uids;
 
-use crate::tables::fields::{fixed_binary, ts_us_utc, utf8};
+use crate::tables::fields::{fixed_binary, ts_us_utc, utf8, variant};
 use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, daily_layout, sort_desc};
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
@@ -28,7 +28,7 @@ use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 /// and carries no Verifier or binding identity. `trace_id` and `span_id` use
 /// the same fixed-width binary identities as `vala.traces.spans` so an Eval
 /// record joins directly to the span that produced it. `context` and `media`
-/// are canonical JSON text and are classified sensitive, so projecting them
+/// are Variants holding the record's JSON values and are classified sensitive, so projecting them
 /// requires the elevated payload permission.
 pub struct ObservationsTable;
 
@@ -49,11 +49,11 @@ impl DomainTable for ObservationsTable {
         vec![
             utf8("record_id", false),
             utf8("session_id", true),
-            utf8("context", false),
+            variant("context", false),
             fixed_binary("trace_id", 16, true),
             fixed_binary("span_id", 8, true),
             ts_us_utc("created_at", false),
-            utf8("media", true),
+            variant("media", true),
         ]
     }
 

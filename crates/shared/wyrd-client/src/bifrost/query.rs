@@ -175,6 +175,9 @@ fn queue_catalog_error(error: &WyrdQueueError) -> WyrdError {
                 column: column.clone(),
             },
         },
+        WyrdQueueError::Variant(error) => WyrdError::Vala {
+            error: error.clone(),
+        },
         WyrdQueueError::Sink(inner) => inner.clone(),
     }
 }

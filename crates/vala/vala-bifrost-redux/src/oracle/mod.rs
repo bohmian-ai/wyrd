@@ -4532,11 +4532,11 @@ mod tests {
             }
         }
         for sql in [
-            "SELECT request_payload_json FROM vala.gateway.calls",
+            "SELECT request_payload FROM vala.gateway.calls",
             "SELECT * FROM vala.gateway.calls",
-            "SELECT call_id FROM vala.gateway.calls WHERE response_payload_json LIKE '%key%'",
+            "SELECT call_id FROM vala.gateway.calls WHERE response_payload IS NOT NULL",
             "SELECT count(*) FROM vala.logs.records WHERE EXISTS \
-             (SELECT 1 FROM vala.gateway.calls WHERE request_payload_json IS NOT NULL)",
+             (SELECT 1 FROM vala.gateway.calls WHERE request_payload IS NOT NULL)",
         ] {
             assert!(
                 matches!(
@@ -4572,7 +4572,7 @@ mod tests {
         assert!(matches!(
             authorize_payload_columns(
                 &metadata,
-                &typed("SELECT response_payload_json FROM vala.gateway.calls").await
+                &typed("SELECT response_payload FROM vala.gateway.calls").await
             ),
             Err(BifrostError::QueryForbidden)
         ));

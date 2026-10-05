@@ -2,7 +2,7 @@ use arrow::datatypes::{DataType, Field};
 
 use crate::catalog::TableRef;
 use crate::namespaces::BifrostNamespace;
-use crate::tables::fields::utf8;
+use crate::tables::fields::{utf8, variant};
 use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, sort_asc, sort_desc};
 use wyrd_spec::vala::api::{PhysicalLayoutWire, TimeGranularityWire};
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
@@ -34,6 +34,11 @@ impl AuditLogTable {
     }
 }
 
+/// The content column holding the decision's structured detail as a Variant.
+///
+/// The value decodes to exactly the canonical JSON the entry hash covered.
+pub const DETAIL: &str = "detail";
+
 /// The content column naming the credential a decision was made against.
 pub const CREDENTIAL_ID: &str = "credential_id";
 
@@ -58,7 +63,7 @@ impl DomainTable for AuditLogTable {
             utf8("principal_kind", false),
             utf8("permission", false),
             utf8("outcome", false),
-            utf8("detail", true),
+            variant(DETAIL, true),
             utf8(CREDENTIAL_ID, true),
         ]
     }

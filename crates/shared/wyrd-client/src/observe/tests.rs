@@ -862,11 +862,12 @@ fn eval_projects_context_media_and_trace_identity() {
     assert_eq!(row["trace_id"], json!("0102030405060708090a0b0c0d0e0f10"));
     assert_eq!(row["span_id"], json!("1112131415161718"));
     assert_eq!(row["session_id"], json!(uuid::Uuid::nil().to_string()));
-    let context: Value = serde_json::from_str(row["context"].as_str().expect("context text"))
-        .expect("context is canonical JSON text");
-    assert_eq!(context, json!({ "question": "why?", "answer": "because" }));
-    let media: Value = serde_json::from_str(row["media"].as_str().expect("media text"))
-        .expect("media is canonical JSON text");
+    assert_eq!(
+        row["context"],
+        json!({ "question": "why?", "answer": "because" }),
+        "context stays a JSON value for its Variant column"
+    );
+    let media = &row["media"];
     assert_eq!(media[0]["id"], json!("screenshot"));
     assert_eq!(media[0]["uri"], json!("s3://bucket/shot.png"));
     assert_eq!(

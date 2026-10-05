@@ -1,11 +1,12 @@
 //! `vala.verification.results` — one row per completed Verifier run.
 //!
-//! Owns the shared verdict schema, its sensitive `details` payload, and the
-//! Bloom columns a result lookup by id, subject, or binding prunes on.
+//! Owns the shared verdict schema, its sensitive `drift_report` and
+//! `eval_summary` Struct payloads, and the Bloom columns a result lookup by id,
+//! subject, or binding prunes on.
 
-use arrow::datatypes::Field;
+use arrow::datatypes::{DataType, Field, Fields};
 
-use crate::tables::fields::{ts_us_utc, utf8};
+use crate::tables::fields::{float64, int32, int64, ts_us_utc, utf8, variant};
 use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, daily_layout, sort_desc};
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
@@ -14,16 +15,51 @@ use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 ///
 /// Drift and Eval share this table so a dashboard reads one verdict surface
 /// regardless of implementation; `implementation` selects which detail table
-/// and which `details` payload shape applies. Only `completed` runs appear:
-/// errored, timed-out, and still-running executions have no row here, so the
-/// presence of a row is itself the statement that the run produced a verdict.
-/// `details` is the one implementation-specific summary — a `DriftReport` or an
-/// `EvalWorkflowSummary` — and is null only for a completed Drift execution
-/// that could not score valid input, which is recorded rather than fabricated.
+/// and which summary column applies. Only `completed` runs appear: errored,
+/// timed-out, and still-running executions have no row here, so the presence
+/// of a row is itself the statement that the run produced a verdict.
+/// A scored Drift result sets only [`DRIFT_REPORT`], the typed `DriftReport`;
+/// a scored Eval result sets only [`EVAL_SUMMARY`], the typed
+/// `EvalWorkflowSummary`; a completed Drift execution that could not score
+/// valid input sets neither, which is recorded rather than fabricated.
 /// The managed `run_id` is the Verifier run and the managed `card_uid` is the
 /// Verifier Card; the verified subject and binding owner are separate payload
 /// columns, both null for a direct Verifier run with no binding.
 pub struct ResultsTable;
+
+/// Typed `DriftReport` column: method, open per-feature reports, and verdict.
+pub const DRIFT_REPORT: &str = "drift_report";
+
+/// Typed `EvalWorkflowSummary` column: executed-task counts and duration.
+pub const EVAL_SUMMARY: &str = "eval_summary";
+
+impl ResultsTable {
+    /// Children of [`DRIFT_REPORT`] in persisted order.
+    ///
+    /// `method` and `verdict` hold the owning enums' serialized names;
+    /// `features` is a Variant because feature names are open. Every child is
+    /// non-null: a null report is a null struct, never a partial one.
+    #[must_use]
+    pub fn drift_report_fields() -> Fields {
+        Fields::from(vec![
+            utf8("method", false),
+            variant("features", false),
+            utf8("verdict", false),
+        ])
+    }
+
+    /// Children of [`EVAL_SUMMARY`] in persisted order, all non-null.
+    #[must_use]
+    pub fn eval_summary_fields() -> Fields {
+        Fields::from(vec![
+            int32("total_tasks", false),
+            int32("passed_tasks", false),
+            int32("failed_tasks", false),
+            float64("pass_rate", false),
+            int64("duration_ms", false),
+        ])
+    }
+}
 
 impl DomainTable for ResultsTable {
     /// Lives in `vala.verification`, the namespace the catalog registers it under.
@@ -32,10 +68,10 @@ impl DomainTable for ResultsTable {
     const NAME: &'static str = "results";
     /// The server appends and stamps the managed Verifier `run_id`, Verifier `card_uid`, and `principal_id`.
     const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;
-    /// The `details` summary makes projecting this table require the elevated payload permission.
+    /// The implementation summaries make projecting this table require the elevated payload permission.
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
-    /// The implementation-specific summary column gated behind the elevated payload permission.
-    const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &["details"];
+    /// The implementation-specific summary columns gated behind the elevated payload permission.
+    const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[DRIFT_REPORT, EVAL_SUMMARY];
 
     /// Authored columns in order; managed correlation and system columns are appended by the catalog.
     fn arrow_fields() -> Vec<Field> {
@@ -54,7 +90,16 @@ impl DomainTable for ResultsTable {
             ts_us_utc("window_end", true),
             ts_us_utc("started_at", false),
             ts_us_utc("ended_at", false),
-            utf8("details", true),
+            Field::new(
+                DRIFT_REPORT,
+                DataType::Struct(Self::drift_report_fields()),
+                true,
+            ),
+            Field::new(
+                EVAL_SUMMARY,
+                DataType::Struct(Self::eval_summary_fields()),
+                true,
+            ),
         ]
     }
 

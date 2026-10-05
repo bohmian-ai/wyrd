@@ -18,10 +18,11 @@ use arrow::ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use serde_json::{Map, Value};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::vala::api::BifrostTableDescription;
+use wyrd_spec::vala::api::{BifrostTableDescription, VARIANT_EXTENSION_NAME};
 use wyrd_spec::vala::ids::RunId;
 
 use crate::error::WyrdQueueError;
+use crate::variant::{EncodedVariant, VariantColumnBuilder};
 
 /// Reserved per-row correlation column carrying the client's card reference.
 pub const CARD_REF_COLUMN: &str = "card_ref";
@@ -237,16 +238,21 @@ fn collect<T>(
 /// that column; a missing value becomes null only when the field is nullable.
 /// `FixedSizeBinary` columns take canonical lowercase hex text and decode it to
 /// exactly the declared width, so trace and span ids land as the same bytes
-/// `vala.traces.spans` stores.
+/// `vala.traces.spans` stores. A Variant column takes any JSON value and keeps
+/// its JSON types; JSON `null` or an absent key is a null row.
 ///
 /// # Errors
 ///
 /// Returns [`WyrdQueueError::SchemaParse`] when a value does not convert to
 /// the column type (including malformed or wrong-width hex), when a required
-/// value is null or missing, or when the data type is unsupported.
+/// value is null or missing, or when the data type is unsupported, and
+/// [`WyrdQueueError::Variant`] when a Variant value exceeds a Variant limit.
 fn build_column(field: &Field, rows: &[BuiltRow]) -> Result<ArrayRef, WyrdQueueError> {
     let name = field.name();
     let nullable = field.is_nullable();
+    if field.extension_type_name() == Some(VARIANT_EXTENSION_NAME) {
+        return build_variant_column(name, rows, nullable);
+    }
     let array: ArrayRef = match field.data_type() {
         DataType::Boolean => Arc::new(BooleanArray::from(collect(
             name,
@@ -328,6 +334,35 @@ fn build_column(field: &Field, rows: &[BuiltRow]) -> Result<ArrayRef, WyrdQueueE
         }
     };
     Ok(array)
+}
+
+/// Build one Variant column from each row's JSON value for `name`.
+///
+/// # Errors
+///
+/// Returns [`WyrdQueueError::SchemaParse`] when a non-nullable column has a
+/// null or absent value, and [`WyrdQueueError::Variant`] naming the field and
+/// row when a value exceeds a Variant limit.
+fn build_variant_column(
+    name: &str,
+    rows: &[BuiltRow],
+    nullable: bool,
+) -> Result<ArrayRef, WyrdQueueError> {
+    let values = collect(name, rows, nullable, |value| Some(value.clone()))?;
+    let mut builder = VariantColumnBuilder::with_capacity(values.len());
+    for (row, value) in values.iter().enumerate() {
+        let encoded = value
+            .as_ref()
+            .map(EncodedVariant::from_json)
+            .transpose()
+            .map_err(|violation| {
+                WyrdQueueError::Variant(
+                    violation.into_error(name, u64::try_from(row).unwrap_or(u64::MAX)),
+                )
+            })?;
+        builder.append_option(encoded.as_ref());
+    }
+    Ok(builder.finish())
 }
 
 /// Decode exactly `width` bytes from canonical lowercase hex.

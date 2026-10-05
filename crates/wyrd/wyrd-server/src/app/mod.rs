@@ -9,7 +9,9 @@ use tracing::info;
 use wyrd_telemetry::TelemetryGuard;
 
 use crate::app::metrics::{WyrdTelemetryRuntime, metrics_router, serve_metrics};
-use crate::app::supervise::{TaskExit, TaskId, fallible_task, supervise, worker_task};
+use crate::app::supervise::{
+    TaskExit, TaskId, fallible_task, restarting_worker, supervise, worker_task,
+};
 use crate::boot::{
     BootedServer, StateOverrides, build_state, production_guards, spawn_forge_worker,
 };
@@ -100,12 +102,13 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
 ///
 /// The only optional listener is the existing metrics endpoint. Forge task
 /// execution and the signal watcher share the same bounded supervisor used by
-/// the server topology.
+/// the server topology. The Forge worker runs under [`restarting_worker`], so
+/// a failed instance is replaced in place rather than ending the process.
 ///
 /// # Errors
 ///
-/// Returns listener, worker construction, worker execution, or supervision
-/// failures through [`BootExit::Other`].
+/// Returns listener, first worker construction, resource-poison, or
+/// supervision failures through [`BootExit::Other`].
 async fn run_forge_worker_process(
     config: &WyrdServerConfig,
     state: AppState,
@@ -117,9 +120,14 @@ async fn run_forge_worker_process(
         .ok_or_else(|| BootExit::Other("configured Bifrost node identity is unavailable".into()))?;
     let shutdown = state.shutdown_token.clone();
     let mut set: JoinSet<TaskExit> = JoinSet::new();
-    let worker = spawn_forge_worker(&state, shutdown.clone())
-        .map_err(|error| BootExit::Other(Box::new(error)))?;
-    set.spawn(fallible_task(TaskId::Worker("forge_worker"), worker));
+    // A failed worker instance is replaced in place, so this process keeps its
+    // metrics endpoint and node identity while compaction is briefly unready.
+    let worker_state = state.clone();
+    let worker = restarting_worker("forge_worker", shutdown.clone(), move |token| {
+        spawn_forge_worker(&worker_state, token)
+    })
+    .map_err(|error| BootExit::Other(Box::new(error)))?;
+    set.spawn(worker);
     if let Some(health) = state.bifrost.resource_health() {
         set.spawn(fallible_task(
             TaskId::Worker("bifrost_resource_health"),
@@ -271,6 +279,15 @@ mod tests {
 
     /// The API lifecycle has no worker-only branch, while the dedicated runner
     /// has exactly one top-level worker construction path.
+    ///
+    /// Every Forge loop is owned by exactly one restarting supervisor whose
+    /// constructor is that single path, so a restarted instance is the same
+    /// boot-composed worker rather than a second owner.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a composition site gains a second construction path, loses
+    /// its restarting owner, or supervises a Forge loop as process-terminal.
     #[test]
     fn process_role_composition_has_one_dedicated_worker_runner() {
         let dedicated_runner = include_str!("mod.rs");
@@ -324,5 +341,28 @@ mod tests {
             1,
             "All must compose exactly one embedded Forge worker"
         );
+
+        // Each construction above is the one constructor its restarting owner
+        // calls again after a failure, so a restart rebuilds from the same
+        // boot-composed worker (and its boot-resolved identity) rather than
+        // from a second construction path.
+        for (source, owner) in [
+            (production_runner, "restarting_worker(\"forge_worker\""),
+            (server, "restarting_worker(\"forge_worker\""),
+            (server, "restarting_worker(\"maintenance_scheduler\""),
+        ] {
+            assert_eq!(
+                source.matches(owner).count(),
+                1,
+                "{owner} must own its Forge loop exactly once"
+            );
+        }
+        for source in [production_runner, server] {
+            assert!(
+                !source.contains("TaskId::Worker(\"forge_worker\")")
+                    && !source.contains("TaskId::Worker(\"maintenance_scheduler\")"),
+                "a Forge loop must not be supervised as a process-terminal task"
+            );
+        }
     }
 }

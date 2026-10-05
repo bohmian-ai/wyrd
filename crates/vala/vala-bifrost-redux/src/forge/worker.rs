@@ -2402,22 +2402,81 @@ impl ForgeWorker {
     /// loop read the database never answered: reclaim, the recovery claim, the
     /// unattended-authority question, and the fair claim back off through
     /// [`Self::answered`] with readiness retracted, and the next turn retries.
+    ///
+    /// # Cancellation
+    ///
+    /// Every exit, including a failure, first joins every plan runner and
+    /// claim heartbeat this loop spawned, so a stopped loop leaves no task of
+    /// its own behind.
     async fn run_event_loop(&mut self, shutdown: CancellationToken) -> Result<(), ForgeError> {
-        let claim_limits = self.claim_limits()?;
-        // One worker owns exactly one maintenance execution position, and it is
-        // outside the compaction queue: maintenance strategies are tried first
-        // on every pass so a ready snapshot expiry is never starved behind
-        // compaction backlog.
-        let reserved_maintenance = true;
         // One FIFO, one attempt map, and one completion channel for the whole
         // worker. Constructing them here rather than per attempt is what makes
         // the parallelism and memory budgets describe this worker's real load:
         // two tasks claimed a moment apart compete for the same room, in the
         // order their plans were offered.
         let mut pool = ForgeAttemptPool::new(&self.config);
+        // Boxed for the same layout-depth reason `run` boxes this loop.
+        let outcome = Box::pin(self.drive_event_loop(&mut pool, shutdown.clone())).await;
+        shutdown.cancel();
+        Self::join_spawned(&mut pool).await;
+        outcome
+    }
+
+    /// Joins every task the event loop spawned and still holds.
+    ///
+    /// Called with the loop's stop token already cancelled. Running plans
+    /// observe it at their safe boundaries and send their one completion; each
+    /// completion is recorded so the attempt it drains can be joined. Every
+    /// attempt left in the pool then has its claim heartbeat joined; the
+    /// heartbeat exits because its operation token is a child of the cancelled
+    /// stop token. Nothing is settled here: whatever an unsettled attempt left
+    /// durable is recovered by the next owner's startup drain.
+    ///
+    /// # Cancellation
+    ///
+    /// Waits for each running plan to reach a safe boundary, exactly as a clean
+    /// shutdown does; a plan that never completes holds this join.
+    async fn join_spawned(pool: &mut ForgeAttemptPool) {
+        let mut drained = Vec::new();
+        while pool.attempts.values().any(|state| state.running > 0) {
+            let Some(completion) = pool.completion_rx.recv().await else {
+                break;
+            };
+            match Self::record_plan_completion(pool, completion) {
+                Ok(Some(state)) => drained.push(state),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "Forge plan completion could not be recorded while joining a stopped loop");
+                }
+            }
+        }
+        drained.extend(pool.attempts.drain().map(|(_, state)| state));
+        for state in drained {
+            if let Err(error) = state.fenced.heartbeat.await {
+                tracing::warn!(error = %error, "Forge claim heartbeat panicked while joining a stopped loop");
+            }
+        }
+    }
+
+    /// Runs the event loop body over the worker's one attempt pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failures documented on [`Self::run_event_loop`].
+    async fn drive_event_loop(
+        &mut self,
+        pool: &mut ForgeAttemptPool,
+        shutdown: CancellationToken,
+    ) -> Result<(), ForgeError> {
+        let claim_limits = self.claim_limits()?;
+        // One worker owns exactly one maintenance execution position, and it is
+        // outside the compaction queue: maintenance strategies are tried first
+        // on every pass so a ready snapshot expiry is never starved behind
+        // compaction backlog.
+        let reserved_maintenance = true;
         let mut next_pull = Instant::now();
         loop {
-            let stranded = self.start_fitting_plans(&mut pool, &shutdown);
+            let stranded = self.start_fitting_plans(pool, &shutdown);
             for state in stranded {
                 self.settle_or_release_attempt(state, &shutdown).await?;
             }
@@ -2434,7 +2493,7 @@ impl ForgeWorker {
                     // now may be written durably, and the successor owns that
                     // proof.
                     if let Some(completion) = pool.completion_rx.recv().await
-                        && let Some(state) = Self::record_plan_completion(&mut pool, completion)?
+                        && let Some(state) = Self::record_plan_completion(pool, completion)?
                     {
                         self.settle_or_release_attempt(state, &shutdown).await?;
                     }
@@ -2447,11 +2506,7 @@ impl ForgeWorker {
             let reclaimed = self
                 .reclaim_expired_attempts(claim_limits.max_active_per_tenant)
                 .await;
-            if self
-                .answered(reclaimed, &mut pool, &shutdown)
-                .await?
-                .is_none()
-            {
+            if self.answered(reclaimed, pool, &shutdown).await?.is_none() {
                 continue;
             }
             // Checked immediately before each durable claim so a stop signal
@@ -2460,7 +2515,7 @@ impl ForgeWorker {
                 continue;
             }
             let prepared = self.claim_prepared(claim_limits).await;
-            match self.answered(prepared, &mut pool, &shutdown).await? {
+            match self.answered(prepared, pool, &shutdown).await? {
                 Some(Some(prepared)) => {
                     self.reconcile_claimed_prepared(prepared, &shutdown).await?;
                     continue;
@@ -2475,7 +2530,7 @@ impl ForgeWorker {
             // authority is acquired, so the budget a finished plan freed is the
             // budget the pull calculation below sees.
             while let Ok(completion) = pool.completion_rx.try_recv() {
-                if let Some(state) = Self::record_plan_completion(&mut pool, completion)? {
+                if let Some(state) = Self::record_plan_completion(pool, completion)? {
                     self.settle_or_release_attempt(state, &shutdown).await?;
                 }
             }
@@ -2485,8 +2540,8 @@ impl ForgeWorker {
             if shutdown.is_cancelled() {
                 continue;
             }
-            let unattended = self.holds_unattended_authority(&pool).await;
-            let Some(unattended) = self.answered(unattended, &mut pool, &shutdown).await? else {
+            let unattended = self.holds_unattended_authority(pool).await;
+            let Some(unattended) = self.answered(unattended, pool, &shutdown).await? else {
                 continue;
             };
             if unattended {
@@ -2499,20 +2554,20 @@ impl ForgeWorker {
                 // taken. Attempts already admitted keep draining: they are
                 // attended work with owners that can still settle them.
                 self.publish_readiness(false);
-                self.wait_for_progress(&mut pool, &shutdown).await?;
+                self.wait_for_progress(pool, &shutdown).await?;
                 continue;
             }
             self.publish_readiness(true);
-            if self.free_pull_room(&pool) == 0 {
+            if self.free_pull_room(pool) == 0 {
                 // No running parallelism remains, so this turn acquires no
                 // authority at all. Waiting plans keep their pending
                 // reservation; it does not authorize a pull.
-                Box::pin(self.await_loop_event(&mut pool, None, &shutdown)).await?;
+                Box::pin(self.await_loop_event(pool, None, &shutdown)).await?;
                 continue;
             }
             let Some(claimed) = self
                 .pull_claimed_tasks(
-                    &mut pool,
+                    pool,
                     claim_limits,
                     reserved_maintenance,
                     &mut next_pull,
@@ -2536,7 +2591,7 @@ impl ForgeWorker {
             // running plan is the idle wait, because polling for new work on a
             // timer would delay the settlement that frees its budget. The one
             // timer is the leader pull, which this worker has room for.
-            Box::pin(self.await_loop_event(&mut pool, Some(next_pull), &shutdown)).await?;
+            Box::pin(self.await_loop_event(pool, Some(next_pull), &shutdown)).await?;
         }
     }
 

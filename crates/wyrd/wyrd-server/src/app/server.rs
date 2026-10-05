@@ -17,7 +17,7 @@ use crate::app::metrics::{install_recorder, metrics_router, serve_metrics};
 use crate::app::serve::serve;
 use crate::app::supervise::{
     TaskExit, TaskId, classify_first_exit_with_shutdown, drain_with_shutdown_hooks, fallible_task,
-    worker_task,
+    restarting_worker, worker_task,
 };
 use crate::boot::{
     ServerBootError, check_card_recovery_pool, spawn_maintenance_scheduler, spawn_storage_sweeper,
@@ -619,24 +619,34 @@ impl BoundServer {
                 }
             }));
         }
-        // One supervised Redux Forge worker owns compaction, expiry, reconciliation,
-        // live-set rebuild, and orphan GC for this process.
-        if let Some(scheduler) = spawn_maintenance_scheduler(&self.state, shutdown.clone())
-            .map_err(|e| BootExit::Other(Box::new(e)))?
-        {
-            set.spawn(fallible_task(
-                TaskId::Worker("maintenance_scheduler"),
-                scheduler,
-            ));
+        // One supervised Redux Forge scheduler owns compaction, expiry,
+        // reconciliation, live-set rebuild, and orphan GC for this process. A
+        // Forge failure costs only maintenance on this pod, so the scheduler and
+        // the embedded worker restart in place instead of stopping the API.
+        if self.state.forge_handle().is_some() {
+            let state = self.state.clone();
+            let scheduler =
+                restarting_worker("maintenance_scheduler", shutdown.clone(), move |token| {
+                    spawn_maintenance_scheduler(&state, token)?.ok_or_else(|| {
+                        ServerBootError::ForgeSchedulerRequired {
+                            detail: "Forge maintenance owner is no longer composed".to_owned(),
+                        }
+                    })
+                })
+                .map_err(|e| BootExit::Other(Box::new(e)))?;
+            set.spawn(scheduler);
         }
         // `All` owns one bounded Forge worker in addition to the scheduler;
         // `Server` intentionally schedules maintenance without executing it.
         // The dedicated `ForgeWorker` process is composed by
         // `run_forge_worker_process` and never reaches this serving owner.
         if self.config.role == BifrostTarget::All {
-            let worker = crate::boot::spawn_forge_worker(&self.state, shutdown.clone())
-                .map_err(|e| BootExit::Other(Box::new(e)))?;
-            set.spawn(fallible_task(TaskId::Worker("forge_worker"), worker));
+            let state = self.state.clone();
+            let worker = restarting_worker("forge_worker", shutdown.clone(), move |token| {
+                crate::boot::spawn_forge_worker(&state, token)
+            })
+            .map_err(|e| BootExit::Other(Box::new(e)))?;
+            set.spawn(worker);
         }
 
         if let Some(operator) = self.state.postgres.operator_pool() {

@@ -872,6 +872,12 @@ and objects of a table with an active Oracle read, are hard GC roots even
 when no Iceberg snapshot references them. Once the last reader releases,
 expired-object cleanup deletes without an age floor and removes the matching
 terminal `file_list` row in the same completion transaction.
+Every destructive effect holds the table's exclusive maintenance authority
+through its known outcome, and the Forge lease TTL bounds that hold: an
+object-store call still running at the bound is an uncertain effect left for
+idempotent replay, so a hung store never blocks the table's readers
+indefinitely. An Oracle cut that waits on the authority waits at most until
+its query deadline and then fails with the query timeout.
 An open Scribe fragment retains its local Arrow batches and staged resources
 until its stream completes or drops. It names no Forge-collectable object and
 contributes no independent Forge GC root.

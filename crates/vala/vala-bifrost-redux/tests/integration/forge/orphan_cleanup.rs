@@ -1580,3 +1580,86 @@ async fn assert_takeover_replays_the_same_batch(
         "a completed orphan task carries no resume position: {evidence:?}"
     );
 }
+
+/// Proves a hung orphan delete surrenders the table's exclusive authority at
+/// the lease bound and retains its prepared batch for replay.
+///
+/// The delete is suspended inside the object store and never released, the
+/// shape of a hung store request. The worker's Forge runs a short lease TTL, so
+/// the bound arrives quickly: the batch stays one prepared operation under the
+/// standing attempt, and the maintenance-authority row is free for an Oracle
+/// cut again instead of being held for as long as the store hangs.
+///
+/// # Panics
+///
+/// Panics when the batch does not return within the scenario bound, settles,
+/// leaves anything but one prepared operation, or leaves the authority row
+/// locked.
+#[tokio::test]
+async fn hung_orphan_delete_surrenders_table_authority_at_the_lease_bound() {
+    let mut batch = one_eligible_orphan("orphan_hung_delete").await;
+    let lease_ttl = std::time::Duration::from_secs(6);
+    batch.promoted.fixture.config = vala_bifrost_redux::forge::ForgeConfig {
+        lease_ttl,
+        iceberg_total_retry_timeout: std::time::Duration::from_secs(2),
+        catalog_request_timeout: std::time::Duration::from_secs(2),
+        uncertainty_margin: std::time::Duration::from_secs(1),
+        ..batch.promoted.fixture.config.clone()
+    };
+    let fixture = &batch.promoted.fixture;
+    let forge = fixture.build_forge_for_test(
+        fixture.catalog.iceberg_catalog(),
+        Arc::clone(&batch.store) as Arc<dyn ForgeObjectStore>,
+        batch.forge.clock_for_test(),
+        vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new(),
+        vala_bifrost_redux::forge::ForgeSchedulerTrigger::with_owner_for_test(Uuid::now_v7()),
+    );
+    let owner = ForgeWorker::new(forge, ForgeWorkerConfig::default(), Uuid::now_v7())
+        .expect("short-lease Forge worker");
+    let claim = owner
+        .claim_for_test()
+        .await
+        .expect("claim transaction runs")
+        .expect("the ready orphan task is claimable");
+    let attempt = claim.attempt_id.expect("a claim carries its attempt");
+
+    batch.store.pause_delete_at(1);
+    let retained = tokio::time::timeout(
+        lease_ttl * 4,
+        owner.execute_orphan_cleanup_claim_for_test(claim, &CancellationToken::new()),
+    )
+    .await
+    .expect("a hung delete does not hold the batch past the lease bound")
+    .expect_err("a batch cut off at the bound does not settle the attempt");
+    assert!(
+        matches!(
+            retained,
+            vala_bifrost_redux::forge::ForgeError::ShutdownRetained
+        ),
+        "a prepared batch cut off at the bound retains its attempt for reclaim: {retained}"
+    );
+    assert_attempt_is_retained(fixture, batch.task_id, attempt).await;
+    let unresolved = orphan_operations(fixture).await;
+    assert!(
+        matches!(unresolved.as_slice(), [(_, phase)] if phase == "prepared"),
+        "the bounded batch stays one prepared operation: {unresolved:?}"
+    );
+
+    let identity = fixture.table_identity().await;
+    let mut probe = fixture
+        .operator_pool
+        .pool()
+        .begin()
+        .await
+        .expect("independent transaction");
+    sqlx::query("SELECT 1 FROM vala.bifrost_table_maintenance_authority WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4 FOR SHARE NOWAIT")
+        .bind(identity.tenant.as_uuid())
+        .bind(&identity.catalog_name)
+        .bind(&identity.namespace_name)
+        .bind(&identity.table_name)
+        .fetch_one(&mut *probe)
+        .await
+        .expect("the surrendered authority admits an Oracle cut's share lock");
+    probe.rollback().await.expect("end the probe transaction");
+    batch.store.release_delete();
+}

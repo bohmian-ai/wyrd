@@ -1485,8 +1485,14 @@ impl Forge {
     /// deleted-plus-skipped partition still covers the full candidate set and no
     /// deletion is attempted past the budget.
     ///
+    /// The lease TTL bounds the exclusive table authority the deletions hold,
+    /// so a hung object store cannot block Oracle cuts on the table
+    /// indefinitely; the authority is surrendered at the bound and the batch
+    /// is left for the idempotent replay.
+    ///
     /// # Errors
-    /// Returns lease, catalog, object-store, SQL, or audit failures.
+    /// Returns lease, catalog, object-store, SQL, or audit failures, and
+    /// [`ForgeError::Timeout`] when the deletions outlive the lease TTL.
     async fn delete_gc_batch(
         &self,
         lease: &mut ForgeLease,
@@ -1535,7 +1541,12 @@ impl Forge {
             .exclusive(table.key.tenant, &table.key.table_ref)
             .await?
         {
-            Some(exclusive) => {
+            // The lease TTL bounds the authority hold: an Oracle cut waits on
+            // this row, and the store has no request timeout of its own. A
+            // batch cut off at the bound leaves its operation open, and the
+            // idempotent replay re-proves every candidate.
+            Some(exclusive) => tokio::time::timeout(
+                self.core.config.lease_ttl,
                 self.apply_gc_deletions(
                     lease,
                     table,
@@ -1543,9 +1554,12 @@ impl Forge {
                     &protection,
                     candidate_paths,
                     request.deadline,
-                )
-                .await
-            }
+                ),
+            )
+            .await
+            .unwrap_or(Err(ForgeError::Timeout {
+                operation: "orphan-GC deletion under table authority",
+            })),
             None => Ok(GcDeletionTally {
                 skipped: candidate_paths
                     .iter()

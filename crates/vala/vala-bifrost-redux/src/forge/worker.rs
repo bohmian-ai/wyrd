@@ -7935,12 +7935,16 @@ impl ForgeWorker {
 
     /// Deletes every remaining candidate through the two-phase protocol.
     ///
-    /// Each candidate is handled alone and in order: prepare durably, close
-    /// Postgres, take a fresh reachability proof, submit the delete, then
-    /// settle. Postgres is never open across the object-store call, and the
-    /// frontier advances only for a confirmed deletion or a proven absence, so
-    /// a refusal or an uncertain acceptance retains the exact candidate for
-    /// replay instead of skipping it.
+    /// Each candidate is handled alone and in order: take the table's
+    /// exclusive authority, prepare durably, take a fresh reachability proof,
+    /// submit the delete, surrender the authority, then settle. The authority
+    /// transaction is the one Postgres transaction open across the
+    /// object-store calls, and the lease TTL bounds it: a proof or delete still
+    /// running at the bound is an unknown acceptance, so a hung store cannot
+    /// block Oracle cuts on the table indefinitely. The frontier advances only
+    /// for a confirmed deletion or a proven absence, so a refusal or an
+    /// uncertain acceptance retains the exact candidate for replay instead of
+    /// skipping it.
     ///
     /// # Errors
     ///
@@ -8031,7 +8035,7 @@ impl ForgeWorker {
             }
             prepared = false;
             let outcome = self
-                .attempt_cleanup_delete(attempt, lease, &exclusive, index, candidate, stop)
+                .bounded_cleanup_delete(attempt, lease, &exclusive, index, candidate, stop)
                 .await;
             drop(exclusive);
             authority_conn.commit().await.map_err(ForgeError::Sql)?;
@@ -8181,6 +8185,43 @@ impl ForgeWorker {
         require_running(stop)?;
         lease.require_fence(&self.forge.core.operator_pool).await?;
         Ok(Some(path))
+    }
+
+    /// Runs [`Self::attempt_cleanup_delete`] within the lease TTL.
+    ///
+    /// An Oracle cut waits on the exclusive authority this candidate holds,
+    /// and the object store has no request timeout of its own, so the lease
+    /// TTL bounds the hold. A proof or delete still running at the bound may
+    /// already have reached the store, so it is an unknown acceptance: the
+    /// candidate stays prepared for exact replay and the caller surrenders the
+    /// authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::attempt_cleanup_delete`] returns; the bound itself
+    /// never fails.
+    async fn bounded_cleanup_delete(
+        &self,
+        attempt: &CleanupAttempt<'_>,
+        lease: &mut ForgeLease,
+        exclusive: &ExclusiveTableAuthority<'_, '_>,
+        index: u32,
+        candidate: &ForgeCleanupCandidate,
+        stop: &CancellationToken,
+    ) -> Result<ExpiredCleanupOutcome, ForgeError> {
+        tokio::time::timeout(
+            self.forge.core.config.lease_ttl,
+            self.attempt_cleanup_delete(attempt, lease, exclusive, index, candidate, stop),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!(
+                task_id = %attempt.task_id,
+                index,
+                "expired cleanup delete outlived the lease bound; surrendering table authority"
+            );
+            Ok(ExpiredCleanupOutcome::Uncertain)
+        })
     }
 
     /// Takes one candidate's fresh proof and submits its deletion.

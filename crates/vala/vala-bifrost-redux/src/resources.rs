@@ -4234,18 +4234,23 @@ impl OracleExecution {
 
     /// Builds a default-featured session state for `config` under this grant.
     ///
-    /// Sessions that need upstream's distributed builder hooks compose
-    /// [`Self::configure`] and [`Self::runtime`] themselves; every other
-    /// session under a grant is built here.
+    /// The Oracle Variant SQL surface is installed before the state exists,
+    /// so admission execution and follower decode resolve the same functions
+    /// the leader planned with. Sessions that need upstream's distributed
+    /// builder hooks compose [`Self::configure`] and [`Self::runtime`]
+    /// themselves; every other session under a grant is built here.
     #[must_use]
     pub fn session_state(
         &self,
         config: datafusion::execution::context::SessionConfig,
     ) -> datafusion::execution::SessionState {
-        datafusion::execution::SessionStateBuilder::new()
-            .with_default_features()
-            .with_config(self.configure(config))
-            .with_runtime_env(Arc::clone(&self.runtime))
+        crate::oracle::variant_sql::OracleVariantSql::shared()
+            .install(
+                datafusion::execution::SessionStateBuilder::new()
+                    .with_default_features()
+                    .with_config(self.configure(config))
+                    .with_runtime_env(Arc::clone(&self.runtime)),
+            )
             .build()
     }
 }

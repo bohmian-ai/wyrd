@@ -101,6 +101,7 @@ pub fn query_lifecycle_observer_for_test() -> std::sync::Arc<query_stream::Query
 }
 mod tail_discovery;
 pub mod telemetry;
+pub mod variant_sql;
 
 use telemetry::{
     OracleAdmissionOutcome, OracleAdmissionReason, OracleCancellationReason, query_class_label,
@@ -3094,10 +3095,13 @@ impl Oracle {
         let config = shape
             .session_config()
             .with_extension(Arc::new(OracleExecutionLock::new()));
-        let state = datafusion::execution::session_state::SessionStateBuilder::new()
-            .with_default_features()
-            .with_config(config)
-            .with_runtime_env(Arc::clone(&self.planning_runtime))
+        let state = variant_sql::OracleVariantSql::shared()
+            .install(
+                datafusion::execution::session_state::SessionStateBuilder::new()
+                    .with_default_features()
+                    .with_config(config)
+                    .with_runtime_env(Arc::clone(&self.planning_runtime)),
+            )
             .build();
         let planning = SessionContext::new_with_state(state);
         // Substitution is unconditional once a roster exists: the placeholder
@@ -4248,6 +4252,9 @@ fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostEr
     if datafusion_resources_exhausted(error) {
         return BifrostError::QueryResourcesExhausted;
     }
+    if let Some(variant) = variant_query_error(error) {
+        return variant;
+    }
     let message = error.to_string().to_ascii_lowercase();
     if is_tenant_refusal(error) {
         BifrostError::QueryTenantInvariant
@@ -4258,6 +4265,28 @@ fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostEr
     } else {
         BifrostError::QueryExecutionFailed
     }
+}
+
+/// Returns the catalogued Variant failure a query function raised, if any.
+///
+/// `parse_json` raises its typed Variant error inside the execution chain;
+/// it is returned as-is so the caller sees the stable Variant code rather
+/// than a generic execution failure.
+fn variant_query_error(error: &DataFusionError) -> Option<BifrostError> {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        if let Some(
+            found @ (BifrostError::VariantInvalidJson { .. }
+            | BifrostError::VariantNumericOutOfRange { .. }
+            | BifrostError::VariantTooDeep { .. }
+            | BifrostError::VariantTooLarge { .. }),
+        ) = current.downcast_ref::<BifrostError>()
+        {
+            return Some(found.clone());
+        }
+        source = current.source();
+    }
+    None
 }
 
 /// Reports whether an execution error is a footer-tenant refusal.

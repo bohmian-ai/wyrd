@@ -303,7 +303,9 @@ pub const MAX_STAGE_BODY_BYTES: usize = 8 * 1024 * 1024;
 ///
 /// Both the coordinator (at mint time) and the follower (at verification time)
 /// call this over the same bytes, so a matching digest proves the follower is
-/// about to decode exactly the message the coordinator described.
+/// about to decode exactly the message the coordinator described. The Oracle
+/// Variant SQL version is bound in, so a peer with a different Variant
+/// function set refuses the stage before decoding its plan.
 ///
 /// # Errors
 ///
@@ -315,6 +317,7 @@ pub fn stage_body_digest(body: &[u8]) -> Result<String, PeerSecurityError> {
     }
     let mut hash = Sha256::new();
     hash.update(b"wyrd.oracle.stage.body.v1\0");
+    hash.update(super::variant_sql::ORACLE_VARIANT_SQL_VERSION.to_be_bytes());
     hash.update((body.len() as u64).to_be_bytes());
     hash.update(body);
     Ok(hex::encode(hash.finalize()))

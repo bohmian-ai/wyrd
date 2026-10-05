@@ -1,7 +1,7 @@
 ---
 id: TASK-001-R1
 kind: remediation
-status: ready
+status: review
 spec: SPEC-forge-concurrent-planning
 spec_revision: 11
 parent_task: TASK-001
@@ -67,3 +67,29 @@ leader handlers. Pause maintenance, revoke the term, and prove no later rewrite,
 expiration, or cleanup effect occurs. Run the exact focused tests, the Forge
 journey, the owning Bifrost verification lane, format, lints, and diff check.
 
+
+## Implementation evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Promotion IO cannot prevent renewal | `forge/scheduler.rs` `Forge::renew` is a third `tokio::join!` branch that awaits only the election row. `forge/leadership.rs` `ForgeLeadership::heartbeat` serializes renewal and bounds it by the term's local deadline (`timeout_at`, measured from before the last successful acquire/renew, so it never falls after PostgreSQL's expiry) | `revoked_term_stops_promotion_dispatch_and_maintenance`: a hinted promotion is parked at its catalog commit, the row lapses, the standby acquires token 2 > 1, and the parked replica's renewal loop logs `term lost; revoking it fencing_token=1` while the promotion is still held | PASS |
+| A replaced term is revoked | `ForgeHeldTerm.revocation` is a child of the coordinator shutdown. `set_held` cancels the term it replaces; `held()`/`term()` filter revoked terms; `resign` still resigns a revoked slot | same journey: `await_revoked(old_term)` and `held(old_leader).is_none()` | PASS |
+| notify/pull/report perform no later effect under it | `term()` returns `FenceLost` for a revoked term; these handlers only touch the in-memory schedule | same journey: notify, pull and report under the old token all return `FenceLost` | PASS |
+| Maintenance performs no later effect under it | `run_maintenance` and the debt sweep run under `term.revocation()`. `rewrite_manifests` checks it under the lease before its commit; `execute_accepted` refuses (`Shutdown`) before recording a new attempt once it is cancelled | same journey: a maintenance pass is paused after the catalog accepts the expiry, the term is replaced and revoked, then the pass is released. Snapshots and maintenance rows stay equal to the accepted state, the orphan remains, and the trace shows `snapshot expiration failed error=Forge scheduler was shut down` | PASS |
+| The successor resumes recovery without duplicate settlement | Unchanged durable recovery from attempt rows | same journey: the successor counts the parked promotion once (`pending_commits == 1`); the third term rejoins, sweeps the orphan, and leaves 0 unsettled `forge_tasks` rows | PASS |
+
+Preserved behavior and non-goals: single-row election, immediate resignation on stop, the volatile schedule, durable promotion recovery, and per-table fencing are unchanged. No second lease, scheduler, durable schedule or host-clock authority was added. Promotion, worker pull and maintenance membership were not redesigned.
+
+Commands:
+
+- `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test forge -P journey --run-ignored=all -E "test(=production_closeout::revoked_term_stops_promotion_dispatch_and_maintenance)"'`: PASS
+- `mise run test:bifrost:journey:forge`: 22/22 PASS
+- `mise run test:bifrost`: 8/9 lanes PASS. In `integration:server`, `pg_verification_runtime::crash_after_detail_ack_reclaims_the_same_run_before_dispatch` failed once; see the diagnosis below. A rerun of `test:bifrost:integration:server:inner` passed 84/84, and the exact test also passed when rerun on its own.
+- `mise run fmt`, `mise run lints`, `git diff --check`: clean
+
+Diagnosis of the one `test:bifrost` failure:
+
+- **Symptom:** in `pg_verification_runtime::crash_after_detail_ack_reclaims_the_same_run_before_dispatch`, the in-process Forge worker got `pool timed out while waiting for an open connection` at 02:22:35. That stopped the supervised worker, and the test's Scribe flush then failed with `ingress dispatcher is closed`.
+- **Evidence:** the whole process starved for Postgres at the same moment. The card reconciler timed out on the same pool, the readiness Postgres probe timed out at 1.5s, and the next acquire took 7.58s. The only leadership SQL in the window is the initial acquire at 02:22:29.35. The new renewal loop first ticks at +10s (02:22:39), after the failure.
+- **Cause:** pool or Postgres starvation inside the verification-runtime harness, not leadership SQL from this change. It did not reproduce in two reruns. I could not identify the holder of the connections from the info-level trace.
+- **Fix site:** outside this task's write set (the verification runtime harness and pool sizing). Reported to the caller as a risk.

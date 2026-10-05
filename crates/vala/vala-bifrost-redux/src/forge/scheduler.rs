@@ -138,8 +138,9 @@ impl Forge {
     /// promotes the Scribe hot objects its own hints name, through a private
     /// attempt executor. The term holder sweeps `file_list` promotion debt on
     /// every heartbeat; under a test-owned trigger it sweeps only on the
-    /// passes that trigger requests. A separate timer runs the leader's Iceberg maintenance
-    /// pass, so a long pass never delays term renewal. The term is resigned on
+    /// passes that trigger requests. Term renewal runs in its own loop and a
+    /// separate timer runs the leader's Iceberg maintenance pass, so neither
+    /// promotion nor maintenance can delay renewal. The term is resigned on
     /// stop, so a standby takes over at once.
     ///
     /// # Errors
@@ -166,6 +167,7 @@ impl Forge {
             Uuid::now_v7(),
         )?;
         tokio::join!(
+            self.renew(&shutdown, &readiness),
             self.supervise(&executor, &shutdown, &readiness),
             self.maintain(&executor, &shutdown),
         );
@@ -175,7 +177,33 @@ impl Forge {
         Ok(())
     }
 
-    /// Renews the term on a heartbeat and promotes hinted tables until stop.
+    /// Renews or contends for the leader term on its own heartbeat until stop.
+    ///
+    /// This loop awaits nothing but the election row, so promotion, sweeps
+    /// and maintenance can never delay renewal past the term. A renewal that
+    /// fails or outlives the term revokes it inside
+    /// [`super::leadership::ForgeLeadership::heartbeat`] and clears readiness
+    /// until the next successful leader pass.
+    async fn renew(&self, shutdown: &CancellationToken, readiness: &super::ForgeRoleReadiness) {
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + LEADER_HEARTBEAT,
+            LEADER_HEARTBEAT,
+        );
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                _ = heartbeat.tick() => {
+                    if let Err(error) = self.leadership.heartbeat(shutdown).await {
+                        tracing::error!(error = %error, "Forge leader term renewal failed");
+                        readiness.publish(false);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Promotes hinted tables and runs leader passes until stop.
     async fn supervise(
         &self,
         executor: &ForgeWorker,
@@ -254,7 +282,7 @@ impl Forge {
             // Boxed: the pass nests every attempt future, and inlining it in
             // this loop's state machine overflows the server's layout depth.
             tracing::Instrument::instrument(
-                Box::pin(self.run_maintenance(executor, shutdown)),
+                Box::pin(self.run_maintenance(executor)),
                 tracing::info_span!("bifrost.forge.maintenance.pass", role = "server"),
             )
             .await;
@@ -329,7 +357,9 @@ impl Forge {
     /// sweeps promotion debt.
     ///
     /// Returns whether this replica holds the term after the pass. A pass
-    /// without `sweep` only renews or contends for the term.
+    /// without `sweep` only renews or contends for the term. The sweep runs
+    /// under the term's revocation, so a term lost mid-sweep stops it before
+    /// the next table and at each promotion's durable boundary.
     ///
     /// # Errors
     ///
@@ -340,13 +370,17 @@ impl Forge {
         stop: &CancellationToken,
         sweep: bool,
     ) -> Result<bool, ForgeError> {
-        self.leadership.heartbeat().await?;
-        if !sweep || self.leadership.held().is_none() {
-            return Ok(self.leadership.held().is_some());
+        self.leadership.heartbeat(stop).await?;
+        let Some(term) = self.leadership.held() else {
+            return Ok(false);
+        };
+        if !sweep {
+            return Ok(true);
         }
         // ponytail: one indexed debt read per heartbeat; gate it on
         // acquisition plus a slower tick if the read ever shows up.
-        self.sweep_promotion_debt(executor, stop).await?;
+        self.sweep_promotion_debt(executor, term.revocation())
+            .await?;
         Ok(self.leadership.held().is_some())
     }
 
@@ -360,6 +394,9 @@ impl Forge {
     ///
     /// Returns the debt read's SQL error; per-table failures are logged and
     /// left for the next sweep.
+    ///
+    /// `stop` is the term's revocation; a sweep it interrupts leaves each
+    /// attempt to recovery from its own row.
     ///
     /// Returns whether any table owed a promotion, whether this sweep ran it,
     /// left it to an attempt already active or queued, or failed it.

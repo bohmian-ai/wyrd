@@ -16,8 +16,9 @@ use rand::{RngCore, SeedableRng, rngs::StdRng};
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
 use vala_bifrost_redux::forge::{
-    ForgeCompactionDispatch, ForgeCompactionOutcome, ForgeCompactionType, ForgeConfig,
-    ForgeHeldTerm, ForgeLifecycleEvent, ForgeTableKey, ForgeWorkerCompletionObserver,
+    ForgeCommitNotice, ForgeCompactionDispatch, ForgeCompactionOutcome, ForgeCompactionType,
+    ForgeConfig, ForgeError, ForgeHeldTerm, ForgeLifecycleEvent, ForgeTableKey, ForgeTableSettings,
+    ForgeWorkerCompletionObserver,
 };
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::resources::{ResourceSource, SystemResourceSnapshot};
@@ -2454,6 +2455,240 @@ async fn one_leader_failover_volatile_state() {
         journey.leaders(),
         vec![(standby, successor.fencing_token())]
     );
+    journey.cluster.shutdown().await.expect("cluster drains");
+}
+
+/// Ends the live election term the way a lapsed lease does.
+///
+/// The row stays owned by the old term but is no longer live, which is
+/// exactly what PostgreSQL holds once a renewal fails to land in time. The
+/// replica that held it is not told; it must discover the loss itself.
+///
+/// # Panics
+/// Panics when the election row cannot be updated.
+async fn lapse_leader_term(journey: &LeaderJourney) {
+    sqlx::query(
+        "UPDATE vala.forge_scheduler_state SET expires_at = statement_timestamp() WHERE singleton",
+    )
+    .execute(journey.cluster.pg_fixture().operator_pool().pool())
+    .await
+    .expect("election row lapses");
+}
+
+/// Waits for `term` to be revoked by its own replica's renewal loop.
+///
+/// # Panics
+/// Panics if the replica keeps the term past the diagnostic bound.
+async fn await_revoked(term: &ForgeHeldTerm) {
+    tokio::time::timeout(PASS_BOUND, term.revoked())
+        .await
+        .expect("the replaced term is revoked by its renewal loop");
+}
+
+/// A lost term is revoked while promotion and maintenance are parked.
+///
+/// Renewal runs beside hinted promotion, so a promotion held at the catalog
+/// cannot keep a replaced term alive: the old replica discovers the loss on
+/// its own heartbeat and refuses notify, pull and report under that term.
+/// The same revocation stops a paused maintenance pass, which then performs
+/// no cleanup or orphan effect, and the next leader settles what it left.
+///
+/// # Panics
+/// Panics when a replaced term is not revoked, still serves a leader handler,
+/// or its maintenance pass makes a durable effect after revocation, or when
+/// the successor leaves an attempt unsettled.
+#[tokio::test]
+#[ignore = "requires Postgres and two coordinator replicas"]
+async fn revoked_term_stops_promotion_dispatch_and_maintenance() {
+    let spec = BifrostClusterSpec::two_mixed();
+    let (first, second) = (spec.nodes[0].node_id, spec.nodes[1].node_id);
+    let journey = LeaderJourney::start(spec, true).await;
+    let catalog = journey
+        .cluster
+        .commit_uncertainty_catalog()
+        .expect("the topology wraps the real Forge catalog");
+    journey.pass(first).await;
+    journey.pass(second).await;
+    let (old_leader, _) = journey.leaders()[0];
+    let successor = if old_leader == first { second } else { first };
+    let forge = |node: NodeId| {
+        Arc::clone(
+            journey
+                .node(node)
+                .state()
+                .forge_coordinator()
+                .expect("coordinator"),
+        )
+    };
+
+    // A hinted promotion on the leader is parked at its catalog commit.
+    let table = journey
+        .register_scheduled_table(old_leader, "revoked_promotion")
+        .await;
+    let old_term = journey.held(old_leader).expect("leader term");
+    catalog.pause_before_commit();
+    journey.write_hot(old_leader, &table, &[1, 2]).await;
+    tokio::time::timeout(PASS_BOUND, catalog.wait_for_before_commit())
+        .await
+        .expect("the hinted promotion reaches the catalog");
+
+    // The term lapses; the standby takes it, and the parked replica's own
+    // renewal loop revokes the old term while the promotion is still held.
+    lapse_leader_term(&journey).await;
+    journey.pass(successor).await;
+    let new_term = journey.held(successor).expect("the standby takes over");
+    assert!(new_term.fencing_token() > old_term.fencing_token());
+    await_revoked(&old_term).await;
+    assert!(journey.held(old_leader).is_none());
+    let old = forge(old_leader);
+    let key = journey.key(&table);
+    let refused = |result: Result<(), ForgeError>, handler: &str| {
+        assert!(
+            matches!(result, Err(ForgeError::FenceLost { .. })),
+            "{handler} under a revoked term: {result:?}"
+        );
+    };
+    refused(
+        old.accept_commit_notice(
+            old_term.fencing_token(),
+            ForgeCommitNotice {
+                key: key.clone(),
+                snapshot_id: 1,
+                settings: ForgeTableSettings::default(),
+            },
+        ),
+        "notify",
+    );
+    refused(
+        old.serve_compaction_pull(old_term.fencing_token(), 4)
+            .map(|_| ()),
+        "pull",
+    );
+    refused(
+        old.serve_compaction_report(
+            old_term.fencing_token(),
+            &key,
+            Uuid::now_v7(),
+            ForgeCompactionOutcome::Failed,
+        )
+        .map(|_| ()),
+        "report",
+    );
+
+    // Released, the promotion lands once and its notice reaches the successor.
+    catalog.release_paused_before_commit();
+    journey.await_promoted(&table).await;
+    assert_eq!(
+        new_term
+            .schedule()
+            .track_for_test(&key)
+            .map(|track| track.pending_commits),
+        Some(1),
+        "the successor counts the parked promotion exactly once"
+    );
+
+    // A cold table the successor maintains: expiry is due and an aged
+    // rowless output waits for the orphan sweep that follows it.
+    let cold = register_table(
+        journey.node(successor),
+        journey.tenant,
+        &unique_table("revoked_maintenance"),
+    )
+    .await;
+    set_table_properties(
+        journey.node(successor),
+        &cold.binding,
+        &[("wyrd.forge.enable-compaction", "false")],
+    )
+    .await;
+    for values in [&[1, 2][..], &[3, 4]] {
+        journey.write_hot(successor, &cold, values).await;
+        journey.await_promoted(&cold).await;
+    }
+    let orphan = format!(
+        "{}/data/forge/v2/{}-00000-{}.parquet",
+        cold.binding.object_prefix.trim_end_matches('/'),
+        Uuid::now_v7(),
+        Uuid::now_v7()
+    );
+    journey
+        .cluster
+        .storage_operator()
+        .write(&orphan, b"never published".to_vec())
+        .await
+        .expect("rowless output");
+    journey.advance(chrono::Duration::days(2));
+    assert_eq!(
+        journey.eligibility(successor, &cold, &orphan).await,
+        "Eligible"
+    );
+
+    // The pass is held after the catalog accepts the expiry; the term is
+    // replaced and revoked there, and the pass then starts nothing more.
+    let controls = forge(successor).expiry_controls_for_test();
+    controls.arm_expiry_accepted();
+    let server = journey.node(successor);
+    let passes = server.completed_forge_scheduler_passes_for_test();
+    server.request_forge_maintenance_pass_for_test();
+    tokio::time::timeout(PASS_BOUND, controls.wait_expiry_accepted())
+        .await
+        .expect("the successor's expiry is accepted");
+    let accepted = (
+        journey.snapshots(successor, &cold).await,
+        journey.maintenance_rows(&cold).await,
+    );
+    lapse_leader_term(&journey).await;
+    journey.pass(old_leader).await;
+    let third = journey.held(old_leader).expect("a third term is acquired");
+    assert!(third.fencing_token() > new_term.fencing_token());
+    await_revoked(&new_term).await;
+    // The accepted expiry is one table-fenced effect that completes through
+    // loss of the leader term; nothing after it may start.
+    controls.release_expiry_accepted();
+    tokio::time::timeout(
+        PASS_BOUND,
+        server.wait_for_forge_scheduler_passes_for_test(passes + 1),
+    )
+    .await
+    .expect("the revoked maintenance pass returns");
+    assert_eq!(
+        (
+            journey.snapshots(successor, &cold).await,
+            journey.maintenance_rows(&cold).await,
+        ),
+        accepted,
+        "a revoked pass makes no later expiry or cleanup effect"
+    );
+    assert!(
+        journey.exists(&orphan).await,
+        "a revoked pass sweeps nothing"
+    );
+    assert!(journey.held(successor).is_none());
+
+    // The third term rejoins the table on its next commit and settles the
+    // revoked pass's accepted expiry before its own cleanup.
+    journey.write_hot(old_leader, &cold, &[5]).await;
+    tokio::time::timeout(PASS_BOUND, async {
+        while journey.unpromoted(&cold).await > 0 {
+            let next = journey.observer.attempts() + 1;
+            journey.observer.wait_for_attempts_at_least(next).await;
+        }
+    })
+    .await
+    .expect("the rejoining commit is promoted");
+    journey.advance(chrono::Duration::minutes(1));
+    journey.maintain(old_leader).await;
+    assert!(!journey.exists(&orphan).await, "the next leader sweeps it");
+    let unsettled: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id = $1 \
+         AND table_name = $2 AND state NOT IN ('succeeded', 'failed', 'cancelled')",
+    )
+    .bind(journey.tenant.as_uuid())
+    .bind(&cold.name)
+    .fetch_one(journey.cluster.pg_fixture().operator_pool().pool())
+    .await
+    .expect("forge_tasks inspection");
+    assert_eq!(unsettled, 0, "every maintenance attempt settled");
     journey.cluster.shutdown().await.expect("cluster drains");
 }
 

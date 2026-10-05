@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::forge_leader::ForgeLeaderElection;
 use wyrd_tonic::tonic::transport::Channel;
@@ -93,14 +94,40 @@ impl ForgeLeaderPeer {
 }
 
 /// One term this replica holds, with the schedule that lives exactly as long.
+///
+/// A term is revocable: losing, failing to renew, outliving, replacing or
+/// shutting down the term cancels its revocation token. Every leader-only
+/// consumer checks that token, so work started under a term stops before its
+/// next durable effect once the term ends, even while it still holds this
+/// `Arc`.
 pub struct ForgeHeldTerm {
     /// Fencing token minted when this term was acquired.
     fencing_token: i64,
     /// Volatile per-table schedule; empty when the term began.
     schedule: ForgeSchedule,
+    /// Cancelled when this term ends; a child of the coordinator's shutdown.
+    revocation: CancellationToken,
 }
 
 impl ForgeHeldTerm {
+    /// Returns whether this term has ended.
+    #[must_use]
+    pub fn is_revoked(&self) -> bool {
+        self.revocation.is_cancelled()
+    }
+
+    /// Waits until this term ends.
+    pub async fn revoked(&self) {
+        self.revocation.cancelled().await;
+    }
+
+    /// Returns the token leader-only work passes as its stop signal.
+    ///
+    /// It is cancelled on revocation and on coordinator shutdown alike.
+    pub(super) fn revocation(&self) -> &CancellationToken {
+        &self.revocation
+    }
+
     /// Returns the fencing token of this term.
     #[must_use]
     pub fn fencing_token(&self) -> i64 {
@@ -122,8 +149,16 @@ pub(super) struct ForgeLeadership {
     owner: Uuid,
     /// Peer route; absent for a single-process deployment with no peer listener.
     peer: Option<ForgeLeaderPeer>,
-    /// The term this replica holds, if any.
+    /// The term this replica holds, if any; a revoked term may linger until
+    /// it is resigned.
     held: RwLock<Option<Arc<ForgeHeldTerm>>>,
+    /// Serializes renewal and records the local deadline of the held term.
+    ///
+    /// The deadline is measured from the start of the last successful
+    /// acquire or renew, so it never falls after the row's own
+    /// `statement_timestamp()` expiry; a renewal still pending at it revokes
+    /// the term.
+    renewal: tokio::sync::Mutex<tokio::time::Instant>,
 }
 
 impl ForgeLeadership {
@@ -134,6 +169,7 @@ impl ForgeLeadership {
             owner,
             peer: None,
             held: RwLock::new(None),
+            renewal: tokio::sync::Mutex::new(tokio::time::Instant::now()),
         }
     }
 
@@ -142,51 +178,82 @@ impl ForgeLeadership {
         self.peer = Some(peer);
     }
 
-    /// Returns the term this replica currently holds.
+    /// Returns the unrevoked term this replica currently holds.
     pub(super) fn held(&self) -> Option<Arc<ForgeHeldTerm>> {
+        self.slot().filter(|term| !term.is_revoked())
+    }
+
+    /// Returns the held slot as stored, including a revoked term not yet resigned.
+    fn slot(&self) -> Option<Arc<ForgeHeldTerm>> {
         self.held
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
-    /// Replaces the held term.
+    /// Replaces the held term and revokes the one it replaces.
     fn set_held(&self, term: Option<Arc<ForgeHeldTerm>>) {
-        *self.held.write().unwrap_or_else(PoisonError::into_inner) = term;
+        let replaced = std::mem::replace(
+            &mut *self.held.write().unwrap_or_else(PoisonError::into_inner),
+            term,
+        );
+        if let Some(replaced) = replaced {
+            replaced.revocation.cancel();
+        }
     }
 
     /// Renews the held term or contends for a new one.
     ///
-    /// Returns `true` only when this call acquired a new term, whose schedule
-    /// is empty. A failed renewal drops the held term before contending again,
-    /// so dispatch stops as soon as authority cannot be proven.
+    /// Calls are serialized, so the renewal loop and a leader pass never
+    /// mint two terms for one owner. Returns `true` only when this call
+    /// acquired a new term, whose schedule is empty and whose revocation is a
+    /// child of `shutdown`. A renewal that is refused, fails, or is still
+    /// pending at the term's local deadline revokes the held term before
+    /// contending again, so dispatch and leader-timer work stop as soon as
+    /// authority cannot be proven.
     ///
     /// # Errors
     ///
-    /// Returns SQL errors from the election row; the held term is dropped
-    /// first, so an unreachable database never leaves a leader dispatching.
-    pub(super) async fn heartbeat(&self) -> Result<bool, ForgeError> {
+    /// Returns SQL errors from the election row and
+    /// [`ForgeError::Timeout`] when renewal outlives the term; the held term
+    /// is revoked first, so an unreachable database never leaves a leader
+    /// dispatching.
+    pub(super) async fn heartbeat(&self, shutdown: &CancellationToken) -> Result<bool, ForgeError> {
+        let mut deadline = self.renewal.lock().await;
         if let Some(term) = self.held() {
-            match self
-                .election
-                .renew(self.owner, term.fencing_token, LEADER_TERM)
-                .await
+            let started = tokio::time::Instant::now();
+            match tokio::time::timeout_at(
+                *deadline,
+                self.election
+                    .renew(self.owner, term.fencing_token, LEADER_TERM),
+            )
+            .await
             {
-                Ok(true) => return Ok(false),
-                Ok(false) => {
+                Ok(Ok(true)) => {
+                    *deadline = started + LEADER_TERM;
+                    return Ok(false);
+                }
+                Ok(Ok(false)) => {
                     tracing::warn!(
                         fencing_token = term.fencing_token,
-                        "Forge leader term lost; dropping its schedule"
+                        "Forge leader term lost; revoking it"
                     );
                     self.set_held(None);
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     self.set_held(None);
                     return Err(ForgeError::Sql(error));
+                }
+                Err(_) => {
+                    self.set_held(None);
+                    return Err(ForgeError::Timeout {
+                        operation: "Forge leader term renewal",
+                    });
                 }
             }
         }
         let uri = self.peer.as_ref().map(|peer| peer.advertise_uri.as_str());
+        let started = tokio::time::Instant::now();
         let Some(fencing_token) = self
             .election
             .acquire(self.owner, uri, LEADER_TERM)
@@ -199,9 +266,11 @@ impl ForgeLeadership {
             fencing_token,
             "Forge leader term acquired with an empty schedule"
         );
+        *deadline = started + LEADER_TERM;
         self.set_held(Some(Arc::new(ForgeHeldTerm {
             fencing_token,
             schedule: ForgeSchedule::new(DEFAULT_REPORT_TIMEOUT),
+            revocation: shutdown.child_token(),
         })));
         Ok(true)
     }
@@ -210,10 +279,10 @@ impl ForgeLeadership {
     ///
     /// # Errors
     ///
-    /// Returns SQL errors from the election row; the local term is dropped
-    /// regardless, and the row then expires on its own.
+    /// Returns SQL errors from the election row; the local term is revoked
+    /// and dropped regardless, and the row then expires on its own.
     pub(super) async fn resign(&self) -> Result<(), ForgeError> {
-        let Some(term) = self.held() else {
+        let Some(term) = self.slot() else {
             return Ok(());
         };
         self.set_held(None);
@@ -285,13 +354,14 @@ impl ForgeLeadership {
                 detail: format!("promotion notice to {uri}: {status}"),
             })
     }
-    /// Returns the held term when it is `fencing_token`, or the local term
-    /// for the in-process path (`None`).
+
+    /// Returns the unrevoked held term when it is `fencing_token`, or the
+    /// local term for the in-process path (`None`).
     ///
     /// # Errors
     ///
     /// Returns [`ForgeError::FenceLost`] when this replica does not hold the
-    /// named term.
+    /// named term or that term was revoked.
     fn term(&self, fencing_token: Option<i64>) -> Result<Arc<ForgeHeldTerm>, ForgeError> {
         match self.held() {
             Some(term) if fencing_token.is_none_or(|token| token == term.fencing_token) => Ok(term),

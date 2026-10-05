@@ -3636,17 +3636,24 @@ impl ForgeWorker {
     /// evidence, so start, settlement and recovery stay those of
     /// [`Self::execute_claim`]. Returns `Ok(false)` without effect when the
     /// table already has an active attempt or the exact plan was recorded.
+    /// A cancelled `shutdown` — coordinator shutdown or the revocation of
+    /// the leader term that chose the work — records nothing, so no new
+    /// attempt starts once that authority has ended.
     ///
     /// # Errors
     ///
-    /// Returns validation and SQL errors from recording the attempt and the
-    /// errors of [`Self::execute_claim`].
+    /// Returns [`ForgeError::Shutdown`] when `shutdown` is already cancelled,
+    /// validation and SQL errors from recording the attempt, and the errors
+    /// of [`Self::execute_claim`].
     pub async fn execute_accepted(
         &self,
         task_id: Uuid,
         task: &NewForgeTask,
         shutdown: &CancellationToken,
     ) -> Result<bool, ForgeError> {
+        if shutdown.is_cancelled() {
+            return Err(ForgeError::Shutdown);
+        }
         let Some(claim) = self
             .tasks
             .insert_claimed(

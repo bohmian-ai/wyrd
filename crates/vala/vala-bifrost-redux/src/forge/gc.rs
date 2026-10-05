@@ -147,12 +147,15 @@ impl Forge {
     /// expiry committed. Orphan cleanup runs last for members that owe no
     /// compaction. A replica without the term does nothing.
     ///
-    /// Per-table failures are logged and the pass continues; cancellation stops
-    /// before the next table.
-    pub(super) async fn run_maintenance(&self, executor: &ForgeWorker, stop: &CancellationToken) {
+    /// Per-table failures are logged and the pass continues. The pass runs
+    /// under the term's revocation, which shutdown also cancels: once the
+    /// term ends, the pass stops before the next table and every effect in
+    /// progress stops before its next durable step.
+    pub(super) async fn run_maintenance(&self, executor: &ForgeWorker) {
         let Some(term) = self.leadership.held() else {
             return;
         };
+        let stop = term.revocation();
         let schedule = term.schedule();
         let (rewrite, expire) = schedule.maintenance_tables();
         tracing::info!(
@@ -164,7 +167,7 @@ impl Forge {
             if stop.is_cancelled() {
                 return;
             }
-            if let Err(error) = self.rewrite_manifests(schedule, key).await {
+            if let Err(error) = self.rewrite_manifests(schedule, key, stop).await {
                 tracing::error!(error = %error, table = %key.table.table, "Forge manifest rewrite failed");
             }
         }
@@ -220,13 +223,17 @@ impl Forge {
     /// forbids this rewrite. The target size and minimum merge count are the
     /// standard Iceberg commit properties.
     ///
+    /// `stop` is checked under the lease, immediately before the commit.
+    ///
     /// # Errors
     ///
-    /// Returns catalog, lease, property and commit errors.
+    /// Returns catalog, lease, property and commit errors, and
+    /// [`ForgeError::Shutdown`] when `stop` is cancelled before the commit.
     async fn rewrite_manifests(
         &self,
         schedule: &ForgeSchedule,
         key: &ForgeTableKey,
+        stop: &CancellationToken,
     ) -> Result<(), ForgeError> {
         let (binding, table, settings) = self.load_member(key).await?;
         if !settings.manifest_rewrite_enabled {
@@ -279,7 +286,11 @@ impl Forge {
             tracing::debug!(table = %key.table.table, "Forge manifest rewrite deferred behind a table lease");
             return Ok(());
         };
-        let committed = self.commit_manifest_rewrite(&binding, plan).await;
+        let committed = if stop.is_cancelled() {
+            Err(ForgeError::Shutdown)
+        } else {
+            self.commit_manifest_rewrite(&binding, plan).await
+        };
         if let Err(error) = lease.release(&self.core.operator_pool).await {
             tracing::warn!(error = %error, table = %key.table.table, "Forge manifest rewrite lease was not released; it will expire");
         }

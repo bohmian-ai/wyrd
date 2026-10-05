@@ -20,6 +20,14 @@ PathLike: TypeAlias = str | os.PathLike[str] | pathlib.Path
 JsonDict: TypeAlias = dict[str, Any]
 StringMap: TypeAlias = Mapping[str, str]
 
+def run_wyrd_cli() -> int:
+    """Run the ``wyrd`` command line with ``sys.argv`` and return its exit status.
+
+    Uses the same parser and commands as the ``wyrd`` binary; the installed
+    ``wyrd`` console script calls it.
+    """
+    ...
+
 class CardRefLike(Protocol):
     """Object that can be represented as a Wyrd card reference.
 
@@ -62,62 +70,36 @@ class WyrdError(Exception):
     title: str
     type: str
 
-    def __init__(
-        self,
-        code: str,
-        message: str,
-        *,
-        details: dict[str, Any] | None = None,
-        remediation: str = ...,
-    ) -> None:
-        """Create a bare Wyrd error.
+    def __init__(self, *args: object) -> None:
+        """Create a bare Wyrd error, exactly as ``Exception(*args)``.
 
-        Wyrd raises fully populated instances itself. Constructing one
-        directly keeps the positional arguments in ``args`` only and does not
-        set the attributes above; call ``build_wyrd_error`` instead to get a
-        populated instance.
+        Wyrd raises fully populated instances itself. Direct construction
+        accepts no keyword arguments, keeps the positional arguments in
+        ``args`` only, and sets none of the attributes above; call
+        ``build_wyrd_error`` for a populated instance. When an Agent callback
+        raises an error whose ``args`` start with a catalog ``code`` and a
+        ``message``, the Agent run keeps that code.
         """
         ...
 
 class AgentError(WyrdError):
     """``WyrdError`` for a ``WYRD_AGENT_*`` code raised by the Agent runtime."""
 
-    def __init__(
-        self,
-        code: str,
-        message: str,
-        *,
-        details: dict[str, Any] | None = None,
-        remediation: str = ...,
-    ) -> None:
+    def __init__(self, *args: object) -> None:
         """As ``WyrdError()``."""
         ...
 
 class ToolError(WyrdError):
     """``WyrdError`` for a ``WYRD_TOOL_*`` code raised by tool registration or calls."""
 
-    def __init__(
-        self,
-        code: str,
-        message: str,
-        *,
-        details: dict[str, Any] | None = None,
-        remediation: str = ...,
-    ) -> None:
+    def __init__(self, *args: object) -> None:
         """As ``WyrdError()``."""
         ...
 
 class SessionError(WyrdError):
     """``WyrdError`` for a ``WYRD_SESSION_*`` code raised by session memory."""
 
-    def __init__(
-        self,
-        code: str,
-        message: str,
-        *,
-        details: dict[str, Any] | None = None,
-        remediation: str = ...,
-    ) -> None:
+    def __init__(self, *args: object) -> None:
         """As ``WyrdError()``."""
         ...
 

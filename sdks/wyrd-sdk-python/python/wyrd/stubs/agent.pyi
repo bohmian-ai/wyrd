@@ -15,9 +15,12 @@ from .prompt import Prompt, ProviderResponse
 class Role:
     """Session turn role.
 
-    Values identify whether a turn came from the user, assistant, or tool.
+    Values identify whether a turn is a system instruction or came from the
+    user, assistant, or a tool. ``str(role)`` is the lowercase name
+    (``"system"``, ``"user"``, ``"assistant"``, or ``"tool"``).
     """
 
+    System: Role
     User: Role
     Assistant: Role
     Tool: Role
@@ -30,37 +33,65 @@ class SessionTurn:
 
     def __init__(
         self,
-        role: Role,
-        content: str,
         *,
-        tool_call_id: str | None = ...,
+        role: Role | str,
+        content: str,
+        call_id: str | None = None,
     ) -> None:
-        """Create a session turn.
+        """Create a session turn; every argument is keyword-only.
 
         Args:
-            role (Role): Role for the turn.
-            content (str): Turn content.
-            tool_call_id (str | None): Optional tool call id for tool turns.
+            role: a ``Role`` or its name, lowercase (``"system"``,
+                ``"user"``, ``"assistant"``, ``"tool"``) or capitalized.
+            content: the turn text.
+            call_id: the provider tool call id a ``tool`` turn answers.
+                Omitted, the turn answers no tool call.
+
+        Raises:
+            WyrdError: ``WYRD_AGENT_422_INVALID_ARGUMENT`` for an unknown
+                role name.
         """
         ...
 
     @property
-    def role(self) -> Role:
-        """Return the turn role."""
+    def role(self) -> str:
+        """Return the lowercase role name, such as ``"user"``."""
         ...
 
     @property
     def content(self) -> str:
-        """Return the turn content."""
+        """Return the turn text."""
         ...
 
     @property
-    def tool_call_id(self) -> str | None:
-        """Return the optional tool call id."""
+    def call_id(self) -> str | None:
+        """Return the tool call id a ``tool`` turn answers, or ``None``."""
         ...
 
-    def to_dict(self) -> JsonDict:
-        """Return a JSON-compatible session turn mapping."""
+    def model_dump(self) -> JsonDict:
+        """Return the turn as ``{"role", "content", "call_id"}``."""
+        ...
+
+    def model_dump_json(self) -> str:
+        """Return the turn as JSON text in the ``model_dump()`` shape."""
+        ...
+
+    @staticmethod
+    def model_validate(value: SessionTurn | Mapping[str, Any]) -> SessionTurn:
+        """Build a turn from a ``SessionTurn`` or a ``model_dump()``-shaped mapping.
+
+        Raises:
+            WyrdError: when the mapping is not one valid turn.
+        """
+        ...
+
+    @staticmethod
+    def model_validate_json(data: str) -> SessionTurn:
+        """Build a turn from ``model_dump_json()`` text.
+
+        Raises:
+            WyrdError: when the text is not one valid turn.
+        """
         ...
 
 @runtime_checkable
@@ -163,8 +194,9 @@ if True:
         """Reason an Agent run terminated.
 
         A returned ``AgentRun`` reports ``ModelStopped`` (the model answered
-        without tool calls) or ``CallbackAborted`` (a ``before_agent`` or
-        ``before_model`` callback raised; see ``AgentRun.error``). Iteration
+        without tool calls) or ``CallbackAborted`` (a ``before_agent``,
+        ``before_model``, ``after_model``, or ``after_agent`` callback raised
+        or returned a value of the wrong type; see ``AgentRun.error``). Iteration
         exhaustion, provider failure, and timeout raise ``WyrdError`` from
         ``Agent.run()`` instead of returning ``MaxIterations``,
         ``ProviderError``, or ``Timeout``, and failed tools are reported back
@@ -274,9 +306,12 @@ class Agent:
 
         Every callback receives a ``ctx`` mapping with ``agent_id``,
         ``session_id``, ``iteration``, and ``conversation`` as its first
-        argument. Returning ``None`` keeps the value unchanged. A ``before_*``
-        callback that returns a value of the wrong type is treated as raising,
-        with ``WYRD_AGENT_422_CALLBACK_RETURN_TYPE`` as the error.
+        argument. Returning ``None`` keeps the value unchanged. A callback
+        that returns a value of the wrong type is treated as raising, with
+        ``WYRD_AGENT_422_CALLBACK_RETURN_TYPE`` as the error. A raised
+        ``WyrdError``, or any exception whose ``args`` start with a catalog
+        code and a message, keeps that code; any other exception becomes
+        ``WYRD_AGENT_422_VALIDATION``.
 
         Args:
             prompt: the Prompt that fixes provider, model, and messages, or a
@@ -297,12 +332,15 @@ class Agent:
                 ends the run ``CallbackAborted`` with zero iterations.
             after_agent_callback: ``(ctx, run) -> mapping | None`` after the
                 model stops; a mapping in the serialized ``AgentRun`` shape
-                replaces the result.
+                replaces the result. Raising ends the run ``CallbackAborted``
+                with empty ``output`` and the run's iteration count.
             before_model_callback: ``(ctx, request) -> ProviderRequest | None``
                 before each model call; a request replaces the outbound one.
                 Raising ends the run ``CallbackAborted``.
             after_model_callback: ``(ctx, response) -> ProviderResponse | None``
                 after each successful model call; a response replaces it.
+                Raising discards the response and ends the run
+                ``CallbackAborted``.
             before_tool_callback: ``(ctx, tool_name, args) -> args | None``
                 before each tool call; a value replaces the arguments.
                 Raising skips that tool call, reports an error result to the
@@ -310,7 +348,8 @@ class Agent:
             after_tool_callback: ``(ctx, tool_name, result) -> result | None``
                 after each tool call; ``result`` is the tool's JSON output, or
                 ``{"error", "code"}`` when it failed. A value replaces it as a
-                successful result.
+                successful result. Raising reports that tool call to the model
+                as failed with the raised error and continues the run.
             session: a ``SessionMemory`` used for runs given a ``session_id``.
                 Omitted, nothing is remembered between runs.
             labels: Agent Card labels.
@@ -462,6 +501,76 @@ class Agent:
                 declared JSON output or ``output_type`` cannot be parsed,
                 ``WYRD_SESSION_500_RECENT`` or ``WYRD_SESSION_500_APPEND``.
         """
+        ...
+
+    def add_tool(self, tool: object) -> None:
+        """Attach one more runtime-local tool in place.
+
+        Args:
+            tool: a callable decorated with ``tool()`` or returned by
+                ``as_tool()``.
+
+        Raises:
+            WyrdError: ``WYRD_TOOL_400_INVALID_SCHEMA`` for an undecorated
+                callable.
+        """
+        ...
+
+    def set_tools(self, tools: Sequence[object]) -> None:
+        """Replace every runtime-local tool in place; raises as ``add_tool()``."""
+        ...
+
+    def with_prompt(self, prompt: Prompt) -> None:
+        """Replace the Prompt in place.
+
+        Unlike ``Agent(prompt=)``, only a ``Prompt`` instance is accepted.
+
+        Raises:
+            WyrdError: ``WYRD_AGENT_422_INVALID_ARGUMENT`` when ``prompt`` is
+                not a ``Prompt``.
+        """
+        ...
+
+    def with_session(self, session: SessionMemory) -> None:
+        """Replace the session memory in place.
+
+        Raises:
+            WyrdError: ``WYRD_AGENT_422_INVALID_ARGUMENT`` when ``session``
+                lacks callable ``recent`` and ``append`` methods.
+        """
+        ...
+
+    def with_run_config(self, run_config: RunConfig) -> None:
+        """Replace the loop limits in place."""
+        ...
+
+    def add_before_agent(self, callback: Callable[..., object]) -> None:
+        """Append a callback after any registered ``before_agent_callback``.
+
+        Callbacks of one hook run in registration order, each seeing the
+        previous one's replacement; the first that raises stops the chain with
+        that hook's raise behavior from ``Agent()``.
+        """
+        ...
+
+    def add_after_agent(self, callback: Callable[..., object]) -> None:
+        """Append an ``after_agent_callback``, chained as ``add_before_agent()``."""
+        ...
+
+    def add_before_model(self, callback: Callable[..., object]) -> None:
+        """Append a ``before_model_callback``, chained as ``add_before_agent()``."""
+        ...
+
+    def add_after_model(self, callback: Callable[..., object]) -> None:
+        """Append an ``after_model_callback``, chained as ``add_before_agent()``."""
+        ...
+
+    def add_before_tool(self, callback: Callable[..., object]) -> None:
+        """Append a ``before_tool_callback``, chained as ``add_before_agent()``."""
+        ...
+
+    def add_after_tool(self, callback: Callable[..., object]) -> None:
+        """Append an ``after_tool_callback``, chained as ``add_before_agent()``."""
         ...
 
     def as_tool(self, *, description: str | None = ...) -> object:

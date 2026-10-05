@@ -143,26 +143,28 @@ pub struct BifrostTableDescription {
     /// The table's explicit Forge compaction type.
     ///
     /// Present only when the table stores its own `wyrd.forge.compaction.type`;
-    /// omitted means Forge compacts it `full`.
+    /// omitted means Forge compacts it `small-files`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_type: Option<CompactionTypeWire>,
 }
 
 /// Physical compaction strategy a table asks Forge to apply.
 ///
-/// Stored as the table's `wyrd.forge.compaction.type` Iceberg property, whose
-/// own spelling is hyphenated (`small-files`); the wire keeps the `snake_case`
-/// convention every other Wyrd enum uses. A copy-on-write table always compacts
-/// `full` whatever it names.
+/// The public wire spelling is hyphenated (`auto`, `full`, `small-files`,
+/// `files-with-delete`), matching the table's stored
+/// `wyrd.forge.compaction.type` Iceberg property; underscore spellings are
+/// rejected. A table that names no type compacts `small-files`, and a
+/// copy-on-write table always compacts `full` whatever it names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum CompactionTypeWire {
     /// Choose a delete-heavy or small-file plan from table-wide thresholds.
     Auto,
-    /// Rewrite every live data file; the default when none is declared.
+    /// Rewrite every live data file.
     Full,
-    /// Rewrite only data files below the small-file threshold.
+    /// Rewrite only data files below the small-file threshold; the default
+    /// when none is declared.
     SmallFiles,
     /// Rewrite only data files with associated delete files.
     FilesWithDelete,
@@ -411,7 +413,7 @@ pub struct RegisterTableRequest {
     /// Optional physical compaction strategy Forge applies to this table.
     ///
     /// Omitted, the table stores no explicit type and Forge compacts it
-    /// `full`. Supplied, it is stored as the table's
+    /// `small-files`. Supplied, it is stored as the table's
     /// `wyrd.forge.compaction.type` Iceberg property. A re-register may omit
     /// it or repeat the stored value; a different value is
     /// `WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH`.
@@ -2644,14 +2646,14 @@ mod bifrost_wire_tests {
         bifrost_wire_round_trip(&req);
     }
 
-    /// The register request carries the compaction type in its `snake_case`
-    /// wire spelling and rejects the hyphenated Iceberg property spelling, so
-    /// one table has exactly one way to name its type on the wire.
+    /// The register request carries the compaction type in its hyphenated
+    /// public spelling and rejects the underscore spelling, so one table has
+    /// exactly one way to name its type on the wire.
     #[test]
-    fn bifrost_wire_register_request_carries_snake_case_compaction_type() {
+    fn bifrost_wire_register_request_carries_hyphenated_compaction_type() {
         let req: RegisterTableRequest = serde_json::from_str(
             r#"{"namespace":"vala.datasets","name":"events","fields":[],
-                "compaction_type":"small_files"}"#,
+                "compaction_type":"small-files"}"#,
         )
         .expect("deserialize");
         assert_eq!(req.compaction_type, Some(CompactionTypeWire::SmallFiles));
@@ -2663,10 +2665,46 @@ mod bifrost_wire_tests {
         assert!(
             serde_json::from_str::<RegisterTableRequest>(
                 r#"{"namespace":"vala.datasets","name":"events","fields":[],
-                    "compaction_type":"small-files"}"#,
+                    "compaction_type":"small_files"}"#,
             )
             .is_err()
         );
+    }
+
+    /// Every compaction type serializes to exactly its approved hyphenated
+    /// value, the underscore spellings are refused, and the generated request
+    /// and description schemas publish the same set and the `small-files`
+    /// omitted default.
+    #[test]
+    fn bifrost_wire_compaction_type_values_and_schemas_are_hyphenated() {
+        for (kind, spelling) in [
+            (CompactionTypeWire::Auto, "auto"),
+            (CompactionTypeWire::Full, "full"),
+            (CompactionTypeWire::SmallFiles, "small-files"),
+            (CompactionTypeWire::FilesWithDelete, "files-with-delete"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(kind).expect("serialize"),
+                serde_json::Value::String(spelling.to_owned())
+            );
+            assert_eq!(
+                serde_json::from_value::<CompactionTypeWire>(spelling.into()).expect("parse"),
+                kind
+            );
+        }
+        for refused in ["small_files", "files_with_delete"] {
+            assert!(serde_json::from_value::<CompactionTypeWire>(refused.into()).is_err());
+        }
+        for schema in [
+            serde_json::to_string(&schema_for!(RegisterTableRequest)).expect("schema"),
+            serde_json::to_string(&schema_for!(BifrostTableDescription)).expect("schema"),
+        ] {
+            assert!(schema.contains(r#""small-files""#), "{schema}");
+            assert!(schema.contains(r#""files-with-delete""#), "{schema}");
+            assert!(!schema.contains("small_files"), "{schema}");
+            assert!(!schema.contains("files_with_delete"), "{schema}");
+            assert!(schema.contains("compacts it `small-files`"), "{schema}");
+        }
     }
 
     /// No wire field names a partition column any more, so a declaration that

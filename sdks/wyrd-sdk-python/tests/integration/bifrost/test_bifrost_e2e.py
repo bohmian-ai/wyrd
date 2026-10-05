@@ -437,12 +437,12 @@ def test_compaction_type_registers_describes_and_conflicts(
             credential=wyrd_server.api_key,
         )
 
-    assert writer("small_files").register() == "created"
+    assert writer("small-files").register() == "created"
     described = TableConfig.describe(
         fqn, server_url=wyrd_server.base_url, credential=wyrd_server.api_key
     )
-    assert described.compaction_type == "small_files"
-    assert writer("small_files").register() == "already_exists"
+    assert described.compaction_type == "small-files"
+    assert writer("small-files").register() == "already_exists"
     assert writer(None).register() == "already_exists"
 
     with pytest.raises(WyrdError) as captured:
@@ -452,7 +452,7 @@ def test_compaction_type_registers_describes_and_conflicts(
     unchanged = TableConfig.describe(
         fqn, server_url=wyrd_server.base_url, credential=wyrd_server.api_key
     )
-    assert unchanged.compaction_type == "small_files"
+    assert unchanged.compaction_type == "small-files"
 
 
 @pytest.mark.integration

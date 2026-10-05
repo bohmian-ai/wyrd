@@ -60,7 +60,7 @@ pub struct TableConfig {
     /// Explicit Forge compaction file target; `None` follows the deployment
     /// default.
     compaction_target_file_size_bytes: Option<u64>,
-    /// Explicit Forge compaction type; `None` compacts with the `full`
+    /// Explicit Forge compaction type; `None` compacts with the `small-files`
     /// default.
     compaction_type: Option<CompactionTypeWire>,
     /// Server-assigned once registered or described; `None` while inert.
@@ -232,7 +232,7 @@ impl TableConfig {
 
     /// Declare the physical compaction type Forge applies to this table.
     ///
-    /// Omitted, the table stores no type and Forge compacts it `full`. A
+    /// Omitted, the table stores no type and Forge compacts it `small-files`. A
     /// copy-on-write table compacts `full` whatever it declares. The server
     /// refuses a re-register whose type differs from the stored one with
     /// `WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH`.

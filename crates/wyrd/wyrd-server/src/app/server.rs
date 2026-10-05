@@ -625,15 +625,21 @@ impl BoundServer {
         // the embedded worker restart in place instead of stopping the API.
         if self.state.forge_handle().is_some() {
             let state = self.state.clone();
-            let scheduler =
-                restarting_worker("maintenance_scheduler", shutdown.clone(), move |token| {
+            // The scheduler's restarts are logged; its leader term carries the
+            // scheduler's own telemetry.
+            let scheduler = restarting_worker(
+                "maintenance_scheduler",
+                shutdown.clone(),
+                move |token| {
                     spawn_maintenance_scheduler(&state, token)?.ok_or_else(|| {
                         ServerBootError::ForgeSchedulerRequired {
                             detail: "Forge maintenance owner is no longer composed".to_owned(),
                         }
                     })
-                })
-                .map_err(|e| BootExit::Other(Box::new(e)))?;
+                },
+                |_, _| {},
+            )
+            .map_err(|e| BootExit::Other(Box::new(e)))?;
             set.spawn(scheduler);
         }
         // `All` owns one bounded Forge worker in addition to the scheduler;
@@ -642,9 +648,12 @@ impl BoundServer {
         // `run_forge_worker_process` and never reaches this serving owner.
         if self.config.role == BifrostTarget::All {
             let state = self.state.clone();
-            let worker = restarting_worker("forge_worker", shutdown.clone(), move |token| {
-                crate::boot::spawn_forge_worker(&state, token)
-            })
+            let worker = restarting_worker(
+                "forge_worker",
+                shutdown.clone(),
+                move |token| crate::boot::spawn_forge_worker(&state, token),
+                vala_bifrost_redux::forge::ForgeTelemetry::record_worker_restart,
+            )
             .map_err(|e| BootExit::Other(Box::new(e)))?;
             set.spawn(worker);
         }

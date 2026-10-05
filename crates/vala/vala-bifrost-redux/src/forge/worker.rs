@@ -2042,7 +2042,7 @@ impl ForgeWorker {
         let Some(controls) = &self.loop_handles else {
             return;
         };
-        controls.readiness.publish(false);
+        publish_worker_readiness(&controls.readiness, false);
         controls.stop.cancel();
     }
 
@@ -2136,7 +2136,7 @@ impl ForgeWorker {
         if !self.start_and_drain(&shutdown).await? {
             return Ok(());
         }
-        readiness.publish(true);
+        publish_worker_readiness(&readiness, true);
         let stop = shutdown.child_token();
         self.loop_handles = Some(ForgeWorkerLoopHandles {
             readiness: readiness.clone(),
@@ -2147,7 +2147,7 @@ impl ForgeWorker {
         // stack in debug builds.
         let outcome = Box::pin(self.run_event_loop(stop)).await;
         if let Err(error) = outcome {
-            readiness.publish(false);
+            publish_worker_readiness(&readiness, false);
             tracing::error!(worker = %self.owner, error = %error, "Forge worker stopped after it could not settle its work");
             return Err(error);
         }
@@ -3119,6 +3119,7 @@ impl ForgeWorker {
             Ok(answer) => Ok(Some(answer)),
             Err(error) if error.is_database_unavailable() => {
                 tracing::warn!(worker = %self.owner, error = %error, "Forge worker could not reach the database; backing off");
+                ForgeTelemetry::record_worker_backoff();
                 self.publish_readiness(false);
                 self.wait_for_progress(pool, shutdown).await?;
                 Ok(None)
@@ -3134,7 +3135,7 @@ impl ForgeWorker {
     /// owner that will not claim it.
     fn publish_readiness(&self, ready: bool) {
         if let Some(handles) = &self.loop_handles {
-            handles.readiness.publish(ready);
+            publish_worker_readiness(&handles.readiness, ready);
         }
     }
 
@@ -8961,8 +8962,17 @@ struct ForgeWorkerReadinessGuard(super::ForgeRoleReadiness);
 
 impl Drop for ForgeWorkerReadinessGuard {
     fn drop(&mut self) {
-        self.0.publish(false);
+        publish_worker_readiness(&self.0, false);
     }
+}
+
+/// Publishes the worker's readiness and mirrors the resulting bit to its gauge.
+///
+/// The gauge reads the bit back after publishing rather than echoing `ready`,
+/// so a role the shutdown owner already closed reports not ready.
+fn publish_worker_readiness(readiness: &super::ForgeRoleReadiness, ready: bool) {
+    readiness.publish(ready);
+    ForgeTelemetry::record_worker_ready(readiness.is_ready());
 }
 
 #[cfg(test)]

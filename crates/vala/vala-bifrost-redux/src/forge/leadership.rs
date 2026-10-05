@@ -32,7 +32,9 @@ use super::leader::{
     DEFAULT_REPORT_TIMEOUT, ForgeCommitNotice, ForgeCompactionDispatch, ForgeCompactionOutcome,
     ForgeSchedule, ForgeTableKey,
 };
-use super::metrics::{ForgeLeaderDecision, ForgeTelemetry};
+use super::metrics::{
+    ForgeLeaderDecision, ForgeLeaderRenewal, ForgeLeaderRevocation, ForgeTelemetry,
+};
 use super::settings::ForgeCompactionType;
 use crate::oracle::dispatcher::BifrostPeerTls;
 
@@ -212,14 +214,34 @@ impl ForgeLeadership {
             .clone()
     }
 
-    /// Replaces the held term and revokes the one it replaces.
-    fn set_held(&self, term: Option<Arc<ForgeHeldTerm>>) {
+    /// Replaces the held term and revokes the one it replaces for `reason`.
+    ///
+    /// Every term enters the slot once and leaves it once, here, so each
+    /// departure is counted as exactly one revocation under the reason the
+    /// caller gives, and the held gauge follows the slot.
+    fn set_held(&self, term: Option<Arc<ForgeHeldTerm>>, reason: ForgeLeaderRevocation) {
+        let held = term.is_some();
         let replaced = std::mem::replace(
             &mut *self.held.write().unwrap_or_else(PoisonError::into_inner),
             term,
         );
+        ForgeTelemetry::record_leader_held(held);
         if let Some(replaced) = replaced {
             replaced.revocation.cancel();
+            ForgeTelemetry::record_leader_revocation(reason);
+            if reason == ForgeLeaderRevocation::Shutdown {
+                tracing::info!(
+                    fencing_token = replaced.fencing_token,
+                    reason = reason.as_str(),
+                    "Forge leader term revoked"
+                );
+            } else {
+                tracing::warn!(
+                    fencing_token = replaced.fencing_token,
+                    reason = reason.as_str(),
+                    "Forge leader term revoked"
+                );
+            }
         }
     }
 
@@ -251,22 +273,34 @@ impl ForgeLeadership {
             .await
             {
                 Ok(Ok(true)) => {
+                    ForgeTelemetry::record_leader_renewal(
+                        ForgeLeaderRenewal::Ok,
+                        started.elapsed(),
+                    );
                     *deadline = started + LEADER_TERM;
                     return Ok(false);
                 }
                 Ok(Ok(false)) => {
-                    tracing::warn!(
-                        fencing_token = term.fencing_token,
-                        "Forge leader term lost; revoking it"
+                    ForgeTelemetry::record_leader_renewal(
+                        ForgeLeaderRenewal::Refused,
+                        started.elapsed(),
                     );
-                    self.set_held(None);
+                    self.set_held(None, ForgeLeaderRevocation::RenewalRefused);
                 }
                 Ok(Err(error)) => {
-                    self.set_held(None);
+                    ForgeTelemetry::record_leader_renewal(
+                        ForgeLeaderRenewal::Failed,
+                        started.elapsed(),
+                    );
+                    self.set_held(None, ForgeLeaderRevocation::RenewalFailed);
                     return Err(ForgeError::Sql(error));
                 }
                 Err(_) => {
-                    self.set_held(None);
+                    ForgeTelemetry::record_leader_renewal(
+                        ForgeLeaderRenewal::Timeout,
+                        started.elapsed(),
+                    );
+                    self.set_held(None, ForgeLeaderRevocation::RenewalTimeout);
                     return Err(ForgeError::Timeout {
                         operation: "Forge leader term renewal",
                     });
@@ -287,12 +321,16 @@ impl ForgeLeadership {
             fencing_token,
             "Forge leader term acquired with an empty schedule"
         );
+        ForgeTelemetry::record_leader_acquired();
         *deadline = started + LEADER_TERM;
-        self.set_held(Some(Arc::new(ForgeHeldTerm {
-            fencing_token,
-            schedule: ForgeSchedule::new(DEFAULT_REPORT_TIMEOUT),
-            revocation: shutdown.child_token(),
-        })));
+        self.set_held(
+            Some(Arc::new(ForgeHeldTerm {
+                fencing_token,
+                schedule: ForgeSchedule::new(DEFAULT_REPORT_TIMEOUT),
+                revocation: shutdown.child_token(),
+            })),
+            ForgeLeaderRevocation::Replaced,
+        );
         Ok(true)
     }
 
@@ -306,7 +344,7 @@ impl ForgeLeadership {
         let Some(term) = self.slot() else {
             return Ok(());
         };
-        self.set_held(None);
+        self.set_held(None, ForgeLeaderRevocation::Shutdown);
         self.election
             .resign(self.owner, term.fencing_token)
             .await

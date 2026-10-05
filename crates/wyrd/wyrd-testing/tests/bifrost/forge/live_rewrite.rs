@@ -1245,6 +1245,15 @@ const APPROVED_FORGE_FAMILIES: &[&str] = &[
     "bifrost_forge_snapshots_expired_total",
     "bifrost_forge_compaction_debt_files",
     "bifrost_forge_compaction_debt_bytes",
+    "bifrost_forge_leader_held",
+    "bifrost_forge_leader_acquisitions_total",
+    "bifrost_forge_leader_renewals_total",
+    "bifrost_forge_leader_renewal_seconds",
+    "bifrost_forge_leader_revocations_total",
+    "bifrost_forge_worker_ready",
+    "bifrost_forge_worker_backoffs_total",
+    "bifrost_forge_worker_restarts_total",
+    "bifrost_forge_worker_restart_backoff_seconds",
 ];
 
 /// Promoted rows survive a rewrite whose acceptance the committer never learned.
@@ -2445,16 +2454,24 @@ async fn write_two_commits(
 /// the failing worker is held at that fatal point the pod reports Forge not
 /// ready and the public read still serves. Once released, the supervisor
 /// rebuilds the worker after its backoff, readiness returns, and a second
-/// table written afterwards is compacted by the fresh worker.
+/// table written afterwards is compacted by the fresh worker. The production
+/// metrics then show one leader acquisition and renewals, one worker restart
+/// after a one-second backoff, a ready worker and held term, and, once the pod
+/// shuts down, one `shutdown` revocation with both gauges back at zero.
 ///
 /// # Panics
 ///
 /// Panics when the pod cannot start, the fault never fires, readiness does not
-/// drop and recover, a public call fails, or the fresh worker commits no
-/// rewrite.
+/// drop and recover, a public call fails, the fresh worker commits no rewrite,
+/// or the leader and worker metrics disagree with that story.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
 async fn failed_worker_restarts_while_the_api_serves() {
+    let (_telemetry_guard, telemetry) =
+        shared_process_telemetry_for_test().expect("process production telemetry");
+    let checkpoint = telemetry
+        .checkpoint()
+        .expect("production telemetry baseline");
     let cluster = WyrdTestCluster::start_with_embedded_forge_observer()
         .await
         .expect("one bound embedded Bifrost pod starts");
@@ -2523,6 +2540,79 @@ async fn failed_worker_restarts_while_the_api_serves() {
         "compacted by the rebuilt worker",
     )
     .await;
+
+    // The leader and worker lifecycle is visible on the production metrics:
+    // one acquisition renewed by the requested passes, one restart after the
+    // first one-second backoff, and a worker and leader that ended ready.
+    let running = telemetry
+        .delta_since(&checkpoint)
+        .expect("production telemetry window");
+    println!(
+        "{}",
+        running.evidence(&[
+            "bifrost_forge_leader_acquisitions_total",
+            "bifrost_forge_leader_renewals_total",
+            "bifrost_forge_worker_restarts_total",
+            "bifrost_forge_worker_restart_backoff_seconds",
+            "bifrost_forge_worker_ready",
+            "bifrost_forge_leader_held",
+        ])
+    );
+    assert_eq!(
+        counter_delta(&running, "bifrost_forge_leader_acquisitions_total", &[]),
+        1.0
+    );
+    assert!(
+        counter_delta(
+            &running,
+            "bifrost_forge_leader_renewals_total",
+            &[("outcome", "ok")]
+        ) >= 1.0
+    );
+    assert_eq!(
+        counter_delta(&running, "bifrost_forge_worker_restarts_total", &[]),
+        1.0,
+        "the injected failure restarted the worker exactly once"
+    );
+    assert_eq!(
+        gauge_final(&running, "bifrost_forge_worker_restart_backoff_seconds"),
+        1.0
+    );
+    assert_eq!(gauge_final(&running, "bifrost_forge_worker_ready"), 1.0);
+    assert_eq!(gauge_final(&running, "bifrost_forge_leader_held"), 1.0);
+
+    let running_end = telemetry
+        .checkpoint()
+        .expect("production telemetry shutdown baseline");
+    cluster.shutdown().await.expect("the pod drains");
+    let stopped = telemetry
+        .delta_since(&running_end)
+        .expect("production telemetry shutdown window");
+    assert_eq!(
+        counter_delta(
+            &stopped,
+            "bifrost_forge_leader_revocations_total",
+            &[("reason", "shutdown")]
+        ),
+        1.0,
+        "shutdown resigned the one held term"
+    );
+    assert_eq!(gauge_final(&stopped, "bifrost_forge_leader_held"), 0.0);
+    assert_eq!(gauge_final(&stopped, "bifrost_forge_worker_ready"), 0.0);
+}
+
+/// Reads one unlabelled gauge's value at the close of a telemetry window.
+///
+/// # Panics
+///
+/// Panics when the window rendered no sample of the gauge.
+fn gauge_final(delta: &BifrostTelemetryDelta, family: &str) -> f64 {
+    delta
+        .gauge_final
+        .iter()
+        .find(|sample| sample.family == family)
+        .unwrap_or_else(|| panic!("the window rendered no {family} sample"))
+        .value
 }
 
 /// Reads the compaction type of every leader-dispatched Forge task of one table.

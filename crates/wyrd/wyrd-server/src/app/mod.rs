@@ -123,9 +123,12 @@ async fn run_forge_worker_process(
     // A failed worker instance is replaced in place, so this process keeps its
     // metrics endpoint and node identity while compaction is briefly unready.
     let worker_state = state.clone();
-    let worker = restarting_worker("forge_worker", shutdown.clone(), move |token| {
-        spawn_forge_worker(&worker_state, token)
-    })
+    let worker = restarting_worker(
+        "forge_worker",
+        shutdown.clone(),
+        move |token| spawn_forge_worker(&worker_state, token),
+        vala_bifrost_redux::forge::ForgeTelemetry::record_worker_restart,
+    )
     .map_err(|error| BootExit::Other(Box::new(error)))?;
     set.spawn(worker);
     if let Some(health) = state.bifrost.resource_health() {
@@ -346,16 +349,25 @@ mod tests {
         // calls again after a failure, so a restart rebuilds from the same
         // boot-composed worker (and its boot-resolved identity) rather than
         // from a second construction path.
-        for (source, owner) in [
-            (production_runner, "restarting_worker(\"forge_worker\""),
-            (server, "restarting_worker(\"forge_worker\""),
-            (server, "restarting_worker(\"maintenance_scheduler\""),
+        for (source, owners) in [
+            (production_runner, &["\"forge_worker\","][..]),
+            (
+                server,
+                &["\"forge_worker\",", "\"maintenance_scheduler\","][..],
+            ),
         ] {
             assert_eq!(
-                source.matches(owner).count(),
-                1,
-                "{owner} must own its Forge loop exactly once"
+                source.matches("restarting_worker(").count(),
+                owners.len(),
+                "each Forge loop has exactly one restarting owner"
             );
+            for owner in owners {
+                assert_eq!(
+                    source.matches(owner).count(),
+                    1,
+                    "{owner} must own its Forge loop exactly once"
+                );
+            }
         }
         for source in [production_runner, server] {
             assert!(

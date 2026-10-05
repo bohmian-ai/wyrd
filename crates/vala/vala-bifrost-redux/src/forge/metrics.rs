@@ -1,12 +1,12 @@
 //! Public Forge production telemetry.
 //!
-//! Forge exposes exactly the twelve Prometheus families operators need to
-//! read active ownership, durable results, latency, failure class, physical
-//! data flow, and the elected leader's in-memory decision time. Lease,
-//! fence, catalog, reconciliation, cursor, scheduler, and resource protocol
-//! detail belongs to structured traces and durable audit/task evidence, and
-//! unresolved authority belongs to role readiness — none of it is duplicated
-//! here.
+//! Forge exposes exactly the Prometheus families operators need to read
+//! active ownership, durable results, latency, failure class, physical data
+//! flow, the elected leader's in-memory decision time, the leader term's
+//! acquire/renew/revoke lifecycle, and the worker's readiness, back-offs, and
+//! restarts. Table lease, fence, catalog, reconciliation, cursor, and resource
+//! protocol detail belongs to structured traces and durable audit/task
+//! evidence — none of it is duplicated here.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use metrics::Gauge;
 use vala_sql::row_types::forge_tasks::{ForgeFailureClass, ForgeTaskStrategy};
+
+use super::error::ForgeError;
 
 /// Every `task_type` label Forge publishes, in durable strategy order.
 ///
@@ -27,9 +29,16 @@ pub(super) const TASK_TYPES: [ForgeTaskStrategy; 5] = [
     ForgeTaskStrategy::OrphanCleanup,
 ];
 
+/// Unlabelled gauges [`ForgeTelemetry::new`] publishes as an explicit zero.
+const ZEROED_GAUGES: [&str; 3] = [
+    "bifrost_forge_leader_held",
+    "bifrost_forge_worker_ready",
+    "bifrost_forge_worker_restart_backoff_seconds",
+];
+
 /// The exact public Forge family inventory, used by documentation coverage.
 #[cfg(test)]
-pub(super) const FORGE_METRIC_FAMILIES: [&str; 12] = [
+pub(super) const FORGE_METRIC_FAMILIES: [&str; 21] = [
     "bifrost_forge_tasks_created_total",
     "bifrost_forge_active_tasks",
     "bifrost_forge_task_attempts_total",
@@ -42,6 +51,15 @@ pub(super) const FORGE_METRIC_FAMILIES: [&str; 12] = [
     "bifrost_forge_deleted_objects_total",
     "bifrost_forge_snapshots_expired_total",
     "bifrost_forge_leader_decision_seconds",
+    "bifrost_forge_leader_held",
+    "bifrost_forge_leader_acquisitions_total",
+    "bifrost_forge_leader_renewals_total",
+    "bifrost_forge_leader_renewal_seconds",
+    "bifrost_forge_leader_revocations_total",
+    "bifrost_forge_worker_ready",
+    "bifrost_forge_worker_backoffs_total",
+    "bifrost_forge_worker_restarts_total",
+    "bifrost_forge_worker_restart_backoff_seconds",
 ];
 
 /// One leader schedule operation, the closed `operation` label.
@@ -65,6 +83,62 @@ impl ForgeLeaderDecision {
         }
     }
 }
+
+/// Outcome of one leader term renewal, the closed `outcome` label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForgeLeaderRenewal {
+    /// The election row extended this replica's term.
+    Ok,
+    /// The election row no longer names this replica's term.
+    Refused,
+    /// The renewal statement failed.
+    Failed,
+    /// The renewal was still pending at the term's local deadline.
+    Timeout,
+}
+
+impl ForgeLeaderRenewal {
+    /// Returns the stable `outcome` label for this renewal.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Refused => "refused",
+            Self::Failed => "failed",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+/// Why a held leader term ended, the closed revocation `reason` label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForgeLeaderRevocation {
+    /// A renewal found the term no longer held.
+    RenewalRefused,
+    /// A renewal statement failed.
+    RenewalFailed,
+    /// A renewal outlived the term's local deadline.
+    RenewalTimeout,
+    /// A newly acquired term replaced it.
+    Replaced,
+    /// The coordinator stopped and resigned it.
+    Shutdown,
+}
+
+impl ForgeLeaderRevocation {
+    /// Returns the stable `reason` label for this revocation.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::RenewalRefused => "renewal_refused",
+            Self::RenewalFailed => "renewal_failed",
+            Self::RenewalTimeout => "renewal_timeout",
+            Self::Replaced => "replaced",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+/// The `reason` label of a worker back-off: the database could not answer.
+pub(super) const WORKER_BACKOFF_DATABASE_UNAVAILABLE: &str = "database_unavailable";
 
 /// Closed durable result of one completed Forge ownership episode.
 ///
@@ -115,9 +189,16 @@ pub struct ForgeTelemetry {
 }
 
 impl ForgeTelemetry {
-    /// Registers the per-task-type active gauges that must export zero first.
+    /// Registers every gauge that must export zero before its first use.
+    ///
+    /// That is the per-task-type active gauges plus the leader, worker
+    /// readiness, and restart backoff gauges, which read zero until this
+    /// process holds a term, readies its worker, or restarts it.
     #[must_use]
     pub fn new() -> Self {
+        for gauge in ZEROED_GAUGES {
+            metrics::gauge!(gauge).set(0.0);
+        }
         Self {
             active_tasks: zeroed_task_type_gauges("bifrost_forge_active_tasks"),
         }
@@ -226,6 +307,74 @@ impl ForgeTelemetry {
         .record(elapsed.as_secs_f64());
     }
 
+    /// Counts one leader term this replica acquired.
+    pub(super) fn record_leader_acquired() {
+        metrics::counter!("bifrost_forge_leader_acquisitions_total").increment(1);
+    }
+
+    /// Publishes whether this replica currently holds the leader term.
+    pub(super) fn record_leader_held(held: bool) {
+        metrics::gauge!("bifrost_forge_leader_held").set(if held { 1.0 } else { 0.0 });
+    }
+
+    /// Counts one leader renewal and records how long the election row took.
+    pub(super) fn record_leader_renewal(outcome: ForgeLeaderRenewal, elapsed: Duration) {
+        metrics::counter!(
+            "bifrost_forge_leader_renewals_total",
+            "outcome" => outcome.as_str()
+        )
+        .increment(1);
+        metrics::histogram!(
+            "bifrost_forge_leader_renewal_seconds",
+            "outcome" => outcome.as_str()
+        )
+        .record(elapsed.as_secs_f64());
+    }
+
+    /// Counts one held leader term ending, by why it ended.
+    pub(super) fn record_leader_revocation(reason: ForgeLeaderRevocation) {
+        metrics::counter!(
+            "bifrost_forge_leader_revocations_total",
+            "reason" => reason.as_str()
+        )
+        .increment(1);
+    }
+
+    /// Publishes whether this process's Forge worker currently advertises ready.
+    pub(super) fn record_worker_ready(ready: bool) {
+        metrics::gauge!("bifrost_forge_worker_ready").set(if ready { 1.0 } else { 0.0 });
+    }
+
+    /// Counts one worker turn that backed off because the database could not answer.
+    pub(super) fn record_worker_backoff() {
+        metrics::counter!(
+            "bifrost_forge_worker_backoffs_total",
+            "reason" => WORKER_BACKOFF_DATABASE_UNAVAILABLE
+        )
+        .increment(1);
+    }
+
+    /// Counts one failed Forge worker restart and publishes its backoff.
+    ///
+    /// Called by the process supervisor each time it schedules a rebuild of a
+    /// worker that stopped before shutdown. The `reason` label is the failure
+    /// class of the error the worker returned; a panic or an unexplained early
+    /// return (`None`) has no error to classify and is counted as an internal
+    /// invariant failure. The backoff gauge holds the wait before the most
+    /// recent rebuild and stays at zero until the first one.
+    pub fn record_worker_restart(error: Option<&ForgeError>, backoff: Duration) {
+        let reason = error.map_or(
+            ForgeFailureClass::InternalInvariant,
+            ForgeError::failure_class,
+        );
+        metrics::counter!(
+            "bifrost_forge_worker_restarts_total",
+            "reason" => reason.as_str()
+        )
+        .increment(1);
+        metrics::gauge!("bifrost_forge_worker_restart_backoff_seconds").set(backoff.as_secs_f64());
+    }
+
     /// Opens one balanced active-task guard for the duration of an attempt.
     ///
     /// The gauge is incremented here and decremented exactly once when the
@@ -312,6 +461,23 @@ mod tests {
         ForgeLeaderDecision::Report,
     ];
 
+    /// Every renewal `outcome` value Forge may publish.
+    const LEADER_RENEWALS: [ForgeLeaderRenewal; 4] = [
+        ForgeLeaderRenewal::Ok,
+        ForgeLeaderRenewal::Refused,
+        ForgeLeaderRenewal::Failed,
+        ForgeLeaderRenewal::Timeout,
+    ];
+
+    /// Every revocation `reason` value Forge may publish.
+    const LEADER_REVOCATIONS: [ForgeLeaderRevocation; 5] = [
+        ForgeLeaderRevocation::RenewalRefused,
+        ForgeLeaderRevocation::RenewalFailed,
+        ForgeLeaderRevocation::RenewalTimeout,
+        ForgeLeaderRevocation::Replaced,
+        ForgeLeaderRevocation::Shutdown,
+    ];
+
     /// Split one recorded series key into its family and its label pairs.
     fn parse_series(series: &str) -> (String, Vec<(String, String)>) {
         let Some((family, tail)) = series.split_once('{') else {
@@ -349,10 +515,16 @@ mod tests {
         let reasons = FAILURE_CLASSES
             .iter()
             .map(|reason| reason.as_str())
+            .chain(LEADER_REVOCATIONS.iter().map(|reason| reason.as_str()))
+            .chain([WORKER_BACKOFF_DATABASE_UNAVAILABLE])
             .collect::<BTreeSet<_>>();
         let operations = LEADER_DECISIONS
             .iter()
             .map(|operation| operation.as_str())
+            .collect::<BTreeSet<_>>();
+        let outcomes = LEADER_RENEWALS
+            .iter()
+            .map(|outcome| outcome.as_str())
             .collect::<BTreeSet<_>>();
         for series in snapshot
             .counters
@@ -366,6 +538,7 @@ mod tests {
                     "result" => &results,
                     "reason" => &reasons,
                     "operation" => &operations,
+                    "outcome" => &outcomes,
                     other => panic!("{series} carries the unapproved label key {other}"),
                 };
                 assert!(
@@ -424,6 +597,25 @@ mod tests {
             for operation in LEADER_DECISIONS {
                 ForgeTelemetry::record_leader_decision(operation, Duration::from_micros(2));
             }
+            ForgeTelemetry::record_leader_acquired();
+            ForgeTelemetry::record_leader_held(true);
+            for outcome in LEADER_RENEWALS {
+                ForgeTelemetry::record_leader_renewal(outcome, Duration::from_millis(3));
+            }
+            for reason in LEADER_REVOCATIONS {
+                ForgeTelemetry::record_leader_revocation(reason);
+            }
+            ForgeTelemetry::record_leader_held(false);
+            ForgeTelemetry::record_worker_ready(true);
+            ForgeTelemetry::record_worker_backoff();
+            ForgeTelemetry::record_worker_ready(false);
+            ForgeTelemetry::record_worker_restart(None, Duration::from_secs(1));
+            ForgeTelemetry::record_worker_restart(
+                Some(&ForgeError::Capacity {
+                    detail: "the worker refused its own capacity".to_owned(),
+                }),
+                Duration::from_secs(2),
+            );
 
             drop(telemetry.active_task(ForgeTaskStrategy::SmallFiles));
             let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -443,8 +635,8 @@ mod tests {
         );
         assert_eq!(
             registered.gauges.len(),
-            TASK_TYPES.len(),
-            "construction registers exactly the per-task-type active gauges"
+            TASK_TYPES.len() + ZEROED_GAUGES.len(),
+            "construction registers exactly the per-task-type active gauges and the zeroed gauges"
         );
         for (series, value) in &registered.gauges {
             assert!(

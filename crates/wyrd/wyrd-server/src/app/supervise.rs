@@ -79,10 +79,12 @@ const WORKER_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// (the Forge worker and maintenance scheduler), so their failure must not stop
 /// the process. The first instance is built eagerly, so a misconfigured worker
 /// still fails boot. Each instance is awaited as its own task, so an error, a
-/// panic, or an early return all land here: the failure is logged, the loop
-/// backs off (doubling from one second to a thirty-second cap, reset once an
-/// instance has run longer than the cap), and `build` is called again with the
-/// same shutdown token, which is exactly how boot built the first instance.
+/// panic, or an early return all land here: the failure is logged,
+/// `on_restart` is told the failure (`None` for a panic or an early clean
+/// return) and the backoff about to be waited, the loop backs off (doubling
+/// from one second to a thirty-second cap, reset once an instance has run
+/// longer than the cap), and `build` is called again with the same shutdown
+/// token, which is exactly how boot built the first instance.
 /// Readiness needs no handling here: each Forge loop's own readiness guard
 /// retracts it when the instance exits, and the fresh instance republishes it
 /// only after its startup recovery succeeds. The returned task completes only
@@ -96,16 +98,18 @@ const WORKER_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(30);
 ///
 /// Dropping the returned future (the supervisor's drain-deadline abort) aborts
 /// the running instance.
-pub fn restarting_worker<B, F, E, BE>(
+pub fn restarting_worker<B, F, E, BE, R>(
     name: &'static str,
     shutdown: CancellationToken,
     mut build: B,
+    mut on_restart: R,
 ) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = TaskExit> + Send>>, BE>
 where
     B: FnMut(CancellationToken) -> Result<F, BE> + Send + 'static,
     F: std::future::Future<Output = Result<(), E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
     BE: std::fmt::Display,
+    R: FnMut(Option<&E>, Duration) + Send + 'static,
 {
     // Boxed so the deep worker state machine stays out of this loop's layout.
     let mut instance = Box::pin(build(shutdown.clone())?);
@@ -114,30 +118,44 @@ where
         let mut backoff = WORKER_RESTART_BACKOFF_MIN;
         loop {
             let started = Instant::now();
-            let outcome =
-                match tokio_util::task::AbortOnDropHandle::new(tokio::spawn(instance)).await {
+            let joined = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(instance)).await;
+            if shutdown.is_cancelled() {
+                let outcome = match joined {
                     Ok(result) => result.map_err(|error| error.to_string()),
                     Err(join_error) => Err(format!("task panicked: {join_error}")),
                 };
-            if shutdown.is_cancelled() {
                 return TaskExit { id, outcome };
             }
             if started.elapsed() >= WORKER_RESTART_BACKOFF_MAX {
                 backoff = WORKER_RESTART_BACKOFF_MIN;
             }
-            match &outcome {
-                Ok(()) => tracing::error!(
+            let backoff_ms = backoff.as_millis();
+            match &joined {
+                Ok(Ok(())) => tracing::error!(
                     worker = name,
-                    backoff_ms = backoff.as_millis(),
+                    backoff_ms,
                     "worker exited before shutdown; restarting it on this pod"
                 ),
-                Err(error) => tracing::error!(
+                Ok(Err(error)) => tracing::error!(
                     worker = name,
                     %error,
-                    backoff_ms = backoff.as_millis(),
+                    backoff_ms,
                     "worker failed; restarting it on this pod"
                 ),
+                Err(join_error) => tracing::error!(
+                    worker = name,
+                    error = %join_error,
+                    backoff_ms,
+                    "worker panicked; restarting it on this pod"
+                ),
             }
+            on_restart(
+                joined
+                    .as_ref()
+                    .ok()
+                    .and_then(|result| result.as_ref().err()),
+                backoff,
+            );
             loop {
                 tokio::select! {
                     biased;
@@ -617,26 +635,46 @@ mod tests {
         let parked = Arc::new(tokio::sync::Notify::new());
         let counter = Arc::clone(&builds);
         let parked_signal = Arc::clone(&parked);
-        let worker = restarting_worker("probe", shutdown.clone(), move |token| {
-            let build = counter.fetch_add(1, Ordering::AcqRel);
-            let parked = Arc::clone(&parked_signal);
-            Ok::<_, &'static str>(async move {
-                match build {
-                    0 => Err("first instance failed"),
-                    1 => panic!("second instance panicked"),
-                    _ => {
-                        parked.notify_one();
-                        token.cancelled().await;
-                        Ok(())
+        let restarts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&restarts);
+        let worker = restarting_worker(
+            "probe",
+            shutdown.clone(),
+            move |token| {
+                let build = counter.fetch_add(1, Ordering::AcqRel);
+                let parked = Arc::clone(&parked_signal);
+                Ok::<_, &'static str>(async move {
+                    match build {
+                        0 => Err("first instance failed"),
+                        1 => panic!("second instance panicked"),
+                        _ => {
+                            parked.notify_one();
+                            token.cancelled().await;
+                            Ok(())
+                        }
                     }
-                }
-            })
-        })
+                })
+            },
+            move |error: Option<&&'static str>, backoff| {
+                observed
+                    .lock()
+                    .expect("the restart record is not poisoned")
+                    .push((error.copied(), backoff));
+            },
+        )
         .expect("the first instance builds");
         let handle = tokio::spawn(worker);
 
         parked.notified().await;
         assert_eq!(builds.load(Ordering::Acquire), 3, "two rebuilds happened");
+        assert_eq!(
+            *restarts.lock().expect("the restart record is not poisoned"),
+            [
+                (Some("first instance failed"), Duration::from_secs(1)),
+                (None, Duration::from_secs(2)),
+            ],
+            "each restart reports its failure and the doubling backoff"
+        );
         assert!(!handle.is_finished(), "no exit before shutdown");
 
         shutdown.cancel();

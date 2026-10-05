@@ -605,7 +605,13 @@ class Split:
 
 class DataCardMetadata:
     """Interface, schema, split, SQL, artifact-reference, and statistics
-    metadata a DataCard accumulates before it becomes a durable Data spec."""
+    metadata a DataCard accumulates before it becomes a durable Data spec.
+
+    Only a ``DataCard`` creates it; direct construction raises ``TypeError``."""
+
+    def to_dict(self) -> JsonDict:
+        """Return this metadata as a JSON-compatible dictionary for inspection."""
+        ...
 
 class DataCard:
     """Local DataCard holder and spec builder.

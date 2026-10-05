@@ -701,9 +701,13 @@ fn drift_report(report: Option<&DriftReport>) -> Result<ArrayRef, ResultPayloadE
                 serialized_name(&report.verdict)?,
             )
         }
+        // The children are non-nullable, so a null report holds placeholder
+        // values under its null parent rather than child nulls.
         None => {
-            features.append_null();
-            (None, None)
+            let placeholder = EncodedVariant::from_json(&serde_json::Value::Null)
+                .map_err(|violation| violation.into_error(DRIFT_REPORT, 0))?;
+            features.append(&placeholder);
+            (Some(String::new()), Some(String::new()))
         }
     };
     Ok(Arc::new(StructArray::try_new(
@@ -1069,8 +1073,15 @@ mod tests {
         let summary = &payload.batches()[0].batch;
         assert_eq!(payload.batches()[0].table, "vala.verification.results");
         assert_eq!(cell(summary, "verdict", 0).as_deref(), Some("inconclusive"));
-        assert!(struct_column(summary, DRIFT_REPORT).is_null(0));
-        assert!(struct_column(summary, EVAL_SUMMARY).is_null(0));
+        for column in [DRIFT_REPORT, EVAL_SUMMARY] {
+            let report = struct_column(summary, column);
+            assert!(report.is_null(0), "{column} is null");
+            assert!(
+                report.columns().iter().all(|child| child.null_count() == 0),
+                "{column}'s non-nullable children hold placeholders, not nulls, \
+                 under the null parent, as native ingest requires"
+            );
+        }
     }
 
     /// Eval writes one item per ran and skipped outcome before the summary,

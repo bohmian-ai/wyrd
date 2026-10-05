@@ -282,3 +282,71 @@ silently narrowing required scenarios.
 - `architecture/wyrd-design.md`; `architecture/wyrd-doctrine.mdx`
 - `architecture/wyrd-security-posture.md`; `architecture/bifrost-design.md`
 - `architecture/references/languages/{agent-harness,errors,spec-driven-development,implementation-execution,testing-workflows}.md`
+
+## Implementation Evidence
+
+Authority: approved spec Revision 14 (one ProviderRequest variant per wire
+schema; `Prompt.provider` is the optional native destination), which
+supersedes this task's Revision 12 references.
+
+Commits: `cb2417666` (CLI), `99c613e6e` (CLI journeys), `57cf922c4`
+(architecture/docs), `2cbdf4e00` (regenerated Prompt card reference),
+`2167650cf` (Python/TypeScript journeys), `44d113c70` (Rust SDK journey).
+
+### Reuse map revalidation
+
+| Capability | Owner reused | Gap closed |
+|---|---|---|
+| CLI local run | `wyrd_client::Workflow::from_path`, `Cards::workflow().load`, `Workflow::run` | Clap projection in `crates/wyrd/wyrd-cli/src/workflow.rs`; no CLI loader, executor, or config parser |
+| CLI server run | `wyrd_client::Workflows::{create,get,cancel,wait}`, `crate::client::from_global` | Detach, wait with Ctrl-C (exit 130, run left active), status, cancel |
+| Registration | existing `wyrd apply` / `Cards::register_from_path` | None; journeys drive it unchanged |
+| Local bindings | `GlobalConfig.workflow.external_gateway_bindings` via shared run preparation | None; CLI and SDKs read the same `config.toml` |
+| SDK journey fixtures | `WyrdTestServer` provider root, Python `gateway_server` + `gateway/support.py`, TS `startTestServer(providerBaseUrl)` | Python `gateway_server` fixture moved to `tests/integration/conftest.py` so the Cards journey reuses it |
+
+### Acceptance
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| S1 CLI choices unambiguous; invalid choices fail before side effects with stable errors; secrets never printed; JSON/human named outputs/steps | `crates/wyrd/wyrd-cli/src/workflow.rs`, `src/cli.rs`, `src/lib.rs` | `workflow_journey::workflow_cli_contract` | PASS |
+| S2 actual bundle runs concurrently from file, apply executes nothing, registered exact/UID runs match; team reuse pinned; native/ext/public routes, step precedence, fallback | `tests/workflow_journey.rs` | `workflow_journey::workflow_file_apply_registered_local`, `workflow_journey::workflow_registered_route_protocol_matrix` | PASS |
+| S3 server acceptance prints ID before wait; detach/status/cancel idempotent; SIGINT exits 130 leaving the run active with no resubmission; unknown ID 404 | `RunArgs::run_server`, `RunIdArgs` | `workflow_journey::workflow_server_detach_status_cancel` | PASS |
+| S4 Chat/Responses/Anthropic/Gemini/Vertex matrix; local Vertex refused before dispatch, server Vertex succeeds; protocol mismatch 422 with no dispatch; ext secret sent, no Wyrd authorization | `tests/workflow_journey.rs` | `workflow_journey::workflow_registered_route_protocol_matrix` | PASS |
+| S5 team reuse across SDKs with exact UIDs/no floating; SDK local Native/ext_gateway/public wyrd_gateway; registration dispatches nothing | `sdks/wyrd-sdk-rust/tests/workflow_loading.rs`, `sdks/wyrd-sdk-python/tests/integration/cards/test_cards_crud.py` (team and mixed registration through the installed `wyrd apply`), `sdks/wyrd-sdk-ts/wyrd/tests/integration/workflow-loading.test.ts` | Rust, Python, TypeScript focused journeys below | PASS |
+| Architecture/security/operations/docs record affinity and restart loss, capability-scoped surfaces, explicit bindings/results, native inline Prompt, route ownership, fallback header, graph/snapshot/terminal-reserve bounds | `architecture/wyrd-design.md`, `wyrd-doctrine.mdx`, `wyrd-security-posture.md`, `operations/deployment-and-release.md`, `operations/reliability-and-recovery.md`, `docs/src/content/docs/how-to/build-a-workflow.svx` | `mise run docs:check` | PASS |
+
+The fallback header was already recorded in `wyrd-design.md` and the served
+OpenAPI document; no change was needed.
+
+### Commands
+
+All prefixed with `CARGO_TARGET_DIR=<repo>/target CARGO_BUILD_JOBS=12`.
+
+- `mise exec -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=workflow_journey::workflow_cli_contract)'`
+- `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && WYRD_CLI_E2E=1 mise exec -- cargo nextest run --locked -p wyrd-cli --test cli --run-ignored all -E "test(=workflow_journey::workflow_file_apply_registered_local)"'`
+- `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && WYRD_CLI_E2E=1 mise exec -- cargo nextest run --locked -p wyrd-cli --test cli --run-ignored all -E "test(=workflow_journey::workflow_server_detach_status_cancel)"'`
+- `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && WYRD_CLI_E2E=1 mise exec -- cargo nextest run --locked -p wyrd-cli --test cli --run-ignored all -E "test(=workflow_journey::workflow_registered_route_protocol_matrix)"'`
+- Rust SDK: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-sdk-rust --test workflow_loading --run-ignored all -E "test(=workflow_loading_journey)"'`
+- Python: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run py:setup && cd sdks/wyrd-sdk-python && mise exec -- uv run python -m pytest -q -m integration tests/integration/cards/test_cards_crud.py -k test_workflow_loading_journey'`
+- Python fixture move: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cd sdks/wyrd-sdk-python && mise exec -- uv run python -m pytest -q -m integration tests/integration/gateway'` (9 passed)
+- TypeScript (corrected): `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run ts:build && mise run ts:build:testing && cd sdks/wyrd-sdk-ts/wyrd && mise exec -- pnpm exec vitest run tests/integration/workflow-loading.test.ts -t "^Workflow loading workflow loading journey$"'`. Vitest matches `-t` against the full `describe` + `it` name, so the recorded `-t "^workflow loading journey$"` selects nothing and skips the file.
+- `mise run docs:check`
+- `mise run gate`, then `git diff --check`
+
+### Gate failure diagnoses
+
+**check:mocks-scope** (first gate run; every test passed before it).
+- Symptom: `scripts/checks/mocks-scope.sh` flagged wiremock in `skald-workflow` (`Cargo.toml`, `src/workflow.rs`), `skald-providers/src/endpoint.rs`, `wyrd-client/src/workflow/mod.rs`, and `wyrd-client/tests/workflow_transport.rs`.
+- Evidence: each hit is a `[dev-dependencies]` wiremock used only inside a `#[cfg(test)] mod tests` or a `tests/` target.
+- Cause: earlier Workflow route tests were not added to the allowlist.
+- Fix site: the check's documented per-file allowlist, following the `wyrd-client` `cards/handle.rs` and `tests/storage_dispatch.rs` precedent (`9b3fb0238`, approved by the team lead).
+
+**check:ci-selection** (second gate run; 52 passed, 1 failed).
+- Symptom: the case "shared Skald change packages Python and server" expected `package_typescript=false` for `crates/skald/skald-cache/src/lib.rs`, but the selector reported `true`.
+- Evidence (read-only diagnostician, given only the command, trace and diff): `cargo tree --offline -i skald-cache` shows `skald-cache → skald-runtime → wyrd-client → wyrd-sdk-ts` and `skald-cache → skald-runtime → skald-agent → skald-workflow → wyrd-client → wyrd-sdk-ts`. All eight Skald crates now reach `wyrd-sdk-ts`. `select-ci.py` `closure()` follows normal and build edges and sets `package_typescript` when `wyrd-sdk-ts` ships, which is correct.
+- Cause: `wyrd-client` now depends on `skald-runtime`, `skald-workflow`, `skald-tool` and `skald-providers`. The spec requires this so TypeScript `Workflow.fromPath`/`cards.workflow.load` can run locally through the shared facade (`sdks/wyrd-sdk-ts/native/src/workflow.rs` wraps `wyrd_client::Workflow`). The case's premise that Skald is outside the TypeScript cone is stale.
+- Fix site: that single expectation in `.github/scripts/tests/test-detect-changes.sh`. It is retitled "shared Skald change packages every SDK and server" and now expects `package_typescript=true` (approved by the team lead). No other case rests on that assumption, and the selector is unchanged.
+
+### Limits
+
+- Scenario 5 deviation (approved by the team lead): Scenario 5 asks every SDK journey to register through the compiled CLI `wyrd apply`. The Rust and TypeScript journeys cannot, because their test runtimes have no CLI binary; reaching one would need a new mechanism (a wyrd-cli dev-dependency, an in-test cargo build, or a `target/` binary lookup), and none was added. Those two journeys register through the SDK Cards `register_from_path`, the same Cards path `wyrd apply` calls, and add the local route coverage. The compiled-CLI `wyrd apply` and team-reuse proof lives in the wyrd-cli `workflow_journey` (`workflow_file_apply_registered_local`, which runs the binary via `CARGO_BIN_EXE`). The Python journey runs the installed `wyrd apply`.
+- Non-goals stayed excluded: no Python/TS server-run lifecycle, MCP Workflow surface, persistent queue/recovery, credential administration, or compatibility aliases.

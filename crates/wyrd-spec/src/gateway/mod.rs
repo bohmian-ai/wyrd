@@ -32,11 +32,11 @@ pub use deployment::{
     ProviderAdapter, ProviderAuth, ProviderAuthHeader, ProviderDeployment, VertexLocation,
 };
 pub use policy::{
-    FallbackRule, FallbackScope, GatewayBudget, GatewayBudgetPeriod, GatewayCaptureMode,
-    GatewayCapturePolicy, GatewayCapturePolicyWrite, GatewayFallbackOverride,
+    FALLBACK_HEADER, FallbackRule, FallbackScope, GatewayBudget, GatewayBudgetPeriod,
+    GatewayCaptureMode, GatewayCapturePolicy, GatewayCapturePolicyWrite, GatewayFallbackOverride,
     GatewayFallbackPolicy, GatewayGovernancePolicy, GatewayLimit, GatewayLimitSubject,
     GatewayModelPricing, GatewayPayloadField, GatewayPolicySubject, GatewayPolicyTarget,
-    GatewayPriceRate, UnknownCostPolicy,
+    GatewayPriceRate, MAX_FALLBACK_HEADER_BYTES, MAX_FALLBACK_JSON_BYTES, UnknownCostPolicy,
 };
 pub use record::{
     GATEWAY_JSON_MAX_BYTES, GatewayAccountingEntryId, GatewayAccountingEntryV1,

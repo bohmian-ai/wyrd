@@ -3,6 +3,8 @@
 use std::collections::{BTreeSet, HashSet};
 use std::num::NonZeroU64;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -120,7 +122,66 @@ impl GatewayFallbackOverride {
         }
         Ok(())
     }
+
+    /// Encode this override as a [`FALLBACK_HEADER`] value: unpadded
+    /// base64url over its JCS UTF-8 serialization.
+    ///
+    /// Encoding does not check the header limits; the receiving ingress
+    /// refuses an oversized value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GatewayContractError`] for field `fallback` when the
+    /// override cannot be serialized.
+    pub fn to_header_value(&self) -> Result<String, GatewayContractError> {
+        let json = serde_jcs::to_vec(self)
+            .map_err(|_| GatewayContractError::new("fallback", "could not be serialized"))?;
+        Ok(URL_SAFE_NO_PAD.encode(json))
+    }
+
+    /// Decode a [`FALLBACK_HEADER`] value and validate it for `requested`.
+    ///
+    /// The value must be at most [`MAX_FALLBACK_HEADER_BYTES`] of unpadded
+    /// base64url decoding to at most [`MAX_FALLBACK_JSON_BYTES`] of JSON that
+    /// deserializes as an override and passes [`Self::validate_for`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GatewayContractError`] for field `fallback` when the value is
+    /// oversized, not unpadded base64url, not an override document, or lists
+    /// no, a repeated, or the requested model.
+    pub fn from_header_value(
+        value: &[u8],
+        requested: &ModelRef,
+    ) -> Result<Self, GatewayContractError> {
+        let refuse = |reason| GatewayContractError::new("fallback", reason);
+        if value.len() > MAX_FALLBACK_HEADER_BYTES {
+            return Err(refuse("must be at most 8 KiB encoded"));
+        }
+        let json = URL_SAFE_NO_PAD
+            .decode(value)
+            .map_err(|_| refuse("must be unpadded base64url"))?;
+        if json.len() > MAX_FALLBACK_JSON_BYTES {
+            return Err(refuse("must decode to at most 4 KiB"));
+        }
+        let fallback: Self = serde_json::from_slice(&json)
+            .map_err(|_| refuse("must be a JSON fallback override"))?;
+        fallback
+            .validate_for(requested)
+            .map_err(|error| refuse(error.reason))?;
+        Ok(fallback)
+    }
 }
+
+/// Request header carrying one call's [`GatewayFallbackOverride`] to the
+/// public gateway ingress; absent means tenant fallback policy applies.
+pub const FALLBACK_HEADER: &str = "wyrd-gateway-fallback";
+
+/// Largest accepted encoded [`FALLBACK_HEADER`] value, in bytes.
+pub const MAX_FALLBACK_HEADER_BYTES: usize = 8 * 1024;
+
+/// Largest accepted decoded [`FALLBACK_HEADER`] JSON, in bytes.
+pub const MAX_FALLBACK_JSON_BYTES: usize = 4 * 1024;
 
 /// Rejects an empty or duplicated fallback candidate list.
 ///
@@ -508,12 +569,15 @@ pub struct GatewayCapturePolicy {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+
     use super::{
         GatewayCapturePolicyWrite, GatewayFallbackOverride, GatewayFallbackPolicy,
-        GatewayGovernancePolicy,
+        GatewayGovernancePolicy, MAX_FALLBACK_HEADER_BYTES,
     };
     use crate::gateway::ModelRef;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     /// Builds a `ModelRef` JSON document.
     fn model(provider: &str, name: &str) -> serde_json::Value {
@@ -552,6 +616,49 @@ mod tests {
             serde_json::from_value(json!({"candidates": [model("openai", "gpt-4o")]}))
                 .expect("decodes");
         assert!(override_self.validate_for(&requested).is_err());
+    }
+
+    /// Proves the fallback header round-trips through its exact encoding and
+    /// refuses every malformed, oversized, or invalid value as `fallback`.
+    ///
+    /// # Panics
+    /// Panics when the fixed requested model or override fixture stops
+    /// parsing or encoding, the encoding is not the exact unpadded base64url
+    /// JCS document, or any malformed value is accepted or refused under a
+    /// field other than `fallback`.
+    #[test]
+    fn fallback_header_round_trips_and_refuses() {
+        let requested = ModelRef::from_projection("openai/gpt-4o").expect("model");
+        let fallback: GatewayFallbackOverride =
+            serde_json::from_value(json!({"candidates": [model("anthropic", "claude")]}))
+                .expect("decodes");
+        let value = fallback.to_header_value().expect("encodes");
+        assert_eq!(
+            URL_SAFE_NO_PAD.decode(&value).expect("base64url"),
+            br#"{"candidates":[{"model":"claude","provider":"anthropic"}]}"#
+        );
+        assert_eq!(
+            GatewayFallbackOverride::from_header_value(value.as_bytes(), &requested),
+            Ok(fallback)
+        );
+
+        let encode = |document: Value| URL_SAFE_NO_PAD.encode(document.to_string());
+        let oversized_json = encode(json!({"candidates": [model("a-a", &"x".repeat(5000))]}));
+        for value in [
+            String::new(),
+            "not base64!".to_owned(),
+            URL_SAFE.encode(r#"{"candidates":[]}"#),
+            "A".repeat(MAX_FALLBACK_HEADER_BYTES + 1),
+            oversized_json,
+            encode(json!({"candidates": [model("a-a", "x")], "extra": true})),
+            encode(json!({"candidates": []})),
+            encode(json!({"candidates": [model("a-a", "x"), model("a-a", "x")]})),
+            encode(json!({"candidates": [model("openai", "gpt-4o")]})),
+        ] {
+            let error = GatewayFallbackOverride::from_header_value(value.as_bytes(), &requested)
+                .expect_err("refused");
+            assert_eq!(error.field, "fallback", "{value}");
+        }
     }
 
     /// Proves governance duplicates, mixed currencies, zero budgets, and empty

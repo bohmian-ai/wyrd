@@ -28,7 +28,7 @@ def test_openai_seed_and_logit_bias_from_dict_model_settings() -> None:
         model_settings={"seed": 42, "logit_bias": {"123": -100}},
     )
 
-    body = prompt.request.model_dump()
+    body = prompt.request.model_dump()["body"]
     assert body["seed"] == 42
     assert body["logit_bias"] == {"123": -100}
     assert "settings" not in body
@@ -41,14 +41,14 @@ def test_openai_unmodeled_field_passthrough() -> None:
         model_settings={"future_knob": {"enabled": True}},
     )
 
-    assert prompt.request.model_dump()["future_knob"] == {"enabled": True}
+    assert prompt.request.model_dump()["body"]["future_knob"] == {"enabled": True}
 
 
 def test_typed_openai_settings_round_trip() -> None:
     settings = OpenAISettings(seed=7, metadata={"purpose": "unit"})
     prompt = Prompt.openai_chat("gpt-4o", messages="hello", model_settings=settings)
 
-    assert prompt.request.model_dump()["seed"] == 7
+    assert prompt.request.model_dump()["body"]["seed"] == 7
     assert prompt.model_settings.to_dict()["metadata"] == {"purpose": "unit"}
 
 
@@ -77,7 +77,7 @@ def test_model_settings_decode_error() -> None:
 def test_anthropic_default_max_tokens() -> None:
     prompt = Prompt.anthropic("claude-sonnet-4-5", messages="hello")
 
-    assert prompt.request.model_dump()["max_tokens"] == 4096
+    assert prompt.request.model_dump()["body"]["max_tokens"] == 4096
     assert prompt.model_settings.to_dict()["max_tokens"] == 4096
 
 
@@ -92,7 +92,7 @@ def test_gemini_thinking_config() -> None:
         },
     )
 
-    assert prompt.request.model_dump()["generation_config"]["thinking_config"] == {
+    assert prompt.request.model_dump()["body"]["generation_config"]["thinking_config"] == {
         "include_thoughts": True,
         "thinking_budget": 128,
     }
@@ -118,7 +118,7 @@ def test_cache_sugar_and_model_settings_precedence() -> None:
         model_settings={"prompt_cache_key": "cache-from-settings"},
     )
 
-    assert prompt.request.model_dump()["prompt_cache_key"] == "cache-from-settings"
+    assert prompt.request.model_dump()["body"]["prompt_cache_key"] == "cache-from-settings"
 
 
 def test_yaml_prompt_load_with_model_settings(tmp_path) -> None:
@@ -134,7 +134,7 @@ model_settings:
     )
 
     prompt = Prompt.load(path)
-    assert prompt.request.model_dump()["seed"] == 99
+    assert prompt.request.model_dump()["body"]["seed"] == 99
 
 
 def test_old_sampling_kwargs_are_absent() -> None:
@@ -160,7 +160,7 @@ def test_vertex_reuses_gemini_settings() -> None:
     )
 
     assert isinstance(prompt.model_settings, GeminiSettings)
-    assert prompt.request.model_dump()["generation_config"]["max_output_tokens"] == 64
+    assert prompt.request.model_dump()["body"]["generation_config"]["max_output_tokens"] == 64
 
 
 def test_prompt_card_accepts_model_settings_union() -> None:
@@ -169,7 +169,7 @@ def test_prompt_card_accepts_model_settings_union() -> None:
     card = PromptCard(prompt, model_settings=OpenAISettings(seed=77))
 
     assert isinstance(card.model_settings, OpenAISettings)
-    assert card.prompt.request.model_dump()["seed"] == 77
+    assert card.prompt.request.model_dump()["body"]["seed"] == 77
     assert card.model_settings.to_dict()["seed"] == 77
 
 
@@ -206,6 +206,6 @@ spec:
 
     card = PromptCard.load(path)
 
-    assert card.prompt.request.model_dump()["seed"] == 123
-    assert card.prompt.request.model_dump()["future_knob"] == {"enabled": True}
+    assert card.prompt.request.model_dump()["body"]["seed"] == 123
+    assert card.prompt.request.model_dump()["body"]["future_knob"] == {"enabled": True}
     assert card.model_settings.to_dict()["seed"] == 123

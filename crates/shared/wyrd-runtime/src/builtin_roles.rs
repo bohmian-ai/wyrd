@@ -64,6 +64,7 @@ pub const BUILTIN_ROLES: &[BuiltinRole] = &[
             Permission::operator_invoke(),
             Permission::eval_run(),
             Permission::trigger_write(),
+            Permission::workflow_run(),
         ],
     },
     BuiltinRole {
@@ -83,6 +84,7 @@ pub const BUILTIN_ROLES: &[BuiltinRole] = &[
             Permission::artifact_write(),
             Permission::operator_invoke(),
             Permission::eval_run(),
+            Permission::workflow_run(),
         ],
     },
     BuiltinRole {
@@ -114,6 +116,25 @@ mod tests {
             let round_trip: Vec<Permission> =
                 serde_json::from_value(value).expect("permissions deserialize");
             assert_eq!(round_trip, role.permissions);
+        }
+    }
+
+    /// Proves Workflow run authority is granted to `writer` and `agent`,
+    /// covered by `admin`'s wildcard, and withheld from `reader` and
+    /// `runtime_admin`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a role's Workflow run grant differs from that split.
+    #[test]
+    fn workflow_run_is_granted_to_writing_roles_only() {
+        for role in BUILTIN_ROLES {
+            let granted = role
+                .permissions
+                .iter()
+                .any(|permission| permission.covers(&Permission::workflow_run()));
+            let expected = matches!(role.name, "admin" | "writer" | "agent");
+            assert_eq!(granted, expected, "role {}", role.name);
         }
     }
 

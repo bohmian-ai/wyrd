@@ -22,14 +22,14 @@ use http::header::{HeaderMap, HeaderName, HeaderValue};
 use secrecy::{ExposeSecret, SecretString};
 use skald_providers::{EndpointPolicy, ExternalGatewayClient, ProviderError, ProviderStream};
 use skald_runtime::{Provider, ProviderRegistry};
-use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
+use skald_spec::{Prompt, ProviderName, ProviderRequest, ProviderResponse};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 use wyrd_spec::card::workflow::{ExternalGatewayProtocol, LlmRoute, is_reserved_transport_header};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::gateway::GatewayFallbackOverride;
-use wyrd_spec::ids::{CredentialBindingName, WorkflowRunId};
+use wyrd_spec::gateway::{GatewayFallbackOverride, ModelRef};
+use wyrd_spec::ids::{CredentialBindingName, ModelId, ProviderId, WorkflowRunId};
 
 use crate::error::WorkflowResult;
 
@@ -64,6 +64,8 @@ pub struct WorkflowGatewayCorrelation {
 pub struct WyrdGatewayCall {
     /// Native request exactly as the Agent loop produced it.
     pub request: ProviderRequest,
+    /// Gateway model identity of the step's Prompt provider and model.
+    pub model: ModelRef,
     /// Ordered fallback declared on the step, if any.
     pub fallback: Option<GatewayFallbackOverride>,
     /// Remaining time the call may take; the caller enforces it.
@@ -271,7 +273,8 @@ impl WorkflowExecutionDependencies {
     ///
     /// Returns `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` for a gateway route
     /// without a caller or an unknown external binding, and
-    /// `WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED` when the binding's protocol or
+    /// `WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED` when a gateway route's Prompt
+    /// provider and model are not a gateway model identity, the binding's protocol or
     /// origin differs from the route, the scheme is not allowed by the
     /// profile, an authored header is invalid or collides with a secret
     /// header, or the endpoint policy refuses the base URL.
@@ -280,6 +283,7 @@ impl WorkflowExecutionDependencies {
         field: &str,
         route: &LlmRoute,
         fallback: Option<&GatewayFallbackOverride>,
+        prompt: &Prompt,
     ) -> WorkflowResult<StepRoute> {
         match route {
             LlmRoute::Native => Ok(StepRoute::Native),
@@ -291,9 +295,16 @@ impl WorkflowExecutionDependencies {
                             message: format!("{field}: no Wyrd gateway is available"),
                             details: serde_json::json!({ "field": field }),
                         })?;
+                let model = gateway_model(&prompt.provider(), &prompt.model).ok_or_else(|| {
+                    route_unsupported(
+                        field,
+                        "Prompt provider and model are not a gateway model identity",
+                    )
+                })?;
                 Ok(StepRoute::WyrdGateway {
                     caller: Arc::clone(caller),
                     fallback: fallback.cloned(),
+                    model,
                 })
             }
             LlmRoute::ExtGateway {
@@ -356,6 +367,8 @@ pub(crate) enum StepRoute {
         caller: Arc<dyn WyrdGatewayCaller>,
         /// Step fallback forwarded with every call.
         fallback: Option<GatewayFallbackOverride>,
+        /// Gateway model identity of the step's Prompt.
+        model: ModelRef,
     },
     /// Post each model call to a bound external gateway.
     External {
@@ -390,9 +403,14 @@ impl StepRoute {
     ) -> Option<ProviderRegistry> {
         let adapter: Arc<dyn Provider> = match self {
             Self::Native => return None,
-            Self::WyrdGateway { caller, fallback } => Arc::new(WyrdGatewayProvider {
+            Self::WyrdGateway {
+                caller,
+                fallback,
+                model,
+            } => Arc::new(WyrdGatewayProvider {
                 caller: Arc::clone(caller),
                 fallback: fallback.clone(),
+                model: model.clone(),
                 deadline: context.deadline,
                 cancellation: context.cancellation,
                 correlation: context.correlation,
@@ -409,6 +427,8 @@ impl StepRoute {
 }
 
 /// Return true when `request`'s native dialect is the one `protocol` accepts.
+///
+/// Gemini and Vertex gateways both accept a Google GenerateContent body.
 pub(crate) fn protocol_matches(
     protocol: ExternalGatewayProtocol,
     request: &ProviderRequest,
@@ -429,7 +449,7 @@ pub(crate) fn protocol_matches(
             ProviderRequest::GeminiGenerateContent(_)
         ) | (
             ExternalGatewayProtocol::VertexGenerateContent,
-            ProviderRequest::Vertex(_)
+            ProviderRequest::GeminiGenerateContent(_)
         )
     )
 }
@@ -440,6 +460,25 @@ pub(crate) fn route_unsupported(field: &str, reason: &str) -> WyrdError {
         message: format!("{field}: {reason}"),
         details: serde_json::json!({ "field": field, "reason": reason }),
     }
+}
+
+/// Project a Prompt's provider and model onto the gateway model identity.
+///
+/// Built-in providers map to the gateway's built-in provider IDs (Google AI
+/// Studio is `gemini`); any other provider keeps its own name. Returns `None`
+/// when either half is not a valid gateway identity.
+fn gateway_model(provider: &ProviderName, model: &str) -> Option<ModelRef> {
+    let provider = match provider {
+        ProviderName::OpenAi => "openai",
+        ProviderName::Anthropic => "anthropic",
+        ProviderName::Google => "gemini",
+        ProviderName::Vertex => "vertex",
+        ProviderName::Custom(name) => name,
+    };
+    Some(ModelRef {
+        provider: ProviderId::new(provider).ok()?,
+        model: ModelId::new(model).ok()?,
+    })
 }
 
 /// Build a binding-unavailable error for binding `name`.
@@ -508,6 +547,8 @@ struct WyrdGatewayProvider {
     caller: Arc<dyn WyrdGatewayCaller>,
     /// Step fallback.
     fallback: Option<GatewayFallbackOverride>,
+    /// Gateway model identity of the step's Prompt.
+    model: ModelRef,
     /// Absolute deadline for every call in this attempt.
     deadline: Option<Instant>,
     /// Run cancellation forwarded to the caller.
@@ -541,6 +582,7 @@ impl Provider for WyrdGatewayProvider {
         };
         let call = WyrdGatewayCall {
             request,
+            model: self.model.clone(),
             fallback: self.fallback.clone(),
             timeout,
             correlation: self.correlation.clone(),

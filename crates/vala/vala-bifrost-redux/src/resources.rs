@@ -3768,27 +3768,6 @@ impl OracleQueryResources {
         Arc::clone(&self.memory_peak_bytes)
     }
 
-    /// Reports whether every nested memory child of this query envelope is gone.
-    ///
-    /// [`OracleQueryResources::release`] poisons the process governor when a
-    /// child outlives its owner, which is correct for a leak but wrong for a
-    /// teardown that is merely still in progress. An owner that cannot observe
-    /// its consumers directly — a follower whose stage plan is dropped by
-    /// upstream's own task cache — asks this first and waits, so the poison
-    /// keeps its meaning.
-    #[must_use]
-    pub fn nested_idle(&self) -> bool {
-        self.nested_memory_bytes() == 0
-    }
-
-    /// Returns the query-pool memory a child still holds, in bytes.
-    ///
-    /// A drain that times out is only actionable if it names what stayed.
-    #[must_use]
-    pub fn nested_memory_bytes(&self) -> usize {
-        self.execution.memory_pool().reserved()
-    }
-
     /// Splits one named memory child from the already admitted query pool.
     ///
     /// # Errors
@@ -3808,7 +3787,11 @@ impl OracleQueryResources {
         )
     }
 
-    /// Releases the query envelope only after every nested child is gone.
+    /// Releases the query envelope's slot.
+    ///
+    /// A nested child that is still being torn down keeps its own reference to
+    /// the query's memory view, so its bytes return through the shared root as
+    /// it shrinks; the view's drop is what poisons on bytes that never return.
     ///
     /// Slot units return under the governor lock; the attached admission
     /// charge is then dropped outside it, and only after both is the Oracle
@@ -3817,18 +3800,10 @@ impl OracleQueryResources {
     ///
     /// # Errors
     ///
-    /// Returns a poison error while retaining root capacity when nested memory
-    /// ownership survives, or when root counters diverge.
+    /// Returns a poison error when root counters diverge.
     fn release(&mut self) -> Result<(), BifrostResourceError> {
         if self.released {
             return Ok(());
-        }
-        if self.execution.memory_pool().reserved() != 0 {
-            self.governor
-                .poison("Oracle query owner outlived a nested resource child");
-            return Err(BifrostResourceError::Poisoned {
-                detail: "Oracle query nested resource child survived owner release".to_owned(),
-            });
         }
         let mut state = self.governor.lock_state()?;
         let class_count = match self.query_class {
@@ -6169,7 +6144,7 @@ mod tests {
         drop((analytical, interactive));
     }
 
-    /// Query release is exact, idempotent, and fail-closed on surviving children.
+    /// Query release is exact, idempotent, and outlived safely by a late child.
     #[test]
     fn oracle_release_paths_are_exact_and_idempotent() {
         let roles = BifrostRuntimeResources::composed_for_test(
@@ -6200,24 +6175,34 @@ mod tests {
             0
         );
 
-        let poisoned_roles = BifrostRuntimeResources::composed_for_test(
+        let late_roles = BifrostRuntimeResources::composed_for_test(
             1024 * MIB,
             512 * MIB as u64,
             [BifrostRole::Oracle],
         );
-        let poisoned_oracle = poisoned_roles.oracle().expect("poison test capability");
-        let owner = poisoned_oracle
+        let late_oracle = late_roles.oracle().expect("late child test capability");
+        let owner = late_oracle
             .try_acquire_query(interactive_query(0.0))
-            .expect("poison owner");
+            .expect("late child owner");
         let child = owner
             .try_split_memory("surviving-child", 1)
             .expect("surviving child");
         drop(owner);
         assert_eq!(
-            poisoned_roles.health().reason(),
-            Some(BifrostResourcePoisonReason::Accounting)
+            late_roles.health().reason(),
+            None,
+            "a child still being torn down does not poison its owner's release"
         );
         drop(child);
+        assert_eq!(late_roles.health().reason(), None);
+        assert_eq!(
+            late_oracle
+                .snapshot()
+                .expect("a late child leaves an unpoisoned root")
+                .oracle_query_memory_used_bytes,
+            0,
+            "the late child returns its bytes through the shared root"
+        );
 
         let underflow_roles = BifrostRuntimeResources::composed_for_test(
             1024 * MIB,

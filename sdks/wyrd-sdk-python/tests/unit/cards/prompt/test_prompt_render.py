@@ -9,7 +9,7 @@ def assert_code(error: pytest.ExceptionInfo[WyrdError], code: str) -> None:
 
 
 def rendered_text(request: ProviderRequest) -> str:
-    body = request.model_dump()
+    body = request.model_dump()["body"]
     if "messages" in body:
         content = body["messages"][-1]["content"]
         if isinstance(content, list):
@@ -46,7 +46,7 @@ def test_render_dollar_and_double_brace_placeholders() -> None:
 def test_render_preserves_provider_request_variant(prompt: Prompt) -> None:
     rendered = prompt.render(name="Ada")
 
-    assert rendered.provider == prompt.provider
+    assert rendered.provider == prompt.request.provider
 
 
 def test_render_missing_variable_raises_exact_code() -> None:

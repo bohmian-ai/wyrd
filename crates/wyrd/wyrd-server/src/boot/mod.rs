@@ -1459,6 +1459,7 @@ fn attach_config_fields(
         )?)
         .with_telemetry(telemetry)
         .with_limits(config.limits.into_state())
+        .with_workflow_config(config.workflow.clone())
         .with_gateway(config.gateway.clone())
         .with_gateway_secret_keys(Arc::clone(&gateway_secret_keys))
         .with_gateway_engine(wyrd_gateway::GatewayEngine::new(

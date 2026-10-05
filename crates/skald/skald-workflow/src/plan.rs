@@ -264,11 +264,6 @@ impl ExecutionPlan {
         for &declared in &order {
             let step = &spec.steps[declared];
             let field = format!("steps[{declared}].llm_route");
-            let route = dependencies.resolve_route(
-                &field,
-                spec.resolved_route(step),
-                step.fallback.as_ref(),
-            )?;
             let Some(resolved_step) = resolved[declared].take() else {
                 return Err(WyrdError::WorkflowInternal {
                     message: "resolved step was planned twice".to_owned(),
@@ -276,6 +271,12 @@ impl ExecutionPlan {
                 }
                 .into());
             };
+            let route = dependencies.resolve_route(
+                &field,
+                spec.resolved_route(step),
+                step.fallback.as_ref(),
+                resolved_step.agent.prompt.native(),
+            )?;
             let dependents = std::mem::take(&mut dependents[steps.len()]);
             steps.push(PlannedStep {
                 id: resolved_step.id,

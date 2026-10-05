@@ -7,15 +7,17 @@ metadata:
 spec:
   model: gpt-5-5
   request:
-    model: gpt-5-5
-    messages:
-      - role: system
-        content: |
-          You are a security reviewer. Report only exploitable security findings.
-          For every finding, identify the affected code and a concrete failure path.
-      - role: user
-        content: |
-          Review this change:
-          {{code}}
+    provider: open_ai_chat_completion
+    body:
+      model: gpt-5-5
+      messages:
+        - role: system
+          content: |
+            You are a security reviewer. Report only exploitable security findings.
+            For every finding, identify the affected code and a concrete failure path.
+        - role: user
+          content: |
+            Review this change:
+            {{code}}
   variables: [code]
   response_type: text

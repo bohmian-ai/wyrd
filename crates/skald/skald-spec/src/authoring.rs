@@ -16,7 +16,6 @@ use crate::wire::openai_chat::{
 use crate::wire::openai_responses::{
     OpenAiResponseContentPart, OpenAiResponseItem, OpenAiResponsesRequest, OpenAiResponsesSettings,
 };
-use crate::wire::vertex_generate::VertexGenerateContentRequest;
 
 /// Declarative prompt draft that compiles into a native `Prompt`.
 ///
@@ -71,7 +70,14 @@ impl DraftMessages {
 impl PromptDraft {
     /// Compile this declarative draft into a native `Prompt`.
     ///
-    /// `provider` is the discriminator — not untagged guessing.
+    /// `provider` is the discriminator — not untagged guessing. A `vertex`
+    /// draft compiles to a Google GenerateContent body whose Prompt provider
+    /// is Vertex.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkaldError::PromptDraftInvalid`] for an unknown provider and
+    /// the settings decode or Prompt validation error of the built request.
     pub fn compile(self) -> SkaldResult<Prompt> {
         let provider = provider_from_str(&self.provider);
         let model = self.model.clone();
@@ -81,6 +87,7 @@ impl PromptDraft {
             .as_deref()
             .is_some_and(|op| op.eq_ignore_ascii_case("responses"));
 
+        let dispatch = (provider == ProviderName::Vertex).then_some(ProviderName::Vertex);
         let request = match provider {
             ProviderName::OpenAi if is_responses => {
                 build_openai_responses(model.clone(), self.system, messages, self.model_settings)?
@@ -103,7 +110,9 @@ impl PromptDraft {
             }
         };
 
-        Prompt::new(request, model, self.version, ResponseType::Text)
+        let mut prompt = Prompt::new(request, model, self.version, ResponseType::Text)?;
+        prompt.provider = dispatch;
+        Ok(prompt)
     }
 }
 
@@ -258,13 +267,7 @@ fn build_gemini(
         tool_config: None,
         settings,
     };
-    if vertex_target {
-        Ok(ProviderRequest::Vertex(VertexGenerateContentRequest(
-            request,
-        )))
-    } else {
-        Ok(ProviderRequest::GeminiGenerateContent(request))
-    }
+    Ok(ProviderRequest::GeminiGenerateContent(request))
 }
 
 #[cfg(test)]
@@ -331,7 +334,11 @@ mod authoring_compile {
         let prompt = draft("vertex", "gemini-2.0-flash-exp", vec!["Hello"])
             .compile()
             .expect("vertex compiles");
-        assert!(matches!(prompt.request, ProviderRequest::Vertex(_)));
+        assert!(matches!(
+            prompt.request,
+            ProviderRequest::GeminiGenerateContent(_)
+        ));
+        assert_eq!(prompt.provider(), ProviderName::Vertex);
     }
 
     #[test]

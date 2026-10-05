@@ -131,9 +131,11 @@ impl WorkflowBodies {
     /// # Errors
     /// Returns the errors of [`Workflow::from_card_bodies`].
     pub(crate) fn hydrate(&self, workflow: WorkflowCard) -> Result<Workflow, WyrdError> {
-        Workflow::from_card_bodies(workflow, skald_tool::default_registry(), &|dependency| {
-            self.body(dependency)
-        })
+        Workflow::from_card_bodies(
+            workflow,
+            &|_| Box::new(skald_tool::default_registry()),
+            &|dependency| self.body(dependency),
+        )
     }
 
     /// Return the body a reference names from its own provenance.

@@ -141,10 +141,7 @@ mod prompt_io {
         let prompt = skald_spec::Prompt::new(
             skald_spec::ProviderRequest::RawV1 {
                 provider: skald_spec::ProviderName::Custom("unit".to_owned()),
-                body: serde_json::value::RawValue::from_string(
-                    r#"{"messages":["hello"]}"#.to_owned(),
-                )
-                .expect("static raw JSON is valid"),
+                body: serde_json::json!({"messages": ["hello"]}),
             },
             "unit-model",
             None,
@@ -278,14 +275,13 @@ spec:
     }
 
     #[test]
-    fn raw_v1_prompt_body_preserves_provider_bytes() {
+    fn raw_v1_prompt_body_preserves_provider_body() {
         let path = temp_path("raw_v1.json");
         let raw = r#"{"a":[true,{"nested":"value"}],"z":2}"#;
         let prompt = skald_spec::Prompt::new(
             skald_spec::ProviderRequest::RawV1 {
                 provider: skald_spec::ProviderName::Custom("raw-provider".to_owned()),
-                body: serde_json::value::RawValue::from_string(raw.to_owned())
-                    .expect("static raw JSON is valid"),
+                body: serde_json::from_str(raw).expect("static raw JSON is valid"),
             },
             "raw-model",
             None,
@@ -305,7 +301,10 @@ spec:
         let skald_spec::ProviderRequest::RawV1 { body, .. } = spec.prompt.request else {
             panic!("loaded prompt is RawV1");
         };
-        assert_eq!(body.get(), raw);
+        assert_eq!(
+            body,
+            serde_json::from_str::<serde_json::Value>(raw).expect("static raw JSON is valid")
+        );
         let _ = std::fs::remove_file(path);
     }
 }

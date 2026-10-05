@@ -208,6 +208,10 @@ class ProviderRequest:
     """Opaque provider-native request returned by prompt rendering."""
 
     provider: str
+    """Request dialect's default provider, such as "google" for a Vertex body.
+
+    `Prompt.provider` names the dispatch destination.
+    """
     messages: list[JsonDict]
     message: JsonDict | None
     system: Any
@@ -244,10 +248,6 @@ class ProviderRequest:
         """Return the typed Google Gemini request accessor."""
         ...
 
-    def vertex(self) -> VertexRequest:
-        """Return the typed Vertex AI request accessor."""
-        ...
-
     def __str__(self) -> str:
         """Return pretty JSON for interactive inspection.
 
@@ -260,12 +260,16 @@ class ProviderResponse:
     """Typed provider response wrapper. Use provider accessors for typed field access."""
 
     @property
-    def provider(self) -> str: ...
+    def provider(self) -> str:
+        """Response dialect's default provider, such as "google" for a Vertex body.
+
+        `Prompt.provider` names the dispatch destination.
+        """
+        ...
     def openai(self) -> OpenAiChatResponse: ...
     def openai_responses(self) -> OpenAiResponsesResponse: ...
     def anthropic(self) -> AnthropicMessagesResponse: ...
     def gemini(self) -> GeminiResponse: ...
-    def vertex(self) -> VertexResponse: ...
     def model_dump(self) -> JsonDict: ...
     def model_dump_json(self) -> str: ...
 
@@ -506,14 +510,6 @@ class GoogleUsageMetadata:
     def candidates_token_count(self) -> int: ...
     @property
     def total_token_count(self) -> int: ...
-
-class VertexRequest:
-    @property
-    def contents(self) -> list[GoogleContent]: ...
-
-class VertexResponse:
-    @property
-    def candidates(self) -> list[GoogleCandidate]: ...
 
 class OpenAiResponsesRequest:
     @property

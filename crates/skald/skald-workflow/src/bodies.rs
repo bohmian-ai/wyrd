@@ -32,6 +32,14 @@ use crate::workflow_surface::{AgentResolver, Workflow};
 /// `None` when the environment holds no body for that provenance and identity.
 pub type CardBodies<'a> = dyn Fn(&Ref) -> Option<Spec> + Sync + 'a;
 
+/// Lookup from the exact Agent Card reference a step executes to the tools
+/// that Agent's declared names bind to.
+///
+/// A referenced Agent is looked up by its exact authored reference; an inline
+/// Agent has no reference of its own and is looked up by its Workflow's
+/// reference. The resolver is used only while hydrating that Agent.
+pub type AgentTools<'a> = dyn Fn(&CardRef) -> Box<dyn ToolResolver + 'a> + Sync + 'a;
+
 /// Return the Agent and Prompt references `spec` names, in authored form.
 ///
 /// Walks the canonical [`ReferenceSlotVisitor`] and keeps every Agent and
@@ -57,7 +65,12 @@ pub fn card_body_dependencies(spec: &Spec) -> Vec<Ref> {
 
 impl Workflow {
     /// Hydrate a runnable Workflow whose referenced Agents and Prompts come
-    /// from `bodies`, binding each Agent's declared tool names from `tools`.
+    /// from `bodies`, binding each Agent's declared tool names from the
+    /// resolver `tools` returns for that Agent.
+    ///
+    /// `tools` receives a referenced Agent's exact reference and, for an
+    /// inline Agent, the Workflow's own reference, so an environment can bind
+    /// tools to the executing Agent's identity.
     ///
     /// Runs the pure Workflow contract, lowers every step through Skald's
     /// existing Agent and Prompt construction, and then runs resolved
@@ -65,7 +78,8 @@ impl Workflow {
     /// and route dialect). Performs no IO.
     ///
     /// # Errors
-    /// Returns the pure Workflow contract error;
+    /// Returns the pure Workflow contract error; the Workflow identity errors
+    /// of [`WorkflowCard::card_ref`];
     /// `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` when `bodies` holds no body
     /// for a referenced Agent or Prompt; `WYRD_REGISTRY_400_INVALID_CARD_SPEC`
     /// for an unresolved path or a body of the wrong kind; the Agent tool and
@@ -73,16 +87,21 @@ impl Workflow {
     /// [`Workflow::validate`].
     pub fn from_card_bodies(
         card: WorkflowCard,
-        tools: &dyn ToolResolver,
+        tools: &AgentTools<'_>,
         bodies: &CardBodies<'_>,
     ) -> Result<Self, WyrdError> {
+        let inline_tools = tools(&card.card_ref()?);
         let resolver = CardBodyResolver {
             bodies,
             tools,
             bind_tools: true,
         };
-        let workflow =
-            Self::from_card_with_agent_resolver(card, tools, &resolver, Some(&resolver))?;
+        let workflow = Self::from_card_with_agent_resolver(
+            card,
+            inline_tools.as_ref(),
+            &resolver,
+            Some(&resolver),
+        )?;
         workflow.validate()?;
         Ok(workflow)
     }
@@ -112,7 +131,7 @@ impl Workflow {
         let tools = ToolRegistry::new();
         let resolver = CardBodyResolver {
             bodies,
-            tools: &tools,
+            tools: &|_| Box::new(ToolRegistry::new()),
             bind_tools: false,
         };
         Self::from_card_with_agent_resolver(card, &tools, &resolver, Some(&resolver))?
@@ -123,16 +142,16 @@ impl Workflow {
 
 /// Serves an environment's fetched bodies through Skald's Agent and Prompt
 /// resolver seams for one hydration or validation pass.
-struct CardBodyResolver<'a> {
+struct CardBodyResolver<'a, 't> {
     /// Environment-owned lookup from authored reference to exact body.
     bodies: &'a CardBodies<'a>,
-    /// Tools bound to referenced Agents' declared names.
-    tools: &'a dyn ToolResolver,
+    /// Per-Agent tools bound to referenced Agents' declared names.
+    tools: &'a AgentTools<'t>,
     /// Whether referenced Agents bind their declared tool names.
     bind_tools: bool,
 }
 
-impl CardBodyResolver<'_> {
+impl CardBodyResolver<'_, '_> {
     /// Return the body `bodies` holds for an identity-bearing reference slot,
     /// with the exact reference it names.
     ///
@@ -165,7 +184,7 @@ impl CardBodyResolver<'_> {
     }
 }
 
-impl AgentResolver for CardBodyResolver<'_> {
+impl AgentResolver for CardBodyResolver<'_, '_> {
     /// Build the runtime Agent for a referenced step from the body held under
     /// the step's authored provenance, keeping its exact identity and UID.
     ///
@@ -199,11 +218,12 @@ impl AgentResolver for CardBodyResolver<'_> {
             cascade_children: Vec::new(),
             created_at: Utc::now(),
         };
-        Agent::from_card(card, self.tools, self)
+        let tools = (self.tools)(&card_ref);
+        Agent::from_card(card, tools.as_ref(), self)
     }
 }
 
-impl PromptResolver for CardBodyResolver<'_> {
+impl PromptResolver for CardBodyResolver<'_, '_> {
     /// Return an inline native Prompt or the Prompt Card body held under the
     /// slot's authored provenance.
     ///
@@ -219,5 +239,129 @@ impl PromptResolver for CardBodyResolver<'_> {
                 "Agent prompt {card_ref} did not resolve to a Prompt body"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
+
+    use skald_agent::Agent;
+    use skald_tool::{AgentTool, ToolRegistry};
+    use wyrd_spec::envelope::Spec;
+    use wyrd_spec::reference::Ref;
+
+    use crate::test_support::{RecordingTool, agent, bindings, lock};
+    use crate::workflow_surface::Workflow;
+
+    /// Recording tool named `name`.
+    fn tool(name: &str) -> Arc<dyn AgentTool> {
+        Arc::new(RecordingTool {
+            name: name.to_owned(),
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    /// Registered fixture Agent `name` in space `team` declaring `tool_name`.
+    fn registered(name: &str, tool_name: &str) -> Agent {
+        agent(name, &format!("{name} static"), None)
+            .version("1.0.0")
+            .space("team")
+            .with_tool(tool(tool_name))
+    }
+
+    /// Each Agent binds its declared tools from the resolver returned for its
+    /// own exact reference, and an inline Agent from the Workflow's reference;
+    /// an Agent handed another Agent's resolver could not bind its tool.
+    #[test]
+    fn agent_tools_follow_each_agent_reference() {
+        let alpha = registered("alpha", "alpha_tool");
+        let beta = registered("beta", "beta_tool");
+        let bodies: Vec<_> = [&alpha, &beta]
+            .into_iter()
+            .map(|agent| {
+                let card_ref = agent
+                    .card_ref()
+                    .expect("fixture identity is valid")
+                    .expect("fixture Agent is referenced");
+                (card_ref, Spec::Agent(agent.to_spec()))
+            })
+            .collect();
+        let inline = agent("gamma", "gamma static", None).with_tool(tool("gamma_tool"));
+        let card = Workflow::builder("flow")
+            .version("1.0.0")
+            .space("team")
+            .add(alpha)
+            .and_then(|b| b.add(beta))
+            .and_then(|b| b.add(inline))
+            .and_then(|b| b.with_outputs(bindings(&[("text", "steps.gamma.output.text")])))
+            .and_then(|b| b.build())
+            .and_then(|workflow| Ok(workflow.to_card()?))
+            .expect("fixture Workflow builds");
+        let tool_for: BTreeMap<&str, &str> = [
+            ("alpha", "alpha_tool"),
+            ("beta", "beta_tool"),
+            ("flow", "gamma_tool"),
+        ]
+        .into();
+        let asked = Mutex::new(Vec::new());
+
+        let workflow = Workflow::from_card_bodies(
+            card,
+            &|card_ref| {
+                lock(&asked).push(card_ref.clone());
+                let registry = ToolRegistry::new();
+                if let Some(name) = tool_for.get(card_ref.name.as_str()) {
+                    registry
+                        .register(tool(name))
+                        .expect("fixture tool name is unique");
+                }
+                Box::new(registry)
+            },
+            &|dependency| match dependency {
+                Ref::Ref(card_ref) => bodies
+                    .iter()
+                    .find(|(held, _)| held.same_identity(card_ref))
+                    .map(|(_, spec)| spec.clone()),
+                _ => None,
+            },
+        )
+        .expect("every Agent binds its own tools");
+
+        for (step, expected) in [
+            ("alpha", "alpha_tool"),
+            ("beta", "beta_tool"),
+            ("gamma", "gamma_tool"),
+        ] {
+            let names: Vec<&str> = workflow.resolved_agents[step]
+                .tools()
+                .iter()
+                .map(|tool| tool.name())
+                .collect();
+            assert_eq!(names, [expected], "step {step} binds its own tool");
+        }
+        let mut asked: Vec<String> = lock(&asked)
+            .iter()
+            .map(|card_ref| {
+                format!(
+                    "{}/{}@{}",
+                    card_ref.kind.wire_name(),
+                    card_ref.name,
+                    card_ref.version
+                )
+            })
+            .collect();
+        asked.sort();
+        assert_eq!(
+            asked,
+            [
+                "Agent/alpha@1.0.0",
+                "Agent/beta@1.0.0",
+                "Workflow/flow@1.0.0"
+            ],
+            "tools are asked for by each Agent's reference and the Workflow's"
+        );
     }
 }

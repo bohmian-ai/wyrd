@@ -380,11 +380,26 @@ spec:
 ```
 
 ### Prompt
-Provider-specific request shape, flat-flattened from Skald.
+Provider-native request envelope, the serialized Skald `Prompt`.
 ```yaml
 spec:
-  # Flattened Skald Prompt: provider, model, messages, variables, response_format, ...
+  model: string
+  provider?: ProviderName          # destination; absent = the request schema's default provider
+  request:
+    provider: <wire schema>        # open_ai_chat_completion | open_ai_responses | anthropic_messages | gemini_generate_content | ...
+    body: { ... }                  # that schema's native request body
+  variables: [string]
+  response_type: text | json
 ```
+
+`request.provider` names a wire schema, never a destination; each schema has
+one variant. `provider` names where native dispatch sends it, so a custom
+OpenAI-compatible endpoint is an `open_ai_chat_completion` request with
+`provider: {custom: <name>}`, and a Vertex Prompt is a Gemini GenerateContent
+body with `provider: vertex`. Gateway routes ignore `provider` and select the
+upstream themselves. Standalone Prompt Cards may still be authored with the
+declarative `provider`/`model`/`messages` shorthand, which compiles to this
+envelope; an Agent's inline Prompt is the native envelope itself.
 
 ### Agent
 Agent contract: prompt + tools + run config. Tool names resolve through the
@@ -404,11 +419,36 @@ DAG of steps invoking other cards.
 spec:
   description?: string
   inputs: { string: ParameterValue }
-  steps: [WorkflowStep]
-  outputs: { string: json }
+  llm_route?: LlmRoute             # native (default) | wyrd_gateway | ext_gateway
+  steps: [WorkflowStep]            # id, action, depends_on, inputs, llm_route?, fallback?, timeout_seconds?, retry?
+  outputs: { string: WorkflowBinding }
   governance?: Governance
   details: { string: NonSecretValue }
 ```
+
+Data flow is explicit. A step's `inputs` bind exact sources (`input.<name>`,
+`steps.<id>.output.text`, a structured-output path) to declared Prompt
+variables, `depends_on` alone orders steps, and the Workflow's `outputs` name
+every result a run returns. Nothing is forwarded implicitly and there is no
+last-step result. Local and server runs return the same `WorkflowRun`
+snapshot, addressed by output name and step ID.
+
+A step's `llm_route` overrides the Workflow's. `native` uses the local
+process's provider registry and the Prompt's destination; server execution
+refuses it at submission with `WYRD_WORKFLOW_422_SERVER_NATIVE_UNSUPPORTED`. `wyrd_gateway` calls
+the governed Wyrd gateway with the caller's identity: locally through the
+public protocol ingress (Chat Completions, Responses, Anthropic Messages, or
+Gemini GenerateContent; a Vertex Prompt is refused before dispatch because
+the public ingress serves no Vertex dialect), and on the server in process,
+where Vertex is served. `ext_gateway` is execution-local: the process running
+the step sends the native body directly to the named binding's origin. A
+local run reads that binding from the `[workflow.external_gateway_bindings]`
+section of the shared client `config.toml`, whose secret headers are secret
+references resolved at run start for the selected bindings only; a server run
+uses the tenant-assigned server binding. An `ext_gateway` call never passes
+through the Wyrd gateway, and a binding of another protocol or with an
+unreadable secret is refused before any dispatch. Loading and registration
+never read a binding or secret.
 
 Workflow is a declarative Card, not a principal. It owns no credential, role,
 or authority; invocation uses the caller's identity. WyrdState remains a
@@ -430,6 +470,55 @@ boundary without duplicating graph state, traversal, parsing, validation, or
 runtime logic. Language SDKs project that facade; no public loader or hydrator
 is required. Shared local execution configuration serves SDKs and CLI, while
 Skald remains independent of registry IO and server tenancy.
+
+A `wyrd_gateway` step calls the existing authenticated public gateway ingress.
+Its per-step fallback travels in the optional `wyrd-gateway-fallback` request
+header: unpadded base64url over the JCS UTF-8 serialization of a
+`GatewayFallbackOverride`, at most 8 KiB encoded and 4 KiB decoded. The ingress
+authenticates the caller before parsing the header, refuses a repeated,
+malformed, oversized, empty, duplicated, or self-listing value with
+`WYRD_GATEWAY_400_INVALID_REQUEST` naming `fallback` before any dispatch, and
+consumes the header without forwarding it to a provider. Without the header,
+tenant fallback policy applies unchanged, so unmodified clients behave as
+before.
+
+A server-hosted Workflow run is an accepted job. The authenticated,
+`workflows:run`-authorized, audited submission pins the exact active graph and
+captures token-free execution authority: the caller's principal attribution
+and scopes, bounded to that run's pinned graph and total deadline. Neither a
+bearer token nor a secret is retained. Token expiry and later grant or
+credential changes neither cancel nor widen an accepted run. Later HTTP
+create/replay, get, and cancel requests authenticate and authorize afresh,
+and replay never replaces run authority. Within the run, Cards reads, Bifrost
+queries, and gateway calls still make and audit their own live per-call
+decisions under the captured authority and current owner admission rules.
+Runs are process-local; restart loses them.
+
+The server bounds runs before acceptance: step count, dependency edges,
+resolved graph bytes, decoded input bytes, and a complete-snapshot budget
+from which it reserves room for a payload-free terminal snapshot of every
+declared step, including bounded run and step error projections. A graph whose terminal snapshot cannot fit is
+refused at submission. An oversized step result fails its step, and a
+transition whose full snapshot would exceed the budget discards the provider
+payload and fails the run, so no terminal transition lacks room for its
+statuses or errors. Active and retained runs have global and per-tenant
+ceilings; terminal runs are queryable for 24 hours or until oldest-first
+eviction. Shutdown cancels and drains active runs. A multi-replica
+deployment must route a run's create, get, and cancel requests to the replica
+that owns it; any other replica answers not found.
+
+Workflow surfaces are scoped by capability. Rust, Python, and TypeScript load
+and run authored files and registered Workflows locally. Server-run
+submission, status, and cancellation ship only through the Rust
+`wyrd_client::Workflows` handle, the `/v1/workflow-runs` HTTP resource, and
+the CLI. MCP has no Workflow surface. `wyrd workflow run` takes exactly one
+source (`--file`, `--uid`, or `--space`/`--name`/`--version`) and
+`--execution local|server`; a file runs only locally. `wyrd workflow`
+commands take no `--server` option; the endpoint comes from the ambient client
+configuration. Server execution prints
+the accepted run ID and waits unless `--detach`; an interrupted wait leaves
+the run running and never cancels or resubmits it. `wyrd workflow status` and
+`wyrd workflow cancel` act on server runs.
 
 ### Mcp
 MCP server registration. The server enumerates its own tools at runtime; we do
@@ -1586,8 +1675,10 @@ prompt: ./prompts/triage.yaml
 prompt:
   model: example-model
   request:
-    model: example-model
-    messages: [{role: user, content: "Hello"}]
+    provider: open_ai_chat_completion
+    body:
+      model: example-model
+      messages: [{role: user, content: "Hello"}]
   variables: []
   response_type: text
 ```

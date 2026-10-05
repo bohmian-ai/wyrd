@@ -6,7 +6,6 @@ pub mod google_generate;
 pub mod openai_chat;
 pub mod openai_embeddings;
 pub mod openai_responses;
-pub mod vertex_generate;
 pub mod vertex_predict;
 
 #[cfg(test)]
@@ -60,11 +59,6 @@ mod wire_snapshots {
         insta::assert_json_snapshot!(common::google_response(
             crate::wire::google_generate::GoogleFinishReason::Stop
         ));
-    }
-
-    #[test]
-    fn vertex_generate_request_matches_fixture() {
-        insta::assert_json_snapshot!(common::vertex_generate_request());
     }
 
     #[test]

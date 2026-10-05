@@ -149,6 +149,13 @@ async fn the_served_document_describes_the_composed_surface() {
     ] {
         assert!(paths.contains_key(path), "missing {path}");
     }
+    for (path, method) in [
+        ("/v1/workflow-runs", "post"),
+        ("/v1/workflow-runs/{run_id}", "get"),
+        ("/v1/workflow-runs/{run_id}/cancel", "post"),
+    ] {
+        assert!(paths[path][method].is_object(), "missing {method} {path}");
+    }
     assert!(
         !paths.contains_key("/v1/cards/{card_uid}/abort"),
         "a route the server does not mount is not documented"
@@ -801,6 +808,58 @@ async fn gateway_ingress_publishes_typed_contracts() {
             "{component} must accept native extensions"
         );
     }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// Every public inference ingress publishes the optional
+/// `wyrd-gateway-fallback` header with its encoding, size limits, and refusal
+/// code, while ingresses that ignore it publish no such parameter.
+///
+/// # Panics
+/// Panics when the server fails to start or stop or a published header
+/// contract differs.
+#[tokio::test]
+async fn gateway_inference_ingress_publishes_the_fallback_header() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let fallback = |path: &str| {
+        document["paths"][path]["post"]["parameters"]
+            .as_array()
+            .and_then(|parameters| {
+                parameters
+                    .iter()
+                    .find(|parameter| parameter["name"] == "wyrd-gateway-fallback")
+            })
+            .cloned()
+    };
+
+    for path in [
+        "/v1/chat/completions",
+        "/v1/responses",
+        "/v1/messages",
+        "/v1beta/models/{target}",
+    ] {
+        let header = fallback(path).unwrap_or_else(|| panic!("{path} publishes the header"));
+        assert_eq!(header["in"], "header", "{path}");
+        assert_ne!(header["required"], true, "{path} header is optional");
+        let description = header["description"].as_str().unwrap_or_default();
+        for term in [
+            "unpadded base64url",
+            "JCS",
+            "8 KiB",
+            "4 KiB",
+            "WYRD_GATEWAY_400_INVALID_REQUEST",
+        ] {
+            assert!(description.contains(term), "{path} documents {term}");
+        }
+    }
+    assert!(
+        fallback("/v1/embeddings").is_none(),
+        "embeddings ignores the header"
+    );
 
     server.shutdown().await.expect("server shuts down");
 }

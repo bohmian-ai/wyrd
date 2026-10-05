@@ -399,8 +399,11 @@ their pinned byte backpressure without a Wyrd item-count guarantee. Oracle does
 not claim to predict every dependency allocation or transient encoded-message
 byte. Follower spill is charged to the same query-owned scratch allocation.
 Memory-pool, transport, or scratch exhaustion is typed and releases all memory,
-scratch, slot, task, cache, and transport owners exactly once after the graph
-drains. Cleanup timeout or failure is never reported as a successful release:
+scratch, slot, task, cache, and transport owners exactly once when the graph
+ends, without waiting for nested children still being torn down: a late
+child returns its bytes through the shared memory root as it frees them, and
+the query's memory view poisons the governor only when it is dropped still
+holding bytes. Cleanup failure is never reported as a successful release:
 the remaining graph stays observable to the owning supervisor, the node does
 not claim a clean terminal state, and readiness or shutdown evidence surfaces
 the failure.

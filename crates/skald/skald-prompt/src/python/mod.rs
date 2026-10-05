@@ -50,7 +50,7 @@ pub use google::{
     PyGoogleFunctionCallingConfig, PyGoogleFunctionDeclaration, PyGoogleFunctionResponse,
     PyGoogleGenerationConfig, PyGoogleInlineData, PyGooglePart, PyGoogleSafetyRating,
     PyGoogleSafetySetting, PyGoogleThinkingConfig, PyGoogleTool, PyGoogleToolConfig,
-    PyGoogleUsageMetadata, PyVertexRequest, PyVertexResponse,
+    PyGoogleUsageMetadata,
 };
 pub use openai_chat_messages::{
     PyOpenAiChatMessage, PyOpenAiContentPart, PyOpenAiFilePart, PyOpenAiImageUrl,

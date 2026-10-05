@@ -618,7 +618,11 @@ pub struct ParticipantGrant {
     /// Grant identity the participant minted; bound into stage claims.
     reservation_id: ReservationId,
     /// The open stream; dropping it ends the grant on the participant.
-    _stream: Box<dyn Send>,
+    ///
+    /// Never read, only dropped. The mutex makes the grant `Sync` so the
+    /// stream-owned graph lifecycle holding it can be borrowed across awaits
+    /// in a `Send` future; a transport stream itself is only `Send`.
+    _stream: std::sync::Mutex<Box<dyn Send>>,
 }
 
 impl fmt::Debug for ParticipantGrant {
@@ -637,7 +641,7 @@ impl ParticipantGrant {
     pub fn new(reservation_id: ReservationId, stream: Box<dyn Send>) -> Self {
         Self {
             reservation_id,
-            _stream: stream,
+            _stream: std::sync::Mutex::new(stream),
         }
     }
 

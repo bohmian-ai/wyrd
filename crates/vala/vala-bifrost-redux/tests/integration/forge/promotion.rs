@@ -686,7 +686,8 @@ mod promotion_barrier {
     /// Prepares one new rewrite operation through the operation owner.
     ///
     /// # Errors
-    /// Returns the owner's refusal, including an unsettled promotion.
+    /// Returns the owner's refusal, including an unsettled promotion, and
+    /// [`SqlError::Conflict`] when an active read leaves no exclusive authority.
     ///
     /// # Panics
     /// Panics when the fixed detail is invalid or the commit fails.
@@ -765,7 +766,8 @@ mod promotion_barrier {
     /// Prepares one snapshot expiration for snapshot 30 through the SQL owner.
     ///
     /// # Errors
-    /// Returns the owner's refusal, including an unsettled promotion.
+    /// Returns the owner's refusal, including an unsettled promotion, and
+    /// [`SqlError::Conflict`] when an active read leaves no exclusive authority.
     ///
     /// # Panics
     /// Panics when the fixed resource or path is invalid.
@@ -801,11 +803,25 @@ mod promotion_barrier {
             cleanup_candidates: Vec::new(),
             deleted_candidate_count: 0,
         };
-        ForgeOperations::new(&resource, ForgeOperationFamily::SnapshotExpire)
+        // Preparation runs the way Forge runs it: under the table's live
+        // exclusive maintenance authority, surrendered afterwards.
+        let mut conn =
+            vala_sql::TenantConn::acquire(fixture.database.app_pool(), identity.tenant).await?;
+        let exclusive =
+            vala_sql::queries::oracle_reader_authority::BifrostTableMaintenanceAuthority::new(
+                &mut conn,
+            )
+            .exclusive(identity.clone())
+            .await?
+            .ok_or_else(|| SqlError::Conflict {
+                detail: "an Oracle query is still reading this table".to_owned(),
+            })?;
+        let prepared = ForgeOperations::new(&resource, ForgeOperationFamily::SnapshotExpire)
             .expect("valid Forge resource")
             .prepare_snapshot_expiration(
                 fixture.database.operator_pool(),
                 identity.tenant,
+                &exclusive,
                 &ForgeExpirationPreparation {
                     authority,
                     table: &table,
@@ -815,7 +831,10 @@ mod promotion_barrier {
                 },
             )
             .await
-            .map(|_| ())
+            .map(|_| ());
+        drop(exclusive);
+        conn.commit().await?;
+        prepared
     }
 
     /// Proves a Prepared promotion blocks rewrite and expiration until settled.

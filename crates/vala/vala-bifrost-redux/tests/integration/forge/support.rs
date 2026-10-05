@@ -838,21 +838,87 @@ impl PromotionIntegrationFixture {
     /// # Panics
     /// Panics when the acquisition fails.
     pub(crate) async fn hold_active_read(&self) -> Uuid {
-        let query_id = Uuid::now_v7();
-        self.catalog
-            .acquire_active_cut(
-                self.tenant,
-                ActiveReadOwner {
-                    query_id,
-                    node_id: Uuid::now_v7(),
-                    fencing_token: 1,
-                    deadline: std::time::Duration::from_hours(1),
-                },
-                std::slice::from_ref(&self.binding.table_ref),
-            )
-            .await
-            .expect("the registered table's active read commits");
+        let (query_id, acquisition) = self.spawn_active_read();
+        acquisition.await.expect("the active read task joins");
         query_id
+    }
+
+    /// Starts one Oracle query's production cut acquisition on its own task.
+    ///
+    /// Returns the query id at once and the acquisition as a join handle, so
+    /// a scenario can race the acquisition against a live destructive Forge
+    /// owner: the statement waits on the table's maintenance authority until
+    /// that owner yields, then returns the pointer it read.
+    ///
+    /// # Panics
+    /// The spawned task panics when the acquisition fails or the one-hour
+    /// deadline has already passed; awaiting the handle surfaces that panic.
+    pub(crate) fn spawn_active_read(
+        &self,
+    ) -> (
+        Uuid,
+        JoinHandle<vala_sql::queries::oracle_reader_authority::AcquiredTableCut>,
+    ) {
+        let query_id = Uuid::now_v7();
+        let catalog = Arc::clone(&self.catalog);
+        let tenant = self.tenant;
+        let table = self.binding.table_ref.clone();
+        let acquisition = tokio::spawn(async move {
+            catalog
+                .acquire_active_cut(
+                    tenant,
+                    ActiveReadOwner {
+                        query_id,
+                        node_id: Uuid::now_v7(),
+                        fencing_token: 1,
+                    },
+                    std::time::Instant::now() + std::time::Duration::from_hours(1),
+                    std::slice::from_ref(&table),
+                )
+                .await
+                .expect("the registered table's active read commits")
+                .expect("an hour remains before the deadline")
+                .pop()
+                .expect("one acquired table")
+        });
+        (query_id, acquisition)
+    }
+
+    /// Waits until exactly one Oracle cut acquisition is blocked on a row lock.
+    ///
+    /// Observes `pg_stat_activity` rather than elapsed time, so a returning
+    /// call proves the acquisition statement reached `PostgreSQL` and is waiting
+    /// on the table's maintenance authority rather than merely not yet run.
+    /// The probe runs as the fixture superuser because `PostgreSQL` hides other
+    /// roles' wait state and statement text from the operator role.
+    ///
+    /// # Panics
+    /// Panics when the superuser pool or the activity read fails, or no
+    /// acquisition blocks within thirty seconds.
+    pub(crate) async fn await_blocked_cut_acquisition(&self) {
+        let observer = self
+            .database
+            .superuser_pool()
+            .await
+            .expect("fixture superuser pool");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let blocked: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_stat_activity \
+                      WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                        AND query LIKE '%oracle_acquire_table_cut%'",
+                )
+                .fetch_one(&observer)
+                .await
+                .expect("lock waits read");
+                if blocked == 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cut acquisition blocks on the table authority");
     }
 
     /// Releases one query's active reads through the production statement.

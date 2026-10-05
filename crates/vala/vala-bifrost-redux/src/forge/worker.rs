@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeTasks};
+use vala_sql::queries::oracle_reader_authority::ExclusiveTableAuthority;
 use vala_sql::row_types::forge_operations::ForgeExpirationAuthority;
 use vala_sql::row_types::forge_operations::ForgeOperationFamily;
 use vala_sql::row_types::forge_tasks::{
@@ -7784,12 +7785,28 @@ impl ForgeWorker {
                 .ok_or_else(|| ForgeError::Invariant {
                     detail: "expired cleanup cursor named an absent candidate".to_owned(),
                 })?;
+            // The exclusive table authority is held from reader exclusion
+            // through this candidate's delete outcome, including a resumed
+            // preparation, and surrendered before settlement, which takes the
+            // same row on its own connection.
+            let mut authority_conn = self
+                .forge
+                .core
+                .vala
+                .tenant_conn(attempt.tenant)
+                .await
+                .map_err(ForgeError::Sql)?;
+            let exclusive = super::table_authority::TableAuthority::new(&mut authority_conn)
+                .exclusive(attempt.tenant, &attempt.binding.table_ref)
+                .await?
+                .ok_or_else(super::table_authority::active_read_refusal)?;
             if !prepared {
                 require_running(stop)?;
                 lease.require_fence(&self.forge.core.operator_pool).await?;
                 self.tasks
                     .prepare_expired_cleanup_candidate(
                         attempt.tenant,
+                        &exclusive,
                         ExpiredCleanupCandidateRequest {
                             authority: &authority,
                             table: &table,
@@ -7802,8 +7819,11 @@ impl ForgeWorker {
             }
             prepared = false;
             let outcome = self
-                .attempt_cleanup_delete(attempt, lease, index, candidate, stop)
-                .await?;
+                .attempt_cleanup_delete(attempt, lease, &exclusive, index, candidate, stop)
+                .await;
+            drop(exclusive);
+            authority_conn.commit().await.map_err(ForgeError::Sql)?;
+            let outcome = outcome?;
             self.tasks
                 .settle_expired_cleanup_candidate(
                     attempt.tenant,
@@ -7841,29 +7861,37 @@ impl ForgeWorker {
 
     /// Proves one prepared candidate is still safe to delete right now.
     ///
-    /// No Postgres transaction is alive here: the preparation committed and
-    /// closed before this runs, so the object-store call cannot hold a database
-    /// resource. The protection proof exempts exactly this task, attempt,
-    /// cursor index, and candidate, so the drain's own prepared row stops
-    /// protecting the object it is about to delete while every other
+    /// The preparation committed before this runs, so its evidence is durable;
+    /// the only transaction alive is the caller's `exclusive` table authority,
+    /// which keeps every Oracle cut acquisition on this table waiting until
+    /// the delete's outcome is known. The protection proof exempts exactly this task,
+    /// attempt, cursor index, and candidate, so the drain's own prepared row
+    /// stops protecting the object it is about to delete while every other
     /// unresolved preparation still does. `Ok(None)` reports an absence proven
     /// by a fresh stat, the only non-deleting outcome permitted to advance the
     /// cursor; `Ok(Some(path))` is the bound path the caller may delete.
     ///
     /// # Errors
     ///
-    /// Returns clock, protection, object-metadata, refreshed-eligibility,
-    /// path-binding, cancellation, and fencing failures. Every one of them
+    /// Returns authority-coverage, clock, protection, object-metadata,
+    /// refreshed-eligibility, path-binding, cancellation, and fencing
+    /// failures. Every one of them
     /// happens strictly before a deletion is constructed, so the caller settles
     /// them all as [`ExpiredCleanupOutcome::Refused`] rather than propagating.
     async fn prove_cleanup_candidate(
         &self,
         attempt: &CleanupAttempt<'_>,
         lease: &mut ForgeLease,
+        exclusive: &ExclusiveTableAuthority<'_, '_>,
         index: u32,
         candidate: &ForgeCleanupCandidate,
         stop: &CancellationToken,
     ) -> Result<Option<String>, ForgeError> {
+        super::table_authority::require_covers(
+            exclusive,
+            attempt.tenant,
+            &attempt.binding.table_ref,
+        )?;
         let key = super::compact::ForgeTableKey {
             tenant: attempt.tenant,
             table_ref: attempt.binding.table_ref.clone(),
@@ -7917,12 +7945,13 @@ impl ForgeWorker {
 
     /// Takes one candidate's fresh proof and submits its deletion.
     ///
-    /// No Postgres transaction is alive here: the preparation committed and
-    /// closed before this runs, so the object-store call cannot hold a database
-    /// resource. The protection proof exempts exactly this task, attempt,
-    /// cursor index, and candidate, so the drain's own prepared row stops
-    /// protecting the object it is about to delete while every other
-    /// unresolved preparation still does.
+    /// `exclusive` is the table's live exclusive maintenance authority; the
+    /// borrow lasts until this returns the delete's outcome, so no Oracle read
+    /// can be admitted between the reader exclusion and the delete. The
+    /// protection proof exempts exactly this task, attempt, cursor index, and
+    /// candidate, so the drain's own prepared row stops protecting the object
+    /// it is about to delete while every other unresolved preparation still
+    /// does.
     ///
     /// # Errors
     ///
@@ -7935,12 +7964,13 @@ impl ForgeWorker {
         &self,
         attempt: &CleanupAttempt<'_>,
         lease: &mut ForgeLease,
+        exclusive: &ExclusiveTableAuthority<'_, '_>,
         index: u32,
         candidate: &ForgeCleanupCandidate,
         stop: &CancellationToken,
     ) -> Result<ExpiredCleanupOutcome, ForgeError> {
         let path = match self
-            .prove_cleanup_candidate(attempt, lease, index, candidate, stop)
+            .prove_cleanup_candidate(attempt, lease, exclusive, index, candidate, stop)
             .await
         {
             Ok(Some(path)) => path,

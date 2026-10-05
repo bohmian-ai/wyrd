@@ -7,6 +7,7 @@ mod pg_tests {
     use sqlx::{PgPool, types::Uuid};
     use vala_sql::TenantConn;
     use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeTasks};
+    use vala_sql::queries::oracle_reader_authority::BifrostTableMaintenanceAuthority;
     use vala_sql::row_types::forge_operations::{ForgeClaimTable, ForgeExpirationAuthority};
     use vala_sql::row_types::forge_tasks::{
         ExpiredCleanupCandidateRequest, ExpiredCleanupOutcome, ExpiredCleanupPayload,
@@ -17,8 +18,45 @@ mod pg_tests {
         MAINTENANCE_STRATEGIES, NewForgeTask, ORPHAN_CLEANUP_PAYLOAD_VERSION, OrphanCleanupPayload,
         SnapshotWatermark,
     };
+    use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
+
+    /// Prepares one cleanup candidate the way the Forge drain does: under the
+    /// table's live exclusive maintenance authority, surrendered afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`vala_sql::SqlError::Conflict`] when an Oracle read still holds
+    /// the table, so no authority exists, and otherwise the preparation's own
+    /// result.
+    async fn prepare_exclusively(
+        app: &PgPool,
+        tasks: &ForgeTasks,
+        tenant: DataTenantId,
+        request: ExpiredCleanupCandidateRequest<'_>,
+    ) -> Result<ForgeTaskTransitionOutcome, vala_sql::SqlError> {
+        let mut conn = TenantConn::acquire(app, tenant).await?;
+        let identity = TableAuthorityIdentity {
+            tenant,
+            table_uid: request.table.table_uid,
+            catalog_name: request.table.catalog_name.clone(),
+            namespace_name: request.table.namespace_name.clone(),
+            table_name: request.table.table_name.clone(),
+        };
+        let exclusive = BifrostTableMaintenanceAuthority::new(&mut conn)
+            .exclusive(identity)
+            .await?
+            .ok_or_else(|| vala_sql::SqlError::Conflict {
+                detail: "an Oracle query is still reading this table".to_owned(),
+            })?;
+        let prepared = tasks
+            .prepare_expired_cleanup_candidate(tenant, &exclusive, request)
+            .await;
+        drop(exclusive);
+        conn.commit().await?;
+        prepared
+    }
 
     /// Starts one isolated migrated database and returns its administrative pool.
     ///
@@ -2076,17 +2114,18 @@ mod pg_tests {
             .expect("seed an active table read");
         assert!(
             matches!(
-                tasks
-                    .prepare_expired_cleanup_candidate(
-                        tenant,
-                        ExpiredCleanupCandidateRequest {
-                            authority: &authority,
-                            table: &table,
-                            index: 0,
-                            candidate: &candidates[0]
-                        },
-                    )
-                    .await,
+                prepare_exclusively(
+                    fixture.app_pool(),
+                    &tasks,
+                    tenant,
+                    ExpiredCleanupCandidateRequest {
+                        authority: &authority,
+                        table: &table,
+                        index: 0,
+                        candidate: &candidates[0]
+                    },
+                )
+                .await,
                 Err(vala_sql::SqlError::Conflict { .. })
             ),
             "an active table read refuses cleanup preparation"
@@ -2103,18 +2142,19 @@ mod pg_tests {
 
         let index = 0_u32;
         assert_eq!(
-            tasks
-                .prepare_expired_cleanup_candidate(
-                    tenant,
-                    ExpiredCleanupCandidateRequest {
-                        authority: &authority,
-                        table: &table,
-                        index,
-                        candidate: &candidates[0]
-                    },
-                )
-                .await
-                .expect("prepare candidate zero"),
+            prepare_exclusively(
+                fixture.app_pool(),
+                &tasks,
+                tenant,
+                ExpiredCleanupCandidateRequest {
+                    authority: &authority,
+                    table: &table,
+                    index,
+                    candidate: &candidates[0]
+                },
+            )
+            .await
+            .expect("prepare candidate zero"),
             ForgeTaskTransitionOutcome::Applied
         );
         let prepared = evidence_of(&admin, cleanup_id).await.expect("evidence");
@@ -2124,18 +2164,19 @@ mod pg_tests {
 
         // The exact already-prepared tuple replays read-only.
         assert_eq!(
-            tasks
-                .prepare_expired_cleanup_candidate(
-                    tenant,
-                    ExpiredCleanupCandidateRequest {
-                        authority: &authority,
-                        table: &table,
-                        index: 0,
-                        candidate: &candidates[0]
-                    },
-                )
-                .await
-                .expect("replay preparation"),
+            prepare_exclusively(
+                fixture.app_pool(),
+                &tasks,
+                tenant,
+                ExpiredCleanupCandidateRequest {
+                    authority: &authority,
+                    table: &table,
+                    index: 0,
+                    candidate: &candidates[0]
+                },
+            )
+            .await
+            .expect("replay preparation"),
             ForgeTaskTransitionOutcome::AlreadyApplied
         );
 
@@ -2180,18 +2221,19 @@ mod pg_tests {
         assert_eq!(advanced.prepared_candidate_index, None);
 
         // Refusal and uncertainty audit without moving the frontier.
-        tasks
-            .prepare_expired_cleanup_candidate(
-                tenant,
-                ExpiredCleanupCandidateRequest {
-                    authority: &authority,
-                    table: &table,
-                    index: 1,
-                    candidate: &candidates[1],
-                },
-            )
-            .await
-            .expect("prepare candidate one");
+        prepare_exclusively(
+            fixture.app_pool(),
+            &tasks,
+            tenant,
+            ExpiredCleanupCandidateRequest {
+                authority: &authority,
+                table: &table,
+                index: 1,
+                candidate: &candidates[1],
+            },
+        )
+        .await
+        .expect("prepare candidate one");
         for outcome in [
             ExpiredCleanupOutcome::Refused,
             ExpiredCleanupOutcome::Uncertain,

@@ -418,8 +418,8 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
     } = input;
     let frames = async_stream::stream! {
         let distributed_settlement = Arc::clone(&admitted.distributed_settlement);
-        let mut admitted = Some(admitted);
-        // Re-bound after `admitted` on purpose. When a consumer walks away the
+        let mut owners = LeaderStreamOwners::new(admitted, active_reads);
+        // Re-bound after `owners` on purpose. When a consumer walks away the
         // generator state is dropped in reverse declaration order, so the plan's
         // `RecordBatch` stream must be declared last to release its memory-pool
         // reservations before the analytical envelope that granted them. The
@@ -443,7 +443,7 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
                     match encode_frame(
                         &batch,
                         &mut ipc,
-                        admitted.as_ref(),
+                        owners.admitted.as_ref(),
                         &mut query_telemetry,
                         &mut row_count,
                     ) {
@@ -456,7 +456,8 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
                         Ok(Some(frame)) => {
                             yield Ok(QueryStreamFrame::Batch(frame));
                             #[cfg(feature = "test-support")]
-                            if let Some(probe) = admitted
+                            if let Some(probe) = owners
+                                .admitted
                                 .as_ref()
                                 .and_then(|admitted| admitted.resource_probe.clone())
                                 && let Some(refusal) = probe.park_after_rows().await
@@ -489,19 +490,56 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
             request_cancellation: &request_cancellation,
             stream_cancellation: &stream_cancellation,
             distributed_settlement: &distributed_settlement,
-            admitted: &mut admitted,
+            admitted: &mut owners.admitted,
             ipc: &mut ipc,
             query_telemetry: &mut query_telemetry,
             gate_lifecycle: gate_lifecycle.as_ref(),
             running_query: &mut running_query,
             query_class,
             row_count,
-            active_reads,
+            active_reads: &mut owners.active_reads,
         })
         .await;
         yield Ok(QueryStreamFrame::Terminal(terminal));
     };
     Box::pin(frames)
+}
+
+/// The two leader-stream owners whose release order is load-bearing.
+///
+/// A consumer may drop the frame stream at any await, including mid-settlement.
+/// The admission guard carries the query's Analytical graph lifecycle, whose
+/// drop revokes every follower grant and aborts every local driver before it
+/// returns; the active-read claim's drop starts its release. Releasing the
+/// claim first would let Forge destroy objects a still-running follower or
+/// local driver may read, so this value's `Drop` fixes the order explicitly
+/// instead of leaving it to generator-state drop order.
+struct LeaderStreamOwners {
+    /// Admission guard, and through it the Analytical graph lifecycle.
+    admitted: Option<AdmittedQueryGuard>,
+    /// Active table reads, released only after `admitted` is gone.
+    active_reads: Option<super::planner::ActiveReadClaim>,
+}
+
+impl LeaderStreamOwners {
+    /// Takes ownership of the stream's admission guard and active-read claim.
+    const fn new(
+        admitted: AdmittedQueryGuard,
+        active_reads: Option<super::planner::ActiveReadClaim>,
+    ) -> Self {
+        Self {
+            admitted: Some(admitted),
+            active_reads,
+        }
+    }
+}
+
+impl Drop for LeaderStreamOwners {
+    /// Revokes the Analytical graph first, then starts the claim's release.
+    fn drop(&mut self) {
+        drop(self.admitted.take());
+        drop(self.active_reads.take());
+    }
 }
 
 /// Ordered degradation observed by one distributed query.
@@ -580,7 +618,11 @@ struct StreamSettlementInputs<'a> {
     /// Rows emitted before the terminal, reported on every outcome.
     row_count: u64,
     /// Active table reads released only once nothing can read again.
-    active_reads: Option<super::planner::ActiveReadClaim>,
+    ///
+    /// Borrowed from the stream's [`LeaderStreamOwners`] rather than moved, so
+    /// a settlement dropped mid-await leaves the claim where that owner's
+    /// `Drop` releases it after the Analytical graph is revoked.
+    active_reads: &'a mut Option<super::planner::ActiveReadClaim>,
 }
 
 /// Settles every owner the drained stream holds and assembles its terminal.
@@ -652,7 +694,7 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
     // Released only here. Every leader-local batch source was dropped by the
     // caller and the distributed and Analytical settlements have joined, so
     // no descendant of this query can read its cut again.
-    if let Some(claim) = active_reads {
+    if let Some(claim) = active_reads.take() {
         claim.release().await;
     }
     terminal
@@ -756,9 +798,8 @@ async fn settle_distributed(
 /// however it ended, the point at which follower work stops rather than the
 /// point at which it is merely no longer awaited.
 ///
-/// Signalling and awaiting is the whole of this stream's part in settlement:
-/// the graph's lifecycle task owns the cleanup order, and reproducing any of it
-/// here would be a second, racing sequence.
+/// The graph's lifecycle, owned by this stream, holds the one cleanup order;
+/// this only hands it the outcome and runs it inline.
 ///
 /// Reports what one stream's Analytical settlement did with its two owners.
 ///
@@ -774,12 +815,11 @@ pub(super) struct AnalyticalStreamSettlement {
 
 /// Settles this stream's Analytical attempt after moving admission to its graph.
 ///
-/// The transfer happens *before* settlement is signalled and awaited, not
-/// after: the lifecycle task may already have settled by the time this observes
-/// the outcome, and a permit handed over afterwards would arrive at a graph that
-/// no longer exists. Releasing it here instead would decrement class, tenant,
-/// and active-query accounting — waking a queued waiter — while a failed
-/// cleanup still holds this query's whole envelope.
+/// The transfer happens *before* settlement runs, not after: a successful
+/// settlement removes the graph, and a permit handed over afterwards would
+/// arrive at a graph that no longer exists. Releasing it here instead would
+/// decrement class, tenant, and active-query accounting — waking a queued
+/// waiter — while a failed cleanup still holds this query's whole envelope.
 ///
 /// Taking the Analytical ownership out of the guard first is what makes the
 /// transfer sound: the ownership names the supervisor that would then hold the

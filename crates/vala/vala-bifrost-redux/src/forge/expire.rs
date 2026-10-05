@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::forge_operations::ForgeOperations;
 use vala_sql::queries::forge_tasks::ForgeTasks;
+use vala_sql::queries::oracle_reader_authority::ExclusiveTableAuthority;
 use vala_sql::row_types::forge_operations::{
     ForgeClaimTable, ForgeExpirationAuthority, ForgeExpirationPreparation,
     ForgeExpirationResetRequest, ForgeExpirationSettlement, ForgeExpirationSettlementRequest,
@@ -192,9 +193,12 @@ impl Forge {
     /// ends the pass so a successor never submits a second expiry effect from the
     /// same metadata load. New selections reload metadata before commit.
     ///
-    /// Postgres closes before Iceberg: the preparation transaction commits and
-    /// releases the table maintenance-authority row before the second catalog
-    /// read, so no SQL lock is held across catalog or object-store IO.
+    /// The preparation transaction commits before the second catalog read, so
+    /// its uncertain-effect evidence is durable before Iceberg is touched. The
+    /// table's exclusive maintenance authority is the one SQL lock deliberately
+    /// held across that IO: it is taken before preparation and surrendered
+    /// only once the commit's outcome is known, which is what makes the reader
+    /// check and the destructive commit inseparable.
     async fn run_snapshot_expiry_for_table_inner(
         &self,
         lease: &mut ForgeLease,
@@ -237,26 +241,46 @@ impl Forge {
         let claim_table = self.expiry_claim_table(key, &table).await?;
         require_running(stop)?;
         lease.require_fence(&self.core.operator_pool).await?;
-        self.prepare_expiration(lease, key, authority, &claim_table, &detail)
+        // The exclusive table authority is held from reader exclusion through
+        // the Iceberg commit's known outcome, so no Oracle cut can pin the
+        // pre-expiry pointer between the reader check and the commit. It is
+        // surrendered before reset or settlement, which take the same row on
+        // their own connection.
+        let mut authority_conn = self
+            .core
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let exclusive = super::table_authority::TableAuthority::new(&mut authority_conn)
+            .exclusive(key.tenant, &key.table_ref)
+            .await?
+            .ok_or_else(super::table_authority::active_read_refusal)?;
+        self.prepare_expiration(lease, key, authority, &exclusive, &claim_table, &detail)
             .await?;
         require_running(stop)?;
         // The one corroborating read. Every pinned field must still be exactly
         // what preparation recorded; anything else is definite pre-call drift
         // that releases the claims without making a single Iceberg mutation.
         let reloaded = self.load_table(&binding.table_ident()).await?;
-        if let Err(drift) = corroborate_expiry(&reloaded, &claim_table, &detail) {
-            self.reset_expiration(lease, key, authority, &claim_table, &detail, &drift)
-                .await?;
-            outcome.unresolved = outcome.unresolved.saturating_add(1);
-            outcome.destructive_maintenance =
-                super::live_reconcile::DestructiveMaintenance::Blocked;
-            return Ok(outcome);
-        }
-        let expired_files = match self
-            .complete_expiry(lease, key, reloaded, &detail, stop)
-            .await
-        {
-            Ok(files) => files,
+        let effect = match corroborate_expiry(&reloaded, &claim_table, &detail) {
+            Err(drift) => Err(drift),
+            Ok(()) => Ok(self
+                .complete_expiry(lease, key, &exclusive, reloaded, &detail, stop)
+                .await),
+        };
+        drop(exclusive);
+        authority_conn.commit().await.map_err(ForgeError::Sql)?;
+        let expired_files = match effect {
+            Err(drift) => {
+                self.reset_expiration(lease, key, authority, &claim_table, &detail, &drift)
+                    .await?;
+                outcome.unresolved = outcome.unresolved.saturating_add(1);
+                outcome.destructive_maintenance =
+                    super::live_reconcile::DestructiveMaintenance::Blocked;
+                return Ok(outcome);
+            }
+            Ok(Ok(files)) => files,
             // A definite optimistic-commit rejection proves the mutation was
             // never applied, so it releases the claims exactly like drift.
             // A retryable catalog error is not that proof: the pinned Iceberg
@@ -265,7 +289,7 @@ impl Forge {
             // path below. Every other failure leaves acceptance unproven and
             // therefore leaves task, operation, and claims Prepared for
             // reconciliation.
-            Err(ForgeError::Catalog(error)) if !error.retryable() => {
+            Ok(Err(ForgeError::Catalog(error))) if !error.retryable() => {
                 let rejection = ForgeError::Catalog(error);
                 self.reset_expiration(lease, key, authority, &claim_table, &detail, &rejection)
                     .await?;
@@ -274,7 +298,7 @@ impl Forge {
                     super::live_reconcile::DestructiveMaintenance::Blocked;
                 return Ok(outcome);
             }
-            Err(error) => return Err(error),
+            Ok(Err(error)) => return Err(error),
         };
         let evidence = self
             .settle_expiration(
@@ -661,9 +685,16 @@ fn expiry_selection<'detail>(
 impl Forge {
     /// Submits the canonical expiry transaction while preserving uncertain acceptance.
     ///
+    /// `exclusive` is the table's live exclusive maintenance authority. The
+    /// borrow keeps every Oracle cut acquisition on this table waiting until
+    /// the caller surrenders it after this commit's outcome is known, so a
+    /// reader either committed before the authority was taken — and no
+    /// authority exists — or observes the post-expiry pointer.
+    ///
     /// # Errors
     ///
-    /// Returns validation, lease, catalog, traversal, or reconciliation failures.
+    /// Returns validation, authority-coverage, lease, catalog, traversal, or
+    /// reconciliation failures.
     /// Timeout or cancellation after submission returns reconciliation-required
     /// and deliberately leaves the caller's Prepared operation open.
     ///
@@ -675,10 +706,12 @@ impl Forge {
         &self,
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
+        exclusive: &ExclusiveTableAuthority<'_, '_>,
         table: iceberg::table::Table,
         detail: &AuditDetail,
         stop: &CancellationToken,
     ) -> Result<ExpiredFileSet, ForgeError> {
+        super::table_authority::require_covers(exclusive, key.tenant, &key.table_ref)?;
         let selected_snapshot_ids = expiry_selection(detail, key)?;
         if !lease.renew(&self.core.operator_pool).await? {
             return Err(ForgeError::FenceLost {
@@ -909,7 +942,9 @@ impl Forge {
     /// reconciliation reads that operation by primary key instead of scanning
     /// open operations and matching derived candidates. A selection already
     /// absent from Iceberg is settled `Recovered`. A selection still present is
-    /// retried only after the uncertainty bound has elapsed.
+    /// retried only after the uncertainty bound has elapsed, and only under
+    /// the table's exclusive maintenance authority; while a reader holds the
+    /// table the operation stays Prepared and the pass reports it pending.
     ///
     /// # Errors
     ///
@@ -994,8 +1029,16 @@ impl Forge {
                     .await?
             }
             ForgeExpirationSettlement::Committed => {
-                self.complete_expiry(lease, key, table, &detail, stop)
+                let Some(files) = self
+                    .retry_committed_expiry(lease, key, table, &detail, stop)
                     .await?
+                else {
+                    outcome.pending = 1;
+                    outcome.destructive_maintenance =
+                        super::live_reconcile::DestructiveMaintenance::Blocked;
+                    return Ok(outcome);
+                };
+                files
             }
         };
         let evidence = self
@@ -1012,6 +1055,49 @@ impl Forge {
         outcome.settled_evidence = Some(evidence);
         outcome.recovered = 1;
         Ok(outcome)
+    }
+
+    /// Retries one reconciled expiration commit under exclusive table authority.
+    ///
+    /// A retried commit is destructive exactly like the first one, so it holds
+    /// the same exclusive maintenance authority through its known outcome. The
+    /// authority's connection commits only after that outcome, releasing the
+    /// row before settlement takes it again.
+    ///
+    /// Returns `None`, with nothing destroyed, while any reader holds the
+    /// table; the operation then stays Prepared for a later pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL failures acquiring or committing the authority, and every
+    /// failure [`Self::complete_expiry`] reports for the commit itself.
+    async fn retry_committed_expiry(
+        &self,
+        lease: &mut ForgeLease,
+        key: &ForgeTableKey,
+        table: iceberg::table::Table,
+        detail: &AuditDetail,
+        stop: &CancellationToken,
+    ) -> Result<Option<ExpiredFileSet>, ForgeError> {
+        let mut authority_conn = self
+            .core
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let Some(exclusive) = super::table_authority::TableAuthority::new(&mut authority_conn)
+            .exclusive(key.tenant, &key.table_ref)
+            .await?
+        else {
+            authority_conn.commit().await.map_err(ForgeError::Sql)?;
+            return Ok(None);
+        };
+        let files = self
+            .complete_expiry(lease, key, &exclusive, table, detail, stop)
+            .await;
+        drop(exclusive);
+        authority_conn.commit().await.map_err(ForgeError::Sql)?;
+        files.map(Some)
     }
 
     /// Counts the exact snapshots one settled expiration durably removed.
@@ -1068,10 +1154,13 @@ impl Forge {
 
     /// Opens the atomic preparation transaction that closes before Iceberg.
     ///
+    /// `exclusive` is the caller's live table authority, which it keeps
+    /// holding through the Iceberg commit this preparation precedes.
+    ///
     /// # Errors
     ///
     /// Returns [`ForgeError::Sql`] when the fence, task identity, table
-    /// identity, surviving reader protection, or operation phase refuses the
+    /// identity, authority coverage, or operation phase refuses the
     /// preparation, and [`ForgeError::SnapshotExpiry`] when the detail is not
     /// canonical expiry evidence.
     async fn prepare_expiration(
@@ -1079,6 +1168,7 @@ impl Forge {
         lease: &ForgeLease,
         key: &ForgeTableKey,
         authority: &ExpiryTaskAuthority,
+        exclusive: &ExclusiveTableAuthority<'_, '_>,
         table: &ForgeClaimTable,
         detail: &AuditDetail,
     ) -> Result<(), ForgeError> {
@@ -1088,6 +1178,7 @@ impl Forge {
             .prepare_snapshot_expiration(
                 &self.core.operator_pool,
                 key.tenant,
+                exclusive,
                 &ForgeExpirationPreparation {
                     authority: &expiration_authority(authority, lease),
                     table,

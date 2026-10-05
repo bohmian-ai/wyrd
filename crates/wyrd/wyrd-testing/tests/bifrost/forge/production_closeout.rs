@@ -501,7 +501,8 @@ impl CloseoutJourney {
     ///
     /// # Panics
     /// Panics when the route wrote no operation, its operation never settled,
-    /// or a destructive sibling route ran beside it.
+    /// or it reported no physical deletion. Independently eligible sibling
+    /// expiry or cleanup is permitted and is not evidence against it.
     async fn assert_orphan_evidence(&self, tenant: DataTenantId) {
         let mut conn = self
             .coordinator()
@@ -516,12 +517,6 @@ impl CloseoutJourney {
         .fetch_all(&mut **conn.transaction())
         .await
         .expect("orphan collection lineage evidence");
-        let strategies: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT strategy FROM vala.forge_tasks WHERE data_tenant_id=wyrd.current_tenant()",
-        )
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .expect("durable strategy inventory");
         conn.commit()
             .await
             .expect("read-only lineage inspection completes");
@@ -536,12 +531,6 @@ impl CloseoutJourney {
             );
             eprintln!("orphan collection operation {operation}: {phase}");
         }
-        assert!(
-            strategies
-                .iter()
-                .all(|strategy| strategy != "snapshot_expiry" && strategy != "expired_cleanup"),
-            "a sibling destructive route ran beside collection: {strategies:?}"
-        );
         let metrics = self
             .cluster
             .telemetry()

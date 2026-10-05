@@ -163,10 +163,14 @@ impl OraclePlanner {
     /// table's metadata and manifests are read concurrently. Only an
     /// object-store `NotFound` on a selected document — a catalog move that
     /// already deleted it — reacquires, and only once; the replay refreshes
-    /// the same rows.
+    /// the same rows. Every acquisition, the replay included, binds only the
+    /// time remaining before the attempt's one immutable `deadline`, so a
+    /// replay refreshes the rows' expiry to that same deadline rather than
+    /// extending it.
     ///
     /// # Errors
-    /// Returns [`BifrostError::QueryForbidden`] when the caller's grants do not
+    /// Returns [`BifrostError::QueryTimeout`] when under one millisecond
+    /// remains before an acquisition, [`BifrostError::QueryForbidden`] when the caller's grants do not
     /// cover every resolved table, the public catalog error for an
     /// unregistered table or a failed acquisition or materialization, and the
     /// second `NotFound` as the catalog's public failure.
@@ -175,14 +179,16 @@ impl OraclePlanner {
         context: &AuthorizedQueryContext,
         catalog: &BifrostCatalog,
         owner: ActiveReadOwner,
+        deadline: Instant,
     ) -> Result<Vec<PinnedSealedTable>, BifrostError> {
         let tenant = context.data_tenant_id;
         let mut reacquired = false;
         loop {
             let acquired = catalog
-                .acquire_active_cut(tenant, owner, tables)
+                .acquire_active_cut(tenant, owner, deadline, tables)
                 .await
-                .map_err(BifrostCatalogError::into_public)?;
+                .map_err(BifrostCatalogError::into_public)?
+                .ok_or(BifrostError::QueryTimeout)?;
             let identities = acquired
                 .iter()
                 .zip(tables)
@@ -258,7 +264,7 @@ impl OraclePlanner {
         };
         let planned = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
-            Self::acquire_and_materialize(tables, context, catalog, owner),
+            Self::acquire_and_materialize(tables, context, catalog, owner, deadline),
         )
         .await
         .map_err(|_| BifrostError::QueryTimeout)

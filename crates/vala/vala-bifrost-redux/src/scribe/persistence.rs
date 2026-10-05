@@ -1198,7 +1198,7 @@ impl PersistenceRuntime {
             .ok_or_else(|| ScribeError::Internal {
                 detail: "Scribe staged recovery has no control pool for write recipes".to_owned(),
             })?;
-        staging.restore(pool.pool()).await
+        staging.restore(pool).await
     }
 
     /// Reconciles durable staged publications before WAL replay opens readiness.
@@ -2060,8 +2060,7 @@ impl PersistenceWorker {
                 .as_ref()
                 .ok_or_else(|| ScribeError::Internal {
                     detail: "writer-v2 staging requires the operator control capability".to_owned(),
-                })?
-                .pool(),
+                })?,
             binding,
             &frozen.schema,
         )

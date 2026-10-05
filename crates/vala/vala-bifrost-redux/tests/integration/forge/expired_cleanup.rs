@@ -1,9 +1,11 @@
 //! Tier-2 coverage for the separate expired-object cleanup task.
 //!
 //! Cleanup consumes an immutable handoff one committed expiration left behind,
-//! prepares exactly one candidate at a time with Postgres closed before any
-//! object-store call, refuses while any Oracle query holds an active read on the
-//! table, and advances only for a confirmed deletion or a proven absence.
+//! prepares exactly one candidate at a time and commits that preparation before
+//! any object-store call, deletes only while it holds the table's exclusive
+//! maintenance authority, refuses while any Oracle query holds an active read
+//! on the table, and advances only for a confirmed deletion or a proven
+//! absence.
 
 use std::sync::Arc;
 
@@ -206,17 +208,19 @@ fn sibling_path(candidate: &ForgeCleanupCandidate, file_name: &str) -> String {
     format!("{directory}/{file_name}")
 }
 
-/// Asserts the preparation committed and released its table-authority lock.
+/// Asserts the preparation committed while the exclusive authority stays held.
 ///
 /// The drain is suspended between its committed preparation and its first
-/// external call, so an independent transaction taking the same row without
-/// waiting is the direct proof that no Postgres resource spans object IO.
+/// external call. The preparation is already durable, yet an independent
+/// transaction cannot take the table's maintenance-authority row: the drain's
+/// live exclusive authority holds it through the delete's known outcome, so no
+/// reader can be admitted between the fresh proof and the deletion.
 ///
 /// # Panics
 ///
-/// Panics when the cursor differs, a deletion was submitted, or the probe lock
-/// is blocked.
-async fn assert_preparation_closed_its_transaction(
+/// Panics when the cursor differs, a deletion was submitted, or the probe
+/// lock is granted or fails for any reason other than the held row.
+async fn assert_preparation_committed_under_held_authority(
     table: &ExpirableTable,
     identity: &TableAuthorityIdentity,
     cleanup_id: Uuid,
@@ -238,19 +242,23 @@ async fn assert_preparation_closed_its_transaction(
         .begin()
         .await
         .expect("independent transaction");
-    tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        sqlx::query("SELECT 1 FROM vala.bifrost_table_maintenance_authority WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4 FOR UPDATE NOWAIT")
-            .bind(identity.tenant.as_uuid())
-            .bind(&identity.catalog_name)
-            .bind(&identity.namespace_name)
-            .bind(&identity.table_name)
-            .fetch_one(&mut *lock),
-    )
-    .await
-    .expect("the independent lock is not blocked")
-    .expect("the preparation transaction released the table-authority row");
-    lock.rollback().await.expect("release the probe lock");
+    let refused = sqlx::query("SELECT 1 FROM vala.bifrost_table_maintenance_authority WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4 FOR UPDATE NOWAIT")
+        .bind(identity.tenant.as_uuid())
+        .bind(&identity.catalog_name)
+        .bind(&identity.namespace_name)
+        .bind(&identity.table_name)
+        .fetch_one(&mut *lock)
+        .await
+        .expect_err("the drain's exclusive authority holds the table-authority row");
+    assert_eq!(
+        refused
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("55P03"),
+        "the probe is refused only because the row is locked: {refused}"
+    );
+    lock.rollback().await.expect("end the probe transaction");
 }
 
 /// Asserts an unresolved preparation excludes every competing Forge authority.
@@ -294,7 +302,6 @@ async fn assert_prepared_candidate_excludes_competitors(
 ///
 /// Panics when any exemption axis or safety input classifies unexpectedly.
 async fn assert_self_exemption_is_exact(
-    fixture: &PromotionIntegrationFixture,
     forge: &Arc<Forge>,
     binding: &TenantTableBinding,
     cleanup_id: Uuid,
@@ -314,20 +321,6 @@ async fn assert_self_exemption_is_exact(
         eligibility(cleanup_id, attempt, 0, candidate, path).await,
         "Eligible",
         "the exact prepared tuple proceeds"
-    );
-    // The fresh proof before each delete re-reads the active table reads, so
-    // a query admitted after the preparation still blocks the delete.
-    let reader = fixture.hold_active_read().await;
-    assert_eq!(
-        eligibility(cleanup_id, attempt, 0, candidate, path).await,
-        "Protected",
-        "an active table read blocks even the exact prepared tuple"
-    );
-    fixture.release_active_read(reader).await;
-    assert_eq!(
-        eligibility(cleanup_id, attempt, 0, candidate, path).await,
-        "Eligible",
-        "the released read no longer blocks the prepared tuple"
     );
     for (task_id, attempt_id, index, mismatch) in [
         (Uuid::now_v7(), attempt, 0, "task id"),
@@ -384,9 +377,9 @@ async fn assert_self_exemption_is_exact(
 ///
 /// The drain is suspended between its committed preparation and its first
 /// external call, so each assertion here observes production state directly:
-/// the SQL transaction is closed, the prepared row is the competing-Forge
-/// boundary, an active table read blocks the delete, and the self-exemption
-/// covers exactly one tuple.
+/// the preparation is durable while the exclusive authority is held, the
+/// prepared row is the competing-Forge boundary, and the self-exemption covers
+/// exactly one tuple.
 ///
 /// # Panics
 ///
@@ -405,10 +398,9 @@ async fn assert_paused_candidate_gates(
     attempt: Uuid,
     payload: &ExpiredCleanupPayload,
 ) {
-    assert_preparation_closed_its_transaction(table, identity, cleanup_id).await;
+    assert_preparation_committed_under_held_authority(table, identity, cleanup_id).await;
     assert_prepared_candidate_excludes_competitors(worker, forge, binding).await;
     assert_self_exemption_is_exact(
-        &table.fixture,
         forge,
         binding,
         cleanup_id,
@@ -555,7 +547,26 @@ async fn candidate_preparation_releases_sql_and_blocks_active_reads_and_competin
                 &table, &worker, &forge, &binding, &identity, cleanup_id, attempt, &payload,
             )
             .await;
+            // A query racing the live exclusive authority waits on it; it
+            // cannot commit its cut until the delete's outcome is known.
+            let (reader, acquisition) = table.fixture.spawn_active_read();
+            table.fixture.await_blocked_cut_acquisition().await;
+            assert!(
+                !acquisition.is_finished(),
+                "no reader commits while the cleanup's exclusive authority is live"
+            );
             table.store.release_stat();
+            acquisition.await.expect("the raced acquisition joins");
+            assert_eq!(
+                table.store.deletes(),
+                deletes_before + 1,
+                "the racing reader committed only after the delete finished"
+            );
+            assert!(
+                !object_exists(&table.fixture, payload.cleanup_candidates[0].path.as_str()).await,
+                "the racing reader observes the candidate already deleted"
+            );
+            table.fixture.release_active_read(reader).await;
         }
     );
     drained.expect("the drained cleanup task succeeds");

@@ -339,6 +339,13 @@ impl BifrostCatalog {
     /// protected by a durable active read when the caller opens its metadata.
     /// A replayed acquisition for the same query refreshes the same rows.
     ///
+    /// `deadline` is the query's one immutable absolute deadline. The
+    /// remaining duration bound into the statement is derived from it after
+    /// the tenant connection is obtained, so every acquisition, the one
+    /// permitted reacquisition included, expires its rows at that same
+    /// deadline in `PostgreSQL` time. `Ok(None)` means under one millisecond
+    /// remained and nothing was acquired; the caller reports its timeout.
+    ///
     /// # Errors
     /// Returns [`BifrostCatalogError::InvalidBinding`] when a table cannot be
     /// bound to `tenant`, [`BifrostCatalogError::TableNotFound`] when any table
@@ -353,8 +360,9 @@ impl BifrostCatalog {
         &self,
         tenant: DataTenantId,
         owner: ActiveReadOwner,
+        deadline: std::time::Instant,
         tables: &[TableRef],
-    ) -> Result<Vec<AcquiredTableCut>, BifrostCatalogError> {
+    ) -> Result<Option<Vec<AcquiredTableCut>>, BifrostCatalogError> {
         #[cfg(any(test, feature = "test-support"))]
         TEST_ACTIVE_CUT_ACQUISITIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let bindings = tables
@@ -372,8 +380,15 @@ impl BifrostCatalog {
             })
             .collect::<Vec<_>>();
         let mut conn = self.postgres.tenant_conn(tenant).await?;
+        // Derived only now, after the pool wait, so the row PostgreSQL stamps
+        // expires at the caller's original deadline however long the wait or
+        // however many times the cut is reacquired.
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining < std::time::Duration::from_millis(1) {
+            return Ok(None);
+        }
         let acquired = match OracleActiveTableReads::new(&mut conn)
-            .acquire(owner, &refs)
+            .acquire(owner, remaining, &refs)
             .await
         {
             Err(vala_sql::SqlError::NoRows) => {
@@ -383,7 +398,7 @@ impl BifrostCatalog {
             other => other?,
         };
         conn.commit().await?;
-        Ok(acquired)
+        Ok(Some(acquired))
     }
 
     /// Deletes every active table read one query holds, idempotently.
@@ -2325,12 +2340,17 @@ mod production_pin_tests {
             query_id: uuid::Uuid::now_v7(),
             node_id: uuid::Uuid::now_v7(),
             fencing_token: 1,
-            deadline: std::time::Duration::from_hours(1),
         };
         let acquired = catalog
-            .acquire_active_cut(tenant, owner, std::slice::from_ref(table))
+            .acquire_active_cut(
+                tenant,
+                owner,
+                std::time::Instant::now() + std::time::Duration::from_hours(1),
+                std::slice::from_ref(table),
+            )
             .await
             .expect("the registered table acquires")
+            .expect("an hour remains before the deadline")
             .pop()
             .expect("one acquired table");
         catalog

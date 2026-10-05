@@ -4,7 +4,8 @@
 //! tenant scope for wyrd_app-role paths.
 // raw-query grep allowlist: olap control tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
-use wyrd_sql::TenantConn;
+use wyrd_spec::DataTenantId;
+use wyrd_sql::{OperatorPool, TenantConn};
 
 use crate::SqlError;
 use crate::queries::oracle_reader_authority::{
@@ -91,6 +92,35 @@ pub async fn get_by_fqn(
     )
     .bind(fqn)
     .fetch_optional(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
+}
+
+/// Reads the canonical physical layout registered for one tenant's table.
+///
+/// Scribe resolves its write recipe from this control row once per write task
+/// on its operator lane, which serves every tenant's staged work, so the read
+/// names `tenant` explicitly instead of relying on a tenant bind.
+///
+/// # Errors
+/// Returns [`SqlError`] when the query fails. A missing registration is
+/// `Ok(None)` so the caller decides how an unregistered table fails.
+// tenant-isolation: cross-tenant OperatorPool
+pub async fn registered_physical_layout(
+    operator: &OperatorPool,
+    tenant: DataTenantId,
+    fqn: &str,
+) -> Result<Option<serde_json::Value>, SqlError> {
+    sqlx::query_scalar(
+        r"
+        SELECT physical_layout
+          FROM vala.bifrost_tables
+         WHERE data_tenant_id = $1 AND fqn = $2
+        ",
+    )
+    .bind(tenant.as_uuid())
+    .bind(fqn)
+    .fetch_optional(operator.pool())
     .await
     .map_err(SqlError::from)
 }

@@ -27,7 +27,7 @@ use wyrd_spec::vala::api::{
     ForgeSnapshotExpirePhase, audit_detail_canonical_json,
 };
 
-use crate::queries::oracle_reader_authority::BIFROST_CATALOG_NAME;
+use crate::queries::oracle_reader_authority::{BIFROST_CATALOG_NAME, ExclusiveTableAuthority};
 use crate::row_types::forge_operations::{
     ForgeClaimTable, ForgeExpirationAuthority, ForgeExpirationPreparation,
     ForgeExpirationResetOutcome, ForgeExpirationResetRequest, ForgeExpirationSettlementRequest,
@@ -863,11 +863,17 @@ fn extract_detail_phase(detail: &AuditDetail) -> Result<ForgeOperationPhase, Sql
 impl ForgeOperations<'_> {
     /// Atomically prepares one snapshot-expiration selection.
     ///
+    /// `exclusive` is the caller's live table authority: holding it is what
+    /// proves no Oracle read exists and none can be admitted, and the caller
+    /// keeps holding it through the Iceberg effect this preparation precedes.
+    /// This transaction therefore never locks the authority row itself — it
+    /// would wait on the caller's own lock — and only verifies the capability
+    /// covers the request's exact tenant and table.
+    ///
     /// In one operator transaction this asserts the caller's live lease fence,
-    /// pins the exact running attempt, takes the table's maintenance-authority
-    /// row, discards provably abandoned active table reads and refuses while
-    /// any other active read remains, inserts the Prepared operation state, claims every
-    /// selected snapshot, and moves the task to Prepared with its evidence.
+    /// pins the exact running attempt, inserts the Prepared operation state,
+    /// claims every selected snapshot, and moves the task to Prepared with its
+    /// evidence.
     ///
     /// Replaying the identical preparation writes nothing. An identical
     /// selection whose previous pass was reset is prepared again, reopening
@@ -878,8 +884,9 @@ impl ForgeOperations<'_> {
     /// Returns [`SqlError::Conflict`] when the family is not
     /// `snapshot_expire`, the transition does not name this operation, the
     /// lease fence is lost, the task/attempt/owner/table identity does not
-    /// match, an Oracle query still reads the table, a Scribe promotion on the
-    /// table is unsettled, or the operation is already resolved.
+    /// match, `exclusive` does not cover the request's table, a Scribe
+    /// promotion on the table is unsettled, or the operation is already
+    /// resolved.
     /// Returns [`SqlError::InvariantViolation`] when stored state is malformed.
     /// Returns [`SqlError::Query`] for statement failures.
     ///
@@ -892,9 +899,11 @@ impl ForgeOperations<'_> {
         &self,
         operator: &OperatorPool,
         tenant: DataTenantId,
+        exclusive: &ExclusiveTableAuthority<'_, '_>,
         request: &ForgeExpirationPreparation<'_>,
     ) -> Result<ForgeOperationTransition, SqlError> {
         self.require_snapshot_expire()?;
+        require_exclusive_authority(exclusive, tenant, request.table)?;
         let (detail, _, operation_id) = validate_transition(
             request.operation,
             request.detail,
@@ -915,8 +924,6 @@ impl ForgeOperations<'_> {
             &["running", "prepared"],
         )
         .await?;
-        let identity = lock_table_authority(&mut tx, tenant, request.table).await?;
-        refuse_active_table_reads(&mut tx, &identity).await?;
         self.refuse_unsettled_promotion(&mut tx).await?;
 
         self.acquire_operation_lock(&mut tx, operation_id).await?;
@@ -1549,36 +1556,36 @@ pub(crate) async fn lock_table_authority(
     Ok(identity)
 }
 
-/// Discards one table's abandoned active reads, then refuses destructive work
-/// while any active read remains.
+/// Fails closed unless the caller's exclusive authority covers exactly the
+/// tenant and table a destructive preparation names.
 ///
-/// Runs inside a Forge operator transaction that is already tenant-bound and
-/// already holds the table's maintenance-authority row `FOR UPDATE`, so no
-/// acquisition can commit a new read between this decision and the caller's
-/// destructive preparation. Abandonment follows
-/// [`active_table_reads_exist`].
+/// Shared by every destructive Forge preparation, each of which runs on its own
+/// operator connection while the caller's capability holds the authority row.
 ///
 /// # Errors
 ///
-/// Returns [`SqlError::Conflict`] when an active read remains and
-/// [`SqlError`] when either statement fails.
-pub(crate) async fn refuse_active_table_reads(
-    tx: &mut Transaction<'_, Postgres>,
-    identity: &TableAuthorityIdentity,
+/// Returns [`SqlError::Conflict`] when the capability covers another tenant or
+/// table.
+pub(crate) fn require_exclusive_authority(
+    exclusive: &ExclusiveTableAuthority<'_, '_>,
+    tenant: DataTenantId,
+    table: &ForgeClaimTable,
 ) -> Result<(), SqlError> {
-    if active_table_reads_exist(tx, identity).await? {
-        return Err(SqlError::Conflict {
-            detail: "an Oracle query is still reading this table".to_owned(),
-        });
-    }
-    Ok(())
+    exclusive.require_covers(
+        tenant,
+        &table.table_uid,
+        &table.catalog_name,
+        &table.namespace_name,
+        &table.table_name,
+    )
 }
 
 /// Discards one table's abandoned active reads and reports whether any
 /// active read remains.
 ///
 /// The caller's tenant-bound transaction must already hold the table's
-/// maintenance-authority row `FOR UPDATE`, so the answer stays true for the
+/// maintenance-authority row in a mode that excludes cut acquisition
+/// (`FOR UPDATE` or `FOR NO KEY UPDATE`), so the answer stays true for the
 /// rest of that transaction. A row is abandoned once PostgreSQL time has
 /// passed its `abandon_after`, the owning query's deadline bound at
 /// acquisition; a live query releases its own rows before then. The

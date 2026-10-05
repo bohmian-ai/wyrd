@@ -1652,6 +1652,46 @@ mod pg_tests {
         // Serialized snapshot expiration claims
         // -------------------------------------------------------------------
 
+        /// Prepares one expiration the way Forge does: under the table's live
+        /// exclusive maintenance authority, surrendered afterwards.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`SqlError::Conflict`] when an Oracle read still holds the
+        /// table, so no authority exists, and otherwise the preparation's own
+        /// result.
+        async fn prepare_expiration_exclusively(
+            app: &PgPool,
+            ops: &ForgeOperations<'_>,
+            operator: &vala_sql::OperatorPool,
+            tenant: DataTenantId,
+            request: &ForgeExpirationPreparation<'_>,
+        ) -> Result<ForgeOperationTransition, SqlError> {
+            let mut conn = vala_sql::TenantConn::acquire(app, tenant).await?;
+            let identity = vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity {
+                tenant,
+                table_uid: request.table.table_uid,
+                catalog_name: request.table.catalog_name.clone(),
+                namespace_name: request.table.namespace_name.clone(),
+                table_name: request.table.table_name.clone(),
+            };
+            let exclusive =
+                vala_sql::queries::oracle_reader_authority::BifrostTableMaintenanceAuthority::new(
+                    &mut conn,
+                )
+                .exclusive(identity)
+                .await?
+                .ok_or_else(|| SqlError::Conflict {
+                    detail: "an Oracle query is still reading this table".to_owned(),
+                })?;
+            let prepared = ops
+                .prepare_snapshot_expiration(operator, tenant, &exclusive, request)
+                .await;
+            drop(exclusive);
+            conn.commit().await?;
+            prepared
+        }
+
         /// Fixed table identity every expiration test claims against.
         fn claim_table(table_uuid: Uuid) -> ForgeClaimTable {
             ForgeClaimTable {
@@ -1914,10 +1954,15 @@ mod pg_tests {
                 detail: &detail,
             };
 
-            let applied = ops
-                .prepare_snapshot_expiration(operator, tenant, &preparation)
-                .await
-                .expect("preparation applies");
+            let applied = prepare_expiration_exclusively(
+                fixture.app_pool(),
+                &ops,
+                operator,
+                tenant,
+                &preparation,
+            )
+            .await
+            .expect("preparation applies");
             assert!(
                 matches!(applied, ForgeOperationTransition::Applied),
                 "first preparation applies: {applied:?}"
@@ -1939,10 +1984,15 @@ mod pg_tests {
             );
 
             // Replaying the identical preparation writes nothing.
-            let replay = ops
-                .prepare_snapshot_expiration(operator, tenant, &preparation)
-                .await
-                .expect("preparation replay");
+            let replay = prepare_expiration_exclusively(
+                fixture.app_pool(),
+                &ops,
+                operator,
+                tenant,
+                &preparation,
+            )
+            .await
+            .expect("preparation replay");
             assert!(
                 matches!(replay, ForgeOperationTransition::AlreadyApplied),
                 "identical preparation replay is idempotent: {replay:?}"
@@ -1965,7 +2015,7 @@ mod pg_tests {
                 detail: &rival_detail,
             };
             assert!(
-                ops.prepare_snapshot_expiration(operator, tenant, &rival)
+                prepare_expiration_exclusively(fixture.app_pool(), &ops, operator, tenant, &rival)
                     .await
                     .is_err(),
                 "a rival operation cannot claim an already-claimed snapshot"
@@ -2061,7 +2111,9 @@ mod pg_tests {
                 ForgeSnapshotExpirePhase::Prepared,
                 resource(),
             );
-            ops.prepare_snapshot_expiration(
+            prepare_expiration_exclusively(
+                fixture.app_pool(),
+                &ops,
                 operator,
                 tenant,
                 &ForgeExpirationPreparation {

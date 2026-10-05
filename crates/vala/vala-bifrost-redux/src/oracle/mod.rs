@@ -1915,7 +1915,6 @@ impl Oracle {
                     query_id: attempt_id.as_uuid(),
                     node_id: self.admission.local_role.key.node_id.as_uuid(),
                     fencing_token,
-                    deadline: duration,
                 },
             )
             .await?;

@@ -1,7 +1,8 @@
 //! Tier-2 coverage for the Postgres boundaries that bracket the one pinned
 //! Iceberg snapshot-expiration call.
 //!
-//! Preparation closes and releases its lock before the catalog gate, a definite
+//! Preparation commits before the catalog gate while the table's exclusive
+//! maintenance authority stays held through the commit's outcome, a definite
 //! rejection releases the claims without expiring anything, an unproven outcome
 //! retains every claim under the preparing worker's immutable evidence, and a
 //! takeover settles the same operation under its own live fence while storing
@@ -96,7 +97,7 @@ async fn expiry_state(fixture: &PromotionIntegrationFixture, task_id: Uuid) -> E
 /// # Panics
 ///
 /// Panics when the seeding statement fails.
-async fn seed_running_task(
+pub(super) async fn seed_running_task(
     fixture: &PromotionIntegrationFixture,
     tenant: DataTenantId,
     attempt_id: Uuid,
@@ -219,8 +220,8 @@ async fn prepare_and_abandon_at_the_catalog_gate(
         let early = tokio::time::timeout(std::time::Duration::from_secs(5), parked).await;
         panic!("the expiration never reached the catalog gate: {early:?}");
     }
-    // Postgres closed before the catalog gate: the preparation is fully durable
-    // and holds no lock while the commit is parked.
+    // The preparation committed before the catalog gate, so it is fully
+    // durable while the commit is parked under the held table authority.
     let prepared = expiry_state(fixture, task).await;
     assert_eq!(prepared.task_state, "prepared");
     assert!(prepared.claims > 0, "preparation claims every selection");

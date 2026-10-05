@@ -20,10 +20,9 @@ use crate::contracts::ScribeError;
 
 /// Resolves the canonical write recipe registered for `binding`.
 ///
-/// `executor` is whatever Postgres capability the calling lane already owns:
-/// the seal path passes its tenant transaction, and the persistence worker
-/// passes its operator pool. Both observe the same control row, so the recipe
-/// is identical either way.
+/// `operator` is the Scribe operator lane's control capability. The registry
+/// read itself belongs to the `vala-sql` `olap_catalog` owner, which names the
+/// tenant explicitly because that lane serves every tenant's staged work.
 ///
 /// `schema` is the frozen generation's physical Arrow schema — the exact schema
 /// the encoder will write — so re-resolving against it guarantees every sort
@@ -43,30 +42,21 @@ use crate::contracts::ScribeError;
 /// schema, while a sealed generation only carries the managed columns its
 /// payload mode stamps (`run_id` is native-only). See
 /// [`PhysicalLayout::resolve_for_physical_schema`].
-pub(crate) async fn resolve_write_recipe<'executor, E>(
-    executor: E,
+pub(crate) async fn resolve_write_recipe(
+    operator: &vala_sql::OperatorPool,
     binding: &TenantTableBinding,
     schema: &arrow::datatypes::Schema,
-) -> Result<Arc<PhysicalLayout>, ScribeError>
-where
-    E: sqlx::PgExecutor<'executor>,
-{
+) -> Result<Arc<PhysicalLayout>, ScribeError> {
     let fqn = binding.table_ref.fqn();
-    let stored: serde_json::Value = sqlx::query_scalar(
-        r"SELECT physical_layout
-            FROM vala.bifrost_tables
-           WHERE data_tenant_id = $1 AND fqn = $2",
-    )
-    .bind(binding.tenant.as_uuid())
-    .bind(&fqn)
-    .fetch_optional(executor)
-    .await
-    .map_err(|error| ScribeError::Internal {
-        detail: format!("write recipe control read failed for {fqn}: {error}"),
-    })?
-    .ok_or_else(|| ScribeError::Internal {
-        detail: format!("write recipe has no registered control row for {fqn}"),
-    })?;
+    let stored =
+        vala_sql::queries::olap_catalog::registered_physical_layout(operator, binding.tenant, &fqn)
+            .await
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("write recipe control read failed for {fqn}: {error}"),
+            })?
+            .ok_or_else(|| ScribeError::Internal {
+                detail: format!("write recipe has no registered control row for {fqn}"),
+            })?;
     let stored: wyrd_spec::vala::api::PhysicalLayoutWire =
         serde_json::from_value(stored).map_err(|error| ScribeError::Internal {
             detail: format!("registered physical layout for {fqn} is malformed: {error}"),

@@ -16,6 +16,7 @@ use vala_sql::TenantConn;
 use vala_sql::queries::file_list::list_nonterminal_file_paths;
 use vala_sql::queries::forge_operations::ForgeOperations;
 use vala_sql::queries::forge_tasks::list_prepared_cleanup_candidates;
+use vala_sql::queries::oracle_reader_authority::ExclusiveTableAuthority;
 use vala_sql::row_types::forge_operations::{
     ForgeOperationFamily, ForgeOperationPhase, ForgeOperationStateRow, ForgeOperationTransition,
 };
@@ -1147,8 +1148,8 @@ impl Forge {
                 .push(normalize(prepared.candidate.path.as_str())?);
         }
         // An active Oracle table read may still open any object its cut
-        // named, so it blocks the whole pass. The check serializes with cut
-        // acquisition on the table's maintenance authority.
+        // named, so it blocks the pass. This is a lock-free hint: every
+        // deletion separately requires the table's exclusive authority.
         roots.blocked |= super::table_authority::TableAuthority::new(&mut conn)
             .has_active_reads(key.tenant, &key.table_ref)
             .await?;
@@ -1388,18 +1389,24 @@ impl Forge {
     /// deleted-plus-skipped partition always covers the full candidate set and no
     /// deletion is attempted past the budget.
     ///
+    /// `exclusive` is the table's live exclusive maintenance authority; the
+    /// borrow lasts until every delete's outcome is known, so no Oracle read
+    /// can be admitted between the reader exclusion and any deletion.
+    ///
     /// # Errors
-    /// Returns cancellation, lease-fence, or object-store failures. A candidate
-    /// whose path escapes the table binding fails closed as a reconciliation
-    /// error before any deletion.
+    /// Returns authority-coverage, cancellation, lease-fence, or object-store
+    /// failures. A candidate whose path escapes the table binding fails closed
+    /// as a reconciliation error before any deletion.
     async fn apply_gc_deletions(
         &self,
         lease: &mut ForgeLease,
         table: &GcTableContext<'_>,
+        exclusive: &ExclusiveTableAuthority<'_, '_>,
         protection: &MaintenanceProtection,
         candidate_paths: &[StoragePath],
         deadline: Option<Instant>,
     ) -> Result<GcDeletionTally, ForgeError> {
+        super::table_authority::require_covers(exclusive, table.key.tenant, &table.key.table_ref)?;
         let mut tally = GcDeletionTally::default();
         for path in candidate_paths {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -1512,13 +1519,45 @@ impl Forge {
                 cleanup_exemption: None,
             })
             .await?;
+        // The exclusive table authority is taken after the protection load
+        // and held through every delete's outcome. While a reader holds the table
+        // no authority exists and the whole batch is retained, exactly as a
+        // blocked protection retains it.
+        let mut authority_conn = self
+            .core
+            .vala
+            .tenant_conn(table.key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let tally = match super::table_authority::TableAuthority::new(&mut authority_conn)
+            .exclusive(table.key.tenant, &table.key.table_ref)
+            .await?
+        {
+            Some(exclusive) => {
+                self.apply_gc_deletions(
+                    lease,
+                    table,
+                    &exclusive,
+                    &protection,
+                    candidate_paths,
+                    request.deadline,
+                )
+                .await
+            }
+            None => Ok(GcDeletionTally {
+                skipped: candidate_paths
+                    .iter()
+                    .map(|path| path.as_str().to_owned())
+                    .collect(),
+                ..GcDeletionTally::default()
+            }),
+        };
+        authority_conn.commit().await.map_err(ForgeError::Sql)?;
         let GcDeletionTally {
             deleted,
             skipped,
             deferred,
-        } = self
-            .apply_gc_deletions(lease, table, &protection, candidate_paths, request.deadline)
-            .await?;
+        } = tally?;
         require_running(table.stop)?;
         lease.require_fence(&self.core.operator_pool).await?;
         let deleted_count = deleted.len();

@@ -606,7 +606,7 @@ impl ScribeStagingRuntime {
     /// recovered or validated, a member's binding, schema, or recipe cannot be
     /// reconstructed, the recovered layout contradicts the key, the ready index
     /// refuses a duplicate member.
-    pub async fn restore(&self, pool: &sqlx::PgPool) -> Result<usize, ScribeError> {
+    pub async fn restore(&self, pool: &vala_sql::OperatorPool) -> Result<usize, ScribeError> {
         let recovered = self
             .stage
             .recover()
@@ -750,7 +750,7 @@ impl ScribeStagingRuntime {
     /// table, or the resolved recipe does not reproduce the key.
     async fn restore_context(
         &self,
-        pool: &sqlx::PgPool,
+        pool: &vala_sql::OperatorPool,
         key: &ScribeAssemblyKey,
         members: &[&crate::scribe::hot_stage::StagedMember],
     ) -> Result<ClaimContext, ScribeError> {
@@ -1893,7 +1893,9 @@ mod tests {
                 .expect("assembler controls"),
         )
         .with_hot_sources(Arc::clone(&hot_sources));
-        let pool = sqlx::PgPool::connect_lazy("postgres://unused/unused").expect("lazy pool");
+        let pool: vala_sql::OperatorPool = sqlx::PgPool::connect_lazy("postgres://unused/unused")
+            .expect("lazy pool")
+            .into();
         assert_eq!(
             recovered
                 .restore(&pool)
@@ -2038,7 +2040,9 @@ mod tests {
             config(),
         )
         .with_hot_sources(Arc::clone(&hot_sources));
-        let pool = sqlx::PgPool::connect_lazy("postgres://unused/unused").expect("lazy pool");
+        let pool: vala_sql::OperatorPool = sqlx::PgPool::connect_lazy("postgres://unused/unused")
+            .expect("lazy pool")
+            .into();
         assert_eq!(
             recovered.restore(&pool).await.expect("claim recovers"),
             0,
@@ -2430,7 +2434,7 @@ mod pg_tests {
         );
 
         let restored = replacement
-            .restore(database.operator_pool().pool())
+            .restore(database.operator_pool())
             .await
             .expect("staged namespace restores");
         assert_eq!(restored, durable_members);
@@ -2593,7 +2597,7 @@ mod pg_tests {
             config,
         );
         restarted
-            .restore(database.operator_pool().pool())
+            .restore(database.operator_pool())
             .await
             .expect("the stranded claim restores");
         let resumed = restarted
@@ -2690,7 +2694,7 @@ mod pg_tests {
             config,
         );
         let restored = restarted
-            .restore(database.operator_pool().pool())
+            .restore(database.operator_pool())
             .await
             .expect("a key with finished-claim leftovers beside a live member restores");
         assert_eq!(restored, 1, "only the live member is restored");

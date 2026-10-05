@@ -3,9 +3,12 @@
 //! Two owners share one serialization row per tenant-qualified table,
 //! `vala.bifrost_table_maintenance_authority`. Oracle cut acquisition takes it
 //! `FOR SHARE` inside the one statement that also records the query's active
-//! table reads; destructive Forge preparation takes it `FOR UPDATE` and then
-//! refuses while any active read exists. That gives the read-versus-destroy
-//! race exactly one durable winner per table.
+//! table reads; destructive Forge work takes it `FOR NO KEY UPDATE` as an
+//! [`ExclusiveTableAuthority`] that exists only while no active read does and
+//! is held through the destructive effect's known outcome. That gives the
+//! read-versus-destroy race exactly one durable winner per table: either the
+//! reader commits first and no authority exists, or destruction finishes
+//! first and the waiting reader selects the later pointer.
 //!
 //! Every read fails closed. A missing row, an identity mismatch, or a
 //! malformed result is contradictory evidence and never degrades into
@@ -48,6 +51,74 @@ pub(crate) fn invariant(detail: &str) -> SqlError {
 fn table_uid(bytes: Vec<u8>) -> Result<[u8; 16], SqlError> {
     <[u8; 16]>::try_from(bytes.as_slice())
         .map_err(|_| invariant("stored Bifrost table UID is not 16 bytes"))
+}
+
+/// Live, exclusive maintenance authority over one tenant-qualified table.
+///
+/// Obtained only from [`BifrostTableMaintenanceAuthority::exclusive`] after
+/// the table's authority row was locked and no active Oracle read remained.
+/// It mutably borrows the transaction holding that lock, so the lock cannot be
+/// released while this value exists, and every destructive Forge operation
+/// takes `&ExclusiveTableAuthority` as its proof. There is no state in which
+/// the reader check passed, the authority was surrendered, and destruction is
+/// still callable: ending the transaction first ends this borrow.
+///
+/// The owner holds no destructive SQL of its own. Forge's preparation and
+/// settlement transactions run on separate connections, so the caller drops
+/// this value and ends the borrowed transaction once the external effect's
+/// outcome is known and before settlement, which takes the row exclusively.
+pub struct ExclusiveTableAuthority<'conn, 'tx> {
+    /// Transaction holding the authority row `FOR NO KEY UPDATE`.
+    conn: &'conn mut TenantConn<'tx>,
+    /// Exact table the held row serializes.
+    identity: TableAuthorityIdentity,
+}
+
+impl ExclusiveTableAuthority<'_, '_> {
+    /// Returns the exact table identity the held authority covers.
+    #[must_use]
+    pub fn identity(&self) -> &TableAuthorityIdentity {
+        &self.identity
+    }
+
+    /// Returns the tenant the held authority transaction is bound to.
+    #[must_use]
+    pub fn tenant(&self) -> DataTenantId {
+        self.conn.data_tenant_id()
+    }
+
+    /// Fails closed unless this authority covers exactly `tenant` and the
+    /// table named by `table_uid`, `catalog_name`, `namespace_name`, and
+    /// `table_name`.
+    ///
+    /// Destructive preparation calls this with its request's identity, so a
+    /// capability taken for one table can never authorize work on another.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Conflict`] when any component differs.
+    pub fn require_covers(
+        &self,
+        tenant: DataTenantId,
+        table_uid: &[u8; 16],
+        catalog_name: &str,
+        namespace_name: &str,
+        table_name: &str,
+    ) -> Result<(), SqlError> {
+        if self.tenant() == tenant
+            && self.identity.tenant == tenant
+            && &self.identity.table_uid == table_uid
+            && self.identity.catalog_name == catalog_name
+            && self.identity.namespace_name == namespace_name
+            && self.identity.table_name == table_name
+        {
+            return Ok(());
+        }
+        Err(SqlError::Conflict {
+            detail: "Forge maintenance names a table its exclusive authority does not cover"
+                .to_owned(),
+        })
+    }
 }
 
 /// The single SQL serialization boundary for one tenant-qualified table.
@@ -100,20 +171,81 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
         Ok(())
     }
 
-    /// Takes the exact table's serialization row `FOR UPDATE`.
+    /// Reports, without taking any lock, whether an unabandoned Oracle read
+    /// still holds the table.
     ///
-    /// The lock is held for the remainder of the caller's transaction, so every
-    /// competing cut acquisition or destructive decision for this table waits
-    /// here rather than racing on the active-read rows themselves.
+    /// This is a scheduling hint only and authorizes nothing: a reader may be
+    /// admitted or released the instant after it answers. Every destructive
+    /// effect instead requires [`Self::exclusive`]. Taking no lock is what
+    /// lets the hint run beside a held exclusive authority — including on the
+    /// same table, in another transaction — without waiting on it. Abandoned
+    /// reads (PostgreSQL time past `abandon_after`) are ignored here and
+    /// discarded only under the exclusive authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::InvariantViolation`] when the identity is malformed
+    /// and [`SqlError`] when the read fails.
+    pub async fn has_active_reads(
+        &mut self,
+        identity: &TableAuthorityIdentity,
+    ) -> Result<bool, SqlError> {
+        identity.validate(BIFROST_CATALOG_NAME)?;
+        sqlx::query_scalar(
+            r"
+            SELECT EXISTS (
+                SELECT 1
+                  FROM vala.oracle_active_table_reads
+                 WHERE data_tenant_id = wyrd.current_tenant()
+                   AND table_uid = $1
+                   AND abandon_after > statement_timestamp()
+            )
+            ",
+        )
+        .bind(identity.table_uid.as_slice())
+        .fetch_one(&mut **self.conn.transaction())
+        .await
+        .map_err(SqlError::from)
+    }
+
+    /// Takes the table's exclusive maintenance authority and turns this owner
+    /// into the capability destructive Forge work requires.
+    ///
+    /// The row is locked `FOR NO KEY UPDATE`, the mode that conflicts with the
+    /// `FOR SHARE` Oracle cut acquisition takes but not with the `FOR KEY
+    /// SHARE` a claim row's foreign key takes, so a separate Forge preparation
+    /// transaction can still record claims while this one holds the row.
+    /// Abandoned reads are discarded under the rule
+    /// [`crate::queries::forge_operations::active_table_reads_exist`] owns; any
+    /// read that remains means no capability exists.
+    ///
+    /// The lock lives for the rest of the borrowed transaction, which the
+    /// returned capability keeps mutably borrowed: the caller cannot commit or
+    /// roll it back — and so cannot surrender the authority — while the
+    /// capability, and therefore any destructive call taking it, is alive.
+    /// `Ok(None)` still holds the lock until the caller ends the transaction.
     ///
     /// # Errors
     ///
     /// Returns [`SqlError::InvariantViolation`] when the identity is malformed,
-    /// when no row exists for the exact catalog/namespace/table, or when the
-    /// stored table UID differs from the caller's — all of which are identity
-    /// failures that must fail closed rather than proceed unserialized.
-    pub async fn lock(&mut self, identity: &TableAuthorityIdentity) -> Result<(), SqlError> {
+    /// names a table with no authority row, names a different table UID, or
+    /// names a tenant other than the borrowed connection's; and [`SqlError`]
+    /// when the lock or either active-read statement fails.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation leaves the lock with the borrowed transaction, which
+    /// releases it when it commits, rolls back, or is dropped.
+    pub async fn exclusive(
+        self,
+        identity: TableAuthorityIdentity,
+    ) -> Result<Option<ExclusiveTableAuthority<'conn, 'tx>>, SqlError> {
         identity.validate(BIFROST_CATALOG_NAME)?;
+        if identity.tenant != self.conn.data_tenant_id() {
+            return Err(invariant(
+                "exclusive table authority names a tenant other than its connection's",
+            ));
+        }
         let stored: Option<Vec<u8>> = sqlx::query_scalar(
             r"
             SELECT table_uid
@@ -122,7 +254,7 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
                AND catalog_name = $1
                AND namespace_name = $2
                AND table_name = $3
-               FOR UPDATE
+               FOR NO KEY UPDATE
             ",
         )
         .bind(&identity.catalog_name)
@@ -139,32 +271,18 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
                 "Bifrost table maintenance authority names a different registered table UID",
             ));
         }
-        Ok(())
-    }
-
-    /// Locks the table's authority row and reports whether an Oracle query is
-    /// still reading the table.
-    ///
-    /// Abandoned reads are discarded first, under the rule
-    /// [`crate::queries::forge_operations::active_table_reads_exist`] owns. The
-    /// lock is held for the rest of the caller's transaction, so no cut
-    /// acquisition can commit a new read between this answer and the caller's
-    /// commit.
-    ///
-    /// # Errors
-    ///
-    /// Returns the identity failures of [`Self::lock`] and [`SqlError`] when
-    /// either active-read statement fails.
-    pub async fn has_active_reads(
-        &mut self,
-        identity: &TableAuthorityIdentity,
-    ) -> Result<bool, SqlError> {
-        self.lock(identity).await?;
-        crate::queries::forge_operations::active_table_reads_exist(
+        if crate::queries::forge_operations::active_table_reads_exist(
             self.conn.transaction(),
-            identity,
+            &identity,
         )
-        .await
+        .await?
+        {
+            return Ok(None);
+        }
+        Ok(Some(ExclusiveTableAuthority {
+            conn: self.conn,
+            identity,
+        }))
     }
 
     /// Returns every snapshot of this table an unresolved Forge expiration has
@@ -172,7 +290,7 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
     ///
     /// A snapshot another prepared expiration owns is removed from a new
     /// selection rather than prepared twice; preparation re-checks the claim
-    /// index under [`Self::lock`]. The owner never mutates a claim; only the
+    /// index under [`Self::exclusive`]. The owner never mutates a claim; only the
     /// fenced Forge lifecycle does.
     ///
     /// # Errors
@@ -211,9 +329,10 @@ pub struct ActiveTableRef<'a> {
 
 /// The exact Oracle role fence that owns one query's active table reads.
 ///
-/// The fence identifies the node that recorded the reads; `deadline` is the
-/// query's remaining time, from which PostgreSQL derives when a row the owner
-/// never released may be discarded.
+/// The fence identifies the node that recorded the reads. It carries no
+/// deadline: the query's remaining time shrinks between acquisitions, so each
+/// [`OracleActiveTableReads::acquire`] call binds the remaining duration its
+/// caller derived immediately before that statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActiveReadOwner {
     /// Durable query identity Oracle already uses for the request.
@@ -222,9 +341,6 @@ pub struct ActiveReadOwner {
     pub node_id: Uuid,
     /// That node's current Oracle role fencing token.
     pub fencing_token: i64,
-    /// Remaining query deadline; PostgreSQL stores `abandon_after` as
-    /// `statement_timestamp()` plus this duration.
-    pub deadline: Duration,
 }
 
 /// One table of an acquired cut: its registered identity, the catalog pointer
@@ -266,15 +382,18 @@ impl<'conn, 'tx> OracleActiveTableReads<'conn, 'tx> {
     /// result has exactly one entry per distinct table, in input order. A
     /// replayed acquisition for the same query refreshes the existing rows to
     /// the caller's fence and a new PostgreSQL abandonment time. Each row may be
-    /// discarded once PostgreSQL time passes acquisition plus `owner.deadline`.
+    /// discarded once PostgreSQL time passes this statement's
+    /// `statement_timestamp()` plus `remaining`. The caller derives `remaining`
+    /// from its query's one absolute deadline immediately before each call, so
+    /// a replayed acquisition never extends protection past that deadline.
     ///
     /// # Errors
     ///
     /// Returns [`SqlError::NoRows`] when any table has no registration visible
     /// to this tenant or no catalog pointer; no active read commits in that
     /// case. Returns [`SqlError::InvariantViolation`] for an empty request, a
-    /// non-positive fence, a deadline shorter than one millisecond or longer
-    /// than `i64::MAX` milliseconds, or a result that does not contain exactly one
+    /// non-positive fence, a `remaining` duration shorter than one millisecond
+    /// or longer than `i64::MAX` milliseconds, or a result that does not contain exactly one
     /// well-formed identity and pointer per requested table. Returns
     /// [`SqlError`] when the statement fails.
     ///
@@ -285,9 +404,10 @@ impl<'conn, 'tx> OracleActiveTableReads<'conn, 'tx> {
     pub async fn acquire(
         &mut self,
         owner: ActiveReadOwner,
+        remaining: Duration,
         tables: &[ActiveTableRef<'_>],
     ) -> Result<Vec<AcquiredTableCut>, SqlError> {
-        let deadline_ms = i64::try_from(owner.deadline.as_millis()).unwrap_or(0);
+        let deadline_ms = i64::try_from(remaining.as_millis()).unwrap_or(0);
         if tables.is_empty() || owner.fencing_token <= 0 || deadline_ms <= 0 {
             return Err(invariant(
                 "active table read acquisition needs tables, a positive fence, and a deadline",

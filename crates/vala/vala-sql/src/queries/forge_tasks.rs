@@ -11,8 +11,9 @@ use sqlx::{AssertSqlSafe, types::Uuid};
 use wyrd_spec::DataTenantId;
 
 use crate::queries::forge_operations::{
-    assert_lease_fence, bind_tenant, lock_table_authority, refuse_active_table_reads,
+    assert_lease_fence, bind_tenant, lock_table_authority, require_exclusive_authority,
 };
+use crate::queries::oracle_reader_authority::ExclusiveTableAuthority;
 use crate::row_types::forge_operations::{ForgeClaimTable, ForgeExpirationAuthority};
 use crate::row_types::forge_tasks::{
     ExpiredCleanupCandidateRequest, ExpiredCleanupOutcome, ExpiredCleanupPayload,
@@ -1154,25 +1155,26 @@ impl ForgeTasks {
     /// Atomically prepares one expired-cleanup candidate for physical deletion.
     ///
     /// This is the durable half of the per-candidate protocol: it opens and
-    /// commits its own short operator transaction so no Postgres transaction or
-    /// lock is alive while the worker stats or deletes the object. Locks are
-    /// taken in the canonical order — live table lease, exact cleanup
-    /// task/attempt/current owner, `bifrost_table_maintenance_authority`,
-    /// cleanup evidence, then the tenant audit chain.
+    /// commits its own short operator transaction. Locks are taken in the
+    /// canonical order — live table lease, exact cleanup task/attempt/current
+    /// owner, cleanup evidence, then the tenant audit chain.
     ///
     /// The first preparation of a task copies the immutable plan handoff into
     /// evidence and moves `Running -> Prepared`; every later preparation mutates
     /// only the nullable prepared index. Replaying the exact already-prepared
     /// tuple is read-only and emits no audit; every mismatch refuses.
     ///
-    /// Every candidate preparation, including an exact replay, refuses while
-    /// any Oracle query still holds an active read on the table, so no
-    /// physical delete is prepared from a previously observed absence.
+    /// `exclusive` is the caller's live table authority, which already proved
+    /// no Oracle read exists and keeps every new read out until the caller
+    /// knows the delete's outcome. Every preparation, including an exact
+    /// replay, requires it, so no physical delete is ever prepared or
+    /// performed from a previously observed absence. This transaction never
+    /// locks the authority row itself; it would wait on the caller's lock.
     ///
     /// # Errors
     ///
-    /// Returns [`SqlError::Conflict`] when an Oracle query still reads the
-    /// table, the lease fence is lost, the task,
+    /// Returns [`SqlError::Conflict`] when `exclusive` does not cover the
+    /// request's table, the lease fence is lost, the task,
     /// attempt, owner, table, or claim does not match exactly, the plan and
     /// evidence disagree, the cursor is not `request.index`, a candidate is
     /// already prepared, or the named candidate is not the plan's candidate at
@@ -1186,8 +1188,10 @@ impl ForgeTasks {
     pub async fn prepare_expired_cleanup_candidate(
         &self,
         tenant: DataTenantId,
+        exclusive: &ExclusiveTableAuthority<'_, '_>,
         request: ExpiredCleanupCandidateRequest<'_>,
     ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
+        require_exclusive_authority(exclusive, tenant, request.table)?;
         let mut tx = self
             .operator_pool
             .pool()
@@ -1197,11 +1201,6 @@ impl ForgeTasks {
         bind_tenant(&mut tx, tenant).await?;
         assert_lease_fence(&mut tx, request.authority).await?;
         let locked = lock_cleanup_task(&mut tx, request.authority, request.table).await?;
-        // The table-authority row lock serializes this preparation with Oracle
-        // cut acquisition, so the active-read refusal below stays true until
-        // this transaction commits the prepared candidate.
-        let identity = lock_table_authority(&mut tx, tenant, request.table).await?;
-        refuse_active_table_reads(&mut tx, &identity).await?;
         let payload = locked.payload()?;
         require_named_candidate(&payload, request.index, request.candidate)?;
 

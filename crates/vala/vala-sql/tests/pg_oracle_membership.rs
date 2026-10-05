@@ -377,6 +377,10 @@ mod pg_tests {
     /// Logical namespace every table in this module is registered under.
     const NAMESPACE: &str = "vala.bifrost";
 
+    /// Remaining query time every fixture acquisition binds; long enough that
+    /// no row it writes is abandoned during the test.
+    const QUERY_DEADLINE: std::time::Duration = std::time::Duration::from_hours(1);
+
     /// Canonical layout JSON one registration needs; its shape is opaque here.
     fn layout() -> serde_json::Value {
         serde_json::json!({
@@ -588,7 +592,6 @@ mod pg_tests {
                 query_id,
                 node_id: self.node_id,
                 fencing_token: self.fence,
-                deadline: std::time::Duration::from_hours(1),
             }
         }
 
@@ -613,7 +616,7 @@ mod pg_tests {
                 .collect();
             let mut conn = self.conn(tenant).await;
             let cuts = OracleActiveTableReads::new(&mut conn)
-                .acquire(self.owner(query_id), &refs)
+                .acquire(self.owner(query_id), QUERY_DEADLINE, &refs)
                 .await?;
             conn.commit().await?;
             Ok(cuts)
@@ -634,10 +637,10 @@ mod pg_tests {
             .expect("active reads count")
         }
 
-        /// Runs Forge's destructive gate for one acquired table the way the
-        /// leader does: a tenant transaction locks the table's maintenance
-        /// authority, discards abandoned reads, and reports whether any read
-        /// remains; committed so any discard sticks.
+        /// Runs Forge's destructive gate for one acquired table: a tenant
+        /// transaction takes the table's exclusive maintenance authority,
+        /// which discards abandoned reads and exists only while no read
+        /// remains, then surrenders it; committed so any discard sticks.
         ///
         /// # Errors
         ///
@@ -645,11 +648,13 @@ mod pg_tests {
         /// SQL failure.
         async fn forge_gate(&self, identity: &TableAuthorityIdentity) -> Result<(), SqlError> {
             let mut conn = TenantConn::acquire(self.fixture.app_pool(), identity.tenant).await?;
-            let active = BifrostTableMaintenanceAuthority::new(&mut conn)
-                .has_active_reads(identity)
+            let exclusive = BifrostTableMaintenanceAuthority::new(&mut conn)
+                .exclusive(identity.clone())
                 .await?;
+            let granted = exclusive.is_some();
+            drop(exclusive);
             conn.commit().await?;
-            if active {
+            if !granted {
                 return Err(SqlError::Conflict {
                     detail: "an Oracle query is still reading this table".to_owned(),
                 });
@@ -811,7 +816,7 @@ mod pg_tests {
         ];
         let mut conn = reads.conn(tenant_a).await;
         let cuts = OracleActiveTableReads::new(&mut conn)
-            .acquire(reads.owner(q1), &refs)
+            .acquire(reads.owner(q1), QUERY_DEADLINE, &refs)
             .await
             .expect("acquisition succeeds");
         assert_eq!(
@@ -896,19 +901,32 @@ mod pg_tests {
         ));
         assert_eq!(reads.rows_for(q3).await, 0, "no partial claim set commits");
 
-        // Serialization: a destructive holder of the authority row finishes
+        // Serialization: a live exclusive authority finishes its effect
         // first, and the waiting acquisition observes its later pointer.
+        // A dedicated table keeps the earlier readers out of this ordering.
         let events_a = cuts[0].identity.clone();
-        let mut forge = pool.begin().await.expect("forge transaction");
-        sqlx::query(
-            "SELECT 1 FROM vala.bifrost_table_maintenance_authority \
-              WHERE data_tenant_id = $1 AND table_uid = $2 FOR UPDATE",
-        )
-        .bind(tenant_a.as_uuid())
-        .bind(events_a.table_uid.as_slice())
-        .fetch_one(&mut *forge)
-        .await
-        .expect("forge locks the table");
+        reads
+            .register(tenant_a, "serial", Some("s3://a/serial/v1.metadata.json"))
+            .await;
+        let probe = Uuid::now_v7();
+        let serial = reads
+            .acquire(tenant_a, probe, &["serial"])
+            .await
+            .expect("probe acquires")[0]
+            .identity
+            .clone();
+        let mut releaser = reads.conn(tenant_a).await;
+        OracleActiveTableReads::new(&mut releaser)
+            .release(probe)
+            .await
+            .expect("probe releases");
+        releaser.commit().await.expect("probe release commits");
+        let mut forge = reads.conn(tenant_a).await;
+        let exclusive = BifrostTableMaintenanceAuthority::new(&mut forge)
+            .exclusive(serial)
+            .await
+            .expect("exclusive authority statement")
+            .expect("no read holds the table");
         let q4 = Uuid::now_v7();
         let waiting = {
             let app = reads.fixture.app_pool().clone();
@@ -918,9 +936,10 @@ mod pg_tests {
                 let cut = OracleActiveTableReads::new(&mut conn)
                     .acquire(
                         owner,
+                        QUERY_DEADLINE,
                         &[ActiveTableRef {
                             namespace_name: NAMESPACE,
-                            table_name: "events",
+                            table_name: "serial",
                         }],
                     )
                     .await?;
@@ -941,15 +960,24 @@ mod pg_tests {
             }
             tokio::task::yield_now().await;
         }
+        // The destructive effect lands while the authority is still held.
         reads
-            .move_pointer(tenant_a, "events", "s3://a/events/v2.metadata.json")
+            .move_pointer(tenant_a, "serial", "s3://a/serial/v2.metadata.json")
             .await;
-        forge.commit().await.expect("forge commits first");
+        assert!(
+            !waiting.is_finished(),
+            "the reader cannot commit while the exclusive authority is live"
+        );
+        drop(exclusive);
+        forge
+            .commit()
+            .await
+            .expect("forge surrenders its authority");
         let later = waiting
             .await
             .expect("acquisition task joins")
             .expect("acquisition succeeds");
-        assert_eq!(later[0].metadata_location, "s3://a/events/v2.metadata.json");
+        assert_eq!(later[0].metadata_location, "s3://a/serial/v2.metadata.json");
 
         // The other ordering: a committed reader makes Forge refuse.
         assert!(matches!(

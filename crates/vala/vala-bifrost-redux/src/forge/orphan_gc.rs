@@ -1226,9 +1226,11 @@ impl Forge {
         }
         for snapshot in table.metadata().snapshots() {
             add(snapshot.manifest_list())?;
-            let manifest_list = table
-                .manifest_list_reader(snapshot)
-                .load()
+            // Boxed because Iceberg's manifest-list load runs through key
+            // decryption and its cache; inlining that chain into the worker's
+            // prepared-cleanup reconciliation future exceeds the compiler's
+            // layout depth limit.
+            let manifest_list = Box::pin(table.manifest_list_reader(snapshot).load())
                 .await
                 .map_err(ForgeError::Catalog)?;
             for manifest_file in manifest_list.entries() {

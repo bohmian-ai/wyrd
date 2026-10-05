@@ -2473,8 +2473,9 @@ impl ForgeWorker {
             let prepared = self.claim_prepared(claim_limits).await;
             match self.answered(prepared, &mut pool, &shutdown).await? {
                 Some(Some(prepared)) => {
-                    self.reconcile_claimed_prepared(prepared, &shutdown).await?;
-                    continue;
+                    if self.reconcile_claimed_prepared(prepared, &shutdown).await? {
+                        continue;
+                    }
                 }
                 Some(None) => {}
                 None => continue,
@@ -3293,8 +3294,7 @@ impl ForgeWorker {
         let Some(prepared) = self.claim_prepared(claim_limits).await? else {
             return Ok(false);
         };
-        self.reconcile_claimed_prepared(prepared, shutdown).await?;
-        Ok(true)
+        self.reconcile_claimed_prepared(prepared, shutdown).await
     }
 
     /// Claims one `prepared` attempt for reconciliation by this owner, if any.
@@ -3314,6 +3314,10 @@ impl ForgeWorker {
 
     /// Reconciles one `prepared` attempt this owner already claimed.
     ///
+    /// Returns `true` when the attempt was reconciled, and `false` when an
+    /// expired cleanup retained its candidate for replay, so the caller paces
+    /// the next replay instead of reclaiming the same refusing candidate.
+    ///
     /// # Errors
     ///
     /// A reconciliation or release failure retains exact evidence and is
@@ -3326,7 +3330,7 @@ impl ForgeWorker {
         &self,
         prepared: ForgePreparedTaskClaim,
         shutdown: &CancellationToken,
-    ) -> Result<(), ForgeError> {
+    ) -> Result<bool, ForgeError> {
         #[cfg(feature = "test-support")]
         let (task_id, strategy) = (
             prepared.task.task_id,
@@ -3351,7 +3355,7 @@ impl ForgeWorker {
         }
         #[cfg(feature = "test-support")]
         self.record_completion(task_id, &strategy);
-        Ok(())
+        Ok(true)
     }
 
     /// Maps one claimed strategy onto its durable work type, if this build knows it.

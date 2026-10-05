@@ -1,7 +1,7 @@
 ---
 id: TASK-001
 kind: implementation
-status: proposed
+status: review
 spec: SPEC-forge-concurrent-planning
 spec_revision: 6
 requirements: [REQ-001, REQ-002, REQ-003, REQ-008, INV-001, INV-002, INV-005, AC-001, AC-002, AC-003]

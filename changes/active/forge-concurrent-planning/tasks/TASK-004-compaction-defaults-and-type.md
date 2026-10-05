@@ -1,7 +1,7 @@
 ---
 id: TASK-004
 kind: implementation
-status: proposed
+status: review
 spec: SPEC-forge-concurrent-planning
 requirements: [REQ-011, REQ-012, REQ-013]
 depends_on: [TASK-003]

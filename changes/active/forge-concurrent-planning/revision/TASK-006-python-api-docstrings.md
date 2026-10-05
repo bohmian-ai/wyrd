@@ -1,7 +1,7 @@
 ---
 id: TASK-006
 kind: implementation
-status: ready
+status: review
 spec: SPEC-forge-concurrent-planning
 spec_revision: 6
 requirements: [USER-PYTHON-DOCSTRINGS]

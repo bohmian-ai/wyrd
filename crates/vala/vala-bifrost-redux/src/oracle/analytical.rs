@@ -2323,6 +2323,13 @@ const METRIC_FOLD_EXPIRED: &str =
 /// retain the graph; only this one names an error the dependency reported.
 const METRIC_FOLD_REFUSED: &str = "Oracle analytical distributed metric rewrite failed";
 
+/// Detail one graph records when its owner was dropped outside a runtime.
+///
+/// Nothing can run the graph's release there, so the graph is retained as
+/// attributable residue rather than released unconfirmed.
+const RECLAIM_WITHOUT_RUNTIME: &str =
+    "Oracle analytical graph owner was dropped outside a Tokio runtime";
+
 impl AnalyticalGraphLifecycle {
     /// Composes one graph's stream-owned lifecycle over its registered entry.
     ///
@@ -2597,29 +2604,39 @@ impl AnalyticalGraphLifecycle {
         }
     }
 
-    /// Returns a dropped graph's envelope and admission immediately.
+    /// Returns a dropped graph's envelope and admission on the current runtime.
     ///
-    /// Aborted drivers drop their memory reservations on a later runtime poll;
-    /// they keep the memory view alive and return their bytes through the
-    /// shared root, so nothing here waits for them. A graph the supervisor
-    /// refuses to release is retained as draining residue, which fails
-    /// readiness.
-    fn release_dropped(&self) {
-        match self.supervisor.release_graph(self.graph) {
-            Ok(Some(mut owner)) => {
-                owner.finish(wyrd_spec::vala::api::QueryTerminalOutcome::Failed);
+    /// `Drop` has already revoked every other owner; this is the one step that
+    /// runs afterwards. Aborted drivers drop their memory reservations on a
+    /// later runtime poll; they keep the memory view alive and return their
+    /// bytes through the shared root, so nothing here waits for them. A graph
+    /// dropped outside any runtime, or one the supervisor refuses to release,
+    /// is retained as draining residue, which fails readiness.
+    fn reclaim(&self) {
+        let supervisor = Arc::clone(&self.supervisor);
+        let graph = self.graph;
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            supervisor.retain_graph_cleanup(graph, RECLAIM_WITHOUT_RUNTIME.to_owned());
+            return;
+        };
+        runtime.spawn(async move {
+            #[cfg(feature = "test-support")]
+            analytical_cleanup_pause_for_test().hold().await;
+            match supervisor.release_graph(graph) {
+                Ok(Some(mut owner)) => {
+                    owner.finish(wyrd_spec::vala::api::QueryTerminalOutcome::Failed);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        public_query_id = %graph.public_query_id,
+                        "Oracle analytical dropped graph could not return its envelope"
+                    );
+                    supervisor.retain_graph_cleanup(graph, error.to_string());
+                }
             }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::error!(
-                    %error,
-                    public_query_id = %self.graph.public_query_id,
-                    "Oracle analytical dropped graph could not return its envelope"
-                );
-                self.supervisor
-                    .retain_graph_cleanup(self.graph, error.to_string());
-            }
-        }
+        });
     }
 
     /// Admits every remote participant and publishes the complete cut once.
@@ -2810,7 +2827,7 @@ impl Drop for AnalyticalGraphLifecycle {
             super::planner::LeaderOwnershipEvent::GraphRevoked,
         );
         drop(self.supervisor.take_metric_fold(self.graph));
-        self.release_dropped();
+        self.reclaim();
     }
 }
 
@@ -5489,6 +5506,7 @@ mod tests {
             2,
             "every follower grant is closed before the drop returns"
         );
+        await_until(|| fixture.supervisor.live_graphs().is_ok_and(|live| live == 0)).await;
         assert_eq!(
             (
                 fixture

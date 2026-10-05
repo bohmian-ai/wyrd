@@ -352,6 +352,12 @@ All prefixed with `CARGO_TARGET_DIR=<repo>/target CARGO_BUILD_JOBS=12`.
 - Fix site: the helper now composes `test_support::{test_server_postgres, test_storage, test_catalog}`, the `query/service.rs` `state_without_oracle` pattern. The test already initialized that shared fixture through `test_catalog()`. No allowlist entry was added.
 - Verification: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --lib -E "test(=components::workflow::tools::tests::tools_use_the_prepared_run_deadline)"'` PASS.
 
+### Final verification
+
+- `mise run gate`: exit 0 (`Finished in 2641.69s`, no failed task) on `b88102317`.
+- The three ignored CLI journeys above, run after the gate: each PASS, exit 0.
+- `git diff --check`: clean; no untracked files.
+
 ### Limits
 
 - Scenario 5 deviation (approved by the team lead): Scenario 5 asks every SDK journey to register through the compiled CLI `wyrd apply`. The Rust and TypeScript journeys cannot, because their test runtimes have no CLI binary; reaching one would need a new mechanism (a wyrd-cli dev-dependency, an in-test cargo build, or a `target/` binary lookup), and none was added. Those two journeys register through the SDK Cards `register_from_path`, the same Cards path `wyrd apply` calls, and add the local route coverage. The compiled-CLI `wyrd apply` and team-reuse proof lives in the wyrd-cli `workflow_journey` (`workflow_file_apply_registered_local`, which runs the binary via `CARGO_BIN_EXE`). The Python journey runs the installed `wyrd apply`.

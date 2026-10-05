@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::release_server::{LocalServer, MemoryPeak, Metrics};
 
@@ -239,7 +240,7 @@ pub fn release_binary() -> Result<PathBuf, Error> {
 /// # Errors
 ///
 /// Returns the metadata failure.
-pub fn binary_identity(binary: &Path) -> Result<serde_json::Value, Error> {
+pub fn binary_identity(binary: &Path) -> Result<Value, Error> {
     let metadata = std::fs::metadata(binary)?;
     let modified: chrono::DateTime<chrono::Utc> = metadata.modified()?.into();
     Ok(serde_json::json!({

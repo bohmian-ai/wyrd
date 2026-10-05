@@ -164,6 +164,11 @@ pub(super) async fn append_values(
 /// # Errors
 ///
 /// Returns the stable Wyrd error the public ingest route produced.
+///
+/// # Panics
+///
+/// Panics when the public ingest transport cannot connect or the batch
+/// cannot be IPC-encoded.
 pub(super) async fn append_batch(
     client: &wyrd_client::WyrdClient,
     table: &str,

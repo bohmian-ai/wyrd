@@ -313,6 +313,11 @@ fn observed_in_current_month(now: DateTime<Utc>) -> Result<DateTime<Utc>, Server
 /// # Errors
 /// Returns cluster, seeding, client, runtime, or query errors, or a
 /// description of the first expectation that does not hold.
+///
+/// # Panics
+///
+/// Panics only if `#[tokio::test]` cannot build its runtime; every
+/// expectation failure is returned as an error instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourneyError> {

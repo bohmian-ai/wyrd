@@ -1,3 +1,6 @@
+//! Postgres-backed `vala-sql` integration tests; the proofs live in `pg_tests` so
+//! the credential-free lanes can skip them by module name.
+
 mod pg_tests {
     //! Real-Postgres lifecycle, fencing, audit, and isolation proofs for Forge tasks.
 
@@ -5,7 +8,6 @@ mod pg_tests {
 
     use chrono::{Duration, Utc};
     use sqlx::{PgPool, types::Uuid};
-    use vala_sql::TenantConn;
     use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeTasks};
     use vala_sql::queries::oracle_reader_authority::BifrostTableMaintenanceAuthority;
     use vala_sql::row_types::forge_operations::{ForgeClaimTable, ForgeExpirationAuthority};
@@ -19,6 +21,7 @@ mod pg_tests {
         SnapshotWatermark,
     };
     use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
+    use vala_sql::{SqlError, TenantConn};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
 
@@ -27,7 +30,7 @@ mod pg_tests {
     ///
     /// # Errors
     ///
-    /// Returns [`vala_sql::SqlError::Conflict`] when an Oracle read still holds
+    /// Returns [`SqlError::Conflict`] when an Oracle read still holds
     /// the table, so no authority exists, and otherwise the preparation's own
     /// result.
     async fn prepare_exclusively(
@@ -35,7 +38,7 @@ mod pg_tests {
         tasks: &ForgeTasks,
         tenant: DataTenantId,
         request: ExpiredCleanupCandidateRequest<'_>,
-    ) -> Result<ForgeTaskTransitionOutcome, vala_sql::SqlError> {
+    ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
         let mut conn = TenantConn::acquire(app, tenant).await?;
         let identity = TableAuthorityIdentity {
             tenant,
@@ -47,7 +50,7 @@ mod pg_tests {
         let exclusive = BifrostTableMaintenanceAuthority::new(&mut conn)
             .exclusive(identity)
             .await?
-            .ok_or_else(|| vala_sql::SqlError::Conflict {
+            .ok_or_else(|| SqlError::Conflict {
                 detail: "an Oracle query is still reading this table".to_owned(),
             })?;
         let prepared = tasks
@@ -1932,6 +1935,22 @@ mod pg_tests {
             .expect("drop the malformed source");
     }
 
+    /// Proves the expired-cleanup handoff and candidate lifecycle are exact and
+    /// atomic.
+    ///
+    /// The bounded handoff read and locked enqueue admit exactly one cleanup
+    /// task per consumed expiration source, refuse payload-less, malformed,
+    /// altered, or competing plans, and replay an identical plan read-only.
+    /// Candidate preparation is refused while an Oracle read holds the table, a
+    /// prepared tuple replays read-only, a stale owner can neither prepare nor
+    /// settle, and only a confirmed deletion advances the frontier while
+    /// refusal and uncertainty audit without moving it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start, any SQL step fails unexpectedly,
+    /// or any admission, refusal, replay, frontier, or audit outcome differs
+    /// from the contract above.
     #[tokio::test]
     async fn expired_cleanup_handoff_and_candidate_lifecycle_are_exact_atomic_and_audited() {
         let (fixture, admin) = setup().await;
@@ -2004,7 +2023,7 @@ mod pg_tests {
         assert!(
             matches!(
                 tasks.enqueue(&divergent).await,
-                Err(vala_sql::SqlError::Conflict { .. })
+                Err(SqlError::Conflict { .. })
             ),
             "a candidate vector that disagrees with its source is refused"
         );
@@ -2020,7 +2039,7 @@ mod pg_tests {
         assert!(
             matches!(
                 tasks.enqueue(&conflicting).await,
-                Err(vala_sql::SqlError::Conflict { .. })
+                Err(SqlError::Conflict { .. })
             ),
             "a second, different plan for a consumed source is refused"
         );
@@ -2126,7 +2145,7 @@ mod pg_tests {
                     },
                 )
                 .await,
-                Err(vala_sql::SqlError::Conflict { .. })
+                Err(SqlError::Conflict { .. })
             ),
             "an active table read refuses cleanup preparation"
         );

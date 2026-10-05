@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use tokio::sync::Mutex;
@@ -305,7 +305,7 @@ pub struct BifrostTestControls {
     /// Optional object-store wrapper used to inject object-store behavior.
     pub forge_object_store: Option<Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>>,
     /// Deterministic delay in the existing Scribe WAL IO lane.
-    pub scribe_wal_sync_delay: std::time::Duration,
+    pub scribe_wal_sync_delay: Duration,
     /// Optional complete override of the production Scribe geometry.
     ///
     /// Scaled production journeys need the assembled-object target and the
@@ -515,6 +515,11 @@ impl Oracle {
     ///
     /// Returns [`wyrd_spec::vala::error::BifrostError`] when the retained role
     /// composition cannot be completed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the engine was composed without its distributed fragment
+    /// dispatcher, which production Oracle composition always installs.
     pub fn new(inputs: OracleBuildInputs) -> Result<Self, wyrd_spec::vala::error::BifrostError> {
         let OracleBuildInputs {
             engine,
@@ -1160,7 +1165,7 @@ pub struct LimitsConfig {
     /// Maximum streamed Audio transcription or translation upload in bytes.
     pub audio_upload_bytes: usize,
     /// Per-request processing timeout.
-    pub timeout: std::time::Duration,
+    pub timeout: Duration,
     /// Maximum in-flight concurrent requests.
     pub concurrency: usize,
 }
@@ -1408,11 +1413,14 @@ impl QueryStreamFaultController {
 }
 
 impl Default for LimitsConfig {
+    /// Production request limits used when configuration supplies none: 1 MiB
+    /// bodies, 25 MiB audio uploads, a 30 s timeout, and 1024 concurrent
+    /// requests.
     fn default() -> Self {
         Self {
             body_bytes: 1_048_576,
             audio_upload_bytes: 26_214_400,
-            timeout: std::time::Duration::from_secs(30),
+            timeout: Duration::from_secs(30),
             concurrency: 1024,
         }
     }
@@ -2568,6 +2576,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use super::{AppState, LimitsConfig};
 
@@ -2609,11 +2618,11 @@ mod tests {
         owner
             .handle()
             .expect("composed handle")
-            .spawn_blocking(|| std::thread::sleep(std::time::Duration::from_secs(30)));
+            .spawn_blocking(|| std::thread::sleep(Duration::from_secs(30)));
         let started = std::time::Instant::now();
         drop(owner);
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(5),
             "dropping the compaction runtime must detach its threads, not join them"
         );
 
@@ -2727,13 +2736,19 @@ mod tests {
         );
     }
 
+    /// `with_limits` replaces every request limit on the state it returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the test state cannot be built or a supplied limit is not
+    /// reflected on the returned state.
     #[tokio::test]
     async fn with_limits_updates_all_fields() {
         let state = test_state().await;
         let limits = LimitsConfig {
             body_bytes: 2048,
             audio_upload_bytes: 4096,
-            timeout: std::time::Duration::from_millis(1000),
+            timeout: Duration::from_millis(1000),
             concurrency: 10,
         };
         let state = state.with_limits(limits);

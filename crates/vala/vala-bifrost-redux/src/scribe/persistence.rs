@@ -1,5 +1,8 @@
 //! Bounded immutable-generation persistence for Scribe.
 
+use std::path::Path;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(any(test, feature = "test-support"))]
@@ -7,11 +10,14 @@ use std::time::Duration;
 
 use arrow::datatypes::SchemaRef;
 use num_traits::ToPrimitive;
+use opendal::Operator;
 use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
+#[cfg(any(test, feature = "test-support"))]
+use tokio::sync::watch;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{Instrument, Span};
-use vala_sql::ValaPostgres;
+use vala_sql::{OperatorPool, ValaPostgres};
 
 use crate::catalog::{TenantTableBinding, TenantTableKey};
 use crate::contracts::ScribeError;
@@ -19,9 +25,11 @@ use crate::maintenance::StagingFilePublisher;
 use crate::parquet::object_uploader::{
     BifrostParquetUploader, BifrostUploadRole, ParquetObjectIdentity, VerifiedParquetObject,
 };
-use crate::resources::ScribeResources;
+use crate::resources::{ScratchVolume, ScribeResources};
 #[cfg(any(test, feature = "test-support"))]
 use crate::scribe::assembly::StagingBacklog;
+use crate::scribe::assembly::StagingClaim;
+use crate::scribe::claim_assembly::{AssembledClaim, ClaimRuns};
 use crate::scribe::execution_lanes::{
     ScribePersistenceCpuOp, ScribePersistenceCpuPool, ScribePersistenceCpuResult, ScribeWalIoOp,
     ScribeWalIoPool, ScribeWalIoResult,
@@ -34,6 +42,9 @@ use crate::scribe::seal_key::SealKey;
 use crate::scribe::staging::{
     RecoveredPublication, ScribeStaging, StageElection, StagedArtifactClaim,
 };
+#[cfg(any(test, feature = "test-support"))]
+use crate::scribe::staging_runtime::PublishedClaimObservation;
+use crate::scribe::staging_runtime::{ClaimTakeError, DrivenClaim, ScribeStagingRuntime};
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::wal::{ScribeAppendMeta, WalLsn, WalSegmentRef, WalWriter};
 
@@ -98,26 +109,40 @@ fn record_encoded_bytes(file_size: usize) {
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Default)]
 pub struct PersistenceFaults {
-    object_write: Arc<std::sync::atomic::AtomicBool>,
+    /// One-shot failure of the next object-store write, before it mutates storage.
+    object_write: Arc<AtomicBool>,
+    /// Object-write attempts left until the armed one fails; zero arms nothing.
     object_write_failure_countdown: Arc<AtomicUsize>,
-    sql_commit: Arc<std::sync::atomic::AtomicBool>,
-    post_commit_client_error: Arc<std::sync::atomic::AtomicBool>,
-    manifest_publication: Arc<std::sync::atomic::AtomicBool>,
+    /// One-shot failure of the next file-list SQL commit after it is staged.
+    sql_commit: Arc<AtomicBool>,
+    /// One-shot error returned after the next publication COMMIT succeeds.
+    post_commit_client_error: Arc<AtomicBool>,
+    /// One-shot failure of the next manifest publication after its SQL commit.
+    manifest_publication: Arc<AtomicBool>,
     /// One-shot failure of a claim's retirement after its commit landed.
-    claim_retirement: Arc<std::sync::atomic::AtomicBool>,
-    object_write_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    claim_retirement: Arc<AtomicBool>,
+    /// Delay, in milliseconds, applied to an object write once the per-write
+    /// delays are used up.
+    object_write_delay_ms: Arc<AtomicU64>,
+    /// Per-write delays, in milliseconds, consumed in order before the fixed delay.
     object_write_delays_ms: Arc<Mutex<Vec<u64>>>,
+    /// Object writes currently in flight.
     object_write_active: Arc<AtomicUsize>,
+    /// Highest number of object writes observed in flight together.
     max_object_write_active: Arc<AtomicUsize>,
-    encode_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Delay, in milliseconds, applied inside every encode interval.
+    encode_delay_ms: Arc<AtomicU64>,
+    /// Parquet encode intervals currently entered.
     encode_active: Arc<AtomicUsize>,
+    /// Highest number of encode intervals observed entered together.
     max_encode_active: Arc<AtomicUsize>,
+    /// Most recent persistence error observed by the fixture.
     last_error: Arc<Mutex<Option<String>>>,
     /// Next real writer-v2 publication paused on both sides of fenced SQL visibility.
     publication_barrier:
         Arc<Mutex<Option<crate::scribe::file_list_writer::PublicationFenceBarrier>>>,
     /// Claim-publication progress a test can await instead of polling.
-    claim_probe: Arc<tokio::sync::watch::Sender<ClaimPublicationProbe>>,
+    claim_probe: Arc<watch::Sender<ClaimPublicationProbe>>,
 }
 
 /// Claim-publication progress observed through [`PersistenceFaults`].
@@ -564,13 +589,13 @@ pub struct ScribePersistenceConfig {
     /// Tenant-scoped Vala Postgres pool owner.
     pub postgres: Arc<ValaPostgres>,
     /// Operator capability used for membership-fenced durable publication.
-    pub operator_pool: Option<vala_sql::OperatorPool>,
+    pub operator_pool: Option<OperatorPool>,
     /// Maximum queued immutable generations.
     pub queue_items: usize,
     /// Number of asynchronous persistence workers.
     pub workers: usize,
     /// Generation-scoped output scratch capability required before encoding.
-    pub output_scratch: Option<Arc<crate::resources::ScratchVolume>>,
+    pub output_scratch: Option<Arc<ScratchVolume>>,
     /// Concrete test-tier fault points; production uses the default no-fault value.
     #[cfg(any(test, feature = "test-support"))]
     pub faults: PersistenceFaults,
@@ -603,14 +628,14 @@ impl ScribePersistenceConfig {
 
     /// Installs the audited operator capability required by production publication.
     #[must_use]
-    pub fn with_operator_pool(mut self, operator_pool: vala_sql::OperatorPool) -> Self {
+    pub fn with_operator_pool(mut self, operator_pool: OperatorPool) -> Self {
         self.operator_pool = Some(operator_pool);
         self
     }
 
     /// Installs the generation-owned output scratch authority.
     #[must_use]
-    pub fn with_output_scratch(mut self, output_scratch: crate::resources::ScratchVolume) -> Self {
+    pub fn with_output_scratch(mut self, output_scratch: ScratchVolume) -> Self {
         self.output_scratch = Some(Arc::new(output_scratch));
         self
     }
@@ -624,9 +649,15 @@ impl ScribePersistenceConfig {
     }
 }
 
+/// Shared dependencies every persistence worker needs to publish a claim.
+///
+/// Built once when the persistence runtime starts and handed to each worker,
+/// so workers share one object-store operator, WAL writer, CPU and WAL-IO
+/// lanes, fenced actor stream, memory budget, and hot-source registry rather
+/// than constructing their own.
 pub(crate) struct PersistenceRuntimeContext {
     /// Object-store operator shared by persistence workers.
-    pub(crate) operator: Arc<opendal::Operator>,
+    pub(crate) operator: Arc<Operator>,
     /// WAL writer used for manifest location and recovery identity.
     pub(crate) wal: Arc<WalWriter>,
     /// Bounded CPU lane used to encode immutable generations.
@@ -664,7 +695,7 @@ pub struct PersistenceRuntime {
     /// WAL-root stage owner used for pre-readiness publication recovery.
     recovery_wal: Option<Arc<WalWriter>>,
     /// Durable object store used for pre-readiness upload convergence.
-    recovery_operator: Option<opendal::Operator>,
+    recovery_operator: Option<Operator>,
     /// Root owner charged before allocating recovery transfer buffers.
     recovery_memory: Option<ScribeResources>,
     /// The shared worker retained so drain can publish residue after the queue empties.
@@ -763,9 +794,9 @@ impl PersistenceRuntime {
     /// free to merge, and a budget below it would idle a worker that has work.
     fn build_staging(
         context: &PersistenceRuntimeContext,
-        operator_pool: Option<&vala_sql::OperatorPool>,
+        operator_pool: Option<&OperatorPool>,
         workers: usize,
-    ) -> Option<Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>> {
+    ) -> Option<Arc<ScribeStagingRuntime>> {
         let stage_root = context.memory.stage_root()?.to_path_buf();
         let operator_pool = operator_pool?.clone();
         let config = crate::scribe::assembly::StagingAssemblerConfig::new(
@@ -786,7 +817,7 @@ impl PersistenceRuntime {
             ),
         );
         Some(Arc::new(
-            crate::scribe::staging_runtime::ScribeStagingRuntime::new(stage, publisher, config)
+            ScribeStagingRuntime::new(stage, publisher, config)
                 .with_hot_sources(Arc::clone(&context.hot_sources)),
         ))
     }
@@ -1088,9 +1119,7 @@ impl PersistenceRuntime {
     /// is the same condition under which it can publish nothing at all.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
-    pub fn published_claims_for_test(
-        &self,
-    ) -> Vec<crate::scribe::staging_runtime::PublishedClaimObservation> {
+    pub fn published_claims_for_test(&self) -> Vec<PublishedClaimObservation> {
         self.worker
             .as_ref()
             .and_then(|worker| worker.staging.as_ref())
@@ -1306,7 +1335,7 @@ enum ClaimSlotWait {
 #[derive(Clone)]
 struct PersistenceWorker {
     /// Audited operator pool for atomically fenced publication.
-    operator_pool: Option<vala_sql::OperatorPool>,
+    operator_pool: Option<OperatorPool>,
     /// Shared durable failure ledger consumed by startup recovery.
     failures: Arc<Mutex<Vec<String>>>,
     /// Replacement actor identity used only for publication authority.
@@ -1332,7 +1361,7 @@ struct PersistenceWorker {
     /// Optional local wake-up publisher used after confirmed file-list commits.
     staging_file_publisher: Option<StagingFilePublisher>,
     /// Generation-owned scratch authority required before writer creation.
-    output_scratch: Option<Arc<crate::resources::ScratchVolume>>,
+    output_scratch: Option<Arc<ScratchVolume>>,
     /// Test-only fault points for deterministic persistence-path coverage.
     #[cfg(any(test, feature = "test-support"))]
     faults: PersistenceFaults,
@@ -1343,7 +1372,7 @@ struct PersistenceWorker {
     /// `None` only when this pod was provisioned without a staging volume or
     /// without the operator capability publication requires; such a worker
     /// refuses durable work rather than persisting through a second path.
-    staging: Option<Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>>,
+    staging: Option<Arc<ScribeStagingRuntime>>,
 }
 
 /// Separate Scribe mover that uploads finalized stages but owns no catalog decision.
@@ -1357,7 +1386,7 @@ pub struct ScribeStageMover {
 impl ScribeStageMover {
     /// Builds the mover over the WAL-root stage namespace and durable object store.
     #[must_use]
-    pub fn new(wal_root: &std::path::Path, operator: opendal::Operator) -> Self {
+    pub fn new(wal_root: &Path, operator: Operator) -> Self {
         Self {
             staging: ScribeStaging::new(wal_root),
             uploader: BifrostParquetUploader::new(operator),
@@ -1702,7 +1731,7 @@ pub enum ScribePublicationOutcome {
 #[derive(Clone)]
 pub struct ScribePublicationReconciler {
     /// Existing audited operator capability used for every retry.
-    operator_pool: vala_sql::OperatorPool,
+    operator_pool: OperatorPool,
     /// Replacement actor whose membership fence authorizes publication.
     actor_stream: StreamIdentity,
     /// Deterministic post-COMMIT response fault used by integration proofs.
@@ -1714,7 +1743,7 @@ impl ScribePublicationReconciler {
     /// Constructs the sole publication reconciler for one persistence worker.
     #[must_use]
     pub(crate) fn new(
-        operator_pool: vala_sql::OperatorPool,
+        operator_pool: OperatorPool,
         actor_stream: StreamIdentity,
         #[cfg(any(test, feature = "test-support"))] faults: PersistenceFaults,
     ) -> Self {
@@ -1796,14 +1825,11 @@ impl PersistenceWorker {
     ///
     /// Panics if the claim-merge threads cannot be started.
     fn new(
-        operator_pool: Option<vala_sql::OperatorPool>,
+        operator_pool: Option<OperatorPool>,
         failures: Arc<Mutex<Vec<String>>>,
         context: PersistenceRuntimeContext,
-        output_scratch: Option<Arc<crate::resources::ScratchVolume>>,
-        (staging, claim_budget): (
-            Option<Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>>,
-            usize,
-        ),
+        output_scratch: Option<Arc<ScratchVolume>>,
+        (staging, claim_budget): (Option<Arc<ScribeStagingRuntime>>, usize),
     ) -> Self {
         let claim_budget = claim_budget.max(1);
         let merge_threads = merge_lane_threads(
@@ -2179,19 +2205,15 @@ impl PersistenceWorker {
     /// WAL stays authoritative for its rows.
     async fn publish_claims(
         &self,
-        staging: &Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>,
+        staging: &Arc<ScribeStagingRuntime>,
         slots: ClaimSlotWait,
-        mut next: impl FnMut() -> Result<
-            Option<crate::scribe::staging_runtime::DrivenClaim>,
-            crate::scribe::staging_runtime::ClaimTakeError,
-        >,
+        mut next: impl FnMut() -> Result<Option<DrivenClaim>, ClaimTakeError>,
     ) -> Result<usize, ScribeError> {
-        use crate::scribe::staging_runtime::ClaimTakeError;
         use futures_util::FutureExt as _;
         use futures_util::StreamExt as _;
         // A fresh claim was just taken from ready members, so only a retried
         // one can have committed already.
-        let drive = |claim: crate::scribe::staging_runtime::DrivenClaim, retried: bool| async move {
+        let drive = |claim: DrivenClaim, retried: bool| async move {
             if retried {
                 self.resume_claim(staging, &claim).await
             } else {
@@ -2352,8 +2374,8 @@ impl PersistenceWorker {
     /// stays outstanding and the next tick resumes it again.
     async fn resume_claim(
         &self,
-        staging: &Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>,
-        claim: &crate::scribe::staging_runtime::DrivenClaim,
+        staging: &Arc<ScribeStagingRuntime>,
+        claim: &DrivenClaim,
     ) -> Result<(), ScribeError> {
         if !staging.finish_committed(claim).await? {
             return self.publish_claim(staging, claim).await;
@@ -2383,8 +2405,8 @@ impl PersistenceWorker {
     /// refused or uncertain.
     async fn publish_claim(
         &self,
-        staging: &Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>,
-        claim: &crate::scribe::staging_runtime::DrivenClaim,
+        staging: &Arc<ScribeStagingRuntime>,
+        claim: &DrivenClaim,
     ) -> Result<(), ScribeError> {
         let runs = staging.gather(claim).await?;
         let scratch = self
@@ -2474,11 +2496,11 @@ impl PersistenceWorker {
     /// result that does not belong to claim assembly.
     async fn assemble_claim_output(
         &self,
-        staging: &Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>,
-        claim: &crate::scribe::assembly::StagingClaim,
-        runs: &crate::scribe::claim_assembly::ClaimRuns,
-        scratch_dir: &std::path::Path,
-    ) -> Result<crate::scribe::claim_assembly::AssembledClaim, ScribeError> {
+        staging: &Arc<ScribeStagingRuntime>,
+        claim: &StagingClaim,
+        runs: &ClaimRuns,
+        scratch_dir: &Path,
+    ) -> Result<AssembledClaim, ScribeError> {
         #[cfg(any(test, feature = "test-support"))]
         if self.fail_before_sql_commit() {
             return Err(ScribeError::Internal {
@@ -2525,9 +2547,7 @@ impl PersistenceWorker {
     /// Returns [`ScribeError::Internal`] when the pod was provisioned without a
     /// staging volume or without the operator capability publication requires.
     /// Refusing is the conservative outcome: the WAL stays authoritative.
-    fn staging(
-        &self,
-    ) -> Result<Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>, ScribeError> {
+    fn staging(&self) -> Result<Arc<ScribeStagingRuntime>, ScribeError> {
         self.staging.clone().ok_or_else(|| ScribeError::Internal {
             detail: "Scribe staging requires a staging volume and the operator capability"
                 .to_owned(),
@@ -2647,8 +2667,12 @@ mod tests {
     use super::*;
     use std::future::Future;
     use std::panic::AssertUnwindSafe;
+    #[cfg(feature = "test-support")]
+    use std::path::PathBuf;
     use std::task::{Context, Poll};
 
+    #[cfg(feature = "test-support")]
+    use crate::resources::BifrostRuntimeResources;
     use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
 
     /// Builds a persistence owner with empty queues for finalizer-only tests.
@@ -2835,12 +2859,12 @@ mod tests {
         /// Panics if the injected snapshot and policy cannot produce valid
         /// Bifrost runtime resources.
         fn scribe_only_runtime_resources(
-            scratch_root: &std::path::Path,
-            wal_root: &std::path::Path,
-            scribe_stage: std::path::PathBuf,
-            scribe_output: std::path::PathBuf,
-        ) -> crate::resources::BifrostRuntimeResources {
-            crate::resources::BifrostRuntimeResources::from_snapshot(
+            scratch_root: &Path,
+            wal_root: &Path,
+            scribe_stage: PathBuf,
+            scribe_output: PathBuf,
+        ) -> BifrostRuntimeResources {
+            BifrostRuntimeResources::from_snapshot(
                 crate::resources::SystemResourceSnapshot {
                     memory_limit_bytes: 2 * 1024 * 1024 * 1024,
                     effective_cpu: 2,
@@ -2870,6 +2894,12 @@ mod tests {
         }
 
         /// Starts one real persistence runtime before it accepts work.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the Postgres fixture, its superuser pool, the temporary
+        /// WAL or scratch roots, the cluster-node seed row, or the persistence
+        /// runtime itself cannot be set up.
         async fn start() -> Self {
             let database = wyrd_dev_fixtures::pg::PgFixture::start()
                 .await
@@ -2927,7 +2957,7 @@ mod tests {
                     .with_output_scratch(output_scratch),
                 PersistenceRuntimeContext {
                     operator: Arc::new(
-                        opendal::Operator::new(opendal::services::Memory::default())
+                        Operator::new(opendal::services::Memory::default())
                             .expect("memory operator")
                             .finish(),
                     ),

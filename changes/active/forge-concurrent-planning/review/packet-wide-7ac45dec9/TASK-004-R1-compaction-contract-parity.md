@@ -97,4 +97,3 @@ aliases for underscore values; generated files only from codegen or `ts:build`.
 
 Limit: the full `mise run verify:bifrost` aggregate was not rerun to
 completion; the focused journeys above cover every compaction-type surface.
-

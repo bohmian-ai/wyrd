@@ -26,6 +26,11 @@ use super::support::{
 };
 
 /// Builds the leader-schedule key of the fixture's one table.
+///
+/// # Panics
+///
+/// Panics when the fixture namespace and table name do not form a valid
+/// Forge task table identity.
 fn table_key(fixture: &PromotionIntegrationFixture) -> ForgeTableKey {
     ForgeTableKey {
         tenant: fixture.tenant,
@@ -58,6 +63,14 @@ fn table_key(fixture: &PromotionIntegrationFixture) -> ForgeTableKey {
 /// at the only point where the distinction is observable — outputs exist,
 /// nothing has been derived, audited, or submitted — and requires the attempt
 /// to refuse with no effect at all.
+///
+/// # Panics
+///
+/// Panics when a table still owing promotion is offered a rewrite, the
+/// leader pull or report fails, the pull does not offer exactly one
+/// default-type dispatch, an in-flight table is dispatched twice, dispatch
+/// writes an object, or any held-authority mutation fails to refuse the
+/// attempt without effect.
 #[tokio::test]
 async fn rewrite_scheduler_dispatches_only_after_promotion_and_authority() {
     let telemetry = ForgeTelemetryCheckpoint::install();
@@ -161,6 +174,12 @@ struct SharedDeleteState {
 /// commit, so the rewrite meets them as ordinary table state. The position delete removes a row of the
 /// chosen target object; the equality delete removes a row value that lives in
 /// the other object, which is what makes the two disposition rules separable.
+///
+/// # Panics
+///
+/// Panics when the promotion did not publish exactly two data objects,
+/// either object has no rows, or a delete commit fails or leaves no current
+/// snapshot.
 async fn seed_shared_deletes(promoted: &PromotedRewriteFixture) -> SharedDeleteState {
     let inputs = promoted
         .live_data_files()

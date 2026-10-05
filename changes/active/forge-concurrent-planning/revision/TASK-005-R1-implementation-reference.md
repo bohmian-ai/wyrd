@@ -461,4 +461,3 @@ elapsed-time threshold is evidence for the one-statement contract.
 - `architecture/wyrd-design.md`
 - `architecture/wyrd-doctrine.mdx`
 - `architecture/bifrost-design.md`
-

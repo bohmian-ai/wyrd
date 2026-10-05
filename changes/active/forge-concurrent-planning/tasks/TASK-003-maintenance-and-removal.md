@@ -304,4 +304,3 @@ admits the cleanup handoff), `ForgeSchedulerTrigger` (gained
 | REQ-010 superseded machinery removed | see Removed | static inventory above; vala-sql `pg_forge_tasks` 33/33 | PASS |
 | Docs | forge.svx, bifrost-design.md | `mise run docs:check` pass | PASS |
 | Integrated `verify:bifrost` | integration branch 51c64fb29 (tree merged unchanged) | `mise run verify:bifrost` exit 0, 9/9 lanes; log free of `internal_invariant` (TASK-002 evidence) | PASS |
-

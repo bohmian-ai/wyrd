@@ -4,12 +4,15 @@
 //! source reconciliation in the Redux crate so later serving adapters cannot
 //! bypass the engine's invariants.  IO-backed execution is intentionally
 //! composed around these small owners.
+use bindings::OracleExecutionLock;
+use datafusion::prelude::SessionConfig;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use chrono::{DateTime, Utc};
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
@@ -37,7 +40,9 @@ use wyrd_spec::vala::api::{
     SourceCompletion, SourceCompletionOutcome,
 };
 
-use crate::catalog::{BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef};
+use crate::catalog::{
+    BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef, TableUid, TenantTableBinding,
+};
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, RegisteredRole};
 use crate::schema::SchemaFingerprint;
 use crate::scribe::tail_rpc::TailReadError;
@@ -110,6 +115,7 @@ pub use participant_cut::{
     OracleQueryAttemptCut, OracleQueryAttemptCutError, OracleQueryAttemptRoster,
     OracleQueryParticipant,
 };
+use planner::ActiveReadClaim;
 pub use planner::OraclePlanner;
 pub use query_stream::OracleQueryStream;
 pub use query_stream::QueryStreamLifecycle;
@@ -975,7 +981,7 @@ pub struct OracleBuildConfig {
     /// present the peer client certificate cannot reach a follower at all.
     pub peer_tls: Option<dispatcher::BifrostPeerTls>,
     /// Query-scoped live Scribe discovery owner.
-    pub tail_discovery: Option<Arc<dyn tail_discovery::TailStreamDiscovery>>,
+    pub tail_discovery: Option<Arc<dyn TailStreamDiscovery>>,
     /// Optional node-aware local/tonic directory used for immutable sealed leaves.
     pub peer_transports: Option<Arc<dispatcher::OraclePeerTransportDirectory>>,
     /// Engine limits and lifecycle values.
@@ -1051,7 +1057,7 @@ enum OracleExecutionError {
 /// resolves its post-admission bindings through.
 struct RetainedPhysicalPlan {
     /// Exact `SessionConfig` the root was planned with.
-    config: datafusion::prelude::SessionConfig,
+    config: SessionConfig,
     /// The single physical root this query executes.
     root: Arc<dyn ExecutionPlan>,
     /// Whether live-stream listing failed for a table before planning.
@@ -1126,7 +1132,7 @@ pub struct ClaimedSqlCut {
     /// The immutable cut every provider is built from.
     cut: PlannedSqlCut,
     /// This query's committed active reads on every table of `cut`.
-    claim: planner::ActiveReadClaim,
+    claim: ActiveReadClaim,
 }
 
 impl ClaimedSqlCut {
@@ -1170,12 +1176,12 @@ struct SqlAttemptInput<'a> {
     /// It is finalized into the signed participant cut only after the physical
     /// root has been built and its class derived, so no topology or source
     /// refresh can occur between the class and the cut it is signed into.
-    roster: participant_cut::OracleQueryAttemptRoster,
+    roster: OracleQueryAttemptRoster,
     /// Catalog snapshot already pinned in this process for this attempt.
     prepared: PlannedSqlCut,
     /// The attempt's active-read claim, held by the caller's frame until the
     /// returned stream takes it.
-    active_reads: &'a mut Option<planner::ActiveReadClaim>,
+    active_reads: &'a mut Option<ActiveReadClaim>,
 }
 
 /// Inputs for the pre-admission half of one attempt.
@@ -1187,7 +1193,7 @@ struct ClassifyInput<'a> {
     /// Absolute whole-query deadline.
     deadline: Instant,
     /// Class-neutral membership frozen before any class existed.
-    roster: participant_cut::OracleQueryAttemptRoster,
+    roster: OracleQueryAttemptRoster,
     /// Catalog snapshot already pinned in this process for this attempt.
     prepared: PlannedSqlCut,
     /// Telemetry slot opened once the class is known.
@@ -1237,7 +1243,7 @@ pub struct Oracle {
     /// from its own admitted grant after the class is derived.
     planning_runtime: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
     /// Query-scoped live Scribe discovery owner.
-    tail_discovery: Option<Arc<dyn tail_discovery::TailStreamDiscovery>>,
+    tail_discovery: Option<Arc<dyn TailStreamDiscovery>>,
     /// Test-tier one-shot refusal armed immediately before the distributed build.
     ///
     /// Selection has two distinct pre-selection refusals that both fall back to
@@ -1723,7 +1729,7 @@ impl Oracle {
         let duration = self.planner.request_deadline(request.deadline_ms);
         let duration =
             chrono::Duration::from_std(duration).map_err(|_| BifrostError::QueryTimeout)?;
-        chrono::Utc::now()
+        Utc::now()
             .checked_add_signed(duration)
             .map(|deadline| deadline.timestamp_millis())
             .ok_or(BifrostError::QueryTimeout)
@@ -1879,15 +1885,15 @@ impl Oracle {
         context: &AuthorizedQueryContext,
         request: &BifrostQueryRequest,
         absolute_deadline_ms: i64,
-    ) -> Result<(participant_cut::OracleQueryAttemptRoster, ClaimedSqlCut), BifrostError> {
+    ) -> Result<(OracleQueryAttemptRoster, ClaimedSqlCut), BifrostError> {
         let tables = self.validate_query(request)?;
         if !self.is_ready() {
             return Err(BifrostError::OracleRoleUnavailable);
         }
-        let wall_deadline = chrono::DateTime::from_timestamp_millis(absolute_deadline_ms)
+        let wall_deadline = DateTime::from_timestamp_millis(absolute_deadline_ms)
             .ok_or(BifrostError::QueryTimeout)?;
         let duration = wall_deadline
-            .signed_duration_since(chrono::Utc::now())
+            .signed_duration_since(Utc::now())
             .to_std()
             .map_err(|_| BifrostError::QueryTimeout)?;
         if duration.is_zero() {
@@ -1953,7 +1959,7 @@ impl Oracle {
         &self,
         context: &AuthorizedQueryContext,
         deadline: Instant,
-        wall_deadline: chrono::DateTime<chrono::Utc>,
+        wall_deadline: DateTime<Utc>,
     ) -> Result<(), BifrostError> {
         let pause = self
             .preparation_pause
@@ -1985,9 +1991,9 @@ impl Oracle {
         snapshot: &ClusterSnapshot,
         attempt_id: QueryId,
         deadline: Instant,
-        wall_deadline: chrono::DateTime<chrono::Utc>,
-    ) -> Result<participant_cut::OracleQueryAttemptRoster, BifrostError> {
-        if Instant::now() >= deadline || chrono::Utc::now() >= wall_deadline {
+        wall_deadline: DateTime<Utc>,
+    ) -> Result<OracleQueryAttemptRoster, BifrostError> {
+        if Instant::now() >= deadline || Utc::now() >= wall_deadline {
             return Err(BifrostError::QueryTimeout);
         }
         self.freeze_roster(snapshot, attempt_id, wall_deadline)
@@ -2004,16 +2010,16 @@ impl Oracle {
     /// stale or conflicting membership, an absent leader, or an elapsed deadline.
     fn freeze_roster(
         &self,
-        snapshot: &crate::cluster::ClusterSnapshot,
+        snapshot: &ClusterSnapshot,
         attempt_id: QueryId,
-        wall_deadline: chrono::DateTime<chrono::Utc>,
-    ) -> Result<participant_cut::OracleQueryAttemptRoster, BifrostError> {
-        let now = chrono::Utc::now();
+        wall_deadline: DateTime<Utc>,
+    ) -> Result<OracleQueryAttemptRoster, BifrostError> {
+        let now = Utc::now();
         let observed_age = now
             .signed_duration_since(snapshot.observed_at())
             .to_std()
             .unwrap_or_default();
-        participant_cut::OracleQueryAttemptRoster::freeze(
+        OracleQueryAttemptRoster::freeze(
             snapshot,
             attempt_id,
             self.admission.local_role.key.node_id,
@@ -2056,7 +2062,7 @@ impl Oracle {
         &self,
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
-        roster: participant_cut::OracleQueryAttemptRoster,
+        roster: OracleQueryAttemptRoster,
         prepared: ClaimedSqlCut,
     ) -> Result<OracleQueryStream, BifrostError> {
         let ClaimedSqlCut { cut, claim } = prepared;
@@ -2086,9 +2092,9 @@ impl Oracle {
         &self,
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
-        roster: participant_cut::OracleQueryAttemptRoster,
+        roster: OracleQueryAttemptRoster,
         prepared: PlannedSqlCut,
-        active_reads: &mut Option<planner::ActiveReadClaim>,
+        active_reads: &mut Option<ActiveReadClaim>,
     ) -> Result<OracleQueryStream, BifrostError> {
         if !self.is_ready() {
             return Err(BifrostError::OracleRoleUnavailable);
@@ -2276,9 +2282,9 @@ impl Oracle {
         &self,
         audit: CutAuditInput<'_>,
         retained: &RetainedPhysicalPlan,
-        cut_deadline: chrono::DateTime<chrono::Utc>,
+        cut_deadline: DateTime<Utc>,
         phases: &mut AttemptPhaseTimer,
-    ) -> Result<Arc<bindings::OracleExecutionLock>, BifrostError> {
+    ) -> Result<Arc<OracleExecutionLock>, BifrostError> {
         let admitted = audit.admitted;
         let deadline = audit.deadline;
         let sources = PlannedSources {
@@ -2568,12 +2574,12 @@ impl Oracle {
     /// record on.
     fn bind_execution_sources(
         &self,
-        config: &datafusion::prelude::SessionConfig,
+        config: &SessionConfig,
         admitted: &AdmittedQueryGuard,
-        cut_deadline: chrono::DateTime<chrono::Utc>,
+        cut_deadline: DateTime<Utc>,
         deadline: Instant,
         sources: &PlannedSources<'_>,
-    ) -> Result<Arc<bindings::OracleExecutionLock>, BifrostError> {
+    ) -> Result<Arc<OracleExecutionLock>, BifrostError> {
         let &PlannedSources {
             context,
             query_class,
@@ -2582,7 +2588,7 @@ impl Oracle {
             live_listing_lost,
         } = sources;
         let lock = config
-            .get_extension::<bindings::OracleExecutionLock>()
+            .get_extension::<OracleExecutionLock>()
             .ok_or(BifrostError::QueryExecutionFailed)?;
         let mut planned = Vec::new();
         let mut follower_assignments: std::collections::HashMap<
@@ -2700,7 +2706,7 @@ impl Oracle {
         admitted: &AdmittedQueryGuard,
         participant_cut: &OracleQueryAttemptCut,
     ) -> Result<RunningQueryTerminalOwner, BifrostError> {
-        let now = chrono::Utc::now();
+        let now = Utc::now();
         if admitted.query_id != participant_cut.attempt_id()
             || admitted.leader.node_id != participant_cut.leader().node_id
             || admitted.leader.fencing_token != participant_cut.leader().fencing_token
@@ -3069,7 +3075,7 @@ impl Oracle {
         context: &AuthorizedQueryContext,
         sql: &str,
         planned: &PlannedSqlCut,
-        roster: &mut participant_cut::OracleQueryAttemptRoster,
+        roster: &mut OracleQueryAttemptRoster,
         deadline: Instant,
     ) -> Result<RetainedPhysicalPlan, BifrostError> {
         let cuts = planned.cuts.as_slice();
@@ -3087,7 +3093,7 @@ impl Oracle {
         // grant, and drained batches arrive once, after admission.
         let config = shape
             .session_config()
-            .with_extension(Arc::new(bindings::OracleExecutionLock::new()));
+            .with_extension(Arc::new(OracleExecutionLock::new()));
         let state = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
             .with_config(config)
@@ -3152,7 +3158,7 @@ impl Oracle {
     /// [`BifrostError::QueryExecutionFailed`] for any other listing fault.
     async fn discover_live_routes(
         &self,
-        roster: &mut participant_cut::OracleQueryAttemptRoster,
+        roster: &mut OracleQueryAttemptRoster,
         cuts: &[PinnedSealedTable],
         deadline: Instant,
     ) -> Result<LiveDiscovery, BifrostError> {
@@ -3187,8 +3193,8 @@ impl Oracle {
     /// roster refreeze failure.
     async fn list_live_routes(
         &self,
-        discovery: &dyn tail_discovery::TailStreamDiscovery,
-        roster: &participant_cut::OracleQueryAttemptRoster,
+        discovery: &dyn TailStreamDiscovery,
+        roster: &OracleQueryAttemptRoster,
         cuts: &[PinnedSealedTable],
         deadline: Instant,
         stale_is_loss: bool,
@@ -3269,8 +3275,8 @@ impl Oracle {
     /// leader before the deadline.
     async fn refreeze_roster(
         &self,
-        roster: &participant_cut::OracleQueryAttemptRoster,
-    ) -> Result<participant_cut::OracleQueryAttemptRoster, BifrostError> {
+        roster: &OracleQueryAttemptRoster,
+    ) -> Result<OracleQueryAttemptRoster, BifrostError> {
         self.cluster
             .refresh_snapshot()
             .await
@@ -3604,7 +3610,7 @@ pub fn assignment_schema_fingerprint(schema: &Schema) -> String {
 /// or `DataFusion` rejects a duplicate/incompatible schema or table.
 fn register_session_table(
     session: &SessionContext,
-    binding: &crate::catalog::TenantTableBinding,
+    binding: &TenantTableBinding,
     provider: Arc<dyn TableProvider>,
 ) -> Result<(), BifrostError> {
     let schema_name = binding
@@ -3864,8 +3870,8 @@ fn execution_topology(
 /// An acquired identity and the sealed cut it materializes into carry the same
 /// binding and UID, so both authorization stages name the same object.
 pub(super) fn resolved_table_scope(
-    binding: &crate::catalog::TenantTableBinding,
-    table_uid: &crate::catalog::TableUid,
+    binding: &TenantTableBinding,
+    table_uid: &TableUid,
 ) -> PermissionScope {
     binding.table_ref.permission_scope(table_uid)
 }
@@ -3886,7 +3892,7 @@ pub(super) fn resolved_table_scope(
 /// principal's effective permissions do not cover.
 pub(super) fn authorize_resolved_tables(
     context: &AuthorizedQueryContext,
-    resolved: &[(crate::catalog::TenantTableBinding, crate::catalog::TableUid)],
+    resolved: &[(TenantTableBinding, TableUid)],
 ) -> Result<(), BifrostError> {
     for (binding, table_uid) in resolved {
         let required = Permission {
@@ -4117,7 +4123,7 @@ async fn settle_attempt_output(
     output: AttemptOutput,
     settle: AttemptSettlement,
     query_telemetry: &mut Option<QueryTelemetryGuard>,
-    active_reads: &mut Option<planner::ActiveReadClaim>,
+    active_reads: &mut Option<ActiveReadClaim>,
 ) -> Result<OracleQueryStream, BifrostError> {
     let AttemptOutput {
         schema,
@@ -4389,9 +4395,9 @@ where
 ///
 /// Returns [`BifrostError::QueryTimeout`] when the deadline has already passed
 /// or the remaining budget cannot form an instant.
-fn instant_deadline(deadline: chrono::DateTime<chrono::Utc>) -> Result<Instant, BifrostError> {
+fn instant_deadline(deadline: DateTime<Utc>) -> Result<Instant, BifrostError> {
     let remaining = deadline
-        .signed_duration_since(chrono::Utc::now())
+        .signed_duration_since(Utc::now())
         .to_std()
         .map_err(|_| BifrostError::QueryTimeout)?;
     Instant::now()
@@ -4422,6 +4428,11 @@ mod tests {
 
     /// Omitted, zero, and negative budgets fall back to the default; a positive
     /// budget is honored exactly.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an omitted, zero, or negative budget does not resolve to the
+    /// configured default, or when a positive budget is not honored exactly.
     #[test]
     fn request_deadline_projects_unusable_budgets_to_the_default() {
         let default = Duration::from_secs(30);

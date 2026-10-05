@@ -1,6 +1,8 @@
 //! Tenant-scoped reads of the sealed `vala.file_list` manifest.
 
 use std::collections::BTreeSet;
+
+use uuid::Uuid;
 use wyrd_sql::TenantConn;
 
 use crate::SqlError;
@@ -34,7 +36,7 @@ pub struct HotFileCut {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromotableHotFileRow {
     /// Durable file-list identity carried into the promoted-file-set digest.
-    pub id: uuid::Uuid,
+    pub id: Uuid,
     /// Canonical object-store path of the already-published hot object.
     pub file_path: String,
     /// Lowercase object checksum the promoter revalidates before appending.
@@ -55,13 +57,13 @@ pub struct PromotableHotFileRow {
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct PlannedHotFileRow {
     /// Durable file-list identity this state describes.
-    pub id: uuid::Uuid,
+    pub id: Uuid,
     /// Canonical object-store path of the planned hot object.
     pub file_path: String,
     /// Snapshot that settled this row, when a promotion already committed it.
     pub committed_snapshot_id: Option<i64>,
     /// Forge publication operation that settled this row, when one did.
-    pub forge_publication_operation_id: Option<uuid::Uuid>,
+    pub forge_publication_operation_id: Option<Uuid>,
     /// Whether the row has left the hot scan set.
     pub compacted: bool,
 }
@@ -70,7 +72,7 @@ pub struct PlannedHotFileRow {
 fn is_unresolved_hot(
     row: &HotFileRow,
     pinned_paths: &BTreeSet<String>,
-    pinned_operation: Option<uuid::Uuid>,
+    pinned_operation: Option<Uuid>,
 ) -> (bool, bool) {
     let represented_by_path = pinned_paths.contains(&row.file_path);
     let represented_by_operation = row.compacted
@@ -100,7 +102,7 @@ impl HotFileCut {
     pub fn reconcile(
         rows: Vec<HotFileRow>,
         pinned_paths: &BTreeSet<String>,
-        pinned_operation: Option<uuid::Uuid>,
+        pinned_operation: Option<Uuid>,
     ) -> Self {
         let read = rows.len();
         let mut hot_files = Vec::new();
@@ -152,9 +154,8 @@ impl HotFileCatalog {
         &self,
         conn: &mut TenantConn<'_>,
     ) -> Result<Vec<PromotableHotFileRow>, SqlError> {
-        let rows: Vec<(uuid::Uuid, String, Option<String>, i64, serde_json::Value)> =
-            sqlx::query_as(
-                r#"
+        let rows: Vec<(Uuid, String, Option<String>, i64, serde_json::Value)> = sqlx::query_as(
+            r#"
             SELECT id, file_path, file_checksum, file_size, promotion_record
               FROM vala.file_list
              WHERE data_tenant_id = wyrd.current_tenant()
@@ -165,12 +166,12 @@ impl HotFileCatalog {
                AND forge_publication_operation_id IS NULL
              ORDER BY created_at, file_ordinal, id
             "#,
-            )
-            .bind(&self.namespace)
-            .bind(&self.table_name)
-            .fetch_all(&mut **conn.transaction())
-            .await
-            .map_err(SqlError::from)?;
+        )
+        .bind(&self.namespace)
+        .bind(&self.table_name)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)?;
         rows.into_iter()
             .map(
                 |(id, file_path, file_checksum, file_size, promotion_record)| {
@@ -212,7 +213,7 @@ impl HotFileCatalog {
     pub async fn planned_settlement(
         &self,
         conn: &mut TenantConn<'_>,
-        file_ids: &[uuid::Uuid],
+        file_ids: &[Uuid],
     ) -> Result<Vec<PlannedHotFileRow>, SqlError> {
         // raw-query grep allowlist: this tenant-scoped file-list read post-dates the sqlx offline cache; run `mise run sqlx:prepare` to promote it to a macro. It remains bound to `TenantConn` and `wyrd.current_tenant()` and introduces no tenant-boundary exception.
         sqlx::query_as::<_, PlannedHotFileRow>(
@@ -252,9 +253,9 @@ impl HotFileCatalog {
     pub async fn settle_promoted(
         &self,
         conn: &mut TenantConn<'_>,
-        file_ids: &[uuid::Uuid],
+        file_ids: &[Uuid],
         committed_snapshot_id: i64,
-        operation_id: uuid::Uuid,
+        operation_id: Uuid,
     ) -> Result<u64, SqlError> {
         sqlx::query(
             r#"
@@ -353,10 +354,15 @@ mod tests {
     use super::*;
 
     /// Builds one valid manifest row for cut-membership policy tests.
-    fn row(compacted: bool, committed: Option<i64>, operation: Option<uuid::Uuid>) -> HotFileRow {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixed fixture partition start is not a representable
+    /// timestamp.
+    fn row(compacted: bool, committed: Option<i64>, operation: Option<Uuid>) -> HotFileRow {
         HotFileRow {
-            id: uuid::Uuid::now_v7(),
-            data_tenant_id: uuid::Uuid::now_v7(),
+            id: Uuid::now_v7(),
+            data_tenant_id: Uuid::now_v7(),
             namespace: "vala.bifrost".to_owned(),
             table_name: "events".to_owned(),
             file_path: "events/a.parquet".to_owned(),
@@ -372,7 +378,7 @@ mod tests {
             compacted,
             committed_snapshot_id: committed,
             forge_publication_operation_id: operation,
-            node_id: uuid::Uuid::now_v7(),
+            node_id: Uuid::now_v7(),
             writer_epoch: 1,
             wal_lsn_min: 1,
             wal_lsn_max: 2,
@@ -381,10 +387,15 @@ mod tests {
     }
 
     /// Covers hot, path, operation, committed, reset, unrelated, and ambiguous states.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any row state classifies differently from its expected
+    /// `(unresolved, ambiguous)` pair.
     #[test]
     fn hot_cut_excludes_only_snapshot_represented_rows() {
-        let pinned = uuid::Uuid::from_u128(7);
-        let unrelated = uuid::Uuid::from_u128(8);
+        let pinned = Uuid::from_u128(7);
+        let unrelated = Uuid::from_u128(8);
         let empty = BTreeSet::new();
         assert_eq!(
             is_unresolved_hot(&row(false, None, None), &empty, Some(pinned)),
@@ -419,6 +430,7 @@ mod tests {
 mod pg_tests {
     //! Database proofs for promotion demand and settlement.
 
+    use uuid::Uuid;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_sql::TenantConn;
 
@@ -446,17 +458,11 @@ mod pg_tests {
         for (ordinal, checksum, compacted, snapshot, operation) in [
             (0_i16, "a".repeat(64), false, None, None),
             (1, "b".repeat(64), false, None, None),
-            (
-                2,
-                "c".repeat(64),
-                true,
-                Some(41_i64),
-                Some(uuid::Uuid::now_v7()),
-            ),
+            (2, "c".repeat(64), true, Some(41_i64), Some(Uuid::now_v7())),
             (3, "d".repeat(64), false, Some(42), None),
-            (4, "e".repeat(64), false, None, Some(uuid::Uuid::now_v7())),
+            (4, "e".repeat(64), false, None, Some(Uuid::now_v7())),
         ] {
-            let id = uuid::Uuid::now_v7();
+            let id = Uuid::now_v7();
             ids.push(id);
             sqlx::query(
                 r#"
@@ -484,7 +490,7 @@ mod pg_tests {
             .bind(compacted)
             .bind(snapshot)
             .bind(operation)
-            .bind(uuid::Uuid::now_v7())
+            .bind(Uuid::now_v7())
             .execute(&pool)
             .await
             .expect("insert manifest row");
@@ -510,7 +516,7 @@ mod pg_tests {
             serde_json::json!({"version": 1})
         );
 
-        let operation = uuid::Uuid::now_v7();
+        let operation = Uuid::now_v7();
         let settled = catalog
             .settle_promoted(&mut conn, &ids[..2], 77, operation)
             .await

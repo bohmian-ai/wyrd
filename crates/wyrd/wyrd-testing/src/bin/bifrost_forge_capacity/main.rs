@@ -389,6 +389,10 @@ fn resource_plans(output: &Path, ladder: &[usize]) -> ResourcePlans {
 
 /// Runs the benchmark; exits 1 on any failed check or error and 2 when the
 /// host was too loaded to measure.
+///
+/// # Panics
+///
+/// Panics if `#[tokio::main]` cannot build the Tokio runtime.
 #[tokio::main]
 async fn main() -> ExitCode {
     install_tracing();

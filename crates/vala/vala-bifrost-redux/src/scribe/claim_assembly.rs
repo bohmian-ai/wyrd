@@ -325,6 +325,11 @@ mod tests {
     /// `offset` shifts the member's event times by one microsecond so the two
     /// members' rows must interleave in the merged object; a merge that simply
     /// concatenated the runs would produce a different, detectable order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture timestamps cannot form a batch under the assembly
+    /// schema.
     fn frozen_member(tenant: DataTenantId, rows: i64, offset: i64, batch: u8) -> FrozenMemtable {
         let schema = assembly_schema();
         let times =
@@ -424,6 +429,14 @@ mod tests {
     /// the rows of both interleave in layout order, the object carries exactly
     /// the rows the claim promised, and a smaller object target rolls the same
     /// rows into several objects without losing or reordering any of them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture directory, staging, claim, gather, or encode step
+    /// fails, when the claim does not hold both members and their two runs, when
+    /// the default target does not yield one globally ordered object of every
+    /// promised row, or when the one-byte target does not roll the same rows, in
+    /// the same order, into several objects.
     #[tokio::test]
     async fn a_claim_merges_its_members_into_rolling_objects() {
         let root = tempfile::tempdir().expect("assembly root");

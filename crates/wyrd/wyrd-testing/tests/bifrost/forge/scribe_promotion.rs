@@ -383,6 +383,12 @@ async fn scribe_promotion_revalidates_footer_and_appends_without_data_put() {
 /// still unsettled in SQL. The production `pin_sealed_table` cut is taken at
 /// that instant, and before and after it, and each cut must partition the
 /// sealed set exactly.
+///
+/// # Panics
+///
+/// Panics when the fixture seals nothing, the held promotion does not reach
+/// or leave the catalog boundary in time, or any cut double-counts or misses
+/// a sealed row.
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
@@ -400,6 +406,12 @@ async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
     assert!(!sealed.is_empty(), "the fixture sealed real objects");
 
     /// Asserts one production cut sees every sealed path exactly once.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the cut cannot be acquired, materialized, or released, when
+    /// a path is visible from both hot and promoted sources, or when the cut
+    /// does not cover the sealed set exactly.
     async fn assert_exact_cut(
         catalog: &vala_bifrost_redux::catalog::BifrostCatalog,
         table: &vala_bifrost_redux::catalog::TableRef,
@@ -664,6 +676,12 @@ async fn scribe_promotion_ambiguity_reconciles_without_recommit() {
 /// already be spent, so the definite conflict closes the operation instead of
 /// buying a second catalog call. One delegated update — against two in the
 /// retry scenario — is what proves the barrier held.
+///
+/// # Panics
+///
+/// Panics when the manual Forge clock cannot advance past the retry budget,
+/// the catalog sees more than one update attempt, the operation does not
+/// close as `reset`, or any sealed row is settled.
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn scribe_promotion_deadline_expires_before_conflict_retry() {
@@ -718,6 +736,11 @@ async fn scribe_promotion_deadline_expires_before_conflict_retry() {
 /// before delegation, so acceptance is unknown by construction. Draining must therefore release the
 /// attempt and its lease while leaving the operation Prepared: settling it
 /// either way would claim knowledge the worker does not have.
+///
+/// # Panics
+///
+/// Panics when the drained operation leaves `prepared`, any sealed row is
+/// settled, or the drained attempt still holds its lease.
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn scribe_promotion_cancellation_drains_without_settlement() {

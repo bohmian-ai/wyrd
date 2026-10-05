@@ -363,7 +363,8 @@ mod pg_tests {
     use vala_sql::queries::cluster_nodes::ClusterNodes;
     use vala_sql::queries::olap_catalog::upsert_table;
     use vala_sql::queries::oracle_reader_authority::{
-        ActiveReadOwner, ActiveTableRef, BifrostTableMaintenanceAuthority, OracleActiveTableReads,
+        AcquiredTableCut, ActiveReadOwner, ActiveTableRef, BifrostTableMaintenanceAuthority,
+        OracleActiveTableReads,
     };
     use vala_sql::row_types::cluster_nodes::RoleRegistration;
     use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
@@ -605,8 +606,7 @@ mod pg_tests {
             tenant: DataTenantId,
             query_id: Uuid,
             tables: &[&str],
-        ) -> Result<Vec<vala_sql::queries::oracle_reader_authority::AcquiredTableCut>, SqlError>
-        {
+        ) -> Result<Vec<AcquiredTableCut>, SqlError> {
             let refs: Vec<ActiveTableRef<'_>> = tables
                 .iter()
                 .map(|table| ActiveTableRef {
@@ -685,6 +685,10 @@ mod pg_tests {
     }
 
     /// Projects the privileges one role holds on one relation, sorted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the `information_schema` privilege read fails.
     async fn grants(pool: &PgPool, table: &str, grantee: &str) -> Vec<String> {
         sqlx::query_scalar(
             "SELECT privilege_type FROM information_schema.role_table_grants \

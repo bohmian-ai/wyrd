@@ -712,9 +712,16 @@ impl ForgeSchedule {
 
 #[cfg(test)]
 mod tests {
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+
     use super::*;
 
     /// Builds a valid key for one numbered table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed tenant UUID is not a valid v7 tenant id or the
+    /// table name is not a valid task identity.
     fn key(table: &str) -> ForgeTableKey {
         ForgeTableKey {
             tenant: DataTenantId::new(Uuid::from_u128(0x0190_0000_0000_7000_8000_0000_0000_0007))
@@ -1009,7 +1016,6 @@ mod tests {
     /// the index drifts from the tracks.
     #[test]
     fn due_index_selects_exactly_what_the_scan_selects() {
-        use rand::{Rng, SeedableRng, rngs::StdRng};
         let tables: Vec<String> = (0..12).map(|n| format!("t{n:02}")).collect();
         let mut pulls = 0_usize;
         let mut dispatched = 0_usize;

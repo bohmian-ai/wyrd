@@ -29,6 +29,8 @@ pub use wyrd_client::*;
 /// SDK root re-export shape.
 #[cfg(test)]
 mod tests {
+    use super::bifrost::{CompactionTypeWire, TableConfig};
+
     /// The SDK root names every composed client capability from `wyrd-client`.
     #[test]
     fn sdk_root_projects_the_composed_client_capabilities() {
@@ -47,10 +49,13 @@ mod tests {
     /// A Rust SDK user names every compaction type and declares it on a
     /// table config through `wyrd_sdk::bifrost` alone, with no direct
     /// `wyrd-spec` dependency.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the one-column JSON schema is rejected or a config does not
+    /// report the compaction type it was given.
     #[test]
     fn sdk_bifrost_names_the_compaction_type() {
-        use super::bifrost::{CompactionTypeWire, TableConfig};
-
         for kind in [
             CompactionTypeWire::Auto,
             CompactionTypeWire::Full,

@@ -31,10 +31,11 @@
 //!
 //! [`AnalyticalSupervisor`]: crate::oracle::analytical_supervisor::AnalyticalSupervisor
 
+use super::participant_cut::OracleQueryParticipant;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -51,6 +52,7 @@ use http::HeaderMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
@@ -60,6 +62,7 @@ use wyrd_spec::vala::api::NodeId;
 pub use super::analytical_supervisor::AnalyticalSupervisor;
 
 use super::AuthorizedQueryContext;
+use super::admission::AdmittedQueryGuard;
 use super::analytical_supervisor::{
     AnalyticalAttemptGuard, AnalyticalAttemptKey, AnalyticalAttemptRelease, AnalyticalGraphGuard,
     AnalyticalSupervisorInspection, StageId, TaskId,
@@ -70,17 +73,20 @@ use super::analytical_transport::{
     AnalyticalParticipantCut, AnalyticalStageSigning, StageWireIdentity, read_context,
 };
 use super::dispatcher::{
-    BifrostPeerTls, GraphLeaseRequest, PendingGraphActivation, ReservationRegistry,
+    BifrostPeerTls, DispatchCandidate, GraphLeaseRequest, OraclePeerTransportDirectory,
+    ParticipantGrant, PendingGraphActivation, ReservationRegistry,
 };
 use super::participant_cut::OracleQueryAttemptCut;
 use super::peer::{AuthorizedStage, OracleStageAuthority, PeerSecurityError, StageOperationV1};
+use super::query_stream::RunningQueryTerminalOwner;
 use super::telemetry::{
     AnalyticalAttemptOutcome, AnalyticalStageOperation, record_stage_operation,
 };
 use crate::resources::OracleExecution;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
-    AnalyticalGraphRef, FencingToken, QueryId, ReservationId, ReserveNodeSlotsRequest,
+    AnalyticalGraphRef, FencingToken, QueryId, ReservationId, ReservationRejected,
+    ReserveNodeSlotsRequest,
 };
 
 /// Header carrying the client-visible query identity on every stage operation.
@@ -706,7 +712,7 @@ impl AnalyticalStageEgress {
             self.peer_tls.clone(),
             // A follower adopts a cut that is already complete, so its cell is
             // published at construction and never observed unset.
-            Arc::new(std::sync::OnceLock::from(recorded.cut)),
+            Arc::new(OnceLock::from(recorded.cut)),
             recorded.exchanges,
             AnalyticalStageSigning {
                 absolute_deadline_ms: recorded.deadline_ms,
@@ -2257,7 +2263,7 @@ impl AnalyticalStageIngress {
 #[derive(Default)]
 pub struct AnalyticalParticipantGrants {
     /// Every grant a participant accepted for this attempt.
-    grants: Vec<super::dispatcher::ParticipantGrant>,
+    grants: Vec<ParticipantGrant>,
 }
 
 impl fmt::Debug for AnalyticalParticipantGrants {
@@ -2293,13 +2299,13 @@ pub(super) struct AnalyticalGraphLifecycle {
     /// Supervisor the graph's registry entry and retained cleanup live in.
     supervisor: Arc<AnalyticalSupervisor>,
     /// Directory every reserve is issued through.
-    transports: Option<Arc<super::dispatcher::OraclePeerTransportDirectory>>,
+    transports: Option<Arc<OraclePeerTransportDirectory>>,
     /// Frozen remote participants, already excluding this coordinator.
-    remote: Vec<(Url, super::dispatcher::DispatchCandidate)>,
+    remote: Vec<(Url, DispatchCandidate)>,
     /// The exact reserve request every participant receives.
     request: ReserveNodeSlotsRequest,
     /// The graph-owned cell the complete cut is published into.
-    participants: Arc<std::sync::OnceLock<Arc<AnalyticalParticipantCut>>>,
+    participants: Arc<OnceLock<Arc<AnalyticalParticipantCut>>>,
     /// The participant grants, reserved at most once and held until revoked.
     ///
     /// `None` both before reservation and after a refusal or revocation;
@@ -2323,7 +2329,7 @@ pub(super) struct AnalyticalGraphLifecycle {
     ///
     /// The query's own admission deadline, not a second timer: one envelope has
     /// one deadline, and every peer RPC this graph issues ends by it.
-    deadline: tokio::time::Instant,
+    deadline: Instant,
     /// Whether settlement reached its verdict, leaving `Drop` nothing to revoke.
     ///
     /// Set only once every remaining settlement step is synchronous, so a
@@ -2382,10 +2388,10 @@ impl AnalyticalGraphLifecycle {
     pub(super) fn start(
         graph: AnalyticalGraphKey,
         supervisor: Arc<AnalyticalSupervisor>,
-        transports: Option<Arc<super::dispatcher::OraclePeerTransportDirectory>>,
-        remote: Vec<(Url, super::dispatcher::DispatchCandidate)>,
+        transports: Option<Arc<OraclePeerTransportDirectory>>,
+        remote: Vec<(Url, DispatchCandidate)>,
         request: ReserveNodeSlotsRequest,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
         owners: AnalyticalGraphLifecycleOwners,
     ) -> Result<Self, BifrostError> {
         let AnalyticalGraphLifecycleOwners {
@@ -2404,7 +2410,7 @@ impl AnalyticalGraphLifecycle {
             transports,
             remote,
             request,
-            participants: Arc::new(std::sync::OnceLock::new()),
+            participants: Arc::new(OnceLock::new()),
             grants: None,
             reserved: false,
             attempt,
@@ -2416,7 +2422,7 @@ impl AnalyticalGraphLifecycle {
 
     /// Returns the cell every channel this attempt resolves reads its cut from.
     #[must_use]
-    pub(super) fn participants(&self) -> Arc<std::sync::OnceLock<Arc<AnalyticalParticipantCut>>> {
+    pub(super) fn participants(&self) -> Arc<OnceLock<Arc<AnalyticalParticipantCut>>> {
         Arc::clone(&self.participants)
     }
 
@@ -2433,8 +2439,8 @@ impl AnalyticalGraphLifecycle {
     /// losing the query's admission.
     fn retain_admission(
         &self,
-        admitted: super::admission::AdmittedQueryGuard,
-    ) -> Result<(), Box<super::admission::AdmittedQueryGuard>> {
+        admitted: AdmittedQueryGuard,
+    ) -> Result<(), Box<AdmittedQueryGuard>> {
         self.supervisor.retain_admission(self.graph, admitted)
     }
 
@@ -2502,9 +2508,7 @@ impl AnalyticalGraphLifecycle {
         let Some(fold) = self.supervisor.take_metric_fold(self.graph) else {
             return Ok(());
         };
-        let remaining = self
-            .deadline
-            .saturating_duration_since(tokio::time::Instant::now());
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
         let Ok(folded) = tokio::time::timeout(remaining, fold.settle()).await else {
             return Err(METRIC_FOLD_EXPIRED.to_owned());
         };
@@ -2659,6 +2663,12 @@ impl AnalyticalGraphLifecycle {
     /// Returns `None` when a participant failed ambiguously, a refusal could
     /// not be retried within the deadline or cancellation, or the cut could
     /// not be frozen. Every grant taken is already dropped by then.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if freezing an empty participant cut fails, which cannot
+    /// happen: an empty cut names no plaintext endpoint and cannot exceed the
+    /// participant bound.
     async fn reserve(&mut self) -> Option<AnalyticalParticipantGrants> {
         if self.remote.is_empty() {
             let _ = self.participants.set(Arc::new(
@@ -2728,12 +2738,9 @@ impl AnalyticalGraphLifecycle {
     /// retried as capacity.
     async fn reserve_round(
         &mut self,
-        transports: &super::dispatcher::OraclePeerTransportDirectory,
+        transports: &OraclePeerTransportDirectory,
         grants: &mut AnalyticalParticipantGrants,
-    ) -> Result<
-        HashMap<Url, AnalyticalDestination>,
-        Option<wyrd_spec::vala::api::ReservationRejected>,
-    > {
+    ) -> Result<HashMap<Url, AnalyticalDestination>, Option<ReservationRejected>> {
         let mut destinations = HashMap::with_capacity(self.remote.len());
         for (url, candidate) in &self.remote {
             // Bounded on both edges: the graph's cancellation ends admission
@@ -2844,7 +2851,7 @@ struct AnalyticalGraphRelease {
     /// The graph whose envelope is returned.
     graph: AnalyticalGraphKey,
     /// The query's absolute deadline, which also bounds this release.
-    deadline: tokio::time::Instant,
+    deadline: Instant,
 }
 
 impl AnalyticalGraphRelease {
@@ -2863,11 +2870,9 @@ impl AnalyticalGraphRelease {
     /// or a nested child of the query envelope is still live after the poll
     /// count, and the supervisor's refusal when the graph itself cannot be
     /// released.
-    async fn release(
-        &self,
-    ) -> Result<Option<super::query_stream::RunningQueryTerminalOwner>, BifrostError> {
+    async fn release(&self) -> Result<Option<RunningQueryTerminalOwner>, BifrostError> {
         for _ in 0..GRAPH_DRAIN_POLLS {
-            let now = tokio::time::Instant::now();
+            let now = Instant::now();
             if now >= self.deadline {
                 break;
             }
@@ -3106,8 +3111,7 @@ impl AnalyticalCleanupPause {
 
 /// Process-wide cleanup pause shared by the test harness and the lifecycle.
 #[cfg(feature = "test-support")]
-static ANALYTICAL_CLEANUP_PAUSE: std::sync::OnceLock<std::sync::Arc<AnalyticalCleanupPause>> =
-    std::sync::OnceLock::new();
+static ANALYTICAL_CLEANUP_PAUSE: OnceLock<std::sync::Arc<AnalyticalCleanupPause>> = OnceLock::new();
 
 /// Returns the process-wide Analytical cleanup pause.
 #[cfg(feature = "test-support")]
@@ -6965,7 +6969,7 @@ struct OracleRouteTasks {
     ///
     /// Membership here is authorization: a leaf naming a peer absent from this
     /// set was not admitted by the pinned participant cut.
-    destinations: Vec<(Url, super::dispatcher::DispatchCandidate)>,
+    destinations: Vec<(Url, DispatchCandidate)>,
 }
 
 impl OracleRouteTasks {
@@ -6977,9 +6981,7 @@ impl OracleRouteTasks {
     /// The walk itself is [`super::remote_placeholders`], the one the binder
     /// also uses, so a plan shape either side cannot see is a single defect
     /// rather than two divergent ones.
-    fn stage_destinations(
-        plan: &Arc<dyn ExecutionPlan>,
-    ) -> Vec<super::dispatcher::DispatchCandidate> {
+    fn stage_destinations(plan: &Arc<dyn ExecutionPlan>) -> Vec<DispatchCandidate> {
         super::remote_placeholders(plan.as_ref())
             .iter()
             .filter_map(|placeholder| placeholder.destination().cloned())
@@ -7283,7 +7285,7 @@ pub struct AnalyticalExecutionHandle {
     /// Absent only where no peer transport was composed, which is a node that
     /// cannot address a participant at all; a leader without it can execute
     /// nothing remote and refuses rather than freezing an unreserved cut.
-    peer_transports: Option<Arc<super::dispatcher::OraclePeerTransportDirectory>>,
+    peer_transports: Option<Arc<OraclePeerTransportDirectory>>,
     /// Node-scoped identity, budget, and peer-transport configuration.
     config: AnalyticalExecutionConfig,
     /// Capability every Analytical leaf this node encodes or decodes resolves through.
@@ -7312,7 +7314,7 @@ pub struct AnalyticalExecutionOwners {
     /// Node-local supervisor owning graphs, attempts, and the runtime registry.
     pub supervisor: Arc<AnalyticalSupervisor>,
     /// Peer transports the leader reserves participant capacity through.
-    pub peer_transports: Option<Arc<super::dispatcher::OraclePeerTransportDirectory>>,
+    pub peer_transports: Option<Arc<OraclePeerTransportDirectory>>,
 }
 
 impl fmt::Debug for AnalyticalExecutionOwners {
@@ -7539,7 +7541,7 @@ impl AnalyticalExecutionHandle {
     pub(super) fn planning_session(
         &self,
         local: &SessionContext,
-        oracles: &[super::participant_cut::OracleQueryParticipant],
+        oracles: &[OracleQueryParticipant],
         work_units: usize,
     ) -> Result<SessionContext, BifrostError> {
         let destinations = self.remote_participants(oracles)?;
@@ -7589,8 +7591,8 @@ impl AnalyticalExecutionHandle {
     pub(super) fn retain_running_query(
         &self,
         graph: AnalyticalGraphKey,
-        owner: super::query_stream::RunningQueryTerminalOwner,
-    ) -> Result<(), Box<super::query_stream::RunningQueryTerminalOwner>> {
+        owner: RunningQueryTerminalOwner,
+    ) -> Result<(), Box<RunningQueryTerminalOwner>> {
         self.supervisor.retain_running_query(graph, owner)
     }
 
@@ -7699,8 +7701,8 @@ impl AnalyticalExecutionHandle {
     /// not a valid URL.
     pub(super) fn frozen_destinations(
         &self,
-        oracles: &[super::participant_cut::OracleQueryParticipant],
-    ) -> Result<Vec<super::dispatcher::DispatchCandidate>, BifrostError> {
+        oracles: &[OracleQueryParticipant],
+    ) -> Result<Vec<DispatchCandidate>, BifrostError> {
         Ok(self
             .remote_participants(oracles)?
             .into_iter()
@@ -7729,8 +7731,8 @@ impl AnalyticalExecutionHandle {
     /// valid URL, which would otherwise leave a worker unreachable and unsigned.
     fn remote_participants(
         &self,
-        oracles: &[super::participant_cut::OracleQueryParticipant],
-    ) -> Result<Vec<(Url, super::dispatcher::DispatchCandidate)>, BifrostError> {
+        oracles: &[OracleQueryParticipant],
+    ) -> Result<Vec<(Url, DispatchCandidate)>, BifrostError> {
         oracles
             .iter()
             .filter(|participant| participant.node_id != self.config.node_id)
@@ -7743,7 +7745,7 @@ impl AnalyticalExecutionHandle {
                     })?;
                 Ok((
                     url,
-                    super::dispatcher::DispatchCandidate {
+                    DispatchCandidate {
                         node_id: participant.node_id,
                         role: wyrd_spec::vala::api::ClusterRole::Oracle,
                         worker_fence: participant.fencing_token,
@@ -7768,13 +7770,13 @@ pub(super) struct AnalyticalLeaseInputs<'a> {
     /// Authenticated principal, tenant, and audit correlation.
     pub(super) context: &'a AuthorizedQueryContext,
     /// Admission guard whose query envelope is transferred onto the graph.
-    pub(super) admitted: &'a mut super::admission::AdmittedQueryGuard,
+    pub(super) admitted: &'a mut AdmittedQueryGuard,
     /// Scannable work units the frozen cut selected.
     pub(super) work_units: usize,
     /// The exact `SessionConfig` the retained physical root was built with.
     pub(super) config: datafusion::prelude::SessionConfig,
     /// One absolute execution deadline shared by every stage.
-    pub(super) deadline: tokio::time::Instant,
+    pub(super) deadline: Instant,
 }
 
 /// The leader-session inputs one attempt composes its distributed session from.
@@ -7793,7 +7795,7 @@ struct AnalyticalSessionInputs<'a> {
     /// planning happens before anything is reserved.
     urls: Vec<Url>,
     /// Graph-owned cell every channel this attempt opens resolves its cut from.
-    participants: Arc<std::sync::OnceLock<Arc<AnalyticalParticipantCut>>>,
+    participants: Arc<OnceLock<Arc<AnalyticalParticipantCut>>>,
     /// Digest of the leader-authorized permissions for this query.
     permission_digest: &'a str,
     /// The exact `SessionConfig` the retained root was planned with.
@@ -7889,8 +7891,8 @@ impl AnalyticalAttemptOwnership {
     /// permit, leaving the caller responsible for releasing it.
     pub(super) fn retain_admission(
         &self,
-        admitted: super::admission::AdmittedQueryGuard,
-    ) -> Result<(), Box<super::admission::AdmittedQueryGuard>> {
+        admitted: AdmittedQueryGuard,
+    ) -> Result<(), Box<AdmittedQueryGuard>> {
         self.lifecycle.retain_admission(admitted)
     }
 

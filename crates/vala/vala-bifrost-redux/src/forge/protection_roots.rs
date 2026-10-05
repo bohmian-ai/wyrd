@@ -66,6 +66,12 @@ mod tests {
     /// This inventory carries no live-tail case because a v1 live-tail lease
     /// names no Forge-collectable object and so contributes no independent
     /// Forge GC root. Active Oracle reads reach the union only as `blocked`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the complete union misses a root's object, when dropping a
+    /// root class leaves its object protected, or when a blocked root set stops
+    /// reporting blocked.
     #[test]
     fn forge_orphan_protection_includes_all_noncatalog_authority() {
         let catalog_path = "t/spans/data/forge/catalog-00000.parquet";

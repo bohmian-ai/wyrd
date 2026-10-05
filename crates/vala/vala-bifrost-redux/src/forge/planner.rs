@@ -156,6 +156,11 @@ mod tests {
 
     /// A plan read back from JSONB, whose object keys come back reordered,
     /// hashes to the digest it was stored under.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture parameters fail to parse, hashing fails, or the
+    /// two key orders hash differently.
     #[test]
     fn plan_hash_ignores_parameter_key_order() {
         let plan = |parameters: &str| ForgeTaskPlan {

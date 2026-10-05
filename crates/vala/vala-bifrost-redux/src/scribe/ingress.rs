@@ -9,8 +9,11 @@ use crate::scribe::preprocess::{
 };
 use crate::tables::AuditLogTable;
 
+use std::sync::Arc;
 use std::time::Instant;
 
+use iceberg::spec::Schema;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
 
 /// Validates that one decoded request fits the persistence bucket that must own it.
@@ -121,7 +124,7 @@ struct AdmittedRowContext {
     ///
     /// `None` only for the embedded engine seam, which has no catalog owner
     /// and writes objects that no registered table promotes.
-    registered_schema: Option<std::sync::Arc<iceberg::spec::Schema>>,
+    registered_schema: Option<Arc<Schema>>,
 }
 
 /// The registered contract Scribe resolves for one logical frame before it
@@ -138,7 +141,7 @@ struct LogicalFrameContract {
     ///
     /// `None` only for the embedded engine seam, which has no catalog owner
     /// and writes objects that no registered table promotes.
-    registered_schema: Option<std::sync::Arc<iceberg::spec::Schema>>,
+    registered_schema: Option<Arc<Schema>>,
 }
 
 /// Root admission state established before any scalable materialization.
@@ -151,7 +154,7 @@ struct RootAdmission {
     ///
     /// `None` only for the embedded engine seam, which has no catalog owner
     /// and writes objects that no registered table promotes.
-    registered_schema: Option<std::sync::Arc<iceberg::spec::Schema>>,
+    registered_schema: Option<Arc<Schema>>,
     /// One authoritative receipt time shared by planning and projection.
     receipt_micros: i64,
     /// Complete immutable source-derived material plan.
@@ -460,7 +463,7 @@ impl ScribeImpl {
     ///
     /// Returns the `PostgreSQL` acquisition or read error, or an internal error
     /// when the system clock is unreadable.
-    async fn admission_instant(&self, tenant: wyrd_spec::DataTenantId) -> Result<i64, ScribeError> {
+    async fn admission_instant(&self, tenant: DataTenantId) -> Result<i64, ScribeError> {
         let micros = match &self.control_postgres {
             Some(postgres) => {
                 let mut conn = postgres.tenant_conn(tenant).await?;

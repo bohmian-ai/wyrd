@@ -192,6 +192,12 @@ mod tests {
     /// module names no mutation of a rewrite result, so observation cannot
     /// change what a rewrite produces — the source assertion is what keeps
     /// that true as the module grows.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the folded outputs differ from the cumulative ordinal-ordered
+    /// set, when the module source has no test section, or when its non-test body
+    /// names a forbidden rewrite-result type or mutation.
     #[test]
     fn forge_managed_observer_folds_outputs_without_semantics() {
         const SOURCE: &str = include_str!("observer.rs");

@@ -6,11 +6,16 @@
 //! scheduler, worker, Postgres, catalog, and warehouse; nothing here calls the
 //! managed core or the publication owner directly.
 
+use super::support::{ForgeTaskRow, PromotionIntegrationFixture};
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use vala_bifrost_redux::forge::ForgeClockControl;
 
+use uuid::Uuid;
 use vala_bifrost_redux::forge::{ForgeClock, ForgeLifecycleEvent, ForgeObjectStore, ForgeTableKey};
 use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
+use wyrd_spec::ids::DataTenantId;
 
 use super::rewrite_support::PromotedRewriteFixture;
 use super::support::{CountingObjectStore, PromotionCatalogSeam, SupervisedPromotion};
@@ -363,9 +368,7 @@ const REFUSALS_PER_PLAN: usize = 4;
 /// # Panics
 ///
 /// Panics when the fixture has planned no small-files task at all.
-async fn latest_small_files_task(
-    fixture: &super::support::PromotionIntegrationFixture,
-) -> super::support::ForgeTaskRow {
+async fn latest_small_files_task(fixture: &PromotionIntegrationFixture) -> ForgeTaskRow {
     fixture
         .forge_tasks()
         .await
@@ -1037,7 +1040,7 @@ const ADMISSION_BOUND: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// Reads every Forge task this tenant holds, across all of its tables.
 ///
-/// [`super::support::PromotionIntegrationFixture::forge_tasks`] is scoped to the
+/// [`PromotionIntegrationFixture::forge_tasks`] is scoped to the
 /// fixture's own table, which is exactly what a scenario about two concurrently
 /// owned attempts cannot use: the second attempt belongs to a sibling table.
 ///
@@ -1045,8 +1048,8 @@ const ADMISSION_BOUND: std::time::Duration = std::time::Duration::from_mins(1);
 ///
 /// Panics when the read-only diagnostic query fails.
 async fn tenant_tasks(
-    fixture: &super::support::PromotionIntegrationFixture,
-) -> Vec<(uuid::Uuid, String, String, String)> {
+    fixture: &PromotionIntegrationFixture,
+) -> Vec<(Uuid, String, String, String)> {
     tasks_of(fixture, fixture.tenant).await
 }
 
@@ -1059,9 +1062,9 @@ async fn tenant_tasks(
 ///
 /// Panics when the read-only diagnostic query fails.
 async fn tasks_of(
-    fixture: &super::support::PromotionIntegrationFixture,
-    tenant: wyrd_spec::ids::DataTenantId,
-) -> Vec<(uuid::Uuid, String, String, String)> {
+    fixture: &PromotionIntegrationFixture,
+    tenant: DataTenantId,
+) -> Vec<(Uuid, String, String, String)> {
     sqlx::query_as(
         "SELECT task_id, strategy, state, table_name FROM vala.forge_tasks \
          WHERE data_tenant_id = $1 ORDER BY created_at, task_id",
@@ -1083,8 +1086,8 @@ const OWNED_TASK_STATES: &[&str] = &["claimed", "running", "prepared"];
 /// Earlier phases of a long scenario leave settled rows behind on other tables,
 /// so a count that is about *this* phase's tables has to name them.
 async fn small_files_named(
-    fixture: &super::support::PromotionIntegrationFixture,
-    tenant: wyrd_spec::ids::DataTenantId,
+    fixture: &PromotionIntegrationFixture,
+    tenant: DataTenantId,
     prefix: &str,
     states: &[&str],
 ) -> usize {
@@ -1103,7 +1106,7 @@ async fn small_files_named(
 ///
 /// A released attempt leaves its task Running with nobody publishing under it,
 /// so a count of what a worker owns must subtract them.
-fn released_tasks(supervisor: &SupervisedPromotion) -> BTreeSet<uuid::Uuid> {
+fn released_tasks(supervisor: &SupervisedPromotion) -> BTreeSet<Uuid> {
     supervisor
         .observer()
         .released_attempts_for_test()
@@ -1119,10 +1122,10 @@ fn released_tasks(supervisor: &SupervisedPromotion) -> BTreeSet<uuid::Uuid> {
 /// Running with nobody publishing under them until their claim lease lapses and
 /// are therefore no longer part of what this worker owns.
 async fn owned_tasks(
-    fixture: &super::support::PromotionIntegrationFixture,
-    tenants: &[wyrd_spec::ids::DataTenantId],
+    fixture: &PromotionIntegrationFixture,
+    tenants: &[DataTenantId],
     supervisor: &SupervisedPromotion,
-) -> Vec<(uuid::Uuid, String, String, String)> {
+) -> Vec<(Uuid, String, String, String)> {
     let mut rows = Vec::new();
     for tenant in tenants {
         rows.extend(tasks_of(fixture, *tenant).await);
@@ -1140,7 +1143,7 @@ async fn owned_tasks(
 }
 
 /// Counts this tenant's successfully settled Scribe promotions.
-async fn promotions_succeeded(fixture: &super::support::PromotionIntegrationFixture) -> usize {
+async fn promotions_succeeded(fixture: &PromotionIntegrationFixture) -> usize {
     tenant_tasks(fixture)
         .await
         .into_iter()
@@ -1149,10 +1152,7 @@ async fn promotions_succeeded(fixture: &super::support::PromotionIntegrationFixt
 }
 
 /// Counts this tenant's small-files tasks whose state is one of `states`.
-async fn small_files_in_state(
-    fixture: &super::support::PromotionIntegrationFixture,
-    states: &[&str],
-) -> usize {
+async fn small_files_in_state(fixture: &PromotionIntegrationFixture, states: &[&str]) -> usize {
     tenant_tasks(fixture)
         .await
         .into_iter()
@@ -1174,7 +1174,7 @@ async fn small_files_in_state(
 /// Panics when the count is not reached inside [`ADMISSION_BOUND`], reporting
 /// the durable rows it did observe.
 async fn await_small_files_in_state(
-    fixture: &super::support::PromotionIntegrationFixture,
+    fixture: &PromotionIntegrationFixture,
     states: &[&str],
     expected: usize,
 ) -> usize {
@@ -1212,7 +1212,7 @@ async fn await_small_files_in_state(
 ///
 /// Panics when the pass does not settle inside [`ADMISSION_BOUND`], reporting
 /// the durable task and operation rows it observed.
-async fn await_small_files_settled(fixture: &super::support::PromotionIntegrationFixture) {
+async fn await_small_files_settled(fixture: &PromotionIntegrationFixture) {
     let settled = tokio::time::timeout(ADMISSION_BOUND, async {
         loop {
             let owed = small_files_in_state(
@@ -1531,9 +1531,9 @@ async fn release_one_unresolvable_attempt(
     promoted: &PromotedRewriteFixture,
     catalog: &Arc<PromotionCatalogSeam>,
     supervisor: &mut SupervisedPromotion,
-    own_tenant: wyrd_spec::ids::DataTenantId,
+    own_tenant: DataTenantId,
     table: &str,
-) -> uuid::Uuid {
+) -> Uuid {
     let released_before = supervisor.observer().released_attempts_for_test().len();
     catalog.stall_next_commit_responses(usize::MAX);
     supervisor
@@ -1607,9 +1607,9 @@ async fn release_one_unresolvable_attempt(
 async fn assert_unready_takes_no_new_authority(
     promoted: &PromotedRewriteFixture,
     supervisor: &mut SupervisedPromotion,
-    own_tenant: wyrd_spec::ids::DataTenantId,
-    released_task: uuid::Uuid,
-) -> BTreeSet<uuid::Uuid> {
+    own_tenant: DataTenantId,
+    released_task: Uuid,
+) -> BTreeSet<Uuid> {
     await_readiness(
         supervisor,
         false,
@@ -1678,10 +1678,15 @@ const GATED_TABLE: &str = "gated_readiness_b";
 ///
 /// Compaction debt lives only in the leader's volatile schedule, so a scenario
 /// that needs a table to owe a rewrite reads it there rather than from rows.
+///
+/// # Panics
+///
+/// Panics when the fixture namespace and `table` do not form a valid Forge
+/// task table identity.
 fn owes_compaction(
     promoted: &PromotedRewriteFixture,
     supervisor: &SupervisedPromotion,
-    tenant: wyrd_spec::ids::DataTenantId,
+    tenant: DataTenantId,
     table: &str,
 ) -> bool {
     let key = ForgeTableKey {
@@ -1714,8 +1719,8 @@ fn owes_compaction(
 async fn assert_lapsed_claim_restores_readiness(
     promoted: &PromotedRewriteFixture,
     supervisor: &SupervisedPromotion,
-    own_tenant: wyrd_spec::ids::DataTenantId,
-    unresolved: &BTreeSet<uuid::Uuid>,
+    own_tenant: DataTenantId,
+    unresolved: &BTreeSet<Uuid>,
 ) {
     assert!(
         !unresolved.is_empty(),
@@ -1745,7 +1750,7 @@ async fn assert_lapsed_claim_restores_readiness(
 }
 
 /// Returns every operation identity this tenant currently holds Prepared.
-async fn prepared_operations(promoted: &PromotedRewriteFixture) -> BTreeSet<uuid::Uuid> {
+async fn prepared_operations(promoted: &PromotedRewriteFixture) -> BTreeSet<Uuid> {
     promoted
         .fixture
         .rewrite_operations()
@@ -1788,7 +1793,7 @@ async fn await_readiness(supervisor: &SupervisedPromotion, expected: bool, conte
 /// [`ADMISSION_BOUND`].
 async fn assert_both_tenants_owned_at_once(
     promoted: &PromotedRewriteFixture,
-    other_tenant: wyrd_spec::ids::DataTenantId,
+    other_tenant: DataTenantId,
 ) {
     let both = tokio::time::timeout(ADMISSION_BOUND, async {
         loop {
@@ -1826,7 +1831,7 @@ async fn assert_both_tenants_owned_at_once(
 /// Panics when that task does not settle inside [`ADMISSION_BOUND`].
 async fn assert_second_tenant_settles(
     promoted: &PromotedRewriteFixture,
-    other_tenant: wyrd_spec::ids::DataTenantId,
+    other_tenant: DataTenantId,
 ) {
     let settled = tokio::time::timeout(ADMISSION_BOUND, async {
         while small_files_named(
@@ -1918,10 +1923,10 @@ async fn assert_concurrent_attempts_published(
 /// to name it, because a table accumulates a settled task per compaction it
 /// has already been through and only the newest one is the work under test.
 async fn newest_small_files_task(
-    fixture: &super::support::PromotionIntegrationFixture,
-    tenant: wyrd_spec::ids::DataTenantId,
+    fixture: &PromotionIntegrationFixture,
+    tenant: DataTenantId,
     table: &str,
-) -> Option<(uuid::Uuid, String)> {
+) -> Option<(Uuid, String)> {
     tasks_of(fixture, tenant)
         .await
         .into_iter()
@@ -1935,9 +1940,9 @@ async fn newest_small_files_task(
 /// that cancelled one task has to follow the *other* task's own row to prove it
 /// was neither removed nor stalled.
 async fn task_state(
-    fixture: &super::support::PromotionIntegrationFixture,
-    tenant: wyrd_spec::ids::DataTenantId,
-    task_id: uuid::Uuid,
+    fixture: &PromotionIntegrationFixture,
+    tenant: DataTenantId,
+    task_id: Uuid,
 ) -> Option<String> {
     tasks_of(fixture, tenant)
         .await
@@ -1958,7 +1963,7 @@ async fn task_state(
 async fn promote_tables(
     promoted: &PromotedRewriteFixture,
     supervisor: &mut SupervisedPromotion,
-    tables: &[(wyrd_spec::ids::DataTenantId, &str)],
+    tables: &[(DataTenantId, &str)],
 ) {
     for (tenant, name) in tables {
         promoted
@@ -2024,7 +2029,7 @@ async fn pull_turn_stops_at_the_tenant_allowance(
     promoted: &PromotedRewriteFixture,
     catalog: &Arc<PromotionCatalogSeam>,
     supervisor: &mut SupervisedPromotion,
-    other_tenant: wyrd_spec::ids::DataTenantId,
+    other_tenant: DataTenantId,
 ) {
     let own = promoted.fixture.tenant;
     let tables = PULL_BOUND_TABLES
@@ -2134,9 +2139,9 @@ async fn pull_turn_stops_at_the_tenant_allowance(
 async fn hold_out_earlier_phases(
     promoted: &PromotedRewriteFixture,
     supervisor: &SupervisedPromotion,
-    own: wyrd_spec::ids::DataTenantId,
-    other_tenant: wyrd_spec::ids::DataTenantId,
-    tenants: &[wyrd_spec::ids::DataTenantId],
+    own: DataTenantId,
+    other_tenant: DataTenantId,
+    tenants: &[DataTenantId],
 ) {
     // The tables earlier phases used are not part of the turn under test, and a
     // row of theirs that becomes claimable again would spend an allowance this
@@ -2234,9 +2239,7 @@ async fn await_settled_submissions(catalog: &PromotionCatalogSeam) -> usize {
 /// The retained-ambiguity contract is stated in operation identities: the same
 /// UUIDs must still be there, still Prepared, after a reconciliation pass that
 /// resubmitted nothing.
-async fn operation_phases(
-    fixture: &super::support::PromotionIntegrationFixture,
-) -> std::collections::BTreeMap<uuid::Uuid, String> {
+async fn operation_phases(fixture: &PromotionIntegrationFixture) -> BTreeMap<Uuid, String> {
     fixture.rewrite_operations().await.into_iter().collect()
 }
 
@@ -2252,8 +2255,8 @@ async fn operation_phases(
 ///
 /// Panics when a phase is not reached inside [`ADMISSION_BOUND`].
 async fn await_operation_phase(
-    fixture: &super::support::PromotionIntegrationFixture,
-    ids: &BTreeSet<uuid::Uuid>,
+    fixture: &PromotionIntegrationFixture,
+    ids: &BTreeSet<Uuid>,
     phases: &[&str],
 ) {
     let reached = tokio::time::timeout(ADMISSION_BOUND, async {
@@ -2375,7 +2378,7 @@ async fn unresolved_commit_resets_once_absence_is_provable(
     promoted: &PromotedRewriteFixture,
     catalog: &Arc<PromotionCatalogSeam>,
     supervisor: &mut SupervisedPromotion,
-    control: &vala_bifrost_redux::forge::ForgeClockControl,
+    control: &ForgeClockControl,
 ) {
     // 1. Nothing landed, and nobody can say so yet.
     catalog.park_next_commit();
@@ -2656,7 +2659,7 @@ async fn release_one_unresolved_attempt(
     promoted: &PromotedRewriteFixture,
     catalog: &Arc<PromotionCatalogSeam>,
     supervisor: &mut SupervisedPromotion,
-) -> (BTreeSet<uuid::Uuid>, usize) {
+) -> (BTreeSet<Uuid>, usize) {
     supervisor.stop_worker().await;
     // The new hot objects are published first, so the seam armed below meets
     // the rewrite's own commit rather than the promotion's.
@@ -2738,7 +2741,7 @@ async fn crash_recovery_reconciles_the_exact_operation(
     catalog: &Arc<PromotionCatalogSeam>,
     object_store: &Arc<CountingObjectStore>,
     supervisor: &mut SupervisedPromotion,
-    control: &vala_bifrost_redux::forge::ForgeClockControl,
+    control: &ForgeClockControl,
 ) {
     let deletes_before = object_store.deletes();
     let (unresolved, errors_before) =
@@ -2823,8 +2826,8 @@ async fn successor_reconciles_before_publishing(
     promoted: &PromotedRewriteFixture,
     catalog: &Arc<PromotionCatalogSeam>,
     supervisor: &mut SupervisedPromotion,
-    control: &vala_bifrost_redux::forge::ForgeClockControl,
-    inherited: &BTreeSet<uuid::Uuid>,
+    control: &ForgeClockControl,
+    inherited: &BTreeSet<Uuid>,
 ) {
     // The successor takes over the exact operation identity its predecessor
     // minted, and it closes that operation before it publishes anything new on

@@ -254,6 +254,11 @@ impl PromotedRewriteFixture {
     /// object per day, so every object is its own group, and the scenarios
     /// here are about what happens to a plan rather than which files a type
     /// selects.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the managed-rewrite attempt context cannot be built for the
+    /// fixture binding.
     pub(crate) async fn run_attempt(
         &self,
         forge: &Arc<Forge>,

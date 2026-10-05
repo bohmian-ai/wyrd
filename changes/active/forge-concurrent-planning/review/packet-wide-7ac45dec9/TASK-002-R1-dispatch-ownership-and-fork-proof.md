@@ -94,4 +94,3 @@ Phase 2 (fork re-pin to `380a4d0`):
 ### Non-goals preserved
 
 Only the three approved Wyrd differences remain: Scribe hot-publication recovery, Oracle/hot-object deletion protection, and central-governor charging with governed spill placement. No new planner, strategy or default was added. No unrelated file changed.
-

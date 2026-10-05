@@ -33,6 +33,19 @@ struct ToolCall {
 }
 
 /// Runs the bounded loop for input text.
+///
+/// Journals the start, seeds session history, applies the `before_agent`
+/// callback chain (an abort finishes the run as `CallbackAborted` without
+/// error), renders the prompt, and drives the provider/tool loop under the
+/// configured run timeout.
+///
+/// # Errors
+///
+/// Returns [`AgentError::JournalAppendFailed`] or a session-store error when
+/// journal or session persistence fails, [`AgentError::CallbackPanic`] when a
+/// callback panics, [`AgentError::Prompt`] when the prompt cannot render,
+/// [`AgentError::Timeout`] when the run exceeds its timeout, and any provider,
+/// tool, structured-output, or max-iterations error from the loop.
 pub(crate) async fn run(
     this: &Agent,
     providers: &ProviderRegistry,

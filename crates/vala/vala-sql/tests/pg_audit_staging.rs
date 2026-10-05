@@ -1,3 +1,6 @@
+//! Postgres-backed `vala-sql` integration tests; the proofs live in `pg_tests` so
+//! the credential-free lanes can skip them by module name.
+
 mod pg_tests {
     //! SQL integration tests for transactional audit staging.
     //!
@@ -535,6 +538,13 @@ mod pg_tests {
         }
 
         /// Two-epoch replay suppresses an exact retry and fails a contradiction without mutation.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the fixture or a tenant connection cannot start, the first
+        /// observation does not commit or store the admission instant, an exact or
+        /// re-sent retry does not resolve as committed, a contradictory replay is
+        /// accepted, or the replay appends audit or publication rows.
         #[tokio::test]
         async fn replay_two_epoch_batch_fence_suppresses_exact_and_rejects_contradiction() {
             let (fixture, superuser, tenant) = setup().await;

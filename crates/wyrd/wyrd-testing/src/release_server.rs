@@ -26,6 +26,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use secrecy::SecretString;
+use tempfile::TempDir;
 
 /// The server's default public HTTP address, as the guide exports it in
 /// `WYRD_SERVER_URL`.
@@ -135,7 +136,7 @@ pub struct SetupTenant {
 /// Dropping it kills the process; [`LocalServer::stop`] is the clean exit.
 pub struct LocalServer {
     /// Working directory holding the store, `.wyrd/` state, and the log.
-    root: tempfile::TempDir,
+    root: TempDir,
     /// The serving process until it is reaped.
     child: Option<Child>,
     /// The process's cgroup-v2 directory, where its envelope is enforced.
@@ -309,7 +310,7 @@ impl LocalServer {
     /// ready, or its cgroup does not enforce the envelope.
     async fn serve(
         binary: &Path,
-        root: tempfile::TempDir,
+        root: TempDir,
         storage_url: &str,
         ordinal: u16,
         role: Role,

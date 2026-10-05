@@ -216,6 +216,11 @@ const ASSIGNMENT_AUTHORITY_DOMAIN: &[u8] = b"wyrd.oracle.assignment-authority.v7
 
 /// Appends a length-prefixed UTF-8 string: a big-endian `u32` byte length
 /// followed by the raw UTF-8 bytes.
+///
+/// # Errors
+///
+/// Returns [`AssignmentDigestError::LengthOverflow`] when the string
+/// exceeds the `u32` length domain.
 fn push_string(buffer: &mut Vec<u8>, value: &str) -> Result<(), AssignmentDigestError> {
     push_bytes(buffer, value.as_bytes(), "string length")
 }
@@ -267,6 +272,17 @@ fn push_option<T>(
     Ok(())
 }
 
+/// Appends one scan literal as its digest tag followed by its typed
+/// payload.
+///
+/// Fixed-width values are big-endian, booleans one byte, and UTF-8 and byte
+/// literals length-prefixed, so two literals of different types or values
+/// never encode identically.
+///
+/// # Errors
+///
+/// Returns [`AssignmentDigestError::LengthOverflow`] when a UTF-8 or byte
+/// literal exceeds the `u32` length domain.
 fn push_literal(buffer: &mut Vec<u8>, literal: &ScanLiteral) -> Result<(), AssignmentDigestError> {
     buffer.push(literal.digest_tag());
     match literal {
@@ -555,6 +571,12 @@ mod tests {
     /// uuid + 8 snapshot + 8 snapshot timestamp + 8 retained head + 4 ancestry
     /// count + 24 for its three entries + 4 digest version + 32 digest + 8
     /// epoch fence are gone.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture identifier fails to parse, encoding fails, or the
+    /// encoded vector differs from the normative 348-byte length or fixed
+    /// digest.
     #[test]
     fn normative_vector_encodes_to_fixed_length_and_digest() {
         let fingerprint: String = (0u8..32).map(|byte| format!("{byte:02x}")).collect();
@@ -811,6 +833,11 @@ mod tests {
     /// Every mutation class the packet requires must change the digest:
     /// scan id, tenant, namespace, table, fingerprint bytes, file path bytes,
     /// list reordering, float bits, and predicate operator/column/literal.
+    ///
+    /// # Panics
+    ///
+    /// Panics when encoding fails or any required field-class mutation leaves
+    /// the digest unchanged.
     #[test]
     fn every_field_class_mutation_changes_the_digest() {
         let predicates = vec![ScanPredicate::Eq(

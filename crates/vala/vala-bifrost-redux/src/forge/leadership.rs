@@ -17,13 +17,14 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use tokio::{sync, time};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::forge_leader::ForgeLeaderElection;
 use wyrd_tonic::tonic::transport::Channel;
 use wyrd_tonic::wyrd::v1::forge_leader_peer_service_client::ForgeLeaderPeerServiceClient;
 use wyrd_tonic::wyrd::v1::{
-    ForgeCompactionTask, NotifyForgePromotionRequest, PullForgeCompactionRequest,
+    self, ForgeCompactionTask, NotifyForgePromotionRequest, PullForgeCompactionRequest,
     ReportForgeCompactionRequest,
 };
 
@@ -181,7 +182,7 @@ pub(super) struct ForgeLeadership {
     /// acquire or renew, so it never falls after the row's own
     /// `statement_timestamp()` expiry; a renewal still pending at it revokes
     /// the term.
-    renewal: tokio::sync::Mutex<tokio::time::Instant>,
+    renewal: sync::Mutex<time::Instant>,
 }
 
 impl ForgeLeadership {
@@ -192,7 +193,7 @@ impl ForgeLeadership {
             owner,
             peer: None,
             held: RwLock::new(None),
-            renewal: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+            renewal: sync::Mutex::new(time::Instant::now()),
         }
     }
 
@@ -264,8 +265,8 @@ impl ForgeLeadership {
     pub(super) async fn heartbeat(&self, shutdown: &CancellationToken) -> Result<bool, ForgeError> {
         let mut deadline = self.renewal.lock().await;
         if let Some(term) = self.held() {
-            let started = tokio::time::Instant::now();
-            match tokio::time::timeout_at(
+            let started = time::Instant::now();
+            match time::timeout_at(
                 *deadline,
                 self.election
                     .renew(self.owner, term.fencing_token, LEADER_TERM),
@@ -308,7 +309,7 @@ impl ForgeLeadership {
             }
         }
         let uri = self.peer.as_ref().map(|peer| peer.advertise_uri.as_str());
-        let started = tokio::time::Instant::now();
+        let started = time::Instant::now();
         let Some(fencing_token) = self
             .election
             .acquire(self.owner, uri, LEADER_TERM)
@@ -631,14 +632,11 @@ pub fn table_key_from_wire(
 
 /// Encodes one report outcome for the peer wire.
 #[must_use]
-pub fn outcome_to_wire(
-    outcome: ForgeCompactionOutcome,
-) -> wyrd_tonic::wyrd::v1::ForgeCompactionOutcome {
-    use wyrd_tonic::wyrd::v1::ForgeCompactionOutcome as Wire;
+pub fn outcome_to_wire(outcome: ForgeCompactionOutcome) -> v1::ForgeCompactionOutcome {
     match outcome {
-        ForgeCompactionOutcome::Succeeded => Wire::Succeeded,
-        ForgeCompactionOutcome::Failed => Wire::Failed,
-        ForgeCompactionOutcome::NotStarted => Wire::NotStarted,
+        ForgeCompactionOutcome::Succeeded => v1::ForgeCompactionOutcome::Succeeded,
+        ForgeCompactionOutcome::Failed => v1::ForgeCompactionOutcome::Failed,
+        ForgeCompactionOutcome::NotStarted => v1::ForgeCompactionOutcome::NotStarted,
     }
 }
 
@@ -648,11 +646,10 @@ pub fn outcome_to_wire(
 ///
 /// Returns a description when the outcome is unspecified or unknown.
 pub fn outcome_from_wire(raw: i32) -> Result<ForgeCompactionOutcome, String> {
-    use wyrd_tonic::wyrd::v1::ForgeCompactionOutcome as Wire;
-    match Wire::try_from(raw) {
-        Ok(Wire::Succeeded) => Ok(ForgeCompactionOutcome::Succeeded),
-        Ok(Wire::Failed) => Ok(ForgeCompactionOutcome::Failed),
-        Ok(Wire::NotStarted) => Ok(ForgeCompactionOutcome::NotStarted),
+    match v1::ForgeCompactionOutcome::try_from(raw) {
+        Ok(v1::ForgeCompactionOutcome::Succeeded) => Ok(ForgeCompactionOutcome::Succeeded),
+        Ok(v1::ForgeCompactionOutcome::Failed) => Ok(ForgeCompactionOutcome::Failed),
+        Ok(v1::ForgeCompactionOutcome::NotStarted) => Ok(ForgeCompactionOutcome::NotStarted),
         _ => Err(format!("compaction outcome {raw} is not a known outcome")),
     }
 }
@@ -672,6 +669,12 @@ mod tests {
 
     /// A stop caused by revocation reads as the lost leader fence, while a
     /// coordinator shutdown and every unrelated error keep their own identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a revoked term's stop is not attributed to the leader fence,
+    /// or when a live term, a coordinator shutdown, or an unrelated error loses
+    /// its own identity.
     #[test]
     fn revoked_stop_is_attributed_to_the_leader_fence() {
         let shutdown = CancellationToken::new();

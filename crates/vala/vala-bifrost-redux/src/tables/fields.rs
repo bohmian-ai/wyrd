@@ -262,8 +262,10 @@ mod tests {
     /// the tree declares a field id.
     #[test]
     fn nested_declarations_carry_sensitivity_and_no_field_id() {
+        /// Sensitive list element, the nested level under test.
         static CHILD: CanonicalField =
             CanonicalField::sensitive("item", CanonicalType::UInt64, false);
+        /// Non-sensitive list column whose element is [`CHILD`].
         static ROOT: CanonicalField =
             CanonicalField::payload("counts", CanonicalType::List(&CHILD), true);
 

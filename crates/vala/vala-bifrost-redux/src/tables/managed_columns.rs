@@ -207,6 +207,11 @@ mod tests {
     }
 
     /// Code-axis tables omit only the `run_id` they declare themselves.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the code-axis column list differs from every managed column
+    /// except `run_id`, in declaration order.
     #[test]
     fn code_axis_policy_omits_run_id() {
         let fields = ensure_managed_columns(vec![], CorrelationPolicy::CodeAxis);
@@ -223,6 +228,11 @@ mod tests {
     }
 
     /// Tables without a correlation policy append only the two time columns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when anything other than the event and ingest time columns is
+    /// appended.
     #[test]
     fn none_policy_appends_only_the_time_columns() {
         let fields = ensure_managed_columns(vec![], CorrelationPolicy::None);
@@ -233,6 +243,10 @@ mod tests {
     }
 
     /// Caller-declared fields remain ahead of every server-managed field.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the caller's field is not first in the managed schema.
     #[test]
     fn user_fields_come_before_managed_columns() {
         let user = vec![Field::new("my_col", arrow::datatypes::DataType::Utf8, true)];

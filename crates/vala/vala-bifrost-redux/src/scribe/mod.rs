@@ -79,6 +79,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::runtime::Handle;
+use vala_sql::ValaPostgres;
 
 /// Awaits one already-signalled Scribe cleanup phase within the caller deadline.
 ///
@@ -246,6 +247,14 @@ struct PersistenceDependencies {
     hot_sources: Arc<hot_source::ScribeHotSourceRegistry>,
 }
 
+/// The Scribe engine: the one owner of this node's durable ingest path.
+///
+/// Admits each ingest frame, appends and fsyncs it to the WAL before the
+/// acknowledgement, holds the rows in shard memtables for live reads, and,
+/// when built with persistence, hands sealed memtables to the staging and
+/// publication runtime that turns them into published Parquet objects. Startup
+/// replays the WAL before the engine reports ready, and shutdown drains
+/// in-flight appends before persistence stops.
 pub struct ScribeImpl {
     /// Catalog owner used to validate and resolve logical transport frames.
     catalog: Option<Arc<crate::catalog::BifrostCatalog>>,
@@ -311,7 +320,8 @@ pub struct ScribeImpl {
     ///
     /// `None` only for an engine built without persistence, which has no
     /// durable control state and stamps admission from the system clock.
-    control_postgres: Option<Arc<vala_sql::ValaPostgres>>,
+    control_postgres: Option<Arc<ValaPostgres>>,
+    /// Test-tier barrier installed at the public ingest seam, if any.
     #[cfg(any(test, feature = "test-support"))]
     ingest_stall: Arc<std::sync::Mutex<Option<Arc<IngestStall>>>>,
     /// Optional decoded-request ceiling used only by bounded regression tests;

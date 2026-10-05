@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use serde::Serialize;
+use serde_json::Value;
 use wyrd_testing::capacity::Percentiles;
 
 use crate::Result;
@@ -231,7 +232,7 @@ pub struct Report {
     /// Host load sampled after the run.
     pub load_after: HostLoad,
     /// The measured server binary's identity.
-    pub binary: serde_json::Value,
+    pub binary: Value,
     /// Workload settings.
     pub settings: Settings,
     /// What each process resolved from its scope.
@@ -264,7 +265,7 @@ pub struct Evidence {
     /// Host load after the run.
     pub load_after: HostLoad,
     /// The binary's identity.
-    pub binary: serde_json::Value,
+    pub binary: Value,
     /// Workload settings.
     pub settings: Settings,
     /// Resolved resource plans.

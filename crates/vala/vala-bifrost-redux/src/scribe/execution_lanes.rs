@@ -10,6 +10,7 @@ use arrow::array::{Array, ArrayRef, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
+use iceberg::spec::Schema as IcebergSchema;
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 use crate::catalog::TenantTableBinding;
@@ -479,7 +480,7 @@ pub(crate) struct IngressDecodeInputs {
     ///
     /// `None` only for the embedded engine seam, which has no catalog owner
     /// and writes objects that no registered table promotes.
-    pub(crate) registered_schema: Option<Arc<iceberg::spec::Schema>>,
+    pub(crate) registered_schema: Option<Arc<IcebergSchema>>,
 }
 
 /// Immutable validation and stamping context for one decoded batch.
@@ -511,7 +512,7 @@ pub(crate) struct DecodeContext<'a> {
     ///
     /// `None` only for the embedded engine seam, which has no catalog owner
     /// and writes objects that no registered table promotes.
-    pub(crate) registered_schema: Option<&'a iceberg::spec::Schema>,
+    pub(crate) registered_schema: Option<&'a IcebergSchema>,
 }
 
 /// Applies source-contract validation and server-managed stamping to one batch.
@@ -2218,6 +2219,10 @@ mod tests {
 
     /// The current admission instant, for fixtures whose event times are
     /// derived from the same clock.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the system clock cannot be read as microseconds since the epoch.
     fn receipt_now() -> i64 {
         super::current_receipt_micros().expect("the receipt clock is readable")
     }
@@ -2241,6 +2246,12 @@ mod tests {
     }
 
     /// Native stamping writes the complete canonical physical schema.
+    ///
+    /// # Panics
+    ///
+    /// Panics when stamping fails, when the stamped batch has no nullable all-null
+    /// `run_id`, or when its fingerprint differs from the canonical managed schema
+    /// for the same user field.
     #[test]
     fn native_stamping_materializes_nullable_run_id() {
         let rows = batch(
@@ -2274,6 +2285,8 @@ mod tests {
     /// ingestion time differs from the admission instant in the context.
     #[test]
     fn stamping_writes_the_admission_instant_and_no_batch_column() {
+        /// Fixed admission instant, distinct from any live clock reading, so every
+        /// stamped row can be compared against one exact value.
         const ADMITTED_AT: i64 = 1_700_000_000_123_456;
         let rows = batch(
             vec![Field::new("value", DataType::Int64, false)],
@@ -2657,6 +2670,11 @@ mod tests {
 
     /// Projected payloads retain their caller-provided run identifier as the
     /// correlation value used by the projected-observation path.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the projected payload is refused or when its `run_id` column is
+    /// missing, not UTF-8, or not the caller's value.
     #[test]
     fn projected_run_id_remains_correlation_data() {
         let rows = batch(
@@ -2810,6 +2828,13 @@ mod tests {
         assert!(matches!(dup_err, ScribeError::InvalidFrame));
     }
 
+    /// A `card_ref` value outside the service principal's own Card scope is refused
+    /// during decode, before any writer admission sees the frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics when decode accepts the out-of-scope row or refuses it with anything
+    /// other than `CardScopeDenied`.
     #[test]
     fn card_scope_rejects_before_writer_admission() {
         let card = CardRef::from_str("prod/Service/billing@1.0.0").expect("card");
@@ -2858,6 +2883,11 @@ mod tests {
     /// projection while name lookup only ever sees the first occurrence. An
     /// authorized (here null) first column could therefore hide a second,
     /// out-of-scope assertion. The shared decode guard rejects the frame first.
+    ///
+    /// # Panics
+    ///
+    /// Panics when decode accepts the duplicated column or refuses it with anything
+    /// other than `InvalidFrame`.
     #[test]
     fn duplicate_arrow_column_names_fail_closed_for_dynamic_tables() {
         let rows = batch(
@@ -2888,6 +2918,14 @@ mod tests {
         assert!(matches!(error, ScribeError::InvalidFrame));
     }
 
+    /// Decode keeps the caller's field order and binds each value to its field by
+    /// name, so a payload whose fields are not in alphabetical order keeps every
+    /// value under its own name.
+    ///
+    /// # Panics
+    ///
+    /// Panics when decode refuses the payload, when the decoded fields change
+    /// order, or when either column's value moves to the other field.
     #[test]
     fn schema_fields_map_by_name_not_position() {
         let rows = batch(
@@ -2937,6 +2975,15 @@ mod tests {
         );
     }
 
+    /// Decode finishes schema validation and server stamping before
+    /// acknowledgement: the decoded batch carries the principal, event-time,
+    /// ingestion-time, and request columns, and neither a tenant column nor a
+    /// per-row batch column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when decode refuses the payload, when a stamped managed column is
+    /// missing, or when a tenant or batch-identity column is present.
     #[test]
     fn ipc_decode_schema_type_validation_and_stamping_precede_ack() {
         let rows = batch(
@@ -3036,6 +3083,11 @@ mod tests {
     /// `wyrd_ingested_at`) — the order the Oracle's pinned sealed-fragment
     /// fingerprint requires. Before D88 the caller column stayed in the user block
     /// and diverged from [`ensure_managed_columns`], breaking every sealed read.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the caller event time is refused or when the stamped field order
+    /// differs from the canonical managed order.
     #[test]
     fn native_caller_event_time_lands_in_canonical_managed_slot() {
         let (principal, card) = scoped_service_principal();
@@ -3076,6 +3128,11 @@ mod tests {
     /// D88: a stamped native payload WITHOUT a caller `wyrd_event_time` (server
     /// stamps receipt time) has the identical canonical field order — the
     /// event-time value source does not perturb the physical layout.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the payload is refused or when the stamped field order differs
+    /// from the canonical managed order.
     #[test]
     fn native_server_stamped_event_time_lands_in_canonical_managed_slot() {
         let (principal, card) = scoped_service_principal();
@@ -3112,6 +3169,11 @@ mod tests {
     /// D88: a stamped projected payload with a preserved caller `wyrd_event_time`
     /// also produces the canonical managed field order (`run_id` retained as
     /// correlation data, event time lifted into the managed slot).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the projected event time is refused or when the stamped field
+    /// order differs from the canonical managed order.
     #[test]
     fn projected_preserved_event_time_lands_in_canonical_managed_slot() {
         let (event_field, event_array) = managed_event_time(vec![now_micros_offset(-3600)]);
@@ -3153,6 +3215,12 @@ mod tests {
     /// slot and is never re-stamped — it is distinct from the receipt-time
     /// `wyrd_ingested_at`, proving the managed slot holds the caller value, not a
     /// server-stamped one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the caller event time is refused, when either time column is
+    /// missing or not a microsecond timestamp, when the event time differs from the
+    /// caller value, or when it equals the receipt time.
     #[test]
     fn caller_event_time_value_is_verbatim_not_receipt_time() {
         let (principal, card) = scoped_service_principal();
@@ -3212,6 +3280,12 @@ mod tests {
     /// A native payload MAY carry a valid caller `wyrd_event_time`: its values
     /// survive decode+stamp unchanged, exactly once, and the user-schema
     /// fingerprint is identical to the same payload without the column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the user-schema fingerprints differ, when the caller event time
+    /// is refused, or when the decoded event-time column is missing, mistyped, or
+    /// not the caller's values.
     #[test]
     fn native_caller_event_time_is_preserved_without_fingerprint_drift() {
         let (principal, card) = scoped_service_principal();
@@ -3282,6 +3356,11 @@ mod tests {
 
     /// A native payload WITHOUT `wyrd_event_time` is still server-stamped exactly
     /// as before, and `wyrd_ingested_at` remains the server receipt time.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the payload is refused, when the server-stamped event time is
+    /// missing, mistyped, or nullable, or when no ingestion time is stamped.
     #[test]
     fn native_without_event_time_is_server_stamped() {
         let (principal, card) = scoped_service_principal();
@@ -3323,6 +3402,11 @@ mod tests {
 
     /// A native `wyrd_event_time` with the wrong Arrow type, unit, timezone,
     /// nulls, or a duplicate field fails closed with `InvalidFrame`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any malformed event-time variant is accepted or refused with
+    /// anything other than `InvalidFrame`.
     #[test]
     fn native_event_time_physical_type_is_validated() {
         let (principal, card) = scoped_service_principal();
@@ -3440,6 +3524,11 @@ mod tests {
 
     /// Native batch with event times inside the default window is accepted and
     /// the values are preserved verbatim.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the in-window value is refused or when the decoded event time is
+    /// missing, mistyped, or not the caller value.
     #[test]
     fn native_event_time_within_window_accepted() {
         let (principal, card) = scoped_service_principal();
@@ -3480,6 +3569,10 @@ mod tests {
     }
 
     /// Value exactly at the past edge (receipt − past) is accepted (inclusive).
+    ///
+    /// # Panics
+    ///
+    /// Panics when a value exactly at the past bound is refused.
     #[test]
     fn native_event_time_past_edge_accepted() {
         let (principal, card) = scoped_service_principal();
@@ -3516,6 +3609,10 @@ mod tests {
     }
 
     /// Value exactly at the future edge (receipt + future) is accepted (inclusive).
+    ///
+    /// # Panics
+    ///
+    /// Panics when a value exactly at the future bound is refused.
     #[test]
     fn native_event_time_future_edge_accepted() {
         let (principal, card) = scoped_service_principal();
@@ -3552,6 +3649,11 @@ mod tests {
 
     /// A value older than the past bound is rejected with `EventTimeOutOfRange`.
     /// The whole batch is refused; no partial write occurs.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the value older than the past bound is not refused with
+    /// `EventTimeOutOfRange`.
     #[test]
     fn native_event_time_before_past_bound_rejected() {
         let (principal, card) = scoped_service_principal();
@@ -3597,6 +3699,11 @@ mod tests {
 
     /// A value further in the future than the future bound is rejected with
     /// `EventTimeOutOfRange`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the value beyond the future bound is not refused with
+    /// `EventTimeOutOfRange`.
     #[test]
     fn native_event_time_after_future_bound_rejected() {
         let (principal, card) = scoped_service_principal();
@@ -3641,6 +3748,11 @@ mod tests {
     }
 
     /// A projected (OTLP) batch with an in-window event time is accepted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the in-window projected value is refused or when the decoded
+    /// event time is missing, mistyped, or not the caller value.
     #[test]
     fn projected_event_time_within_window_accepted() {
         let t = now_micros_offset(-3600);
@@ -3675,6 +3787,11 @@ mod tests {
 
     /// A projected (OTLP) batch with an out-of-range event time is rejected with
     /// `EventTimeOutOfRange` — proving both paths share enforcement.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the out-of-range projected value is not refused with
+    /// `EventTimeOutOfRange`.
     #[test]
     fn projected_event_time_out_of_range_rejected() {
         let old = now_micros_offset(-(31 * 24 * 60 * 60));
@@ -3712,6 +3829,11 @@ mod tests {
 
     /// When `wyrd_event_time` is absent the server stamps receipt time and no
     /// window check runs — behavior is byte-identical to the prior contract.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the payload is refused or when the server-stamped event time is
+    /// missing, mistyped, or null.
     #[test]
     fn absent_event_time_unchanged_regression() {
         let rows = batch(
@@ -3786,6 +3908,11 @@ mod tests {
 
     /// Managed columns other than `wyrd_event_time` remain reserved and are
     /// rejected when a native payload supplies them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a native payload supplying any other managed column is accepted
+    /// or refused with anything other than `InvalidFrame`.
     #[test]
     fn native_other_reserved_columns_still_rejected() {
         let (principal, card) = scoped_service_principal();

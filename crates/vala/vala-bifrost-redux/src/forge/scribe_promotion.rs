@@ -13,8 +13,11 @@
 //! object Scribe published and break the exactness the route exists to
 //! preserve.
 
+use bytes::Bytes;
+use iceberg::spec::DataFile;
 use std::collections::BTreeSet;
 
+use iceberg::table::Table;
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -352,9 +355,9 @@ fn event_time_bound_micros(
 /// event-time bounds fall outside the partition the record claims.
 fn validate_promoted_object(
     record: &ScribePublishedHotFileV1,
-    bytes: &bytes::Bytes,
+    bytes: &Bytes,
     file_size: u64,
-    table: &iceberg::table::Table,
+    table: &Table,
 ) -> Result<(), ForgeError> {
     let metadata = table.metadata();
     if record.partition_spec_id != metadata.default_partition_spec_id() {
@@ -540,9 +543,9 @@ pub(super) async fn read_promotion_demand(
 /// two `Uuid` arguments.
 pub(super) struct ForgePromotionCommit<'a> {
     /// Table state the append is built against.
-    pub(super) table: &'a iceberg::table::Table,
+    pub(super) table: &'a Table,
     /// Writer-owned `DataFile` values appended unchanged.
-    pub(super) data_files: Vec<iceberg::spec::DataFile>,
+    pub(super) data_files: Vec<DataFile>,
     /// Durable task that owns this promotion.
     pub(super) task_id: Uuid,
     /// Attempt used only to label the commit span.
@@ -718,7 +721,7 @@ impl Forge {
         &self,
         tenant: DataTenantId,
         table_ref: &ForgeTaskTableIdentity,
-        table: &iceberg::table::Table,
+        table: &Table,
     ) {
         let Some(snapshot_id) = table.metadata().current_snapshot_id() else {
             return;
@@ -776,7 +779,7 @@ impl Forge {
         &self,
         binding: &TenantTableBinding,
         plan: &ScribePromotionPlan,
-        table: &iceberg::table::Table,
+        table: &Table,
     ) -> Result<PromotionPlanStatus, ForgeError> {
         let planned = plan.file_ids();
         let mut conn = self
@@ -844,7 +847,7 @@ impl Forge {
     async fn live_data_object_keys(
         &self,
         binding: &TenantTableBinding,
-        table: &iceberg::table::Table,
+        table: &Table,
     ) -> Result<BTreeSet<String>, ForgeError> {
         let Some(snapshot) = table.metadata().current_snapshot() else {
             return Ok(BTreeSet::new());
@@ -911,8 +914,8 @@ impl Forge {
         &self,
         binding: &TenantTableBinding,
         plan: &ScribePromotionPlan,
-        table: &iceberg::table::Table,
-    ) -> Result<Vec<iceberg::spec::DataFile>, ForgeError> {
+        table: &Table,
+    ) -> Result<Vec<DataFile>, ForgeError> {
         let mut conn = self
             .core
             .vala
@@ -998,7 +1001,7 @@ impl Forge {
         lease: &mut ForgeLease,
         commit: ForgePromotionCommit<'_>,
         stop: &CancellationToken,
-    ) -> Result<iceberg::table::Table, ForgeError> {
+    ) -> Result<Table, ForgeError> {
         let ForgePromotionCommit {
             table,
             data_files,

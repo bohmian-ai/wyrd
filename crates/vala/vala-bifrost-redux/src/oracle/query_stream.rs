@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use tracing::Span;
 
+use super::planner::ActiveReadClaim;
 use super::telemetry::AnalyticalAttemptOutcome;
 
 use super::*;
@@ -242,7 +243,7 @@ pub(super) struct QueryStreamInput {
     /// Exactly-once owner-local registry settlement retained through terminal output.
     pub(super) running_query: Option<RunningQueryTerminalOwner>,
     /// Active table reads released only after every descendant has joined.
-    pub(super) active_reads: Option<super::planner::ActiveReadClaim>,
+    pub(super) active_reads: Option<ActiveReadClaim>,
 }
 
 /// Exactly-once terminal owner for one inserted running-query entry.
@@ -330,10 +331,9 @@ struct FrameBuildInput {
     /// Exactly-once active-registry terminal owner.
     running_query: Option<RunningQueryTerminalOwner>,
     /// Active table reads released only when this stream is finished.
-    active_reads: Option<super::planner::ActiveReadClaim>,
+    active_reads: Option<ActiveReadClaim>,
 }
 
-/// Builds the lazy frame stream that owns terminal cleanup state.
 /// Resolves the next event one frame loop iteration acts on.
 ///
 /// Cancellation is checked before anything is taken from the plan, so a
@@ -398,7 +398,25 @@ fn encode_frame(
     Ok(Some(frame))
 }
 
-fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameStream>> {
+/// Builds the lazy leader frame stream that owns every terminal cleanup duty.
+///
+/// The returned stream yields the schema frame first, then one batch frame per
+/// encoded batch, and always ends with exactly one terminal frame. It pulls
+/// the next event through [`next_frame_event`], so stream cancellation,
+/// request cancellation, and the query deadline are observed before another
+/// batch is taken from the plan. On exhaustion, failure, or cancellation it
+/// drops the plan's batch stream and then settles through
+/// [`settle_and_finish_stream`], which releases admission, finishes the
+/// running-query registry entry, and awaits the active-read claim's release
+/// before the terminal frame is yielded.
+///
+/// A consumer that drops the stream at any await skips that settlement. The
+/// admission guard and the active-read claim are therefore moved into one
+/// [`LeaderStreamOwners`] value before the generator is built, whose `Drop`
+/// revokes the query's Analytical graph before starting the claim's release,
+/// so Forge can never destroy objects a still-running follower or local driver
+/// may read.
+fn build_frames(input: FrameBuildInput) -> Pin<Box<OracleFrameStream>> {
     let FrameBuildInput {
         query_class,
         schema_frame,
@@ -522,15 +540,12 @@ struct LeaderStreamOwners {
     /// Admission guard, and through it the Analytical graph lifecycle.
     admitted: Option<AdmittedQueryGuard>,
     /// Active table reads, released only after `admitted` is gone.
-    active_reads: Option<super::planner::ActiveReadClaim>,
+    active_reads: Option<ActiveReadClaim>,
 }
 
 impl LeaderStreamOwners {
     /// Takes ownership of the stream's admission guard and active-read claim.
-    const fn new(
-        admitted: AdmittedQueryGuard,
-        active_reads: Option<super::planner::ActiveReadClaim>,
-    ) -> Self {
+    const fn new(admitted: AdmittedQueryGuard, active_reads: Option<ActiveReadClaim>) -> Self {
         Self {
             admitted: Some(admitted),
             active_reads,
@@ -626,7 +641,7 @@ struct StreamSettlementInputs<'a> {
     /// Borrowed from the stream's [`LeaderStreamOwners`] rather than moved, so
     /// a settlement dropped mid-await leaves the claim where that owner's
     /// `Drop` releases it after the Analytical graph is revoked.
-    active_reads: &'a mut Option<super::planner::ActiveReadClaim>,
+    active_reads: &'a mut Option<ActiveReadClaim>,
 }
 
 /// Settles every owner the drained stream holds and assembles its terminal.
@@ -1490,6 +1505,11 @@ impl OracleQueryStream {
     }
 
     /// Builds a test stream through the production telemetry and admission owners.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the IPC encoder cannot encode `schema` into the opening schema
+    /// frame.
     #[cfg(test)]
     pub(super) fn test_from_physical(
         schema: &arrow::datatypes::SchemaRef,
@@ -2111,6 +2131,12 @@ mod tests {
     }
 
     /// A success terminal is observable only after local ownership is released.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a terminal frame is observed while the admission registry still
+    /// counts the query active, when no terminal frame is emitted, or when the
+    /// query is still active after the stream ends.
     #[tokio::test]
     async fn success_terminal_requires_completed_local_release() {
         let (admitted, shared, _request_cancellation) = admitted_guard_for_test();
@@ -2147,6 +2173,12 @@ mod tests {
     }
 
     /// A typed stale object observed after schema output fails without replacement.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the first frame is not the schema frame, when the stale batch
+    /// does not produce a failed terminal next, when that terminal carries a
+    /// stale-cut replan warning, or when the query is still admitted afterwards.
     #[tokio::test]
     async fn post_output_typed_stale_object_is_terminal_without_replan() {
         let (admitted, shared, _request_cancellation) = admitted_guard_for_test();
@@ -2187,6 +2219,12 @@ mod tests {
     }
 
     /// Caller cancellation reaches the production stream without canceling siblings.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the first frame is not the schema frame, when request
+    /// cancellation does not yield a terminal frame within one second, or when the
+    /// query is still admitted afterwards.
     #[tokio::test]
     async fn request_cancellation_interrupts_production_stream() {
         let (admitted, shared, request_cancellation) = admitted_guard_for_test();

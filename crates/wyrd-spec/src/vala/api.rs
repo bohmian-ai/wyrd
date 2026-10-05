@@ -2649,6 +2649,12 @@ mod bifrost_wire_tests {
     /// The register request carries the compaction type in its hyphenated
     /// public spelling and rejects the underscore spelling, so one table has
     /// exactly one way to name its type on the wire.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the hyphenated or omitted request fails to deserialize or
+    /// round-trip, carries the wrong compaction type, or the underscore
+    /// spelling is accepted.
     #[test]
     fn bifrost_wire_register_request_carries_hyphenated_compaction_type() {
         let req: RegisterTableRequest = serde_json::from_str(
@@ -2675,6 +2681,12 @@ mod bifrost_wire_tests {
     /// value, the underscore spellings are refused, and the generated request
     /// and description schemas publish the same set and the `small-files`
     /// omitted default.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a compaction type serializes or parses to a spelling other
+    /// than its hyphenated value, an underscore spelling parses, or a generated
+    /// schema omits the approved values or the `small-files` default.
     #[test]
     fn bifrost_wire_compaction_type_values_and_schemas_are_hyphenated() {
         for (kind, spelling) in [
@@ -2761,6 +2773,14 @@ mod bifrost_wire_tests {
         bifrost_wire_round_trip(&spec);
     }
 
+    /// A table entry and its full description survive a JSON round trip,
+    /// including correlation fields, field-id metadata, managed candidates,
+    /// physical layout, and the compaction target and type.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either value does not serialize and deserialize back to an
+    /// equal value.
     #[test]
     fn bifrost_wire_table_entry_and_description_round_trip() {
         let entry = BifrostTableEntry {

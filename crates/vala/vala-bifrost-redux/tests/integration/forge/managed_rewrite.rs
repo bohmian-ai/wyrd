@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use iceberg::spec::DataContentType;
+use iceberg::spec::{DataContentType, DataFile};
 use vala_bifrost_redux::catalog::layout::FORGE_WRITER_RECIPE;
 use vala_bifrost_redux::forge::{ForgeClock, ForgeError, ForgeObjectStore, ForgeUnsettledOutput};
 
@@ -687,6 +687,13 @@ async fn assert_position_delete_applies_to_output_rows() {
 /// ceiling and the row-group target is left independent of it. What the core
 /// receives must carry both values unchanged, and the attempt must consume the
 /// whole promoted set rather than a fixed number of groups.
+///
+/// # Panics
+///
+/// Panics when the fixture table declares a whole-file size property, the
+/// attempt fails, it rewrites fewer than both promoted files, the output does
+/// not carry every row exactly once, or a produced object is empty or reaches
+/// the erased 128 MiB ceiling.
 #[tokio::test]
 async fn managed_rewrite_scaled_geometry_has_no_legacy_file_or_group_ceiling() {
     let fixture = PromotedRewriteFixture::start("rewrite_geometry").await;
@@ -724,7 +731,7 @@ async fn managed_rewrite_scaled_geometry_has_no_legacy_file_or_group_ceiling() {
     assert_eq!(
         run.output_data_files()
             .into_iter()
-            .map(iceberg::spec::DataFile::record_count)
+            .map(DataFile::record_count)
             .sum::<u64>(),
         4,
         "every promoted row is carried forward exactly once"
@@ -870,10 +877,7 @@ const STAGED_DAY: i64 = 5;
 /// # Panics
 ///
 /// Panics when the live cut cannot be read.
-async fn live_files_with_rows(
-    promoted: &PromotedRewriteFixture,
-    rows: usize,
-) -> Vec<iceberg::spec::DataFile> {
+async fn live_files_with_rows(promoted: &PromotedRewriteFixture, rows: usize) -> Vec<DataFile> {
     let rows = u64::try_from(rows).expect("fixture row counts fit u64");
     promoted
         .live_data_files()
@@ -884,7 +888,7 @@ async fn live_files_with_rows(
 }
 
 /// Returns the object path of every file, in order.
-fn paths(files: &[iceberg::spec::DataFile]) -> BTreeSet<String> {
+fn paths(files: &[DataFile]) -> BTreeSet<String> {
     files
         .iter()
         .map(|file| file.file_path().to_owned())
@@ -896,7 +900,7 @@ fn paths(files: &[iceberg::spec::DataFile]) -> BTreeSet<String> {
 /// # Panics
 ///
 /// Panics when an object cannot be read.
-async fn values(promoted: &PromotedRewriteFixture, files: &[iceberg::spec::DataFile]) -> Vec<i64> {
+async fn values(promoted: &PromotedRewriteFixture, files: &[DataFile]) -> Vec<i64> {
     promoted
         .object_values(&paths(files).into_iter().collect::<Vec<_>>())
         .await
@@ -930,14 +934,8 @@ async fn promote_then_compact(supervisor: &mut SupervisedPromotion) {
 ///
 /// Panics when a staged object is not below the threshold or the property
 /// commit fails.
-async fn scale_target_to_pair(
-    promoted: &PromotedRewriteFixture,
-    staged: &[iceberg::spec::DataFile],
-) -> u64 {
-    let staged_bytes: u64 = staged
-        .iter()
-        .map(iceberg::spec::DataFile::file_size_in_bytes)
-        .sum();
+async fn scale_target_to_pair(promoted: &PromotedRewriteFixture, staged: &[DataFile]) -> u64 {
+    let staged_bytes: u64 = staged.iter().map(DataFile::file_size_in_bytes).sum();
     let target = staged_bytes * 5 / 4;
     let row_group = target / 8;
     let threshold = target / 100 * 75 + target % 100 * 75 / 100;

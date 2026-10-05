@@ -1008,6 +1008,11 @@ async fn forge_worker_readiness_gates_on_recovery() {
 
 /// The coordinator publishes ready only once a full fenced pass completes, and
 /// its guard removes the bit when the supervised loop stops.
+///
+/// # Panics
+///
+/// Panics if the server or scheduler fails to start or stop, or if readiness
+/// is reported before the first completed pass or after the loop stops.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forge_coordinator_readiness_follows_a_completed_pass() {

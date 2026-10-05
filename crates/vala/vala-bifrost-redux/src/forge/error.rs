@@ -28,6 +28,11 @@ mod tests {
 
     /// Only a statement the database never answered is an unavailable
     /// database; an answered SQL failure and a lease failure are not.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an answered SQL or lease failure is classified as an
+    /// unavailable database, or a pool timeout is not.
     #[test]
     fn database_unavailable_is_only_an_unanswered_statement() {
         let unavailable = ForgeError::Sql(vala_sql::SqlError::Query(sqlx::Error::PoolTimedOut));
@@ -118,7 +123,10 @@ pub enum ForgeError {
     },
     /// The live Forge leader could not be reached or refused a peer call.
     #[error("Forge leader peer call failed: {detail}")]
-    LeaderPeer { detail: String },
+    LeaderPeer {
+        /// Transport status or refusal message from the failed peer call.
+        detail: String,
+    },
     /// Cancellation stopped work at a bounded stage or batch boundary *before*
     /// any durable side effect, so the claim is safe to release.
     ///

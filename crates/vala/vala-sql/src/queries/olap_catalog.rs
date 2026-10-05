@@ -4,6 +4,7 @@
 //! tenant scope for wyrd_app-role paths.
 // raw-query grep allowlist: olap control tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
+use serde_json::Value;
 use wyrd_spec::DataTenantId;
 use wyrd_sql::{OperatorPool, TenantConn};
 
@@ -34,7 +35,7 @@ pub async fn upsert_table(
     table_uid: &[u8; 16],
     fqn: &str,
     fingerprint: &[u8; 32],
-    physical_layout: &serde_json::Value,
+    physical_layout: &Value,
 ) -> Result<(), SqlError> {
     sqlx::query(
         r#"
@@ -110,7 +111,7 @@ pub async fn registered_physical_layout(
     operator: &OperatorPool,
     tenant: DataTenantId,
     fqn: &str,
-) -> Result<Option<serde_json::Value>, SqlError> {
+) -> Result<Option<Value>, SqlError> {
     sqlx::query_scalar(
         r"
         SELECT physical_layout

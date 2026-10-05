@@ -1,19 +1,25 @@
 //! Redux-owned tenant-qualified Bifrost catalog.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
-use arrow::datatypes::{Field, Schema};
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use iceberg::io::object_cache::ObjectCache;
 use iceberg::io::{FileIO, FileIOBuilder};
-use iceberg::spec::{FormatVersion, TableMetadata, TableProperties, Transform};
-use iceberg::{Catalog as _, Error as IcebergError, TableCreation};
+use iceberg::spec::{
+    self, FormatVersion, TableMetadata, TableMetadataRef, TableProperties, Transform,
+};
+use iceberg::table::Table;
+use iceberg::{Catalog as _, Error as IcebergError, TableCreation, TableIdent};
 use iceberg_catalog_sql::SqlCatalog;
 use sha2::{Digest as _, Sha256};
+use uuid::Uuid;
 use vala_sql::queries::file_list::HotFileCut;
 use vala_sql::queries::oracle_reader_authority::{
     AcquiredTableCut, ActiveReadOwner, ActiveTableRef, OracleActiveTableReads,
 };
+use vala_sql::row_types::file_list::HotFileRow;
 use vala_sql::{TenantConn, ValaPostgres};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::WYRD_EVENT_TIME;
@@ -56,8 +62,12 @@ fn digest_strings(values: impl IntoIterator<Item = String>) -> String {
 pub struct TableUid([u8; 16]);
 
 impl TableUid {
+    /// Mints a fresh time-ordered identity for a table being registered.
+    ///
+    /// A version-7 UUID keeps newly registered table ids roughly insertion-ordered in
+    /// `vala.bifrost_tables`; the identity is opaque to every other reader.
     fn new_v7() -> Self {
-        Self(*uuid::Uuid::now_v7().as_bytes())
+        Self(*Uuid::now_v7().as_bytes())
     }
 
     fn from_row(bytes: &[u8], table: &str) -> Result<Self, BifrostCatalogError> {
@@ -113,7 +123,7 @@ pub struct PinnedSealedTable {
     /// reconstruct one.
     pub table_uid: TableUid,
     /// Iceberg table metadata loaded once for this cut.
-    pub iceberg_table: iceberg::table::Table,
+    pub iceberg_table: Table,
     /// Exact current snapshot identity selected from the immutable table metadata.
     pub snapshot_id: Option<i64>,
     /// Stable digest of the selected snapshot identity and live data-file set.
@@ -123,7 +133,7 @@ pub struct PinnedSealedTable {
     /// Ordered immutable data-file work from the pinned Iceberg snapshot.
     pub iceberg_files: Vec<PinnedIcebergFile>,
     /// Ordered tenant hot rows absent from the exact pinned snapshot manifest.
-    pub hot_files: Vec<vala_sql::row_types::file_list::HotFileRow>,
+    pub hot_files: Vec<HotFileRow>,
     /// Stable digest of the ordered, post-subtraction hot manifest.
     pub hot_manifest_digest: String,
     /// Bounded sealed-byte estimate used by Oracle classification.
@@ -222,7 +232,7 @@ struct PinnedIcebergState {
     /// Current snapshot identity, when the table has committed data.
     snapshot_id: Option<i64>,
     /// Validated Forge publication operation recorded by the current snapshot.
-    forge_publication_operation_id: Option<uuid::Uuid>,
+    forge_publication_operation_id: Option<Uuid>,
     /// Canonical paths used to exclude hot-manifest overlap.
     file_paths: BTreeSet<String>,
     /// Exact immutable metadata keyed by canonical path.
@@ -253,7 +263,7 @@ pub struct BifrostCatalog {
     /// it. Only found rows are cached, so a table registered later is still
     /// seen on its first lookup. Grows with registered tables, never with
     /// queries.
-    table_uids: Arc<std::sync::RwLock<HashMap<(DataTenantId, String), TableUid>>>,
+    table_uids: Arc<RwLock<HashMap<(DataTenantId, String), TableUid>>>,
     /// Registered Iceberg schemas this node has already loaded, by tenant and
     /// table name.
     ///
@@ -261,12 +271,12 @@ pub struct BifrostCatalog {
     /// object. A registered table's schema never evolves and its registration
     /// is never dropped, so a loaded schema stays authoritative for the life
     /// of the node. Grows with registered tables, never with writes.
-    registered_schemas: Arc<std::sync::RwLock<RegisteredSchemas>>,
+    registered_schemas: Arc<RwLock<RegisteredSchemas>>,
 }
 
 /// Registered Iceberg schemas a node has loaded, keyed by tenant and table
 /// name; the field-id authority behind [`BifrostCatalog`]'s schema cache.
-type RegisteredSchemas = HashMap<(DataTenantId, String), Arc<iceberg::spec::Schema>>;
+type RegisteredSchemas = HashMap<(DataTenantId, String), Arc<spec::Schema>>;
 
 /// Estimated-weight eviction limit of the node-wide decoded manifest cache.
 ///
@@ -360,7 +370,7 @@ impl BifrostCatalog {
         &self,
         tenant: DataTenantId,
         owner: ActiveReadOwner,
-        deadline: std::time::Instant,
+        deadline: Instant,
         tables: &[TableRef],
     ) -> Result<Option<Vec<AcquiredTableCut>>, BifrostCatalogError> {
         #[cfg(any(test, feature = "test-support"))]
@@ -383,7 +393,7 @@ impl BifrostCatalog {
         // Derived only now, after the pool wait, so the row PostgreSQL stamps
         // expires at the caller's original deadline however long the wait or
         // however many times the cut is reacquired.
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining < std::time::Duration::from_millis(1) {
             return Ok(None);
         }
@@ -409,7 +419,7 @@ impl BifrostCatalog {
     pub async fn release_active_reads(
         &self,
         tenant: DataTenantId,
-        query_id: uuid::Uuid,
+        query_id: Uuid,
     ) -> Result<u64, BifrostCatalogError> {
         let mut conn = self.postgres.tenant_conn(tenant).await?;
         let released = OracleActiveTableReads::new(&mut conn)
@@ -536,12 +546,12 @@ impl BifrostCatalog {
     /// from the identity and metadata.
     fn cached_table(
         &self,
-        identifier: &iceberg::TableIdent,
-        metadata: iceberg::spec::TableMetadataRef,
+        identifier: &TableIdent,
+        metadata: TableMetadataRef,
         metadata_location: Option<String>,
-    ) -> Result<iceberg::table::Table, BifrostCatalogError> {
+    ) -> Result<Table, BifrostCatalogError> {
         let manifest_cache = self.manifest_cache(identifier, &metadata)?;
-        let mut builder = iceberg::table::Table::builder()
+        let mut builder = Table::builder()
             .file_io(self.file_io.clone())
             .metadata(metadata)
             .identifier(identifier.clone())
@@ -566,13 +576,13 @@ impl BifrostCatalog {
     /// built from the supplied identity and metadata.
     fn manifest_cache(
         &self,
-        identifier: &iceberg::TableIdent,
-        metadata: &iceberg::spec::TableMetadataRef,
+        identifier: &TableIdent,
+        metadata: &TableMetadataRef,
     ) -> Result<Arc<ObjectCache>, BifrostCatalogError> {
         if let Some(cache) = self.manifest_cache.get() {
             return Ok(Arc::clone(cache));
         }
-        let seed = iceberg::table::Table::builder()
+        let seed = Table::builder()
             .file_io(self.file_io.clone())
             .metadata(Arc::clone(metadata))
             .identifier(identifier.clone())
@@ -592,7 +602,7 @@ impl BifrostCatalog {
     /// tenant binding, file metadata conflicts, or byte accounting overflows.
     async fn pin_iceberg_snapshot(
         &self,
-        iceberg_table: &iceberg::table::Table,
+        iceberg_table: &Table,
         binding: &TenantTableBinding,
     ) -> Result<PinnedIcebergState, BifrostCatalogError> {
         let snapshot_id = iceberg_table.metadata().current_snapshot_id();
@@ -613,7 +623,7 @@ impl BifrostCatalog {
             .additional_properties
             .get("forge.operation_id")
             .map(|value| {
-                uuid::Uuid::parse_str(value).map_err(|_| {
+                Uuid::parse_str(value).map_err(|_| {
                     BifrostCatalogError::MetadataMismatch(
                         "current snapshot has malformed forge.operation_id".to_owned(),
                     )
@@ -838,7 +848,14 @@ impl BifrostCatalog {
     /// Ensure one canonical built-in exists for a tenant.
     ///
     /// Built-ins are lazy: this method is the only path that creates one, and
-    /// callers choose when a tenant first needs the table.
+    /// callers choose when a tenant first needs the table. Registration runs
+    /// through the same locked create path as caller-owned tables, so an
+    /// already-registered built-in resolves to its existing UID.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::MetadataMismatch`] when the definition
+    /// names an unknown namespace, and otherwise the registration, fingerprint,
+    /// metadata, Iceberg, or SQL error from the locked create path.
     pub async fn ensure_builtin(
         &self,
         tenant: DataTenantId,
@@ -895,7 +912,7 @@ impl BifrostCatalog {
     async fn create_table_locked(
         &self,
         request: CreateTableRequest,
-        canonical_schema: Option<arrow::datatypes::SchemaRef>,
+        canonical_schema: Option<SchemaRef>,
         compaction: CompactionRegistration,
     ) -> Result<TableUid, BifrostCatalogError> {
         reject_reserved_field_names(&request.user_fields)?;
@@ -1051,7 +1068,7 @@ impl BifrostCatalog {
     /// converted for shape validation.
     fn validate_physical_table(
         &self,
-        table: &iceberg::table::Table,
+        table: &Table,
         binding: &TenantTableBinding,
         expected_schema: &Schema,
         layout: &PhysicalLayout,
@@ -1222,7 +1239,7 @@ impl BifrostCatalog {
         &self,
         table: &TableRef,
         tenant: DataTenantId,
-    ) -> Result<Arc<iceberg::spec::Schema>, BifrostCatalogError> {
+    ) -> Result<Arc<spec::Schema>, BifrostCatalogError> {
         let key = (tenant, table.fqn());
         let cached = self
             .registered_schemas
@@ -1282,7 +1299,7 @@ impl BifrostCatalog {
         &self,
         table: &TableRef,
         tenant: DataTenantId,
-    ) -> Result<arrow::datatypes::SchemaRef, BifrostCatalogError> {
+    ) -> Result<SchemaRef, BifrostCatalogError> {
         // Schema only: the provider is built from the loaded metadata document
         // and dropped here, so this path opens no snapshot object.
         let fqn = table.fqn();
@@ -1826,7 +1843,7 @@ mod schema_shape_tests {
 /// binding or the byte estimate cannot be represented.
 fn hot_cut_bytes(
     binding: &TenantTableBinding,
-    hot_files: &[vala_sql::row_types::file_list::HotFileRow],
+    hot_files: &[HotFileRow],
     base: u64,
 ) -> Result<u64, BifrostCatalogError> {
     hot_files.iter().try_fold(base, |total, row| {
@@ -2100,13 +2117,14 @@ mod production_pin_tests {
 
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
     use secrecy::ExposeSecret as _;
+    use wyrd_spec::DataTenantId;
     use wyrd_spec::vala::WYRD_EVENT_TIME;
 
     use crate::storage::BifrostStorage;
 
     use std::sync::Arc;
 
-    use super::{BifrostCatalog, CompactionRegistration};
+    use super::{BifrostCatalog, CompactionRegistration, PinnedSealedTable};
     use crate::catalog::TableRef;
     use crate::catalog::event_time::{EventTimeBoundsDefect, EventTimeStatistics};
     use crate::namespaces::BifrostNamespace;
@@ -2333,9 +2351,9 @@ mod production_pin_tests {
     /// Panics when acquisition or materialization fails.
     async fn pin_current(
         catalog: &BifrostCatalog,
-        tenant: wyrd_spec::DataTenantId,
+        tenant: DataTenantId,
         table: &TableRef,
-    ) -> super::PinnedSealedTable {
+    ) -> PinnedSealedTable {
         let owner = vala_sql::queries::oracle_reader_authority::ActiveReadOwner {
             query_id: uuid::Uuid::now_v7(),
             node_id: uuid::Uuid::now_v7(),

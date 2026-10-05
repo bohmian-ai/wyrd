@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use sqlx::PgPool;
 use tokio::task::JoinSet;
+use tokio::time;
 use vala_bifrost_redux::forge::{ForgeCompactionOutcome, outcome_to_wire};
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_sql::OperatorPool;
@@ -116,7 +117,7 @@ impl LeaderProbe {
         let period = vala_bifrost_redux::forge::ForgeWorkerConfig::default()
             .pull_interval
             .div_f64(multiplier);
-        let started = tokio::time::Instant::now();
+        let started = time::Instant::now();
         let end = started + Duration::from_secs_f64(seconds);
         let mut compactors = JoinSet::new();
         for worker in 0..FLEET_WORKERS {
@@ -158,14 +159,14 @@ impl LeaderProbe {
 async fn compactor(
     mut client: ForgeLeaderPeerServiceClient<Channel>,
     fencing_token: i64,
-    first: tokio::time::Instant,
+    first: time::Instant,
     period: Duration,
-    end: tokio::time::Instant,
+    end: time::Instant,
 ) -> Tally {
     let mut tally = Tally::default();
     let mut arrival = first;
     while arrival < end {
-        tokio::time::sleep_until(arrival).await;
+        time::sleep_until(arrival).await;
         arrival += period;
         let timer = Instant::now();
         let pulled = client

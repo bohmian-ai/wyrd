@@ -1532,6 +1532,8 @@ mod tests {
     /// when a step issues a different number of syncs.
     #[tokio::test(flavor = "current_thread")]
     async fn a_claim_costs_two_syncs_per_member_state_and_one_to_retire() {
+        /// Members in the fixture claim; more than one, so a per-member cost cannot
+        /// pass as a per-claim one.
         const MEMBERS: u64 = 4;
         let recorder = wyrd_bench::BenchmarkRecorder::default();
         let _guard = metrics::set_default_local_recorder(&recorder);

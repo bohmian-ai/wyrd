@@ -1048,6 +1048,11 @@ async fn registry_card_uid(
 /// # Errors
 ///
 /// Returns the stable Wyrd error the public ingest route produced.
+///
+/// # Panics
+///
+/// Panics when the batch cannot be built or IPC-encoded, or the public ingest
+/// transport cannot connect.
 async fn append_correlated(
     client: &wyrd_client::WyrdClient,
     table: &str,

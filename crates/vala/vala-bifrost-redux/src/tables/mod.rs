@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit as ArrowTimeUnit};
 use arrow::record_batch::RecordBatch;
+use iceberg::spec::{self, NestedField, Type};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use wyrd_spec::vala::api::{
@@ -412,7 +413,7 @@ fn declares_stable_field_ids(schema: &Schema) -> bool {
 /// re-typed batch fails Arrow validation.
 pub fn stamp_registered_field_ids(
     batch: &RecordBatch,
-    registered: &iceberg::spec::Schema,
+    registered: &spec::Schema,
 ) -> Result<RecordBatch, TableError> {
     let schema = batch.schema();
     let mut fields = Vec::with_capacity(schema.fields().len());
@@ -448,12 +449,7 @@ pub fn stamp_registered_field_ids(
 ///
 /// Returns [`TableError::Internal`] when a child has no registered counterpart
 /// or the registered nesting differs from the Arrow nesting.
-fn with_registered_id(
-    field: &Field,
-    registered: &iceberg::spec::NestedField,
-) -> Result<Field, TableError> {
-    use iceberg::spec::Type;
-
+fn with_registered_id(field: &Field, registered: &NestedField) -> Result<Field, TableError> {
     let mismatch = || {
         TableError::Internal(format!(
             "field {} does not match its registered Iceberg nesting",

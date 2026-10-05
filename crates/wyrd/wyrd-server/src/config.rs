@@ -511,8 +511,8 @@ impl OracleRuntimeConfig {
     /// engine and the public forwarder, so neither path can fall back to the
     /// built-in default while the other honors the configured value.
     #[must_use]
-    pub const fn default_query_deadline(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.default_query_deadline_ms)
+    pub const fn default_query_deadline(&self) -> Duration {
+        Duration::from_millis(self.default_query_deadline_ms)
     }
 }
 

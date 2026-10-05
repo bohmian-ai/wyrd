@@ -358,6 +358,11 @@ fn public_query(sql: String) -> BifrostQueryRequest {
 /// Used only for the cross-tenant probe, where the interesting outcome is the
 /// refusal itself: a tenant that can name a neighbour's table at all is a
 /// tenancy defect, so the journey must see an error rather than empty rows.
+///
+/// # Errors
+///
+/// Returns the public [`wyrd_client::bifrost::BifrostClientError`] when the
+/// query is refused, or when opening or draining its result stream fails.
 pub(crate) async fn try_read(
     client: &wyrd_client::WyrdClient,
     table: &str,

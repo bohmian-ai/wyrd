@@ -14,6 +14,9 @@
 
 use std::sync::Arc;
 
+use arrow::datatypes::Schema;
+use vala_sql::OperatorPool;
+
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::PhysicalLayout;
 use crate::contracts::ScribeError;
@@ -43,9 +46,9 @@ use crate::contracts::ScribeError;
 /// payload mode stamps (`run_id` is native-only). See
 /// [`PhysicalLayout::resolve_for_physical_schema`].
 pub(crate) async fn resolve_write_recipe(
-    operator: &vala_sql::OperatorPool,
+    operator: &OperatorPool,
     binding: &TenantTableBinding,
-    schema: &arrow::datatypes::Schema,
+    schema: &Schema,
 ) -> Result<Arc<PhysicalLayout>, ScribeError> {
     let fqn = binding.table_ref.fqn();
     let stored =

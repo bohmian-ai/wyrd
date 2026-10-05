@@ -84,6 +84,15 @@ pub type AfterToolFn = Arc<
         + Sync,
 >;
 
+/// Applies a generic `(context, value)` callback chain such as the model hooks.
+///
+/// Each callback runs in registration order under `catch_unwind`; a
+/// replacement becomes the value seen by the next callback, and the first
+/// abort stops the chain and returns the value held at that point.
+///
+/// # Errors
+///
+/// Returns [`AgentError::CallbackPanic`] naming `hook` when a callback panics.
 pub(crate) fn apply_chain_with_panic_catch<T, F>(
     chain: &[Arc<F>],
     ctx: &AgentContext,
@@ -107,6 +116,15 @@ where
     Ok(ChainResult::Replaced(current))
 }
 
+/// Applies the `before_agent` chain to the run's input text.
+///
+/// Each callback runs in registration order under `catch_unwind`; a
+/// replacement becomes the value seen by the next callback, and the first
+/// abort stops the chain and returns the value held at that point.
+///
+/// # Errors
+///
+/// Returns [`AgentError::CallbackPanic`] naming `hook` when a callback panics.
 pub(crate) fn apply_before_agent_chain_with_panic_catch(
     chain: &[BeforeAgentFn],
     ctx: &AgentContext,
@@ -128,6 +146,15 @@ pub(crate) fn apply_before_agent_chain_with_panic_catch(
     Ok(ChainResult::Replaced(current))
 }
 
+/// Applies the `before_tool` chain to one tool call's arguments.
+///
+/// Each callback runs in registration order under `catch_unwind`; a
+/// replacement becomes the value seen by the next callback, and the first
+/// abort stops the chain and returns the value held at that point.
+///
+/// # Errors
+///
+/// Returns [`AgentError::CallbackPanic`] naming `hook` when a callback panics.
 pub(crate) fn apply_chain_with_panic_catch_tool(
     chain: &[BeforeToolFn],
     ctx: &AgentContext,
@@ -150,6 +177,15 @@ pub(crate) fn apply_chain_with_panic_catch_tool(
     Ok(ChainResult::Replaced(current))
 }
 
+/// Applies the `after_tool` chain to one tool call's result.
+///
+/// Each callback runs in registration order under `catch_unwind`; a
+/// replacement becomes the value seen by the next callback, and the first
+/// abort stops the chain and returns the value held at that point.
+///
+/// # Errors
+///
+/// Returns [`AgentError::CallbackPanic`] naming `hook` when a callback panics.
 pub(crate) fn apply_chain_with_panic_catch_tool_result(
     chain: &[AfterToolFn],
     ctx: &AgentContext,

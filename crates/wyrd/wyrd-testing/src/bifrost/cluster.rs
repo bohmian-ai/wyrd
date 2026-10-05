@@ -1576,6 +1576,7 @@ impl WyrdTestCluster {
     /// # Panics
     /// Panics when a coordinator does not complete either pass in 30 seconds.
     pub async fn lead_forge_for_test(&self) {
+        /// Longest each coordinator may take to complete one awaited pass.
         const BOUND: Duration = Duration::from_secs(30);
         for server in self
             .servers()

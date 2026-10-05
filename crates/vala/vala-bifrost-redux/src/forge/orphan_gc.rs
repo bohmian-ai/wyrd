@@ -998,8 +998,23 @@ struct GcDeletionTally {
     deferred: bool,
 }
 
-/// Build protection from every retained Iceberg object and every open workflow.
 impl Forge {
+    /// Build protection from every retained Iceberg object and every open workflow.
+    ///
+    /// Catalog reachability is loaded first, then the durable Postgres roots,
+    /// and the two are composed into one live set plus the blocked operations.
+    /// The object-age cutoff is the caller's pinned cutoff when the request
+    /// carries one, otherwise the configured GC age floor from `now`. The
+    /// method reads only; cancellation is checked before and after the reads,
+    /// so a stop leaves nothing behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Shutdown`] when the request's stop token is
+    /// cancelled, catalog or manifest errors from reachability, the SQL,
+    /// operation-state, and path-normalization errors of the durable roots,
+    /// and [`ForgeError::InvalidConfig`] when the cutoff cannot be represented
+    /// as an object-store timestamp.
     async fn load_maintenance_protection_inner(
         &self,
         request: ProtectionRequest<'_>,
@@ -2105,6 +2120,11 @@ mod tests {
     /// binding, the destructive-maintenance gate, fresh unreachability from
     /// every retained head, the object age floor, and the object's own
     /// existence and kind — and requires the deletion to be refused.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a candidate missing any one proof is classified as deletable,
+    /// or a fully proven candidate is not.
     #[test]
     fn forge_expired_cleanup_eligibility_matrix() {
         use crate::catalog::TableRef;
@@ -2272,6 +2292,11 @@ mod tests {
     }
 
     /// The fixed age cutoff and evaluation time every matrix case shares.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the fixed 48-hour evaluation time or 24-hour cutoff stops
+    /// being a representable timestamp.
     fn orphan_matrix_protection(roots: OrphanProtectionRoots) -> MaintenanceProtection {
         let composed = roots.compose();
         MaintenanceProtection::new(
@@ -2351,6 +2376,11 @@ mod tests {
     /// case first asserts the complete root set does protect its
     /// subject, so a removal can never pass because the subject was unprotected
     /// to begin with.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the complete root set fails to protect a case's subject, or
+    /// when removing that case's root leaves the subject protected.
     fn assert_each_orphan_root_is_load_bearing(paths: &OrphanMatrixPaths) {
         let aged = orphan_matrix_aged();
         for case in orphan_root_cases() {

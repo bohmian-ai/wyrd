@@ -143,6 +143,10 @@ pub struct UnresolvableSource;
 #[async_trait]
 impl FollowerSourceResolver for UnresolvableSource {
     /// Always refuses, naming the fixture rather than a catalog failure.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`FollowerResolutionError::Fault`].
     async fn resolve(
         &self,
         _target_role: ClusterRole,
@@ -1960,6 +1964,12 @@ pub(crate) mod tests {
     }
 
     /// The local identity fetches hot data while a sibling placeholder resolves empty.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either assignment fails to resolve, when the local identity does
+    /// not fetch the hot stream exactly once, or when the sibling placeholder
+    /// fetches it again.
     #[tokio::test]
     async fn scribe_provider_executes_only_its_identity_bound_scan() {
         let tenant_id = DataTenantId::new_v7();

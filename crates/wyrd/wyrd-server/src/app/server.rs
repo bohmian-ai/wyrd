@@ -499,6 +499,10 @@ impl BoundServer {
     /// Returns [`BootExit::Other`] on a terminal task error, a Bifrost
     /// lifecycle failure, or if the process-global metrics recorder fails to
     /// install.
+    ///
+    /// # Panics
+    /// Panics if a bound peer listener has no peer router. Binding sets both
+    /// together, so this is an invariant violation, not a runtime condition.
     pub async fn run(mut self) -> Result<BifrostShutdownReport, BootExit> {
         // A production deployment without the Wyrd operator pool cannot run the
         // Card recovery sweep, so stale precommits would leak indefinitely.

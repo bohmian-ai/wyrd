@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use arrow::array::Array;
 use arrow::compute::cast;
 #[cfg(test)]
-use arrow::datatypes::{DataType, Field};
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::Field;
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -48,6 +48,7 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
 };
+use datafusion::scalar::ScalarValue;
 use datafusion_distributed::NetworkBoundaryExt as _;
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
@@ -60,15 +61,18 @@ use iceberg_datafusion::IcebergStaticTableProvider;
 use iceberg_datafusion::physical_plan::IcebergTableScan;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
+use parquet::basic::{ConvertedType, LogicalType, Type as PhysicalType};
+use parquet::bloom_filter::Sbbf;
 use parquet::errors::ParquetError;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
+use parquet::schema::types::ColumnDescriptor;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::BifrostError;
 
 use crate::scribe::hot_source::StagedSourceLease;
 use crate::storage::error_chain_contains_not_found;
 use wyrd_spec::vala::api::{QueryClass, WorkerScanStats};
-use wyrd_spec::vala::assignment_authority::ScanPredicate;
+use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 use super::live::LiveScribeExec;
@@ -2140,12 +2144,7 @@ fn classify_filter_for_schema(physical_schema: &Schema, filter: &Expr) -> Filter
 /// literal's exact width, because a `FixedSizeBinary` scalar of any other width
 /// is not a value of that column. Every other literal keeps the classifier's
 /// existing contract, where the residual filter decides typed comparisons.
-fn literal_fits_column(
-    leaf: &wyrd_spec::vala::assignment_authority::ScanPredicate,
-    data_type: &arrow::datatypes::DataType,
-) -> bool {
-    use arrow::datatypes::DataType;
-    use wyrd_spec::vala::assignment_authority::ScanLiteral;
+fn literal_fits_column(leaf: &ScanPredicate, data_type: &DataType) -> bool {
     match (leaf.literal(), data_type) {
         (Some(ScanLiteral::Bytes(value)), DataType::FixedSizeBinary(width)) => {
             usize::try_from(*width).is_ok_and(|width| width == value.len())
@@ -3180,12 +3179,7 @@ impl BloomProbe {
     /// columns, because a timestamp or unsigned annotation changes what the
     /// stored value means. Every other physical type — boolean, floating
     /// point, `INT32`, `INT96` — keeps the group.
-    fn for_column(
-        descriptor: &parquet::schema::types::ColumnDescriptor,
-        literal: &wyrd_spec::vala::assignment_authority::ScanLiteral,
-    ) -> Option<Self> {
-        use parquet::basic::{ConvertedType, LogicalType, Type as PhysicalType};
-        use wyrd_spec::vala::assignment_authority::ScanLiteral;
+    fn for_column(descriptor: &ColumnDescriptor, literal: &ScanLiteral) -> Option<Self> {
         match (descriptor.physical_type(), literal) {
             (PhysicalType::BYTE_ARRAY, ScanLiteral::Utf8(value)) => {
                 Some(Self::Bytes(value.as_bytes().to_vec()))
@@ -3212,7 +3206,7 @@ impl BloomProbe {
     }
 
     /// Reports whether `filter` may contain this value.
-    fn may_contain(&self, filter: &parquet::bloom_filter::Sbbf) -> bool {
+    fn may_contain(&self, filter: &Sbbf) -> bool {
         match self {
             Self::Bytes(value) => filter.check(value.as_slice()),
             Self::Int64(value) => filter.check(value),
@@ -3225,10 +3219,7 @@ impl HotBloomProbes {
     ///
     /// Only equality leaves become probes; a column the file does not carry or
     /// a literal [`BloomProbe::for_column`] cannot encode is skipped.
-    fn new(
-        metadata: &ParquetMetaData,
-        predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
-    ) -> Self {
+    fn new(metadata: &ParquetMetaData, predicates: &[ScanPredicate]) -> Self {
         let schema = metadata.file_metadata().schema_descr();
         let probes = predicates
             .iter()
@@ -3804,13 +3795,7 @@ fn scan_literal_scalar(
 /// physical comparison never needs a cast. Any other column — absent, or a
 /// width the classifier would have refused — falls back to plain `Binary`,
 /// leaving the residual filter authoritative.
-fn binary_scalar_for(
-    schema: &SchemaRef,
-    column: &str,
-    value: &[u8],
-) -> datafusion::scalar::ScalarValue {
-    use arrow::datatypes::DataType;
-    use datafusion::scalar::ScalarValue;
+fn binary_scalar_for(schema: &SchemaRef, column: &str, value: &[u8]) -> ScalarValue {
     match schema
         .field_with_name(column)
         .map(arrow::datatypes::Field::data_type)
@@ -4295,6 +4280,7 @@ fn plan_properties_with_partitions(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::io::Cursor;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -4304,11 +4290,12 @@ mod tests {
         FollowerSourceKey, OracleExecutionBindingInputs, OracleExecutionBindings,
     };
     use crate::oracle::codec::RemoteSourcePlaceholderExec;
-    use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
+    use arrow::array::{ArrayRef, FixedSizeBinaryArray, Int32Array, Int64Array, StringArray};
     use async_trait::async_trait;
+    use bytes::Bytes;
     use datafusion::common::tree_node::TreeNode;
     use datafusion::datasource::memory::MemorySourceConfig;
-    use datafusion::logical_expr::{col, lit};
+    use datafusion::logical_expr::{LogicalPlan, col, lit};
     use datafusion::physical_plan::union::UnionExec;
     use parquet::file::properties::WriterProperties;
     use wyrd_runtime::Principal;
@@ -4821,10 +4808,16 @@ mod tests {
     /// file's, and the decoded rows are exactly the matching rows. A
     /// high-cardinality column in the same recipe stays lossless after
     /// parquet-rs falls back off its dictionary.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture footer does not decode, when the file is not two
+    /// dictionary-encoded, Bloom-filtered groups, when the equality leaf does not
+    /// retain exactly the first group, when the retained bytes are not strictly
+    /// fewer than the file's, or when the decoded or high-cardinality rows differ
+    /// from what was written.
     #[test]
     fn dictionary_recipe_row_group_min_max_pruning_contract() {
-        use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
-
         const BLOCK_ROWS: i64 = 2_048;
 
         let schema: SchemaRef = Arc::new(Schema::new(vec![
@@ -4886,8 +4879,7 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the fixture batch cannot be built or encoded.
-    fn write_trace_id_fixture() -> (bytes::Bytes, Vec<Vec<[u8; 16]>>) {
-        use arrow::array::FixedSizeBinaryArray;
+    fn write_trace_id_fixture() -> (Bytes, Vec<Vec<[u8; 16]>>) {
         let schema: SchemaRef = Arc::new(Schema::new(vec![
             Field::new("trace_id", DataType::FixedSizeBinary(16), false),
             Field::new("score", DataType::Float64, false),
@@ -4948,9 +4940,9 @@ mod tests {
     ///
     /// Panics when the footer cannot be decoded.
     async fn in_memory_stream_builder(
-        published: &bytes::Bytes,
-    ) -> ParquetRecordBatchStreamBuilder<std::io::Cursor<Vec<u8>>> {
-        ParquetRecordBatchStreamBuilder::new(std::io::Cursor::new(published.to_vec()))
+        published: &Bytes,
+    ) -> ParquetRecordBatchStreamBuilder<Cursor<Vec<u8>>> {
+        ParquetRecordBatchStreamBuilder::new(Cursor::new(published.to_vec()))
             .await
             .expect("in-memory stream builder")
     }
@@ -4962,10 +4954,15 @@ mod tests {
     /// Bloom-negative in the written filter, so the assertion cannot flake on a
     /// false positive. Unsupported physical types and filterless columns build
     /// no probe and keep every group.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a group's Bloom filter cannot be read, when no Bloom-negative id
+    /// lies inside both groups' bounds, when statistics alone exclude a group, when
+    /// the Bloom probes keep a group for the absent id or drop the group holding a
+    /// present id, or when an unsupported or filterless probe drops any group.
     #[tokio::test]
     async fn hot_bloom_probes_exclude_an_absent_id_inside_statistics_bounds() {
-        use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
-
         let (published, groups) = write_trace_id_fixture();
         let mut builder = in_memory_stream_builder(&published).await;
         let metadata = Arc::clone(builder.metadata());
@@ -5049,10 +5046,13 @@ mod tests {
     /// Binary statistics and page bounds prune by unsigned byte order: a
     /// `Bytes` leaf outside a group's `FIXED_LEN_BYTE_ARRAY` min/max excludes
     /// it, and invalid UTF-8 bytes compare as bytes rather than failing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture footer does not decode or when a `Bytes` leaf
+    /// outside both groups' binary bounds retains either group.
     #[test]
     fn binary_min_max_prunes_fixed_len_row_groups() {
-        use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
-
         let (published, _) = write_trace_id_fixture();
         let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
             .parse_and_finish(&published)
@@ -5076,11 +5076,16 @@ mod tests {
     /// classifies as one lossless `Bytes` equality after `DataFusion` unwraps
     /// its coercion cast, materializes back as the column's own type, and a
     /// literal of the wrong width stays unsupported.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture table cannot be registered or planned, when the
+    /// optimized plan has no filter, when the binary equality does not classify as
+    /// one `Bytes` leaf, when it does not materialize as a 16-byte
+    /// `FixedSizeBinary` scalar, or when a literal of the wrong width is classified
+    /// as supported.
     #[tokio::test]
     async fn binary_sql_literal_classifies_as_lossless_bytes() {
-        use datafusion::logical_expr::LogicalPlan;
-        use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
-
         let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
             "trace_id",
             DataType::FixedSizeBinary(16),

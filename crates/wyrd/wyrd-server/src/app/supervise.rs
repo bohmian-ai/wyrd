@@ -9,6 +9,8 @@
 //! through [`restarting_worker`] instead: it never exits before shutdown, so
 //! its failure is restarted in place and never becomes the terminal error.
 
+use std::fmt::Display;
+use std::pin::Pin;
 use std::time::Duration;
 
 use tokio::task::JoinSet;
@@ -47,7 +49,7 @@ pub struct TaskExit {
 /// Wrap a `()`-producing future (worker/signal) into a `TaskExit`.
 pub async fn worker_task<F>(id: TaskId, fut: F) -> TaskExit
 where
-    F: std::future::Future<Output = ()> + Send + 'static,
+    F: Future<Output = ()> + Send + 'static,
 {
     fut.await;
     TaskExit {
@@ -59,8 +61,8 @@ where
 /// Wrap a `Result<(), E: Display>`-producing future (transport) into a `TaskExit`.
 pub async fn fallible_task<F, E>(id: TaskId, fut: F) -> TaskExit
 where
-    F: std::future::Future<Output = Result<(), E>> + Send + 'static,
-    E: std::fmt::Display,
+    F: Future<Output = Result<(), E>> + Send + 'static,
+    E: Display,
 {
     let outcome = fut.await.map_err(|e| e.to_string());
     TaskExit { id, outcome }
@@ -103,12 +105,12 @@ pub fn restarting_worker<B, F, E, BE, R>(
     shutdown: CancellationToken,
     mut build: B,
     mut on_restart: R,
-) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = TaskExit> + Send>>, BE>
+) -> Result<Pin<Box<dyn Future<Output = TaskExit> + Send>>, BE>
 where
     B: FnMut(CancellationToken) -> Result<F, BE> + Send + 'static,
-    F: std::future::Future<Output = Result<(), E>> + Send + 'static,
-    E: std::fmt::Display + Send + 'static,
-    BE: std::fmt::Display,
+    F: Future<Output = Result<(), E>> + Send + 'static,
+    E: Display + Send + 'static,
+    BE: Display,
     R: FnMut(Option<&E>, Duration) + Send + 'static,
 {
     // Boxed so the deep worker state machine stays out of this loop's layout.
@@ -210,7 +212,7 @@ pub async fn supervise_with_shutdown<F, Fut>(
 ) -> Option<String>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    Fut: Future<Output = ()>,
 {
     let terminal = classify_first_exit_with_shutdown(&mut set, &shutdown).await;
     let deadline = Instant::now() + drain;
@@ -269,7 +271,7 @@ pub async fn drain_with_shutdown<F, Fut>(
 ) -> bool
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    Fut: Future<Output = ()>,
 {
     drain_with_shutdown_hooks(set, shutdown, deadline, before_cancel, || async { false }).await
 }
@@ -289,9 +291,9 @@ pub async fn drain_with_shutdown_hooks<F, Fut, C, CFut>(
 ) -> bool
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    Fut: Future<Output = ()>,
     C: FnOnce() -> CFut,
-    CFut: std::future::Future<Output = bool>,
+    CFut: Future<Output = bool>,
 {
     match timeout_at(deadline, before_cancel()).await {
         Ok(()) => {}

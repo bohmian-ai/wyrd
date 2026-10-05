@@ -9,6 +9,7 @@
 //! row as `wyrd_ingested_at` and [`record`] stores the same value here.
 // raw-query grep allowlist: every statement is fixed and tenant-bound; `vala.scribe_batch_commits` post-dates the sqlx offline cache, so run `mise run sqlx:prepare` to promote them to macros.
 
+use chrono::{DateTime, Utc};
 use wyrd_spec::DataTenantId;
 
 use crate::{SqlError, TenantConn};
@@ -250,9 +251,7 @@ pub async fn resolve(
 /// # Errors
 ///
 /// Returns [`SqlError`] when PostgreSQL cannot execute the read.
-pub async fn ingest_instant(
-    conn: &mut TenantConn<'_>,
-) -> Result<chrono::DateTime<chrono::Utc>, SqlError> {
+pub async fn ingest_instant(conn: &mut TenantConn<'_>) -> Result<DateTime<Utc>, SqlError> {
     sqlx::query_scalar("SELECT statement_timestamp()")
         .fetch_one(&mut **conn.transaction())
         .await
@@ -280,7 +279,7 @@ pub async fn ingest_instant(
 pub async fn record(
     conn: &mut TenantConn<'_>,
     commit: &ScribeBatchCommit,
-    ingested_at: chrono::DateTime<chrono::Utc>,
+    ingested_at: DateTime<Utc>,
 ) -> Result<ScribeBatchCommitResolution, SqlError> {
     if conn.data_tenant_id() != commit.tenant {
         return Err(invariant(

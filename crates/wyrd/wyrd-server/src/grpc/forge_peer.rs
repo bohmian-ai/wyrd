@@ -88,6 +88,12 @@ impl ForgeLeaderPeerService for ForgeLeaderPeerGrpc {
     ///
     /// A coordinator that does not hold the named term answers
     /// `FailedPrecondition`; the sender drops the notice.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArgument` for a malformed tenant, table identity or
+    /// table setting, `FailedPrecondition` when this coordinator does not hold
+    /// the named leader term, and `Internal` for any other leader-side failure.
     async fn notify_promotion(
         &self,
         request: Request<NotifyForgePromotionRequest>,
@@ -105,6 +111,11 @@ impl ForgeLeaderPeerService for ForgeLeaderPeerGrpc {
     ///
     /// The response is the pull's acknowledgement; a coordinator that does
     /// not hold the named term answers `FailedPrecondition`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FailedPrecondition` when this coordinator does not hold the
+    /// named leader term and `Internal` for any other leader-side failure.
     async fn pull_compaction(
         &self,
         request: Request<PullForgeCompactionRequest>,
@@ -128,6 +139,12 @@ impl ForgeLeaderPeerService for ForgeLeaderPeerGrpc {
     /// Applies one remote compactor's report to the held term.
     ///
     /// A stale task identity is answered with `matched = false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArgument` for a malformed table key, task id or outcome,
+    /// `FailedPrecondition` when this coordinator does not hold the named
+    /// leader term, and `Internal` for any other leader-side failure.
     async fn report_compaction(
         &self,
         request: Request<ReportForgeCompactionRequest>,

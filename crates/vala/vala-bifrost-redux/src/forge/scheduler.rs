@@ -5,12 +5,16 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(feature = "test-support")]
+use tokio::sync::Notify;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::error::ForgeError;
 use super::leadership::{ForgeHeldTerm, LEADER_HEARTBEAT};
-use super::{Forge, ForgeWorker, ForgeWorkerConfig};
+use super::{Forge, ForgeRoleReadiness, ForgeWorker, ForgeWorkerConfig};
+use crate::catalog::TenantTableBinding;
 use crate::maintenance::StagingFileCommitted;
 
 /// Test-tier control and observation for a supervised production scheduler loop.
@@ -21,13 +25,13 @@ use crate::maintenance::StagingFileCommitted;
 #[cfg(feature = "test-support")]
 pub struct ForgeSchedulerTrigger {
     /// Wakeup consumed by the production supervisor select loop.
-    requested: Arc<tokio::sync::Notify>,
+    requested: Arc<Notify>,
     /// Wakeup consumed by the leader maintenance timer loop.
-    maintenance: Arc<tokio::sync::Notify>,
+    maintenance: Arc<Notify>,
     /// Completed scheduler passes observed after their durable result returns.
     completed: Arc<AtomicUsize>,
     /// Wakeup for deterministic test waits on completed passes.
-    completed_ready: Arc<tokio::sync::Notify>,
+    completed_ready: Arc<Notify>,
     /// Optional stable scheduler owner shared across reconstructed test supervisors.
     #[cfg(feature = "test-support")]
     owner: Arc<std::sync::Mutex<Option<Uuid>>>,
@@ -131,7 +135,7 @@ enum ForgeSweep {
 ///
 /// Every exit — clean shutdown, construction failure, or an unwind — runs the
 /// same clear, so no path can leave a stopped role advertising itself.
-struct ForgeReadinessGuard(super::ForgeRoleReadiness);
+struct ForgeReadinessGuard(ForgeRoleReadiness);
 
 impl Drop for ForgeReadinessGuard {
     fn drop(&mut self) {
@@ -166,7 +170,7 @@ impl Forge {
     pub async fn run(
         self: &Arc<Self>,
         shutdown: CancellationToken,
-        readiness: super::ForgeRoleReadiness,
+        readiness: ForgeRoleReadiness,
     ) -> Result<(), ForgeError> {
         let _guard = self.acquire_run_guard()?;
         // Cleared whenever this loop stops for any reason, so routing closes
@@ -189,7 +193,7 @@ impl Forge {
             .is_some();
         #[cfg(not(feature = "test-support"))]
         let quiet = false;
-        let (sweeps, requested) = tokio::sync::mpsc::unbounded_channel();
+        let (sweeps, requested) = unbounded_channel();
         tokio::join!(
             self.renew(&shutdown, &readiness, &sweeps, quiet),
             self.supervise(&executor, &shutdown, &readiness, requested, quiet),
@@ -218,8 +222,8 @@ impl Forge {
     async fn renew(
         &self,
         shutdown: &CancellationToken,
-        readiness: &super::ForgeRoleReadiness,
-        sweeps: &tokio::sync::mpsc::UnboundedSender<ForgeSweep>,
+        readiness: &ForgeRoleReadiness,
+        sweeps: &UnboundedSender<ForgeSweep>,
         quiet: bool,
     ) {
         let now = tokio::time::Instant::now();
@@ -254,7 +258,7 @@ impl Forge {
     async fn renew_term(
         &self,
         shutdown: &CancellationToken,
-        readiness: &super::ForgeRoleReadiness,
+        readiness: &ForgeRoleReadiness,
     ) -> bool {
         match self.leadership.heartbeat(shutdown).await {
             Ok(acquired) => {
@@ -280,8 +284,8 @@ impl Forge {
         &self,
         executor: &ForgeWorker,
         shutdown: &CancellationToken,
-        readiness: &super::ForgeRoleReadiness,
-        mut requested: tokio::sync::mpsc::UnboundedReceiver<ForgeSweep>,
+        readiness: &ForgeRoleReadiness,
+        mut requested: UnboundedReceiver<ForgeSweep>,
         quiet: bool,
     ) {
         let mut heartbeat = tokio::time::interval_at(
@@ -353,7 +357,7 @@ impl Forge {
     async fn promote_hinted(
         &self,
         executor: &ForgeWorker,
-        binding: crate::catalog::TenantTableBinding,
+        binding: TenantTableBinding,
         stop: &CancellationToken,
     ) {
         let promoted = match vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity::new(
@@ -380,7 +384,7 @@ impl Forge {
         &self,
         executor: &ForgeWorker,
         shutdown: &CancellationToken,
-        readiness: &super::ForgeRoleReadiness,
+        readiness: &ForgeRoleReadiness,
     ) {
         let span = tracing::info_span!(
             "bifrost.forge.scheduler.pass",

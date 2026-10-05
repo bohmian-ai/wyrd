@@ -15,7 +15,9 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use iceberg::spec::{DataFile, NestedField, Schema, Type};
 use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::schema::types;
 
 use crate::parquet::footer::footer_schema_fingerprint;
 use crate::scribe::promotion::ScribeDataFileV1;
@@ -28,7 +30,7 @@ use crate::scribe::promotion::ScribeDataFileV1;
 /// discovering that here keeps it out of the manifest.
 pub struct PromotedObjectFooter {
     /// Iceberg projection of the object's own footer.
-    data_file: iceberg::spec::DataFile,
+    data_file: DataFile,
     /// Lowercase hex Wyrd schema fingerprint the footer carries.
     schema_fingerprint: String,
 }
@@ -53,7 +55,7 @@ impl PromotedObjectFooter {
     pub fn decode(
         bytes: &Bytes,
         object_key: &str,
-        table_schema: Arc<iceberg::spec::Schema>,
+        table_schema: Arc<Schema>,
         file_size: u64,
     ) -> Result<Self, String> {
         let length = u64::try_from(bytes.len())
@@ -115,7 +117,7 @@ impl PromotedObjectFooter {
 
     /// Borrows the Iceberg projection of the object's own footer.
     #[must_use]
-    pub fn data_file(&self) -> &iceberg::spec::DataFile {
+    pub fn data_file(&self) -> &DataFile {
         &self.data_file
     }
 }
@@ -129,10 +131,7 @@ impl PromotedObjectFooter {
 /// # Errors
 ///
 /// Returns a description naming the first column whose id disagrees.
-fn verify_registered_field_ids(
-    root: &parquet::schema::types::Type,
-    table_schema: &iceberg::spec::Schema,
-) -> Result<(), String> {
+fn verify_registered_field_ids(root: &types::Type, table_schema: &Schema) -> Result<(), String> {
     for column in root.get_fields() {
         let registered = table_schema.field_by_name(column.name()).ok_or_else(|| {
             format!(
@@ -156,12 +155,7 @@ fn verify_registered_field_ids(
 ///
 /// Returns a description naming the node whose id is missing or differs, or
 /// whose nesting does not match the table field's type.
-fn verify_field_id(
-    node: &parquet::schema::types::Type,
-    registered: &iceberg::spec::NestedField,
-) -> Result<(), String> {
-    use iceberg::spec::Type;
-
+fn verify_field_id(node: &types::Type, registered: &NestedField) -> Result<(), String> {
     let info = node.get_basic_info();
     if !info.has_id() || info.id() != registered.id {
         return Err(format!(
@@ -210,10 +204,17 @@ fn verify_field_id(
 
 #[cfg(test)]
 mod tests {
+    use arrow::datatypes::Schema;
+    use parquet::schema::types::TypePtr;
+
     use super::*;
 
     /// Convert one Arrow schema to the Parquet schema the Arrow writer emits.
-    fn parquet_root(schema: &arrow::datatypes::Schema) -> parquet::schema::types::TypePtr {
+    ///
+    /// # Panics
+    ///
+    /// Panics when the Arrow schema has no Parquet projection.
+    fn parquet_root(schema: &Schema) -> TypePtr {
         parquet::arrow::ArrowSchemaConverter::new()
             .convert(schema)
             .expect("the schema has a Parquet projection")

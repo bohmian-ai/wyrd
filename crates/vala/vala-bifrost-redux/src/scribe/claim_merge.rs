@@ -450,6 +450,11 @@ mod tests {
     /// Rows are given as `(event_time, value)` so a test can place an exact
     /// tie on `wyrd_event_time` and name each row in the merged output by its
     /// `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the rows cannot form a batch under the merge schema or when the
+    /// Parquet file cannot be created, written, or closed.
     fn write_run(directory: &Path, name: &str, rows: &[(i64, i32)]) -> PathBuf {
         let schema = merge_schema();
         let times = TimestampMicrosecondArray::from_iter_values(rows.iter().map(|row| row.0));
@@ -467,6 +472,11 @@ mod tests {
     }
 
     /// Drains a merge into the exact `(event_time, value)` order it emitted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the merge fails to produce a batch or when a merged batch's
+    /// columns are not the expected timestamp and `Int32` arrays.
     fn drain(merge: &mut StagedRunMerge) -> Vec<(i64, i32)> {
         let mut merged = Vec::new();
         while let Some(batch) = merge.next_batch().expect("merged batch") {
@@ -492,6 +502,12 @@ mod tests {
     /// dropped or
     /// duplicated, and re-running the same claim over the same runs reproduces
     /// the identical sequence.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture run cannot be written, when the merge cannot open,
+    /// when the merged order differs from layout order with run-then-position tie
+    /// breaking, or when a different batch size changes the sequence.
     #[test]
     fn merged_runs_leave_in_one_total_deterministic_order() {
         let directory = tempfile::tempdir().expect("merge fixture root");
@@ -540,6 +556,12 @@ mod tests {
     /// A run encoded under a different physical schema is refused at open:
     /// merging it would put rows into an object whose footer claims the claim's
     /// schema fingerprint.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture run cannot be written, when the merge opens under
+    /// the foreign schema, or when the refusal does not name the physical schema
+    /// disagreement.
     #[test]
     fn a_run_under_another_schema_is_refused() {
         let directory = tempfile::tempdir().expect("merge fixture root");

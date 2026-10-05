@@ -179,6 +179,11 @@ fn test_principal(tenant: DataTenantId) -> Principal {
 /// tenant, the Gate-owned allow/success audit event, the projected `value`-only
 /// source fingerprint (`wyrd_event_time` is server-managed and never part of
 /// schema identity), and the measured wire size.
+///
+/// # Panics
+///
+/// Panics if the composed server exposes no Bifrost catalog or Scribe, if
+/// dataset registration fails, or if Scribe does not admit both rows.
 async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
     let rows = non_empty_tail_batch();
     let principal = test_principal(tenant);

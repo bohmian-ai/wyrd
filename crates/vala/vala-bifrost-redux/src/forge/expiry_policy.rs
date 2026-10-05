@@ -221,10 +221,15 @@ mod tests {
     }
 
     /// Builds the policy under test with one shared geometry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the policy's [`ForgeError::SnapshotExpiry`] when `roots` carry a
+    /// watermark the fixture history cannot corroborate.
     fn decide(
         ref_heads: &[i64],
         roots: &SnapshotProtectionRoots,
-    ) -> Result<SnapshotExpiryDecision, crate::forge::error::ForgeError> {
+    ) -> Result<SnapshotExpiryDecision, ForgeError> {
         decide_from(Some(40), ref_heads, roots)
     }
 
@@ -233,11 +238,16 @@ mod tests {
     /// Removing the current snapshot is its own root: a table with no current
     /// snapshot protects nothing through it, which is only visible when the
     /// geometry can be decided both ways.
+    ///
+    /// # Errors
+    ///
+    /// Returns the policy's [`ForgeError::SnapshotExpiry`] when `roots` carry a
+    /// watermark the fixture history cannot corroborate.
     fn decide_from(
         current_snapshot_id: Option<i64>,
         ref_heads: &[i64],
         roots: &SnapshotProtectionRoots,
-    ) -> Result<SnapshotExpiryDecision, crate::forge::error::ForgeError> {
+    ) -> Result<SnapshotExpiryDecision, ForgeError> {
         SnapshotExpiryPolicy {
             snapshots: &history(),
             current_snapshot_id,
@@ -343,6 +353,12 @@ mod tests {
     /// read refuses the whole expiration at preparation rather than protecting
     /// individual snapshots, and no live-tail case because a v1 live-tail lease
     /// names no Forge-collectable object.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a case fails to decide, when a root no longer protects its
+    /// snapshot, or when removing that root alone does not make the snapshot
+    /// eligible.
     #[test]
     fn snapshot_expiry_root_mutation_matrix() {
         // Baseline: with no protection beyond the current head, every replaced

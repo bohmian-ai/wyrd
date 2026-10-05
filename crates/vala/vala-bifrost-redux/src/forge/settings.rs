@@ -12,7 +12,11 @@
 //! decides.
 
 use std::collections::HashMap;
+use std::fmt::Display;
+use std::str::FromStr;
 use std::time::Duration;
+
+use wyrd_spec::vala::api::CompactionTypeWire;
 
 use super::error::ForgeError;
 
@@ -93,10 +97,9 @@ impl ForgeCompactionType {
     }
 }
 
-impl From<wyrd_spec::vala::api::CompactionTypeWire> for ForgeCompactionType {
+impl From<CompactionTypeWire> for ForgeCompactionType {
     /// Maps a registration's wire type onto the type a worker plans with.
-    fn from(wire: wyrd_spec::vala::api::CompactionTypeWire) -> Self {
-        use wyrd_spec::vala::api::CompactionTypeWire;
+    fn from(wire: CompactionTypeWire) -> Self {
         match wire {
             CompactionTypeWire::Auto => Self::Auto,
             CompactionTypeWire::Full => Self::Full,
@@ -106,7 +109,7 @@ impl From<wyrd_spec::vala::api::CompactionTypeWire> for ForgeCompactionType {
     }
 }
 
-impl From<ForgeCompactionType> for wyrd_spec::vala::api::CompactionTypeWire {
+impl From<ForgeCompactionType> for CompactionTypeWire {
     /// Maps a stored type back onto the wire spelling a description reports.
     fn from(kind: ForgeCompactionType) -> Self {
         match kind {
@@ -247,8 +250,8 @@ impl ForgeTableSettings {
 /// Returns [`ForgeError::InvalidConfig`] when the present value does not parse.
 fn parse_or<T>(properties: &HashMap<String, String>, key: &str, default: T) -> Result<T, ForgeError>
 where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
+    T: FromStr,
+    T::Err: Display,
 {
     properties.get(key).map_or(Ok(default), |raw| {
         raw.parse().map_err(|error| ForgeError::InvalidConfig {

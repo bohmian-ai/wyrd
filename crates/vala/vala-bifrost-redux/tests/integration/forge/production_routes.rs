@@ -13,7 +13,7 @@ use uuid::Uuid;
 use vala_bifrost_redux::forge::{
     DEFAULT_REPORT_TIMEOUT, Forge, ForgeClock, ForgeCommitNotice, ForgeCompactionDispatch,
     ForgeCompactionOutcome, ForgeCompactionType, ForgeObjectStore, ForgeRoleReadiness,
-    ForgeSchedulerTrigger, ForgeTableKey, ForgeTableSettings, ForgeWorker,
+    ForgeSchedulerTrigger, ForgeTableKey, ForgeTableSettings, ForgeTrackView, ForgeWorker,
     ForgeWorkerCompletionObserver, ForgeWorkerConfig,
 };
 use vala_sql::queries::forge_tasks::ForgeTasks;
@@ -88,6 +88,12 @@ async fn fragmented_table(name: &str, properties: &[(&str, &str)]) -> ExpirableT
 /// head. Had expiry run first, the pre-pass head would have been current at
 /// expiry and survived. A retained member whose table does not exist fails in
 /// the same pass without stopping the real table's maintenance.
+///
+/// # Panics
+///
+/// Panics when the missing-table identity is invalid, the head was not
+/// fragmented, the pass did not commit one merged `replace` manifest, or
+/// expiry did not retire the pre-pass head.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Postgres, Iceberg, and object storage"]
 async fn leader_timer_rewrites_manifests_before_expiry() {
@@ -135,6 +141,11 @@ async fn leader_timer_rewrites_manifests_before_expiry() {
 ///
 /// Snapshot expiry is on by default, so the same pass still retires the aged
 /// ancestors of the unchanged head.
+///
+/// # Panics
+///
+/// Panics when the pass committed a rewrite, changed the manifest count, or
+/// retired no aged ancestor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Postgres, Iceberg, and object storage"]
 async fn leader_timer_skips_manifest_rewrite_when_disabled() {
@@ -149,6 +160,11 @@ async fn leader_timer_skips_manifest_rewrite_when_disabled() {
 }
 
 /// A format-v3 table is skipped by manifest rewrite, as `RisingWave` does.
+///
+/// # Panics
+///
+/// Panics when the table cannot be loaded or upgraded to format v3, or when
+/// the pass committed a rewrite or changed the manifest count.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Postgres, Iceberg, and object storage"]
 async fn leader_timer_skips_manifest_rewrite_on_format_v3() {
@@ -180,6 +196,11 @@ async fn leader_timer_skips_manifest_rewrite_on_format_v3() {
 }
 
 /// Builds the validated logical identity of the fixture's one table.
+///
+/// # Panics
+///
+/// Panics when the fixture namespace and table name do not form a valid
+/// Forge task table identity.
 fn identity(fixture: &PromotionIntegrationFixture) -> ForgeTaskTableIdentity {
     ForgeTaskTableIdentity::new(
         "wyrd-redux",
@@ -283,6 +304,12 @@ async fn advance_routes(table: &mut ExpirableTable) {
 /// produced its own durable task, which is only reachable when each strategy is
 /// admitted, dispatched to its own owner, and settled without borrowing another
 /// strategy's effect.
+///
+/// # Panics
+///
+/// Panics when a route never owns or settles its own task, two routes share
+/// a task identity, expiry evidence is unreadable, or an expiration deleted
+/// candidates instead of handing them off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Postgres, Iceberg, and object storage"]
 async fn four_strategies_schedule_dispatch_and_settle_independently() {
@@ -2003,7 +2030,7 @@ async fn snapshot_count(fixture: &PromotionIntegrationFixture) -> usize {
 fn track(
     supervisor: &SupervisedPromotion,
     fixture: &PromotionIntegrationFixture,
-) -> vala_bifrost_redux::forge::ForgeTrackView {
+) -> ForgeTrackView {
     let key = ForgeTableKey {
         tenant: fixture.tenant,
         table: identity(fixture),

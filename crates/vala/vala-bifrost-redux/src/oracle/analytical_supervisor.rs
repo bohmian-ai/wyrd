@@ -1419,10 +1419,24 @@ mod tests {
     use wyrd_spec::vala::api::QueryClass;
 
     use super::*;
+    #[cfg(feature = "test-support")]
+    use crate::oracle::analytical::{
+        AnalyticalGraphLifecycle, AnalyticalGraphLifecycleOwners, AnalyticalGraphMetricFold,
+    };
     use crate::resources::{
         BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, OracleResourceRequest,
         OracleResources, ResourceSource, SystemResourceSnapshot,
     };
+    #[cfg(feature = "test-support")]
+    use datafusion::common::Result as DataFusionResult;
+    #[cfg(feature = "test-support")]
+    use datafusion::physical_plan::ExecutionPlan;
+    #[cfg(feature = "test-support")]
+    use futures_util::future::BoxFuture;
+    #[cfg(feature = "test-support")]
+    use tokio::time::Instant;
+    #[cfg(feature = "test-support")]
+    use wyrd_spec::vala::api::{AnalyticalGraphRef, QueryId, ReserveNodeSlotsRequest};
 
     /// Bytes each fixture attempt charges as its exchange-buffer child.
     const FIXTURE_EXCHANGE_BYTES: usize = 64 * 1024;
@@ -1523,17 +1537,9 @@ mod tests {
         graph: AnalyticalGraphKey,
         resources: OracleQueryResources,
         runtime: OracleExecution,
-        deadline: tokio::time::Instant,
-        fold: futures_util::future::BoxFuture<
-            'static,
-            datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
-        >,
-    ) -> super::super::analytical::AnalyticalGraphLifecycle {
-        use super::super::analytical::{
-            AnalyticalGraphLifecycle, AnalyticalGraphLifecycleOwners, AnalyticalGraphMetricFold,
-        };
-        use wyrd_spec::vala::api::{AnalyticalGraphRef, QueryId, ReserveNodeSlotsRequest};
-
+        deadline: Instant,
+        fold: BoxFuture<'static, DataFusionResult<Arc<dyn ExecutionPlan>>>,
+    ) -> AnalyticalGraphLifecycle {
         let graph_guard = supervisor
             .register_graph(graph, resources, runtime)
             .map_err(|(_, error)| error)

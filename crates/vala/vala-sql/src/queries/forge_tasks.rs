@@ -828,6 +828,11 @@ impl ForgeTasks {
     ///
     /// # Cancellation
     /// Caller-owned rollback removes the cancellation.
+    ///
+    /// # Panics
+    ///
+    /// Never panics in practice: the attempt and owner are unwrapped only after
+    /// the conflict check above has returned early when either is absent.
     pub async fn cancel_superseded(
         &self,
         conn: &mut TenantConn<'_>,

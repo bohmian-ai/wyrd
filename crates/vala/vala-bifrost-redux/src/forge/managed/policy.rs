@@ -578,6 +578,8 @@ fn declared_bytes(
 
 #[cfg(test)]
 mod tests {
+    use SelectionStrategyKind::{UpstreamFilesWithDeletes, UpstreamSmallFiles};
+
     use super::*;
 
     /// Builds table metadata carrying an explicit Forge geometry.
@@ -641,6 +643,13 @@ mod tests {
     /// file geometry without any operator asking for it. An undeclared table
     /// falls back to the deployment file target — 1 GiB unless the operator
     /// moved it, never Iceberg's 512 MiB — and the Iceberg row-group default.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a declared geometry is refused, when either declared target
+    /// is altered or conflated on its way to the selection policy or execution
+    /// configuration, or when an undeclared table misses the deployment and
+    /// Iceberg defaults.
     #[test]
     fn forge_table_policy_preserves_declared_target_geometry() {
         let metadata = metadata_with(vec![
@@ -794,6 +803,11 @@ mod tests {
     /// and a data location that is not the registered recipe location. Each is
     /// a condition under which an admitted attempt could only produce wrong or
     /// no work, so the refusal belongs at extraction rather than mid-rewrite.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any impossible geometry is admitted or refused with a
+    /// different error, or when the smallest registrable target is refused.
     #[test]
     fn forge_table_policy_rejects_impossible_geometry() {
         assert!(matches!(
@@ -947,7 +961,6 @@ mod tests {
     /// delete-first order departs from upstream.
     #[test]
     fn auto_candidates_follow_upstream_thresholds_and_delete_first_order() {
-        use SelectionStrategyKind::{UpstreamFilesWithDeletes, UpstreamSmallFiles};
         assert!(
             auto_candidates(1, 1, 1).is_empty(),
             "one file plans nothing"

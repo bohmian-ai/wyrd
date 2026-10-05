@@ -3889,7 +3889,7 @@ impl ForgeWorker {
     pub async fn promote_for_test(
         &self,
         tenant: DataTenantId,
-        table_ref: &vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity,
+        table_ref: &ForgeTaskTableIdentity,
         shutdown: &CancellationToken,
     ) -> Result<bool, ForgeError> {
         self.forge
@@ -9127,9 +9127,10 @@ fn task_progress_effect(
 ///
 /// Held for the whole `run` body so quarantine, registration failure, a slot
 /// failure, and an unwind all clear readiness on the same path.
-struct ForgeWorkerReadinessGuard(super::ForgeRoleReadiness);
+struct ForgeWorkerReadinessGuard(ForgeRoleReadiness);
 
 impl Drop for ForgeWorkerReadinessGuard {
+    /// Publishes not-ready, which also covers a stop by panic unwind.
     fn drop(&mut self) {
         publish_worker_readiness(&self.0, false);
     }
@@ -9139,7 +9140,7 @@ impl Drop for ForgeWorkerReadinessGuard {
 ///
 /// The gauge reads the bit back after publishing rather than echoing `ready`,
 /// so a role the shutdown owner already closed reports not ready.
-fn publish_worker_readiness(readiness: &super::ForgeRoleReadiness, ready: bool) {
+fn publish_worker_readiness(readiness: &ForgeRoleReadiness, ready: bool) {
     readiness.publish(ready);
     ForgeTelemetry::record_worker_ready(readiness.is_ready());
 }

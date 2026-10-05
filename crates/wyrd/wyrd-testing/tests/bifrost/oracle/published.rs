@@ -67,6 +67,11 @@ async fn published_cache_pruning_and_shutdown_are_production_governed() {
 ///
 /// Returns a client, Postgres, ingest, Forge-scheduling, telemetry, or
 /// cluster-lifecycle error surfaced by any phase.
+///
+/// # Panics
+///
+/// Panics when a phase's observation does not hold: tenant-isolated reads,
+/// metadata-cache and pruning counters, or settled shutdown reports.
 async fn prove_published_governance() -> Result<(), JourneyError> {
     // Forge promotes each Scribe flush to Iceberg as soon as it is published
     // (REQ-002), but phases 1-3 and 5 observe hot objects. The pod's Forge

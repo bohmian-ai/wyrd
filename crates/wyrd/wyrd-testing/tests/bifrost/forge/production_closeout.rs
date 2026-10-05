@@ -2350,6 +2350,9 @@ impl LeaderJourney {
     }
 
     /// Builds the leader's key for one journey table.
+    ///
+    /// # Panics
+    /// Panics if the journey table name is not a valid Forge table identity.
     fn key(&self, table: &JourneyTable) -> ForgeTableKey {
         ForgeTableKey {
             tenant: self.tenant,

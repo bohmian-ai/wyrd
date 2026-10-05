@@ -1,3 +1,6 @@
+//! Postgres-backed `vala-sql` integration tests; the proofs live in `pg_tests` so
+//! the credential-free lanes can skip them by module name.
+
 mod pg_tests {
     //! SQL integration tests for `vala.forge_operation_state`.
     //!
@@ -32,7 +35,7 @@ mod pg_tests {
             ForgeExpirationSettlementRequest, ForgeOperationFamily, ForgeOperationTransition,
         };
         use vala_sql::row_types::forge_tasks::ForgeTaskEvidence;
-        use vala_sql::{SqlError, TenantConn};
+        use vala_sql::{OperatorPool, SqlError, TenantConn};
 
         // -----------------------------------------------------------------------
         // Fixture and helpers
@@ -1663,7 +1666,7 @@ mod pg_tests {
         async fn prepare_expiration_exclusively(
             app: &PgPool,
             ops: &ForgeOperations<'_>,
-            operator: &vala_sql::OperatorPool,
+            operator: &OperatorPool,
             tenant: DataTenantId,
             request: &ForgeExpirationPreparation<'_>,
         ) -> Result<ForgeOperationTransition, SqlError> {

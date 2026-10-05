@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use chrono::Duration as ChronoDuration;
+use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::TenantTableBinding;
@@ -388,6 +389,19 @@ async fn assert_self_exemption_is_exact(
     clippy::too_many_arguments,
     reason = "the gate proof observes the whole live drain context and owns no state of its own"
 )]
+/// Asserts every durable gate a paused cleanup candidate must hold.
+///
+/// Runs while the first candidate's reachability stat is suspended, after
+/// the preparation committed and before any deletion: the preparation is
+/// committed under the held table authority, the prepared candidate
+/// excludes competing Forge claims, and the self-exemption names exactly
+/// this cleanup attempt.
+///
+/// # Panics
+///
+/// Panics when the preparation is not visible under the held authority, a
+/// competing claim is admitted, or the self-exemption does not match the
+/// cleanup, attempt, and candidate.
 async fn assert_paused_candidate_gates(
     table: &ExpirableTable,
     worker: &ForgeWorker,
@@ -489,6 +503,21 @@ async fn assert_cross_table_plan_is_refused(
     release_cleanup_claim(&table.fixture, cleanup_id).await;
 }
 
+/// Proves a prepared cleanup candidate gates readers and competing claims.
+///
+/// A persisted cross-table plan is refused first. The cleanup claim then
+/// excludes a second Forge claim for the table, and with the first deletion
+/// paused the candidate's durable gates hold while a racing reader waits on
+/// the exclusive authority and commits its cut only after the delete. The
+/// drain succeeds with every candidate deleted once and an empty prepared
+/// frontier.
+///
+/// # Panics
+///
+/// Panics when the cleanup task is not claimable, a second claim is
+/// admitted, the racing reader commits before the delete, the drain fails,
+/// or the final cursor, delete count, or object absence differ from one
+/// deletion per candidate.
 #[tokio::test]
 async fn candidate_preparation_releases_sql_and_blocks_active_reads_and_competing_forge_claims() {
     let _telemetry = ForgeTelemetryCheckpoint::install();
@@ -609,11 +638,16 @@ async fn candidate_preparation_releases_sql_and_blocks_active_reads_and_competin
 ///
 /// Keeps the durable owner assertion out of the scenario body so the replay
 /// sequence stays one readable narrative.
+///
+/// # Panics
+///
+/// Panics when the second worker cannot be built, when it is allowed to drain
+/// the claim, or when the task row no longer names the original owner.
 async fn assert_foreign_takeover_is_refused(
     table: &ExpirableTable,
     claim: &ForgeTaskClaim,
     cleanup_id: Uuid,
-    pool: &sqlx::PgPool,
+    pool: &PgPool,
 ) {
     let foreign = ForgeWorker::new(
         table.supervised.forge(),
@@ -689,7 +723,7 @@ async fn seed_extra_candidates(
 /// # Panics
 ///
 /// Panics when the update fails.
-pub(super) async fn expire_claim(pool: &sqlx::PgPool, task_id: Uuid) {
+pub(super) async fn expire_claim(pool: &PgPool, task_id: Uuid) {
     sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 hour' WHERE task_id=$1")
         .bind(task_id)
         .execute(pool)
@@ -702,7 +736,7 @@ pub(super) async fn expire_claim(pool: &sqlx::PgPool, task_id: Uuid) {
 /// # Panics
 ///
 /// Panics when the task is unreadable.
-async fn attempt_of(pool: &sqlx::PgPool, task_id: Uuid) -> Option<Uuid> {
+async fn attempt_of(pool: &PgPool, task_id: Uuid) -> Option<Uuid> {
     sqlx::query_scalar("SELECT attempt_id FROM vala.forge_tasks WHERE task_id = $1")
         .bind(task_id)
         .fetch_one(pool)
@@ -1277,7 +1311,7 @@ async fn refused_prepared_cleanup_retains_identity_and_replays_after_root_clears
 /// # Panics
 ///
 /// Panics when the task is unreadable.
-async fn retry_state(pool: &sqlx::PgPool, task_id: Uuid) -> (String, Option<String>, i32) {
+async fn retry_state(pool: &PgPool, task_id: Uuid) -> (String, Option<String>, i32) {
     sqlx::query_as(
         "SELECT state, failure_class, attempt_count FROM vala.forge_tasks WHERE task_id = $1",
     )

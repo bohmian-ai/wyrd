@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::time::Duration;
 
 use iceberg::Catalog;
+use uuid::Uuid;
+
+use leadership::ForgeLeadership;
 
 mod clock;
 pub(crate) mod compact;
@@ -184,7 +187,7 @@ pub struct ForgeBuildConfig {
     /// which would leave planning stalled for that whole TTL. The
     /// identity must never be shared by two live processes, the same
     /// invariant the worker's claim owner already relies on.
-    pub scheduler_owner: uuid::Uuid,
+    pub scheduler_owner: Uuid,
     /// Concrete wall clock captured once by each Forge work batch.
     pub clock: ForgeClock,
     /// Optional test-only observer of successful supervised task completion.
@@ -206,7 +209,7 @@ pub struct Forge {
     /// Rejects a second directly supervised scheduler loop.
     running: AtomicBool,
     /// This coordinator's leader term, its volatile schedule, and notice routing.
-    leadership: leadership::ForgeLeadership,
+    leadership: ForgeLeadership,
 }
 
 /// Immutable dependency graph shared by one Forge owner.
@@ -269,7 +272,7 @@ impl Forge {
             .unwrap_or(build.scheduler_owner);
         #[cfg(not(feature = "test-support"))]
         let leader_owner = build.scheduler_owner;
-        let leadership = leadership::ForgeLeadership::new(
+        let leadership = ForgeLeadership::new(
             vala_sql::queries::forge_leader::ForgeLeaderElection::new(build.operator_pool.clone()),
             leader_owner,
         );
@@ -360,7 +363,7 @@ impl Forge {
         &self,
         fencing_token: i64,
         key: &ForgeTableKey,
-        task_id: uuid::Uuid,
+        task_id: Uuid,
         outcome: ForgeCompactionOutcome,
     ) -> Result<bool, ForgeError> {
         self.leadership.serve_report(

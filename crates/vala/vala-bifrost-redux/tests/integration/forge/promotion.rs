@@ -162,6 +162,12 @@ async fn scribe_promotion_integration_conflict_revalidates_before_retry() {
 /// instead fail every remaining attempt on the reopen refusal while the
 /// retryable task holds the table's promotion behind it. The production retry
 /// backoff is brought forward rather than slept through.
+///
+/// # Panics
+///
+/// Panics when the surviving conflict does not reset the operation, a later
+/// attempt fails on the reopen refusal, or the retry does not commit a
+/// second operation generation beside the closed reset one.
 #[tokio::test]
 async fn scribe_promotion_integration_reset_operation_retries_under_fresh_operation() {
     let fixture = PromotionIntegrationFixture::start("promotion_reset_retry").await;
@@ -285,6 +291,11 @@ async fn scribe_promotion_integration_deadline_expires_before_conflict_retry() {
 /// attempt and its lease while leaving the operation Prepared: settling it
 /// either way would claim knowledge the worker does not have, and holding the
 /// lease would leak the owner past its own shutdown.
+///
+/// # Panics
+///
+/// Panics when the drained operation is not left `prepared`, the drained
+/// attempt keeps its lease, or any settlement is recorded.
 #[tokio::test]
 async fn scribe_promotion_integration_cancellation_drains_without_settlement() {
     let fixture = PromotionIntegrationFixture::start("promotion_drain").await;

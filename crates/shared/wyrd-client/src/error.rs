@@ -423,6 +423,11 @@ mod tests {
     }
 
     /// Bifrost-specific codes retain their typed status instead of becoming upstream failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any Bifrost problem code maps to a status or code other than
+    /// the one it carried on the wire.
     #[test]
     fn bifrost_grpc_codes_keep_their_wire_status() {
         let not_found = from_problem_json(&serde_json::json!({

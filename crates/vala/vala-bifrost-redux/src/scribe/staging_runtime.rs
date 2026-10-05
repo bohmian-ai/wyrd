@@ -19,11 +19,15 @@
 //! thread that a caller expected to keep responsive.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use arrow::datatypes::SchemaRef;
 use chrono::{DateTime, Utc};
+use tokio::sync::Notify;
+use tokio::sync::futures::Notified;
+use vala_sql::OperatorPool;
 
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::PhysicalLayout;
@@ -36,7 +40,8 @@ use crate::scribe::claim_assembly::{
     AssembleClaimRequest, AssembledClaim, ClaimAssembler, ClaimRuns,
 };
 use crate::scribe::claim_publication::{ClaimPublisher, PublishClaimRequest, PublishedClaim};
-use crate::scribe::hot_stage::ScribeHotStage;
+use crate::scribe::hot_source::ScribeHotSourceRegistry;
+use crate::scribe::hot_stage::{ScribeHotStage, StagedMember, StagedMemberState};
 use crate::scribe::member_stager::{ScribeMemberStager, StageMemberRequest, StagedRuns};
 use crate::scribe::seal_key::ScribeClaimIdentity;
 use crate::scribe::stream_identity::StreamIdentity;
@@ -113,7 +118,7 @@ struct ClaimDrivers {
     /// Identities of the claims currently held by a [`DrivenClaim`].
     driven: Mutex<HashSet<StagingClaimId>>,
     /// Wakes every publisher waiting for a claim slot when a drive ends.
-    released: tokio::sync::Notify,
+    released: Notify,
 }
 
 impl ClaimDrivers {
@@ -172,7 +177,8 @@ pub struct DrivenClaim {
     drivers: Arc<ClaimDrivers>,
 }
 
-impl std::ops::Deref for DrivenClaim {
+impl Deref for DrivenClaim {
+    /// The outstanding claim this drive grants the right to publish.
     type Target = StagingClaim;
 
     /// Exposes the driven claim's identity, key, and members.
@@ -211,7 +217,7 @@ pub struct ScribeStagingRuntime {
     /// Staging and publication are the two moments a generation's rows change
     /// hands, so this owner is what moves the authority forward. A fixture
     /// runtime built without a pod tracks no authority and none is asked of it.
-    hot_sources: Option<Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>>,
+    hot_sources: Option<Arc<ScribeHotSourceRegistry>>,
     /// Read-only record of which shards contributed to each published claim.
     ///
     /// Neither the `file_list` row nor its promotion record names the shard
@@ -266,10 +272,7 @@ impl ScribeStagingRuntime {
     /// every member it makes durable hands its generation's authority over from
     /// the memtable in the same step that makes the rows survivable.
     #[must_use]
-    pub fn with_hot_sources(
-        mut self,
-        hot_sources: Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>,
-    ) -> Self {
+    pub fn with_hot_sources(mut self, hot_sources: Arc<ScribeHotSourceRegistry>) -> Self {
         self.publisher.set_hot_sources(Arc::clone(&hot_sources));
         self.hot_sources = Some(hot_sources);
         self
@@ -539,7 +542,7 @@ impl ScribeStagingRuntime {
     ///
     /// A publisher that found every claim slot held creates this *before* it
     /// asks for a claim, so a release racing that request still wakes it.
-    pub fn claim_released(&self) -> tokio::sync::futures::Notified<'_> {
+    pub fn claim_released(&self) -> Notified<'_> {
         self.drivers.released.notified()
     }
 
@@ -606,7 +609,7 @@ impl ScribeStagingRuntime {
     /// recovered or validated, a member's binding, schema, or recipe cannot be
     /// reconstructed, the recovered layout contradicts the key, the ready index
     /// refuses a duplicate member.
-    pub async fn restore(&self, pool: &vala_sql::OperatorPool) -> Result<usize, ScribeError> {
+    pub async fn restore(&self, pool: &OperatorPool) -> Result<usize, ScribeError> {
         let recovered = self
             .stage
             .recover()
@@ -617,10 +620,7 @@ impl ScribeStagingRuntime {
         let mut restored = 0;
         for (key, members) in recovered {
             self.restore_authorities(&key, &members)?;
-            let records = members
-                .iter()
-                .map(crate::scribe::hot_stage::StagedMember::record)
-                .collect::<Vec<_>>();
+            let records = members.iter().map(StagedMember::record).collect::<Vec<_>>();
             let terminal = self
                 .publisher
                 .recover_terminal_members(&key, &records)
@@ -672,7 +672,7 @@ impl ScribeStagingRuntime {
     fn restore_authorities(
         &self,
         key: &ScribeAssemblyKey,
-        members: &[crate::scribe::hot_stage::StagedMember],
+        members: &[StagedMember],
     ) -> Result<(), ScribeError> {
         let Some(hot_sources) = &self.hot_sources else {
             return Ok(());
@@ -686,11 +686,11 @@ impl ScribeStagingRuntime {
             let id = member.record().member();
             let wal = member.record().wal_range();
             let authority = match member.record().state() {
-                crate::scribe::hot_stage::StagedMemberState::Published {
+                StagedMemberState::Published {
                     published_object_identities,
                     ..
                 }
-                | crate::scribe::hot_stage::StagedMemberState::CleanupPending {
+                | StagedMemberState::CleanupPending {
                     published_object_identities,
                     ..
                 } => {
@@ -704,9 +704,9 @@ impl ScribeStagingRuntime {
                         object_keys: published_object_identities.clone(),
                     }
                 }
-                crate::scribe::hot_stage::StagedMemberState::Ready
-                | crate::scribe::hot_stage::StagedMemberState::Claimed { .. }
-                | crate::scribe::hot_stage::StagedMemberState::Publishing { .. } => {
+                StagedMemberState::Ready
+                | StagedMemberState::Claimed { .. }
+                | StagedMemberState::Publishing { .. } => {
                     crate::scribe::hot_source::HotAuthority::StagedRun {
                         member: id,
                         runs: member.run_paths(),
@@ -750,9 +750,9 @@ impl ScribeStagingRuntime {
     /// table, or the resolved recipe does not reproduce the key.
     async fn restore_context(
         &self,
-        pool: &vala_sql::OperatorPool,
+        pool: &OperatorPool,
         key: &ScribeAssemblyKey,
-        members: &[&crate::scribe::hot_stage::StagedMember],
+        members: &[&StagedMember],
     ) -> Result<ClaimContext, ScribeError> {
         let run = members
             .iter()
@@ -1094,6 +1094,11 @@ mod tests {
     }
 
     /// Freezes one bucket of `rows` rows for the fixture tenant and shard.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture timestamps cannot form a batch under the runtime
+    /// schema.
     pub(super) fn frozen_member(tenant: DataTenantId, rows: i64, shard: u8) -> FrozenMemtable {
         let schema = runtime_schema();
         let record = RecordBatch::try_new(
@@ -1449,7 +1454,7 @@ mod tests {
         }
         let node_id = NodeId::new(uuid::Uuid::from_u128(0xd2a3));
         let stage = Arc::new(ScribeHotStage::new(stage_root.clone()));
-        let hot_sources = Arc::new(crate::scribe::hot_source::ScribeHotSourceRegistry::new());
+        let hot_sources = Arc::new(ScribeHotSourceRegistry::new());
         let runtime = ScribeStagingRuntime::new(
             Arc::clone(&stage),
             publisher(stage, &wal_root, node_id),
@@ -1777,7 +1782,7 @@ mod tests {
             .transition(
                 key,
                 member_ids[0],
-                crate::scribe::hot_stage::StagedMemberState::Publishing {
+                StagedMemberState::Publishing {
                     claim_id: claim_id.to_owned(),
                     operation_id: uuid::Uuid::from_u128(0xc01),
                 },
@@ -1785,19 +1790,19 @@ mod tests {
             .await
             .expect("first member remains publishing");
         for (index, state) in [
-            crate::scribe::hot_stage::StagedMemberState::Published {
+            StagedMemberState::Published {
                 claim_id: claim_id.to_owned(),
                 file_list_commit_key: "node:10:49".to_owned(),
                 published_object_identities: objects.clone(),
                 persisted_lsn_ranges: vec![StagedLsnRange { min: 20, max: 29 }],
             },
-            crate::scribe::hot_stage::StagedMemberState::CleanupPending {
+            StagedMemberState::CleanupPending {
                 claim_id: claim_id.to_owned(),
                 file_list_commit_key: "node:10:49".to_owned(),
                 published_object_identities: objects.clone(),
                 persisted_lsn_ranges: vec![StagedLsnRange { min: 30, max: 39 }],
             },
-            crate::scribe::hot_stage::StagedMemberState::Published {
+            StagedMemberState::Published {
                 claim_id: claim_id.to_owned(),
                 file_list_commit_key: "node:10:49".to_owned(),
                 published_object_identities: objects,
@@ -1825,7 +1830,7 @@ mod tests {
     ///
     /// Panics when an authority lookup fails or still names a live authority.
     fn assert_no_restored_authority_survives(
-        hot_sources: &crate::scribe::hot_source::ScribeHotSourceRegistry,
+        hot_sources: &ScribeHotSourceRegistry,
         key: &ScribeAssemblyKey,
         member_ids: &[StagedMemberId],
     ) {
@@ -1885,7 +1890,7 @@ mod tests {
             .expect("one member retired before the crash");
         drop(runtime);
 
-        let hot_sources = Arc::new(crate::scribe::hot_source::ScribeHotSourceRegistry::new());
+        let hot_sources = Arc::new(ScribeHotSourceRegistry::new());
         let recovered = ScribeStagingRuntime::new(
             Arc::clone(&stage),
             publisher(Arc::clone(&stage), &wal_root, node_id),
@@ -1893,7 +1898,7 @@ mod tests {
                 .expect("assembler controls"),
         )
         .with_hot_sources(Arc::clone(&hot_sources));
-        let pool: vala_sql::OperatorPool = sqlx::PgPool::connect_lazy("postgres://unused/unused")
+        let pool: OperatorPool = sqlx::PgPool::connect_lazy("postgres://unused/unused")
             .expect("lazy pool")
             .into();
         assert_eq!(
@@ -1924,7 +1929,7 @@ mod tests {
         stage: &ScribeHotStage,
         key: &ScribeAssemblyKey,
         member_ids: &[StagedMemberId],
-        state_for: impl Fn(&StagedMemberId) -> crate::scribe::hot_stage::StagedMemberState,
+        state_for: impl Fn(&StagedMemberId) -> StagedMemberState,
     ) {
         for member in member_ids {
             stage
@@ -1994,14 +1999,14 @@ mod tests {
             }]
         };
         move_claim(&stage, &key, &member_ids, |_| {
-            crate::scribe::hot_stage::StagedMemberState::Publishing {
+            StagedMemberState::Publishing {
                 claim_id: claim_id.clone(),
                 operation_id: uuid::Uuid::from_u128(0xba7),
             }
         })
         .await;
         move_claim(&stage, &key, &member_ids, |member| {
-            crate::scribe::hot_stage::StagedMemberState::Published {
+            StagedMemberState::Published {
                 claim_id: claim_id.clone(),
                 file_list_commit_key: "node:10:49".to_owned(),
                 published_object_identities: objects.clone(),
@@ -2011,7 +2016,7 @@ mod tests {
         .await;
         if cleanup_pending {
             move_claim(&stage, &key, &member_ids, |member| {
-                crate::scribe::hot_stage::StagedMemberState::CleanupPending {
+                StagedMemberState::CleanupPending {
                     claim_id: claim_id.clone(),
                     file_list_commit_key: "node:10:49".to_owned(),
                     published_object_identities: objects.clone(),
@@ -2033,14 +2038,14 @@ mod tests {
         }
         drop(runtime);
 
-        let hot_sources = Arc::new(crate::scribe::hot_source::ScribeHotSourceRegistry::new());
+        let hot_sources = Arc::new(ScribeHotSourceRegistry::new());
         let recovered = ScribeStagingRuntime::new(
             Arc::clone(&stage),
             publisher(Arc::clone(&stage), &wal_root, node_id),
             config(),
         )
         .with_hot_sources(Arc::clone(&hot_sources));
-        let pool: vala_sql::OperatorPool = sqlx::PgPool::connect_lazy("postgres://unused/unused")
+        let pool: OperatorPool = sqlx::PgPool::connect_lazy("postgres://unused/unused")
             .expect("lazy pool")
             .into();
         assert_eq!(
@@ -2066,7 +2071,7 @@ mod tests {
     /// rescan or left its directory behind, or an authority is still live.
     async fn assert_claim_fully_retired(
         stage: &ScribeHotStage,
-        hot_sources: &crate::scribe::hot_source::ScribeHotSourceRegistry,
+        hot_sources: &ScribeHotSourceRegistry,
         key: &ScribeAssemblyKey,
         member_ids: &[StagedMemberId],
     ) {
@@ -2176,7 +2181,7 @@ mod tests {
         let node_id = NodeId::new(uuid::Uuid::from_u128(0xf1e));
         let tenant = DataTenantId::new_v7();
         let seal_key = frozen_member(tenant, 1, 1).seal_key;
-        let hot_sources = Arc::new(crate::scribe::hot_source::ScribeHotSourceRegistry::new());
+        let hot_sources = Arc::new(ScribeHotSourceRegistry::new());
         for shard in 1..=4_u8 {
             hot_sources
                 .register_memtable(
@@ -2247,12 +2252,11 @@ mod tests {
     /// refuses an advance or release.
     async fn interrupt_committed_removal(
         stage: &ScribeHotStage,
-        hot_sources: &crate::scribe::hot_source::ScribeHotSourceRegistry,
+        hot_sources: &ScribeHotSourceRegistry,
         key: &ScribeAssemblyKey,
         member_ids: &[StagedMemberId],
         claim: &StagingClaimId,
     ) {
-        use crate::scribe::hot_stage::StagedMemberState;
         let claim_id = claim.to_string();
         let objects = vec![format!("objects/{claim_id}/hot-0.parquet")];
         let seal_key = SealKey::new(key.tenant(), key.table().clone(), key.partition());
@@ -2460,11 +2464,15 @@ mod pg_tests {
     }
 
     /// Builds a publisher whose fenced transaction runs against `pool`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the in-memory object-store operator cannot be built.
     fn fenced_publisher(
         stage: Arc<ScribeHotStage>,
         wal_root: &Path,
         node: NodeId,
-        pool: vala_sql::OperatorPool,
+        pool: OperatorPool,
     ) -> ClaimPublisher {
         let operator = opendal::Operator::new(opendal::services::Memory::default())
             .expect("memory operator")
@@ -2485,6 +2493,10 @@ mod pg_tests {
     /// # Errors
     ///
     /// Returns the first gather, merge, or publication refusal.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the claim's scratch directory cannot be created.
     async fn publish_claim_once(
         runtime: &ScribeStagingRuntime,
         claim: &StagingClaim,
@@ -2668,7 +2680,7 @@ mod pg_tests {
             .expect("four members form one claim");
         let claim_id = claim.id().to_string();
         move_claim(&stage, &key, &finished, |member| {
-            crate::scribe::hot_stage::StagedMemberState::Published {
+            StagedMemberState::Published {
                 claim_id: claim_id.clone(),
                 file_list_commit_key: "node:10:49".to_owned(),
                 published_object_identities: vec![format!("objects/{claim_id}/hot-0.parquet")],

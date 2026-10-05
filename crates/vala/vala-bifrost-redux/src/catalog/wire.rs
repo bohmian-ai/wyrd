@@ -12,6 +12,13 @@ use crate::catalog::BifrostCatalogError;
 use crate::tables::managed_columns::is_managed_column;
 
 /// Reject user fields that collide with server-owned physical columns.
+///
+/// Registration calls this before any schema is resolved, so a caller can
+/// never declare a column the server stamps or derives itself.
+///
+/// # Errors
+/// Returns [`BifrostCatalogError::ReservedColumn`] naming the first user field
+/// whose name is a managed column.
 pub fn reject_reserved_field_names(user_fields: &[Field]) -> Result<(), BifrostCatalogError> {
     for field in user_fields {
         let name = field.name();
@@ -245,6 +252,11 @@ mod tests {
     /// The names are iterated from the managed-column declaration rather than
     /// spelled out here. A hand-written list silently stops covering a name the
     /// moment one is added to the declaration.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a managed name is accepted or refused with any error other
+    /// than [`BifrostCatalogError::ReservedColumn`] for that name.
     #[test]
     fn every_managed_field_name_is_rejected() {
         for name in MANAGED_COLUMNS.iter().map(|column| column.field.name) {

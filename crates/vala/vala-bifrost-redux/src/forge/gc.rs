@@ -15,7 +15,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use iceberg::spec::{FormatVersion, ManifestContentType, ManifestFile};
+use iceberg::table::Table;
 use iceberg::transaction::{
     ApplyTransactionAction, MANIFEST_MIN_MERGE_COUNT, MANIFEST_MIN_MERGE_COUNT_DEFAULT,
     MANIFEST_TARGET_SIZE_BYTES, MANIFEST_TARGET_SIZE_BYTES_DEFAULT, Transaction,
@@ -29,6 +31,7 @@ use vala_sql::row_types::forge_tasks::{
     ExpiredCleanupPayload, FORGE_TASK_PAYLOAD_VERSION, ForgeTaskEstimates, ForgeTaskPlan,
     ForgeTaskStrategy, NewForgeTask, ORPHAN_CLEANUP_PAYLOAD_VERSION, OrphanCleanupPayload,
 };
+use wyrd_spec::DataTenantId;
 
 use super::compact::ForgeGroupKey;
 use super::error::ForgeError;
@@ -40,8 +43,8 @@ use super::planner::{ForgePlanCandidate, ForgeTableSnapshot, plan_hash, plan_tab
 use super::scribe_promotion::PROMOTION_BRANCH;
 use super::settings::ForgeTableSettings;
 use super::{Forge, ForgeWorker};
-use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::forge_data_location;
+use crate::catalog::{TableRef, TenantTableBinding};
 
 /// Cluster key every rewritten manifest shares, as in `RisingWave`.
 ///
@@ -210,14 +213,7 @@ impl Forge {
     async fn load_member(
         &self,
         key: &ForgeTableKey,
-    ) -> Result<
-        (
-            TenantTableBinding,
-            iceberg::table::Table,
-            ForgeTableSettings,
-        ),
-        ForgeError,
-    > {
+    ) -> Result<(TenantTableBinding, Table, ForgeTableSettings), ForgeError> {
         let binding = task_table_binding(key.tenant, key.tenant, &key.table)?;
         let table = self.load_table(&binding.table_ident()).await?;
         let settings = ForgeTableSettings::from_properties(table.metadata().properties())?;
@@ -415,8 +411,8 @@ impl Forge {
     /// [`ForgeError::Invariant`] when the table is unregistered.
     async fn table_is_read(
         &self,
-        tenant: wyrd_spec::DataTenantId,
-        table_ref: &crate::catalog::TableRef,
+        tenant: DataTenantId,
+        table_ref: &TableRef,
     ) -> Result<bool, ForgeError> {
         let mut conn = self
             .core
@@ -446,7 +442,7 @@ impl Forge {
     async fn expiry_task(
         &self,
         key: &ForgeTableKey,
-        table: &iceberg::table::Table,
+        table: &Table,
         expiry_due: bool,
         reconciliation_due: bool,
     ) -> Result<Option<NewForgeTask>, ForgeError> {
@@ -613,7 +609,7 @@ impl Forge {
 /// table no longer retains skips the table. This is only the leader's
 /// pre-check: the recorded attempt re-derives its selection from every
 /// durable root before preparing anything.
-fn expiry_due(table: &iceberg::table::Table, watermark: Option<i64>) -> bool {
+fn expiry_due(table: &Table, watermark: Option<i64>) -> bool {
     let metadata = table.metadata();
     let Some(current) = metadata.current_snapshot_id() else {
         return false;
@@ -649,7 +645,7 @@ fn orphan_cleanup_task(
     key: &ForgeTableKey,
     base_snapshot_id: i64,
     scan_prefix: String,
-    now: chrono::DateTime<chrono::Utc>,
+    now: DateTime<Utc>,
     ttl: Duration,
 ) -> Result<NewForgeTask, ForgeError> {
     let ttl = chrono::Duration::from_std(ttl).map_err(|_| ForgeError::Invariant {
@@ -756,6 +752,11 @@ mod tests {
     }
 
     /// Fragmented same-spec manifests merge; one manifest or split specs do not.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the plan skips a fragmented same-spec pair, or merges a lone
+    /// manifest, a split-spec pair, or a pair below the minimum count.
     #[test]
     fn manifest_plan_merges_only_fragmented_same_spec_manifests() {
         let same_spec = [manifest("a", 10, 0, 1), manifest("b", 10, 0, 2)];
@@ -767,6 +768,11 @@ mod tests {
     }
 
     /// A completed target-sized bin merges oldest first; deletes never merge.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the plan selects anything but the two oldest data manifests
+    /// that fill one target-sized bin.
     #[test]
     fn manifest_plan_takes_the_oldest_full_bin() {
         let mut delete = manifest("d", 10, 0, 0);

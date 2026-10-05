@@ -1569,6 +1569,11 @@ mod tests {
     }
 
     /// A completed worker footer round-trips as the terminal frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture digest is invalid, the footer fails to convert
+    /// back from the wire, or the round-tripped frame differs.
     #[test]
     fn worker_footer_round_trips() {
         let expected = domain::WorkerAttemptFrame::Footer(domain::WorkerFooter {
@@ -1599,6 +1604,11 @@ mod tests {
     /// Every closed scalar/op round-trips through the v2 wire, and malformed
     /// closed-shape input (unspecified op, literal on a null-check, missing
     /// literal on a comparison) is rejected before it reaches the domain type.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a valid scalar or operator fails to round-trip through the
+    /// v2 wire, or a malformed closed-shape predicate is accepted.
     #[test]
     fn follower_assignment_v2_contract() {
         let predicates = vec![

@@ -1,3 +1,6 @@
+//! Postgres-backed `vala-sql` integration tests; the proofs live in `pg_tests` so
+//! the credential-free lanes can skip them by module name.
+
 mod pg_tests {
     //! Real-Postgres proof of the singleton Forge leader term.
 

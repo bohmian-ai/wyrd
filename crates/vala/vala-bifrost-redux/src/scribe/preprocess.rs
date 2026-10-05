@@ -4,7 +4,9 @@ use arrow::array::{Array, ArrayData};
 use arrow::buffer::Buffer;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
+use iceberg::spec::Schema;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -43,6 +45,7 @@ pub(crate) struct DurableCompletion {
 /// A complete request accepted by pod-global admission.
 #[derive(Debug)]
 pub(crate) struct AdmittedAppend {
+    /// Stable batch identity keying every produced slice and the commit fence.
     pub batch_id: Uuid,
     /// Request correlation retained for the durable batch-commit fence.
     pub request_id: Uuid,
@@ -103,7 +106,7 @@ pub(crate) struct NativeAdmittedRows {
     ///
     /// `None` only for the embedded engine seam, which has no catalog owner
     /// and writes objects that no registered table promotes.
-    pub(crate) registered_schema: Option<std::sync::Arc<iceberg::spec::Schema>>,
+    pub(crate) registered_schema: Option<Arc<Schema>>,
     /// Expanded-data ceiling the decoded, stamped output must fit before WAL.
     pub(crate) expanded_limit_bytes: usize,
 }
@@ -111,6 +114,7 @@ pub(crate) struct NativeAdmittedRows {
 /// A request after deterministic event-day splitting and serialization.
 #[derive(Debug)]
 pub(crate) struct PreparedAppend {
+    /// Stable batch identity keying every produced slice and the commit fence.
     pub batch_id: Uuid,
     /// Admission instant stamped as `wyrd_ingested_at` and stored on the fence.
     pub ingested_at_micros: i64,
@@ -961,6 +965,10 @@ mod tests {
     }
 
     /// Builds the retained owner required by the descriptor-driven decoder.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture bytes do not plan as a native payload.
     fn planned_source(bytes: Bytes, fingerprint: SchemaFingerprint) -> NativeAdmittedRows {
         let plan = ScribeIngressPlanner::default()
             .plan_native(&bytes)

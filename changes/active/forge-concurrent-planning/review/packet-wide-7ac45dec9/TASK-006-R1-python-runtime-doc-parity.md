@@ -116,4 +116,3 @@ PyO3 scope unchanged, Python tests top-level only.
 | `mise run py:format`; `mise run py:lints` | pass |
 | `mise run fmt`; `mise run lints` | pass |
 | `git diff --check` | clean |
-

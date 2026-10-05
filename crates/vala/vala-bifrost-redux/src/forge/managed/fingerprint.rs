@@ -179,6 +179,9 @@ pub(crate) fn policy_fingerprint(report: &SelectionReport) -> String {
 
 #[cfg(test)]
 mod tests {
+    use iceberg_compaction_core::managed::SelectionStrategyKind::{
+        UpstreamFull, UpstreamSmallFiles,
+    };
     use iceberg_compaction_core::managed::{SelectedFile, SelectionStrategyKind};
 
     use super::*;
@@ -216,10 +219,15 @@ mod tests {
     /// base is a different decision, because the base is what the commit will
     /// be validated against. Domain separation keeps a selection receipt from
     /// ever comparing equal to a debt summary computed over the same report.
+    ///
+    /// # Panics
+    ///
+    /// Panics when reordering the files changes the receipt, when a different
+    /// base snapshot or strategy leaves it unchanged, when a selection receipt
+    /// equals the debt summary of the same report, or when the receipt is not
+    /// a 64-character digest.
     #[test]
     fn forge_selection_fingerprint_is_ordered_versioned_and_snapshot_bound() {
-        use SelectionStrategyKind::{UpstreamFull, UpstreamSmallFiles};
-
         let forward = report(41, UpstreamSmallFiles, &["a.parquet", "b.parquet"]);
         let reversed = report(41, UpstreamSmallFiles, &["b.parquet", "a.parquet"]);
         assert_eq!(
@@ -265,10 +273,14 @@ mod tests {
     ///
     /// The contrast cases prove the summary is not simply constant: a changed
     /// file count, a changed policy, and a changed delete scope each move it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when two reports describing the same debt summarize differently,
+    /// or when a changed file count, policy, or delete scope leaves the summary
+    /// unchanged.
     #[test]
     fn forge_no_progress_refuses_unchanged_semantic_debt_before_io() {
-        use SelectionStrategyKind::{UpstreamFull, UpstreamSmallFiles};
-
         let before = report(41, UpstreamSmallFiles, &["old-a.parquet", "old-b.parquet"]);
         let after = report(77, UpstreamSmallFiles, &["new-a.parquet", "new-b.parquet"]);
         assert_eq!(

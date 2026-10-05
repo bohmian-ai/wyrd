@@ -6,6 +6,7 @@
 //! execution side effects. The query class is derived
 //! later from the physical root alone, so nothing here classifies.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -17,7 +18,9 @@ use super::{
     PlannedSqlCut, TableRef,
 };
 use crate::catalog::{PinnedSealedTable, TableUid, TenantTableBinding};
+use uuid::Uuid;
 use vala_sql::queries::oracle_reader_authority::ActiveReadOwner;
+use wyrd_spec::DataTenantId;
 
 /// Query floor and logical-plan preparation owner.
 ///
@@ -89,16 +92,16 @@ pub(crate) struct ActiveReadClaim {
     /// Catalog owning the tenant-scoped active-read statements.
     catalog: Arc<BifrostCatalog>,
     /// Tenant whose RLS scopes the rows.
-    tenant: wyrd_spec::DataTenantId,
+    tenant: DataTenantId,
     /// Durable query identity the rows are keyed by.
-    query_id: uuid::Uuid,
+    query_id: Uuid,
     /// Whether [`Self::release`] already ran, so drop skips its own release.
     released: bool,
 }
 
-impl std::fmt::Debug for ActiveReadClaim {
+impl fmt::Debug for ActiveReadClaim {
     /// Prints the claim's identity without its catalog handle.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ActiveReadClaim")
             .field("query_id", &self.query_id)
@@ -126,7 +129,7 @@ pub enum LeaderOwnershipEvent {
 /// Test-support only: appended synchronously at each transition, so the
 /// recorded order is the order the transitions happened in on this process.
 #[cfg(feature = "test-support")]
-static LEADER_OWNERSHIP_ORDER: std::sync::Mutex<Vec<(uuid::Uuid, LeaderOwnershipEvent)>> =
+static LEADER_OWNERSHIP_ORDER: std::sync::Mutex<Vec<(Uuid, LeaderOwnershipEvent)>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Appends one transition for `query_id` to the test-support ordering log.
@@ -134,7 +137,7 @@ static LEADER_OWNERSHIP_ORDER: std::sync::Mutex<Vec<(uuid::Uuid, LeaderOwnership
 /// A poisoned log records nothing; the journey reading it then fails on the
 /// missing event rather than this owner panicking.
 #[cfg(feature = "test-support")]
-pub(crate) fn record_leader_ownership(query_id: uuid::Uuid, event: LeaderOwnershipEvent) {
+pub(crate) fn record_leader_ownership(query_id: Uuid, event: LeaderOwnershipEvent) {
     if let Ok(mut order) = LEADER_OWNERSHIP_ORDER.lock() {
         order.push((query_id, event));
     }
@@ -146,7 +149,7 @@ pub(crate) fn record_leader_ownership(query_id: uuid::Uuid, event: LeaderOwnersh
 /// id that is both the Analytical graph's public id and the claim's owner id.
 #[cfg(feature = "test-support")]
 #[must_use]
-pub fn take_leader_ownership_order_for_test() -> Vec<(uuid::Uuid, LeaderOwnershipEvent)> {
+pub fn take_leader_ownership_order_for_test() -> Vec<(Uuid, LeaderOwnershipEvent)> {
     LEADER_OWNERSHIP_ORDER
         .lock()
         .map(|mut order| std::mem::take(&mut *order))
@@ -168,11 +171,7 @@ impl ActiveReadClaim {
     }
 
     /// Deletes one query's active reads, logging and counting a failure.
-    async fn release_rows(
-        catalog: &BifrostCatalog,
-        tenant: wyrd_spec::DataTenantId,
-        query_id: uuid::Uuid,
-    ) {
+    async fn release_rows(catalog: &BifrostCatalog, tenant: DataTenantId, query_id: Uuid) {
         if let Err(error) = catalog.release_active_reads(tenant, query_id).await {
             metrics::counter!("bifrost_oracle_active_read_release_failures_total").increment(1);
             tracing::warn!(

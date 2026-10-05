@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use vala_bifrost_redux::catalog::TenantTableBinding;
 use vala_sql::row_types::forge_tasks::{ForgeClaimStrategy, ForgeTaskStrategy};
+use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::CompactionTypeWire;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::RegisterOutcome;
@@ -799,7 +800,7 @@ async fn rewrite_operation_phase(cluster: &WyrdTestCluster, operation: Uuid) -> 
 ///
 /// Panics when the public read differs from the acknowledged rows in any way.
 async fn assert_public_rows(
-    client: &wyrd_client::WyrdClient,
+    client: &WyrdClient,
     table: &JourneyTable,
     expected: &[ManagedRow],
     cut: &str,
@@ -2435,7 +2436,7 @@ async fn await_worker_readiness(cluster: &WyrdTestCluster, expected: bool, label
 /// Panics when a public append or the pod's flush fails.
 async fn write_two_commits(
     cluster: &WyrdTestCluster,
-    client: &wyrd_client::WyrdClient,
+    client: &WyrdClient,
     table: &JourneyTable,
 ) -> Vec<ManagedRow> {
     let server = cluster.server(0).expect("the embedded pod is running");

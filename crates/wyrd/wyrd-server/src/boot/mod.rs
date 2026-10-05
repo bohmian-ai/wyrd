@@ -6,7 +6,10 @@ pub mod init;
 pub mod issuer;
 pub mod node_identity;
 
+use crate::config::ForgeRuntimeConfig;
 use std::sync::Arc;
+use std::time::Duration;
+use vala_bifrost_redux::resources::ResourcePlan;
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, TryStreamExt};
@@ -15,8 +18,9 @@ use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::forge::{
-    Forge as ForgeCoordinator, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeLeaderPeer,
-    ForgeObjectPages, ForgeObjectStore, ForgeTelemetry, ForgeWorker, ForgeWorkerConfig,
+    Forge as ForgeCoordinator, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeError,
+    ForgeLeaderPeer, ForgeObjectPages, ForgeObjectStore, ForgeTelemetry, ForgeWorker,
+    ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::oracle::dispatcher::{
@@ -62,9 +66,14 @@ use crate::state::{
     ScribeCoordinationRuntime,
 };
 
-const DEFAULT_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_hours(1);
+/// Cadence of the leader's Forge maintenance timer when `[forge]` sets no
+/// `maintenance_interval_secs`; [`resolve_forge_config`] applies it.
+const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_hours(1);
+/// Bound on the advisory staging-file wake-up channel that feeds Forge
+/// promotion; wake-ups are advisory, so a full channel loses no durable work.
 const DEFAULT_HINT_CAPACITY: usize = 1_024;
-const ORACLE_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Longest boot waits for the Oracle to finish startup before failing.
+const ORACLE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Number of listing entries the production Forge object store groups into one
 /// orphan-GC page. The producer owns page granularity: this bounds how much of
 /// an OpenDAL recursive walk materializes before orphan GC can check its page
@@ -395,7 +404,7 @@ pub enum ServerBootError {
     CardRecoveryPoolRequired,
     /// Forge configuration validation failed during boot.
     #[error(transparent)]
-    Forge(#[from] vala_bifrost_redux::forge::ForgeError),
+    Forge(#[from] ForgeError),
     /// Scribe WAL/runtime construction failed during boot.
     #[error("Scribe runtime construction failed: {0}")]
     Scribe(String),
@@ -422,21 +431,19 @@ pub enum ServerBootError {
 /// [`Forge::new`], which runs [`ForgeConfig::validate`] and the maintenance
 /// interval check; this function performs no validation itself and never
 /// panics.
-fn resolve_forge_config(
-    forge_runtime: &crate::config::ForgeRuntimeConfig,
-) -> (ForgeConfig, std::time::Duration) {
+fn resolve_forge_config(forge_runtime: &ForgeRuntimeConfig) -> (ForgeConfig, Duration) {
     let base = ForgeConfig::default();
     let config = ForgeConfig {
         orphan_gc_ttl: forge_runtime
             .orphan_gc_ttl_secs
-            .map(std::time::Duration::from_secs)
+            .map(Duration::from_secs)
             .unwrap_or(base.orphan_gc_ttl),
         orphan_gc_max_list_pages: forge_runtime
             .orphan_gc_max_list_pages
             .unwrap_or(base.orphan_gc_max_list_pages),
         orphan_gc_run_budget: forge_runtime
             .orphan_gc_run_budget_secs
-            .map(std::time::Duration::from_secs)
+            .map(Duration::from_secs)
             .unwrap_or(base.orphan_gc_run_budget),
         default_target_file_size_bytes: forge_runtime
             .target_file_size_bytes
@@ -445,7 +452,7 @@ fn resolve_forge_config(
     };
     let maintenance_interval = forge_runtime
         .maintenance_interval_secs
-        .map(std::time::Duration::from_secs)
+        .map(Duration::from_secs)
         .unwrap_or(DEFAULT_MAINTENANCE_INTERVAL);
     (config, maintenance_interval)
 }
@@ -602,6 +609,11 @@ async fn build_bifrost_external_dependencies(
 ///
 /// Returns [`ServerBootError`] when Scribe, Forge, Oracle, role fencing, or
 /// request-boundary construction fails before publication.
+///
+/// # Panics
+///
+/// Panics if a Forge compaction runtime owner built around a live runtime
+/// yields no handle; construction guarantees one, so this is an invariant.
 pub async fn compose_bifrost(
     inputs: crate::state::BifrostBuildInputs,
 ) -> Result<crate::state::ComposedBifrost, ServerBootError> {
@@ -747,9 +759,7 @@ pub async fn compose_bifrost(
         #[cfg(feature = "test-support")]
         let wal_sync_delay = test_controls
             .as_ref()
-            .map_or(std::time::Duration::ZERO, |controls| {
-                controls.scribe_wal_sync_delay
-            });
+            .map_or(Duration::ZERO, |controls| controls.scribe_wal_sync_delay);
         let execution_pools = ScribeExecutionPools::new(
             ScribeIngressCpuPool::try_new_with_capacity(scribe_config.ingress_cpu_threads, 256)
                 .map_err(|error| {
@@ -769,7 +779,7 @@ pub async fn compose_bifrost(
                 }
                 #[cfg(not(feature = "test-support"))]
                 {
-                    std::time::Duration::ZERO
+                    Duration::ZERO
                 }
             })
             .map_err(|error| ServerBootError::Scribe(format!("WAL IO pool failed: {error}")))?,
@@ -784,12 +794,12 @@ pub async fn compose_bifrost(
             event_time_window: EventTimeWindow {
                 past: scribe_config
                     .event_time_past_window_secs
-                    .map(std::time::Duration::from_secs)
-                    .unwrap_or_else(|| std::time::Duration::from_secs(30 * 24 * 60 * 60)),
+                    .map(Duration::from_secs)
+                    .unwrap_or_else(|| Duration::from_secs(30 * 24 * 60 * 60)),
                 future: scribe_config
                     .event_time_future_window_secs
-                    .map(std::time::Duration::from_secs)
-                    .unwrap_or_else(|| std::time::Duration::from_secs(24 * 60 * 60)),
+                    .map(Duration::from_secs)
+                    .unwrap_or_else(|| Duration::from_secs(24 * 60 * 60)),
             },
         };
         #[cfg(feature = "test-support")]
@@ -983,7 +993,7 @@ pub async fn compose_bifrost(
                 .enable_all()
                 .build()
                 .map_err(|error| {
-                    ServerBootError::Forge(vala_bifrost_redux::forge::ForgeError::InvalidConfig {
+                    ServerBootError::Forge(ForgeError::InvalidConfig {
                         detail: format!("Forge compaction runtime failed: {error}"),
                     })
                 })?;
@@ -1149,11 +1159,9 @@ pub async fn compose_bifrost(
 /// four times that, so a burst of planned work queues rather than being refused
 /// while earlier plans still run. Tenant fairness is unrelated to either and
 /// stays with the SQL fair claim.
-///
-/// [`ResourcePlan`]: vala_bifrost_redux::resources::ResourcePlan
 fn forge_compaction_worker_config(
-    plan: &vala_bifrost_redux::resources::ResourcePlan,
-    forge_runtime: &crate::config::ForgeRuntimeConfig,
+    plan: &ResourcePlan,
+    forge_runtime: &ForgeRuntimeConfig,
 ) -> ForgeWorkerConfig {
     let max_task_parallelism = u32::try_from(plan.effective_cpu.saturating_mul(12))
         .unwrap_or(u32::MAX)
@@ -1189,13 +1197,8 @@ fn forge_compaction_worker_config(
 pub fn spawn_forge_worker(
     state: &AppState,
     shutdown: CancellationToken,
-) -> Result<
-    impl std::future::Future<Output = Result<(), vala_bifrost_redux::forge::ForgeError>>
-    + Send
-    + 'static
-    + use<>,
-    ServerBootError,
-> {
+) -> Result<impl Future<Output = Result<(), ForgeError>> + Send + 'static + use<>, ServerBootError>
+{
     let forge = state
         .bifrost
         .forge()
@@ -1691,7 +1694,7 @@ impl<'a> OracleRoleBuilder<'a> {
                 |value| value.queue_capacity,
             ),
             max_queue_wait: calibrated.as_ref().map_or(
-                std::time::Duration::from_millis(config.oracle.max_queue_wait_ms),
+                Duration::from_millis(config.oracle.max_queue_wait_ms),
                 |value| value.max_queue_wait,
             ),
             default_deadline: config.oracle.default_query_deadline(),
@@ -2158,12 +2161,7 @@ pub fn spawn_maintenance_scheduler(
     state: &AppState,
     shutdown: CancellationToken,
 ) -> Result<
-    Option<
-        impl std::future::Future<Output = Result<(), vala_bifrost_redux::forge::ForgeError>>
-        + Send
-        + 'static
-        + use<>,
-    >,
+    Option<impl Future<Output = Result<(), ForgeError>> + Send + 'static + use<>>,
     ServerBootError,
 > {
     let Some(forge) = state.forge_handle().cloned() else {
@@ -2275,7 +2273,7 @@ mod tests {
     /// admission bounds do not follow effective CPU.
     #[test]
     fn forge_runtime_is_role_scoped_and_cpu_sized() {
-        let mut plan = vala_bifrost_redux::resources::ResourcePlan {
+        let mut plan = ResourcePlan {
             memory_limit_bytes: 4 * 1024 * 1024 * 1024,
             effective_cpu: 6,
             oracle_query_slot_limit: None,
@@ -2286,7 +2284,7 @@ mod tests {
             forge_enabled: true,
             scratch_limit_bytes: 1024 * 1024 * 1024,
         };
-        let forge_runtime = crate::config::ForgeRuntimeConfig::default();
+        let forge_runtime = ForgeRuntimeConfig::default();
         let worker = super::forge_compaction_worker_config(&plan, &forge_runtime);
         assert_eq!(
             worker.max_task_parallelism, 72,
@@ -2468,10 +2466,14 @@ mod tests {
     /// An empty `forge` config resolves to the compiled `ForgeConfig` default
     /// and the default maintenance interval, pinning byte-identical no-config
     /// behavior (AC1).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the resolved config or interval differs from the compiled
+    /// defaults, including the 1 GiB deployment file target.
     #[test]
     fn resolve_forge_config_defaults_match_compiled_defaults() {
-        let (config, maintenance_interval) =
-            resolve_forge_config(&crate::config::ForgeRuntimeConfig::default());
+        let (config, maintenance_interval) = resolve_forge_config(&ForgeRuntimeConfig::default());
         assert_eq!(config, ForgeConfig::default());
         assert_eq!(
             config.default_target_file_size_bytes,
@@ -2483,25 +2485,27 @@ mod tests {
 
     /// Supplied `forge` values override the compiled defaults on exactly the
     /// promoted fields, and the resolved config still validates fail-closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a supplied value is not carried into the resolved config or
+    /// when the overridden config fails validation.
     #[test]
     fn resolve_forge_config_applies_supplied_overrides() {
-        let runtime = crate::config::ForgeRuntimeConfig {
+        let runtime = ForgeRuntimeConfig {
             orphan_gc_ttl_secs: Some(3_600),
             orphan_gc_max_list_pages: Some(64),
             orphan_gc_run_budget_secs: Some(30),
             maintenance_interval_secs: Some(45),
             target_file_size_bytes: Some(2_147_483_648),
-            ..crate::config::ForgeRuntimeConfig::default()
+            ..ForgeRuntimeConfig::default()
         };
         let (config, maintenance_interval) = resolve_forge_config(&runtime);
         assert_eq!(config.default_target_file_size_bytes, 2_147_483_648);
-        assert_eq!(config.orphan_gc_ttl, std::time::Duration::from_secs(3_600));
+        assert_eq!(config.orphan_gc_ttl, Duration::from_secs(3_600));
         assert_eq!(config.orphan_gc_max_list_pages, 64);
-        assert_eq!(
-            config.orphan_gc_run_budget,
-            std::time::Duration::from_secs(30)
-        );
-        assert_eq!(maintenance_interval, std::time::Duration::from_secs(45));
+        assert_eq!(config.orphan_gc_run_budget, Duration::from_secs(30));
+        assert_eq!(maintenance_interval, Duration::from_secs(45));
         config
             .validate()
             .expect("resolved override config must validate");
@@ -2511,11 +2515,14 @@ mod tests {
 
     /// A zeroed promoted duration resolves through and is rejected by the
     /// downstream `ForgeConfig::validate` fail-closed check.
+    ///
+    /// # Panics
+    /// Panics if `validate` accepts the zero orphan-GC TTL.
     #[test]
     fn resolve_forge_config_zero_value_is_rejected_by_validate() {
-        let runtime = crate::config::ForgeRuntimeConfig {
+        let runtime = ForgeRuntimeConfig {
             orphan_gc_ttl_secs: Some(0),
-            ..crate::config::ForgeRuntimeConfig::default()
+            ..ForgeRuntimeConfig::default()
         };
         let (config, _) = resolve_forge_config(&runtime);
         assert!(config.validate().is_err());

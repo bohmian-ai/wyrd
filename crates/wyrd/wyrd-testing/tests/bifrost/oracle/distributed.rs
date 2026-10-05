@@ -5,33 +5,59 @@
 //! and `support.rs` for the fixtures it shares.
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{Array, Int64Array};
+use arrow::datatypes::{DataType, Fields, SchemaRef};
+use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
+use iceberg::Catalog;
+use iceberg::spec::{self, NestedField, StructType, Type};
 use parquet::arrow::ARROW_SCHEMA_META_KEY;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::file::metadata::KeyValue;
+use parquet::file::metadata::{KeyValue, ParquetMetaData};
+use parquet::file::reader::FileReader;
+use vala_bifrost_redux::catalog::{
+    TableRef, TableUid, TenantTableBinding, inject_metadata_not_found_for_test,
+    reset_active_cut_acquisitions_for_test,
+};
 use vala_bifrost_redux::forge::ForgeConfig;
-use vala_bifrost_redux::oracle::iceberg_projection_probe;
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::oracle::planner::{
+    LeaderOwnershipEvent, take_leader_ownership_order_for_test,
+};
+use vala_bifrost_redux::oracle::{AuthorizedQueryContext, Oracle, iceberg_projection_probe};
 use vala_bifrost_redux::parquet::footer::tenant_key_value;
 use vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties_with_metadata;
 use vala_bifrost_redux::scribe::hot_source::HotAuthority;
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::BifrostClientError;
+use wyrd_runtime::permission::PermissionSet;
+use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_server::config::BifrostTarget;
 use wyrd_server::oracle::{
     ScribeFragmentFault, arm_scribe_fragment_fault_for_test, arm_tail_listing_stale_for_test,
     arm_tail_listing_stall_for_test,
 };
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::api::{
+    AuthMethod, NodeId, NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire,
+    TimeGranularityWire,
+};
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, QueryClass, QueryTerminalErrorCode, QueryTerminalOutcome, QueryWarning,
 };
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::WyrdTestServer;
+use wyrd_testing::bifrost::canonical_signals::{Cell, Row, attributes, batch};
+use wyrd_testing::bifrost::write::BifrostWriter;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 
 use crate::peer_cluster::PeerCluster;
@@ -565,12 +591,9 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
         .bifrost_catalog()
         .ok_or("Scribe composition retains the shared catalog")?
         .iceberg_catalog();
-    let binding = vala_bifrost_redux::catalog::TenantTableBinding::resolve((
+    let binding = TenantTableBinding::resolve((
         tenant,
-        vala_bifrost_redux::catalog::TableRef::new(
-            vala_bifrost_redux::namespaces::BifrostNamespace::Bifrost,
-            &table,
-        ),
+        vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Bifrost, &table),
     ))?;
     let loaded = catalog.load_table(&binding.table_ident()).await?;
     let tx = iceberg::transaction::Transaction::new(&loaded);
@@ -978,7 +1001,7 @@ async fn append_event_time_row(
         .iter()
         .cloned()
         .collect::<Vec<_>>();
-    fields.push(std::sync::Arc::new(arrow::datatypes::Field::new(
+    fields.push(Arc::new(arrow::datatypes::Field::new(
         wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
         arrow::datatypes::DataType::Timestamp(
             arrow::datatypes::TimeUnit::Microsecond,
@@ -986,13 +1009,13 @@ async fn append_event_time_row(
         ),
         false,
     )));
-    let batch = arrow::record_batch::RecordBatch::try_new(
-        std::sync::Arc::new(arrow::datatypes::Schema::new(fields)),
+    let batch = RecordBatch::try_new(
+        Arc::new(arrow::datatypes::Schema::new(fields)),
         vec![
-            std::sync::Arc::new(arrow::array::Int64Array::from(vec![id])),
-            std::sync::Arc::new(arrow::array::StringArray::from(vec!["live"])),
-            std::sync::Arc::new(arrow::array::StringArray::from(vec![unused_payload(id)])),
-            std::sync::Arc::new(
+            Arc::new(arrow::array::Int64Array::from(vec![id])),
+            Arc::new(arrow::array::StringArray::from(vec!["live"])),
+            Arc::new(arrow::array::StringArray::from(vec![unused_payload(id)])),
+            Arc::new(
                 arrow::array::TimestampMicrosecondArray::from(vec![event_time_micros])
                     .with_timezone("UTC"),
             ),
@@ -2092,12 +2115,14 @@ fn rewrite_footer_tenant(run: &Path, foreign: DataTenantId) -> Result<(), Journe
 ///
 /// Returns an error when setup, writing, promotion, or reading fails, or when
 /// any of the properties above does not hold.
+///
+/// # Panics
+///
+/// Panics only if `#[tokio::test]` cannot build its runtime; every
+/// expectation failure is returned as an error instead.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn iceberg_assigned_field_ids_promote_fresh_signal_tables() -> Result<(), JourneyError> {
-    use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
-    use vala_bifrost_redux::namespaces::BifrostNamespace;
-
     let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
         BifrostClusterSpec::one_mixed(),
         ForgeConfig::default(),
@@ -2148,7 +2173,7 @@ async fn iceberg_assigned_field_ids_promote_fresh_signal_tables() -> Result<(), 
         }
         let binding = TenantTableBinding::resolve((tenant, table_ref))?;
         let loaded = catalog.load_table(&binding.table_ident()).await?;
-        let registered = std::sync::Arc::clone(loaded.metadata().current_schema());
+        let registered = Arc::clone(loaded.metadata().current_schema());
         let mut assigned = registered_ids(registered.as_struct(), "");
         assigned.sort_unstable_by_key(|(_, id)| *id);
         let dense = (1..).take(assigned.len()).collect::<Vec<i32>>();
@@ -2176,7 +2201,7 @@ async fn iceberg_assigned_field_ids_promote_fresh_signal_tables() -> Result<(), 
             vala_bifrost_redux::parquet::PromotedObjectFooter::decode(
                 &bytes,
                 path,
-                std::sync::Arc::clone(&registered),
+                Arc::clone(&registered),
                 size,
             )
             .map_err(|refusal| format!("{name}: Forge refuses its own table's ids: {refusal}"))?;
@@ -2184,7 +2209,7 @@ async fn iceberg_assigned_field_ids_promote_fresh_signal_tables() -> Result<(), 
             match vala_bifrost_redux::parquet::PromotedObjectFooter::decode(
                 &bytes,
                 path,
-                std::sync::Arc::new(renumbered),
+                Arc::new(renumbered),
                 size,
             ) {
                 Err(refusal) if refusal.contains("field id") => {}
@@ -2224,16 +2249,12 @@ async fn iceberg_assigned_field_ids_promote_fresh_signal_tables() -> Result<(), 
 }
 
 /// Report whether any field in `fields`, at any depth, declares a field id.
-fn declared_field_ids(fields: &arrow::datatypes::Fields) -> bool {
-    use arrow::datatypes::DataType;
-
+fn declared_field_ids(fields: &Fields) -> bool {
     fields.iter().any(|field| {
         field.metadata().contains_key("PARQUET:field_id")
             || match field.data_type() {
                 DataType::List(element) | DataType::LargeList(element) => {
-                    declared_field_ids(&arrow::datatypes::Fields::from(vec![
-                        element.as_ref().clone(),
-                    ]))
+                    declared_field_ids(&Fields::from(vec![element.as_ref().clone()]))
                 }
                 DataType::Struct(children) => declared_field_ids(children),
                 _ => false,
@@ -2246,7 +2267,7 @@ fn declared_field_ids(fields: &arrow::datatypes::Fields) -> bool {
 /// A list element is named `element` and a map's entries `key` and `value`,
 /// so the same path names the same field in the table and in a Parquet file
 /// read back through Iceberg's Arrow conversion.
-fn registered_ids(fields: &iceberg::spec::StructType, prefix: &str) -> Vec<(String, i32)> {
+fn registered_ids(fields: &StructType, prefix: &str) -> Vec<(String, i32)> {
     let mut ids = Vec::new();
     for field in fields.fields() {
         collect_ids(field, &format!("{prefix}{}", field.name), &mut ids);
@@ -2255,9 +2276,7 @@ fn registered_ids(fields: &iceberg::spec::StructType, prefix: &str) -> Vec<(Stri
 }
 
 /// Push `field`'s id under `path`, then every descendant's.
-fn collect_ids(field: &iceberg::spec::NestedField, path: &str, ids: &mut Vec<(String, i32)>) {
-    use iceberg::spec::Type;
-
+fn collect_ids(field: &NestedField, path: &str, ids: &mut Vec<(String, i32)>) {
     ids.push((path.to_owned(), field.id));
     match field.field_type.as_ref() {
         Type::Struct(children) => ids.extend(registered_ids(children, &format!("{path}."))),
@@ -2282,8 +2301,8 @@ fn collect_ids(field: &iceberg::spec::NestedField, path: &str, ids: &mut Vec<(St
 /// any path's id differs from the registered table's.
 fn expect_registered_ids(
     table: &str,
-    object: &bytes::Bytes,
-    registered: &iceberg::spec::Schema,
+    object: &Bytes,
+    registered: &spec::Schema,
 ) -> Result<(), JourneyError> {
     let footer = parquet::file::metadata::ParquetMetaDataReader::new().parse_and_finish(object)?;
     let arrow =
@@ -2308,11 +2327,9 @@ fn expect_registered_ids(
 /// # Errors
 ///
 /// Returns the Iceberg error when the renumbered schema does not build.
-fn renumbered_first_field(
-    registered: &iceberg::spec::Schema,
-) -> Result<iceberg::spec::Schema, JourneyError> {
+fn renumbered_first_field(registered: &spec::Schema) -> Result<spec::Schema, JourneyError> {
     let shift = registered.highest_field_id() + 1;
-    Ok(iceberg::spec::Schema::builder()
+    Ok(spec::Schema::builder()
         .with_fields(
             registered
                 .as_struct()
@@ -2324,7 +2341,7 @@ fn renumbered_first_field(
                     if index == 0 {
                         field.id = shift;
                     }
-                    std::sync::Arc::new(field)
+                    Arc::new(field)
                 }),
         )
         .build()?)
@@ -2383,6 +2400,11 @@ const CUSTOM_BLOOM_COLUMN: &str = "label";
 ///
 /// Returns cluster, registration, write, storage, telemetry, or query errors,
 /// or a description of the first expectation that does not hold.
+///
+/// # Panics
+///
+/// Panics only if `#[tokio::test]` cannot build its runtime; every
+/// expectation failure is returned as an error instead.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn hot_filtering_mechanisms_cover_all_table_kinds() -> Result<(), JourneyError> {
@@ -2452,6 +2474,11 @@ const REWRITE_ROW_GROUP_BYTES: u64 = 512 * 1024;
 /// Returns cluster, registration, write, catalog, storage, Forge, telemetry,
 /// or query errors, or a description of the first expectation that does not
 /// hold.
+///
+/// # Panics
+///
+/// Panics only if `#[tokio::test]` cannot build its runtime; every
+/// expectation failure is returned as an error instead.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn iceberg_filtering_mechanisms_cover_all_table_kinds() -> Result<(), JourneyError> {
@@ -2518,7 +2545,7 @@ struct FilteringFixture {
     /// Unqualified name of the caller-registered custom dataset.
     custom: String,
     /// The Scribe-node client that registered and wrote every table.
-    writer: wyrd_testing::bifrost::write::BifrostWriter,
+    writer: BifrostWriter,
 }
 
 /// One query of the filtering matrix and its exact expected row identities.
@@ -2584,7 +2611,7 @@ impl FilteringFixture {
         ] {
             let described =
                 wyrd_client::bifrost::TableConfig::describe(fixture.writer.client(), fqn).await?;
-            schemas.push(std::sync::Arc::clone(described.user_schema()));
+            schemas.push(Arc::clone(described.user_schema()));
         }
         let [spans, records, points] = schemas.as_slice() else {
             return Err("three signal schemas were described".into());
@@ -2620,10 +2647,6 @@ impl FilteringFixture {
     /// resolved partition, sort order, or Bloom columns differ from the
     /// declaration.
     async fn register_custom(&self) -> Result<(), JourneyError> {
-        use wyrd_spec::vala::api::{
-            NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
-        };
-
         let declared_sort = vec![SortKeyWire {
             column: "key_id".to_owned(),
             direction: SortDirectionWire::Asc,
@@ -2703,18 +2726,18 @@ impl FilteringFixture {
     /// # Errors
     ///
     /// Returns the Arrow error when the batch does not assemble.
-    fn custom_batch(&self, file: i64) -> Result<arrow::record_batch::RecordBatch, JourneyError> {
+    fn custom_batch(&self, file: i64) -> Result<RecordBatch, JourneyError> {
         let keys: Vec<i64> = custom_keys(file).rev().collect();
-        let batch = arrow::record_batch::RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             custom_schema(),
             vec![
-                std::sync::Arc::new(arrow::array::Int64Array::from(keys.clone())),
-                std::sync::Arc::new(arrow::array::StringArray::from(
+                Arc::new(arrow::array::Int64Array::from(keys.clone())),
+                Arc::new(arrow::array::StringArray::from(
                     keys.iter()
                         .map(|key| custom_label(*key))
                         .collect::<Vec<_>>(),
                 )),
-                std::sync::Arc::new(arrow::array::Float64Array::from(
+                Arc::new(arrow::array::Float64Array::from(
                     keys.iter()
                         .map(|key| f64::from(i32::try_from(*key).unwrap_or(i32::MAX)))
                         .collect::<Vec<_>>(),
@@ -2739,13 +2762,7 @@ impl FilteringFixture {
     /// # Errors
     ///
     /// Returns the Arrow error when the event-time column does not attach.
-    fn spans_batch(
-        &self,
-        schema: &arrow::datatypes::SchemaRef,
-        file: i64,
-    ) -> Result<arrow::record_batch::RecordBatch, JourneyError> {
-        use wyrd_testing::bifrost::canonical_signals::{Cell, Row, attributes, batch};
-
+    fn spans_batch(&self, schema: &SchemaRef, file: i64) -> Result<RecordBatch, JourneyError> {
         let rows: Vec<Row> = (0..SIGNAL_ROWS_PER_FILE)
             .map(|row| {
                 let id = signal_id(file, row);
@@ -2794,13 +2811,7 @@ impl FilteringFixture {
     /// # Errors
     ///
     /// Returns the Arrow error when the event-time column does not attach.
-    fn records_batch(
-        &self,
-        schema: &arrow::datatypes::SchemaRef,
-        file: i64,
-    ) -> Result<arrow::record_batch::RecordBatch, JourneyError> {
-        use wyrd_testing::bifrost::canonical_signals::{Cell, Row, batch};
-
+    fn records_batch(&self, schema: &SchemaRef, file: i64) -> Result<RecordBatch, JourneyError> {
         let rows: Vec<Row> = (0..SIGNAL_ROWS_PER_FILE)
             .map(|row| {
                 let id = signal_id(file, row);
@@ -2840,13 +2851,7 @@ impl FilteringFixture {
     /// # Errors
     ///
     /// Returns the Arrow error when the event-time column does not attach.
-    fn points_batch(
-        &self,
-        schema: &arrow::datatypes::SchemaRef,
-        file: i64,
-    ) -> Result<arrow::record_batch::RecordBatch, JourneyError> {
-        use wyrd_testing::bifrost::canonical_signals::{Cell, Row, batch};
-
+    fn points_batch(&self, schema: &SchemaRef, file: i64) -> Result<RecordBatch, JourneyError> {
         let rows: Vec<Row> = (0..SIGNAL_ROWS_PER_FILE)
             .map(|row| {
                 let id = signal_id(file, row);
@@ -2880,9 +2885,7 @@ impl FilteringFixture {
     }
 
     /// The four tables the fixture writes, as `(namespace, table)`.
-    fn tables(&self) -> [(vala_bifrost_redux::namespaces::BifrostNamespace, &str); 4] {
-        use vala_bifrost_redux::namespaces::BifrostNamespace;
-
+    fn tables(&self) -> [(BifrostNamespace, &str); 4] {
         [
             (BifrostNamespace::Datasets, self.custom.as_str()),
             (BifrostNamespace::Traces, "spans"),
@@ -2904,14 +2907,12 @@ impl FilteringFixture {
         &self,
         server: &WyrdTestServer,
     ) -> Result<(), JourneyError> {
-        use vala_bifrost_redux::namespaces::BifrostNamespace;
-
         let catalog = server
             .state()
             .bifrost_catalog()
             .ok_or("Scribe composition retains the shared catalog")?
             .iceberg_catalog();
-        let binding = vala_bifrost_redux::catalog::TenantTableBinding::resolve((
+        let binding = TenantTableBinding::resolve((
             server.data_tenant_id(),
             vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Datasets, &self.custom),
         ))?;
@@ -2944,7 +2945,7 @@ impl FilteringFixture {
     async fn await_promotion(
         &self,
         cluster: &WyrdTestCluster,
-        coordinator: wyrd_spec::vala::api::NodeId,
+        coordinator: NodeId,
     ) -> Result<(), JourneyError> {
         let server = cluster
             .server_by_node(coordinator)
@@ -3716,7 +3717,7 @@ const FORGE_PHASE_BUDGET: Duration = Duration::from_secs(180);
 async fn planned_paths(
     server: &WyrdTestServer,
     tenant: DataTenantId,
-    namespace: vala_bifrost_redux::namespaces::BifrostNamespace,
+    namespace: BifrostNamespace,
     table: &str,
 ) -> Result<Vec<String>, JourneyError> {
     let catalog = server
@@ -3724,7 +3725,7 @@ async fn planned_paths(
         .bifrost_catalog()
         .ok_or("Scribe composition retains the shared catalog")?
         .iceberg_catalog();
-    let binding = vala_bifrost_redux::catalog::TenantTableBinding::resolve((
+    let binding = TenantTableBinding::resolve((
         tenant,
         vala_bifrost_redux::catalog::TableRef::new(namespace, table),
     ))?;
@@ -3746,11 +3747,11 @@ struct SealedObject {
     /// Durable `vala.file_list` path.
     path: String,
     /// Complete object bytes.
-    bytes: bytes::Bytes,
+    bytes: Bytes,
     /// Footer decoded with page indexes.
-    metadata: parquet::file::metadata::ParquetMetaData,
+    metadata: ParquetMetaData,
     /// Every row in physical order.
-    rows: arrow::record_batch::RecordBatch,
+    rows: RecordBatch,
 }
 
 impl SealedObject {
@@ -3767,7 +3768,7 @@ impl SealedObject {
         cluster: &WyrdTestCluster,
         server: &WyrdTestServer,
         tenant: DataTenantId,
-        namespace: vala_bifrost_redux::namespaces::BifrostNamespace,
+        namespace: BifrostNamespace,
         table: &str,
         tier: PhysicalTier,
     ) -> Result<Vec<Self>, JourneyError> {
@@ -3776,7 +3777,7 @@ impl SealedObject {
             .bifrost_catalog()
             .ok_or("Scribe composition retains the shared catalog")?
             .iceberg_catalog();
-        let binding = vala_bifrost_redux::catalog::TenantTableBinding::resolve((
+        let binding = TenantTableBinding::resolve((
             tenant,
             vala_bifrost_redux::catalog::TableRef::new(namespace, table),
         ))?;
@@ -3805,7 +3806,7 @@ impl SealedObject {
                 .collect::<Result<Vec<_>, _>>()?;
             let schema = decoded
                 .first()
-                .map(arrow::record_batch::RecordBatch::schema)
+                .map(RecordBatch::schema)
                 .ok_or_else(|| format!("{path}: the sealed object holds no rows"))?;
             let rows = arrow::compute::concat_batches(&schema, &decoded)?;
             objects.push(Self {
@@ -3848,13 +3849,7 @@ impl SealedObject {
     ///
     /// Returns an error naming the first inverted row pair, or the Arrow
     /// error when a key column is missing or cannot be encoded.
-    fn expect_sorted(
-        &self,
-        table: &str,
-        keys: &[wyrd_spec::vala::api::SortKeyWire],
-    ) -> Result<(), JourneyError> {
-        use wyrd_spec::vala::api::{NullOrderWire, SortDirectionWire};
-
+    fn expect_sorted(&self, table: &str, keys: &[SortKeyWire]) -> Result<(), JourneyError> {
         let mut fields = Vec::with_capacity(keys.len());
         let mut columns = Vec::with_capacity(keys.len());
         for key in keys {
@@ -3869,7 +3864,7 @@ impl SealedObject {
                     nulls_first: key.null_order == NullOrderWire::First,
                 },
             ));
-            columns.push(std::sync::Arc::clone(column));
+            columns.push(Arc::clone(column));
         }
         let encoded = arrow::row::RowConverter::new(fields)?.convert_columns(&columns)?;
         for index in 1..encoded.num_rows() {
@@ -3952,8 +3947,6 @@ impl SealedObject {
     /// Returns an error when the object does not decode or a row group
     /// carries no filter on the column.
     fn may_contain(&self, column: &str, value: &[u8]) -> Result<bool, JourneyError> {
-        use parquet::file::reader::FileReader;
-
         let reader = parquet::file::serialized_reader::SerializedFileReader::new_with_options(
             self.bytes.clone(),
             parquet::file::serialized_reader::ReadOptionsBuilder::new()
@@ -4138,8 +4131,8 @@ fn expect_measure(
 
 /// The custom dataset's user schema: a sort key, a nullable Bloom key, and a
 /// value column with neither.
-fn custom_schema() -> arrow::datatypes::SchemaRef {
-    std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+fn custom_schema() -> SchemaRef {
+    Arc::new(arrow::datatypes::Schema::new(vec![
         arrow::datatypes::Field::new("key_id", arrow::datatypes::DataType::Int64, false),
         arrow::datatypes::Field::new(CUSTOM_BLOOM_COLUMN, arrow::datatypes::DataType::Utf8, true),
         arrow::datatypes::Field::new("score", arrow::datatypes::DataType::Float64, false),
@@ -4147,7 +4140,7 @@ fn custom_schema() -> arrow::datatypes::SchemaRef {
 }
 
 /// The ascending custom keys file `file` holds; files own disjoint ranges.
-fn custom_keys(file: i64) -> std::ops::Range<i64> {
+fn custom_keys(file: i64) -> Range<i64> {
     file * CUSTOM_ROWS_PER_FILE..(file + 1) * CUSTOM_ROWS_PER_FILE
 }
 
@@ -4211,12 +4204,9 @@ fn sql_timestamp(micros: i64) -> Result<String, JourneyError> {
 /// # Errors
 ///
 /// Returns the Arrow error when the column count differs from the rows.
-fn with_event_time(
-    batch: &arrow::record_batch::RecordBatch,
-    micros: Vec<i64>,
-) -> Result<arrow::record_batch::RecordBatch, JourneyError> {
+fn with_event_time(batch: &RecordBatch, micros: Vec<i64>) -> Result<RecordBatch, JourneyError> {
     let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
-    fields.push(std::sync::Arc::new(arrow::datatypes::Field::new(
+    fields.push(Arc::new(arrow::datatypes::Field::new(
         wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
         arrow::datatypes::DataType::Timestamp(
             arrow::datatypes::TimeUnit::Microsecond,
@@ -4225,11 +4215,11 @@ fn with_event_time(
         false,
     )));
     let mut columns = batch.columns().to_vec();
-    columns.push(std::sync::Arc::new(
+    columns.push(Arc::new(
         arrow::array::TimestampMicrosecondArray::from(micros).with_timezone("UTC"),
     ));
-    Ok(arrow::record_batch::RecordBatch::try_new(
-        std::sync::Arc::new(arrow::datatypes::Schema::new(fields)),
+    Ok(RecordBatch::try_new(
+        Arc::new(arrow::datatypes::Schema::new(fields)),
         columns,
     )?)
 }
@@ -4259,14 +4249,14 @@ const BINARY_PROBE_ROW: i64 = 30_000;
 /// Returns cluster, registration, write, promotion, storage, telemetry, or
 /// query errors, or a description of the first expectation that does not
 /// hold.
+///
+/// # Panics
+///
+/// Panics only if `#[tokio::test]` cannot build its runtime; every
+/// expectation failure is returned as an error instead.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn binary_sort_key_page_pruning() -> Result<(), JourneyError> {
-    use vala_bifrost_redux::namespaces::BifrostNamespace;
-    use wyrd_spec::vala::api::{
-        NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
-    };
-
     let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
         BifrostClusterSpec::one_mixed(),
         ForgeConfig::default(),
@@ -4299,14 +4289,14 @@ async fn binary_sort_key_page_pruning() -> Result<(), JourneyError> {
         (chrono::Utc::now().timestamp_micros() / FILTER_HOUR_MICROS - 2) * FILTER_HOUR_MICROS;
     let event_time = |row: i64| hour + row * 10_000;
     let written: Vec<i64> = (0..BINARY_KEY_ROWS).rev().collect();
-    let batch = arrow::record_batch::RecordBatch::try_new(
+    let batch = RecordBatch::try_new(
         binary_key_schema(),
         vec![
-            std::sync::Arc::new(arrow::array::Int64Array::from(written.clone())),
-            std::sync::Arc::new(arrow::array::FixedSizeBinaryArray::try_from_iter(
+            Arc::new(arrow::array::Int64Array::from(written.clone())),
+            Arc::new(arrow::array::FixedSizeBinaryArray::try_from_iter(
                 written.iter().map(|row| fixed_binary_key(*row)),
             )?),
-            std::sync::Arc::new(arrow::array::BinaryArray::from_iter_values(
+            Arc::new(arrow::array::BinaryArray::from_iter_values(
                 written.iter().map(|row| variable_binary_key(*row)),
             )),
         ],
@@ -4403,8 +4393,8 @@ async fn binary_sort_key_page_pruning() -> Result<(), JourneyError> {
 
 /// The binary-key dataset's user schema: a row identity, a fixed-size binary
 /// sort key, and a variable-length binary key ordered the same way.
-fn binary_key_schema() -> arrow::datatypes::SchemaRef {
-    std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+fn binary_key_schema() -> SchemaRef {
+    Arc::new(arrow::datatypes::Schema::new(vec![
         arrow::datatypes::Field::new("row_id", arrow::datatypes::DataType::Int64, false),
         arrow::datatypes::Field::new(
             "fixed_key",
@@ -4435,7 +4425,7 @@ fn variable_binary_key(row: i64) -> Vec<u8> {
 /// Returns the pre-stream query error, or a frame error from the stream.
 async fn settle_query(
     server: &WyrdTestServer,
-    context: vala_bifrost_redux::oracle::AuthorizedQueryContext,
+    context: AuthorizedQueryContext,
     sql: &str,
 ) -> Result<(), BifrostError> {
     let mut stream = server
@@ -4474,17 +4464,6 @@ async fn settle_query(
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn tenant_scoped_active_cut_is_one_statement_and_one_bounded_retry()
 -> Result<(), JourneyError> {
-    use vala_bifrost_redux::catalog::{
-        TableRef, TableUid, TenantTableBinding, inject_metadata_not_found_for_test,
-        reset_active_cut_acquisitions_for_test,
-    };
-    use vala_bifrost_redux::namespaces::BifrostNamespace;
-    use wyrd_runtime::permission::PermissionSet;
-    use wyrd_runtime::{Permission, Principal, PrincipalKind};
-    use wyrd_spec::auth::PrincipalId;
-    use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::AuthMethod;
-
     let server = WyrdTestServer::start_bound().await?;
     let tenant = server.data_tenant_id();
     let left = unique_table("cut_left");
@@ -4554,7 +4533,7 @@ async fn tenant_scoped_active_cut_is_one_statement_and_one_bounded_retry()
     );
     // The action permission is tenant-wide, exactly as the public query
     // service builds it; table coverage comes only from the effective grants.
-    let denied = vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(
+    let denied = AuthorizedQueryContext::try_new(
         principal,
         tenant,
         RequestId::now_v7(),
@@ -4616,7 +4595,7 @@ const HELD_CUT_SCRIBE: usize = 3;
 /// Returns a harness error when the pod is not running or the read fails.
 async fn active_reads(
     cluster: &PeerCluster,
-    binding: &vala_bifrost_redux::catalog::TenantTableBinding,
+    binding: &TenantTableBinding,
 ) -> Result<i64, JourneyError> {
     Ok(cluster
         .server(HELD_CUT_LEADER)?
@@ -4632,7 +4611,7 @@ async fn active_reads(
 /// harness error when the count cannot be read.
 async fn await_no_active_reads(
     cluster: &PeerCluster,
-    binding: &vala_bifrost_redux::catalog::TenantTableBinding,
+    binding: &TenantTableBinding,
     case: &str,
 ) -> Result<(), JourneyError> {
     let deadline = tokio::time::Instant::now() + LIVE_SETTLE_TIMEOUT;
@@ -4663,9 +4642,6 @@ async fn await_no_active_reads(
 /// a claim release precedes its graph's revocation, or a revoked graph's
 /// claim never began releasing.
 fn assert_graphs_revoked_before_claims(case: &str, expected: usize) -> Result<(), JourneyError> {
-    use vala_bifrost_redux::oracle::planner::{
-        LeaderOwnershipEvent, take_leader_ownership_order_for_test,
-    };
     let order = take_leader_ownership_order_for_test();
     let position = |query: uuid::Uuid, event: LeaderOwnershipEvent| {
         order
@@ -4738,18 +4714,15 @@ async fn held_cut_owns_active_reads_until_all_descendants_settle() -> Result<(),
         .ingest_rows(HELD_CUT_SCRIBE, &table, 0, 12, 3)
         .await?;
     cluster.refresh_snapshots().await?;
-    let binding = vala_bifrost_redux::catalog::TenantTableBinding::resolve((
+    let binding = TenantTableBinding::resolve((
         tenant,
-        vala_bifrost_redux::catalog::TableRef::new(
-            vala_bifrost_redux::namespaces::BifrostNamespace::Bifrost,
-            &table,
-        ),
+        vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Bifrost, &table),
     ))?;
     let engine = cluster
         .server(HELD_CUT_LEADER)?
         .state()
         .bifrost_query()
-        .map(|query| std::sync::Arc::clone(query.engine()))
+        .map(|query| Arc::clone(query.engine()))
         .ok_or("the leader pod composes no Oracle")?;
     let request = BifrostQueryRequest {
         sql: format!(
@@ -4857,8 +4830,8 @@ const HELD_QUERY_TRANSITION_BOUND: Duration = Duration::from_secs(120);
 /// # Errors
 /// Returns a catalog, manifest, or path error.
 async fn held_query_live_files(
-    catalog: &dyn iceberg::Catalog,
-    binding: &vala_bifrost_redux::catalog::TenantTableBinding,
+    catalog: &dyn Catalog,
+    binding: &TenantTableBinding,
 ) -> Result<(Option<i64>, BTreeSet<i64>, BTreeSet<String>), JourneyError> {
     let table = catalog.load_table(&binding.table_ident()).await?;
     let snapshots = table
@@ -4888,8 +4861,8 @@ async fn held_query_live_files(
 /// # Errors
 /// Returns the catalog load, transaction, or commit error.
 async fn held_query_set_property(
-    catalog: &std::sync::Arc<dyn iceberg::Catalog>,
-    binding: &vala_bifrost_redux::catalog::TenantTableBinding,
+    catalog: &Arc<dyn Catalog>,
+    binding: &TenantTableBinding,
     key: &str,
     value: &str,
 ) -> Result<(), JourneyError> {
@@ -4947,8 +4920,8 @@ async fn held_query_maintenance_pass(server: &WyrdTestServer) -> Result<(), Jour
 /// Returns a query, decode, or terminal error, or an error when the terminal
 /// is not a success.
 async fn held_query_ids(
-    engine: &vala_bifrost_redux::oracle::Oracle,
-    context: vala_bifrost_redux::oracle::AuthorizedQueryContext,
+    engine: &Oracle,
+    context: AuthorizedQueryContext,
     sql: String,
 ) -> Result<Vec<i64>, JourneyError> {
     let mut stream = engine
@@ -5027,12 +5000,9 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
     let tenant = cluster.data_tenant_id();
     let table = unique_table("held_replaced");
     register_table(server, tenant, &table).await?;
-    let binding = vala_bifrost_redux::catalog::TenantTableBinding::resolve((
+    let binding = TenantTableBinding::resolve((
         tenant,
-        vala_bifrost_redux::catalog::TableRef::new(
-            vala_bifrost_redux::namespaces::BifrostNamespace::Bifrost,
-            &table,
-        ),
+        vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Bifrost, &table),
     ))?;
     let catalog = server
         .state()
@@ -5088,13 +5058,13 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
     let engine = server
         .state()
         .bifrost_query()
-        .map(|query| std::sync::Arc::clone(query.engine()))
+        .map(|query| Arc::clone(query.engine()))
         .ok_or("the mixed node composes no Oracle")?;
     let context = query_context(tenant)?;
-    let pause = std::sync::Arc::new(vala_bifrost_redux::oracle::OraclePreparationPause::new(
+    let pause = Arc::new(vala_bifrost_redux::oracle::OraclePreparationPause::new(
         context.request_id.clone(),
     ));
-    engine.bind_preparation_pause_for_test(Some(std::sync::Arc::clone(&pause)))?;
+    engine.bind_preparation_pause_for_test(Some(Arc::clone(&pause)))?;
     let observer = cluster
         .forge_completion_observer()
         .ok_or("cluster was started without a Forge completion observer")?;

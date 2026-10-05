@@ -404,6 +404,9 @@ mod pg_tests {
         assert_eq!(row.request_id, caller.request_id.as_str());
     }
 
+    /// Builds a `vala.datasets` registration request for `name` with the given
+    /// fields and every optional layout and compaction setting left unset, so
+    /// each test exercises the server defaults.
     fn register_req(name: &str, fields: Vec<FieldSpec>) -> RegisterTableRequest {
         RegisterTableRequest {
             namespace: "vala.datasets".to_owned(),

@@ -12,12 +12,15 @@
 //! reports what committed so its caller can settle the claim and retire the
 //! members' staged bytes.
 
+use crate::scribe::hot_stage::HotStageError;
 use std::sync::Arc;
+
+use uuid::Uuid;
 
 use crate::catalog::TenantTableBinding;
 use crate::contracts::ScribeError;
 use crate::parquet::object_uploader::VerifiedParquetObject;
-use crate::scribe::assembly::StagingClaim;
+use crate::scribe::assembly::{ScribeAssemblyKey, StagedMemberId, StagingClaim};
 use crate::scribe::claim_assembly::{AssembledClaim, ClaimRuns};
 use crate::scribe::file_list_writer::{self, FileListCommitKey};
 use crate::scribe::hot_stage::{ScribeHotStage, StagedHotSourceRecordV1, StagedMemberState};
@@ -177,8 +180,8 @@ impl ClaimPublisher {
     /// rows — either way the publication must not report a clean handover.
     fn release_authority(
         &self,
-        key: &crate::scribe::assembly::ScribeAssemblyKey,
-        member: crate::scribe::assembly::StagedMemberId,
+        key: &ScribeAssemblyKey,
+        member: StagedMemberId,
     ) -> Result<(), ScribeError> {
         let Some(hot_sources) = &self.hot_sources else {
             return Ok(());
@@ -218,8 +221,8 @@ impl ClaimPublisher {
     /// a reader may still open.
     async fn await_lease_drain(
         &self,
-        key: &crate::scribe::assembly::ScribeAssemblyKey,
-        member: crate::scribe::assembly::StagedMemberId,
+        key: &ScribeAssemblyKey,
+        member: StagedMemberId,
     ) -> Result<(), ScribeError> {
         let Some(hot_sources) = &self.hot_sources else {
             return Ok(());
@@ -404,8 +407,8 @@ impl ClaimPublisher {
     /// shape recovery resumes per member.
     async fn move_each(
         &self,
-        key: &crate::scribe::assembly::ScribeAssemblyKey,
-        moves: impl IntoIterator<Item = (crate::scribe::assembly::StagedMemberId, StagedMemberState)>,
+        key: &ScribeAssemblyKey,
+        moves: impl IntoIterator<Item = (StagedMemberId, StagedMemberState)>,
     ) -> Result<Vec<StagedHotSourceRecordV1>, ScribeError> {
         futures_util::future::try_join_all(moves.into_iter().map(|(member, next)| async move {
             let label = next.label();
@@ -621,8 +624,8 @@ impl ClaimPublisher {
     /// for any other reason, which means nothing durable holds the rows.
     fn release_retired_authority(
         &self,
-        key: &crate::scribe::assembly::ScribeAssemblyKey,
-        member: crate::scribe::assembly::StagedMemberId,
+        key: &ScribeAssemblyKey,
+        member: StagedMemberId,
     ) -> Result<(), ScribeError> {
         let Some(hot_sources) = &self.hot_sources else {
             return Ok(());
@@ -663,7 +666,7 @@ impl ClaimPublisher {
     /// refusal. Unprocessed records remain intact for the next attempt.
     pub(crate) async fn recover_terminal_members(
         &self,
-        key: &crate::scribe::assembly::ScribeAssemblyKey,
+        key: &ScribeAssemblyKey,
         records: &[&StagedHotSourceRecordV1],
     ) -> Result<RecoveredTerminalCleanup, ScribeError> {
         let terminal_facts = TerminalPublicationFacts::collect(records);
@@ -693,8 +696,8 @@ impl ClaimPublisher {
     /// found it, which the next startup re-reads.
     async fn retire_terminal_member(
         &self,
-        key: &crate::scribe::assembly::ScribeAssemblyKey,
-        id: crate::scribe::assembly::StagedMemberId,
+        key: &ScribeAssemblyKey,
+        id: StagedMemberId,
         plan: TerminalMemberPlan,
     ) -> Result<(), ScribeError> {
         if plan.records_publication {
@@ -889,16 +892,14 @@ impl std::fmt::Debug for ClaimPublisher {
 /// replay instead of refusing it as a backwards move. Nothing else reads the
 /// value; Forge derives its own promotion operation identities from its
 /// tasks.
-fn publication_operation_id(claim: &StagingClaim) -> uuid::Uuid {
+fn publication_operation_id(claim: &StagingClaim) -> Uuid {
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&claim.id().as_bytes()[..16]);
     uuid::Builder::from_custom_bytes(bytes).into_uuid()
 }
 
 /// Builds the failure describing one member's refused durable transition.
-fn transition_failure(
-    member: crate::scribe::assembly::StagedMemberId,
-) -> impl Fn(crate::scribe::hot_stage::HotStageError) -> ScribeError {
+fn transition_failure(member: StagedMemberId) -> impl Fn(HotStageError) -> ScribeError {
     move |error| ScribeError::Internal {
         detail: format!(
             "record the publication of staged member {}-{}: {error}",

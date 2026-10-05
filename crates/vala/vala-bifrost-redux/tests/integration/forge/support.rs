@@ -11,7 +11,9 @@
 //! a delegating [`iceberg::Catalog`] that can refuse or park one commit. Both
 //! are plumbing around the real dependency, not a second implementation of it.
 
+use chrono::{DateTime, Utc};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -42,7 +44,7 @@ use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::resources::{
     BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, BifrostVolumeRoots,
-    ResourceSource, SystemResourceSnapshot,
+    ForgeResources, ResourceSource, SystemResourceSnapshot,
 };
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
@@ -51,11 +53,14 @@ use vala_bifrost_redux::scribe::{
     ScribeIngressCpuPool, ScribePersistenceConfig, ScribePersistenceCpuPool, ScribePressureConfig,
     ScribeWalIoPool,
 };
+use vala_sql::OperatorPool;
 use vala_sql::queries::forge_tasks::ForgeTasks;
-use vala_sql::queries::oracle_reader_authority::ActiveReadOwner;
+use vala_sql::queries::oracle_reader_authority::{AcquiredTableCut, ActiveReadOwner};
 use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
 use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
+use wyrd_bench::BenchmarkRecorder;
 use wyrd_spec::DataTenantId;
+use wyrd_telemetry::{TelemetryGuard, TestTraceCapture};
 
 /// Bounded wait every fixture handshake uses instead of a sleep.
 const FIXTURE_BOUND: Duration = Duration::from_secs(30);
@@ -796,7 +801,7 @@ pub(crate) struct PromotionIntegrationFixture {
     /// Real catalog owner used for registration, cuts, and Forge commits.
     pub(crate) catalog: Arc<BifrostCatalog>,
     /// Privileged pool used for read-only durable inspection.
-    pub(crate) operator_pool: vala_sql::OperatorPool,
+    pub(crate) operator_pool: OperatorPool,
     /// Tenant-scoped SQL handle Forge transitions run through.
     pub(crate) vala: vala_sql::ValaPostgres,
     /// Raw staging operator shared by Scribe, the catalog, and Forge.
@@ -808,9 +813,9 @@ pub(crate) struct PromotionIntegrationFixture {
     /// Validated Forge limits every supervised pair is built with.
     pub(crate) config: ForgeConfig,
     /// Forge capability every supervised Forge owner is built with.
-    pub(crate) forge_resources: vala_bifrost_redux::resources::ForgeResources,
+    pub(crate) forge_resources: ForgeResources,
     /// Existing spill directory every supervised Forge owner leases.
-    pub(crate) forge_spill: std::path::PathBuf,
+    pub(crate) forge_spill: PathBuf,
     /// Real Scribe retained so its owned WAL and workers outlive the seals,
     /// and reused by [`PromotionIntegrationFixture::seal_more`] to publish
     /// further hot objects through the same writer.
@@ -853,12 +858,7 @@ impl PromotionIntegrationFixture {
     /// # Panics
     /// The spawned task panics when the acquisition fails or the one-hour
     /// deadline has already passed; awaiting the handle surfaces that panic.
-    pub(crate) fn spawn_active_read(
-        &self,
-    ) -> (
-        Uuid,
-        JoinHandle<vala_sql::queries::oracle_reader_authority::AcquiredTableCut>,
-    ) {
+    pub(crate) fn spawn_active_read(&self) -> (Uuid, JoinHandle<AcquiredTableCut>) {
         let query_id = Uuid::now_v7();
         let catalog = Arc::clone(&self.catalog);
         let tenant = self.tenant;
@@ -1018,7 +1018,7 @@ impl PromotionIntegrationFixture {
         assert!(
             first.execute_one_for_test(stop).await.is_err(),
             "terminal SQL refusal must surface; tasks at {}: {:?}",
-            chrono::Utc::now(),
+            Utc::now(),
             self.forge_tasks().await
         );
         let state: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks")
@@ -1085,7 +1085,7 @@ impl PromotionIntegrationFixture {
 
         let binding = create_table(&catalog, tenant, table_name).await;
         let operator_pool = database.operator_pool().clone();
-        let seeded_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT now()")
+        let seeded_at: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
             .fetch_one(operator_pool.pool())
             .await
             .expect("fixture seed marker");
@@ -1201,7 +1201,7 @@ impl PromotionIntegrationFixture {
     /// Panics when the fixture cannot produce a validated Forge graph.
     pub(crate) fn build_forge_over_operator_pool_for_test(
         &self,
-        operator_pool: vala_sql::OperatorPool,
+        operator_pool: OperatorPool,
     ) -> Arc<Forge> {
         let (_publisher, hints) =
             staging_file_channel(self.config.max_hints_per_wake).expect("fixture hint capacity");
@@ -1313,7 +1313,7 @@ impl PromotionIntegrationFixture {
     pub(crate) async fn seal_more(&self, count: usize) {
         let before = self.file_rows().await.len();
         let first = i64::try_from(before).expect("fixture row counts stay representable");
-        let seeded_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT now()")
+        let seeded_at: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
             .fetch_one(self.operator_pool.pool())
             .await
             .expect("fixture seed marker");
@@ -1359,7 +1359,7 @@ impl PromotionIntegrationFixture {
         first_value: u64,
     ) {
         let before = self.file_rows().await.len();
-        let seeded_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT now()")
+        let seeded_at: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
             .fetch_one(self.operator_pool.pool())
             .await
             .expect("fixture seed marker");
@@ -1440,7 +1440,7 @@ impl PromotionIntegrationFixture {
         count: usize,
     ) {
         let binding = create_table(&self.catalog, tenant, name).await;
-        let seeded_at = chrono::Utc::now();
+        let seeded_at = Utc::now();
         let schema = ingress_schema();
         for number in 0..count {
             append_and_seal(
@@ -1464,7 +1464,7 @@ impl PromotionIntegrationFixture {
     /// Panics when registration, sealing, or eligibility aging fails.
     pub(crate) async fn register_and_seal_table(&self, name: &str, count: usize) {
         let binding = create_table(&self.catalog, self.tenant, name).await;
-        let seeded_at = chrono::Utc::now();
+        let seeded_at = Utc::now();
         let schema = ingress_schema();
         for number in 0..count {
             append_and_seal(
@@ -2741,7 +2741,7 @@ async fn register_scribe_fence(
 ///
 /// Panics when midnight is not representable, which cannot happen for a UTC day.
 pub(crate) fn fixture_day() -> chrono::NaiveDate {
-    chrono::Utc::now().date_naive() - chrono::Duration::days(1)
+    Utc::now().date_naive() - chrono::Duration::days(1)
 }
 
 /// User-visible ingress schema for the fixture table.
@@ -2992,10 +2992,10 @@ async fn append_only(
 ///
 /// Panics when the aging update fails.
 async fn age_files(
-    operator_pool: &vala_sql::OperatorPool,
+    operator_pool: &OperatorPool,
     tenant: DataTenantId,
     binding: &TenantTableBinding,
-    since: chrono::DateTime<chrono::Utc>,
+    since: DateTime<Utc>,
 ) {
     sqlx::query(
         "UPDATE vala.file_list SET created_at = now() - interval '3 minutes' \
@@ -3016,7 +3016,7 @@ async fn age_files(
 ///
 /// Panics when the manual clock cannot be initialized.
 pub(crate) fn manual_clock() -> (ForgeClock, ForgeClockControl) {
-    ForgeClock::manual(chrono::Utc::now())
+    ForgeClock::manual(Utc::now())
 }
 
 /// The integration binary's one production-shaped telemetry installation.
@@ -3030,11 +3030,11 @@ pub(crate) fn manual_clock() -> (ForgeClock, ForgeClockControl) {
 /// what a checkpoint asserts on is production emission.
 pub(crate) struct ProcessTelemetry {
     /// Process-wide metrics recorder every production counter writes into.
-    recorder: Arc<wyrd_bench::BenchmarkRecorder>,
+    recorder: Arc<BenchmarkRecorder>,
     /// Handle over spans exported by the production tracing pipeline.
-    capture: wyrd_telemetry::TestTraceCapture,
+    capture: TestTraceCapture,
     /// Keeps the installed provider alive for the life of the process.
-    _guard: wyrd_telemetry::TelemetryGuard,
+    _guard: TelemetryGuard,
 }
 
 /// The one [`ProcessTelemetry`] of this test process.
@@ -3053,7 +3053,7 @@ impl ProcessTelemetry {
     /// owner's recorder or capture could then be trusted.
     pub(crate) fn shared() -> &'static Self {
         PROCESS_TELEMETRY.get_or_init(|| {
-            let recorder = wyrd_bench::BenchmarkRecorder::new()
+            let recorder = BenchmarkRecorder::new()
                 .install()
                 .expect("no other global metrics recorder is installed in this test process");
             let (guard, capture) =

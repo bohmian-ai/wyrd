@@ -4,11 +4,14 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio::sync::{mpsc, watch};
+use vala_sql::ValaPostgres;
+use vala_sql::queries::scribe_batch_commits::ScribeBatchCommit;
 use wyrd_spec::ids::DataTenantId;
 
 use crate::catalog::TableRef;
@@ -803,7 +806,7 @@ struct ShardOwner {
     /// Optional immutable-generation persistence runtime.
     persistence: Option<Arc<PersistenceRuntime>>,
     /// Vala SQL pool retained only by the production batch-control fence.
-    control_postgres: Option<Arc<vala_sql::ValaPostgres>>,
+    control_postgres: Option<Arc<ValaPostgres>>,
     /// Completion sender routed back to this owner's command mailbox.
     completion_tx: mpsc::Sender<ShardCommand>,
     /// Typed WAL stream identity for generations and replay.
@@ -889,7 +892,7 @@ pub(crate) struct ScribeShardStartConfig {
     /// Optional immutable-generation persistence runtime.
     pub(crate) persistence: Option<Arc<PersistenceRuntime>>,
     /// Tenant-scoped SQL owner used to fence durable public batch ACKs.
-    pub(crate) control_postgres: Option<Arc<vala_sql::ValaPostgres>>,
+    pub(crate) control_postgres: Option<Arc<ValaPostgres>>,
     /// Typed pod stream identity.
     pub(crate) stream: StreamIdentity,
     /// Shared active/immutable memory ledger.
@@ -3659,9 +3662,9 @@ impl ShardOwner {
     /// failures poison admission and retain the group until restart.
     async fn commit_batch_control_fence(
         &self,
-        postgres: &vala_sql::ValaPostgres,
-        commit: &vala_sql::queries::scribe_batch_commits::ScribeBatchCommit,
-        ingested_at: chrono::DateTime<chrono::Utc>,
+        postgres: &ValaPostgres,
+        commit: &ScribeBatchCommit,
+        ingested_at: DateTime<Utc>,
     ) -> Result<bool, ScribeError> {
         loop {
             let mut conn = postgres.tenant_conn(commit.tenant).await?;

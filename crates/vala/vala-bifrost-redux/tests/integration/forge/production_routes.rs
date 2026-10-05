@@ -1263,6 +1263,75 @@ async fn worker_duration_includes_claim_and_failed_release() {
     );
 }
 
+/// A worker whose operator database stops answering backs off and recovers.
+///
+/// The worker's operator pool is narrowed to one connection, which the test
+/// then holds past the pool's acquire timeout. Every loop read times out
+/// without reaching the database, so the worker retracts readiness and keeps
+/// running instead of stopping its process; once the connection is released
+/// the next answered turn advertises it again.
+///
+/// # Panics
+///
+/// Panics when the worker stops, never withdraws readiness while the database
+/// is unreachable, or never advertises it again once the database answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn worker_backs_off_while_the_operator_database_is_unreachable() {
+    let fixture = PromotionIntegrationFixture::start("unreachable_operator_db").await;
+    let narrow = vala_sql::OperatorPool::from(
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_with((*fixture.operator_pool.pool().connect_options()).clone())
+            .await
+            .expect("narrow operator pool"),
+    );
+    let forge = fixture.build_forge_over_operator_pool_for_test(narrow.clone());
+    let worker =
+        ForgeWorker::new(forge, ForgeWorkerConfig::default(), Uuid::now_v7()).expect("worker");
+    let readiness = ForgeRoleReadiness::default();
+    let stop = CancellationToken::new();
+    let work = AbortOnDropHandle::new(tokio::spawn(worker.run(stop.clone(), readiness.clone())));
+    let ready = |expected: bool| {
+        let readiness = readiness.clone();
+        async move {
+            timeout(OWNERSHIP_BOUND, async {
+                while readiness.is_ready() != expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok()
+        }
+    };
+    assert!(ready(true).await, "the worker starts ready");
+
+    let held = narrow
+        .pool()
+        .acquire()
+        .await
+        .expect("the test holds the only operator connection");
+    assert!(
+        ready(false).await,
+        "an unreachable database withdraws readiness"
+    );
+    assert!(!work.is_finished(), "the worker keeps running");
+    drop(held);
+    assert!(
+        ready(true).await,
+        "the worker advertises again once the database answers: finished={}",
+        work.is_finished()
+    );
+
+    stop.cancel();
+    timeout(OWNERSHIP_BOUND, work)
+        .await
+        .expect("the worker drains")
+        .expect("the worker task joins")
+        .expect("the worker stops cleanly");
+}
+
 /// A running slot discovering invalid Prepared evidence closes readiness before
 /// held lease cleanup, preserves reconciliation over release, and observes uncertainty.
 ///

@@ -25,6 +25,29 @@ mod tests {
             ForgeFailureClass::TransientObjectStore
         );
     }
+
+    /// Only a statement the database never answered is an unavailable
+    /// database; an answered SQL failure and a lease failure are not.
+    #[test]
+    fn database_unavailable_is_only_an_unanswered_statement() {
+        let unavailable = ForgeError::Sql(vala_sql::SqlError::Query(sqlx::Error::PoolTimedOut));
+        assert!(unavailable.is_database_unavailable());
+        assert_eq!(
+            unavailable.failure_class(),
+            ForgeFailureClass::TransientCoordination
+        );
+        assert!(
+            ForgeError::Sql(vala_sql::SqlError::Query(sqlx::Error::Io(
+                std::io::Error::from(std::io::ErrorKind::ConnectionReset)
+            )))
+            .is_database_unavailable()
+        );
+        assert!(!ForgeError::Sql(vala_sql::SqlError::NoRows).is_database_unavailable());
+        assert!(
+            !ForgeError::Lease(vala_sql::SqlError::Query(sqlx::Error::PoolTimedOut))
+                .is_database_unavailable()
+        );
+    }
 }
 
 /// Failures that preserve the durable boundary where Forge stopped.
@@ -143,6 +166,24 @@ impl ForgeError {
     #[must_use]
     pub fn reconciliation(detail: String) -> Self {
         Self::Reconciliation { detail }
+    }
+
+    /// Reports whether a SQL failure never reached the database.
+    ///
+    /// A pool acquire timeout or a connection I/O failure means the
+    /// statement could not be answered, which is a
+    /// [`ForgeFailureClass::TransientCoordination`] condition that a later
+    /// attempt may clear. Callers use this only for reads whose failure
+    /// leaves no durable state to account for; a settlement or release that
+    /// fails this way still stops its owner.
+    #[must_use]
+    pub fn is_database_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Sql(vala_sql::SqlError::Query(
+                sqlx::Error::PoolTimedOut | sqlx::Error::Io(_)
+            ))
+        )
     }
 
     /// Classifies one execution failure without parsing diagnostic strings.

@@ -2398,7 +2398,10 @@ impl ForgeWorker {
     /// cancellation-release failures. Each leaves durable state that no longer
     /// describes what this owner did, so the loop stops rather than claiming
     /// again. An execution failure this attempt durably settled is not one of
-    /// them: it stays a healthy exit that permits the next claim.
+    /// them: it stays a healthy exit that permits the next claim. Neither is a
+    /// loop read the database never answered: reclaim, the recovery claim, the
+    /// unattended-authority question, and the fair claim back off through
+    /// [`Self::answered`] with readiness retracted, and the next turn retries.
     async fn run_event_loop(&mut self, shutdown: CancellationToken) -> Result<(), ForgeError> {
         let claim_limits = self.claim_limits()?;
         // One worker owns exactly one maintenance execution position, and it is
@@ -2441,15 +2444,29 @@ impl ForgeWorker {
                 // with nothing in flight and nothing idle cannot exist.
                 return Ok(());
             }
-            self.reclaim_expired_attempts(claim_limits.max_active_per_tenant)
-                .await?;
+            let reclaimed = self
+                .reclaim_expired_attempts(claim_limits.max_active_per_tenant)
+                .await;
+            if self
+                .answered(reclaimed, &mut pool, &shutdown)
+                .await?
+                .is_none()
+            {
+                continue;
+            }
             // Checked immediately before each durable claim so a stop signal
             // lands before this loop takes new work.
             if shutdown.is_cancelled() {
                 continue;
             }
-            if self.reconcile_one_prepared(claim_limits, &shutdown).await? {
-                continue;
+            let prepared = self.claim_prepared(claim_limits).await;
+            match self.answered(prepared, &mut pool, &shutdown).await? {
+                Some(Some(prepared)) => {
+                    self.reconcile_claimed_prepared(prepared, &shutdown).await?;
+                    continue;
+                }
+                Some(None) => {}
+                None => continue,
             }
             if shutdown.is_cancelled() {
                 continue;
@@ -2468,7 +2485,11 @@ impl ForgeWorker {
             if shutdown.is_cancelled() {
                 continue;
             }
-            if self.holds_unattended_authority(&pool).await? {
+            let unattended = self.holds_unattended_authority(&pool).await;
+            let Some(unattended) = self.answered(unattended, &mut pool, &shutdown).await? else {
+                continue;
+            };
+            if unattended {
                 // This owner released an attempt it could not account for: the
                 // task is still Running under its name, its operation is still
                 // Prepared, and its claim is owned until the lease lapses.
@@ -2551,7 +2572,12 @@ impl ForgeWorker {
             let claim = self
                 .claim_next(claim_limits, reserved_maintenance)
                 .await
-                .map_err(ForgeError::Sql)?;
+                .map_err(ForgeError::Sql);
+            // The claims this turn already started are admitted work; only the
+            // unanswered claim is retried.
+            let Some(claim) = self.answered(claim, pool, shutdown).await? else {
+                return Ok(Some(claimed));
+            };
             let Some(claim) = claim else {
                 break;
             };
@@ -2972,8 +2998,9 @@ impl ForgeWorker {
     /// # Errors
     ///
     /// Returns the SQL failure the predicate raised. The answer gates readiness
-    /// and new claims, so an unanswered question must stop the loop rather than
-    /// be read as "nothing unresolved".
+    /// and new claims, so an unanswered question is never read as "nothing
+    /// unresolved": the loop stops, or backs off without claiming when the
+    /// database could not be reached.
     async fn holds_unattended_authority(
         &self,
         pool: &ForgeAttemptPool,
@@ -3009,6 +3036,40 @@ impl ForgeWorker {
             return Ok(());
         }
         Box::pin(self.await_loop_event(pool, None, shutdown)).await
+    }
+
+    /// Passes through one loop read's answer, or backs off when the
+    /// database could not answer it.
+    ///
+    /// Reclaim, the recovery claim, the unattended-authority question, and
+    /// the fair claim either answer or roll back, so a statement that never
+    /// reached the database leaves nothing to account for. Such a failure
+    /// retracts readiness, waits through [`Self::wait_for_progress`], and
+    /// returns `None` so the loop re-reads durable state; readiness returns
+    /// with the next turn that answers. Any other failure still stops the
+    /// loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns the read's error unless
+    /// [`ForgeError::is_database_unavailable`] holds, and the settlement
+    /// failures a completion recorded during the wait raises.
+    async fn answered<T>(
+        &self,
+        read: Result<T, ForgeError>,
+        pool: &mut ForgeAttemptPool,
+        shutdown: &CancellationToken,
+    ) -> Result<Option<T>, ForgeError> {
+        match read {
+            Ok(answer) => Ok(Some(answer)),
+            Err(error) if error.is_database_unavailable() => {
+                tracing::warn!(worker = %self.owner, error = %error, "Forge worker could not reach the database; backing off");
+                self.publish_readiness(false);
+                self.wait_for_progress(pool, shutdown).await?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Publishes this loop's readiness, when it is running under a role handle.
@@ -3192,14 +3253,43 @@ impl ForgeWorker {
         claim_limits: ForgeClaimLimits,
         shutdown: &CancellationToken,
     ) -> Result<bool, ForgeError> {
-        let Some(prepared) = self
-            .tasks
-            .claim_prepared_for_reconciliation(self.owner, claim_limits.lease_seconds)
-            .await
-            .map_err(ForgeError::Sql)?
-        else {
+        let Some(prepared) = self.claim_prepared(claim_limits).await? else {
             return Ok(false);
         };
+        self.reconcile_claimed_prepared(prepared, shutdown).await?;
+        Ok(true)
+    }
+
+    /// Claims one `prepared` attempt for reconciliation by this owner, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the bounded recovery claim fails.
+    async fn claim_prepared(
+        &self,
+        claim_limits: ForgeClaimLimits,
+    ) -> Result<Option<ForgePreparedTaskClaim>, ForgeError> {
+        self.tasks
+            .claim_prepared_for_reconciliation(self.owner, claim_limits.lease_seconds)
+            .await
+            .map_err(ForgeError::Sql)
+    }
+
+    /// Reconciles one `prepared` attempt this owner already claimed.
+    ///
+    /// # Errors
+    ///
+    /// A reconciliation or release failure retains exact evidence and is
+    /// returned, stopping the slot before any later claim.
+    ///
+    /// # Cancellation
+    ///
+    /// A cancelled reconciliation leaves the attempt durable for a later owner.
+    async fn reconcile_claimed_prepared(
+        &self,
+        prepared: ForgePreparedTaskClaim,
+        shutdown: &CancellationToken,
+    ) -> Result<(), ForgeError> {
         #[cfg(feature = "test-support")]
         let (task_id, strategy) = (
             prepared.task.task_id,
@@ -3217,7 +3307,7 @@ impl ForgeWorker {
         }
         #[cfg(feature = "test-support")]
         self.record_completion(task_id, &strategy);
-        Ok(true)
+        Ok(())
     }
 
     /// Maps one claimed strategy onto its durable work type, if this build knows it.

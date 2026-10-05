@@ -105,3 +105,16 @@ Diagnosis of the one `test:bifrost` failure:
 Commands: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=forge::leadership::tests::revoked_stop_is_attributed_to_the_leader_fence)'` PASS; the focused journey command above PASS; `mise run test:bifrost:journey:forge` 22/22 PASS; `mise run fmt`, `mise run lints` and `git diff --check` clean.
 
 Pool-timeout follow-up (read-only diagnostician): a Postgres-side stall of about 7s starved the app, operator and Vala pools at once, including a bare readiness `SELECT 1`, so the cause is not lock contention and not this change. It is fatal only because `ForgeWorker::run_event_loop` (`worker.rs` ~2444/2451/2467/2554) propagates read-only SQL errors as `Err`, and `wyrd_server::app::supervise` then terminates the process. That fix site is outside this task's write set and overlaps TASK-002-R1's `worker.rs` edits, so it is escalated to the caller.
+
+### Follow-up: Forge worker survives an unreachable database (caller-directed)
+
+- **Symptom:** `pg_verification_runtime::crash_after_detail_ack_reclaims_the_same_run_before_dispatch` failed once in `test:bifrost` with `Forge worker stopped after it could not settle its work error=... pool timed out while waiting for an open connection`. `supervise` then terminated the in-process server, so the test's flush hit `ingress dispatcher is closed`.
+- **Evidence:** about 7s of Postgres starvation hit the operator, app and Vala pools at once, including a readiness `SELECT 1`. `ForgeWorker::run_event_loop` propagated the read-only reclaim, recovery-claim, unattended-authority and fair-claim errors with `?`, and `run()` returned them to the fatal supervisor.
+- **Cause:** a statement the database never answered was treated like an unsettleable durable failure.
+- **Fix site:** `forge/worker.rs` `ForgeWorker::answered`. Those four loop reads route through it. `ForgeError::is_database_unavailable` (`PoolTimedOut` or I/O on a `Sql` error, a `TransientCoordination` case) retracts readiness and backs off through the existing `wait_for_progress`. Every other error, and every settlement, reconciliation and lease-release failure, still stops the worker. `reconcile_one_prepared` was split into `claim_prepared` and `reconcile_claimed_prepared`, so only its claim is retried. Startup drain is unchanged.
+
+| Requirement | Verification | Result |
+|---|---|---|
+| A transient pool failure on a loop read backs off and the loop continues | new integration test `forge::production_routes::worker_backs_off_while_the_operator_database_is_unreachable`. Against the previous `worker.rs` it fails (`finished=true`, `could not settle its work ... pool timed out`); with the fix it passes | PASS |
+| Only an unanswered statement is classified as unavailable | unit test `forge::error::tests::database_unavailable_is_only_an_unanswered_statement` | PASS |
+| No regression | `mise run test:bifrost:integration:server` 84/84; `mise run test:bifrost:integration:redux` 893/893; `mise run fmt`, `mise run lints` and `git diff --check` clean | PASS |

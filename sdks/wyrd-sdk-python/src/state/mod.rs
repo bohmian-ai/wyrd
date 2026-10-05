@@ -31,6 +31,7 @@ use wyrd_client::state::WyrdState;
 
 use crate::bifrost::PyTableConfig;
 use crate::observe::PyRun;
+use crate::workflow::PyWorkflow;
 
 /// Python state hydration boundary and all-or-nothing holder owner.
 mod hydrator;
@@ -1635,6 +1636,18 @@ impl PyCards {
         }
     }
 
+    /// Return the typed view for loading registered Workflows.
+    ///
+    /// Use `cards.workflow.load` to read a registered Workflow and its locked
+    /// Agent and Prompt closure into a runnable `wyrd.agent.Workflow`. The view
+    /// uses the parent client's connection and tenant context.
+    #[getter]
+    fn workflow(&self) -> PyWorkflowCards {
+        PyWorkflowCards {
+            inner: self.inner.clone(),
+        }
+    }
+
     /// Register a caller-owned `DataCard`, `ModelCard`, or `PromptCard`.
     ///
     /// Registration serializes the complete Card envelope, saves `DataCard` or
@@ -2541,6 +2554,91 @@ impl PyPromptCardRegistry {
     }
 }
 
+/// Typed loading of registered Workflows.
+///
+/// Obtain this view from `Cards.workflow`. It uses the connection and tenant
+/// context from the parent `Cards` object. Callers normally do not construct
+/// this type directly.
+#[pyclass(module = "wyrd.cards", name = "WorkflowCards")]
+pub struct PyWorkflowCards {
+    /// Parent `Cards` handle clone carrying the connection and tenant context.
+    inner: Cards,
+}
+
+#[pymethods]
+impl PyWorkflowCards {
+    /// Load one registered Workflow by exact identity or by UID.
+    ///
+    /// Pass either `uid` alone or all of `space`, `name`, and `version`; a
+    /// mixed or versionless selector is refused before any read. Every Agent
+    /// and Prompt is read along the Workflow's locked relationships, so later
+    /// versions never float in. The GIL is released while loading.
+    ///
+    /// Loading only reads Cards; it registers and runs nothing. It blocks
+    /// until loading finishes, and a failure after some reads returns no
+    /// partial Workflow and writes nothing durable.
+    ///
+    /// # Arguments
+    /// * `uid` - Exact server-assigned Workflow UID.
+    /// * `space` - Workflow space.
+    /// * `name` - Workflow name.
+    /// * `version` - Exact Workflow version.
+    ///
+    /// # Returns
+    /// A runnable `wyrd.agent.Workflow`.
+    ///
+    /// # Errors
+    /// Returns `WYRD_WORKFLOW_400_INVALID_CARD_REF` for a mixed or incomplete
+    /// selector or a malformed field, before any read, with `details.field`
+    /// naming the field. Otherwise returns the error of
+    /// the shared [`wyrd_client::WorkflowCards::load`]:
+    /// `WYRD_PERMISSION_403_DENIED_RBAC` when the credential cannot read
+    /// Cards, `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no Workflow matches, and
+    /// the inactive-dependency and Workflow validation errors. Python raises
+    /// each as a `WyrdError` with that code.
+    #[pyo3(signature = (*, uid=None, space=None, name=None, version=None))]
+    fn load(
+        &self,
+        py: Python<'_>,
+        uid: Option<&str>,
+        space: Option<&str>,
+        name: Option<&str>,
+        version: Option<&str>,
+    ) -> CardPyResult<PyWorkflow> {
+        let invalid = |field: &str, reason: String| {
+            WyrdPyError::from(WyrdError::WorkflowInvalidCardRef {
+                message: format!("invalid Workflow {field}: {reason}"),
+                details: serde_json::json!({ "field": field }),
+            })
+        };
+        let selector = match (uid, space, name, version) {
+            (Some(uid), None, None, None) => CardSelector::uid(
+                CardKind::Workflow,
+                CardUid::new(uid).map_err(|error| invalid("uid", error.to_string()))?,
+            ),
+            (None, Some(space), Some(name), Some(version)) => CardSelector::named(
+                CardKind::Workflow,
+                SpaceName::new(space).map_err(|error| invalid("space", error.to_string()))?,
+                CardName::new(name).map_err(|error| invalid("name", error.to_string()))?,
+            )
+            .with_version(
+                VersionBlock::parse(version)
+                    .map_err(|error| invalid("version", error.to_string()))?,
+            ),
+            _ => {
+                return Err(invalid(
+                    "selector",
+                    "pass either uid alone or space, name, and version".to_owned(),
+                ));
+            }
+        };
+        let workflow = py
+            .detach(|| wyrd_runtime::runtime().block_on(self.inner.workflow().load(&selector)))
+            .map_err(WyrdPyError::from)?;
+        Ok(PyWorkflow::from(workflow))
+    }
+}
+
 /// Saved Python holder state awaiting native manifest construction.
 struct SavedPythonCard {
     /// Validated envelope carrying one coherent server-native version intent.
@@ -2930,7 +3028,7 @@ fn selector_for_kind(
     version: Option<&str>,
 ) -> CardPyResult<CardSelector> {
     if let Some(uid) = uid {
-        let uid = CardUid::new(uid).map_err(|error| WyrdPyError::validation(error.to_string()))?;
+        let uid = CardUid::new(uid).map_err(|error| invalid_selector("uid", error.to_string()))?;
         let selector = CardSelector::uid(kind, uid).with_identity_assertions(
             space.map(parse_space).transpose()?,
             name.map(parse_name).transpose()?,
@@ -2944,10 +3042,10 @@ fn selector_for_kind(
     }
 
     let space = space
-        .ok_or_else(|| WyrdPyError::validation("space is required when uid is not provided"))
+        .ok_or_else(|| invalid_selector("space", "space is required when uid is not provided"))
         .and_then(parse_space)?;
     let name = name
-        .ok_or_else(|| WyrdPyError::validation("name is required when uid is not provided"))
+        .ok_or_else(|| invalid_selector("name", "name is required when uid is not provided"))
         .and_then(parse_name)?;
     let selector = CardSelector::named(kind, space, name);
     version
@@ -2958,13 +3056,27 @@ fn selector_for_kind(
         })
 }
 
+/// Builds the request validation error for one malformed registry selector
+/// field.
+///
+/// Selector identity is generic across Card kinds, so these failures are
+/// request validation rather than any kind's body validation; `field` names
+/// the selector argument that failed.
+fn invalid_selector(field: &str, reason: impl Into<String>) -> WyrdPyError {
+    WyrdError::Validation {
+        message: reason.into(),
+        details: serde_json::json!({ "field": field }),
+    }
+    .into()
+}
+
 /// Validates a Card space name.
 ///
 /// # Errors
 ///
 /// Returns a validation error carrying the space-name rule that failed.
 fn parse_space(value: &str) -> CardPyResult<SpaceName> {
-    SpaceName::new(value).map_err(|error| WyrdPyError::validation(error.to_string()))
+    SpaceName::new(value).map_err(|error| invalid_selector("space", error.to_string()))
 }
 
 /// Validates a Card name.
@@ -2973,7 +3085,7 @@ fn parse_space(value: &str) -> CardPyResult<SpaceName> {
 ///
 /// Returns a validation error carrying the name rule that failed.
 fn parse_name(value: &str) -> CardPyResult<CardName> {
-    CardName::new(value).map_err(|error| WyrdPyError::validation(error.to_string()))
+    CardName::new(value).map_err(|error| invalid_selector("name", error.to_string()))
 }
 
 /// Parses a version or version block used to narrow a selector.
@@ -2982,7 +3094,7 @@ fn parse_name(value: &str) -> CardPyResult<CardName> {
 ///
 /// Returns a validation error for an unparseable version.
 fn parse_version(value: &str) -> CardPyResult<VersionBlock> {
-    VersionBlock::parse(value).map_err(|error| WyrdPyError::validation(error.to_string()))
+    VersionBlock::parse(value).map_err(|error| invalid_selector("version", error.to_string()))
 }
 
 /// Parses a case-insensitive lifecycle status filter.
@@ -3119,6 +3231,7 @@ pub fn register_cards(module: &Bound<'_, PyModule>) -> CardPyResult<()> {
     module.add_class::<PyDataCardRegistry>()?;
     module.add_class::<PyModelCardRegistry>()?;
     module.add_class::<PyPromptCardRegistry>()?;
+    module.add_class::<PyWorkflowCards>()?;
     module.add_class::<PyCardSummary>()?;
     module.add_class::<PyCardList>()?;
     module.add_class::<PyRegistrationOutcome>()?;

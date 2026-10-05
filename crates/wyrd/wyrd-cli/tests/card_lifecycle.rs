@@ -204,6 +204,7 @@ impl RuntimeServiceFixture {
     const EXPECTED_ALIASES: &[&str] = &[
         "agent_inline",
         "agent_triage",
+        "default-Agent-triage-1.0.0",
         "default-Data-training-1.0.0",
         "default-Prompt-triage-prompt-1.0.0",
         "default-Verifier-model-drift-1.0.0",

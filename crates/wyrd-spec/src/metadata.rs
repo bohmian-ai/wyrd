@@ -411,6 +411,7 @@ mod metadata_tests {
             variables: Vec::new(),
             media_variables: Vec::new(),
             response_type: ResponseType::Text,
+            provider: None,
         })
         .expect("static prompt spec is valid")
     }

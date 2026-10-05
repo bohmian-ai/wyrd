@@ -1,0 +1,23 @@
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  space: workflow-loading
+  name: correctness-review-prompt
+  version: "1.0.0"
+spec:
+  model: gpt-5-5
+  request:
+    provider: open_ai_chat_completion
+    body:
+      model: gpt-5-5
+      messages:
+        - role: system
+          content: |
+            You are a correctness reviewer. Find reachable bugs, data loss, races,
+            and contract violations. Ignore style-only concerns.
+        - role: user
+          content: |
+            Review this change:
+            {{code}}
+  variables: [code]
+  response_type: text

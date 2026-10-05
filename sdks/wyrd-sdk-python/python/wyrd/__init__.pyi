@@ -12,9 +12,6 @@ from .agent import (
     RunConfig,
     SessionMemory,
     SessionTurn,
-    StepEvent,
-    StepOutcome,
-    StepStatus,
     Workflow,
     WorkflowRun,
     local_registry,
@@ -26,8 +23,6 @@ from .client import WyrdClient
 from .config import WyrdConfig
 from .data import DataCard, Split
 from .model import ModelCard, ModelSignature, SampleInput
-from .observer import Observer
-from .otel import OtelObserver
 from .prompt import (
     AnthropicSettings,
     GeminiSettings,
@@ -65,8 +60,6 @@ __all__ = [
     "NoSession",
     "OpenAIResponsesSettings",
     "OpenAISettings",
-    "Observer",
-    "OtelObserver",
     "Prompt",
     "PromptCard",
     "PromptCardMetadata",
@@ -82,9 +75,6 @@ __all__ = [
     "SessionMemory",
     "SessionTurn",
     "Split",
-    "StepEvent",
-    "StepOutcome",
-    "StepStatus",
     "ToolError",
     "Workflow",
     "WorkflowRun",

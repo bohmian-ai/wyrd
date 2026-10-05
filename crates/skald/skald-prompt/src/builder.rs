@@ -1,6 +1,5 @@
 //! Provider-shaped constructors that emit native Skald prompt requests.
 
-use serde_json::value::RawValue;
 use skald_spec::wire::anthropic_messages::{
     AnthropicMessage, AnthropicMessagesRequest, AnthropicMessagesSettings,
 };
@@ -14,7 +13,6 @@ use skald_spec::wire::openai_responses::{
     OpenAiResponseContentPart, OpenAiResponseItem, OpenAiResponsesRequest, OpenAiResponsesSettings,
     OpenAiResponsesText, OpenAiTextResponseFormat,
 };
-use skald_spec::wire::vertex_generate::VertexGenerateContentRequest;
 use skald_spec::{ProviderName, ProviderRequest, ResponseType};
 
 use crate::coerce::{checked_model, schema_object};
@@ -145,6 +143,7 @@ pub fn openai_chat(
         variables: options.variables,
         media_variables: Vec::new(),
         response_type,
+        provider: None,
     })
 }
 
@@ -183,6 +182,7 @@ pub fn openai_responses(
         variables: options.variables,
         media_variables: Vec::new(),
         response_type,
+        provider: None,
     })
 }
 
@@ -226,6 +226,7 @@ pub fn anthropic(
         variables: options.variables,
         media_variables: Vec::new(),
         response_type,
+        provider: None,
     })
 }
 
@@ -237,21 +238,37 @@ pub fn gemini(model: impl Into<String>, options: GeminiOptions) -> PromptBuilder
 }
 
 /// Builds a native Vertex `GenerateContent` prompt.
+///
+/// Vertex shares the Gemini `GenerateContent` body schema, so the Prompt
+/// carries a `GeminiGenerateContent` request and sets `Prompt.provider` to
+/// Vertex as its dispatch destination.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::EmptyModel`] for a blank model,
+/// [`PromptBuilderError::InvalidResponseSchema`] when a JSON-schema response
+/// format is not a JSON object, and [`PromptBuilderError::Skald`] when native
+/// Prompt construction rejects the request.
 pub fn vertex(model: impl Into<String>, options: VertexOptions) -> PromptBuilderResult<Prompt> {
     let model = checked_model(model)?;
     google_prompt(model, options, true)
 }
 
 /// Builds a raw passthrough prompt with a durable provider target.
+///
+/// `bytes` is parsed as JSON and stored as the `RawV1` body sent to `provider`.
+///
+/// # Errors
+///
+/// Returns an invalid-model error for a blank model and
+/// [`PromptBuilderError::InvalidRawJson`] when `bytes` is not JSON.
 pub fn raw(
     provider: ProviderName,
     model: impl Into<String>,
     bytes: &[u8],
 ) -> PromptBuilderResult<Prompt> {
     let model = checked_model(model)?;
-    let body = std::str::from_utf8(bytes)
-        .map_err(|error| PromptBuilderError::InvalidRawJson(error.to_string()))?;
-    let body = RawValue::from_string(body.to_owned())
+    let body = serde_json::from_slice(bytes)
         .map_err(|error| PromptBuilderError::InvalidRawJson(error.to_string()))?;
     finalize_prompt(skald_spec::Prompt {
         request: ProviderRequest::RawV1 { provider, body },
@@ -260,9 +277,21 @@ pub fn raw(
         variables: Vec::new(),
         media_variables: Vec::new(),
         response_type: ResponseType::Text,
+        provider: None,
     })
 }
 
+/// Builds the shared `GenerateContent` Prompt behind [`gemini`] and [`vertex`].
+///
+/// The request body is identical for both destinations; `vertex_target` only
+/// selects whether `Prompt.provider` is set to Vertex or left unset so dispatch
+/// uses the schema's Google default.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::InvalidResponseSchema`] when a JSON-schema
+/// response format is not a JSON object, and [`PromptBuilderError::Skald`]
+/// when [`finalize_prompt`] rejects the request.
 fn google_prompt(
     model: String,
     options: GeminiOptions,
@@ -290,27 +319,41 @@ fn google_prompt(
         settings,
     };
     finalize_prompt(skald_spec::Prompt {
-        request: if vertex_target {
-            ProviderRequest::Vertex(VertexGenerateContentRequest(request))
-        } else {
-            ProviderRequest::GeminiGenerateContent(request)
-        },
+        request: ProviderRequest::GeminiGenerateContent(request),
         model,
         version: options.version,
         variables: options.variables,
         media_variables: Vec::new(),
         response_type,
+        provider: vertex_target.then_some(ProviderName::Vertex),
     })
 }
 
+/// Normalizes a builder-assembled Prompt and wraps it for callers.
+///
+/// Without caller-declared variables, the Prompt is rebuilt through
+/// [`skald_spec::Prompt::new`] so variables and media placeholders are derived
+/// from the request. That constructor always resets the destination to `None`,
+/// so the builder's `provider` (for example Vertex for a shared
+/// `GenerateContent` body) is saved first and restored afterwards; dropping
+/// that step would silently retarget Vertex Prompts to Google. With declared
+/// variables, only media placeholders are normalized and the destination is
+/// untouched.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::Skald`] when system content holds a media
+/// placeholder or the request cannot be serialized for variable extraction.
 fn finalize_prompt(mut prompt: skald_spec::Prompt) -> PromptBuilderResult<Prompt> {
     if prompt.variables.is_empty() {
+        let provider = prompt.provider;
         prompt = skald_spec::Prompt::new(
             prompt.request,
             prompt.model,
             prompt.version,
             prompt.response_type,
         )?;
+        prompt.provider = provider;
     } else {
         prompt.normalize_media_placeholders_mut()?;
     }
@@ -609,12 +652,13 @@ mod builder_tests {
         .unwrap();
         assert!(matches!(
             vertex_prompt.native().request,
-            ProviderRequest::Vertex(_)
+            ProviderRequest::GeminiGenerateContent(_)
         ));
+        assert_eq!(vertex_prompt.native().provider(), ProviderName::Vertex);
     }
 
     #[test]
-    fn raw_preserves_provider_and_body_bytes() {
+    fn raw_preserves_provider_and_body() {
         let prompt = raw(
             ProviderName::Custom("local".to_owned()),
             "local-model",
@@ -626,7 +670,7 @@ mod builder_tests {
             panic!("expected raw request");
         };
         assert_eq!(provider, &ProviderName::Custom("local".to_owned()));
-        assert_eq!(body.get(), r#"{"a":1}"#);
+        assert_eq!(body, &serde_json::json!({"a": 1}));
     }
 
     #[test]

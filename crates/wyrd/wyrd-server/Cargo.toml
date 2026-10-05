@@ -52,8 +52,11 @@ rmcp = { workspace = true, features = [
 vala-drift = { workspace = true }
 vala-eval = { workspace = true }
 skald-prompt = { workspace = true }
+skald-providers = { workspace = true }
 skald-runtime = { workspace = true }
 skald-spec = { workspace = true }
+skald-tool = { workspace = true }
+skald-workflow = { workspace = true }
 wyrd-telemetry = { workspace = true }
 uuid = { workspace = true, features = ["v4", "v7"] }
 base64 = { workspace = true }
@@ -98,6 +101,7 @@ wyrd-client = { path = "../../shared/wyrd-client", version = "0.0.1" }
 wyrd-gateway = { workspace = true }
 wyrd-storage = { workspace = true }
 wyrd-tls = { workspace = true }
+wyrd-utils = { workspace = true }
 wyrd-vault = { workspace = true }
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
@@ -106,6 +110,7 @@ utoipa-axum = { workspace = true }
 workspace-hack.workspace = true
 tracing-subscriber = { workspace = true }
 insta = { workspace = true }
+jsonschema = { workspace = true }
 reqwest = { workspace = true }
 wyrd-storage = { workspace = true }
 temp-env = { workspace = true }
@@ -150,3 +155,10 @@ required-features = ["storage-emulator"]
 
 [[test]]
 name = "pg_card_registration_route"
+
+[[test]]
+name = "pg_workflow_registration"
+
+[[test]]
+name = "pg_workflow_runs"
+required-features = ["test-support"]

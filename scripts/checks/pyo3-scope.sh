@@ -28,7 +28,6 @@ if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/shared \
 fi
 
 if rg -n 'pyo3|pymodule|pyclass|pymethods|Python|Bound<|Py<|PyErr' crates/skald \
-  --glob '!crates/skald/skald-observer/**' \
   --glob '!crates/skald/skald-prompt/**' \
   --glob '!crates/skald/skald-runtime/Cargo.toml' \
   --glob '!crates/skald/skald-runtime/src/lib.rs' \
@@ -52,7 +51,7 @@ if rg -n 'pyo3|pymodule|pyclass|pymethods|Python|Bound<|Py<|PyErr' crates/skald 
   exit 1
 fi
 
-for crate in skald-observer skald-prompt skald-runtime skald-agent skald-tool skald-workflow; do
+for crate in skald-prompt skald-runtime skald-agent skald-tool skald-workflow; do
   manifest="crates/skald/$crate/Cargo.toml"
   if ! rg -q 'python = \[' "$manifest" || ! rg -q 'dep:pyo3' "$manifest"; then
     echo "$crate must gate PyO3 behind its python feature"

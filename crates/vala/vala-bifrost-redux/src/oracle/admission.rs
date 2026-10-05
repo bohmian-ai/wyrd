@@ -1316,43 +1316,6 @@ impl Drop for AdmittedQueryGuard {
 }
 
 impl AdmittedQueryGuard {
-    /// Waits, bounded, for every task-owned child of this failed query's
-    /// envelope to drop before admission is released.
-    ///
-    /// Dropping a failed plan aborts its spawned `DataFusion` partition tasks,
-    /// but the runtime drops an aborted task — and the memory
-    /// reservation it holds — only on a later poll. Releasing the envelope in
-    /// that window would poison the process governor for a teardown that is
-    /// merely in progress. This first returns the reservations the guard itself
-    /// retains, exactly as [`Self::release`] would, then polls the envelope on
-    /// the same bounded schedule a follower graph drains on. A child still
-    /// alive after the wait is a real leak, and the following release poisons
-    /// as before.
-    pub(super) async fn drain_children(&mut self) {
-        self.live_reservations.clear();
-        self.physical_projections.clear();
-        for _ in 0..super::analytical::GRAPH_DRAIN_POLLS {
-            if self.children_idle() {
-                return;
-            }
-            tokio::time::sleep(super::analytical::GRAPH_DRAIN_INTERVAL).await;
-        }
-        tracing::warn!(
-            query_id = ?self.query_id,
-            "Oracle query children did not drain before admission release"
-        );
-    }
-
-    /// Reports whether the admitted envelope has no live nested child.
-    ///
-    /// A released, moved, or poisoned envelope reports idle so the caller
-    /// proceeds to release, which owns reporting those states.
-    fn children_idle(&self) -> bool {
-        self.resources
-            .as_ref()
-            .is_none_or(crate::resources::OracleQueryResources::nested_idle)
-    }
-
     /// Takes the Analytical ownership so the stream can settle it.
     ///
     /// Taking rather than borrowing is deliberate: settlement consumes the two
@@ -1368,9 +1331,8 @@ impl AdmittedQueryGuard {
     /// retains the guard.
     ///
     /// The projections are children of the very envelope the graph returns on
-    /// release, and the graph releases only once that envelope has no live
-    /// children. A retained guard still holding them would make the graph wait
-    /// on itself until its deadline and strand its capacity on this node.
+    /// release. A retained guard still holding them would keep that envelope's
+    /// memory charged for as long as the graph retains the guard.
     pub(super) fn release_physical_projections(&mut self) {
         self.physical_projections.clear();
     }

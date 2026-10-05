@@ -18,6 +18,12 @@ Replicas may enable a subset of server roles through the canonical target
 configuration. Targeting changes activated subsystems and resource ownership;
 it does not create another public service, protocol, or durable contract.
 
+Server Workflow runs are process-local. A deployment with more than one
+replica serving `/v1/workflow-runs` must route every request for one run
+(create and its idempotent replays, get, and cancel) to the replica that
+accepted it, for example by tenant or principal affinity at the gateway. A
+non-owning replica answers not found; there is no cross-replica lookup.
+
 The gateway owns public addressability, request-size and connection bounds,
 rate-limit integration, and external TLS termination when TLS is not terminated
 by `wyrd-server`. It does not establish tenant identity, reinterpret Wyrd

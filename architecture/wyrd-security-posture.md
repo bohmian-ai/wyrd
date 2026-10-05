@@ -178,6 +178,16 @@ credential.
   token already issued keeps its snapshot authority until its five-minute
   expiry; there is no revocation list or authorization epoch. The platform
   plane instead revalidates current state on every request.
+- An accepted server Workflow run is the one bounded exception to
+  request-scoped authority. Its audited `workflows:run` submission captures a
+  token-free snapshot of principal attribution and scopes, bounded to the
+  run's pinned graph and total deadline; no bearer token or secret is
+  retained, renewed, or exposed. Token expiry, revocation, or later grant
+  change neither cancels nor widens the run, and the snapshot ends with it.
+  Later HTTP create/replay, get, and cancel requests authenticate and
+  authorize afresh. Cards reads, Bifrost queries, and gateway calls inside
+  the run still make and audit their own live per-call decisions, including
+  current gateway deployment and credential eligibility.
 - Bearer access tokens remain replayable until expiry. TLS, short lifetime,
   token-family replay detection, least privilege, and audit are the required
   replay controls. Logs and traces never record bearer material.
@@ -326,6 +336,20 @@ Before fetching any user- or tenant-supplied URL, the server must:
 
 A string allowlist without resolved-address validation and connection pinning
 is not an SSRF control.
+
+Workflow `ext_gateway` steps use that same egress procedure from the process
+that executes them. A binding names one protocol, one exact origin, and secret
+headers given as secret references; a step's `base_url` must share the
+binding's origin and protocol. A local run reads its bindings from the shared
+client configuration under the local profile, which admits explicitly
+configured private origins and plain HTTP only to loopback; the production
+profile admits HTTPS on port 443 to public addresses only. A server run uses
+only bindings the server operator assigned to the run's tenant. Secrets are
+resolved when a run that selects the binding starts, never while loading or
+registering, and never enter Cards, run snapshots, errors, or logs. A binding
+of another protocol, an unassigned binding, or an unreadable secret refuses
+the run before any dispatch. An `ext_gateway` request never passes through
+the Wyrd gateway, and a `wyrd_gateway` request never carries binding secrets.
 
 ## Tenant and data isolation
 

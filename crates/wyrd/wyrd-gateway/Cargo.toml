@@ -30,6 +30,7 @@ url = { workspace = true }
 wyrd-crypt = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-tls = { workspace = true }
+wyrd-utils = { workspace = true }
 wyrd-vault = { workspace = true }
 zeroize = { workspace = true }
 

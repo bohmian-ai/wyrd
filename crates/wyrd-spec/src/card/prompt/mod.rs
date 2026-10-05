@@ -38,7 +38,6 @@ pub(crate) mod prompt_support {
     };
     use skald_spec::wire::openai_chat::OpenAiMessageContent;
     use skald_spec::wire::openai_responses::{OpenAiResponseContentPart, OpenAiResponseItem};
-    use skald_spec::wire::vertex_generate::VertexGenerateContentRequest;
     use skald_spec::{
         AnthropicContentBlock, AnthropicMessage, AnthropicMessagesRequest,
         AnthropicMessagesSettings, GoogleContent, GoogleGenerateContentRequest,
@@ -60,6 +59,7 @@ pub(crate) mod prompt_support {
             variables: variables.into_iter().map(ToOwned::to_owned).collect(),
             media_variables: Vec::new(),
             response_type: ResponseType::Text,
+            provider: None,
         }
     }
 
@@ -211,22 +211,13 @@ pub(crate) mod prompt_support {
         })
     }
 
-    pub fn vertex_request(text: &str) -> ProviderRequest {
-        let google = match google_request(text) {
-            ProviderRequest::GeminiGenerateContent(request) => request,
-            _ => unreachable!("helper returns Google"),
-        };
-        ProviderRequest::Vertex(VertexGenerateContentRequest(google))
-    }
-
     pub fn raw_request(provider: ProviderName) -> ProviderRequest {
         ProviderRequest::RawV1 {
             provider,
-            body: serde_json::value::to_raw_value(&serde_json::json!({
+            body: serde_json::json!({
                 "native": true,
                 "nested": { "b": 2, "a": 1 }
-            }))
-            .expect("raw value builds"),
+            }),
         }
     }
 
@@ -261,9 +252,10 @@ pub(crate) mod prompt_support {
         }
     }
 
-    pub fn raw_body_text(request: &ProviderRequest) -> Option<&str> {
+    /// Returns the raw provider body of a `RawV1` request, or `None` for a typed request.
+    pub fn raw_body(request: &ProviderRequest) -> Option<&Value> {
         match request {
-            ProviderRequest::RawV1 { body, .. } => Some(body.get()),
+            ProviderRequest::RawV1 { body, .. } => Some(body),
             _ => None,
         }
     }
@@ -275,7 +267,7 @@ pub(crate) mod prompt_support {
 
 #[cfg(test)]
 mod prompt_codec_tests {
-    use super::prompt_support::{prompt_card, prompt_spec, raw_body_text, raw_request};
+    use super::prompt_support::{prompt_card, prompt_spec, raw_body, raw_request};
     use crate::{CardLoadFormat, parse_card_bytes, serialize_card};
     use skald_spec::ProviderName;
 
@@ -304,19 +296,19 @@ mod prompt_codec_tests {
     }
 
     #[test]
-    fn parse_raw_v1_preserves_body_bytes() {
+    fn parse_raw_v1_preserves_body() {
         let card = prompt_card(prompt_spec(
             raw_request(ProviderName::Custom("acme".to_owned())),
             Vec::new(),
         ));
         let original_body = match &card.spec {
-            crate::envelope::Spec::Prompt(spec) => raw_body_text(&spec.prompt.request),
+            crate::envelope::Spec::Prompt(spec) => raw_body(&spec.prompt.request),
             _ => None,
         };
         let bytes = serialize_card(CardLoadFormat::Json, &card).expect("serialize");
         let decoded = parse_card_bytes(CardLoadFormat::Json, &bytes).expect("parse");
         let decoded_body = match &decoded.spec {
-            crate::envelope::Spec::Prompt(spec) => raw_body_text(&spec.prompt.request),
+            crate::envelope::Spec::Prompt(spec) => raw_body(&spec.prompt.request),
             _ => None,
         };
 
@@ -335,7 +327,7 @@ mod prompt_codec_tests {
 mod prompt_construct_tests {
     use super::prompt_support::{
         anthropic_request, google_request, openai_chat_request, openai_responses_request,
-        prompt_spec, raw_request, vertex_request,
+        prompt_spec, raw_request,
     };
     use skald_spec::ProviderName;
 
@@ -346,7 +338,6 @@ mod prompt_construct_tests {
             openai_responses_request("hello"),
             anthropic_request("hello"),
             google_request("hello"),
-            vertex_request("hello"),
         ] {
             let spec = prompt_spec(request, Vec::new());
             assert!(spec.parameters().is_empty());
@@ -731,7 +722,7 @@ mod prompt_envelope_invariants_tests {
     fn raw_v1_with_no_placeholders_validates() {
         let raw = ProviderRequest::RawV1 {
             provider: skald_spec::ProviderName::Custom("acme".to_owned()),
-            body: serde_json::value::to_raw_value(&serde_json::json!({"x": 1})).expect("raw"),
+            body: serde_json::json!({"x": 1}),
         };
 
         assert!(PromptSpec::new(prompt(raw, Vec::new())).is_ok());

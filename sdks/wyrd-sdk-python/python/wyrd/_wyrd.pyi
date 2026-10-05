@@ -12,9 +12,6 @@ import pathlib
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol, TypeAlias, overload
 
-from wyrd.observer import Observer
-from wyrd.otel import OtelObserver
-
 PathLike: TypeAlias = str | os.PathLike[str] | pathlib.Path
 JsonDict: TypeAlias = dict[str, Any]
 StringMap: TypeAlias = Mapping[str, str]
@@ -173,16 +170,11 @@ def build_wyrd_error(
     """
     ...
 
-def _init() -> None:
-    """Initialize the native Wyrd extension."""
-    ...
-
 ### GLOBAL EXPORTS ###
 __all__ = [
     "AgentError",
     "SessionError",
     "ToolError",
     "WyrdError",
-    "_init",
     "build_wyrd_error",
 ]

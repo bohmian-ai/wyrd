@@ -11,6 +11,7 @@ default = []
 python = ["dep:pyo3"]
 
 [dependencies]
+secrecy = { workspace = true }
 semver = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

@@ -50,8 +50,7 @@ impl<'a> ResponseAdapter<'a> {
             ProviderResponse::OpenAiChatCompletion(response) => openai_chat_text(response),
             ProviderResponse::OpenAiResponses(response) => openai_responses_text(response),
             ProviderResponse::AnthropicMessage(response) => anthropic_text(response),
-            ProviderResponse::GeminiGenerateContent(response)
-            | ProviderResponse::VertexGenerateContent(response) => google_text(response),
+            ProviderResponse::GeminiGenerateContent(response) => google_text(response),
             ProviderResponse::OpenAiEmbeddings(_)
             | ProviderResponse::GoogleBatchEmbed(_)
             | ProviderResponse::VertexPredict(_)
@@ -99,8 +98,7 @@ impl<'a> ResponseAdapter<'a> {
                     _ => None,
                 })
                 .collect(),
-            ProviderResponse::GeminiGenerateContent(response)
-            | ProviderResponse::VertexGenerateContent(response) => response
+            ProviderResponse::GeminiGenerateContent(response) => response
                 .candidates
                 .first()
                 .map(|candidate| {
@@ -149,8 +147,7 @@ impl<'a> ResponseAdapter<'a> {
             ProviderResponse::AnthropicMessage(response) => {
                 Some(TokenUsage::from(response.usage.clone()))
             }
-            ProviderResponse::GeminiGenerateContent(response)
-            | ProviderResponse::VertexGenerateContent(response) => {
+            ProviderResponse::GeminiGenerateContent(response) => {
                 response.usage_metadata.clone().map(TokenUsage::from)
             }
             ProviderResponse::OpenAiEmbeddings(_)
@@ -190,8 +187,7 @@ impl<'a> ResponseAdapter<'a> {
                 .as_ref()
                 .map(anthropic_finish_reason)
                 .unwrap_or(FinishReason::Other),
-            ProviderResponse::GeminiGenerateContent(response)
-            | ProviderResponse::VertexGenerateContent(response) => response
+            ProviderResponse::GeminiGenerateContent(response) => response
                 .candidates
                 .first()
                 .and_then(|candidate| candidate.finish_reason.as_ref())

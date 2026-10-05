@@ -10,6 +10,7 @@ pub mod fs;
 pub mod json;
 #[cfg(feature = "python")]
 pub mod py;
+pub mod secret;
 
 use std::path::PathBuf;
 

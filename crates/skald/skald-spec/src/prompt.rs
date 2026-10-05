@@ -45,6 +45,12 @@ pub struct Prompt {
     /// Expected response shape for runtime validation.
     #[serde(default)]
     pub response_type: ResponseType,
+    /// Native dispatch target, such as a custom OpenAI-compatible endpoint.
+    ///
+    /// When absent, native dispatch uses the request dialect's default
+    /// provider. Gateway routes select their own upstream and ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderName>,
 }
 
 /// Borrowed view of native generation settings for the active provider.
@@ -136,6 +142,18 @@ pub fn split_text_on_media(text: &str) -> Vec<TextSegment> {
 impl Prompt {
     /// Create a prompt, split media placeholders into isolated native text
     /// parts, and populate `variables` / `media_variables` from the request.
+    ///
+    /// The request carries only the body schema, so the created Prompt has no
+    /// destination (`provider` is `None`) and native dispatch uses the
+    /// schema's default provider. A caller that targets a different
+    /// destination, such as Vertex for a shared GenerateContent body, sets
+    /// `provider` after construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkaldError::MediaInSystemMessage`] when system content holds a
+    /// `${media:name}` placeholder, and a serialization error when the request
+    /// cannot be serialized to scan its `${name}` / `{{name}}` variables.
     pub fn new(
         request: ProviderRequest,
         model: impl Into<String>,
@@ -149,17 +167,27 @@ impl Prompt {
             variables: Vec::new(),
             media_variables: Vec::new(),
             response_type,
+            provider: None,
         };
         prompt.normalize_media_placeholders_mut()?;
         prompt.variables = extract_text_variables(&prompt.request)?;
         Ok(prompt)
     }
 
+    /// Return the provider native dispatch sends this Prompt to.
+    ///
+    /// This is [`Prompt::provider`](Self::provider) when set, otherwise the
+    /// request dialect's default from [`ProviderRequest::provider`].
+    pub fn provider(&self) -> ProviderName {
+        self.provider
+            .clone()
+            .unwrap_or_else(|| self.request.provider())
+    }
+
     /// Borrow native generation settings for the request's active provider.
     pub fn settings_ref(&self) -> Option<ProviderSettingsRef<'_>> {
         match &self.request {
-            ProviderRequest::OpenAiChatCompletion(request)
-            | ProviderRequest::OpenAiChatCompatible { request, .. } => {
+            ProviderRequest::OpenAiChatCompletion(request) => {
                 Some(ProviderSettingsRef::OpenAiChat(&request.settings))
             }
             ProviderRequest::OpenAiResponses(request) => {
@@ -170,9 +198,6 @@ impl Prompt {
             }
             ProviderRequest::GeminiGenerateContent(request) => {
                 Some(ProviderSettingsRef::Google(&request.settings))
-            }
-            ProviderRequest::Vertex(request) => {
-                Some(ProviderSettingsRef::Google(&request.0.settings))
             }
             ProviderRequest::OpenAiEmbeddings(_)
             | ProviderRequest::GoogleBatchEmbed(_)
@@ -196,7 +221,7 @@ impl Prompt {
     ///
     /// This is the reusable primitive behind higher-level prompt binding. It performs
     /// replacement inside JSON string leaves after serializing the native
-    /// request, then deserializes back into the same provider-native enum.
+    /// request, then deserializes back into the same provider-tagged variant.
     pub fn bind(&self, vars: &[(&str, &str)]) -> SkaldResult<Self> {
         let mut prompt = self.clone();
         prompt.bind_mut(vars)?;
@@ -210,8 +235,7 @@ impl Prompt {
     pub fn bind_mut(&mut self, vars: &[(&str, &str)]) -> SkaldResult<()> {
         let mut request = serde_json::to_value(&self.request).map_err(SkaldError::serialize)?;
         replace_string_leaves(&mut request, vars);
-        self.request =
-            deserialize_request_like(&self.request, request).map_err(SkaldError::deserialize)?;
+        self.request = serde_json::from_value(request).map_err(SkaldError::deserialize)?;
         self.variables
             .retain(|name| !vars.iter().any(|(key, _)| key == name));
         Ok(())
@@ -231,9 +255,9 @@ impl Prompt {
     /// `AnthropicContentBlock::Document`, or `GooglePart::InlineData`.
     pub fn bind_media_mut(&mut self, name: &str, media: &MediaRef) -> SkaldResult<()> {
         self.normalize_media_placeholders_mut()?;
+        let provider = self.provider();
         match &mut self.request {
-            ProviderRequest::OpenAiChatCompletion(request)
-            | ProviderRequest::OpenAiChatCompatible { request, .. } => {
+            ProviderRequest::OpenAiChatCompletion(request) => {
                 bind_media_openai_chat(request, name, media)?;
             }
             ProviderRequest::OpenAiResponses(request) => {
@@ -243,10 +267,7 @@ impl Prompt {
                 bind_media_anthropic(request, name, media)?;
             }
             ProviderRequest::GeminiGenerateContent(request) => {
-                bind_media_google(request, name, media, ProviderName::Google)?;
-            }
-            ProviderRequest::Vertex(request) => {
-                bind_media_google(&mut request.0, name, media, ProviderName::Vertex)?;
+                bind_media_google(request, name, media, provider)?;
             }
             ProviderRequest::OpenAiEmbeddings(_)
             | ProviderRequest::GoogleBatchEmbed(_)
@@ -304,38 +325,6 @@ fn replace_string_leaves(value: &mut Value, vars: &[(&str, &str)]) {
     }
 }
 
-fn deserialize_request_like(
-    original: &ProviderRequest,
-    value: Value,
-) -> serde_json::Result<ProviderRequest> {
-    Ok(match original {
-        ProviderRequest::OpenAiChatCompletion(_) => {
-            ProviderRequest::OpenAiChatCompletion(serde_json::from_value(value)?)
-        }
-        ProviderRequest::OpenAiChatCompatible { .. } => serde_json::from_value(value)?,
-        ProviderRequest::OpenAiResponses(_) => {
-            ProviderRequest::OpenAiResponses(serde_json::from_value(value)?)
-        }
-        ProviderRequest::OpenAiEmbeddings(_) => {
-            ProviderRequest::OpenAiEmbeddings(serde_json::from_value(value)?)
-        }
-        ProviderRequest::AnthropicMessage(_) => {
-            ProviderRequest::AnthropicMessage(serde_json::from_value(value)?)
-        }
-        ProviderRequest::GeminiGenerateContent(_) => {
-            ProviderRequest::GeminiGenerateContent(serde_json::from_value(value)?)
-        }
-        ProviderRequest::GoogleBatchEmbed(_) => {
-            ProviderRequest::GoogleBatchEmbed(serde_json::from_value(value)?)
-        }
-        ProviderRequest::Vertex(_) => ProviderRequest::Vertex(serde_json::from_value(value)?),
-        ProviderRequest::VertexPredict(_) => {
-            ProviderRequest::VertexPredict(serde_json::from_value(value)?)
-        }
-        ProviderRequest::RawV1 { .. } => serde_json::from_value(value)?,
-    })
-}
-
 fn extract_text_variables(request: &ProviderRequest) -> SkaldResult<Vec<String>> {
     let json = serde_json::to_string(request).map_err(SkaldError::serialize)?;
     let mut out = Vec::new();
@@ -369,8 +358,7 @@ fn placeholder_token(name: &str) -> String {
 
 fn scan_system_for_media(request: &ProviderRequest) -> SkaldResult<()> {
     match request {
-        ProviderRequest::OpenAiChatCompletion(request)
-        | ProviderRequest::OpenAiChatCompatible { request, .. } => {
+        ProviderRequest::OpenAiChatCompletion(request) => {
             for message in &request.messages {
                 if message.role == "system" {
                     scan_openai_chat_content(message.content.as_ref())?;
@@ -397,9 +385,6 @@ fn scan_system_for_media(request: &ProviderRequest) -> SkaldResult<()> {
         }
         ProviderRequest::GeminiGenerateContent(request) => {
             scan_google_system(request.system_instruction.as_ref())?;
-        }
-        ProviderRequest::Vertex(request) => {
-            scan_google_system(request.0.system_instruction.as_ref())?;
         }
         ProviderRequest::OpenAiEmbeddings(_)
         | ProviderRequest::GoogleBatchEmbed(_)
@@ -447,14 +432,12 @@ fn scan_text_for_system_media(text: &str) -> SkaldResult<()> {
 fn split_request_text_parts(request: &mut ProviderRequest) -> Vec<String> {
     let mut names = Vec::new();
     match request {
-        ProviderRequest::OpenAiChatCompletion(request)
-        | ProviderRequest::OpenAiChatCompatible { request, .. } => {
+        ProviderRequest::OpenAiChatCompletion(request) => {
             split_openai_chat(request, &mut names);
         }
         ProviderRequest::OpenAiResponses(request) => split_openai_responses(request, &mut names),
         ProviderRequest::AnthropicMessage(request) => split_anthropic(request, &mut names),
         ProviderRequest::GeminiGenerateContent(request) => split_google(request, &mut names),
-        ProviderRequest::Vertex(request) => split_google(&mut request.0, &mut names),
         ProviderRequest::OpenAiEmbeddings(_)
         | ProviderRequest::GoogleBatchEmbed(_)
         | ProviderRequest::VertexPredict(_)
@@ -1355,6 +1338,25 @@ mod prompt_media {
             }
         );
 
+        let mut vertex = google_prompt("${media:image}");
+        vertex.provider = Some(ProviderName::Vertex);
+        let vertex_https = vertex
+            .bind_media(
+                "image",
+                &MediaRef::image_url(
+                    "https://example.com/image.png",
+                    Some("image/png".to_owned()),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(
+            vertex_https,
+            SkaldError::UnsupportedMediaForProvider {
+                provider: ProviderName::Vertex,
+                kind: MediaKind::Image,
+            }
+        );
+
         let missing_mime = google_prompt("${media:image}")
             .bind_media("image", &MediaRef::image_file("files/abc", None))
             .unwrap_err();
@@ -1390,7 +1392,7 @@ mod prompt_media {
     #[test]
     fn serde_default_accepts_prompts_without_media_variables() {
         let value = json!({
-            "request": common::openai_chat_request(),
+            "request": ProviderRequest::OpenAiChatCompletion(common::openai_chat_request()),
             "model": "model",
             "variables": ["name"],
             "response_type": "text"
@@ -1416,6 +1418,7 @@ mod prompt_render {
             variables: variables.into_iter().map(str::to_string).collect(),
             media_variables: Vec::new(),
             response_type: ResponseType::Text,
+            provider: None,
         }
     }
 

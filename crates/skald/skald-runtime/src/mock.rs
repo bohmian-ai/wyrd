@@ -178,7 +178,6 @@ impl Provider for MockProvider {
 fn last_user_text(request: &ProviderRequest) -> String {
     let messages = match request {
         ProviderRequest::OpenAiChatCompletion(request) => &request.messages,
-        ProviderRequest::OpenAiChatCompatible { request, .. } => &request.messages,
         _ => return String::new(),
     };
     messages

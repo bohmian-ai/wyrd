@@ -86,3 +86,37 @@ def test_cards_with_an_empty_server_url_raise_config_invalid_details() -> None:
     assert captured.value.code == "WYRD_CLIENT_400_CONFIG_INVALID"
     assert captured.value.status == 400
     assert captured.value.details == {"field": "server_url", "reason": "must not be empty"}
+
+
+@pytest.mark.parametrize("kind", ["data", "model", "prompt"])
+@pytest.mark.parametrize(
+    ("method", "kwargs", "field"),
+    [
+        ("get", {"uid": "not-a-uid"}, "uid"),
+        ("get", {"uid": "not-a-uid", "space": "unit", "name": "card"}, "uid"),
+        ("get", {"space": "Bad Space", "name": "card"}, "space"),
+        ("get", {"space": "unit", "name": "Bad Name"}, "name"),
+        ("get", {"space": "unit", "name": "card", "version": "not-a-version"}, "version"),
+        ("get", {}, "space"),
+        ("get", {"space": "unit"}, "name"),
+        ("list", {"space": "Bad Space"}, "space"),
+        ("list", {"name": "Bad Name"}, "name"),
+        ("resolve_latest", {"space": "unit", "name": "Bad Name"}, "name"),
+        ("delete", {"uid": "not-a-uid"}, "uid"),
+        ("delete", {"space": "unit"}, "name"),
+    ],
+)
+def test_registry_selector_errors_use_request_validation(
+    kind: str, method: str, kwargs: dict[str, str], field: str
+) -> None:
+    """Malformed registry selectors raise request validation before any IO."""
+    registry = getattr(_offline_cards(), kind)
+    with pytest.raises(wyrd.WyrdError) as captured:
+        getattr(registry, method)(**kwargs)
+    assert captured.value.code == "WYRD_SPEC_400_VALIDATION"
+    assert captured.value.status == 400
+    assert captured.value.title == "Validation failed"
+    assert captured.value.remediation == (
+        "Check the submitted Wyrd request fields against the published schema and retry."
+    )
+    assert captured.value.details == {"field": field}

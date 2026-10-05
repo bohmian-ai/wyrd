@@ -203,7 +203,7 @@ mod tests {
     const API_KEY_FIXTURE: &str =
         "wyrd_sk_4d5e1c3a9b7f4e2d8a6c0b1e2f3a4b5c_1a2b3c4d_9f8e7d6c5b4a39281706f5e4d3c2b1a0";
 
-    use crate::global_config::{ClientSection, GlobalConfig};
+    use crate::global_config::{ClientSection, GlobalConfig, LocalWorkflowConfig};
 
     use super::{ClientConfig, TokenCacheMode};
     use crate::transport::{
@@ -245,6 +245,7 @@ mod tests {
                 tenant: Some("file-tenant".to_owned()),
                 token_cache: None,
             },
+            workflow: LocalWorkflowConfig::default(),
         };
         let resolved = ClientConfig::from_global_with_env(&config);
 

@@ -14,15 +14,15 @@
 
 /// Initialize Wyrd subsystems.
 ///
-/// This is idempotent. Rust users may call it manually when they want Skald
-/// agent runs to resolve observers through Wyrd observer state.
+/// This is idempotent: it refreshes the default provider registry from the
+/// environment. Agent and Workflow telemetry is plain `tracing`; install a
+/// subscriber to export it.
 pub fn init() {
-    skald_observer::init();
     skald_runtime::refresh_default_registry_from_env();
 }
 
 /// Agent runtime: identity, single-provider binding, bounded tool loop,
-/// observer hook, and `SKALD_AGENT_*` error catalog.
+/// `tracing` spans, and `SKALD_AGENT_*` error catalog.
 pub mod agent;
 
 /// Prompt authoring helpers and structured-output response formats.

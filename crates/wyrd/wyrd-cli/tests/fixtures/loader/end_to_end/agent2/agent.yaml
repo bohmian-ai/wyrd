@@ -17,14 +17,16 @@ spec:
   # elsewhere.
   prompt:
     request:
-      contents:
-        - role: user
+      provider: gemini_generate_content
+      body:
+        contents:
+          - role: user
+            parts:
+              - text: Execute the selected retention runbook.
+        system_instruction:
+          role: system
           parts:
-            - text: Execute the selected retention runbook.
-      system_instruction:
-        role: system
-        parts:
-          - text: !file runbook.txt
+            - text: !file runbook.txt
     model: gemini-flash-lite
     variables: []
     media_variables: []

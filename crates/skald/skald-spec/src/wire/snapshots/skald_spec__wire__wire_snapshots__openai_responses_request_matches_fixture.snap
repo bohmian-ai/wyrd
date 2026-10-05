@@ -1,6 +1,6 @@
 ---
 source: crates/skald/skald-spec/src/wire/mod.rs
-assertion_line: 15
+assertion_line: 28
 expression: "common::openai_responses_request()"
 ---
 {
@@ -29,7 +29,13 @@ expression: "common::openai_responses_request()"
     },
     {
       "type": "reasoning",
-      "summary": "short",
+      "id": "rs_1",
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "short"
+        }
+      ],
       "encrypted_content": "abc"
     },
     {

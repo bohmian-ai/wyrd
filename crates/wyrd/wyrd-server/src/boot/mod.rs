@@ -1459,6 +1459,7 @@ fn attach_config_fields(
         )?)
         .with_telemetry(telemetry)
         .with_limits(config.limits.into_state())
+        .with_workflow_config(config.workflow.clone())
         .with_gateway(config.gateway.clone())
         .with_gateway_secret_keys(Arc::clone(&gateway_secret_keys))
         .with_gateway_engine(wyrd_gateway::GatewayEngine::new(
@@ -1469,7 +1470,7 @@ fn attach_config_fields(
             wyrd_gateway::DeploymentHealth::default(),
             Arc::new(
                 wyrd_gateway::HttpProviderDispatch::new(
-                    wyrd_gateway::EndpointPolicy::new(config.deployment_profile.is_production()),
+                    skald_providers::EndpointPolicy::new(config.deployment_profile.is_production()),
                     wyrd_gateway::BuiltinEndpoints::default(),
                 )
                 .map_err(|error| ServerBootError::GatewayTransport(error.to_string()))?,

@@ -23,7 +23,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             providers.as_ref(),
             &agent.prompt,
             &[("topic", "the Rust borrow checker")],
-            None,
         )
         .await?;
 
